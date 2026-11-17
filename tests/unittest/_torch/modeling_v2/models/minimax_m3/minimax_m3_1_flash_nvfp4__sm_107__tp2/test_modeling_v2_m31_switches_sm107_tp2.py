@@ -1,11 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The contract of this target's kill switches and opt-ins (m31_switches).
-
-1 / true / on / yes set TRTLLM_M31_DISABLE_<ID>, empty / 0 / false / off / no leave it unset (case-insensitive), and
-anything else raises at import naming the variable; the environment is read once, at import. ``ITEMS`` registers every
-id the target reads: querying another id raises, and a TRTLLM_M31_DISABLE_* variable naming an unregistered id is
-ignored. The default-off items (``OPT_INS``, TRTLLM_M31_ENABLE_<ID>, ``m31_enabled``) follow the same contract.
+"""This target's kill-switch and opt-in registry (m31_switches): every id the target's modules read is registered in
+``ITEMS`` / ``OPT_INS``, the two sets are disjoint, and every opt-in is off by default. The parser's spelling contract
+is covered by the sm_107 TP8 target's copy of this test.
 
 Each case loads a private copy of the module from its file, so the in-tree module (read by every other module of the
 target at import) is never reloaded. CPU only.
@@ -24,9 +21,7 @@ TARGET = "minimax_m3_1_flash_nvfp4__sm_107__tp2"
 _TARGET_DIR = Path(_family.__file__).resolve().parent / TARGET
 _SWITCHES = _TARGET_DIR / "m31_switches.py"
 PREFIX = "TRTLLM_M31_DISABLE_"
-ITEM = "TP2WIDE_LC2"  # a registered id
 ENABLE_PREFIX = "TRTLLM_M31_ENABLE_"
-OPT_IN = "R6_DENSE_PREQUANT"  # a registered opt-in
 
 pytestmark = pytest.mark.cpu_only
 
@@ -43,46 +38,6 @@ def _load(monkeypatch, env):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-@pytest.mark.parametrize(
-    "value", ["", "  ", "0", " 0 ", "false", "FALSE", "off", " Off ", "no", "No"]
-)
-def test_unset_spellings_leave_the_switch_unset(monkeypatch, value):
-    assert not _load(monkeypatch, {}).m31_disabled(ITEM)
-    assert not _load(monkeypatch, {PREFIX + ITEM: value}).m31_disabled(ITEM)
-
-
-@pytest.mark.parametrize("value", ["1", " 1 ", "true", "TRUE", "on", "On", "yes", "YES"])
-def test_set_spellings_set_the_switch(monkeypatch, value):
-    assert _load(monkeypatch, {PREFIX + ITEM: value}).m31_disabled(ITEM)
-
-
-@pytest.mark.parametrize("value", ["2", "-1", "1.0", "y", "n", "enable", "disabled", "truee", "of"])
-def test_any_other_value_fails_at_import_naming_the_variable(monkeypatch, value):
-    """Typos must fail loudly: a loose parse would count any value but "" / "0" as set (DISABLE_X=false disabling X)."""
-    with pytest.raises(ValueError, match=PREFIX + ITEM):
-        _load(monkeypatch, {PREFIX + ITEM: value})
-
-
-def test_an_unregistered_id_raises(monkeypatch):
-    switches = _load(monkeypatch, {PREFIX + ITEM: "1"})
-    assert switches.m31_disabled(ITEM)
-    for other in (ITEM.lower(), ITEM + "_X", ITEM[:-1], ""):
-        with pytest.raises(KeyError):
-            switches.m31_disabled(other)
-
-
-def test_an_unregistered_variable_is_ignored(monkeypatch):
-    """Another target's switch in a shared environment (or an old name) is not read, whatever its value."""
-    switches = _load(monkeypatch, {PREFIX + "NOT_A_SWITCH_OF_THIS_TARGET": "maybe"})
-    assert switches._DISABLED == frozenset()
-
-
-def test_the_environment_is_read_once_at_import(monkeypatch):
-    switches = _load(monkeypatch, {})
-    monkeypatch.setenv(PREFIX + ITEM, "1")
-    assert not switches.m31_disabled(ITEM)
 
 
 def _read_ids():
@@ -138,39 +93,3 @@ def test_every_opt_in_is_off_by_default(monkeypatch):
     switches = _load(monkeypatch, {})
     assert switches._ENABLED == frozenset()
     assert not any(switches.m31_enabled(item_id) for item_id in switches.OPT_INS)
-
-
-@pytest.mark.parametrize("value", ["1", " 1 ", "true", "TRUE", "on", "On", "yes", "YES"])
-def test_set_spellings_turn_an_opt_in_on(monkeypatch, value):
-    switches = _load(monkeypatch, {ENABLE_PREFIX + OPT_IN: value})
-    assert switches.m31_enabled(OPT_IN)
-    assert switches._ENABLED == frozenset({OPT_IN})
-
-
-@pytest.mark.parametrize("value", ["", "  ", "0", "false", "off", "no"])
-def test_unset_spellings_leave_an_opt_in_off(monkeypatch, value):
-    assert not _load(monkeypatch, {ENABLE_PREFIX + OPT_IN: value}).m31_enabled(OPT_IN)
-
-
-@pytest.mark.parametrize("value", ["2", "-1", "y", "enable", "truee"])
-def test_an_opt_in_fails_at_import_on_any_other_value(monkeypatch, value):
-    with pytest.raises(ValueError, match=ENABLE_PREFIX + OPT_IN):
-        _load(monkeypatch, {ENABLE_PREFIX + OPT_IN: value})
-
-
-def test_an_unregistered_opt_in_raises(monkeypatch):
-    switches = _load(monkeypatch, {ENABLE_PREFIX + OPT_IN: "1"})
-    for other in (OPT_IN.lower(), OPT_IN + "_X", ITEM, ""):
-        with pytest.raises(KeyError):
-            switches.m31_enabled(other)
-
-
-def test_an_unregistered_opt_in_variable_is_ignored(monkeypatch):
-    switches = _load(monkeypatch, {ENABLE_PREFIX + "NOT_AN_OPT_IN_OF_THIS_TARGET": "maybe"})
-    assert switches._ENABLED == frozenset()
-
-
-def test_an_opt_in_is_read_once_at_import(monkeypatch):
-    switches = _load(monkeypatch, {})
-    monkeypatch.setenv(ENABLE_PREFIX + OPT_IN, "1")
-    assert not switches.m31_enabled(OPT_IN)

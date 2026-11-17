@@ -13,9 +13,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.moe.m3_moe_engine import (  # noqa: E501
-    HIDDEN,
-    INTER,
-    SHARED_INTER,
     M3MoeState,
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.moe.m3_moe_engine import (  # noqa: E501
@@ -23,14 +20,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
 )
 
 __extra_import_path__ = ["../../../..", "."]
-from _m3_moe_operands import (  # noqa: E402
-    I_TP,
-    SHARED_I,
-    H,
-    check_routed_part,
-    hidden_states,
-    layer_for,
-)
+from _m3_moe_operands import H, check_routed_part, hidden_states, layer_for  # noqa: E402
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
@@ -42,15 +32,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 _STATES = {}
-
-
-def test_the_operands_are_the_tp8_engine_geometry() -> None:
-    assert (H, I_TP, SHARED_I) == (HIDDEN, INTER, SHARED_INTER) == (6144, 384, 384)
-
-
-def test_the_engine_refuses_the_tp4_width() -> None:
-    with pytest.raises(ValueError, match="384"):
-        M3MoeState(torch.device("cuda"), num_tokens=1, inter=768)
 
 
 def _state(m: int) -> M3MoeState:

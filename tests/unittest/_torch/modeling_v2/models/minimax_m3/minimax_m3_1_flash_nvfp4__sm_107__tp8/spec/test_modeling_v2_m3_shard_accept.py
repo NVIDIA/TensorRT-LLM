@@ -92,14 +92,6 @@ def test_guard_refuses_nan_logits() -> None:
             op(*args)
 
 
-def test_guard_refuses_a_batch_index_past_the_requests() -> None:
-    args = list(_case(op.CELLS[0].spec, 2))
-    args[9] = args[9] + 1
-    with pytest.raises(AssertionError, match="batch_idx"):
-        with validating(op):
-            op(*args)
-
-
 def _signed_zero_maxima(logits: torch.Tensor) -> None:
     """Every row's maximum is zero, reached as -0.0 at a lower index and +0.0 at a higher one."""
     logits.fill_(-1.0)

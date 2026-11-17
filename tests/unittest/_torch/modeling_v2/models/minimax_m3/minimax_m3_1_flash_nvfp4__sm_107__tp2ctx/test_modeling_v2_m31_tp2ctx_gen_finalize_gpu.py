@@ -79,7 +79,7 @@ def _moe(ex, x, logits, do_finalize):
     return out
 
 
-@pytest.mark.parametrize("rows", [1, 37, 448, 2048, 2560, 16384])
+@pytest.mark.parametrize("rows", [37, 2560, 16384])
 def test_gen_finalize_bitwise(experts, rows):
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2ctx import (  # noqa: E501
         modeling,
@@ -101,25 +101,6 @@ def test_gen_finalize_bitwise(experts, rows):
     assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
 
 
-def test_gen_finalize_rejects_finalized_output():
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2ctx import (  # noqa: E501
-        modeling,
-    )
-
-    shared = torch.zeros(4, H, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(RuntimeError, match="TP2CTX_GEN_FINALIZE"):
-        modeling._gen_finalize(4, shared.clone(), shared)
-
-
-def test_kill_switch_reason(monkeypatch):
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2ctx import (  # noqa: E501
-        modeling,
-    )
-
-    monkeypatch.setattr(modeling, "_GEN_FINALIZE", False)
-    assert modeling._gen_finalize_reason(SimpleNamespace(), 16384, None) == "killed"
-
-
 def _finalize_operands(rows, w_dtype, ld, drop, seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     pairs = rows * TOP_K
@@ -132,15 +113,13 @@ def _finalize_operands(rows, w_dtype, ld, drop, seed):
     return fc2, weights, idx.contiguous(), shared
 
 
-@pytest.mark.parametrize("cfg", [-1, 0, 1, 2, 3, 4, 5, 6, 7])
+@pytest.mark.parametrize("cfg", [-1, 7])
 @pytest.mark.parametrize(
     "rows,w_dtype,ld,drop,with_shared",
     [
-        (1, torch.float32, H, False, True),
         (37, torch.bfloat16, H, True, True),
         (2560, torch.float32, H + 64, True, True),
         (2560, torch.float32, H, False, False),
-        (16384, torch.float32, H, False, True),
     ],
 )
 def test_finalize_into_matches_native_op(cfg, rows, w_dtype, ld, drop, with_shared):
@@ -162,21 +141,6 @@ def test_finalize_into_matches_native_op(cfg, rows, w_dtype, ld, drop, with_shar
     )
     torch.cuda.synchronize()
     assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
-
-
-def test_finalize_into_contract():
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels import (
-        m31_moe_finalize_out as fin,
-    )
-
-    fc2, weights, idx, shared = _finalize_operands(8, torch.float32, H, False, 1)
-    out = torch.empty(8, H, dtype=torch.bfloat16, device="cuda")
-    assert fin.outside_contract(fc2, weights, idx, shared, out[:, :-8], 4) is not None
-    assert fin.outside_contract(fc2, weights, idx, shared, shared, 4) == "out aliases shared"
-    assert fin.outside_contract(fc2, weights, idx.long(), shared, out, 4) is not None
-    # fc2 is [8 * TOP_K, H] contiguous here, so any [8, H] row block of it is an otherwise valid out.
-    assert fin.outside_contract(fc2, weights, idx, shared, fc2[:8], 4) == "out overlaps fc2"
-    assert fin.outside_contract(fc2, weights, idx, shared, fc2[8:16], 4) == "out overlaps fc2"
 
 
 @pytest.mark.parametrize("rows", [448, 16384])

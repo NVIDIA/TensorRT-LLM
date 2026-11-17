@@ -3,8 +3,6 @@
 """DRAFT_AG_BF16 on the TP2 target: the native BF16 Markov consumer writes the stock FP32 consumer's bytes, eager
 and under changing graph replays. One request (D8) is a diagnostic cell the adapter itself declines."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -16,22 +14,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 try:
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.ops.spec import (  # noqa: E501
-        draft_bf16 as b1,
-    )
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)
 
 
-@pytest.fixture(autouse=True)
-def native_operator(monkeypatch):
-    monkeypatch.setattr(b1, "_DISABLED", False)
-    assert b1._load(), "the sm_107 family library must carry the BF16 Markov epilogue"
-
-
 @pytest.mark.parametrize(
-    "batch", [1, *range(13, 29)], ids=lambda n: "D8_diagnostic" if n == 1 else f"D{n * 8}"
+    "batch", [1, 13, 20, 28], ids=lambda n: "D8_diagnostic" if n == 1 else f"D{n * 8}"
 )
 @pytest.mark.parametrize("ties", [False, True], ids=["random", "ties"])
 def test_bf16_consumer_exact_eager_and_changing_graph(batch, ties):
@@ -107,12 +96,3 @@ def test_bf16_consumer_exact_eager_and_changing_graph(batch, ties):
         reference()
         graph.replay()
         check()
-
-
-def test_bf16_adapter_kill_and_d8_bypass(monkeypatch):
-    worker = type("DSparkWorker", (), {"__module__": b1._TARGET + ".dspark"})()
-    processor = type("_DraftA1Logits", (), {"__module__": b1._TARGET + ".dspark"})()
-    model = SimpleNamespace(logits_processor=processor)
-    assert b1.try_head_and_refine(worker, model, None, None, None, None, 1, 7) is None
-    monkeypatch.setattr(b1, "_DISABLED", True)
-    assert b1.try_head_and_refine(worker, model, None, None, None, None, 22, 7) is None

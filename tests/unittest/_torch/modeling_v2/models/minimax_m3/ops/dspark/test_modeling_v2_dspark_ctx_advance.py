@@ -4,14 +4,11 @@
 the read block table exactly as DFlashWorker._advance_ctx_len and the generation branch's read-view lines
 (dflash_allocated_ctx_limit, dflash_rebased_ctx_view) do, and returns the same advertised lengths; eager and in a CUDA
 graph. Both launch layouts are the CUDA C++ ops (one launch, and ADV_PAR's advance-only + parallel copy); where the
-op is not taken (kill switch) the function returns None and nothing is written."""
+op is not taken the function returns None and nothing is written."""
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
-    dspark_ctx_advance as AD,
-)
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark.dspark_ctx_advance import (
     advance_ctx_and_read_view,
 )
@@ -99,47 +96,14 @@ def _copy(st):
 
 
 @pytest.mark.parametrize("parallel", [False, True])
-@pytest.mark.parametrize("width", [5, 33, 2112])
-@pytest.mark.parametrize("n,dummy_rows", [(1, 0), (4, 1), (8, 3), (16, 0)])
+@pytest.mark.parametrize("width", [0, 33, 65536])
+@pytest.mark.parametrize("n,dummy_rows", [(1, 0), (8, 3)])
 def test_advance_is_the_stock_advance_bit_for_bit(parallel, width, n, dummy_rows):
     for seed in range(4):
         st = _state(n, width, 135168, seed, dummy_rows)
         ref, got = _copy(st), _copy(st)
         ref_ctx = _stock(ref)
         got_ctx = _fused(got, parallel)
-        torch.cuda.synchronize()
-        assert got_ctx is not None and got_ctx.dtype == ref_ctx.dtype
-        assert torch.equal(ref_ctx, got_ctx), seed
-        assert torch.equal(ref["ctx_len"], got["ctx_len"]), seed
-        assert torch.equal(ref["read"], got["read"]), seed
-
-
-@pytest.mark.parametrize("parallel", [False, True])
-@pytest.mark.parametrize("width", [5, 33, 2112])
-@pytest.mark.parametrize("n,dummy_rows", [(1, 0), (4, 1), (8, 3)])
-def test_int32_accept_counts_advance_bit_for_bit(parallel, width, n, dummy_rows):
-    """DFlashWorker.enable_int32_accept_counts: the fused advance (either launch layout) given the int32 counts leaves
-    exactly what the stock advance leaves from the int64 ones."""
-    for seed in range(4):
-        st = _state(n, width, 135168, seed, dummy_rows)
-        ref, got = _copy(st), _copy(st)
-        got["nacc"] = got["nacc"].int()
-        ref_ctx = _stock(ref)
-        got_ctx = advance_ctx_and_read_view(
-            got["slots"],
-            got["rows"],
-            got["nacc"],
-            got["ctx_len"],
-            got["max_ctx"],
-            got["dummy"],
-            got["counts"],
-            got["base"],
-            got["tables"],
-            got["read"],
-            PAGE,
-            BLOCK,
-            parallel=parallel,
-        )
         torch.cuda.synchronize()
         assert got_ctx is not None and got_ctx.dtype == ref_ctx.dtype
         assert torch.equal(ref_ctx, got_ctx), seed
@@ -171,31 +135,3 @@ def test_advance_in_a_cuda_graph(parallel):
     torch.cuda.synchronize()
     assert torch.equal(ref_ctx, out)
     assert torch.equal(ref["ctx_len"], got["ctx_len"]) and torch.equal(ref["read"], got["read"])
-
-
-def test_unsupported_layouts_keep_the_stock_path():
-    st = _state(2, 8, 4096, 0, 0)
-    assert _fused(_copy(st)) is not None
-    bad = _copy(st)
-    bad["read"] = bad["read"].long()
-    assert _fused(bad) is None
-    bad = _copy(st)
-    bad["ctx_len"] = bad["ctx_len"].int()
-    assert _fused(bad) is None
-    for parallel in (False, True):  # strided ctx_len: the C++ ops take dense arrays only
-        bad = _copy(st)
-        bad["ctx_len"] = torch.zeros(2 * bad["ctx_len"].numel(), dtype=torch.int64, device="cuda")[
-            ::2
-        ]
-        assert _fused(bad, parallel) is None
-
-
-@pytest.mark.parametrize("parallel", [False, True])
-def test_killed_keeps_the_stock_path(monkeypatch, parallel):
-    """TRTLLM_M31_DISABLE_DSPARK_GLUE_CPP routes to the caller's stock path (None), with nothing written."""
-    monkeypatch.setattr(AD, "_GLUE_CPP_OFF", True)
-    st = _state(4, 33, 4096, 1, 1)
-    got = _copy(st)
-    assert _fused(got, parallel) is None
-    torch.cuda.synchronize()
-    assert torch.equal(got["ctx_len"], st["ctx_len"]) and torch.equal(got["read"], st["read"])

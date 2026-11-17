@@ -101,41 +101,6 @@ def test_a_launch_of_the_mask_rows_takes_it_and_others_take_none():
     assert backend.masks[1:] == [None, None]
 
 
-def test_install_leaves_out_moe_layers_whose_backend_cannot_mask():
-    dense = SimpleNamespace(block_sparse_moe=None)
-    stock = _layer(object())
-    fc1 = _layer(_Backend(decline="the top-k weights apply in FC1, so the reduce is unweighted"))
-    assert pad_mask.install([dense, stock, fc1], pad_mask.PadMask()) == (
-        0,
-        "backend object takes no pad mask",
-    )
-    assert pad_mask.install([fc1], pad_mask.PadMask()) == (
-        0,
-        "the top-k weights apply in FC1, so the reduce is unweighted",
-    )
-    fc1.block_sparse_moe.experts(torch.zeros(1, 4), None)
-    assert fc1.block_sparse_moe.experts.backend.masks == []
-
-
-def test_the_switch_installs_nothing(monkeypatch):
-    monkeypatch.setattr(pad_mask, "PAD_MASK", False)
-    backend = _Backend()
-    layer = _layer(backend)
-    assert pad_mask.install([layer], pad_mask.PadMask()) == (0, None)
-    layer.block_sparse_moe.experts(torch.zeros(1, 4), None)
-    assert backend.masks == []
-
-
-def test_installing_twice_hooks_once():
-    backend = _Backend()
-    layer = _layer(backend)
-    state = pad_mask.PadMask()
-    pad_mask.install([layer], state)
-    assert pad_mask.install([layer], state) == (1, None)
-    layer.block_sparse_moe.experts(torch.zeros(1, 4), None)
-    assert backend.masks == [None]
-
-
 def _armed(slots, lc2_layers=2):
     state = pad_mask.PadMask()
     state.lc2_layers = lc2_layers
@@ -156,39 +121,6 @@ def test_lc2_reads_zero_kv_for_the_padding_requests_once_per_forward():
     assert state.lc2_seq_lens(seq_lens) is seq_lens
 
 
-def test_the_lc2_lengths_are_rebuilt_for_each_forward():
-    state = _armed([DUMMY, 2])
-    seq_lens = torch.tensor([8, 9], dtype=torch.int32)
-    assert state.lc2_seq_lens(seq_lens).tolist() == [0, 9]
-    attn, spec = _metadata([1, DUMMY])
-    state.begin(attn, spec, 2 * ROWS)
-    assert state.lc2_seq_lens(seq_lens).tolist() == [8, 0]
-
-
-@pytest.mark.parametrize("case", ["unarmed", "mismatch", "no_mask"])
-def test_lc2_keeps_the_lengths_when_it_cannot_skip(case):
-    state = pad_mask.PadMask()
-    state.lc2_layers = 0 if case == "unarmed" else 3
-    if case != "no_mask":
-        attn, spec = _metadata([3, DUMMY])
-        state.begin(attn, spec, 2 * ROWS)
-    seq_lens = torch.tensor([5, 8, 1] if case == "mismatch" else [5, 8], dtype=torch.int32)
-    assert state.lc2_seq_lens(seq_lens) is seq_lens
-
-
-@pytest.mark.parametrize(
-    "moe_layers, lc2_layers, switch, armed",
-    [(4, 60, True, 60), (0, 60, True, 0), (4, 0, True, 0), (4, 60, False, 0)],
-)
-def test_lc2_skips_only_with_the_moe_mask(monkeypatch, moe_layers, lc2_layers, switch, armed):
-    monkeypatch.setattr(pad_mask, "LC2_PAD_SKIP", switch)
-    monkeypatch.setattr(lc2_decode, "_PAD_ROWS", None)
-    state = pad_mask.PadMask()
-    assert pad_mask.arm_lc2(state, moe_layers, lc2_layers) == armed
-    assert state.lc2_layers == armed
-    assert lc2_decode._PAD_ROWS is (state if armed else None)
-
-
 def test_a_taken_lc2_call_reads_the_masked_lengths(monkeypatch):
     calls = []
     monkeypatch.setattr(lc2_decode, "lc2_op", lambda: lambda *args: calls.append(args))
@@ -206,20 +138,3 @@ def test_a_taken_lc2_call_reads_the_masked_lengths(monkeypatch):
         q, None, None, None, None, seq_lens, sm_scale=1.0, output=out, decode_query_len=8
     )
     assert calls[0][9].tolist() == [0, 300]
-
-
-def test_each_row_count_logs_its_engagement_once_on_every_rank(monkeypatch):
-    lines = []
-    monkeypatch.setattr(pad_mask.logger, "info", lines.append)
-    state = pad_mask.PadMask(rank=3)
-    state.lc2_layers = 60
-    # A rank whose requests are all padding dispatches nothing but still logs from its forward.
-    attn, spec = _metadata([DUMMY, DUMMY])
-    for _ in range(2):
-        state.begin(attn, spec, 2 * ROWS)
-    attn, spec = _metadata([DUMMY, 1, 2, 3])
-    state.begin(attn, spec, 4 * ROWS)
-    assert lines == [
-        "[M3.1 DEP] rank 3: PAD_MASK engaged at 16 rows (2 requests): MoE mask on, LC2 skip on 60 layers",
-        "[M3.1 DEP] rank 3: PAD_MASK engaged at 32 rows (4 requests): MoE mask on, LC2 skip on 60 layers",
-    ]

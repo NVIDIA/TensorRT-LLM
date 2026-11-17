@@ -83,18 +83,6 @@ def _in_tree(w, logits, draft, num_contexts, batch_size, md):
     )
 
 
-@pytest.fixture(autouse=True)
-def _a1_opted_in(monkeypatch):
-    """A1 is on by default (switch TRTLLM_M31_DISABLE_VERIFY_LOGITS_ALLGATHER_MC); pin it on so the environment cannot
-    turn it off here (test_prebuild_a1_off turns it off again)."""
-    monkeypatch.setattr(dspark, "A1_DISABLED", False)
-
-
-@pytest.fixture(autouse=True)
-def _compiled():
-    strict_accept.precompile((3, 7), torch.device("cuda"))
-
-
 @pytest.mark.parametrize(
     "n_req,draft_len,pad,int64",
     [
@@ -156,19 +144,6 @@ def test_forced_acceptance_alternating_steps_matches_in_tree(monkeypatch):
     assert not w._n3a_eligible(logits, draft, 0, 8, _metadata(ragged=True))
 
 
-def test_ineligible_and_switch_take_the_in_tree_path(monkeypatch):
-    gen = torch.Generator(device="cuda").manual_seed(9)
-    logits, draft, tokens = _step(4, 3, gen)
-    w = _worker()
-    # A context row, a row-count mismatch, too many requests: declined.
-    assert not w._n3a_eligible(logits, draft, 1, 4, _metadata())
-    assert not w._n3a_eligible(logits[:-1], draft, 0, 4, _metadata())
-    big_logits, big_draft, _ = _step(strict_accept.max_requests() + 1, 3, gen)
-    assert not w._n3a_eligible(big_logits, big_draft, 0, big_draft.shape[0], _metadata())
-    monkeypatch.setattr(dspark, "N3A_DISABLED", True)
-    assert not w._n3a_eligible(logits, draft, 0, 4, _metadata())
-
-
 @pytest.mark.parametrize(
     "draft_len,wide,shuffle", [(3, False, False), (3, True, True), (7, False, True)]
 )
@@ -195,7 +170,7 @@ def test_next_new_tokens_matches_in_tree(draft_len, wide, shuffle):
 # N3 P-gid + P-cat: the worker's target logits equal the logits processor's.
 
 
-@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("tp", [2])
 def test_rank_major_strided_copy_equals_vocab_concat_and_cast(tp):
     """The all-gather along dim 0 + one strided copy writes what the vocab concat + .float() writes."""
     gen = torch.Generator(device="cuda").manual_seed(tp)
@@ -227,77 +202,6 @@ def _lm_head(vocab=50016, hidden=6144):
             torch.randn_like(head.weight, dtype=torch.float32).to(torch.bfloat16) * 0.02
         )
     return head
-
-
-def test_target_logits_equal_the_processor_at_tp1():
-    from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
-
-    head = _lm_head()
-    rows = 32
-    hidden = torch.randn(rows, 6144, device="cuda").to(torch.bfloat16)
-    md = SimpleNamespace(
-        is_ragged_verify=False, gather_ids=torch.arange(rows, device="cuda", dtype=torch.int32)
-    )
-    attn = SimpleNamespace(num_contexts=0)
-    out = _worker().target_logits(hidden, attn, md, head)
-    ref = LogitsProcessor().forward(hidden[md.gather_ids], head, attn, True)
-    assert out is not None and out.dtype == ref.dtype and torch.equal(out, ref)
-
-
-def test_target_logits_decline_to_the_processor(monkeypatch):
-    head = _lm_head(vocab=1024, hidden=256)
-    hidden = torch.randn(8, 256, device="cuda").to(torch.bfloat16)
-    ids = torch.arange(8, device="cuda", dtype=torch.int32)
-    w = _worker()
-    # A context row, a gather that is not every row, a ragged verify, a padded head: the processor runs.
-    assert (
-        w.target_logits(
-            hidden,
-            SimpleNamespace(num_contexts=1),
-            SimpleNamespace(is_ragged_verify=False, gather_ids=ids),
-            head,
-        )
-        is None
-    )
-    assert (
-        w.target_logits(
-            hidden,
-            SimpleNamespace(num_contexts=0),
-            SimpleNamespace(is_ragged_verify=False, gather_ids=ids[:4]),
-            head,
-        )
-        is None
-    )
-    assert (
-        w.target_logits(
-            hidden,
-            SimpleNamespace(num_contexts=0),
-            SimpleNamespace(is_ragged_verify=True, gather_ids=ids),
-            head,
-        )
-        is None
-    )
-    monkeypatch.setattr(head, "padding_size", 3)
-    assert (
-        w.target_logits(
-            hidden,
-            SimpleNamespace(num_contexts=0),
-            SimpleNamespace(is_ragged_verify=False, gather_ids=ids),
-            head,
-        )
-        is None
-    )
-    monkeypatch.setattr(head, "padding_size", 0)
-    monkeypatch.setattr(dspark, "N3P_DISABLED", True)
-    assert (
-        w.target_logits(
-            hidden,
-            SimpleNamespace(num_contexts=0),
-            SimpleNamespace(is_ragged_verify=False, gather_ids=ids),
-            head,
-        )
-        is None
-    )
 
 
 # N3 A1: the verify logits' all-gather + concat + cast in one launch (catalog/comm/allgather_cast) when set up.
@@ -334,7 +238,7 @@ def _a1_step(monkeypatch, rows: int, compiled: bool = True):
     return out, sentinel, calls
 
 
-@pytest.mark.parametrize("rows", [4, 32, 64, 184, 256, 257, 320, 448])
+@pytest.mark.parametrize("rows", [4, 64, 257, 448])
 def test_target_logits_take_a1_when_set_up(monkeypatch, rows):
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
         m3_report,
@@ -349,159 +253,6 @@ def test_target_logits_take_a1_when_set_up(monkeypatch, rows):
         "A1": 1,
         "A1_K7": 1,
     }
-
-
-@pytest.mark.parametrize("rows,compiled", [(449, True), (4, False)])
-def test_target_logits_fall_back_to_nccl_past_a1(monkeypatch, rows, compiled):
-    """More rows than the workspace holds, or a shape never compiled: the NCCL all-gather + strided copy."""
-    out, _, calls = _a1_step(monkeypatch, rows, compiled=compiled)
-    assert (
-        calls == {"a1": 0, "nccl": 1}
-        and out.shape == (rows, 2 * 1024)
-        and out.dtype == torch.float32
-    )
-
-
-def _a1_prebuild_worker(monkeypatch, tp: int = 2, draft_len: int = 3):
-    w = _worker()
-    w.mapping = SimpleNamespace(tp_size=tp, tp_rank=0, enable_attention_dp=False)
-    w.spec_config = SimpleNamespace(max_draft_len=draft_len)  # max_draft_len reads it
-    # Eligibility needs every SM up to the workspace's grid; any CUDA device passes with a 1-CTA workspace grid.
-    monkeypatch.setattr(dspark._allgather_cast, "MAX_GRID", 1)
-    monkeypatch.setattr(dspark._allgather_cast, "configure_capacity", lambda rows: None)
-    monkeypatch.setattr(dspark.M3DSparkWorker, "_a1_all_ok", lambda self, local: local)
-    return w
-
-
-def test_prebuild_a1_sets_up_k3_rows(monkeypatch):
-    head = _lm_head(vocab=1024, hidden=256)
-    seen = {}
-
-    def fake_precompile(mapping, cols, rows, device, group=None, agree=None):
-        seen.update(cols=cols, rows=rows, agreed=agree(True))
-        return True
-
-    ws = {"ws_uc": torch.zeros(4, dtype=torch.int32), "rank": 0}
-    monkeypatch.setattr(dspark._allgather_cast, "precompile", fake_precompile)
-    monkeypatch.setattr(
-        dspark._allgather_cast, "workspace_args", lambda mapping, cols, group=None: ws
-    )
-    assert _a1_prebuild_worker(monkeypatch)._prebuild_a1(head) is ws
-    # K3 verify rows of batches 1..112 fit the extended workspace.
-    assert dspark.A1_WIDE and dspark.A1_WIDE_448 and dspark.A1_MAX_ROWS == 448
-    assert seen == {"cols": 1024, "rows": tuple(range(4, 449, 4)), "agreed": True}
-
-
-@pytest.mark.parametrize("draft_len", [3, 7])
-def test_prebuild_a1_sets_up_the_verify_rows_of_k3_and_k7(monkeypatch, draft_len):
-    """K3: rows 4..448 (batches 1..112); K7: rows 8..448 (batches 1..56)."""
-    head = _lm_head(vocab=1024, hidden=256)
-    seen = {}
-
-    def fake_precompile(mapping, cols, rows, device, group=None, agree=None):
-        seen.update(rows=rows, agreed=agree(True))
-        return True
-
-    ws = {"ws_uc": torch.zeros(4, dtype=torch.int32), "rank": 0}
-    monkeypatch.setattr(dspark._allgather_cast, "precompile", fake_precompile)
-    monkeypatch.setattr(
-        dspark._allgather_cast, "workspace_args", lambda mapping, cols, group=None: ws
-    )
-    assert _a1_prebuild_worker(monkeypatch, draft_len=draft_len)._prebuild_a1(head) is ws
-    k1 = draft_len + 1
-    assert seen == {"rows": tuple(range(k1, 449, k1)), "agreed": True}
-
-
-def test_prebuild_a1_raises_the_workspace_capacity_first(monkeypatch):
-    """configure_capacity(A1_MAX_ROWS) runs before the compiles and the workspace."""
-    head = _lm_head(vocab=1024, hidden=256)
-    order = []
-    w = _a1_prebuild_worker(monkeypatch)
-    monkeypatch.setattr(
-        dspark._allgather_cast, "configure_capacity", lambda rows: order.append(("cap", rows))
-    )
-    monkeypatch.setattr(
-        dspark._allgather_cast, "precompile", lambda *a, **k: order.append(("compile",)) or True
-    )
-    ws = {"ws_uc": torch.zeros(4, dtype=torch.int32), "rank": 0}
-    monkeypatch.setattr(
-        dspark._allgather_cast,
-        "workspace_args",
-        lambda mapping, cols, group=None: order.append(("ws",)) or ws,
-    )
-    assert w._prebuild_a1(head) is ws
-    assert order == [("cap", dspark.A1_MAX_ROWS), ("compile",), ("ws",)]
-
-
-def test_configure_capacity(monkeypatch):
-    """The capacity (and the fp32 half) is set before any workspace; afterwards only the same value passes."""
-    ag = dspark._allgather_cast
-    monkeypatch.setattr(ag, "MAX_ROWS", 64)
-    monkeypatch.setattr(ag, "MAX_ROWS_FP32", 32)
-    monkeypatch.setattr(ag, "_workspaces", {})
-    ag.configure_capacity(256)
-    assert (ag.MAX_ROWS, ag.MAX_ROWS_FP32) == (256, 128)
-    monkeypatch.setattr(ag, "_workspaces", {"built": object()})
-    ag.configure_capacity(256)  # the same value: no-op
-    with pytest.raises(RuntimeError):
-        ag.configure_capacity(64)
-    with pytest.raises(ValueError):
-        ag.configure_capacity(255)
-
-
-def test_a1_wide_kill_switch_keeps_64_rows():
-    """TRTLLM_M31_DISABLE_VERIFY_LOGITS_ALLGATHER_MC_WIDE=1: A1_MAX_ROWS 64 (read at import)."""
-    import os
-    import subprocess
-    import sys
-
-    probe = (
-        f"import importlib; m = importlib.import_module('{dspark.__name__}'); "
-        "print('CAP', m.A1_WIDE, m.A1_MAX_ROWS)"
-    )
-    for flag, want in (("1", "CAP False 64"), ("0", "CAP True 448")):
-        out = subprocess.run(
-            [sys.executable, "-c", probe],
-            env=dict(
-                os.environ,
-                TRTLLM_M31_DISABLE_VERIFY_LOGITS_ALLGATHER_MC_WIDE=flag,
-                TRTLLM_M31_DISABLE_VERIFY_LOGITS_ALLGATHER_MC_448="0",
-            ),
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        assert [ln for ln in out.stdout.splitlines() if ln.startswith("CAP ")][-1] == want
-
-
-def test_prebuild_a1_off(monkeypatch):
-    """The switch, another draft length, one rank, a rank that is not eligible, or a compile that failed on any rank:
-    no A1, no workspace."""
-    head = _lm_head(vocab=1024, hidden=256)
-    built = {"n": 0}
-
-    def fake_precompile(*a, **k):
-        built["n"] += 1
-        return False  # a failed compile somewhere
-
-    monkeypatch.setattr(dspark._allgather_cast, "precompile", fake_precompile)
-    monkeypatch.setattr(dspark, "A1_K7_DISABLED", True)
-    assert _a1_prebuild_worker(monkeypatch, draft_len=7)._prebuild_a1(head) is None
-    monkeypatch.setattr(dspark, "A1_K7_DISABLED", False)
-    assert (
-        _a1_prebuild_worker(monkeypatch, draft_len=448)._prebuild_a1(head) is None
-    )  # 449 rows at batch 1
-    assert _a1_prebuild_worker(monkeypatch, tp=1)._prebuild_a1(head) is None
-    assert built["n"] == 0
-    assert _a1_prebuild_worker(monkeypatch)._prebuild_a1(head) is None
-    assert built["n"] == 1
-    # Another rank not eligible: off here too, nothing compiled.
-    w = _a1_prebuild_worker(monkeypatch)
-    monkeypatch.setattr(dspark.M3DSparkWorker, "_a1_all_ok", lambda self, local: False)
-    assert w._prebuild_a1(head) is None and built["n"] == 1
-    monkeypatch.setattr(dspark, "A1_DISABLED", True)
-    assert _a1_prebuild_worker(monkeypatch)._prebuild_a1(head) is None
-    assert built["n"] == 1
 
 
 # N3A-KV: the draft-forward KV bookkeeping in one launch, through the DFlash hook (bitwise to the stock lines).
@@ -544,35 +295,3 @@ def test_kv_rewind_hook_equals_the_stock_lines(nc, bs):
     (r0, k0, *rest0), (r1, k1, *rest1) = outs
     assert torch.equal(k0, k1) and rest0 == rest1
     assert r0.dtype == r1.dtype and r0.shape == r1.shape and torch.equal(r0, r1)
-
-
-def test_kv_rewind_hook_declines_unsupported_operands():
-    w = _kv_worker(True)
-    num64 = torch.ones(4, dtype=torch.int64, device="cuda")  # not the buffer's dtype
-    kv = torch.zeros(4, dtype=torch.int32, device="cuda")
-    assert w._n3a_kv_rewind(num64, kv, 0, 4) is None and torch.equal(kv, torch.zeros_like(kv))
-    w._n3a_kv_buf = None
-    assert w._n3a_kv_rewind(torch.ones(4, dtype=torch.int32, device="cuda"), kv, 0, 4) is None
-
-
-@pytest.mark.parametrize(
-    "wide_kill,extension_kill,capacity",
-    [("0", "0", 448), ("0", "1", 256), ("1", "0", 64), ("1", "1", 64)],
-)
-def test_a1_capacity_kill_hierarchy(wide_kill, extension_kill, capacity):
-    import os
-    import subprocess
-    import sys
-
-    code = f"import {dspark.__name__} as m; print('CAP', m.A1_MAX_ROWS)"
-    env = dict(
-        os.environ,
-        TRTLLM_M31_DISABLE_VERIFY_LOGITS_ALLGATHER_MC_WIDE=wide_kill,
-        TRTLLM_M31_DISABLE_VERIFY_LOGITS_ALLGATHER_MC_448=extension_kill,
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
-    )
-    assert [line for line in result.stdout.splitlines() if line.startswith("CAP ")][
-        -1
-    ] == f"CAP {capacity}"

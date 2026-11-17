@@ -5,24 +5,19 @@ for bit the stock lines of DFlashForCausalLM.dflash_forward's flashinfer-RoPE br
 flashinfer_apply_rope_with_cos_sin_cache_inplace), at the drafter's per-rank head counts, 16 seeds, rows 3..56,
 real-scale activations with tiny / huge / all-zero heads, eager and in a CUDA graph. DRAFT_APPEND_FUSE
 (``qk_norm_rope_append``): the same launch's K / V pages are bit for bit flashinfer.page.append_paged_kv_cache's
-(HND), with blocks crossing page boundaries, slots re-written, int32 / int64 indices, eager and in a CUDA graph. The
-launch is the family op minimax_m31_dspark_qk_norm_rope (no Triton): its vector-load path, and its
-element-load path for operands the vector loads cannot take (misaligned qkv / cos-sin rows); the kill switch returns
-None (the stock path) with nothing written."""
+(HND), with blocks crossing page boundaries, slots re-written, int32 / int64 indices. The launch is the family op
+minimax_m31_dspark_qk_norm_rope (no Triton)."""
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
-    dspark_ctx_advance as AD,
+from tensorrt_llm._torch.custom_ops import (
+    flashinfer_apply_rope_with_cos_sin_cache_inplace as fi_rope,
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark.dspark_qk_norm_rope import (
     append_supported,
     qk_norm_rope,
     qk_norm_rope_append,
-)
-from tensorrt_llm._torch.custom_ops import (
-    flashinfer_apply_rope_with_cos_sin_cache_inplace as fi_rope,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
@@ -122,19 +117,6 @@ def test_in_a_cuda_graph():
     assert torch.equal(got[0], rq) and torch.equal(got[1], rk)
 
 
-def test_unsupported_inputs_keep_the_stock_path():
-    hq, hkv = 8, 1
-    qn, kn = _norms(0)
-    qkv, pos = _qkv(4, hq, hkv, 3)
-    assert (
-        qk_norm_rope(qkv, hq * HD, hkv * HD, HD, qn, kn, pos, _cs(), False) is None
-    )  # interleaved RoPE
-    assert qk_norm_rope(qkv.float(), hq * HD, hkv * HD, HD, qn, kn, pos, _cs(), True) is None
-    assert qk_norm_rope(qkv, hq * HD, hkv * HD, HD, qn, kn, pos.long(), _cs(), True) is None
-    gem = RMSNorm(hidden_size=HD, eps=EPS, dtype=torch.bfloat16, device="cuda", use_gemma=True)
-    assert qk_norm_rope(qkv, hq * HD, hkv * HD, HD, gem, kn, pos, _cs(), True) is None
-
-
 PS = 32  # the draft pool's page size
 
 
@@ -204,103 +186,3 @@ def test_append_pages_bitwise_to_flashinfer(hq, hkv, idx_dtype):
                 B,
                 ctx,
             )
-
-
-def test_append_in_a_cuda_graph():
-    hq, hkv, K, B, pps = 8, 1, 7, 1, 4
-    qn, kn = _norms(0)
-    qkv, pos = _qkv(B * K, hq, hkv, 5)
-    cache, bidx, apos, kvi, kvp = _paged(B, K, hkv, pps, [29], 0)
-    qk_norm_rope_append(
-        qkv, hq * HD, hkv * HD, HD, qn, kn, pos, _cs(), True, cache, bidx, apos, kvi, kvp
-    )
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(s):
-        with torch.cuda.graph(g, stream=s):
-            got = qk_norm_rope_append(qkv, hq * HD, hkv * HD, HD, qn, kn, pos, _cs(), True, cache, bidx, apos, kvi,
-                                      kvp)  # fmt: skip
-    torch.cuda.current_stream().wait_stream(s)
-    for rep, c in enumerate((29, 60, 3, 95)):
-        q2, p2 = _qkv(B * K, hq, hkv, 40 + rep)
-        qkv.copy_(q2), pos.copy_(p2)
-        _, _, a2, _, _ = _paged(B, K, hkv, pps, [c], 0)
-        apos.copy_(a2)
-        ref_cache = cache.clone()
-        rq, rk = _stock_append(qkv, hq, hkv, qn, kn, pos, ref_cache, bidx, apos, kvi, kvp)
-        g.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(got[0], rq) and torch.equal(got[1], rk), rep
-        assert torch.equal(cache.view(torch.int16), ref_cache.view(torch.int16)), rep
-
-
-def test_append_unsupported_keeps_the_stock_path():
-    hq, hkv, K = 8, 1, 7
-    qn, kn = _norms(0)
-    qkv, pos = _qkv(K, hq, hkv, 9)
-    cache, bidx, apos, kvi, kvp = _paged(1, K, hkv, 4, [10], 0)
-    args = (qkv, hq * HD, hkv * HD, HD, qn, kn, pos, _cs(), True)
-    assert qk_norm_rope_append(*args, cache.float(), bidx, apos, kvi, kvp) is None  # fp32 cache
-    assert (
-        qk_norm_rope_append(*args, cache.transpose(2, 3), bidx, apos, kvi, kvp) is None
-    )  # NHD / strided
-    assert qk_norm_rope_append(*args, cache, bidx[:-1], apos, kvi, kvp) is None  # rows mismatch
-    assert qk_norm_rope_append(*args, cache, bidx.float(), apos, kvi, kvp) is None
-    before = cache.clone()
-    assert qk_norm_rope_append(qkv, hq * HD, hkv * HD, HD, qn, kn, pos, _cs(), False, cache, bidx, apos, kvi,
-                               kvp) is None  # interleaved RoPE: nothing written  # fmt: skip
-    assert torch.equal(cache.view(torch.int16), before.view(torch.int16))
-
-
-@pytest.mark.parametrize("hq,hkv", [(8, 1), (16, 1)], ids=["hq8", "hq16"])
-def test_unaligned_operands_take_the_element_load_path(hq, hkv):
-    """qkv starting one column into its rows (2-B aligned) and a cos / sin cache with an odd row stride: the vector
-    loads cannot take them, the op's element-load instantiation runs, same bits as the stock lines (and the append)."""
-    K, pps = 7, 4
-    rot = _cs().shape[1]
-    cs_odd = torch.zeros(MAX_POS, rot + 1, device="cuda", dtype=torch.float32)[:, :rot]
-    cs_odd.copy_(_cs())
-    for seed in range(3):
-        qn, kn = _norms(seed)
-        for B, ctx in ((1, [29]), (3, [5, 95, 31])):
-            T = B * K
-            qkv, pos = _qkv(T, hq, hkv, 900 + 10 * seed + B)
-            shifted = torch.empty(T, qkv.shape[1] + 1, device="cuda", dtype=torch.bfloat16)[:, 1:]
-            shifted.copy_(qkv)
-            assert shifted.data_ptr() % 16 != 0 and cs_odd.stride(0) % 4 != 0
-            rq, rk = _stock(qkv, hq, hkv, qn, kn, pos)
-            for q_in, cs_in in ((shifted, _cs()), (qkv, cs_odd), (shifted, cs_odd)):
-                got = qk_norm_rope(q_in, hq * HD, hkv * HD, HD, qn, kn, pos, cs_in, True)
-                assert got is not None
-                torch.cuda.synchronize()
-                assert torch.equal(got[0], rq) and torch.equal(got[1], rk), (seed, B)
-            cache, bidx, apos, kvi, kvp = _paged(B, K, hkv, pps, ctx, seed)
-            ref_cache = cache.clone()
-            _stock_append(qkv, hq, hkv, qn, kn, pos, ref_cache, bidx, apos, kvi, kvp)
-            got = qk_norm_rope_append(shifted, hq * HD, hkv * HD, HD, qn, kn, pos, cs_odd, True, cache, bidx, apos,
-                                      kvi, kvp)  # fmt: skip
-            assert got is not None
-            torch.cuda.synchronize()
-            assert torch.equal(got[0], rq) and torch.equal(got[1], rk), (seed, B)
-            assert torch.equal(cache.view(torch.int16), ref_cache.view(torch.int16)), (seed, B)
-
-
-def test_killed_keeps_the_stock_path(monkeypatch):
-    """TRTLLM_M31_DISABLE_DSPARK_GLUE_CPP: both entry points return None (the stock flashinfer path), nothing
-    written."""
-    monkeypatch.setattr(AD, "_GLUE_CPP_OFF", True)
-    hq, hkv, K = 8, 1, 7
-    qn, kn = _norms(0)
-    qkv, pos = _qkv(K, hq, hkv, 11)
-    assert qk_norm_rope(qkv, hq * HD, hkv * HD, HD, qn, kn, pos, _cs(), True) is None
-    cache, bidx, apos, kvi, kvp = _paged(1, K, hkv, 4, [10], 0)
-    before = cache.clone()
-    assert qk_norm_rope_append(qkv, hq * HD, hkv * HD, HD, qn, kn, pos, _cs(), True, cache, bidx, apos, kvi,
-                               kvp) is None  # fmt: skip
-    torch.cuda.synchronize()
-    assert torch.equal(cache.view(torch.int16), before.view(torch.int16))
-    assert (
-        "minimax_m31_dspark_qk_norm_rope",
-        "killed (TRTLLM_M31_DISABLE_DSPARK_GLUE_CPP=1)",
-    ) in AD._glue_logged

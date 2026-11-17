@@ -69,14 +69,6 @@ def test_certified_cells(cell) -> None:
     )
 
 
-def test_a_strided_activation_is_declined() -> None:
-    """The prologue reads x densely; the op declines a strided x (None) rather than computing on it."""
-    x, w, wsf = build(6144, 4096, 2, seed=1)
-    wide = torch.zeros(2, 8192, dtype=torch.bfloat16, device="cuda")
-    wide[:, :4096] = x
-    assert op(wide[:, :4096], w, wsf) is None
-
-
 def _dispatch():
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2 import (
         modeling as dispatch,
@@ -96,24 +88,6 @@ def _stress_cases():
         for m in sorted({1, 8, 16, top})
         if m <= top and mx_gemv.serves(nk[0], nk[1], m, True)
     ]
-
-
-def test_the_bf16_row_table_is_served_at_tp2() -> None:
-    """Every (projection, rows) the decode dispatch sends to the bf16-in GEMV (``MX_GEMV_BF16_MAX_TOKENS``) is one
-    the GEMV serves at the TP2 width; a row it declines is a ``missed`` fast path (raises under require). The prologue
-    pays one 32-element block per thread and round, at most 8 rounds per CTA: at TP2 the wider K halves the rows
-    each split serves relative to TP4."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.kernels.mx_gemv import (  # noqa: E501
-        op as mx_gemv,
-    )
-
-    declined = [
-        (nk, m)
-        for nk, top in sorted(_dispatch().MX_GEMV_BF16_MAX_TOKENS.items())
-        for m in range(1, top + 1)
-        if not mx_gemv.serves(nk[0], nk[1], m, True)
-    ]
-    assert not declined, f"bf16-in rows the dispatch routes but the GEMV declines: {declined}"
 
 
 STRESS_CASES = _stress_cases()

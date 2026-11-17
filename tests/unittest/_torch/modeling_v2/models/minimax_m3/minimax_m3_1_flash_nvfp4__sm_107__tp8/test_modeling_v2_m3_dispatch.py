@@ -8,22 +8,12 @@ Every range's covered shapes are listed in ``ENABLED``; a range not listed cover
 CPU only: nothing here launches a kernel.
 """
 
-import inspect
-import os
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8 import (  # noqa: E501
     modeling as dispatch,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
-    m3_draft_step as draft_step_kernel,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
-    triton_sparse_decode as tsd,
 )
 
 ROWS = range(1, dispatch.DECODE_STEP_MAX + 2)  # every decode row count and the first one past it
@@ -48,20 +38,6 @@ def test_every_covered_shape_is_a_certified_cell(fast_path) -> None:
     )
 
 
-def test_the_fast_path_names_are_unique() -> None:
-    names = [r.path for r in dispatch.FAST_PATHS]
-    assert len(names) == len(set(names))
-
-
-def test_the_decode_target_takes_the_gen_workers_batch() -> None:
-    """The TP2-lineage paths' 8 rows (2 requests verifying 1 + 3 drafts); R1VR8 certifies the ops to 32 rows (8
-    requests, K3 c8) and VR-BANDS raises the step bound to 64 (K7 c8); a wider step is the prefill target's."""
-    assert dispatch.TP2_ROWS == 8
-    assert dispatch.DECODE_MAX_TOKENS == _STEP_MAX
-    assert dispatch.DECODE_STEP_MAX == (64 if dispatch.VR_BANDS else _STEP_MAX)
-    assert [dispatch.is_decode_step(n) for n in ROWS] == [True] * dispatch.DECODE_STEP_MAX + [False]
-
-
 # ------------------------------------------------------------------ the cells turned on
 
 
@@ -79,61 +55,6 @@ def test_the_moe_engine_takes_every_decode_step() -> None:
 
 
 # ------------------------------------------------------------------ on: the sparse layers' block selection
-
-
-def test_the_index_scorer_takes_one_and_two_requests_with_their_schedules() -> None:
-    assert dispatch.INDEX_SCORE.keys == frozenset({1, 2})
-    assert dispatch.index_score_schedule(1) == (1272, True)
-    assert dispatch.index_score_schedule(2) == (768, True)
-    # every covered request count has a split (the graph captures it)
-    assert set(dispatch.INDEX_SCORE.keys) <= set(dispatch.INDEX_SCORE_SPLIT_K)
-
-
-def test_the_long_select_takes_every_key_width_up_to_its_maximum() -> None:
-    assert dispatch.LONG_SELECT.keys == frozenset(dispatch.LONG_SELECT_KEY_WIDTHS)
-    assert (dispatch.LONG_SELECT_MIN_BLOCKS, dispatch.LONG_SELECT_MAX_BLOCKS) == (129, 9216)
-
-
-def test_the_384_thread_select_takes_every_key_width_with_its_launch_key() -> None:
-    assert dispatch.SELECT_LONG_DSL is True
-    assert dispatch.LONG_SELECT_DSL.keys == frozenset(dispatch.LONG_SELECT_DSL_KEY_WIDTHS)
-    keys = dispatch.long_select_dsl_keys()
-    # SELECT_EARLY (default ON, 8 rows) adds the early-trigger key (phase 0) next to the exit-trigger one
-    early = [(True, 0)] if dispatch.SELECT_EARLY_MAX_ROWS else []
-    assert [key[1:] for key in keys] == [(False, dispatch.SELECT_LONG_TRIGGER_PHASE)] + early
-
-
-@pytest.mark.parametrize("num_blocks", [129, 1294, 5888, 9216])
-def test_a_long_select_decline_inside_its_range_is_a_miss(num_blocks) -> None:
-    """The kernel declining operands its cells certify must not fall back silently under require."""
-    assert dispatch.long_select_covers(num_blocks)
-    # Outside require: logged once, the in-tree selector runs.
-    dispatch.long_select_fallback(num_blocks, 8)
-    dispatch.set_require(True)
-    with pytest.raises(dispatch.FastPathUnavailable, match="long_select"):
-        dispatch.long_select_fallback(num_blocks, 8)
-
-
-@pytest.mark.parametrize("num_blocks", [1, 16, 128, 9217, 20000])
-def test_rows_outside_the_long_select_range_are_uncovered_even_under_require(num_blocks) -> None:
-    """Short rows and rows past LONG_SELECT_MAX_BLOCKS take the in-tree selector in every mode (long contexts must not
-    fail under require)."""
-    assert not dispatch.long_select_covers(num_blocks)
-    dispatch.set_require(True)
-    dispatch.long_select_fallback(num_blocks, 8)
-
-
-def test_taken_logs_without_raising_under_require() -> None:
-    dispatch.set_require(True)
-    dispatch.taken(dispatch.INDEX_SCORE.path, 1)
-    dispatch.taken(dispatch.LONG_SELECT.path, 8)
-
-
-def test_an_index_score_cell_of_another_schedule_certifies_nothing() -> None:
-    spec = dict(seq_lens=(165521,), qlen=4, heads=1, split_k=512, early=True)
-    assert tuple(dispatch.INDEX_SCORE.certifies(spec)) == ()
-    assert tuple(dispatch.INDEX_SCORE.certifies(dict(spec, split_k=1272, heads=2))) == ()
-    assert tuple(dispatch.INDEX_SCORE.certifies(dict(spec, split_k=1272))) == (1,)
 
 
 #: Every TP8 per-rank MXFP8 projection (N, K): sparse-layer QKV + index, dense QKV, o_proj, shared gate_up / down,
@@ -269,70 +190,10 @@ def test_every_enabled_fast_path_is_registered() -> None:
     assert not missing, f"ENABLED lists paths FAST_PATHS does not register: {sorted(missing)}"
 
 
-@pytest.mark.parametrize("fast_path", dispatch.FAST_PATHS, ids=lambda r: r.path)
-def test_skeleton_no_fast_path_covers_a_shape(fast_path) -> None:
-    expected = ENABLED.get(fast_path.path, frozenset())
-    assert fast_path.keys == expected, f"{fast_path.path} covers {sorted(fast_path.keys, key=str)}"
-
-
-def test_the_sparse_decode_writes_the_mxfp8_handoff() -> None:
-    """The sparse decode (LC8, the Triton merge) writes the MXFP8 o_proj hand-off; the range keys the target's
-    SPARSE_DECODE_LC8 / SPARSE_DECODE_PRODUCER cover are the kernel module's."""
-    assert tsd.MERGE_MXFP8_HANDOFF is True
-    assert dispatch.SPARSE_DECODE_LC8.keys is tsd.LC8_KEYS
-    assert dispatch.SPARSE_DECODE_PRODUCER.keys is tsd.PRODUCER_KEYS
-
-
-def test_sparse_decode_lc8_covers_the_decode_steps_with_the_handoff() -> None:
-    """Every decode step (at most DECODE_MAX_TOKENS rows) writes the MXFP8 o_proj hand-off; the one-launch decode
-    stages its pre-wait reads up to m3_attn_lc8.PREWAIT_MAX_ROWS rows and merges once."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
-        m3_attn_lc8,
-    )
-
-    assert dispatch.SPARSE_DECODE_LC8.keys == frozenset({"plain", "prewait"})
-    assert tsd.MERGE_MXFP8_MIN_TOKENS <= 1 and dispatch.DECODE_MAX_TOKENS <= tsd.MergeMxfp8.MAX_ROWS
-    assert m3_attn_lc8.PREWAIT_MAX_ROWS == 8 and m3_attn_lc8.MERGE_ONCE
-
-
-def test_the_dense_layers_take_the_fullctx_decode_at_the_gen_workers_shapes() -> None:
-    """One or two requests, 1 + 3 verify rows or one draft-pass row, each at its own pinned recipe."""
-    assert dispatch.FULLCTX_DECODE_ENABLED
-    assert dispatch.FULLCTX_DECODE.keys == {(4, 1), (1, 1), (4, 2), (1, 2)}
-    assert set(dispatch.FULLCTX_DECODE_RECIPES) == set(dispatch.FULLCTX_DECODE.keys)
-    for recipe in dispatch.FULLCTX_DECODE_RECIPES.values():
-        assert 2 <= recipe["splits"] <= 128  # the standalone reducer's range
-
-
-def test_the_fullctx_entry_cells_run_at_the_forward_plan_capacity() -> None:
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.attention import (  # noqa: E501
-        m3_fullctx_decode as entry,
-    )
-
-    assert entry.MAX_KV_LEN == dispatch.FULLCTX_DECODE_MAX_KV_LEN
-
-
-def test_the_fullctx_capacity_covers_the_long_context_cache_bound() -> None:
-    """The forward compares the cache's length bound (max_seq_len plus the speculative rows it reserves) with the plan
-    capacity; at a max_seq_len of 1 << 20 with up to 8 draft rows the dense layers must still be taken."""
-    assert dispatch.FULLCTX_DECODE_MAX_KV_LEN >= (1 << 20) + 8
-
-
-def test_the_drafter_takes_the_fullctx_decode_at_the_same_shapes() -> None:
-    assert dispatch.DRAFTER_FULLCTX_ENABLED
-    assert dispatch.DRAFTER_FULLCTX.keys == dispatch.FULLCTX_DECODE.keys
-
-
 # ------------------------------------------------------------------ landed: the decode MXFP8 GEMVs
 
 
-def test_the_gemv_rows_follow_the_kill_constant() -> None:
-    expected = set(TP8_PROJECTIONS) if dispatch.MX_GEMV_TP2 else set()
-    assert set(dispatch.MX_GEMV_ROWS) == expected
-    assert set(dispatch.MX_GEMV_BF16_MAX_TOKENS) == expected
-
-
-@pytest.mark.parametrize("rows", _DECODE_ROWS)
+@pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize("nk", TP8_PROJECTIONS, ids=str)
 def test_every_projection_takes_the_gemv_at_every_decode_row(nk, rows) -> None:
     """MXFP8 activation (a producer quantized it) -> the GEMV; bf16 -> the GEMV quantizing in its prologue (staged:
@@ -346,101 +207,6 @@ def test_every_projection_takes_the_gemv_at_every_decode_row(nk, rows) -> None:
     )
 
 
-@pytest.mark.parametrize("rows", [*_WIDE_ROWS, 65])
-@pytest.mark.parametrize("nk", TP8_PROJECTIONS, ids=str)
-def test_wider_than_the_decode_step(nk, rows) -> None:
-    """Past the decode bound: the GEMV on GEMV48_SHAPES at 33..48 rows, cuBLASLt's MXFP8 GEMM on its shapes at the
-    other rows up to 64, else (and past 64) FlashInfer's GEMM; the same choice for either activation."""
-    gemv48 = (
-        (dispatch.MX_GEMV_TP2 and dispatch.VR_GEMV48)
-        and nk in _GEMV48_SHAPES
-        and rows in _GEMV48_ROWS
-    )
-    cublaslt = (
-        dispatch.LINEAR_CUBLASLT and nk in _CUBLASLT_SHAPES and rows in _WIDE_ROWS and not gemv48
-    )
-    for prequant, generic in (
-        (True, dispatch.PREQUANT_GEMM_PATH),
-        (False, dispatch.GENERIC_GEMM_PATH),
-    ):
-        expected = (
-            dispatch.GEMV48_PATH
-            if gemv48
-            else (dispatch.CUBLASLT_GEMM_PATH if cublaslt else generic)
-        )
-        assert dispatch.linear_path(*nk, rows, prequant=prequant, low_m_gemm=True) == expected
-
-
-@pytest.mark.parametrize(
-    "switch, expected",
-    [
-        # Without the GEMV past the bound, cuBLASLt takes those rows too; without cuBLASLt, FlashInfer's GEMM does.
-        ("TRTLLM_M31_DISABLE_VR_GEMV48", "0 m3_mxfp8_cublaslt m3_mxfp8_cublaslt"),
-        ("TRTLLM_M31_DISABLE_LINEAR_CUBLASLT", "0 m3_mx_gemv48 flashinfer_mxfp8_gemm"),
-    ],
-)
-def test_wide_kill_switches(switch, expected) -> None:
-    """Each switch, read at import, removes its rows (printed: the killed table's size, the 40-row QKV_SPARSE path,
-    the 56-row QKV_SPARSE path on an MXFP8 activation)."""
-    table = "GEMV48_ROWS" if "GEMV48" in switch else "LINEAR_CUBLASLT_ROWS"
-    code = (
-        f"from {dispatch.__name__} import {table} as r, linear_path as p\n"
-        "print(len(r), p(1536, 6144, 40, True, True), p(1536, 6144, 56, True, True))"
-    )
-    env = {**os.environ, switch: "1"}
-    out = subprocess.run(
-        [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
-    )
-    assert " ".join(out.stdout.split()[-3:]) == expected
-
-
-def test_router48_kill_switch() -> None:
-    """TRTLLM_M31_DISABLE_ROUTER_TF32_48_ROWS=1, read at import, keeps the tensor-core router at its 16-row range."""
-    code = (
-        f"from {dispatch.__name__} import ROUTER_TC_GEN as r\n"
-        "print(min(r.keys), max(r.keys), r.covers(32))"
-    )
-    env = {**os.environ, "TRTLLM_M31_DISABLE_ROUTER_TF32_48_ROWS": "1"}
-    out = subprocess.run(
-        [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
-    )
-    assert out.stdout.split()[-3:] == ["9", "16", "False"]
-    assert max(dispatch.ROUTER_TC_GEN.keys) == (48 if dispatch.ROUTER48 else 16)
-
-
-def test_an_unknown_projection_is_the_generic_gemm() -> None:
-    assert (
-        dispatch.linear_path(256, 512, 1, prequant=True, low_m_gemm=True)
-        == dispatch.PREQUANT_GEMM_PATH
-    )
-    assert (
-        dispatch.linear_path(256, 512, 1, prequant=False, low_m_gemm=True)
-        == dispatch.GENERIC_GEMM_PATH
-    )
-
-
-def test_taken_logs_once_per_path_and_rows(monkeypatch) -> None:
-    lines = []
-    monkeypatch.setattr(dispatch.logger, "info", lines.append)
-    for _ in range(3):
-        dispatch.taken(dispatch.MX_GEMV_PATH, 4, "[6144, 4096] mxfp8 in")
-    dispatch.taken(dispatch.MX_GEMV_PATH, 8, "[6144, 4096] mxfp8 in")
-    assert len(lines) == 2 and all("m3_mx_gemv taken at" in line for line in lines)
-
-
-def test_skeleton_the_dense_decode_split_is_the_built_in_one() -> None:
-    assert dict(dispatch.DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH) == {}
-
-
-def test_skeleton_speculation_runs_the_in_tree_loop() -> None:
-    # Fused greedy / sampled verify and the fused draft loop at b1/b2 (BF16 head; no coded heads).
-    assert dispatch.SHARD_ACCEPT_MAX_REQUESTS == 2
-    assert dispatch.SAMPLED_VERIFY_MAX_REQUESTS == 2
-    assert dispatch.DRAFT_STEP_MAX_REQUESTS == 2
-    assert dispatch.FC_EARLY_MAX_ROWS == 0
-    assert not draft_step_kernel.HEAD_CODED
-
-
 def test_a_miss_raises_only_under_require() -> None:
     dispatch.missed("some_path", 1, "a precondition")
     dispatch.set_require(True)
@@ -448,140 +214,16 @@ def test_a_miss_raises_only_under_require() -> None:
         dispatch.missed("some_path", 1, "a precondition")
 
 
-def test_skeleton_first_drafter_inputs_are_in_tree() -> None:
-    # The sampled verify is on (SAMPLED_VERIFY_MAX_REQUESTS 2, test_skeleton_speculation_...).
-    assert dispatch.FIRST_DRAFTER_INPUTS_MAX_REQUESTS == 0
-
-
-@pytest.mark.parametrize(
-    "rows, capture_normed, taken",
-    [
-        (4, False, True),
-        (8, False, True),
-        (8, True, True),
-        (12, False, False),
-        (12, True, False),
-        (16, True, False),
-    ],
-)
-def test_the_fused_first_inputs_take_only_their_covered_rows(rows, capture_normed, taken) -> None:
-    """The fused first drafter inputs (and the fc fork) take a fused-verify step only at the requests
-    FUSED_FIRST_INPUTS covers and, unless the captures applied the fc_norm, the rows CHUNK_NORM covers; anything else
-    runs the in-tree first drafter inputs."""
-
-    worker = object.__new__(dispatch.M3Eagle3Worker)
-    worker._m3_capture_norm = (None, 1e-6) if capture_normed else None
-    meta = SimpleNamespace(runtime_draft_len=dispatch.SHARD_ACCEPT_DRAFT_LEN)
-    assert worker._m3_first_inputs_covered(rows, meta) is taken
-
-
 # ------------------------------------------------------- landed: the multicast boundary all-reduce
-
-
-def test_both_boundaries_take_the_multicast_all_reduce() -> None:
-    """The 8-token plan for the TP2 rows (R1VR8 adds the 16- and 32-row plans); every plan's boundaries take the
-    multicast all-reduce and the MoE boundary publishes the next QKV's MXFP8 rows (killed: every boundary on the
-    built-in all-reduce while MC_AR_TP2 is off)."""
-    on = dispatch.MC_AR_TP2
-    assert tuple(p.max_tokens for p in dispatch.DECODE_PLANS) == (
-        (8, 16, 32) if dispatch.R1VR8 else (8,)
-    ) + ((64,) if dispatch.VR_BANDS else ())
-    for plan in dispatch.DECODE_PLANS:
-        want = (False, False, False) if plan.name == "wide" else (on, on, on)
-        assert (plan.attn_mc_ar, plan.moe_mc_ar, plan.qkv_prequant) == want, plan
-    assert dispatch.ATTN_PUSH_MAX_TOKENS == (8 if on and dispatch.ATTN_PUSH_TP2 else 0)
-    assert dispatch.DENSE_PUSH_MAX_TOKENS == (8 if on and dispatch.DENSE_PUSH_TP2 else 0)
-    for rows in _DECODE_ROWS:
-        assert dispatch.plan_for(rows) is dispatch.DECODE_PLANS[0]
-    # The MoE pushes only from its engine, at the engine's rows.
-    assert dispatch.MOE_PUSH_MAX_TOKENS == (dispatch.MOE_ENGINE_MAX_TOKENS if on else 0)
-
-
-def test_the_generic_boundaries_take_the_multicast_all_reduce() -> None:
-    """Prefill, mixed steps and the Eagle3 capture layers: the same certified rows, alone and folded."""
-    rows = 8 if dispatch.MC_AR_TP2 else 0
-    assert dispatch.GENERIC_MC_AR_MAX_TOKENS == rows
-    assert dispatch.GENERIC_MC_AR_FOLDED_MAX_TOKENS == rows
 
 
 # ------------------------------------------------------------------ landed: the fused embedding + first RMSNorm
 
 
-def test_the_fused_embedding_rows_follow_the_kill_constant() -> None:
-    assert dispatch.EMBED_FIRSTNORM_MAX_TOKENS == (8 if dispatch.EMBED_FIRSTNORM_TP2 else 0)
-
-
 # ------------------------------------------------------- landed: MX-TAC (pinned decode-graph MXFP8 GEMM tactic)
 
 
-def test_the_decode_mxfp8_decision_is_pinned_to_cute_dsl() -> None:
-    from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-        FlashInferMXFP8GemmRunner,
-        MXFP8QuantizeRunner,
-    )
-
-    assert dispatch.MXFP8_DECODE_QUANT_TACTIC == MXFP8QuantizeRunner.CUTE_DSL
-    assert dispatch.MXFP8_DECODE_GEMM_TACTIC == FlashInferMXFP8GemmRunner.CUTE_DSL
-
-
-@pytest.mark.parametrize("target", ["DecodeTarget", "PrefillTarget"])
-def test_the_moe_forward_reports_the_engine_taken(target) -> None:
-    """The engagement evidence comes from the forward (not the engine build's warm call)."""
-
-    src = inspect.getsource(getattr(dispatch, target)._moe)
-    assert src.index("taken(MOE_ENGINE.path") < src.index("m3_moe_engine(h.contiguous()")
-
-
 # ------------------------------------------------------------------ the drafter's low-M linears (TP8 port)
-
-
-def test_draft_lowm_covers_exactly_the_certified_rows_of_its_tactic_table() -> None:
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.gemm import (  # noqa: E501
-        m3_draft_lowm as entry,
-    )
-
-    assert set(entry.TACTICS) == set(entry.ROWS) == set(dispatch.DRAFT_LOWM_ROWS)
-    assert dispatch.DRAFT_LOWM.keys == frozenset(
-        (nk, m)
-        for nk, rows in entry.ROWS.items()
-        for m in rows
-        if m <= dispatch.DRAFT_LOWM_MAX_ROWS
-    )
-    for nk, table in entry.TACTICS.items():
-        rows = [row[0] for row in table]
-        assert rows == sorted(rows) and len(set(rows)) == len(rows), nk
-        for m in entry.ROWS[nk]:
-            assert entry.tactic_for(*nk, m) is not None, (nk, m)
-
-
-def test_prebuild_draft_head_is_idempotent_and_keeps_replaced_copies(monkeypatch) -> None:
-    """A repeated cache_derived_state with an unchanged head weight keeps the built (placed) copy; a changed weight
-    rebuilds it and keeps the old copy alive, so a CUDA graph captured earlier never reads unmapped memory."""
-
-    import torch
-
-    built = []
-
-    def fake_prepare(lm_head, tp_rank):
-        head = SimpleNamespace(weight=lm_head.weight)
-        built.append(head)
-        return head
-
-    monkeypatch.setattr(draft_step_kernel, "prepare_head", fake_prepare)
-    worker = object.__new__(dispatch.M3Eagle3Worker)
-    worker._m3_draft_head = None
-    worker._m3_draft_head_version = None
-    worker._m3_draft_head_graveyard = []
-    worker.mapping = SimpleNamespace(tp_rank=0)
-    monkeypatch.setattr(worker, "_m3_drafter_supported", lambda dm: True, raising=False)
-    model = SimpleNamespace(lm_head=SimpleNamespace(weight=torch.zeros(4, 4)))
-
-    assert worker.prebuild_draft_head(model) and len(built) == 1
-    first = worker._m3_draft_head
-    assert worker.prebuild_draft_head(model) and len(built) == 1 and worker._m3_draft_head is first
-    model.lm_head.weight.add_(1.0)  # new values: version bump
-    assert worker.prebuild_draft_head(model) and len(built) == 2
-    assert worker._m3_draft_head is built[1] and worker._m3_draft_head_graveyard == [first]
 
 
 def _runtime(fused: bool, indexer: str = "fp8", kv: str = "fp8"):

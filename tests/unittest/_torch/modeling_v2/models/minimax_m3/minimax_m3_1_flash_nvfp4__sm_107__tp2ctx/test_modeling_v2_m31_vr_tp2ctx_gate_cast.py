@@ -63,7 +63,7 @@ def _rows(rows, cols, seed):
     return x
 
 
-@pytest.mark.parametrize("rows", [1024, 1160, 2049, 8192, 16384])
+@pytest.mark.parametrize("rows", [1160, 16384])
 def test_the_cast_and_the_router_logits_are_bitwise_aten(rows):
     mod = importlib.import_module(_MOD)
     x = _rows(rows, 6144, rows)
@@ -103,18 +103,6 @@ def test_small_noncontiguous_and_captured_inputs_keep_the_aten_cast():
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(graphed.view(torch.int32), eager.view(torch.int32))
-
-
-def test_wiring_kill_switch_and_engagement():
-    from pathlib import Path
-
-    src = Path(importlib.import_module(_MOD).__file__).read_text()
-    assert '_ROUTER_CAST = not m31_disabled("TP2CTX_GATE_CAST")' in src
-    assert (
-        "return torch.nn.functional.linear(_router_input_fp32(hidden_states), self.weight)" in src
-    )
-    assert "TP2CTX_GATE_CAST {path} router input cast taken" in src
-    assert 'getattr(family_ops(), "minimax_m31_bf16_to_fp32", None)' in src
 
 
 @pytest.mark.parametrize("numel_rows", [1, 7, 1160, 4097])

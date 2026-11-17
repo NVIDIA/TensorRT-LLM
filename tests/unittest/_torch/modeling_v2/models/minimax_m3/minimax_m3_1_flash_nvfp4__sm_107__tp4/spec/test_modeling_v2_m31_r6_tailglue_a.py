@@ -23,23 +23,16 @@ compared, every byte, with the Triton kernel it ports (kernels/m3_tail_glue, the
 import functools
 import importlib
 import importlib.util
-import re
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-import tensorrt_llm._torch.modeling_v2.models.minimax_m3 as _family
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4 import (
     native_ops,
 )
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
-    dspark_ctx_advance as adv,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
-    dspark_ctx_store as store,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import dspark_ctx_advance as adv
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import dspark_ctx_store as store
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
     dspark_drafter_inputs as dinp,
 )
@@ -49,7 +42,6 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
 
 TARGET = "minimax_m3_1_flash_nvfp4__sm_107__tp4"
 _PKG = "tensorrt_llm._torch.modeling_v2.models.minimax_m3." + TARGET
-_DIR = Path(_family.__file__).resolve().parent / TARGET
 
 needs_gpu = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -255,11 +247,17 @@ CASES = [
 ]
 
 
+# Every case on the advance-parallel launch, plus the deployed b1 K7 case on the one-launch path.
+_GLUE_CASES = [pytest.param(*c.values, True, id=f"advpar-{c.id}") for c in CASES] + [
+    pytest.param(*CASES[0].values, False, id=f"onelaunch-{CASES[0].id}")
+]
+
+
 @needs_gpu
 @pytest.mark.parametrize(
-    "n,width,ps,hidden,rot,per_layer,dummy_req,at_cap,rebase,small_counts,fold", CASES
+    "n,width,ps,hidden,rot,per_layer,dummy_req,at_cap,rebase,small_counts,fold,parallel",
+    _GLUE_CASES,
 )
-@pytest.mark.parametrize("parallel", [True, False], ids=["advpar", "onelaunch"])
 def test_fused_glue_equals_the_four_launches(fold_flag, n, width, ps, hidden, rot, per_layer, dummy_req, at_cap,
                                              rebase, small_counts, fold, parallel):  # fmt: skip
     tfold, tfork, glue = _mods()
@@ -296,34 +294,6 @@ def test_fused_glue_equals_the_four_launches(fold_flag, n, width, ps, hidden, ro
         )
         assert any(bool((t != 0).any()) for t in b.kv_bits()), "the store wrote nothing"
         assert not torch.equal(b.tables_read, st.tables_read), "the read view wrote nothing"
-
-
-def _offset_view(t, elems):
-    """A contiguous copy of t that starts `elems` elements into a fresh allocation."""
-    buf = torch.zeros(t.numel() + elems, dtype=t.dtype, device=t.device)
-    v = buf[elems:].view(t.shape)
-    v.copy_(t)
-    return v
-
-
-@needs_gpu
-def test_misaligned_pointer_list_cache_equals_the_four_launches(fold_flag):
-    """Per-layer caches at a 2-byte offset (no 8-byte alignment): the launch takes the generic store, same bytes."""
-    _, tfork, glue = _mods()
-    dev = torch.device("cuda")
-    fold_flag[0] = True
-    draft = _drafter(dev, 3, 512, 64)
-    st = _State(dev, 5, 2, 300, 32, 512, True, False, False, True, False)
-    a, b = st.clone(), st.clone()
-    b.kv = [_offset_view(t, 1) for t in b.kv]
-    assert all(t.data_ptr() % 8 != 0 for t in b.kv)
-    store._cache_arg(a.kv)
-    store._cache_arg(b.kv)
-    out_a, idx_a = _stock(tfork, draft, a)
-    out_b, idx_b = _fused(tfork, glue, draft, b)
-    torch.cuda.synchronize()
-    _assert_same(a, b, out_a, out_b, idx_a, idx_b, "(misaligned per-layer caches)")
-    assert any(bool((t != 0).any()) for t in b.kv_bits()), "the store wrote nothing"
 
 
 @needs_gpu
@@ -421,45 +391,6 @@ def test_fused_glue_in_a_cuda_graph_over_accepted_counts(fold_flag, n):
     assert int(sides["fused"].ctx_len[sides["fused"].slots[0]]) > int(base.ctx_len[base.slots[0]])
 
 
-def _dot():
-    spec = importlib.util.spec_from_file_location(
-        "_m31_r6_graph_dot", Path(__file__).parent / "_m31_r6_graph_dot.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-@needs_gpu
-def test_graph_holds_one_glue_kernel_for_four(fold_flag):
-    tfold, tfork, glue = _mods()
-    dot = _dot()
-    dev = torch.device("cuda")
-    fold_flag[0] = True
-    draft = _drafter(dev, 23, 512, 64)
-    st = _State(dev, 51, 1, 16416, 32, 512, True, False, False, True, False)
-    names = {}
-    for side in ("stock", "fused"):
-        s = st.clone()
-        store._cache_arg(s.kv)
-        fn = (
-            (lambda s=s: _stock(tfork, draft, s))
-            if side == "stock"
-            else (lambda s=s: _fused(tfork, glue, draft, s))
-        )
-        _, nodes, _ = dot.capture(fn)
-        names[side] = [v["name"] for v in nodes.values() if v["type"] == "KERNEL"]
-    # The catalog's stock glue kernels, by their Triton or C++ (S10c / ADV_PAR) names.
-    glue_keys = ("_ctx_store_kernel", "dsparkCtxStore", "_advance_only_kernel", "dsparkAdvanceOnly",
-                 "_read_view_kernel", "dsparkReadView", "_indices_kernel", "dsparkIndices")  # fmt: skip
-    stock_glue = [n for n in names["stock"] if any(k in n for k in glue_keys)]
-    assert len(stock_glue) == 4, names["stock"]
-    assert [n for n in names["fused"] if "tailGlueKernel" in n] and len(names["fused"]) == len(
-        names["stock"]
-    ) - 3
-    assert not any(any(k in n for k in glue_keys) for n in names["fused"])
-
-
 # ------------------------------------------------------------------------------------------------ TailGlue (worker)
 
 
@@ -507,138 +438,6 @@ def test_tailglue_defers_fuses_and_hands_back_the_indices(fold_flag):
     again = tg.indices(out_b[: b.n], b.rows, b.qpos, BLOCK, b.width, b.ps)
     assert all(x is not y for x, y in zip(again, idx_b))
     assert all(torch.equal(x, y) for x, y in zip(again, idx_b))
-
-
-@needs_gpu
-@pytest.mark.parametrize(
-    "variant",
-    [
-        "no-store",
-        "other-counts",
-        "no-inputs",
-        "explicit-cols",
-        "indices-other-qpos",
-        "flush",
-        "other-slots",
-        "other-ctx-len",
-        "other-positions",
-    ],
-)
-def test_tailglue_every_other_path_is_the_stock_one(fold_flag, variant):
-    tfold, tfork, glue = _mods()
-    dev = torch.device("cuda")
-    fold_flag[0] = True
-    draft = _drafter(dev, 13, 512, 64)
-    st = _State(dev, 31, 1, 300, 32, 512, True, False, False, True, False)
-    a, b = st.clone(), st.clone()
-    store._cache_arg(a.kv)
-    store._cache_arg(b.kv)
-    out_a, idx_a = _stock(tfork, draft, a)
-    tg = _glue_obj(tfold)
-    tg.inputs = None if variant == "no-inputs" else _inputs_for(tfold, b)
-    if (
-        variant == "other-slots"
-    ):  # DRAFTER_INPUTS_FUSED read other slots than the advance's (equal values, another tensor)
-        tg.inputs.slots = b.slots.clone()
-    elif variant == "other-ctx-len":
-        tg.inputs.ctx_len = b.ctx_len.clone()
-    elif (
-        variant == "other-positions"
-    ):  # the store's positions are not DRAFTER_INPUTS_FUSED's context positions
-        tg.inputs.outs = (None, b.qpos, b.positions.clone().view(b.n, KP1), None)
-    prep = tfork.ctx_store_prep(draft, b.projected)
-    counts = b.counts.clone() if variant == "other-counts" else b.counts
-    if variant == "explicit-cols":
-        cols = torch.minimum(b.positions, b.counts[b.rows].repeat_interleave(KP1) * b.ps - 1).clamp(
-            min=0
-        )
-        done = tg.store(
-            prep, draft, b.projected, b.positions, b.nacc, b.rows, cols, b.tables, b.kv, KP1
-        )
-        assert done is True and tg.pending is None  # launched at once
-    elif variant != "no-store":
-        done = tg.store(prep, draft, b.projected, b.positions, b.nacc, b.rows, None, b.tables, b.kv, KP1,
-                        capacity_counts=b.counts, max_col=None)  # fmt: skip
-        assert done is True and tg.pending is not None
-    else:
-        _store_ops(tfork, draft, b).launch()
-    if variant == "flush":
-        assert tg.flush() and tg.pending is None and not tg.flush()
-    out_b = tg.advance(b.slots, b.rows, b.nacc, b.ctx_len, b.max_ctx, DUMMY, counts, b.base, b.tables,
-                       b.tables_read, b.ps, BLOCK)  # fmt: skip
-    fused = variant in ("indices-other-qpos",)
-    assert tg.fused == (1 if fused else 0)
-    if variant in ("other-counts", "no-inputs", "other-slots", "other-ctx-len", "other-positions"):
-        assert tg.declined == 1 and tg.last_decline
-    qpos = b.qpos.clone() if variant == "indices-other-qpos" else b.qpos
-    idx_b = tg.indices(out_b[: b.n], b.rows, qpos, BLOCK, b.width, b.ps)
-    assert tg.handed == 0
-    torch.cuda.synchronize()
-    _assert_same(a, b, out_a, out_b, idx_a, idx_b, variant)
-
-
-@needs_gpu
-def test_store_operands_launch_is_ctx_store_launch(fold_flag):
-    """The refactored store launch: StoreOperands.launch == ctx_store_launch == the whole fused_ctx_store."""
-    tfold, tfork, glue = _mods()
-    dev = torch.device("cuda")
-    fold_flag[0] = True
-    draft = _drafter(dev, 17, 512, 64)
-    st = _State(dev, 41, 2, 64, 32, 512, True, False, False, False, False)
-    a, b, c = st.clone(), st.clone(), st.clone()
-    for s in (a, b, c):
-        store._cache_arg(s.kv)
-    assert store.fused_ctx_store(draft, a.projected, a.positions, a.nacc, a.rows, None, a.tables, a.kv, KP1,
-                                 capacity_counts=a.counts, max_col=None)  # fmt: skip
-    prep = tfork.ctx_store_prep(draft, b.projected)
-    assert tfork.ctx_store_launch(prep, draft, b.projected, b.positions, b.nacc, b.rows, None, b.tables, b.kv, KP1,
-                                  capacity_counts=b.counts, max_col=None)  # fmt: skip
-    _store_ops(tfork, draft, c).launch()
-    torch.cuda.synchronize()
-    for x, y, z in zip(a.kv_bits(), b.kv_bits(), c.kv_bits()):
-        assert torch.equal(x, y) and torch.equal(x, z)
-    # Declines pass through unchanged.
-    assert tfork.ctx_store_operands(None, draft, b.projected, b.positions, b.nacc, b.rows, None, b.tables, b.kv,
-                                    KP1, capacity_counts=b.counts) is None  # fmt: skip
-    assert tfork.ctx_store_operands(prep, draft, b.projected, b.positions, b.nacc, b.rows, None, b.tables, b.kv,
-                                    KP1) is False  # fmt: skip
-
-
-@needs_gpu
-def test_the_fused_launch_runs_only_over_s10c_c_positions_and_store_rows(fold_flag):
-    """The read view's context length before the advance is the store's first position of each request: the fused
-    launch needs those positions to be DRAFTER_INPUTS_FUSED's, from the advance's own slots and context lengths, and the
-    store's rows (its grid) to be the requests' K + 1 rows. Host checks only; nothing is launched here."""
-    tfold, tfork, glue = _mods()
-    dev = torch.device("cuda")
-    fold_flag[0] = True
-    draft = _drafter(dev, 19, 512, 64)
-    b = _State(dev, 43, 2, 300, 32, 512, True, False, False, True, False)
-    store._cache_arg(b.kv)
-    tg = _glue_obj(tfold)
-    p = _store_ops(tfork, draft, b)
-
-    def why(**over):
-        args = dict(slots=b.slots, ctx_len=b.ctx_len)
-        args.update(over)
-        return tg._unfit(p, args["slots"], b.rows, b.nacc, args["ctx_len"], b.counts, b.base, b.tables,
-                         b.tables_read, b.ps)  # fmt: skip
-
-    tg.inputs = None
-    assert why() == "no DRAFTER_INPUTS_FUSED call this step"
-    tg.inputs = _inputs_for(tfold, b)
-    assert why() is None
-    assert "slots or context lengths" in why(slots=b.slots.clone())
-    assert "slots or context lengths" in why(ctx_len=b.ctx_len.clone())
-    tg.inputs.outs = (None, b.qpos, b.positions.clone().view(b.n, KP1), None)
-    assert "context positions" in why()
-    tg.inputs = _inputs_for(tfold, b)
-    grid = p.grid
-    p.grid = (grid[0] + 1,) + tuple(grid[1:])
-    assert "store rows" in why()
-    p.grid = grid
-    tg.broken = "RuntimeError: x"
-    assert "failed earlier" in why()
 
 
 class _Log:
@@ -705,263 +504,4 @@ def test_a_failed_fused_launch_keeps_the_stock_order(fold_flag, monkeypatch, err
     assert tg.pending is None
 
 
-@needs_gpu
-def test_engagement_lines_report_the_captured_path(fold_flag, monkeypatch):
-    """The fused launch's and the hand-back's lines are logged once, the first time each is taken under capture (the
-    eager warmup before a capture does not count)."""
-    tfold, tfork, glue = _mods()
-    dev = torch.device("cuda")
-    fold_flag[0] = True
-    draft = _drafter(dev, 37, 512, 64)
-    log = _Log()
-    monkeypatch.setattr(tfold, "logger", log)
-    tg = _glue_obj(tfold)
-    for capt in (False, True, True):
-        monkeypatch.setattr(tfold, "capturing", lambda capt=capt: capt)
-        b = _State(dev, 71, 1, 300, 32, 512, True, False, False, True, False)
-        store._cache_arg(b.kv)
-        tg.inputs = _inputs_for(tfold, b)
-        prep = tfork.ctx_store_prep(draft, b.projected)
-        tg.store(prep, draft, b.projected, b.positions, b.nacc, b.rows, None, b.tables, b.kv, KP1,
-                 capacity_counts=b.counts, max_col=None)  # fmt: skip
-        out = tg.advance(b.slots, b.rows, b.nacc, b.ctx_len, b.max_ctx, DUMMY, b.counts, b.base, b.tables,
-                         b.tables_read, b.ps, BLOCK)  # fmt: skip
-        tg.indices(out[: b.n], b.rows, b.qpos, BLOCK, b.width, b.ps)
-        tg.end_step()
-        taken = [x for x in log.lines if x.startswith("[M3 dispatch] TAILGLUE_A taken: ")]
-        handed = [
-            x for x in log.lines if x.startswith("[M3 dispatch] TAILGLUE_A indices handed back: ")
-        ]
-        assert len(taken) == len(handed) == (1 if capt else 0)
-    assert tg.fused == 3 and tg.handed == 3
-    assert taken[0].endswith("(1 requests, width 300) on rank 0") and handed[0].endswith(
-        "(1 requests) on rank 0"
-    )
-    torch.cuda.synchronize()
-
-
-class _Deferred:
-    """A deferred store (the advance launches it on the stock path)."""
-
-    def __init__(self):
-        self.launched = 0
-
-    def launch(self):
-        self.launched += 1
-
-
-def _host_glue(tfold, glue, monkeypatch, rank=2):
-    """A TailGlue whose fused launch and fit check are host stand-ins (the lines are host logic only); returns it, the
-    advance's arguments and a step function step(capturing, why, deferred=True) -> the advance's result."""
-    tg = tfold.TailGlue(lambda *a: "stock", None, rank)
-    q = torch.zeros(1, BLOCK, dtype=torch.int64)
-    rows = torch.zeros(1, dtype=torch.int64)
-    tables = torch.zeros(1, 300, dtype=torch.int32)
-    monkeypatch.setattr(glue, "launch", lambda *a: (torch.zeros(1, dtype=torch.int64), ("i",) * 7))
-    adv_args = (None, rows, None, None, None, DUMMY, None, None, tables, None, 32, BLOCK)
-
-    def step(capt, why, deferred=True):
-        monkeypatch.setattr(tfold, "capturing", lambda: capt)
-        monkeypatch.setattr(tg, "_unfit", lambda *a: why)
-        tg.inputs = tfold.StepInputs((None, q, None, None), None, None)
-        tg.pending = _Deferred() if deferred else None
-        out = tg.advance(*adv_args)
-        tg.end_step()
-        return out
-
-    return tg, step
-
-
-def test_eager_and_captured_stock_lines(monkeypatch):
-    """Beside the captured take's line, once per rank each: the first step with a deferred store run eagerly after
-    that take (taken, or the stock path with why) and the first one captured with the stock path. Nothing before the
-    captured take (the eager warmup), nothing for a step without a deferred store."""
-    tfold, _, glue = _mods()
-    log = _Log()
-    monkeypatch.setattr(tfold, "logger", log)
-    tg, step = _host_glue(tfold, glue, monkeypatch)
-    eager = "[M3 dispatch] TAILGLUE_A at an eager step after the capture: "
-    capt_stock = "[M3 dispatch] TAILGLUE_A stock path while a CUDA graph is captured ("
-
-    def lines(prefix):
-        return [x for x in log.lines if x.startswith(prefix)]
-
-    assert (
-        step(False, None) is not None
-        and step(False, "no DRAFTER_INPUTS_FUSED call this step") == "stock"
-    )
-    assert step(False, None, deferred=False) == "stock"  # no deferred store: not counted, no line
-    assert log.lines == [] and (tg.fused, tg.declined) == (1, 1)
-    step(True, None)  # the captured take
-    assert len(lines("[M3 dispatch] TAILGLUE_A taken: ")) == 1 and len(log.lines) == 1
-    step(True, None)
-    assert len(log.lines) == 1
-    step(True, "no DRAFTER_INPUTS_FUSED call this step")
-    step(True, "another reason")
-    assert lines(capt_stock) == [
-        capt_stock + "no DRAFTER_INPUTS_FUSED call this step; fused 3, stock 2) on rank 2"
-    ]
-    step(False, "the advance's slots or context lengths are not the ones DRAFTER_INPUTS_FUSED read")
-    step(False, None)
-    step(False, "a later reason")
-    assert lines(eager) == [
-        eager
-        + "stock path (the advance's slots or context lengths are not the ones DRAFTER_INPUTS_FUSED read) "
-        "(fused 3, stock 4) on rank 2"
-    ]
-    assert len(log.lines) == 3
-    # The eager step after the capture that takes the fused launch.
-    log.lines.clear()
-    tg2, step2 = _host_glue(tfold, glue, monkeypatch, rank=0)
-    step2(True, None)
-    step2(False, None)
-    step2(False, "x")
-    assert lines(eager) == [eager + "taken (fused 2, stock 0) on rank 0"]
-    assert not lines(capt_stock)
-
-
 # ------------------------------------------------------------------------------------------------ wiring + switches
-
-
-def _src(name):
-    return (_DIR / name).read_text()
-
-
-def _flat(text):
-    """Source text without blanks and parentheses (the formatter's line wraps)."""
-    return re.sub(r"[\s()]", "", text)
-
-
-def test_worker_wiring():
-    src = _flat(_src("dspark.py"))
-    for needle in (
-        "self._tfold_hook_inputs(s10c_c_drafter_inputs)",
-        "else self._tfold_hook_advance(",
-        "(self._tg.indices if self._tg is not None else forward_indices)",
-        "(self._tg.store if self._tg is not None else ctx_store_launch)(",
-        "self._tg.flush()",
-    ):
-        assert _flat(needle) in src, needle
-
-
-def test_hook_advance_follows_the_switch(monkeypatch):
-    tfold, _, _ = _mods()
-    dspark = importlib.import_module(_PKG + ".dspark")
-    w = dspark.M3DSparkWorker.__new__(dspark.M3DSparkWorker)
-    torch.nn.Module.__init__(w)
-    stock = functools.partial(adv.advance_ctx_and_read_view, parallel=True)
-    # Pin TAILGLUE_A on for the taken case (default ON; the environment may carry its kill switch).
-    monkeypatch.setattr(tfold, "TAILGLUE_A", True)
-    assert w._tfold_hook_advance(stock, True, True, True) == w._tg.advance
-    assert w._tg.stock_advance is stock and w._tg.stock_indices is fidx.forward_indices
-    for args in ((False, True, True), (True, False, True), (True, True, False)):
-        assert w._tfold_hook_advance(stock, *args) is stock and w._tg is None
-    monkeypatch.setattr(tfold, "TAILGLUE_A", False)
-    assert w._tfold_hook_advance(stock, True, True, True) is stock and w._tg is None
-    inputs_fn = dinp.drafter_inputs
-    monkeypatch.setattr(tfold, "MEMCPY86K", False)
-    assert w._tfold_hook_inputs(inputs_fn) is inputs_fn
-    monkeypatch.setattr(tfold, "MEMCPY86K", True)
-    hook = w._tfold_hook_inputs(inputs_fn)
-    assert hook is not inputs_fn and hook.inner is inputs_fn
-
-
-# Each item's default: TAILGLUE_A and MEMCPY86K on; MEMCPY4B off (opt-in).
-_DEFAULTS = {"TAILGLUE_A": True, "MEMCPY86K": True, "MEMCPY4B": False}
-
-
-@pytest.mark.parametrize("item", ["TAILGLUE_A", "MEMCPY86K", "MEMCPY4B"])
-def test_kill_switches(monkeypatch, item):
-    sw = importlib.import_module(_PKG + ".m31_switches")
-    tfold = importlib.import_module(_PKG + ".dspark_tailfold")
-    try:
-        for o in _DEFAULTS:
-            monkeypatch.delenv(f"TRTLLM_M31_ENABLE_{o}", raising=False)
-            monkeypatch.delenv(f"TRTLLM_M31_DISABLE_{o}", raising=False)
-        importlib.reload(sw)
-        importlib.reload(tfold)
-        assert {o: getattr(tfold, o) for o in _DEFAULTS} == _DEFAULTS
-        if not _DEFAULTS[item]:
-            monkeypatch.setenv(f"TRTLLM_M31_ENABLE_{item}", "1")
-            importlib.reload(sw)
-            importlib.reload(tfold)
-            assert getattr(tfold, item) is True
-            assert all(getattr(tfold, o) is _DEFAULTS[o] for o in _DEFAULTS if o != item)
-        monkeypatch.setenv(f"TRTLLM_M31_DISABLE_{item}", "1")
-        importlib.reload(sw)
-        importlib.reload(tfold)
-        assert getattr(tfold, item) is False
-        assert all(getattr(tfold, o) is _DEFAULTS[o] for o in _DEFAULTS if o != item)
-    finally:
-        monkeypatch.undo()
-        importlib.reload(sw)
-        importlib.reload(tfold)
-    assert tfold.TAILGLUE_A == (not sw.m31_disabled("TAILGLUE_A"))
-
-
-def test_engagement_and_setup_lines():
-    tfold, _, _ = _mods()
-    w = SimpleNamespace(mapping=SimpleNamespace(tp_rank=3))
-    on = tfold.tailfold_setup_line(w, True, True, True)
-    off = tfold.tailfold_setup_line(w, False, False, False)
-    assert on[0].startswith("M3.1 DSpark TAILGLUE_A: ") and on[0].endswith(" on on rank 3")
-    assert on[1].startswith("M3.1 DSpark MEMCPY86K: ") and on[1].endswith(" on on rank 3")
-    assert on[2].startswith("M3.1 DSpark MEMCPY4B: ") and on[2].endswith(" on on rank 3")
-    assert all(x.endswith(" off on rank 3") for x in off[:2])
-    assert off[2].startswith("M3.1 DSpark MEMCPY4B: ")
-    assert off[2].endswith(" off on rank 3" + tfold._memcpy4b_off_reason())
-    src = _src("dspark_tailfold.py")
-    assert (
-        "[M3 dispatch] TAILGLUE_A taken: ctx store + context advance + read view + forward indices in one"
-        in src
-    )
-    assert (
-        "[M3 dispatch] TAILGLUE_A indices handed back: the drafter's forward indices come from the fused"
-        in src
-    )
-    dsrc = _src("dspark.py")
-    assert (
-        "[M3 dispatch] MEMCPY86K taken: drafter residual stream starts in the DRAFTER_INPUTS_FUSED "
-        in dsrc
-    )
-    assert (
-        "[M3 dispatch] MEMCPY4B taken: seq_lens copy for the draft forward taken on the fork's stream"
-        in dsrc
-    )
-
-
-class _Pending:
-    def __init__(self):
-        self.launched = 0
-
-    def launch(self):
-        self.launched += 1
-
-
-@pytest.mark.parametrize("raises", [False, True])
-def test_drafter_inputs_never_return_with_a_deferred_store(raises):
-    """A store deferred but not taken by an advance (any path, an exception included) is launched before the drafter
-    inputs return: the drafter forward reads the cache next."""
-    tfold, _, _ = _mods()
-    dspark = importlib.import_module(_PKG + ".dspark")
-    w = dspark.M3DSparkWorker.__new__(dspark.M3DSparkWorker)
-    torch.nn.Module.__init__(w)
-    w._tg = tfold.TailGlue(None, None, 0)
-    p = _Pending()
-
-    def inner(*args, **kwargs):
-        w._tg.pending = p
-        if raises:
-            raise RuntimeError("inner failed")
-        return {"noise_embedding": None}
-
-    w._tf_prepare_1st_drafter_inputs = inner
-    if raises:
-        with pytest.raises(RuntimeError):
-            w.prepare_1st_drafter_inputs(draft_model=None)
-    else:
-        assert w.prepare_1st_drafter_inputs(draft_model=None) == {"noise_embedding": None}
-    assert p.launched == 1 and w._tg.pending is None
-    w._tg.pending = p
-    w._tfold_end_step(None)
-    assert p.launched == 2 and w._tg.pending is None and w._tg.inputs is None

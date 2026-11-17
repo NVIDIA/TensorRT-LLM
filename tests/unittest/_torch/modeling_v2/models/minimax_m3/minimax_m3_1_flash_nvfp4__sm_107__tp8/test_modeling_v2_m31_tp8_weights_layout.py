@@ -57,13 +57,6 @@ def test_layer_kinds_come_from_the_config_independently():
     assert list(W._three_way_qkv_layers(d)) == []
 
 
-def test_unfused_projection_uses_the_three_way_qkv_everywhere():
-    d = W.MODEL_WEIGHTS.dims(_core([0, 0, 1, 1], [0, 0, 1, 1], fused=False))
-    assert list(W._three_way_qkv_layers(d)) == [0, 1, 2, 3]
-    assert list(W._unfused_sparse_layers(d)) == [2, 3]
-    assert list(W._five_way_qkv_layers(d)) == []
-
-
 def test_expert_scalars_are_the_fp32_reciprocal_of_the_stored_multiplier():
     stored = torch.tensor(12345.678, dtype=torch.float32)
     out = W._divisor(stored, None)

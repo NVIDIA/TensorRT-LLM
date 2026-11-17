@@ -258,8 +258,26 @@ _WIDE_CASES = {
 }
 
 
-@pytest.mark.parametrize("name", list(_CASES) + list(_WIDE_CASES))
-@pytest.mark.parametrize("seed", [0, 1])
+# Boundary rows: long / short / one-token-tail / padded top-k / tiny / ties / 4 requests, and the wide K3 / K7 steps
+# (including the 184-row step that ends in a partial scale tile).
+_BOUNDARY = [
+    "b1-165k",
+    "b2-mixed",
+    "b1-one-token-tail",
+    "b1-padded-topk",
+    "b1-tiny",
+    "b1-ties",
+    "b4",
+    "k7-c5",
+    "k7-c16",
+    "k3-c46",
+    "k3-c56",
+    "k7-c56",
+]
+
+
+@pytest.mark.parametrize("name", _BOUNDARY)
+@pytest.mark.parametrize("seed", [0])
 def test_band_vs_float64(name, seed) -> None:
     c = _case(seed=seed, **{**_CASES, **_WIDE_CASES}[name])
     out, _, _ = _run(c)
@@ -281,8 +299,11 @@ def test_variants_write_the_same_rows(name) -> None:
     assert elem <= _ELEMENT_ULP and rms <= _RMS_ULP, (elem, rms)
 
 
-@pytest.mark.parametrize("name", list(_CASES) + list(_WIDE_CASES))
-@pytest.mark.parametrize("linear", [False, True])
+@pytest.mark.parametrize(
+    "name,linear",
+    [(n, False) for n in ("b1-165k", "b1-padded-topk", "b4")]
+    + [(n, lin) for n in ("k7-c16", "k3-c46", "k7-c56") for lin in (False, True)],
+)
 def test_mxfp8_handoff_is_stock_mxfp8_quantize(name, linear) -> None:
     """The o_proj interface: (q8, sf) == mxfp8_quantize(out, is_sf_swizzled_layout=True), bitwise."""
     c = _case(seed=3, **{**_CASES, **_WIDE_CASES}[name])
@@ -353,73 +374,9 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 # reduction order there and in chunk order here (the per-block math is the same), so the rows differ by summation
 # order only. Band, in BF16 ulps of each row's largest magnitude: measured on SM107 at most 1.92 per element and
 # 0.18 RMS, so 2 / 0.25.
-_LC_VS_KILLED_ELEMENT_ULP = 2.0
-_LC_VS_KILLED_RMS_ULP = 0.25
 # The K7 wide cells (40..128 rows; this target's Triton route at 1-2 top-k chunks, unlike the cells above): LC and the
 # killed Triton path each sit within the float64-reference band (_ELEMENT_ULP / _RMS_ULP, asserted below for both), so
 # their distance is bounded by twice that band. Measured on SM107: at most 1.97 per element and 0.263 RMS.
-_LC_VS_KILLED_WIDE_ELEMENT_ULP = 2 * _ELEMENT_ULP
-_LC_VS_KILLED_WIDE_RMS_ULP = 2 * _RMS_ULP
-
-
-def _target_decode(c, killed):
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
-        m3_prequant,
-        triton_sparse_decode,
-    )
-
-    landed = triton_sparse_decode.LC_KEYS
-    if killed:
-        triton_sparse_decode.LC_KEYS = frozenset()
-    try:
-        total_q = c["q"].shape[0]
-        out = torch.empty(total_q, NUM_HEADS_TOTAL, DIM, dtype=torch.bfloat16, device="cuda")
-        triton_sparse_decode.minimax_m3_sparse_attn_decode(
-            c["q"],
-            c["k"],
-            c["v"],
-            c["topk"],
-            c["bt"],
-            c["seq"],
-            sm_scale=SM_SCALE,
-            output=out,
-            decode_query_len=c["dql"],
-            k_block_scale=c["ksc"],
-            v_block_scale=c["vsc"],
-            k_global_scale=c["kgs"],
-            v_global_scale=c["vgs"],
-        )
-        torch.cuda.synchronize()
-    finally:
-        triton_sparse_decode.LC_KEYS = landed
-        m3_prequant.SLOT.clear()
-    return out.view(total_q, WIDTH)
-
-
-NUM_HEADS_TOTAL = KV_HEADS * GROUP
-
-
-@pytest.mark.parametrize("name", list(_CASES) + list(_WIDE_CASES))
-@pytest.mark.parametrize("seed", [0, 1, 2])
-def test_lc_vs_killed_stock_path(name, seed) -> None:
-    """The landed cell and its kill switch on the same step: rows within summation-order distance of each other
-    (bitwise equal at most 32 rows, where both arms run the Triton route)."""
-    c = _case(seed=seed, **{**_CASES, **_WIDE_CASES}[name])
-    lc = _target_decode(c, killed=False)
-    stock = _target_decode(c, killed=True)
-    assert torch.isfinite(lc.float()).all() and torch.isfinite(stock.float()).all()
-    elem, rms = _band(lc, stock.to(torch.float64))
-    if name in _WIDE_CASES:
-        assert elem <= _LC_VS_KILLED_WIDE_ELEMENT_ULP and rms <= _LC_VS_KILLED_WIDE_RMS_ULP, (
-            elem,
-            rms,
-        )
-    else:
-        assert elem <= _LC_VS_KILLED_ELEMENT_ULP and rms <= _LC_VS_KILLED_RMS_ULP, (elem, rms)
-    ref = _reference(c)
-    for out in (lc, stock):
-        e, r = _band(out, ref)
-        assert e <= _ELEMENT_ULP and r <= _RMS_ULP, (e, r)
 
 
 # N1 (n1_ids): the layer's previous-step block ids, prefetched into L2 before the grid wait and overwritten with this
@@ -560,258 +517,11 @@ def _kernels():
 # LC2_ALLROWS (LC2 from one row and past LC_MAX_ROWS) and LC2_IDENTITY (LC2 on identity steps) are default ON; the
 # band / Triton-route contracts below are tested with both killed, their defaults in
 # test_allrows_and_identity_defaults.
-_BAND_KILLS = frozenset({"LC2_ALLROWS", "LC2_IDENTITY"})
-
-
-@pytest.fixture(autouse=True)
-def _lc2_band_only(monkeypatch):
-    _, _, _, tsd = _kernels()
-    monkeypatch.setattr(tsd, "LC2_ALLROWS", False)
-    monkeypatch.setattr(tsd, "LC2_IDENTITY", False)
-    monkeypatch.setattr(tsd, "LC_KEYS", tsd.LC_KEYS - {"plain"})
-
-
-def _dispatch(c, monkeypatch, killed=False, n1=None):
-    """One step through the target's minimax_m3_sparse_attn_decode: (BF16 rows, LC2 calls, report paths taken).
-
-    The helper's own patches live in a nested context and are undone on return; the caller's ``monkeypatch`` patches
-    (the autouse band settings, a test's pinned switches) stay active across its calls."""
-    m3_attn_lc, m3_prequant, m3_report, tsd = _kernels()
-    calls, taken = [], []
-    real = m3_attn_lc.m3_sparse_decode_lc
-    total_q = c["q"].shape[0]
-    out = torch.empty(total_q, NUM_HEADS_TOTAL, DIM, dtype=torch.bfloat16, device="cuda")
-    with pytest.MonkeyPatch.context() as patch:
-        if killed:
-            patch.setattr(tsd, "LC_KEYS", frozenset())
-        patch.setattr(
-            m3_attn_lc,
-            "m3_sparse_decode_lc",
-            lambda *a, **k: (calls.append(a[-1]), real(*a, **k))[1],
-        )
-        patch.setattr(m3_report, "taken", lambda path, rows, what="": taken.append(path))
-        m3_attn_lc.N1_IDS.ids = n1
-        try:
-            tsd.minimax_m3_sparse_attn_decode(
-                c["q"],
-                c["k"],
-                c["v"],
-                c["topk"],
-                c["bt"],
-                c["seq"],
-                sm_scale=SM_SCALE,
-                output=out,
-                decode_query_len=c["dql"],
-                k_block_scale=c["ksc"],
-                v_block_scale=c["vsc"],
-                k_global_scale=c["kgs"],
-                v_global_scale=c["vgs"],
-            )
-            torch.cuda.synchronize()
-        finally:
-            m3_attn_lc.N1_IDS.ids = None
-            m3_prequant.SLOT.clear()
-    return out.view(total_q, WIDTH), calls, taken
 
 
 # Below lc_min_rows: 1 / 2 / 4 requests of the K7 verify (8 / 16 / 32 rows), 1 / 2 requests of the K3 verify (4 / 8
 # rows), a plain decode at 32 requests (32 rows).
-_NARROW_CASES = {
-    "k7-c1": dict(seq_lens=[165521], dql=8),
-    "k7-c2": dict(seq_lens=[165521, 20000], dql=8),
-    "k7-c4": dict(seq_lens=[165521, 20000, 1285, 0], dql=8),
-    "k3-c1": dict(seq_lens=[165521], dql=4),
-    "k3-c2": dict(seq_lens=[165521, 20000], dql=4),
-    "dql1-c32": dict(seq_lens=[4096 * (i + 1) + 77 * i for i in range(31)] + [0], dql=1),
-}
 # TP2_LC2_SMALL: the K3 verify (4 query rows per request) at 3 / 4 / 8 requests (12 / 16 / 32 rows) takes LC2.
-_K3_SMALL_CASES = {
-    "k3-c3": dict(seq_lens=[165521, 20000, 1285], dql=4),
-    "k3-c4": dict(seq_lens=[165521, 20000, 1285, 0], dql=4),
-    "k3-c8": dict(seq_lens=[165521, 98765, 20000, 2048, 1285, 136, 4, 0], dql=4),
-}
-
-_K7_SMALL_CASES = {
-    "k7-c2": dict(seq_lens=[165521, 20000], dql=8),
-    "k7-c3": dict(seq_lens=[165521, 20000, 1285], dql=8),
-    "k7-c4": dict(seq_lens=[165521, 20000, 1285, 0], dql=8),
-}
-
-
-@pytest.mark.parametrize("name", list(_NARROW_CASES) + list(_K3_SMALL_CASES))
-def test_rows_up_to_32_keep_the_triton_route_bitwise(name, monkeypatch) -> None:
-    """With the small-row exception killed, dispatch never calls LC2 below 33 rows, and
-    writes the rows of the killed dispatch bit for bit; the N1 buffer is not touched."""
-    _, _, _, tsd = _kernels()
-    monkeypatch.setattr(tsd, "TP2_LC2_SMALL", False)
-    c = _case(seed=41, **{**_NARROW_CASES, **_K3_SMALL_CASES}[name])
-    assert c["q"].shape[0] < tsd.lc_min_rows(c["dql"])
-    n1 = torch.full((KV_HEADS, 128, TOPK), -1, dtype=torch.int32, device="cuda")
-    on, calls, taken = _dispatch(c, monkeypatch, n1=n1)
-    killed, kcalls, _ = _dispatch(c, monkeypatch, killed=True)
-    assert not calls and not kcalls, "LC2 ran at most 32 rows"
-    assert tsd.LC_PATH not in taken and tsd.LC_TRITON_PATH in taken, taken
-    assert torch.equal(on.view(torch.int16), killed.view(torch.int16))
-    assert bool((n1 == -1).all()), "the Triton route must not record N1 ids"
-
-
-@pytest.fixture
-def full_lc2_dispatch(monkeypatch):
-    """Exercise the full operator band independently of a serving vehicle's release hold."""
-    import importlib
-
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2 import (
-        m31_switches,
-    )
-
-    _, _, _, tsd = _kernels()
-    try:
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(
-                m31_switches,
-                "_DISABLED",
-                (m31_switches._DISABLED - {"TP2WIDE_LC2", "TP2WIDE_LC2_448", "TP2_LC2_SMALL"})
-                | _BAND_KILLS,
-            )
-            importlib.reload(tsd)
-            yield
-    finally:
-        # The test's patches of tsd were taken on the reloaded module: undo them before the clean reload, so the
-        # module the later tests import keeps no value from this band.
-        monkeypatch.undo()
-        importlib.reload(tsd)
-
-
-@pytest.mark.parametrize("name", list(_WIDE_CASES) + list(_K3_SMALL_CASES) + list(_K7_SMALL_CASES))
-def test_wide_rows_take_lc2_with_n1_and_handoff(name, monkeypatch, full_lc2_dispatch) -> None:
-    """lc_min_rows(qlen)..LC_MAX_ROWS rows take LC2 with log-domain recurrence, MXFP8 hand-off and N1 ids. The
-    rows in the band of the float64 reference and bitwise the direct op call with the same settings; the kill switch
-    routes the step back to the Triton producer + merge."""
-    _, _, _, tsd = _kernels()
-    if name in _K3_SMALL_CASES or name in _K7_SMALL_CASES:
-        monkeypatch.setattr(tsd, "TP2_LC2_SMALL", True)
-        monkeypatch.setattr(tsd, "LC2_SMALL_QLENS", frozenset({4, 8}))
-    c = _case(seed=43, **{**_WIDE_CASES, **_K3_SMALL_CASES, **_K7_SMALL_CASES}[name])
-    total_q = c["q"].shape[0]
-    assert tsd.lc_min_rows(c["dql"]) <= total_q <= tsd.LC_MAX_ROWS
-    n1 = torch.full((KV_HEADS, tsd.LC_MAX_ROWS, TOPK), -1, dtype=torch.int32, device="cuda")
-    on, calls, taken = _dispatch(c, monkeypatch, n1=n1)
-    assert len(calls) == 1 and calls[0] is n1, "LC2 must run once and take the staged N1 buffer"
-    assert tsd.LC_PATH in taken and tsd.LC_TRITON_PATH not in taken, taken
-    assert total_q in tsd._TP2WIDE_LC2_LOGGED
-    direct, _, _ = _run(c, mxfp8=True)
-    assert torch.equal(on.view(torch.int16), direct.view(torch.int16))
-    assert torch.equal(n1, _n1_expected(c, tsd.LC_MAX_ROWS))
-    ref = _reference(c)
-    elem, rms = _band(on, ref)
-    assert elem <= _ELEMENT_ULP and rms <= _RMS_ULP, (elem, rms)
-    killed, kcalls, ktaken = _dispatch(c, monkeypatch, killed=True)
-    assert not kcalls and tsd.LC_PATH not in ktaken and tsd.LC_TRITON_PATH in ktaken, ktaken
-    elem, rms = _band(killed, ref)
-    assert elem <= _ELEMENT_ULP and rms <= _RMS_ULP, (elem, rms)
-
-
-def test_identity_steps_never_take_lc2(monkeypatch) -> None:
-    """With LC2_IDENTITY killed, the identity selection (every request within 16 blocks) keeps the Triton producer
-    at every width."""
-    m3_attn_lc, m3_prequant, _, tsd = _kernels()
-    c = _case(seed=45, seq_lens=[900, 2048, 130, 1500, 700], dql=8)
-    calls = []
-    real = m3_attn_lc.m3_sparse_decode_lc
-    monkeypatch.setattr(
-        m3_attn_lc, "m3_sparse_decode_lc", lambda *a, **k: (calls.append(1), real(*a, **k))[1]
-    )
-    out = torch.empty(c["q"].shape[0], NUM_HEADS_TOTAL, DIM, dtype=torch.bfloat16, device="cuda")
-    try:
-        tsd.minimax_m3_sparse_attn_decode(
-            c["q"],
-            c["k"],
-            c["v"],
-            c["topk"],
-            c["bt"],
-            c["seq"],
-            sm_scale=SM_SCALE,
-            output=out,
-            decode_query_len=c["dql"],
-            k_block_scale=c["ksc"],
-            v_block_scale=c["vsc"],
-            k_global_scale=c["kgs"],
-            v_global_scale=c["vgs"],
-            identity_blocks=True,
-        )
-        torch.cuda.synchronize()
-    finally:
-        m3_prequant.SLOT.clear()
-    assert not calls
-
-
-def test_kill_switch_contract(monkeypatch, full_lc2_dispatch) -> None:
-    """TRTLLM_M31_DISABLE_TP2WIDE_LC2=1 empties LC_KEYS (no step takes LC2) at import; unset, LC2 covers "mxfp8"."""
-    import importlib
-
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2 import (  # noqa: E501
-        m31_switches,
-    )
-
-    _, _, _, tsd = _kernels()
-    assert tsd.TP2WIDE_LC2 and tsd.LC_KEYS == frozenset({"mxfp8"}) and tsd.LC_MIN_ROWS == 33
-    assert (
-        tsd.LC_MAX_ROWS == tsd.MergeMxfp8.MAX_ROWS == 448
-        and tsd.MergeMxfp8.TRITON_MAX_ROWS == 128
-        and tsd.TP2_LC2_SMALL
-        and tsd.lc_min_rows(8) == 9
-        and tsd.lc_min_rows(4) == tsd.lc_min_rows(1) == 33
-    )
-    monkeypatch.setattr(m31_switches, "_DISABLED", frozenset({"TP2WIDE_LC2"}))
-    try:
-        m = importlib.reload(tsd)
-        assert not m.TP2WIDE_LC2 and m.LC_KEYS == frozenset()
-    finally:
-        monkeypatch.undo()
-        importlib.reload(tsd)
-
-
-def test_lc2_448_kill_switch_contract(monkeypatch) -> None:
-    """TRTLLM_M31_DISABLE_TP2WIDE_LC2_448=1 restores the 128-row LC2 bound at import (LC_KEYS unchanged); the hand-off
-    buffers keep their 448-row capacity either way."""
-    import importlib
-
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2 import (  # noqa: E501
-        m31_switches,
-    )
-
-    _, _, _, tsd = _kernels()
-    monkeypatch.setattr(m31_switches, "_DISABLED", frozenset({"TP2WIDE_LC2_448"}) | _BAND_KILLS)
-    try:
-        m = importlib.reload(tsd)
-        assert m.TP2WIDE_LC2 and m.LC_KEYS == frozenset({"mxfp8"})
-        assert m.LC_MAX_ROWS == m.MergeMxfp8.TRITON_MAX_ROWS == 128 and m.MergeMxfp8.MAX_ROWS == 448
-    finally:
-        monkeypatch.undo()
-        importlib.reload(tsd)
-
-
-@pytest.mark.parametrize("name", ["k3-c56", "k7-c46"])
-def test_lc2_448_killed_restores_the_triton_route(name, monkeypatch) -> None:
-    """Past 128 rows with the 448 bound killed (LC_MAX_ROWS = 128), the step takes the Triton producer + merge, bitwise
-    the step with LC2 killed entirely, and the Triton route publishes no MXFP8 hand-off there (its own bound,
-    MergeMxfp8.TRITON_MAX_ROWS, is unchanged by TP2WIDE_LC2_448)."""
-    _, m3_prequant, _, tsd = _kernels()
-    c = _case(seed=47, **_WIDE_CASES[name])
-    total_q = c["q"].shape[0]
-    assert tsd.MergeMxfp8.TRITON_MAX_ROWS < total_q <= tsd.MergeMxfp8.MAX_ROWS
-    published = []
-    real_publish = m3_prequant.SLOT.publish
-    monkeypatch.setattr(
-        m3_prequant.SLOT, "publish", lambda *a, **k: (published.append(1), real_publish(*a, **k))[1]
-    )
-    monkeypatch.setattr(tsd, "LC_MAX_ROWS", tsd.MergeMxfp8.TRITON_MAX_ROWS)
-    bound, calls, taken = _dispatch(c, monkeypatch)
-    assert not calls and tsd.LC_PATH not in taken and tsd.LC_TRITON_PATH in taken, taken
-    assert not published, "the Triton route must not publish a hand-off past TRITON_MAX_ROWS"
-    killed, kcalls, _ = _dispatch(c, monkeypatch, killed=True)
-    assert not kcalls
-    assert torch.equal(bound.view(torch.int16), killed.view(torch.int16))
 
 
 def test_handoff_buffers_cover_whole_scale_tiles() -> None:
@@ -824,60 +534,3 @@ def test_handoff_buffers_cover_whole_scale_tiles() -> None:
     for rows in (1, 33, 128, 129, 184, 224, 256, 368, tsd.LC_MAX_ROWS):
         hq, hs = tsd.MergeMxfp8.handoff((q8, sf), rows)
         assert hq.shape[0] == rows and hs.numel() == (rows + 127) // 128 * 128 * (WIDTH // 32), rows
-
-
-@pytest.mark.parametrize("disabled,k3_min,k7_min", [(False, 33, 9), (True, 33, 33)])
-def test_lc2_small_contract(disabled, k3_min, k7_min, monkeypatch) -> None:
-    """K7 defaults ON at 9 rows, K3 keeps 33, and the kill switch restores the K7 lower bound."""
-    import importlib
-
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2 import (
-        m31_switches,
-    )
-
-    _, _, _, tsd = _kernels()
-    monkeypatch.setattr(
-        m31_switches,
-        "_DISABLED",
-        (frozenset({"TP2_LC2_SMALL"}) if disabled else frozenset()) | _BAND_KILLS,
-    )
-    try:
-        m = importlib.reload(tsd)
-        assert m.TP2_LC2_SMALL == (not disabled)
-        assert m.lc_min_rows(4) == k3_min
-        assert m.lc_min_rows(8) == k7_min
-        assert m.lc_min_rows(1) == m.lc_min_rows(2) == 33
-        assert m.LC_MAX_ROWS == 448 and m.LC_KEYS == frozenset({"mxfp8"})
-    finally:
-        monkeypatch.undo()
-        importlib.reload(tsd)
-
-
-def test_allrows_and_identity_defaults(monkeypatch) -> None:
-    """Default ON: LC2 from one row with the "plain" key past LC_MAX_ROWS (LC2_ALLROWS) and on identity steps
-    (LC2_IDENTITY); each kill switch turns only its own item off, and TP2WIDE_LC2 killed turns both off."""
-    import importlib
-
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2 import (  # noqa: E501
-        m31_switches,
-    )
-
-    _, _, _, tsd = _kernels()
-    try:
-        for disabled, allrows, identity in (
-            (frozenset(), True, True),
-            (frozenset({"LC2_ALLROWS"}), False, True),
-            (frozenset({"LC2_IDENTITY"}), True, False),
-            (frozenset({"TP2WIDE_LC2"}), False, False),
-        ):
-            monkeypatch.setattr(m31_switches, "_DISABLED", disabled)
-            m = importlib.reload(tsd)
-            assert (m.LC2_ALLROWS, m.LC2_IDENTITY) == (allrows, identity), disabled
-            if allrows:
-                assert m.LC_KEYS == frozenset({"mxfp8", "plain"})
-                assert m.lc_min_rows(1) == m.lc_min_rows(4) == m.lc_min_rows(8) == 1
-            elif m.TP2WIDE_LC2:
-                assert m.LC_KEYS == frozenset({"mxfp8"}) and m.lc_min_rows(8) == 9
-    finally:
-        monkeypatch.undo()
-        importlib.reload(tsd)

@@ -18,7 +18,6 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
 HIDDEN = 6144
 VOCAB = 200064
 WORLD = 8
-TARGET_SHARD = VOCAB // WORLD
 EPS = 1e-6
 
 
@@ -78,22 +77,6 @@ def plant_peers(
         keys = make_keys(value, index)
         for t in range(m):
             uc[(half * slot_rows + t) * world + r] = keys[t]
-
-
-def assert_bf16_close(out: torch.Tensor, ref: torch.Tensor, max_frac: float = 1e-3) -> None:
-    """At most one bf16 ulp per element, and only on a ``max_frac`` share of the elements.
-
-    Kernel and reference compute the same fp32 expression and round once; they differ only where a different
-    summation order (or rsqrtf) puts the fp32 value on the other side of a bf16 rounding boundary.
-    """
-    assert out.shape == ref.shape and out.dtype == ref.dtype == torch.bfloat16
-    o, r = out.float(), ref.float()
-    ulp = torch.ldexp(torch.ones_like(r), torch.frexp(r).exponent - 8)
-    ulp = torch.where(r == 0, torch.full_like(r, 2.0**-133), ulp)
-    diff = (o - r).abs()
-    assert bool((diff <= ulp * 1.0001).all()), f"max |diff| / ulp = {(diff / ulp).max().item():.2f}"
-    frac = (diff > 0).float().mean().item()
-    assert frac <= max_frac, f"{frac:.2e} of the elements moved by one ulp (allowed {max_frac})"
 
 
 def craft_drafts(tokens: torch.Tensor, nreq: int, d: int) -> torch.Tensor:

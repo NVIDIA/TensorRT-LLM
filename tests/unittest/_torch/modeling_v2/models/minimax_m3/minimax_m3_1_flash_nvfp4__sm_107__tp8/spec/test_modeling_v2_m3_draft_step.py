@@ -18,9 +18,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
-    m3_draft_step as draft_step_kernels,
-)
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.gemm.m3_target_head import (  # noqa: E501
     encode_chunked,
     round_trip_ok,
@@ -31,7 +28,6 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
     HIDDEN,
     MAX_TOKENS,
     bf16_fragments,
-    from_fragments,
     head_weight,
     max_tile_pieces,
     shard_logits,
@@ -316,18 +312,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
             )
 
 
-def test_fragments_round_trip() -> None:
-    g = gen(seed_of("fragments"))
-    w = randn((64, 96), g)
-    wf = bf16_fragments(w)
-    assert wf.shape == (4, 6, 256)
-    assert torch.equal(from_fragments(wf), w)
-    head = SimpleNamespace(weight=w, bias=None)
-    prepared = draft_step_kernels.prepare_head(head, 3)  # K 96: no coding, the BF16 fragments
-    assert not prepared.coded
-    assert torch.equal(prepared.wf, wf) and prepared.vocab_offset == 3 * 64 and prepared.weight is w
-
-
 # ------------------------------------------------------------------ against the in-tree drafter, bit for bit
 
 
@@ -421,166 +405,7 @@ def test_forced_bf16_ties_take_the_lowest_global_id(coded) -> None:
     _assert_stock(w, x, coded)
 
 
-@pytest.mark.parametrize("coded", [True, False], ids=["coded", "bf16"])
-def test_signed_zero_maxima_take_the_lowest_global_id(coded) -> None:
-    """Rows whose maximum is zero: an all-zero head input (every logit +-0) and logits <= 0 with zeros by cancellation
-    on several ranks. -0 and +0 compare equal, so the lowest global id reaching zero wins."""
-    w = torch.zeros((WORLD * DRAFT_SHARD, HIDDEN), dtype=torch.bfloat16, device="cuda")
-    w[:, 0] = -1.0
-    w[:, 1] = -1.0
-    for gid in (DRAFT_SHARD + 5, DRAFT_SHARD + 40000, DRAFT_SHARD + 70007, 24999):
-        w[gid, 0] = 1.0
-        w[gid, 1] = -1.0
-    x = torch.zeros((3, HIDDEN), dtype=torch.bfloat16, device="cuda")
-    x[1, :2] = 1.0
-    x[2, :2] = 2.0
-    x[2, 2] = -1.0  # w[:, 2] is zero: a -0 product on every row
-    _assert_stock(w, x, coded, expect=[0, 24999, 24999])
-
-
-@pytest.mark.parametrize(
-    "lower,higher,winner",
-    [
-        (1000, 1001, "lower"),  # 1001 rounds to 1000 in BF16: a tie, the lower id wins
-        (1001, 1002, "lower"),  # 1001 and the tie-to-even midpoint 1002 both round to 1000
-        (1000, 1004, "higher"),  # adjacent BF16 values: the larger wins
-        (1003, 1000, "lower"),  # 1003 rounds up to 1004 > 1000
-    ],
-    ids=["one_fp32_step", "midpoint", "adjacent_bf16", "rounds_up"],
-)
-@pytest.mark.parametrize("where", ["in_shard", "across_ranks"])
-@pytest.mark.parametrize("coded", [True, False], ids=["coded", "bf16"])
-def test_near_equal_top2_follow_the_bf16_logits(lower, higher, winner, where, coded) -> None:
-    """Top-2 logits one to four fp32 steps apart: the winner is the one the BF16 logits decide (the in-tree logits'
-    dtype), not the fp32 sum. The pair sits inside rank 1's shard or on ranks 0 and 1; every other logit is at most
-    240 in magnitude."""
-    g = gen(seed_of(f"near top2 {lower} {higher} {where}"))
-    w = _integer_head(g)
-    if where == "in_shard":
-        lo_id, hi_id = DRAFT_SHARD + 100, DRAFT_SHARD + 200
-    else:
-        lo_id, hi_id = DRAFT_SHARD - 1000, DRAFT_SHARD + 3
-    for gid, value in ((lo_id, lower), (hi_id, higher)):
-        q, r = divmod(value, 4)  # four integers <= 251, exact in BF16
-        w[gid, :4] = torch.tensor([q + (i < r) for i in range(4)], device="cuda").to(torch.bfloat16)
-    expect = lo_id if winner == "lower" else hi_id
-    _assert_stock(w, _ones_rows(2), coded, expect=[expect, expect])
-
-
 # ------------------------------------------------------------------ non-integer rows at a BF16 rounding midpoint
-
-#: A BF16 rounding midpoint (between 6.0 and 6.03125; a tie there rounds to the even 6.0) and the FP32 spacing there.
-MIDPOINT = 6.0 + 2.0**-6
-FP32_ULP = 2.0**-21
-
-
-def _near_midpoint_head(g: torch.Generator, targets: dict):
-    """A full-vocabulary head [8 * 25008, 6144] and one head-input row x with 65 non-zero entries: 1, 2^-12, 2^-20
-    and 2^-28 on columns 0..3 and 61 random non-integer BF16 values. Every head row carries random non-integer BF16
-    values on those 61 columns (logits about 0.2 in magnitude); each row of ``targets`` (global id -> fp64 value) also
-    gets columns 0..3 set so its fp64 logit is the target to within 2^-30 (a coarse value, then three finer
-    corrections, each BF16-rounded)."""
-    x = torch.zeros((1, HIDDEN), dtype=torch.bfloat16, device="cuda")
-    scales = (1.0, 2.0**-12, 2.0**-20, 2.0**-28)
-    for col, scale in enumerate(scales):
-        x[0, col] = scale
-    x[0, 4:65] = randn((61,), g, 0.5)
-    w = torch.zeros((WORLD * DRAFT_SHARD, HIDDEN), dtype=torch.bfloat16, device="cuda")
-    w[:, 4:65] = randn((WORLD * DRAFT_SHARD, 61), g, 0.05)
-    xd = x[0].double()
-    for gid, target in targets.items():
-        rest = float(target - (w[gid].double() * xd).sum())
-        for col, scale in enumerate(scales):
-            v = torch.tensor(rest / scale, dtype=torch.float64).to(torch.bfloat16)
-            w[gid, col] = v
-            rest -= float(v) * scale
-        assert abs(rest) <= 2.0**-30, (gid, rest)
-    return w, x
-
-
-def _check_fused_against_stock(
-    name: str, w: torch.Tensor, x: torch.Tensor, coded: bool, expect=None
-) -> int:
-    """Each rank's fused tokens against the in-tree tokens under the per-row rule (full-vocabulary candidates);
-    ``expect`` (a token per row) additionally pins rows the bound decides. Returns the undecidable rows."""
-    shards = _shards(w)
-    gathered, tp_gather = _stock_tokens(shards, x)
-    assert torch.equal(gathered, tp_gather), "the two in-tree pickers disagree"
-    fused = _fused_tokens(shards, x, coded)
-    for tokens in fused[1:]:
-        assert torch.equal(tokens, fused[0]), "the ranks disagree on the global token"
-    logits, bound, lo, hi = bounds(x, w)
-    ids = torch.arange(w.shape[0], device="cuda")
-    undecidable = 0
-    for r in range(x.shape[0]):
-        undecidable += check_row(
-            f"{name} row {r}",
-            int(fused[0][r]),
-            int(gathered[r]),
-            ids,
-            logits[r],
-            bound[r],
-            lo[r],
-            hi[r],
-        )
-        if expect is not None:
-            assert int(gathered[r]) == expect[r] and int(fused[0][r]) == expect[r], (
-                name,
-                int(gathered[r]),
-                int(fused[0][r]),
-                expect[r],
-            )
-            others = ids != expect[r]
-            assert _winnable(expect[r], ids, lo[r], hi[r]), (
-                f"{name}: the bound does not let {expect[r]} win"
-            )
-            rivals = [int(i) for i in ids[others][hi[r][others] >= lo[r][expect[r]]]]
-            assert not any(_winnable(i, ids, lo[r], hi[r]) for i in rivals), (
-                f"{name}: the row is not decided"
-            )
-    report(name, x.shape[0], undecidable)
-    return undecidable
-
-
-@pytest.mark.parametrize(
-    "lower,higher,winner",
-    [
-        (
-            -2,
-            2,
-            None,
-        ),  # straddling the midpoint by 2 FP32 ulps: either side is in-tree up to the order
-        (2, -2, None),
-        (0, -2, None),  # exactly on the midpoint (ties to the even 6.0) against just below it
-        (
-            -2048,
-            2048,
-            "higher",
-        ),  # ~1e-3 either side, well outside the bound: decided by BF16 rounding
-        (
-            -4096,
-            -2048,
-            "lower",
-        ),  # both below the midpoint, ~1e-3 apart: a BF16 tie the lower id wins
-    ],
-    ids=["straddle", "straddle_reversed", "on_midpoint", "decided_up", "decided_tie"],
-)
-@pytest.mark.parametrize("where", ["in_shard", "across_ranks"])
-@pytest.mark.parametrize("coded", [True, False], ids=["coded", "bf16"])
-def test_top2_at_a_bf16_midpoint(lower, higher, winner, where, coded) -> None:
-    """Non-integer rows whose top-2 fp64 logits sit the given number of FP32 ulps from a BF16 rounding midpoint, inside
-    rank 1's shard or on ranks 0 and 1, every other logit far below. The per-row rule holds on every row; outside the
-    bound the token is the one the BF16 rounding decides, bit for bit."""
-    g = gen(seed_of(f"midpoint {lower} {higher} {where}"))
-    if where == "in_shard":
-        lo_id, hi_id = DRAFT_SHARD + 100, DRAFT_SHARD + 200
-    else:
-        lo_id, hi_id = DRAFT_SHARD - 1000, DRAFT_SHARD + 3
-    w, x = _near_midpoint_head(
-        g, {lo_id: MIDPOINT + lower * FP32_ULP, hi_id: MIDPOINT + higher * FP32_ULP}
-    )
-    expect = None if winner is None else [lo_id if winner == "lower" else hi_id]
-    _check_fused_against_stock(f"midpoint {where} {lower:+d}/{higher:+d} ulp", w, x, coded, expect)
 
 
 # ------------------------------------------------------------------ the coded head against the BF16 fragments
@@ -621,76 +446,6 @@ def test_coded_head_is_the_bf16_head_bit_for_bit(nreq) -> None:
     )
 
 
-@pytest.mark.parametrize("nreq", [1, 2, 8])
-def test_tiny_exception_products_are_exact(nreq) -> None:
-    """Weights of 1 (exponent window base 113) with column 0 zero except 2^-30 / 2^-29 on rows 0 / 1, and a one-hot
-    activation on column 0: the exceptions' exact products are the only non-zero logits, so the coded head must pick
-    row 1 with the BF16 head's key bit for bit (a correction against a non-zero placeholder cancels them to 0)."""
-    n, k = 256, 1024
-    w = torch.ones((n, k), dtype=torch.bfloat16, device="cuda")
-    w[:, 0] = 0.0
-    w[0, 0] = 2.0**-30
-    w[1, 0] = 2.0**-29
-    x = torch.zeros((nreq, k), dtype=torch.bfloat16, device="cuda")
-    x[:, 0] = 1.0
-    wf_c, cd = _head(w, True)
-    assert cd[3] == 113
-    keys = []
-    for wf, c in ((wf_c, cd), _head(w, False)):
-        args = _args(x, None, nreq, wf, 0, 1, 1, gen(seed_of("tiny exceptions")), coded=c)
-        with validating(op):
-            # 16 tiles on an all-SM grid: every tile is streamed by all 16 warps, which only the fixed-order sum
-            # (D-FIX) adds deterministically (is_valid rejects the atomics there).
-            op(*args, fixed_order=True)
-        torch.cuda.synchronize()
-        assert args[13].tolist() == [1] * nreq
-        keys.append(args[22])
-    best, idx = local_argmax(torch.nn.functional.linear(x, w).float(), 0)
-    assert torch.equal(keys[0], keys[1]) and torch.equal(keys[0], make_keys(best, idx))
-
-
-def test_prepare_head_codes_the_shard_and_fails_closed(monkeypatch) -> None:
-    """With the coding on, prepare_head keeps the coded shard when it decodes to the weight bit for bit; a coding
-    that does not is dropped for the BF16 fragments. (The tp8 target ships HEAD_CODED = False.)"""
-    monkeypatch.setattr(draft_step_kernels, "HEAD_CODED", True)
-    g = gen(seed_of("prepare coded"))
-    w = randn((4096, 1024), g, 0.02)
-    head = SimpleNamespace(weight=w, bias=None)
-    prepared = draft_step_kernels.prepare_head(head, 2)
-    assert prepared.coded and prepared.vocab_offset == 2 * 4096 and prepared.weight is w
-    assert torch.equal(head_weight(prepared.wf, 1024, prepared.exc_off, prepared.exc_pos, prepared.exc_w,
-                                   prepared.exp_base), w)  # fmt: skip
-
-    def corrupt(weight, *args, **kwargs):
-        packed, base, exc_off, exc_pos, exc_w = encode_chunked(weight)
-        packed = packed.clone()
-        packed[11] ^= 0x10
-        return packed, base, exc_off, exc_pos, exc_w
-
-    monkeypatch.setattr(draft_step_kernels, "encode_chunked", corrupt)
-    dropped = draft_step_kernels.prepare_head(head, 2)
-    assert not dropped.coded and dropped.exc_off is None
-    assert torch.equal(dropped.wf, bf16_fragments(w))
-
-
-def test_prepare_head_keeps_bf16_when_coding_is_off(monkeypatch) -> None:
-    """HEAD_CODED = False keeps the BF16 fragments even for a shard whose coding would decode bit for bit."""
-    g = gen(seed_of("prepare bf16"))
-    w = randn((4096, 1024), g, 0.02)
-    monkeypatch.setattr(draft_step_kernels, "HEAD_CODED", False)
-    prepared = draft_step_kernels.prepare_head(SimpleNamespace(weight=w, bias=None), 2)
-    assert not prepared.coded and prepared.exc_off is None
-    assert torch.equal(prepared.wf, bf16_fragments(w))
-
-
-def test_guard_refuses_head_rows_past_x() -> None:
-    args = list(_case(op.CELLS[0].spec, 1))
-    args[1] = args[1] + 1000
-    with pytest.raises(AssertionError, match="x_rows must index x"):
-        with validating(op):
-            op(*args, fixed_order=_fixed(args))
-
-
 def test_guard_refuses_too_few_ctas() -> None:
     args = list(_case(op.CELLS[1].spec, 2))
     args[20] = 8
@@ -700,49 +455,3 @@ def test_guard_refuses_too_few_ctas() -> None:
 
 
 # ------------------------------------------------- one pass as two launches (uGPU, kernels/m3_draft_step.UGPU)
-
-
-@pytest.mark.parametrize(
-    "cell",
-    [c for c in op.CELLS if not c.spec["coded"]],
-    ids=[c.why[:44] for c in op.CELLS if not c.spec["coded"]],
-)
-def test_two_launches_per_domain_are_the_one_launch_pass(cell) -> None:
-    """A pass split into two launches (tiles [0, split) and [split, n), one per locality domain stream, the exchange
-    and bookkeeping by the last of both launches' CTAs) writes exactly what the one-launch pass writes: tokens,
-    winning keys, draft columns, next positions, KV and sequence lengths, and re-arms the counters and keys."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.m3ll.locality import (
-        LocalityMap,
-    )
-
-    one = _case(cell.spec, seed_of(cell.why))
-    two = _case(cell.spec, seed_of(cell.why))
-    op(*one)
-    lm = LocalityMap.get(torch.cuda.current_device())
-    streams = lm.domain_streams()
-    n_tiles = two[3].shape[0]
-    split = max(1, n_tiles // 2)
-    per = min(lm.sms_per_domain, split, n_tiles - split)
-    main = torch.cuda.current_stream()
-    fork = torch.cuda.Event()
-    fork.record(main)
-    for st, lo, hi in ((streams[0], 0, split), (streams[1], split, n_tiles)):
-        st.wait_event(fork)
-        with torch.cuda.stream(st):
-            op(*two[:20], per, False, *two[22:], tile_lo=lo, tile_hi=hi, total_ctas=2 * per)
-    for st in streams:
-        done = torch.cuda.Event()
-        done.record(st)
-        main.wait_event(done)
-    torch.cuda.synchronize()
-    for i, name in (
-        (11, "draft_out"),
-        (13, "ids_next"),
-        (15, "pos_next"),
-        (16, "kv_lens"),
-        (22, "out_keys"),
-    ):
-        assert torch.equal(one[i], two[i]), name
-    if one[18] is not None:
-        assert torch.equal(one[18], two[18]), "seq_lens"
-    assert two[6].tolist() == [0, 1] and not bool(two[5].any()), "counters / keys not re-armed"

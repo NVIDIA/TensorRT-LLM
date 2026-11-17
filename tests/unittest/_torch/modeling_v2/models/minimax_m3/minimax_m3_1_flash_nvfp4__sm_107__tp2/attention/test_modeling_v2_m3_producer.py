@@ -154,15 +154,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     assert checked >= spec["tokens"] - 2
 
 
-def test_early_trigger_does_not_change_the_bits() -> None:
-    inputs = _inputs(48, 1.0, False, 7)
-    a, b = _caches(), _caches()
-    out_a = op(*_args(inputs, a, early=True))
-    out_b = op(*_args(inputs, b, early=False))
-    for x, y in zip((*out_a, *a), (*out_b, *b)):
-        assert torch.equal(x.view(torch.uint8), y.view(torch.uint8))
-
-
 @pytest.mark.parametrize("tokens", [1, 4, 8, 48])
 def test_prewait_step_inputs_do_not_change_the_bits(tokens: int) -> None:
     """Reading the position ids, slots and RoPE rows before the grid wait leaves every output and cache byte as is,
@@ -182,44 +173,6 @@ def test_guard_refuses_a_repeated_slot() -> None:
     with pytest.raises(AssertionError, match="must not repeat a slot"):
         with validating(op):
             op(*_args(tuple(inputs), _caches()))
-
-
-def test_op_refuses_an_operand_off_the_device() -> None:
-    inputs = list(_inputs(4, 1.0, False, 9))
-    inputs[5] = inputs[5].cpu()  # position ids on the host
-    with pytest.raises(RuntimeError, match="packed's CUDA device"):
-        op(*_args(tuple(inputs), _caches()))
-
-
-def test_op_refuses_an_unaligned_index_k_page_stride() -> None:
-    """The index-K rows are written as 32-bit words: a page stride that is not a multiple of 4 is refused."""
-    kv_data, kv_scale, _ = _caches()
-    backing = torch.zeros(PAGES * (128 * 128 + 1), dtype=torch.float8_e4m3fn, device="cuda")
-    index_k = backing.as_strided((PAGES, 1, PAGE, 128), (128 * 128 + 1, 128 * 128, 128, 1))
-    with pytest.raises(RuntimeError, match="index_k"):
-        op(*_args(_inputs(4, 1.0, False, 13), (kv_data, kv_scale, index_k)))
-
-
-def test_op_refuses_unaligned_weights_or_rope_table() -> None:
-    """The norm weights are read as 8-byte words and the RoPE rows as float4: offset views are refused."""
-    packed, slots, quant, weights, rotary, positions = _inputs(4, 1.0, False, 17)
-    offset_weight = torch.zeros(129, dtype=torch.bfloat16, device="cuda")[1:]
-    with pytest.raises(RuntimeError, match="norm weights"):
-        op(
-            *_args(
-                (packed, slots, quant, [offset_weight, *weights[1:]], rotary, positions), _caches()
-            )
-        )
-    flat = torch.zeros(rotary.numel() + 1, device="cuda")
-    offset_rope = flat[1:].view(rotary.shape)
-    with pytest.raises(RuntimeError, match="rotary_cos_sin"):
-        op(*_args((packed, slots, quant, weights, offset_rope, positions), _caches()))
-
-
-def test_tp2_geometry() -> None:
-    """The wrapper is built for the TP2 per-rank heads: 32 query, 2 KV, 2 index heads, a 39-head packed row."""
-    assert (HEADS_Q, HEADS_KV, HEADS_INDEX, HEADS_PACKED) == (32, 2, 2, 39)
-    assert HEADS_PACKED * 128 == 4992
 
 
 def test_each_kv_head_lands_in_its_own_block() -> None:

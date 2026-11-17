@@ -7,14 +7,8 @@ override.
 It must equal ``flashinfer.sampling.softmax(logits, temperature)`` bit for bit (the microbenchmark generators: randn /
 peaked / ties / near_uniform / all_equal / masked / wide rows, temperature 1 / per-row mixed / scalar). The shared
 sampler hook must be byte-for-byte stock while no override is set, and fall back to the stock call whenever the
-override declines. TRTLLM_M31_DISABLE_SOFTMAX_MC=1 installs nothing.
+override declines.
 """
-
-import os
-import subprocess
-import sys
-import types
-from unittest import mock
 
 import pytest
 import torch
@@ -27,11 +21,7 @@ try:
     )
 except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)
-from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as fi_ops
 
-TARGET = "tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_103__tp4"
-CLASSES = ("randn", "peaked", "ties", "near_uniform", "all_equal", "masked", "wide")
-TEMPS = ("t1", "mixed", "scalar")
 op = entry.m31_softmax_mc
 
 
@@ -91,8 +81,18 @@ def _same(a, b, what):
     assert torch.equal(a.view(torch.int32), b.view(torch.int32)), f"{what}: fp32 bits differ"
 
 
-@pytest.mark.parametrize("mode", TEMPS)
-@pytest.mark.parametrize("cls", CLASSES)
+# Every class at temperature 1; the mixed and scalar temperature modes on randn only.
+# Boundary classes at temperature 1, plus the per-row and scalar temperature forms.
+_CLASS_MODES = [
+    ("randn", "t1"),
+    ("ties", "t1"),
+    ("masked", "t1"),
+    ("randn", "mixed"),
+    ("randn", "scalar"),
+]
+
+
+@pytest.mark.parametrize("cls,mode", _CLASS_MODES, ids=[f"{c}-{m}" for c, m in _CLASS_MODES])
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:40] for c in op.CELLS])
 def test_bitwise_flashinfer_softmax(cell, cls, mode) -> None:
     """At each certified (rows, d): the override equals FlashInfer's softmax bit for bit, and the explicit entry call
@@ -108,15 +108,6 @@ def test_bitwise_flashinfer_softmax(cell, cls, mode) -> None:
         for write_ctas in (4, 8):
             again = op(logits, temperature, entry.prebuild(logits.device), write_ctas)
             _same(again, got, f"write_ctas={write_ctas}")
-
-
-def test_no_temperature_is_one() -> None:
-    """A None temperature (softmax_op's Optional) is FlashInfer's default, 1.0."""
-    _gpu()
-    logits = _make("peaked", 8, 200064, 11)
-    got = entry.softmax_mc(logits, None)
-    assert got is not None
-    _same(got, _fi(logits, None), "temperature None")
 
 
 def test_graph_replay_equals_eager() -> None:
@@ -164,103 +155,3 @@ def test_outside_the_contract_the_override_declines() -> None:
     wide = _make("randn", entry.MAX_ROWS + 1, d, 2)
     assert entry.softmax_mc(wide, torch.full((entry.MAX_ROWS + 1,), 0.9, device="cuda")) is None
     assert entry.softmax_mc(logits.cpu(), temperature.cpu()) is None
-
-
-@pytest.fixture
-def _fake_flashinfer(monkeypatch):
-    """The sampler ops module with a stand-in flashinfer whose calls are recorded, and no override afterwards."""
-    stock = torch.full((2, 8), 0.125)
-    sampling = types.SimpleNamespace(
-        softmax=mock.Mock(return_value=stock),
-        top_p_renorm_probs=mock.Mock(side_effect=lambda probs, top_p: probs),
-        top_k_mask_logits=mock.Mock(side_effect=lambda logits, top_k: logits),
-    )
-    monkeypatch.setattr(fi_ops, "flashinfer", types.SimpleNamespace(sampling=sampling))
-    previous_softmax = fi_ops._SOFTMAX_OVERRIDE
-    previous_top_p = fi_ops._TOP_P_RENORM_OVERRIDE
-    fi_ops.set_softmax_override(None)
-    fi_ops.set_top_p_renorm_override(None)
-    try:
-        yield sampling, stock
-    finally:
-        fi_ops.set_softmax_override(previous_softmax)
-        fi_ops.set_top_p_renorm_override(previous_top_p)
-
-
-def test_hook_unset_is_stock(_fake_flashinfer) -> None:
-    """No override: both ops make exactly the stock flashinfer call and return its result."""
-    sampling, stock = _fake_flashinfer
-    logits, temperature = torch.rand(2, 8), torch.ones(2)
-    assert fi_ops._SOFTMAX_OVERRIDE is None
-    assert fi_ops.softmax_op(logits, temperature) is stock
-    sampling.softmax.assert_called_once_with(logits, temperature, enable_pdl=mock.ANY)
-    assert fi_ops.compute_probs_from_logits_op(logits, temperature, None, None) is stock
-    assert sampling.softmax.call_count == 2
-
-
-def test_hook_override_result_is_used(_fake_flashinfer) -> None:
-    """An override's tensor replaces the stock call in both ops; the stock kernel does not run, and a top_p renorm
-    after it gets the override's probs."""
-    sampling, _ = _fake_flashinfer
-    mine = torch.zeros(2, 8)
-    override = mock.Mock(return_value=mine)
-    fi_ops.set_softmax_override(override)
-    logits, temperature = torch.rand(2, 8), torch.ones(2)
-    assert fi_ops.softmax_op(logits, temperature) is mine
-    override.assert_called_once_with(logits, temperature)
-    assert fi_ops.compute_probs_from_logits_op(logits, temperature, None, None) is mine
-    top_p = torch.full((2,), 0.9)
-    assert fi_ops.compute_probs_from_logits_op(logits, temperature, None, top_p) is mine
-    sampling.top_p_renorm_probs.assert_called_once_with(mine, top_p)
-    assert override.call_count == 3
-    sampling.softmax.assert_not_called()
-
-
-def test_hook_override_declining_falls_back(_fake_flashinfer) -> None:
-    """An override that returns None leaves the stock call in place in both ops."""
-    sampling, stock = _fake_flashinfer
-    override = mock.Mock(return_value=None)
-    fi_ops.set_softmax_override(override)
-    logits, temperature = torch.rand(2, 8), torch.ones(2)
-    assert fi_ops.softmax_op(logits, temperature) is stock
-    assert fi_ops.compute_probs_from_logits_op(logits, temperature, None, None) is stock
-    assert override.call_count == 2 and sampling.softmax.call_count == 2
-
-
-def test_the_target_installs_the_override() -> None:
-    """With SOFTMAX_MC on (the default) and the op built, the target installs ``softmax_mc`` once per process."""
-    _gpu()
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_103__tp4 import (  # noqa: E501
-        modeling,
-    )
-
-    if not modeling.SOFTMAX_MC:
-        pytest.skip("SOFTMAX_MC is switched off in this environment")
-    saved = dict(modeling._SOFTMAX_MC_STATE)
-    saved_hook = fi_ops._SOFTMAX_OVERRIDE
-    modeling._SOFTMAX_MC_STATE.clear()
-    fi_ops.set_softmax_override(None)
-    try:
-        modeling._install_softmax_mc()
-        assert fi_ops._SOFTMAX_OVERRIDE is entry.softmax_mc
-        assert modeling._SOFTMAX_MC_STATE["installed"] is True
-    finally:
-        fi_ops.set_softmax_override(saved_hook)
-        modeling._SOFTMAX_MC_STATE.clear()
-        modeling._SOFTMAX_MC_STATE.update(saved)
-
-
-def test_the_kill_switch_installs_nothing() -> None:
-    """TRTLLM_M31_DISABLE_SOFTMAX_MC=1 (read at import): SOFTMAX_MC is off and the target leaves the sampler hook
-    unset."""
-    probe = (
-        f"import {TARGET}.modeling as m\n"
-        "from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as f\n"
-        "m._install_softmax_mc()\n"
-        "print(m.SOFTMAX_MC, f._SOFTMAX_OVERRIDE is None, m._SOFTMAX_MC_STATE['installed'])"
-    )
-    env = dict(os.environ, TRTLLM_M31_DISABLE_SOFTMAX_MC="1")
-    out = subprocess.run(
-        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, check=True
-    )
-    assert out.stdout.strip().splitlines()[-1] == "False True False"

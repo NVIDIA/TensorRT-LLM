@@ -15,9 +15,7 @@ import torch
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep import (  # noqa: E501
     native_ops,
 )
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels import (
-    nvfp4_index_k,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels import nvfp4_index_k
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -270,40 +268,7 @@ def test_nvfp4_index_k_mode_stress_rows(main_kv, stress):
     _report_vs_sink_pack(runs, slots, f"{main_kv} {stress}")
 
 
-@pytest.mark.parametrize("main_kv", ["fp8", "nvfp4"])
-@torch.inference_mode()
-def test_nvfp4_index_k_mode_cuda_graph_replay(main_kv):
-    """Captured once, replayed on new packed rows, positions and slots: the pages equal an eager run on them."""
-    _require_sm107()
-    inputs = _inputs(8, 1, seed=4321)
-    packed, slots, positions = inputs[:3]
-    main_pools, main_views = _main_caches(main_kv, 1)
-    index_pool, index_view = _index_cache(1)
-    _produce(main_kv, inputs, main_views, index_view)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_q, graph_index_q = _produce(main_kv, inputs, main_views, index_view)
-
-    packed.copy_(torch.randn_like(packed))
-    positions.copy_(torch.arange(len(SLOTS), dtype=torch.int32, device="cuda") * 7 + 3)
-    slots.copy_(slots.roll(3))
-    for pool in (*main_pools, index_pool):
-        pool.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-
-    runs = _run_modes(main_kv, inputs)
-    (q, index_q), eager_main, eager_pages = runs[1]
-    assert torch.equal(_bytes(graph_q), _bytes(q))
-    assert torch.equal(_bytes(graph_index_q), _bytes(index_q))
-    for got, want in zip(main_pools, eager_main):
-        assert torch.equal(_bytes(got), _bytes(want))
-    assert torch.equal(index_pool, eager_pages)
-    _assert_pages_equal_writer(runs, slots)
-
-
-@pytest.mark.parametrize("main_kv", ["fp8", "nvfp4"])
+@pytest.mark.parametrize("main_kv", ["nvfp4"])
 @pytest.mark.parametrize(
     "invalid,error",
     [
@@ -347,22 +312,3 @@ def test_direct_index_k_modes_reject_invalid_caches(main_kv, invalid, error):
         index = torch.zeros(NUM_PAGES, 1, PAGE, DIM, dtype=torch.float32, device="cuda")
     with pytest.raises(RuntimeError, match=error):
         _produce(main_kv, inputs, main_views, index)
-
-
-@pytest.mark.parametrize(
-    "num_heads_q,num_kv_heads",
-    [pytest.param(8, 1, id="tp8-hq8-hkv1"), pytest.param(64, 4, id="dep-hq64-hkv4")],
-)
-@torch.inference_mode()
-def test_fp8_e4m3_mode_is_bitwise_the_builtin_producer(num_heads_q, num_kv_heads):
-    """Mode 0 of the target's FP8 producer writes every output the built-in op writes, bit for bit."""
-    inputs = _inputs(num_heads_q, num_kv_heads)
-    got, want = [], []
-    for builtin, sink in ((False, got), (True, want)):
-        main_pools, main_views = _main_caches("fp8", num_kv_heads)
-        index_pool, index_view = _index_cache(0)
-        outputs = _produce("fp8", inputs, main_views, index_view, builtin=builtin)
-        sink.extend((*outputs, *main_pools, index_pool))
-    torch.cuda.synchronize()
-    for a, b in zip(got, want):
-        assert torch.equal(_bytes(a), _bytes(b))

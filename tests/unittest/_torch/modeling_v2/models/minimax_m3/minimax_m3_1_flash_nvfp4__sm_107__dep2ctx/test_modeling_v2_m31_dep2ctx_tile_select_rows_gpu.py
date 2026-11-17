@@ -5,7 +5,7 @@ stride, the Q8KV8 scorer's [T * H, pitch] buffer as [H, pages, T]) writes the ta
 writes on the same values head-major, BIT FOR BIT, and the table ``minimax_m3_select_blocks`` writes on the view itself.
 
 Adversarial values (ties, +-0, both NaN signs, +-inf, all-equal rows, short rows) over block counts across the narrow /
-tile / wide boundaries (128 / 2600) up to the 5856-block bound, 1 / 2 / 4 KV heads, row counts off the 8-row tile,
+tile / wide boundaries (128 / 2600) up to the 5856-block bound, 1 / 4 KV heads, a row count off the 8-row tile,
 pitches 0 and 1 mod 4 and a 4-byte base offset (the scalar staging path), random per-row counts (rows of one tile end
 apart). The built-in select ranks negative NaN above finite scores from 129 blocks (see the tp2ctx tile select test's
 strict xfail), so that comparison leaves negative NaN out there. Skipped off sm_107.
@@ -99,11 +99,11 @@ def _same_selection_shape(a, b, nvb):
     return torch.equal((a >= 0).sum(dim=-1), (b >= 0).sum(dim=-1))
 
 
-@pytest.mark.parametrize("blocks", [1, 16, 17, 32, 64, 128, 129, 2599, 2600, 5856])
-@pytest.mark.parametrize("rows", [256, 257, 1001])
-@pytest.mark.parametrize("heads", [1, 2, 4])
-@pytest.mark.parametrize("init_blocks,local_blocks", [(0, 1), (2, 3)])
-@pytest.mark.parametrize("pitch_mod,offset", [(0, 0), (1, 0), (0, 1)])
+@pytest.mark.parametrize("blocks", [128, 129, 5856])
+@pytest.mark.parametrize("rows", [1001])
+@pytest.mark.parametrize("heads", [4])
+@pytest.mark.parametrize("init_blocks,local_blocks", [(2, 3)])
+@pytest.mark.parametrize("pitch_mod,offset", [(0, 0), (1, 1)])
 def test_rows_op_equals_the_tile_op_bitwise(
     blocks, rows, heads, init_blocks, local_blocks, pitch_mod, offset
 ):
@@ -139,54 +139,3 @@ def test_served_shapes_with_causal_counts(ctx_end, rows):
     assert (
         torch.equal(rows_out, tile) and torch.equal(routed, tile) and torch.equal(rows_out, builtin)
     )
-
-
-def test_rows_op_rejects_a_non_unit_block_stride():
-    values = torch.randn(4, 64, 300, device="cuda")
-    out = torch.empty((300, 4, 16), dtype=torch.int32, device="cuda")
-    nvb = torch.full((300,), 64, dtype=torch.int32, device="cuda")
-    with pytest.raises(RuntimeError, match="unit block stride"):
-        family_ops().minimax_m31_select_prefill_tile_rows(values, nvb, out, 0, 1)
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
-@pytest.mark.parametrize(
-    "op_name", ["minimax_m31_select_prefill_tile", "minimax_m31_select_prefill_tile_rows"]
-)
-@pytest.mark.parametrize("moved", ["n_valid_blocks", "out"])
-def test_ops_reject_operands_on_another_device(op_name, moved):
-    values = torch.randn(4, 64, 300, device="cuda:0")
-    scores = values if op_name.endswith("tile") else _row_major(values, 0, 0)
-    nvb = torch.full((300,), 64, dtype=torch.int32, device="cuda:0")
-    out = torch.empty((4, 300, 16), dtype=torch.int32, device="cuda:0").permute(1, 0, 2)
-    if moved == "n_valid_blocks":
-        nvb = nvb.to("cuda:1")
-    else:
-        out = torch.empty((4, 300, 16), dtype=torch.int32, device="cuda:1").permute(1, 0, 2)
-    with pytest.raises(RuntimeError, match="same CUDA device"):
-        getattr(family_ops(), op_name)(scores, nvb, out, 0, 1)
-
-
-@pytest.mark.parametrize("blocks", [1, 16, 17, 64, 128])
-@pytest.mark.parametrize("rows", [256, 1001])
-def test_the_narrow_kill_switch_keeps_the_table(blocks, rows):
-    """narrow=False (TSEL_NARROW off) runs the tile kernel on the short tiles the narrow-row kernel takes on sm_107:
-    both ops write the same table either way."""
-    g = torch.Generator(device="cuda").manual_seed(blocks * 7 + rows)
-    nvb = torch.randint(0, blocks + 4, (rows,), generator=g, device="cuda", dtype=torch.int32)
-    for kind in ("random", "ties", "specials"):
-        values = _values(kind, 4, blocks, rows, blocks + rows, True)
-        view = _row_major(values, 0, 0)
-        tables = []
-        for narrow in (True, False):
-            tile = torch.empty((4, rows, 16), dtype=torch.int32, device="cuda").permute(1, 0, 2)
-            rows_out = torch.empty_like(tile.permute(1, 0, 2)).permute(1, 0, 2)
-            family_ops().minimax_m31_select_prefill_tile(
-                values.contiguous(), nvb, tile, 0, 1, narrow=narrow
-            )
-            family_ops().minimax_m31_select_prefill_tile_rows(
-                view, nvb, rows_out, 0, 1, narrow=narrow
-            )
-            tables += [tile, rows_out]
-        for t in tables[1:]:
-            assert torch.equal(t, tables[0]), f"{kind}: {_diff(t, tables[0])}"

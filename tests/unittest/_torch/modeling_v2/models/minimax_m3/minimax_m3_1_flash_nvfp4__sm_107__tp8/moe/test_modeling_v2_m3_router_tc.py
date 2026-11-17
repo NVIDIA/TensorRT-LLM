@@ -37,15 +37,6 @@ def test_tc_certified_cells(cell) -> None:
         _compare_fp4(outs[1], outs[2], x, sf_scale)
 
 
-def test_tc_reference_is_tf32_and_the_gate_sees_it() -> None:
-    """The tensor-core router rounds the weight to TF32: against a true fp32 product its logits sit far outside
-    the band, so the TF32 rounding in ``reference`` is load-bearing rather than decoration."""
-    x, w = _build(16, 128, 6144, 5)
-    out = tc(x, w, None, False)[0]
-    with pytest.raises(AssertionError):
-        _compare_logits(out, fp32_logits(x, w))
-
-
 def test_guard_refuses_a_misaligned_activation() -> None:
     """A row view starting 8 bytes into the buffer keeps a legal row stride but not a legal bulk-copy source."""
     x, w = _build(2, 128, 6144, 3)

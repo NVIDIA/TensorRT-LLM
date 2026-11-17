@@ -6,9 +6,7 @@ import sys
 
 import pytest
 
-_CTX_STORE = (
-    "tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark.dspark_ctx_store"
-)
+_CTX_STORE = "tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark.dspark_ctx_store"
 
 
 @pytest.fixture(autouse=True)

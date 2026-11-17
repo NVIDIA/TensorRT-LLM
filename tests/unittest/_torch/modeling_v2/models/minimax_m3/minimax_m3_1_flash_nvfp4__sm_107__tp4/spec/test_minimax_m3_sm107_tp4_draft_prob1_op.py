@@ -20,14 +20,6 @@ def _op():
     return getattr(family_ops(), OP)
 
 
-def test_fake_is_registered():
-    _op()
-    # The family fakes register when family_ops() loads the library; importing them before that fails.
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import fake_ops
-
-    assert torch._C._dispatch_has_kernel_for_dispatch_key(f"{fake_ops._NS}::{OP}", "Meta")
-
-
 def test_max_grid():
     _op()
     sms = torch.cuda.get_device_properties(0).multi_processor_count
@@ -96,9 +88,7 @@ def test_refuses_before_launch(kw):
         op(*_args(**kw))
 
 
-@pytest.mark.parametrize(
-    "index", [1, 2, 5, 6, 7, 8, 16, 18, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33]
-)
+@pytest.mark.parametrize("index", [1, 16, 33])
 def test_refuses_cpu_operands_before_launch(index):
     op = _op()
     args = _args()

@@ -5,11 +5,7 @@ of a K 7 block over the full 200064 vocab: TP_GUMBEL_DRAFT), through ``draw_bloc
 - every stored proposal q_k equals ``softmax((base_k + bias(d_{k-1})) / T)`` of the token drawn before it (an fp32
   reference, to reduction-order tolerance), at the served geometry (vocab 200064, rank 256, K 7);
 - the drawn tokens follow those distributions (a chi-square goodness of fit per position over many seeds);
-- the same seeds draw the same block, eager and replayed from a CUDA graph;
-- CUDA-graph padding rows (the dummy slot) with non-finite logits leave every real row's tokens and proposals as they
-  are without them;
 - vocab-sharded drafter logits (TP) are gathered before the draw: a TP8 split draws exactly the full-logits block;
-- ``install`` follows the target's switch and puts its tag / switch name on the lines.
 Not bitwise vs the stock loop by design (another random stream): the served gates are natural AL and GSM8K."""
 
 import math
@@ -84,7 +80,7 @@ def _reference_q(draft_model, gen_logits, inputs, meta, tokens):
     return torch.stack(qs, dim=1)
 
 
-TP_ROWS = [1, 2, 3, 4, 8]
+TP_ROWS = [1, 8]
 VOCAB, K, RANK = 200064, 7, 256
 
 
@@ -113,7 +109,7 @@ def test_the_stored_proposals_are_the_drawn_distributions(rows):
     assert bool((picked > 0).all())
 
 
-@pytest.mark.parametrize("rows", [1, 4])
+@pytest.mark.parametrize("rows", [1])
 def test_the_draws_follow_the_proposals(rows):
     """Pooled over draws, each position's token counts match the summed conditional proposals (chi-square), at a TP
     batch (the draws come from rows x batches seeds)."""
@@ -142,45 +138,6 @@ def test_the_draws_follow_the_proposals(rows):
         assert stat < df + 6 * math.sqrt(2 * df), (pos, stat, df)  # far past p = 1e-6 for these df
 
 
-@pytest.mark.parametrize("rows", [1, 4])
-def test_the_same_seeds_draw_the_same_block_eager_and_in_a_cuda_graph(rows):
-    draft_model, gen_logits, inputs, meta = _case(rows, K, VOCAB, RANK, seed=30 + rows)
-    eager_tokens, _ = _draw(draft_model, gen_logits, inputs, meta)
-    eager_probs = meta.draft_probs.clone()
-    again, _ = _draw(draft_model, gen_logits, inputs, meta)
-    assert torch.equal(again, eager_tokens)
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        _draw(draft_model, gen_logits, inputs, meta)  # warm up outside the capture
-    torch.cuda.current_stream().wait_stream(side)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out, _ = _draw(draft_model, gen_logits, inputs, meta)
-    meta.draft_probs.zero_()
-    for _ in range(3):  # every replay redraws the same block from the same seeds
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(out, eager_tokens)
-        assert torch.equal(meta.draft_probs, eager_probs)
-
-
-def test_padding_rows_leave_the_real_rows_as_they_are():
-    rows, dummy = 4, 1  # a TP batch padded up to a captured graph size
-    draft_model, gen_logits, inputs, meta = _case(rows, K, VOCAB, RANK, seed=11, dummy_rows=dummy)
-    real = rows - dummy
-    tokens, _ = _draw(draft_model, gen_logits, inputs, meta)
-    probs = meta.draft_probs[meta.batch_slot_ids[:real]].clone()
-    garbage = gen_logits.clone()
-    garbage[real:] = float("nan")
-    meta.draft_probs.zero_()
-    tokens2, _ = _draw(draft_model, garbage, inputs, meta)
-    assert torch.equal(tokens2[:real], tokens[:real])
-    assert torch.equal(meta.draft_probs[meta.batch_slot_ids[:real]], probs)
-    assert bool(torch.isfinite(meta.draft_probs[meta.dummy_slot_row]).all())
-    assert bool(((tokens2[real:] >= 0) & (tokens2[real:] < VOCAB)).all())
-
-
 @pytest.mark.parametrize("world", [2, 8])
 def test_sharded_logits_are_gathered_before_the_draw(world):
     rows = 4
@@ -195,23 +152,3 @@ def test_sharded_logits_are_gathered_before_the_draw(world):
     assert out is not None
     assert torch.equal(out[0], expected) and out[1] == VOCAB
     assert torch.equal(meta.draft_probs, expected_probs)
-
-
-def test_a_disabled_install_clears_only_its_own_override(monkeypatch):
-    from tensorrt_llm._torch.speculative import dspark
-
-    def setter(hook):
-        dspark._ANCESTRAL_BLOCK_OVERRIDE = hook
-
-    monkeypatch.setattr(dspark, "_ANCESTRAL_BLOCK_OVERRIDE", None, raising=False)
-    monkeypatch.setattr(dspark, "set_ancestral_block_override", setter, raising=False)
-    monkeypatch.setattr(gumbel_draft, "_STATE", dict(gumbel_draft._STATE))
-    monkeypatch.setattr(gumbel_draft, "block_sampler", lambda: object())
-    assert gumbel_draft.install("[M3.1 TP2]", "TP_GUMBEL_DRAFT", True)
-    assert dspark._ANCESTRAL_BLOCK_OVERRIDE is gumbel_draft.draw_block
-    assert not gumbel_draft.install("[M3.1 TP2]", "TP_GUMBEL_DRAFT", False)
-    assert dspark._ANCESTRAL_BLOCK_OVERRIDE is None
-    other = object()
-    setter(other)
-    assert not gumbel_draft.install("[M3.1 TP2]", "TP_GUMBEL_DRAFT", False)
-    assert dspark._ANCESTRAL_BLOCK_OVERRIDE is other

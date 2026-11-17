@@ -132,6 +132,8 @@ def _compare(name: str, got, want, bad: Dict[str, dict]) -> None:
 
 def _run_matrix() -> None:
     import tensorrt_llm._torch.custom_ops  # noqa: F401 -- registers trtllm::mxfp8_quantize
+    from tensorrt_llm._torch.distributed import AllReduce
+    from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2 import (  # noqa: E501
         native_ops,
     )
@@ -141,8 +143,6 @@ def _run_matrix() -> None:
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm import (
         mxfp8_cute_pinned_tactics as pin,
     )
-    from tensorrt_llm._torch.distributed import AllReduce
-    from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
     from tensorrt_llm.functional import AllReduceStrategy
     from tensorrt_llm.mapping import Mapping
 

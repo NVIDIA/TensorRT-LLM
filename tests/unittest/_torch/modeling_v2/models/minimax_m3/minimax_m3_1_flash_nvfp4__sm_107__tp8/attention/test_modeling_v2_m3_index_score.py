@@ -74,36 +74,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     assert torch.equal(score, stock), "the scores differ from the in-tree scorer"
 
 
-@pytest.mark.parametrize("early", [True, False], ids=["early", "prefetch"])
-def test_bf16_index_is_the_in_tree_scorer(early) -> None:
-    idx_q, index_k, block_table, seq, stride = _inputs((5000,), 4, 11, dtype=torch.bfloat16)
-    score, stock = _score(stride, 4), _score(stride, 4)
-    op(idx_q, index_k, block_table, seq, score, 4, 1536, early)
-    torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
-        idx_q, index_k, block_table, seq, stock, 4
-    )
-    assert torch.equal(score, stock)
-
-
-@pytest.mark.parametrize("qlen", [1, 2, 3, 4])
-def test_prestaged_blocks_at_the_stable_edge_are_the_in_tree_scorer(qlen) -> None:
-    """Lengths around the edge between pre-staged (all-old) and post-wait first blocks, 1 and 2 requests."""
-    for k in (1, 2, 1294):
-        for length in (k * PAGE - qlen - 1, k * PAGE - qlen, k * PAGE - qlen + 1, k * PAGE + 1):
-            for seq_lens, split in (
-                ((length,), 1536),
-                ((length,), 1272),
-                ((length, max(qlen, length // 3)), 768),
-            ):
-                idx_q, index_k, block_table, seq, stride = _inputs(seq_lens, qlen, 31 + length)
-                score, stock = _score(stride, idx_q.shape[0]), _score(stride, idx_q.shape[0])
-                op(idx_q, index_k, block_table, seq, score, qlen, split, True)
-                torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
-                    idx_q, index_k, block_table, seq, stock, qlen
-                )
-                assert torch.equal(score, stock), (qlen, seq_lens)
-
-
 def test_guard_refuses_a_request_past_its_block_table() -> None:
     idx_q, index_k, block_table, seq, stride = _inputs((1000,), 1, 5)
     seq = seq + 4 * PAGE

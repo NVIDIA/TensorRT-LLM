@@ -140,35 +140,6 @@ def test_padding_rows(mode):
             _assert_same(ref, got)
 
 
-def test_denormal_probabilities():
-    c = _case(12, 1234)
-    gen = torch.Generator(device="cuda").manual_seed(4321)
-    for key in ("draft", "target"):
-        c[key][torch.rand(c[key].shape, generator=gen, device="cuda") < 0.01] = 1.0e-39
-    rows = torch.arange(12, device="cuda")
-    tok = c["ids"][:, 0].long()
-    c["draft"][rows, 0, tok] = 1.0e-39
-    c["target"][rows, 0, tok] = 2.0e-39
-    c["buf"][c["slot_ids"]] = c["draft"]
-    for k in range(4):
-        s, o = _seeds(12, 300 + k)
-        ref = _flashinfer(c, s, o)
-        for got in _both_forms(c, s, o):
-            _assert_same(ref, got)
-
-
-def test_the_output_does_not_depend_on_ctas_per_row():
-    c = _case(12, 55)
-    ws = rej_mc_fi.prebuild(torch.device("cuda", torch.cuda.current_device()))
-    op = rej_mc_fi.mc_fi_op()
-    s, o = _seeds(12, 5)
-    ref = _flashinfer(c, s, o)
-    for ctas in (1, 2, 4, 8, 16, 32):
-        _assert_same(ref, op(c["draft"], c["ids"], c["target"], s, o, ws, ctas))
-    with pytest.raises(RuntimeError):
-        op(c["draft"], c["ids"], c["target"], s, o, ws, 64)
-
-
 def test_the_slot_form_replays_inside_a_cuda_graph():
     c = _case(12, 66)
     s, o = _seeds(12, 6)

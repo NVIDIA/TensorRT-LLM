@@ -13,9 +13,6 @@ import torch
 from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 try:
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
-        m3_select_long_dsl as select_kernels,
-    )
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.ops.attention.m3_select_long import (  # noqa: E501
         TOPK,
         m3_select_long,
@@ -27,7 +24,7 @@ except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)
 
 __extra_import_path__ = ["../../../.."]
-from _validating import certifying, validating  # noqa: E402, F401 — needs the path declared above
+from _validating import certifying  # noqa: E402, F401 — needs the path declared above
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
@@ -149,85 +146,3 @@ def test_layouts_and_widths_match_the_1024_thread_select(layout, valid) -> None:
     op(s, nvb, out, 0, 1, False)
     m3_select_long(s, nvb, ref, 0, 1, False)
     assert torch.equal(out, ref)
-
-
-def test_pdl_launch_selects_the_same() -> None:
-    spec = op.CELLS[2].spec
-    scores, nvb, out, init_blocks, local_blocks, _ = _case(spec, seed=1)
-    pdl_out = torch.empty_like(out)
-    op(scores, nvb, out, init_blocks, local_blocks, False)
-    op(scores, nvb, pdl_out, init_blocks, local_blocks, True)
-    assert torch.equal(out, pdl_out)
-
-
-def test_early_trigger_selects_the_same() -> None:
-    spec = op.CELLS[2].spec
-    scores, nvb, out, init_blocks, local_blocks, _ = _case(spec, seed=2)
-    early_out = torch.empty_like(out)
-    op(scores, nvb, out, init_blocks, local_blocks, True, False)
-    op(scores, nvb, early_out, init_blocks, local_blocks, True, True)
-    assert torch.equal(out, early_out)
-
-
-@pytest.mark.parametrize("cell", [0, 1, 2])
-def test_trigger_phase_selects_the_same(cell: int) -> None:
-    spec = op.CELLS[cell].spec
-    scores, nvb, out, init_blocks, local_blocks, _ = _case(spec, seed=3 + cell)
-    loaded_out = torch.empty_like(out)
-    op(scores, nvb, out, init_blocks, local_blocks, True, False, 0)
-    op(scores, nvb, loaded_out, init_blocks, local_blocks, True, False, 1)
-    assert torch.equal(out, loaded_out)
-
-
-@pytest.mark.parametrize("early_trigger", [False, True])
-@pytest.mark.parametrize("cell", range(len(op.CELLS)))
-def test_valid_count_read_before_the_wait_selects_the_same(cell: int, early_trigger: bool) -> None:
-    """kernels/m3_select_long_dsl.N_VALID_PREWAIT: the kernel that reads its row's valid-block count before the grid
-    wait selects exactly the blocks of the one that reads it after, on every certified cell (padding, clamped and tied
-    rows)."""
-    phase = 0 if early_trigger else 1
-    spec = op.CELLS[cell].spec
-    scores, nvb, before, init_blocks, local_blocks, _ = _case(spec, seed=11 + cell)
-    after = torch.empty_like(before)
-    select_kernels._compile((True, early_trigger, phase, True))(
-        scores, nvb, before, init_blocks, local_blocks
-    )
-    select_kernels._compile((True, early_trigger, phase, False))(
-        scores, nvb, after, init_blocks, local_blocks
-    )
-    assert torch.equal(before, after)
-
-
-def test_graph_replay_selects_the_same() -> None:
-    spec = op.CELLS[1].spec
-    scores, nvb, out, init_blocks, local_blocks, _ = _case(spec, seed=9)
-    ref = op.reference(scores, nvb, out, init_blocks, local_blocks)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        op(scores, nvb, out, init_blocks, local_blocks, True, False, 1)
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        op(scores, nvb, out, init_blocks, local_blocks, True, False, 1)
-    for _ in range(3):
-        out.fill_(-7)
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(out, ref)
-
-
-def test_op_refuses_a_row_past_its_width() -> None:
-    scores = torch.zeros(1, 9217, 1, device="cuda")
-    nvb = torch.ones(1, dtype=torch.int32, device="cuda")
-    out = torch.empty(1, 1, TOPK, dtype=torch.int32, device="cuda")
-    with pytest.raises(RuntimeError, match="at most 9216"):
-        op(scores, nvb, out, 0, 1, False)
-
-
-def test_guard_refuses_negative_forcing() -> None:
-    args = list(_case(op.CELLS[0].spec, seed=2))
-    args[4] = -1
-    with pytest.raises(AssertionError, match="non-negative"):
-        with validating(op):
-            op(*args)

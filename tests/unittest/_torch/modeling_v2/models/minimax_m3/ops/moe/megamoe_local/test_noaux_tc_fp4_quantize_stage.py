@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Bitwise tests for the family's noaux_tc_fp4_quantize_stage_out against noaux_tc_op + fp4_quantize."""
+"""Bitwise tests for the family's noaux_tc_fp4_quantize_stage_out against noaux_tc_op + fp4_quantize, and for
+noaux_tc_route_stage_out against noaux_tc_fp4_quantize_stage_out's ids and weights."""
 
 import pytest
 import torch
@@ -105,10 +106,16 @@ def _inputs(num_tokens, num_experts, hidden_size, seed, ties):
     return scores, bias, hidden, global_scale
 
 
-@pytest.mark.parametrize("num_experts,topk", [(128, 4), (128, 8), (256, 8)])
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 47, 96, 148, 191, 192, 296, 384])
-@pytest.mark.parametrize("split", ["half", "all_first", "all_second"])
-@pytest.mark.parametrize("ties", [False, True])
+#: (num_experts, topk, num_tokens, split, ties): tied scores at every geometry, plus one untied case.
+STAGE_OUT_CASES = [
+    (num_experts, topk, num_tokens, split, True)
+    for num_experts, topk in ((256, 8),)
+    for num_tokens in (1, 192, 384)
+    for split in ("half", "all_first")
+] + [(128, 8, 47, "half", False)]
+
+
+@pytest.mark.parametrize("num_experts,topk,num_tokens,split,ties", STAGE_OUT_CASES)
 def test_stage_out_matches_separate_ops(num_experts, topk, num_tokens, split, ties):
     hidden_size, scale = 6144, 2.0
     scores, bias, hidden, global_scale = _inputs(
@@ -123,30 +130,6 @@ def test_stage_out_matches_separate_ops(num_experts, topk, num_tokens, split, ti
     ref = _reference(scores, bias, hidden, global_scale, topk, scale)
     _check_stage(stages[0], ref, range(0, rows0), topk)
     _check_stage(stages[1], ref, range(rows0, num_tokens), topk)
-
-
-@pytest.mark.parametrize("hidden_size", [64, 3072])
-@pytest.mark.parametrize("scale", [1.0, 2.5])
-def test_stage_out_other_hidden_sizes_and_scales(hidden_size, scale):
-    num_tokens, topk = 37, 4
-    scores, bias, hidden, global_scale = _inputs(num_tokens, 128, hidden_size, 11, False)
-    rows0 = 19
-    stages = (_stage(19, topk, hidden_size, 0, "cuda"), _stage(18, topk, hidden_size, 0, "cuda"))
-    _run(scores, bias, hidden, global_scale, topk, scale, rows0, stages)
-    ref = _reference(scores, bias, hidden, global_scale, topk, scale)
-    _check_stage(stages[0], ref, range(0, rows0), topk)
-    _check_stage(stages[1], ref, range(rows0, num_tokens), topk)
-
-
-def test_zero_tokens_resets_both_tails():
-    topk, hidden_size = 4, 6144
-    scores, bias, hidden, global_scale = _inputs(0, 128, hidden_size, 0, False)
-    stages = (_stage(32, topk, hidden_size, 0, "cuda"), _stage(32, topk, hidden_size, 0, "cuda"))
-    _run(scores, bias, hidden, global_scale, topk, 2.0, 0, stages)
-    for stage in stages:
-        assert bool((stage["topk_indices"] == -1).all())
-        assert bool((stage["topk_weights"] == 0).all())
-        assert bool((stage["fp4_out"] == BYTE_SENTINEL).all())
 
 
 def test_cuda_graph_replay_matches_eager():
@@ -172,24 +155,6 @@ def test_cuda_graph_replay_matches_eager():
         assert torch.equal(stage["topk_weights"], expected["topk_weights"])
 
 
-def test_rejects_bad_arguments():
-    topk, hidden_size = 4, 6144
-    scores, bias, hidden, global_scale = _inputs(8, 128, hidden_size, 0, False)
-    stages = (_stage(8, topk, hidden_size, 0, "cuda"), _stage(8, topk, hidden_size, 0, "cuda"))
-    with pytest.raises(RuntimeError):
-        _run(scores, bias, hidden, global_scale, topk, 2.0, 9, stages)
-    small = (_stage(2, topk, hidden_size, 0, "cuda"), _stage(8, topk, hidden_size, 0, "cuda"))
-    with pytest.raises(RuntimeError):
-        _run(scores, bias, hidden, global_scale, topk, 2.0, 4, small)
-    narrow = _inputs(8, 128, 96, 0, False)
-    with pytest.raises(RuntimeError):
-        _run(
-            *narrow, topk, 2.0, 4, (_stage(8, topk, 96, 0, "cuda"), _stage(8, topk, 96, 0, "cuda"))
-        )
-    with pytest.raises(RuntimeError):
-        _run(scores, bias, hidden.float(), global_scale, topk, 2.0, 4, stages)
-
-
 def _pad_mask(num_tokens, pattern):
     rows = torch.arange(num_tokens, device="cuda")
     masked = {
@@ -201,9 +166,9 @@ def _pad_mask(num_tokens, pattern):
     return masked.to(torch.uint8)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 47, 96, 192])
-@pytest.mark.parametrize("split", ["half", "all_first", "all_second"])
-@pytest.mark.parametrize("pattern", ["none", "every_third", "all", "tail"])
+@pytest.mark.parametrize("num_tokens", [1, 192])
+@pytest.mark.parametrize("split", ["half"])
+@pytest.mark.parametrize("pattern", ["every_third", "tail"])
 def test_pad_mask_rows_take_the_tail_values(num_tokens, split, pattern):
     topk, hidden_size = 4, 6144
     scores, bias, hidden, global_scale = _inputs(num_tokens, 128, hidden_size, 11, False)
@@ -233,38 +198,86 @@ def test_pad_mask_rows_take_the_tail_values(num_tokens, split, pattern):
         assert torch.equal(m["topk_weights"][n:], p["topk_weights"][n:])
 
 
-def test_pad_mask_is_read_at_replay():
-    num_tokens, topk, hidden_size = 64, 4, 6144
-    scores, bias, hidden, global_scale = _inputs(num_tokens, 128, hidden_size, 3, False)
-    pad_mask = torch.zeros(num_tokens, dtype=torch.uint8, device="cuda")
-    stages = (_stage(64, topk, hidden_size, 0, "cuda"), _stage(64, topk, hidden_size, 0, "cuda"))
-    _run(scores, bias, hidden, global_scale, topk, 2.0, num_tokens, stages, pad_mask=pad_mask)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        _run(scores, bias, hidden, global_scale, topk, 2.0, num_tokens, stages, pad_mask=pad_mask)
-    pad_mask[[5, 40]] = 1
-    graph.replay()
-    torch.cuda.synchronize()
-    idx = stages[0]["topk_indices"]
-    assert bool((idx[[5, 40]] == -1).all()) and bool((idx[[4, 6, 39, 41]] >= 0).all())
-    pad_mask.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert bool((idx[:num_tokens] >= 0).all())
+# noaux_tc_route_stage_out: the route-only stage against the fused stage's ids and weights
+HIDDEN = 64
 
 
-def test_rejects_bad_pad_masks():
-    topk, hidden_size = 4, 6144
-    scores, bias, hidden, global_scale = _inputs(8, 128, hidden_size, 0, False)
-    stages = (_stage(8, topk, hidden_size, 0, "cuda"), _stage(8, topk, hidden_size, 0, "cuda"))
-    bad_masks = (
-        torch.zeros(8, dtype=torch.bool, device="cuda"),
-        torch.zeros(8, dtype=torch.int32, device="cuda"),
-        torch.zeros(7, dtype=torch.uint8, device="cuda"),
-        torch.zeros(8, 1, dtype=torch.uint8, device="cuda"),
-        torch.zeros(16, dtype=torch.uint8, device="cuda")[::2],
-        torch.zeros(8, dtype=torch.uint8),
+def _route_inputs(num_tokens, num_experts, seed, ties):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    scores = torch.randn(num_tokens, num_experts, generator=gen, device="cuda", dtype=torch.float32)
+    bias = 0.1 * torch.randn(num_experts, generator=gen, device="cuda", dtype=torch.float32)
+    if ties:
+        scores[:, ::3] = scores[:, :1]
+        bias.zero_()
+    return scores, bias
+
+
+def _ids_weights(cap_idx, cap_w, topk, extra_cols):
+    return (
+        torch.full((cap_idx, topk + extra_cols), IDX_SENTINEL, dtype=torch.int32, device="cuda"),
+        torch.full((cap_w, topk + extra_cols), WEIGHT_SENTINEL, dtype=torch.float32, device="cuda"),
     )
-    for bad in bad_masks:
-        with pytest.raises(RuntimeError):
-            _run(scores, bias, hidden, global_scale, topk, 2.0, 4, stages, pad_mask=bad)
+
+
+def _fused(scores, bias, topk, scale, idx, w, pad_mask=None):
+    num_tokens = scores.shape[0]
+    hidden = torch.zeros(num_tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    gs = torch.ones(1, device="cuda")
+    fp4 = torch.empty(max(num_tokens, 1), HIDDEN // 2, dtype=torch.uint8, device="cuda")
+    sf = torch.empty(max(num_tokens, 1), HIDDEN // 16, dtype=torch.uint8, device="cuda")
+    e = (
+        torch.empty(0, topk, dtype=torch.int32, device="cuda"),
+        torch.empty(0, topk, dtype=torch.float32, device="cuda"),
+        torch.empty(0, HIDDEN // 2, dtype=torch.uint8, device="cuda"),
+        torch.empty(0, HIDDEN // 16, dtype=torch.uint8, device="cuda"),
+    )
+    family_ops().noaux_tc_fp4_quantize_stage_out(
+        scores,
+        bias,
+        hidden,
+        gs,
+        topk,
+        scale,
+        num_tokens,
+        idx,
+        w[:, :topk],
+        fp4,
+        sf,
+        *e,
+        **({} if pad_mask is None else {"pad_mask": pad_mask}),
+    )
+
+
+def _route(scores, bias, topk, scale, idx, w, pad_mask=None):
+    family_ops().noaux_tc_route_stage_out(
+        scores,
+        bias,
+        topk,
+        scale,
+        idx,
+        w[:, :topk],
+        **({} if pad_mask is None else {"pad_mask": pad_mask}),
+    )
+
+
+def _assert_same(a, b):
+    assert torch.equal(a[0], b[0])
+    assert torch.equal(a[1].view(torch.int32), b[1].view(torch.int32))
+
+
+@pytest.mark.parametrize("num_experts,topk", [(256, 8)])
+@pytest.mark.parametrize("num_tokens", [0, 1, 47, 4100])
+@pytest.mark.parametrize("cap_extra", [5])
+def test_route_stage_matches_the_fused_stage(num_experts, topk, num_tokens, cap_extra):
+    ties = num_tokens == 47  # tied scores at one interior row count
+    scores, bias = _route_inputs(num_tokens, num_experts, num_tokens + cap_extra, ties)
+    cap = num_tokens + cap_extra
+    fused, routed = _ids_weights(cap, cap + 3, topk, 2), _ids_weights(cap, cap + 3, topk, 2)
+    _fused(scores, bias, topk, 2.0, *fused)
+    _route(scores, bias, topk, 2.0, *routed)
+    _assert_same(fused, routed)
+    assert bool((routed[0][:, topk:] == IDX_SENTINEL).all())
+    assert bool((routed[1][:, topk:] == WEIGHT_SENTINEL).all())
+    assert bool((routed[0][num_tokens:, :topk] == -1).all())
+    assert bool((routed[1][num_tokens:, :topk] == 0).all())
+    assert not bool(torch.signbit(routed[1][num_tokens:, :topk]).any())

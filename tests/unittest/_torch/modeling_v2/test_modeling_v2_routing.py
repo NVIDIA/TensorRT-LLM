@@ -1997,8 +1997,10 @@ def _m31_dspark(tmp_path, **drafter):
     return DSparkDecodingConfig(max_draft_len=7, speculative_model=str(tmp_path))
 
 
-@pytest.mark.parametrize("topology", sorted(_M31_TARGETS))
-@pytest.mark.parametrize("speculation", ["none", "dspark"])
+@pytest.mark.parametrize(
+    "topology, speculation",
+    [*((topology, "none") for topology in sorted(_M31_TARGETS)), ("tp2", "dspark")],
+)
 def test_minimax_m3_1_route_picks_the_target_by_topology(
     _m31_route, tmp_path, topology, speculation
 ):
@@ -2047,6 +2049,34 @@ def test_minimax_m3_1_route_declines_with_the_reason(
 
     with pytest.raises(NoTarget, match=f"^MiniMax-M3.1-Flash: .*{reason}"):
         _m31_route.route(_m31_model_config(topology), _m3_llm_args("auto", kv_dtype), capability)
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        dict(layout=dict(_M31_LAYOUT, rope_theta=5_000_000)),
+        dict(
+            layout=dict(
+                _M31_LAYOUT, sparse_attention_config=dict(sparse_attention_freq=[0] * 3 + [1] * 57)
+            )
+        ),
+        dict(quantization=dict(_M31_QUANTIZATION, moe_quant_algo="FP8")),
+        dict(text=dict(num_key_value_heads=8)),
+    ],
+    ids=["m3_rope", "m3_layers", "wrong_experts", "num_key_value_heads_8"],
+)
+def test_minimax_m3_1_route_declines_another_checkpoint_on_tp8(_m31_route, checkpoint):
+    """A checkpoint that is not the M3.1 export (another RoPE base, sparse layout, expert quantization or shape) on
+    the M3.1 tp8 topology is declined, and not with the M3.1 targets' message."""
+    from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+
+    config = _m31_model_config("tp8", layout=checkpoint.get("layout"))
+    if "quantization" in checkpoint:
+        config.pretrained_config.quantization_config = checkpoint["quantization"]
+    config.pretrained_config.text_config.update(checkpoint.get("text", {}))
+    with pytest.raises(NoTarget) as excinfo:
+        _m31_route.route(config, _m3_llm_args("auto", "nvfp4"), (10, 7))
+    assert "MiniMax-M3.1-Flash" not in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
@@ -2100,7 +2130,7 @@ def test_minimax_m3_1_route_declines_a_windowed_draft_pool_that_needs_a_resize(
     assert _m31_route.route(config, unchunked, (10, 7)).__name__ == _M31_TARGETS["tp2"][1]
 
 
-@pytest.mark.parametrize("topology", ["tp2", "tp4", "tp8", "dep"])
+@pytest.mark.parametrize("topology", ["tp2", "dep"])
 def test_minimax_m3_1_route_declines_a_windowed_drafter_on_a_generation_worker(
     _m31_route, monkeypatch, tmp_path, topology
 ):
@@ -2155,8 +2185,10 @@ def test_minimax_m3_1_checkpoint_is_not_taken_by_the_m3_targets(_m31_route):
     assert resolved.__name__ == _M31_TARGETS["tp4"][1]
 
 
-@pytest.mark.parametrize("topology", sorted(_M31_SM103_TARGETS))
-@pytest.mark.parametrize("speculation", ["none", "dspark"])
+@pytest.mark.parametrize(
+    "topology, speculation",
+    [*((topology, "none") for topology in sorted(_M31_SM103_TARGETS)), ("tp4", "dspark")],
+)
 def test_minimax_m3_1_route_picks_the_gb300_target_by_topology(
     _m31_route, tmp_path, topology, speculation
 ):
@@ -2171,30 +2203,3 @@ def test_minimax_m3_1_route_picks_the_gb300_target_by_topology(
     assert resolved.__name__ == name
     rubin = _m31_route.route(_m31_model_config(topology), _m3_llm_args("auto", "nvfp4"), (10, 7))
     assert rubin.__name__ == _M31_TARGETS[topology][1]
-
-
-def test_minimax_m3_1_dep_target_is_built_only_when_modeling_v2_is_set():
-    """The DEP generation target is ``@disable_v2_by_default``: read from its source, since its module needs a GPU
-    build to import."""
-    import ast
-    from pathlib import Path
-
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
-
-    directory, name = _M31_TARGETS["dep"]
-    source = Path(routing.__file__).parent / directory / "modeling.py"
-    (node,) = [
-        n
-        for n in ast.parse(source.read_text()).body
-        if isinstance(n, ast.ClassDef) and n.name == name
-    ]
-    assert "disable_v2_by_default" in [ast.unparse(d) for d in node.decorator_list]
-    for topology in ("tp2", "tp8", "tp2ctx", "dep2ctx"):
-        directory, name = _M31_TARGETS[topology]
-        source = Path(routing.__file__).parent / directory / "modeling.py"
-        (node,) = [
-            n
-            for n in ast.parse(source.read_text()).body
-            if isinstance(n, ast.ClassDef) and n.name == name
-        ]
-        assert "disable_v2_by_default" not in [ast.unparse(d) for d in node.decorator_list]

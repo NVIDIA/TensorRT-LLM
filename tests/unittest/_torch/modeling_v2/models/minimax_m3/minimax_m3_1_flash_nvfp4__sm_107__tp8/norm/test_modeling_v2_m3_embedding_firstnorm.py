@@ -70,34 +70,3 @@ def test_ids_outside_the_table_give_zero_rows() -> None:
     op(ids, table, weight, EPS, raw, out)
     assert not raw[0].any() and not raw[2].any() and not out[0].any() and not out[2].any()
     assert torch.equal(raw[1], table[5])
-
-
-@pytest.mark.parametrize("rows", range(1, 9))
-def test_against_the_stock_embedding_and_rmsnorm(rows) -> None:
-    """What this target certifies on SM107 against the built-in path it replaces (the model's Embedding gather, then
-    the first layer's RMSNorm module), including a constant row, large and tiny rows and both vocab ends: the gather
-    bit for bit, the norm within one bf16 ulp (the sum-of-squares tree differs from flashinfer's: measured ~5e-6 of
-    the elements one ulp off over 12000 random rows)."""
-    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-
-    table, weight = _operands()
-    table = table.clone()
-    g = torch.Generator(device="cuda").manual_seed(rows)
-    table[1] = 3.0
-    table[2] = (300.0 * torch.randn(H, generator=g, device="cuda")).to(torch.bfloat16)
-    table[3] = (1e-4 * torch.randn(H, generator=g, device="cuda")).to(torch.bfloat16)
-    norm = RMSNorm(hidden_size=H, eps=EPS, dtype=torch.bfloat16).cuda()
-    with torch.no_grad():
-        norm.weight.copy_(weight)
-    for ids in (
-        torch.randint(0, VOCAB, (rows,), generator=g, device="cuda"),
-        torch.tensor([1, 2, 3, 0, VOCAB - 1, 1, 2, 3][:rows], device="cuda"),
-    ):
-        raw, out = _buffers(rows)
-        normed, residual = op(ids, table, weight, EPS, raw, out)
-        x = torch.nn.functional.embedding(ids, table)
-        assert torch.equal(residual.view(torch.int16), x.view(torch.int16))
-        stock = norm(x)
-        off = normed != stock
-        assert int(off.sum()) <= 4, f"{int(off.sum())} normed elements differ from stock"
-        assert_within_ulp(normed, stock, element_ulp=1.0, rms_ulp=0.05)

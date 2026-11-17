@@ -153,10 +153,10 @@ def _site(monkeypatch):
     from transformers.configuration_utils import PretrainedConfig
 
     import tensorrt_llm._torch.custom_ops  # noqa: F401
+    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.megamoe.megamoe_topk_reduce_tail import (  # noqa: E501
         megamoe_topk_reduce_add_rmsnorm_matches_flashinfer,
     )
-    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_minimaxm3 import _build_swiglu_oai_dense_mlp
     from tensorrt_llm._torch.modules.rms_norm import RMSNorm
     from tensorrt_llm.mapping import Mapping
@@ -244,37 +244,3 @@ def test_the_shared_expert_with_both_hand_offs_is_the_stock_shared_expert(monkey
         assert torch.equal(out.view(torch.int16), ref_x.view(torch.int16)), rows
         assert torch.equal(res.view(torch.int16), ref_residual.view(torch.int16)), rows
         assert torch.equal(ours.view(torch.int16), stock.view(torch.int16)), rows
-
-
-def test_the_shared_expert_hand_offs_under_graph_replay_are_the_stock_shared_expert(monkeypatch):
-    """The norm and the shared expert captured together replay the stock output on new rows."""
-    norm, mlp, gen = _site(monkeypatch)
-    rows = 44
-    x = torch.randn((rows, HIDDEN), device="cuda", generator=gen).to(torch.bfloat16)
-    residual = (torch.randn((rows, HIDDEN), device="cuda", generator=gen) * 4).to(torch.bfloat16)
-    x_in, residual_in = x.clone(), residual.clone()
-    result = {}
-
-    def run():
-        x.copy_(x_in)
-        residual.copy_(residual_in)
-        out, _ = norm(x, residual)
-        router_operand.SLOT.clear()
-        result["out"] = mlp(out)
-
-    run()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    for _ in range(2):
-        new_x = torch.randn((rows, HIDDEN), device="cuda", generator=gen).to(torch.bfloat16)
-        new_residual = (torch.randn((rows, HIDDEN), device="cuda", generator=gen) * 4).to(
-            torch.bfloat16
-        )
-        x_in.copy_(new_x)
-        residual_in.copy_(new_residual)
-        graph.replay()
-        torch.cuda.synchronize()
-        _, _, stock = _stock(norm, mlp, new_x, new_residual)
-        assert torch.equal(result["out"].view(torch.int16), stock.view(torch.int16))

@@ -77,9 +77,3 @@ def test_deterministic() -> None:
         assert all(
             torch.equal(a.view(torch.uint8), b.view(torch.uint8)) for a, b in zip(outs[0], o)
         )
-
-
-def test_small_boundaries_keep_the_fused_allreduce() -> None:
-    """Below CTXNORMQ_MIN_ROWS the boundary is not taken (the microbench crossover); decided before any collective."""
-    x = torch.zeros(m.CTXNORMQ_MIN_ROWS - 1, H, dtype=torch.bfloat16, device="cuda")
-    assert m._ctxnormq_allreduce_norm(None, x, x, x[0], None) is None

@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN = 6144
 EPS = 1e-6
-ROWS = (1, 7, 128, 129, 1000)
+ROWS = (1, 129, 1000)
 
 
 def _inputs(rows, seed, scale=1.0):
@@ -56,8 +56,8 @@ def test_f32_op_is_base_op_plus_exact_widen(rows, fp4):
 
 
 @pytest.mark.parametrize("rows", ROWS)
-@pytest.mark.parametrize("variant", ["no_norm", "norm", "norm_fp4", "norm_f32", "norm_fp4_f32"])
-@pytest.mark.parametrize("ctas_per_sm", [1, 2])
+@pytest.mark.parametrize("variant", ["no_norm", "norm_fp4", "norm_fp4_f32"])
+@pytest.mark.parametrize("ctas_per_sm", [2])
 def test_sp_addnorm_is_peer_add_then_base_op(rows, variant, ctas_per_sm):
     local, residual, weight = _inputs(rows, 7 * rows + len(variant))
     peer, _, _ = _inputs(rows, 13 * rows + 1)

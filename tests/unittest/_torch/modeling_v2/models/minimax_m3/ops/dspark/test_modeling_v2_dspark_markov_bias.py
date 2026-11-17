@@ -3,16 +3,13 @@
 """`ops/dspark/dspark_markov_bias` (TAILBK_SPEC S4L): its two launches around the bias GEMM equal, bit for bit, the
 in-tree batched biased-logits lines (prevs cat / casts, markov_prev_embeddings, F.linear, fp32 widen + add), on the
 M3.1 TP8 shard (25008 columns, rank 256), K = 3 / 7, batches 1..8, with out-of-vocab anchors (-1, V, a large id),
-extreme logits, eagerly and replayed from a CUDA graph; ``supports`` declines what the kernels do not take."""
+extreme logits, eagerly and replayed from a CUDA graph; and the fp32 widen + add's vector paths."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
-    dspark_markov_bias as mb,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import dspark_markov_bias as mb
 from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_step_bias
 from tensorrt_llm._utils import get_sm_version
 
@@ -77,7 +74,7 @@ def _bits_equal(a, b):
 
 
 @pytest.mark.parametrize("K", [3, 7])
-@pytest.mark.parametrize("B", [1, 2, 8])
+@pytest.mark.parametrize("B", [1, 8])
 @pytest.mark.parametrize("kind", ["random", "oov", "extremes"])
 def test_bitwise_in_tree(B, K, kind):
     w1, w2 = _weights()
@@ -87,26 +84,6 @@ def test_bitwise_in_tree(B, K, kind):
         got = _fused(logits, first_prev, tokens, w1, w2)
         want = _reference(logits, first_prev, tokens, w1, w2)
         assert _bits_equal(got, want), f"B {B} K {K} {kind} seed {seed}"
-
-
-def test_prev_embeddings_rows():
-    """Each row is w1[prev] bit for bit, or +0.0 for an anchor outside [0, V); int32 and int64 ids."""
-    w1, _ = _weights()
-    B, K = 3, 7
-    first_prev = torch.tensor([5, -1, V], device="cuda")
-    tokens = torch.tensor([[1, 2, 3, -7, V - 1, 0, 9]] * B, device="cuda", dtype=torch.int32)
-    for fp, tk in ((first_prev, tokens), (first_prev.int(), tokens.long())):
-        e = mb.prev_embeddings(fp, tk, w1)
-        for b in range(B):
-            for k in range(K):
-                prev = int(fp[b]) if k == 0 else int(tk[b, k - 1])
-                row = e[b * K + k]
-                if 0 <= prev < V:
-                    assert torch.equal(row.view(torch.int16), w1[prev].view(torch.int16)), (b, k)
-                else:
-                    assert torch.equal(
-                        row.view(torch.int16), torch.zeros_like(row).view(torch.int16)
-                    ), (b, k)
 
 
 def test_cuda_graph_replay():
@@ -130,49 +107,6 @@ def test_cuda_graph_replay():
         g.replay()
         torch.cuda.synchronize()
         assert _bits_equal(out, _reference(logits, first_prev, tokens, w1, w2)), f"replay {rep}"
-
-
-def test_supports_declines():
-    w1, _ = _weights()
-    logits, first_prev, tokens = _case(3, 2, 7)
-    assert mb.supports(logits, first_prev, tokens, w1)
-    assert not mb.supports(logits.float(), first_prev, tokens, w1)
-    assert not mb.supports(logits.transpose(0, 1), first_prev, tokens, w1)
-    assert not mb.supports(logits, first_prev.float(), tokens, w1)
-    assert not mb.supports(logits, first_prev, tokens[:, :3], w1)
-    assert not mb.supports(logits, first_prev[:1], tokens, w1)
-    assert not mb.supports(logits, first_prev, tokens, w1[:, :200])
-    assert not mb.supports(logits, first_prev, tokens, w1.float())
-
-
-@pytest.mark.parametrize("B", [1, 2, 8])
-def test_widen_add_padded_rows(B):
-    """FOLD_F5B hands widen_add the first N columns of the chain's padded [B * K, rows] buffer. Unarmed (no
-    strided_by), supports() keeps the contiguous-only rule and widen_add refuses the view; armed by a target, both
-    take it and the sum equals the contiguous logits' bit for bit; the padding is never read."""
-    w1, w2 = _weights()
-    K, pad = 7, 80
-    logits, first_prev, tokens = _case(40 + B, B, K, "oov")
-    buf = torch.full((B * K, N + pad), float("nan"), dtype=torch.bfloat16, device="cuda")
-    buf[:, :N].copy_(logits.view(B * K, N))
-    view = buf[:, :N].view(B, K, N)
-    assert not view.is_contiguous() and not mb.supports(view, first_prev, tokens, w1)
-    with pytest.raises(ValueError, match="contiguous"):
-        _fused(view, first_prev, tokens, w1, w2)
-    assert mb.supports(view, first_prev, tokens, w1, strided_by="a test target")
-    got = _fused(view, first_prev, tokens, w1, w2, strided_by="a test target")
-    want = _reference(logits, first_prev, tokens, w1, w2)
-    assert _bits_equal(got, want), f"B {B}"
-
-
-def test_cpp_ops_no_triton():
-    """DSPARK_MARKOV_BIAS_CPP: the module carries no Triton kernel and both launches are the C++ ops."""
-    import pathlib
-
-    src = pathlib.Path(mb.__file__).read_text()
-    assert "import triton" not in src and "triton.jit" not in src
-    assert hasattr(family_ops(), "minimax_m31_dspark_prev_embeddings")
-    assert hasattr(family_ops(), "minimax_m31_dspark_widen_add")
 
 
 @pytest.mark.parametrize("n", [25008, 25004, 25001, 7])

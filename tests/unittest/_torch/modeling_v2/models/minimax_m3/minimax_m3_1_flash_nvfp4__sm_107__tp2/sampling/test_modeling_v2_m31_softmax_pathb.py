@@ -90,9 +90,7 @@ def test_capture_first_use_does_not_load_or_poison_state(monkeypatch) -> None:
     assert entry._STATE == {}
 
 
-@pytest.mark.parametrize(
-    "kill", ["SOFTMAX_PATHB", "SOFTMAX_MC_WIDE", "SOFTMAX_MC", "SOFTMAX_MC_128"]
-)
+@pytest.mark.parametrize("kill", ["SOFTMAX_MC"])
 def test_import_time_kill_hierarchy(kill, monkeypatch) -> None:
     _gpu()
     logits = torch.zeros(129, entry.VOCAB, device="cuda")

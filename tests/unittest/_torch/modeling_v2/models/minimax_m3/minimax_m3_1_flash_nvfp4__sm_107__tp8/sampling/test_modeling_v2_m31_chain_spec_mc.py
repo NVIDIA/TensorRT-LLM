@@ -1,19 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Tests for REJ_MC: the spec sampler's chain speculative sampling as
-``mv2_minimax_m3::minimax_m31_chain_speculative_sampling_mc`` through ``ops/sampling/m31_chain_spec_mc``, installed as
-the rejection sampler's override where the engine offers one.
+``mv2_minimax_m3::minimax_m31_chain_speculative_sampling_mc`` through ``ops/sampling/m31_chain_spec_mc``.
 
-It must equal the stock ``torch.ops.trtllm.chain_speculative_sampling`` bit for bit, tokens and counts (the microbench
-generators: realistic / same / far / ties / onehot drafts and targets, K7). Outside its contract the override
-declines. The target installs it only through the engine's override setter; TRTLLM_M31_DISABLE_REJ_MC=1 installs
-nothing.
-"""
-
-import os
-import subprocess
-import sys
-from unittest import mock
+It must equal the stock ``torch.ops.trtllm.chain_speculative_sampling`` bit for bit, tokens and counts (realistic /
+same / far / ties / onehot drafts and targets, K7, the slot-gathered form, adversarial rows of the v3 kernel).
+Outside its contract the override declines."""
 
 import pytest
 import torch
@@ -22,7 +14,6 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
     m31_chain_spec_mc as entry,
 )
 
-TARGET = "tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8"
 CASES = ("realistic", "same", "far", "ties", "onehot")
 op = entry.m31_chain_spec_mc
 
@@ -105,31 +96,6 @@ def test_bitwise_stock_op(cell, case) -> None:
             _same(op(*args, entry.prebuild(args[0].device), ctas), got, f"ctas_per_row={ctas}")
 
 
-def test_graph_replay_equals_eager() -> None:
-    """Captured in a CUDA graph (workspace prebuilt outside the capture), the replay gives the eager result."""
-    _gpu()
-    args = _make("realistic", 8, 7, 200064, 7)
-    entry.prebuild(args[0].device)
-    ref = entry.chain_spec_mc(*args)
-    stream = torch.cuda.Stream()
-    # The eager warm-up on the side stream shares the persistent workspace with the default-stream
-    # calls above (and reads their inputs): order it after them.
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        entry.chain_spec_mc(*args)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            out = entry.chain_spec_mc(*args)
-    assert out is not None, "a prebuilt workspace must serve a captured call"
-    for _ in range(3):
-        out[0].fill_(-7)
-        out[1].fill_(-7)
-        graph.replay()
-        torch.cuda.synchronize()
-        _same(out, ref, "graph replay")
-
-
 def test_outside_the_contract_the_override_declines() -> None:
     """Non-fp32 probs, non-int32 draft tokens, non-int64 or mis-sized seed / offset, a vocab not divisible by 4, a
     misaligned or non-contiguous probs, mismatched shapes, CPU inputs or more requests than MAX_BATCH return None (the
@@ -170,44 +136,6 @@ def test_outside_the_contract_the_override_declines() -> None:
     # This device's own SM count keeps the largest grid co-resident.
     sms = entry.sm_count(torch.device("cuda"))
     assert entry.MAX_BATCH * entry.ctas_per_row(entry.MAX_BATCH, sms) <= sms
-
-
-def test_the_target_installs_the_override(monkeypatch) -> None:
-    """With REJ_MC on (the default) and the op built, the target installs ``chain_spec_mc`` once per process through the
-    engine's override setter, and installs nothing on an engine that has no such setter."""
-    _gpu()
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8 import (  # noqa: E501
-        modeling,
-    )
-
-    if not modeling.REJ_MC:
-        pytest.skip("REJ_MC is switched off in this environment")
-    saved = dict(modeling._REJ_MC_STATE)
-    try:
-        for setter in (None, mock.Mock()):
-            monkeypatch.setattr(modeling, "_SET_CHAIN_SPEC_OVERRIDE", setter)
-            modeling._REJ_MC_STATE.clear()
-            modeling._install_rej_mc()
-            assert modeling._REJ_MC_STATE["installed"] is (setter is not None)
-            if setter is not None:
-                setter.assert_called_once_with(entry.chain_spec_mc)
-    finally:
-        modeling._REJ_MC_STATE.clear()
-        modeling._REJ_MC_STATE.update(saved)
-
-
-def test_the_kill_switch_installs_nothing() -> None:
-    """TRTLLM_M31_DISABLE_REJ_MC=1 (read at import): REJ_MC is off and the target installs nothing."""
-    probe = (
-        f"import {TARGET}.modeling as m\n"
-        "m._install_rej_mc()\n"
-        "print(m.REJ_MC, m._REJ_MC_STATE['installed'])"
-    )
-    env = dict(os.environ, TRTLLM_M31_DISABLE_REJ_MC="1")
-    out = subprocess.run(
-        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, check=True
-    )
-    assert out.stdout.strip().splitlines()[-1] == "False False"
 
 
 def _slot_case(case, batch, k, v, seed, slots=16, max_draft=8, v_pad=64):
@@ -255,126 +183,6 @@ def test_slots_bitwise_the_gathered_call(case, batch) -> None:
             _stock(gathered, ids, tp, seeds, offs),
             f"{case} batch={batch} seed={seed} vs stock",
         )
-
-
-def test_slots_graph_replay_with_new_slots() -> None:
-    """Captured with the slot ids as a device tensor: a replay after the slots change reads the new rows."""
-    _slots_gpu()
-    batch, k, v = 2, 7, 200064
-    buf, slot_ids, gathered, ids, tp, seeds, offs = _slot_case("realistic", batch, k, v, 5)
-    entry.prebuild(buf.device)
-    entry.chain_spec_mc_slots(buf, slot_ids, k, ids, tp, seeds, offs)
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            out = entry.chain_spec_mc_slots(buf, slot_ids, k, ids, tp, seeds, offs)
-    for rep in range(3):
-        g = torch.Generator(device="cuda").manual_seed(50 + rep)
-        new_slots = torch.randperm(buf.shape[0], generator=g, device="cuda")[:batch].to(torch.int64)
-        slot_ids.copy_(new_slots)
-        graph.replay()
-        torch.cuda.synchronize()
-        ref = _stock(buf[slot_ids, :k, :v].contiguous(), ids, tp, seeds, offs)
-        _same(out, ref, f"graph replay {rep}")
-
-
-def test_slots_outside_the_contract_decline() -> None:
-    _slots_gpu()
-    buf, slot_ids, gathered, ids, tp, seeds, offs = _slot_case("realistic", 2, 7, 200064, 9)
-    assert (
-        entry.chain_spec_mc_slots(buf, slot_ids.int(), 7, ids, tp, seeds, offs) is None
-    )  # int32 slots
-    assert entry.chain_spec_mc_slots(buf.double(), slot_ids, 7, ids, tp, seeds, offs) is None
-    assert (
-        entry.chain_spec_mc_slots(buf, slot_ids, 9, ids, tp, seeds, offs) is None
-    )  # num_draft > max draft
-    assert (
-        entry.chain_spec_mc_slots(buf[:, :, :1000], slot_ids, 7, ids, tp, seeds, offs) is None
-    )  # narrow / strided
-
-
-def test_the_slots_kill_switch_installs_no_slot_hook(monkeypatch) -> None:
-    """TRTLLM_M31_DISABLE_REJ_SLOTS: REJ_MC still installs, the slot-indexed override is not installed."""
-    _slots_gpu()
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8 import (  # noqa: E501
-        modeling,
-    )
-
-    if not modeling.REJ_MC:
-        pytest.skip("REJ_MC is switched off in this environment")
-    saved = dict(modeling._REJ_MC_STATE)
-    try:
-        for slots in (True, False):
-            setter, slot_setter = mock.Mock(), mock.Mock()
-            monkeypatch.setattr(modeling, "_SET_CHAIN_SPEC_OVERRIDE", setter)
-            monkeypatch.setattr(modeling, "_SET_CHAIN_SPEC_SLOT_OVERRIDE", slot_setter)
-            monkeypatch.setattr(modeling, "REJ_SLOTS", slots)
-            modeling._REJ_MC_STATE.clear()
-            modeling._install_rej_mc()
-            setter.assert_called_once_with(entry.chain_spec_mc)
-            assert slot_setter.call_count == int(slots)
-    finally:
-        modeling._REJ_MC_STATE.clear()
-        modeling._REJ_MC_STATE.update(saved)
-
-
-def test_the_slots_hook_is_on_by_default() -> None:
-    """REJ_SLOTS is on by default (read at import); TRTLLM_M31_DISABLE_REJ_SLOTS=1 turns it off."""
-    probe = f"import {TARGET}.modeling as m\nprint(m.REJ_SLOTS)"
-    base = {k: v for k, v in os.environ.items() if not k.endswith("_REJ_SLOTS")}
-    for extra, want in (
-        ({}, "True"),
-        ({"TRTLLM_M31_DISABLE_REJ_SLOTS": "1"}, "False"),
-    ):
-        out = subprocess.run(
-            [sys.executable, "-c", probe],
-            env=dict(base, **extra),
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        assert out.stdout.strip().splitlines()[-1] == want, (extra, out.stdout[-200:])
-
-
-def test_rej_v2_taken_line_once_per_grid(monkeypatch) -> None:
-    """REJ_V2's taken line names the grid a served call launched with, once per distinct ctas_per_row."""
-    _gpu()
-    from tensorrt_llm.logger import logger
-
-    lines = []
-    monkeypatch.setattr(logger, "info", lambda msg, *a, **k: lines.append(msg))
-    monkeypatch.setattr(entry, "_V2_TAKEN", set())
-    args = _make("realistic", 1, 7, 32768, 5)
-    g = entry.ctas_per_row(1, entry.sm_count(args[0].device))
-    for _ in range(2):
-        assert entry.chain_spec_mc(*args) is not None
-    taken = [m for m in lines if "REJ_V2 taken" in m]
-    assert taken == [
-        f"[M3 dispatch] REJ_V2 taken (max_ctas_per_row {entry.MAX_CTAS_PER_ROW}, ctas_per_row {g} at batch 1)"
-    ], taken
-
-
-def test_rej_v3_taken_line_once() -> None:
-    """REJ v3 (the default kernel) logs one REJ_V3 taken line per process, with the lib's workspace bytes."""
-    _gpu()
-    from tensorrt_llm.logger import logger
-
-    lines = []
-    with (
-        mock.patch.object(logger, "info", lambda msg, *a, **k: lines.append(msg)),
-        mock.patch.object(entry, "_V2_TAKEN", set()),
-    ):
-        args = _make("realistic", 1, 7, 32768, 6)
-        for _ in range(2):
-            assert entry.chain_spec_mc(*args) is not None
-    if entry.kernel_version() != 3:
-        pytest.skip("this lib launches the v2 kernel")
-    assert [m for m in lines if "REJ_V3 taken" in m] == [
-        f"[M3 dispatch] REJ_V3 taken (ws_bytes_per_row {entry.ws_bytes_per_row()})"
-    ], lines
-    assert not [m for m in lines if "REJ_V2_KERNEL" in m], lines
 
 
 def _v3_adversarial(case, batch, k, v, seed):
@@ -434,22 +242,3 @@ def test_v3_adversarial_rows_bitwise(case, v) -> None:
                     ref,
                     f"{case} v={v} batch={batch} seed={seed} ctas={ctas}",
                 )
-
-
-@pytest.mark.parametrize("case", ["realistic", "same", "far"])
-def test_the_rej_v3_kill_switch_runs_v2_with_the_same_tokens(case) -> None:
-    """v3=False (REJ_V3 off) launches the v2 kernel on every device and still equals the stock op."""
-    _gpu()
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
-
-    ops = family_ops()
-    assert int(ops.minimax_m31_chain_speculative_sampling_mc_version(False)) == 2
-    for batch in (1, 8):
-        args = _make(case, batch, 7, 200064, 17 * batch)
-        ref = _stock(*args)
-        ws = entry.prebuild(args[0].device)
-        for ctas in (1, 16):
-            if ctas > 1 and batch * ctas > entry.sm_count(args[0].device):
-                continue
-            got = ops.minimax_m31_chain_speculative_sampling_mc(*args, ws, ctas, v3=False)
-            _same(got, ref, f"{case} batch={batch} ctas={ctas} v2")

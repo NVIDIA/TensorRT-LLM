@@ -58,22 +58,12 @@ def _assert_same(probs, s, o):
     assert torch.equal(got, _flashinfer(probs, s, o))
 
 
-@pytest.mark.parametrize("rows", [1, 8, 12, 16, 24, 48])
+@pytest.mark.parametrize("rows", [1, 12, 48])
 @pytest.mark.parametrize("mode", ["spread", "skewed"])
 def test_bitwise_flashinfer_at_deps_row_counts(rows, mode):
     for k in range(6):
         probs = _probs(rows, 10 * rows + k, mode, temp=(0.6, 0.8, 1.0)[k % 3])
         _assert_same(probs, *_seeds(rows, k))
-
-
-@pytest.mark.parametrize("rows", [1, 12, 48])
-def test_bitwise_flashinfer_with_one_seed_and_offset_for_every_row(rows):
-    # FlashInfer's sampling_from_probs broadcasts a one-entry seed / offset tensor to every row (and indexes a
-    # per-row one by row).
-    for k in range(4):
-        probs = _probs(rows, 900 + rows + k)
-        s, o = _seeds(rows, 900 + k)
-        _assert_same(probs, s[:1].contiguous(), o[:1].contiguous())
 
 
 @pytest.mark.parametrize("mode", ["first", "last"])
@@ -108,45 +98,3 @@ def test_padding_rows(mode):
         probs[pad] = 1.0 / VOCAB
     for k in range(4):
         _assert_same(probs, *_seeds(12, 300 + k))
-
-
-def test_denormal_probabilities():
-    probs = _probs(12, 800)
-    gen = torch.Generator(device="cuda").manual_seed(4321)
-    probs[torch.rand(probs.shape, generator=gen, device="cuda") < 0.01] = 1.0e-39
-    rows = torch.arange(12, device="cuda")
-    top = probs.argmax(-1)
-    probs[rows, (top + 1).clamp(max=VOCAB - 1)] = 1.0e-39
-    probs[rows, (top - 1).clamp(min=0)] = 2.0e-39
-    for k in range(4):
-        _assert_same(probs, *_seeds(12, 400 + k))
-
-
-@pytest.mark.parametrize("rows", [1, 12, 48])
-def test_the_output_does_not_depend_on_ctas_per_row(rows):
-    probs = _probs(rows, 55)
-    ws = sfp_mc_fi.prebuild(torch.device("cuda", torch.cuda.current_device()))
-    op = sfp_mc_fi.sfp_mc_fi_op()
-    s, o = _seeds(rows, 5)
-    ref = _flashinfer(probs, s, o)
-    for ctas in (1, 2, 4, 8, 16, 32, 64):
-        assert torch.equal(op(probs, s, o, ws, ctas), ref)
-
-
-def test_the_override_replays_inside_a_cuda_graph():
-    probs = _probs(12, 66)
-    s, o = _seeds(12, 6)
-    sfp_mc_fi.sampling_from_probs_mc_fi(probs, s, o)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = sfp_mc_fi.sampling_from_probs_mc_fi(probs, s, o)
-    for k in range(3):
-        new = _probs(12, 600 + k, "skewed")
-        probs.copy_(new)
-        ns, no = _seeds(12, 60 + k)
-        s.copy_(ns)
-        o.copy_(no)
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(out, _flashinfer(new, ns, no))

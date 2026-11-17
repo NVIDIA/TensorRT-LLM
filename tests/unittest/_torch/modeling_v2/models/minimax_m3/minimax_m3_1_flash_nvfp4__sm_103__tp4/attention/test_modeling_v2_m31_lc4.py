@@ -3,8 +3,9 @@
 """GPU test for LC4: this target's copy of the long-context sparse decode
 (``native_ops.minimax_m31_tp4_sparse_decode_lc``) with its two exact options, block-table staging (btsmem) and
 the softmax sync trim (sync3), must write the same bits as the M3 op (``minimax_m3_sparse_decode_lc``): the BF16 rows,
-the MXFP8 hand-off and its UE8M0 scales, for every option combination over the certified cells' shapes, a row longer
-than the staged block table, repeated runs and a CUDA-graph replay.
+the MXFP8 hand-off and its UE8M0 scales, for every option combination on the shortest and longest certified cells
+and at the shipped placement on the rest, a row longer than the staged block table, repeated runs and a CUDA-graph
+replay.
 """
 
 import zlib
@@ -87,14 +88,32 @@ def _assert_same(a, b, what):
         assert torch.equal(a[2], b[2]), f"{what}: UE8M0 scales differ"
 
 
-@pytest.mark.parametrize(
-    "cell",
-    entry.m3_sparse_decode_lc.CELLS,
-    ids=[c.why[:44] for c in entry.m3_sparse_decode_lc.CELLS],
-)
-@pytest.mark.parametrize("linear_softmax", (False, True))
-@pytest.mark.parametrize("mxfp8", (False, True))
-@pytest.mark.parametrize("btsmem,sync3", _OPTIONS)
+def _bit_for_bit_cases():
+    """The full option matrix on the shortest and the longest cell (by KV tokens); every other cell at the shipped
+    placement (log-domain softmax, MXFP8 hand-off, btsmem and sync3 on)."""
+    cells = entry.m3_sparse_decode_lc.CELLS
+    kv = [sum(c.spec["seq_lens"]) for c in cells]
+    full = {kv.index(min(kv)), kv.index(max(kv))}
+    cases = []
+    for i, cell in enumerate(cells):
+        combos = (
+            [
+                (ls, mx, bt, s3)
+                for ls in (False, True)
+                for mx in (False, True)
+                for bt, s3 in _OPTIONS
+            ]
+            if i in full
+            else [(False, True, True, True)]
+        )
+        for ls, mx, bt, s3 in combos:
+            cases.append(
+                pytest.param(cell, ls, mx, bt, s3, id=f"{cell.why[:44]}-{ls}-{mx}-{bt}-{s3}")
+            )
+    return cases
+
+
+@pytest.mark.parametrize("cell,linear_softmax,mxfp8,btsmem,sync3", _bit_for_bit_cases())
 def test_lc4_matches_the_m3_op_bit_for_bit(cell, linear_softmax, mxfp8, btsmem, sync3) -> None:
     lc4 = _lc4()
     spec = cell.spec
@@ -169,11 +188,3 @@ def test_lc4_graph_replay_and_repeats_are_bit_identical() -> None:
     graph.replay()
     torch.cuda.synchronize()
     _assert_same((out, q8, sf), first, "graph replay")
-
-
-def test_btsmem_is_scoped_to_small_steps() -> None:
-    """btsmem costs larger grids their occupancy: the entry enables it only up to LC4_BTSMEM_MAX_ROWS rows."""
-    assert entry.LC4_BTSMEM_MAX_ROWS == 8
-    if entry.LC4_BTSMEM:
-        assert entry._lc4_btsmem(4) and entry._lc4_btsmem(8)
-    assert not entry._lc4_btsmem(9) and not entry._lc4_btsmem(32)

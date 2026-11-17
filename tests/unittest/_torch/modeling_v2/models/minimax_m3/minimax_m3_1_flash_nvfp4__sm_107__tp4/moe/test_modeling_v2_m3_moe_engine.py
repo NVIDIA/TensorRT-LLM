@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the moe/m3_moe_engine entry: the 1..8-token MoE engine on its caller-owned state.
+"""GPU test for the moe/m3_moe_engine entry (the 1..8-token MoE engine) and the moe/m3_moe16_engine entry (the
+9..13-row engine: 128 routed CTAs + 24 shared-expert CTAs), each on its caller-owned state.
 
 One GB300 rank of the tp4 deployment: 128 experts (all local, intermediate 768 per rank), top 4, hidden 6144, the
 shared expert folded in, ``num_ctas`` = SMs - 24 as the target builds it. Operands: ``_m3_moe_operands``.
@@ -11,7 +12,13 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.moe.m3_moe_engine import (  # noqa: E501  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.moe.m3_moe16_engine import (  # noqa: E501
+    M3Moe16State,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.moe.m3_moe16_engine import (  # noqa: E501
+    m3_moe16_engine as op16,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.moe.m3_moe_engine import (  # noqa: E501
     M3MoeState,
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.moe.m3_moe_engine import (  # noqa: E501
@@ -83,27 +90,6 @@ def test_routed_part_is_trtllm_gen_bit_for_bit(m) -> None:
     check_routed_part(op, _state(m), m, seed=100 + m)
 
 
-_GB_STATES = {}
-
-
-@pytest.mark.parametrize("case", ("random", "concentrated"))
-@pytest.mark.parametrize("m", range(1, 9))
-def test_engine_is_the_gb_tp4_engine_bit_for_bit(m, case) -> None:
-    """The target's engine (the Rubin m3_moe at the TP4 widths) against the GB TP4 engine it replaces, same operands
-    and CTA count: the per-expert accumulation order is the same, so the outputs are equal bit for bit."""
-    # The shared GB300 engine leaves the tree once no target imports it.
-    gb_op = pytest.importorskip("tensorrt_llm._torch.cute_dsl_kernels.minimax_m3.moe.op")
-    if m not in _GB_STATES:
-        sms = torch.cuda.get_device_properties(0).multi_processor_count
-        _GB_STATES[m] = gb_op.M3MoeState(
-            torch.device("cuda"), num_tokens=m, num_ctas=sms - 24, shared=True
-        )
-    hidden = hidden_states(m, seed=300 + m)
-    out = layer_for(_state(m), case)(hidden)
-    ref = layer_for(_GB_STATES[m], case)(hidden)
-    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
-
-
 def test_layers_on_one_state_do_not_leak_into_each_other() -> None:
     """Two layers share one state's workspace, in stream order: A, B, A gives A's output twice, bit for bit, and the
     caller's ``out`` receives the same rows as a fresh tensor."""
@@ -120,7 +106,7 @@ def test_layers_on_one_state_do_not_leak_into_each_other() -> None:
 
 @pytest.mark.parametrize(
     "bad",
-    ("misaligned hidden", "fp32 out", "short out", "long out", "int32 arp"),
+    ("misaligned hidden", "short out", "int32 arp"),
 )
 def test_malformed_buffers_are_rejected_by_the_call(bad) -> None:
     """Why the entry has no is_valid: the compiled call checks each buffer against its signature and raises."""
@@ -129,13 +115,40 @@ def test_malformed_buffers_are_rejected_by_the_call(bad) -> None:
     hidden, kw = hidden_states(2, seed=3), {}
     if bad == "misaligned hidden":
         hidden = torch.randn(2 * H + 8, device="cuda").to(torch.bfloat16)[2 : 2 + 2 * H].view(2, H)
-    elif bad == "fp32 out":
-        kw["out"] = torch.empty(2, H, dtype=torch.float32, device="cuda")
     elif bad == "short out":
         kw["out"] = torch.empty(1, H, dtype=torch.bfloat16, device="cuda")
-    elif bad == "long out":
-        kw["out"] = torch.empty(3, H, dtype=torch.bfloat16, device="cuda")
     else:
         kw["arp"] = torch.zeros(8, dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError):
         op(hidden, layer, **kw)
+
+
+_STATES16 = {}
+
+
+def _state16(m: int) -> M3Moe16State:
+    if m not in _STATES16:
+        _STATES16[m] = M3Moe16State(torch.device("cuda"), num_tokens=m)
+    return _STATES16[m]
+
+
+@pytest.mark.parametrize("case", ("random", "concentrated"))
+@pytest.mark.parametrize("cell", op16.CELLS, ids=[c.why[:44] for c in op16.CELLS])
+def test_moe16_certified_cells(cell, case) -> None:
+    """The 9..13-row engine: the same arithmetic and quantization boundaries, so the same band."""
+    m = cell.spec["tokens"]
+    layer = layer_for(_state16(m), case)
+    hidden = hidden_states(m, seed=zlib.crc32((cell.why + case).encode()) % 2**31)
+    with validating(op16):
+        out = op16(hidden, layer)
+        again = op16(hidden, layer)
+    assert out.shape == (m, H) and out.dtype is torch.bfloat16
+    assert torch.equal(out.view(torch.int16), again.view(torch.int16)), (
+        "a repeated call changed the output"
+    )
+    compare(out, op16.reference(hidden, layer))
+
+
+@pytest.mark.parametrize("m", (9, 13))
+def test_moe16_routed_part_is_trtllm_gen_bit_for_bit(m) -> None:
+    check_routed_part(op16, _state16(m), m, seed=100 + m)

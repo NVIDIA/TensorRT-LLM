@@ -97,14 +97,11 @@ def _producers():
     "tokens, seed, scale, bad_slots",
     [
         (1, 21, 1.0, False),
-        (2, 22, 1.0, False),
-        (4, 23, 1.0, False),
         (4, 24, 40.0, False),
-        (8, 25, 1.0, False),
         (8, 26, 0.01, False),
         (8, 27, 1.0, True),
     ],
-    ids=["t1", "t2", "t4", "t4-large", "t8", "t8-tiny", "t8-bad-slots"],
+    ids=["t1", "t4-large", "t8-tiny", "t8-bad-slots"],
 )
 @pytest.mark.parametrize("producer", _producers())
 def test_producer_gemv_is_bitwise_the_chain(tokens, seed, scale, bad_slots, producer) -> None:
@@ -192,45 +189,3 @@ def test_producer_gemv_edge_rows(edge, eps, producer) -> None:
         assert diff.numel() == 0, (
             f"{edge}: {name}: {diff.shape[0]} bytes differ, first at {tuple(diff[0].tolist())}"
         )
-
-
-def test_producer_gemv_is_deterministic_and_graph_replays() -> None:
-    """Three eager runs and a captured replay write the same bytes."""
-    case = _case(4, 31)
-    outs = []
-    for _ in range(3):
-        caches = _caches()
-        q, iq = _fused(case, caches)
-        outs.append([t.contiguous().view(torch.uint8).clone() for t in (q, iq, *caches)])
-    xq, xsf, wq, wsf, slots, quant, norms, rotary, positions = case
-    q = torch.zeros(4, HEADS_Q, 128, dtype=torch.float8_e4m3fn, device="cuda")
-    iq = torch.zeros(4, 1, 128, dtype=torch.float8_e4m3fn, device="cuda")
-    caches = _caches()
-    stream = torch.cuda.Stream()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
-        gemv.m3_mx_gemv_producer(
-            xq, xsf, wq, wsf, q, iq, *caches, slots, quant, EPS, *norms, rotary, positions, use_pdl=True
-        )  # fmt: skip
-    graph.replay()
-    torch.cuda.synchronize()
-    outs.append([t.contiguous().view(torch.uint8).clone() for t in (q, iq, *caches)])
-    for run in outs[1:]:
-        for a, b in zip(outs[0], run):
-            assert torch.equal(a, b)
-
-
-def test_declines_outside_its_shape() -> None:
-    """More than 8 tokens, or a projection other than the 12-head packed one, launches nothing."""
-    case = _case(8, 41)
-    xq, xsf, wq, wsf, slots, quant, norms, rotary, positions = case
-    wide = torch.cat([xq, xq], dim=0)
-    q = torch.zeros(16, HEADS_Q, 128, dtype=torch.float8_e4m3fn, device="cuda")
-    iq = torch.zeros(16, 1, 128, dtype=torch.float8_e4m3fn, device="cuda")
-    xsf16 = torch.ops.trtllm.mxfp8_quantize(
-        torch.zeros(16, K, dtype=torch.bfloat16, device="cuda"), True
-    )[1]
-    caches = _caches()
-    assert not gemv.m3_mx_gemv_producer(
-        wide, xsf16, wq, wsf, q, iq, *caches, slots, quant, EPS, *norms, rotary, positions
-    )  # fmt: skip

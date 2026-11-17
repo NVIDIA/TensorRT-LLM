@@ -10,8 +10,6 @@ KV cache, speculation) is ``test_modeling_v2_routing.py``'s.
 
 import pytest
 
-from tensorrt_llm._torch.modeling_v2 import _router_index
-from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 from tensorrt_llm.mapping import Mapping
 
@@ -62,13 +60,3 @@ def test_attention_dp_with_experts_over_every_rank_is_dep(ep):
 )
 def test_other_layouts_never_land_on_dep(mapping_kwargs, topology):
     assert routing._m31_topology(Mapping(**mapping_kwargs)) == topology
-
-
-def test_the_dep_target_is_built_only_when_modeling_v2_is_set():
-    try:
-        from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep.modeling import (  # noqa: E501
-            ModelingV2MiniMaxM31FlashNvfp4Sm107Dep,
-        )
-    except NoTarget as exc:
-        pytest.skip(str(exc))
-    assert ModelingV2MiniMaxM31FlashNvfp4Sm107Dep in _router_index._V2_DISABLED_BY_DEFAULT

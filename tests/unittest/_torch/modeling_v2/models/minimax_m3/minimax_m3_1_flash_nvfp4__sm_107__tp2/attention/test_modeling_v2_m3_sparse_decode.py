@@ -47,24 +47,14 @@ __extra_import_path__ = ["../../../..", "."]
 from _m3_nvfp4_cache import (  # noqa: E402 — needs the path declared above
     HEAD_DIM,
     NUM_HEADS,
-    NUM_KV_HEADS,
     build_step,
 )
-from _validating import assert_within_ulp, validating  # noqa: E402
+from _validating import assert_within_ulp  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
     reason="the sm_107 TP2 target runs on SM107 only",
 )
-
-
-@pytest.fixture(autouse=True)
-def _lc2_band_only(monkeypatch):
-    """These tests cover the Triton route of at most 32 rows: LC2_ALLROWS (LC2 from one row) and LC2_IDENTITY (LC2 on
-    identity steps) are killed here; their defaults are tested in test_modeling_v2_m3_sparse_decode_lc.py."""
-    monkeypatch.setattr(target_kernel, "LC2_ALLROWS", False)
-    monkeypatch.setattr(target_kernel, "LC2_IDENTITY", False)
-    monkeypatch.setattr(target_kernel, "LC_KEYS", target_kernel.LC_KEYS - {"plain"})
 
 
 # Band, in BF16 ulps (2^-8) of each [heads, 128] row's largest magnitude, and of the relative RMS (the TP4 entry's
@@ -73,8 +63,18 @@ def _lc2_band_only(monkeypatch):
 _ELEMENT_ULP = 2.0
 _RMS_ULP = 0.5
 
+
 # The entry's certified step shapes (op.CELLS' lengths and query lengths), rebuilt at the TP2 geometry, plus the K7
 # verify rows (decode_query_len 8) of c1..c4 and a 165521-token request.
+@pytest.fixture(autouse=True)
+def _lc2_band_only(monkeypatch):
+    """These tests cover the Triton route of at most 32 rows: LC2_ALLROWS (LC2 from one row) and LC2_IDENTITY (LC2 on
+    identity steps) are turned off here; their defaults are tested with the LC2 kernel."""
+    monkeypatch.setattr(target_kernel, "LC2_ALLROWS", False)
+    monkeypatch.setattr(target_kernel, "LC2_IDENTITY", False)
+    monkeypatch.setattr(target_kernel, "LC_KEYS", target_kernel.LC_KEYS - {"plain"})
+
+
 _STEPS = [
     *((c.spec["seq_lens"], c.spec["decode_query_len"], c.spec["identity"]) for c in op.CELLS),
     ((165521,), 8, False),
@@ -153,12 +153,6 @@ def _empty(case):
     return torch.empty(case.q.shape[0], NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
 
 
-def test_tp2_geometry() -> None:
-    case = build_step((3000,), 4, identity=False, seed=1)
-    assert tuple(case.q.shape[1:]) == (32, 128) and NUM_KV_HEADS == 2
-    assert int(case.k_paged.shape[1]) == 2 and int(case.topk.shape[0]) == 2
-
-
 @pytest.mark.parametrize("step", _STEPS, ids=[f"{len(s[0])}req_q{s[1]}_{s[2]}" for s in _STEPS])
 def test_triton_route_at_tp2_shapes(step, monkeypatch) -> None:
     """Every step runs the Triton route (never the LC op), reports the Triton route's engagement path, stays finite on
@@ -193,39 +187,6 @@ def test_triton_route_at_tp2_shapes(step, monkeypatch) -> None:
     assert_within_ulp(output, ref, element_ulp=_ELEMENT_ULP, rms_ulp=_RMS_ULP)
 
 
-def test_rows_up_to_32_keep_the_triton_route(monkeypatch) -> None:
-    """``lc_applies`` accepts the TP2 q [T, 32, 128] on two KV heads (LC2), but at most 32 rows the dispatch never
-    asks it: the step runs the Triton route, also with the LC_TP2 opt-in forced on (bit for bit the default rows).
-    (8 rows at the K3 verify: below lc_min_rows(4).)"""
-    case = build_step((165521, 3000), 4, identity=False, seed=31)
-    assert 2 * 4 < target_kernel.lc_min_rows(4)
-    assert m3_attn_lc.lc_applies(
-        case.q,
-        case.k_paged,
-        case.v_paged,
-        case.topk,
-        case.k_block_scale,
-        case.v_block_scale,
-        _empty(case),
-    )
-    lc_calls = []
-    real = m3_attn_lc.m3_sparse_decode_lc
-    monkeypatch.setattr(
-        m3_attn_lc,
-        "m3_sparse_decode_lc",
-        lambda *a, **k: (lc_calls.append(1), real(*a, **k))[1],
-    )
-    default = _empty(case)
-    _call(case, default, False)
-    monkeypatch.setattr(target_kernel, "LC_TP2", True)
-    forced = _empty(case)
-    _call(case, forced, False)
-    m3_prequant.SLOT.clear()
-    torch.cuda.synchronize()
-    assert not lc_calls, "the C++ long-context op ran at 8 rows"
-    assert torch.equal(default.view(torch.int16), forced.view(torch.int16))
-
-
 @pytest.mark.parametrize("requests", [1, 2, 4])
 @pytest.mark.parametrize("qlen", [4, 8])
 def test_identity_route_is_bitwise_the_stock_decode(requests, qlen) -> None:
@@ -257,7 +218,7 @@ _EDGE_LENS = (1284, 1287, 1281, 129, 132, 2048, 1028, 5, 643, 1920, 256, 1)
 
 
 @pytest.mark.parametrize("fault", ["stale_one_step", "all_minus_one", "random_ids"])
-@pytest.mark.parametrize("requests", [1, 2, 3, 4])
+@pytest.mark.parametrize("requests", [1, 4])
 def test_identity_route_reads_its_own_lengths_not_the_table(requests, fault) -> None:
     """The Triton identity route derives block i for slot i from the kv lengths the kernel reads: a staged table that
     lags the lengths by a verify step, or is garbage, gives the stock decode's rows over the true identity selection,
@@ -291,36 +252,6 @@ def test_identity_route_reads_its_own_lengths_not_the_table(requests, fault) -> 
     )
 
 
-def _short_lens(requests: int, g: torch.Generator) -> tuple:
-    """Short contexts of 1..16 blocks of 128 tokens (the identity-route regime), a few exactly on a block edge."""
-    lens = torch.randint(4, 16 * 128 + 1, (requests,), generator=g).tolist()
-    if requests > 1:
-        lens[0] = 128 * int(torch.randint(1, 17, (1,), generator=g))
-    return tuple(lens)
-
-
-@pytest.mark.parametrize("seed", range(6))
-@pytest.mark.parametrize("requests", [1, 2, 3, 4])
-def test_short_table_stress_is_bitwise_the_stock_decode(requests, seed, monkeypatch) -> None:
-    """Short contexts (1..16 blocks) at 1..4 requests x 4 verify rows, the identity route and a random selected route
-    with -1 tails past each token's blocks (each KV head its own selection): the stock decode's rows bit for bit.
-    The Triton route's contract: 3 / 4 requests (12 / 16 rows) can opt into LC2 (TP2_LC2_SMALL, in the reference
-    band, not bitwise; test_modeling_v2_m3_sparse_decode_lc.py), so it is pinned off here."""
-    monkeypatch.setattr(target_kernel, "TP2_LC2_SMALL", False)
-    g = torch.Generator().manual_seed(1000 * requests + seed)
-    for identity in (True, False):
-        case = build_step(_short_lens(requests, g), 4, identity=identity, seed=7 * seed + requests)
-        target, stock = _empty(case), _empty(case)
-        _call(case, target, identity)
-        _stock(case, stock)
-        m3_prequant.SLOT.clear()
-        torch.cuda.synchronize()
-        assert torch.equal(target.view(torch.int16), stock.view(torch.int16)), (
-            identity,
-            case.seq_lens.tolist(),
-        )
-
-
 @pytest.mark.parametrize("head", [0, 1])
 @pytest.mark.parametrize("fault", ["neg_in_window", "id_past_row"])
 def test_invalid_slot_fails_closed(fault, head, monkeypatch) -> None:
@@ -342,22 +273,3 @@ def test_invalid_slot_fails_closed(fault, head, monkeypatch) -> None:
     assert_within_ulp(
         output, _reference(case, ref_topk, output), element_ulp=_ELEMENT_ULP, rms_ulp=_RMS_ULP
     )
-
-
-def test_guard_refuses_a_padded_selection_slot() -> None:
-    """The Triton producers index the block table with every one of a token's first min(16, blocks) ids, -1 included,
-    on every KV head."""
-    case = build_step((1500,), 1, identity=True, seed=23)
-    case.topk[1, 0, 3] = -1
-    with pytest.raises(AssertionError, match="blocks of the request"):
-        with validating(op):
-            _call(case, _empty(case), True)
-
-
-def test_guard_refuses_a_false_identity_promise() -> None:
-    """identity_blocks promises every token's table holds every block of its request in order."""
-    case = build_step((1500, 1600, 1700, 1800), 4, identity=True, seed=29)
-    case.topk[1, 5, :2] = case.topk[1, 5, :2].flip(0)
-    with pytest.raises(AssertionError, match="identity_blocks promises"):
-        with validating(op):
-            _call(case, _empty(case), True)

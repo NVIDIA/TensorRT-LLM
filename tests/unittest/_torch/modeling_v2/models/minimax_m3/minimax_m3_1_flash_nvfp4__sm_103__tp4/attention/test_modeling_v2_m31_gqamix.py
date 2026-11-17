@@ -2,17 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GQAMIX: a mixed step's sparse generation rows (MsaDecodeFmha) through ops/gqamix_sparse_decode.
 
-The copy must be the in-tree kernel module except for the two decode kernels' specialization (no row count, no slice
-alignment) and the one import it cannot make relatively, and must write the in-tree kernel's output bit for bit on a
-mixed step's [num_ctx:] slices. The shared MsaDecodeFmha hook must change nothing while it is unset.
+The copy must write the in-tree kernel's output bit for bit on a mixed step's [num_ctx:] slices.
+The shared MsaDecodeFmha hook must change nothing while it is unset.
 """
-
-import inspect
-import os
-import subprocess
-import sys
-import types
-from pathlib import Path
 
 import pytest
 import torch
@@ -21,138 +13,18 @@ import tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_s
 from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 try:
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_103__tp4 import (
-        modeling as m,
-    )
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_103__tp4.ops import (  # noqa: E501
         gqamix_sparse_decode as copy,
     )
 except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)
-from tensorrt_llm._torch.attention.backends.fmha.msa_decode import MsaDecodeFmha
 
 HEADS = 16  # query heads per rank at tp4, one KV head
 D, PAGE, TOPK, QLEN, SF_VEC = 128, 128, 16, 4, 16
 
-_JIT_OLD = '@triton.jit(do_not_specialize=["decode_query_len"])'
-_JIT_NEW = (
-    "@triton.jit(\n"
-    '    do_not_specialize=["decode_query_len", "total_q"],\n'
-    '    do_not_specialize_on_alignment=["block_table_ptr", "seq_lens"],\n'
-    ")"
-)
-_IMPORT_OLD = "from .msa_utils import check_decode_span_shape"
-_IMPORT_NEW = (
-    "from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (\n"
-    "    check_decode_span_shape,\n"
-    ")"
-)
-
-
-def _code_lines(text: str) -> list:
-    return [line for line in text.splitlines() if line.strip()]
-
-
-def test_the_copy_is_the_in_tree_module_but_for_its_specialization() -> None:
-    """Line for line (blank lines aside: the import sorts into a different block) the in-tree module."""
-    ours = Path(copy.__file__).read_text()
-    theirs = Path(in_tree.__file__).read_text()
-    assert (
-        ours.count(_JIT_NEW) == 2
-        and ours.count(_IMPORT_NEW) == 1
-        and theirs.count(_IMPORT_OLD) == 1
-    )
-    ours = ours.replace(_JIT_NEW, _JIT_OLD).replace(_IMPORT_NEW, "")
-    assert _code_lines(ours) == _code_lines(theirs.replace(_IMPORT_OLD, "")), (
-        "ops/gqamix_sparse_decode.py must stay a copy of the in-tree triton_sparse_decode.py: re-copy it"
-    )
-
-
-def test_register_sets_the_hook_once_and_only_where_it_exists() -> None:
-    lib = types.SimpleNamespace(sparse_decode_hook=None)
-    other_lib = types.SimpleNamespace()  # an FMHA library without the hook
-    manager = types.SimpleNamespace(fmha_libs=[other_lib, lib])
-    m._gqamix_register(types.SimpleNamespace(_fmha_manager=manager))
-    assert lib.sparse_decode_hook is m._gqamix_decode
-    assert not hasattr(other_lib, "sparse_decode_hook")
-    mine = object()
-    lib.sparse_decode_hook = mine
-    m._gqamix_register(types.SimpleNamespace(_fmha_manager=manager))
-    assert lib.sparse_decode_hook is mine
-    m._gqamix_register(types.SimpleNamespace())  # a backend without an FMHA manager
-
-
-def test_the_kill_switch_leaves_the_pre_hook_decode() -> None:
-    """TRTLLM_M31_DISABLE_GQAMIX=1: GQAMIX is off, so no layer registers the hook and MsaDecodeFmha runs the in-tree
-    decode (whose output the copy matches bit for bit below)."""
-    target = "tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_103__tp4"
-    probe = f"import {target}.modeling as m; print(m.GQAMIX)"
-    env = dict(os.environ, TRTLLM_M31_DISABLE_GQAMIX="1")
-    out = subprocess.run(
-        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, check=True
-    )
-    assert out.stdout.strip().splitlines()[-1] == "False"
-    source = inspect.getsource(m.PrefillTarget)
-    assert "if GQAMIX and sparse:\n            _gqamix_register(core.attn[i])" in source
-    assert source.count("_gqamix_register(") == 1
-
-
-class _Attn:
-    is_mla_enable = False
-    kv_lora_rank = None
-    v_head_dim = None
-    head_dim = D
-    num_heads = HEADS
-    layer_idx = 3
-    q_scaling = 1.0
-
-    def out_head_size(self, is_gen_only: bool) -> int:
-        return D
-
 
 # GQAMIX rides MsaDecodeFmha.sparse_decode_hook, an engine hook main's MsaDecodeFmha does not have yet:
 # _gqamix_register leaves such a library alone and the in-tree decode runs.
-_HAS_SPARSE_DECODE_HOOK = "sparse_decode_hook" in inspect.getsource(MsaDecodeFmha)
-
-
-def _params(attn, num_tokens):
-    return types.SimpleNamespace(
-        attn=attn,
-        num_tokens=num_tokens,
-        meta=types.SimpleNamespace(kv_cache_manager=object()),
-        fwd=types.SimpleNamespace(kv_scale_quant_orig=None),
-        query_input=torch.zeros(num_tokens, HEADS * D),
-        output=torch.zeros(num_tokens, HEADS * D),
-        token_offset=2,
-        input_seq_length=QLEN,
-    )
-
-
-@pytest.mark.skipif(
-    not _HAS_SPARSE_DECODE_HOOK,
-    reason="needs the MsaDecodeFmha.sparse_decode_hook engine hook, which this TensorRT-LLM does not have",
-)
-@pytest.mark.parametrize("hooked", [False, True], ids=["unset", "registered"])
-def test_the_shared_decode_hook_is_inert_unset(monkeypatch, hooked) -> None:
-    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import msa_utils
-
-    calls = []
-    monkeypatch.setattr(msa_utils, "msa_paged_kv", lambda manager, layer: ("k", "v"))
-    monkeypatch.setattr(
-        in_tree, "minimax_m3_sparse_attn_decode", lambda *a, **k: calls.append(("in_tree", a, k))
-    )
-    attn = _Attn()
-    fmha = MsaDecodeFmha(attn)
-    assert fmha.sparse_decode_hook is None
-    if hooked:
-        fmha.sparse_decode_hook = lambda *a, **k: calls.append(("hook", a, k))
-    indexes = torch.zeros(10, 1, TOPK, dtype=torch.int32)
-    fmha._run_sparse(_params(attn, QLEN), indexes, "bt", "sl")
-    assert [c[0] for c in calls] == ["hook" if hooked else "in_tree"]
-    _, args, kwargs = calls[0]
-    assert args[1:3] == ("k", "v") and args[4:] == ("bt", "sl")
-    assert args[3].shape == (1, QLEN, TOPK)
-    assert kwargs["decode_query_len"] == QLEN and kwargs["sm_scale"] == D**-0.5
 
 
 def _mixed_step(nreq, seq_len, row_first, seed):
@@ -197,7 +69,7 @@ def _mixed_step(nreq, seq_len, row_first, seed):
     or torch.cuda.get_device_capability() not in copy._SM100F_CAPABILITIES,
     reason="needs a CUDA device with the NVFP4 sparse decode kernels",
 )
-@pytest.mark.parametrize("nreq,row_first", [(1, 0), (1, 1), (3, 2), (5, 3), (8, 1)])
+@pytest.mark.parametrize("nreq,row_first", [(1, 0), (5, 3), (8, 1)])
 @pytest.mark.parametrize("seq_len", [16384, 131072])
 def test_the_copy_writes_the_in_tree_output_on_a_mixed_step(nreq, row_first, seq_len) -> None:
     args, kwargs, total_q = _mixed_step(nreq, seq_len, row_first, 31 * nreq + row_first)

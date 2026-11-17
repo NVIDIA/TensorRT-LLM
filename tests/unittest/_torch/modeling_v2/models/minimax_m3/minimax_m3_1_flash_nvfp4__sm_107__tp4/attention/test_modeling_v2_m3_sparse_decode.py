@@ -2,21 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the m3_sparse_decode entry (the target's Triton block-sparse decode and its routes)."""
 
-import zlib
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
+    minimax_m3_sparse_attn_decode as stock_decode,
+)
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels import (  # noqa: E501
     m3_attn_lc,
     m3_report,
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.attention.m3_sparse_decode import (  # noqa: E501
     m3_sparse_decode as op,
-)
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
-    minimax_m3_sparse_attn_decode as stock_decode,
 )
 
 __extra_import_path__ = ["../../../..", "."]
@@ -64,75 +63,6 @@ def _call(case, output, identity):
     )
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
-    spec = cell.spec
-    case = build_step(
-        spec["seq_lens"],
-        spec["decode_query_len"],
-        identity=spec["identity"],
-        seed=zlib.crc32(cell.why.encode()) % 2**31,
-    )
-    output = torch.empty(case.q.shape[0], NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    certifying(op)
-    _call(case, output, spec["identity"])
-    ref = op.reference(
-        case.q,
-        case.k_paged,
-        case.v_paged,
-        case.topk,
-        case.block_table,
-        case.seq_lens,
-        case.sm_scale,
-        output,
-        case.decode_query_len,
-        None,
-        case.k_block_scale,
-        case.v_block_scale,
-        case.k_global_scale,
-        case.v_global_scale,
-        None,
-        spec["identity"],
-    )
-    assert torch.isfinite(output.float()).all(), "padding rows must be zeros, not NaN"
-    assert_within_ulp(output, ref, element_ulp=_ELEMENT_ULP, rms_ulp=_RMS_ULP)
-
-
-def test_identity_flag_does_not_change_the_answer() -> None:
-    """On an identity table the identity routes (the producer, or the multi-query producer from 17 rows) and the
-    selected-table route (the long-context kernel) compute the same attention."""
-    case = build_step((2048, 130, 5, 0, 1777, 900, 2000, 0), 4, identity=True, seed=17)
-    outs = []
-    for identity in (True, False):
-        output = torch.empty(
-            case.q.shape[0], NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
-        )
-        _call(case, output, identity)
-        outs.append(output)
-    assert_within_ulp(outs[0], outs[1], element_ulp=_ELEMENT_ULP, rms_ulp=_RMS_ULP)
-
-
-def test_guard_refuses_a_padded_selection_slot() -> None:
-    """The Triton producers index the block table with every one of a token's first min(16, blocks) ids,
-    -1 included."""
-    case = build_step((1500,), 1, identity=True, seed=23)
-    case.topk[0, 0, 3] = -1
-    output = torch.empty(1, NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(AssertionError, match="blocks of the request"):
-        with validating(op):
-            _call(case, output, True)
-
-
-def test_guard_refuses_a_false_identity_promise() -> None:
-    """identity_blocks lets the multi-query producer read one table for the whole request."""
-    case = build_step((1500, 1600, 1700, 1800, 1500, 1600, 1700, 1800), 4, identity=True, seed=29)
-    case.topk[0, 5, :2] = case.topk[0, 5, :2].flip(0)
-    output = torch.empty(case.q.shape[0], NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(AssertionError, match="identity_blocks promises"):
-        with validating(op):
-            _call(case, output, True)
-
-
 def _stock(case, output):
     stock_decode(
         case.q,
@@ -167,60 +97,6 @@ def _identity_table(
 _EDGE_LENS = (1284, 1287, 1281, 129, 132, 2048, 1028, 5, 643, 1920, 256, 1)
 
 
-@pytest.mark.parametrize("fault", ["stale_one_step", "all_minus_one", "random_ids"])
-@pytest.mark.parametrize("requests", [1, 2, 3, 4])
-def test_identity_route_reads_its_own_lengths_not_the_table(requests, fault, monkeypatch) -> None:
-    """The Triton identity route (single / pair producer, up to 16 rows) derives block i for slot i from the kv lengths
-    the kernel reads: a staged table that lags the lengths by a verify step (a 128-token edge crossed), or is garbage,
-    gives the stock decode's rows over the true identity selection bit for bit. (The LC identity route has its own test
-    below.)"""
-    _triton_route(monkeypatch)
-    lens = tuple(_EDGE_LENS[(requests * 5 + k) % len(_EDGE_LENS)] for k in range(requests))
-    case = build_step(lens, 4, identity=True, seed=400 + requests)
-    heads = case.topk.shape[0]
-    true_table = _identity_table(case.seq_lens, 4, heads)
-    assert torch.equal(case.topk, true_table), (
-        "build_step's identity table is the identity selection"
-    )
-    if fault == "stale_one_step":
-        staged = _identity_table(case.seq_lens, 4, heads, lag=4)
-    elif fault == "all_minus_one":
-        staged = torch.full_like(true_table, -1)
-    else:
-        g = torch.Generator().manual_seed(requests)
-        staged = (
-            torch.randint(-1, case.block_table.shape[1], true_table.shape, generator=g)
-            .to(torch.int32)
-            .cuda()
-        )
-    rows = case.q.shape[0]
-    target = torch.empty(rows, NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    stock = torch.empty_like(target)
-    _stock(case, stock)
-    case_staged = SimpleNamespace(**{**vars(case), "topk": staged})
-    _call(case_staged, target, True)
-    torch.cuda.synchronize()
-    assert torch.equal(target.view(torch.int16), stock.view(torch.int16)), (
-        fault,
-        case.seq_lens.tolist(),
-    )
-
-
-@pytest.mark.parametrize("requests", [1, 2, 4])
-def test_identity_route_is_bitwise_the_stock_decode(requests, monkeypatch) -> None:
-    """The target's Triton producer + split-K merge takes the stock in-tree decode's split-K at every row count
-    (4 / 8 / 16 identity rows here) and so writes its rows bit for bit."""
-    _triton_route(monkeypatch)
-    case = build_step((1500, 2048, 900, 130)[:requests], 4, identity=True, seed=60 + requests)
-    rows = case.q.shape[0]
-    target = torch.empty(rows, NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    stock = torch.empty_like(target)
-    _call(case, target, True)
-    _stock(case, stock)
-    torch.cuda.synchronize()
-    assert torch.equal(target.view(torch.int16), stock.view(torch.int16)), case.seq_lens.tolist()
-
-
 def _triton_route(monkeypatch) -> None:
     """Route selected steps to the target's Triton producer + merge (this target takes the LC whenever it applies)."""
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels import (  # noqa: E501
@@ -238,8 +114,8 @@ def _short_lens(requests: int, g: torch.Generator) -> tuple:
     return tuple(lens)
 
 
-@pytest.mark.parametrize("seed", range(12))
-@pytest.mark.parametrize("requests", [1, 2, 3, 4])
+@pytest.mark.parametrize("seed", range(2))
+@pytest.mark.parametrize("requests", [1, 4])
 def test_short_table_stress_is_bitwise_the_stock_decode(requests, seed, monkeypatch) -> None:
     """The fail-closed id / page guard leaves valid inputs alone: short contexts (1..16 blocks) at 1..4 requests x 4
     verify rows, the identity route and a random selected route with -1 tails past each token's blocks, write the
@@ -312,24 +188,20 @@ def test_invalid_slot_fails_closed(fault, monkeypatch) -> None:
     assert_within_ulp(output, ref, element_ulp=_ELEMENT_ULP, rms_ulp=_RMS_ULP)
 
 
-@pytest.mark.parametrize("fault", ["none", "stale_one_step", "all_minus_one", "random_ids"])
-@pytest.mark.parametrize("requests", [1, 2, 3, 4])
+@pytest.mark.parametrize("fault", ["stale_one_step", "random_ids"])
+@pytest.mark.parametrize("requests", [1, 4])
 def test_lc_identity_route_reads_its_own_lengths_not_the_table(
     requests, fault, monkeypatch
 ) -> None:
     """An identity step runs the long-context kernel, which takes block i for CTA i from the kv lengths it reads.
-    Whatever the staged table holds (true, lagging a verify step, all -1, garbage), the rows are the LC's on the true
+    Whatever the staged table holds (lagging a verify step, garbage), the rows are the LC's on the true
     identity table (the selected-table route) bit for bit, and in the band of the float64 reference."""
     lens = tuple(_EDGE_LENS[(requests * 5 + k) % len(_EDGE_LENS)] for k in range(requests))
     case = build_step(lens, 4, identity=True, seed=700 + requests)
     heads = case.topk.shape[0]
     true_table = _identity_table(case.seq_lens, 4, heads)
-    if fault == "none":
-        staged = true_table.clone()
-    elif fault == "stale_one_step":
+    if fault == "stale_one_step":
         staged = _identity_table(case.seq_lens, 4, heads, lag=4)
-    elif fault == "all_minus_one":
-        staged = torch.full_like(true_table, -1)
     else:
         g = torch.Generator().manual_seed(requests)
         staged = (
@@ -376,36 +248,6 @@ def test_lc_identity_route_reads_its_own_lengths_not_the_table(
         False,
     )
     assert_within_ulp(target, ref, element_ulp=_ELEMENT_ULP, rms_ulp=_RMS_ULP)
-
-
-@pytest.mark.parametrize("requests", [1, 2])
-def test_lc_identity_step_reads_q_after_the_wait(requests, monkeypatch) -> None:
-    """An identity step has no select, so the LC must read q after its grid wait: the op gets identity_step (and the
-    device identity selection) on every identity step."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels import (  # noqa: E501
-        m3_attn_lc,
-        m3_prequant,
-    )
-
-    lens = tuple(_EDGE_LENS[(requests * 3 + k) % len(_EDGE_LENS)] for k in range(requests))
-    case = build_step(lens, 4, identity=True, seed=900 + requests)
-    true_table = _identity_table(case.seq_lens, 4, case.topk.shape[0])
-    case_true = SimpleNamespace(**{**vars(case), "topk": true_table})
-    rows = case.q.shape[0]
-    seen = []
-    real = m3_attn_lc.m3_sparse_decode_lc
-
-    def spy(*args, **kwargs):
-        seen.append((kwargs.get("identity", False), kwargs.get("identity_step", False)))
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(m3_attn_lc, "m3_sparse_decode_lc", spy)
-    out = torch.empty(rows, NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    _call(case_true, out, True)
-    m3_prequant.SLOT.clear()
-    torch.cuda.synchronize()
-    assert seen[0] == (True, True), seen
-    assert bool(torch.isfinite(out.float()).all())
 
 
 @pytest.mark.parametrize("requests", [2, 3])

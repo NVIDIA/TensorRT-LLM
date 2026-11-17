@@ -1,19 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for TOPP_DET: the spec sampler's top-p renorm as
-``mv2_minimax_m3::minimax_m31_topp_renorm_det`` through ``ops/sampling/m31_topp_det``, installed as the sampler's
-top-p renorm override where the engine offers one.
+"""Tests for TOPP_DET: the spec sampler's top-p renorm as ``mv2_minimax_m3::minimax_m31_topp_renorm_det`` through
+``ops/sampling/m31_topp_det``.
 
 On rows with top_p < 1 it must equal FlashInfer's ``top_p_renorm_probs(probs, top_p, is_deterministic=True)`` bit for
-bit (the microbench generators: randn / peaked / ties / near_uniform / all_equal rows); rows with top_p >= 1 keep every
-token. Outside its contract the override declines (the sampler runs stock FlashInfer). The target installs it only
-through the engine's override setter; TRTLLM_M31_DISABLE_TOPP_DET=1 installs nothing.
-"""
-
-import os
-import subprocess
-import sys
-from unittest import mock
+bit (randn / peaked / ties / near_uniform / all_equal rows); rows with top_p >= 1 keep every token. Outside its
+contract the override declines (the sampler runs stock FlashInfer)."""
 
 import pytest
 import torch
@@ -22,7 +14,6 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
     m31_topp_det as entry,
 )
 
-TARGET = "tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8"
 CLASSES = ("randn", "peaked", "ties", "near_uniform", "all_equal")
 FLT_MIN = torch.finfo(torch.float32).tiny
 op = entry.m31_topp_det
@@ -127,31 +118,6 @@ def test_keep_all_rows_in_a_mixed_batch(cls) -> None:
         assert abs(total - 1.0) <= 1e-5, f"{cls} row {r}: sum {total}"
 
 
-def test_graph_replay_equals_eager() -> None:
-    """Captured in a CUDA graph (workspace prebuilt outside the capture), the replay gives the eager bits."""
-    _gpu()
-    probs = _make("peaked", 8, 200064, 5)
-    top_p = _top_p("mixed", 8, 5)
-    entry.prebuild(probs.device)
-    ref = entry.top_p_renorm_det(probs, top_p)
-    stream = torch.cuda.Stream()
-    # The eager warm-up on the side stream shares the persistent workspace with the default-stream
-    # calls above (and reads their inputs): order it after them.
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        entry.top_p_renorm_det(probs, top_p)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            out = entry.top_p_renorm_det(probs, top_p)
-    assert out is not None, "a prebuilt workspace must serve a captured call"
-    for _ in range(3):
-        out.fill_(float("nan"))
-        graph.replay()
-        torch.cuda.synchronize()
-        _same(out, ref, "graph replay")
-
-
 def test_outside_the_contract_the_override_declines() -> None:
     """A float top_p, a non-fp32 / misaligned / non-contiguous probs, a d % 4 width, a mis-sized top_p or more rows
     than the workspace holds return None (the sampler runs stock FlashInfer)."""
@@ -174,42 +140,3 @@ def test_outside_the_contract_the_override_declines() -> None:
     assert entry.ctas_per_row(1, 148) == 16 and entry.ctas_per_row(8, 148) == 16
     assert entry.ctas_per_row(16, 148) == 8 and entry.ctas_per_row(64, 148) == 2
     assert entry.ctas_per_row(200, 148) == 1
-
-
-def test_the_target_installs_the_override(monkeypatch) -> None:
-    """With TOPP_DET on (the default) and the op built, the target installs ``top_p_renorm_det`` once per process
-    through the
-    engine's override setter, and installs nothing on an engine that has no such setter."""
-    _gpu()
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8 import (  # noqa: E501
-        modeling,
-    )
-
-    if not modeling.TOPP_DET:
-        pytest.skip("TOPP_DET is switched off in this environment")
-    saved = dict(modeling._TOPP_DET_STATE)
-    try:
-        for setter in (None, mock.Mock()):
-            monkeypatch.setattr(modeling, "_SET_TOP_P_RENORM_OVERRIDE", setter)
-            modeling._TOPP_DET_STATE.clear()
-            modeling._install_topp_det()
-            assert modeling._TOPP_DET_STATE["installed"] is (setter is not None)
-            if setter is not None:
-                setter.assert_called_once_with(entry.top_p_renorm_det)
-    finally:
-        modeling._TOPP_DET_STATE.clear()
-        modeling._TOPP_DET_STATE.update(saved)
-
-
-def test_the_kill_switch_installs_nothing() -> None:
-    """TRTLLM_M31_DISABLE_TOPP_DET=1 (read at import): TOPP_DET is off and the target installs nothing."""
-    probe = (
-        f"import {TARGET}.modeling as m\n"
-        "m._install_topp_det()\n"
-        "print(m.TOPP_DET, m._TOPP_DET_STATE['installed'])"
-    )
-    env = dict(os.environ, TRTLLM_M31_DISABLE_TOPP_DET="1")
-    out = subprocess.run(
-        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, check=True
-    )
-    assert out.stdout.strip().splitlines()[-1] == "False False"

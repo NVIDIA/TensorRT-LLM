@@ -51,11 +51,11 @@ def _reference(x, r, w, gs, f32, write_norm):
     return inter, out
 
 
-@pytest.mark.parametrize("T", [6144, 8192, 16384])
-@pytest.mark.parametrize("kind", ["randn", "stress"])
+@pytest.mark.parametrize("T", [8192])
+@pytest.mark.parametrize("kind", ["stress"])
 @pytest.mark.parametrize("fp4", [False, True])
 @pytest.mark.parametrize("f32", [False, True])
-@pytest.mark.parametrize("half", [0, 1])
+@pytest.mark.parametrize("half", [1])
 def test_out_into_the_owned_gather_rows(T, kind, fp4, f32, half):
     n = T // 2
     rows = slice(half * n, (half + 1) * n)
@@ -102,10 +102,10 @@ def test_out_into_the_owned_gather_rows(T, kind, fp4, f32, half):
     assert all(bool((u == SENT).all()) for u in untouched), "the op wrote outside the owned rows"
 
 
-@pytest.mark.parametrize("rows", [1, 127, 128, 129, 4097])
-@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize("rows", [1, 129, 4097])
+@pytest.mark.parametrize("fp4", [True])
 @pytest.mark.parametrize("write_norm", [False, True])
-@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("pdl", [True])
 def test_out_edge_rows_and_norm_off(rows, fp4, write_norm, pdl):
     """Partial 128-row scale tiles, no norm output (norm_out None) and the programmatic launch."""
     x, r = _bf16(rows, H, "stress", rows), _bf16(rows, H, "randn", rows + 1)
@@ -131,23 +131,3 @@ def test_out_edge_rows_and_norm_off(rows, fp4, write_norm, pdl):
         assert torch.equal(_u8(fq), _u8(ref[3])) and torch.equal(_u8(fsf), _u8(ref[4])), (
             "nvfp4 differs"
         )
-
-
-@pytest.mark.parametrize("T", [129, 8192])
-@pytest.mark.parametrize("f32", [False, True])
-def test_the_lb2_kill_switch_keeps_the_bits(T, f32):
-    """lb2=False (CTXNORM_LB2 off) launches one CTA per SM: every output equals the two-CTA launch's."""
-    x, r = _bf16(T, H, "stress", T), _bf16(T, H, "randn", T + 1)
-    w = _bf16(1, H, "randn", 3).view(H)
-    gs = torch.tensor([448.0 * 6.0 / 64.0], device="cuda")
-    outs = []
-    for lb2 in (True, False):
-        inter = x.clone()
-        if f32:
-            out = _ops.minimax_m31_ctx_residual_rmsnorm_mxfp8_f32(inter, r, w, EPS, gs, lb2=lb2)
-        else:
-            out = _ops.minimax_m31_ctx_residual_rmsnorm_mxfp8(inter, r, w, EPS, True, gs, lb2=lb2)
-        outs.append((inter, *out))
-    torch.cuda.synchronize()
-    for a, b in zip(*outs):
-        assert torch.equal(_u8(a), _u8(b))

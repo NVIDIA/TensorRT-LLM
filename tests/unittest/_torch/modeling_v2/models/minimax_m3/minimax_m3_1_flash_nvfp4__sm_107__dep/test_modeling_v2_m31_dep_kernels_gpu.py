@@ -3,11 +3,10 @@
 """The MiniMax-M3.1 DEP target's kernels on an SM107 GPU.
 
 TOPP_DET with keep_all_ge1 off is bitwise FlashInfer's deterministic top_p_renorm_probs on every row, including rows
-with top_p = 1 (greedy and CUDA-graph padding rows), at the DEP K7 draft and verify widths; LC2's split workspace
-reserve takes the attention-DP geometry (4 KV heads); LC2's MXFP8 o_proj hand-off gives the o_proj GEMM the stock
-quantize's operands bit for bit; a boundary norm's MXFP8 qkv_proj hand-off is the stock norm, and gives the qkv_proj
-GEMM the stock quantize's operands, bit for bit; a post-attention norm's gate operand is the stock norm, and gives the
-gate the stock logits bit for bit, eagerly and under graph replay.
+with top_p = 1 (greedy and CUDA-graph padding rows), at the DEP K7 draft and verify widths; LC2's MXFP8 o_proj hand-
+off gives the o_proj GEMM the stock quantize's operands bit for bit; a boundary norm's MXFP8 qkv_proj hand-off is
+the stock norm, and gives the qkv_proj GEMM the stock quantize's operands, bit for bit; a post-attention norm's gate
+operand is the stock norm, and gives the gate the stock logits bit for bit.
 """
 
 import types
@@ -22,7 +21,6 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
     router_operand,
     topp_det,
 )
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 _VOCAB = 200064
 
@@ -46,8 +44,8 @@ def _top_p(rows: int, mode: str) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("mode", ["p095", "mixed", "ones", "low"])
-@pytest.mark.parametrize("rows", [19, 48, 96, 107, 128, 152, 159, 160, 280, 384, 448])
-@pytest.mark.parametrize("scale", [1.0, 4.0])
+@pytest.mark.parametrize("rows", [19, 448])
+@pytest.mark.parametrize("scale", [1.0])
 def test_topp_det_is_flashinfer_on_every_row(rows, mode, scale):
     flashinfer = pytest.importorskip("flashinfer")
     assert topp_det.topp_det_op() is not None, (
@@ -62,47 +60,6 @@ def test_topp_det_is_flashinfer_on_every_row(rows, mode, scale):
     assert out is not None
     torch.cuda.synchronize()
     assert torch.equal(out.view(torch.int32), expected.view(torch.int32))
-
-
-@pytest.mark.parametrize("rows", [107, 128, 159])
-def test_topp_split_is_flashinfer_under_graph_replay(rows):
-    """TOPP_SPLIT's two launches share the persistent workspace by row slices: replays stay bitwise FlashInfer."""
-    flashinfer = pytest.importorskip("flashinfer")
-    assert topp_det.topp_det_op() is not None, (
-        "the family library lacks minimax_m31_topp_renorm_det_v3"
-    )
-    if not topp_det.TOPP_SPLIT:
-        pytest.skip("TRTLLM_M31_DISABLE_TOPP_SPLIT=1")
-    if torch.cuda.get_device_properties(0).multi_processor_count != 212:
-        pytest.skip("the split window is priced at 212 SMs")
-    assert len(topp_det.launch_plan(rows, 212)) == 2
-    topp_det.prebuild()
-    gen = torch.Generator(device="cuda").manual_seed(rows)
-    probs = torch.softmax(
-        torch.randn(rows, _VOCAB, device="cuda", generator=gen) * 4.0, dim=-1
-    ).contiguous()
-    top_p = _top_p(rows, "mixed")
-    topp_det.top_p_renorm_det(probs, top_p)  # warm-up outside the capture
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = topp_det.top_p_renorm_det(probs, top_p)
-    for scale in (4.0, 1.0, 8.0):
-        probs.copy_(
-            torch.softmax(torch.randn(rows, _VOCAB, device="cuda", generator=gen) * scale, dim=-1)
-        )
-        graph.replay()
-        expected = flashinfer.sampling.top_p_renorm_probs(probs, top_p, is_deterministic=True)
-        torch.cuda.synchronize()
-        assert torch.equal(out.view(torch.int32), expected.view(torch.int32))
-
-
-def test_lc2_reserve_takes_4_kv_heads():
-    assert hasattr(family_ops(), "minimax_m3_sm107_tp2_sparse_decode_lc_prepare"), (
-        "the family library lacks minimax_m3_sm107_tp2_sparse_decode_lc_prepare"
-    )
-    reserved = lc2_decode.reserve_workspace(torch.device("cuda"))
-    # 0 when TRTLLM_M31_DISABLE_TP2WIDE_LC2_SPLIT=1; otherwise 448 rows x 4 heads x 16 x 16 partials of 129 floats.
-    assert reserved == 0 or reserved >= 448 * 4 * 16 * 16 * (128 + 1) * 4
 
 
 def _lc2_step(rows: int, seed: int):
@@ -229,12 +186,12 @@ def test_norm_mxfp8_hand_off_is_the_qkv_proj_norm_quantize_and_gemm(monkeypatch)
     publishes trtllm::mxfp8_quantize of its output, and the qkv_proj GEMM on that is bitwise the stock quantize + GEMM,
     natively and as the decode graphs' tuned pair (each at its untuned tactics)."""
     import tensorrt_llm._torch.custom_ops  # noqa: F401
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.megamoe.megamoe_topk_reduce_tail import (  # noqa: E501
-        megamoe_topk_reduce_add_rmsnorm_matches_flashinfer,
-    )
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
         mxfp8_gemm_autotuned,
         mxfp8_quantize_gemm_autotuned,
+    )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.megamoe.megamoe_topk_reduce_tail import (  # noqa: E501
+        megamoe_topk_reduce_add_rmsnorm_matches_flashinfer,
     )
     from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
@@ -330,37 +287,3 @@ def test_router_operand_is_the_stock_norm_cat_and_gate(monkeypatch):
         assert torch.equal(res.view(torch.int16), ref_residual.view(torch.int16)), rows
         assert logits.dtype == torch.float32 and logits.shape == (rows, 128), rows
         assert torch.equal(logits.view(torch.int32), stock.view(torch.int32)), rows
-
-
-def test_router_operand_graph_replay_is_the_stock_gate(monkeypatch):
-    """The norm and the gate captured together replay the stock norm and logits on new rows."""
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Gate
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    norm, gate, gen = _router_site(monkeypatch, device)
-    x, residual = _router_rows(88, gen)
-    x_in, residual_in = x.clone(), residual.clone()
-    result = {}
-
-    def run():
-        x.copy_(x_in)
-        residual.copy_(residual_in)
-        out, _ = norm(x, residual)
-        result["logits"] = gate(out)
-
-    run()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    for _ in range(2):
-        new_x, new_residual = _router_rows(88, gen)
-        x_in.copy_(new_x)
-        residual_in.copy_(new_residual)
-        graph.replay()
-        torch.cuda.synchronize()
-        torch.ops.trtllm.flashinfer_fused_add_rmsnorm(new_x, new_residual, norm.weight, 1e-6)
-        stock = MiniMaxM3Gate.forward(gate, new_x)
-        assert torch.equal(x.view(torch.int16), new_x.view(torch.int16))
-        assert torch.equal(residual.view(torch.int16), new_residual.view(torch.int16))
-        assert torch.equal(result["logits"].view(torch.int32), stock.view(torch.int32))

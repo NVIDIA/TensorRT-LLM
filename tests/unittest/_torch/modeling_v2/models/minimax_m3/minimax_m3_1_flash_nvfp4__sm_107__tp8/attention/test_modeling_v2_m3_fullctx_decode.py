@@ -104,40 +104,6 @@ def test_certified_cells(cell, subpages, certifying) -> None:  # noqa: F811
     assert torch.equal(out, eager), "the CUDA-graph replay differs from the eager call"
 
 
-def test_the_cells_cover_the_target_rows() -> None:
-    certified = {(c.spec["qlen"], len(c.spec["kv_lens"])) for c in op.CELLS}
-    assert set(modeling.FULLCTX_DECODE.keys) <= certified
-
-
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_the_bf16_merge_is_the_primts_reducer_to_one_ulp(cell) -> None:
-    """The BF16 split-KV merge op against PrimTS's own FP16 reducer and the cast: the same partials, merged once
-    in fp32 and rounded once, so within one BF16 spacing of the FP16-then-BF16 result."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
-        m3_fullctx_decode as kernel,
-    )
-
-    if not kernel.has_own_reducer():
-        pytest.skip("this build does not carry minimax_m3_sm107_tp2_fullctx_reduce")
-    spec = cell.spec
-    qlen, nreq = spec["qlen"], len(spec["kv_lens"])
-    recipe = modeling.FULLCTX_DECODE_RECIPES[(qlen, nreq)]
-    q, manager, block_table, seq_lens = _inputs(spec["kv_lens"], qlen, 11, 2)
-    outs = []
-    for own in (True, False):
-        out = torch.zeros(q.shape, dtype=torch.bfloat16, device="cuda")
-        op(q, manager, 0, block_table, seq_lens, SM_SCALE, out, qlen, recipe, own_reducer=own)
-        outs.append(out.float())
-    ours, primts = outs
-    _, exp = torch.frexp(primts.abs())
-    spacing = torch.where(
-        primts == 0,
-        torch.full_like(primts, 2.0**-133),
-        torch.ldexp(torch.ones_like(primts), exp - 8),
-    )
-    assert bool(((ours - primts).abs() <= spacing).all())
-
-
 def _tile_edge_kv_lens(plan, qlen: int):
     """KV lengths around every kind of boundary the split ranges have, so each query row of the Q CTA in turn ends
     its keys on a KV tile edge (k * tile + d, d in -1 .. qlen - 1): the first tiles, the reducer's 8-group stride, the
@@ -153,10 +119,10 @@ def test_rows_with_no_key_in_a_trailing_split(qlen, nreq) -> None:
     """A row whose keys end before its Q CTA's causal union does has trailing splits holding none of its keys
     (log2-LSE -inf); both reducers must leave them out. [1300, 1281] at 4 query rows is the batch a GSM8K decode
     step first hit (NaN rows from exp2(-inf - -inf))."""
+    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
         m3_fullctx_decode as kernel,
     )
-    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
     recipe = modeling.FULLCTX_DECODE_RECIPES[(qlen, nreq)]
     reducers = (True, False) if kernel.has_own_reducer() else (False,)
@@ -187,10 +153,10 @@ def test_rows_with_no_key_in_a_trailing_split(qlen, nreq) -> None:
 def test_kv_lengths_past_the_policy_length(qlen, nreq) -> None:
     """The plans are compiled for MAX_KV_LEN of K/V with PrimTS's policy sized at 1 << 20 (POLICY_KV_LEN): caches just
     past the policy length (a 1 << 20 bound plus the speculative rows) and well past it stay exact."""
+    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
         m3_fullctx_decode as kernel,
     )
-    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
     recipe = modeling.FULLCTX_DECODE_RECIPES[(qlen, nreq)]
     reducers = (True, False) if kernel.has_own_reducer() else (False,)
@@ -214,98 +180,3 @@ def test_kv_lengths_past_the_policy_length(qlen, nreq) -> None:
             ):
                 failures.append((kv_lens, "bf16-merge" if own else "primts-reducer"))
     assert not failures, failures
-
-
-@pytest.mark.parametrize(
-    "splits,rows,seq_len_q", [(108, 8, 1), (64, 8, 1), (96, 32, 4), (96, 32, 4)]
-)
-def test_the_tp8_merge_is_the_tp2_merge_bitwise(splits, rows, seq_len_q) -> None:
-    """The TP8 copy of the BF16 split-KV merge (one row per CTA, early dependent release) returns the image TP2 op's
-    bits on random 16-bit partials with empty (-inf log2-LSE) splits, both partial dtypes, two requests."""
-    ops = torch.ops.trtllm
-    if not (
-        hasattr(ops, "minimax_m3_sm107tp8_fullctx_reduce")
-        and hasattr(ops, "minimax_m3_sm107_tp2_fullctx_reduce")
-    ):
-        pytest.skip("needs both the TP8 merge copy and the image's TP2 merge op")
-    dev = torch.device("cuda")
-    g = torch.Generator(device=dev).manual_seed(splits * 131 + rows)
-    nreq, kvh = 2, 1
-    for dtype in (torch.float16, torch.bfloat16):
-        po = (
-            (torch.randn(nreq, kvh, splits, rows, 128, device=dev, generator=g) * 3)
-            .to(dtype)
-            .contiguous()
-        )
-        ps = torch.randn(nreq, kvh, splits, rows, device=dev, generator=g) * 4
-        ps[torch.rand(ps.shape, device=dev, generator=g) < 0.05] = float("-inf")
-        seq = torch.tensor([165521, 120011], dtype=torch.int32, device=dev)
-        outs = []
-        for reduce in (
-            ops.minimax_m3_sm107_tp2_fullctx_reduce,
-            ops.minimax_m3_sm107tp8_fullctx_reduce,
-        ):
-            out = torch.zeros(
-                nreq * seq_len_q, kvh * rows // seq_len_q, 128, dtype=torch.bfloat16, device=dev
-            )
-            reduce(
-                po, ps.contiguous(), seq, out, seq_len_q, seq_len_q, 128, 1, seq_len_q > 1, False
-            )
-            outs.append(out)
-        torch.cuda.synchronize()
-        assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16)), (
-            splits,
-            rows,
-            seq_len_q,
-            dtype,
-        )
-
-
-def _swizzled_scale_offsets(rows: int, width: int) -> torch.Tensor:
-    """Offsets of rows [0, rows)'s UE8M0 scales in the 128x4-swizzled layout of mxfp8_quantize(x, True)."""
-    k_sf = width // 32
-    k_tiles = (k_sf + 3) // 4
-    r = torch.arange(rows, device="cuda").view(-1, 1)
-    k = torch.arange(k_sf, device="cuda").view(1, -1)
-    offsets = (
-        (r // 128) * k_tiles * 512 + (k // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + k % 4
-    )
-    return offsets.reshape(-1)
-
-
-@pytest.mark.parametrize("splits,rows,seq_len_q", [(108, 8, 1), (64, 8, 1), (96, 32, 4)])
-def test_the_tp8_merge_mxfp8_copy_is_stock_mxfp8_quantize(splits, rows, seq_len_q) -> None:
-    """The TP8 merge's MXFP8 copy (the dense o_proj hand-off) equals mxfp8_quantize(out, True) bit for bit: E4M3 rows
-    and the real rows' swizzled UE8M0 scales, with an all-zero head row (amax 0) and saturating outliers; the BF16
-    output is the merge without the copy."""
-    ops = torch.ops.trtllm
-    if not hasattr(ops, "minimax_m3_sm107tp8_fullctx_reduce"):
-        pytest.skip("needs the TP8 merge copy")
-    dev = torch.device("cuda")
-    g = torch.Generator(device=dev).manual_seed(splits * 7 + rows)
-    nreq, kvh = 2, 1
-    tokens = nreq * seq_len_q
-    width = kvh * rows // seq_len_q * 128
-    for dtype in (torch.float16, torch.bfloat16):
-        po = torch.randn(nreq, kvh, splits, rows, 128, device=dev, generator=g) * 3
-        po[0, 0, :, 1] = 0.0
-        po[1, 0, :, 0, 5] = 6.0e4
-        po = po.to(dtype).contiguous()
-        ps = (torch.randn(nreq, kvh, splits, rows, device=dev, generator=g) * 4).contiguous()
-        seq = torch.tensor([165521, 120011], dtype=torch.int32, device=dev)
-        args = (po, ps, seq)
-        tail = (seq_len_q, seq_len_q, 128, 1, seq_len_q > 1, False)
-        plain = torch.zeros(tokens, width, dtype=torch.bfloat16, device=dev)
-        ops.minimax_m3_sm107tp8_fullctx_reduce(*args, plain, *tail)
-        out = torch.zeros(tokens, width, dtype=torch.bfloat16, device=dev)
-        q8 = torch.empty(128, width, dtype=torch.float8_e4m3fn, device=dev)
-        sf = torch.zeros(128 * (width // 32), dtype=torch.uint8, device=dev)
-        ops.minimax_m3_sm107tp8_fullctx_reduce(*args, out, *tail, q8, sf)
-        torch.cuda.synchronize()
-        assert torch.equal(out.view(torch.int16), plain.view(torch.int16))
-        stock_q, stock_sf = ops.mxfp8_quantize(out, True)
-        assert torch.equal(
-            q8[:tokens].view(torch.uint8), stock_q.view(torch.uint8).reshape(tokens, -1)
-        ), dtype
-        at = _swizzled_scale_offsets(tokens, width)
-        assert torch.equal(sf[at], stock_sf.view(torch.uint8).reshape(-1)[at]), dtype

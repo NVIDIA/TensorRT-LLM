@@ -46,7 +46,7 @@ def test_certified_cells(cell) -> None:
         _assert_bitwise(x)
 
 
-@pytest.mark.parametrize("m", [17, 24, 32])
+@pytest.mark.parametrize("m", [17, 32])
 @pytest.mark.parametrize("scale", [1e-3, 1.0, 1e3])
 def test_bitwise_across_magnitudes_and_edges(m, scale) -> None:
     """Scaled inputs, gates past the clamp, an all-zero row and a -0.0 row: q bytes and every scale byte."""

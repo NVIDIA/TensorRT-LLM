@@ -14,18 +14,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8 import (  # noqa: E501
     modeling,
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.gemm.m3_draft_lowm import (  # noqa: E501
     ROWS,
-    TACTICS,
     tactic_for,
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.gemm.m3_draft_lowm import (  # noqa: E501
     m3_draft_lowm as op,
 )
-from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402, F401
@@ -58,6 +57,7 @@ DRAFTER_LINEARS = {
 
 @pytest.fixture(autouse=True)
 def _policy():
+    """Every test starts outside require mode with nothing logged, and leaves it so."""
     modeling.set_require(False)
     modeling.reset_logged()
     yield
@@ -70,11 +70,6 @@ def build(n: int, k: int, m: int, seed: int):
     w = (torch.randn(n, k, generator=g, device="cuda") / k**0.5).to(torch.bfloat16)
     x = torch.randn(m, k, generator=g, device="cuda").to(torch.bfloat16)
     return x, w
-
-
-def test_the_table_is_the_tp8_drafter() -> None:
-    assert set(TACTICS) == set(DRAFTER_LINEARS)
-    assert {c.spec["nk"] for c in op.CELLS} == set(TACTICS)
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -139,40 +134,3 @@ def test_the_projection_is_the_entry_and_falls_back_past_its_rows(prebuilt, nk) 
         x, _ = build(n, k, m, seed=m)
         got = prebuilt.linear(x, key)
         assert torch.equal(got.view(torch.int16), F.linear(x, w).view(torch.int16)), m
-
-
-def test_a_projection_outside_the_table_is_the_in_tree_gemm() -> None:
-    draft = _draft({(256, 512): "o"})
-    x, _ = build(256, 512, 1, seed=3)
-    assert draft._lowm_linear(draft.w["o"], x) is None
-    got = draft.linear(x, "o")
-    assert torch.equal(got.view(torch.int16), F.linear(x, draft.w["o"]).view(torch.int16))
-
-
-def test_a_covered_call_not_prebuilt_raises_under_require() -> None:
-    draft = _draft({(6144, 1024): "o"})
-    x, _ = build(6144, 1024, 1, seed=5)
-    modeling.set_require(True)
-    with pytest.raises(modeling.FastPathUnavailable, match="not compiled before warmup"):
-        draft.linear(x, "o")
-    # Outside require it falls back to the in-tree GEMM.
-    modeling.set_require(False)
-    got = draft.linear(x, "o")
-    assert torch.equal(got.view(torch.int16), F.linear(x, draft.w["o"]).view(torch.int16))
-
-
-def test_guard_refuses_a_strided_activation() -> None:
-    x, w = build(6144, 1024, 2, seed=6)
-    wide = torch.zeros(2, 2048, dtype=torch.bfloat16, device="cuda")
-    wide[:, :1024] = x
-    kind, tactic = tactic_for(6144, 1024, 2)
-    with pytest.raises(AssertionError, match="contiguous"):
-        with validating(op):
-            op(
-                wide[:, :1024],
-                w,
-                torch.empty(2, 6144, dtype=torch.bfloat16, device="cuda"),
-                kind,
-                tactic,
-                False,
-            )

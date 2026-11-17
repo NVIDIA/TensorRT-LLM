@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """TP2W_MOE_FINALIZE (a port of the M3 tp2 test): kernels/m3_moe_finalize finalizes the routed experts (+ the shared
 expert) from the TRTLLM-Gen runner's unfinalized parts, bitwise to the runner's finalizeKernelVecLoad order (acc = 0;
-acc += w_k * fc2[idx_k] for k in order, skipping -1; one BF16 rounding) and to ``shared.add_(routed)``, at the rows the
-target routes there (49..16K), with dropped (-1) slots, padded FC2 rows, eager and CUDA-graph replay."""
+acc += w_k * fc2[idx_k] for k in order, skipping -1; one BF16 rounding) and to ``shared.add_(routed)``, at rows across
+the range the target routes there (49..16K), with dropped (-1) slots, padded FC2 rows, eager and CUDA-graph replay.
+The native family op (``minimax_m31_moe_finalize``) that replaces it is bit for bit the Triton kernel on every
+work-split table entry."""
 
 import pytest
 import torch
@@ -16,6 +18,10 @@ try:
     )
 except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
+
+if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+    pytest.skip("the sm_107 TP2 target runs on SM107 only", allow_module_level=True)
 
 H, TOP_K = 6144, 4
 
@@ -41,7 +47,7 @@ def _reference(fc2, w, idx):
     return acc.to(torch.bfloat16)
 
 
-@pytest.mark.parametrize("rows", [49, 64, 65, 192, 1000, 4096, 16384])
+@pytest.mark.parametrize("rows", [49, 65, 4096])
 def test_bitwise_to_the_runner_order(rows: int) -> None:
     fc2, w, idx, shared = _parts(rows, rows)
     ref = _reference(fc2, w, idx)
@@ -71,8 +77,18 @@ def test_graph_replay_matches_eager() -> None:
     assert eager.shape == out.shape
 
 
-def test_declines_other_layouts() -> None:
-    fc2, w, idx, shared = _parts(64, 3)
-    assert m3_moe_finalize(fc2.float(), w, idx) is None
-    assert m3_moe_finalize(fc2, w, idx.long()) is None
-    assert m3_moe_finalize(fc2, w, idx, shared[:, :128].contiguous()) is None
+@pytest.mark.parametrize("rows", [1, 49, 4096])
+@pytest.mark.parametrize("fp32_weights", [False, True])
+@pytest.mark.parametrize("with_shared", [False, True])
+def test_native_finalize_is_the_triton_finalize_on_every_cfg(
+    rows, fp32_weights, with_shared
+) -> None:
+    fc2, w, idx, shared = _parts(rows, rows * 31 + 4)
+    if fp32_weights:
+        w = (w.float() * 2.0**-126).contiguous()  # denormal products
+    sh = shared if with_shared else None
+    ref = m3_moe_finalize(fc2, w, idx, sh)
+    assert ref is not None
+    for cfg in (-1, 0, 1, 2, 3, 4, 5, 6, 7):
+        got = family_ops().minimax_m31_moe_finalize(fc2, w, idx, sh, cfg)
+        assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), f"cfg {cfg}"

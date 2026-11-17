@@ -8,6 +8,13 @@ TP2W_S2_TAIL), 2 ranks (SM107): bit for bit the chain it fuses,
 Every output is compared: norm_out, residual_out, the MXFP8 bytes and the valid rows' scales; the pad rows' scales
 are 0. Inputs: random rows, dropped top-k slots, and rows scaled by 2^-12..2^12; BF16 and FP32 routing weights.
 
+A second phase alternates the fused tail with the built-in one-shot Lamport all-reduce on one ``AllReduce``
+workspace, as the decode layer runs them (attention boundary: the built-in one; MoE boundary: the fused tail). Every
+Lamport kernel on the workspace clears the sub-buffer of the call before it by the clear size that call left; a tail
+call that leaves less keeps stale words a later call takes as already arrived (a wrong sum, or a hang). One rank per
+round starts each call late, and small integers keep every sum exact, so the outputs are compared bit for bit with
+the exact sums.
+
 Its own 2-rank launcher, as ``_m3_allreduce_op_matrix.py`` is; the collected entry point is
 ``test_modeling_v2_m31_s2_moe_tail.py``.
 
@@ -33,6 +40,22 @@ DEADLINE_S = 900
 
 HIDDEN, TOPK, EPS = 6144, 4, 1e-6
 ROWS = (1, 8, 48, 64, 88, 112, 128, 136, 176, 224)
+
+# Lamport phase. About 10 ms of GPU time: the other rank polls the late rank's part of the buffer before it is
+# written.
+LATE_RANK_SLEEP_CYCLES = 20_000_000
+# (kind, rows) per call: a large fused tail, two small built-in calls, the large fused tail again, so the last call
+# lands on the first call's sub-buffer (four calls per round on a triple buffer: each round starts on another one).
+LAMPORT_CALLS = (
+    ("tail", 224),
+    ("stock", 8),
+    ("stock", 8),
+    ("tail", 224),
+    ("stock", 224),
+    ("tail", 8),
+    ("tail", 8),
+)
+LAMPORT_ROUNDS = 3
 
 RANK = 0
 WORLD = 1
@@ -75,13 +98,13 @@ def _single_node_cluster_info() -> None:
 
 def _run_matrix() -> None:
     import tensorrt_llm._torch.custom_ops  # noqa: F401 -- registers trtllm::mxfp8_quantize
+    from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp, AllReduceParams
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2 import (  # noqa: E501
         native_ops,
     )
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.kernels.m3_moe_finalize import (  # noqa: E501
         m3_moe_finalize,
     )
-    from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp, AllReduceParams
     from tensorrt_llm.functional import AllReduceStrategy
     from tensorrt_llm.mapping import Mapping
 
@@ -167,6 +190,69 @@ def _run_matrix() -> None:
     )
 
 
+def _ints(seed: int, *shape: int) -> torch.Tensor:
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    return torch.randint(-4, 5, shape, generator=g, device="cuda").to(torch.bfloat16)
+
+
+def _tail_inputs(step: int, rank: int, rows: int):
+    """One rank's routed parts (identity permutation, unit scales) and shared output, all small integers."""
+    fc2 = _ints(1000 * step + 10 * rank + 1, rows * TOPK, HIDDEN)
+    shared = _ints(1000 * step + 10 * rank + 2, rows, HIDDEN)
+    return fc2, shared
+
+
+@torch.inference_mode()
+def _run_lamport_phase() -> None:
+    """The fused tail and the built-in one-shot all-reduce alternating on one workspace, a late rank per round."""
+    from tensorrt_llm._torch.distributed import AllReduce
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2 import (  # noqa: E501
+        native_ops,
+    )
+    from tensorrt_llm.functional import AllReduceStrategy
+    from tensorrt_llm.mapping import Mapping
+
+    op = native_ops.minimax_m31_s2_moe_tail
+    mapping = Mapping(world_size=WORLD, tp_size=WORLD, rank=RANK, gpus_per_node=WORLD)
+    ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.ONESHOT, dtype=torch.bfloat16)
+    ws = ar.workspace
+    assert ws is not None, "the one-shot all-reduce has no Lamport workspace"
+    norm_w = torch.ones(HIDDEN, device="cuda", dtype=torch.bfloat16)
+    for step, (kind, rows) in enumerate(LAMPORT_CALLS * LAMPORT_ROUNDS):
+        late = step // len(LAMPORT_CALLS) % WORLD
+        residual = _ints(1000 * step + 7, rows, HIDDEN)
+        if kind == "tail":
+            parts = [_tail_inputs(step, r, rows) for r in range(WORLD)]
+            expected = residual.float()
+            for fc2, shared in parts:
+                expected = expected + fc2.float().view(rows, TOPK, HIDDEN).sum(1) + shared.float()
+            fc2, shared = parts[RANK]
+            perm = torch.arange(rows * TOPK, device="cuda", dtype=torch.int32).view(rows, TOPK)
+            scales = torch.ones(rows, TOPK, device="cuda", dtype=torch.float32)
+            if RANK == late:
+                torch.cuda._sleep(LATE_RANK_SLEEP_CYCLES)
+            _, got, _, _ = op(
+                fc2, scales, perm, shared, residual, norm_w, ws, RANK, WORLD, EPS, False
+            )
+        else:
+            xs = [_ints(1000 * step + 10 * r + 3, rows, HIDDEN) for r in range(WORLD)]
+            expected = sum(x.float() for x in xs)
+            if RANK == late:
+                torch.cuda._sleep(LATE_RANK_SLEEP_CYCLES)
+            got = ar(xs[RANK])
+        torch.cuda.synchronize()
+        bad = int((got.float() != expected).sum().item())
+        assert bad == 0, (
+            f"step {step} ({kind}, {rows} rows, late rank {late}): {bad} elements differ from the exact sum"
+        )
+        dist.barrier()
+    if RANK == 0:
+        print(
+            f"[s2-lamport] {len(LAMPORT_CALLS) * LAMPORT_ROUNDS} alternating calls exact",
+            flush=True,
+        )
+
+
 def _run_one_rank() -> int:
     global RANK, WORLD
     os.environ.setdefault("TLLM_DISABLE_MPI", "1")
@@ -180,6 +266,7 @@ def _run_one_rank() -> int:
     assert WORLD == 2, f"the tp2 target runs at 2 ranks, got {WORLD}"
     try:
         _run_matrix()
+        _run_lamport_phase()
     except BaseException:
         import traceback  # only the rank subprocess's failure path needs it
 

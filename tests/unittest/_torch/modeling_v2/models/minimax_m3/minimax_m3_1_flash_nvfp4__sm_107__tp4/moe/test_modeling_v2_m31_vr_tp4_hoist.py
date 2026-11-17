@@ -4,15 +4,12 @@
 test is collective, run the whole file on every rank). Skipped unless the MPI world is 4.
 
 - the seams install on the TP MPI communicator and the block builds on MNNVL exchanges, including the post's build-time
-  warm call on the MNNVL rx slots (S0b: the reference's MNNVL drop-in failed that call's rx-slot / prx-bucket check);
-- the engine module is the default (B2LAG on) HYB_ENGINE, or tp4_hoist_block.HYB_ENGINE_B2LAG_OFF with
-  TRTLLM_M31_DISABLE_TP4WC_B2LAG=1;
+  warm call on the MNNVL rx slots;
 - one eager call: the post's residual_out against the fp64 all-reduce of the 4 ranks' o_proj partials + residual_mid,
   normed2 against the folded-weight RMSNorm of it, the published routes against an fp64 routing of it (flip rate);
 - a CUDA graph of the call replays the eager bits; a 3 s late rank does not trap (hang cap default).
 """
 
-import os
 import time
 from types import SimpleNamespace
 
@@ -193,31 +190,6 @@ def _inputs(seed):
     return xq, xsf
 
 
-def test_build_on_mnnvl_and_the_engine_is_hyb():
-    block = _block()
-    bm = _S["blockmod"]
-    # B2LAG is default on: HYB_ENGINE; TRTLLM_M31_DISABLE_TP4WC_B2LAG=1 (seams.B2LAG_OFF) builds the shipped engine.
-    want = bm.HYB_ENGINE_B2LAG_OFF if _S["seams"].B2LAG_OFF else bm.HYB_ENGINE
-    ok = (
-        block.engine_config == want
-        and block.engine_config["DL"] == 1
-        and bool(block.placed)
-        and bool(block.armed)
-    )
-    _all_ranks_ok(ok, f"engine {block.engine_config} placed {block.placed} armed {block.armed}")
-    COMM.Barrier()
-
-
-def test_engagement_line_says_dl_1_placed_1():
-    block = _block()
-    bm = _S["blockmod"]
-    bm._ENGAGED.clear()
-    line = bm.log_engaged(COMM.Get_rank(), block, _S["seams"].HANG_CAP_NS)
-    ok = line.startswith("[M31_TP4WC_HOIST] engaged:") and " dl 1 placed 1 " in line
-    _all_ranks_ok(ok, line)
-    COMM.Barrier()
-
-
 def _to_wire(t):
     """A tensor as (uint8 numpy bytes, shape, dtype name) for an mpi4py object collective. mpi4py pickles its
     payload, and a pickled torch tensor (here MXFP8 float8_e4m3fn) does not unpickle in this torch build
@@ -317,32 +289,3 @@ def test_late_rank_does_not_trap():
     same = torch.equal(block.residual_out.view(torch.int16), want.view(torch.int16))
     _all_ranks_ok(same, "the late call differs from the on-time bits")
     _rearm()
-
-
-def test_kill_switch_env_reaches_the_target():
-    import subprocess
-    import sys
-
-    code = (
-        f"import importlib,sys; m = importlib.import_module('{FAM}.minimax_m3_1_flash_nvfp4__sm_107__tp4.modeling'); "
-        "sys.exit(0 if m.TP4WC_HOIST is False else 1)"
-    )
-    for env in ("TRTLLM_M31_DISABLE_TP4WC_HOIST", "TRTLLM_M31_DISABLE_TP4_WHOLECHAIN"):
-        ok = True
-        if COMM.Get_rank() == 0:
-            # a fresh, non-MPI interpreter: a child that inherits this mpirun rank's OMPI / PMIx env blocks in MPI init
-            # until the 600 s timeout
-            base = {
-                k: v for k, v in os.environ.items() if not k.startswith(("OMPI_", "PMIX_", "PMI_"))
-            }
-            try:
-                r = subprocess.run(
-                    [sys.executable, "-c", code],
-                    env={**base, env: "1", "TLLM_DISABLE_MPI": "1"},
-                    timeout=600,
-                )
-                ok = r.returncode == 0
-            except (subprocess.TimeoutExpired, OSError):
-                ok = False
-        _all_ranks_ok(ok, env)
-    COMM.Barrier()

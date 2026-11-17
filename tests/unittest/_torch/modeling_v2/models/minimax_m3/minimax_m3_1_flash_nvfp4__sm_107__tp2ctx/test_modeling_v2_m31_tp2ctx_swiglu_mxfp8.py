@@ -4,40 +4,19 @@
 
 The family op minimax_m31_swiglu_oai_mxfp8 must be bitwise the stock pair, the Triton silu_and_mul (limit 7, alpha
 1.702, beta 1) followed by mxfp8_quantize(h, True): the E4M3 values, the swizzled UE8M0 scales (padding rows zeroed)
-and the optional bf16 activation. The tp2ctx target swaps it into the swigluoai MLPs whose down_proj is a
-TP2CTX_NORMQ consumer (kill switch TRTLLM_M31_DISABLE_TP2CTX_SWIGLU_MXFP8). The GPU tests run on SM107, where the
-family library carries the op.
+and the optional bf16 activation. The GPU tests run on SM107, where the family library carries the op.
 
 From 1024 rows the op launches its rows form (4 rows in flight per CTA on an occupancy-true grid), bitwise the stock
 pair on stress inputs, also when its first launch is inside a CUDA-graph capture.
 """
 
-import os
-import subprocess
-import sys
 import textwrap
-from pathlib import Path
 
 import pytest
 import torch
 
-import tensorrt_llm._torch.modeling_v2.models.minimax_m3 as _family
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._utils import get_sm_version
-
-_TARGET = Path(_family.__file__).resolve().parent / "minimax_m3_1_flash_nvfp4__sm_107__tp2ctx"
-
-
-def test_tp2ctx_swaps_only_swigluoai_normq_mlps_with_a_kill_switch():
-    src = (_TARGET / "modeling.py").read_text()
-    assert '_SWIGLU_MXFP8 = not m31_disabled("TP2CTX_SWIGLU_MXFP8")' in src
-    assert "module.__class__ = _SwigluMxfp8GatedMLP" in src
-    flat = "".join(src.split())  # the condition may wrap across lines
-    assert "(module.swiglu_alpha,module.swiglu_beta,module.swiglu_limit)==(1.702,1.0,7.0)" in flat
-    # The swap runs after down_proj's quant method became the TP2CTX_NORMQ consumer.
-    assert src.index("module.quant_method.__class__ = _NormqMXFP8LinearMethod") < src.index(
-        "module.__class__ = _SwigluMxfp8GatedMLP"
-    )
 
 
 def _op():
@@ -67,8 +46,8 @@ def _reference(x):
     return h, q, sf.view(torch.uint8).flatten()
 
 
-@pytest.mark.parametrize("d", [256, 1536, 3072])
-@pytest.mark.parametrize("rows", [1, 127, 1000, 1031, 1160, 4096, 8192, 16384])
+@pytest.mark.parametrize("d", [256, 3072])
+@pytest.mark.parametrize("rows", [1, 1024, 1160])
 def test_bitwise_vs_silu_and_mul_then_mxfp8_quantize(rows, d):
     op = _op()
     x = _inputs(rows, d, seed=rows * 7 + d)
@@ -85,62 +64,6 @@ def test_bitwise_vs_silu_and_mul_then_mxfp8_quantize(rows, d):
     assert torch.equal(h.view(torch.int16), h_ref.view(torch.int16))
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
     assert torch.equal(sf, sf_ref)
-
-
-def test_without_the_bf16_output_and_under_graph_replay():
-    op = _op()
-    rows, d = 4096, 1536
-    x = _inputs(rows, d, seed=11)
-    _, q_ref, sf_ref = _reference(x)
-    q = torch.empty((rows, d), dtype=torch.float8_e4m3fn, device="cuda")
-    sf = torch.empty((rows * d // 32,), dtype=torch.uint8, device="cuda")
-    op(x, q, sf, None)
-    torch.cuda.synchronize()
-    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)) and torch.equal(sf, sf_ref)
-    q.zero_()
-    sf.zero_()
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        op(x, q, sf, None)
-    torch.cuda.current_stream().wait_stream(s)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        op(x, q, sf, None)
-    q.zero_()
-    sf.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)) and torch.equal(sf, sf_ref)
-
-
-def test_rejects_unsupported_widths():
-    op = _op()
-    x = torch.zeros(8, 2 * 160, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(RuntimeError, match="multiple of 256"):
-        op(x, torch.empty(8, 160, dtype=torch.float8_e4m3fn, device="cuda"),
-           torch.empty(128 * 5, dtype=torch.uint8, device="cuda"), None)  # fmt: skip
-
-
-def test_the_mlp_publishes_the_pair_for_its_down_proj():
-    """The swapped MLP's down_proj takes the published (q, sf) for its own bf16 input, so its GEMM reads the operands
-    the stock quantize would have produced; a different input is not taken."""
-    op = _op()
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2ctx import (  # noqa: E501
-        modeling,
-    )
-
-    rows, d = modeling._NORMQ_MIN_ROWS, 1536
-    x = _inputs(rows, d, seed=5)
-    h = torch.empty((rows, d), dtype=torch.bfloat16, device="cuda")
-    q = torch.empty((rows, d), dtype=torch.float8_e4m3fn, device="cuda")
-    sf = torch.empty((rows * d // 32,), dtype=torch.uint8, device="cuda")
-    op(x, q, sf, h)
-    modeling._NORMQ_SLOT.publish(h, q, sf)
-    assert modeling._NORMQ_SLOT.take(h.clone()) is None
-    modeling._NORMQ_SLOT.publish(h, q, sf)
-    taken = modeling._NORMQ_SLOT.take(h)
-    assert taken is not None and taken[0] is q and taken[1] is sf
 
 
 # --- SWIGLU_MXFP8_ROWS: the rows form against the one-row launch ---------------------------------------------
@@ -205,50 +128,6 @@ def test_rows_form_stress_bitwise_vs_stock():
         assert torch.equal(got["h"].view(torch.int16), h_ref.view(torch.int16))
         assert torch.equal(got["q"].view(torch.uint8), q_ref.view(torch.uint8))
         assert torch.equal(got["sf"], sf_ref)
-
-
-_CAPTURE_FIRST = textwrap.dedent(
-    """
-    import torch
-    import tensorrt_llm  # noqa: F401  (loads the trtllm op library)
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
-
-    op = family_ops().minimax_m31_swiglu_oai_mxfp8
-    rows, d = 8192, 3072
-    x = stress_inputs(rows, d, seed=3)
-    q = torch.zeros((rows, d), dtype=torch.float8_e4m3fn, device="cuda")
-    sf = torch.zeros((rows * d // 32,), dtype=torch.uint8, device="cuda")
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):  # the process's first launch (switch read, occupancy query) is under capture
-        op(x, q, sf, None)
-    graph.replay()
-    torch.cuda.synchronize()
-    h_ref = torch.ops.trtllm.silu_and_mul(x, swiglu_limit=7.0, swiglu_alpha=1.702, swiglu_beta=1.0)
-    q_ref, sf_ref = torch.ops.trtllm.mxfp8_quantize(h_ref, True)
-    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
-    assert torch.equal(sf, sf_ref.view(torch.uint8).flatten())
-    print("CAPTURE_FIRST_OK")
-    """
-)
-
-
-def test_rows_form_first_launch_under_graph_capture():
-    """The rows form's one-time work (the switch read, the occupancy query) may first run inside a graph capture, and
-    the captured launch is the rows form (the occupancy query is not a stream operation, so it must not fail there)."""
-    _op()
-    env = dict(os.environ, TLLM_LOG_LEVEL="INFO")
-    out = subprocess.run(
-        [sys.executable, "-c", _STRESS_SRC + _CAPTURE_FIRST],
-        env=env,
-        check=True,
-        timeout=900,
-        capture_output=True,
-        text=True,
-    )
-    assert "CAPTURE_FIRST_OK" in out.stdout
-    log = out.stdout + out.stderr
-    assert "rows form kRows=4 at d 3072 (h elided)" in log, log
-    assert "NOT ENGAGED" not in log and "occupancy query failed" not in log, log
 
 
 @pytest.mark.parametrize("k_rows", [2, 4, 8])

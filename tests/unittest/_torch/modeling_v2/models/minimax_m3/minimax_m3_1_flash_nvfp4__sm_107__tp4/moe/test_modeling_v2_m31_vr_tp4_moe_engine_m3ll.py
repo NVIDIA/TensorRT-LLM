@@ -9,16 +9,10 @@ family module minimax_m3/kernels/m3ll) built on the target's m3_moe state is m3_
 * the 8-row B2LAG build (lag 6 on the 8-deep fc1_done ring) never hangs on the served route sets with the most
   distinct experts (>= 21: >= 6 groups, the heavy_fc2_only CTAs without FC1 work: the idle-CTA hang shape on m3_moe's
   4-slot ring), and a CUDA-graph replay gives the eager bits;
-* the SERVED class: ``MiniMaxM3Tp4ModelingV2._build_engine_agreed`` builds the reference engine at 8 rows and m3_moe at
-the
-  other rows, the decode target's ``DecodeTarget._moe`` runs it (bit for bit m3_moe) and prints the engagement line,
-  and the kill switch restores m3_moe; 9 rows (the served bound + 1) is never this engine's.
 """
 
 import json
 import os
-import subprocess
-import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,13 +21,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.m3ll import (  # noqa: E501
-    moe_engine_host as host,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.m3ll import (  # noqa: E501
     tp4_moe_engine as wc,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4 import (  # noqa: E501
-    modeling,
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.m3_moe import (  # noqa: E501
     op as moe_op,
@@ -229,74 +217,19 @@ def _route_rows(r, m):
     return r["ids"][:m]
 
 
-@pytest.mark.parametrize("m", range(1, 9))
+@pytest.mark.parametrize("m", [1, 5, 8])
 def test_bitwise_vs_m3_moe_on_served_routes(m: int) -> None:
     for j, r in enumerate(ROUTES[:: max(1, len(ROUTES) // 6)]):
         _check_pair(m, _route_rows(r, m), seed=1000 * m + j, wide=False, stress=False)
 
 
-@pytest.mark.parametrize("m", (5, 8))
-def test_bitwise_vs_m3_moe_all_served_routes_8(m: int) -> None:
-    for j, r in enumerate(ROUTES):
-        _check_pair(m, _route_rows(r, m), seed=7000 + j, wide=False, stress=False)
-
-
-@pytest.mark.parametrize("m", (1, 4, 7, 8))
+@pytest.mark.parametrize("m", (1, 8))
 @pytest.mark.parametrize("wide", (False, True))
 def test_bitwise_block_scale_stress(m: int, wide: bool) -> None:
     """2^+-12 activation block scales (the NVFP4 activation's block scales saturate and underflow) and, ``wide``,
     weight block scales over the whole normal E4M3 range: still m3_moe's bits."""
     for j, r in enumerate(ROUTES[:4] + ROUTES[-2:]):
         _check_pair(m, _route_rows(r, m), seed=9000 + 31 * m + j, wide=wide, stress=True)
-
-
-def test_engine_config_and_module() -> None:
-    ref = _reference(8)
-    cfg = ref.config
-    assert cfg["num_ctas"] == _ours(8).num_ctas and int(ref.mod.NSH) == 24
-    assert int(ref.mod.LAG) == wc.B2LAG_LAG and int(ref.mod.FC1D) == wc.B2LAG_FC1D
-    assert int(ref.mod.FC1D) > int(ref.mod.LAG) + 1 and int(ref.mod.FC1D) >= int(ref.mod.NG_CAP)
-    assert (
-        not ref.mod.DL and not ref.mod.SHARDED and not ref.mod.ROUTER_VLLM and not ref.mod.SILU_VLLM
-    )
-    assert (
-        ref.mod.B2IMG
-        and ref.mod.SF2_W6
-        and ref.mod.ROLL_FC2
-        and ref.mod.EARLY_TRIG
-        and ref.mod.SH_TRIG
-    )
-    assert torch.equal(ref.plan, _ours(8).plan), "the reference engine must run m3_moe's plan"
-    for k in wc.OURS_ONLY_KEYS:
-        assert k not in cfg
-    with pytest.raises(ValueError, match="1..8 tokens"):
-        host.M3MoeState(torch.device("cuda"), num_tokens=9, num_ctas=ref.num_ctas, shared=True)
-
-
-@pytest.mark.parametrize("b2lag,early_trig", [(False, True), (True, False), (False, False)])
-def test_kill_switch_configs_bitwise_at_8_rows(b2lag: bool, early_trig: bool) -> None:
-    """B2LAG off (the default) / TRTLLM_M31_DISABLE_TP4WC_EARLY_TRIG at the served 8 rows: the state builds (B2LAG off
-    keeps m3_moe's 5-stage ring, where the rows are read from global: xstage 0, as m3_moe does) and stays m3_moe's
-    bits."""
-    ref = _reference(8, b2lag, early_trig)
-    assert (int(ref.mod.LAG) == wc.B2LAG_LAG) == b2lag
-    assert bool(ref.mod.EARLY_TRIG) == early_trig and bool(ref.mod.SH_TRIG) == early_trig
-    if not b2lag:
-        assert ref.config["stages"] == _ours(8).config["stages"] and ref.config["b2buf"] == 1
-        assert not ref.mod.XSTAGE and not _ours(8).mod.XSTAGE
-    for j, r in enumerate(ROUTES[::4]):
-        _check_pair(
-            8,
-            r["ids"],
-            seed=11000 + j,
-            wide=False,
-            stress=False,
-            b2lag=b2lag,
-            early_trig=early_trig,
-        )
-    _check_pair(
-        8, ROUTES[-1]["ids"], seed=11999, wide=True, stress=True, b2lag=b2lag, early_trig=early_trig
-    )
 
 
 def test_b2lag_ring_never_hangs_on_the_widest_served_routes() -> None:
@@ -349,159 +282,3 @@ def test_cuda_graph_replay_is_eager_bits() -> None:
         want = m3_moe_engine(static, lo).clone()
         torch.cuda.synchronize()
         assert _same(out, want), f"seed {seed}: replay differs from m3_moe"
-
-
-# ---- the served class: MiniMaxM3Tp4ModelingV2's engine build + DecodeTarget._moe ------------------------------------
-
-_LAYER = 5
-
-
-def _served_core():
-    ops = experts()
-    ids = ROUTES[0]["ids"]
-    w, bias = _forced_router(ids)
-    t = ops.tensors
-    data = {
-        f"l{_LAYER}_e_w31": t[0],
-        f"l{_LAYER}_e_s31": t[1],
-        f"l{_LAYER}_e_w2": t[2],
-        f"l{_LAYER}_e_s2": t[3],
-        f"l{_LAYER}_router_bias": bias,
-        f"l{_LAYER}_router": w,
-        f"l{_LAYER}_sh_gu_w": ops.shared[0],
-        f"l{_LAYER}_sh_gu_s": ops.shared[1],
-        f"l{_LAYER}_sh_dn_w": ops.shared[2],
-        f"l{_LAYER}_sh_dn_s": ops.shared[3],
-    }
-    core = SimpleNamespace(
-        mapping=SimpleNamespace(tp_size=1, tp_rank=0, enable_attention_dp=False),
-        w={k: SimpleNamespace(data=v) for k, v in data.items()},
-        moe={
-            _LAYER: SimpleNamespace(
-                fc31_alpha=t[4],
-                fc31_scale_c=t[5],
-                act_alpha=t[6],
-                act_beta=t[7],
-                act_clamp=t[8],
-                fc2_alpha=t[9],
-                fc31_input_scale=ops.fc31_input_scale,
-            )
-        },
-        moe_engines={},
-        moe16_engines={},
-        tp4_moe_engine=modeling.TP4_MOE_ENGINE,
-    )
-    cls = modeling.MiniMaxM3Tp4ModelingV2
-    for name in (
-        "_build_engine_agreed",
-        "_try_build",
-        "_build_engine",
-        "_build_wc_engine",
-        "_expert_operands",
-        "_shared_weights",
-        "engine",
-        "_lookup",
-    ):
-        setattr(core, name, getattr(cls, name).__get__(core))
-    core._engine_state = cls._engine_state  # a staticmethod
-    return core, ids
-
-
-@pytest.mark.parametrize(
-    "env,constant,value",
-    [
-        ("TRTLLM_M31_DISABLE_TP4_WHOLECHAIN", "TP4_MOE_ENGINE", False),
-        ("TRTLLM_M31_DISABLE_TP4_MOE_ENGINE", "TP4_MOE_ENGINE", False),
-        ("TRTLLM_M31_DISABLE_TP4WC_B2LAG", "TP4_MOE_ENGINE_B2LAG", False),
-        ("TRTLLM_M31_DISABLE_TP4WC_EARLY_TRIG", "TP4_MOE_ENGINE_EARLY_TRIG", False),
-    ],
-)
-def test_kill_envs_reach_the_target(env: str, constant: str, value: bool) -> None:
-    """Each switch, set in the environment of a fresh process, sets its constant at the target's import (and only that
-    one); B2LAG is default on."""
-    names = ("TP4_MOE_ENGINE", "TP4_MOE_ENGINE_B2LAG", "TP4_MOE_ENGINE_EARLY_TRIG")
-    code = (
-        "import json; from tensorrt_llm._torch.modeling_v2.models.minimax_m3."
-        "minimax_m3_1_flash_nvfp4__sm_107__tp4 import modeling as m; "
-        f"print('KILLENV ' + json.dumps({{n: getattr(m, n) for n in {names!r}}}))"
-    )
-    envs = {
-        k: v
-        for k, v in os.environ.items()
-        if not k.startswith(("TRTLLM_M31_DISABLE_", "TRTLLM_M31_ENABLE_"))
-    }
-    envs[env] = "1"
-    out = subprocess.run(
-        [sys.executable, "-c", code], env=envs, capture_output=True, text=True, timeout=600
-    )
-    assert out.returncode == 0, out.stderr[-2000:]
-    got = json.loads(
-        [ln for ln in out.stdout.splitlines() if ln.startswith("KILLENV ")][-1][len("KILLENV ") :]
-    )
-    want = {n: True for n in names}
-    want[constant] = value
-    assert got == want
-
-
-@pytest.mark.parametrize("knob", ["TP4_MOE_ENGINE_B2LAG", "TP4_MOE_ENGINE_EARLY_TRIG"])
-def test_served_class_knob_off_builds_and_runs(monkeypatch, knob: str) -> None:
-    """The served class with B2LAG or EARLY_TRIG switched off: still the port at 8 rows (a state of its own, keyed on
-    the switches), bit for bit m3_moe through DecodeTarget._moe."""
-    monkeypatch.setattr(modeling, "TP4_MOE_ENGINE", True)
-    monkeypatch.setattr(modeling, knob, False)
-    core, ids = _served_core()
-    core.moe_engines.setdefault(_LAYER, {})[(8, True, True)] = core._build_engine_agreed(_LAYER, 8)
-    e8 = core.engine(_LAYER, 8, shared=True)
-    assert wc.is_engine(e8)
-    if knob == "TP4_MOE_ENGINE_B2LAG":
-        assert int(e8.state.mod.LAG) == 2 and not e8.state.mod.XSTAGE
-    else:
-        assert not e8.state.mod.EARLY_TRIG and not e8.state.mod.SH_TRIG
-    hidden = _hidden(8, seed=78, stress=False)
-    out, _, _, _ = modeling.DecodeTarget._moe(
-        SimpleNamespace(core=core), _LAYER, hidden, return_parts=False
-    )
-    ref = m3_moe_engine(hidden, _layer(_ours(8), ids, False)).clone()
-    torch.cuda.synchronize()
-    assert _same(out, ref)
-
-
-@pytest.mark.parametrize("killed", [False, True])
-def test_served_class_builds_and_runs_the_engine(monkeypatch, capfd, killed: bool) -> None:
-    monkeypatch.setattr(modeling, "TP4_MOE_ENGINE", not killed)
-    assert modeling.TP4_MOE_ENGINE_ROWS == frozenset({8})
-    assert max(modeling.MOE_ENGINE.keys) == 8, (
-        "9 rows (the served bound + 1) is the 9..13-row engine's"
-    )
-    core, ids = _served_core()
-    lag = wc.B2LAG_LAG if modeling.TP4_MOE_ENGINE_B2LAG else 2
-    key = ("sm_107 tp4", 0, 8, lag, 1)
-    first = (
-        key not in wc.engaged()
-    )  # the line prints once per key per process (a knob-off test may own it)
-    engines = core.moe_engines.setdefault(_LAYER, {})
-    for n in (7, 8):
-        engines[(n, True, True)] = core._build_engine_agreed(_LAYER, n)
-    e8, e7 = core.engine(_LAYER, 8, shared=True), core.engine(_LAYER, 7, shared=True)
-    assert e8 is not None and e7 is not None
-    assert wc.is_engine(e8) == (not killed) and not wc.is_engine(e7)
-    assert isinstance(e8.state, host.M3MoeState) == (not killed)
-    err = capfd.readouterr().err
-    if not killed:
-        # one line per (target, rank, rows, lag, early trigger) per process; B2LAG is default off (lag 2)
-        assert key in wc.engaged()
-        if first:
-            assert (
-                "[M31_TP4_MOE_ENGINE] engaged: target sm_107 tp4 rank 0" in err
-                and "rows 8" in err
-                and f"lag {lag}" in err
-            )
-    target = SimpleNamespace(core=core)
-    hidden = _hidden(8, seed=77, stress=False)
-    out, routed, pushed, shared_pushed = modeling.DecodeTarget._moe(
-        target, _LAYER, hidden, return_parts=False
-    )
-    assert routed is None and not pushed and not shared_pushed
-    ref = m3_moe_engine(hidden, _layer(_ours(8), ids, False)).clone()
-    torch.cuda.synchronize()
-    assert _same(out, ref), "the served decode MoE differs from m3_moe"

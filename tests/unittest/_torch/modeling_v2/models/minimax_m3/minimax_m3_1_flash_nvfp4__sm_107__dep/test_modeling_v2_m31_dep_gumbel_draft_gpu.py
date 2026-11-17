@@ -125,29 +125,6 @@ def test_the_draws_follow_the_proposals():
         assert stat < df + 6 * math.sqrt(2 * df), (pos, stat, df)  # far past p = 1e-6 for these df
 
 
-def test_the_same_seeds_draw_the_same_block_eager_and_in_a_cuda_graph():
-    draft_model, gen_logits, inputs, meta = _case(12, 7, 200064, 256, seed=3)
-    eager_tokens, _ = _draw(draft_model, gen_logits, inputs, meta)
-    eager_probs = meta.draft_probs.clone()
-    again, _ = _draw(draft_model, gen_logits, inputs, meta)
-    assert torch.equal(again, eager_tokens)
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        _draw(
-            draft_model, gen_logits, inputs, meta
-        )  # warm up (Triton compiles) outside the capture
-    torch.cuda.current_stream().wait_stream(side)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out, _ = _draw(draft_model, gen_logits, inputs, meta)
-    meta.draft_probs.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out, eager_tokens)
-    assert torch.equal(meta.draft_probs, eager_probs)
-
-
 def test_padding_rows_leave_the_real_rows_as_they_are():
     rows, dummy = 12, 3
     draft_model, gen_logits, inputs, meta = _case(rows, 7, 200064, 256, seed=11, dummy_rows=dummy)

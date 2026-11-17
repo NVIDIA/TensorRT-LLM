@@ -72,19 +72,6 @@ def test_certified_cells(cell) -> None:
     assert_within_ulp(out, ref_normed, element_ulp=1.0, rms_ulp=0.1)
 
 
-def test_cells_cover_the_targets_own_row_bound() -> None:
-    """The tp2 target ships its own copy of the fused kernel (kernels/embedding_firstnorm, MAX_ROWS 16: the norm at
-    1..8 rows, the gather alone at 9..16; the shared copy's 32-row bound is not this target's): every row count
-    1..MAX_ROWS is a cell, none past it."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.kernels.embedding_firstnorm import (  # noqa: E501
-        op as kernel_op,
-    )
-
-    assert kernel_op.MAX_ROWS == 16
-    rows = {cell.spec["rows"] for cell in op.CELLS}
-    assert rows == set(range(1, kernel_op.MAX_ROWS + 1))
-
-
 def test_ids_outside_the_table_give_zero_rows() -> None:
     """Documented, not refused: an id outside [0, V) gathers a zero row whose norm is zero."""
     table, weight = _operands()

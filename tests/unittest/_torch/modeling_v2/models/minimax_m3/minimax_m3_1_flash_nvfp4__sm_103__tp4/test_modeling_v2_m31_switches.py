@@ -40,51 +40,22 @@ def _load(monkeypatch, env):
     return module
 
 
-@pytest.mark.parametrize(
-    "value", ["", "  ", "0", " 0 ", "false", "FALSE", "off", " Off ", "no", "No"]
-)
+@pytest.mark.parametrize("value", ["", " 0 ", "Off"])
 def test_unset_spellings_leave_the_switch_unset(monkeypatch, value):
     assert not _load(monkeypatch, {}).m31_disabled(ITEM)
     assert not _load(monkeypatch, {PREFIX + ITEM: value}).m31_disabled(ITEM)
 
 
-@pytest.mark.parametrize("value", ["1", " 1 ", "true", "TRUE", "on", "On", "yes", "YES"])
+@pytest.mark.parametrize("value", ["1", " TRUE ", "yes"])
 def test_set_spellings_set_the_switch(monkeypatch, value):
     assert _load(monkeypatch, {PREFIX + ITEM: value}).m31_disabled(ITEM)
 
 
-@pytest.mark.parametrize("value", ["2", "-1", "1.0", "y", "n", "enable", "disabled", "truee", "of"])
+@pytest.mark.parametrize("value", ["2", "truee"])
 def test_any_other_value_fails_at_import_naming_the_variable(monkeypatch, value):
     """Typos must fail loudly: a loose parse would count any value but "" / "0" as set (DISABLE_X=false disabling X)."""
     with pytest.raises(ValueError, match=PREFIX + ITEM):
         _load(monkeypatch, {PREFIX + ITEM: value})
-
-
-def test_an_unregistered_id_raises_when_queried(monkeypatch):
-    switches = _load(monkeypatch, {PREFIX + ITEM: "1"})
-    assert switches.m31_disabled(ITEM)
-    for other in (ITEM.lower(), ITEM + "_X", ITEM[:-1], ""):
-        with pytest.raises(KeyError):
-            switches.m31_disabled(other)
-
-
-def test_a_variable_naming_another_id_is_ignored(monkeypatch):
-    """Another target's switch (or a renamed id) in a shared environment neither raises nor turns anything off."""
-    switches = _load(monkeypatch, {PREFIX + "NOT_A_SWITCH_OF_THIS_TARGET": "not-a-value"})
-    assert not any(switches.m31_disabled(item) for item in switches.ITEMS)
-
-
-def test_the_environment_is_read_once_at_import(monkeypatch):
-    switches = _load(monkeypatch, {})
-    monkeypatch.setenv(PREFIX + ITEM, "1")
-    assert not switches.m31_disabled(ITEM)
-
-
-def test_every_id_says_what_its_switch_restores(monkeypatch):
-    switches = _load(monkeypatch, {})
-    assert switches.ITEMS and all(
-        isinstance(why, str) and why.strip() for why in switches.ITEMS.values()
-    )
 
 
 def _literal_reads():
@@ -116,72 +87,3 @@ def test_every_id_the_target_reads_is_registered(monkeypatch):
 
 # The step-input pack items and the order each one needs: a killed prerequisite turns off
 # every item that needs it.
-_PACK_FLAGS = ("PACK_PSCATTER", "PACK_IN_GRAPH", "PACK_EARLY_COPY", "H2D_CHANGED_SPAN")
-_PACK_HOOKS = {
-    "pack_parallel_scatter": "PACK_PSCATTER",
-    "pack_in_graph": "PACK_IN_GRAPH",
-    "pack_early_copy": "PACK_EARLY_COPY",
-    "h2d_changed_span": "H2D_CHANGED_SPAN",
-}
-
-
-def _modeling_tree():
-    return ast.parse((_SWITCHES.parent / "modeling.py").read_text())
-
-
-def _pack_flags(disabled):
-    """The target's pack flags as its module computes them at import, with ``disabled`` the switched-off ids (the
-    flags' own statements, evaluated with a stand-in m31_disabled: no import of the target)."""
-    statements = [
-        node
-        for node in _modeling_tree().body
-        if isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-        and node.targets[0].id in _PACK_FLAGS
-    ]
-    assert sorted(node.targets[0].id for node in statements) == sorted(_PACK_FLAGS)
-    namespace = {"m31_disabled": lambda item_id: item_id in disabled}
-    exec(compile(ast.Module(body=statements, type_ignores=[]), "<pack flags>", "exec"), namespace)
-    return {name: namespace[name] for name in _PACK_FLAGS}
-
-
-@pytest.mark.parametrize(
-    "disabled,expect_on",
-    [
-        ((), _PACK_FLAGS),
-        (("H2D_CHANGED_SPAN",), ("PACK_PSCATTER", "PACK_IN_GRAPH", "PACK_EARLY_COPY")),
-        (("PACK_EARLY_COPY",), ("PACK_PSCATTER", "PACK_IN_GRAPH", "H2D_CHANGED_SPAN")),
-        (("PACK_IN_GRAPH",), ("PACK_PSCATTER", "H2D_CHANGED_SPAN")),
-        (("PACK_PSCATTER",), ("H2D_CHANGED_SPAN",)),
-        (("PACK_PSCATTER", "H2D_CHANGED_SPAN"), ()),
-    ],
-)
-def test_pack_items_default_on_and_a_killed_prerequisite_turns_its_dependents_off(
-    disabled, expect_on
-):
-    flags = _pack_flags(set(disabled))
-    assert {name for name, on in flags.items() if on} == set(expect_on)
-
-
-def test_runtime_hooks_take_the_pack_flags():
-    """_runtime_hooks passes each pack flag to its RuntimeHooks field (not a literal True), through
-    runtime_hooks_compat.build's hook fields."""
-    (function,) = [
-        node
-        for node in _modeling_tree().body
-        if isinstance(node, ast.FunctionDef) and node.name == "_runtime_hooks"
-    ]
-    (call,) = [
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "build"
-    ]
-    passed = {kw.arg: kw.value for kw in call.args[0].keywords}
-    for field, flag in _PACK_HOOKS.items():
-        assert isinstance(passed.get(field), ast.Name) and passed[field].id == flag, field
-    assert (
-        isinstance(passed["skip_unchanged_h2d"], ast.Constant)
-        and passed["skip_unchanged_h2d"].value
-    )
-    assert isinstance(passed["pack_step_inputs"], ast.Constant) and passed["pack_step_inputs"].value

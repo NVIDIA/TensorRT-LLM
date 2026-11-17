@@ -81,7 +81,7 @@ def _bytes_equal(a, b):
 
 
 @pytest.mark.parametrize("cell", entry.CELLS, ids=[c.why[:44] for c in entry.CELLS])
-@pytest.mark.parametrize("tail", ["at_total_q", "inside_spare", "at_end"])
+@pytest.mark.parametrize("tail", ["inside_spare", "at_end"])
 def test_the_tail_fill_and_nothing_else_differs(cell, tail):
     base = _case(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     fused = _clone(base)

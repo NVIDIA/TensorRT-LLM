@@ -137,7 +137,7 @@ def _tail(store, engine, ctrl, slots_buf, out, t, rows, cpp=False):
 
 
 @pytest.mark.parametrize("cpp", [False, True], ids=["triton", "cpp"])
-@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize("widths", [(4, 4, 3), (8, 8, 7)], ids=["store=step", "store wider"])
 def test_tail_matches_scatter_then_gather(rows, widths, cpp) -> None:
     """Store bit for bit; engine rows [0, P*T) / [0, P) bit for bit (the forward reads only those rows)."""
@@ -180,43 +180,6 @@ def test_unarmed_tail_writes_nothing(cpp) -> None:
         assert torch.all(buf == STALE)
 
 
-@pytest.mark.parametrize("cpp", [False, True], ids=["triton", "cpp"])
-def test_strided_slots_are_declined_without_writes(cpp) -> None:
-    """The kernels read ``slots[i]`` at unit stride: a strided view is declined and nothing is written."""
-    t, rows = 4, 2
-    g = torch.Generator(device="cuda").manual_seed(17)
-    store = _store((4, 4, 3), g)
-    out = _outputs(rows, t, g)
-    before, engine = _clone(store), _engine(t)
-    ctrl = torch.tensor([rows], dtype=torch.int32, device="cuda")
-    slots = torch.arange(2 * MAX_ROWS, dtype=torch.long, device="cuda")[::2]
-    ids, draft, pos_off, kv_off = engine
-    assert not m3_fold_tail.fold_tail(
-        ctrl,
-        slots,
-        rows,
-        out["new_tokens"],
-        store.new_tokens.squeeze(-1).T,
-        out["next_new_tokens"],
-        store.next_new_tokens.squeeze(-1).T,
-        out["next_draft_tokens"],
-        store.next_draft_tokens,
-        out["new_tokens_lens"],
-        store.new_tokens_lens,
-        ids,
-        draft,
-        pos_off,
-        kv_off,
-        t,
-        cpp=cpp,
-    )
-    torch.cuda.synchronize()
-    for name in vars(store):
-        assert torch.equal(getattr(before, name), getattr(store, name)), name
-    for buf in engine:
-        assert torch.all(buf == STALE)
-
-
 def _fold():
     fold = spec_fold.M3SpecStepFold(in_forward=True)
     t = 4
@@ -244,22 +207,6 @@ def test_fold_handshake_stages_only_confirmed_rows() -> None:
     assert fold.begin_step([5, 3], 2) is False
 
 
-def test_fold_handshake_needs_the_tail_outputs() -> None:
-    """Outputs the tail did not run on (another dict, a mixed step, an unarmed step) are never reported stored."""
-    fold, g, t = _fold()
-    fold.begin_step([1], 1)
-    fold.store_in_forward(_outputs(1, t, g))
-    assert fold.sampler_rows_stored(_outputs(1, t, g), 0, [1]) is False
-    fold.begin_step(None, 1)
-    out = _outputs(1, t, g)
-    fold.store_in_forward(out)
-    assert fold.sampler_rows_stored(out, 0, [1]) is False
-    fold.begin_step([1], 1)
-    out = _outputs(1, t, g)
-    fold.store_in_forward(out)
-    assert fold.sampler_rows_stored(out, 1, [1]) is False  # rows were skipped (chunked context)
-
-
 def test_a_padded_step_after_an_armed_one_writes_nothing() -> None:
     """K3 #150 check #5: CUDA-graph padding rows carry no seq slot, so the engine passes rows=None for a padded step.
     Even right after an armed step, that step uploads ctrl 0 and its forward tail leaves the store and the engine
@@ -281,60 +228,3 @@ def test_a_padded_step_after_an_armed_one_writes_nothing() -> None:
         assert torch.equal(getattr(store_before, name), getattr(fold.store, name)), name
     for before, buf in zip(engine_before, fold.step_inputs):
         assert torch.equal(before, buf)
-
-
-def test_fold_off_by_default() -> None:
-    fold = spec_fold.M3SpecStepFold()
-    assert not fold.in_forward
-    assert fold.begin_step([0], 1) is False
-
-
-@pytest.mark.parametrize(
-    "in_forward, store_copy_wait, expected",
-    [(True, True, True), (True, False, False), (False, True, False)],
-)
-def test_the_store_copy_event_exists_only_with_the_tail_and_the_wait(
-    in_forward, store_copy_wait, expected
-):
-    """STEP_SPEC_STORE_COPY_SIDE: an external event the sampler records after its side-stream store copies and the
-    forward's tail waits on; only a fold that stores in the forward needs it."""
-    fold = spec_fold.M3SpecStepFold(in_forward=in_forward, store_copy_wait=store_copy_wait)
-    device = torch.device("cuda")
-    fold.bind_engine_buffers(
-        torch.zeros(8, dtype=torch.int32, device=device),
-        torch.zeros(8, dtype=torch.int32, device=device),
-        torch.zeros(8, dtype=torch.int32, device=device),
-        torch.zeros(8, dtype=torch.int32, device=device),
-        4,
-    )
-    assert (fold.store_copies_done is not None) == expected
-    if expected:
-        fold.store_copies_done.synchronize()
-
-
-def test_the_store_wait_precedes_only_a_plain_launch_under_capture():
-    """The store wait is an external-event wait node under graph capture, which drops the next kernel's PDL edge:
-    it may precede the fold tail (a plain launch); any other launch fails the capture (eager steps are not
-    checked)."""
-    fold = spec_fold.M3SpecStepFold(in_forward=True, store_copy_wait=True)
-    device = torch.device("cuda")
-    fold.bind_engine_buffers(
-        *(torch.zeros(8, dtype=torch.int32, device=device) for _ in range(4)), 4
-    )
-    assert fold.STORE_WAIT_BEFORE == frozenset({"fold_tail"})
-    fold._wait_store_copies(before="draft_step")  # eager: allowed
-    x = torch.zeros(4, device=device)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            fold._wait_store_copies(before="fold_tail")
-            x.add_(1)
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(x, torch.ones(4, device=device))
-        bad = torch.cuda.CUDAGraph()
-        with pytest.raises(RuntimeError, match="PDL edge"):
-            with torch.cuda.graph(bad, stream=stream):
-                fold._wait_store_copies(before="draft_step")

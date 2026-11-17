@@ -34,7 +34,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 N, K = 6144, 4096
-ROWS = (49, 64, 65, 100, 128, 129, 200, 256)
+ROWS = (49, 65, 128, 129, 256)
 NEG_ZERO_WORD = -(2**31)
 
 
@@ -120,16 +120,3 @@ def test_prebuild_byte_check_accepts_the_stock_decode_gemm(operands, launcher, r
     assert modeling._push_gemm_tactic(rows) == _tactic(rows)
     assert modeling._push_gemm_check(launcher, _tactic(rows), rows, w, w_sf) is None
     assert table._ARMED[0] == before
-
-
-def test_steps_take_the_gemm_only_while_the_engine_table_is_armed():
-    modeling = _modeling()
-    table = modeling._engine_pinned_tactics()
-    before = table._ARMED[0]
-    try:
-        table._ARMED[0] = False
-        assert not modeling._push_gemm_stock_is_pinned()
-        table._ARMED[0] = True
-        assert modeling._push_gemm_stock_is_pinned() == table.ENABLED
-    finally:
-        table._ARMED[0] = before

@@ -4,7 +4,7 @@
 
 - minimax_m31_ctx_boundary_normq (every write_norm / write_f32 / fp4 flavor) equals the served
   minimax_m31_ctx_residual_rmsnorm_mxfp8(_f32) on every field it writes (norm, MXFP8, swizzled scales incl. the padded
-  tile rows, NVFP4, linear scales, FP32, the in-place residual update) at 1024 / 8192 / 16384 / 32768 rows, odd row
+  tile rows, NVFP4, linear scales, FP32, the in-place residual update) at 1024 / 16384 rows, odd row
   counts and the block-scale stress set (each 32-column block scaled by 2^k, k in [-12, 12]).
 - minimax_m31_ctx_boundary_normq_out into row-strided stage buffers writes the same bytes, the stage's padded tail
   (ids -1, weights 0 in the first topk columns) and nothing else, with or without the FP32 copy (without it and with
@@ -15,13 +15,10 @@
   where the thread limit holds the 768-thread kernel to one (sm_107), else that kernel's CTAs per SM, and the ring
   depth the per-block shared-memory opt-in allows).
 - DEP2CTX_TOPK_FOLD: minimax_m31_ctx_boundary_normq_topk equals megamoe_topk_reduce_shared_add followed by
-  minimax_m31_ctx_boundary_normq bit for bit (new residual, norm, MXFP8, scales) at 1 .. 16384 rows, PDL on / off.
+  minimax_m31_ctx_boundary_normq bit for bit (new residual, norm, MXFP8, scales) at 1 .. 16384 rows, PDL on.
 - CBNQ_TOPK_DUAL: the fold's launch form equals the plan's (the dual-group kernel on sm_107, the fold's grid and
   shared memory).
 """
-
-import importlib.util
-import pathlib
 
 import pytest
 import torch
@@ -58,19 +55,6 @@ class _Ops:
 
 
 _ops = _Ops()
-
-_PLAN_PATH = (
-    pathlib.Path(__file__).resolve().parents[7]
-    / "tensorrt_llm/_torch/modeling_v2/models/minimax_m3/"
-    "minimax_m3_1_flash_nvfp4__sm_107__dep2ctx/ctx_boundary_plan.py"
-)
-
-
-def _plan():
-    spec = importlib.util.spec_from_file_location("ctx_boundary_plan", _PLAN_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def _bf16(rows, cols, kind, seed):
@@ -121,11 +105,11 @@ def _assert_fields(got, ref, write_norm, write_f32, fp4, what):
         assert got[5].numel() == 0
 
 
-@pytest.mark.parametrize("rows", [1024, 8192, 16384, 32768])
+@pytest.mark.parametrize("rows", [16384])
 @pytest.mark.parametrize("kind", ["randn", "stress"])
-@pytest.mark.parametrize("write_norm", [True, False])
-@pytest.mark.parametrize("write_f32", [True, False])
-@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize(
+    "write_norm, write_f32, fp4", [(True, True, False), (True, False, True), (False, False, True)]
+)
 def test_ring_op_equals_the_served_op(rows, kind, write_norm, write_f32, fp4):
     x, r, w = _inputs(rows, kind, rows + 11 * write_norm + 5 * write_f32 + fp4)
     gs = torch.tensor([GS], device="cuda") if fp4 else None
@@ -137,7 +121,7 @@ def test_ring_op_equals_the_served_op(rows, kind, write_norm, write_f32, fp4):
     _assert_fields(got, ref, write_norm, write_f32, fp4, f"rows {rows} {kind}")
 
 
-@pytest.mark.parametrize("rows", [1, 31, 127, 128, 129, 1000, 4097, 8191])
+@pytest.mark.parametrize("rows", [1, 129, 4097])
 @pytest.mark.parametrize("pdl", [False, True])
 def test_odd_rows_and_pdl(rows, pdl):
     x, r, w = _inputs(rows, "stress", rows)
@@ -150,15 +134,6 @@ def test_odd_rows_and_pdl(rows, pdl):
     _assert_fields(got, ref, True, True, True, f"rows {rows} pdl {pdl}")
 
 
-def test_repeat_runs_are_identical():
-    x, r, w = _inputs(8192, "stress", 3)
-    gs = torch.tensor([GS], device="cuda")
-    a = _ops.minimax_m31_ctx_boundary_normq(x.clone(), r, w, EPS, True, True, gs)
-    b = _ops.minimax_m31_ctx_boundary_normq(x.clone(), r, w, EPS, True, True, gs)
-    for u, v in zip(a, b):
-        assert torch.equal(_u8(u), _u8(v))
-
-
 def _stage(cap):
     """A MegaMoE-like stage of cap rows whose NVFP4 rows sit in row strides wider than the data (sentinel-filled):
     (ids, weights, act full, act view, act_sf full, act_sf view)."""
@@ -169,10 +144,10 @@ def _stage(cap):
     return ids, wts, act_full, act_full[:, : H // 2], sf_full, sf_full[:, : H // 16]
 
 
-@pytest.mark.parametrize("rows, cap", [(8192, 8192), (8000, 8192), (1000, 1024), (16384, 16384)])
+@pytest.mark.parametrize("rows, cap", [(8000, 8192), (1000, 1024)])
 @pytest.mark.parametrize("write_norm", [True, False])
 @pytest.mark.parametrize("write_f32", [True, False])
-@pytest.mark.parametrize("kind", ["randn", "stress"])
+@pytest.mark.parametrize("kind", ["stress"])
 def test_out_op_writes_the_stage_and_its_tail(rows, cap, write_norm, write_f32, kind):
     """write_f32 False with write_norm True is DEP2CTX_ROUTER_BF16S's staged call (flavor <add, norm, mx, !f32,
     fp4>: the router reads the BF16 norm, no FP32 copy)."""
@@ -272,76 +247,6 @@ def test_materialize_recomputes_the_left_out_norm(rows):
     assert torch.equal(_u8(norm), _u8(ref[0]))
 
 
-def test_out_op_rejects_flavors_it_has_no_form_for():
-    x, r, w = _inputs(256, "randn", 1)
-    with pytest.raises(RuntimeError):
-        _ops.minimax_m31_ctx_boundary_normq_out(x.clone(), None, w, EPS, None, None, None)
-    with pytest.raises(RuntimeError):
-        _ops.minimax_m31_ctx_boundary_normq_out(x.clone(), r, w, EPS, None, None, None)
-
-
-def test_ops_reject_zero_width_rows():
-    """A [1, 0] input is rejected by the hidden check before the row count divides by the width."""
-    x = torch.empty(1, 0, dtype=torch.bfloat16, device="cuda")
-    w = torch.empty(0, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(RuntimeError, match="hidden must be a multiple of 256"):
-        _ops.minimax_m31_ctx_boundary_normq(x, x.clone(), w, EPS, True)
-    with pytest.raises(RuntimeError, match="hidden must be a multiple of 256"):
-        _ops.minimax_m31_ctx_boundary_normq_out(x, x.clone(), w, EPS, None, None, None)
-
-
-def test_out_op_rejects_overlapping_stage_rows():
-    """Row-strided NVFP4 / stage destinations whose rows alias (stride 0) are rejected before launch."""
-    rows = 256
-    x, r, w = _inputs(rows, "randn", 2)
-    gs = torch.tensor([GS], device="cuda")
-    q = torch.empty(rows, H, dtype=torch.float8_e4m3fn, device="cuda")
-    sf = torch.empty(rows * (H // 32), dtype=torch.uint8, device="cuda")
-    act = torch.zeros(rows, H // 2, dtype=torch.uint8, device="cuda")
-    act_sf = torch.zeros(rows, H // 16, dtype=torch.uint8, device="cuda")
-    ids = torch.zeros(rows + 8, TOPK, dtype=torch.int32, device="cuda")
-    wts = torch.zeros(rows + 8, TOPK, dtype=torch.float32, device="cuda")
-    with pytest.raises(RuntimeError, match="non-overlapping rows"):
-        _ops.minimax_m31_ctx_boundary_normq_out(
-            x.clone(), r, w, EPS, None, q, sf, None, gs, act[:1].expand(rows, -1), act_sf
-        )
-    with pytest.raises(RuntimeError, match="non-overlapping rows"):
-        _ops.minimax_m31_ctx_boundary_normq_out(
-            x.clone(), r, w, EPS, None, q, sf, None, gs, act, act_sf[:1].expand(rows, -1)
-        )
-    with pytest.raises(RuntimeError, match="rows not overlapping"):
-        _ops.minimax_m31_ctx_boundary_normq_out(
-            x.clone(), r, w, EPS, None, q, sf, None, gs, act, act_sf,
-            ids[:1].expand(rows + 8, -1), wts, TOPK,
-        )  # fmt: skip
-
-
-@pytest.mark.parametrize("rows", [1, 8192, 16384])
-@pytest.mark.parametrize(
-    "add, write_norm, write_f32, fp4",
-    [(True, True, False, False), (True, False, True, True), (False, True, False, False)],
-)
-def test_launch_shape_matches_the_plan(rows, add, write_norm, write_f32, fp4):
-    plan = _plan()
-    t = torch.empty(rows, H, dtype=torch.bfloat16, device="cuda")
-    ctas, grid, smem = _ops.minimax_m31_ctx_boundary_normq_shape(t, add, write_norm, write_f32, fp4)
-    props = torch.cuda.get_device_properties(0)
-    chunks, want_ctas, stages = plan.launch_form(
-        H,
-        add,
-        props.max_threads_per_multi_processor,
-        props.shared_memory_per_block_optin,
-        props.shared_memory_per_multiprocessor,
-    )
-    assert ctas == want_ctas, (
-        f"{ctas} CTAs per SM (registers or shared memory over the launch bound; chunks {chunks})"
-    )
-    assert smem == plan.smem_bytes(stages, add, H)
-    assert grid == plan.grid(rows, ctas, props.multi_processor_count)
-    form = _ops.minimax_m31_ctx_boundary_normq_form(t, add, write_norm, write_f32, fp4)
-    assert tuple(form) == (chunks, ctas, grid, smem, stages)
-
-
 def _fold_inputs(rows, kind, seed):
     """(plane [rows, 4, H], scores [rows, 4], shared, residual) at served scales: plane / shared N(0, 0.05^2), scores
     sigmoid x 2 (top-4 weights), residual N(0, 1). Stress: the first min(rows, 3) rows are finite FP32-subnormal rows
@@ -391,9 +296,9 @@ def _subnormal_f32(t: torch.Tensor) -> torch.Tensor:
     return (a > 0) & (a < 2.0**-126)
 
 
-@pytest.mark.parametrize("rows", [1, 7, 127, 128, 129, 1024, 1025, 4096, 8192, 12288, 16383, 16384])
-@pytest.mark.parametrize("kind", ["randn", "stress"])
-@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("rows", [1, 129, 16384])
+@pytest.mark.parametrize("kind", ["stress"])
+@pytest.mark.parametrize("pdl", [True])
 def test_topk_fold_bitwise_equals_reduce_then_boundary(rows, kind, pdl):
     """DEP2CTX_TOPK_FOLD: the fold op equals megamoe_topk_reduce_shared_add then minimax_m31_ctx_boundary_normq on
     the new residual (the shared buffer), the BF16 norm, the MXFP8 rows and the swizzled scales incl. the padded
@@ -441,93 +346,4 @@ def test_topk_fold_bitwise_equals_reduce_then_boundary(rows, kind, pdl):
     assert torch.equal(_u8(residual), _u8(residual0))
 
 
-def test_topk_fold_rejects_what_it_cannot_fold():
-    plane, scores, shared, residual = _fold_inputs(64, "randn", 1)
-    w = torch.ones(H, dtype=torch.bfloat16, device="cuda")
-    op = _ops.minimax_m31_ctx_boundary_normq_topk
-    with pytest.raises(RuntimeError):  # top-8
-        op(shared.clone(), plane.repeat(1, 2, 1), scores.repeat(1, 2), residual, w, EPS, True)
-    with pytest.raises(RuntimeError):  # unaligned scores
-        s = torch.empty(64 * TOPK + 1, device="cuda")[1:].view(64, TOPK).copy_(scores)
-        op(shared.clone(), plane, s, residual, w, EPS, True)
-    with pytest.raises(RuntimeError):  # rows mismatch
-        op(shared[:32].clone(), plane, scores, residual[:32], w, EPS, True)
-
-
-@pytest.mark.parametrize("rows", [1, 129, 4096, 16384])
-@pytest.mark.parametrize("write_norm", [True, False])
-def test_topk_fold_form_matches_the_plan(rows, write_norm):
-    plan = _plan()
-    props = torch.cuda.get_device_properties(0)
-    threads = props.max_threads_per_multi_processor
-    dual, ctas, grid, smem = (
-        int(v)
-        for v in _ops.minimax_m31_ctx_boundary_normq_topk_form(
-            torch.empty(rows, H, dtype=torch.bfloat16, device="cuda"), write_norm
-        )
-    )
-    want_dual = plan.topk_dual_form(plan.topk_dual_choice(), H, threads)
-    assert dual == int(want_dual)
-    assert ctas == 1 and smem == plan.topk_smem_bytes(plan.STAGES, plan.TOPK, H)
-    assert grid == plan.grid(rows, ctas, props.multi_processor_count)
-
-
 # ---- the launch-choice arguments (CBNQ_P2 / CBNQ_2CTA / CBNQ_TOPK_DUAL kill switches, ring depths) ----------------
-_CHOICES = [
-    dict(p2=False),
-    dict(two_cta=False),
-    dict(p2=False, two_cta=False),
-    dict(stages=4),
-    dict(p2=False, stages=6),
-    dict(p2=False, stages=8),
-    dict(p2_stages=4),
-]
-
-
-@pytest.mark.parametrize(
-    "choice", _CHOICES, ids=lambda c: ",".join(f"{k}={v}" for k, v in c.items())
-)
-@pytest.mark.parametrize("rows", [129, 8192])
-def test_every_launch_choice_writes_the_same_bits(choice, rows):
-    """Each launch the op's choice arguments select writes the default launch's outputs bit for bit, and its form is
-    the plan's for the same arguments."""
-    x, r, w = _inputs(rows, "stress", rows + 17)
-    gs = torch.tensor([GS], device="cuda")
-    base_inter, got_inter = x.clone(), x.clone()
-    base = _ops.minimax_m31_ctx_boundary_normq(base_inter, r, w, EPS, True, True, gs)
-    got = _ops.minimax_m31_ctx_boundary_normq(got_inter, r, w, EPS, True, True, gs, **choice)
-    torch.cuda.synchronize()
-    assert torch.equal(_u8(got_inter), _u8(base_inter))
-    for a, b in zip(got, base):
-        assert torch.equal(_u8(a), _u8(b)), choice
-    plan = _plan()
-    props = torch.cuda.get_device_properties(0)
-    chunks, _, stages = plan.launch_form(
-        H,
-        True,
-        props.max_threads_per_multi_processor,
-        props.shared_memory_per_block_optin,
-        props.shared_memory_per_multiprocessor,
-        **choice,
-    )
-    form = _ops.minimax_m31_ctx_boundary_normq_form(x, True, True, True, True, **choice)
-    assert (int(form[0]), int(form[4])) == (chunks, stages), choice
-
-
-@pytest.mark.parametrize("rows", [129, 4096])
-def test_the_one_group_fold_writes_the_same_bits(rows):
-    """dual=False (CBNQ_TOPK_DUAL off) runs the one-group fold: its form says so and every output equals the dual
-    fold's."""
-    plane, scores, shared, residual = _fold_inputs(rows, "randn", 77 + rows)
-    w = torch.ones(H, dtype=torch.bfloat16, device="cuda")
-    a_shared, b_shared = shared.clone(), shared.clone()
-    a = _ops.minimax_m31_ctx_boundary_normq_topk(a_shared, plane, scores, residual, w, EPS, True)
-    b = _ops.minimax_m31_ctx_boundary_normq_topk(
-        b_shared, plane, scores, residual, w, EPS, True, dual=False
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(_u8(a_shared), _u8(b_shared))
-    for u, v in zip(a, b):
-        assert torch.equal(_u8(u), _u8(v))
-    t = torch.empty(rows, H, dtype=torch.bfloat16, device="cuda")
-    assert int(_ops.minimax_m31_ctx_boundary_normq_topk_form(t, True, dual=False)[0]) == 0

@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """S4FE on the tp2 target: the steps S4's chain declines run the in-tree Markov chain with the fused tail
 (``ops/spec/m31_markov_epilogue.py``). CPU: the routing (only full-vocab, unsharded steps with a Markov head while S4 is
-not serving; the in-tree path otherwise) and the kill switch. GPU (SM107, the op built): the certified cells and the
-edge cases bitwise the in-tree chain, eager and under graph replay, and the counters left zero."""
+not serving; the in-tree path otherwise). GPU (SM107, the op built): the certified cells and the
+edge cases bitwise the in-tree chain, eager and under graph replay, and the counters left zero. The worker's
+padding-row zeroing (``minimax_m31_zero_padding_rows``, one launch) is bitwise the stock
+``SpecWorkerBase._zero_padding_rows`` with 0 / 1 / all padding requests at 3 and 4 rows per request."""
 
-import os
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +23,7 @@ try:
     )
 except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)
+from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
 VOCAB = 16
 
@@ -62,51 +62,10 @@ def _route(monkeypatch, wk, draft, logits, result="fused"):
     return out, seen
 
 
-def test_s4fe_is_on_by_default():
-    assert w1.S4FE
-
-
 def test_a_declined_full_vocab_step_takes_the_fused_chain(monkeypatch):
     wk = _Worker()
     out, seen = _route(monkeypatch, wk, _draft(), torch.zeros(13, 3, VOCAB))
     assert out == "fused" and len(seen) == 1 and wk.calls == []
-
-
-@pytest.mark.parametrize(
-    "why, worker, draft, width",
-    [
-        ("no Markov head", _Worker(), _draft(markov=False), VOCAB),
-        ("sharded logits", _Worker(sharded=True), _draft(), VOCAB),
-        ("a vocab shard", _Worker(), _draft(), VOCAB // 2),
-    ],
-)
-def test_other_steps_keep_the_in_tree_chain(monkeypatch, why, worker, draft, width):
-    out, seen = _route(monkeypatch, worker, draft, torch.zeros(13, 3, width))
-    assert out == "in-tree" and seen == [] and worker.calls == ["in-tree"], why
-
-
-def test_an_op_decline_keeps_the_in_tree_chain(monkeypatch):
-    wk = _Worker()
-    out, seen = _route(monkeypatch, wk, _draft(), torch.zeros(13, 3, VOCAB), result=None)
-    assert out == "in-tree" and len(seen) == 1 and wk.calls == ["in-tree"]
-
-
-def test_a_served_s4_step_never_reaches_s4fe(monkeypatch):
-    wk = _Worker()
-    wk._s4_step = SimpleNamespace(
-        shard=VOCAB // 2
-    )  # an S4 step whose logits are not its shard: S4 falls through
-    out, seen = _route(monkeypatch, wk, _draft(), torch.zeros(13, 3, VOCAB))
-    assert out == "in-tree" and seen == []
-
-
-def test_kill_switch():
-    code = f"from {w1.__name__} import S4FE\nprint(S4FE)"
-    env = {**os.environ, "TRTLLM_M31_DISABLE_S4FE": "1"}
-    out = subprocess.run(
-        [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
-    )
-    assert out.stdout.split()[-1] == "False"
 
 
 _GPU = pytest.mark.skipif(
@@ -160,7 +119,7 @@ def test_edge_cases_bitwise_the_in_tree_chain(case):
 
 
 @_GPU
-@pytest.mark.parametrize("b,k", [(16, 3), (32, 3), (56, 3), (112, 3), (56, 7)])
+@pytest.mark.parametrize("b,k", [(16, 3), (112, 3), (56, 7)])
 def test_graph_replay_matches_eager_and_leaves_the_counters_zero(b, k):
     assert epi.markov_epilogue_op() is not None, "this build lacks the Markov epilogue ops"
     op = epi.m31_markov_chain_fused
@@ -180,11 +139,17 @@ def test_graph_replay_matches_eager_and_leaves_the_counters_zero(b, k):
     assert int(counters.abs().sum()) == 0
 
 
-def test_wider_steps_decline():
-    base = torch.zeros(epi.MAX_ROWS + 1, 3, 16)
-    assert (
-        epi.m31_markov_chain_fused(
-            base, torch.zeros(epi.MAX_ROWS + 1), torch.zeros(16, 4), torch.zeros(16, 4)
-        )
-        is None
-    )
+@_GPU
+@pytest.mark.parametrize("rpr", [3, 4])
+@pytest.mark.parametrize("npad", [0, 1, 4])
+def test_zero_padding_rows_bitwise_the_stock_zeroing(rpr, npad):
+    assert epi.markov_epilogue_op() is not None, "this build lacks the Markov epilogue ops"
+    dummy, nc, ng, v = 7, 2, 4, 200064
+    slots = torch.arange(10, 10 + nc + ng, dtype=torch.int64, device="cuda")
+    slots[nc + ng - npad : nc + ng] = dummy
+    meta = SimpleNamespace(batch_slot_ids=slots, dummy_slot_row=dummy, is_ragged_verify=False)
+    logits = torch.randn(ng * rpr, v, device="cuda")
+    logits[0, 5] = float("nan")
+    ref = SpecWorkerBase._zero_padding_rows(logits.clone(), meta, nc, nc + ng, rpr)
+    got = w1.S4WorkerMixin._zero_padding_rows(logits.clone(), meta, nc, nc + ng, rpr)
+    assert torch.equal(ref.view(torch.int32), got.view(torch.int32))

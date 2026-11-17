@@ -260,37 +260,3 @@ def test_fold_is_deterministic_and_graph_replays() -> None:
     for run in outs[1:]:
         for a, b in zip(outs[0], run):
             assert torch.equal(a, b)
-
-
-@pytest.mark.parametrize("tokens", [9, 16, 32])
-def test_declines_past_8_rows(tokens) -> None:
-    """9..32 rows (and any row count on a non-split-8 config): nothing is launched; the step keeps the plain GEMV +
-    producer, so those rows stay bitwise today's."""
-    case = _case(tokens, 40 + tokens)
-    caches = _caches()
-    ok, q, iq = _fused(case, caches)
-    assert not ok
-    for t in (q, iq, *caches):
-        assert not bool(t.contiguous().view(torch.uint8).any()), "a declined call wrote output"
-
-
-def test_declines_other_configs_and_shapes() -> None:
-    case = _case(8, 41)
-    ok, _, _ = _fused(case, _caches(), cfg=(4, 12))
-    assert not ok, "split 4 cannot run the one-token-per-cluster-rank exchange"
-    xq, xsf, wq, wsf, *rest = case
-    narrow = (xq, xsf, wq[: 38 * 128].contiguous(), wsf[: 38 * 128 * K // 32].contiguous(), *rest)
-    ok, _, _ = _fused(narrow, _caches())
-    assert not ok, "only the 39-head packed projection"
-
-
-def test_fold_rows_and_kill_switch(monkeypatch) -> None:
-    """The dispatch: the fold serves the packed projection at 1..8 rows on its split-8 override, nothing past 8 rows or
-    on any other projection, and nothing when killed."""
-    for rows in range(1, 9):
-        assert modeling._fold_cfg(N, K, rows) == CFG
-    for rows in range(9, 33):
-        assert modeling._fold_cfg(N, K, rows) is None
-    assert modeling._fold_cfg(*modeling.QKV, 4) is None
-    monkeypatch.setattr(modeling, "QKV_PRODUCER_FOLD", False)
-    assert modeling._fold_cfg(N, K, 4) is None

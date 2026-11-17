@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Collected entry point for the tp2 target's fused MoE tail (``_m31_s2_moe_tail_op_matrix.py`` beside this file,
-its own 2-rank launcher); see ``_rank_job`` for why."""
+its own 2-rank launcher): the bitwise chain matrix and the shared Lamport workspace phase; see ``_rank_job`` for
+why."""
 
 import _rank_job
 import pytest
@@ -22,4 +23,7 @@ pytestmark = [
 # Spawns 2 rank processes over the visible devices; under xdist workers would fight for them.
 @pytest.mark.no_xdist
 def test_s2_moe_tail_is_the_fused_chain_bit_for_bit() -> None:
-    _rank_job.run("m31_s2_moe_tail")
+    out = _rank_job.run("m31_s2_moe_tail")
+    assert "alternating calls exact" in out, (
+        f"the launcher reported no Lamport phase result:\n{out}"
+    )

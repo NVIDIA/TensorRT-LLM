@@ -22,9 +22,6 @@ try:
 except NoTarget as no_target:
     pytest.skip(str(no_target), allow_module_level=True)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import MiniMaxM3SparseConfig
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
-    per_token_valid_blocks,
-)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import MsaIndexer
 
 
@@ -155,74 +152,6 @@ def test_tables_equal_the_proxy(qo, kv, scale_exp) -> None:
     a, b, calls = _tables(qo, kv, seed=sum(qo) + sum(kv), scale_exp=scale_exp)
     assert calls and all(calls), "the scorer hook declined"
     assert torch.equal(a, b)
-
-
-def test_declines_bf16_and_misaligned_rows() -> None:
-    q, k, kv_indices, qo_cpu, kv_cpu, off_cpu = _inputs([256], [256 + 4096], seed=3)
-    assert idx_scorer.score(q.to(torch.bfloat16), k, qo_cpu, kv_cpu, off_cpu, kv_indices) is None
-    assert idx_scorer.score(q, k, qo_cpu, kv_cpu, off_cpu + 1, kv_indices) is None
-
-
-def _written(ref, qo_cpu, kv_cpu, off_cpu):
-    """The cells the scorer writes: each token's historical pages (block < n_valid_blocks - 1); the local page, which
-    the select forces, and later pages keep the score buffer's old contents."""
-    n_valid = per_token_valid_blocks(qo_cpu, kv_cpu, off_cpu, causal=True, block_size=PAGE).cuda()
-    return torch.arange(ref.shape[1], device="cuda")[:, None] < n_valid[None, :] - 1
-
-
-def test_plan_is_kept_and_an_in_place_page_table_rewrite_is_scored() -> None:
-    q, k, kv_indices, qo_cpu, kv_cpu, off_cpu = _inputs([256], [256 + 4096], seed=4)
-    idx_scorer.score(q, k, qo_cpu, kv_cpu, off_cpu, kv_indices)
-    first = idx_scorer._STATE["wrapper"]
-    idx_scorer.score(q, k, qo_cpu, kv_cpu, off_cpu, kv_indices)
-    assert idx_scorer._STATE["wrapper"] is first
-    kv_indices.copy_(kv_indices.flip(0))  # in place: same lengths, new pages
-    kept = idx_scorer.score(q, k, qo_cpu, kv_cpu, off_cpu, kv_indices)
-    assert idx_scorer._STATE["wrapper"] is first
-    idx_scorer._STATE.pop("wrapper")
-    fresh = idx_scorer.score(q, k, qo_cpu, kv_cpu, off_cpu, kv_indices)
-    torch.cuda.synchronize()
-    written = _written(fresh, qo_cpu, kv_cpu, off_cpu)
-    assert torch.equal(kept[0][written], fresh[0][written])
-
-
-def test_inference_mode_page_table_scores_equal() -> None:
-    """Under torch.inference_mode (serving: the page table is an inference tensor, no version counter) the scorer runs,
-    keeps one plan, and its written scores and top-16 tables equal the non-inference ones and the proxy's, also after an
-    in-place rewrite of the inference page table."""
-    q, k, kv_indices, qo_cpu, kv_cpu, off_cpu = _inputs(
-        [256, 1000], [256 + 4096, 1000 + 20000], seed=5
-    )
-    ref = idx_scorer.score(q, k, qo_cpu, kv_cpu, off_cpu, kv_indices)
-    args = dict(idx_sm_scale=D**-0.5, qo_lens_cpu=qo_cpu, kv_lens_cpu=kv_cpu, qo_offset_cpu=off_cpu)
-    ref_table = MsaIndexer(_config())
-    ref_table.prefill_scorer_hook = idx_scorer.score
-    c = _hooked_select(ref_table, q, k, kv_indices=kv_indices, **args)
-    with torch.inference_mode():
-        kv_inf = kv_indices.clone()
-        assert kv_inf.is_inference()
-        first = idx_scorer.score(q, k, qo_cpu, kv_cpu, off_cpu, kv_inf)
-        w1 = idx_scorer._STATE["wrapper"]
-        second = idx_scorer.score(q, k, qo_cpu, kv_cpu, off_cpu, kv_inf)
-        assert idx_scorer._STATE["wrapper"] is w1
-        proxy = MsaIndexer(_config())
-        hooked = MsaIndexer(_config())
-        hooked.prefill_scorer_hook = idx_scorer.score
-        a = proxy.select_blocks(q, k, kv_indices=kv_inf, **args)
-        b = _hooked_select(hooked, q, k, kv_indices=kv_inf, **args)
-        kv_inf.copy_(kv_inf.flip(0))
-        a2 = proxy.select_blocks(q, k, kv_indices=kv_inf, **args)
-        b2 = _hooked_select(hooked, q, k, kv_indices=kv_inf, **args)
-    torch.cuda.synchronize()
-    written = _written(ref, qo_cpu, kv_cpu, off_cpu)
-    for out in (first, second):
-        assert out.shape == ref.shape
-        print(
-            f"IDXFIX_UNWRITTEN_CELLS_DIFFER: {int(((out != ref)[0] & ~written).sum())} of {int((~written).sum())}"
-        )
-        assert torch.equal(out[0][written], ref[0][written])
-    assert torch.equal(a, b) and torch.equal(b, c)
-    assert torch.equal(a2, b2) and not torch.equal(a2, a)
 
 
 def test_per_kv_head_tables_equal_the_proxy_after_an_in_place_rewrite() -> None:

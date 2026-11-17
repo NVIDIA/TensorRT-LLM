@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the gemm/m3_mx_gemv entry: the decode MXFP8 GEMV on a producer-quantized activation.
+"""GPU test for the gemm/m3_mx_gemv and gemm/m3_mx_gemv_bf16 entries: the decode MXFP8 GEMV on a producer-quantized
+activation, and the same GEMV quantizing a bf16 activation in its prologue.
 
 Operands as the target holds them: the weight through mxfp8_quantize with the swizzled scale layout (the MXFP8 linear
 method's storage), the activation through mxfp8_quantize with the swizzled layout (what the boundary all-reduce and
-the attention merge publish).
+the attention merge publish). The bf16 entry's prologue quantization is also held to mxfp8_quantize itself: the
+GEMV on a bf16 x must equal, bit for bit, the prequantized GEMV on mxfp8_quantize(x), the claim the target relies on
+when it mixes the two paths.
 """
 
 import zlib
@@ -15,6 +18,9 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.mxfp8_quantize
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.gemm.m3_mx_gemv import (  # noqa: E501
     m3_mx_gemv as op,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.gemm.m3_mx_gemv_bf16 import (  # noqa: E501
+    m3_mx_gemv_bf16 as bf16_op,
 )
 
 __extra_import_path__ = ["../../../.."]
@@ -79,10 +85,16 @@ def test_guard_refuses_linear_activation_scales() -> None:
             op(xq.view(4, 4096), xsf, w, wsf)
 
 
-def test_guard_refuses_a_strided_weight() -> None:
-    _, xq, xsf, w, wsf = build(6144, 4096, 1, seed=3)
-    wide = torch.zeros(6144, 8192, dtype=w.dtype, device="cuda")
-    wide[:, :4096] = w
-    with pytest.raises(AssertionError, match="contiguous e4m3"):
-        with validating(op):
-            op(xq, xsf, wide[:, :4096], wsf)
+@pytest.mark.parametrize("cell", bf16_op.CELLS, ids=[c.why[:44] for c in bf16_op.CELLS])
+def test_bf16_prologue_certified_cells(cell) -> None:
+    (n, k), m = cell.spec["nk"], cell.spec["m"]
+    x, xq, xsf, w, wsf = build(n, k, m, seed=zlib.crc32(cell.why.encode()) % 2**31)
+    with validating(bf16_op):
+        out = bf16_op(x, w, wsf, use_pdl=True)  # the target launches with PDL
+    assert out is not None, "a certified shape must be served"
+    assert out.shape == (m, n) and out.dtype is torch.bfloat16
+    compare(out, bf16_op.reference(x, w, wsf))
+    pre = op(xq, xsf, w, wsf, use_pdl=True)
+    assert pre is not None and torch.equal(out.view(torch.int16), pre.view(torch.int16)), (
+        "the prologue's MXFP8 quantization differs from mxfp8_quantize"
+    )

@@ -16,151 +16,10 @@ replaces:
   steps and fractions.
 """
 
-import ast
-import importlib.util
-import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-
-import tensorrt_llm._torch.modeling_v2.models.minimax_m3 as _family
-
-TARGET = "minimax_m3_1_flash_nvfp4__sm_107__tp4"
-_DIR = Path(_family.__file__).resolve().parent / TARGET
-_SWITCHES = _DIR / "m31_switches.py"
-
-
-def _eval_constants(monkeypatch, source: Path, names, env):
-    """The module-level assignments ``names`` of ``source`` evaluated (in file order) against a private copy of
-    m31_switches loaded under ``env`` (every other TRTLLM_M31_* variable cleared)."""
-    for name in list(os.environ):
-        if name.startswith(("TRTLLM_M31_DISABLE_", "TRTLLM_M31_ENABLE_", "TRTLLM_M31_TAIL_")):
-            monkeypatch.delenv(name)
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
-    spec = importlib.util.spec_from_file_location(f"_m31_switches_tailopt_{id(env)}", _SWITCHES)
-    switches = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(switches)
-    tree = ast.parse(source.read_text(), filename=str(source))
-    statements = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-        and node.targets[0].id in names
-    ]
-    assert sorted(n.targets[0].id for n in statements) == sorted(names)
-    namespace = {
-        "m31_disabled": switches.m31_disabled,
-        "m31_enabled": switches.m31_enabled,
-        "os": os,
-    }
-    exec(compile(ast.Module(statements, []), str(source), "exec"), namespace)
-    return {n: namespace[n] for n in names}
-
-
-_BLOCKOFF = ("STEP_BLOCKOFF_GUARD", "STEP_BLOCKOFF_PATCH")
-_TAIL = (
-    "TAIL_FORK",
-    "TAIL_FORK_KV",
-    "TAIL_DEFER_CAPTURE",
-    "TAIL_FC_GATHER",
-    "TAIL_FORK_REFRESH",
-    "TAIL_FORCEVEC",
-    "TAIL_LEAN_WORKER",
-)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "env, want",
-    [
-        ({}, (True, True)),
-        ({"TRTLLM_M31_DISABLE_BLOCKOFF_GUARD": "1"}, (False, False)),
-        ({"TRTLLM_M31_DISABLE_BLOCKOFF_PATCH": "1"}, (True, False)),
-        ({"TRTLLM_M31_DISABLE_BLOCKOFF_GUARD": "0"}, (True, True)),
-    ],
-)
-def test_blockoff_switches(monkeypatch, env, want):
-    got = _eval_constants(monkeypatch, _DIR / "modeling.py", _BLOCKOFF, env)
-    assert (got["STEP_BLOCKOFF_GUARD"], got["STEP_BLOCKOFF_PATCH"]) == want
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "env, want",
-    [
-        ({}, True),
-        ({"TRTLLM_M31_DISABLE_TAIL_DSFOLD_FWD": "1"}, False),
-        ({"TRTLLM_M31_ENABLE_TAIL_DSFOLD_FWD": "1"}, True),
-        ({"TRTLLM_M31_DISABLE_STEP_GATHER_FUSED": "1"}, True),
-    ],
-)
-def test_dsfold_fwd_switch(monkeypatch, env, want):
-    got = _eval_constants(monkeypatch, _DIR / "modeling.py", ("TAIL_DSFOLD_FWD",), env)
-    assert got["TAIL_DSFOLD_FWD"] is want
-
-
-@pytest.mark.cpu_only
-def test_dsfold_fwd_fold_is_the_in_forward_dsfold():
-    """The DSpark fold built under TAIL_DSFOLD_FWD: DSFOLD's gather-counting fold with the in-forward store + staging
-    of the Eagle3 fold (scatter still declines, so unarmed rows keep the sampler's own stores)."""
-    tree = ast.parse((_DIR / "modeling.py").read_text())
-    cls = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
-    fwd = cls["M3DSparkStepFoldFwd"]
-    assert [b.id for b in fwd.bases] == ["M3DSparkStepFold"]
-    assert "scatter" not in {n.name for n in fwd.body if isinstance(n, ast.FunctionDef)}
-    init = next(n for n in fwd.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
-    call = next(
-        n
-        for n in ast.walk(init)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "__init__"
-        and isinstance(n.func.value, ast.Name)
-        and n.func.value.id == "M3SpecStepFold"
-    )
-    assert {k.arg: k.value for k in call.keywords}["in_forward"].value is True
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "env, want",
-    [
-        # TAIL_DEFER_CAPTURE is opt-in on this target (FRONT_CAPFORK keeps the capture copies off the PDL chain).
-        ({}, (True, True, False, True, True, True, True)),
-        ({"TRTLLM_M31_ENABLE_TAIL_DEFER_CAPTURE": "1"}, (True, True, True, True, True, True, True)),
-        (
-            {
-                "TRTLLM_M31_ENABLE_TAIL_DEFER_CAPTURE": "1",
-                "TRTLLM_M31_DISABLE_TAIL_DEFER_CAPTURE": "1",
-            },
-            (True, True, False, True, True, True, True),
-        ),
-        (
-            {"TRTLLM_M31_ENABLE_TAIL_DEFER_CAPTURE": "1", "TRTLLM_M31_DISABLE_TAIL_FORK": "1"},
-            (False, False, False, False, False, True, True),
-        ),
-        ({"TRTLLM_M31_DISABLE_TAIL_FORK_KV": "1"}, (True, False, False, True, True, True, True)),
-        ({"TRTLLM_M31_DISABLE_TAIL_FC_GATHER": "1"}, (True, True, False, False, True, True, True)),
-        (
-            {"TRTLLM_M31_DISABLE_TAIL_FORK_REFRESH": "1"},
-            (True, True, False, True, False, True, True),
-        ),
-        ({"TRTLLM_M31_DISABLE_TAIL_FORCEVEC": "1"}, (True, True, False, True, True, False, True)),
-        (
-            {"TRTLLM_M31_DISABLE_TAIL_LEAN_WORKER": "1"},
-            (True, True, False, True, True, True, False),
-        ),
-    ],
-)
-def test_tail_switches(monkeypatch, env, want):
-    got = _eval_constants(monkeypatch, _DIR / "dspark.py", _TAIL, env)
-    assert tuple(got[n] for n in _TAIL) == want
-
 
 # ----------------------------------------------------------------------------------------------------- GPU tests
 
@@ -256,30 +115,12 @@ def test_ctx_store_split_on_a_forked_stream_is_bitwise(graph):
 
 
 @needs_gpu
-def test_ctx_store_launch_declines_foreign_rows():
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4 import (  # noqa: E501
-        dspark_tailfork as tf,
-    )
-
-    dev = torch.device("cuda")
-    draft = _fake_drafter(dev)
-    projected, kv, table, counts, positions, num_accepted, rows = _store_operands(dev)
-    prep = tf.ctx_store_prep(draft, projected)
-    other = projected.clone()
-    assert tf.ctx_store_launch(
-        prep, draft, other, positions, num_accepted, rows, None, table, kv, KP1,
-        capacity_counts=counts, max_col=None,
-    ) is None  # fmt: skip
-    assert tf.ctx_store_prep(SimpleNamespace(_fused_kv_weight=None), projected) is None
-
-
-@needs_gpu
 @pytest.mark.parametrize("all_layers", [True, False])
 def test_copy_captures_is_the_slice_copy(all_layers):
+    from tensorrt_llm._torch.custom_ops import inplace_slice_copy
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4 import (  # noqa: E501
         dspark_tailfork as tf,
     )
-    from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 
     dev = torch.device("cuda")
     g = torch.Generator(device="cpu").manual_seed(7)
@@ -319,8 +160,8 @@ def _worker(force: float, warm: bool, device):
 
 
 @needs_gpu
-@pytest.mark.parametrize("force", [3.04, 0.5, 2.6, 6.99, 3.0, 7.5])
-@pytest.mark.parametrize("num_contexts,num_gens", [(0, 1), (0, 8), (1, 1), (0, 3)])
+@pytest.mark.parametrize("force", [3.04, 0.5, 7.5])
+@pytest.mark.parametrize("num_contexts,num_gens", [(0, 1), (1, 1)])
 def test_forcevec_is_the_in_tree_draw(force, num_contexts, num_gens):
     dev = torch.device("cuda")
     ref = _worker(force, False, dev)

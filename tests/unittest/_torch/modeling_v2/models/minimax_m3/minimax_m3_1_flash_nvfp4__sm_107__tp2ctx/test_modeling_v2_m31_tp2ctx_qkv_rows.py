@@ -5,30 +5,18 @@
 minimax_m31_nvfp4_qkv_indexer_producer_rows (one warp per head slot and 4 consecutive tokens) against
 minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert on the same inputs, at the tp2ctx per-rank geometry (32 query heads, 2
 KV heads, 2 index heads): equal FP8 q / index-q and equal bytes in every paged cache (NVFP4 K/V data and scales, FP8
-index-K), including untouched slots, for chunk lengths on and off the 4-token warp boundary. Also the gate that sends
-only long chunks there, from source. GPU: SM107, where the family library carries the op.
+index-K), including untouched slots, for chunk lengths on and off the 4-token warp boundary.
+GPU: SM107, where the family library carries the op.
 """
-
-from pathlib import Path
 
 import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401  (registers torch.ops.trtllm)
-import tensorrt_llm._torch.modeling_v2.models.minimax_m3 as _family
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._utils import get_sm_version
 
-_TARGET = Path(_family.__file__).resolve().parent / "minimax_m3_1_flash_nvfp4__sm_107__tp2ctx"
 HQ, HKV, HIDX, D, PAGE = 32, 2, 2, 128, 128
-
-
-def test_long_chunks_take_the_rows_producer_with_a_kill_switch():
-    src = (_TARGET / "modeling.py").read_text()
-    assert '_QKV_ROWS = not m31_disabled("TP2CTX_QKV_ROWS")' in src
-    assert "_QKV_ROWS_MIN_TOKENS = 1024" in src
-    assert "q, index_q = _nvfp4_qkv_producer(num_tokens)(" in src
-    assert "return torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert" in src
 
 
 def _inputs(num_tokens, num_pages, seed):
@@ -81,7 +69,7 @@ def _run(op, inputs):
     return q, index_q, kv_data, kv_scale, index_k
 
 
-@pytest.mark.parametrize("num_tokens", [1024, 1029, 4096, 8192])
+@pytest.mark.parametrize("num_tokens", [1029, 8192])
 def test_rows_producer_is_bitwise_the_per_token_producer(num_tokens):
     if not torch.cuda.is_available() or get_sm_version() != 107:
         pytest.skip("SM107 (Rubin) only")

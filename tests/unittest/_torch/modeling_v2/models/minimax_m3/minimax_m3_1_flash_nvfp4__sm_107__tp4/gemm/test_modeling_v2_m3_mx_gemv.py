@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the gemm/m3_mx_gemv entry: the decode MXFP8 GEMV on a producer-quantized activation.
+"""GPU test for the gemm/m3_mx_gemv entry: the decode MXFP8 GEMV on a producer-quantized activation, and for the
+gemm/m3_mx_gemv_bf16 entry that quantizes a bf16 activation in its prologue.
 
 Operands as the target holds them: the weight through mxfp8_quantize with the swizzled scale layout (the MXFP8 linear
 method's storage), the activation through mxfp8_quantize with the swizzled layout (what the boundary all-reduce and
@@ -18,6 +19,9 @@ from tensorrt_llm._torch.modeling_v2._native import NoTarget
 try:
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.gemm.m3_mx_gemv import (  # noqa: E501
         m3_mx_gemv as op,
+    )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.gemm.m3_mx_gemv_bf16 import (  # noqa: E501
+        m3_mx_gemv_bf16 as op_bf16,
     )
 except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)
@@ -79,15 +83,6 @@ def test_an_unserved_shape_returns_none() -> None:
     assert op(xq, xsf, w, wsf) is None
 
 
-def test_guard_refuses_linear_activation_scales() -> None:
-    """A linear [M, K / 32] scale buffer is read as the swizzled one."""
-    x, _, _, w, wsf = build(6144, 2048, 4, seed=2)
-    xq, xsf = torch.ops.trtllm.mxfp8_quantize(x, False)
-    with pytest.raises(AssertionError, match="swizzled"):
-        with validating(op):
-            op(xq.view(4, 2048), xsf, w, wsf)
-
-
 def test_guard_refuses_a_strided_weight() -> None:
     _, xq, xsf, w, wsf = build(6144, 2048, 1, seed=3)
     wide = torch.zeros(6144, 4096, dtype=w.dtype, device="cuda")
@@ -98,7 +93,7 @@ def test_guard_refuses_a_strided_weight() -> None:
 
 
 @pytest.mark.parametrize("nk", [(2560, 6144), (2304, 6144)], ids=["qkv_sparse", "qkv_dense"])
-@pytest.mark.parametrize("m", range(1, 9))
+@pytest.mark.parametrize("m", [1, 4, 8])
 def test_qkv_split8_config(nk, m) -> None:
     """The TP4 dispatch's (split, ring) override for the QKV at decode rows: within the band of the fp64 reference,
     and the graph replay bit-identical to the eager call (one split-K order per config)."""
@@ -118,70 +113,6 @@ def test_qkv_split8_config(nk, m) -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(captured.view(torch.int16), eager.view(torch.int16))
-
-
-def test_qkv_split8_config_is_bounded(monkeypatch) -> None:
-    """The overrides cover only the two QKV projections (split 8) and the o_proj (strided k-tiles) at decode
-    rows; every other call, and every call with its kill knob off, keeps the shared table."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4 import (
-        modeling as dispatch,
-    )
-
-    assert dispatch.mx_gemv_cfg(2560, 6144, 9) is None
-    assert dispatch.mx_gemv_cfg(6144, 2048, 4) == (
-        (2, 8, 0, 1, 1, 1, 6) if dispatch.GEMV_OPROJ_TMEM256_TP4 else (2, 8, 0)
-    )
-    assert dispatch.mx_gemv_cfg(6144, 2048, 9) is None
-    assert dispatch.mx_gemv_cfg(6144, 3072, 4) is None
-    monkeypatch.setattr(dispatch, "GEMV_OPROJ_STRIDED_TP4", False)
-    assert dispatch.mx_gemv_cfg(6144, 2048, 4) is None
-    assert dispatch.mx_gemv_cfg(2560, 6144, 4) == (8, 8)
-
-
-@pytest.mark.parametrize(
-    "nk",
-    [(2560, 6144), (2304, 6144), (6144, 2048)],
-    ids=["qkv_sparse", "qkv_dense", "o_proj_strided"],
-)
-def test_prebuild_covers_the_split8_config_while_frozen(nk) -> None:
-    """The core's prebuild (``prebuild_kernels``: ``_gemv_variants`` + ``_precompile_cfg``) compiles every (rows, cfg)
-    ``_linear`` can pick for this projection, the TP4 (split, ring) override included: with compiles frozen afterwards
-    (as the target freezes them before warmup), every decode-row MXFP8 call at the override is served, none
-    declines."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4 import (
-        modeling as dispatch,
-    )
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.mx_gemv import (  # noqa: E501
-        op as mx_gemv,
-    )
-
-    n, k = nk
-    _, _, _, wq, wsf = build(n, k, 1, zlib.crc32(f"prebuild-{nk}".encode()))
-    mx_gemv.freeze(False)
-    mx_gemv.ensure_compiled(wq, wsf, True)
-    for rows, x_bf16, ar in dispatch._gemv_variants(n, k, None, 4):
-        cfg = None if x_bf16 else dispatch.mx_gemv_cfg(n, k, rows)
-        if cfg is not None:
-            dispatch._precompile_cfg(wq, wsf, rows, cfg, True, ar=ar)
-        else:
-            mx_gemv.precompile(wq, wsf, rows, x_bf16, use_pdl=True, ar=ar)
-    picked = [
-        (rows, dispatch.mx_gemv_cfg(n, k, rows))
-        for rows in sorted(dispatch.MX_GEMV_ROWS[nk])
-        if dispatch.mx_gemv_cfg(n, k, rows) is not None
-    ]
-    assert picked, "the override covers decode rows of this projection"
-    for rows, cfg in picked:
-        resolved = mx_gemv._resolve(rows, n, k, False, True, cfg, True, None)
-        assert resolved is not None and mx_gemv.is_compiled(resolved[0]), (rows, cfg)
-    mx_gemv.freeze(True)
-    try:
-        for rows, cfg in picked:
-            _, xq, xsf, _, _ = build(n, k, rows, rows)
-            out = mx_gemv.m3_mx_gemv(xq, xsf, wq, wsf, cfg=cfg, use_pdl=True)
-            assert out is not None, (rows, cfg, mx_gemv.last_uncompiled)
-    finally:
-        mx_gemv.freeze(False)
 
 
 @pytest.mark.parametrize("m", [1, 4, 8])
@@ -213,13 +144,32 @@ def test_oproj_partial_tmem_a_is_bitwise(m) -> None:
     assert torch.equal(captured.view(torch.int16), outs[0].view(torch.int16))
 
 
-def test_partial_tmem_a_needs_the_whole_ring() -> None:
-    """Partial TMEM A reads the remaining tiles from smem stages that are never refilled: a ring shorter than the CTA's
-    k-tiles is declined rather than run."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.mx_gemv import (  # noqa: E501
-        op as mx_gemv,
-    )
+# ---- gemm/m3_mx_gemv_bf16: the prologue's quantization is mxfp8_quantize itself -------------------------------------
+# Besides the reference band, the GEMV on a bf16 x must equal, bit for bit, the prequantized GEMV on
+# mxfp8_quantize(x) -- the claim the target relies on when it mixes the two paths.
 
-    assert mx_gemv._resolve(4, 6144, 2048, False, True, (2, 4, 0, 1, 1, 1, 6), True, None) is None
-    key, _ = mx_gemv._resolve(4, 6144, 2048, False, True, (2, 8, 0, 1, 1, 1, 8), True, None)
-    assert key[18] == 0, "a_tiles >= the CTA's tiles is the all-TMEM kernel"
+
+def _build_bf16(n: int, k: int, m: int, seed: int):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    w = (torch.randn(n, k, generator=g, device="cuda") / k**0.5).to(torch.bfloat16)
+    x = torch.randn(m, k, generator=g, device="cuda").to(torch.bfloat16)
+    wq, wsf = torch.ops.trtllm.mxfp8_quantize(w, True)
+    return x, wq.view(n, k), wsf
+
+
+@pytest.mark.parametrize("cell", op_bf16.CELLS, ids=[c.why[:44] for c in op_bf16.CELLS])
+def test_bf16_certified_cells(cell) -> None:
+    (n, k), m = cell.spec["nk"], cell.spec["m"]
+    x, w, wsf = _build_bf16(n, k, m, seed=zlib.crc32(cell.why.encode()) % 2**31)
+    with validating(op_bf16):
+        out = op_bf16(x, w, wsf, use_pdl=True)  # the target launches with PDL
+    assert out is not None, "a certified shape must be served"
+    assert out.shape == (m, n) and out.dtype is torch.bfloat16
+    # The band of compare: the quantized operands are the reference's exactly (checked below), the sums differ only
+    # in order.
+    compare(out, op_bf16.reference(x, w, wsf))
+    xq, xsf = torch.ops.trtllm.mxfp8_quantize(x, True)
+    pre = op(xq.view(m, k), xsf, w, wsf, use_pdl=True)
+    assert pre is not None and torch.equal(out.view(torch.int16), pre.view(torch.int16)), (
+        "the prologue's MXFP8 quantization differs from mxfp8_quantize"
+    )

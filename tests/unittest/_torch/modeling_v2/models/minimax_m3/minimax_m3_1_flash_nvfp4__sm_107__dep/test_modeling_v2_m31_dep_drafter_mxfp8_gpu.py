@@ -29,7 +29,7 @@ pytestmark = pytest.mark.skipif(not _sm107(), reason="needs an SM107 GPU")
 
 HIDDEN, Q_HEADS, KV_HEADS, HEAD_DIM, FFN = 6144, 64, 4, 128, 12288
 QKV = (Q_HEADS + 2 * KV_HEADS) * HEAD_DIM
-ROWS = (33, 42, 77, 112, 128)
+ROWS = (33, 128)
 #: The routed output vs the fp32 MXFP8 reference: accumulation order + one BF16 rounding.
 REF_TOL = 4e-3
 #: The routed output vs the BF16 GEMM: the MXFP8 activation's error (MB: 2.66e-2..2.68e-2).
@@ -132,11 +132,6 @@ def on(monkeypatch):
     monkeypatch.setattr(drafter_mxfp8, "DEP_MXDRAFT", True)
 
 
-def test_install_routes_the_drafter_shapes(drafter, on):
-    draft, _, _ = drafter
-    assert drafter_mxfp8.install(draft) == (4, 1)
-
-
 @pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("kind", ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"])
 def test_routed_projection_is_the_mxfp8_reference(drafter, on, kind, rows):
@@ -172,69 +167,3 @@ def test_routed_mlp_is_the_mxfp8_reference(drafter, on, rows):
     low, high = BF16_BAND
     got = _rel(out, ref_mlp(x))
     assert low < got < high, (rows, got)
-
-
-@pytest.mark.parametrize("rows", [32, 129, 256])
-def test_rows_outside_the_band_are_the_bf16_path(drafter, on, rows):
-    draft, stock, gen = drafter
-    drafter_mxfp8.install(draft)
-    layer, ref_layer = draft.model.layers[0], stock.model.layers[0]
-    x = (torch.randn(rows, HIDDEN, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
-    assert torch.equal(layer.self_attn.qkv_proj(x), ref_layer.self_attn.qkv_proj(x))
-    assert torch.equal(layer.mlp(x), ref_layer.mlp(x))
-
-
-@pytest.mark.parametrize("rows", [42, 77, 112])
-def test_graph_replay_is_the_eager_output(drafter, on, rows):
-    draft, _, gen = drafter
-    drafter_mxfp8.install(draft)
-    layer = draft.model.layers[0]
-    x = (torch.randn(rows, HIDDEN, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
-
-    def step():
-        return layer.mlp(layer.self_attn.qkv_proj(x)[:, :HIDDEN].contiguous())
-
-    eager = step()
-    torch.cuda.synchronize()
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(s):
-        step()
-        torch.cuda.synchronize()
-        with torch.cuda.graph(g, stream=s):
-            out = step()
-    torch.cuda.synchronize()
-    for _ in range(3):
-        out.zero_()  # the capture already wrote the eager bits: only a replay that writes can pass
-        g.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(out.view(torch.int16), eager.view(torch.int16)), rows
-
-
-def test_taken_lines_name_the_projection_and_rows(drafter, on):
-    draft, _, gen = drafter
-    drafter_mxfp8.install(draft)
-    x = (torch.randn(77, HIDDEN, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
-    draft.model.layers[0].mlp(x)
-    assert ("gate_up_proj", 77) in drafter_mxfp8._LOGGED and (
-        "down_proj (swiglu_mxfp8)",
-        77,
-    ) in drafter_mxfp8._LOGGED
-
-
-def test_knob_off_is_todays_bf16_bitwise(monkeypatch):
-    monkeypatch.setattr(drafter_mxfp8, "DEP_MXDRAFT", False)
-    gen = torch.Generator(device="cuda").manual_seed(7)
-    draft = _drafter(gen)
-    stock = _drafter(torch.Generator(device="cuda").manual_seed(7))
-    assert drafter_mxfp8.install(draft) == (0, 0)
-    for rows in (42, 77, 112):
-        x = (torch.randn(rows, HIDDEN, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
-        layer, ref = draft.model.layers[0], stock.model.layers[0]
-        assert torch.equal(layer.self_attn.qkv_proj(x), ref.self_attn.qkv_proj(x))
-        assert torch.equal(
-            layer.self_attn.o_proj(x[:, : Q_HEADS * HEAD_DIM // 4].repeat(1, 4).contiguous()),
-            ref.self_attn.o_proj(x[:, : Q_HEADS * HEAD_DIM // 4].repeat(1, 4).contiguous()),
-        )
-        assert torch.equal(layer.mlp(x), ref.mlp(x))

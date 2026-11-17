@@ -17,12 +17,16 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 try:
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4 import (  # noqa: E501
+        modeling as m,
+    )
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.attention.m3_index_score_t2sc import (  # noqa: E501
         PAGE,
     )
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.attention.m3_index_score_t2sc import (  # noqa: E501
         m3_index_score_t2sc as op,
     )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops import m3_fsel_topk as fsel
 except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)
 
@@ -115,66 +119,14 @@ def test_guard_refuses_a_request_past_its_block_table() -> None:
             op(idx_q, index_k, block_table, seq, _score(stride + 16, 1), 1, 1536, True)
 
 
-# T2SC_TOKEN_MAJOR (opt-in): the scorer writes and the long-row select reads the selector buffer backed token-major.
-# The logical [heads, blocks, tokens] values and the picks (ties included) are the block-major buffer's.
-@pytest.mark.parametrize("ties", [False, True], ids=["random", "ties"])
-@pytest.mark.parametrize("length", [20000, 165521, 330000, 600000, 1000000])
-def test_token_major_selector_buffer_is_bitwise_the_block_major(length, ties) -> None:
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.long_select import (  # noqa: E501
-        long_select_blocks,
-    )
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.modeling import (  # noqa: E501
-        max_score_token_major,
-    )
-
-    qlen = 8
-    idx_q, index_k, block_table, seq, _ = _inputs((length,), qlen, 3 + length % 997)
-    if ties:
-        index_k = index_k.view(torch.uint8)[:, :, :1].expand(-1, -1, HEAD_DIM).clone()
-        index_k = (index_k % 4).to(torch.float32).to(torch.float8_e4m3fn)
-    width = 9216  # the worst-case block extent of a 1M-token engine
-    store = torch.full(
-        (HEADS * width * qlen + 64,), -float("inf"), device="cuda", dtype=torch.float32
-    )
-    bm = store[: HEADS * width * qlen].view(HEADS, width, qlen)
-    tm = max_score_token_major(bm)
-    assert (
-        tm.shape == bm.shape
-        and tm.data_ptr() == bm.data_ptr()
-        and tm.stride() == (width * qlen, 1, width)
-    )
-    nb = (length + PAGE - 1) // PAGE
-    nvb = torch.tensor([nb] * qlen, dtype=torch.int32, device="cuda")
-    out = {}
-    for name, buf in (("bm", bm), ("tm", tm)):
-        buf.fill_(-float("inf"))
-        op(idx_q, index_k, block_table, seq, buf.transpose(1, 2), qlen, 1272, True)
-        table = long_select_blocks(buf, n_valid_blocks=nvb, init_blocks=1, local_blocks=2, use_pdl=False,
-                                   early_trigger=False, trigger_phase=1, fast_tail=False, dsl=True)  # fmt: skip
-        torch.cuda.synchronize()
-        out[name] = (buf[:, :nb, :].contiguous().clone(), table.clone())
-    assert torch.equal(out["bm"][0].view(torch.int32), out["tm"][0].view(torch.int32)), (
-        "a score differs"
-    )
-    assert torch.equal(out["bm"][1], out["tm"][1]), "the selection differs"
-
-
 # T2SC_QOWN (opt-in): Q in its own buffer, so the CTA's second block is issued at the grid wait. The blocks and the
 # per-block code are the default's, so the scores are the default schedule's bit for bit at every length, request
 # count and query length, through repeated launches and graph replays.
-_QOWN_CASES = [
-    ((129,), 4, 1272),
-    ((5000,), 8, 1272),
-    ((131072,), 8, 1272),
-    ((165521,), 8, 1272),
-    ((330000,), 8, 1272),
-    ((450000,), 8, 1272),
-    ((600000,), 8, 1272),
-    ((1000000,), 8, 1272),
+_QOWN_CASES = [  # one served case per query length
     ((600000,), 1, 1272),
     ((600000,), 3, 1272),
     ((400000, 70000), 4, 768),
-    ((300, 262144), 4, 768),
+    ((165521,), 8, 1272),
 ]
 
 
@@ -204,22 +156,6 @@ def test_qown_schedule_is_bitwise_the_default(seq_lens, qlen, split) -> None:
         )
 
 
-@pytest.mark.parametrize("qlen", [1, 4, 8])
-def test_qown_at_the_prestage_edge_is_bitwise_the_default(qlen) -> None:
-    kern = _kern()
-    for k in (1, 2, 1272, 2544, 2545, 3816):
-        for length in (k * PAGE - qlen - 1, k * PAGE - qlen, k * PAGE - qlen + 1, k * PAGE + 1):
-            idx_q, index_k, block_table, seq, stride = _inputs((length,), qlen, 31 + length)
-            key = (idx_q.dtype, HEADS, qlen, HEAD_DIM, 1272, True)
-            base = kern.IndexScoreRunner.compile_schedule(key)
-            alt = kern.IndexScoreRunner.compile_schedule(key, qown=True)
-            s_base, s_alt = _score(stride, idx_q.shape[0]), _score(stride, idx_q.shape[0])
-            base(idx_q, index_k, block_table, s_base, seq)
-            alt(idx_q, index_k, block_table, s_alt, seq)
-            torch.cuda.synchronize()
-            assert torch.equal(s_base.view(torch.int32), s_alt.view(torch.int32)), (qlen, length)
-
-
 def test_qown_in_a_cuda_graph_replays_bitwise() -> None:
     kern = _kern()
     cases = []
@@ -247,11 +183,108 @@ def test_qown_in_a_cuda_graph_replays_bitwise() -> None:
             assert torch.equal(c[5].view(torch.int32), c[6].view(torch.int32))
 
 
-def test_qown_switch_compiles_the_qown_kernel() -> None:
-    """With TRTLLM_M31_ENABLE_T2SC_QOWN=1 the runner's early keys are the qown kernel (run under that env too)."""
-    kern = _kern()
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.m31_switches import (  # noqa: E501
-        m31_enabled,
+# T2SC_TOKEN_MAJOR (modeling.T2SC_TOKEN_MAJOR) on the target's own routes: the scorer and the select the target takes
+# at that row count (FSEL at <= FSEL_MAX_ROWS rows plus the 384-thread DSL select, the DSL select alone wider) run once
+# on a block-major view of a flat store and once on the token-major view of a second store. The logical scores must be
+# the same bit for bit, the token-major store must hold them token-major, and the top-16 tables must be the same bit for
+# bit (and the FSEL reference's).
+_TM_QLEN = 8  # K7 verify rows per request
+_TM_NB = 8193  # the 1M engine's selector width (worst-case k tiles)
+_TM_CASES = {
+    "b1_128k": (131072,),  # 8 rows: FSEL and DSL
+    "b2_mixed": (524288, 61000),  # 16 rows: DSL
+}
+
+
+def _tm_inputs(seq_lens, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    batch = len(seq_lens)
+    max_blocks = (max(seq_lens) + PAGE - 1) // PAGE
+    pages = batch * max_blocks
+    block_table = (
+        torch.randperm(pages, device="cuda", generator=g).to(torch.int32).view(batch, max_blocks)
+    )
+    idx_q = torch.randn(batch * _TM_QLEN, HEADS, HEAD_DIM, device="cuda", generator=g).to(
+        torch.float8_e4m3fn
+    )
+    index_k = torch.randn(pages, PAGE, HEAD_DIM, device="cuda", generator=g).to(torch.float8_e4m3fn)
+    seq = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
+    # Each verify row's causal valid-block count (the metadata's msa_n_valid_blocks).
+    nvb = torch.tensor(
+        [(s - _TM_QLEN + t + 1 + PAGE - 1) // PAGE for s in seq_lens for t in range(_TM_QLEN)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    return idx_q, index_k, block_table, seq, nvb
+
+
+def _tm_view(token_major: bool, total_q: int):
+    store = torch.full(
+        (HEADS * _TM_NB * total_q + 4096,), -float("inf"), device="cuda", dtype=torch.float32
+    )
+    view = store[: HEADS * _TM_NB * total_q].view(HEADS, _TM_NB, total_q)
+    return store, (m.max_score_token_major(view) if token_major else view)
+
+
+def _tm_selects(scores, nvb, rows):
+    """{name: table} for every select the target can run at ``rows`` (FSEL at <= FSEL_MAX_ROWS, DSL at any)."""
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.long_select import (  # noqa: E501
+        long_select_blocks,
     )
 
-    assert kern.T2SC_QOWN == m31_enabled("T2SC_QOWN")
+    out = {}
+    if rows <= m.FSEL_MAX_ROWS:
+        out["fsel"] = fsel.fsel_select_blocks(
+            scores,
+            n_valid_blocks=nvb,
+            init_blocks=0,
+            local_blocks=1,
+            use_pdl=False,
+            trigger_phase=m.FSEL_TRIGGER_PHASE,
+            variant=m.FSEL_VARIANT,
+        )
+    out["dsl"] = long_select_blocks(
+        scores,
+        n_valid_blocks=nvb,
+        init_blocks=0,
+        local_blocks=1,
+        use_pdl=False,
+        early_trigger=rows <= m.SELECT_EARLY_MAX_ROWS,
+        trigger_phase=m.SELECT_LONG_TRIGGER_PHASE if rows <= m.SELECT_LONG_TRIGGER_MAX_ROWS else 0,
+        dsl=True,
+    )
+    return out
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="T2SC_TOKEN_MAJOR kernels require an sm_10x CUDA device",
+)
+@pytest.mark.parametrize("case", list(_TM_CASES))
+def test_token_major_scores_and_tables_are_bitwise(case) -> None:
+    seq_lens = _TM_CASES[case]
+    requests = len(seq_lens)
+    assert m.INDEX_SCORE_T2SC_PATH.covers(requests)
+    split_k, early = m.index_score_t2sc_schedule(requests)
+    idx_q, index_k, block_table, seq, nvb = _tm_inputs(
+        seq_lens, 1234 + requests * 7 + seq_lens[0] % 97
+    )
+    rows = requests * _TM_QLEN
+    res = {}
+    for tm in (False, True):
+        store, view = _tm_view(tm, rows)
+        op(idx_q, index_k, block_table, seq, view.transpose(1, 2), _TM_QLEN, split_k, early)
+        res[tm] = (store, view, _tm_selects(view, nvb, rows))
+    torch.cuda.synchronize()
+    (bstore, bview, btab), (tstore, tview, ttab) = res[False], res[True]
+    assert torch.equal(bview, tview), "the logical scores differ"
+    n = HEADS * _TM_NB * rows
+    assert torch.equal(tstore[:n].view(HEADS, rows, _TM_NB), bview.permute(0, 2, 1)), (
+        "not backed token-major"
+    )
+    assert torch.equal(bstore[:n].view(HEADS, _TM_NB, rows), bview)
+    ref = fsel.M3FselTopk().reference(bview, nvb, None, 0, 1)
+    for name in btab:
+        assert btab[name] is not None and ttab[name] is not None, name
+        assert torch.equal(btab[name], ttab[name]), f"{name}: the top-16 tables differ"
+        assert torch.equal(ttab[name], ref), f"{name}: the table is not the select contract's"

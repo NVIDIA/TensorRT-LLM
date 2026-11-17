@@ -33,22 +33,6 @@ def test_m3_mc_allreduce_norm_op_matrix(world_size) -> None:
     _rank_job.run("m3_mc_allreduce_norm", world_size)
 
 
-def test_the_cells_are_world_independent() -> None:
-    """What lets a single-node job certify the tp8 entries: no cell's spec names a world size."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.comm import (  # noqa: E501
-        m3_mc_allreduce_norm,
-        m3_mc_finalize_allreduce_norm,
-    )
-
-    for op in (
-        m3_mc_allreduce_norm.m3_mc_allreduce_norm,
-        m3_mc_finalize_allreduce_norm.m3_mc_finalize_allreduce_norm,
-    ):
-        assert op.CELLS
-        for cell in op.CELLS:
-            assert not {"world", "world_size", "rank"} & set(cell.spec), cell.why
-
-
 def test_finalize_partial_rounds_the_routed_sum_before_the_shared_expert() -> None:
     """As stock: the finalized routed output is BF16, and the shared expert is added to it (shared.add_(routed)).
     Four routed rows of 1.0 at FP32 routing weight 0.2509765625 sum to 1.00390625, which rounds to BF16 1.0; plus the

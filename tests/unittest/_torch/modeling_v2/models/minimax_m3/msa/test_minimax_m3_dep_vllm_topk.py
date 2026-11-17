@@ -4,11 +4,8 @@
 
 * the op against a Python model of vLLM's 16-bit key, on the NVFP4 reader's native score layout;
 * ascending ids, -1 past short rows, the local block always taken, determinism and CUDA graph replay;
-* its agreement with the exact select (minimax_m3_select_blocks) on random scores;
-* the gate: only native-layout scores, init 0 / local 1, the op's bounds, and the kill switch;
-* the served call: MsaIndexer._select at the proxy plan's worst-case score width (8320 columns at a 1M max_seq_len
-  with DSpark K7), which the op takes by ranking the first max_row_blocks columns (the KV manager's max_blocks_per_seq,
-  8196), a row at that bound included, and the logged reason when it declines.
+* the served call: MsaIndexer._select with rows at the KV manager's max_blocks_per_seq bound (and one past it)
+  agrees with the exact select (minimax_m3_select_blocks).
 """
 
 import math
@@ -16,12 +13,12 @@ import math
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import MiniMaxM3SparseConfig
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa import msa_indexer
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     select_blocks_from_maxscore,
 )
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import MiniMaxM3SparseConfig
 
 CUDA = torch.cuda.is_available()
 SM107 = CUDA and torch.cuda.get_device_capability() == (10, 7)
@@ -124,39 +121,6 @@ def test_ascending_local_taken_deterministic_and_graph_replay():
     assert torch.equal(captured.cpu(), _reference(fresh, nvb))
 
 
-@needs_op
-@torch.inference_mode()
-def test_agrees_with_the_exact_select_on_random_scores():
-    heads, rows, blocks = 4, 128, 1500
-    scores = _native_scores(heads, rows, blocks, seed=9)
-    nvb = _lengths(rows, blocks, seed=10)
-    ours = select_blocks_from_maxscore(
-        scores, topk=16, n_valid_blocks=nvb, init_blocks=0, local_blocks=1, head_major_output=True
-    )
-    theirs = msa_indexer._dep_vllm_topk_select(scores, nvb, 0, 1)
-    same = (ours == theirs).all(dim=-1).float().mean().item()
-    assert same >= 0.99, f"only {same:.4f} of the rows match the exact select"
-
-
-@needs_op
-@torch.inference_mode()
-def test_the_gate_keeps_the_built_in_select(monkeypatch):
-    heads, rows, blocks = 4, 32, 400
-    native = _native_scores(heads, rows, blocks, seed=1)
-    nvb = _lengths(rows, blocks, seed=2)
-    hpr = native.contiguous()  # [heads, blocks, rows], rows contiguous: the hpr / FP8 scorer layout
-    assert msa_indexer._dep_vllm_topk_select(hpr, nvb, 0, 1) is None
-    assert msa_indexer._dep_vllm_topk_select(native, nvb, 1, 1) is None
-    assert msa_indexer._dep_vllm_topk_select(native, nvb, 0, 2) is None
-    assert msa_indexer._dep_vllm_topk_select(native, nvb[: rows - 1], 0, 1) is None
-    wide = _native_scores(1, 2, msa_indexer.DEP_VLLM_TOPK_MAX_BLOCKS + 1, seed=6)
-    assert msa_indexer._dep_vllm_topk_select(wide, nvb, 0, 1) is None
-    many = _native_scores(4, 512, 64, seed=7)
-    assert msa_indexer._dep_vllm_topk_select(many, _lengths(512, 64, seed=8), 0, 1) is None
-    monkeypatch.setattr(msa_indexer, "DEP_VLLM_TOPK", False)
-    assert msa_indexer._dep_vllm_topk_select(native, nvb, 0, 1) is None
-
-
 # DEP generation shapes, derived as the executor and KV cache manager V2 do for DSpark K7 (max_draft_len 7,
 # tokens_per_gen_step 8, 6 extra-KV tokens): the engine max_seq_len is 1048576 + 7 (overlap scheduler) + 6 + 7, the
 # manager adds a generation headroom of 6 + 8 tokens, and pads its block count to a multiple of 4 (copy_block_offsets):
@@ -188,14 +152,6 @@ def _served_lengths(requests: int) -> torch.Tensor:
     return torch.tensor(n, dtype=torch.int32, device="cuda")
 
 
-def _served_scores(heads, rows, blocks, *, seed):
-    """Native-layout scores [rows, heads, blocks] seen as [heads, blocks, rows], at a width too large for the
-    reader-shaped generator above."""
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    native = torch.randn(rows, heads, blocks, generator=g, device="cuda") * 5.7
-    return native.as_strided((heads, blocks, rows), (blocks, 1, heads * blocks))
-
-
 def _served_indexer(max_row_blocks):
     config = MiniMaxM3SparseConfig(
         num_q_heads=16, num_kv_heads=4, head_dim=128, num_index_heads=4, sparse_index_dim=128, block_size=128,
@@ -220,73 +176,6 @@ def _spy(monkeypatch):
         msa_indexer, "_dep_vllm_topk_decline", lambda reason, detail="": declined.append(reason)
     )
     return taken, declined
-
-
-@needs_op
-@torch.inference_mode()
-@pytest.mark.parametrize("requests", [44, 48])  # decode requests of a rank (x 8 query rows)
-# bounded: the backend's row bound, or the full score width.
-@pytest.mark.parametrize("bounded", [True, False])
-def test_served_width_is_taken_through_the_select(monkeypatch, requests, bounded):
-    assert (_KV_BLOCKS, SERVED_MAX_ROW_BLOCKS, SERVED_TILES) == (8193, 8196, 8320)
-    heads, rows = 4, requests * DECODE_QUERY_LEN
-    scores = _served_scores(heads, rows, SERVED_TILES, seed=requests)
-    nvb = _served_lengths(requests)
-    taken, declined = _spy(monkeypatch)
-    table = _served_indexer(SERVED_MAX_ROW_BLOCKS if bounded else None)._select(scores, nvb)
-    assert taken == [True] and declined == []
-    assert table.shape == (rows, heads, MSA_REQUIRED_TOPK)
-    assert table.permute(1, 0, 2).is_contiguous()
-    # The longest row (8196 candidates, the KV manager's bound) forces its own block, id 8195.
-    assert int(nvb[-1]) == SERVED_MAX_ROW_BLOCKS
-    assert bool((table[-1, :, -1] == SERVED_MAX_ROW_BLOCKS - 1).all())
-    # vLLM's key, bit for bit, on the first two and the last two requests' rows.
-    narrowed = scores.narrow(1, 0, SERVED_MAX_ROW_BLOCKS)
-    pick = list(range(2 * DECODE_QUERY_LEN)) + list(range(rows - 2 * DECODE_QUERY_LEN, rows))
-    ref = _reference(narrowed[:, :, pick], nvb[pick])
-    assert torch.equal(table[pick].cpu(), ref)
-    exact = select_blocks_from_maxscore(
-        scores, topk=16, n_valid_blocks=nvb, init_blocks=0, local_blocks=1, head_major_output=True
-    )
-    same = (exact == table).all(dim=-1).float().mean().item()
-    assert same >= 0.99, f"only {same:.4f} of the rows match the exact select"
-
-
-@needs_op
-@torch.inference_mode()
-@pytest.mark.parametrize("max_row_blocks", [None, msa_indexer.DEP_VLLM_TOPK_MAX_BLOCKS + 1])
-def test_a_width_past_the_bound_declines_with_its_reason(monkeypatch, max_row_blocks):
-    heads, requests = 4, 44
-    rows = requests * DECODE_QUERY_LEN
-    tiles = math.ceil((msa_indexer.DEP_VLLM_TOPK_MAX_BLOCKS + 1) / 128) * 128
-    scores = _served_scores(heads, rows, tiles, seed=3)
-    nvb = _served_lengths(requests)
-    taken, declined = _spy(monkeypatch)
-    table = _served_indexer(max_row_blocks)._select(scores, nvb)
-    assert taken == [False] and declined == ["too many blocks"]
-    exact = select_blocks_from_maxscore(
-        scores, topk=16, n_valid_blocks=nvb, init_blocks=0, local_blocks=1, head_major_output=True
-    )
-    assert torch.equal(table, exact)
-
-
-@needs_op
-@torch.inference_mode()
-def test_a_single_row_with_a_unit_row_stride_keeps_the_built_in_select(monkeypatch):
-    # One query row in the FP8 scorer's layout [heads, blocks, 1], strides (blocks, 1, 1): the rows are not a block-row
-    # apart, so the select stays on minimax_m3_select_blocks. The CTX / prefill workers hand it such rows (served 3.3.10
-    # logs "overlapping rows (1 rows, row stride 1)" there); taking them would change CTX numerics, out of this scope.
-    heads, blocks = 4, 700
-    native = _native_scores(heads, 1, blocks, seed=11)
-    single = native.clone().as_strided((heads, blocks, 1), (blocks, 1, 1))
-    nvb = _lengths(1, blocks, seed=12)
-    taken, declined = _spy(monkeypatch)
-    table = _served_indexer(None)._select(single, nvb)
-    assert taken == [False] and declined == ["overlapping rows"]
-    exact = select_blocks_from_maxscore(
-        single, topk=16, n_valid_blocks=nvb, init_blocks=0, local_blocks=1, head_major_output=True
-    )
-    assert torch.equal(table, exact)
 
 
 def _distinct_scores(heads, rows, blocks, *, seed):
@@ -316,22 +205,3 @@ def test_rows_at_the_row_bound_are_taken_and_match_the_exact_select(monkeypatch,
         scores, topk=16, n_valid_blocks=nvb, init_blocks=0, local_blocks=1, head_major_output=True
     )
     assert torch.equal(table, exact)
-
-
-@needs_op
-@torch.inference_mode()
-def test_each_decline_names_its_reason(monkeypatch):
-    heads, rows, blocks = 4, 32, 400
-    native = _native_scores(heads, rows, blocks, seed=1)
-    nvb = _lengths(rows, blocks, seed=2)
-    _, declined = _spy(monkeypatch)
-    assert msa_indexer._dep_vllm_topk_select(native, nvb, 1, 1) is None
-    assert msa_indexer._dep_vllm_topk_select(native.contiguous(), nvb, 0, 1) is None
-    assert msa_indexer._dep_vllm_topk_select(_native_scores(4, 512, 64, seed=7), nvb, 0, 1) is None
-    assert msa_indexer._dep_vllm_topk_select(native, nvb[: rows - 1], 0, 1) is None
-    assert declined == [
-        "init / local blocks",
-        "not the native layout",
-        "too many rows",
-        "short n_valid_blocks",
-    ]

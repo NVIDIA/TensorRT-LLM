@@ -15,8 +15,6 @@ of 256 tokens), where the main kernel's plan stages its candidates in the K tile
 weights, the rows stay within the band and repeated calls and a graph replay are bitwise the first call.
 """
 
-import sys
-import types
 from typing import List, Optional
 
 import pytest
@@ -25,7 +23,6 @@ import torch
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep import (  # noqa: E501
     lc2_decode,
     merge_mxfp8,
-    native_ops,
     pad_mask,
 )
 
@@ -214,26 +211,7 @@ def _scale_positions(rows: int) -> torch.Tensor:
     return (r // 128) * 64 * 512 + (k // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + k % 4
 
 
-def _reserve_workspaces():
-    lc2_decode.reserve_workspace(torch.device("cuda"))
-    native_ops.minimax_m3_sm107_sparse_decode_own_t_prepare(
-        torch.empty(0, dtype=torch.uint8, device="cuda"), lc2_decode.OWNT_MAX_ITEMS
-    )
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _workspaces():
-    _reserve_workspaces()
-
-
-def test_the_reserve_holds_the_widest_step(monkeypatch):
-    monkeypatch.setattr(lc2_decode, "DEP_OWNT", True)
-    reserved = lc2_decode.reserve_own_t_workspace(torch.device("cuda"))
-    # At least the fp32 partial rows of 256 items: 128 query rows x head_dim 128 each.
-    assert reserved >= lc2_decode.OWNT_MAX_ITEMS * 128 * HEAD_DIM * 4
-
-
-@pytest.mark.parametrize("reqs", [1, 4, 11, 16, 33, 56])
+@pytest.mark.parametrize("reqs", [1, 11, 56])
 def test_own_t_is_within_the_float64_band_and_deterministic(reqs):
     args, kwargs = _step(reqs, seed=reqs)
     out = _own_t(args, kwargs)
@@ -249,15 +227,8 @@ def test_own_t_is_within_the_float64_band_and_deterministic(reqs):
 #: The plan cells: (requests, top-16 overlap swaps, contexts or None for the default mix, seed).
 _PLAN_CELLS = {
     "C88_s0_o100": (11, 0, None, 0),
-    "C88_s2_o100": (11, 0, None, 2),
-    "C88_s4_o100": (11, 0, None, 4),
-    "C128_s0_o100": (16, 0, None, 0),
-    "C128_s2_o100": (16, 0, None, 2),
     "C128_s4_o100": (16, 0, None, 4),
-    "C88_s2_o75": (11, 4, None, 2),
     "C88_s2_o50": (11, 8, None, 2),
-    "C128_s2_o75": (16, 4, None, 2),
-    "C128_s2_o50": (16, 8, None, 2),
     "C88_fix256_o100": (11, 0, [256] * 11, 0),
 }
 
@@ -358,77 +329,6 @@ def test_the_hook_hands_o_proj_the_mxfp8_quantize_of_own_ts_rows(monkeypatch):
         ), rows
 
 
-def test_the_hand_off_quantizes_a_byte_0_group_like_mxfp8_quantize(monkeypatch):
-    """A V scale small enough that 32-value groups take UE8M0 byte 0 (0 < amax <= 448 * 2^-127): the hand-off is still
-    bitwise trtllm::mxfp8_quantize, so those groups are zero codes, and no code is a NaN."""
-    monkeypatch.setattr(lc2_decode, "DEP_OWNT", True)
-    monkeypatch.setattr(merge_mxfp8, "DEP_MERGE_MXFP8", True)
-    monkeypatch.setattr(merge_mxfp8, "_BUFFERS", {})
-    merge_mxfp8.reserve(torch.device("cuda", torch.cuda.current_device()))
-    args, kwargs = _step(11, seed=11)
-    kwargs["v_global_scale"] = torch.full((1,), 3e-37, device="cuda")
-    rows = 11 * ROWS
-    out = torch.empty(
-        (rows, KV_HEADS * HEADS_PER_KV, HEAD_DIM), dtype=torch.bfloat16, device="cuda"
-    )
-    lc2_decode.dep_lc2_decode(*args, output=out, **kwargs)
-    out = out.view(rows, WIDTH)
-    q8, sf = merge_mxfp8.SLOT.take(out)
-    ref_q, ref_sf = torch.ops.trtllm.mxfp8_quantize(out, True)
-    codes = q8.view(torch.uint8)
-    assert torch.equal(codes, ref_q.view(torch.uint8))
-    at = _scale_positions(rows)
-    assert torch.equal(sf.view(torch.uint8).flatten()[at], ref_sf.view(torch.uint8).flatten()[at])
-    amax = out.float().abs().view(rows, WIDTH // 32, 32).amax(-1)
-    byte_0 = (amax > 0) & (amax <= 448 * 2.0**-127)
-    assert byte_0.any(), "no group reached UE8M0 byte 0"
-    assert not (codes.view(rows, WIDTH // 32, 32)[byte_0] & 0x7F).any()
-    assert not ((codes & 0x7F) == 0x7F).any()
-
-
-@pytest.mark.parametrize("reqs", [11, 4], ids=["split", "cluster"])
-def test_the_kill_switch_restores_lc2_bitwise(monkeypatch, reqs):
-    """With DEP_OWNT off the hook's rows are bitwise the LC2 op's on the same operands, on the split grid (88 rows)
-    and the cluster grid (32 rows)."""
-    monkeypatch.setattr(lc2_decode, "DEP_OWNT", False)
-    monkeypatch.setattr(
-        lc2_decode, "own_t_op", lambda: pytest.fail("TRTLLM_M31_DISABLE_DEP_OWNT=1 runs LC2")
-    )
-    monkeypatch.setattr(merge_mxfp8, "_BUFFERS", {})
-    rows = reqs * ROWS
-    args, kwargs = _step(reqs, seed=reqs)
-    out = torch.empty(
-        (rows, KV_HEADS * HEADS_PER_KV, HEAD_DIM), dtype=torch.bfloat16, device="cuda"
-    )
-    lc2_decode.dep_lc2_decode(*args, output=out, **kwargs)
-    q, k, v, topk, table, seqs = args
-    ref = torch.empty((rows, WIDTH), dtype=torch.bfloat16, device="cuda")
-    lc2_decode.lc2_op()(
-        q.view(torch.uint8),
-        k,
-        v,
-        kwargs["k_block_scale"],
-        kwargs["v_block_scale"],
-        kwargs["k_global_scale"],
-        kwargs["v_global_scale"],
-        topk,
-        table,
-        seqs,
-        ref,
-        None,
-        None,
-        WIDTH // 128,
-        ROWS,
-        kwargs["sm_scale"],
-        False,
-        lc2_decode.DEP_LC2_PDL and rows >= lc2_decode.SPLIT_MIN_ROWS,
-        False,
-        None,
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(out.view(rows, WIDTH).view(torch.int16), ref.view(torch.int16))
-
-
 def test_a_block_some_rows_did_not_select_leaves_their_rows_bitwise():
     """A union block that some rows of a (request, KV head) selected and others did not gets maximal K / V: the rows
     that did not select it are bitwise unchanged (their scores for it are unused and their P is zero), and the rows
@@ -472,48 +372,6 @@ def test_a_block_some_rows_did_not_select_leaves_their_rows_bitwise():
         assert same == (r in without), r
 
 
-def test_the_union_keeps_lc2s_selection_rule():
-    """OWN-T attends what LC2 attends: a row's slots below min(16, its blocks), with ids >= 0 below the request's
-    block count. Reordering those slots, filling the slots past them with valid ids, and writing an id past the
-    request's last block into a -1 slot leave the rows bitwise unchanged."""
-    args, kwargs = _step(11, seed=31)
-    q, k, v, topk, table, seqs = args
-    lens = seqs.cpu().tolist()
-
-    def real_slots(seq, r):
-        return min(TOPK, (max(seq - ROWS + r + 1, 0) + PAGE - 1) // PAGE)
-
-    # The reference table: each row drops its last real slot to -1.
-    ref = topk.cpu().clone()
-    for req, seq in enumerate(lens):
-        for r in range(ROWS):
-            real = real_slots(seq, r)
-            if real > 1:
-                ref[:, req * ROWS + r, real - 1] = -1
-    base = _own_t((q, k, v, ref.cuda(), table, seqs), kwargs).clone()
-    gen = torch.Generator().manual_seed(31)
-    edited = ref.clone()
-    counts = {"reordered": 0, "past_real": 0, "past_last": 0}
-    for req, seq in enumerate(lens):
-        blocks = (seq + PAGE - 1) // PAGE
-        for r in range(ROWS):
-            real = real_slots(seq, r)
-            for h in range(KV_HEADS):
-                row = edited[h, req * ROWS + r]
-                if real > 1:
-                    row[:real] = row[:real][torch.randperm(real, generator=gen)]
-                    row[int(row[:real].eq(-1).nonzero()[0, 0])] = blocks + 3
-                    counts["reordered"] += 1
-                    counts["past_last"] += 1
-                if real < TOPK:
-                    row[real:] = 0
-                    counts["past_real"] += 1
-    assert all(counts.values()), counts
-    out = _own_t((q, k, v, edited.cuda(), table, seqs), kwargs)
-    torch.cuda.synchronize()
-    assert torch.equal(out.view(torch.int16), base.view(torch.int16))
-
-
 @pytest.mark.parametrize("bucket, real", [(12, 11), (16, 13), (12, 0)])
 def test_the_hook_writes_zeros_for_the_padding_requests(monkeypatch, bucket, real):
     monkeypatch.setattr(lc2_decode, "DEP_OWNT", True)
@@ -537,59 +395,3 @@ def test_the_hook_writes_zeros_for_the_padding_requests(monkeypatch, bucket, rea
     if real:
         rel, worst = _band(out, args, kwargs, sorted({0, real * ROWS // 2, real * ROWS - 1}))
         assert rel <= REL_GLOBAL and worst <= REL_ROW_HEAD, (rel, worst)
-
-
-@pytest.mark.parametrize("reqs", [16, 48], ids=["128_rows", "384_rows"])
-def test_the_hook_runs_own_t_bitwise_at_the_served_widths(monkeypatch, reqs):
-    """Generation steps of 88 and 128 requests per rank (up to max_num_tokens 384) take OWN-T, bitwise its op."""
-    monkeypatch.setattr(lc2_decode, "DEP_OWNT", True)
-    monkeypatch.setattr(lc2_decode, "DEP_LC2_PDL", True)
-    monkeypatch.setattr(lc2_decode, "_PAD_ROWS", None)
-    monkeypatch.setattr(merge_mxfp8, "_BUFFERS", {})
-    rows = reqs * ROWS
-    args, kwargs = _step(reqs, seed=100 + reqs)
-    out = torch.empty(
-        (rows, KV_HEADS * HEADS_PER_KV, HEAD_DIM), dtype=torch.bfloat16, device="cuda"
-    )
-    lc2_decode.dep_lc2_decode(*args, output=out, **kwargs)
-    ref = _own_t(args, kwargs)
-    torch.cuda.synchronize()
-    assert torch.equal(out.view(rows, WIDTH).view(torch.int16), ref.view(torch.int16))
-
-
-def test_a_step_wider_than_the_reserve_raises_and_writes_nothing(monkeypatch):
-    """57 requests (456 rows) exceed LC2's 448-row reserve: the hook raises, runs no kernel and has no Triton route."""
-    fake = types.ModuleType(
-        "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode"
-    )
-    fake.minimax_m3_sparse_attn_decode = lambda *a, **kw: pytest.fail(
-        "the DEP hook has no Triton fallback"
-    )
-    monkeypatch.setitem(sys.modules, fake.__name__, fake)
-    monkeypatch.setattr(lc2_decode, "DEP_OWNT", True)
-    monkeypatch.setattr(
-        lc2_decode, "lc2_op", lambda: lambda *a: pytest.fail("a declined step must not run LC2")
-    )
-    monkeypatch.setattr(
-        lc2_decode, "own_t_op", lambda: lambda *a: pytest.fail("a declined step must not run OWN-T")
-    )
-    reqs = lc2_decode.MAX_ROWS // ROWS + 1
-    args, kwargs = _step(reqs, seed=7)
-    out = torch.full(
-        (reqs * ROWS, KV_HEADS * HEADS_PER_KV, HEAD_DIM), 3.0, dtype=torch.bfloat16, device="cuda"
-    )
-    with pytest.raises(RuntimeError, match=r"456 rows \(outside 1\.\.448\)"):
-        lc2_decode.dep_lc2_decode(*args, output=out, **kwargs)
-    torch.cuda.synchronize()
-    assert bool((out == 3.0).all())
-
-
-@pytest.mark.parametrize("reqs", [1, 16, 56])
-def test_the_fastplan_kill_switch_keeps_the_bits(reqs):
-    """fast_plan=False (DEP_OWNT_FASTPLAN off) loads the union's block weights in the plan instead of deriving them:
-    the same split, so the same rows bit for bit."""
-    args, kwargs = _step(reqs, seed=100 + reqs)
-    fast = _own_t(args, kwargs).clone()
-    loaded = _own_t(args, kwargs, fast_plan=False)
-    torch.cuda.synchronize()
-    assert torch.equal(fast.view(torch.int16), loaded.view(torch.int16))

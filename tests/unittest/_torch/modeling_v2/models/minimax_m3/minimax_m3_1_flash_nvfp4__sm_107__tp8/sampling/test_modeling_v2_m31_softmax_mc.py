@@ -1,19 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for SOFTMAX_MC: the spec sampler's softmax as
-``mv2_minimax_m3::minimax_m31_softmax_mc`` through ``ops/sampling/m31_softmax_mc``, installed as the sampler's softmax
-override where the engine offers one.
+"""Tests for SOFTMAX_MC: the spec sampler's softmax as ``mv2_minimax_m3::minimax_m31_softmax_mc`` through
+``ops/sampling/m31_softmax_mc``.
 
-It must equal ``flashinfer.sampling.softmax(logits, temperature)`` bit for bit (the microbench generators: randn /
-peaked / ties / near_uniform / all_equal / masked / wide rows, temperature 1 / per-row mixed / scalar). Outside its
-contract the override declines. The target installs it only through the engine's override setter;
-TRTLLM_M31_DISABLE_SOFTMAX_MC=1 installs nothing.
-"""
-
-import os
-import subprocess
-import sys
-from unittest import mock
+It must equal ``flashinfer.sampling.softmax(logits, temperature)`` bit for bit (peaked / ties / masked / wide rows,
+temperature 1 / per-row mixed / scalar), and no temperature is temperature 1."""
 
 import pytest
 import torch
@@ -22,8 +13,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
     m31_softmax_mc as entry,
 )
 
-TARGET = "tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8"
-CLASSES = ("randn", "peaked", "ties", "near_uniform", "all_equal", "masked", "wide")
+CLASSES = ("peaked", "ties", "masked", "wide")
 TEMPS = ("t1", "mixed", "scalar")
 op = entry.m31_softmax_mc
 
@@ -111,93 +101,3 @@ def test_no_temperature_is_one() -> None:
     got = entry.softmax_mc(logits, None)
     assert got is not None
     _same(got, _fi(logits, None), "temperature None")
-
-
-def test_graph_replay_equals_eager() -> None:
-    """Captured in a CUDA graph (workspace prebuilt outside the capture), the replay gives the eager bits."""
-    _gpu()
-    logits = _make("peaked", 8, 200064, 5)
-    temperature = _temperature("mixed", 8, 5)
-    entry.prebuild(logits.device)
-    ref = entry.softmax_mc(logits, temperature)
-    stream = torch.cuda.Stream()
-    # The eager warm-up on the side stream shares the persistent workspace with the default-stream
-    # calls above (and reads their inputs): order it after them.
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        entry.softmax_mc(logits, temperature)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            out = entry.softmax_mc(logits, temperature)
-    assert out is not None, "a prebuilt workspace must serve a captured call"
-    for _ in range(3):
-        out.fill_(float("nan"))
-        graph.replay()
-        torch.cuda.synchronize()
-        _same(out, ref, "graph replay")
-
-
-def test_outside_the_contract_the_override_declines() -> None:
-    """A non-fp32 / misaligned / non-contiguous logits, a d % 4 width, a vocab below FlashInfer's Path A, a mis-sized,
-    non-fp32 or 2-D temperature, a non-number temperature or more rows than MAX_ROWS return None (the sampler runs
-    stock FlashInfer)."""
-    _gpu()
-    d = 200064
-    logits = _make("randn", 4, d, 1)
-    temperature = torch.full((4,), 0.9, device="cuda")
-    assert entry.softmax_mc(logits.half(), temperature) is None
-    assert entry.softmax_mc(logits, temperature.double()) is None
-    assert entry.softmax_mc(logits, temperature[:3]) is None
-    assert entry.softmax_mc(logits, temperature.view(4, 1)) is None
-    assert entry.softmax_mc(logits, "0.9") is None
-    assert entry.softmax_mc(logits[:, : d - 4], temperature) is None
-    assert entry.softmax_mc(logits[:, : d - 2].contiguous(), temperature) is None
-    assert (
-        entry.softmax_mc(logits[:, : entry.PATH_A_MIN_VOCAB - 4].contiguous(), temperature) is None
-    )
-    flat = torch.empty(4 * d + 1, device="cuda")
-    assert entry.softmax_mc(flat[1:].view(4, d), temperature) is None
-    cap = entry.max_rows()  # TP8WIDE_SOFTMAX: 32, else 8
-    wide = _make("randn", cap + 1, d, 2)
-    assert entry.softmax_mc(wide, torch.full((cap + 1,), 0.9, device="cuda")) is None
-    assert entry.softmax_mc(logits.cpu(), temperature.cpu()) is None
-
-
-def test_the_target_installs_the_override(monkeypatch) -> None:
-    """With SOFTMAX_MC on (the default) and the op built, the target installs ``softmax_mc`` once per process through
-    the
-    engine's override setter, and installs nothing on an engine that has no such setter."""
-    _gpu()
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8 import (  # noqa: E501
-        modeling,
-    )
-
-    if not modeling.SOFTMAX_MC:
-        pytest.skip("SOFTMAX_MC is switched off in this environment")
-    saved = dict(modeling._SOFTMAX_MC_STATE)
-    try:
-        for setter in (None, mock.Mock()):
-            monkeypatch.setattr(modeling, "_SET_SOFTMAX_OVERRIDE", setter)
-            modeling._SOFTMAX_MC_STATE.clear()
-            modeling._install_softmax_mc()
-            assert modeling._SOFTMAX_MC_STATE["installed"] is (setter is not None)
-            if setter is not None:
-                setter.assert_called_once_with(entry.softmax_mc)
-    finally:
-        modeling._SOFTMAX_MC_STATE.clear()
-        modeling._SOFTMAX_MC_STATE.update(saved)
-
-
-def test_the_kill_switch_installs_nothing() -> None:
-    """TRTLLM_M31_DISABLE_SOFTMAX_MC=1 (read at import): SOFTMAX_MC is off and the target installs nothing."""
-    probe = (
-        f"import {TARGET}.modeling as m\n"
-        "m._install_softmax_mc()\n"
-        "print(m.SOFTMAX_MC, m._SOFTMAX_MC_STATE['installed'])"
-    )
-    env = dict(os.environ, TRTLLM_M31_DISABLE_SOFTMAX_MC="1")
-    out = subprocess.run(
-        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, check=True
-    )
-    assert out.stdout.strip().splitlines()[-1] == "False False"

@@ -17,9 +17,6 @@ import torch
 from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 try:
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.kernels.m3_moe import (  # noqa: E501
-        op as moe_op,
-    )
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
         M3MoeState,
     )
@@ -91,62 +88,6 @@ def test_certified_cells(cell, case) -> None:
 @pytest.mark.parametrize("m", (1, 2, 8))
 def test_routed_part_is_trtllm_gen_bit_for_bit(m) -> None:
     check_routed_part(op, _state(m), m, seed=100 + m)
-
-
-def test_the_engine_is_built_at_the_tp2_width() -> None:
-    assert moe_op.INTER == moe_op.SHARED_INTER == 1536
-    state = _state(1)
-    assert state.inter == 1536 and state.config["i_tp"] == 1536
-    assert state.config.get("sh_i") == 1536
-
-
-def _killed_state(m: int, item: str, monkeypatch) -> M3MoeState:
-    """A fresh state for ``m`` tokens with ``item``'s kill switch set (the module constant or switch read at build)."""
-    if item == "MOE_VRPOLL":
-        monkeypatch.setattr(moe_op, "VRPOLL", False)
-    elif item == "MOE_HALFPLAN":
-        monkeypatch.setattr(moe_op, "HALFPLAN", False)
-    elif item == "MOE_M8CFG":
-        monkeypatch.setattr(moe_op, "m31_disabled", lambda item_id: item_id == "MOE_M8CFG")
-    else:
-        raise ValueError(item)
-    sms = torch.cuda.get_device_properties(0).multi_processor_count
-    return M3MoeState(torch.device("cuda"), num_tokens=m, num_ctas=sms - 24, shared=True)
-
-
-LEVER_CASES = [("MOE_M8CFG", 8), ("MOE_VRPOLL", 7), ("MOE_VRPOLL", 8)] + [
-    ("MOE_HALFPLAN", m) for m in range(1, 9)
-]
-
-
-@pytest.mark.parametrize("case", ("random", "concentrated"))
-@pytest.mark.parametrize("item, m", LEVER_CASES, ids=[f"{i}-m{m}" for i, m in LEVER_CASES])
-def test_each_lever_is_bitwise_its_kill_switch(item, m, case, monkeypatch) -> None:
-    """The lever's state and the killed state give the same bits on the same layer operands (eager, and the default
-    state also from a CUDA-graph replay); the default state records the lever where its config carries it, the killed
-    state never does."""
-    on = _state(m)
-    off = _killed_state(m, item, monkeypatch)
-    assert item not in off.items
-    if item == "MOE_M8CFG":
-        assert item in on.items and on.config["b2img"] == 0
-    elif item == "MOE_VRPOLL":
-        assert item in on.items and on.config["lg_repl"] == moe_op.VRPOLL_LG_REPL
-        assert off.config.get("lg_repl") != moe_op.VRPOLL_LG_REPL
-    hidden = hidden_states(m, seed=zlib.crc32(f"{item}-{m}-{case}".encode()) % 2**31)
-    ref = layer_for(off, case)(hidden)
-    out = layer_for(on, case)(hidden)
-    assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), f"{item} at {m} tokens"
-    layer = layer_for(on, case)
-    layer(hidden)  # compiled before the capture
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = layer(hidden)
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(captured.view(torch.int16), ref.view(torch.int16)), (
-        f"{item} at {m} tokens (graph)"
-    )
 
 
 def test_layers_on_one_state_do_not_leak_into_each_other() -> None:

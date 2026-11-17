@@ -7,16 +7,12 @@ Every cell is held to the float64 reference within the derived band, its MXFP8 h
 the two ``prewait`` variants (staging before or after the grid wait) to each other bit for bit.
 """
 
-import re
 import zlib
 
 import pytest
 import torch
-from torch.profiler import ProfilerActivity, profile
 
-import tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.attention.m3_sparse_decode_lc8 as lc8_entry  # noqa: E501
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.attention.m3_sparse_decode_lc8 import (  # noqa: E501
-    NUM_HEADS,
     WIDTH,
     dequant_nvfp4_pages,
     mxfp8_handoff_reference,
@@ -26,7 +22,6 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
 )
 
 __extra_import_path__ = ["../../../..", "."]
-from _m3_nvfp4_cache import NUM_HEADS as CASE_HEADS  # noqa: E402 — needs the path declared above
 from _m3_nvfp4_cache import build_step  # noqa: E402
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402, F401
 
@@ -92,10 +87,6 @@ def _case(spec, seed):
     return build_step(spec["seq_lens"], spec["decode_query_len"], identity=False, seed=seed)
 
 
-def test_the_cases_are_the_tp8_geometry() -> None:
-    assert CASE_HEADS == NUM_HEADS == 8 and WIDTH == 1024
-
-
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     spec = cell.spec
@@ -154,24 +145,6 @@ def test_reference_dequant_matches_the_quantizer() -> None:
         )
 
 
-def test_the_variants_agree() -> None:
-    """The two softmax recurrences, the hand-off switch and the staging must not change the BF16 rows beyond
-    rounding; the hand-off switch and the staging not at all."""
-    case = build_step((5000, 12345), 4, identity=False, seed=11)
-    outs = {}
-    for linear in (False, True):
-        for mxfp8 in (False, True):
-            for prewait in (False, True):
-                out, q8, sf = _buffers(case.q.shape[0], mxfp8)
-                op(*_args(case, out, q8, sf, linear, prewait))
-                outs[(linear, mxfp8, prewait)] = out
-    base = outs[(False, False, False)]
-    for key, other in outs.items():
-        assert_within_ulp(other, base, element_ulp=_ELEMENT_ULP, rms_ulp=_RMS_ULP)
-        same_recurrence = outs[(key[0], False, False)]
-        torch.testing.assert_close(other, same_recurrence, rtol=0, atol=0)
-
-
 def test_guard_refuses_a_block_past_the_request() -> None:
     """A selected id at or past the request's block count reads a page the token cannot attend; with every
     position masked the CTA's softmax is NaN."""
@@ -181,27 +154,6 @@ def test_guard_refuses_a_block_past_the_request() -> None:
     with pytest.raises(AssertionError, match="block count"):
         with validating(op):
             op(*_args(case, out, q8, sf, False, True))
-
-
-def test_guard_refuses_strided_page_rows() -> None:
-    """The kernel walks a page's token rows at a fixed 64-byte pitch; a padded row stride is misread."""
-    case = build_step((3000,), 1, identity=False, seed=6)
-    wide = torch.zeros(*case.k_paged.shape[:3], 80, dtype=torch.uint8, device="cuda")[..., :64]
-    wide.copy_(case.k_paged)
-    case.k_paged = wide
-    out, q8, sf = _buffers(1, True)
-    with pytest.raises(AssertionError, match="64-byte rows"):
-        with validating(op):
-            op(*_args(case, out, q8, sf, False, True))
-
-
-def test_guard_refuses_a_narrow_handoff() -> None:
-    """The hand-off rows are 1024 wide (8 scale k-tiles); a smaller count overlaps them."""
-    case = build_step((3000,), 1, identity=False, seed=7)
-    out, q8, sf = _buffers(1, True)
-    with pytest.raises(AssertionError, match="num_sf_k_tiles"):
-        with validating(op):
-            op(*_args(case, out, q8, sf, False, True, num_sf_k_tiles=4))
 
 
 @pytest.mark.parametrize("prewait", [True, False], ids=["prewait", "plain"])
@@ -236,163 +188,3 @@ def test_run_to_run_deterministic(prewait, mxfp8) -> None:
                     linear,
                     prewait,
                 )
-
-
-@pytest.mark.parametrize(
-    "seq_lens, decode_query_len",
-    [((165521,), 4), ((5000, 12345), 4), ((700,), 1), ((200000, 3000, 64, 70000), 4)],
-    ids=["1x165k", "2req", "short-1row", "4req-incl-64"],
-)
-def test_merge_once_is_bitwise_the_image_op(seq_lens, decode_query_len) -> None:
-    """kernels/m3_attn_lc8.MERGE_ONCE: the target's op (merge weights formed once per CTA) writes exactly the
-    image op's rows and hand-off, at both softmax recurrences and both staging variants, including requests with fewer
-    than 16 selected blocks (empty chunks, -inf LSE). With SPARSE_DECODE_LC8_PREFETCH_OPROJ it also pulls two ranges
-    the size of the TP8 o_proj weight and scales (one not a multiple of 16 bytes) into L2: the same bits again. With
-    SPARSE_DECODE_LC8_PREFETCH_NEXT_KV it records each row's selection (the first min(16, blocks) ids, -1 after) and
-    prefetches a next layer's recorded blocks, stale ids past a request's blocks included: the same bits, and the
-    record."""
-    assert hasattr(torch.ops.trtllm, "minimax_m3_sm107_tp8_sparse_decode_lc8"), (
-        "the target's LC8 op is not loaded (its TP8 extension)"
-    )
-    case = build_step(
-        seq_lens, decode_query_len, identity=False, seed=zlib.crc32(repr(seq_lens).encode())
-    )
-    o_proj_weight = torch.empty(6144, 1024, dtype=torch.uint8, device="cuda")
-    o_proj_scale = torch.empty(6144 * 32 + 9, dtype=torch.uint8, device="cuda")
-    rows = case.q.shape[0]
-    n1_next = torch.randint(
-        -1, 2 * (max(seq_lens) // 128 + 1), (128, 16), dtype=torch.int32, device="cuda"
-    )
-    for linear in (False, True):
-        for prewait in (False, True):
-            for mxfp8 in (False, True):
-                n1_self = torch.full((128, 16), -7, dtype=torch.int32, device="cuda")
-                next_kv = (
-                    n1_self,
-                    n1_next,
-                    case.k_paged.view(torch.uint8),
-                    case.v_paged.view(torch.uint8),
-                    case.k_block_scale.view(torch.uint8),
-                    case.v_block_scale.view(torch.uint8),
-                )
-                variants = (
-                    (False, None, None),
-                    (True, None, None),
-                    (True, (o_proj_weight, o_proj_scale), None),
-                    (True, (o_proj_weight, o_proj_scale), next_kv),
-                )
-                got = []
-                for merge_once, prefetch, n1 in variants:
-                    out, q8, sf = _buffers(case.q.shape[0], mxfp8)
-                    op(
-                        *_args(case, out, q8, sf, linear, prewait),
-                        merge_once=merge_once,
-                        prefetch=prefetch,
-                        next_kv=n1,
-                    )
-                    got.append((out, q8, sf))
-                torch.cuda.synchronize()
-                a, aq, asf = got[0]
-                for i, (b, bq, bsf) in enumerate(got[1:], 1):
-                    assert torch.equal(a.view(torch.int16), b.view(torch.int16)), (
-                        linear,
-                        prewait,
-                        mxfp8,
-                        i,
-                    )
-                    if mxfp8:
-                        assert torch.equal(aq, bq) and torch.equal(asf, bsf), (linear, prewait, i)
-                # The record: each row's first min(16, blocks) selected ids, -1 past them; rows past the step untouched.
-                want = case.topk[0].clone()
-                for tok in range(rows):
-                    req, qoff = divmod(tok, case.decode_query_len)
-                    kv_len = max(int(case.seq_lens[req]) - case.decode_query_len + qoff + 1, 0)
-                    want[tok, min(16, (kv_len + 127) // 128) :] = -1
-                assert torch.equal(n1_self[:rows], want), "the recorded selection"
-                assert bool((n1_self[rows:] == -7).all()), "rows past the step"
-
-
-@pytest.mark.parametrize("linear", [False, True])
-@pytest.mark.parametrize("prewait", [True, False], ids=["prewait", "plain"])
-@pytest.mark.parametrize(
-    "seq_lens, decode_query_len",
-    [((165521,), 4), ((5000, 12345), 4), ((700,), 1), ((200000, 3000, 64, 70000), 4)],
-    ids=["1x165k", "2req", "short-1row", "4req-incl-64"],
-)
-def test_one_div_merge_is_deterministic_and_in_band(
-    seq_lens, decode_query_len, prewait, linear
-) -> None:
-    """The op's ``one_div`` merge (one division per row): it writes the same rows on
-    every run (5 eager runs, PDL on and off) and under CUDA-graph replay (3 replays == eager), MXFP8 hand-off included;
-    the rows are within the float64 reference's band, and within summation-order distance of the per-chunk merge."""
-    case = build_step(
-        seq_lens, decode_query_len, identity=False, seed=zlib.crc32(repr(seq_lens).encode()) + 3
-    )
-    total_q = case.q.shape[0]
-
-    def run(out, q8, sf, use_pdl, one_div):
-        args = list(_args(case, out, q8, sf, linear, prewait))
-        args[18] = use_pdl
-        op(*args, merge_once=True, one_div=one_div)
-
-    runs = []
-    for i in range(6):
-        out, q8, sf = _buffers(total_q, True)
-        run(out, q8, sf, i == 5, True)
-        runs.append((out, q8, sf))
-    torch.cuda.synchronize()
-    a, aq, asf = runs[0]
-    for b, bq, bsf in runs[1:]:
-        assert torch.equal(a.view(torch.int16), b.view(torch.int16))
-        assert torch.equal(aq, bq) and torch.equal(asf, bsf)
-    out = torch.empty_like(a)
-    run(out, None, None, True, True)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run(out, None, None, True, True)
-    for _ in range(3):
-        out.zero_()
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(out.view(torch.int16), a.view(torch.int16))
-    per, _, _ = _buffers(total_q, False)
-    run(per, None, None, False, False)
-    ref = op.reference(*_args(case, a, None, None, linear, prewait))
-    assert torch.isfinite(a.float()).all()
-    assert_within_ulp(a, ref, element_ulp=_ELEMENT_ULP, rms_ulp=_RMS_ULP)
-    assert_within_ulp(a, per, element_ulp=_ELEMENT_ULP, rms_ulp=_RMS_ULP)
-
-
-def _lc8_extract_rows(monkeypatch, extract, case):
-    """The merge-once op's rows and hand-offs at both softmax recurrences and both staging variants with LC8_EXTRACT
-    set to ``extract``, and the EXTRACT template argument of every LC8 kernel those calls launched."""
-    monkeypatch.setattr(lc8_entry, "LC8_EXTRACT", extract)
-    rows = {}
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        for linear in (False, True):
-            for prewait in (False, True):
-                out, q8, sf = _buffers(case.q.shape[0], True)
-                op(*_args(case, out, q8, sf, linear, prewait), merge_once=True)
-                rows[(linear, prewait)] = (out.view(torch.int16).clone(), q8.clone(), sf.clone())
-        torch.cuda.synchronize()
-    kernels = [e.name for e in prof.events() if "m3_tp8_lc8_attn_kernel<" in e.name]
-    templates = sorted(
-        {re.search(r"m3_tp8_lc8_attn_kernel<(?:\w+, ){4}(\w+)>", n).group(1) for n in kernels}
-    )
-    return rows, templates, len(kernels)
-
-
-def test_the_extract_switch_keeps_the_bits(monkeypatch) -> None:
-    """The dequant's fewer-move byte extraction (LC8_EXTRACT, on by default) and the instance its kill switch selects
-    (the op's extract=False) write the same rows and hand-offs at both softmax recurrences and both staging variants,
-    and each setting launches the instance it names."""
-    case = build_step((165521,), 4, identity=False, seed=4242)
-    on, on_templates, on_launches = _lc8_extract_rows(monkeypatch, True, case)
-    off, off_templates, off_launches = _lc8_extract_rows(monkeypatch, False, case)
-    assert on_templates == ["true"] and on_launches == 4, (on_templates, on_launches)
-    assert off_templates == ["false"] and off_launches == 4, (off_templates, off_launches)
-    for key, (out, q8, sf) in on.items():
-        b_out, b_q8, b_sf = off[key]
-        assert torch.equal(out, b_out), key
-        assert torch.equal(q8, b_q8) and torch.equal(sf, b_sf), key

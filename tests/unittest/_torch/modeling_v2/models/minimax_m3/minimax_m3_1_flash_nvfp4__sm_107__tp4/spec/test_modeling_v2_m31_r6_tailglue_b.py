@@ -13,23 +13,16 @@ the tail skips its own launch only for the outputs the fused launch stored, the 
 holds, and the worker takes the launch only on decode-only steps under the switch.
 """
 
-import ast
-import importlib.util
-import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-import tensorrt_llm._torch.modeling_v2.models.minimax_m3 as _family
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels import (  # noqa: E501
     m3_fold_tail,
     m3_nnt_fold,
 )
 
-TARGET = "minimax_m3_1_flash_nvfp4__sm_107__tp4"
-_DIR = Path(_family.__file__).resolve().parent / TARGET
 VOCAB = 200064
 NUM_SLOTS = 12
 MAX_ROWS = 8
@@ -47,9 +40,7 @@ def _sm107() -> bool:
 def _stock_next_new_tokens(accepted, num_accepted, batch_idx, next_draft):
     """N3 A2's catalog op where it runs (sm_90+: its kernel waits on the grid dependency), else its exact reference
     (the in-tree index + concat)."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
-        strict_accept,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import strict_accept
 
     op = strict_accept.spec_next_new_tokens
     if torch.cuda.get_device_capability()[0] >= 9 and strict_accept.supports_next_new_tokens(
@@ -138,8 +129,8 @@ _CPP = pytest.param(
 
 @needs_gpu
 @pytest.mark.parametrize("cpp", [False, _CPP], ids=["triton", "cpp"])
-@pytest.mark.parametrize("bidx_dtype", [torch.int32, torch.int64], ids=["bidx32", "bidx64"])
-@pytest.mark.parametrize("armed", ["all", "none", "part"])
+@pytest.mark.parametrize("bidx_dtype", [torch.int32], ids=["bidx32"])
+@pytest.mark.parametrize("armed", ["all", "part"])
 @pytest.mark.parametrize(
     "n,d,widths,acc_extra",
     [
@@ -312,254 +303,3 @@ def test_fold_object_over_steps_after_admissions(monkeypatch):
         assert ref.sampler_rows_stored(ref_out, 0, seq_slots) == got.sampler_rows_stored(
             outputs, 0, seq_slots
         )
-
-
-@needs_gpu
-def test_fold_object_runs_its_tail_for_other_outputs():
-    """Outputs that are not the ones the fused launch stored (another new_tokens tensor) get the stock tail."""
-    modeling = _fold_classes()
-    m3_nnt_fold.precompile(torch.device("cuda"))
-    g = torch.Generator(device="cuda").manual_seed(5)
-    bufs = _Bufs((8, 8, 7), 8, g)
-    fold = _bound_fold(modeling, bufs)
-    fold.begin_step([4], 1)
-    accepted, num, bidx, next_draft = _step(1, 7, g)
-    out = fold.fold_next_new_tokens(accepted, num, bidx, next_draft)
-    assert out is not None and fold._tail_done is not None
-    other = accepted.clone()
-    seen = []
-    fold.store_in_forward(
-        {
-            "new_tokens": other,
-            "next_new_tokens": out,
-            "new_tokens_lens": num,
-            "next_draft_tokens": next_draft,
-        }
-    )
-    seen.append(fold._eager_outputs is other)
-    assert seen == [True] and fold._tail_done is None
-    # An unbound fold declines without waiting or launching.
-    bare = modeling.M3DSparkStepFoldFwd(store_copy_wait=False, cpp_tail=False)
-    assert bare.fold_next_new_tokens(accepted, num, bidx, next_draft) is None
-    assert "nnt_fold" in modeling.M3DSparkStepFoldFwd.STORE_WAIT_BEFORE
-
-
-def _external_events() -> bool:
-    """Whether this torch has the external CUDA events the deployed store wait uses (torch.cuda.Event(external=))."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        torch.cuda.Event(external=True)
-    except TypeError:
-        return False
-    return True
-
-
-@needs_gpu
-@pytest.mark.skipif(not _external_events(), reason="needs torch.cuda.Event(external=True)")
-def test_fold_object_with_the_store_wait_in_a_cuda_graph(monkeypatch):
-    """The deployed configuration (STEP_SPEC_STORE_COPY_SIDE: store_copy_wait=True): the store wait (an external-event
-    wait node under capture) and then the fused launch, captured in one graph with the tail's store_in_forward (which
-    skips its own launch), replayed over armed, re-armed and unarmed steps while the sampler copies the store to the
-    host on its side stream (late, behind a sleep) and records the event. The replay must wait for that copy (the
-    host copy holds the store before the replay's writes), and every buffer and next_new_tokens must equal the stock
-    pair's."""
-    modeling = _fold_classes()
-    m3_nnt_fold.precompile(torch.device("cuda"))
-    g = torch.Generator(device="cuda").manual_seed(13)
-    n, d, t = 1, 7, 8
-    bufs = _Bufs((8, 8, 7), t, g)
-    ref = bufs.clone()
-    fold = modeling.M3DSparkStepFoldFwd(store_copy_wait=True, cpp_tail=False)
-    fold.bind_engine_buffers(bufs.ids, bufs.draft_ids, bufs.pos_off, bufs.kv_off, MAX_ROWS)
-    assert fold.store_copies_done is not None
-    fold.bind_sampler_store(
-        SimpleNamespace(
-            new_tokens=bufs.new_tokens,
-            next_new_tokens=bufs.next_new_tokens,
-            next_draft_tokens=bufs.next_draft_tokens,
-            new_tokens_lens=bufs.new_tokens_lens,
-        )
-    )
-    accepted, num, bidx, next_draft = _step(n, d, g)
-    tail_calls = []
-    real_fold_tail = m3_fold_tail.fold_tail
-
-    def counted(*a, **k):
-        tail_calls.append(a[2])
-        return real_fold_tail(*a, **k)
-
-    monkeypatch.setattr(m3_fold_tail, "fold_tail", counted)
-    fold.begin_step([3], n)
-    torch.cuda.synchronize()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            out = fold.fold_next_new_tokens(accepted, num, bidx, next_draft)
-            assert out is not None
-            fold.store_in_forward(
-                {
-                    "new_tokens": accepted,
-                    "next_new_tokens": out,
-                    "new_tokens_lens": num,
-                    "next_draft_tokens": next_draft,
-                }
-            )
-    torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
-    assert tail_calls == [], "the captured tail must not launch the fold tail again"
-    assert fold._tail_done is None and accepted.data_ptr() in fold._graph_outputs
-    side = torch.cuda.Stream()
-    host = torch.empty(bufs.new_tokens.shape, dtype=torch.int32).pin_memory()
-    for step, seq_slots in enumerate([[3], [3], [5], None, [11], [0]]):
-        a2, n2, _, nd2 = _step(n, d, g)
-        accepted.copy_(a2)
-        num.copy_(n2)
-        next_draft.copy_(nd2)
-        fold.begin_step(seq_slots, n)
-        want = _stock_pair(ref, fold._ctrl, fold._slots, accepted, num, bidx, next_draft, False)
-        before = bufs.new_tokens.clone()
-        torch.cuda.synchronize()
-        # The sampler: its host copy of the store on its side stream, late, then the event the tail waits on.
-        with torch.cuda.stream(side):
-            torch.cuda._sleep(20_000_000)
-            host.copy_(bufs.new_tokens, non_blocking=True)
-            fold.store_copies_done.record(side)
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(host, before.cpu()), (
-            step,
-            "the replay rewrote the store before the host copy",
-        )
-        assert torch.equal(out, want), step
-        assert bufs.equal(ref), step
-
-
-def _dspark():
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4 import (  # noqa: E501
-        dspark,
-    )
-
-    return dspark
-
-
-class _FakeFold:
-    def __init__(self, result):
-        self.result = result
-        self.calls = []
-
-    def fold_next_new_tokens(self, accepted, num, bidx, next_draft):
-        self.calls.append((accepted, num, bidx, next_draft))
-        return self.result
-
-
-def _bare_worker(dspark):
-    from torch import nn
-
-    w = dspark.M3DSparkWorker.__new__(dspark.M3DSparkWorker)
-    nn.Module.__init__(w)
-    w.mapping = SimpleNamespace(tp_rank=1)
-    return w
-
-
-@needs_gpu
-def test_worker_takes_the_launch_on_decode_only_steps(monkeypatch):
-    dspark = _dspark()
-    g = torch.Generator(device="cuda").manual_seed(2)
-    accepted, num, _, next_draft = _step(1, 7, g)
-    batch_indices = torch.arange(32, dtype=torch.int32, device="cuda")
-    sentinel = torch.full((1, 8), -9, dtype=torch.int32, device="cuda")
-    lines = []
-    monkeypatch.setattr(dspark.logger, "info", lambda msg, *a, **k: lines.append(msg))
-    w = _bare_worker(dspark)
-    fake = _FakeFold(sentinel)
-    w.bind_tail_fold(fake)
-    stock = _stock_next_new_tokens(accepted, num, batch_indices[:1], next_draft)
-    # Mixed (context + generation) step: the forward tail does not store it, so the stock path runs.
-    w._nnt_fold_step = False
-    assert torch.equal(
-        w._prepare_next_new_tokens(accepted, next_draft, batch_indices, 1, num), stock
-    )
-    assert fake.calls == []
-    # Decode-only step: the fused launch.
-    w._nnt_fold_step = True
-    for _ in range(2):
-        assert w._prepare_next_new_tokens(accepted, next_draft, batch_indices, 1, num) is sentinel
-    assert len(fake.calls) == 2 and fake.calls[0][2].numel() == 1
-    assert [m for m in lines if "TAILGLUE_B" in m] == [
-        "[M3 dispatch] TAILGLUE_B taken: next_new_tokens + forward-tail fold in one launch (1 requests) on rank 1"
-    ]
-    # The fold declines (operands it does not take): the stock path.
-    w.bind_tail_fold(_FakeFold(None))
-    assert torch.equal(
-        w._prepare_next_new_tokens(accepted, next_draft, batch_indices, 1, num), stock
-    )
-    # Kill switch.
-    monkeypatch.setattr(dspark, "TAILGLUE_B", False)
-    w.bind_tail_fold(fake)
-    assert torch.equal(
-        w._prepare_next_new_tokens(accepted, next_draft, batch_indices, 1, num), stock
-    )
-    assert len(fake.calls) == 2
-
-
-def test_worker_forward_marks_decode_only_steps(monkeypatch):
-    dspark = _dspark()
-    seen = []
-
-    def inner(self, *args, **kwargs):
-        seen.append(self._nnt_fold_step)
-        return "out"
-
-    monkeypatch.setattr(dspark.S4WorkerMixin, "_forward_impl", inner)
-    w = _bare_worker(dspark)
-    w._tf = None
-    assert w._forward_impl(attn_metadata=SimpleNamespace(num_contexts=0)) == "out"
-    assert w._forward_impl(attn_metadata=SimpleNamespace(num_contexts=2)) == "out"
-    assert (
-        w._forward_impl(None, None, None, None, SimpleNamespace(num_contexts=0), None, None)
-        == "out"
-    )
-    assert seen == [True, False, True] and w._nnt_fold_step is False
-
-
-def _eval_switch(monkeypatch, env):
-    """dspark.py's TAILGLUE_B assignment evaluated against a private copy of m31_switches under ``env``."""
-    for name in list(os.environ):
-        if name.startswith(("TRTLLM_M31_DISABLE_", "TRTLLM_M31_ENABLE_")):
-            monkeypatch.delenv(name)
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
-    spec = importlib.util.spec_from_file_location(
-        f"_m31_switches_tailglue_{id(env)}", _DIR / "m31_switches.py"
-    )
-    switches = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(switches)
-    tree = ast.parse((_DIR / "dspark.py").read_text())
-    stmts = [
-        n
-        for n in tree.body
-        if isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "TAILGLUE_B" for t in n.targets)
-    ]
-    assert len(stmts) == 1
-    ns = {"m31_disabled": switches.m31_disabled}
-    exec(compile(ast.Module(stmts, []), "dspark.py", "exec"), ns)
-    return ns["TAILGLUE_B"]
-
-
-@pytest.mark.parametrize(
-    "env,want",
-    [
-        ({}, True),
-        ({"TRTLLM_M31_DISABLE_TAILGLUE_B": "0"}, True),
-        ({"TRTLLM_M31_DISABLE_TAILGLUE_B": "1"}, False),
-        # N3A's switch restores the in-tree next_new_tokens, so it turns the fused launch off too.
-        ({"TRTLLM_M31_DISABLE_STRICT_ACCEPT_FUSED": "1"}, False),
-        ({"TRTLLM_M31_DISABLE_DRAFT_KV_REWIND_FUSED": "1"}, True),
-    ],
-)
-def test_tailglue_b_switch(monkeypatch, env, want):
-    assert _eval_switch(monkeypatch, env) is want

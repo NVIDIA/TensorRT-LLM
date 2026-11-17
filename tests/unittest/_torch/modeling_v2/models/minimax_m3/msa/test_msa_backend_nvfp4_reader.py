@@ -36,12 +36,10 @@ def _nvfp4_index_k_kernels_available() -> bool:
 def test_msa_indexer_nvfp4_pure_decode_reads_pages_under_capture() -> None:
     """A pure-decode NVFP4 step hands the selector the Q8KV4 reader's scores of the NVFP4 pages, eager and replayed
     from a CUDA graph whose captured forward rebuilds the reader's history scheduler from the replayed lengths."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels import (
-        nvfp4_index_k,
-    )
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
         MiniMaxM3SparseConfig,
     )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels import nvfp4_index_k
 
     heads, qlen, batch, tiles, num_pages = 4, 8, 3, 6, 24
     attention = MiniMaxM31MsaSparseAttention.__new__(MiniMaxM31MsaSparseAttention)
@@ -173,9 +171,7 @@ def test_nvfp4_reader_native_layout_selects_as_the_hpr_layout(monkeypatch, query
     """At query length 8 the reader writes its native [batch, 8 * heads, cols] layout and hands back a strided
     [heads, cols, rows] view: the history scores and the selected table equal the hpr layout's bit for bit, and the
     kill (or another query length) keeps the hpr buffer."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels import (
-        nvfp4_index_k,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels import nvfp4_index_k
 
     heads, batch, cols, num_pages = 4, 3, 40, 160
     generator = torch.Generator(device="cuda").manual_seed(23)

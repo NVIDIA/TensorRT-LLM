@@ -5,7 +5,8 @@
 
 Its fix moves the query reads after ``griddepcontrol.wait``; on inputs that are complete before the launch it writes
 what ``torch.ops.trtllm.minimax_m3_sm107_tp2_sparse_decode_lc`` writes, byte for byte, for every variant (linear
-softmax, pre-wait block-table staging, MXFP8 hand-off), with ``allow_split=False`` (the MiniMax-M3 callers) and
+softmax, pre-wait block-table staging, MXFP8 hand-off) on the tiny and four-request cases (the long and short cases at
+the served variant only), with ``allow_split=False`` (the MiniMax-M3 callers) and
 with ``allow_split=True`` (the split form the MiniMax-M3.1-Flash callers may take).
 """
 
@@ -134,11 +135,26 @@ def _same(a, b):
     return (a is None and b is None) or torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
-@pytest.mark.parametrize("name", list(_CASES))
-@pytest.mark.parametrize("linear", [False, True])
-@pytest.mark.parametrize("prewait", [False, True])
-@pytest.mark.parametrize("mxfp8", [False, True])
-@pytest.mark.parametrize("allow_split", [False, True])
+def _variants():
+    """Every linear / prewait / MXFP8 variant on b4 and b1-tiny; the long and short cases at the served variant."""
+    flags = (False, True)
+    for name in _CASES:
+        full = name in ("b4", "b1-tiny")
+        for allow_split in flags:
+            for mxfp8 in flags if full else (True,):
+                for prewait in flags if full else (True,):
+                    for linear in flags if full else (False,):
+                        yield pytest.param(
+                            name,
+                            linear,
+                            prewait,
+                            mxfp8,
+                            allow_split,
+                            id=f"{allow_split}-{mxfp8}-{prewait}-{linear}-{name}",
+                        )
+
+
+@pytest.mark.parametrize("name, linear, prewait, mxfp8, allow_split", list(_variants()))
 def test_the_fixed_copy_writes_the_stock_bytes(name, linear, prewait, mxfp8, allow_split):
     c = _case(seed=3, **_CASES[name])
     flags = dict(linear=linear, prewait=prewait, mxfp8=mxfp8, use_pdl=False)

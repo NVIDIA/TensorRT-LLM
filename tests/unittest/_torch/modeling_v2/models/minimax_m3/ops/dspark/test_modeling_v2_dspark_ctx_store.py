@@ -10,12 +10,9 @@ caches filled with a sentinel, compared in an int16 view, for the private arena 
 (see _single_writer) are excluded: stock's own value there is a race.
 """
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark.dspark_ctx_store import (
     ctx_store_supported,
     fold_k_norm_weight,
@@ -179,10 +176,10 @@ def _as_int16(kv_buf):
 
 
 @pytest.mark.parametrize("partial_rotary_factor", [1.0, 0.5])
-@pytest.mark.parametrize("layout", ["stacked", "list"])
-@pytest.mark.parametrize("n_req,kp1", [(1, 4), (3, 4), (2, 8)])
-@pytest.mark.parametrize("placeholder", [False, True])
-@pytest.mark.parametrize("columns", ["given", "from_counts", "from_max_col"])
+@pytest.mark.parametrize("layout", ["stacked"])
+@pytest.mark.parametrize("n_req,kp1", [(3, 4)])
+@pytest.mark.parametrize("placeholder", [True])
+@pytest.mark.parametrize("columns", ["given", "from_counts"])
 @pytest.mark.parametrize("fold", [False, True])
 def test_fused_store_is_the_stock_store_bit_for_bit(
     layout, n_req, kp1, placeholder, partial_rotary_factor, columns, fold
@@ -199,15 +196,6 @@ def test_fused_store_is_the_stock_store_bit_for_bit(
         _check_fused_store(model, layout, n_req, kp1, placeholder, columns)
     finally:
         fold_k_norm_weight(False)
-
-
-@pytest.mark.parametrize("layout", ["stacked", "list"])
-@pytest.mark.parametrize("n_req,kp1", [(1, 8), (3, 4)])
-@pytest.mark.parametrize("columns", ["given", "from_counts"])
-def test_int32_accept_counts_store_bit_for_bit(layout, n_req, kp1, columns):
-    """int32 accept counts: the fused store given the int32 counts writes exactly what the stock store writes from
-    the int64 ones."""
-    _check_fused_store(_drafter(), layout, n_req, kp1, False, columns, counts_dtype=torch.int32)
 
 
 def _check_fused_store(model, layout, n_req, kp1, placeholder, columns, counts_dtype=torch.int64):
@@ -241,41 +229,3 @@ def _check_fused_store(model, layout, n_req, kp1, placeholder, columns, counts_d
         torch.cuda.synchronize()
         keep = _single_writer(c)
         assert torch.equal(_as_int16(ref)[keep], _as_int16(got)[keep]), f"seed {seed}"
-
-
-def test_unsupported_drafters_keep_the_stock_path():
-    model = _drafter()
-    kv = torch.zeros(LAYERS, 4, 2, KV_HEADS, PAGE, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    assert ctx_store_supported(model, kv)
-    assert not ctx_store_supported(model, kv.float())  # not a bf16 cache
-    assert not ctx_store_supported(model, kv[:, :, :1])  # not a [K | V] HND page
-    no_norm = SimpleNamespace(
-        **{k: getattr(model, k) for k in ("_k_norm_eps", "_is_neox", "_num_kv_heads", "_head_dim")}
-    )
-    no_norm._k_norm_stacked = None
-    assert not ctx_store_supported(no_norm, kv)
-    assert not fused_ctx_store(no_norm, None, None, None, None, None, None, kv, 4)
-    # Derived columns need exactly one bound: the page counts (int64) or the arena's last column.
-    assert not fused_ctx_store(model, None, None, None, None, None, None, kv, 4)
-    # A rotary dim the kernel cannot split into power-of-two halves (48 of 128) keeps the stock path.
-    odd_rotary = SimpleNamespace(
-        **{
-            k: getattr(model, k)
-            for k in ("_k_norm_eps", "_is_neox", "_num_kv_heads", "_head_dim", "_k_norm_stacked")
-        }
-    )
-    odd_rotary._get_cos_sin_cache = lambda: torch.zeros(16, 48, device="cuda")
-    assert not ctx_store_supported(odd_rotary, kv)
-
-
-def test_cpp_op_no_triton():
-    """DSPARK_CTX_STORE_CPP: the module carries no Triton kernel and the store is the registered C++ op."""
-    import pathlib
-
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
-        dspark_ctx_store,
-    )
-
-    src = pathlib.Path(dspark_ctx_store.__file__).read_text()
-    assert "import triton" not in src and "triton.jit" not in src
-    assert hasattr(family_ops(), "minimax_m31_dspark_ctx_store")

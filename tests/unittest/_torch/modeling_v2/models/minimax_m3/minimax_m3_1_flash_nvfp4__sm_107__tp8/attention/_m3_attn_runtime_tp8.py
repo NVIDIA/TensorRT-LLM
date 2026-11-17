@@ -21,7 +21,6 @@ from typing import Sequence
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
@@ -33,13 +32,11 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatte
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
     MiniMaxM3MsaSparseAttentionMetadata,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.utils import create_attention
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
-from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.llm_args import (
     Eagle3DecodingConfig,
     KvCacheConfig,
@@ -59,8 +56,6 @@ DENSE, SPARSE, DRAFT = 0, 1, 2
 MAX_BATCH = 8
 MAX_SEQ_LEN = 8192
 MAX_NUM_TOKENS = 8192
-#: The Eagle3 drafter checkpoint's RoPE: NeoX over the whole head, theta 5e6.
-DRAFT_ROPE_THETA = 5.0e6
 
 #: E4M3-exact planted index levels, 1/8 apart in relative terms (0.25 .. 15): 48 distinct block scores.
 LEVELS = tuple(2.0**e * (1 + m / 8) for e in range(-2, 4) for m in range(8))
@@ -133,30 +128,6 @@ def make_msa_backend(layer: int) -> MiniMaxM3MsaSparseAttention:
     return backend
 
 
-def make_draft_backend() -> TrtllmAttention:
-    """The drafter layer's attention as ``M3Eagle3Draft`` builds it: fused NeoX RoPE, an FP8 KV cache (the target
-    overrides the drafter's KV dtype to FP8), no other quantization."""
-    quant = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
-    backend = create_attention(
-        "TRTLLM",
-        DRAFT,
-        HEADS,
-        HEAD_DIM,
-        KV_HEADS,
-        pos_embd_params=PositionalEmbeddingParams(
-            type=PositionEmbeddingType.rope_gpt_neox,
-            rope=RopeParams(dim=HEAD_DIM, theta=DRAFT_ROPE_THETA, max_positions=MAX_SEQ_LEN),
-        ),
-        quant_config=quant,
-        q_scaling=1.0,
-        attention_chunk_size=None,
-        sparse_params=None,
-    )
-    backend.update_quant_config(quant)
-    assert type(backend) is TrtllmAttention, type(backend).__name__
-    return backend
-
-
 def make_msa_metadata(manager) -> MiniMaxM3MsaSparseAttentionMetadata:
     metadata = MiniMaxM3MsaSparseAttentionMetadata(
         max_num_requests=MAX_BATCH,
@@ -169,18 +140,6 @@ def make_msa_metadata(manager) -> MiniMaxM3MsaSparseAttentionMetadata:
     # The target's MSA preparation choice that changes what prepare() stages (the identity tables of short steps).
     metadata.msa_policy = MsaRuntimePolicy(short_sequence_identity=True)
     return metadata
-
-
-def make_draft_metadata(manager) -> TrtllmAttentionMetadata:
-    """Drafter metadata over the shared manager's FP8 draft view, the manager the runtime's draft swap installs."""
-    view = manager.get_draft_kv_cache_view()
-    assert view is not None and view.dtype == DataType.FP8
-    return TrtllmAttentionMetadata(
-        max_num_requests=MAX_BATCH,
-        max_num_tokens=MAX_NUM_TOKENS,
-        kv_cache_manager=view,
-        mapping=mapping(),
-    )
 
 
 def allocate(manager, request_ids: Sequence[int], qlens: Sequence[int], cached: Sequence[int]):
