@@ -13,7 +13,7 @@ SA drafts by matching the request's own token history: it needs no draft model a
 
 ## Recipe
 
-Start from the recommended configuration in the [deployment guide](deployment-guide-for-musespark-open-on-trtllm.md#recommended-performance-settings) (`examples/configs/curated/musespark-open.yaml`) and add:
+Start from the recommended configuration in the [deployment guide](deployment-guide-for-musespark-open-on-trtllm.md#recommended-performance-settings), either the `${EXTRA_LLM_API_FILE}` it creates or a copy of `examples/configs/curated/musespark-open.yaml`, and add:
 
 ```yaml
 speculative_config:
@@ -22,7 +22,7 @@ speculative_config:
   max_matching_ngram_size: -1   # match the longest suffix in the request's history
 ```
 
-Everything else stays as in the recommended configuration, including the `TRTLLM` attention backend, the FP8 KV cache, and the overlap scheduler. Launch the server with the same `trtllm-serve` command as the deployment guide.
+Everything else stays as in the recommended configuration, including the `TRTLLM` attention backend, the FP8 KV cache, and the overlap scheduler. Launch the server with the deployment guide's `trtllm-serve` command, passing that file to `--config`.
 
 ## Limits
 
