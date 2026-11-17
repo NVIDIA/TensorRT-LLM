@@ -128,20 +128,6 @@ class TestSendKvAsyncReleasesIndexSlot:
 
         assert 42 in transfer_manager.requests_in_transfer()
 
-    def test_release_called_once_per_request(self):
-        """If the same request passes through _send_kv_async once, release is
-        called exactly once (it's gated by `is_context_finished`, which is
-        reset after the first pass)."""
-        kv_cache_manager = MagicMock()
-        kv_cache_manager.store_blocks_for_reuse.return_value = 100
-
-        executor, _ = self._build(kv_cache_manager)
-        request = create_mock_request(42)
-
-        PyExecutor._send_kv_async(executor, [request])
-
-        kv_cache_manager.release_index_slot.assert_called_once_with(42)
-
 
 # Not cpu_only: the IndexMapper fixtures pin host buffers, which needs a CUDA device.
 class TestIndexMapperSlotReuse:

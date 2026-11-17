@@ -54,7 +54,7 @@ def _compare(key, head_weights, ref_key, ref_head_weights) -> None:
     assert_within_ulp(head_weights, ref_head_weights, 512.0, 128.0, ulp=FP32_ULP)
 
 
-def _build(rows: int, seed: int):
+def _build(rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
     weight = torch.randn(KEY + HEADS, HIDDEN, generator=g, device="cuda") * HIDDEN**-0.5

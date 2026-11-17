@@ -281,8 +281,11 @@ def test_the_store_wait_precedes_only_a_plain_launch_under_capture():
     checked)."""
     fold = spec_fold.M3SpecStepFold(in_forward=True, store_copy_wait=True)
     device = torch.device("cuda")
+    call_input_ids, call_draft_tokens, call_position_id_offsets, call_kv_lens_offsets = (
+        torch.zeros(8, dtype=torch.int32, device=device) for _ in range(4)
+    )
     fold.bind_engine_buffers(
-        *(torch.zeros(8, dtype=torch.int32, device=device) for _ in range(4)), 4
+        call_input_ids, call_draft_tokens, call_position_id_offsets, call_kv_lens_offsets, 4
     )
     assert fold.STORE_WAIT_BEFORE == frozenset({"fold_tail"})
     fold._wait_store_copies(before="draft_step")  # eager: allowed

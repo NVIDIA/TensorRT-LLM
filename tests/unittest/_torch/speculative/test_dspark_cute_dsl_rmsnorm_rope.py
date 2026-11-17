@@ -24,7 +24,7 @@ def _make_inputs(
     rope_dim: int,
     num_heads: int,
     seed: int = 0,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     shape = (batch, seq, hidden_dim)
     if num_heads > 1:

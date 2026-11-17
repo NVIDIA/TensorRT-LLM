@@ -18,6 +18,7 @@ N = 1 << 16
 
 
 def _wait(counts, spins=m3_fc_wait.MAX_SPINS):
+    # pyrefly: ignore [unexpected-keyword]
     m3_fc_wait.fc_wait_kernel[(1,)](counts, MAX_SPINS=spins, num_warps=1, launch_pdl=True)
 
 

@@ -210,4 +210,26 @@ def test_guard_refuses_an_int64_slot_map() -> None:
     """The fold's slot map is the runner's int32 index map; `is_valid` refuses an int64 one."""
     fold = _build(dict(rows=4, moe=True, fold=10), seed=9)
     with validating(op), pytest.raises(AssertionError, match="int32"):
-        op(*fold[:9], fold[9].long())
+        (
+            call_hyper_input,
+            call_block_out,
+            call_inject,
+            call_norm_weight,
+            call_eps,
+            call_hc_count,
+            call_shared,
+            call_gate_logits,
+            call_topk_weights,
+        ) = fold[:9]
+        op(
+            call_hyper_input,
+            call_block_out,
+            call_inject,
+            call_norm_weight,
+            call_eps,
+            call_hc_count,
+            call_shared,
+            call_gate_logits,
+            call_topk_weights,
+            fold[9].long(),
+        )

@@ -318,6 +318,7 @@ def test_batched_message_is_named_after_the_executor_client_id():
 
     server = object.__new__(OpenAIServer)
     server.model = MODEL
+    server._collect_perf_metrics = False
     server.openai_chat = AsyncMock(side_effect=_records_executor_client_id(7))
 
     status, message = asyncio.run(
