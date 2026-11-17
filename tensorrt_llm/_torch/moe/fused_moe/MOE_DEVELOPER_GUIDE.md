@@ -909,12 +909,16 @@ Tests that pin a tactic keep its promise and do not rely on a fallback
   `trtllm_gen`, and FP8 block-scale MTP layers pin
   `fp8_block_scales_moe_tactic()`. A draft stays unpinned when the target's
   tactic cannot serve its experts on the case's GPUs (the CuTe DSL grouped GEMM
-  runs bf16 on SM107 only), or when the modeling_v2 target honors no draft
-  tactic (`draft_moe_impls_honored`).
+  runs bf16 on SM107 only).
 - A deployment that a modeling_v2 target serves keeps its backend literal
-  unless the target honors the tactic (`moe_impls_honored`). Under the default
-  `modeling_v2='auto'` the tactic makes the target decline and the built-in
-  model run, so the case would still pass without covering the target.
+  unless the target honors the tactic (`moe_impls_honored`) and, when its draft
+  has to stay on the target's implementation, a draft tactic as well
+  (`draft_moe_impls_honored`). Under the default `modeling_v2='auto'` an
+  unhonored tactic makes the target decline and the built-in model run, so the
+  case would still pass without covering the target. A draft left unpinned
+  under a target tactic resolves `AUTO` for its own weights instead of following
+  the target (CUTLASS for the MTP layers of the GLM-5.2 SM107 low-latency
+  target).
 
 What is never allowed is substituting quietly. Every resolution returns a
 `MoEResolutionReport` naming the winner, every rejected candidate, its
