@@ -1130,8 +1130,9 @@ def test_qwen_vl_encoder_puts_item_grid_on_embedding_handles(encoder_cls, mm_enc
     )
 
     def vit(pixel_values, grid_thw):
-        # One row per 2x2 merged patch, like the real encoder.
-        return torch.zeros(int(grid_thw.prod(dim=-1).sum()) // 4, 8)
+        # One row per 2x2 merged patch, like the real encoder. Each row holds
+        # its item's grid, so the test can see which item a row comes from.
+        return torch.cat([grid.float().expand(int(grid.prod()) // 4, 3) for grid in grid_thw])
 
     # Skip the real vision tower; forward only needs the config and the ViT call.
     encoder = encoder_cls.__new__(encoder_cls)
@@ -1143,6 +1144,10 @@ def test_qwen_vl_encoder_puts_item_grid_on_embedding_handles(encoder_cls, mm_enc
     embeddings = encoder.forward([param])
 
     assert sum(embedding.shape[0] for embedding in embeddings) == sum(lengths)
+    # Rows come in prompt order, like the metadata: each item's rows hold its own grid.
+    for rows, item in zip(torch.cat(embeddings).split(lengths), expected, strict=True):
+        (grid,) = item.values()
+        assert torch.equal(rows, torch.tensor(grid, dtype=rows.dtype).expand_as(rows))
     if mm_encoder_only:
         assert param.multimodal_data["multimodal_embedding_metadata"] == expected
     else:
