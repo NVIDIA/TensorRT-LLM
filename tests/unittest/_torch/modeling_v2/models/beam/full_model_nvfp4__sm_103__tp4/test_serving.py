@@ -33,6 +33,18 @@ REPLIES = {
     ),
     "final_only": ("<|channel|>final<|message|>Paris.<|return|>", "Paris.", ""),
     "no_headers": ("Plain text without channels.", "Plain text without channels.", ""),
+    "text_before_message": ("Pre<|message|>Hello<|return|>", "PreHello", ""),
+    "text_before_channel": (
+        "Pre<|channel|>analysis<|message|>Think.<|end|><|start|>assistant"
+        "<|channel|>final<|message|>Hello<|return|>",
+        "PreHello",
+        "Think.",
+    ),
+    "text_before_constraint": (
+        'Pre<|constrain|>json<|message|>{"ok":true}<|return|>',
+        'Pre{"ok":true}',
+        "",
+    ),
     "stopped_in_analysis": ("<|channel|>analysis<|message|>Still thinking", "", "Still thinking"),
     "stopped_in_final": (
         "<|channel|>analysis<|message|>a<|end|><|start|>assistant<|channel|>final<|message|>Par",

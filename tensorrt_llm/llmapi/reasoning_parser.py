@@ -1430,7 +1430,8 @@ class BeamHarmonyTextParser(BaseReasoningParser):
     the detokenized text whatever ``skip_special_tokens`` says. Analysis
     bodies go to ``reasoning_content`` and final bodies to ``content``; every
     header and terminator is dropped. A reply without channel headers is final
-    text. Parsing is incremental: a possible delimiter split across stream
+    text. Ordinary text before the first header is also final text. Parsing
+    is incremental: a possible delimiter split across stream
     chunks is held back until it is resolved, and ``finish`` releases a held
     tail that is ordinary text. ``parse`` runs the same machine over a whole
     reply, so streamed and non-streamed fields agree. Tool calls are not
@@ -1486,8 +1487,7 @@ class BeamHarmonyTextParser(BaseReasoningParser):
             if self._state == "body":
                 self._emit(chunk, out)
             elif self._state == "header":
-                if (self._header or self._saw_header or tag
-                        in (_BEAM_CHANNEL, _BEAM_MESSAGE, _BEAM_CONSTRAIN)):
+                if self._header or self._saw_header:
                     self._header += chunk
                 else:
                     # Text before any header: a reply without channels is
