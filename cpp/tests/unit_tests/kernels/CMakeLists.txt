@@ -267,26 +267,14 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;fmha;gpu")
-set(fmha_test_sources ../../../tensorrt_llm/kernels/fmhaDispatcher.cpp)
 set(fmha_test_libraries context_attention_src trtllm_gen_fmha ${CUDA_DRV_LIB}
                         tllm::common_environment tllm::common_logging)
-if(TRTLLM_BUILD_CPP_TEST_BUNDLE)
-  add_library(tllm_test_fmha SHARED EXCLUDE_FROM_ALL ${fmha_test_sources})
-  target_compile_features(tllm_test_fmha PRIVATE cxx_std_20)
-  target_link_libraries(
-    tllm_test_fmha
-    PRIVATE ${fmha_test_libraries}
-    PUBLIC trtllm_gen_fmha_interface CUDA::cudart)
-  set(fmha_test_sources)
-  set(fmha_test_libraries tllm_test_fmha)
-endif()
 add_tllm_gtest(
   fmhaHead104Test
   OWNER
   kernel
   SOURCES
   fmhaHead104Test.cpp
-  ${fmha_test_sources}
   LINK_LIBRARIES
   ${fmha_test_libraries}
   LABELS
@@ -296,12 +284,7 @@ add_tllm_gtest(
   OWNER
   kernel
   SOURCES
-<<<<<<< HEAD
   fmhaMaskSelectionTest.cpp
-=======
-  fmhaDispatcherTest.cpp
-  ${fmha_test_sources}
->>>>>>> origin/main
   LINK_LIBRARIES
   ${fmha_test_libraries}
   LABELS

@@ -492,7 +492,17 @@ starting with an empty selection cache. `TrtllmAttention` prepares the complete
 per-forward state, passes itself to the manager for selection, and then executes
 the selected library.
 
-<<<<<<< HEAD
+Libraries with a shared JIT module can implement `Fmha.can_prewarm()` and
+`Fmha.prewarm()`. The first checks static layer, dtype and page-size eligibility
+from `FmhaPrewarmConfig`; it does not replace request-level selection.
+Under pipeline parallelism, decoder warmup finds backend attributes on modules
+with retained projection weights, including MLA's `mqa`/`mha` and cross-attention,
+and asks each manager to prewarm its eligible libraries. A shared set limits
+each library to one attempt across the rank's layers. Failures are logged and
+deferred to first use, and all TP peers synchronize before the first forward.
+FlashInfer's decode, prefill and MLA getters load the same `fmha_gen` JIT spec,
+so its prewarm invokes one getter to build the shared library.
+
 The native attention op exposes each of its kernel libraries as its own FMHA
 library: `TrtllmGenFmha`, `FlashMlaFmha`, `XqaFmha`, `FmhaV2Fmha`, `MmhaFmha`
 and `UnfusedFmha` (`fmha/trtllm_gen.py` and siblings), each a `PhasedFmha` of
@@ -514,22 +524,6 @@ call's batch against its KV history; `XqaFmha.has_perf_gain` asks
 and `FmhaManager` keys selection on the answer once a selection reaches XQA. The native
 carrier behind the entry points is per host thread and never visible to
 Python. Generated nanobind readers
-=======
-Libraries with a shared JIT module can implement `Fmha.can_prewarm()` and
-`Fmha.prewarm()`. The first checks static layer, dtype and page-size eligibility
-from `FmhaPrewarmConfig`; it does not replace request-level selection.
-Under pipeline parallelism, decoder warmup finds backend attributes on modules
-with retained projection weights, including MLA's `mqa`/`mha` and cross-attention,
-and asks each manager to prewarm its eligible libraries. A shared set limits
-each library to one attempt across the rank's layers. Failures are logged and
-deferred to first use, and all TP peers synchronize before the first forward.
-FlashInfer's decode, prefill and MLA getters load the same `fmha_gen` JIT spec,
-so its prewarm invokes one getter to build the shared library.
-
-`FallbackFmha` hands the Python `FmhaParams` to `thop.run_context` or
-`thop.run_generation`; the native carrier behind them is per host thread and
-never visible to Python. Generated nanobind readers
->>>>>>> origin/main
 (`scripts/generate_fmha_params.py`) copy the fields C++ reads from `attn`,
 `meta` and `fwd` into the native struct, build an `AttentionConfig` key, and
 resolve the op from a per-thread C++ cache keyed by that configuration; the op
