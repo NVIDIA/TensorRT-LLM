@@ -84,7 +84,7 @@ default bypass the template the model was trained with.
 
 * **Block-sparse attention is required.** MiniMax-M3 runs on the block-sparse attention backend, which must be selected via `sparse_attention_config.algorithm: minimax_m3` in the YAML configuration. There is no dense fallback for the sparse layers.
 * **Weight and KV precision.** BF16, MXFP8, and mixed MXFP8/NVFP4 checkpoints are supported. On SM100/SM103, the MSA backend supports FP8 and NVFP4 KV cache. NVFP4 storage is used in sparse target layers; dense target layers and the shared Eagle3 draft layer use FP8. The curated BF16-KV YAML remains a separate starting configuration.
-* **KV cache reuse must be disabled.** KV cache reuse is not supported on the sparse-attention path, so set `kv_cache_config.enable_block_reuse: false`.
+* **KV cache reuse on generation workers.** With KV cache manager V2 and MSA, set `kv_cache_config.enable_block_reuse: true` on the generation worker to reuse received prompt blocks, including with sparse KV offload. Reuse covers main K/V, NVFP4 scales, and index keys. Offloaded generation history is not published to the reuse tree. The offload configuration keeps reuse disabled on the context worker. Leave `FORCE_DETERMINISTIC` unset or set it to `0`; `1` disables block reuse.
 * **Sparse KV offload.** MSA generation workers can keep sparse main K/V history and NVFP4 block scales in host memory with `sparse_attention_config.enable_kv_cache_offload: true`. Dense layers and index keys remain on the GPU. This requires disaggregated single-token generation, KV cache manager V2, 128-token pages, pipeline parallel size 1, and no beam search or speculative decoding. Keep offload disabled on the context worker and use the same KV dtype on both workers. See the [M3 offload configuration](../features/sparse-attention.md#minimax-m3-block-sparse-gqa) for GPU cache and host history sizing.
 * **Eagle3.** The MSA path supports one shared GQA draft layer with linear Eagle3 drafting. Other MTP and tree-drafting configurations are unsupported. Keep NVFP4 KV and piecewise CUDA graph qualification separate: the existing PCG accuracy cases use FP8 KV.
 * **Rubin (SM107) Eagle3 draft layer.** On SM107 the shared Eagle3 draft layer runs at 128-token pages through FlashInfer's TRTLLM-Gen FMHA, the only FMHA with kernels for that page size there: keep `flashinfer_trtllm_gen` enabled in `TLLM_FMHA_LIBS`. `flashinfer-python` downloads those kernels on first use. On nodes without internet access, or to keep the download off the serving path, pre-populate the cubin directory and serve offline:
@@ -218,7 +218,7 @@ The parallelism, batch, KV-cache, sparse-attention, and CUDA-graph settings all 
 
 #### `--extra_llm_api_options` YAML options
 
-The curated config sets all the YAML knobs; this section only documents the two MiniMax-M3-specific constraints. Every other field in the YAML is a standard TensorRT LLM throughput knob — see the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full reference.
+The curated config sets all the YAML knobs; this section documents attention selection and block reuse. Every other field in the YAML is a standard TensorRT LLM throughput knob — see the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full reference.
 
 ##### `sparse_attention_config.algorithm`
 
@@ -226,7 +226,12 @@ Must be set to `minimax_m3`. There is no dense fallback for the MiniMax-M3 spars
 
 ##### `kv_cache_config.enable_block_reuse`
 
-Must be `false`. The sparse-attention path does not support KV cache block reuse across requests with shared prefixes.
+The curated Triton configuration keeps this `false`. With MSA and KV cache
+manager V2, a disaggregated generation worker can set this to `true` to reuse
+received prompt blocks, including with sparse KV offload. The offload recipe
+keeps reuse disabled on the context worker. See the
+[M3 offload configuration](../features/sparse-attention.md#minimax-m3-block-sparse-gqa)
+for the reuse policy and deterministic-mode settings.
 
 ## Testing API Endpoint
 
@@ -290,7 +295,7 @@ The `message` object contains the visible answer in `content` and, when the mode
 ## Troubleshooting Tips
 
 * **Sparse attention not applied:** Ensure `sparse_attention_config.algorithm` is set to `minimax_m3` in the YAML file passed to `--extra_llm_api_options`.
-* **KV cache reuse errors:** Confirm `kv_cache_config.enable_block_reuse` is `false`; KV cache reuse is not supported on the sparse-attention path.
+* **KV cache reuse not taking effect:** For received-prompt reuse on an MSA generation worker, use KV cache manager V2 and set `kv_cache_config.enable_block_reuse: true`. Leave `FORCE_DETERMINISTIC` unset or set it to `0`; `1` disables block reuse.
 * **Model fails to load:** Make sure `--trust_remote_code` is set and that the checkpoint path is correct and fully downloaded (Git LFS).
 * **Multi-node startup hangs or ranks can't find each other:** Verify that the model weights, the curated YAML, and all mounted paths resolve identically on both nodes (shared filesystem), that the total Slurm task count equals `tensor_parallel_size` (`8`), and that the inter-node interconnect (e.g., InfiniBand) is healthy.
 * **Reasoning/tool output not parsed:** Verify `--reasoning_parser minimax_m3`, `--tool_parser minimax_m3`, and `--chat_template $MODEL/chat_template.jinja` are all passed.

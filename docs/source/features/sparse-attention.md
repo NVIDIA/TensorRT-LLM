@@ -455,7 +455,9 @@ kv_cache_config:
   dtype: nvfp4  # fp8 is also supported
   tokens_per_block: 128
   use_kv_cache_manager_v2: true
-  enable_block_reuse: false
+  enable_block_reuse: true
+  block_reuse_config:
+    policy: per_request
 sparse_attention_config:
   algorithm: minimax_m3
   implementation: msa
@@ -474,7 +476,18 @@ bounds the host history budget in bytes; when unset, sizing follows the shared
 sparse offload memory planner. CUDA graphs reuse the same arena and page-table
 allocations across batch changes.
 
-The sparse path has no dense fallback and does not support KV-cache reuse.
+KV cache manager V2 supports reuse of received prompt blocks on MSA generation
+workers, including with offload enabled. Repeated prompts reuse sparse K/V and
+NVFP4 scales from host pages together with the resident dense K/V and index
+keys. The KV transfer skips reused full blocks and transfers the remaining
+suffix, including any partial block. Offloaded generation history is not
+published to the reuse tree. `block_reuse_config.policy: per_request` applies
+the same limit to resident generation when comparing the two modes. This
+configuration keeps `enable_block_reuse: false` on the context worker.
+`FORCE_DETERMINISTIC=1` disables block reuse; leave it unset or set it to `0`
+when enabling reuse.
+
+The sparse path has no dense fallback.
 Eagle3 supports one shared draft layer and linear drafting; other MTP/tree
 configurations are unsupported. NVFP4 KV with piecewise CUDA graphs is not
 qualified by the existing FP8-KV PCG tests. See the

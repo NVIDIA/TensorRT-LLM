@@ -26,6 +26,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_global_layer_ids
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -41,6 +42,7 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm_100f(), reason="M3 offload needs an SM100-family GPU"
@@ -54,11 +56,16 @@ SPARSE_LAYERS = (1, 3)
 
 
 def _manager(
-    dtype: DataType, heads: int, max_seq_len: int, *, offload: bool = True
+    dtype: DataType,
+    heads: int,
+    max_seq_len: int,
+    *,
+    offload: bool = True,
+    block_reuse: bool = False,
 ) -> MiniMaxM3KVCacheManagerV2:
     return MiniMaxM3KVCacheManagerV2(
         kv_cache_config=KvCacheConfig(
-            enable_block_reuse=False, max_tokens=BATCH * max_seq_len, host_cache_size=0
+            enable_block_reuse=block_reuse, max_tokens=BATCH * max_seq_len, host_cache_size=0
         ),
         kv_cache_type=CacheTypeCpp.SELF,
         num_layers=4,
@@ -170,6 +177,190 @@ def _attention(q, data, scales, topk, table, lengths, out, quant):
         decode_query_len=1,
         **extra,
     )
+
+
+@pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("heads", [1, 2, 4])
+@pytest.mark.parametrize("shorter_prefix", [False, True], ids=["same_prompt", "shorter_prefix"])
+def test_m3_offload_reuses_received_prompt(dtype, heads, shorter_prefix):
+    """Reuse a received prompt or its shorter prefix, then decode across a partial page."""
+    shared_blocks = 5
+    prompt_len = (shared_blocks + 1) * PAGE - 1
+    max_blocks = shared_blocks + 3
+    manager = _manager(dtype, heads, max_blocks * PAGE, block_reuse=True)
+    generator = torch.Generator(device="cuda").manual_seed(283)
+    quant = torch.ones(3, dtype=torch.float32, device="cuda")
+    nvfp4 = dtype == DataType.NVFP4
+    try:
+        metadata = MiniMaxM3MsaSparseAttentionMetadata(
+            max_num_requests=BATCH,
+            max_num_tokens=BATCH,
+            kv_cache_manager=manager,
+            mapping=manager.mapping,
+            sparse_metadata_params=MiniMaxM3SparseMetadataParams(
+                global_num_q_heads=16 * heads,
+                global_num_kv_heads=heads,
+                num_index_heads=4,
+                topk=TOPK,
+            ),
+        )
+        reference = {
+            layer: (
+                torch.zeros(
+                    (max_blocks, 2, heads, PAGE, HEAD_DIM // (2 if nvfp4 else 1)),
+                    dtype=torch.int8 if nvfp4 else torch.float8_e4m3fn,
+                    device="cuda",
+                ),
+                torch.zeros(
+                    (max_blocks, 2, heads, PAGE, HEAD_DIM // 16),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                if nvfp4
+                else None,
+            )
+            for layer in SPARSE_LAYERS
+        }
+        first_pages = {}
+        for rid in (1, 2):
+            if rid == 2 and shorter_prefix:
+                shared_blocks -= 1
+                prompt_len -= PAGE
+            request = LlmRequest(
+                request_id=rid,
+                max_new_tokens=8,
+                input_tokens=list(range(prompt_len)),
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            )
+            assert manager.prepare_disagg_gen_init(request)
+            cache = manager.kv_cache_map[rid]
+            start = 0 if rid == 1 else shared_blocks * PAGE
+            if rid == 2:
+                assert request.context_current_position == cache.num_committed_tokens >= start
+                assert create_cache_reuse_adapter(manager).get_cached_token_count_per_layer_group(
+                    request, [None] * len(cache.reuse_status)
+                ) == [start] * len(cache.reuse_status)
+            for layer in range(4):
+                pages = manager.get_batch_cache_indices([rid], layer_idx=layer)[0]
+                if rid == 2:
+                    assert pages[:shared_blocks] == first_pages[layer][:shared_blocks]
+                else:
+                    first_pages[layer] = pages
+                if layer in SPARSE_LAYERS:
+                    index = manager.get_index_k_buffer(layer).view(torch.uint8)
+                    for page in range(start // PAGE, shared_blocks + 1):
+                        index[pages[page]].fill_(layer + page + rid)
+                    if rid == 2:
+                        for page in range(shared_blocks):
+                            assert (index[pages[page]] == layer + page + 1).all()
+                    data, scales = reference[layer]
+                    k, v = (
+                        torch.randn(
+                            (prompt_len - start, heads, HEAD_DIM),
+                            device="cuda",
+                            generator=generator,
+                        ).to(torch.bfloat16)
+                        for _ in range(2)
+                    )
+                    _write(
+                        data,
+                        scales,
+                        torch.arange(start, prompt_len, device="cuda", dtype=torch.int32),
+                        k,
+                        v,
+                        quant,
+                    )
+                    for page, host in enumerate(_host_pages(manager, layer, rid)):
+                        if start // PAGE <= page <= shared_blocks:
+                            host.copy_(data[page])
+                    if nvfp4:
+                        for page, host in enumerate(_host_pages(manager, layer, rid, scales=True)):
+                            if start // PAGE <= page <= shared_blocks:
+                                host.copy_(scales[page])
+                else:
+                    dense = manager.get_buffers(layer, "HND").view(torch.uint8)
+                    for page in range(start // PAGE, shared_blocks + 1):
+                        dense[pages[page]].fill_(layer + page + rid)
+                    if rid == 2:
+                        for page in range(shared_blocks):
+                            assert (dense[pages[page]] == layer + page + 1).all()
+            torch.cuda.synchronize()
+            request.context_current_position = prompt_len
+            manager.try_commit_blocks(request)
+            assert not _introspection.is_commit_allowed(cache)
+
+            for step in range(3):
+                assert manager.try_allocate_generation(request)
+                scheduled = SimpleNamespace(context_requests=[], generation_requests=[request])
+                manager.prepare_resources(scheduled)
+                history = cache.history_length
+                assert history == prompt_len + step
+                metadata.request_ids = [rid]
+                metadata.seq_lens = torch.ones(1, dtype=torch.int32)
+                metadata.prompt_lens = [prompt_len]
+                metadata.kv_cache_params = KVCacheParams(
+                    use_cache=True, num_cached_tokens_per_seq=[history]
+                )
+                metadata.prepare()
+                topk = torch.full((1, heads, TOPK), -1, dtype=torch.int32, device="cuda")
+                count = history // PAGE + 1
+                topk[:, :, :count] = torch.arange(count, device="cuda", dtype=torch.int32)
+                q = torch.randn((1, 16 * heads, HEAD_DIM), device="cuda", generator=generator).to(
+                    torch.bfloat16
+                )
+                for layer in SPARSE_LAYERS:
+                    k, v = (
+                        torch.randn((1, heads, HEAD_DIM), device="cuda", generator=generator).to(
+                            torch.bfloat16
+                        )
+                        for _ in range(2)
+                    )
+                    data, scales = reference[layer]
+                    _write(
+                        data,
+                        scales,
+                        torch.tensor([history], device="cuda", dtype=torch.int32),
+                        k,
+                        v,
+                        quant,
+                    )
+                    MiniMaxM3MsaSparseAttention.write_layer_caches(
+                        SimpleNamespace(layer_idx=layer),
+                        k.flatten(1),
+                        v.flatten(1),
+                        None,
+                        metadata,
+                        quant,
+                    )
+                    table = metadata.fetch_sparse_blocks(layer, topk)
+                    actual, expected = torch.empty_like(q), torch.empty_like(q)
+                    _attention(
+                        q,
+                        manager.get_buffers(layer, "HND"),
+                        manager.get_block_scale_buffers(layer, "HND") if nvfp4 else None,
+                        topk,
+                        table,
+                        metadata.msa_seq_lens_cuda[:1],
+                        actual,
+                        quant,
+                    )
+                    _attention(
+                        q,
+                        data,
+                        scales,
+                        topk,
+                        torch.arange(max_blocks, device="cuda", dtype=torch.int32).unsqueeze(0),
+                        metadata.msa_seq_lens_cuda[:1],
+                        expected,
+                        quant,
+                    )
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
+            manager.free_resources(request)
+            assert _introspection.all_tree_pages_droppable(manager.impl)
+    finally:
+        manager.shutdown()
 
 
 @pytest.mark.parametrize(

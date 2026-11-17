@@ -857,6 +857,12 @@ def _test_sparse_offload_long_context(
     # Keep prefill identical across paired runs. This profile tests reuse of
     # received decode KV; cached prefill would change the reference computation.
     ctx_server_config["kv_cache_config"]["enable_block_reuse"] = False
+    if block_reuse:
+        # Offload publishes received prompts only. Resident decode must use
+        # the same policy so it cannot rebase generated KV onto prefill pages.
+        gen_server_config["kv_cache_config"]["block_reuse_config"] = {
+            "policy": "per_request"
+        }
     ctx_server_config.update(enable_chunked_prefill=True, max_num_tokens=8192)
     if is_m3:
         # Fixed prefill chunk shapes keep KV values independent of arrival timing.
@@ -1073,8 +1079,12 @@ def _test_sparse_offload_long_context(
                     cached = sum(
                         sum(stat.get("iterCachedTokensByLevel", ()))
                         for stat in repeat_stats)
-                    minimum = (min(map(len, prompts)) -
-                               1) // tokens_per_block * tokens_per_block
+                    minimum = sum((len(prompts[index]) - 1) //
+                                  tokens_per_block * tokens_per_block
+                                  for index in repeat_indices)
+                    print(
+                        f"Sparse parity reuse {mode}: {cached} cached tokens, "
+                        f"minimum={minimum}")
                     assert cached >= minimum, f"Repeated round reused only {cached}/{minimum} tokens"
                 boundary, boundary_repeated = [], []
                 if boundary_indices:
@@ -3393,6 +3403,18 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
     def test_kv_cache_offload(self, kv_dtype: str) -> None:
         """M3 tokens match resident decode across long-context cache lifecycles."""
+        self._run_kv_cache_offload(kv_dtype, block_reuse=False)
+
+    @pytest.mark.timeout(3600)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
+    def test_kv_cache_offload_block_reuse(self, kv_dtype: str) -> None:
+        """M3 repeated prompts reuse received KV and match resident decode exactly."""
+        self._run_kv_cache_offload(kv_dtype, block_reuse=True)
+
+    def _run_kv_cache_offload(self, kv_dtype: str, *,
+                              block_reuse: bool) -> None:
         common = {
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
@@ -3435,6 +3457,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             model_name="nvidia/MiniMax-M3-NVFP4",
             index_topk=16 * 2,
             unit_tokens=128,
+            block_reuse=block_reuse,
         )
 
     @pytest.mark.skip_less_device(6)
