@@ -403,7 +403,7 @@ def test_replay_rejects_repeated_and_older_seq(replay_router):
     raw.send(_raw_signed(router, seq=4, stream_id=stream_id))
     assert router.receive(timeout_ms=1000)[1:] == [b"TAG"]
     for _ in range(2):
-        with pytest.raises(FrameAuthenticationError, match="Replayed message"):
+        with pytest.raises(FrameAuthenticationError, match="Repeated or out-of-order message"):
             router.receive(timeout_ms=1000)
     assert router.replays_rejected == 2
 

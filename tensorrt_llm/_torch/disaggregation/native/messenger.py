@@ -115,15 +115,16 @@ class FrameSigner:
             sharing a key must use different contexts, otherwise a frame valid
             in one verifies in the other.
 
-    Replay protection. Each signed socket draws a random 16-byte stream id
+    Message ordering. Each signed socket draws a random 16-byte stream id
     and numbers its messages from 1. ``ZMQMessenger`` remembers the last seq
-    per (sender id, stream id) and rejects a message whose seq is not larger,
-    so a captured message cannot be accepted twice. A DEALER-ROUTER pipe
-    delivers in order, so a gap (lost message) is accepted and no sliding
-    window is needed. A restarted peer draws a new stream id and starts again
-    at 1 without being mistaken for a replay. Senders hold a lock around seq
-    assignment and the socket write, so threads sharing a socket cannot
-    reorder their own messages.
+    accepted per (sender id, stream id) and accepts a message only when its
+    seq is larger, so a message is accepted at most once while that state is
+    kept. A gap (lost message) is accepted. A message that arrives after a
+    later one of the same stream is dropped; this can happen when a
+    connection is re-established while earlier messages are still unread at
+    the receiver. A restarted peer draws a new stream id and starts again at
+    1. Senders hold a lock around seq assignment and the socket write, so
+    threads sharing a socket cannot reorder their own messages.
     """
 
     MAC_SIZE = 32
@@ -365,7 +366,7 @@ class ZMQMessenger(MessengerInterface):
     ) -> None:
         # Taking the seq and writing to the socket must be one step: if two
         # threads interleaved them, the larger seq could reach the peer first
-        # and the smaller one would then look like a replay.
+        # and the smaller one would then be dropped.
         with self._send_lock:
             seq = self._next_seq
             self._next_seq += 1
@@ -430,7 +431,9 @@ class ZMQMessenger(MessengerInterface):
                     self._last_seq.popitem(last=False)
                 return
             self.replays_rejected += 1
-        raise FrameAuthenticationError(f"Replayed message (seq {header.seq}, last {last})")
+        raise FrameAuthenticationError(
+            f"Repeated or out-of-order message (seq {header.seq}, last {last})"
+        )
 
     def _record_auth_failure(self, error: FrameAuthenticationError) -> None:
         # Drop the frame and keep listening: stopping here would let one forged
