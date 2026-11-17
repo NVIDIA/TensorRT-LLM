@@ -34,6 +34,7 @@
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/streamingEventSink.h"
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
 #include <algorithm>
@@ -53,10 +54,12 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -68,18 +71,6 @@ namespace tensorrt_llm::nanobind::batch_manager
 {
 namespace
 {
-
-//! A scratch range paired with the slots covering it.
-//!
-//! KvCache reports the two separately, through getSwaScratchRange() and getScratchSlots().
-//! This pairs them for Python consumers that still expect one object, and exists only so
-//! this change stands alone; remove it, and the get_scratch_desc() binding, once the full
-//! sparse attention support lands and those consumers read the two accessors directly.
-struct ScratchDescCompat
-{
-    kv::HalfOpenRange<kv::BlockOrdinal> range;
-    std::vector<int> slotIds;
-};
 
 // Exposed via introspection sub-module for tests.
 class TestPaddingColdPageCodec final : public kv::IKvCacheColdPageCodec
@@ -943,6 +934,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
     static nb::object sCuError = nb::exception<kv::CuError>(m, "CuError");
     static nb::object sCorruptedError = nb::exception<kv::CorruptedError>(m, "CorruptedError");
+    static nb::object sRemoteMemError = nb::exception<kv::RemoteMemError>(m, "RemoteMemError");
     // Default attribute so the class mirrors the pure-Python CuError surface.
     sCuError.attr("error_code") = nb::none();
 
@@ -1010,7 +1002,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("GPU_MEM", kv::CacheTier::GPU_MEM)
         .value("HOST_MEM", kv::CacheTier::HOST_MEM)
         .value("DISK", kv::CacheTier::DISK)
+        .value("REMOTE", kv::CacheTier::REMOTE)
         .export_values();
+
+    nb::enum_<kv::RemoteTransport>(m, "RemoteTransport")
+        .value("NIXL", kv::RemoteTransport::kNixl)
+        .value("FABRIC", kv::RemoteTransport::kFabric);
 
     // ---- KvCache::Status enum (also accessible as _KVCache.Status) ---------
     auto kvCacheStatus = nb::enum_<kv::KvCache::Status>(m, "KvCacheStatus")
@@ -1241,6 +1238,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     nb::class_<kv::StreamingBlockRemovedData>(m, "StreamingBlockRemovedData")
         .def_ro("block_hashes", &kv::StreamingBlockRemovedData::blockHashes);
+
+    nb::class_<kv::StreamingAllBlocksClearedData>(m, "StreamingAllBlocksClearedData");
 
     nb::class_<kv::StreamingEventStats>(m, "StreamingEventStats")
         .def_ro("stored_blocks", &kv::StreamingEventStats::storedBlocks)
@@ -1514,6 +1513,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("total", &kv::StorageStatistics::total)
         .def_ro("free", &kv::StorageStatistics::free)
         .def_ro("evictable", &kv::StorageStatistics::evictable)
+        .def_ro("retained_copies", &kv::StorageStatistics::retainedCopies)
         .def_prop_ro("available", &kv::StorageStatistics::available)
         .def_prop_ro("unavailable", &kv::StorageStatistics::unavailable);
 
@@ -1544,17 +1544,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__contains__", [](BlockRange const& self, int item) { return self.contains(kv::BlockOrdinal{item}); },
             nb::arg("item"));
 
-    // A scratch range and its slots as one object, which is how KvCache used to report
-    // them. Kept for consumers that still read `.range` and `.slot_ids`; the manager
-    // itself reports the two separately through get_swa_scratch_range() and
-    // get_scratch_slots(). Remove this class and get_scratch_desc() once the full sparse
-    // attention support lands and those consumers move to the two accessors -- they exist
-    // only so this change stands alone.
-    nb::class_<ScratchDescCompat>(m, "ScratchDesc")
-        .def_ro("range", &ScratchDescCompat::range)
-        .def_ro("slot_ids", &ScratchDescCompat::slotIds)
-        .def("__bool__", [](ScratchDescCompat const& self) { return static_cast<bool>(self.range); });
-
     nb::enum_<kv::PageIndexMode>(m, "PageIndexMode")
         .value("SHARED", kv::PageIndexMode::SHARED)
         .value("PER_LAYER", kv::PageIndexMode::PER_LAYER);
@@ -1562,7 +1551,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::enum_<kv::ReusePolicy>(m, "ReusePolicy")
         .value("REQUIRED", kv::ReusePolicy::REQUIRED)
         .value("PRIVATE", kv::ReusePolicy::PRIVATE)
-        .value("OPTIONAL", kv::ReusePolicy::OPTIONAL);
+        .value("OPTIONAL", kv::ReusePolicy::OPTIONAL)
+        .value("SINK_REQUIRED_ONLY", kv::ReusePolicy::SINK_REQUIRED_ONLY);
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
         .def(nb::init<std::optional<int>, int, kv::ReusePolicy>(), nb::arg("window_size").none(),
@@ -1581,6 +1571,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::SsmLifeCycle>(m, "SsmLifeCycle")
         .def(nb::init<kv::ReusePolicy>(), nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED)
         .def_ro("reuse_policy", &kv::SsmLifeCycle::reusePolicy)
+        .def_prop_ro(
+            "region_index", [](kv::SsmLifeCycle const& self) { return self.regionIndex; },
+            "Index into KVCacheManagerConfig.regions of the region this life cycle belongs to; None for SSM layer "
+            "buffers.")
         .def(
             "get_stale_range", &kv::SsmLifeCycle::getStaleRange, nb::arg("history_length"), nb::arg("tokens_per_block"))
         .def("__eq__", &kv::SsmLifeCycle::operator==);
@@ -1769,12 +1763,50 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
         .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 
+    m.def("live_slab_bytes", &kv::liveSlabBytes, "Host bytes held by live page slabs in this process.");
+
+    nb::class_<kv::HostMemBackingConfig>(m, "HostMemBackingConfig")
+        .def(nb::init<std::optional<int>, bool>(), nb::arg("numa_node") = nb::none(),
+            nb::arg("allow_remote_numa_fallback") = true)
+        .def_rw("numa_node", &kv::HostMemBackingConfig::numaNode)
+        .def_rw("allow_remote_numa_fallback", &kv::HostMemBackingConfig::allowRemoteNumaFallback)
+        .def("validate", &kv::HostMemBackingConfig::validate) DEF_COPY(kv::HostMemBackingConfig);
+
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
-        .def(nb::init<size_t, std::string>(), nb::arg("quota"), nb::arg("path"))
+        .def(nb::init<size_t, std::string, int, bool, bool, float>(), nb::arg("quota"), nb::arg("path"),
+            nb::arg("num_io_threads") = 0, nb::arg("keep_copy_after_restore") = false, nb::arg("write_through") = false,
+            nb::arg("protected_copy_fraction") = 1.0F)
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
+        .def_rw("num_io_threads", &kv::DiskCacheTierConfig::numIoThreads)
+        .def_rw("keep_copy_after_restore", &kv::DiskCacheTierConfig::keepCopyAfterRestore)
+        .def_rw("write_through", &kv::DiskCacheTierConfig::writeThrough)
+        .def_rw("protected_copy_fraction", &kv::DiskCacheTierConfig::protectedCopyFraction)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
+
+    nb::class_<kv::RemoteTransferConfig>(m, "RemoteTransferConfig")
+        .def(nb::init<kv::RemoteTransport, int64_t, std::map<std::string, std::string>>(),
+            nb::arg("transport") = kv::RemoteTransport::kNixl,
+            nb::arg("timeout_ms") = kv::RemoteTransferConfig{}.timeoutMs,
+            nb::arg("backend_params") = std::map<std::string, std::string>{})
+        .def_rw("transport", &kv::RemoteTransferConfig::transport)
+        .def_rw("timeout_ms", &kv::RemoteTransferConfig::timeoutMs)
+        .def_rw("backend_params", &kv::RemoteTransferConfig::backendParams) DEF_COPY(kv::RemoteTransferConfig);
+
+    nb::class_<kv::RemoteCacheTierConfig>(m, "RemoteCacheTierConfig")
+        .def(nb::init<size_t, std::string, int64_t, uint32_t, std::vector<double>, kv::RemoteTransferConfig>(),
+            nb::arg("quota"), nb::arg("path"), nb::arg("wait_timeout_ms") = kv::RemoteCacheTierConfig{}.waitTimeoutMs,
+            nb::arg("expected_donors") = 0, nb::arg("pool_ratio") = std::vector<double>{},
+            nb::arg("transfer") = kv::RemoteTransferConfig{})
+        .def_rw("quota", &kv::RemoteCacheTierConfig::quota)
+        .def_rw("path", &kv::RemoteCacheTierConfig::path)
+        .def_rw("wait_timeout_ms", &kv::RemoteCacheTierConfig::waitTimeoutMs)
+        .def_rw("expected_donors", &kv::RemoteCacheTierConfig::expectedDonors)
+        .def_rw("pool_ratio", &kv::RemoteCacheTierConfig::poolRatio)
+        .def_rw("transfer", &kv::RemoteCacheTierConfig::transfer)
+        .def_prop_ro("tier", &kv::RemoteCacheTierConfig::tier)
+        .def("validate", &kv::RemoteCacheTierConfig::validate) DEF_COPY(kv::RemoteCacheTierConfig);
 
     nb::class_<kv::SparseCacheConfig>(m, "SparseCacheConfig")
         .def(nb::init<int, int, int, std::optional<int>>(), nb::arg("num_selected_blocks"), nb::arg("max_cached_units"),
@@ -1782,6 +1814,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("num_selected_blocks", &kv::SparseCacheConfig::numSelectedBlocks)
         .def_rw("max_cached_units", &kv::SparseCacheConfig::maxCachedUnits)
         .def_rw("unit_tokens", &kv::SparseCacheConfig::unitTokens)
+        .def_prop_ro(
+            "max_unit_ordinal", [](kv::SparseCacheConfig const&) { return kv::SparseCacheConfig::kMaxUnitOrdinal; },
+            "Largest zero-based unit ordinal supported by the sparse probe index.")
         .def_rw("selection_id", &kv::SparseCacheConfig::selectionId,
             "Layers whose selection is one selection share this id, and with it one resident "
             "set and one resolve. None means the layer selects for itself: it is read as the "
@@ -1825,6 +1860,43 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("reuse_policy", &kv::SsmLayerConfig::reusePolicy)
         .def_rw("layer_id", &kv::SsmLayerConfig::layerId)
         .def_rw("buffers", &kv::SsmLayerConfig::buffers) DEF_COPY(kv::SsmLayerConfig);
+
+    nb::enum_<kv::RegionAllocationUnit>(m, "RegionAllocationUnit")
+        .value("REQUEST", kv::RegionAllocationUnit::kRequest)
+        .value("TOKEN_BLOCK", kv::RegionAllocationUnit::kTokenBlock);
+
+    nb::class_<kv::RegionBuffer>(m, "RegionBuffer")
+        .def(nb::init<kv::LayerId, kv::BufferConfig>(), nb::arg("layer_id"), nb::arg("buffer"))
+        .def_rw("layer_id", &kv::RegionBuffer::layerId)
+        .def_rw("buffer", &kv::RegionBuffer::buffer) DEF_COPY(kv::RegionBuffer);
+
+    nb::class_<kv::RegionConfig>(m, "RegionConfig",
+        "Buffers that share a life cycle of the region's own, never merged with another life cycle. Only "
+        "REQUEST regions with the PRIVATE reuse policy are supported, on layers that have an SsmLayerConfig.")
+        .def(
+            "__init__",
+            [](kv::RegionConfig* cfg, std::string name, std::vector<kv::RegionBuffer> buffers,
+                kv::RegionAllocationUnit allocationUnit, kv::ReusePolicy reusePolicy,
+                std::optional<std::int64_t> fixedSlotCount)
+            {
+                new (cfg) kv::RegionConfig();
+                cfg->name = std::move(name);
+                cfg->buffers = std::move(buffers);
+                cfg->allocationUnit = allocationUnit;
+                cfg->reusePolicy = reusePolicy;
+                cfg->fixedSlotCount = fixedSlotCount;
+            },
+            nb::arg("name"), nb::arg("buffers"), nb::arg("allocation_unit") = kv::RegionAllocationUnit::kRequest,
+            nb::arg("reuse_policy") = kv::ReusePolicy::PRIVATE, nb::arg("fixed_slot_count").none() = std::nullopt)
+        .def_rw("name", &kv::RegionConfig::name)
+        .def_rw("buffers", &kv::RegionConfig::buffers)
+        .def_rw("allocation_unit", &kv::RegionConfig::allocationUnit)
+        .def_rw("reuse_policy", &kv::RegionConfig::reusePolicy)
+        .def_rw("fixed_slot_count", &kv::RegionConfig::fixedSlotCount, nb::for_setter(nb::arg("value").none()),
+            "GPU slot count of the region's pool group. When set, the region gets a pool group of its own with "
+            "exactly this many hot-tier slots, which ratio-based sizing (construction, resize(), adjust() and the "
+            "tuner) leaves alone; a GPU quota too small to hold it is raised. None sizes the region by ratio.")
+        .def("validate", &kv::RegionConfig::validate) DEF_COPY(kv::RegionConfig);
 
     nb::class_<kv::KVCacheDesc>(m, "KVCacheDesc")
         .def(nb::init<int, int, int, int>(), nb::arg("capacity"), nb::arg("history_length"), nb::arg("beam_width") = 1,
@@ -1933,7 +2005,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
-                kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota)
+                kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
+                std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking,
+                std::optional<kv::BatchDesc> coldTypicalStep)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1960,6 +2034,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->poolRebalance = std::move(poolRebalance);
                 cfg->coldTierOffloadMinPriority = coldTierOffloadMinPriority;
                 cfg->hostSparsePoolQuota = hostSparsePoolQuota;
+                cfg->regions = std::move(regions);
+                cfg->hostMemBacking = std::move(hostMemBacking);
+                cfg->coldTypicalStep = std::move(coldTypicalStep);
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1972,16 +2049,26 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true,
             nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{},
             nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority,
-            nb::arg("host_sparse_pool_quota").none() = std::nullopt)
+            nb::arg("host_sparse_pool_quota").none() = std::nullopt,
+            nb::arg("regions") = std::vector<kv::RegionConfig>{},
+            nb::arg("host_mem_backing") = kv::HostMemBackingConfig{},
+            nb::arg("cold_typical_step").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
+        .def_rw("regions", &kv::KVCacheManagerConfig::regions,
+            "Regions, each with a life cycle of its own, numbered after every layer life cycle in declaration "
+            "order. A (layer, role) pair belongs to one layer config or one region.")
         .def_rw("max_util_for_resume", &kv::KVCacheManagerConfig::maxUtilForResume)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("reuse_match_backoff", &kv::KVCacheManagerConfig::reuseMatchBackoff)
         .def_rw("enable_partial_commit", &kv::KVCacheManagerConfig::enablePartialCommit)
         .def_rw("cold_tier_offload_min_priority", &kv::KVCacheManagerConfig::coldTierOffloadMinPriority)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
+        .def_rw("cold_typical_step", &kv::KVCacheManagerConfig::coldTypicalStep,
+            nb::for_setter(nb::arg("value").none()),
+            "Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's "
+            "per-layer-group slot-count proportions at cold page sizes.")
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("host_sparse_pool_quota", &kv::KVCacheManagerConfig::hostSparsePoolQuota,
             "Host bytes the GPU tier's host-backed pools may take. None has the storage manager set it "
@@ -1998,6 +2085,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "One positive, normalized cache-tier quota weight per layer group.")
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
         .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
+        .def_rw("host_mem_backing", &kv::KVCacheManagerConfig::hostMemBacking)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_rw("text_only", &kv::KVCacheManagerConfig::textOnly)
         .def_rw("pool_rebalance", &kv::KVCacheManagerConfig::poolRebalance)
@@ -2021,15 +2109,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::KvCache>(m, "_KVCache")
         .def(
             "resume",
-            // `is_decoding` is accepted and ignored: resuming no longer distinguishes a
-            // decoding request, since what that selected -- sparse history offload -- is the
-            // sparse fetch path's now. Drop the parameter once the full sparse attention
-            // support is merged and its callers stop passing it; it is here only so this
-            // change stands alone.
-            [](kv::KvCache& self, nb::object stream, std::optional<bool> isDecoding,
-                std::optional<std::vector<int>> groups)
+            [](kv::KvCache& self, nb::object stream, std::optional<std::vector<int>> groups)
             {
-                (void) isDecoding;
                 std::optional<CUstream> optStream;
                 if (!stream.is_none())
                     optStream = reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
@@ -2045,8 +2126,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::gil_scoped_release rel;
                 return self.resume(optStream, std::move(selected));
             },
-            nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none(),
-            nb::arg("optional_reuse_groups") = nb::none())
+            nb::arg("cuda_stream") = nb::none(), nb::arg("optional_reuse_groups") = nb::none())
         .def(
             "get_page_priorities",
             [](kv::KvCache const& self, int layerGroupId, int beamIndex)
@@ -2081,7 +2161,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "decoding give a request several and are out of scope; this is the guard.")
         .def(
             "commit",
-            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
+            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd,
+                bool ssmFromPending)
             {
                 // An empty token list with is_end=True must still stop committing, so we do not
                 // early-return on empty; commit() handles it. beam_search_indices is only
@@ -2100,12 +2181,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         TLLM_CHECK_WITH_INFO(!(self.textOnly() && !knownNoDigest),
                             "commit() received a digest token on a text_only sequence — hashing would be corrupted");
                         nb::gil_scoped_release release;
-                        self.commit(view, isEnd);
+                        self.commit(view, isEnd, ssmFromPending);
                     });
             },
             nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
-            nb::arg("is_end") = false)
+            nb::arg("is_end") = false, nb::arg("ssm_from_pending") = false)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "acquire_ssm_snapshot_slot", &kv::KvCache::acquireSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("pending_ssm_snapshot_slot", &kv::KvCache::pendingSsmSnapshotSlot)
+        .def(
+            "release_ssm_snapshot_slot", &kv::KvCache::releaseSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_base_page_indices",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx)
@@ -2146,22 +2232,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>(),
             "Page indices of this life cycle's scratch slots, in slot order.")
-        .def(
-            "get_scratch_desc",
-            [](kv::KvCache const& self, int layerGroupId) -> std::optional<ScratchDescCompat>
-            {
-                auto const lgId = kv::LayerGroupId{layerGroupId};
-                auto const range = self.getSwaScratchRange(lgId);
-                if (!range)
-                {
-                    return std::nullopt;
-                }
-                auto const slots = self.getScratchSlots(lgId);
-                return ScratchDescCompat{range, std::vector<int>(slots.begin(), slots.end())};
-            },
-            nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>(),
-            "get_swa_scratch_range() and get_scratch_slots() as one object, or None when this life "
-            "cycle serves nothing from scratch. Remove with the ScratchDesc class.")
         .def_prop_ro("has_scratch_slots", &kv::KvCache::hasScratchSlots)
         .def_prop_rw("enable_swa_scratch_reuse", &kv::KvCache::isSwaScratchReuseEnabled,
             [](kv::KvCache& self, bool enable)
@@ -2182,24 +2252,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("mode"), nb::arg("layer_group_id"), "Per life cycle, which is where the scratch slots live.")
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)
-        // Admission into decode, which the manager no longer marks: beyond setting a flag,
-        // this offloaded sparse history, and the sparse fetch path owns that now. A cache
-        // with no sparse life cycle had nothing to offload, so always admitting is what it
-        // already did. Remove once the full sparse attention support is merged and its
-        // callers drop this; it exists only so this change stands alone.
-        .def(
-            "enter_decode",
-            [](kv::KvCache const& self)
-            {
-                if (!self.isActive())
-                {
-                    throw kv::LogicError("Decode admission requires an active request");
-                }
-                return true;
-            },
-            nb::call_guard<nb::gil_scoped_release>(),
-            "Admit this request into decode. Always true for an active request.")
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
+        .def_prop_ro("page_storage_version", &kv::KvCache::pageStorageVersion)
         .def_prop_ro(
             "batch_row",
             [](kv::KvCache const& self) -> std::optional<int>
@@ -2256,6 +2310,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "manager", [](kv::KvCache& self) -> kv::KvCacheManager& { return self.manager(); },
             nb::rv_policy::reference_internal)
         .def_prop_ro("committed_tokens", &committedTokensList)
+        .def("_get_committed_prefix_key",
+            [](kv::KvCache const& self, int numTokens) -> nb::object
+            {
+                std::optional<kv::BlockKey> key;
+                {
+                    nb::gil_scoped_release release;
+                    key = self.committedPrefixKey(numTokens);
+                }
+                if (!key)
+                    return nb::none();
+                return nb::bytes(reinterpret_cast<char const*>(key->data()), key->size());
+            })
         .def_prop_ro("reuse_scope", &kv::KvCache::reuseScope)
         .def(
             "plan_committed_block_drop", [](kv::KvCache& self) { return self.planCommittedBlockDrop(); },
@@ -2332,6 +2398,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def(
         "poison_for_testing", [](std::string const& reason) { kv::Poison::set("poison_for_testing", reason.c_str()); },
         nb::arg("reason"), "Set the KVCM2 poison latch directly, to exercise the refusal paths.");
+    mIntrospection.def(
+        "async_disk_io_enabled", []() { return kv::asyncDiskIoEnabled(); },
+        "Whether the process-wide disk I/O pool is running, so disk transfers are asynchronous.");
+    mIntrospection.def(
+        "inject_disk_write_failures_for_testing", [](uint64_t count) { kv::injectDiskWriteFailuresForTesting(count); },
+        nb::arg("count"), "Make the next `count` disk write pieces fail without writing.");
+    mIntrospection.def(
+        "delay_background_disk_writes_for_testing",
+        [](double seconds) { kv::delayBackgroundDiskWritesForTesting(seconds); }, nb::arg("seconds"),
+        "The async disk I/O pool starts a background write piece only once it has been queued for `seconds`.");
 
     nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
 
@@ -2602,22 +2678,25 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return std::make_tuple(std::move(r.first), std::move(r.second));
         },
         nb::arg("batch"));
+    mIntrospection.def("batch_sparse_clock", &kv::KvCacheIntrospection::batchSparseClock, nb::arg("batch"),
+        "The sparse eviction clock as (host counter, staged copy). Both are host reads, so this "
+        "neither synchronises nor waits on a publish in flight.");
     mIntrospection.def(
         "sparse_resolve",
-        [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
+        [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& entryAge, int numLayers,
             int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth,
             std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits, int maxInFlightUnits,
             std::vector<int32_t> const& inactiveRows)
         {
-            auto r = kv::KvCacheIntrospection::sparseResolve(residentOrdinal, lruOrder, numLayers, entriesPerLayer,
+            auto r = kv::KvCacheIntrospection::sparseResolve(residentOrdinal, entryAge, numLayers, entriesPerLayer,
                 selected, selectionWidth, historyUnits, capacityUnits, maxInFlightUnits, inactiveRows);
             // No gil_scoped_release call guard: the tuple below is built from the lambda body,
             // which the guard would have left running without the GIL.
-            return std::make_tuple(std::move(r.residentOrdinal), std::move(r.lruOrder), std::move(r.outSlot),
-                std::move(r.missRow), std::move(r.missOrdinal), std::move(r.missSlot), std::move(r.missTotal),
-                std::move(r.missCount), std::move(r.inFlightSlot));
+            return std::make_tuple(std::move(r.residentOrdinal), std::move(r.entryAge), std::move(r.entryHit),
+                std::move(r.outSlot), std::move(r.missRow), std::move(r.missOrdinal), std::move(r.missSlot),
+                std::move(r.missTotal), std::move(r.missCount), std::move(r.inFlightSlot));
         },
-        nb::arg("resident_ordinal"), nb::arg("lru_order"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
+        nb::arg("resident_ordinal"), nb::arg("entry_age"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
         nb::arg("selected"), nb::arg("selection_width"), nb::arg("history_units"), nb::arg("capacity_units"),
         nb::arg("max_in_flight_units"), nb::arg("inactive_rows"));
     mIntrospection.def("sparse_unit_copy", &kv::KvCacheIntrospection::sparseUnitCopy, nb::arg("host_pool"),
@@ -2782,6 +2861,54 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return std::move(utilization.raw());
         },
         nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "remote_unquiesced_transfers",
+        // Remote transfers past their deadline whose staging is still out of use, after releasing the quiesced ones.
+        [](kv::KvCacheManager& manager) { return manager.storage().reapQuiescedRemoteTransfers(); }, nb::arg("manager"),
+        nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "level_pool_groups",
+        [](kv::KvCacheManager& manager, int cacheLevel)
+        {
+            // Per pool group of one cache level: slot count, bytes per slot, and the layer groups it holds.
+            auto const& storage = manager.storage();
+            kv::CacheLevel const level{cacheLevel};
+            TLLM_CHECK_WITH_INFO(
+                cacheLevel >= 0 && level < storage.numCacheLevels(), "cache_level %d is out of range", cacheLevel);
+            std::vector<std::tuple<int64_t, size_t, std::vector<int>>> groups(
+                static_cast<size_t>(storage.numPoolGroups(level).value()));
+            for (kv::PoolGroupIndex pg{0}; pg < storage.numPoolGroups(level); ++pg)
+            {
+                auto const& sizes = storage.slotSize(level, pg);
+                auto& group = groups[static_cast<size_t>(pg.value())];
+                std::get<0>(group) = static_cast<int64_t>(storage.numSlots(pg, level));
+                std::get<1>(group) = std::accumulate(sizes.begin(), sizes.end(), size_t{0});
+            }
+            for (kv::LifeCycleId lc{0}; lc < storage.numLifeCycles(); ++lc)
+            {
+                std::get<2>(groups[static_cast<size_t>(storage.getPoolGroupIndex(level, lc).value())])
+                    .push_back(lc.value());
+            }
+            return groups;
+        },
+        nb::arg("manager"), nb::arg("cache_level"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "disk_copy_counters",
+        [](kv::KvCacheManager& manager)
+        {
+            auto const c = manager.storage().diskCopyCounters();
+            nb::dict counters;
+            counters["retained"] = c.retained;
+            counters["created"] = c.created;
+            counters["reused"] = c.reused;
+            counters["reused_pending"] = c.reusedPending;
+            counters["reclaimed"] = c.reclaimed;
+            counters["dropped"] = c.dropped;
+            counters["write_through_pages"] = c.writeThroughPages;
+            counters["write_through_skipped"] = c.writeThroughSkipped;
+            return counters;
+        },
+        nb::arg("manager"));
     mIntrospection.def(
         "grains_for_slots",
         [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity,
@@ -3469,7 +3596,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         }
                         nb::gil_scoped_release release;
                         return self->createKvCache(std::move(reuseScope), view, id, std::move(priorityCb), promptLen,
-                            textOnly, enableRequestStats, std::move(retentionConfig));
+                            textOnly, enableRequestStats, std::move(retentionConfig), knownNoDigest);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
@@ -3697,6 +3824,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             { return std::dynamic_pointer_cast<kv::EventManager>(self.eventSink()); })
         .def_prop_ro("init_config", [](kv::KvCacheManager const& self) { return self.config(); })
         .def_prop_ro("cache_tier_list", [](kv::KvCacheManager const& self) { return self.cacheTierList().raw(); })
+        .def_prop_ro("any_remote_level_failed",
+            // A lock-step scheduler stops once any remote level failed on this rank. Lock-free (atomic flags).
+            [](kv::KvCacheManager& self) { return self.storage().anyRemoteLevelFailed(); })
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)
         .def_prop_ro("pool_group_descs",
             [](kv::KvCacheManager const& self)
@@ -3749,6 +3879,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCacheManager const& self, kv::LayerId layerId, kv::DataRole const& role)
             { return self.getBufferGroupId(layerId, role).value(); },
             nb::arg("layer_id"), nb::arg("role"), "CacheGroupId of one buffer of the layer.")
+        .def(
+            "get_region_group_id",
+            [](kv::KvCacheManager const& self, std::string const& name) { return self.getRegionGroupId(name).value(); },
+            nb::arg("name"), "CacheGroupId of the region named `name`; raises IndexError for an unknown name.")
         .def(
             "get_sparse_cache_max_units",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)
@@ -3803,28 +3937,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("scratch_pages_per_block", &kv::PageIndexConverter::scratchPagesPerBlock)
         .def(
             "__call__",
-            // `scratch_range` also takes the ScratchDesc that get_scratch_desc() returns, which
-            // carries its slots with it; see ScratchDescCompat.
             [](kv::PageIndexConverter const& self, std::vector<int> const& baseIndices,
-                std::optional<kv::PageIndexMode> indexMode, nb::object scratch,
+                std::optional<kv::PageIndexMode> indexMode,
+                std::optional<kv::HalfOpenRange<kv::BlockOrdinal>> scratchRange,
                 std::vector<int> const& scratchSlots) -> std::vector<int>
             {
-                kv::HalfOpenRange<kv::BlockOrdinal> range{};
-                std::vector<int> const* slots = &scratchSlots;
-                if (nb::isinstance<ScratchDescCompat>(scratch))
-                {
-                    TLLM_CHECK_WITH_INFO(
-                        scratchSlots.empty(), "scratch_slots must be empty when scratch_range is a ScratchDesc");
-                    auto const& desc = nb::cast<ScratchDescCompat const&>(scratch);
-                    range = desc.range;
-                    slots = &desc.slotIds;
-                }
-                else if (!scratch.is_none())
-                {
-                    range = nb::cast<kv::HalfOpenRange<kv::BlockOrdinal>>(scratch);
-                }
-                return self(
-                    baseIndices, indexMode, range, kv::Span<int const>{slots->data(), static_cast<int>(slots->size())});
+                return self(baseIndices, indexMode, scratchRange.value_or(kv::HalfOpenRange<kv::BlockOrdinal>{}),
+                    kv::Span<int const>{scratchSlots.data(), static_cast<int>(scratchSlots.size())});
             },
             nb::arg("base_indices"), nb::arg("index_mode") = nb::none(), nb::arg("scratch_range") = nb::none(),
             nb::arg("scratch_slots") = std::vector<int>{});

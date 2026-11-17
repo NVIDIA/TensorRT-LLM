@@ -76,6 +76,7 @@ class TestNvfp4MarlinGemm(unittest.TestCase):
 
         torch.random.manual_seed(0)
 
+        input_bf16 = input_e2m1 = input_e4m3_scale = None
         is_bf16_act = act_dtype == "bf16"
 
         if is_bf16_act:

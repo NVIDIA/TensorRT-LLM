@@ -31,6 +31,10 @@ NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(
     temperature=0.7, top_k=50, top_p=0.9, min_p=0.05
 )
 
+# Temperature-only params (no top-k / top-p / min-p, no seed) for the capture pass of the one-engine
+# temperature-only graph variant.
+TEMPERATURE_ONLY_CAPTURE_SAMPLING_PARAMS = SamplingParams(temperature=0.7)
+
 
 class DummyRequestFactory:
     """Builds the dummy batches that warmup and CUDA graph capture run.
@@ -107,8 +111,12 @@ class DummyRequestFactory:
         least_requests: bool = True,
         chunk_alignment: int | None = None,
         chunk_aligned: bool = False,
+        num_context_requests: int | None = None,
     ) -> ScheduledRequests | None:
         """Creates a generic dummy ScheduledRequests object for warmup.
+
+        ``num_context_requests``, when set, splits the context tokens evenly
+        over that many requests instead of following ``least_requests``.
 
         ``chunk_alignment``, when set, rewrites the context lengths onto one
         side of it, so a kernel specializing on chunk alignment can be primed
@@ -172,7 +180,16 @@ class DummyRequestFactory:
             return None
 
         if num_ctx_tokens > 0:
-            if least_requests:
+            if num_context_requests is not None:
+                if not 0 < num_context_requests <= min(num_ctx_tokens, max_context_requests):
+                    return None
+                base_length, remainder = divmod(num_ctx_tokens, num_context_requests)
+                ctx_token_nums = [base_length + 1] * remainder + [base_length] * (
+                    num_context_requests - remainder
+                )
+                if ctx_token_nums[0] > max_seq_len:
+                    return None
+            elif least_requests:
                 num_full_seqs, remainder = divmod(num_ctx_tokens, max_seq_len)
                 ctx_token_nums = [max_seq_len] * num_full_seqs
                 if remainder:
@@ -295,14 +312,19 @@ class DummyRequestFactory:
         force_non_greedy: bool = False,
         context_token_nums: Sequence[int] = (),
         context_request_kwargs: dict[str, Any] | None = None,
+        temperature_only: bool = False,
     ) -> ScheduledRequests | None:
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture.
 
         With ``context_token_nums``, the first rows are context requests of
         those lengths, created with ``context_request_kwargs``; the rest are
-        generation requests.
+        generation requests. ``temperature_only`` (with ``force_non_greedy``)
+        gives the dummies temperature-only sampling params, for the capture
+        pass of the temperature-only variant.
         """
         capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
+        if force_non_greedy and temperature_only:
+            capture_sampling_params = TEMPERATURE_ONLY_CAPTURE_SAMPLING_PARAMS
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )

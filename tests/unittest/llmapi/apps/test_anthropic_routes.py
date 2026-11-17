@@ -16,7 +16,10 @@
 
 import asyncio
 import json
+import re
 import time
+from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -25,9 +28,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
+from test_common.serve.app_factory import AggConfig, ServeTestEnv, isolated_serve_env
 
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 from tensorrt_llm.serve import openai_server as openai_server_module
+from tensorrt_llm.serve.anthropic_batches import BatchItemOutcome, BatchItemRunner
+from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -41,12 +47,19 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.render import chat as render_chat_module
+from tensorrt_llm.serve.responses_utils import ServerArrivalTimeMiddleware
 
 # These tests are CPU-only (no GPU, engine or sockets) and run in the
 # CPU-Generic CI stage, which selects with `-m cpu_only`.
 pytestmark = pytest.mark.cpu_only
 
 MODEL = "test-model"
+
+
+@pytest.fixture
+def validation_env(tmp_path: Path) -> Iterator[ServeTestEnv]:
+    with isolated_serve_env(tmp_path) as env:
+        yield env
 
 
 def _request(**overrides):
@@ -89,17 +102,20 @@ def _json_chat_response(*, tool_arguments=None, status_code=200):
     )
 
 
-def _streaming_chat_response():
+def _streaming_chat_response(chat_id="chatcmpl-route-test"):
     chunks = [
         ChatCompletionStreamResponse(
+            id=chat_id,
             model=MODEL,
             choices=[{"index": 0, "delta": {"role": "assistant"}}],
         ),
         ChatCompletionStreamResponse(
+            id=chat_id,
             model=MODEL,
             choices=[{"index": 0, "delta": {"content": "hello"}}],
         ),
         ChatCompletionStreamResponse(
+            id=chat_id,
             model=MODEL,
             choices=[
                 {
@@ -120,12 +136,17 @@ def _streaming_chat_response():
     return StreamingResponse(source(), media_type="text/event-stream")
 
 
-def _make_route_client(server_kind, openai_response):
+def _make_route_client(
+    server_kind: str,
+    openai_response: JSONResponse | StreamingResponse | None,
+    *,
+    validation_env: ServeTestEnv,
+) -> tuple[TestClient, AsyncMock]:
     app = FastAPI()
     # Body validation fails before the route function runs, so without the
     # server's own handler these tests would see FastAPI's 422 instead of the
     # 400 + Anthropic envelope a client actually gets.
-    _anthropic_validation_handler(app)
+    _anthropic_validation_handler(app, validation_env=validation_env)
     if server_kind == "standard":
         server = object.__new__(OpenAIServer)
         server.model = MODEL
@@ -137,12 +158,16 @@ def _make_route_client(server_kind, openai_response):
         backend = AsyncMock(return_value=openai_response)
         server._wrap_entry_point = Mock(return_value=backend)
     app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
-    return TestClient(app), backend
+    return validation_env.client(app, lifespan=False), backend
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
-def test_messages_route_converts_nonstream_response(server_kind):
-    client, backend = _make_route_client(server_kind, _json_chat_response())
+def test_messages_route_converts_nonstream_response(
+    server_kind: str, validation_env: ServeTestEnv
+) -> None:
+    client, backend = _make_route_client(
+        server_kind, _json_chat_response(), validation_env=validation_env
+    )
 
     response = client.post("/v1/messages", json=_request())
 
@@ -163,9 +188,13 @@ def test_messages_route_converts_nonstream_response(server_kind):
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
-def test_messages_route_accepts_thinking_display(server_kind):
+def test_messages_route_accepts_thinking_display(
+    server_kind: str, validation_env: ServeTestEnv
+) -> None:
     """The thinking config Claude Code sends is served, not answered with a 400."""
-    client, backend = _make_route_client(server_kind, _json_chat_response())
+    client, backend = _make_route_client(
+        server_kind, _json_chat_response(), validation_env=validation_env
+    )
 
     response = client.post(
         "/v1/messages",
@@ -177,8 +206,12 @@ def test_messages_route_accepts_thinking_display(server_kind):
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
-def test_messages_route_rejects_anthropic_server_tools(server_kind):
-    client, backend = _make_route_client(server_kind, _json_chat_response())
+def test_messages_route_rejects_anthropic_server_tools(
+    server_kind: str, validation_env: ServeTestEnv
+) -> None:
+    client, backend = _make_route_client(
+        server_kind, _json_chat_response(), validation_env=validation_env
+    )
 
     response = client.post(
         "/v1/messages",
@@ -214,7 +247,9 @@ def test_messages_route_rejects_anthropic_server_tools(server_kind):
         ),
     ],
 )
-def test_malformed_known_block_is_a_400_against_its_own_type(block, tag, field):
+def test_malformed_known_block_is_a_400_against_its_own_type(
+    block: dict[str, object], tag: str, field: str, validation_env: ServeTestEnv
+) -> None:
     """A known type with bad fields must fail as that type, not as the catch-all.
 
     The union is tagged on `type`, so the block is checked against the model the
@@ -226,7 +261,9 @@ def test_malformed_known_block_is_a_400_against_its_own_type(block, tag, field):
     The error names the block's location in the body, so the tag and then
     the field appear in it as path segments.
     """
-    client, backend = _make_route_client("standard", _json_chat_response())
+    client, backend = _make_route_client(
+        "standard", _json_chat_response(), validation_env=validation_env
+    )
 
     response = client.post(
         "/v1/messages",
@@ -242,13 +279,15 @@ def test_malformed_known_block_is_a_400_against_its_own_type(block, tag, field):
     backend.assert_not_awaited()
 
 
-def test_unknown_block_type_still_reaches_the_adapter():
+def test_unknown_block_type_still_reaches_the_adapter(validation_env: ServeTestEnv) -> None:
     """The catch-all exists for types this server does not model; keep it working.
 
     Tagging the union must not close it: an unmodelled type has to validate and
     be named by the adapter, rather than returning a wall of failed members.
     """
-    client, backend = _make_route_client("standard", _json_chat_response())
+    client, backend = _make_route_client(
+        "standard", _json_chat_response(), validation_env=validation_env
+    )
 
     response = client.post(
         "/v1/messages",
@@ -262,8 +301,12 @@ def test_unknown_block_type_still_reaches_the_adapter():
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
-def test_messages_route_hides_invalid_generated_tool_arguments(server_kind):
-    client, _ = _make_route_client(server_kind, _json_chat_response(tool_arguments="{not-json"))
+def test_messages_route_hides_invalid_generated_tool_arguments(
+    server_kind: str, validation_env: ServeTestEnv
+) -> None:
+    client, _ = _make_route_client(
+        server_kind, _json_chat_response(tool_arguments="{not-json"), validation_env=validation_env
+    )
 
     response = client.post("/v1/messages", json=_request())
 
@@ -274,9 +317,110 @@ def test_messages_route_hides_invalid_generated_tool_arguments(server_kind):
     }
 
 
+def _records_executor_client_id(request_id, *, stream=False):
+    """An openai_chat stand-in that, like the real one, notes the executor client id.
+
+    A streamed answer names its chunks ``chatcmpl-5``, which the message must not take.
+    """
+
+    async def answer(chat_request, raw_request):
+        raw_request.state.executor_client_id = request_id
+        if stream:
+            return _streaming_chat_response(chat_id="chatcmpl-5")
+        return _json_chat_response()
+
+    return answer
+
+
+def _message_id(response, stream):
+    """The id of the message in a /v1/messages response."""
+    if not stream:
+        return response.json()["id"]
+    start = response.text.split("\n\n")[0]
+    assert start.startswith("event: message_start\n")
+    return json.loads(start.split("data: ", 1)[1])["message"]["id"]
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["nonstream", "stream"])
+def test_message_is_named_after_the_executor_client_id(
+    stream: bool, validation_env: ServeTestEnv
+) -> None:
+    client, backend = _make_route_client("standard", None, validation_env=validation_env)
+    backend.side_effect = _records_executor_client_id(42, stream=stream)
+
+    response = client.post("/v1/messages", json=_request(stream=stream))
+
+    assert response.status_code == 200, response.text
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", _message_id(response, stream))
+
+
+def test_batched_message_is_named_after_the_executor_client_id():
+    from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+
+    server = object.__new__(OpenAIServer)
+    server.model = MODEL
+    server._collect_perf_metrics = False
+    server.openai_chat = AsyncMock(side_effect=_records_executor_client_id(7))
+
+    status, message = asyncio.run(
+        server._run_batched_message(AnthropicMessagesRequest(**_request()))
+    )
+
+    assert status == "succeeded"
+    assert re.fullmatch(r"msg_7_[0-9a-f]{16}", message["id"])
+
+
+class _FixedPromptTokenizer:
+    """Renders every conversation to one fixed prompt."""
+
+    def __init__(self):
+        self.tokenizer = self
+        self.vocab_size = 1024
+        self.name_or_path = None
+
+    def apply_chat_template(self, *args, **kwargs) -> str:
+        return "<rendered>"
+
+    def encode(self, text, **kwargs):
+        return [1, 2, 3]
+
+
+def test_nonstream_message_takes_the_id_the_real_chat_route_notes(
+    tmp_path: Path, validation_env: ServeTestEnv
+) -> None:
+    """Through the real openai_chat: the chat completion's id has no request id in it."""
+    from .openai_server_stub import make_stub_openai_server
+
+    def generate_async(**kwargs):
+        return SimpleNamespace(request_id=42, prompt_token_ids=[1, 2, 3])
+
+    server = make_stub_openai_server(
+        tmp_path,
+        MODEL,
+        SimpleNamespace(model_type="llama", vocab_size=1024),
+        generate_async,
+        tokenizer=_FixedPromptTokenizer(),
+    )
+    server.await_disconnected = AsyncMock()
+    server._create_chat_response = AsyncMock(return_value=_chat_response())
+    app = FastAPI()
+    _anthropic_validation_handler(app, validation_env=validation_env)
+    app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
+
+    response = validation_env.client(app, lifespan=False).post("/v1/messages", json=_request())
+
+    assert response.status_code == 200, response.text
+    assert _chat_response().id == "chatcmpl-route-test"
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", response.json()["id"])
+
+
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
-def test_messages_route_reframes_streaming_response(server_kind):
-    client, backend = _make_route_client(server_kind, _streaming_chat_response())
+def test_messages_route_reframes_streaming_response(
+    server_kind: str, validation_env: ServeTestEnv
+) -> None:
+    client, backend = _make_route_client(
+        server_kind, _streaming_chat_response(), validation_env=validation_env
+    )
 
     response = client.post("/v1/messages", json=_request(stream=True))
 
@@ -289,6 +433,50 @@ def test_messages_route_reframes_streaming_response(server_kind):
     assert backend.await_args.args[0].stream
 
 
+def _disagg_route_client(answer):
+    """A disaggregated server whose real request wrapper and hooks call ``answer``."""
+    server = object.__new__(OpenAIDisaggServer)
+    server._service = SimpleNamespace(openai_chat_completion=answer)
+    server._perf_metrics_collector = SimpleNamespace(
+        total_requests=Mock(),
+        stream_requests=Mock(),
+        nonstream_requests=Mock(),
+        total_responses=Mock(),
+        queue_latency_seconds=Mock(),
+    )
+    server._allow_request_chat_template = False
+    server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
+    server._collect_perf_metrics = False
+    app = FastAPI()
+    app.add_middleware(ServerArrivalTimeMiddleware)
+    app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
+    return TestClient(app)
+
+
+@pytest.mark.parametrize("disagg_request_ids", [[17], [16, 17]], ids=["once", "ctx_retried"])
+@pytest.mark.parametrize("stream", [False, True], ids=["nonstream", "stream"])
+def test_disagg_message_is_named_after_the_disagg_request(stream, disagg_request_ids):
+    """Not after the generation worker's id for it: each worker numbers its own.
+
+    The worker names its chat stream ``chatcmpl-<its id for the request>``, and a
+    non-streamed chat completion has a random id. A retried context request gets
+    a new disaggregated request id; the reply takes the one the perf metrics record.
+    """
+
+    async def answer(chat_request, hooks):
+        hooks.on_req_begin(chat_request)
+        for disagg_request_id in disagg_request_ids:
+            hooks.on_disagg_request_id(disagg_request_id)
+        if stream:
+            return _streaming_chat_response(chat_id="chatcmpl-5").body_iterator
+        return _chat_response()
+
+    response = _disagg_route_client(answer).post("/v1/messages", json=_request(stream=stream))
+
+    assert response.status_code == 200, response.text
+    assert re.fullmatch(r"msg_17_[0-9a-f]{16}", _message_id(response, stream))
+
+
 class _StreamedGeneration:
     """A streamed generation whose steps are already post-processed frames.
 
@@ -296,6 +484,7 @@ class _StreamedGeneration:
     for the next step, as a generation does while the model is still running.
     """
 
+    request_id = 1
     prompt_token_ids = [1, 2, 3]
 
     def __init__(self, steps, *, then=None, hang=False):
@@ -325,12 +514,12 @@ class _ModelConfig:
     vocab_size = 1024
 
 
-async def _chat_stream(monkeypatch, generation):
-    """The body of a streamed /v1/chat/completions response, and the server.
+def _streaming_chat_server(monkeypatch, generation):
+    """A server whose real ``openai_chat`` streams ``generation``.
 
-    The real ``openai_chat`` handler runs on a server built with
-    ``object.__new__``; prompt rendering and the engine are stubbed, and the
-    engine's output is already post-processed into SSE frames.
+    The server is built with ``object.__new__``; prompt rendering and the
+    engine are stubbed, and the engine's output is already post-processed into
+    SSE frames.
     """
 
     async def render(**kwargs):
@@ -361,6 +550,12 @@ async def _chat_stream(monkeypatch, generation):
     )
     server.await_disconnected = AsyncMock()
     server._extract_metrics = AsyncMock()
+    return server
+
+
+async def _chat_stream(monkeypatch, generation):
+    """The body of a streamed /v1/chat/completions response, and the server."""
+    server = _streaming_chat_server(monkeypatch, generation)
     request = ChatCompletionRequest(
         model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True
     )
@@ -368,6 +563,36 @@ async def _chat_stream(monkeypatch, generation):
     response = await server.openai_chat(request, raw_request)
     assert isinstance(response, StreamingResponse), response.body
     return response.body_iterator, server
+
+
+async def _collect(stream):
+    return [frame async for frame in stream]
+
+
+def test_streamed_message_takes_the_id_the_real_chat_route_notes(monkeypatch):
+    """Through the real openai_chat: the chat stream's own id does not name the message."""
+    from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+
+    chunks = _streaming_chat_response(chat_id="chatcmpl-5").body_iterator
+    generation = _StreamedGeneration(
+        [[frame] for frame in asyncio.run(_collect(chunks)) if frame != "data: [DONE]\n\n"]
+    )
+    generation.request_id = 42
+
+    async def run():
+        server = _streaming_chat_server(monkeypatch, generation)
+        raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+        response = await server.anthropic_messages(
+            AnthropicMessagesRequest(**_request(stream=True)), raw_request
+        )
+        assert isinstance(response, StreamingResponse), response.body
+        return await _collect(response.body_iterator)
+
+    frames = asyncio.run(run())
+
+    start = next(frame for frame in frames if frame.startswith("event: message_start\n"))
+    message_id = json.loads(start.split("data: ", 1)[1])["message"]["id"]
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", message_id)
 
 
 @pytest.fixture
@@ -522,15 +747,17 @@ def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
     assert "/v1/models" in disagg_paths
 
 
-def _batch_client(runner=None):
+def _batch_client(
+    runner: BatchItemRunner | None = None, *, validation_env: ServeTestEnv
+) -> TestClient:
     """A TestClient over just the batch routes, with a stubbed item runner."""
     from tensorrt_llm.serve.anthropic_batches import AnthropicBatchStore
 
-    async def ok(request):
+    async def ok(request: AnthropicMessagesRequest) -> tuple[BatchItemOutcome, dict[str, object]]:
         return "succeeded", {"type": "message", "role": "assistant", "content": []}
 
     app = FastAPI()
-    _anthropic_validation_handler(app)
+    _anthropic_validation_handler(app, validation_env=validation_env)
     server = object.__new__(OpenAIServer)
     server.model = MODEL
     server._anthropic_batch_store = AnthropicBatchStore(runner=runner or ok)
@@ -548,7 +775,7 @@ def _batch_client(runner=None):
     app.add_api_route(
         "/v1/messages/batches/{batch_id}/results", server.anthropic_batch_results, methods=["GET"]
     )
-    return TestClient(app)
+    return validation_env.client(app, lifespan=False)
 
 
 def _batch_body(*custom_ids):
@@ -592,8 +819,8 @@ def test_batch_routes_are_registered_on_the_standard_server():
         assert path in paths, f"{path} not registered"
 
 
-def test_create_batch_returns_an_in_progress_batch():
-    client = _batch_client()
+def test_create_batch_returns_an_in_progress_batch(validation_env: ServeTestEnv) -> None:
+    client = _batch_client(validation_env=validation_env)
     response = client.post("/v1/messages/batches", json=_batch_body("a", "b"))
 
     assert response.status_code == 200
@@ -604,17 +831,17 @@ def test_create_batch_returns_an_in_progress_batch():
     assert body["request_counts"]["processing"] + body["request_counts"]["succeeded"] == 2
 
 
-def test_create_batch_rejects_duplicate_custom_ids():
-    client = _batch_client()
+def test_create_batch_rejects_duplicate_custom_ids(validation_env: ServeTestEnv) -> None:
+    client = _batch_client(validation_env=validation_env)
     response = client.post("/v1/messages/batches", json=_batch_body("same", "same"))
 
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
 
 
-def test_unknown_batch_says_it_is_not_found_and_explains_why():
+def test_unknown_batch_says_it_is_not_found_and_explains_why(validation_env: ServeTestEnv) -> None:
     """The in-memory limitation is the likeliest cause, so name it."""
-    client = _batch_client()
+    client = _batch_client(validation_env=validation_env)
     response = client.get("/v1/messages/batches/msgbatch_nope")
 
     assert response.status_code == 404
@@ -715,8 +942,8 @@ def test_interrupted_batch_still_reports_counts_that_sum():
     asyncio.run(scenario())
 
 
-def test_finished_batch_serves_ndjson_results():
-    client = _batch_client()
+def test_finished_batch_serves_ndjson_results(validation_env: ServeTestEnv) -> None:
+    client = _batch_client(validation_env=validation_env)
     created = client.post("/v1/messages/batches", json=_batch_body("a", "b")).json()
 
     for _ in range(200):
@@ -734,8 +961,8 @@ def test_finished_batch_serves_ndjson_results():
     assert {line["custom_id"] for line in lines} == {"a", "b"}
 
 
-def test_list_batches_returns_a_page():
-    client = _batch_client()
+def test_list_batches_returns_a_page(validation_env: ServeTestEnv) -> None:
+    client = _batch_client(validation_env=validation_env)
     client.post("/v1/messages/batches", json=_batch_body("a"))
     body = client.get("/v1/messages/batches").json()
 
@@ -841,7 +1068,7 @@ class _FakeTokenizer:
         return text.split()
 
 
-def _anthropic_validation_handler(app):
+def _anthropic_validation_handler(app: FastAPI, *, validation_env: ServeTestEnv) -> None:
     """Install the server's own handler so boundary rejections keep the envelope.
 
     Model-level validation fails before the route function runs, so without
@@ -851,24 +1078,22 @@ def _anthropic_validation_handler(app):
     """
     from fastapi.exceptions import RequestValidationError
 
-    server = object.__new__(OpenAIServer)
-    server.metrics_collector = None
-    server.server_role = None
+    server = validation_env.build_openai_server(AggConfig(model_name=MODEL))
     app.add_exception_handler(RequestValidationError, server._request_validation_error)
 
 
-def _count_tokens_client():
+def _count_tokens_client(*, validation_env: ServeTestEnv) -> TestClient:
     app = FastAPI()
-    _anthropic_validation_handler(app)
+    _anthropic_validation_handler(app, validation_env=validation_env)
     server = object.__new__(OpenAIServer)
     server.model = MODEL
     server.tokenizer = _FakeTokenizer()
     app.add_api_route("/v1/messages/count_tokens", server.anthropic_count_tokens, methods=["POST"])
-    return TestClient(app)
+    return validation_env.client(app, lifespan=False)
 
 
-def test_count_tokens_route_returns_a_count():
-    client = _count_tokens_client()
+def test_count_tokens_route_returns_a_count(validation_env: ServeTestEnv) -> None:
+    client = _count_tokens_client(validation_env=validation_env)
 
     response = client.post(
         "/v1/messages/count_tokens",
@@ -882,9 +1107,11 @@ def test_count_tokens_route_returns_a_count():
     assert response.json() == {"input_tokens": 3}
 
 
-def test_count_tokens_counts_the_rendered_prompt_not_the_raw_messages():
+def test_count_tokens_counts_the_rendered_prompt_not_the_raw_messages(
+    validation_env: ServeTestEnv,
+) -> None:
     """Tools inflate the real prompt, so they have to inflate the count."""
-    client = _count_tokens_client()
+    client = _count_tokens_client(validation_env=validation_env)
     body = {
         "model": MODEL,
         "messages": [{"role": "user", "content": "one two three"}],
@@ -946,8 +1173,8 @@ def test_count_tokens_honours_the_server_chat_template():
     )
 
 
-def test_count_tokens_rejects_a_malformed_request():
-    client = _count_tokens_client()
+def test_count_tokens_rejects_a_malformed_request(validation_env: ServeTestEnv) -> None:
+    client = _count_tokens_client(validation_env=validation_env)
 
     response = client.post(
         "/v1/messages/count_tokens",
@@ -1250,14 +1477,16 @@ def test_await_disconnected_returns_immediately_for_a_synthetic_request():
 
 
 @pytest.mark.parametrize("limit", [0, -1, 101])
-def test_list_batches_rejects_out_of_range_limit(limit):
+def test_list_batches_rejects_out_of_range_limit(limit: int, validation_env: ServeTestEnv) -> None:
     """Clamping hid both a client error and a surprising page size.
 
     limit=0 became 1 rather than an error, and the page was bounded by the
     retention limit -- how many batches are kept, which has nothing to do with
     how many fit on a page.
     """
-    response = _batch_client().get(f"/v1/messages/batches?limit={limit}")
+    response = _batch_client(validation_env=validation_env).get(
+        f"/v1/messages/batches?limit={limit}"
+    )
 
     assert response.status_code == 400, response.text
     assert response.json()["error"]["type"] == "invalid_request_error"

@@ -171,7 +171,16 @@ class _StopBlockInit(Exception):
     """Raised once the resolved MoE class is captured, to abort the build."""
 
 
-def _build_moe_block(moe_backend, exclude_modules, layer_idx, *, sm, quant_config_dict=None):
+def _build_moe_block(
+    moe_backend,
+    exclude_modules,
+    layer_idx,
+    *,
+    sm,
+    quant_config_dict=None,
+    moe_tactic=None,
+    spec_config=None,
+):
     """Run sparse-MoE initialization through its ``create_moe`` call.
 
     ``sm`` is declared, not probed. Which implementation wins is a function of
@@ -201,12 +210,14 @@ def _build_moe_block(moe_backend, exclude_modules, layer_idx, *, sm, quant_confi
             mlp_bias=False,
         ),
         moe_backend=moe_backend,
+        moe_tactic=moe_tactic,
         quant_config=QuantConfig(
             quant_algo=QuantAlgo.NVFP4,
             kv_cache_quant_algo=QuantAlgo.FP8,
             exclude_modules=exclude_modules,
         ),
         quant_config_dict=quant_config_dict,
+        spec_config=spec_config,
     )
     captured = {}
 
@@ -221,6 +232,7 @@ def _build_moe_block(moe_backend, exclude_modules, layer_idx, *, sm, quant_confi
     # will be built with, which the assertions below would not catch.
     def _capture(model_config, **kwargs):
         captured["moe_backend"] = model_config.moe_backend
+        captured["moe_tactic"] = model_config.moe_tactic
         captured["override"] = kwargs.get("override_quant_config")
         captured["moe_cls"] = real_resolve_moe_cls(model_config, **kwargs).__name__
         raise _StopBlockInit
@@ -259,6 +271,124 @@ def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
     assert captured["override"] is not per_layer_quant_config
     assert not captured["override"].layer_quant_mode.has_any_quant(exclude_kv_cache=True)
     assert captured["override"].kv_cache_quant_algo == QuantAlgo.FP8
+
+
+_NVFP4_TACTIC = "cutedsl.grouped_gemm.nvfp4"
+
+
+@pytest.mark.parametrize(
+    "exclude_modules, moe_backend, moe_tactic, expected_moe_cls",
+    [
+        (["model.layers.5*"], "CUTLASS", None, "TrtllmCutlassUnquantizedImpl"),
+        (["model.layers.7*"], "CUTEDSL", _NVFP4_TACTIC, "TrtllmCutedslGroupedGemmNvfp4Impl"),
+    ],
+    ids=["excluded_layer_drops_the_pin", "unexcluded_layer_keeps_the_pin"],
+)
+def test_pinned_tactic_applies_to_quantized_layers_only(
+    exclude_modules, moe_backend, moe_tactic, expected_moe_cls
+):
+    # The model is built for the family the pin implies, as loading builds it;
+    # the excluded layer moves to unquantized CUTLASS and drops the NVFP4 pin,
+    # which could not serve those bf16 experts.
+    captured = _build_moe_block(
+        "CUTEDSL",
+        exclude_modules,
+        5,
+        sm=100,
+        quant_config_dict={"model.layers.5.mlp.experts": QuantConfig(quant_algo=QuantAlgo.NVFP4)},
+        moe_tactic=_NVFP4_TACTIC,
+    )
+
+    assert captured["moe_backend"] == moe_backend
+    assert captured["moe_tactic"] == moe_tactic
+    assert captured["moe_cls"] == expected_moe_cls
+
+
+def test_an_excluded_layer_names_the_tactic_it_drops(monkeypatch):
+    from tensorrt_llm._torch.models import modeling_qwen3_next
+
+    warnings = []
+    monkeypatch.setattr(
+        modeling_qwen3_next.logger, "warning", lambda message: warnings.append(message)
+    )
+    _build_moe_block(
+        "CUTEDSL",
+        ["model.layers.5*"],
+        5,
+        sm=100,
+        quant_config_dict={"model.layers.5.mlp.experts": QuantConfig(quant_algo=QuantAlgo.NVFP4)},
+        moe_tactic=_NVFP4_TACTIC,
+    )
+
+    assert any(f"MoE tactic {_NVFP4_TACTIC!r}" in message for message in warnings)
+
+
+def test_an_excluded_mtp_layer_keeps_the_draft_tactic():
+    """An MTP layer's tactic is speculative_config.moe_tactic, which pins its BF16 experts."""
+    captured = _build_moe_block(
+        "CUTLASS",
+        [f"model.layers.{MTP_LAYER_IDX}*"],
+        MTP_LAYER_IDX,
+        sm=100,
+        moe_tactic="cutlass.none",
+    )
+
+    assert captured["moe_backend"] == "CUTLASS"
+    assert captured["moe_tactic"] == "cutlass.none"
+    assert captured["moe_cls"] == "TrtllmCutlassUnquantizedImpl"
+
+
+def test_an_excluded_mtp_layer_refuses_a_draft_tactic_of_another_format():
+    """A draft tactic with no BF16 implementation fails instead of being replaced."""
+    with pytest.raises(ValueError, match="names no implementation of quant=none"):
+        _build_moe_block(
+            "CUTLASS",
+            [f"model.layers.{MTP_LAYER_IDX}*"],
+            MTP_LAYER_IDX,
+            sm=100,
+            moe_tactic="trtllm.cutlass.grouped_gemm.nvfp4",
+        )
+
+
+def _nvfp4_draft_spec_config():
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+    return MTPDecodingConfig(max_draft_len=1, num_nextn_predict_layers=1, draft_moe_dtype="nvfp4")
+
+
+def _build_nvfp4_draft_block(moe_backend, moe_tactic=None):
+    """The MTP layer of a checkpoint that keeps it in BF16, drafting as NVFP4."""
+    return _build_moe_block(
+        moe_backend,
+        [f"model.layers.{MTP_LAYER_IDX}*"],
+        MTP_LAYER_IDX,
+        sm=100,
+        moe_tactic=moe_tactic,
+        spec_config=_nvfp4_draft_spec_config(),
+    )
+
+
+@pytest.mark.parametrize(
+    "moe_backend, moe_tactic",
+    [
+        ("CUTLASS", None),
+        ("TRTLLM", "trtllm.trtllm_gen.fused_moe.nvfp4"),
+    ],
+    ids=["no_tactic_moves_to_trtllm", "trtllm_gen_tactic_is_kept"],
+)
+def test_nvfp4_draft_experts_run_on_trtllm_gen(moe_backend, moe_tactic):
+    captured = _build_nvfp4_draft_block(moe_backend, moe_tactic)
+
+    assert captured["moe_backend"] == "TRTLLM"
+    assert captured["moe_tactic"] == moe_tactic
+    assert captured["override"].quant_algo == QuantAlgo.NVFP4
+    assert captured["moe_cls"] == "TrtllmTrtllmGenNvfp4Impl"
+
+
+def test_nvfp4_draft_experts_refuse_a_tactic_of_another_family():
+    """The tactic is neither dropped nor overridden by the TRTLLM-gen draft path."""
+    with pytest.raises(ValueError, match=r"draft_moe_dtype='nvfp4'.*backend family CUTEDSL"):
+        _build_nvfp4_draft_block("CUTEDSL", _NVFP4_TACTIC)
 
 
 # "Requested backend wins" only holds where that backend can actually serve the

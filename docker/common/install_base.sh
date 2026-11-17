@@ -1,4 +1,18 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 set -ex
 
@@ -73,13 +87,11 @@ cleanup() {
 
 init_ubuntu() {
   apt-get update
-  # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
-  apt remove -y ibverbs-providers libibverbs1
-  apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
     libtool \
     autoconf \
     automake \
+    pkg-config \
     ccache \
     gdb \
     git-lfs \
@@ -98,7 +110,11 @@ init_ubuntu() {
     pigz \
     libzmq3-dev \
     libssl3t64 \
-    openssl
+    openssl \
+    apt \
+    apt-utils \
+    libbrotli1 \
+    libapt-pkg6.0t64
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
@@ -124,6 +140,25 @@ init_ubuntu() {
     apt-get remove --purge -y tensorrt*
   fi
   pip3 uninstall -y tensorrt
+}
+
+disable_ubi_repos_rockylinux() {
+  # The CUDA Rocky Linux 8 base image also enables Red Hat UBI 8 repositories.
+  # Only some UBI repositories are enabled, so dnf can pick a newer UBI package
+  # whose dependencies exist in neither the enabled UBI repositories nor the Rocky
+  # ones, and the install fails. The Rocky repositories carry the same packages,
+  # so install from them only. The setting persists for later build steps.
+  local ubi_repos
+  ubi_repos=$(
+    set -o pipefail
+    dnf repolist --enabled | awk '$1 ~ /^ubi-8-/ {print $1}'
+  )
+  if [ -z "${ubi_repos}" ]; then
+    return
+  fi
+  dnf install -y --disablerepo='ubi-8-*' dnf-plugins-core
+  # shellcheck disable=SC2086 # one repository id per word
+  dnf config-manager --set-disabled ${ubi_repos}
 }
 
 install_python_rockylinux() {
@@ -199,6 +234,7 @@ case "$ID" in
     install_boost
     ;;
   rocky)
+    disable_ubi_repos_rockylinux
     install_python_rockylinux $1
     install_pyp_rockylinux
     install_gcctoolset_rockylinux

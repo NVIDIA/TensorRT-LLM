@@ -51,6 +51,9 @@ struct AllReduceFusionParams
     bool rmsNormFusion;           //!< Whether to fuse RMS normalization with the AllReduce operation
     ar_fusion::AllReduceFusionPattern pattern
         = ar_fusion::AllReduceFusionPattern::kAllReduce; //!< Fused epilogue pattern
+    bool fp8Payload = false; //!< Two-shot residual RMSNorm calls exchange E4M3 (lossy; see twoshotAllreduceFusionOp)
+    //! One-shot only: false releases PDL dependents before the reduction instead of after it
+    bool triggerCompletionAtEnd = true;
 
     //! @}
 

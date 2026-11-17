@@ -62,8 +62,11 @@ from .backends import (
 )
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
 from .backends.sparse.hooks import get_sparse_mla_hooks
+from .backends.sparse.mixed_precision_high_rows import store_mixed_precision_high_rows
 from .backends.utils import create_attention
 from .rotary_embedding import RotaryEmbedding
+
+_MIN_STRIDED_KV_EXPAND_TOKENS = 4096
 
 
 def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
@@ -439,6 +442,7 @@ class MLA(nn.Module):
             rms_norm_eps = 1e-6
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
+        self._preserve_kv_cache_quant_algo = config._preserve_kv_cache_quant_algo
         # Construction settings used by sparse module hooks.
         self.rms_norm_eps = rms_norm_eps
         self.reduce_output = reduce_output
@@ -1162,7 +1166,7 @@ class MLA(nn.Module):
     def _use_kvbproj_strided_out(self) -> bool:
         """Whether the context KV expansion can skip the k_nope materialization
         copy by running per-head batched GEMMs that write directly into the
-        strided K buffer (and the v half of a kv-layout buffer).
+        strided K buffer and a compact V buffer.
 
         Requires SM100f and an unquantized bf16 kv_b_proj without bias;
         other configs fall back to the wide-GEMM + copy path.
@@ -1206,6 +1210,59 @@ class MLA(nn.Module):
             ]
         return w_k, w_v
 
+    def _project_context_kv_strided(
+        self, compressed_kv: torch.Tensor, k: torch.Tensor
+    ) -> torch.Tensor:
+        """Write K's non-RoPE columns in place and return independently owned V."""
+        num_tokens = compressed_kv.shape[0]
+        w_k, w_v = self._get_kvbproj_head_weights()
+        ckv = compressed_kv.unsqueeze(0).expand(
+            self.num_context_heads, num_tokens, self.kv_lora_rank
+        )
+        k_nope_out = k[..., : self.qk_nope_head_dim].transpose(0, 1)
+        v = torch.empty(
+            num_tokens,
+            self.num_context_heads * self.v_head_dim,
+            dtype=k.dtype,
+            device=k.device,
+        )
+        v_out = v.unflatten(-1, (self.num_context_heads, self.v_head_dim)).transpose(0, 1)
+        torch.ops.trtllm.bmm_out(ckv, w_k.transpose(1, 2), k_nope_out)
+        torch.ops.trtllm.bmm_out(ckv, w_v.transpose(1, 2), v_out)
+        return v
+
+    def _expand_context_kv(
+        self, compressed_kv: torch.Tensor, k_pe: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expand latent KV whose K RoPE columns are already rotated."""
+        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        # Small chunks favor one wide GEMM over two per-head launches.
+        if (
+            compressed_kv.shape[0] >= _MIN_STRIDED_KV_EXPAND_TOKENS
+            and self._use_kvbproj_strided_out()
+        ):
+            k = torch.empty(
+                compressed_kv.shape[0],
+                self.num_context_heads,
+                self.qk_head_dim,
+                dtype=compressed_kv.dtype,
+                device=compressed_kv.device,
+            )
+            v = self._project_context_kv_strided(compressed_kv, k)
+            k[..., self.qk_nope_head_dim :] = k_pe
+        else:
+            kv = self._project_context_kv(compressed_kv)
+            k_nope, v = kv.split(
+                [
+                    self.num_context_heads * self.qk_nope_head_dim,
+                    self.num_context_heads * self.v_head_dim,
+                ],
+                -1,
+            )
+            k_nope = k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
+            k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_context_heads, -1)), dim=-1)
+        return k.view(-1, self.num_context_heads * self.qk_head_dim), v
+
     def forward_context_default(
         self,
         q: torch.Tensor,
@@ -1217,33 +1274,22 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Dense MHA context path: expand KV via kv_b_proj and run attention."""
+        append_owned_kv = (
+            isinstance(attn_metadata, TrtllmAttentionMetadata)
+            and attn_metadata.helix_context_local_slots is not None
+        )
+        if append_owned_kv:
+            assert isinstance(self.mha, TrtllmAttention)
+            if self.mha.uses_fp4_mla_attention:
+                raise NotImplementedError(
+                    "Owner-only Helix prefill does not support dense FP4 MLA KV cache"
+                )
+            assert latent_cache is not None
+            self.mha.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
+            k_pe = latent_cache[:, self.kv_lora_rank :]
         k = torch.empty_like(q).view(-1, self.num_context_heads, self.qk_head_dim)
         if self._use_kvbproj_strided_out():
-            # Expand KV via per-head batched GEMMs that write k_nope directly
-            # into the strided K buffer, skipping the [t, H*256] kv
-            # intermediate and the k_nope materialization copy.
-            num_tokens = compressed_kv.shape[0]
-            w_k, w_v = self._get_kvbproj_head_weights()
-            ckv = compressed_kv.unsqueeze(0).expand(
-                self.num_context_heads, num_tokens, self.kv_lora_rank
-            )
-            # [H, t, qk_nope] view with strides (qk_head_dim, H*qk_head_dim, 1)
-            k_nope_out = k[..., : self.qk_nope_head_dim].transpose(0, 1)
-            # The MLA fp8 quantize kernel (quantizeCopyInputToFp8Kernel,
-            # mlaKernels.cu) hardcodes the V source token stride as
-            # H*(qk_nope+v) -- the layout of the kv.split() view. Keep that
-            # contract: allocate a kv-shaped buffer and only write its v
-            # half; the k_nope half is never written or read.
-            nope_cols = self.num_context_heads * self.qk_nope_head_dim
-            v_cols = self.num_context_heads * self.v_head_dim
-            kv_buf = torch.empty(num_tokens, nope_cols + v_cols, dtype=q.dtype, device=q.device)
-            v = kv_buf[:, nope_cols:]
-            # [H, t, v_head] view with strides (v_head, H*(qk_nope+v), 1)
-            v_out = v.unflatten(-1, (self.num_context_heads, self.v_head_dim)).transpose(0, 1)
-            # cuBLAS consumes the transposed weights and writes strided
-            # outputs directly, without materializing contiguous copies.
-            torch.ops.trtllm.bmm_out(ckv, w_k.transpose(1, 2), k_nope_out)
-            torch.ops.trtllm.bmm_out(ckv, w_v.transpose(1, 2), v_out)
+            v = self._project_context_kv_strided(compressed_kv, k)
         else:
             kv = self._project_context_kv(compressed_kv)
             k_nope, v = kv.split(
@@ -1261,7 +1307,7 @@ class MLA(nn.Module):
         # When rope_fusion=True (apply_rotary_emb=False), the rope portion
         # of k is left uninitialized here; the fused attention kernel
         # handles k_pe RoPE via latent_cache instead.
-        if self.apply_rotary_emb:
+        if self.apply_rotary_emb or append_owned_kv:
             k[..., self.qk_nope_head_dim :] = k_pe.view(-1, 1, self.qk_rope_head_dim)
         k = k.view(-1, self.num_context_heads * self.qk_head_dim)
 
@@ -1272,7 +1318,7 @@ class MLA(nn.Module):
             attn_metadata,
             forward_args=AttentionForwardArgs(
                 attention_input_type=AttentionInputType.context_only,
-                latent_cache=latent_cache,
+                latent_cache=None if append_owned_kv else latent_cache,
                 out_scale=self.out_scale,
                 output=output,
             ),
@@ -1309,28 +1355,9 @@ class MLA(nn.Module):
         assert full_compressed_kv.is_contiguous()
         assert full_k_pe.is_contiguous()
 
-        # compute full_k_nope and full_v from full_compressed_kv
-        full_kv = self._project_context_kv(full_compressed_kv)
-        full_k_nope, full_v = full_kv.split(
-            [
-                self.num_context_heads * self.qk_nope_head_dim,
-                self.num_context_heads * self.v_head_dim,
-            ],
-            -1,
-        )
-
-        full_k_nope = full_k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
-        full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
-        full_k = maybe_compiled_cat(
-            (full_k_nope, full_k_pe.expand(-1, self.num_context_heads, -1)), dim=-1
-        )
-        full_k = full_k.view(-1, self.num_context_heads * self.qk_head_dim)
-
-        # release pytorch activation memory
+        full_k, full_v = self._expand_context_kv(full_compressed_kv, full_k_pe)
         full_compressed_kv = None
         full_k_pe = None
-        full_kv = None
-        full_k_nope = None
 
         # latent_cache must be None to differentiate from normal context phase,
         # so that we can skip applying RoPE and appending KV cache inside attention op
@@ -1357,12 +1384,14 @@ class MLA(nn.Module):
         attn_metadata: TrtllmAttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run dense FP4 MLA chunked prefill through FP8 context partitions.
+        """Run dense FP4 MLA context over a cached prefix through FP8 context partitions.
 
-        The current chunk is appended to the FP4 cache first. Each cached
-        prefix partition is then gathered from the FP4 cache, expanded, and
-        attended with a full mask; the current chunk is attended causally
-        last, and the partial outputs are merged with their softmax stats.
+        The prefix comes from earlier chunks of a chunked prefill or from
+        block reuse. The current chunk is appended to the FP4 cache first.
+        Each cached prefix partition is then gathered from the FP4 cache,
+        expanded, and attended with a full mask; the current chunk is
+        attended causally last, and the partial outputs are merged with their
+        softmax stats.
         """
         trtllm_attention = cast(TrtllmAttention, self.mha)
         if latent_cache is None:
@@ -1540,31 +1569,16 @@ class MLA(nn.Module):
                 chunked_global_offset=chunked_global_offset,
                 chunked_max_seq_len=chunked_max_seq_len,
                 out_dtype=q.dtype,
+                helix_plan=(
+                    attn_metadata.helix_mla_chunk_plans[loop_idx]
+                    if attn_metadata.helix_mla_chunk_plans is not None
+                    else None
+                ),
             )
 
-            # up proj to uncompressed kv
-            # [tokens, 2, h, kv_dim], without rope_dim
-            chunked_kv = self._project_context_kv(chunked_compressed_kv)
-            chunked_k_nope, chunked_v = chunked_kv.split(
-                [
-                    self.num_context_heads * self.qk_nope_head_dim,
-                    self.num_context_heads * self.v_head_dim,
-                ],
-                -1,
-            )
-
-            chunked_k_nope = chunked_k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
-            chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            chunked_k = maybe_compiled_cat(
-                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_context_heads, -1)), dim=-1
-            )
-            chunked_k = chunked_k.view(-1, self.num_context_heads * self.qk_head_dim)
-
-            # release pytorch activation memory
+            chunked_k, chunked_v = self._expand_context_kv(chunked_compressed_kv, chunked_k_pe)
             chunked_compressed_kv = None
             chunked_k_pe = None
-            chunked_kv = None
-            chunked_k_nope = None
 
             # copy chunked_seq_len to replace kv_lens_runtime
             attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[loop_idx]
@@ -1600,25 +1614,11 @@ class MLA(nn.Module):
                 attn_metadata,
             )
 
-        # deal with the uncached kv
-        kv = self._project_context_kv(compressed_kv)
+        # The current chunk's cache already contains rotated K positions.
         _, k_pe = latent_cache.view([-1, self.kv_lora_rank + self.qk_rope_head_dim]).split(
             [self.kv_lora_rank, self.qk_rope_head_dim], -1
         )
-        # final round of attention
-
-        k_nope, v = kv.split(
-            [
-                self.num_context_heads * self.qk_nope_head_dim,
-                self.num_context_heads * self.v_head_dim,
-            ],
-            -1,
-        )
-
-        k_nope = k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_context_heads, -1)), dim=-1)
-        k = k.view(-1, self.num_context_heads * self.qk_head_dim)
+        k, v = self._expand_context_kv(compressed_kv, k_pe)
 
         # copy q_lens to replace kv_lens_runtime
         attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
@@ -1738,6 +1738,17 @@ class MLA(nn.Module):
 
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+            if attn_metadata.helix_context_local_slots is not None:
+                if self.mha.uses_fp4_mla_attention:
+                    raise NotImplementedError(
+                        "Owner-only Helix prefill does not support dense FP4 MLA KV cache"
+                    )
+                if attn_metadata.num_ctx_cached_tokens > 0 and (
+                    not attn_metadata.runtime_features.chunked_prefill or get_sm_version() < 100
+                ):
+                    raise NotImplementedError(
+                        "Helix cached context requires chunked prefill on SM100 or newer"
+                    )
             trtllm_attention = cast(TrtllmAttention, self.mha)
             # Warm up maybe_compiled_cat for both the chunked-prefill path and
             # the cached-kv path; without this, the cached-kv prefill
@@ -1753,10 +1764,16 @@ class MLA(nn.Module):
                     q.dtype,
                     q.device,
                 )
+            # FP4 MLA reads a cached prefix back from FP4 storage in partitions,
+            # whether block reuse or earlier chunked-prefill chunks wrote it.
+            fp4_mla_cached_context = (
+                trtllm_attention.uses_fp4_mla_attention
+                and trtllm_attention.has_cached_kv_for_mla_context(attn_metadata)
+            )
             if (
                 trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
-                and get_sm_version() >= 100
-            ):
+                or fp4_mla_cached_context
+            ) and get_sm_version() >= 100:
                 if trtllm_attention.uses_fp4_mla_attention:
                     return self.forward_context_with_chunked_prefill_fp4(
                         q, compressed_kv, latent_cache, attn_metadata, output
@@ -1770,8 +1787,7 @@ class MLA(nn.Module):
                 if trtllm_attention.uses_fp4_mla_attention:
                     # The cached-KV path writes and reads a dense paged cache.
                     raise RuntimeError(
-                        "FP4 MLA attends a cached prefix only through chunked-prefill "
-                        "partitions on SM100+; enable chunked prefill."
+                        "FP4 MLA attends a cached prefix only through context partitions on SM100+."
                     )
                 return self.forward_context_with_cached_kv(q, latent_cache, attn_metadata, output)
         return self.forward_context_default(
@@ -1992,6 +2008,16 @@ class MLA(nn.Module):
                             quant_q_buffer,
                             **fp4_rope_kwargs,
                         )
+                        if getattr(attn_metadata, "has_mixed_precision_high_rows", False):
+                            # The fused kernel wrote the NVFP4 pool; also write the
+                            # mixed-precision high pool.
+                            store_mixed_precision_high_rows(
+                                self.mqa,
+                                attn_metadata,
+                                latent_cache,
+                                position_ids,
+                                is_generation=True,
+                            )
 
             if fuse_fp4_q_quant or use_fp8_mla:
                 rope_stream = None

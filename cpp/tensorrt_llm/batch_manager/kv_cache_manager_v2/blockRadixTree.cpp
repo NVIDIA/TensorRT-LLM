@@ -488,9 +488,9 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     auto const* const alc = std::get_if<AttnLifeCycle>(&lc);
     NodeBase* pruneStart = &block;
 
-    // If this is a full-attention block or a sink block: evict subtree.
+    // If this is a full-attention block or a sink block of a REQUIRED or SINK_REQUIRED_ONLY lifecycle: evict subtree.
     // Mirrors Python: pages = remove_subtree(self)
-    if (alc && requiresPrefixCoverage(*alc)
+    if (alc && (requiresPrefixCoverage(*alc) || alc->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY)
         && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
     {
         pruneStart = block.prev;
@@ -797,6 +797,29 @@ int numMatchedTokens(std::vector<BlockRadixTree::MatchResult> const& matched, in
 
 } // anonymous namespace
 
+namespace
+{
+
+//! Up to this many children, a digest-free walk compares tokens instead of hashing the next block.
+constexpr size_t kTokenScanMaxChildren = 8;
+
+//! The child of `next` whose tokens are exactly tokens[0, count), if any.
+Block* findChildByTokens(
+    std::unordered_map<BlockKey, SharedPtr<Block>> const& next, TokenIdExt const* tokens, size_t count)
+{
+    for (auto const& entry : next)
+    {
+        Block* child = entry.second.get();
+        if (child->tokens.size() == count && std::memcmp(child->tokens.data(), tokens, count * sizeof(TokenIdExt)) == 0)
+        {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
@@ -804,44 +827,54 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     // awaiting erasure is childless, so it yields no match.
     std::vector<MatchResult> results;
 
-    // Lazily compute one key per iteration — no wasted hashing on early miss.
-    auto gen = sequenceToBlockchainKeys(mTokensPerBlock, reuseScope, tokens.begin(), tokens.size(), knownNoDigest);
-
-    // First step is the root key (empty token range).
-    auto rootStep = gen();
-    if (!rootStep)
-        return results;
-    auto rootIt = mRoots.find(rootStep->key);
+    BlockKey const rootKey = RootBlock::makeKey(reuseScope);
+    auto rootIt = mRoots.find(rootKey);
     if (rootIt == mRoots.end())
         return results;
 
     RootBlock const& root = *rootIt->second;
-    std::unordered_map<BlockKey, SharedPtr<Block>> const* currentNext = &root.next;
+    NodeBase const* current = &root;
     // Token range of the first unmatched block, captured on miss for the partial pass.
     HalfOpenRange<size_t> missedRange;
     bool missed = false;
 
-    // Each step carries the block's key and its token range — no need to re-derive
-    // block boundaries here.
-    while (auto step = gen())
+    // A child's key is makeKey(parent key, child tokens), so the child holding the next block's tokens
+    // is the one a keyed lookup would find. Digest-bearing tokens name content held elsewhere and hash.
+    size_t const tpb = static_cast<size_t>(mTokensPerBlock);
+    size_t const numTokens = static_cast<size_t>(tokens.size());
+    for (size_t beg = 0; beg < numTokens; beg += tpb)
     {
-        auto blockIt = currentNext->find(step->key);
-        if (blockIt == currentNext->end())
+        size_t const end = std::min(beg + tpb, numTokens);
+        auto const& next = current->next;
+        Block* block = nullptr;
+        if (knownNoDigest && next.size() <= kTokenScanMaxChildren)
         {
-            missedRange = step->tokens;
+            block = findChildByTokens(next, tokens.begin() + beg, end - beg);
+        }
+        else
+        {
+            auto const key = Block::makeKey(current->key, tokens.begin() + beg, end - beg, knownNoDigest);
+            auto blockIt = next.find(key);
+            if (blockIt != next.end())
+            {
+                block = blockIt->second.get();
+            }
+        }
+        if (block == nullptr)
+        {
+            missedRange = {beg, end};
             missed = true;
             break;
         }
-        Block* block = blockIt->second.get();
-        results.push_back({block, static_cast<int>(step->tokens.length())});
-        currentNext = &block->next;
+        results.push_back({block, static_cast<int>(end - beg)});
+        current = block;
     }
 
     // Partial match in children of current node.
     if (missed && enablePartialMatch)
     {
         auto [best, bestMatch]
-            = findBestPartialMatchInNextNodes(*currentNext, tokens.begin() + missedRange.beg, missedRange.length());
+            = findBestPartialMatchInNextNodes(current->next, tokens.begin() + missedRange.beg, missedRange.length());
         if (best)
             results.push_back({best, bestMatch});
     }
@@ -899,7 +932,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
         bool shortened = false;
         for (auto [lcId, attn] : attnLcs)
         {
-            if (!requiresPrefixCoverage(*attn))
+            if (!requiresPrefixCoverage(*attn) && attn->reusePolicy != ReusePolicy::SINK_REQUIRED_ONLY)
             {
                 continue;
             }
@@ -907,10 +940,12 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
             int const staleBeg = staleRange.beg.value();
             int const staleEnd = staleRange.end.value();
             int const numMatchedBlocks = static_cast<int>(matched.size());
+            bool const sinksOnly = attn->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY;
             for (int i = 0; i < numMatchedBlocks; ++i)
             {
                 // Mirrors Python's chain(range(stale.beg), range(stale.end, len(matched))).
-                if (staleBeg <= i && i < staleEnd)
+                // SINK_REQUIRED_ONLY checks only range(stale.beg), its sinks; its window is OPTIONAL.
+                if ((staleBeg <= i && i < staleEnd) || (sinksOnly && i >= staleBeg))
                 {
                     continue;
                 }
@@ -1015,6 +1050,10 @@ void BlockRadixTree::clear()
     TLLM_CHECK_DEBUG(mRoots.size() == mPendingRootErases.size());
     mRoots.clear();
     mPendingRootErases.clear();
+    if (mEventSink)
+    {
+        mEventSink->addAllBlocksCleared();
+    }
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

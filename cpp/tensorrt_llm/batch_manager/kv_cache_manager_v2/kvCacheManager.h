@@ -34,10 +34,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cuda.h>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -144,11 +146,22 @@ public:
 
     // ---- Lifecycle --------------------------------------------------------
 
+    //! Releases everything the manager holds with the driver. Call it with cudaContext() current,
+    //! after every KvCache is closed. Idempotent: a second call returns at once, and once it has
+    //! run the destructor has nothing left to do. The destructor calls it for a manager that
+    //! was never shut down, after making cudaContext() current itself.
     void shutdown();
 
     // Number of not-yet-destroyed managers in this process. A manager counts from the start of its
     // construction, so one whose constructor throws is counted for the duration of that attempt.
     [[nodiscard]] static uint32_t numLiveManagers() noexcept;
+
+    //! The CUDA context the manager's device resources live in: the one current when it was
+    //! constructed. Teardown that runs on another thread makes it current first.
+    [[nodiscard]] CUcontext cudaContext() const noexcept
+    {
+        return mCudaContext;
+    }
 
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
@@ -172,11 +185,13 @@ public:
     //                       manager-level statistics are disabled.
     // inputTokens is a non-owning view; the caller must keep the underlying buffer alive for the
     // duration of the call (matching reads it but never stores it).
+    // inputKnownNoDigest: inputTokens hold no digest token (e.g. the zero-copy int32 path), so the reuse
+    // match may skip hashing; the sequence's text_only flag is unchanged.
     std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, TokenSpan inputTokens = {},
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
         std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
-        bool enableRequestStats = false,
-        std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt);
+        bool enableRequestStats = false, std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt,
+        bool inputKnownNoDigest = false);
 
     //! Restore expired, unreferenced pages to the default retention priority.
     void refreshRetention();
@@ -188,12 +203,14 @@ public:
     // Defaults false (safe: the scanning path is taken).
     BlockRadixTree::ReuseMatch matchReuse(
         ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest = false) const;
-    int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+    // Matches under the shared lock. Once a remote level has failed, the first probe after it takes the exclusive lock
+    // to unlink that level's pages, as createKvCache does, so that no probe counts them.
+    int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false);
 
     // Read-only, advisory key of the first full block past the reusable prefix.
     // Uses the same fresh, window-aware match as probeReuse without acquiring pages.
     std::optional<BlockKey> probeFirstNewBlockKey(
-        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false);
 
     // ---- Memory pool queries -----------------------------------------------
 
@@ -292,6 +309,10 @@ public:
 
     //! Cache group of one buffer; throws std::out_of_range for an unknown buffer.
     CacheGroupId getBufferGroupId(LayerId layerId, DataRole const& role) const;
+
+    //! CacheGroupId of the region named `name` (see KVCacheManagerConfig::regions).
+    //! Throws std::out_of_range for a name no region declares.
+    CacheGroupId getRegionGroupId(std::string const& name) const;
 
     //! Deprecated: use bufferGrouping(). Partitions uniform layers by lifecycle.
     //! Throws common::TllmException if any layer spans several groups. Member order
@@ -550,6 +571,13 @@ public:
     friend class Batch;
 
 private:
+    //! Unlink the committed pages of newly failed remote levels from the radix tree, so that no new match reads them;
+    //! a request still holding such a page fails its next resume (RemoteMemError). Caller holds the exclusive lock.
+    void _unlinkPagesOfFailedRemoteLevels();
+    //! _unlinkPagesOfFailedRemoteLevels() under the exclusive lock if a remote client failed since the last unlink; for
+    //! the probes, which otherwise match under the shared lock. Without a failure it reads only atomics.
+    void _unlinkPagesIfARemoteLevelFailed();
+
     //! Units a step selects per buffer of this life cycle. The cache must hold a whole
     //! selection on top of everything in flight, so this is what the in-flight headroom is
     //! measured against.
@@ -625,6 +653,12 @@ private:
     // this manager could leave behind exists, and dropped after ~KvCacheManager has run.
     PoisonHold mPoisonHold;
 
+    //! See cudaContext(). Never null: construction rejects a thread without a current context.
+    CUcontext mCudaContext = nullptr;
+
+    //! shutdown() has run; the destructor then has nothing to do.
+    bool mShutDown = false;
+
     //! Guards all mutable state reachable from this manager. See the scope note above.
     mutable ReentrantSharedMutex mApiMutex;
 
@@ -698,6 +732,8 @@ private:
     std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<StorageManager> mStorage;
     std::shared_ptr<BlockRadixTree> mRadixTree;
+    //! StorageManager::numFailedRemoteClients() as of the last _unlinkPagesOfFailedRemoteLevels().
+    std::atomic<size_t> mNumFailedRemoteClientsUnlinked{0};
 
     // Weak references to all living KvCaches.
     std::set<KvCache*> mLivingKvCaches;
