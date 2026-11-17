@@ -98,6 +98,15 @@ def _barrier_events(fn: ast.FunctionDef, barrier: str) -> list[tuple]:
     return events
 
 
+def _statement_lists(node: ast.AST):
+    """Every list of statements under ``node`` (function, loop and branch bodies)."""
+    for child in ast.walk(node):
+        for field in ("body", "orelse", "finalbody"):
+            statements = getattr(child, field, None)
+            if isinstance(statements, list) and statements and isinstance(statements[0], ast.stmt):
+                yield statements
+
+
 def _only(calls: list[ast.Call], what: str) -> ast.Call:
     """The single call in ``calls``, failing with ``what`` otherwise."""
     assert len(calls) == 1, f"expected exactly one {what}, found {len(calls)}"
@@ -130,6 +139,14 @@ def test_epilog_warp_fences_its_tmem_load_before_releasing(module) -> None:
     assert _barrier_events(epilog_warp, _ALLOC_BAR) == [("arrive",), ("wait", 0), ("arrive",)]
 
     calls = _calls(epilog_warp)
+    alloc_wait = _only(
+        [
+            c
+            for c in calls
+            if _callee(c) == "cute.arch.mbarrier_wait" and _first_arg(c) == _ALLOC_BAR
+        ],
+        f"wait on {_ALLOC_BAR}",
+    )
     mma_done = _only(
         [
             c
@@ -157,6 +174,7 @@ def test_epilog_warp_fences_its_tmem_load_before_releasing(module) -> None:
         for c in calls
         if _callee(c) == "cute.arch.mbarrier_arrive" and _first_arg(c) == _ALLOC_BAR
     ][-1]
+    assert alloc_wait.lineno < load.lineno, "the TMEM load must follow the phase-0 wait"
     assert mma_done.lineno < load.lineno < fence.lineno < release.lineno
 
 
@@ -186,10 +204,23 @@ def test_split_k_mailbox_wait_acquires_at_cluster_scope(module) -> None:
     epilog_warp = _method(module, _CLASS, "epilog_warp")
     calls = _calls(epilog_warp)
 
-    wait = _only(
-        [c for c in calls if _callee(c) == _WAIT and _first_arg(c) == _MAILBOX_BAR],
-        f"{_WAIT} on {_MAILBOX_BAR}",
-    )
+    # The try-wait may time out, so it must be the condition of a ``while not`` loop that
+    # only retries, and the acquire fence must be the statement that follows the loop.
+    loops = [
+        (statements, index, statement)
+        for statements in _statement_lists(epilog_warp)
+        for index, statement in enumerate(statements)
+        if isinstance(statement, ast.While)
+        and isinstance(statement.test, ast.UnaryOp)
+        and isinstance(statement.test.op, ast.Not)
+        and isinstance(statement.test.operand, ast.Call)
+        and _callee(statement.test.operand) == _WAIT
+        and _first_arg(statement.test.operand) == _MAILBOX_BAR
+    ]
+    assert len(loops) == 1, f"expected exactly one `while not {_WAIT}({_MAILBOX_BAR}, ...)` loop"
+    statements, index, loop = loops[0]
+    wait = loop.test.operand
+    assert all(isinstance(s, ast.Pass) for s in loop.body), "the polling loop must only retry"
     assert isinstance(wait.args[1], ast.Constant) and wait.args[1].value == 0
     keywords = {k.arg: ast.unparse(k.value) for k in wait.keywords}
     assert keywords.get("scope") == "prims.MBarrierScope.CLUSTER", keywords
@@ -201,6 +232,10 @@ def test_split_k_mailbox_wait_acquires_at_cluster_scope(module) -> None:
     fence = _only(
         [c for c in calls if _callee(c) == _FENCE and _first_arg(c) == "prims.MemOrder.ACQUIRE"],
         f"{_FENCE}(prims.MemOrder.ACQUIRE)",
+    )
+    following = statements[index + 1]
+    assert isinstance(following, ast.Expr) and following.value is fence, (
+        "the acquire fence must be the statement right after the polling loop"
     )
 
     # The peers push their partials with st.async, crediting the owner's barrier; the owner
