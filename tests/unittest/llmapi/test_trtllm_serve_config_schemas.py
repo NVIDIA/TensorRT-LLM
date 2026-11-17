@@ -667,7 +667,7 @@ def test_dspark_ancestral_draft_sampling_values(
             "max_draft_len": 7,
             "speculative_model": "/path/to/drafter",
             "use_rejection_sampling": True,
-            "ancestral_draft_sampling": value,
+            "use_ancestral_draft_sampling": value,
         }
     }
     if filename == generator.DISAGG_SCHEMA:

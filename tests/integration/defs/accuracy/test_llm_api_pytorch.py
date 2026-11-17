@@ -3426,7 +3426,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
         The two ancestral draft paths run end to end: a no_topk_no_topp
         deployment takes the fused Markov chain, and filtered drafts with
-        ancestral_draft_sampling take the per-position sampler. They pair
+        use_ancestral_draft_sampling take the per-position sampler. They pair
         with token-level and block verification. Every prompt runs twice, so
         the repeat takes a prefix-cache hit and the target recomputes the
         drafter's context tail: None resolves from this drafter's unwindowed
@@ -3445,7 +3445,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             rejection_sample_method=rejection_sample_method,
             advanced_sampling_mode=("no_topk_no_topp"
                                     if fused_chain else "full"),
-            ancestral_draft_sampling=not fused_chain,
+            use_ancestral_draft_sampling=not fused_chain,
             context_recompute_tail=context_recompute_tail)
         kv_cache_config = KvCacheConfig(enable_block_reuse=True,
                                         free_gpu_memory_fraction=0.6)
@@ -3491,6 +3491,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                     # tail reuses the prompt up to the tail.
                     assert all((output.cached_tokens > 0) == (resolved_tail > 0)
                                for output in outputs)
+                    # The claim stops at least the tail short of the prompt end
+                    # (lower for block alignment).
+                    assert all(
+                        output.cached_tokens <= len(output.prompt_token_ids) -
+                        resolved_tail for output in outputs
+                        if resolved_tail > 0)
                 acceptance_length = sum(
                     output.avg_decoded_tokens_per_iter * output.decoding_iter
                     for output in outputs) / sum(output.decoding_iter

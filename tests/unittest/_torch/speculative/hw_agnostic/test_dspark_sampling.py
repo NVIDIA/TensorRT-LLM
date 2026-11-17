@@ -75,7 +75,7 @@ def _drafter(
 def _worker(ancestral: bool = True) -> DSparkWorker:
     worker = DSparkWorker.__new__(DSparkWorker)
     torch.nn.Module.__init__(worker)
-    worker.spec_config = types.SimpleNamespace(ancestral_draft_sampling=ancestral)
+    worker.spec_config = types.SimpleNamespace(use_ancestral_draft_sampling=ancestral)
     worker.mapping = None
     worker._d2t = None
     worker.force_num_accepted_tokens = 0.0
@@ -225,23 +225,23 @@ _REJECTION_OPTIONS = [dict(rejection_sample_method="block")]
 @pytest.mark.cpu_only
 def test_ancestral_draft_sampling_is_off_by_default_and_requires_rejection_sampling() -> None:
     config = DSparkDecodingConfig(max_draft_len=7, speculative_model="/path/to/dspark")
-    assert config.ancestral_draft_sampling is False
+    assert config.use_ancestral_draft_sampling is False
     with pytest.raises(ValueError, match="use_rejection_sampling=True"):
         DSparkDecodingConfig(
-            max_draft_len=7, speculative_model="/path/to/dspark", ancestral_draft_sampling=True
+            max_draft_len=7, speculative_model="/path/to/dspark", use_ancestral_draft_sampling=True
         )
     assert DSparkDecodingConfig(
         max_draft_len=7,
         speculative_model="/path/to/dspark",
         use_rejection_sampling=True,
-        ancestral_draft_sampling=True,
-    ).ancestral_draft_sampling
-    with pytest.raises(ValueError, match="ancestral_draft_sampling=True is not supported"):
+        use_ancestral_draft_sampling=True,
+    ).use_ancestral_draft_sampling
+    with pytest.raises(ValueError, match="use_ancestral_draft_sampling=True is not supported"):
         DSparkDecodingConfig(
             max_draft_len=7,
             speculative_model="/path/to/dspark",
             use_rejection_sampling=True,
-            ancestral_draft_sampling=True,
+            use_ancestral_draft_sampling=True,
             enable_confidence_scheduling=True,
             confidence_cost_table_path="/path/to/costs.json",
         )
@@ -553,7 +553,7 @@ def test_sampled_block_captures_in_a_cuda_graph(mode: AdvancedSamplingMode) -> N
 @_needs_cuda
 @pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16], ids=["fp32_w", "bf16_w"])
 def test_unfiltered_chain_draws_follow_the_stored_proposals(w_dtype: torch.dtype) -> None:
-    """Without filters the fused chain draws ancestrally, also with ancestral_draft_sampling
+    """Without filters the fused chain draws ancestrally, also with use_ancestral_draft_sampling
     off: the joint of two positions is p(d0) p(d1 | d0) under the stored rows, and a greedy
     row takes the argmax chain. BF16 Markov weights over FP32 logits are the checkpoint
     layout: the bias is taken in the weights' dtype, as on the other draft paths."""

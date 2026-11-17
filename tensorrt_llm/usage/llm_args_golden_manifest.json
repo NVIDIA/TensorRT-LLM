@@ -2022,11 +2022,6 @@
       "path": "speculative_config.allow_advanced_sampling"
     },
     {
-      "capture_policy": "bool",
-      "kind": "value",
-      "path": "speculative_config.ancestral_draft_sampling"
-    },
-    {
       "allowed_values": [
         "VANILLA",
         "TRTLLM",
@@ -2271,6 +2266,11 @@
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "speculative_config.target_layer_ids"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.use_ancestral_draft_sampling"
     },
     {
       "capture_policy": "bool|none",

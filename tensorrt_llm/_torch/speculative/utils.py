@@ -823,9 +823,9 @@ def get_spec_worker(spec_config,
     # slot convention on top of DFlashWorker.
     if spec_dec_mode.is_dspark():
         if spec_config.draft_is_embedded_in_target:
-            if spec_config.ancestral_draft_sampling:
+            if spec_config.use_ancestral_draft_sampling:
                 raise ValueError(
-                    "ancestral_draft_sampling=True is not supported with a "
+                    "use_ancestral_draft_sampling=True is not supported with a "
                     "drafter embedded in the target checkpoint.")
             return DSv4DSparkWorker(spec_config, mapping,
                                     use_separate_draft_kv_cache)

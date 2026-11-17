@@ -291,7 +291,7 @@ joint distribution. A fused Triton chain draws the block with three launches per
 normalization at the end; on GB300 its sampler time stayed below the block sampler's at every
 batch size measured, so the acceptance gain comes without extra per-step cost. The choice is made per deployment, not per request: under the default
 `advanced_sampling_mode="full"`, a request that sets no top-k/top-p still takes the existing
-path. `DSparkDecodingConfig.ancestral_draft_sampling=True` (prototype, off by default) extends
+path. `DSparkDecodingConfig.use_ancestral_draft_sampling=True` (prototype, off by default) extends
 ancestral drawing to all other sampled drafts, which cost one sampler call per draft position; at
 low concurrency that outweighs the acceptance gain.
 

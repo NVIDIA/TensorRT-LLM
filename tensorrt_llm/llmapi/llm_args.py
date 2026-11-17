@@ -4555,7 +4555,7 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "layers; otherwise the managers disable it with a warning. On "
         "recurrent-state targets a positive tail becomes -1 (full re-prefill).")
 
-    ancestral_draft_sampling: bool = Field(
+    use_ancestral_draft_sampling: bool = Field(
         default=False,
         status="prototype",
         description=
@@ -4642,8 +4642,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     @model_validator(mode="after")
     def validate_ancestral_draft_sampling(self) -> "DSparkDecodingConfig":
         """Ancestral drafting acts only on rejection-sampled drafts."""
-        if self.ancestral_draft_sampling and not self.use_rejection_sampling:
-            raise ValueError("ancestral_draft_sampling=True requires "
+        if self.use_ancestral_draft_sampling and not self.use_rejection_sampling:
+            raise ValueError("use_ancestral_draft_sampling=True requires "
                              "use_rejection_sampling=True.")
         return self
 
@@ -4674,9 +4674,10 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         # Confidence scheduling admits greedy requests only under rejection
         # sampling, so none of these options would ever act.
         self._reject_rejection_options_with("enable_confidence_scheduling")
-        if self.ancestral_draft_sampling:
-            raise ValueError("ancestral_draft_sampling=True is not supported "
-                             "with enable_confidence_scheduling=True.")
+        if self.use_ancestral_draft_sampling:
+            raise ValueError(
+                "use_ancestral_draft_sampling=True is not supported "
+                "with enable_confidence_scheduling=True.")
         return self
 
     @model_validator(mode="after")
@@ -9708,7 +9709,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 # the main process and the checkpoint path is known local. The
                 # flag then travels with the config, so no rank repeats the
                 # filesystem read and nothing probes at forward time.
-                _ = spec_cfg.draft_is_embedded_in_target
+                if (spec_cfg.draft_is_embedded_in_target
+                        and spec_cfg.use_ancestral_draft_sampling):
+                    raise ValueError(
+                        "use_ancestral_draft_sampling=True is not supported with a "
+                        "drafter embedded in the target checkpoint.")
                 # Resolve target_layer_ids / mask_token_id / block_size /
                 # markov_rank from the draft (or main) model config if not set.
                 # Several checkpoint spellings are in the wild for the same knobs

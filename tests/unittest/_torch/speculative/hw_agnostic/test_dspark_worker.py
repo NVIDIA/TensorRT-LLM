@@ -958,7 +958,7 @@ def _routing_config(embedded):
         attention_backend="TRTLLM",
         confidence_threshold=0.5,
         enable_confidence_scheduling=False,
-        ancestral_draft_sampling=False,
+        use_ancestral_draft_sampling=False,
         _use_shared_kv_cache=False,
         _allow_separate_draft_kv_cache=True,
     )
@@ -969,8 +969,8 @@ def test_an_embedded_drafter_rejects_ancestral_draft_sampling():
     from tensorrt_llm.mapping import Mapping
 
     spec_config = _routing_config(True)
-    spec_config.ancestral_draft_sampling = True
-    with pytest.raises(ValueError, match="ancestral_draft_sampling"):
+    spec_config.use_ancestral_draft_sampling = True
+    with pytest.raises(ValueError, match="use_ancestral_draft_sampling"):
         get_spec_worker(spec_config, None, Mapping())
 
 

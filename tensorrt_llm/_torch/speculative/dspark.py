@@ -1867,7 +1867,7 @@ class DSparkWorker(DFlashWorker):
         int32 draft tokens and the stored vocab width. When the deployment drops
         the sampling filters (the ``NO_TOPK_NO_TOPP`` sampling mode) drafts take the fused
         :func:`markov_sampled_chain`; other sampled drafts take a per-position
-        sampler loop and only with ``ancestral_draft_sampling``. Otherwise,
+        sampler loop and only with ``use_ancestral_draft_sampling``. Otherwise,
         without a Markov head, for argmax drafts, or for a drafter that also
         carries a DFlash 2 candidate scorer (LiLiCorr or the selector), the DFlash path
         (greedy-chained :meth:`_refine_block_logits`, then the scorer and the
@@ -1883,7 +1883,7 @@ class DSparkWorker(DFlashWorker):
             and spec_metadata.advanced_sampling_mode is AdvancedSamplingMode.NO_TOPK_NO_TOPP
         )
         if not (
-            (self.spec_config.ancestral_draft_sampling or fused_chain)
+            (self.spec_config.use_ancestral_draft_sampling or fused_chain)
             and getattr(draft_model, "has_markov_head", False)
             and spec_metadata.wants_advanced_draft_sampling
             and not has_candidate_scorer
