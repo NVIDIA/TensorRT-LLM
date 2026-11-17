@@ -411,7 +411,7 @@ The typical time elapsed from when a request is sent until the first output toke
 * The streaming benchmark records ITLs as gaps between consecutive streamed response chunks. A chunk can contain multiple output tokens or no text.
 * Both TPOT and ITL exclude the initial wait represented by TTFT. With MTP or `stream_interval` greater than one, tokens can arrive in groups; use TPOT for per-token decode comparisons.
 
-For a successful request with more than one output token, the benchmark computes:
+For a successful streaming request with a measured TTFT and more than one output token, the benchmark computes:
 
 $$
 \text{TPOT (1 request)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}
@@ -429,7 +429,7 @@ $$
 \text{Avg ITL (N requests)} = \frac{\text{Sum of all recorded ITLs across requests}}{\text{Num recorded intervals}}
 $$
 
-Requests with at most one output token are excluded from TPOT statistics. When there are no recorded intervals, ITL statistics are unavailable.
+Requests without a measured TTFT, including `--non-streaming` requests, have no TPOT statistic and report `N/A`. Requests with at most one output token are also excluded from TPOT statistics. When there are no recorded intervals, ITL statistics are unavailable.
 
 #### End-to-End (E2E) Latency
 
