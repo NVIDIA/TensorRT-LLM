@@ -383,25 +383,30 @@ P99 E2EL (ms):                            [result]
 The typical time elapsed from when a request is sent until the first output token is generated.
 
 #### Time Per Output Token (TPOT) and Inter-Token Latency (ITL)
+
 * TPOT is the typical time required to generate each token *after* the first one.
-* ITL is the typical time delay between the completion of one token and the completion of the next.
-* Both TPOT and ITL ignore TTFT.
+* The streaming benchmark records ITLs as gaps between consecutive streamed response chunks. A chunk can contain multiple output tokens or no text.
+* Both TPOT and ITL exclude the initial wait represented by TTFT. With MTP or `stream_interval` greater than one, tokens can arrive in groups; use TPOT for per-token decode comparisons.
 
-For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:
+For a successful request with more than one output token, the benchmark computes:
 
 $$
-\text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}
+\text{TPOT (1 request)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}
 $$
 
-Across requests, **average TPOT** weights each request equally, while **average ITL** averages the recorded inter-token intervals:
+TPOT equals Avg(ITL) only when there is one recorded interval per output token after the first, with matching measurement endpoints. Grouped tokens, empty content chunks, and the timing of final metadata events can break this equality.
+
+Across requests, **average TPOT** weights each request with a measured TPOT equally, while **average ITL** weights each recorded interval equally, so requests with more intervals count more:
 
 $$
 \text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
 $$
 
 $$
-\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num measured inter-token intervals}}
+\text{Avg ITL (N requests)} = \frac{\text{Sum of all recorded ITLs across requests}}{\text{Num recorded intervals}}
 $$
+
+Requests with at most one output token are excluded from TPOT statistics. When there are no recorded intervals, ITL statistics are unavailable.
 
 #### End-to-End (E2E) Latency
 The typical total time from when a request is submitted until the final token of the response is received.
