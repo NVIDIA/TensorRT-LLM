@@ -50,6 +50,7 @@ struct Args
     __nv_bfloat16 const* base; // row (r*k + step) of this rank's shard, row stride ld
     int64_t ld;
     __nv_bfloat16 const* w1;
+    int64_t w1_rows; // W1 table rows: an anchor outside [0, w1_rows) gets a zero embedding
     __nv_bfloat16 const* w2s;
     int Vs, voff;
     int C, k;
@@ -192,7 +193,14 @@ __global__ void __launch_bounds__(dkmkpw::Cfg<C>::kNT, 1) dk_mk_prob1_kernel(Arg
             const int64_t p = step > 0 ? s_tok[r]
                 : a.prev32             ? (int64_t) a.prev32[(int64_t) r * a.prev32_stride]
                                        : a.prev_in[r];
-            s_e[r][j] = __bfloat162float(a.w1[p * kR + j]);
+            // Match markov_prev_embeddings: invalid anchors contribute a zero embedding, not W1 row zero.
+            // Test before forming/dereferencing the row address (including INT64_MIN/MAX anchors).
+            float embedding = 0.0f;
+            if (p >= 0 && p < a.w1_rows)
+            {
+                embedding = __bfloat162float(a.w1[p * kR + j]);
+            }
+            s_e[r][j] = embedding;
         }
         __syncthreads();
         float e[C][8];

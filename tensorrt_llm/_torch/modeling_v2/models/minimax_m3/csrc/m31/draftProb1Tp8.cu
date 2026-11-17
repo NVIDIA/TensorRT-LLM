@@ -66,6 +66,7 @@ cudaError_t launchProb1(Prob1Params const& p, int grid, bool pdl, cudaStream_t s
     a.base = static_cast<__nv_bfloat16 const*>(p.base);
     a.ld = p.ld;
     a.w1 = static_cast<__nv_bfloat16 const*>(p.w1);
+    a.w1_rows = p.w1Rows;
     a.w2s = static_cast<__nv_bfloat16 const*>(p.w2s);
     a.Vs = p.vs;
     a.voff = p.voff;

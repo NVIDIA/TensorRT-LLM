@@ -137,6 +137,7 @@ void minimaxM3Sm107Tp8DraftProb1(torch::Tensor const& base, torch::Tensor const&
     a.base = base.data_ptr();
     a.ld = base.stride(0);
     a.w1 = w1.data_ptr();
+    a.w1Rows = w1.size(0);
     a.w2s = w2s.data_ptr();
     a.vs = static_cast<int>(w2s.size(0));
     a.voff = static_cast<int>(voff);

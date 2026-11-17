@@ -62,6 +62,7 @@ struct Prob1Params
     void const* base; // bf16 [C*k][ld]: row (r*k + step) of this rank's vocab shard
     int64_t ld;
     void const* w1;   // bf16 [V][256]
+    int64_t w1Rows;   // V: anchors outside [0, V) get a zero embedding
     void const* w2s;  // bf16 [Vs][256]
     int vs;
     int voff;
