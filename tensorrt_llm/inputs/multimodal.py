@@ -1351,6 +1351,14 @@ class MMHashResult(NamedTuple):
     `None` when the caller supplied no UUIDs at all."""
 
 
+def _mm_items(mm_data: Dict[str, Any]) -> Dict[str, List[Any]]:
+    """Modality -> list of items. A modality set to None has no items."""
+    return {
+        modality: items if isinstance(items, list) else [items]
+        for modality, items in mm_data.items() if items is not None
+    }
+
+
 def validate_mm_uuids(
     mm_data: Dict[str, Any],
     mm_uuids: Optional[Dict[str, Any]],
@@ -1368,17 +1376,16 @@ def validate_mm_uuids(
             "multi_modal_uuids must be a dict of modality to UUIDs, got "
             f"{type(mm_uuids).__name__}")
     uuids_by_modality: Dict[str, List[Optional[str]]] = {}
-    for modality, items in mm_data.items():
+    for modality, items in _mm_items(mm_data).items():
         if modality not in mm_uuids:
             continue
         uuids = mm_uuids[modality]
         if not isinstance(uuids, list):
             uuids = [uuids]
-        num_items = len(items) if isinstance(items, list) else 1
-        if len(uuids) != num_items:
+        if len(uuids) != len(items):
             raise ValueError(
                 f"UUID list length ({len(uuids)}) doesn't match "
-                f"data items length ({num_items}) for modality '{modality}'")
+                f"data items length ({len(items)}) for modality '{modality}'")
         for uuid in uuids:
             if uuid is not None and not isinstance(uuid, str):
                 raise ValueError(
@@ -1434,10 +1441,7 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
         hasher.update(b"</content>")
         return hasher.hexdigest()
 
-    mm_items = {
-        modality: items if isinstance(items, list) else [items]
-        for modality, items in mm_data.items()
-    }
+    mm_items = _mm_items(mm_data)
 
     mm_hashes: Dict[str, List[str]] = {}
     mm_uuids_by_key: Dict[str, List[Optional[str]]] = {}
@@ -1530,10 +1534,7 @@ def find_mm_token_lengths(
     to end, not just pure image/video/audio tokens.
 
     """
-    mm_items = {
-        modality: items if isinstance(items, list) else [items]
-        for modality, items in mm_data.items()
-    }
+    mm_items = _mm_items(mm_data)
     num_mm_tokens = {}
 
     mm_video_dict = (multimodal_data or {}).get("video") or {}

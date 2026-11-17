@@ -796,23 +796,28 @@ def test_modality_without_items_keeps_hashing_on(no_items) -> None:
 
 
 @pytest.mark.parametrize(
+    "hashing_supported", [None, True, False], ids=["unknown", "hashing_on", "hashing_off"]
+)
+@pytest.mark.parametrize(
     "uuids",
     [{"image": [123]}, {"image": ["a", "b"]}, ["image-uuid"]],
     ids=["int_uuid", "length_mismatch", "not_a_dict"],
 )
-def test_bad_multimodal_uuids_are_a_request_error(uuids) -> None:
-    """Bad UUIDs fail the request before any processing and do not turn hashing off."""
+def test_bad_multimodal_uuids_are_a_request_error(uuids, hashing_supported) -> None:
+    """Bad UUIDs fail the request before any processing and do not change the hashing flag."""
     processor = _ProbeFakeProcessor()
+    processor.multimodal_hashing_supported = hashing_supported
     wrapped = create_input_processor_with_hash(processor)
 
     with pytest.raises(ValueError, match="(?i)uuid"):
         wrapped({**_PROBE_INPUTS, "multi_modal_uuids": uuids}, None)
     assert processor.calls == 0
-    assert processor.multimodal_hashing_supported is None
+    assert processor.multimodal_hashing_supported is hashing_supported
 
-    _, extra = wrapped(_PROBE_INPUTS, None)
-    assert processor.multimodal_hashing_supported is True
-    assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+    if hashing_supported is not False:
+        _, extra = wrapped(_PROBE_INPUTS, None)
+        assert processor.multimodal_hashing_supported is True
+        assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
 
 
 class _NoHfTokenCountProcessor(_ProbeFakeProcessor):
@@ -894,7 +899,7 @@ def test_request_without_content_hashes_gets_random_hashes(monkeypatch, hashing_
     """Hashing off, or hashing failed for this request: the items get random hashes.
 
     Two requests with other images and the same prompt get the same spans and other hashes,
-    so their KV cache blocks get other keys.
+    so their KV cache blocks get other keys. A supplied UUID is kept.
     """
     processor = _ProbeFakeProcessor()
     if hashing_off:
@@ -911,6 +916,7 @@ def test_request_without_content_hashes_gets_random_hashes(monkeypatch, hashing_
         {"prompt": "unused", "multi_modal_data": {"image": [np.full((2, 2, 3), i, np.uint8)]}}
         for i in range(2)
     ]
+    inputs[0]["multi_modal_uuids"] = {"image": ["image-0"]}
     mm_inputs = [wrapped(request, None)[1]["multimodal_input"] for request in inputs]
 
     assert processor.multimodal_hashing_supported is (False if hashing_off else None)
@@ -919,6 +925,32 @@ def test_request_without_content_hashes_gets_random_hashes(monkeypatch, hashing_
         assert mm_input.multimodal_lengths == [2]
         assert mm_input.multimodal_hashes != [_CONTENT_HASH_SNAPSHOT["image"]]
     assert mm_inputs[0].multimodal_hashes != mm_inputs[1].multimodal_hashes
+    assert [mm_input.multimodal_uuids for mm_input in mm_inputs] == [["image-0"], None]
+
+
+@pytest.mark.parametrize("hashing_off", [False, True], ids=["hashing_on", "hashing_off"])
+def test_modality_set_to_none_is_like_no_modality(hashing_off) -> None:
+    """``"audio": None`` next to an image changes nothing: the image gets the same span and hash.
+
+    The processor counts image tokens only, so counting the None as an audio item would fail.
+    """
+    processor = _ProbeFakeProcessor()
+    processor.multimodal_hashing_supported = False if hashing_off else None
+    wrapped = create_input_processor_with_hash(processor)
+    image = _PROBE_INPUTS["multi_modal_data"]["image"]
+
+    mm_inputs = [
+        wrapped({"prompt": "unused", "multi_modal_data": data}, None)[1]["multimodal_input"]
+        for data in ({"image": image}, {"image": image, "audio": None})
+    ]
+
+    for mm_input in mm_inputs:
+        assert mm_input.multimodal_positions == [1]
+        assert mm_input.multimodal_lengths == [2]
+        assert len(mm_input.multimodal_hashes) == 1
+    if not hashing_off:
+        assert mm_inputs[1].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+        assert processor.multimodal_hashing_supported is True
 
 
 def test_missing_hf_token_count_is_unsupported() -> None:
