@@ -1426,9 +1426,11 @@ class BeamHarmonyTextParser(BaseReasoningParser):
 
         <|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final<|message|>...<|return|>
 
-    The delimiters are ordinary (non-special) vocabulary tokens, so they reach
-    the detokenized text whatever ``skip_special_tokens`` says. Analysis
-    bodies go to ``reasoning_content`` and final bodies to ``content``; every
+    Most delimiters are ordinary vocabulary tokens, but the tokenizer config
+    declares ``<|return|>`` as EOS, so Transformers treats it as special.
+    Decoding with ``skip_special_tokens=False`` preserves this terminator so
+    the parser can enter its completed state. Analysis bodies go to
+    ``reasoning_content`` and final bodies to ``content``; every
     header and terminator is dropped. A reply without channel headers is final
     text. Ordinary text before the first header is also final text. Parsing
     is incremental: a possible delimiter split across stream
