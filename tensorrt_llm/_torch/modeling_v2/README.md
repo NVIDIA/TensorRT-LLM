@@ -45,7 +45,8 @@ modeling_v2: require
 ```
 
 To opt out and always use Modeling V1, set `modeling_v2="off"` in the Python
-API or `modeling_v2: off` in the configuration file.
+API or `modeling_v2: "off"` in the configuration file. Quote it there: YAML
+reads a bare `off` as `false`, which the configuration rejects.
 
 Use `require` when you validate or benchmark a target, so the run cannot fall
 back to Modeling V1 without you noticing. A target can also read the mode with
