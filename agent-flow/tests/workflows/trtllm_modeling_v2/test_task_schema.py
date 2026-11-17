@@ -199,6 +199,26 @@ def test_a_goal_that_names_its_features_gets_those_and_what_derive_cannot_know_i
         derive.parse_goal("kv=fp8 kv=nvfp4")
 
 
+@pytest.mark.parametrize(
+    "block, entry",
+    [
+        ("acceptance", {"mpt": 2.5}),  # a misspelt unit: its floor would never be applied
+        ("acceptance", {"min_prompts": 32}),  # a key that is gone
+        ("boot", {"mpt": {"max_tokens": 64}}),
+    ],
+)
+def test_a_unit_entry_under_acceptance_or_boot_names_a_unit_of_the_spec(tmp_path, block, entry):
+    spec = _valid_spec(tmp_path)
+    spec["features"] = ["mtp"]
+    spec["accuracy"][block] = entry
+    with pytest.raises(task_schema.TaskSchemaError, match="names no unit or variant of this spec"):
+        load_and_validate_task_yaml(_write(tmp_path, spec))
+    spec["accuracy"][block] = (
+        {"mtp": next(iter(entry.values()))} if block == "boot" else {"mtp": 2.5}
+    )
+    load_and_validate_task_yaml(_write(tmp_path, spec))
+
+
 def test_a_spec_that_says_nothing_of_block_reuse_leaves_it_off(tmp_path):
     spec = load_and_validate_task_yaml(_write(tmp_path, _valid_spec(tmp_path)))
     assert spec["runtime"]["kv_cache_reuse"] is False

@@ -1258,6 +1258,39 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
         )
 
 
+def _unit_names(data: Mapping[str, Any]) -> set[str]:
+    """The names a per-unit key may use: ``default``, ``core``, each feature and each variant."""
+    named = {"default", "core"}
+    if isinstance(data.get(FEATURES_FIELD), list):
+        named.update(str(f) for f in data[FEATURES_FIELD])
+    if isinstance(data.get(VARIANTS_FIELD), Mapping):
+        named.update(str(v) for v in data[VARIANTS_FIELD])
+    return named
+
+
+def _require_named_units(data: Mapping[str, Any], errors: list[str]) -> None:
+    """A unit's entry under ``accuracy.acceptance`` or ``accuracy.boot`` names a unit of this spec.
+
+    Every key there that is not a key of the block is read as a unit's name: a
+    misspelt unit, or a key that is gone, would otherwise be kept and never read.
+    """
+    accuracy = data.get(ACCURACY_FIELD)
+    if not isinstance(accuracy, Mapping):
+        return
+    named = _unit_names(data)
+    for block, keys in (
+        ("acceptance", ACCEPTANCE_BLOCK_KEYS),
+        ("boot", (*BOOT_KEYS, GATE_TIMEOUT_KEY)),
+    ):
+        entries = accuracy.get(block)
+        for unit in entries if isinstance(entries, Mapping) else ():
+            if unit not in keys and unit not in named:
+                errors.append(
+                    f"'{ACCURACY_FIELD}.{block}.{unit}' names no unit or variant of this spec "
+                    f"({sorted(named)})"
+                )
+
+
 def _validate_profile(data: Mapping[str, Any], errors: list[str]) -> None:
     """``profile``: one of :data:`PROFILES`, or a mapping from unit, variant or ``default`` to one."""
     profile = data.get(PROFILE_FIELD)
@@ -1267,11 +1300,7 @@ def _validate_profile(data: Mapping[str, Any], errors: list[str]) -> None:
         if profile not in PROFILES:
             errors.append(f"'{PROFILE_FIELD}' must be one of {list(PROFILES)}, or a mapping")
         return
-    named = {"default", "core"}
-    if isinstance(data.get(FEATURES_FIELD), list):
-        named.update(str(f) for f in data[FEATURES_FIELD])
-    if isinstance(data.get(VARIANTS_FIELD), Mapping):
-        named.update(str(v) for v in data[VARIANTS_FIELD])
+    named = _unit_names(data)
     for unit, value in profile.items():
         if unit not in named:
             errors.append(
@@ -1505,6 +1534,7 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
         )
 
     _validate_profile(data, errors)
+    _require_named_units(data, errors)
 
     if ENVIRONMENT_FIELD not in data:
         errors.append(
