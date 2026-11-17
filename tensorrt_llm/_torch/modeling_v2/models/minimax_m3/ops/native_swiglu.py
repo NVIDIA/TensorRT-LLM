@@ -20,9 +20,7 @@ import torch
 import torch.nn.functional as F
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import (
-    m31_disabled,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import m31_disabled
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm.logger import logger

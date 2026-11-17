@@ -41,9 +41,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import (
-    m31_disabled,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import m31_disabled
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 _adv_par_logged = False

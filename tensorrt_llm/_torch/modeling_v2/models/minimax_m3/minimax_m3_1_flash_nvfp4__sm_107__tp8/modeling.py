@@ -87,30 +87,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.modeling_v2._router_index import (
-    ANY_MOE_IMPL,
-    ModelingV2Mode,
-    NoTarget,
-    resolved_mode,
-    step_contract_enabled,
-)
-from tensorrt_llm._torch.modeling_v2.catalog._op import OpWrapper
-from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import (
-    fused_qk_norm_rope,
-)
-from tensorrt_llm._torch.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
-    fp4_block_scale_moe_runner,
-)
-from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
-    flashinfer_rmsnorm,
-)
-from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (
-    fp4_quantize,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.add_rmsnorm import (
-    m31_fused_add_rmsnorm,
-)
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
@@ -130,6 +106,22 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._router_index import (
+    ANY_MOE_IMPL,
+    ModelingV2Mode,
+    NoTarget,
+    resolved_mode,
+    step_contract_enabled,
+)
+from tensorrt_llm._torch.modeling_v2.catalog._op import OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import fused_qk_norm_rope
+from tensorrt_llm._torch.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
+    fp4_block_scale_moe_runner,
+)
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.add_rmsnorm import m31_fused_add_rmsnorm
 from tensorrt_llm._torch.models.modeling_speculative import (
     _draft_loader_moe_kwargs,
     _draft_moe_selection,

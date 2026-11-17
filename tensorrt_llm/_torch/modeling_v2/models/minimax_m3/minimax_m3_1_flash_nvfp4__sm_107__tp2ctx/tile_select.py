@@ -14,10 +14,10 @@ Kill switch: ``TRTLLM_M31_DISABLE_TP2CTX_TSEL=1``.
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
 )
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm.logger import logger
 
 from .m31_switches import m31_disabled

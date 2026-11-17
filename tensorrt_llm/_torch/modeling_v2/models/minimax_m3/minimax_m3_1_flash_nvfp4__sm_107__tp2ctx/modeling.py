@@ -39,14 +39,6 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.modeling_v2._native import namespace_of
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels.index_k_producer import (
-    index_k_producer_cache as _index_k_producer_cache,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels.index_k_producer import (
-    pack_nvfp4_index_k as _pack_nvfp4_index_k,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
@@ -76,6 +68,14 @@ from tensorrt_llm._torch.distributed import (
     MiniMaxAllReduceRMS,
     allgather,
 )
+from tensorrt_llm._torch.modeling_v2._native import namespace_of
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels.index_k_producer import (
+    index_k_producer_cache as _index_k_producer_cache,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels.index_k_producer import (
+    pack_nvfp4_index_k as _pack_nvfp4_index_k,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
     MINIMAX_M3_PARAMS_MAP,
@@ -958,9 +958,7 @@ def _sp_workspace(mapping) -> Optional[Any]:
             why = f"tp_size {getattr(mapping, 'tp_size', None)} != 2"
         else:
             try:
-                from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import (
-                    tp2ctx_ipc,
-                )
+                from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import tp2ctx_ipc
 
                 ws = tp2ctx_ipc.get_workspace(
                     mapping,

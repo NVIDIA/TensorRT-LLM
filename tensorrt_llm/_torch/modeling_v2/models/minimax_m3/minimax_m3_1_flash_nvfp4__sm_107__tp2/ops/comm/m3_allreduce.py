@@ -8,8 +8,8 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceParams
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 
 class M3AllReduce(OpWrapper):

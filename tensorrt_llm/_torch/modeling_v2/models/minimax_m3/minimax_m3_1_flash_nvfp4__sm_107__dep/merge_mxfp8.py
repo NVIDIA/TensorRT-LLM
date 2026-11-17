@@ -30,10 +30,10 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import mxfp8_gemm_autotuned
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm import (
     mxfp8_cute_pinned_tactics as _pin,
 )
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import mxfp8_gemm_autotuned
 from tensorrt_llm._torch.modules import linear as _linear
 from tensorrt_llm._torch.modules.linear import Linear, MXFP8LinearMethod
 from tensorrt_llm._torch.utils import is_torch_compiling

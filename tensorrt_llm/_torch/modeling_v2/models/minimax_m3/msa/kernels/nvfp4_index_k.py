@@ -20,9 +20,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import (
-    m31_disabled,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import m31_disabled
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.logger import logger

@@ -32,11 +32,11 @@ import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 from cutlass.utils.smem_allocator import SmemAllocator
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 from tensorrt_llm._torch.kernels.blackwell.utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
 )
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
 # The 384-thread select reads its row's valid-block count before its grid wait instead of after it, which takes one
 # dependent global load off the post-wait path; the selection is the same either way. Exact: the count

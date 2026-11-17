@@ -14,9 +14,7 @@ the whole producer grid; the prefetches are non-binding hints. vLLM's reader als
 
 from __future__ import annotations
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels import (
-    nvfp4_index_k as _ik,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels import nvfp4_index_k as _ik
 from tensorrt_llm._torch.models import modeling_minimaxm3 as _mm3
 
 from .m31_switches import m31_disabled

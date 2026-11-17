@@ -7,15 +7,10 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (  # noqa: E501
     minimax_m3_trtllm_gen_dense_decode,
 )
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 __all__ = ["m3_dense_decode"]
 

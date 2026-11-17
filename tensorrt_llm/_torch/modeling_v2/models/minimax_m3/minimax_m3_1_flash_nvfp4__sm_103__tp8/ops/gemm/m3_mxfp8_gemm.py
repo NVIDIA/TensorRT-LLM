@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import mxfp8_gemm_autotuned
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from .m3_mxfp8_linear import mxfp8_reference
 

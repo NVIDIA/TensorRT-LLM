@@ -12,8 +12,8 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8QuantizeRunner
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from .m3_mx_gemv import DENSE_DOWN, DENSE_GATE_UP, O_PROJ, QKV_SPARSE, SHARED_DOWN, SHARED_GATE_UP
 from .m3_mxfp8_linear import mxfp8_reference

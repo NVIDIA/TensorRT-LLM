@@ -41,29 +41,6 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.modeling_v2._native import namespace_of
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep2ctx import (
-    native_ops,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels.index_k_producer import (
-    index_k_producer_cache as _index_k_producer_cache,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels.index_k_producer import (
-    pack_nvfp4_index_k as _pack_nvfp4_index_k,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops import (
-    bcg_ptr_guard as _bcg_ptr_guard,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops import (
-    prefill_pad_rows as _ppr,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops import (
-    router_bf16_split as _router_bf16_split,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
-    dspark_prefill_store as _dps,
-)
 from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
@@ -88,6 +65,25 @@ from tensorrt_llm._torch.attention.backends.sparse.params import SparseBackendFo
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceParams, MiniMaxAllReduceRMS
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.modeling_v2._native import namespace_of
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep2ctx import (
+    native_ops,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels.index_k_producer import (
+    index_k_producer_cache as _index_k_producer_cache,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels.index_k_producer import (
+    pack_nvfp4_index_k as _pack_nvfp4_index_k,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops import bcg_ptr_guard as _bcg_ptr_guard
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops import prefill_pad_rows as _ppr
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops import (
+    router_bf16_split as _router_bf16_split,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
+    dspark_prefill_store as _dps,
+)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
     MINIMAX_M3_PARAMS_MAP,

@@ -27,8 +27,8 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
 from ...m31_switches import m31_disabled
 

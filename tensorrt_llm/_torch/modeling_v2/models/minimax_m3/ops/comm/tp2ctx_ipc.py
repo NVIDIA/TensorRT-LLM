@@ -27,9 +27,7 @@ import os
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import (
-    m31_disabled,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import m31_disabled
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 _DEFAULT_FUSION_WORKSPACE_BYTES = 64 * 1024 * 1024

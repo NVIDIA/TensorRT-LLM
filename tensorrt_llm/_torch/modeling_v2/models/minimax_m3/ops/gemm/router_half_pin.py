@@ -4,9 +4,7 @@
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import (
-    m31_disabled,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import m31_disabled
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 # Only the full-step row counts qualified bitwise against the full-row cuBLAS reference.

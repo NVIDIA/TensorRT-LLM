@@ -22,8 +22,8 @@ from typing import Dict, Optional, Sequence, Tuple
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch.distributed import allgather
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm.logger import logger
 
 # cuBLASLt's algo for the full fc (K = 30720 -> N = 6144, bf16 in / out, fp32 compute) on SM107:

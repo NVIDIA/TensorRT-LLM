@@ -38,10 +38,10 @@ from typing import Callable, Iterable, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm import (
     mxfp8_cute_pinned_tactics as _pin,
 )
-from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.utils import is_torch_compiling

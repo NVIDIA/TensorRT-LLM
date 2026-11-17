@@ -42,9 +42,7 @@ from typing import Dict, List, Optional
 import torch
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.m3ll import (
-    locality as _locality,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.m3ll import locality as _locality
 
 from ..kernels.m3_moe import op as _stock
 from ..m31_switches import m31_disabled

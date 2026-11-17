@@ -39,9 +39,7 @@ from typing import Dict, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import (
-    m31_disabled,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import m31_disabled
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 # DSPARK_CTX_STORE_CPP (no Triton in served paths): the store is the CUDA C++ op

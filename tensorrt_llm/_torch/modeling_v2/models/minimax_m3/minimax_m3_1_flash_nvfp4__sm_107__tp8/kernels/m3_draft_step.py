@@ -117,9 +117,7 @@ def _place_per_domain(wf: torch.Tensor):
     UGPU is off. Placement only: the streamed values are the same."""
     if not UGPU:
         return wf, 0
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.m3ll.locality import (
-        LocalityMap,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.m3ll.locality import LocalityMap
 
     lm = LocalityMap.get(wf.device)
     tile_bytes = wf[0].numel() * wf.element_size()
@@ -299,9 +297,7 @@ def _draft_step_split(
     domain's tiles of the split-mapped fragments; the keys' max and the last-CTA exchange and bookkeeping run once over
     both (the last of the 2 x SMs-per-domain CTAs). Forked from and joined back to the current stream; no PDL on the
     forks."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.m3ll.locality import (
-        LocalityMap,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.m3ll.locality import LocalityMap
 
     lm = LocalityMap.get(x.device)
     per = lm.sms_per_domain

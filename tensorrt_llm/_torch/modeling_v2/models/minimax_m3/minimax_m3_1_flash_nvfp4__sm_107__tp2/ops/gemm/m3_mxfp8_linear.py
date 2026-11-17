@@ -7,13 +7,8 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import mxfp8_quantize_gemm_autotuned
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 _BLOCK = 32
 

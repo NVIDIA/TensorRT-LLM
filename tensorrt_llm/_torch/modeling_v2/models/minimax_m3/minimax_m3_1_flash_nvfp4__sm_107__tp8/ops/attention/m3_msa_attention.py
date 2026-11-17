@@ -8,11 +8,11 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     SparseBackendForwardArgs,
 )
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from .m3_sparse_decode_lc8 import dequant_nvfp4_pages
 

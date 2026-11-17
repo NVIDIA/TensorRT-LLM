@@ -10,16 +10,11 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2._router_index import (
-    NoTarget,
-    disable_v2_by_default,
-)
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget, disable_v2_by_default
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
     dflash_merge as _dflash_merge,
 )
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
-    dspark_glue_install as _dsg,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import dspark_glue_install as _dsg
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3VLForConditionalGeneration,
     get_moe_layer_ids,

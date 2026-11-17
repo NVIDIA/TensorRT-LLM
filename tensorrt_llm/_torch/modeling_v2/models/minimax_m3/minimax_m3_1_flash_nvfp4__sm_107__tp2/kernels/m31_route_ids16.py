@@ -36,11 +36,11 @@ from cutlass._mlir.extras import types as _T
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cutlass_dsl import dsl_user_op
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 from tensorrt_llm._torch.kernels.blackwell.utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
 )
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
 EXPERTS = 128  # capacity: fixed: the checkpoint's routed experts
 TOP_K = 4  # capacity: fixed: the checkpoint's top-k

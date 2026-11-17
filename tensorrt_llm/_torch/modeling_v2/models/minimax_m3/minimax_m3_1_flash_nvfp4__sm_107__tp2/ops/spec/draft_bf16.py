@@ -33,9 +33,7 @@ def _kernel(shard, out, ws_uc, ws_mc, ws_flags, rank, world):
     import cuda.bindings.driver as driver
     import cutlass.cute as cute
 
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import (
-        allgather_cast as ag,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import allgather_cast as ag
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
         allgather_bf16_kernel as kernel,
     )
@@ -186,9 +184,7 @@ def arm_draft_bf16() -> None:
     global _ARMED
     if _ARMED or _DISABLED:
         return
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import (
-        allgather_cast as ag,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import allgather_cast as ag
 
     stock = ag.precompile
 

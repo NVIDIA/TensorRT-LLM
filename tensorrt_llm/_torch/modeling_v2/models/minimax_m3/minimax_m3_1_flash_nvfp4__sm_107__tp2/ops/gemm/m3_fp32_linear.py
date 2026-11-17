@@ -7,12 +7,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 
 class M3Fp32Linear(OpWrapper):

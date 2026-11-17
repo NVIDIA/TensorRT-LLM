@@ -34,9 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
-    dspark_ctx_store as _store,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import dspark_ctx_store as _store
 
 
 class CtxStorePrep:

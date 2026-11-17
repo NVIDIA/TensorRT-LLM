@@ -11,9 +11,7 @@ from pathlib import Path
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_moe_sfa_image import (
-    fc1_scale_image,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_moe_sfa_image import fc1_scale_image
 
 
 def engine_path() -> str:

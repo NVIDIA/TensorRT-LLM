@@ -319,9 +319,7 @@ class FlagFreeGather:
         return ref, exp.view(rows, g.world * g.cols), shards[g.rank]
 
     def _stock(self, g: _Gather, shard: torch.Tensor) -> torch.Tensor:
-        from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import (
-            allgather_cast as ag,
-        )
+        from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import allgather_cast as ag
 
         if g is self.verify:
             return ag.allgather_cast(shard, **self.stock_verify)

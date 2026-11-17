@@ -35,9 +35,7 @@
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import (
-    m31_disabled,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import m31_disabled
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 _CPP_OFF = m31_disabled("DSPARK_MARKOV_CPP")

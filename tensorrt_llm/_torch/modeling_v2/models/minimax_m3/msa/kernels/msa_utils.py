@@ -19,9 +19,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cach
 from tensorrt_llm._utils import is_sm_100f, maybe_pin_memory
 
 # The MSA kernels (MiniMax fmha_sm100) vendored in-tree; see 3rdparty/vendor_sources.lock.yaml.
-MSA_MODULE = (
-    "tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels.fmha_sm100"
-)
+MSA_MODULE = "tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels.fmha_sm100"
 
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
 # selects topk 16. Callers enforce these early so a misconfiguration fails

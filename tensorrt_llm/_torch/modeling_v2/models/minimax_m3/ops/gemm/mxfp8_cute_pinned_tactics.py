@@ -21,9 +21,7 @@ from typing import Dict, Iterator, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import (
-    m31_disabled,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import m31_disabled
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 

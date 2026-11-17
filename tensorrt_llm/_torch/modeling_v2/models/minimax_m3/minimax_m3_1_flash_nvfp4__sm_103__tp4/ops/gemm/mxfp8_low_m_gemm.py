@@ -7,12 +7,7 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 _E4M3_MAX = 448.0

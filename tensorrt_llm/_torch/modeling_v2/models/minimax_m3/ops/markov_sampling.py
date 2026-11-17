@@ -25,9 +25,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import (
-    m31_disabled,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import m31_disabled
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 NATIVE_MARKOV_SAMPLING = not m31_disabled("NATIVE_MARKOV_SAMPLING")

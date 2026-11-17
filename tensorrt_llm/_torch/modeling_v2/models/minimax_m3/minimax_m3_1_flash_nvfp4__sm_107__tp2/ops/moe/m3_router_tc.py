@@ -9,12 +9,7 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 # ROUTER48 at TP2: the sm_107 TP8 wrapper (cells 2..48) with the TP4 wrapper's inline NVFP4 reference quantize
 # (this target has no m3_router_gemv module).

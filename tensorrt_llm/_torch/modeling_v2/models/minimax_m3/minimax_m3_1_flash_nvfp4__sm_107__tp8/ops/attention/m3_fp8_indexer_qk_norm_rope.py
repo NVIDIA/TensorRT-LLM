@@ -9,9 +9,7 @@ import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import (
-    fused_qk_norm_rope,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import fused_qk_norm_rope
 
 
 class M3Fp8IndexerQkNormRope(OpWrapper):

@@ -357,9 +357,7 @@ class ProbLL:
 
     # -- build (local + the cached / collective workspaces) -------------------------------------------------------
     def build(self, w2_shard: torch.Tensor) -> None:
-        from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import (
-            allgather_cast as ag,
-        )
+        from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import allgather_cast as ag
         from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
             dspark_markov_chain as chain,
         )
@@ -480,10 +478,10 @@ class ProbLL:
         checks only; it shares the LL workspace and its sequence numbers, as every LL call does)."""
         import cutlass.cute as cute
 
+        from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
         from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
             dspark_markov_chain as chain,
         )
-        from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
         ll = chain._kernel_module(batch1=True, ll=True)
         only = base_flat_i16 is None
@@ -503,9 +501,7 @@ class ProbLL:
     def launch_gather(self, compile_only: bool = False) -> None:
         import cutlass.cute as cute
 
-        from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import (
-            allgather_cast as ag,
-        )
+        from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import allgather_cast as ag
         from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark import (
             allgather_bf16_kernel as agk,
         )

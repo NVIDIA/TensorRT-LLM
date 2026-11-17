@@ -23,6 +23,8 @@ from typing import Tuple
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.distributed import allgather
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import (
     allgather_cast as _allgather_cast,
 )
@@ -48,8 +50,6 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark.dspark_forward
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark.dspark_qk_norm_rope import (
     qk_norm_rope,
 )
-from tensorrt_llm._torch.distributed import allgather
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_speculative import (
     external_drafter_config_kwargs,
     get_draft_model,

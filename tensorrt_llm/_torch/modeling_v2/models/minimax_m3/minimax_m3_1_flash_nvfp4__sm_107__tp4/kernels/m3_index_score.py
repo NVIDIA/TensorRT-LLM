@@ -31,7 +31,6 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils.smem_allocator import SmemAllocator
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import (
     EVICT_FIRST,
     fp8x4_to_fp16x4,
@@ -39,6 +38,7 @@ from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import (
     simple_tma_copy,
 )
 from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL, griddepcontrol_wait
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
 __all__ = ["IndexDecodeScoreKernel", "IndexScoreRunner"]
 

@@ -8,8 +8,8 @@ from typing import Dict, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8QuantizeRunner
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 _RUNNERS: Dict[torch.dtype, object] = {}
 

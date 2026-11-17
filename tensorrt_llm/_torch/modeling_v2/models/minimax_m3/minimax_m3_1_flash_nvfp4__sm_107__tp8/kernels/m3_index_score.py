@@ -37,7 +37,6 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils.smem_allocator import SmemAllocator
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import (
     EVICT_FIRST,
     fp8x4_to_fp16x4,
@@ -49,6 +48,7 @@ from tensorrt_llm._torch.kernels.blackwell.utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
 )
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 from tensorrt_llm.logger import logger
 
 # With the early issue, a CTA whose first block holds only tokens older than this step also TMA-loads that block's

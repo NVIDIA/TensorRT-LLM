@@ -25,6 +25,9 @@ from typing import Tuple
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.distributed import allgather
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import m31_capture_fork
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops import native_swiglu
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.comm import (
@@ -57,9 +60,6 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.dspark.dspark_qk_norm
     qk_norm_rope,
     qk_norm_rope_append,
 )
-from tensorrt_llm._torch.distributed import allgather
-from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_speculative import (
     external_drafter_config_kwargs,
     get_draft_model,

@@ -30,9 +30,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import (
-    m31_disabled,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_switches import m31_disabled
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 # DSPARK_GLUE_CPP (no Triton in served paths): the C++ op family_ops().minimax_m31_dspark_indices
