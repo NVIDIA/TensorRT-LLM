@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_sm_version
 
 from .interface import Fmha
+from .utils import MAX_KV_POOL_INDEX, get_kv_pool_growth_bound_bytes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -176,7 +177,15 @@ class PhasedFmha(Fmha):
             return int(view_bound(local_layer_idx))
 
         if isinstance(kv_cache_manager, KVCacheManagerV2):
-            return int(kv_cache_manager.impl.get_page_index_upper_bound(local_layer_idx, Role.KEY))
+            # Kernels bound page reads by this extent and decode CUDA graphs capture it,
+            # while KV pool rebalancing grows pools in place after capture. The current
+            # page bound would cut off the pages a later grow adds, so return a bound no
+            # pool can outgrow.
+            impl = kv_cache_manager.impl
+            current = int(impl.get_page_index_upper_bound(local_layer_idx, Role.KEY))
+            stride = int(impl.get_page_stride(local_layer_idx, Role.KEY))
+            stable = get_kv_pool_growth_bound_bytes(torch.cuda.current_device()) // stride
+            return min(MAX_KV_POOL_INDEX, max(current, stable))
         if not isinstance(kv_cache_manager, KVCacheManager):
             raise TypeError(f"Unsupported KV cache manager: {type(kv_cache_manager).__name__}.")
 

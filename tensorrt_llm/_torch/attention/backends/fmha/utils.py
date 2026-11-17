@@ -184,6 +184,22 @@ def get_multi_processor_count_for_device(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+# Page and row indices into KV pools are int32 in the attention kernels.
+MAX_KV_POOL_INDEX = (1 << 31) - 1
+
+
+@lru_cache(maxsize=None)
+def get_kv_pool_growth_bound_bytes(device_index: int) -> int:
+    """Bytes no KV pool on this device can outgrow: device memory plus 1 GiB of slack.
+
+    KV pool rebalancing grows pools in place, after attention has taken their
+    extent (into a cached pool view or a captured decode CUDA graph). An extent
+    derived from the current pool size then cuts off the pages a later grow
+    adds, so an extent that outlives the step must be sized to this bound.
+    """
+    return torch.cuda.get_device_properties(device_index).total_memory + (1 << 30)
+
+
 def get_bmm1_scale(attn: "TrtllmAttention") -> float:
     return 1.0 / (math.sqrt(attn.head_dim) * attn.q_scaling)
 
