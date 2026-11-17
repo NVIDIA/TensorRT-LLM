@@ -15,6 +15,7 @@
 """Tests for Triton prefill attention kernel with custom mask and paged KV cache."""
 
 import math
+from unittest import mock
 
 import pytest
 import torch
@@ -428,6 +429,42 @@ class TestTritonPrefillNoPrefix:
             torch.testing.assert_close(output, dense_output, atol=1e-2, rtol=1e-2)
             ref = _sdpa_reference(q, k, v, mask=window_masks, sm_scale=sm_scale)
             torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
+
+        # Reuse the same tensors to validate the bounds contract before launch.
+        valid_starts = torch.cat(starts).to(torch.int32)
+        valid_ends = torch.cat(ends).to(torch.int32)
+        invalid_bounds = (
+            valid_starts.to(torch.int64),
+            valid_starts.unsqueeze(0),
+            valid_starts[:-1],
+            torch.stack((valid_starts, valid_starts), dim=1)[:, 0],
+            valid_starts.cpu(),
+        )
+        invalid_arguments = [
+            dict(variable_window_token_starts=None, variable_window_token_ends=valid_ends),
+            dict(variable_window_token_starts=valid_starts, variable_window_token_ends=None),
+            dict(
+                variable_window_token_starts=valid_starts,
+                variable_window_token_ends=valid_ends,
+                custom_mask=mask_flat,
+            ),
+        ]
+        for name in ("variable_window_token_starts", "variable_window_token_ends"):
+            for bounds in invalid_bounds:
+                invalid_arguments.append(
+                    dict(
+                        variable_window_token_starts=valid_starts,
+                        variable_window_token_ends=valid_ends,
+                    )
+                    | {name: bounds}
+                )
+        with mock.patch.object(triton_prefill, "_extend_attention_fwd") as launch:
+            for invalid in invalid_arguments:
+                with pytest.raises(ValueError):
+                    triton_prefill_with_custom_mask(
+                        **(args | dict(output=output, custom_mask=None) | invalid)
+                    )
+            launch.assert_not_called()
 
     def test_head_dim_256(self, device):
         """Also works for smaller head_dim (not just 512)."""
