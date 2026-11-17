@@ -1026,7 +1026,7 @@ def minimax_m3(kit, kv_dtype, max_tokens=1024):
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3KVCacheManagerV2
     from tensorrt_llm.bindings import DataType
     from tensorrt_llm.bindings.internal.batch_manager import CacheType
-    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MiniMaxM3SparseAttentionConfig
     from tensorrt_llm.mapping import Mapping
 
     return kit.managed(
@@ -1048,7 +1048,9 @@ def minimax_m3(kit, kv_dtype, max_tokens=1024):
             sparse_layer_ids=[M3_SPARSE_LAYER],
             disable_index_value_layer_ids=[M3_SPARSE_LAYER],
             sparse_index_dim=M3_INDEX_DIM,
-            sparse_attention_config=SimpleNamespace(implementation="msa", indexer_kv_dtype="bf16"),
+            sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+                implementation="msa", indexer_kv_dtype="bf16"
+            ),
         )
     )
 
