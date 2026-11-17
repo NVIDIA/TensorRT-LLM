@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -686,16 +694,16 @@ the latest changes, but their quality is not guaranteed and they may contain bug
 <p>Pre-built TensorRT LLM releases are available as <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release">container images on NGC</a>. This is the simplest way to obtain TensorRT LLM.</p>
 <p>Replace <code class="docutils literal notranslate"><span class="pre">x.y.z</span></code> with the desired version tag. The <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">available tags on NGC</a>
 include both regular and <code class="docutils literal notranslate"><span class="pre">.dev</span></code> nightly releases.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc3
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc4
 
-docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc3
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc4
 </pre></div>
 </div>
 <div class="dropdown note admonition">
 <p class="admonition-title">Container image tags</p>
 <p>In the example shell commands, <code class="docutils literal notranslate"><span class="pre">x.y.z</span></code> corresponds to the TensorRT-LLM container
 version to use. If omitted, <code class="docutils literal notranslate"><span class="pre">IMAGE_TAG</span></code> will default to <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.__version__</span></code>
-(e.g., this documentation was generated from the <code class="docutils literal notranslate"><span class="pre">1.4.0rc3</span></code> source tree).
+(e.g., this documentation was generated from the <code class="docutils literal notranslate"><span class="pre">1.4.0rc4</span></code> source tree).
 If this does not work, e.g., because a container for the version you are
 currently working with has not been released yet, you can try using a
 container published for a previous
@@ -711,8 +719,8 @@ container published for a previous
 </pre></div>
 </div>
 </section>
-<section id="option-2-install-on-linux-via-pip">
-<span id="linux"></span><h2>Option 2: Install on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code><a class="headerlink" href="#option-2-install-on-linux-via-pip" title="Link to this heading">#</a></h2>
+<section id="linux">
+<span id="option-2-install-on-linux-via-pip"></span><h2>Option 2: Install on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code><a class="headerlink" href="#linux" title="Link to this heading">#</a></h2>
 <blockquote>
 <div><p><strong>Note:</strong> The TensorRT LLM wheel on PyPI is built with the <a class="reference external" href="https://pypi.org/project/torch/">public PyTorch package</a>. This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build.
 If you are using the NGC PyTorch container, follow <a class="reference internal" href="#install-in-an-ngc-pytorch-container">Install in an NGC PyTorch container</a> to install a wheel built specifically for that container.</p>
@@ -791,7 +799,7 @@ pip3<span class="w"> </span>install<span class="w"> </span><span class="s2">"</s
 </div>
 </section>
 <section id="id2">
-<h4>Install a nightly release<a class="headerlink" href="#id2" title="Link to this heading">#</a></h4>
+<span id="install-a-nightly-release-1"></span><h4>Install a nightly release<a class="headerlink" href="#id2" title="Link to this heading">#</a></h4>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip3<span class="w"> </span>index<span class="w"> </span>versions<span class="w"> </span>tensorrt_llm<span class="w"> </span>--pre<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--index-url<span class="w"> </span>https://pypi.nvidia.com/trtllm_ngcpytorch_nightly/
 
@@ -943,7 +951,7 @@ pip3<span class="w"> </span>install<span class="w"> </span>--ignore-installed<sp
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#option-1-pre-built-release-container">Option 1: Pre-built Release Container</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#option-2-install-on-linux-via-pip">Option 2: Install on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#linux">Option 2: Install on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#install-prerequisites">Install prerequisites</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#install-pre-built-tensorrt-llm-wheel">Install pre-built TensorRT LLM wheel</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#install-a-nightly-release">Install a nightly release</a></li>
@@ -1050,9 +1058,9 @@ pip3<span class="w"> </span>install<span class="w"> </span>--ignore-installed<sp
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

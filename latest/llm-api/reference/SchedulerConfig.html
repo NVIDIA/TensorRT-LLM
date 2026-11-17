@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2 current active"><a aria-current="page" class="current reference internal" href="#">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -682,15 +690,19 @@
 <em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">SchedulerConfig</span></span><span class="sig-paren">(</span>
 
 <dl>
-<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">capacity_scheduler_policy</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="CapacitySchedulerPolicy.html#tensorrt_llm.llmapi.CapacitySchedulerPolicy" title="tensorrt_llm.llmapi.llm_args.CapacitySchedulerPolicy"><span class="pre">CapacitySchedulerPolicy</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">CapacitySchedulerPolicy.GUARANTEED_NO_EVICT</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">context_chunking_policy</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="ContextChunkingPolicy.html#tensorrt_llm.llmapi.ContextChunkingPolicy" title="tensorrt_llm.llmapi.llm_args.ContextChunkingPolicy"><span class="pre">ContextChunkingPolicy</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">dynamic_batch_config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="DynamicBatchConfig.html#tensorrt_llm.llmapi.DynamicBatchConfig" title="tensorrt_llm.llmapi.llm_args.DynamicBatchConfig"><span class="pre">DynamicBatchConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">waiting_queue_policy</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">WaitingQueuePolicy</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">WaitingQueuePolicy.FCFS</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">use_python_scheduler</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">enable_prefix_aware_scheduling</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">context_scheduling_policy</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">ContextSchedulingPolicy</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">ContextSchedulingPolicy.FCFS</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">context_starvation_iterations</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Annotated</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Gt</span><span class="p"><span class="pre">(</span></span><span class="n"><span class="pre">gt</span></span><span class="o"><span class="pre">=</span></span><span class="m"><span class="pre">0</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">capacity_scheduler_policy:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.CapacitySchedulerPolicy</span> <span class="pre">=</span> <span class="pre">CapacitySchedulerPolicy.GUARANTEED_NO_EVICT</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">context_chunking_policy:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.ContextChunkingPolicy</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">dynamic_batch_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.DynamicBatchConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">waiting_queue_policy:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.WaitingQueuePolicy</span> <span class="pre">=</span> <span class="pre">WaitingQueuePolicy.FCFS</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_python_scheduler:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_prefix_aware_scheduling:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">gen_preemption:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.GenPreemptionConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_gen_init_admissions_per_pass:</span> <span class="pre">~typing.Annotated[int</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">~annotated_types.Gt(gt=0)]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">context_scheduling_policy:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.ContextSchedulingPolicy</span> <span class="pre">=</span> <span class="pre">ContextSchedulingPolicy.FCFS</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">context_starvation_iterations:</span> <span class="pre">~typing.Annotated[int</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">~annotated_types.Gt(gt=0)]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../../_modules/tensorrt_llm/llmapi/llm_args.html#SchedulerConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.SchedulerConfig" title="Link to this definition">#</a></dt>
@@ -729,6 +741,18 @@
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.SchedulerConfig.enable_prefix_aware_scheduling">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_prefix_aware_scheduling</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.SchedulerConfig.enable_prefix_aware_scheduling" title="Link to this definition">#</a></dt>
 <dd><p>Use KV prefix-reuse estimates for scheduler admission, duplicate-request deferral, and token-budget decisions. This is orthogonal to kv_cache_config.enable_block_reuse.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.SchedulerConfig.gen_preemption">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">gen_preemption</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">GenPreemptionConfig</span></em><em class="property"> <span class="pre">[Optional]</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.SchedulerConfig.gen_preemption" title="Link to this definition">#</a></dt>
+<dd><p>GEN slot preemption on disaggregated generation workers.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.SchedulerConfig.max_gen_init_admissions_per_pass">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_gen_init_admissions_per_pass</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Annotated</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Gt</span><span class="p"><span class="pre">(</span></span><span class="n"><span class="pre">gt</span></span><span class="o"><span class="pre">=</span></span><span class="m"><span class="pre">0</span></span><span class="p"><span class="pre">)</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.SchedulerConfig.max_gen_init_admissions_per_pass" title="Link to this definition">#</a></dt>
+<dd><p>Bounds how many disaggregated generation requests a rank admits per scheduling pass of the KV cache manager V2 scheduler (each admission allocates the request’s KV cache); None admits all that fit. A bound trades the start latency of a burst of such requests for shorter passes, which every attention-DP rank waits for. KV cache manager V1 ignores it.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -893,6 +917,8 @@ pybind instance</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SchedulerConfig.context_starvation_iterations"><code class="docutils literal notranslate"><span class="pre">context_starvation_iterations</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SchedulerConfig.dynamic_batch_config"><code class="docutils literal notranslate"><span class="pre">dynamic_batch_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SchedulerConfig.enable_prefix_aware_scheduling"><code class="docutils literal notranslate"><span class="pre">enable_prefix_aware_scheduling</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SchedulerConfig.gen_preemption"><code class="docutils literal notranslate"><span class="pre">gen_preemption</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SchedulerConfig.max_gen_init_admissions_per_pass"><code class="docutils literal notranslate"><span class="pre">max_gen_init_admissions_per_pass</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SchedulerConfig.use_python_scheduler"><code class="docutils literal notranslate"><span class="pre">use_python_scheduler</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SchedulerConfig.waiting_queue_policy"><code class="docutils literal notranslate"><span class="pre">waiting_queue_policy</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.SchedulerConfig.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
@@ -997,9 +1023,9 @@ pybind instance</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

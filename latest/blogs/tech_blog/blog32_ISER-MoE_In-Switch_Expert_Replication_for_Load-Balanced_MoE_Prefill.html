@@ -1,0 +1,1329 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72" href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html" />
+    <link rel="prev" title="Telemetry" href="../../developer-guide/telemetry.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.4.0rc4" />
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvHintsInput.html">KvHintsInput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/multimodal.html">Multimodal Request Data</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-house"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="iser-moe-in-switch-expert-replication-for-load-balanced-moe-prefill">
+<h1>ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill<a class="headerlink" href="#iser-moe-in-switch-expert-replication-for-load-balanced-moe-prefill" title="Link to this heading">#</a></h1>
+<p><em>Per-Layer Dynamic Expert Load Balancing with NVLink Multicast in TensorRT LLM</em></p>
+<p>By NVIDIA TensorRT LLM Team</p>
+<p>An expert-parallel mixture-of-experts (MoE) layer runs at the pace of its most loaded GPU, because fused MoE kernels such as TensorRT LLM’s MegaMoE synchronize all GPUs. In DeepSeek-V4-Pro prefill routing recorded from a mixed trace of agentic coding and benchmark prompts, with expert parallelism (EP) over eight GPUs (EP8) and 8,192 tokens/rank (tokens per GPU per forward pass), the most loaded GPU averaged <strong>1.44×</strong> the mean load, and 2.24× at EP24. Replicating the few hot experts on lightly loaded GPUs would balance the layer, but each replica is a whole expert that must arrive within the layer: <strong>37.16 MB</strong> for DeepSeek-V4-Pro in NVFP4, NVIDIA’s 4-bit floating-point (FP4) format.</p>
+<p><strong>ISER-MoE (In-Switch Expert Replication for MoE) multicasts each hot expert through the NVLink switch into a fixed, aligned group of GPUs, so each byte leaves its owner GPU once, however many replicas the group holds.</strong> At every MoE layer, HALO-Q (Hot-Aligned, Locality-Optimal expert replication with Quota repair), a GPU scheduler, picks hot experts and groups from that layer’s routing, and a replication kernel multicasts each hot expert from its owner or through SAMI (Scalable Asynchronous Multi-port In-switch broadcast), which spreads the injection over the members’ NVLink ports. Both run beside the shared expert, which every token uses, so the MoE kernel waits only for the plan.</p>
+<p>In simulated replay of that routing at 8,192 tokens/rank, HALO-Q removed <strong>98–99% of the excess load</strong> (the most loaded GPU’s load above the mean) at EP4–EP24, with four helper slots (spare expert buffers) per rank. With attention data parallelism (DP) and EP8 (DEP8), ISER-MoE raised DeepSeek-V4-Pro’s context-only (prefill-only) request throughput on GSM8K (Grade School Math 8K) by <strong>6.9% on GB200</strong> and <strong>12.6% on pre-release Rubin GPUs</strong>, reaching over <strong>99% of forced balanced-routing throughput</strong> (Figure 10). In disaggregated serving of agentic coding traces on a GB300 NVL72 rack, it improved P90 (90th-percentile) request latency by <strong>3.1–4.3%</strong> and output throughput per GPU by <strong>1.4–1.9%</strong>.</p>
+<p><strong>Numerical equivalence.</strong> Replicas are byte copies of an expert’s weights and block scales, and tokens keep their routing weights, so ISER-MoE changes where a token-expert pair is calculated, not what is computed; in the <a class="reference internal" href="#megamoe-kernel-time-with-replicas">MegaMoE kernel measurements</a> below, OFF and ON outputs matched bitwise.</p>
+<p>TensorRT LLM’s Expert Parallelism Load Balancer (EPLB), from Scaling Expert Parallelism <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html#ep-load-balancer">Part 1</a> and <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html#expert-parallelism-load-balancer-eplb">Part 2</a>, plans from load history, once (offline) or a few layers per iteration (online). ISER-MoE adds per-layer dynamic EPLB, which re-plans every MoE layer on every forward pass; pull request (PR) <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/19646">#19646</a> merged it as a prototype feature of the NVFP4 MegaMoE backend (<a class="reference internal" href="#using-iser-moe-in-tensorrt-llm">Using ISER-MoE in TensorRT LLM</a>). The method applies in principle to prefill, generation and training; this work implements and evaluates prefill, with attention DP inside one NVLink domain.</p>
+<p><strong>Table of Contents</strong></p>
+<ul class="simple">
+<li><p><strong><a class="reference internal" href="#rank-imbalance-in-expert-parallel-moe-prefill">1. Rank Imbalance in Expert-Parallel MoE Prefill</a></strong></p>
+<ul>
+<li><p><a class="reference internal" href="#expert-parallel-moe">1.1 Expert-Parallel MoE</a></p></li>
+<li><p><a class="reference internal" href="#rank-imbalance-across-workloads-and-layers">1.2 Rank Imbalance Across Workloads and Layers</a></p></li>
+<li><p><a class="reference internal" href="#long-tail-distribution-and-hot-expert-replication">1.3 Long-Tail Distribution and Hot-Expert Replication</a></p></li>
+</ul>
+</li>
+<li><p><strong><a class="reference internal" href="#challenges-in-per-layer-expert-replication">2. Challenges in Per-Layer Expert Replication</a></strong></p>
+<ul>
+<li><p><a class="reference internal" href="#more-weight-copy-overhead-than-routed-expert-computation">2.1 More Weight-Copy Overhead Than Routed-Expert Computation</a></p></li>
+<li><p><a class="reference internal" href="#source-broadcast-hot-spot">2.2 Source Broadcast Hot Spot</a></p></li>
+<li><p><a class="reference internal" href="#latency-and-bandwidth-overheads-in-baseline-broadcasts">2.3 Latency and Bandwidth Overheads in Baseline Broadcasts</a></p></li>
+</ul>
+</li>
+<li><p><strong><a class="reference internal" href="#iser-moe-design">3. ISER-MoE Design</a></strong></p>
+<ul>
+<li><p><a class="reference internal" href="#halo-q-scheduler">3.1 HALO-Q Scheduler</a></p></li>
+<li><p><a class="reference internal" href="#multi-level-symmetric-multicast">3.2 Multi-Level Symmetric Multicast</a></p></li>
+<li><p><a class="reference internal" href="#tma-weight-replication-and-sami-multi-port-broadcast">3.3 TMA Weight Replication and SAMI Multi-Port Broadcast</a></p></li>
+<li><p><a class="reference internal" href="#runtime-overlap">3.4 Runtime Overlap</a></p></li>
+</ul>
+</li>
+<li><p><strong><a class="reference internal" href="#performance-evaluation">4. Performance Evaluation</a></strong></p>
+<ul>
+<li><p><a class="reference internal" href="#methodology">4.1 Methodology</a></p></li>
+<li><p><a class="reference internal" href="#component-evaluation">4.2 Component Evaluation</a></p>
+<ul>
+<li><p><a class="reference internal" href="#halo-q-trace-replay">4.2.1 HALO-Q Trace Replay</a></p></li>
+<li><p><a class="reference internal" href="#sami-broadcast-on-gb200">4.2.2 SAMI Broadcast on GB200</a></p></li>
+<li><p><a class="reference internal" href="#megamoe-kernel-time-with-replicas">4.2.3 MegaMoE Kernel Time with Replicas</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#end-to-end-serving-evaluation">4.3 End-to-End Serving Evaluation</a></p>
+<ul>
+<li><p><a class="reference internal" href="#end-to-end-prefill-serving">4.3.1 End-to-End Prefill Serving</a></p></li>
+<li><p><a class="reference internal" href="#end-to-end-disaggregated-serving-on-a-gb300-nvl72-rack">4.3.2 End-to-End Disaggregated Serving on a GB300 NVL72 Rack</a></p></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p><strong><a class="reference internal" href="#using-iser-moe-in-tensorrt-llm">5. Using ISER-MoE in TensorRT LLM</a></strong></p>
+<ul>
+<li><p><a class="reference internal" href="#configuration">5.1 Configuration</a></p></li>
+<li><p><a class="reference internal" href="#requirements-and-constraints">5.2 Requirements and Constraints</a></p></li>
+<li><p><a class="reference internal" href="#performance-measurement">5.3 Performance Measurement</a></p></li>
+<li><p><a class="reference internal" href="#applicability-and-evaluated-configurations">5.4 Applicability and Evaluated Configurations</a></p></li>
+</ul>
+</li>
+<li><p><strong><a class="reference internal" href="#discussion">6. Discussion</a></strong></p>
+<ul>
+<li><p><a class="reference internal" href="#lower-bound-analysis-of-hierarchical-and-free-slot-usage">6.1 Lower-Bound Analysis of Hierarchical and Free Slot Usage</a></p></li>
+<li><p><a class="reference internal" href="#limitations">6.2 Limitations</a></p></li>
+<li><p><a class="reference internal" href="#related-work">6.3 Related Work</a></p></li>
+</ul>
+</li>
+<li><p><strong><a class="reference internal" href="#conclusion-and-further-reading">7. Conclusion and Further Reading</a></strong></p>
+<ul>
+<li><p><a class="reference internal" href="#conclusion">7.1 Conclusion</a></p></li>
+<li><p><a class="reference internal" href="#further-reading">7.2 Further Reading</a></p></li>
+</ul>
+</li>
+</ul>
+<section id="rank-imbalance-in-expert-parallel-moe-prefill">
+<span id="1-rank-imbalance-in-expert-parallel-moe-prefill"></span><h2>1. Rank Imbalance in Expert-Parallel MoE Prefill<a class="headerlink" href="#rank-imbalance-in-expert-parallel-moe-prefill" title="Link to this heading">#</a></h2>
+<p>Agentic workloads send long, multi-turn prompts, so prefill holds most of the GPUs in disaggregated serving: TensorRT LLM’s AgentPerf configurations of DeepSeek-V4-Pro on GB300 used 24 context GPUs against 8 or 16 for generation (<a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html#agentperf-results-and-external-validation">DeepSeek-V4 on NVIDIA Blackwell</a>).</p>
+<section id="expert-parallel-moe">
+<span id="11-expert-parallel-moe"></span><h3>1.1 Expert-Parallel MoE<a class="headerlink" href="#expert-parallel-moe" title="Link to this heading">#</a></h3>
+<p>An MoE layer routes each token to <span class="math notranslate nohighlight">\(k\)</span> of its <span class="math notranslate nohighlight">\(E\)</span> experts. EP spreads the experts over <span class="math notranslate nohighlight">\(P\)</span> ranks (one GPU each; EP8 means <span class="math notranslate nohighlight">\(P=8\)</span>), each holding <span class="math notranslate nohighlight">\(H=E/P\)</span> <em>home</em> experts; every invocation <em>dispatches</em> tokens to their experts’ ranks and <em>combines</em> the outputs back (<a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">One-Sided AlltoAll over NVLink</a>). Under DEP, each rank contributes its own tokens (tokens/rank, counted before top-<span class="math notranslate nohighlight">\(k\)</span> expansion), and DeepSeek-V4 also runs a <em>shared expert</em> on every token. MegaMoE, the <code class="docutils literal notranslate"><span class="pre">MEGAMOE_CUTEDSL</span></code> backend, is TensorRT LLM’s fused MoE kernel in the CuTe domain-specific language (DSL), after <a class="reference external" href="https://github.com/deepseek-ai/DeepGEMM">DeepGEMM</a>’s Mega MoE design: one persistent kernel runs dispatch, both expert general matrix multiplications (GEMMs) and combine, and synchronizes all ranks, <strong>so every rank finishes with the most loaded one.</strong></p>
+<p>Per layer, the <em>load</em> <span class="math notranslate nohighlight">\(L_r\)</span> of rank <span class="math notranslate nohighlight">\(r\)</span> counts its <em>routes</em> (token-expert assignments), and the rank imbalance ratio is</p>
+<div class="math notranslate nohighlight">
+\[R=\frac{\max_r L_r}{\bar{L}},\qquad 1\le R\le P,\]</div>
+<p>where <span class="math notranslate nohighlight">\(\bar{L}\)</span> is the mean load; <span class="math notranslate nohighlight">\(R-1\)</span> is the <em>excess</em>, and ranks above (below) the mean are <em>hot</em> (<em>cold</em>). On GB200 (EP8, 8,192 tokens/rank, trace-derived routing), MegaMoE without replicas took <span class="math notranslate nohighlight">\(513+1{,}051\thinspace R\)</span> µs per layer, a fit across the 61 MoE layers (Pearson correlation 0.938).</p>
+</section>
+<section id="rank-imbalance-across-workloads-and-layers">
+<span id="12-rank-imbalance-across-workloads-and-layers"></span><h3>1.2 Rank Imbalance Across Workloads and Layers<a class="headerlink" href="#rank-imbalance-across-workloads-and-layers" title="Link to this heading">#</a></h3>
+<p>DeepSeek-V4-Pro’s prefill routing (<a class="reference external" href="https://arxiv.org/abs/2606.19348">DeepSeek-V4 report</a>: 61 MoE layers, <span class="math notranslate nohighlight">\(E=384\)</span>, <span class="math notranslate nohighlight">\(k=6\)</span>) was recorded before load balancing on random tokens and five public workloads: <a class="reference external" href="https://arxiv.org/abs/2110.14168">GSM8K</a>, Massive Multitask Language Understanding (MMLU), IFBench, SciCode and <a class="reference external" href="https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126">agentic coding traces from SemiAnalysis</a>. At EP8, the 61-layer mean of whole-trace <span class="math notranslate nohighlight">\(R\)</span> was 1.40–1.45 for four workloads, 1.69 for GSM8K and 2.00 for random tokens (Figure 1); it ranged over 1.13–2.51 across the agentic traces’ layers, and any two workloads share at most one of their five most imbalanced layers, much as <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html#observation-over-gsm8k-dataset">Part 1</a> saw DeepSeek-R1’s hot layer move between datasets. The means also grow with EP size (Figure 1(b)).</p>
+<p><img alt="Heat strips of per-layer R at EP8 for six workloads, with 61-layer means from 1.40 to 2.00, and lines in which every workload's mean R rises from EP4 to EP8." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_rank_imbalance.svg" /></p>
+<p><em>Figure 1. Rank imbalance ratio R (the most loaded rank’s routed tokens over the mean) of DeepSeek-V4-Pro prefill before load balancing (whole-trace loads, contiguous experts per rank): (a) per MoE layer at EP8, with 61-layer means; (b) 61-layer means at EP4, EP6 and EP8.</em></p>
+<p><strong>Per-invocation load imbalance.</strong> In a mixed trace interleaving the five workloads by request (4,340 requests, 18.2M prefill tokens, 91% agentic), <span class="math notranslate nohighlight">\(R\)</span> per iteration (forward pass) at 8,192 tokens/rank averaged 1.20, 1.44, 1.84 and 2.24 at EP4, EP8, EP16 and EP24, against 1.41 whole-trace at EP8. Most of the skew in a fixed workload mix persists across invocations: a static plan from load history, as in DeepSeek’s <a class="reference external" href="https://github.com/deepseek-ai/EPLB">EPLB</a>, can remove most of it, but not its drift between batches.</p>
+</section>
+<section id="long-tail-distribution-and-hot-expert-replication">
+<span id="13-long-tail-distribution-and-hot-expert-replication"></span><h3>1.3 Long-Tail Distribution and Hot-Expert Replication<a class="headerlink" href="#long-tail-distribution-and-hot-expert-replication" title="Link to this heading">#</a></h3>
+<p>Expert load is long-tailed (Figure 2): over the mixed trace, the four busiest of 384 experts received 13.02% of a layer’s assignments on average (1.04% if uniform), and 13.6% per iteration (EP8, 16,384 tokens/rank). At EP8, the four busiest home experts of a layer’s hottest rank carried at least that rank’s load above the mean in 59 of the 61 layers.</p>
+<p><img alt="Six panels of the cumulative share of a layer's assignments over experts sorted by load, all bowed above the uniform diagonal; in the mixed trace, the top 4 of 384 experts take 13.02%." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_long_tail.svg" /></p>
+<p><em>Figure 2. Expert load is long-tailed (DeepSeek-V4-Pro, whole datasets): cumulative share of a layer’s assignments over its 384 experts sorted by load. Thin lines: MoE layers; thick: 61-layer average, labeled with the Top-1 to Top-16 shares; dashed: uniform load. Mixed: the mixed trace.</em></p>
+<p>A <em>replica</em> copies a hot expert into a <em>helper slot</em>, a per-rank buffer for one more expert (each rank has <span class="math notranslate nohighlight">\(S\)</span> of them), and takes routes from the expert’s <em>owner</em>, its home rank. <strong>Which experts are hot changes with workload, layer and batch, so balance needs replicas planned per invocation, at every layer, each a whole expert copied within that invocation.</strong></p>
+</section>
+</section>
+<section id="challenges-in-per-layer-expert-replication">
+<span id="2-challenges-in-per-layer-expert-replication"></span><h2>2. Challenges in Per-Layer Expert Replication<a class="headerlink" href="#challenges-in-per-layer-expert-replication" title="Link to this heading">#</a></h2>
+<p>Replicas balance a layer only if whole experts arrive within the layer that uses them, and three obstacles stand in the way: copies compete with token traffic for link time, one owner must feed several replicas, and each of the three broadcast options examined below pays a latency or bandwidth overhead.</p>
+<section id="more-weight-copy-overhead-than-routed-expert-computation">
+<span id="21-more-weight-copy-overhead-than-routed-expert-computation"></span><h3>2.1 More Weight-Copy Overhead Than Routed-Expert Computation<a class="headerlink" href="#more-weight-copy-overhead-than-routed-expert-computation" title="Link to this heading">#</a></h3>
+<p>A peak-rate model, not a measurement, counts the copies that computation can hide. Per MoE layer and rank, <span class="math notranslate nohighlight">\(\tau\)</span> tokens make <span class="math notranslate nohighlight">\(\tau k\)</span> token-expert pairs, each costing <span class="math notranslate nohighlight">\(6H_eI\)</span> floating-point operations (FLOPs) in its routed expert (expert input width <span class="math notranslate nohighlight">\(H_e\)</span> and intermediate width <span class="math notranslate nohighlight">\(I\)</span>) and, under uniform routing, moving <span class="math notranslate nohighlight">\(H_eb\)</span> bytes off the rank with probability <span class="math notranslate nohighlight">\((P-1)/P\)</span> in both dispatch and combine (<span class="math notranslate nohighlight">\(b=0.5625\)</span> B per NVFP4 element). Each of the <span class="math notranslate nohighlight">\(n\)</span> expert copies a rank sends or receives moves <span class="math notranslate nohighlight">\(W=3H_eIb\)</span> bytes. Per link direction,</p>
+<div class="math notranslate nohighlight">
+\[\frac{\text{math}}{\text{comm}}=\frac{6\thinspace\tau k H_e I}{2\thinspace\frac{P-1}{P}\thinspace\tau k H_e b+nW}.\]</div>
+<p>Communication hides at peak rates only if this ratio exceeds the <em>device ratio</em> of dense FP4 FLOP/s to per-direction link bandwidth, 16,667 FLOP/B on GB300 (15 PFLOP/s, 900 GB/s; <a class="reference external" href="https://www.nvidia.com/en-us/data-center/gb300-nvl72/">GB300 NVL72</a>). For DeepSeek-V4-Pro and <a class="reference external" href="https://huggingface.co/moonshotai/Kimi-K3">Kimi K3</a>, both assumed NVFP4, the routed-only ratio without copies is 18,725 FLOP/B at EP8; each copy lowers it, and 12 of 16 scenarios (0, 1, 2 or 4 copies; 8,192 or 16,384 tokens/rank; two models) stay above GB300’s ratio (Figure 3(a), orange). At 8,192 tokens/rank, DeepSeek-V4-Pro’s routed computation (432.9 µs) exceeds its dispatch plus combine (385.4 µs) by only 1.15 copies of 41.3 µs; four copies would outlast it by 117.6 µs and delay the combine (Figure 3(b)).</p>
+<p>The shared expert needs neither the plan nor token communication, so it can run before dispatch while the links are idle. GB300 computes FP4 at three times its 8-bit floating-point (FP8) rate, so weighting the shared expert’s FP8 FLOPs by 3 (FP8 shared experts assumed in both models) raises the math/comm ratio to 19,661–32,768 FLOP/B, and all 16 scenarios allow overlap (Figure 3(a), green). DeepSeek-V4-Pro’s shared expert lasts 216.5 µs at 8,192 tokens/rank, room for about five more copies at line rate. <strong>Planning and weight replication should start immediately after routing to overlap with shared-expert computation.</strong></p>
+<p><img alt="Bars of the math/comm ratio with 0 to 4 copies per rank: four routed-only bars fall below the 16,667 FLOP/B line, but no bar with the shared expert does; timelines show four copies delaying the combine but hiding beside the shared expert." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_copy_vs_compute.svg" /></p>
+<p><em>Figure 3. Peak-rate model per MoE layer and rank on GB300 (EP8, uniform routing, NVFP4). (a) Math/comm ratio with n copies per rank, routed experts only (orange) or with the FP8 shared expert weighted ×3 (green); hatched: below the device ratio (dashed). (b) DeepSeek-V4-Pro, 8,192 tokens/rank, four copies: they delay the combine beside the routed experts but hide beside the shared expert.</em></p>
+<p>With MegaMoE’s default 16-bit brain floating-point (BF16) combine instead of the modeled FP4 one, the combine alone (685 µs) outlasts DeepSeek-V4-Pro’s routed computation (433 µs) at 8,192 tokens/rank, so copies hide only beside the shared expert.</p>
+</section>
+<section id="source-broadcast-hot-spot">
+<span id="22-source-broadcast-hot-spot"></span><h3>2.2 Source Broadcast Hot Spot<a class="headerlink" href="#source-broadcast-hot-spot" title="Link to this heading">#</a></h3>
+<p>Hot experts often need several replicas each, and a hot rank’s busiest home experts share one owner. If an owner replicates <span class="math notranslate nohighlight">\(K\)</span> experts, expert <span class="math notranslate nohighlight">\(e\)</span> to <span class="math notranslate nohighlight">\(d_e\)</span> ranks, point-to-point copies send <span class="math notranslate nohighlight">\(\sum_e d_e\le K(P-1)\)</span> payloads out of it; relays, as in <a class="reference external" href="https://arxiv.org/abs/2606.04101">UltraEP</a>, which identified this fan-out bottleneck, relieve the owner but add a store-and-forward hop. In-switch multicast, part of the NVLink Scalable Hierarchical Aggregation and Reduction Protocol (NVLink SHARP, NVLS), replicates stores inside the NVLink switches: a store to a <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MULTICAST.html">CUDA multicast object</a> reaches every member GPU’s memory, so each byte leaves the owner once (Figure 4(a, b)).</p>
+<p>In simulated replay of the mixed trace (8,192 tokens/rank, four helper slots per rank), a greedy point-to-point planner modeled on UltraEP and <a class="reference external" href="https://arxiv.org/abs/2610.00671">MegaFlux</a>, with no limit on an owner’s send-outs, balanced slightly better than HALO-Q (<span class="math notranslate nohighlight">\(R\)</span> = 1.001–1.009 against 1.006–1.020 at EP8–EP24), but its busiest owner sent 7/9/10 expert weights per invocation at EP8/16/24 at the 99th percentile, 289–413 µs at line rate and longer than the 216.5 µs shared-expert window, and up to 10/12/14, against four or fewer with multicast (Figure 4(c)).</p>
+<p><img alt="Eight GPUs: point to point, GPU 0 sends hot expert A five times; with multicast, it sends once and the switch replicates. Bars of worst-case owner send-outs: 10, 12 and 14 point to point against 4 with multicast." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_owner_hotspot.svg" /></p>
+<p><em>Figure 4. Point-to-point replication makes the owner a hot spot. (a, b) Idealized EP8 example: point to point, GPU 0 sends hot expert A five times; with in-switch multicast, each owner sends once. (c) The greedy planner in simulated replay (DeepSeek-V4-Pro, mixed trace, 8,192 tokens/rank, four helper slots per rank), point to point or multicast: the busiest rank’s worst-case expert send-outs per layer invocation.</em></p>
+<p>Multicast membership is fixed before use, and only members map the object, so a writer is a member and receives its own replica. Stores land at the same offset on all members, and each object takes one of a limited number of switch multicast IDs (MLIDs; 1,024 per GB200 NVLink domain, per the <a class="reference external" href="https://docs.nvidia.com/multi-node-nvlink-systems/partition-guide-v1-2.pdf">partition guide</a>). Yet the GPUs that need a replica change with every layer and batch, which is why UltraEP set in-switch multicast aside.</p>
+</section>
+<section id="latency-and-bandwidth-overheads-in-baseline-broadcasts">
+<span id="23-latency-and-bandwidth-overheads-in-baseline-broadcasts"></span><h3>2.3 Latency and Bandwidth Overheads in Baseline Broadcasts<a class="headerlink" href="#latency-and-bandwidth-overheads-in-baseline-broadcasts" title="Link to this heading">#</a></h3>
+<p>Multicast lets each byte leave the owner once, but each of the following three ways to broadcast one expert to <span class="math notranslate nohighlight">\(g\)</span> GPUs pays a latency or bandwidth overhead (Figure 5); A and B are modeled for one 37.16 MB expert at 900 GB/s per link direction and 5 µs per step, and C is measured:</p>
+<ul class="simple">
+<li><p><strong>A, software ring.</strong> The NVIDIA Collective Communications Library (<a class="reference external" href="https://github.com/NVIDIA/nccl">NCCL</a>) 2.31.2 broadcasts only along a pipelined ring (<a class="reference external" href="https://arxiv.org/abs/2507.04786">Demystifying NCCL</a>), whose pipeline fill grows with the group: with 2-MiB slices, its algorithm bandwidth (payload/time) falls to 250 GB/s at <span class="math notranslate nohighlight">\(g=16\)</span>.</p></li>
+<li><p><strong>B, software scatter + all-gather.</strong> The classic large-message broadcast of <a class="reference external" href="https://doi.org/10.1177/1094342005051521">MPICH’s collectives</a> spreads injection over all <span class="math notranslate nohighlight">\(g\)</span> ports but moves the payload twice in series, capping its bandwidth near half the link bandwidth.</p></li>
+<li><p><strong>C, owner-direct (single-port) multicast issued by a copy engine (CE).</strong> Everything enters the switch through one ingress port, replicated at a fixed rate: on four GB200 trays (160 MiB), the total output stayed at 2.0–2.1 TB/s, so each receiver got 535, 266 and 127 GB/s at <span class="math notranslate nohighlight">\(g\)</span> = 4, 8 and 16.</p></li>
+</ul>
+<p><img alt="Diagrams of a ring, a scatter + all-gather and a copy-engine write into one switch port, and a chart in which the ring falls to 250 GB/s at 16 GPUs and the single port from 535 to 127 GB/s." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_broadcast_limits.svg" /></p>
+<p><em>Figure 5. Three ways to broadcast one expert, each limited by latency or bandwidth. (a) One expert in four slices, from GPU 0 to g = 4 GPUs: A, software ring; B, software scatter + all-gather; C, owner-direct (single-port) multicast issued by a CE. (b) Algorithm bandwidth (BW) against g: A and B modeled, C measured on four GB200 trays.</em></p>
+<p><strong>One injection per byte is necessary but not sufficient; injection must also be spread over many ports.</strong></p>
+</section>
+</section>
+<section id="iser-moe-design">
+<span id="3-iser-moe-design"></span><h2>3. ISER-MoE Design<a class="headerlink" href="#iser-moe-design" title="Link to this heading">#</a></h2>
+<p><strong>ISER-MoE uses prebuilt multicast groups with per-invocation expert placement.</strong> Right after routing, <a class="reference internal" href="#halo-q-scheduler">HALO-Q</a> decides which hot experts to replicate where, bounding each owner’s exports, and maps every route to an expert slot. A replication kernel then multicasts each replica with the Tensor Memory Accelerator (TMA) into one of a few <a class="reference internal" href="#multi-level-symmetric-multicast">prebuilt aligned groups</a>, from its owner or through <a class="reference internal" href="#tma-weight-replication-and-sami-multi-port-broadcast">SAMI</a>. Both <a class="reference internal" href="#runtime-overlap">run beside the shared expert</a>: MegaMoE waits only for the plan, and only its <em>helper tiles</em>, its work on replicas, wait for the weights (Figure 6).</p>
+<p><img alt="Schematic: the MAIN and COPY streams of one rank with the READY gate; HALO-Q balancing four ranks to 1,000 routes each and repairing quotas; SAMI members multicasting slices; the original reference levels of 16, 8 and 4 ranks." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_design_overview.svg" /></p>
+<p><em>Figure 6. ISER-MoE in one MoE layer (schematic). (a) One rank under DEP: the highest-priority COPY stream runs HALO-Q and the weight replication (one fused kernel in the merged implementation) beside the shared expert; helper tiles wait at the READY gate until every rank has reached READY counter γ, which advances once per invocation, and a reuse fence orders the next layer’s HALO-Q after MegaMoE. (b) HALO-Q on ranks 0–3: balance to the water level T, then quota repair. (c) SAMI with g = 4 and owner GPU 0. (d) Original reference levels of P, P/2 and P/4 ranks at EP16 with S = 4 helper slots per rank (h0–h3); PR #21373 adds the aligned two-rank level.</em></p>
+<section id="halo-q-scheduler">
+<span id="31-halo-q-scheduler"></span><h3>3.1 HALO-Q Scheduler<a class="headerlink" href="#halo-q-scheduler" title="Link to this heading">#</a></h3>
+<p>HALO-Q runs on the GPU once per MoE layer invocation, with no host step, and pursues two objectives in order:</p>
+<ul class="simple">
+<li><p><strong>Objective 1, balance.</strong> MegaMoE finishes a layer with its most loaded rank, so HALO-Q uses the <em>water level</em> <span class="math notranslate nohighlight">\(T=\lceil\sum_r L_r/P\rceil\)</span> (the mean rank load rounded up) as its target.</p></li>
+<li><p><strong>Objective 2, locality.</strong> A route served off its source rank costs a token sent in dispatch and returned in combine, so among balanced routings HALO-Q calculates as many tokens as possible locally.</p></li>
+</ul>
+<p>It plans in five stages:</p>
+<ol class="arabic simple">
+<li><p><strong>Count exchange.</strong> Ranks exchange their <span class="math notranslate nohighlight">\(E\)</span> route counts through a symmetric NVLink buffer and run the same deterministic planner, as in UltraEP, so all obtain the same plan.</p></li>
+<li><p><strong>Placement (Objective 1).</strong> HALO-Q repeatedly takes the busiest rank above <span class="math notranslate nohighlight">\(T\)</span> that can still export, and its heaviest home expert not yet exported. The expert goes to an aligned group, with or without the owner, whose members all have a free helper slot: at the finest level that can absorb the whole expert at <span class="math notranslate nohighlight">\(T\)</span> (coarser only if none there has room), the group with the most room below <span class="math notranslate nohighlight">\(T\)</span>. Up to the owner’s excess over <span class="math notranslate nohighlight">\(T\)</span> of the expert’s routes move there, coldest member first. With <span class="math notranslate nohighlight">\(S\)</span> helper slots per rank, each owner exports at most <span class="math notranslate nohighlight">\(S\)</span> experts, among its <span class="math notranslate nohighlight">\(\min(S,H)\)</span> heaviest, and each rank receives at most <span class="math notranslate nohighlight">\(S\)</span> replicas.</p></li>
+<li><p><strong>Slot coloring.</strong> Each placed expert gets one helper index free on all members of its group.</p></li>
+<li><p><strong>Quota repair (Objective 2).</strong> Placement fixes each replicated expert’s total quota, not its split among hosts, so two ranks may send each other tokens of different experts; in two round-robin passes over rank pairs, partners trade equal amounts of spare quota on experts both host, canceling such flows at unchanged loads.</p></li>
+<li><p><strong>Route rewrite, local first.</strong> Each rank fills its own quota first, and surplus routes fill other hosts’ spare quotas in rank order, as in UltraEP’s local-first cumulative quotas and <a class="reference external" href="https://github.com/MoonshotAI/MoonEP">MoonEP</a>’s prefix sums.</p></li>
+</ol>
+</section>
+<section id="multi-level-symmetric-multicast">
+<span id="32-multi-level-symmetric-multicast"></span><h3>3.2 Multi-Level Symmetric Multicast<a class="headerlink" href="#multi-level-symmetric-multicast" title="Link to this heading">#</a></h3>
+<p>ISER-MoE predefines aligned rank groups and lets HALO-Q select the destination group for each exported expert. For power-of-two EP, the placement hierarchy can extend through groups of <span class="math notranslate nohighlight">\(P,P/2,\ldots,2\)</span> consecutive ranks: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/21373">PR #21373</a> adds the aligned two-rank level. Figure 6(d) illustrates the original 16/8/4-rank levels at EP16. The <a class="reference internal" href="#lower-bound-analysis-of-hierarchical-and-free-slot-usage">slot-usage comparison</a> is presented in the Discussion.</p>
+<p>The extension separates logical placement groups from their copy paths. At power-of-two EP4–EP16, the multicast ladder includes pairs. At EP32 and non-power-of-two EP, pair records support multicast of the large weight planes and unicast of the small planes into receiver helper rows. Pair and transport-team multicast objects are reused across helper sets; coarse levels retain per-set mappings.</p>
+<p>In the original arena, the default <a class="reference internal" href="#configuration">helper-slot mode</a>, <code class="docutils literal notranslate"><span class="pre">per_layer_resident</span></code>, gives each MoE layer its own helper set, so the coarse-level multicast-object count grows with the number of MoE layers; <code class="docutils literal notranslate"><span class="pre">shared_banks</span></code> uses two sets for all layers. The pair extension’s reuse scheme changes the object accounting, so the number of logical groups is not itself the CUDA multicast-object count. This post does not measure the MLID budget at large EP sizes or with multiple model instances.</p>
+<p>Each rank holds its <span class="math notranslate nohighlight">\(H\)</span> home experts in slots <span class="math notranslate nohighlight">\([0,H)\)</span> and <span class="math notranslate nohighlight">\(S\)</span> helper slots after them, allocated in peer-accessible CUDA fabric-handle memory; a <em>broadcast</em> installs an expert’s weights and block scales (its <em>bundle</em>) in one helper slot on every member of an aligned group.</p>
+<p><strong>Symmetric helper slots.</strong> A multicast store lands at the same offset on every member, so a broadcast needs one helper index free on all members. For power-of-two EP, aligned groups are nested or disjoint: coarse-to-fine coloring needs at most as many indices as the maximum number of broadcasts containing any rank. <a class="reference internal" href="#lower-bound-analysis-of-hierarchical-and-free-slot-usage">Section 6.1</a> compares the achievable load-balance bounds under Hierarchical and Free usage.</p>
+</section>
+<section id="tma-weight-replication-and-sami-multi-port-broadcast">
+<span id="33-tma-weight-replication-and-sami-multi-port-broadcast"></span><h3>3.3 TMA Weight Replication and SAMI Multi-Port Broadcast<a class="headerlink" href="#tma-weight-replication-and-sami-multi-port-broadcast" title="Link to this heading">#</a></h3>
+<p>The replication kernel copies with TMA from streaming multiprocessors (SMs), avoiding a CE’s host round trip: warps stage 8-KiB slices in shared memory and store them to the group’s multicast address (<code class="docutils literal notranslate"><span class="pre">multimem.cp.async.bulk</span></code>), and the switch writes each slice into every member’s helper slot. In <em>owner-direct</em> replication, the owner, a group member, multicasts the whole bundle through its own port. With SAMI, the <span class="math notranslate nohighlight">\(g\)</span> members share the injection in two pipelined steps, with no barrier or reassembly: member <span class="math notranslate nohighlight">\(i\)</span> pulls each slice <span class="math notranslate nohighlight">\(j\equiv i \pmod g\)</span> from the owner (s1) and stores it through its own port to the multicast address (s2), and the switch delivers it to every member (s3).</p>
+<p>SAMI is thus a scatter + all-gather broadcast whose all-gather is in-switch multicast, as in NCCL’s NVLS AllGather: the owner still sends the expert’s <span class="math notranslate nohighlight">\(W\)</span> bytes, but each member injects only <span class="math notranslate nohighlight">\(W/g\)</span>, so the switch output fed by one port falls from <span class="math notranslate nohighlight">\(gW\)</span> to <span class="math notranslate nohighlight">\(W\)</span> and the issue work is shared, at the price of <span class="math notranslate nohighlight">\(W/g\)</span> extra inbound traffic per non-owner member. Since a multicast writer must be a member, SAMI also serves owners outside the group.</p>
+<p><strong>Per-slot replication policy.</strong> In the original runtime evaluated here, owner-direct replication serves a slot whose owner is in the group <span class="math notranslate nohighlight">\(G\)</span> if every broadcast that meets <span class="math notranslate nohighlight">\(G\)</span> targets exactly <span class="math notranslate nohighlight">\(G\)</span> with its owner inside, or if this is the owner’s widest broadcast into a group containing it; SAMI serves the rest. Whether this rule pays off with many owners is untested, and <a class="reference internal" href="#sami-broadcast-on-gb200">one measurement</a> shows it picking the slower path.</p>
+</section>
+<section id="runtime-overlap">
+<span id="34-runtime-overlap"></span><h3>3.4 Runtime Overlap<a class="headerlink" href="#runtime-overlap" title="Link to this heading">#</a></h3>
+<p>Planning and weight replication start immediately after routing to overlap with shared-expert computation, as motivated by the <a class="reference internal" href="#more-weight-copy-overhead-than-routed-expert-computation">peak-rate analysis</a>:</p>
+<ul class="simple">
+<li><p><strong>Two streams.</strong> The COPY stream, the model’s highest-priority stream, runs HALO-Q and then the copy, in the merged implementation as one fused kernel with one cooperative thread array (CTA) on each of <code class="docutils literal notranslate"><span class="pre">auxiliary_sms</span></code> SMs (four by default). Meanwhile, the MAIN stream quantizes the routed input and computes the shared expert, which DeepSeek-V4 hands to <code class="docutils literal notranslate"><span class="pre">MoE.load_balancer_overlap(fn)</span></code> to run right after the COPY work is submitted.</p></li>
+<li><p><strong>MAIN waits only for the plan,</strong> on the device and without holding an SM, then launches MegaMoE; dispatch never waits for the copy, and there is no steady-state host wait.</p></li>
+<li><p><strong>Only helper tiles wait for weights.</strong> MegaMoE claims tiles in slot order, home slots first, so dispatch overlaps the home tiles, and combine overlaps the later home and helper tiles. After its writes drain, each rank’s replication kernel multicasts the invocation’s READY counter <span class="math notranslate nohighlight">\(\gamma\)</span> to every rank, even with nothing to copy, and each MegaMoE CTA waits at the READY gate before its first helper tile until every rank has reached <span class="math notranslate nohighlight">\(\gamma\)</span>.</p></li>
+</ul>
+<p>To first order, the copy is exposed only if it outlasts the shared expert and the home tiles; a copy issued inside MegaMoE, as described for MegaFlux, would miss the shared-expert window. <strong>Overlap depends on SM scheduling:</strong> the fused kernel’s CTAs must get SMs while MAIN runs input quantization and the shared expert. MAIN starts MegaMoE only after every one of these CTAs has finished its share of HALO-Q, so the copy already holds its <code class="docutils literal notranslate"><span class="pre">auxiliary_sms</span></code> SMs when persistent MegaMoE CTAs start waiting at the READY gate. Input quantization and, on the SM100 family, DeepSeek-V4’s fused shared-expert kernel leave these SMs free, in response to <a class="reference internal" href="#sami-broadcast-on-gb200">measured interference</a>; this post does not evaluate the effect of this SM budget.</p>
+</section>
+</section>
+<section id="performance-evaluation">
+<span id="4-performance-evaluation"></span><h2>4. Performance Evaluation<a class="headerlink" href="#performance-evaluation" title="Link to this heading">#</a></h2>
+<section id="methodology">
+<span id="41-methodology"></span><h3>4.1 Methodology<a class="headerlink" href="#methodology" title="Link to this heading">#</a></h3>
+<p>The five experiments in this section test ISER-MoE from the plan alone up to the whole serving system, all with DeepSeek-V4-Pro’s MoE layer and NVFP4 routed experts; OFF has no helper slots, and ON has <span class="math notranslate nohighlight">\(S\)</span> per rank. A GB200 compute tray holds four GPUs, so EP8 spans two trays. Unless stated otherwise, kernel times are the slowest rank’s median over 20 iterations, reported as the time reduction (OFF − ON)/OFF or the speedup OFF/ON, and component results come from pre-merge builds, each labeled where it appears.</p>
+</section>
+<section id="component-evaluation">
+<span id="42-component-evaluation"></span><h3>4.2 Component Evaluation<a class="headerlink" href="#component-evaluation" title="Link to this heading">#</a></h3>
+<section id="halo-q-trace-replay">
+<span id="421-halo-q-trace-replay"></span><h4>4.2.1 HALO-Q Trace Replay<a class="headerlink" href="#halo-q-trace-replay" title="Link to this heading">#</a></h4>
+<p>A simulator replays the mixed trace at 8,192 tokens/rank through the reference HALO-Q planner’s stages, planning each (iteration, layer) independently and counting assignments, not time.</p>
+<p><strong>With four helper slots per rank, HALO-Q removed 98.4–99.0% of the excess load</strong>: the 61-layer mean <span class="math notranslate nohighlight">\(R\)</span> fell from 1.20/1.44/1.84/2.24 to 1.002/1.006/1.010/1.020 at EP4/8/16/24, and every layer stayed within 13% of balance (Figure 7(a)); three slots removed 94.9–95.9%. An earlier <em>all-rank policy</em>, replicating four experts on every rank, left a mean <span class="math notranslate nohighlight">\(R\)</span> of 1.038/1.193/1.348 at EP8/16/24.</p>
+<p><img alt="Per-layer R at EP4 to EP24, flat near 1 with HALO-Q (means 1.002 to 1.020), and bars of the largest per-rank token send-out and receive-in, down 2–8% and 19–55%." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_haloq_eval.svg" /></p>
+<p><em>Figure 7. HALO-Q in simulated trace replay (DeepSeek-V4-Pro, mixed trace, 8,192 tokens/rank). (a) Balance: per-layer R without balancing and with HALO-Q at four (solid) or three (dashed) helper slots per rank, sorted by R without balancing; labels: 61-layer means, three slots in parentheses. (b) Locality (four helper slots): the most routed tokens any rank sends out or receives in during dispatch, mean per iteration and layer, and the change from no balancing.</em></p>
+<p>For locality, the most routed tokens any rank sent out fell by 2–8%, and the most any rank received in by 19–55% (Figure 7(b)); quota repair alone cut both by a further 0.5–2.3%.</p>
+<p>A static per-layer plan with the same four extra slots per rank, built by a re-implementation of DeepSeek’s EPLB rule from past or whole-trace loads under an optimistic even token split, left <span class="math notranslate nohighlight">\(R\)</span> = 1.06–1.07 at EP8, against 1.006. By the <a class="reference internal" href="#expert-parallel-moe">GB200 fit</a>, extrapolated below its fitted range and without helper-tile overhead, it would still capture an estimated 85–88% of the kernel-time gain of per-invocation planning, so the two approaches are complementary.</p>
+<p>HALO-Q’s chosen group excluded the owner in 53% of broadcasts at EP8 and 76% at EP16–EP24, and the evaluated copy path uses SAMI for these groups; restricted to groups containing the owner, <span class="math notranslate nohighlight">\(R\)</span> rose to 1.038/1.201/1.296 at EP8/16/24.</p>
+</section>
+<section id="sami-broadcast-on-gb200">
+<span id="422-sami-broadcast-on-gb200"></span><h4>4.2.2 SAMI Broadcast on GB200<a class="headerlink" href="#sami-broadcast-on-gb200" title="Link to this heading">#</a></h4>
+<p>These reference measurements, taken with a CE prototype and pre-merge builds of the replication kernel rather than the merged implementation, broadcast bundles from one owner to <span class="math notranslate nohighlight">\(g\)</span> GPUs (Figure 8).</p>
+<p><img alt="Four panels: SAMI 1.13×, 2.03× and 3.76× faster than owner-direct multicast at 4, 8 and 16 GPUs; SAMI at 481 GB/s from four copy SMs; SAMI above tuned ncclBroadcast; span increases of 2.0/0.6/0.3% for SAMI against 36.3/14.7/2.9%." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_sami_eval.svg" /></p>
+<p><em>Figure 8. Broadcasts from one owner on GB200 (reference measurements). (a) CE prototype (g = 4: two trays, 144 MiB; g = 8, 16: four trays, 160 MiB). (b) Pre-merge replication kernel, standalone, slowest rank: eight 37.16 MB bundles (283.5 MiB) to 8 GPUs, owner included. (c) One broadcast at a time, until the slowest rank holds it: fastest SAMI variant against fastest tuned ncclBroadcast (nccl-tests, NCCL 2.31.2). (d) Time increase from the shared expert’s start to the end of MegaMoE while the build of (b) copies four experts (4 × 36 MiB) during the shared expert (EP8). Labels in (a, d): SAMI’s speedup.</em></p>
+<p><strong>Multi-port injection.</strong> On a CE prototype that issues SAMI’s steps as host CE copies, in the measured placements (Figure 8(a)), a single injecting port lost per-receiver bandwidth as <span class="math notranslate nohighlight">\(g\)</span> grew, while SAMI stayed near the owner’s egress limit, 1.13×, 2.03× and 3.76× faster at <span class="math notranslate nohighlight">\(g\)</span> = 4, 8 and 16. At <span class="math notranslate nohighlight">\(g=4\)</span>, HALO-Q’s group size at EP8 and EP16 in replay, one port’s 535 GB/s per receiver on four trays at 160 MiB (Figure 5(b)) is already close to that limit.</p>
+<p><strong>SM-issued copies</strong> add a per-SM issue limit. In a pre-merge build of the replication kernel, which, like the merged implementation, uses four SMs by default (Figure 8(b)), owner-direct multicast was issue-bound, rising from 46 GB/s on one SM to 258 GB/s on eight, while SAMI, with every member issuing a share, reached 481 GB/s from four SMs on. The default <a class="reference internal" href="#tma-weight-replication-and-sami-multi-port-broadcast">per-slot rule</a> nonetheless picks owner-direct here.</p>
+<p><strong>Against tuned NCCL</strong> (Figure 8(c)), each broadcast completes on every rank before the next starts, and NCCL 2.31.2 was tuned at every point over protocol, buffer size, channel count, buffer registration and CUDA-graph launch; the LL128 protocol with CUDA-graph launch won all 12 points. <strong>SAMI’s fastest variant, mostly another TMA build with the owner outside the multicast group, was 1.07/1.21/1.34× faster for one expert (35.4 MiB) at 8/12/16 GPUs</strong> and 1.22–1.29× faster for eight. With the owner inside the group, as in Figure 8(b), SAMI only matched tuned ncclBroadcast (1.00×) for eight experts on 8 GPUs, as the owner also receives every replica, which slows the pulls it serves.</p>
+<p><strong>Overlap with a shared expert.</strong> In Figure 8(d), the pre-merge build copied four experts (EP8, balanced synthetic routing, dummy weights) during a 7168→2048→7168 FP8 shared expert, narrower than the model’s. SAMI’s copy took 310–330 µs and lengthened the span by 2.0/0.6/0.3% at 8K/16K/32K tokens/rank, against 0.98–1.20 ms and 36.3/14.7/2.9% for owner-direct multicast, mostly where its copy outlasted the shared expert (256/480/936 µs); SAMI slowed the shared expert by 10/4.8/2.0% and MegaMoE by at most 0.5%.</p>
+<p><strong>The overlap degrades when the copy competes for SMs.</strong> With an earlier revision of the replication kernel on eight SMs, none set aside, SAMI slowed the shared expert at 8K tokens/rank by 49%: the copy ran beside the shared expert’s GEMMs for 99.9% of its time. The merged implementation’s <code class="docutils literal notranslate"><span class="pre">auxiliary_sms</span></code> budget is the design response; this post does not evaluate its effect.</p>
+</section>
+<section id="megamoe-kernel-time-with-replicas">
+<span id="423-megamoe-kernel-time-with-replicas"></span><h4>4.2.3 MegaMoE Kernel Time with Replicas<a class="headerlink" href="#megamoe-kernel-time-with-replicas" title="Link to this heading">#</a></h4>
+<p>Each measurement times one MegaMoE call for a DeepSeek-V4-Pro layer on GB200, OFF and ON with four helper slots per rank, on a pre-merge revision with an FP4 combine instead of the default BF16. ON’s replicas, routes (from the all-rank policy) and READY flags were installed before timing, so <strong>the times exclude HALO-Q, the copy and any READY wait</strong>; OFF ran before and after ON and was averaged, and outputs matched bitwise.</p>
+<p><img alt="MegaMoE kernel time OFF and ON: 1.24×, 1.52×, 1.21× and 1.22× on power-law cells, ON near balanced routing; over 61 layers, mean 1,999 µs OFF against 1,624 µs ON (1.23×)." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_megamoe_kernel.svg" /></p>
+<p><em>Figure 9. MegaMoE kernel time on GB200 (DeepSeek-V4-Pro layer, NVFP4, FP4 combine, four helper slots per rank; slowest rank, median of 20 iterations; replicas and routes from an earlier all-rank policy, installed before timing). (a) Power-law routing (exponent 0.8) at EP4 and EP8, 8K or 16K tokens/rank. (b) 61 layers, routes sampled from the trace (EP8, 8,192 tokens/rank); L20: layer 20. Dashes: balanced routing (OFF).</em></p>
+<p>With <strong>power-law routing</strong> (exponent 0.8) at EP4 and EP8 and 8,192 or 16,384 tokens/rank, replicas cut the skewed cells’ <span class="math notranslate nohighlight">\(R\)</span> from 1.27–1.69 to 1.00–1.03 and kernel time by 17.2–34.1% (1.21–1.52×), <strong>to within 0.3–3.5% of balanced routing</strong> (Figure 9(a)); on balanced routing, time changed by −0.7% to +0.4%.</p>
+<p>For <strong>trace routing</strong>, EP8 routes at 8,192 tokens/rank were sampled per layer from the mixed trace’s expert popularity, calibrated to the layer’s EP8 imbalance within 3% (one seed). Every layer improved, from 1.3% (layer 45, <span class="math notranslate nohighlight">\(R=1.12\)</span>) to 42.8% (layer 20, <span class="math notranslate nohighlight">\(R=2.36\)</span>), and the mean fell from 1,999.3 to 1,624.3 µs (1.23×), 2.1% above balanced routing (Figure 9(b)); ON time was uncorrelated with <span class="math notranslate nohighlight">\(R\)</span> (Pearson 0.01). Both routings are stationary, so this measures the kernel’s gain from replicas, not the value of per-invocation planning.</p>
+<p><strong>Costs outside the kernel</strong> come from earlier builds. Run sequentially, HALO-Q took 19.6–29.2 µs and the replication kernel (eight SMs, READY included) 128.7–340.6 µs, so the copy must overlap other work. Beside a 300 µs single-CTA delay kernel that stood in for the shared expert but moved no data, with ranks arriving 10 µs apart, ON took 15.6–29.2% less time than OFF on the skewed cells and 0.2–1.5% more on the balanced ones, planning, copy and READY waits included.</p>
+</section>
+</section>
+<section id="end-to-end-serving-evaluation">
+<span id="43-end-to-end-serving-evaluation"></span><h3>4.3 End-to-End Serving Evaluation<a class="headerlink" href="#end-to-end-serving-evaluation" title="Link to this heading">#</a></h3>
+<section id="end-to-end-prefill-serving">
+<span id="431-end-to-end-prefill-serving"></span><h4>4.3.1 End-to-End Prefill Serving<a class="headerlink" href="#end-to-end-prefill-serving" title="Link to this heading">#</a></h4>
+<p>Figure 10 shows the whole system serving prefill only: DeepSeek-V4-Pro (NVFP4) in TensorRT LLM with attention DP. For GSM8K, <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> measured OFF and ON request throughput at DEP8 with one output token, using the A/B/C runs reported in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/19646">PR #19646</a>. ON used three helper slots per rank and four auxiliary SMs. FB uses TensorRT LLM’s <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-analysis.md#moe-expert-load-balance-analysis-perfect-router">perfect router</a> to force synthetic, perfectly balanced routing.</p>
+<p>On GB200, ON raised request throughput by <strong>6.9%</strong>, from 2,285 to 2,444 requests/s, against FB’s 7.8%, reaching <strong>99.2% of FB’s throughput</strong> (Figure 10). On pre-release Rubin GPUs, ON gained <strong>12.6%</strong> against FB’s 13.4%, reaching <strong>99.3% of FB</strong>; a second run on other nodes reached 99.1%. These serving measurements do not isolate multicast against a point-to-point copy baseline.</p>
+<p><img alt="Context-only GSM8K results at DEP8: OFF, ON and forced balanced routing on GB200 and pre-release Rubin GPUs; ON raises request throughput by 6.9% and 12.6% and reaches 99.2% and 99.3% of forced balanced-routing throughput." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_e2e_context_only.svg" /></p>
+<p><em>Figure 10. End-to-end (E2E) context-only (prefill-only) serving of DeepSeek-V4-Pro (NVFP4) on GSM8K at DEP8 on GB200 and pre-release Rubin GPUs: request throughput normalized to OFF (load balancer off), with ON (ISER-MoE) and FB (force expert balance: OFF with routing forced to be perfectly balanced; its outputs are not meaningful).</em></p>
+</section>
+<section id="end-to-end-disaggregated-serving-on-a-gb300-nvl72-rack">
+<span id="432-end-to-end-disaggregated-serving-on-a-gb300-nvl72-rack"></span><h4>4.3.2 End-to-End Disaggregated Serving on a GB300 NVL72 Rack<a class="headerlink" href="#end-to-end-disaggregated-serving-on-a-gb300-nvl72-rack" title="Link to this heading">#</a></h4>
+<p>DeepSeek-V4-Pro (NVFP4) was also served with prefill and decode disaggregated (<a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a>) on a GB300 NVL72 rack, in configurations C1–C4. Decoding used speculative decoding with three draft tokens and acceptance fixed at 2.01; clients replayed the agentic coding traces with <a class="reference external" href="https://github.com/ai-dynamo/aiperf">AIPerf</a> for 1,200 s after warm-up. ISER-MoE ran on the prefill instances with three helper slots per rank, and key-value (KV) cache reuse was 94.6–95.2%, equal in both arms of every configuration.</p>
+<p>In C3 and C4, ON kept replicas resident, as the merged implementation’s default <code class="docutils literal notranslate"><span class="pre">per_layer_resident</span></code> mode does, and C4 also skipped replications that would move fewer than 256 routes, a threshold the merged implementation does not have. In C1–C3, the arms split the prefill instances and shared the decode instance; C4 ran each arm in its own job. Since serving varies between runs, each arm reports the best of repeated runs of one fixed configuration.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Config</p></th>
+<th class="head text-center"><p>Prefill</p></th>
+<th class="head text-center"><p>Decode</p></th>
+<th class="head text-center"><p>Total GPUs</p></th>
+<th class="head text-center"><p>Concurrency</p></th>
+<th class="head text-center"><p>P90 latency gain</p></th>
+<th class="head text-center"><p>Output throughput/GPU gain</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>C1</p></td>
+<td class="text-center"><p>5 × DEP8</p></td>
+<td class="text-center"><p>DEP16</p></td>
+<td class="text-center"><p>56</p></td>
+<td class="text-center"><p>2,626</p></td>
+<td class="text-center"><p>4.0%</p></td>
+<td class="text-center"><p>1.6%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>C2</p></td>
+<td class="text-center"><p>3 × DEP8</p></td>
+<td class="text-center"><p>DEP16</p></td>
+<td class="text-center"><p>40</p></td>
+<td class="text-center"><p>1,152</p></td>
+<td class="text-center"><p>4.1%</p></td>
+<td class="text-center"><p>1.4%</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>C3</p></td>
+<td class="text-center"><p>2 × DEP8</p></td>
+<td class="text-center"><p>DEP32</p></td>
+<td class="text-center"><p>48</p></td>
+<td class="text-center"><p>736</p></td>
+<td class="text-center"><p>3.1%</p></td>
+<td class="text-center"><p>1.6%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>C4</p></td>
+<td class="text-center"><p>1 × DEP8</p></td>
+<td class="text-center"><p>DEP32</p></td>
+<td class="text-center"><p>40</p></td>
+<td class="text-center"><p>388</p></td>
+<td class="text-center"><p>4.3%</p></td>
+<td class="text-center"><p>1.9%</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Latency gain is <code class="docutils literal notranslate"><span class="pre">OFF/ON</span> <span class="pre">−</span> <span class="pre">1</span></code>; output throughput per GPU gain is <code class="docutils literal notranslate"><span class="pre">ON/OFF</span> <span class="pre">−</span> <span class="pre">1</span></code>. Both are reported as percentages.</p>
+<p><img alt="Output throughput per GPU against P90 request latency for C1 to C4, each ON point above and left of its OFF point: P90 3.1–4.3% better and throughput 1.4–1.9% higher." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_e2e_disagg.svg" /></p>
+<p><em>Figure 11. Disaggregated serving of DeepSeek-V4-Pro (NVFP4) on a GB300 NVL72 rack with agentic coding traces: output throughput per GPU against P90 request E2E latency, OFF and ON, C1–C4 in order of concurrency. Labels: OFF/ON − 1 for latency and ON/OFF − 1 for throughput (tput); each arm’s best run.</em></p>
+<p><strong>All four configurations improved both request latency and output throughput per GPU (Figure 11).</strong></p>
+</section>
+</section>
+</section>
+<section id="using-iser-moe-in-tensorrt-llm">
+<span id="5-using-iser-moe-in-tensorrt-llm"></span><h2>5. Using ISER-MoE in TensorRT LLM<a class="headerlink" href="#using-iser-moe-in-tensorrt-llm" title="Link to this heading">#</a></h2>
+<p>Per-layer dynamic EPLB is a prototype feature: all four of its configuration fields carry prototype status. It copies helper weights GPU to GPU through the NVLink switch, so online EPLB’s host shared-memory and GDRCopy setup does not apply.</p>
+<section id="configuration">
+<span id="51-configuration"></span><h3>5.1 Configuration<a class="headerlink" href="#configuration" title="Link to this heading">#</a></h3>
+<p>The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer">per-layer dynamic EPLB guide</a> gives this example for a model with 384 routed experts on 8 GPUs:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span>&gt;<span class="w"> </span>./config_per_layer_dynamic.yaml<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
+<span class="s">enable_attention_dp: true</span>
+<span class="s">cuda_graph_config: null</span>
+<span class="s">moe_config:</span>
+<span class="s">    backend: MEGAMOE_CUTEDSL</span>
+<span class="s">    load_balancer:</span>
+<span class="s">      mode: per_layer_dynamic</span>
+<span class="s">      num_slots: 416    # 384 experts + 4 helper slots on each of 8 EP ranks</span>
+<span class="s">      auxiliary_sms: 4  # optional; 4 is the default</span>
+<span class="s">      helper_slot_mode: per_layer_resident  # optional; the default</span>
+<span class="s">EOF</span>
+</pre></div>
+</div>
+<p>Pass the file with <code class="docutils literal notranslate"><span class="pre">--config</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> (with <code class="docutils literal notranslate"><span class="pre">--tp</span> <span class="pre">8</span> <span class="pre">--ep</span> <span class="pre">8</span></code>) or <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> (with <code class="docutils literal notranslate"><span class="pre">--tp_size</span> <span class="pre">8</span> <span class="pre">--ep_size</span> <span class="pre">8</span></code>), since <code class="docutils literal notranslate"><span class="pre">num_slots</span></code> assumes eight EP ranks; the <code class="docutils literal notranslate"><span class="pre">load_balancer</span></code> section can also be a path to a YAML file with the same fields, and omitting it turns load balancing off (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/wide_ep/README.md#num_slots"><code class="docutils literal notranslate"><span class="pre">num_slots</span></code> field</a>).</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">num_slots</span></code></strong> <span class="math notranslate nohighlight">\(=E+P\cdot S\)</span>: each rank keeps its <span class="math notranslate nohighlight">\(H=E/P\)</span> home experts and gets <span class="math notranslate nohighlight">\(S\)</span> helper slots. At EP8, 416 gives DeepSeek-V4-Pro <span class="math notranslate nohighlight">\(S=4\)</span>, and 408 gives <span class="math notranslate nohighlight">\(S=3\)</span>.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">helper_slot_mode</span></code></strong>: the default, <code class="docutils literal notranslate"><span class="pre">per_layer_resident</span></code>, gives every MoE layer its own helper slots (about 6.4 GiB per GPU for DeepSeek-V4-Pro with <span class="math notranslate nohighlight">\(S=3\)</span>, per the guide) and skips a broadcast when every member of its group already holds the expert in the assigned helper slot. <code class="docutils literal notranslate"><span class="pre">shared_banks</span></code> alternates all layers between two banks and copies every helper expert in every forward pass; for DeepSeek-V4-Pro at <span class="math notranslate nohighlight">\(S=4\)</span>, it cuts helper storage per GPU from 9.07 GB for 61 per-layer sets to about 297 MB (both computed).</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">auxiliary_sms</span></code></strong> (default 4, range 1–8, below the GPU’s SM count) is the number of SMs, one CTA each, of the kernel that runs HALO-Q and then the copy. Input quantization and, on the SM100 family, DeepSeek-V4’s fused shared-expert kernel leave these SMs free, so raising the value takes SMs from that work.</p></li>
+</ul>
+</section>
+<section id="requirements-and-constraints">
+<span id="52-requirements-and-constraints"></span><h3>5.2 Requirements and Constraints<a class="headerlink" href="#requirements-and-constraints" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Item</p></th>
+<th class="head text-left"><p>Requirement</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>Backend</p></td>
+<td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">MEGAMOE_CUTEDSL</span></code> only; <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> resolves to it, and other explicit backends are rejected.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Model</p></td>
+<td class="text-left"><p>An architecture in <code class="docutils literal notranslate"><span class="pre">moe_model_arch_list</span></code> with NVFP4 MoE weights, at most 384 routed experts, and an expert count divisible by the EP size; results here cover DeepSeek-V4-Pro only.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>GPUs</p></td>
+<td class="text-left"><p>Evaluated on GB200, GB300 and pre-release Rubin GPUs; the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer">per-layer dynamic EPLB guide</a> lists supported GPUs and build requirements. All EP ranks must be in one multicast-capable NVLink domain, with CUDA 13.1 or later for the TMA multicast copy.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Parallelism</p></td>
+<td class="text-left"><p>Attention DP with pure EP (no MoE tensor or pipeline parallelism), an even EP size from 2 to 32, and no MoE smart router; unsupported setups raise an error.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>CUDA graphs</p></td>
+<td class="text-left"><p>Not supported: a non-null <code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code> is replaced with <code class="docutils literal notranslate"><span class="pre">null</span></code>, with a warning, and any <code class="docutils literal notranslate"><span class="pre">prefill_cuda_graph_backend</span></code> other than <code class="docutils literal notranslate"><span class="pre">DISABLED</span></code> is rejected.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Launch queues</p></td>
+<td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">CUDA_SCALE_LAUNCH_QUEUES=4x</span></code> before CUDA initializes: the LLM API behind <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> sets it; a process that initializes CUDA before creating its <code class="docutils literal notranslate"><span class="pre">LLM</span></code> instance, or that does not use the LLM API, such as the layer-wise benchmarks, must export it.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Other</p></td>
+<td class="text-left"><p>Distributed Weight Data Parallelism (<a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP</a>) is not supported.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Failure handling:</strong> HALO-Q traps once a peer exceeds its spin bound (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md#scheduler--eplb-constraints">MoE developer guide</a>), MegaMoE traps after 120 s at the READY gate, and there is no fallback to home experts.</p>
+</section>
+<section id="performance-measurement">
+<span id="53-performance-measurement"></span><h3>5.3 Performance Measurement<a class="headerlink" href="#performance-measurement" title="Link to this heading">#</a></h3>
+<p><strong>First measure the imbalance</strong> with the expert statistics (<code class="docutils literal notranslate"><span class="pre">EXPERT_STATISTIC_PATH</span></code>, <code class="docutils literal notranslate"><span class="pre">EXPERT_STATISTIC_ITER_RANGE</span></code>) and <code class="docutils literal notranslate"><span class="pre">report_load_statistics.py</span></code> from the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#step-1-run-inference-and-collect-statistics">offline EPLB guide</a>: its <code class="docutils literal notranslate"><span class="pre">imbalance-ratio</span></code> column, (max − mean)/mean of the ranks’ routed tokens averaged over iterations, is the mean of <span class="math notranslate nohighlight">\(R-1\)</span>. In this mode, the statistics record expert IDs before HALO-Q, so they show the imbalance HALO-Q starts from.</p>
+<p><strong>Then compare OFF and ON in serving:</strong> OFF has no <code class="docutils literal notranslate"><span class="pre">load_balancer</span></code> section, and both use otherwise identical configurations with <code class="docutils literal notranslate"><span class="pre">cuda_graph_config:</span> <span class="pre">null</span></code>. OFF with <code class="docutils literal notranslate"><span class="pre">ENABLE_PERFECT_ROUTER=expert_ids</span></code> (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-analysis.md#moe-expert-load-balance-analysis-perfect-router">perfect router</a>) adds a balanced-routing reference (not a strict ceiling); its model outputs are not meaningful.</p>
+<p><strong>On a layer slice</strong>, the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/layer_wise_benchmarks/README.md">layer-wise benchmarks</a> run three DeepSeek-V4 arms: load balancer off, per-layer dynamic, and perfect router. The per-layer dynamic arm, run from <code class="docutils literal notranslate"><span class="pre">examples/layer_wise_benchmarks/</span></code> on one node with eight GPUs through the README’s OpenMPI launcher:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">NP</span><span class="o">=</span><span class="m">8</span><span class="w"> </span>./mpi_launch.sh<span class="w"> </span>-x<span class="w"> </span><span class="nv">MEGAMOE_COMBINE_FORMAT</span><span class="o">=</span>16e2m1xbf16<span class="w"> </span>-x<span class="w"> </span><span class="nv">CUDA_SCALE_LAUNCH_QUEUES</span><span class="o">=</span>4x<span class="w"> </span>./run.sh<span class="w"> </span>config_ctx.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span><span class="nv">$DSV4</span><span class="w"> </span>--layer-indices<span class="w"> </span><span class="m">7</span>,8<span class="w"> </span>--tokens-per-block<span class="w"> </span><span class="m">128</span><span class="w"> </span>--batch-size<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--seq-len-q<span class="w"> </span><span class="m">128</span><span class="w"> </span>--max-seq-len<span class="w"> </span><span class="m">512</span><span class="w"> </span>--moe-backend<span class="w"> </span>MEGAMOE_CUTEDSL<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--balance-method<span class="w"> </span>NotModified<span class="w"> </span>--moe-load-balancer<span class="w"> </span>eplb_per_layer_dynamic.yaml
+</pre></div>
+</div>
+<p>Here <code class="docutils literal notranslate"><span class="pre">eplb_per_layer_dynamic.yaml</span></code> is a file you create in that directory with the two lines <code class="docutils literal notranslate"><span class="pre">mode:</span> <span class="pre">per_layer_dynamic</span></code> and <code class="docutils literal notranslate"><span class="pre">num_slots:</span> <span class="pre">408</span></code>. <code class="docutils literal notranslate"><span class="pre">$DSV4</span></code> is a local checkpoint directory, and <code class="docutils literal notranslate"><span class="pre">MEGAMOE_COMBINE_FORMAT=16e2m1xbf16</span></code> selects the FP4 combine; <code class="docutils literal notranslate"><span class="pre">CUDA_SCALE_LAUNCH_QUEUES=4x</span></code> is exported because the layer-wise runner does not go through the LLM API, which sets it. Without <code class="docutils literal notranslate"><span class="pre">--replay-file-path</span></code>, repeated inputs leave the planned experts in the helper slots, so copies are skipped: a best case. On GB200 or GB300 NVL72 compute trays, which hold four GPUs each, run the same <code class="docutils literal notranslate"><span class="pre">./run.sh</span></code> arguments over two trays with the README’s Slurm launcher (<code class="docutils literal notranslate"><span class="pre">NODES=2</span> <span class="pre">NP=8</span> <span class="pre">./slurm_launch.sh</span></code>), setting the environment variables in front of it instead of with <code class="docutils literal notranslate"><span class="pre">-x</span></code>.</p>
+</section>
+<section id="applicability-and-evaluated-configurations">
+<span id="54-applicability-and-evaluated-configurations"></span><h3>5.4 Applicability and Evaluated Configurations<a class="headerlink" href="#applicability-and-evaluated-configurations" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Routing imbalance.</strong> In the <a class="reference internal" href="#megamoe-kernel-time-with-replicas">kernel measurements</a> (GB200, planning and copy excluded), the time saved at EP8 grew with <span class="math notranslate nohighlight">\(R\)</span>, from 1.3% (layer 45, <span class="math notranslate nohighlight">\(R=1.12\)</span>) to 42.8% (layer 20, <span class="math notranslate nohighlight">\(R=2.36\)</span>), while balanced routing changed by −0.7% to +0.4%.</p></li>
+<li><p><strong>Shared-expert overlap.</strong> Without one, only home tiles hide the copy: at most about one DeepSeek-V4-Pro-sized copy (GB300 peak-rate model, EP8, 8,192 tokens/rank), and none with the BF16 combine.</p></li>
+<li><p><strong>Prefill workloads.</strong> The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/parallel-strategy.md#best-practices">parallelism guide</a> recommends this mode for context-heavy serving whose hot experts change from batch to batch, and online EPLB for generation-heavy deployments that rely on CUDA graphs; generation is untested here.</p></li>
+<li><p><strong>Evaluated configurations.</strong> On hardware, EP4–EP8 for kernels and DEP8 for serving; in replay, EP4–EP24. No controlled hardware point used fewer than 8,192 tokens/rank.</p></li>
+</ul>
+</section>
+</section>
+<section id="discussion">
+<span id="6-discussion"></span><h2>6. Discussion<a class="headerlink" href="#discussion" title="Link to this heading">#</a></h2>
+<section id="lower-bound-analysis-of-hierarchical-and-free-slot-usage">
+<span id="61-lower-bound-analysis-of-hierarchical-and-free-slot-usage"></span><h3>6.1 Lower-Bound Analysis of Hierarchical and Free Slot Usage<a class="headerlink" href="#lower-bound-analysis-of-hierarchical-and-free-slot-usage" title="Link to this heading">#</a></h3>
+<p><strong>Hierarchical and Free slot usage have nearly the same algorithmic load-balancing limit in the tested Zipf workloads.</strong> Across EP8–EP512 and one to four helper slots per rank, the largest difference in the <strong>64-layer mean optimal imbalance ratio is below 0.0041 in R</strong>, or <strong>0.41 percentage points of mean rank load</strong>, at EP8 with one slot (Figure 13). This measures the best achievable balance under each placement rule, independently of the HALO-Q heuristic.</p>
+<p><strong>Optimization problem.</strong> For <span class="math notranslate nohighlight">\(m\in\{\mathrm{Free},\mathrm{Hierarchical}\}\)</span>, given expert-token counts <span class="math notranslate nohighlight">\(w_e\)</span> and their owner ranks, choose binary replica placements <span class="math notranslate nohighlight">\(x\)</span> and token assignments <span class="math notranslate nohighlight">\(a_{er}\in\mathbb Z_{\ge0}\)</span> to minimize the largest final rank load <span class="math notranslate nohighlight">\(T\)</span>. With <span class="math notranslate nohighlight">\(\bar L=\sum_e w_e/P\)</span>, the objective and load constraints are</p>
+<div class="math notranslate nohighlight">
+\[R_m^*=\min_{T,a,x}\frac{T}{\bar L},\qquad
+\sum_r a_{er}=w_e,\qquad
+\sum_e a_{er}\le T.\]</div>
+<p>Tokens may execute only on an expert’s owner or a rank holding its replica. Each rank may export at most <span class="math notranslate nohighlight">\(S\)</span> distinct experts and hold at most <span class="math notranslate nohighlight">\(S\)</span> helper replicas; no rank both exports home-expert load and processes other owners’ tokens. The placement constraints distinguish the two models:</p>
+<ul class="simple">
+<li><p><strong>Free:</strong> each exported expert may use any subset of receiver ranks.</p></li>
+<li><p><strong>Hierarchical:</strong> each exported expert uses one aligned group of size <span class="math notranslate nohighlight">\(2,4,\ldots,P\)</span>. Every group member consumes one helper slot, including an owner inside the group or a member assigned zero tokens.</p></li>
+</ul>
+<p>Every Hierarchical plan is also feasible under Free placement after removing unused replicas, so <span class="math notranslate nohighlight">\(R_{\mathrm{free}}^*\le R_{\mathrm{hier}}^*\)</span>. Figure 12 illustrates the placement rules; the small average gap above is specific to the tested workloads.</p>
+<p><img alt="Free places experts independently; Hierarchical places the same expert across each selected group." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_slot_usage.svg" /></p>
+<p><em>Figure 12. Free places experts independently in each slot. Hierarchical places the same expert on every rank in a selected group. Each box is one helper slot; letters identify experts.</em></p>
+<p><strong>Solving the bound.</strong> Mixed-integer linear programming gives lower bounds on <span class="math notranslate nohighlight">\(R_m^*\)</span>, and validated integral plans give feasible upper bounds. Equal bounds certify the optimum; unresolved cases retain an interval. Figure 13 uses 1,536 experts, top-16 routing, 131,072 tokens per step, random contiguous ownership, and Zipf popularity calibrated to a coefficient of variation of two.</p>
+<p><img alt="Free and Hierarchical mean optimal-load bounds across EP8–EP512, with one through four helper slots per rank." src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_slot_bounds.svg" /></p>
+<p><em>Figure 13. Mean optimal imbalance bounds over 64 layers per EP for S = 1, 2, 3 and 4. Lines and markers show feasible upper bounds; shading spans lower to upper bounds, and † marks unresolved cases. Each panel has its own y-axis scale.</em></p>
+<p>These are load-only optimization bounds: they exclude copy time and GEMM efficiency, and do not imply that a runtime planner attains the optimum.</p>
+</section>
+<section id="limitations">
+<span id="62-limitations"></span><h3>6.2 Limitations<a class="headerlink" href="#limitations" title="Link to this heading">#</a></h3>
+<p>Beyond the <a class="reference internal" href="#applicability-and-evaluated-configurations">tested range</a>:</p>
+<ul class="simple">
+<li><p><strong>Missing measurements.</strong> On GB200, a layer with the real shared expert was not measured, and no hardware result compares ISER-MoE with a static plan; the 85–88% estimate comes from a model fit.</p></li>
+<li><p><strong>Alignment cost.</strong> Every group member spends a helper slot and receives the whole expert: in <a class="reference internal" href="#halo-q-trace-replay">replay</a>, HALO-Q made 2.5–3.3× as many remote copies at EP8–EP24 as the greedy point-to-point planner capped at four copies per owner, which balanced worse (<span class="math notranslate nohighlight">\(R\)</span> = 1.016–1.100).</p></li>
+<li><p><strong>Replica lifetime.</strong> HALO-Q plans each replica for one invocation, although in replay 74–78% of the all-rank policy’s expert selections recur in the next iteration; the merged implementation’s default <code class="docutils literal notranslate"><span class="pre">per_layer_resident</span></code> mode skips a broadcast only when every member of its group still holds the expert in the helper slot HALO-Q assigns, and slot coloring does not try to keep an expert in its previous slot.</p></li>
+<li><p><strong>Static plus dynamic, and arrival skew.</strong> Per-layer dynamic EPLB cannot currently start from an offline EPLB map, and placement cannot fix ranks that reach the layer at different times.</p></li>
+</ul>
+</section>
+<section id="related-work">
+<span id="63-related-work"></span><h3>6.3 Related Work<a class="headerlink" href="#related-work" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Static plans from load history</strong> complement per-invocation replication: <a class="reference external" href="https://arxiv.org/abs/2412.19437">DeepSeek-V3</a>’s redundant prefill experts, DeepSeek’s <a class="reference external" href="https://github.com/deepseek-ai/EPLB">EPLB</a>, TensorRT LLM’s online EPLB, <a class="reference external" href="https://github.com/vllm-project/vllm/releases/tag/v0.23.0">vLLM v0.23.0</a>’s EPLB for DeepSeek-V4 Mega-MoE and the Linear-Programming-Based Load Balancer (<a class="reference external" href="https://github.com/deepseek-ai/LPLB">LPLB</a>).</p></li>
+<li><p><strong>Per-invocation replication</strong> copies replica weights point to point in <a class="reference external" href="https://arxiv.org/abs/2606.04101">UltraEP</a>, <a class="reference external" href="https://github.com/MoonshotAI/MoonEP">MoonEP</a> (from the <a class="reference external" href="https://arxiv.org/abs/2607.24653">Kimi K3 report</a>), the concurrent <a class="reference external" href="https://arxiv.org/abs/2610.00671">MegaFlux</a>, Elastic Cloning for Hot Experts (ECHO) in <a class="reference external" href="https://arxiv.org/abs/2603.07685">Megatron Core</a> and <a class="reference external" href="https://github.com/deepseek-ai/DeepEP">DeepEP</a> V2.5; ISER-MoE multicasts them into fixed groups, as <a class="reference external" href="https://doi.org/10.1145/3503221.3508418">FasterMoE</a> broadcasts to one fixed group.</p></li>
+<li><p><strong>Hiding copies and multi-port injection.</strong> <a class="reference external" href="https://arxiv.org/abs/2604.19654">FEPLB</a>, Topology-Aware Optimal Transport (<a class="reference external" href="https://arxiv.org/abs/2608.03676">TAOT</a>) and <a class="reference external" href="https://arxiv.org/abs/2602.00509">PROBE</a> hide replica copies behind computation, and NCCL’s NVLS AllGather and TensorRT LLM’s <a class="reference external" href="https://developer.nvidia.com/blog/3x-faster-allreduce-with-nvswitch-and-tensorrt-llm-multishot/">MultiShot</a> all-reduce already inject from every member’s port, as SAMI does for weights.</p></li>
+</ul>
+<p>Reported gains are not directly comparable: MegaFlux’s 1.45× kernel-level mean speedup on eight B200 GPUs includes planning and transfers, which the 1.21–1.52× <a class="reference internal" href="#megamoe-kernel-time-with-replicas">MegaMoE speedup</a> above excludes, and UltraEP reports 1.29× the prefill throughput of SGLang with EPLB at EP40–EP64.</p>
+</section>
+</section>
+<section id="conclusion-and-further-reading">
+<span id="7-conclusion-and-further-reading"></span><h2>7. Conclusion and Further Reading<a class="headerlink" href="#conclusion-and-further-reading" title="Link to this heading">#</a></h2>
+<section id="conclusion">
+<span id="71-conclusion"></span><h3>7.1 Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading">#</a></h3>
+<p>Per-invocation replicas of hot experts can remove most of the rank imbalance in expert-parallel MoE layers, but only if their weights arrive within the layer. <strong>ISER-MoE multicasts hot experts through aligned NVLink multicast groups created at initialization, so each byte leaves its owner once.</strong> HALO-Q plans balance, then locality, on the GPU; SAMI spreads the injection over the group’s ports; and planning and replication overlap the shared expert, so only helper tiles wait for their weights.</p>
+<p>The generation phase, training, attention-side imbalance, replication across NVLink domains and a hardware comparison with static plans remain future work. To try ISER-MoE, <a class="reference internal" href="#using-iser-moe-in-tensorrt-llm">enable</a> <code class="docutils literal notranslate"><span class="pre">moe_config.load_balancer.mode:</span> <span class="pre">per_layer_dynamic</span></code> and compare it against OFF on your own traffic.</p>
+</section>
+<section id="further-reading">
+<span id="72-further-reading"></span><h3>7.2 Further Reading<a class="headerlink" href="#further-reading" title="Link to this heading">#</a></h3>
+<p>Using per-layer dynamic EPLB:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer">Per-layer dynamic EPLB guide</a>: how the mode works, an example configuration and its constraints.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/wide_ep/README.md#mode">Wide-EP <code class="docutils literal notranslate"><span class="pre">mode</span></code> field</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/layer_wise_benchmarks/README.md">layer-wise benchmarks</a>: choosing the mode, and comparing it on a DeepSeek-V4 layer slice.</p></li>
+</ul>
+<p>Implementation:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/19646">PR #19646: Add DynamicEPLB kernels and runtime integration</a>, and the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md#scheduler--eplb-constraints">MoE developer guide’s scheduler and EPLB constraints</a>.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/21373">PR #21373: HALO-Q planner and aligned-pair replication extension</a>: two-rank placement groups, updated planning, and pair copy paths.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/4c2238ee524c65dd25259274debf1b3bfe8181e9/tensorrt_llm/_torch/moe/fused_moe/per_layer_dynamic_eplb">Per-layer dynamic EPLB runtime</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/4c2238ee524c65dd25259274debf1b3bfe8181e9/cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb">HALO-Q and replication kernels</a>, including SAMI.</p></li>
+</ul>
+<p>Earlier TensorRT LLM posts: Scaling Expert Parallelism <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Part 1</a>, <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Part 2</a> and <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Part 3</a>, <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">One-Sided AlltoAll over NVLink</a>, and <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell</a>.</p>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../../developer-guide/telemetry.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Telemetry</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#rank-imbalance-in-expert-parallel-moe-prefill">1. Rank Imbalance in Expert-Parallel MoE Prefill</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#expert-parallel-moe">1.1 Expert-Parallel MoE</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rank-imbalance-across-workloads-and-layers">1.2 Rank Imbalance Across Workloads and Layers</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#long-tail-distribution-and-hot-expert-replication">1.3 Long-Tail Distribution and Hot-Expert Replication</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#challenges-in-per-layer-expert-replication">2. Challenges in Per-Layer Expert Replication</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#more-weight-copy-overhead-than-routed-expert-computation">2.1 More Weight-Copy Overhead Than Routed-Expert Computation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#source-broadcast-hot-spot">2.2 Source Broadcast Hot Spot</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#latency-and-bandwidth-overheads-in-baseline-broadcasts">2.3 Latency and Bandwidth Overheads in Baseline Broadcasts</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#iser-moe-design">3. ISER-MoE Design</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#halo-q-scheduler">3.1 HALO-Q Scheduler</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-level-symmetric-multicast">3.2 Multi-Level Symmetric Multicast</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tma-weight-replication-and-sami-multi-port-broadcast">3.3 TMA Weight Replication and SAMI Multi-Port Broadcast</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-overlap">3.4 Runtime Overlap</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-evaluation">4. Performance Evaluation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#methodology">4.1 Methodology</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#component-evaluation">4.2 Component Evaluation</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#halo-q-trace-replay">4.2.1 HALO-Q Trace Replay</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#sami-broadcast-on-gb200">4.2.2 SAMI Broadcast on GB200</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#megamoe-kernel-time-with-replicas">4.2.3 MegaMoE Kernel Time with Replicas</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-serving-evaluation">4.3 End-to-End Serving Evaluation</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-prefill-serving">4.3.1 End-to-End Prefill Serving</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-disaggregated-serving-on-a-gb300-nvl72-rack">4.3.2 End-to-End Disaggregated Serving on a GB300 NVL72 Rack</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#using-iser-moe-in-tensorrt-llm">5. Using ISER-MoE in TensorRT LLM</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration">5.1 Configuration</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#requirements-and-constraints">5.2 Requirements and Constraints</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-measurement">5.3 Performance Measurement</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#applicability-and-evaluated-configurations">5.4 Applicability and Evaluated Configurations</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#discussion">6. Discussion</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#lower-bound-analysis-of-hierarchical-and-free-slot-usage">6.1 Lower-Bound Analysis of Hierarchical and Free Slot Usage</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations">6.2 Limitations</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#related-work">6.3 Related Work</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion-and-further-reading">7. Conclusion and Further Reading</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">7.1 Conclusion</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#further-reading">7.2 Further Reading</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on November 16, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

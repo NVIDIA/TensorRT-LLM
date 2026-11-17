@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -473,6 +473,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -502,11 +504,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -521,6 +525,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -532,6 +537,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -573,6 +579,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -670,8 +678,8 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="numerical-precision">
-<span id="precision"></span><h1>Numerical Precision<a class="headerlink" href="#numerical-precision" title="Link to this heading">#</a></h1>
+  <section class="tex2jax_ignore mathjax_ignore" id="precision">
+<span id="numerical-precision"></span><h1>Numerical Precision<a class="headerlink" href="#precision" title="Link to this heading">#</a></h1>
 <div class="admonition caution">
 <p class="admonition-title">Caution</p>
 <p>The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.</p>
@@ -686,7 +694,7 @@ support 16-bit IEEE floating-point numbers (FP16) and 16-bit Bfloat16 (BF16) as
 described <a class="reference external" href="https://en.wikipedia.org/wiki/Bfloat16_floating-point_format">here</a>.</p>
 </section>
 <section id="quantization-and-dequantization-q-dq">
-<h2>Quantization and Dequantization (Q/DQ)<a class="headerlink" href="#quantization-and-dequantization-q-dq" title="Link to this heading">#</a></h2>
+<span id="quantization-and-dequantization-qdq"></span><h2>Quantization and Dequantization (Q/DQ)<a class="headerlink" href="#quantization-and-dequantization-q-dq" title="Link to this heading">#</a></h2>
 <p>Given a floating-point number <code class="docutils literal notranslate"><span class="pre">x</span></code> and a floating-point scaling factor <code class="docutils literal notranslate"><span class="pre">s</span></code>,
 TensorRT-LLM implements INT8 quantization as:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">q</span> <span class="o">=</span> <span class="n">int8</span><span class="o">.</span><span class="n">satfinite</span><span class="p">(</span><span class="n">x</span> <span class="o">*</span> <span class="n">s</span><span class="p">)</span>
@@ -739,7 +747,7 @@ maintaining the accuracy of the network (on downstream tasks).</p>
 weights of the model. TensorRT-LLM includes scripts to prepare the model to
 run using the SmoothQuant method.</p>
 <p>Examples of how to enable SmoothQuant for GPT, GPT-J and LLaMA can be found in
-the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/quantization">examples/quantization</a> folder of that release.</p>
+the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/examples/quantization">examples/quantization</a> folder of that release.</p>
 </section>
 <section id="int4-and-int8-weight-only-w4a16-and-w8a16">
 <h2>INT4 and INT8 Weight-Only (W4A16 and W8A16)<a class="headerlink" href="#int4-and-int8-weight-only-w4a16-and-w8a16" title="Link to this heading">#</a></h2>
@@ -748,8 +756,8 @@ a model and dequantizing those weights on-the-fly in linear layers (Matmuls).
 The activations are encoded using floating-point values (FP16 or BF16).</p>
 <p>To use INT4/INT8 Weight-Only methods, the user must determine the scaling
 factors to use to quantize and dequantize the weights of the model.</p>
-<p>This release includes examples for <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/models/core/gpt">GPT</a> and
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/models/core/llama">LLaMA</a>.</p>
+<p>This release includes examples for <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/examples/models/core/gpt">GPT</a> and
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/examples/models/core/llama">LLaMA</a>.</p>
 </section>
 <section id="gptq-and-awq-w4a16">
 <h2>GPTQ and AWQ (W4A16)<a class="headerlink" href="#gptq-and-awq-w4a16" title="Link to this heading">#</a></h2>
@@ -759,19 +767,19 @@ and
 <a class="reference external" href="https://arxiv.org/abs/2306.00978">https://arxiv.org/abs/2306.00978</a>,
 respectively. TensorRT-LLM supports per-group scaling factors and
 zero-offsetting in linear layers to implement GPTQ and AWQ methods. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin">WeightOnlyGroupwiseQuantMatmulPlugin</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin">WeightOnlyGroupwiseQuantMatmulPlugin</a>
 plugin and the corresponding
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/tensorrt_llm/quantization/functional.py"><code class="docutils literal notranslate"><span class="pre">weight_only_groupwise_quant_matmul</span></code></a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/tensorrt_llm/quantization/functional.py"><code class="docutils literal notranslate"><span class="pre">weight_only_groupwise_quant_matmul</span></code></a>
 Python function, for details.</p>
-<p>This release includes examples of applying GPTQ to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/models/core/gpt">GPT-NeoX</a>
-and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/models/core/llama">LLaMA-v2</a>, as well as an example of using AWQ with
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/models/contrib/gptj">GPT-J</a>.</p>
+<p>This release includes examples of applying GPTQ to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/examples/models/core/gpt">GPT-NeoX</a>
+and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/examples/models/core/llama">LLaMA-v2</a>, as well as an example of using AWQ with
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/examples/models/contrib/gptj">GPT-J</a>.</p>
 </section>
 <section id="fp8-hopper">
 <h2>FP8 (Hopper)<a class="headerlink" href="#fp8-hopper" title="Link to this heading">#</a></h2>
 <p>This release of TensorRT-LLM contains implementations of FP8 for GPT-NeMo,
 GPT-J and LLaMA. Those examples can be found in
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/quantization">examples/quantization</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/examples/quantization">examples/quantization</a>.</p>
 </section>
 <section id="nvfp4-blackwell">
 <h2>NVFP4 (Blackwell)<a class="headerlink" href="#nvfp4-blackwell" title="Link to this heading">#</a></h2>
@@ -1273,7 +1281,7 @@ The language component decides which quantization methods are supported by a giv
 <section id="technical-detail-the-quantmode-flags">
 <h2>Technical Detail: The <code class="docutils literal notranslate"><span class="pre">QuantMode</span></code> Flags<a class="headerlink" href="#technical-detail-the-quantmode-flags" title="Link to this heading">#</a></h2>
 <p>The quantization method is controlled by the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/tensorrt_llm/quantization/mode.py"><code class="docutils literal notranslate"><span class="pre">QuantMode</span></code></a> flags. The different fields
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/tensorrt_llm/quantization/mode.py"><code class="docutils literal notranslate"><span class="pre">QuantMode</span></code></a> flags. The different fields
 are:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">INT4_WEIGHTS</span></code>, the weights are quantized to 4 bits (W4A*),</p></li>
@@ -1423,9 +1431,9 @@ are:</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

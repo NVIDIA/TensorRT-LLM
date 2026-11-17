@@ -64,7 +64,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +81,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -477,6 +477,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -506,11 +508,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -525,6 +529,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -536,6 +541,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -577,6 +583,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -905,7 +913,7 @@
 <section id="deepseek-sparse-attention-dsa">
 <h3>DeepSeek Sparse Attention (DSA)<a class="headerlink" href="#deepseek-sparse-attention-dsa" title="Link to this heading">#</a></h3>
 <section id="id1">
-<h4>Introduction<a class="headerlink" href="#id1" title="Link to this heading">#</a></h4>
+<span id="introduction-1"></span><h4>Introduction<a class="headerlink" href="#id1" title="Link to this heading">#</a></h4>
 <p>DeepSeek Sparse Attention (DSA) is a model-native sparse attention mechanism introduced with <a class="reference external" href="https://api-docs.deepseek.com/news/news251201">DeepSeek V3.2</a>. Unlike RocketKV, which is a training-free technique applicable to standard attention architectures, DSA is an architectural modification that uses a learned indexer for fine-grained token-level sparse MLA computation.</p>
 <div align="center">
 <figure>
@@ -921,7 +929,7 @@
 </ol>
 </section>
 <section id="id2">
-<h4>How It Works in TensorRT LLM<a class="headerlink" href="#id2" title="Link to this heading">#</a></h4>
+<span id="how-it-works-in-tensorrt-llm-1"></span><h4>How It Works in TensorRT LLM<a class="headerlink" href="#id2" title="Link to this heading">#</a></h4>
 <p>DSA integrates into TensorRT LLM through the same <code class="docutils literal notranslate"><span class="pre">sparse_attn_predict</span></code> interface used by RocketKV, validating the framework’s generality beyond the use case it was originally designed for. The key differences are that DSA’s prediction module is a <strong>neural network</strong> (the indexer) rather than a heuristic scoring function, and it produces <strong>token-level</strong> indices rather than page-level ones.</p>
 <p>The indexer consists of two low-rank linear projections (for Q and K), a LayerNorm, RoPE, and a weight projection layer. Given query token <span class="math notranslate nohighlight">\(c_t^Q\)</span> and hidden state <span class="math notranslate nohighlight">\(h_t\)</span>, it computes index scores via an MQA-style dot product:</p>
 <div class="math notranslate nohighlight">
@@ -951,7 +959,7 @@
 <h2>Evaluation<a class="headerlink" href="#evaluation" title="Link to this heading">#</a></h2>
 <p>This section consolidates accuracy and performance results for the sparse attention algorithms supported in TensorRT LLM.</p>
 <section id="id3">
-<h3>RocketKV<a class="headerlink" href="#id3" title="Link to this heading">#</a></h3>
+<span id="rocketkv-1"></span><h3>RocketKV<a class="headerlink" href="#id3" title="Link to this heading">#</a></h3>
 <p>Unless otherwise specified, the experiments below use the following default settings: <code class="docutils literal notranslate"><span class="pre">budget=2048</span></code>, <code class="docutils literal notranslate"><span class="pre">window_size=32</span></code>, <code class="docutils literal notranslate"><span class="pre">kt_page_size=4</span></code>, <code class="docutils literal notranslate"><span class="pre">kt_cache_dtype=fp8</span></code>, and <code class="docutils literal notranslate"><span class="pre">topk=64</span></code>.</p>
 <section id="accuracy">
 <h4>Accuracy<a class="headerlink" href="#accuracy" title="Link to this heading">#</a></h4>
@@ -1052,11 +1060,11 @@
 </section>
 </section>
 <section id="id4">
-<h3>DeepSeek Sparse Attention (DSA)<a class="headerlink" href="#id4" title="Link to this heading">#</a></h3>
+<span id="deepseek-sparse-attention-dsa-1"></span><h3>DeepSeek Sparse Attention (DSA)<a class="headerlink" href="#id4" title="Link to this heading">#</a></h3>
 <p>For comprehensive DSA evaluation results—including kernel optimizations, precision strategies, and benchmarks with MTP, disaggregated serving, and Wide-EP—please refer to the dedicated blog post: <a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html"><span class="std std-doc">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</span></a>.</p>
 </section>
 <section id="id5">
-<h3>Skip Softmax Attention (BLASST)<a class="headerlink" href="#id5" title="Link to this heading">#</a></h3>
+<span id="skip-softmax-attention-blasst-1"></span><h3>Skip Softmax Attention (BLASST)<a class="headerlink" href="#id5" title="Link to this heading">#</a></h3>
 <p>For Skip Softmax Attention accuracy evaluation and performance benchmarks, please refer to: <a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html"><span class="std std-doc">Accelerating Long-Context Inference with Skip Softmax Attention</span></a>.</p>
 </section>
 </section>
@@ -1263,9 +1271,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

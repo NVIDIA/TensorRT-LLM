@@ -66,6 +66,8 @@ API Reference
     reference/MTPDecodingConfig
     reference/SchedulerConfig
     reference/CapacitySchedulerPolicy
+    reference/CheckpointIOPolicy
+    reference/CheckpointFormat
     reference/QuantConfig
     reference/QuantAlgo
     reference/CalibConfig
@@ -95,11 +97,13 @@ API Reference
     reference/DeepSeekSparseAttentionConfig
     reference/DeepSeekV4SparseAttentionConfig
     reference/MiniMaxM3SparseAttentionConfig
+    reference/SparseKvCacheOffloadConfig
     reference/SchedulingParams
     reference/SkipSoftmaxAttentionConfig
     reference/ColdPageQuantizationCompressionConfig
     reference/TriAttentionKvCacheCompressionConfig
     reference/PrometheusMetricsConfig
+    reference/PromptTokenCacheConfig
     reference/PrefillCudaGraphBackend
     reference/ThinkingBudgetLogitsProcessor
     reference/add_thinking_budget_logits_processor
@@ -262,6 +266,16 @@ This page provides a searchable index of API names and parameters. Open an entry
 
     :doc:`View the full CapacitySchedulerPolicy reference <reference/CapacitySchedulerPolicy>`
 
+.. autoclass:: tensorrt_llm.llmapi.CheckpointIOPolicy
+    :no-index:
+
+    :doc:`View the full CheckpointIOPolicy reference <reference/CheckpointIOPolicy>`
+
+.. autoclass:: tensorrt_llm.llmapi.CheckpointFormat
+    :no-index:
+
+    :doc:`View the full CheckpointFormat reference <reference/CheckpointFormat>`
+
 .. autoclass:: tensorrt_llm.llmapi.QuantConfig
     :no-index:
 
@@ -407,6 +421,11 @@ This page provides a searchable index of API names and parameters. Open an entry
 
     :doc:`View the full MiniMaxM3SparseAttentionConfig reference <reference/MiniMaxM3SparseAttentionConfig>`
 
+.. autoclass:: tensorrt_llm.llmapi.SparseKvCacheOffloadConfig
+    :no-index:
+
+    :doc:`View the full SparseKvCacheOffloadConfig reference <reference/SparseKvCacheOffloadConfig>`
+
 .. autoclass:: tensorrt_llm.llmapi.SchedulingParams
     :no-index:
 
@@ -431,6 +450,11 @@ This page provides a searchable index of API names and parameters. Open an entry
     :no-index:
 
     :doc:`View the full PrometheusMetricsConfig reference <reference/PrometheusMetricsConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.PromptTokenCacheConfig
+    :no-index:
+
+    :doc:`View the full PromptTokenCacheConfig reference <reference/PromptTokenCacheConfig>`
 
 .. autoclass:: tensorrt_llm.llmapi.PrefillCudaGraphBackend
     :no-index:

@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -473,6 +473,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -502,11 +504,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -521,6 +525,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -532,6 +537,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -573,6 +579,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -941,9 +949,6 @@ supplied, sets the decoder task prefix rather than the encoder input.</p>
     <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
     <span class="n">attn_backend</span><span class="o">=</span><span class="s2">"TRTLLM"</span><span class="p">,</span>
     <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
-    <span class="c1"># Cross-KV pool capacity. The default (1024) is smaller than the 1500</span>
-    <span class="c1"># encoder positions that every Whisper request produces.</span>
-    <span class="n">max_input_len</span><span class="o">=</span><span class="mi">1500</span><span class="p">,</span>
     <span class="n">max_num_tokens</span><span class="o">=</span><span class="mi">3000</span><span class="p">,</span>
     <span class="n">enable_chunked_prefill</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
     <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
@@ -961,8 +966,11 @@ supplied, sets the decoder task prefix rather than the encoder input.</p>
     <span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>Set <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> to at least 1500. Every Whisper request produces 1500 encoder
-positions regardless of clip length, and the cross-KV pool is sized from <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code>.</p>
+<p>Every Whisper request produces 1500 encoder positions (the checkpoint’s
+<code class="docutils literal notranslate"><span class="pre">max_source_positions</span></code>) regardless of clip length, and the cross-KV pool is sized
+to hold them; <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> does not affect it. Leave <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> unset, or
+set it to at least 1500, because the engine-level limit also covers the encoder
+pass; a smaller value is rejected at startup.</p>
 <p>Whisper automatically disables block reuse for both the decoder self-attention
 and cross-attention KV caches, even when <code class="docutils literal notranslate"><span class="pre">KvCacheConfig.enable_block_reuse=True</span></code>.
 Both caches depend on the audio features, which cannot be safely identified by
@@ -1178,7 +1186,12 @@ usually too small.</p>
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> controls the total decoder concurrency, while
-<code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> controls encoder microbatch admission. For better
+<code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> controls encoder microbatch admission. One encoder
+step runs at most <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> requests and <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code>
+encoder tokens; admitted encoder requests beyond either limit wait for later
+encoder steps, oldest first, so limits set too low reduce encoder throughput. A
+request whose encoder tokens alone exceed <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code> is rejected
+at admission instead. For better
 performance, tune <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code>, and the
 encoder CUDA graph buckets together for the production workload. Start with
 <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> smaller than <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, such as 2 versus 8,
@@ -1346,13 +1359,13 @@ GPU configuration. Benchmark with a representative workload before deployment.</
 <section id="troubleshooting">
 <h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading">#</a></h2>
 <section id="cross-kv-cache-fraction-is-required">
-<h3><code class="docutils literal notranslate"><span class="pre">cross_kv_cache_fraction</span></code> is required<a class="headerlink" href="#cross-kv-cache-fraction-is-required" title="Link to this heading">#</a></h3>
+<span id="cross_kv_cache_fraction-is-required"></span><h3><code class="docutils literal notranslate"><span class="pre">cross_kv_cache_fraction</span></code> is required<a class="headerlink" href="#cross-kv-cache-fraction-is-required" title="Link to this heading">#</a></h3>
 <p>Every encoder-decoder runtime needs a cross-attention KV pool. Add
 <code class="docutils literal notranslate"><span class="pre">KvCacheConfig(cross_kv_cache_fraction=...)</span></code>; <code class="docutils literal notranslate"><span class="pre">0.5</span></code> is a reasonable initial
 value. Do not set this field for a decoder-only model.</p>
 </section>
 <section id="decoder-start-token-id-is-required">
-<h3><code class="docutils literal notranslate"><span class="pre">decoder_start_token_id</span></code> is required<a class="headerlink" href="#decoder-start-token-id-is-required" title="Link to this heading">#</a></h3>
+<span id="decoder_start_token_id-is-required"></span><h3><code class="docutils literal notranslate"><span class="pre">decoder_start_token_id</span></code> is required<a class="headerlink" href="#decoder-start-token-id-is-required" title="Link to this heading">#</a></h3>
 <p>The checkpoint must define <code class="docutils literal notranslate"><span class="pre">decoder_start_token_id</span></code> or <code class="docutils literal notranslate"><span class="pre">bos_token_id</span></code> in its
 Hugging Face model or generation configuration. Use a checkpoint with a complete
 <code class="docutils literal notranslate"><span class="pre">config.json</span></code> and, when applicable, <code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code>.</p>
@@ -1381,7 +1394,7 @@ that the encoder graph buckets cover the request shape, and that
 eager encoder execution.</p>
 </section>
 <section id="num-tokens-or-seq-lens-unset-is-rejected-at-engine-construction">
-<h3><code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> or <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code> unset is rejected at engine construction<a class="headerlink" href="#num-tokens-or-seq-lens-unset-is-rejected-at-engine-construction" title="Link to this heading">#</a></h3>
+<span id="num_tokens-or-seq_lens-unset-is-rejected-at-engine-construction"></span><h3><code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> or <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code> unset is rejected at engine construction<a class="headerlink" href="#num-tokens-or-seq-lens-unset-is-rejected-at-engine-construction" title="Link to this heading">#</a></h3>
 <p>A text encoder needs both bucket lists, so the engine raises rather than
 silently running eager. Supply them, or drop <code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config</span></code> if you
 do not want encoder graphs. A fixed-shape feature encoder such as Whisper does
@@ -1549,9 +1562,9 @@ differences can change lower-ranked beam hypotheses when scores are close.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

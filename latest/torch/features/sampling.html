@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -236,6 +236,10 @@
     </div>
   
 
+  
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
   
 </div>
 
@@ -469,6 +473,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -498,11 +504,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -517,6 +525,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -528,6 +537,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -569,6 +579,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -666,7 +678,9 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="sampling">
+  <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<section class="tex2jax_ignore mathjax_ignore" id="sampling">
 <h1>Sampling<a class="headerlink" href="#sampling" title="Link to this heading">#</a></h1>
 <p>The PyTorch backend supports most of the sampling features that are supported on the C++ backend, such as temperature, top-k and top-p sampling, stop words, bad words, penalty, context and generation logits, and log probs.</p>
 <p>The following example prepares two identical prompts which will give different results due to the sampling parameters chosen:</p>
@@ -682,6 +696,61 @@
 </pre></div>
 </div>
 <p>When using speculative decoders such as MTP or Eagle-3 the subset of sampling options available is more restricted.</p>
+<section id="context-logits-and-prompt-log-probabilities">
+<h2>Context logits and prompt log probabilities<a class="headerlink" href="#context-logits-and-prompt-log-probabilities" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">SamplingParams(return_context_logits=True)</span></code> requests the full vocabulary logits
+for every prompt position. The returned tensor can be large: an 8192-token prompt
+with a 131072-token vocabulary requires 4 GiB of FP32 result storage.</p>
+<p>For ordinary, non-speculative decoding with a dense LM head and the standard
+logits processor, decoder warmup reserves and initializes a 32-row projection
+workspace before KV capacity estimation. Both single-rank heads and uniformly
+vocabulary-sharded tensor-parallel heads with gathered outputs are supported.
+The context-output path prepares request storage before projecting hidden states. It first attempts GPU
+storage and falls back to CPU storage if that allocation raises a CUDA OOM,
+logging a warning once. Consequently, callers must support either device for
+returned context logits.
+CPU storage still requires enough host memory for the full result.</p>
+<p>When GPU result storage succeeds, projection attempts a larger temporary output
+and halves its row count after allocation failure, with a bounded number of
+attempts. It then falls back to the resident workspace. CPU result storage uses
+the resident workspace directly. Copies from reusable GPU scratch to CPU storage
+complete before that scratch is overwritten. Mixed batches project all context
+rows only for requests that need them; the final rows of other context requests
+are projected together with the generation rows.</p>
+<p>For tensor parallelism, each rank reserves local projection, all-gather receive,
+and full-vocabulary FP32 conversion buffers. All ranks agree on the smallest
+successful chunk capacity before projecting, so allocation failure or CPU result
+storage on one rank cannot change the collective sequence independently. The
+all-gather writes directly into the reserved receive buffer; vocabulary assembly
+and padding removal copy into the conversion buffer without allocating a second
+gathered output. Allocation failures for required sampling rows, CPU result
+storage, batched final rows and GEMM failures, as well as failures storing or
+reducing a chunk, are reported on all TP ranks before the next logits collective. These failures
+abort the operation; they do not trigger an independent per-rank retry. TP
+capacity and failure agreement introduces additional synchronization.</p>
+<p>Requests that only specify <code class="docutils literal notranslate"><span class="pre">prompt_logprobs</span></code> retain the requested probabilities
+and token IDs rather than a full context-logits tensor. Projection chunks are
+reduced on the device as they are produced, with one small host copy per chunk;
+the executor worker builds the returned per-token values. The legacy projection path uses the same probability
+accumulation, so changing batch composition between prefill chunks does not change
+the result format or lose positions. One final vocabulary row is retained on the CPU
+until the first generated token is known. Context probability postprocessing is
+also chunked when consuming complete CPU or GPU logits; a GPU reduction allocation
+failure falls back to CPU for that chunk. With KV cache reuse, the reused prefix
+produces no context logits, so prompt log probabilities cannot be aligned with
+the prompt; such a request fails with an error instead of returning shifted values.</p>
+<p>The bounded projection path does not apply to context/attention-data parallel
+execution, ROW-parallel or unevenly sharded LM heads, speculative decoding,
+quantized or LoRA LM heads, locality partitioned heads, Gemma4 softcapping,
+Cohere2 scaling, or custom/model-specific logits processors.
+Unsupported configurations do not reserve the projection workspace. These paths
+retain their existing projection and CUDA graph selection behavior. Eager
+execution is required only when the bounded projection plan is active. The
+workspace bounds projection, gather-output and dtype-conversion storage; it does
+not guarantee that model activations, sampling outputs, or unrelated runtime
+allocations fit. Ordinary generation without
+context outputs continues to use the existing LM-head path.</p>
+</section>
 </section>
 
 
@@ -701,9 +770,25 @@
             
             
 
-<div class="bd-sidebar-secondary"></div>
+
+              
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#context-logits-and-prompt-log-probabilities">Context logits and prompt log probabilities</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
               
             
 
@@ -791,9 +876,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

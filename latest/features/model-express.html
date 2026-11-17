@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -721,13 +729,29 @@ profiles:</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">trtllm-qwen2-dense-target-layout-v1</span></code></p></td>
 <td><p>Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3-for-causal-lm-bf16-target-v1</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3-for-causal-lm-fp8-block-sm90-target-v1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3</span></code></p></td>
+<td><p>Target model</p></td>
+<td><p>1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-qwen3-dense-fp8-block128-fp32scale-target-layout-v1</span></code></p></td>
+<td><p>Single-node dense BF16, FP8 block-scale (128x128) weights and unquantized KV cache, SM90 only, TRTLLM attention, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3-for-causal-lm-bf16-target-v1</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3</span></code></p></td>
 <td><p>Target model</p></td>
 <td><p>1</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">trtllm-qwen3-dense-target-layout-v1</span></code></p></td>
 <td><p>Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3-for-causal-lm-bf16-tied-target-v1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3</span></code></p></td>
+<td><p>Target model</p></td>
+<td><p>1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-qwen3-dense-tied-target-layout-v1</span></code></p></td>
+<td><p>Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, tied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mistral-for-causal-lm-bf16-target-v1</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code></p></td>
@@ -753,15 +777,26 @@ profiles:</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">trtllm-qwen3_5-dense-vl-complete-layout-v1</span></code></p></td>
 <td><p>Single-node dense BF16 vision-language model with its vision encoder, unquantized weights and KV cache, TRTLLM attention, fused QK-norm/M-RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3-moe-for-causal-lm-bf16-cutlass-target-v1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3_moe</span></code></p></td>
+<td><p>Target model</p></td>
+<td><p>1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-qwen3-moe-cutlass-target-layout-v1</span></code></p></td>
+<td><p>Single-node MoE BF16, unquantized weights and KV cache, TRTLLM attention, CUTLASS MoE backend, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, MoE TP=1 or 2 and MoE EP=1 or 2 with MoE TP x MoE EP = TP, MoE cluster=1, PP/CP=1, no LoRA, sparse attention, attention DP, MoE load balancer, DWDP, speculative mode, or separately loaded draft model</p></td>
+</tr>
 </tbody>
 </table>
 </div>
 <p>The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, the transfer scope that
 <code class="docutils literal notranslate"><span class="pre">ModelLoader</span></code> derives from the constructed root, and any runtime constraints
-declared by the profile. An unregistered subclass, config alias, or undeclared
-runtime variant does not inherit support. It falls back to the standard Hugging
-Face checkpoint path before any P2P transfer starts.</p>
+declared by the profile. Profiles whose post-transform layout depends on the GPU
+architecture also constrain the SM version of the device that runs the load. An
+unregistered subclass, config alias, or undeclared runtime variant does not
+inherit support. It falls back to the standard Hugging Face checkpoint path
+before any P2P transfer starts, and a donor that does not qualify does not
+publish its weights.</p>
 <p>The Scope column names the part of the model that one transfer carries. A
 text-only root transfers the target model. A multimodal root transfers the
 complete model when it owns its multimodal encoder, which is the aggregated
@@ -774,6 +809,21 @@ not registered, and fall back too.</p>
 the exact <code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen2</span></code> pair and satisfy the constraints above.
 Other Qwen roots and variants, including checkpoints with tied embeddings, do
 not match this profile.</p>
+<p>The BF16 Qwen3 identity has two sibling profiles that differ only in
+<code class="docutils literal notranslate"><span class="pre">tie_word_embeddings</span></code>. Untied checkpoints match
+<code class="docutils literal notranslate"><span class="pre">qwen3-for-causal-lm-bf16-target-v1</span></code>; Qwen3-8B is the untied canary. Tied
+checkpoints match <code class="docutils literal notranslate"><span class="pre">qwen3-for-causal-lm-bf16-tied-target-v1</span></code>; Qwen3-4B is the
+tied canary, and Qwen3-0.6B, Qwen3-1.7B, and Qwen3-4B-Instruct-2507 are also
+tied. A tied model makes <code class="docutils literal notranslate"><span class="pre">lm_head.weight</span></code> an alias of
+<code class="docutils literal notranslate"><span class="pre">model.embed_tokens.weight</span></code> at construction on both sides, so MX registers and
+transfers the shared table once, as <code class="docutils literal notranslate"><span class="pre">model.embed_tokens.weight</span></code>, and the
+<code class="docutils literal notranslate"><span class="pre">lm_head.weight</span></code> tensor that some tied checkpoints also store is never loaded.
+Because the two profiles transfer different tensor sets, the tied profile has
+its own transform-layout ABI, and a tied source never pairs with an untied
+receiver, even under the <code class="docutils literal notranslate"><span class="pre">ENFORCE</span></code> identity policy.
+The constructed model must realize the tie that the checkpoint declares: when
+the <code class="docutils literal notranslate"><span class="pre">tie_word_embeddings</span></code> flag and the constructed <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> and <code class="docutils literal notranslate"><span class="pre">embed_tokens</span></code>
+weights disagree, no profile matches.</p>
 <p>The Mistral identity covers dense Hugging Face-format checkpoints that resolve
 to the exact <code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">mistral</span></code> pair and whose realized attention
 runs without a sliding window on every layer; Mistral-7B-Instruct-v0.3 is the
@@ -823,37 +873,75 @@ must use the same <code class="docutils literal notranslate"><span class="pre">m
 is bound by the checkpoint artifact identity and the realized vision parameter
 shapes rather than by the model fingerprint, which hashes the text
 configuration.</p>
+<p>The Qwen3 MoE identity covers Hugging Face-format checkpoints that resolve to
+the exact <code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3_moe</span></code> pair; Qwen3-30B-A3B is the
+qualified canary. Its Instruct-2507 and Thinking-2507 releases declare the same
+identity with BF16 weights, default RoPE, and untied embeddings. The
+Qwen3-235B-A22B checkpoints share the identity and the per-layer tensor layout,
+so they qualify too wherever TP=2 holds their roughly 470 GB of BF16 weights,
+which takes GPUs with more than about 240 GB of memory each, such as B300 or
+GB300. The Qwen3-30B-A3B rows exercise that layout; no row loads Qwen3-235B-A22B
+itself. Quantized checkpoints, such as the FP8 and NVFP4 variants, fail the
+quantization constraints. Qwen3-VL-MoE checkpoints use another root:
+<code class="docutils literal notranslate"><span class="pre">Qwen3VLMoeForConditionalGeneration</span></code> builds a <code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code> internally,
+but qualification matches the outer root, so these checkpoints fall back. The
+profile pins the CUTLASS MoE backend, which <code class="docutils literal notranslate"><span class="pre">moe_config.backend:</span> <span class="pre">AUTO</span></code> selects
+for these checkpoints; an explicitly requested other MoE backend falls back. At
+TP=2 the profile admits MoE TP=2 (the default) and MoE EP=2
+(<code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size:</span> <span class="pre">2</span></code>), so MoE TP x MoE EP always equals TP. MoE
+cluster parallelism, the MoE load balancer, and DWDP fall back.</p>
+<p>The Qwen3 FP8 block-scale identity covers <code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3</span></code>
+checkpoints whose quantization resolves to <code class="docutils literal notranslate"><span class="pre">FP8_BLOCK_SCALES</span></code>, whose Hugging
+Face quantization config declares <code class="docutils literal notranslate"><span class="pre">weight_block_size:</span> <span class="pre">[128,</span> <span class="pre">128]</span></code>, and that run
+with an unquantized KV cache; Qwen3-8B-FP8 (<code class="docutils literal notranslate"><span class="pre">quant_method:</span> <span class="pre">fp8</span></code>, dynamic
+activations) is the qualified canary. Sources that resolve to the same algorithm
+without declaring that block size, such as static-activation FP8 checkpoints or
+ModelOpt and compressed-tensors block FP8 exports, do not match this profile,
+and neither do per-tensor FP8 checkpoints (ModelOpt <code class="docutils literal notranslate"><span class="pre">FP8</span></code>), an FP8 KV cache, or
+any GPU other than SM90. On SM100-family GPUs (by default) and SM120/121 GPUs,
+<code class="docutils literal notranslate"><span class="pre">transform_weights()</span></code> resmooths the weights to power-of-two scales and repacks
+the scales for DeepGEMM, and SM107 can use a CuTe DSL scale layout, so the SM90
+tensors are not valid there. Such loads fall back to the Hugging Face path.
+<code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> does not record the SM version, so this profile constraint is
+what keeps the SM90 layout on SM90.</p>
 <p>TensorRT LLM applies two independent compatibility gates:</p>
 <ul class="simple">
 <li><p>The qualification profile records that a model/config/lifecycle combination
 has passed full-load versus staged-load equivalence testing.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> format version 3 binds two concrete runs to the same
+<li><p><code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> format version 4 binds two concrete runs to the same
 checkpoint artifact, runtime layout choices, local shard layout, and
-transform-layout ABI.</p></li>
+transform-layout ABI. Quantization exclusion patterns compare as a set, so
+their order in the checkpoint’s config does not matter.</p></li>
 </ul>
 <p>The transfer protocol version identifies the staged receiver protocol. The
 transform-layout ABI identifies the meaning of the transferred tensor names,
-layouts, aliases, and receiver finalization. A pre-version-3 identity, a
-missing ABI, or a different ABI is rejected rather than treated as compatible.</p>
+layouts, aliases, and receiver finalization. An identity of another format
+version, a missing ABI, or a different ABI is rejected rather than treated as
+compatible.</p>
 <p>Loads that require a separately loaded draft model also fall back to the
 standard checkpoint path. Target-plus-draft post-transform transfer remains
 disabled until layout state is tracked and qualified independently for each
 submodel.</p>
-<p>The Llama, Qwen2, Qwen3, Mistral, and Phi3 profiles are text-only and do not
-enable reward-model, embedding, MoE, or vision-language roots. FP16, quantized
-weights or KV cache, alternate attention backends, YaRN or LongRoPE scaling,
-tied embeddings, TP greater than 2, PP greater than 1, CP greater than 1, LoRA,
-sparse attention, attention DP, multi-node transfer, and speculative decoding
-require separate qualification rows. Each profile also pins its qualified RoPE realization:
-Llama, Qwen2, Mistral, and Phi3 require the default fused RoPE path, so unfused
-RoPE requires separate qualification for them, while Qwen3 fuses RoPE into the
-QK-norm kernel and therefore requires <code class="docutils literal notranslate"><span class="pre">rope_fusion=False</span></code> in the realized
-configuration. The Mistral profile additionally pins the realized attention
-window: every attention layer must run without a sliding window, so
-sliding-window checkpoints such as Ministral fall back to the Hugging Face path
-until they are qualified separately. The profiles do not constrain MoE-only
-backend and mapping settings because these dense roots do not consume them.
-<code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> still requires donor and receiver configurations to match.</p>
+<p>The Llama, Qwen2, Qwen3, Mistral, Phi3, and Qwen3 MoE profiles are text-only and
+do not enable reward-model, embedding, or vision-language roots; Qwen3 MoE is
+the only qualified MoE root. FP16, quantized weight formats other than SM90 FP8
+block scales on Qwen3, a quantized KV cache, alternate attention backends, YaRN
+or LongRoPE scaling, tied embeddings, TP greater than 2, PP greater than 1, CP
+greater than 1, LoRA, sparse attention, attention DP, multi-node transfer, and
+speculative decoding require separate qualification rows. The Qwen3 FP8
+block-scale profile is pinned to SM90 because its realized weight and scale
+layout differs on other GPU architectures. Each profile also pins its qualified
+RoPE realization: Llama, Qwen2, Mistral, and Phi3 require the default fused RoPE
+path, so unfused RoPE requires separate qualification for them, while Qwen3 and
+Qwen3 MoE fuse RoPE into the QK-norm kernel and therefore require
+<code class="docutils literal notranslate"><span class="pre">rope_fusion=False</span></code> in the realized configuration. The Mistral profile
+additionally pins the realized attention window: every attention layer must run
+without a sliding window, so sliding-window checkpoints such as Ministral fall
+back to the Hugging Face path until they are qualified separately. The dense
+profiles do not constrain MoE-only backend and mapping settings because dense
+roots do not consume them; the Qwen3 MoE profile pins them as the table above
+lists. <code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> still requires donor and receiver configurations to
+match.</p>
 <p>The Qwen3.5 dense vision-language profile carries the vision encoder together
 with the language model and realizes interleaved M-RoPE (<code class="docutils literal notranslate"><span class="pre">rope_type=mrope</span></code>),
 applied by the fused QK-norm/RoPE kernel (<code class="docutils literal notranslate"><span class="pre">rope_fusion=False</span></code>). A YaRN
@@ -870,7 +958,12 @@ structural wiring to <code class="docutils literal notranslate"><span class="pre
 <code class="docutils literal notranslate"><span class="pre">cache_derived_state()</span></code>.</p></li>
 <li><p>Verify that every one-time transform is guarded by <code class="docutils literal notranslate"><span class="pre">_weights_transformed</span></code>
 and that the staged receiver can skip <code class="docutils literal notranslate"><span class="pre">transform_weights()</span></code> without
-changing aliases, derived state, tensor layout, or outputs.</p></li>
+changing aliases, derived state, tensor layout, or outputs. Declare the guard
+before any weight load: staged receivers mark only modules that already carry
+it, and a later transform walk would run any module left unmarked on already
+transformed bytes. For quantized rows, audit each quantization method’s
+<code class="docutils literal notranslate"><span class="pre">transform_weights()</span></code> per GPU architecture and constrain <code class="docutils literal notranslate"><span class="pre">sm_versions</span></code> to the
+architectures whose realized layout the row’s ABI describes.</p></li>
 <li><p>Add an exact qualification profile only after the reusable harness in
 <code class="docutils literal notranslate"><span class="pre">tests/unittest/utils/post_transform_qualification.py</span></code> proves tensor,
 alias, transform-guard, derived-state, and deterministic output
@@ -892,6 +985,19 @@ qualification test below), before documenting the family as supported.</p></li>
 register the scope that was qualified. <code class="docutils literal notranslate"><span class="pre">ModelLoader</span></code> derives the scope from
 parameter ownership: the complete model when the root owns parameters
 outside its language model, and the language model otherwise.</p></li>
+<li><p>For a MoE root, pin the MoE backend in the profile, because routed-expert
+layouts differ per MoE implementation and each needs its own
+transform-layout ABI. The pinned backend and quantization must name exactly
+one implementation. Also pin every MoE partition dimension (<code class="docutils literal notranslate"><span class="pre">moe_tp_sizes</span></code>,
+<code class="docutils literal notranslate"><span class="pre">moe_ep_sizes</span></code>, and <code class="docutils literal notranslate"><span class="pre">moe_cluster_sizes</span></code>); the qualification harness rejects
+a profile that qualifies a model with routed experts but leaves any of them
+unconstrained. The size pins cannot exclude the MoE load balancer (EPLB) or
+DWDP: EPLB changes which experts a rank stores without changing the MoE TP
+or EP size, and DWDP forces the MoE TP and EP sizes to 1, which a TP=1 or
+TP=2 profile admits, while each rank stores its own expert range.
+<code class="docutils literal notranslate"><span class="pre">ModelLoader</span></code> reports both as features instead. Keep them unsupported
+unless they are qualified separately, and add one donor/receiver row per
+admitted MoE partition.</p></li>
 </ol>
 </section>
 <section id="qualification-test">
@@ -931,7 +1037,7 @@ receiver’s <code class="docutils literal notranslate"><span class="pre">cache_
 <p>A row may list <code class="docutils literal notranslate"><span class="pre">final_manifest_exempt_patterns</span></code> on its <code class="docutils literal notranslate"><span class="pre">MxE2ECase</span></code> to exempt
 named tensors from the final-tier digest comparison. That is never a numeric
 tolerance and never applies to the transfer tier, and every pattern needs a
-code comment explaining why; the current BF16 dense rows exempt nothing.
+code comment explaining why; the current rows exempt nothing.
 Manifests carry a <code class="docutils literal notranslate"><span class="pre">manifest_format_version</span></code>, and manifests of different
 versions never compare.</p>
 <p>Run the TP=1 smoke test against an isolated ModelExpress 0.5.1 service with
@@ -958,12 +1064,28 @@ checkpoint path. The Qwen2, Qwen3, Mistral, Phi3, and Qwen3.5 profile rows use
 model path overrides in <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN2_MODEL</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN3_MODEL</span></code>,
 <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_MISTRAL_MODEL</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_PHI3_MODEL</span></code>, and
 <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN3_5_MODEL</span></code>.
+The Qwen3 MoE rows use <code class="docutils literal notranslate"><span class="pre">qwen3-moe-bf16-tp1</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3-moe-bf16-tp2</span></code> (MoE TP=2),
+and <code class="docutils literal notranslate"><span class="pre">qwen3-moe-bf16-tp2-ep2</span></code> (MoE EP=2), with <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN3_MOE_MODEL</span></code>
+overriding the default <code class="docutils literal notranslate"><span class="pre">Qwen3/Qwen3-30B-A3B</span></code> checkpoint. All three roles of
+these rows set <code class="docutils literal notranslate"><span class="pre">moe_config.disable_finalize_fusion=True</span></code>: the CUTLASS
+FC2+finalize fusion is not deterministic for top-k greater than 2, and the test
+requires exact token equality. MoE rows also require every rank’s routed-expert
+tensor shapes in the final manifests to match the row’s MoE EP x MoE TP
+partition, so the comparisons cannot pass on a partition that all roles share
+but the row did not request.
+The Qwen3 FP8 block-scale profile rows use <code class="docutils literal notranslate"><span class="pre">qwen3-fp8-block-tp1</span></code> /
+<code class="docutils literal notranslate"><span class="pre">qwen3-fp8-block-tp2</span></code> with Qwen3-8B-FP8, overridable through
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN3_FP8_MODEL</span></code>; they run only on SM90 GPUs, which the H100 CI
+stages provide, and skip elsewhere.
 <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_E2E_REQUIRED=1</span></code> converts missing service, model, or NIXL
 prerequisites from skips into failures and must be set by a CI qualification
 stage. That stage must also allocate the GPUs declared by the selected test
 row. <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_E2E_TIMEOUT_S</span></code> controls the 1200-second timeout used for the
 baseline worker, receiver worker, and donor-readiness wait; increase it for
-slow model storage or startup.</p>
+slow model storage or startup. The tied Qwen3 profile rows
+<code class="docutils literal notranslate"><span class="pre">qwen3-tied-bf16-tp1</span></code> / <code class="docutils literal notranslate"><span class="pre">qwen3-tied-bf16-tp2</span></code> load the tied Qwen3-4B
+checkpoint, with an optional model path override in
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN3_TIED_MODEL</span></code>.</p>
 <p>The dedicated H100 CI stages own isolated Redis and ModelExpress 0.5.1
 sidecars. Coverage is tiered so that pull requests pay for one lightweight
 end-to-end canary while every qualified family still runs on each main commit:</p>
@@ -981,7 +1103,7 @@ end-to-end canary while every qualified family still runs on each main commit:</
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1</span></code></p></td>
 <td><p>Post-merge only</p></td>
-<td><p>The other TP=1 family rows and the accuracy canaries below</p></td>
+<td><p>The other TP=1 rows and the accuracy canaries below</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1</span></code></p></td>
 <td><p>On demand only</p></td>
@@ -1046,10 +1168,13 @@ HF baseline evaluation because the reference value is that baseline.</p>
 PyTorch backend. The Qwen3 GSM8K entry is the one gated by
 <code class="docutils literal notranslate"><span class="pre">tests/integration/defs/accuracy/test_disaggregated_serving.py::TestQwen3_8B</span></code>,
 so re-run that test to re-measure it if the value drifts. No in-envelope Llama,
-Qwen2, Mistral, Phi3, or Qwen3.5 checkpoint has such a reference today, so
-those families are covered by their smoke rows until one is added. A Qwen3.5
-canary must also size its donor exactly like its receiver, because
-<code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> binds <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> for that root.</p>
+Qwen2, Mistral, Phi3, Qwen3.5, or tied Qwen3 checkpoint has such a reference
+today, so those profiles are covered by their smoke rows until one is added. The
+bare Qwen3-30B-A3B GSM8K and MMLU entries are shared with its quantized variants
+and have no recorded PyTorch-backend measurement, so Qwen3 MoE is covered by its
+smoke rows too, and the Qwen3 FP8 block-scale profile has no accuracy canary
+either. A Qwen3.5 canary must also size its donor exactly like its receiver,
+because <code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> binds <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> for that root.</p>
 <p>The rows are registered as <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code> entries in
 <code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/l0_model_express.yml</span></code>, so they run in
 <code class="docutils literal notranslate"><span class="pre">DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1</span></code> on every main commit and
@@ -1101,7 +1226,19 @@ policy.</p></li>
 every profile that adopts the ID.</p></li>
 <li><p>Never reinterpret an already published ID. Supporting two ABIs requires an
 explicit compatibility decision and tests for each producer/receiver pair.</p></li>
+<li><p>When a quantization method realizes a different tensor layout per GPU
+architecture, give each realized layout its own ID and pin the profile’s
+<code class="docutils literal notranslate"><span class="pre">sm_versions</span></code> to the architectures it was qualified on. <code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code>
+does not record the SM version, so the pin is what keeps a receiver from
+accepting bytes laid out for another architecture.</p></li>
 </ol>
+<p>Routed-expert layouts differ per MoE implementation: the CUTLASS implementation
+for unquantized weights keeps the loaded layout, while the TRTLLM-Gen BF16
+method shuffles and block-converts the expert weights at load. A MoE profile
+therefore pins the MoE backend together with the quantization, which must name
+exactly one implementation, and each implementation gets its own ABI ID. A
+backend that gains a second implementation for the pinned quantization needs a
+realized-implementation constraint before its profile stays exact.</p>
 </section>
 </section>
 <section id="installation">
@@ -1201,10 +1338,11 @@ path.</p>
 <h2>Notes and Limitations<a class="headerlink" href="#notes-and-limitations" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p>Post-transform MX reception is currently limited to the exact Llama,
-Qwen2/Qwen2.5 dense, Qwen3 dense, Mistral dense, Phi3 dense, and Qwen3.5
-dense vision-language profiles above. Other roots and variants that do not
-match the documented identity and runtime envelope safely fall back to
-Hugging Face loading until explicitly qualified.</p></li>
+Qwen2/Qwen2.5 dense, Qwen3 dense (BF16 or SM90 FP8 block-scale), Mistral
+dense, Phi3 dense, Qwen3.5 dense vision-language, and Qwen3 MoE profiles
+above. Other roots and variants that do not match the documented identity and
+runtime envelope safely fall back to Hugging Face loading until explicitly
+qualified.</p></li>
 <li><p>Mistral checkpoints served through the native <code class="docutils literal notranslate"><span class="pre">mistral</span></code> checkpoint format
 (<code class="docutils literal notranslate"><span class="pre">mistral_common</span></code> model type), sliding-window or Ministral <code class="docutils literal notranslate"><span class="pre">layer_types</span></code>
 variants, YaRN variants, Mistral3 vision-language roots, and Mistral Large 3
@@ -1381,9 +1519,9 @@ is already registered.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

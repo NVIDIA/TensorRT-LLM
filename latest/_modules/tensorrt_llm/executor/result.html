@@ -419,7 +419,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -434,7 +434,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -826,6 +826,8 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -855,11 +857,13 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -874,6 +878,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -885,6 +890,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -926,6 +932,8 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -1035,6 +1043,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">traceback</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">queue</span><span class="w"> </span><span class="kn">import</span> <span class="n">Empty</span><span class="p">,</span> <span class="n">Queue</span>
@@ -1264,6 +1273,9 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">decoding_iter</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cached_tokens</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ctx_computed_tokens</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ctx_first_begin</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ctx_num_chunks</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_drafted</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_accepted</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># Cumulative (accepted, drafted) draft-token totals attached by the</span>
@@ -1612,6 +1624,11 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_handle_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                          <span class="n">response</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="s2">"PostprocWorker.Output"</span><span class="p">,</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Response</span><span class="p">,</span>
                                          <span class="n">ResponseWrapper</span><span class="p">,</span> <span class="n">ErrorResponse</span><span class="p">]):</span>
+<span class="w">        </span><span class="sd">"""Update outputs, completion state, and handoff metadata from a response.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            response: Executor or postprocessing result for this request.</span>
+<span class="sd">        """</span>
         <span class="n">req_perf_metrics_dict</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="n">ResponseWrapper</span><span class="p">):</span>
             <span class="n">req_perf_metrics_dict</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">request_perf_metrics</span>
@@ -1626,6 +1643,10 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span> <span class="o">=</span> <span class="p">(</span>
                 <span class="n">response</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">cached_tokens</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">cached_tokens</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ctx_computed_tokens</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="s1">'ctx_computed_tokens'</span><span class="p">,</span>
+                                               <span class="mi">0</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ctx_first_begin</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="s1">'ctx_first_begin'</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ctx_num_chunks</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="s1">'ctx_num_chunks'</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">res</span><span class="p">,</span> <span class="n">CompletionOutput</span><span class="p">):</span>
                 <span class="c1"># in streaming mode</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">res</span>
@@ -1691,6 +1712,11 @@ window.runMermaid = runMermaid;</script>
             <span class="n">context_phase_params</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">context_phase_params</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">decoding_iter</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">decoding_iter</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">cached_tokens</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">'cached_tokens'</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ctx_computed_tokens</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span>
+                                               <span class="s1">'ctx_computed_tokens'</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ctx_first_begin</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">'ctx_first_begin'</span><span class="p">,</span>
+                                           <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ctx_num_chunks</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">'ctx_num_chunks'</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_drafted</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">'per_pos_drafted'</span><span class="p">,</span>
                                            <span class="kc">None</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_accepted</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">'per_pos_accepted'</span><span class="p">,</span>
@@ -1729,6 +1755,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">ctx_info_endpoint</span><span class="o">=</span><span class="n">context_phase_params</span><span class="o">.</span><span class="n">disagg_info_endpoint</span><span class="p">,</span>
                     <span class="n">remote_tail_start</span><span class="o">=</span><span class="n">remote_tail_start</span><span class="p">,</span>
                     <span class="n">multimodal_embedding_handles</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                    <span class="n">multimodal_input_layout</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="p">)</span>
 
             <span class="n">finish_reasons</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">finish_reasons</span>
@@ -1821,6 +1848,15 @@ window.runMermaid = runMermaid;</script>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown response type: </span><span class="si">{</span><span class="n">response</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_num_prompt_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Prompt length without expanding an int32-buffer prompt into a list."""</span>
+        <span class="n">num</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_generation_request"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
+                      <span class="s2">"num_prompt_tokens"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">num</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">num</span>
+        <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"prompt_token_ids"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">)</span> <span class="k">if</span> <span class="n">prompt_token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">0</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">record_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                      <span class="n">output</span><span class="p">:</span> <span class="n">CompletionOutput</span><span class="p">,</span>
                      <span class="n">stats</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -1851,10 +1887,10 @@ window.runMermaid = runMermaid;</script>
             <span class="n">metrics_stats</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">processed_metrics_stat</span><span class="p">)</span>
         <span class="c1"># Record prompt tokens only for the first candidate to avoid</span>
         <span class="c1"># double-counting the shared prompt across n candidates.</span>
-        <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"prompt_token_ids"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="ow">and</span> <span class="n">sequence_index</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">prompt_token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
-                <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">PROMPT_TOKENS</span><span class="p">]</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">)</span>
+            <span class="n">num_prompt_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_prompt_tokens</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">num_prompt_tokens</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">PROMPT_TOKENS</span><span class="p">]</span> <span class="o">=</span> <span class="n">num_prompt_tokens</span>
 
         <span class="c1"># Request-scoped metrics: only record for the first candidate to avoid</span>
         <span class="c1"># double-counting across n candidates.</span>
@@ -1878,6 +1914,9 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">SPEC_DEC_DRAFTED_PER_POS</span><span class="p">]</span> <span class="o">=</span> \
                         <span class="p">[</span><span class="n">spec_dec</span><span class="o">.</span><span class="n">total_draft_tokens</span><span class="p">]</span>
 
+            <span class="c1"># The ids themselves are needed only here, for prompt logprobs.</span>
+            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"prompt_token_ids"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                                <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="ow">and</span> <span class="n">prompt_token_ids</span><span class="p">:</span>
                 <span class="k">try</span><span class="p">:</span>
                     <span class="n">prompt_lps</span> <span class="o">=</span> <span class="p">[]</span>
@@ -1899,8 +1938,8 @@ window.runMermaid = runMermaid;</script>
                         <span class="k">if</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">ppl</span><span class="p">):</span>
                             <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">PREFILL_PERPLEXITY</span><span class="p">]</span> <span class="o">=</span> <span class="n">ppl</span>
                 <span class="k">except</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">):</span>
-                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Failed to compute prefill perplexity"</span><span class="p">,</span>
-                                 <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Failed to compute prefill perplexity:</span><span class="se">\n</span><span class="s2">"</span>
+                                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">traceback</span><span class="o">.</span><span class="n">format_exc</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
         <span class="c1"># Candidate-scoped metric: generation perplexity is computed per candidate</span>
         <span class="c1"># from this candidate's logprobs.</span>
@@ -1927,8 +1966,8 @@ window.runMermaid = runMermaid;</script>
                         <span class="n">mean_lp</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">gen_lps</span><span class="p">)</span> <span class="o">/</span> <span class="nb">len</span><span class="p">(</span><span class="n">gen_lps</span><span class="p">)</span>
                         <span class="n">gen_ppl</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="o">-</span><span class="n">mean_lp</span><span class="p">)</span>
                 <span class="k">except</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">):</span>
-                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Failed to compute generation perplexity"</span><span class="p">,</span>
-                                 <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Failed to compute generation perplexity:</span><span class="se">\n</span><span class="s2">"</span>
+                                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">traceback</span><span class="o">.</span><span class="n">format_exc</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">gen_ppl</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">gen_ppl</span><span class="p">):</span>
                 <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">GENERATION_PERPLEXITY</span><span class="p">]</span> <span class="o">=</span> <span class="n">gen_ppl</span>
 
@@ -1991,10 +2030,10 @@ window.runMermaid = runMermaid;</script>
                           <span class="n">sampling_params</span><span class="o">.</span><span class="n">n</span><span class="p">)</span>
             <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span> <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_REQUEST_ID</span><span class="p">,</span>
                           <span class="bp">self</span><span class="o">.</span><span class="n">id</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">prompt_token_ids</span> <span class="o">:=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"prompt_token_ids"</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">num_prompt_tokens</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_prompt_tokens</span><span class="p">():</span>
                 <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span>
                               <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_USAGE_PROMPT_TOKENS</span><span class="p">,</span>
-                              <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">))</span>
+                              <span class="n">num_prompt_tokens</span><span class="p">)</span>
             <span class="n">safe_set_attr</span><span class="p">(</span><span class="n">span</span><span class="p">,</span>
                           <span class="n">tracing</span><span class="o">.</span><span class="n">SpanAttributes</span><span class="o">.</span><span class="n">GEN_AI_USAGE_COMPLETION_TOKENS</span><span class="p">,</span>
                           <span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">)</span>
@@ -2085,9 +2124,19 @@ window.runMermaid = runMermaid;</script>
                 <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">beam_output</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">outputs</span><span class="p">:</span>
                 <span class="n">beam_output</span><span class="o">.</span><span class="n">_last_text_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">beam_output</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
-                <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span> <span class="s1">'decode_incrementally'</span>
-                <span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streaming</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">use_beam_search</span><span class="p">:</span>
+                <span class="c1"># A stop word matched by token id is trimmed from token_ids in</span>
+                <span class="c1"># _handle_sequence. If some of its ids came in earlier streamed</span>
+                <span class="c1"># responses, the incremental decoder has already turned them</span>
+                <span class="c1"># into text, or holds the lead bytes of a character that the</span>
+                <span class="c1"># final flush would emit as U+FFFD. Decode the kept ids afresh</span>
+                <span class="c1"># instead, as the non-streaming path does.</span>
+                <span class="n">trimmed_streamed_ids</span> <span class="o">=</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">beam_output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">)</span>
+                                        <span class="o">&lt;</span> <span class="n">beam_output</span><span class="o">.</span><span class="n">_last_token_ids_len</span><span class="p">)</span>
+                <span class="n">use_incremental</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_streaming</span>
+                                   <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">use_beam_search</span>
+                                   <span class="ow">and</span> <span class="ow">not</span> <span class="n">trimmed_streamed_ids</span> <span class="ow">and</span> <span class="nb">hasattr</span><span class="p">(</span>
+                                       <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span> <span class="s1">'decode_incrementally'</span><span class="p">))</span>
+                <span class="k">if</span> <span class="n">use_incremental</span><span class="p">:</span>
                     <span class="n">beam_output</span><span class="o">.</span><span class="n">text</span><span class="p">,</span> <span class="n">beam_output</span><span class="o">.</span><span class="n">_incremental_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">decode_incrementally</span><span class="p">(</span>
                         <span class="n">beam_output</span><span class="o">.</span><span class="n">token_ids_diff</span><span class="p">,</span>
                         <span class="n">prev_text</span><span class="o">=</span><span class="n">beam_output</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
@@ -2098,6 +2147,13 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="n">beam_output</span><span class="o">.</span><span class="n">text</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span>
                         <span class="n">beam_output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">trimmed_streamed_ids</span><span class="p">:</span>
+                        <span class="c1"># Drop the pending flush, and move the watermark to the</span>
+                        <span class="c1"># kept ids so that later responses for sibling</span>
+                        <span class="c1"># candidates (n &gt; 1) do not decode this output again.</span>
+                        <span class="n">beam_output</span><span class="o">.</span><span class="n">_incremental_states</span> <span class="o">=</span> <span class="kc">None</span>
+                        <span class="n">beam_output</span><span class="o">.</span><span class="n">_last_token_ids_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span>
+                            <span class="n">beam_output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">)</span>
 
                 <span class="n">is_generating</span> <span class="o">=</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span>
                 <span class="n">is_finished_with_stop_or_length</span> <span class="o">=</span> <span class="p">(</span>
@@ -2396,6 +2452,121 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">StopAsyncIteration</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_reduce_prompt_logprobs_chunk</span><span class="p">(</span><span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                                  <span class="n">token_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span> <span class="n">top_k</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                                  <span class="n">normalized</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="n">logprobs</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">normalized</span><span class="p">:</span>
+        <span class="n">logprobs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">logprobs</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">columns</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">if</span> <span class="n">token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">targets</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">token_ids</span><span class="p">,</span>
+                               <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
+                               <span class="n">device</span><span class="o">=</span><span class="n">logprobs</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+        <span class="n">target_logprobs</span> <span class="o">=</span> <span class="n">logprobs</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">targets</span><span class="p">)</span>
+        <span class="n">ranks</span> <span class="o">=</span> <span class="p">(</span><span class="n">logprobs</span> <span class="o">&gt;</span> <span class="n">target_logprobs</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
+        <span class="n">columns</span> <span class="o">+=</span> <span class="p">[</span><span class="n">target_logprobs</span><span class="p">,</span> <span class="n">ranks</span><span class="p">]</span>
+    <span class="k">if</span> <span class="n">top_k</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">top_values</span><span class="p">,</span> <span class="n">top_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">logprobs</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">top_k</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="n">columns</span> <span class="o">+=</span> <span class="p">[</span><span class="n">top_values</span><span class="p">,</span> <span class="n">top_ids</span><span class="p">]</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">columns</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">((</span><span class="n">logprobs</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="mi">0</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
+    <span class="c1"># FP64 holds FP32 logprobs and integer ranks/token ids exactly.</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">column</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span> <span class="k">for</span> <span class="n">column</span> <span class="ow">in</span> <span class="n">columns</span><span class="p">],</span>
+                     <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">reduce_prompt_logprobs</span><span class="p">(</span><span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                           <span class="n">token_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
+                           <span class="n">top_k</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                           <span class="o">*</span><span class="p">,</span>
+                           <span class="n">normalized</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Reduce context logits to the values reported as prompt logprobs.</span>
+
+<span class="sd">    The reduction runs on the logits' device and copies one small host tensor</span>
+<span class="sd">    per bounded chunk, so no per-token host synchronization is needed.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        logits: ``[rows, vocab]`` (or ``[1, rows, vocab]``) logits of any</span>
+<span class="sd">            floating dtype; row ``t`` predicts ``token_ids[t]``.</span>
+<span class="sd">        token_ids: Target token ids, one per used row, or None to report only</span>
+<span class="sd">            the top-k tokens.</span>
+<span class="sd">        top_k: Number of most likely tokens to report per row.</span>
+<span class="sd">        normalized: ``logits`` already hold log probabilities, so they are</span>
+<span class="sd">            reported as is instead of being log-softmaxed again.</span>
+
+<span class="sd">    Returns:</span>
+<span class="sd">        ``[rows, columns]`` FP64 host tensor. With ``token_ids``, the columns</span>
+<span class="sd">        start with the target logprob and its 1-based vocabulary rank; ``top_k``</span>
+<span class="sd">        logprobs and then ``top_k`` token ids follow.</span>
+<span class="sd">    """</span>
+    <span class="k">if</span> <span class="n">logits</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">3</span><span class="p">:</span>
+        <span class="n">logits</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">logits</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[:</span><span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">)]</span>
+    <span class="c1"># Bound softmax scratch independently of prompt length. On the GPU, a</span>
+    <span class="c1"># slice can fall back to CPU without retaining a full-vocabulary GPU result.</span>
+    <span class="n">rows_per_chunk</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="mi">16</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">)</span> <span class="o">//</span> <span class="p">(</span><span class="mi">4</span> <span class="o">*</span> <span class="n">logits</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]))</span>
+    <span class="n">chunks</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">start</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">logits</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">rows_per_chunk</span><span class="p">):</span>
+        <span class="n">chunk</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">start</span> <span class="o">+</span> <span class="n">rows_per_chunk</span><span class="p">]</span>
+        <span class="n">tokens</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">token_ids</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">token_ids</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">start</span> <span class="o">+</span>
+                                                          <span class="n">chunk</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">reduced</span> <span class="o">=</span> <span class="n">_reduce_prompt_logprobs_chunk</span><span class="p">(</span><span class="n">chunk</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">top_k</span><span class="p">,</span>
+                                                    <span class="n">normalized</span><span class="p">)</span>
+        <span class="k">except</span> <span class="n">torch</span><span class="o">.</span><span class="n">OutOfMemoryError</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">chunk</span><span class="o">.</span><span class="n">is_cuda</span><span class="p">:</span>
+                <span class="k">raise</span>
+            <span class="n">reduced</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">reduced</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">reduced</span> <span class="o">=</span> <span class="n">_reduce_prompt_logprobs_chunk</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">cpu</span><span class="p">(),</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">top_k</span><span class="p">,</span>
+                                                    <span class="n">normalized</span><span class="p">)</span>
+        <span class="n">chunks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">reduced</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">chunks</span><span class="p">:</span>
+        <span class="n">columns</span> <span class="o">=</span> <span class="p">(</span><span class="mi">0</span> <span class="k">if</span> <span class="n">token_ids</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">2</span><span class="p">)</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">top_k</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">((</span><span class="mi">0</span><span class="p">,</span> <span class="n">columns</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">chunks</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">prompt_logprobs_from_reduced</span><span class="p">(</span>
+        <span class="n">reduced</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span> <span class="n">top_k</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">simple</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">TokenLogprobs</span> <span class="o">|</span> <span class="n">SimpleTokenLogprobs</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Build the user-facing prompt logprobs from ``reduce_prompt_logprobs`` rows.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        reduced: ``[rows, columns]`` FP64 host tensor from</span>
+<span class="sd">            ``reduce_prompt_logprobs`` with the same ``token_ids`` presence</span>
+<span class="sd">            and ``top_k``.</span>
+<span class="sd">        token_ids: The target token ids the rows were reduced against, or None.</span>
+<span class="sd">        top_k: Number of top tokens reduced per row.</span>
+<span class="sd">        simple: Return a flat list of target logprobs when ``top_k`` is 0.</span>
+<span class="sd">    """</span>
+    <span class="n">rows</span> <span class="o">=</span> <span class="n">reduced</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">top_k</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">token_ids</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">[]</span>
+        <span class="k">if</span> <span class="n">simple</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">[</span><span class="n">row</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">]</span>
+        <span class="k">return</span> <span class="p">[{</span>
+            <span class="n">token_id</span><span class="p">:</span> <span class="n">Logprob</span><span class="p">(</span><span class="n">logprob</span><span class="o">=</span><span class="n">row</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">rank</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="n">row</span><span class="p">[</span><span class="mi">1</span><span class="p">]))</span>
+        <span class="p">}</span> <span class="k">for</span> <span class="n">token_id</span><span class="p">,</span> <span class="n">row</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">token_ids</span><span class="p">,</span> <span class="n">rows</span><span class="p">)]</span>
+    <span class="n">first</span> <span class="o">=</span> <span class="mi">0</span> <span class="k">if</span> <span class="n">token_ids</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">2</span>
+    <span class="n">results</span><span class="p">:</span> <span class="n">TokenLogprobs</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">index</span><span class="p">,</span> <span class="n">row</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">rows</span><span class="p">):</span>
+        <span class="n">values</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="n">first</span><span class="p">:</span><span class="n">first</span> <span class="o">+</span> <span class="n">top_k</span><span class="p">]</span>
+        <span class="n">ids</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="n">first</span> <span class="o">+</span> <span class="n">top_k</span><span class="p">:</span><span class="n">first</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">top_k</span><span class="p">]</span>
+        <span class="n">token_dict</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="nb">int</span><span class="p">(</span><span class="n">token_id</span><span class="p">):</span> <span class="n">Logprob</span><span class="p">(</span><span class="n">logprob</span><span class="o">=</span><span class="n">value</span><span class="p">,</span> <span class="n">rank</span><span class="o">=</span><span class="n">rank</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">rank</span><span class="p">,</span> <span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">token_id</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">values</span><span class="p">,</span> <span class="n">ids</span><span class="p">))</span>
+        <span class="p">}</span>
+        <span class="k">if</span> <span class="n">token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">token_ids</span><span class="p">[</span><span class="n">index</span><span class="p">]</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">token_dict</span><span class="p">:</span>
+            <span class="n">token_dict</span><span class="p">[</span><span class="n">token_ids</span><span class="p">[</span><span class="n">index</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Logprob</span><span class="p">(</span><span class="n">logprob</span><span class="o">=</span><span class="n">row</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                                                   <span class="n">rank</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="n">row</span><span class="p">[</span><span class="mi">1</span><span class="p">]))</span>
+        <span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">token_dict</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">results</span>
+
+
 <span class="k">def</span><span class="w"> </span><span class="nf">compute_prompt_logprobs</span><span class="p">(</span>
     <span class="n">k_prompt_logprobs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">context_logits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
@@ -2407,69 +2578,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    When ``simple_prompt_logprobs`` is True and ``k_prompt_logprobs`` is 0,</span>
 <span class="sd">    return a flat list of sampled-token logprobs instead of per-token dicts.</span>
 <span class="sd">    """</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">_topk_logprobs</span><span class="p">(</span><span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">top_k</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                       <span class="n">tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
-                       <span class="n">simple</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">TokenLogprobs</span> <span class="o">|</span> <span class="n">SimpleTokenLogprobs</span><span class="p">:</span>
-        <span class="k">if</span> <span class="n">logits</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">3</span><span class="p">:</span>
-            <span class="c1"># reshape from [1, T, V] to [T, V]</span>
-            <span class="n">logits</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="n">tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">logits</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">&gt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">tokens</span><span class="p">):</span>
-            <span class="c1"># Only consume logits corresponding to the supplied tokens.</span>
-            <span class="n">logits</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[:</span><span class="nb">len</span><span class="p">(</span><span class="n">tokens</span><span class="p">)]</span>
-
-        <span class="n">logprobs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">logits</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
-
-        <span class="c1"># only return sampled token</span>
-        <span class="k">if</span> <span class="n">top_k</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">simple</span><span class="p">:</span>
-                <span class="n">simple_results</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-                <span class="k">if</span> <span class="n">tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                    <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">logprobs</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)):</span>
-                        <span class="n">simple_results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">logprobs</span><span class="p">[</span><span class="n">t</span><span class="p">,</span> <span class="n">tokens</span><span class="p">[</span><span class="n">t</span><span class="p">]]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
-                <span class="k">return</span> <span class="n">simple_results</span>
-
-            <span class="n">results</span><span class="p">:</span> <span class="n">TokenLogprobs</span> <span class="o">=</span> <span class="p">[]</span>
-            <span class="k">if</span> <span class="n">tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">logprobs</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)):</span>
-                    <span class="n">token_id</span> <span class="o">=</span> <span class="n">tokens</span><span class="p">[</span><span class="n">t</span><span class="p">]</span>
-                    <span class="n">token_logprob</span> <span class="o">=</span> <span class="n">logprobs</span><span class="p">[</span><span class="n">t</span><span class="p">,</span> <span class="n">token_id</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
-                    <span class="n">rank</span> <span class="o">=</span> <span class="p">(</span><span class="n">logprobs</span><span class="p">[</span><span class="n">t</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">token_logprob</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">+</span> <span class="mi">1</span>
-                    <span class="n">token_dict</span> <span class="o">=</span> <span class="p">{</span>
-                        <span class="n">token_id</span><span class="p">:</span> <span class="n">Logprob</span><span class="p">(</span><span class="n">logprob</span><span class="o">=</span><span class="n">token_logprob</span><span class="p">,</span> <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">)</span>
-                    <span class="p">}</span>
-                    <span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">token_dict</span><span class="p">)</span>
-            <span class="k">return</span> <span class="n">results</span>
-
-        <span class="n">topk_vals</span><span class="p">,</span> <span class="n">topk_indices</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">logprobs</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">top_k</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
-
-        <span class="n">results</span><span class="p">:</span> <span class="n">TokenLogprobs</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="c1"># for each token position</span>
-        <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">logprobs</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)):</span>
-            <span class="n">token_dict</span> <span class="o">=</span> <span class="p">{</span>
-                <span class="n">idx</span><span class="o">.</span><span class="n">item</span><span class="p">():</span> <span class="n">Logprob</span><span class="p">(</span><span class="n">logprob</span><span class="o">=</span><span class="n">val</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span> <span class="n">rank</span><span class="o">=</span><span class="n">r</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
-                <span class="k">for</span> <span class="n">r</span><span class="p">,</span> <span class="p">(</span><span class="n">val</span><span class="p">,</span>
-                        <span class="n">idx</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">topk_vals</span><span class="p">[</span><span class="n">t</span><span class="p">],</span> <span class="n">topk_indices</span><span class="p">[</span><span class="n">t</span><span class="p">]))</span>
-            <span class="p">}</span>
-
-            <span class="c1"># If we have the sampled token list and it's not in top-k, add it</span>
-            <span class="k">if</span> <span class="n">tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">token_id</span> <span class="o">=</span> <span class="n">tokens</span><span class="p">[</span><span class="n">t</span><span class="p">]</span>
-                <span class="k">if</span> <span class="n">token_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">token_dict</span><span class="p">:</span>
-                    <span class="n">token_logprob</span> <span class="o">=</span> <span class="n">logprobs</span><span class="p">[</span><span class="n">t</span><span class="p">,</span> <span class="n">token_id</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
-                    <span class="n">rank</span> <span class="o">=</span> <span class="p">(</span><span class="n">logprobs</span><span class="p">[</span><span class="n">t</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">token_logprob</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">+</span> <span class="mi">1</span>
-                    <span class="n">token_dict</span><span class="p">[</span><span class="n">token_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">Logprob</span><span class="p">(</span><span class="n">logprob</span><span class="o">=</span><span class="n">token_logprob</span><span class="p">,</span>
-                                                   <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">)</span>
-
-            <span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">token_dict</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">results</span>
-
-    <span class="n">prompt_logprobs</span> <span class="o">=</span> <span class="n">_topk_logprobs</span><span class="p">(</span>
-        <span class="n">context_logits</span><span class="p">,</span> <span class="n">k_prompt_logprobs</span><span class="p">,</span> <span class="n">prompt_token_ids</span><span class="p">,</span>
-        <span class="n">simple_prompt_logprobs</span>
-    <span class="p">)</span> <span class="k">if</span> <span class="n">k_prompt_logprobs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">context_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
-    <span class="k">return</span> <span class="n">LogProbsResult</span><span class="p">(</span><span class="n">prompt</span><span class="o">=</span><span class="n">prompt_logprobs</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">k_prompt_logprobs</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">context_logits</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">LogProbsResult</span><span class="p">(</span><span class="n">prompt</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+    <span class="n">reduced</span> <span class="o">=</span> <span class="n">reduce_prompt_logprobs</span><span class="p">(</span><span class="n">context_logits</span><span class="p">,</span> <span class="n">prompt_token_ids</span><span class="p">,</span>
+                                     <span class="n">k_prompt_logprobs</span><span class="p">)</span>
+    <span class="n">tokens</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">prompt_token_ids</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">prompt_token_ids</span><span class="p">[:</span><span class="n">reduced</span><span class="o">.</span>
+                                                                    <span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span>
+    <span class="k">return</span> <span class="n">LogProbsResult</span><span class="p">(</span><span class="n">prompt</span><span class="o">=</span><span class="n">prompt_logprobs_from_reduced</span><span class="p">(</span>
+        <span class="n">reduced</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">k_prompt_logprobs</span><span class="p">,</span> <span class="n">simple_prompt_logprobs</span><span class="p">))</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_build_perf_metrics_dict</span><span class="p">(</span>
@@ -2614,9 +2730,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

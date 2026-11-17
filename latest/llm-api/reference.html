@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -471,6 +471,8 @@
 <li class="toctree-l2"><a class="reference internal" href="reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/CalibConfig.html">CalibConfig</a></li>
@@ -500,11 +502,13 @@
 <li class="toctree-l2"><a class="reference internal" href="reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -519,6 +523,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -530,6 +535,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -571,6 +577,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -872,6 +880,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">additional_model_outputs</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">guided_decoding</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">thinking_token_budget</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">watermarking</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">ignore_eos</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">detokenize</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">add_special_tokens</span></span></em>,</dd>
@@ -949,6 +958,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">multimodal_hashes</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mrope_position_ids_handle</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mrope_position_deltas_handle</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">multimodal_input_layout</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/disaggregated_params.html#DisaggregatedParams"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
@@ -995,8 +1005,13 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">sink_token_length</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">free_gpu_memory_fraction</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">host_cache_size</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">host_cache_bind_to_gpu_numa_node</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disk_cache_size</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disk_cache_path</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">disk_io_threads</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">disk_keep_copy_after_restore</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">disk_write_through</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">disk_protected_copy_fraction</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cross_kv_cache_fraction</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cold_tier_offload_min_priority</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">secondary_offload_min_priority</span></span></em>,</dd>
@@ -1132,9 +1147,11 @@
 <dl>
 <dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_num_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_balancer</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disable_finalize_fusion</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">megamoe_fuse_shared_expert</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_low_precision_moe_combine</span></span></em>,</dd>
 </dl>
 
@@ -1152,6 +1169,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1184,6 +1202,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1217,6 +1236,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1258,6 +1278,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">waiting_queue_policy</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_python_scheduler</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_prefix_aware_scheduling</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">gen_preemption</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_gen_init_admissions_per_pass</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">context_scheduling_policy</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">context_starvation_iterations</span></span></em>,</dd>
 </dl>
@@ -1270,6 +1292,18 @@
 <dt class="sig sig-object py">
 <em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">CapacitySchedulerPolicy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#CapacitySchedulerPolicy"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
 <dd><p><a class="reference internal" href="reference/CapacitySchedulerPolicy.html"><span class="doc">View the full CapacitySchedulerPolicy reference</span></a></p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">CheckpointIOPolicy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#CheckpointIOPolicy"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
+<dd><p><a class="reference internal" href="reference/CheckpointIOPolicy.html"><span class="doc">View the full CheckpointIOPolicy reference</span></a></p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">CheckpointFormat</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/checkpoint_format.html#CheckpointFormat"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
+<dd><p><a class="reference internal" href="reference/CheckpointFormat.html"><span class="doc">View the full CheckpointFormat reference</span></a></p>
 </dd></dl>
 
 <dl class="py class">
@@ -1386,6 +1420,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1417,6 +1452,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1446,6 +1482,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1478,6 +1515,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1493,6 +1531,11 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">block_size</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">markov_rank</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">markov_head_type</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_confidence_scheduling</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">confidence_cost_table_path</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">confidence_calibration_path</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">confidence_min_predicted_gain</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_fused_confidence_scheduler</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_type</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">attention_backend</span></span></em>,</dd>
 </dl>
@@ -1511,6 +1554,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1547,6 +1591,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1595,6 +1640,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1671,6 +1717,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">postprocess_tokenizer_dir</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">num_serve_frontends</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">serve_frontend_affinity_port_stride</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">serve_graceful_shutdown_timeout_s</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">reasoning_parser</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_mpi_session</span></span></em>,</dd>
@@ -1694,6 +1741,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">attention_dp_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disable_overlap_scheduler</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_return_routed_experts</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">watermark_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">lm_head_output_dtype</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">nvfp4_gemm_config</span></span></em>,</dd>
@@ -1710,9 +1758,12 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_low_latency_host_dispatch</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_iter_perf_stats</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_tokenization_cache</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">prompt_token_cache_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_iter_req_stats</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">iter_perf_stats_interval</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">print_iter_log</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_client_io_during_gpu_wait</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">gen_prompt_tail_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">batch_wait_timeout_ms</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">batch_wait_timeout_iters</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">batch_wait_max_tokens_ratio</span></span></em>,</dd>
@@ -1768,6 +1819,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1792,6 +1844,7 @@
 <dl>
 <dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_balance</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_packed_sync</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">timeout_iters</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">batching_wait_iters</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_kv_balanced_admission</span></span></em>,</dd>
@@ -1804,6 +1857,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_routing_conversation_affinity</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_routing_max_sessions</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_routing_new_conv_placement</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_routing_strict_conversation_affinity</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_routing_strict_affinity_max_wait_iters</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#AttentionDpConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
@@ -1826,6 +1881,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">max_total_draft_tokens</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_backend</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tactic</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_concurrency</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">draft_len_schedule</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">load_format</span></span></em>,</dd>
@@ -1913,6 +1969,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">gvr_deterministic_topk</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">indexer_k_dtype</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">index_share_for_mtp_iteration</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_kv_cache_offload</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_offload_config</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#DeepSeekSparseAttentionConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
@@ -1942,9 +2000,10 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">gvr_deterministic_topk</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">indexer_k_dtype</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">index_share_for_mtp_iteration</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_kv_cache_offload</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_offload_config</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">compress_ratios</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">window_size</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">enable_kv_cache_offload</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#DeepSeekV4SparseAttentionConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
@@ -1975,6 +2034,12 @@
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#MiniMaxM3SparseAttentionConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
 <dd><p><a class="reference internal" href="reference/MiniMaxM3SparseAttentionConfig.html"><span class="doc">View the full MiniMaxM3SparseAttentionConfig reference</span></a></p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">SparseKvCacheOffloadConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gpu_cache_factor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_history_size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#SparseKvCacheOffloadConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
+<dd><p><a class="reference internal" href="reference/SparseKvCacheOffloadConfig.html"><span class="doc">View the full SparseKvCacheOffloadConfig reference</span></a></p>
 </dd></dl>
 
 <dl class="py class">
@@ -2020,6 +2085,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">skip_rope_quantization</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">nvfp4_residual_dim</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">scale_checkpoint_path</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">mixed_precision_first_n</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">mixed_precision_last_n</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#ColdPageQuantizationCompressionConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
@@ -2065,6 +2132,12 @@
 
 <dl class="py class">
 <dt class="sig sig-object py">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">PromptTokenCacheConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_bytes</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#PromptTokenCacheConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
+<dd><p><a class="reference internal" href="reference/PromptTokenCacheConfig.html"><span class="doc">View the full PromptTokenCacheConfig reference</span></a></p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py">
 <em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">PrefillCudaGraphBackend</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#PrefillCudaGraphBackend"><span class="viewcode-link"><span class="pre">[source]</span></span></a></dt>
 <dd><p><a class="reference internal" href="reference/PrefillCudaGraphBackend.html"><span class="doc">View the full PrefillCudaGraphBackend reference</span></a></p>
 </dd></dl>
@@ -2105,6 +2178,7 @@
 
 <dl>
 <dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">vision_gpu_normalize</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">encoder_cuda_graph</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">encoder_side_stream_max_ahead</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">encoder_cache_max_bytes</span></span></em>,</dd>
@@ -2243,9 +2317,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

@@ -64,7 +64,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +81,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -477,6 +477,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -506,11 +508,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -525,6 +529,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -536,6 +541,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -577,6 +583,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -980,7 +988,7 @@ limitations under the License.
 <h3>DeepSeek-V4 Performance Optimizations<a class="headerlink" href="#deepseek-v4-performance-optimizations" title="Link to this heading">#</a></h3>
 <p>Building on the production-ready execution stack described above, TensorRT LLM optimizes DeepSeek-V4 across four areas: the CSA/HCA attention hot path, Compressor and mHC, MoE, and runtime execution and memory management. The following sections explain the key techniques in each area, while <a class="reference internal" href="#deepseek-v4-performance-evolution"><strong>DeepSeek-V4 Performance Evolution</strong></a> presents their cumulative end-to-end impact under a consistent model workload. Performance numbers cited here are scoped operator measurements or A/B end-to-end comparisons, not cumulative speedups.</p>
 <section id="optimize-the-csa-hca-hot-path">
-<h4>Optimize the CSA/HCA hot path<a class="headerlink" href="#optimize-the-csa-hca-hot-path" title="Link to this heading">#</a></h4>
+<span id="optimize-the-csahca-hot-path"></span><h4>Optimize the CSA/HCA hot path<a class="headerlink" href="#optimize-the-csa-hca-hot-path" title="Link to this heading">#</a></h4>
 <p>CSA and HCA share a dual-pool attention kernel over the 128-token sliding window and compressed history, while CSA additionally runs an Indexer and Top-K selection. TensorRT LLM optimizes this hot path through attention-kernel improvements, low-precision fusion, multi-stream scheduling, and Top-K optimization.</p>
 <p><strong>Sparse MLA kernel optimization.</strong> The dual-pool kernel processes the 128-token sliding window first, then gathers selected CSA entries or streams all HCA entries from the compressed pool. The optimized TRTLLM-Gen kernel skips redundant dense and sliding-window softmax masking on full tiles and issues sparse V loads with less coordinate setup and register spill/reload pressure. On B200 with an FP8 KV cache, the measured FMHA kernel was up to 1.31× faster for CSA prefill and 1.21× faster for HCA generation in the tested shapes. These are operator-level results, and the model-level gain depends on the model’s mix of SWA, CSA, and HCA layers.</p>
 <p><strong>Kernel fusion and low-precision dataflow.</strong> The functional path initially relied on framework or generic operators around attention. TensorRT LLM adds a DeepSeek-V4-specific Q RMSNorm CUDA kernel and extends the MLA RoPE/assignment and FMHA epilogue kernels so that normalization, rotation, and quantization can be fused into their producers. The resulting optimizations are:</p>
@@ -1184,7 +1192,7 @@ limitations under the License.
 <p>For engineering comparisons, we use concurrency per GPU (CPG). It is the supported concurrency divided by the total number of GPUs in the deployment, including both context and generation GPUs.</p>
 </section>
 <section id="lessons-from-deepseek-v3-2-agentic-workload-optimization">
-<h3>Lessons from DeepSeek-V3.2 Agentic Workload Optimization<a class="headerlink" href="#lessons-from-deepseek-v3-2-agentic-workload-optimization" title="Link to this heading">#</a></h3>
+<span id="lessons-from-deepseek-v32-agentic-workload-optimization"></span><h3>Lessons from DeepSeek-V3.2 Agentic Workload Optimization<a class="headerlink" href="#lessons-from-deepseek-v3-2-agentic-workload-optimization" title="Link to this heading">#</a></h3>
 <p>Before DeepSeek-V4, we optimized DeepSeek-V3.2 for long, multi-turn agentic workloads in both aggregated and disaggregated serving. The durable value of that work was not a particular benchmark result or deployment configuration. It was a set of system-level rules that guided the DeepSeek-V4 effort:</p>
 <ol class="arabic simple">
 <li><p><strong>High reuse creates a different bottleneck from raw GPU throughput.</strong> High prefix reuse can leave only a small uncached suffix to compute while the accumulated conversation still occupies substantial KV-cache capacity. Scheduling and capacity planning should therefore consider the remaining compute tokens and resident KV footprint rather than raw prompt length alone.</p></li>
@@ -1518,9 +1526,9 @@ limitations under the License.
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

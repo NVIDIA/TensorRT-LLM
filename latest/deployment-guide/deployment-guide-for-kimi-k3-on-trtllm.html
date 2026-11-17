@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -676,7 +684,7 @@
                 <article class="bd-article">
                   
   <section class="tex2jax_ignore mathjax_ignore" id="deployment-guide-for-kimi-k3-on-tensorrt-llm-blackwell">
-<h1>Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell<a class="headerlink" href="#deployment-guide-for-kimi-k3-on-tensorrt-llm-blackwell" title="Link to this heading">#</a></h1>
+<span id="deployment-guide-for-kimi-k3-on-tensorrt-llm---blackwell"></span><h1>Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell<a class="headerlink" href="#deployment-guide-for-kimi-k3-on-tensorrt-llm-blackwell" title="Link to this heading">#</a></h1>
 <section id="introduction">
 <h2>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h2>
 <p>This deployment guide provides step-by-step instructions for running the Kimi K3 model using TensorRT LLM on NVIDIA Blackwell GPUs. The deployment configurations and results in this guide were validated on NVIDIA GB300 NVL GPUs. It covers the complete setup required; from preparing the model weights and building the software environment to configuring TensorRT LLM parameters, launching the multi-node server, and validating inference output and accuracy.</p>
@@ -856,37 +864,37 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 <h3>Key YAML Options<a class="headerlink" href="#key-yaml-options" title="Link to this heading">#</a></h3>
 <p>These options are set within the YAML file passed to <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> via the <code class="docutils literal notranslate"><span class="pre">--config</span></code> argument. Only the Kimi-K3-relevant knobs are described here; see the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs"><code class="docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code> class</a> for the full reference.</p>
 <section id="tensor-parallel-size">
-<h4><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code><a class="headerlink" href="#tensor-parallel-size" title="Link to this heading">#</a></h4>
+<span id="tensor_parallel_size"></span><h4><code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code><a class="headerlink" href="#tensor-parallel-size" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Description:</strong> The width of the parallel group. Set it to <code class="docutils literal notranslate"><span class="pre">16</span></code> for DEP16 and TEP16, or <code class="docutils literal notranslate"><span class="pre">8</span></code> for TEP8.</p></li>
 </ul>
 </section>
 <section id="enable-attention-dp">
-<h4><code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code><a class="headerlink" href="#enable-attention-dp" title="Link to this heading">#</a></h4>
+<span id="enable_attention_dp"></span><h4><code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code><a class="headerlink" href="#enable-attention-dp" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Description:</strong> Set it to <code class="docutils literal notranslate"><span class="pre">true</span></code> for the DEP16 high-throughput deployment. The TEP16 low-latency and TEP8 8-GPU deployments set it to <code class="docutils literal notranslate"><span class="pre">false</span></code>.</p></li>
 </ul>
 </section>
 <section id="moe-expert-parallel-size">
-<h4><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code><a class="headerlink" href="#moe-expert-parallel-size" title="Link to this heading">#</a></h4>
+<span id="moe_expert_parallel_size"></span><h4><code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size</span></code><a class="headerlink" href="#moe-expert-parallel-size" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Description:</strong> The expert-parallel width for the MoE layers. Set it to <code class="docutils literal notranslate"><span class="pre">16</span></code> for DEP16 and TEP16, or <code class="docutils literal notranslate"><span class="pre">8</span></code> for TEP8.</p></li>
 </ul>
 </section>
 <section id="cuda-graph-config">
-<h4><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h4>
+<span id="cuda_graph_config"></span><h4><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Description:</strong> The standard DEP16, TEP16, and TEP8 performance recipes enable CUDA graphs. DEP16 also sets <code class="docutils literal notranslate"><span class="pre">enable_padding:</span> <span class="pre">true</span></code>, which pads generation batches to a captured size. Set the CUDA-graph <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> to the same value as the top-level <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>.</p></li>
 </ul>
 </section>
 <section id="disable-overlap-scheduler">
-<h4><code class="docutils literal notranslate"><span class="pre">disable_overlap_scheduler</span></code><a class="headerlink" href="#disable-overlap-scheduler" title="Link to this heading">#</a></h4>
+<span id="disable_overlap_scheduler"></span><h4><code class="docutils literal notranslate"><span class="pre">disable_overlap_scheduler</span></code><a class="headerlink" href="#disable-overlap-scheduler" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Description:</strong> Set it to <code class="docutils literal notranslate"><span class="pre">false</span></code> to enable the overlap scheduler, as used by the standard DEP16, TEP16, and TEP8 performance recipes.</p></li>
 </ul>
 </section>
 <section id="moe-config">
-<h4><code class="docutils literal notranslate"><span class="pre">moe_config</span></code><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h4>
+<span id="moe_config"></span><h4><code class="docutils literal notranslate"><span class="pre">moe_config</span></code><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Options:</strong></p>
 <ul>
@@ -897,13 +905,13 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 </ul>
 </section>
 <section id="enable-chunked-prefill">
-<h4><code class="docutils literal notranslate"><span class="pre">enable_chunked_prefill</span></code><a class="headerlink" href="#enable-chunked-prefill" title="Link to this heading">#</a></h4>
+<span id="enable_chunked_prefill"></span><h4><code class="docutils literal notranslate"><span class="pre">enable_chunked_prefill</span></code><a class="headerlink" href="#enable-chunked-prefill" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Description:</strong> The recommended DEP16 configuration sets this option to <code class="docutils literal notranslate"><span class="pre">true</span></code>. Prompts longer than <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> are then scheduled across multiple prefill steps; this is verified on 16-GPU DEP16 at GSM8K parity with the unchunked baseline.</p></li>
 </ul>
 </section>
 <section id="kv-cache-config">
-<h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code><a class="headerlink" href="#kv-cache-config" title="Link to this heading">#</a></h4>
+<span id="kv_cache_config"></span><h4><code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code><a class="headerlink" href="#kv-cache-config" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Options:</strong></p>
 <ul>
@@ -916,7 +924,7 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 </ul>
 </section>
 <section id="trust-remote-code">
-<h4><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code><a class="headerlink" href="#trust-remote-code" title="Link to this heading">#</a></h4>
+<span id="trust_remote_code"></span><h4><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code><a class="headerlink" href="#trust-remote-code" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p><strong>Description:</strong> Required to load the Kimi K3 configuration and tokenizer code shipped with the checkpoint.</p></li>
 </ul>
@@ -928,7 +936,7 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 <ul class="simple">
 <li><p><strong>Request extensions:</strong> the <code class="docutils literal notranslate"><span class="pre">thinking</span></code> object (<code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;enabled&quot;|&quot;disabled&quot;,</span> <span class="pre">&quot;keep&quot;:</span> <span class="pre">&quot;all&quot;,</span> <span class="pre">&quot;effort&quot;:</span> <span class="pre">&quot;low&quot;|&quot;high&quot;|&quot;max&quot;}</span></code>), <code class="docutils literal notranslate"><span class="pre">reasoning_effort</span></code> values <code class="docutils literal notranslate"><span class="pre">&quot;low&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;high&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;max&quot;</span></code>, and <code class="docutils literal notranslate"><span class="pre">&quot;none&quot;</span></code> (an explicit <code class="docutils literal notranslate"><span class="pre">thinking</span></code> object takes precedence), <code class="docutils literal notranslate"><span class="pre">tool_choice:</span> <span class="pre">&quot;required&quot;</span></code>, message-level (dynamic) tools declared on system messages, and <code class="docutils literal notranslate"><span class="pre">response_format</span></code> <code class="docutils literal notranslate"><span class="pre">json_object</span></code>/<code class="docutils literal notranslate"><span class="pre">json_schema</span></code> (the <code class="docutils literal notranslate"><span class="pre">json_schema</span></code> wrapper must carry a non-empty <code class="docutils literal notranslate"><span class="pre">name</span></code> and a <code class="docutils literal notranslate"><span class="pre">schema</span></code> object). These map onto the checkpoint chat template’s native control messages. For thinking and its effort, which the template reads from the native <code class="docutils literal notranslate"><span class="pre">thinking</span></code> and <code class="docutils literal notranslate"><span class="pre">thinking_effort</span></code> chat-template kwargs, each setting comes from the first of these sources that sets it: (1) <code class="docutils literal notranslate"><span class="pre">thinking</span></code> / <code class="docutils literal notranslate"><span class="pre">thinking_effort</span></code> in <code class="docutils literal notranslate"><span class="pre">chat_template_kwargs</span></code>; (2) the request-level <code class="docutils literal notranslate"><span class="pre">thinking</span></code> object; (3) the request-level <code class="docutils literal notranslate"><span class="pre">reasoning_effort</span></code>; (4) the generic <code class="docutils literal notranslate"><span class="pre">enable_thinking</span></code> (boolean) and <code class="docutils literal notranslate"><span class="pre">reasoning_effort</span></code> (<code class="docutils literal notranslate"><span class="pre">&quot;none&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;low&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;high&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;max&quot;</span></code>) keys in <code class="docutils literal notranslate"><span class="pre">chat_template_kwargs</span></code>, which other chat templates read and <code class="docutils literal notranslate"><span class="pre">/v1/messages</span></code> fills from <code class="docutils literal notranslate"><span class="pre">thinking</span></code> and <code class="docutils literal notranslate"><span class="pre">output_config.effort</span></code>; (5) the template default, thinking on with effort <code class="docutils literal notranslate"><span class="pre">max</span></code>. An effort of <code class="docutils literal notranslate"><span class="pre">&quot;none&quot;</span></code> turns thinking off, and no effort is derived while thinking is off; a <code class="docutils literal notranslate"><span class="pre">thinking_effort</span></code> passed in <code class="docutils literal notranslate"><span class="pre">chat_template_kwargs</span></code> is kept, but the template renders no effort while thinking is off, so it has no effect then. Other effort values (for example <code class="docutils literal notranslate"><span class="pre">&quot;medium&quot;</span></code>) have no K3 equivalent and leave the default. For the other controls, explicit <code class="docutils literal notranslate"><span class="pre">chat_template_kwargs</span></code> win over the values derived from request fields.</p></li>
 <li><p><strong>Streaming usage:</strong> <code class="docutils literal notranslate"><span class="pre">usage</span></code> is reported in the final streaming chunk even when the client does not send <code class="docutils literal notranslate"><span class="pre">stream_options</span></code> (Kimi API parity).</p></li>
-<li><p><strong>Prompt-token accounting:</strong> reported <code class="docutils literal notranslate"><span class="pre">usage.prompt_tokens</span></code> excludes the trailing 3-token generation channel opener, matching Kimi’s reference accounting; the model still consumes the full rendered prompt.</p></li>
+<li><p><strong>Prompt-token accounting:</strong> reported <code class="docutils literal notranslate"><span class="pre">usage.prompt_tokens</span></code> excludes the trailing 3-token generation channel opener, matching Kimi’s reference accounting; the model still consumes the full rendered prompt. <code class="docutils literal notranslate"><span class="pre">/v1/responses</span></code> counts <code class="docutils literal notranslate"><span class="pre">usage.input_tokens</span></code> the same way.</p></li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">TRTLLM_KIMI_PARAM_POLICY</span></code></strong> (default <code class="docutils literal notranslate"><span class="pre">0</span></code>, off): when set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, enforces Kimi’s immutable sampling parameters — <code class="docutils literal notranslate"><span class="pre">top_p</span></code> pinned to 0.95 (unset or the OpenAI default <code class="docutils literal notranslate"><span class="pre">1.0</span></code> are coerced to 0.95; other values are rejected with HTTP 400), <code class="docutils literal notranslate"><span class="pre">presence_penalty</span></code>/<code class="docutils literal notranslate"><span class="pre">frequency_penalty</span></code> 0, <code class="docutils literal notranslate"><span class="pre">n</span></code> 1, and <code class="docutils literal notranslate"><span class="pre">temperature</span></code> bounded to [0, 1]. Off by default so existing deployments keep accepting the requests they accept today; a Kimi-Vendor-Verifier certification run must set it to <code class="docutils literal notranslate"><span class="pre">1</span></code> (the KVV params suite requires the rejections).</p></li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">TLLM_KIMI_K3_FP8_KV_LAYERS</span></code></strong> (NVFP4 KV cache only): comma-separated zero-based global MLA layer IDs to keep in an FP8 KV cache instead of the default last two MLA layers; an empty value keeps every MLA layer in NVFP4. The previous <code class="docutils literal notranslate"><span class="pre">TLLM_KIMI_K3_BF16_KV_LAYERS</span></code> is deprecated: it is still honored as this list, with a warning, when <code class="docutils literal notranslate"><span class="pre">TLLM_KIMI_K3_FP8_KV_LAYERS</span></code> is unset.</p></li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR</span></code></strong> (default <code class="docutils literal notranslate"><span class="pre">0</span></code>): opt-in constrained decoding for tools with <code class="docutils literal notranslate"><span class="pre">strict:</span> <span class="pre">true</span></code> (requires <code class="docutils literal notranslate"><span class="pre">guided_decoding_backend:</span> <span class="pre">xgrammar</span></code>). Disabled by default pending the investigation of a device-side assert observed under sustained concurrent guided load; strict tools otherwise fall back to warn-and-continue.</p></li>
@@ -1375,9 +1383,9 @@ mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">"</span>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
     <link rel="next" title="GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K" href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html" />
-    <link rel="prev" title="Telemetry" href="../../developer-guide/telemetry.html" />
+    <link rel="prev" title="Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72" href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -900,7 +908,7 @@
 <section id="triattention">
 <h3>TriAttention<a class="headerlink" href="#triattention" title="Link to this heading">#</a></h3>
 <section id="id2">
-<h4>Introduction<a class="headerlink" href="#id2" title="Link to this heading">#</a></h4>
+<span id="introduction-1"></span><h4>Introduction<a class="headerlink" href="#id2" title="Link to this heading">#</a></h4>
 <p>In a long generation most of the KV cache is generated tokens, and most of them will not matter to the queries still to come. <a class="reference external" href="https://arxiv.org/abs/2604.04921">TriAttention</a> (ICML 2026) predicts which ones matter from per-head query statistics collected once offline, and every few tokens evicts the rest and compacts the cache, so decoding reads a shorter cache and more sequences fit on the GPU. Figure 8 shows one round. For details, see the paper.</p>
 <div align="center">
 <figure>
@@ -910,7 +918,7 @@
 <p align="center"><sub><em>Figure 8: TriAttention keeps the prompt intact and evicts generated tokens. Every β new tokens, the generated tokens are scored with the calibrated query statistics of each head. The `budget` highest-scoring tokens stay, the rest are evicted, and the cache is compacted, so decoding continues over a shorter cache.</em></sub></p>
 </section>
 <section id="id3">
-<h4>How It Works in TensorRT LLM<a class="headerlink" href="#id3" title="Link to this heading">#</a></h4>
+<span id="how-it-works-in-tensorrt-llm-1"></span><h4>How It Works in TensorRT LLM<a class="headerlink" href="#id3" title="Link to this heading">#</a></h4>
 <p><strong>Migrating the mechanism to high-performance kernels.</strong> A round scores the generated tokens, selects the keep set, and compacts the cache (Figure 9). TriAttention was added in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/16957">#16957</a>, with the batched compaction kernels of <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/16836">#16836</a>. Each step is implemented with the best-suited kernel path, CuTe DSL for scoring and selection, native CUDA for compaction, working on the paged cache in place. A round runs every <code class="docutils literal notranslate"><span class="pre">beta</span></code> generated tokens once a sequence exceeds its <code class="docutils literal notranslate"><span class="pre">budget</span></code>; the prompt is never evicted, so block reuse stays valid.</p>
 <p><strong>Keeping the extra work off the critical path.</strong> These steps are work that attention does not have. The kernels keep the GPU time to a small fraction of a decode step, and the round is driven from the executor’s own callbacks, so no CPU-side overhead is exposed either.</p>
 <p><strong>Injection into decoding.</strong> A round has to run after a decode step has written its tokens and before the next step reads the cache. That is the <code class="docutils literal notranslate"><span class="pre">on_generation_step_end</span></code> hook, the only one TriAttention overrides. It is enabled with <code class="docutils literal notranslate"><span class="pre">algorithm:</span> <span class="pre">triattention</span></code> plus <code class="docutils literal notranslate"><span class="pre">budget</span></code>, <code class="docutils literal notranslate"><span class="pre">beta</span></code>, <code class="docutils literal notranslate"><span class="pre">eviction_mode</span></code> and <code class="docutils literal notranslate"><span class="pre">calibration_path</span></code>. When the hook fires, only the requests that are due run the round in Figure 9, and a speculative step that confirms several tokens triggers at most one.</p>
@@ -928,7 +936,7 @@
 <h2>Evaluation<a class="headerlink" href="#evaluation" title="Link to this heading">#</a></h2>
 <p>This section consolidates performance and accuracy results for the KV cache compression methods supported in TensorRT LLM. Every comparison is against TensorRT LLM’s own uncompressed configuration on the same hardware, software build, and serving configuration; only the compression setting differs.</p>
 <section id="id4">
-<h3>NVFP4 Cold-Page Compression<a class="headerlink" href="#id4" title="Link to this heading">#</a></h3>
+<span id="nvfp4-cold-page-compression-1"></span><h3>NVFP4 Cold-Page Compression<a class="headerlink" href="#id4" title="Link to this heading">#</a></h3>
 <p>Unless otherwise specified, the experiments below use GB300 GPUs, the paged KV cache manager, and block reuse enabled. Before any result was accepted we confirmed that pages were actually compressed during the measured window, using the offload and onboard byte counters on the <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> endpoint and an Nsight Systems trace.</p>
 <section id="performance">
 <h4>Performance<a class="headerlink" href="#performance" title="Link to this heading">#</a></h4>
@@ -992,9 +1000,9 @@
 </section>
 </section>
 <section id="id5">
-<h3>TriAttention<a class="headerlink" href="#id5" title="Link to this heading">#</a></h3>
+<span id="triattention-1"></span><h3>TriAttention<a class="headerlink" href="#id5" title="Link to this heading">#</a></h3>
 <section id="id6">
-<h4>Performance<a class="headerlink" href="#id6" title="Link to this heading">#</a></h4>
+<span id="performance-1"></span><h4>Performance<a class="headerlink" href="#id6" title="Link to this heading">#</a></h4>
 <p>TriAttention helps in two ways: decoding reads a shorter cache at the same batch size, and more sequences fit on the GPU. Figure 17 shows both on Qwen3-8B on one B200 with 1,024 input and 16,384 output tokens per request. At batch size 32 the compacted cache decodes <strong>27% to 60% faster</strong> than dense, depending on the budget. Where the dense cache runs out of memory at batch size 64, TriAttention keeps scaling to batch size 128 and reaches <strong>2.7x the dense peak throughput</strong> on the same GPU.</p>
 <div align="center">
 <figure>
@@ -1004,7 +1012,7 @@
 <p align="center"><sub><em>Figure 17: TriAttention on Qwen3-8B, one B200, 1,024 input and 16,384 output tokens. Output throughput per GPU against batch size for the dense KV cache and for TriAttention with budgets of 4,096 and 2,048 tokens. The dense cache runs out of memory at batch size 64; TriAttention continues to batch size 128.</em></sub></p>
 </section>
 <section id="id7">
-<h4>Accuracy<a class="headerlink" href="#id7" title="Link to this heading">#</a></h4>
+<span id="accuracy-1"></span><h4>Accuracy<a class="headerlink" href="#id7" title="Link to this heading">#</a></h4>
 <p>Eviction is lossy by design, and the budget sets the trade. Figure 18 shows AIME25 accuracy against the decode KV budget for Qwen3-8B and GPT-OSS-120B. From <strong>8,192 tokens on, accuracy is within noise of dense</strong> on both models while the decode KV still shrinks 2 to 4x; at 4,096 tokens, the budget behind the throughput results above, the drop is about 5 points for a 7.9x smaller decode KV. The budget is therefore a dial: a known amount of accuracy for a known amount of capacity.</p>
 <div align="center">
 <figure>
@@ -1057,12 +1065,12 @@
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="../../developer-guide/telemetry.html"
+       href="blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Telemetry</p>
+        <p class="prev-next-title">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</p>
       </div>
     </a>
     <a class="right-next"
@@ -1229,9 +1237,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

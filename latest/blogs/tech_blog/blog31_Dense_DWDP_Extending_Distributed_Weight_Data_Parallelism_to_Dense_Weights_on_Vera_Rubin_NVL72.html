@@ -1,0 +1,1494 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72 &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=75c7c72ae941e8b558d8" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=75c7c72ae941e8b558d8"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="KV Cache Compression in TensorRT LLM" href="blog30_KV_Cache_Compression_in_TensorRT-LLM.html" />
+    <link rel="prev" title="ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill" href="blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.4.0rc4" />
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation" aria-expanded="false" aria-controls="pst-primary-sidebar-modal">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page" aria-expanded="false" aria-controls="pst-secondary-sidebar-modal">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal" tabindex="-1"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_adp.html">Attention-DP KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/render-endpoints.html">Render endpoints</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvHintAction.html">KvHintAction</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvHintsEnvelope.html">KvHintsEnvelope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvHintsInput.html">KvHintsInput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/reranking.html">Reranking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-hints.html">KV hint request metadata</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/watermarking.html">Text Watermarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/multimodal.html">Multimodal Request Data</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-house"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="dense-dwdp-extending-distributed-weight-data-parallelism-to-dense-weights-on-vera-rubin-nvl72">
+<h1>Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72<a class="headerlink" href="#dense-dwdp-extending-distributed-weight-data-parallelism-to-dense-weights-on-vera-rubin-nvl72" title="Link to this heading">#</a></h1>
+<p>By NVIDIA TensorRT LLM Team</p>
+<p>DWDP (<a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html"><span class="std std-doc">Tech Blog 19</span></a>) lets each context GPU of a disaggregated deployment store only a slice of the routed experts and prefetch the rest from its peers before each MoE layer. On a hybrid model such as Kimi-K3, sharding the experts leaves a second large block of replicated memory: the attention weights, the shared expert, the latent projections and the router of every MoE decoder layer, about 54 GiB that every context GPU holds in full. Dense DWDP shards these weights as well. Each GPU keeps a 1/N row shard of every layer and gathers a layer’s full weights from its peers over NVLink two layers before the layer runs, on the copy stream that already carries the expert prefetch. On NVIDIA Vera Rubin NVL72, this gives each Kimi-K3 context GPU 52.7 GiB of HBM back, about a fifth of its memory. Spent on longer prefill chunks and a larger KV cache, the freed memory lets the context tier serve the same agentic coding load with 4 or 8 fewer GPUs: across eight points of an end-to-end Pareto curve, output tokens per second per GPU rise by 6.1% to 19.1% (median 12.5%) at the same tokens per second per user, with a longer time-to-first-token (TTFT) tail at the two points of highest load (TTFT p90 rises from 15.9 s to 23.0 s where the gain is 19.1%). Dense DWDP has been merged into TensorRT LLM (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/21012">PR #21012</a>).</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#motivation">Motivation</a></p>
+<ul>
+<li><p><a class="reference internal" href="#the-memory-that-expert-dwdp-leaves-replicated">The Memory That Expert DWDP Leaves Replicated</a></p></li>
+<li><p><a class="reference internal" href="#why-memory-turns-into-throughput-on-agentic-workloads">Why Memory Turns into Throughput on Agentic Workloads</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#dense-dwdp-overview">Dense DWDP Overview</a></p>
+<ul>
+<li><p><a class="reference internal" href="#high-level-design">High-Level Design</a></p></li>
+<li><p><a class="reference internal" href="#two-modes">Two Modes</a></p></li>
+<li><p><a class="reference internal" href="#transfer-budget">Transfer Budget</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#dense-dwdp-implementation">Dense DWDP Implementation</a></p>
+<ul>
+<li><p><a class="reference internal" href="#configuration">Configuration</a></p></li>
+<li><p><a class="reference internal" href="#key-components">Key Components</a></p></li>
+<li><p><a class="reference internal" href="#runtime-flow">Runtime Flow</a></p></li>
+<li><p><a class="reference internal" href="#correctness">Correctness</a></p></li>
+<li><p><a class="reference internal" href="#current-code-level-constraints">Current Code-Level Constraints</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#key-optimizations">Key Optimizations</a></p>
+<ul>
+<li><p><a class="reference internal" href="#sharing-the-expert-prefetch-pipeline">Sharing the Expert Prefetch Pipeline</a></p></li>
+<li><p><a class="reference internal" href="#committing-dense-weights-before-the-expert-prefetch-ring">Committing Dense Weights Before the Expert Prefetch Ring</a></p></li>
+<li><p><a class="reference internal" href="#a-balanced-expert-partition-for-any-group-size">A Balanced Expert Partition for Any Group Size</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#evaluation">Evaluation</a></p>
+<ul>
+<li><p><a class="reference internal" href="#experimental-setup">Experimental Setup</a></p></li>
+<li><p><a class="reference internal" href="#no-overhead-at-the-same-settings">No Overhead at the Same Settings</a></p></li>
+<li><p><a class="reference internal" href="#end-to-end-evaluation">End-to-End Evaluation</a></p></li>
+<li><p><a class="reference internal" href="#trading-throughput-for-time-to-first-token">Trading Throughput for Time to First Token</a></p></li>
+<li><p><a class="reference internal" href="#accuracy">Accuracy</a></p></li>
+<li><p><a class="reference internal" href="#reproducing-steps">Reproducing Steps</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#summary">Summary</a></p></li>
+</ul>
+</section>
+<section id="motivation">
+<h2>Motivation<a class="headerlink" href="#motivation" title="Link to this heading">#</a></h2>
+<section id="the-memory-that-expert-dwdp-leaves-replicated">
+<h3>The Memory That Expert DWDP Leaves Replicated<a class="headerlink" href="#the-memory-that-expert-dwdp-leaves-replicated" title="Link to this heading">#</a></h3>
+<p>DWDP targets MoE weights because they dominate a model’s memory footprint. That holds for Kimi-K3 as well: the model has 2.8 trillion parameters, most of them in the 896 routed experts of each of its 92 MoE layers, and a DWDP16 context worker stores only 56 of the 896 experts of each layer. Everything else is replicated on every GPU of the group, and for a hybrid model that is not small. Kimi-K3 interleaves 69 Kimi Delta Attention (KDA) layers, a linear-attention design with a recurrent state, with 24 MLA layers, and each MoE layer has a shared expert, a router and latent projections around its routed experts. Table 1 lists these weights on one context GPU.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Weights per context GPU (GiB)</p></th>
+<th class="head text-right"><p>Expert DWDP only</p></th>
+<th class="head text-right"><p>With dense DWDP</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>KDA attention</p></td>
+<td class="text-right"><p>29.9</p></td>
+<td class="text-right"><p>sharded</p></td>
+</tr>
+<tr class="row-odd"><td><p>Shared expert</p></td>
+<td class="text-right"><p>11.7</p></td>
+<td class="text-right"><p>sharded</p></td>
+</tr>
+<tr class="row-even"><td><p>MLA attention</p></td>
+<td class="text-right"><p>6.2</p></td>
+<td class="text-right"><p>sharded</p></td>
+</tr>
+<tr class="row-odd"><td><p>Latent projections</p></td>
+<td class="text-right"><p>4.5</p></td>
+<td class="text-right"><p>sharded</p></td>
+</tr>
+<tr class="row-even"><td><p>Router</p></td>
+<td class="text-right"><p>2.2</p></td>
+<td class="text-right"><p>sharded</p></td>
+</tr>
+<tr class="row-odd"><td><p>This GPU’s row shard (1/16)</p></td>
+<td class="text-right"><p>–</p></td>
+<td class="text-right"><p>3.4</p></td>
+</tr>
+<tr class="row-even"><td><p>Staging slots</p></td>
+<td class="text-right"><p>–</p></td>
+<td class="text-right"><p>1.5</p></td>
+</tr>
+<tr class="row-odd"><td><p>Kept replicated: embeddings, LM head, layer 0, vision encoder</p></td>
+<td class="text-right"><p>7.0</p></td>
+<td class="text-right"><p>7.0</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Total</strong></p></td>
+<td class="text-right"><p><strong>61.5</strong></p></td>
+<td class="text-right"><p><strong>11.9</strong></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>Table 1. Non-expert weights on one Kimi-K3 context GPU of a DWDP16 group, with the <a class="reference external" href="https://huggingface.co/nvidia/Kimi-K3-NVFP4">NVIDIA Kimi-K3 NVFP4</a> checkpoint (medians over 16 ranks). Dense DWDP moves 58.3 GB (54.3 GiB) per GPU; the free memory that CUDA reports grows by 52.7 GiB, which includes allocator fragments released with the weights.</em></p>
+</section>
+<section id="why-memory-turns-into-throughput-on-agentic-workloads">
+<h3>Why Memory Turns into Throughput on Agentic Workloads<a class="headerlink" href="#why-memory-turns-into-throughput-on-agentic-workloads" title="Link to this heading">#</a></h3>
+<p>Agentic coding traffic sends long prompts that mostly repeat. In the <a class="reference external" href="https://inferencex.semianalysis.com/datasets">AgentX</a> coding traces from SemiAnalysis InferenceX that we use below, requests average about 150K tokens, and about 95% of the prompt tokens hit the prefix cache. A context GPU spends its memory on two things that set its throughput on such traffic:</p>
+<ul class="simple">
+<li><p><strong>KV cache.</strong> A prefix hit needs the conversation’s KV pages and, for Kimi-K3’s KDA layers, a snapshot of the conversation’s recurrent state. A context GPU that serves more conversations needs more of both, or its prefix reuse drops and it computes prompts again.</p></li>
+<li><p><strong>Prefill chunk size (<code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code>).</strong> Each forward of a DWDP16 context worker prefetches 92 × 15.6 GB, about 1.4 TB, of remote experts, which takes about 1.3 s at the rate the gather sustains. A forward with too few tokens to cover that is bound by the copies, so longer chunks amortize the prefetch better. Longer chunks also need more activation memory: without dense DWDP, 24K tokens is the longest chunk that fits next to a useful KV cache, and 32K runs out of memory.</p></li>
+</ul>
+<p>Figure 1 shows how dense DWDP changes this budget. At the recipe’s 16K-token chunk, the freed memory raises the KV cache from 56.0 to 93.0 GiB per GPU. Spending part of it on longer chunks pays off more: with 32K-token chunks, a dense DWDP context GPU still has 84.8 GiB of KV cache, 76% more than the best configuration without dense DWDP at 24K tokens.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog31_hbm_breakdown.svg" alt="HBM of one Kimi-K3 context GPU with and without dense DWDP, at 16K-token chunks and at the longest chunk that fits" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1. HBM of one Kimi-K3 context GPU (DWDP16, Vera Rubin, NVFP4 KV cache), median over 16 ranks. The KV cache takes 70% of the memory left after weights and activations (65% in the 24K row); the rest is headroom.</em></sub></p>
+</section>
+</section>
+<section id="dense-dwdp-overview">
+<h2>Dense DWDP Overview<a class="headerlink" href="#dense-dwdp-overview" title="Link to this heading">#</a></h2>
+<section id="high-level-design">
+<h3>High-Level Design<a class="headerlink" href="#high-level-design" title="Link to this heading">#</a></h3>
+<p>For each MoE decoder layer <code class="docutils literal notranslate"><span class="pre">l</span></code> of Kimi-K3 (layers 1-92; layer 0 has a dense MLP and stays replicated), dense DWDP handles two blobs: the attention weights <code class="docutils literal notranslate"><span class="pre">A(l)</span></code>, KDA or MLA, and the MoE-dense weights <code class="docutils literal notranslate"><span class="pre">D(l)</span></code>: router, shared expert, latent projections and their norm. The routed experts stay with expert DWDP, and tensors under 1 MiB stay replicated.</p>
+<ul class="simple">
+<li><p><strong>Row shards.</strong> Each blob is cut into N rows, one per rank of the group. A rank keeps its rows of every layer in a row store of CUDA virtual memory that it exports as a FABRIC handle, and it maps every peer’s row store read-only.</p></li>
+<li><p><strong>Staging slots.</strong> Each rank has a ring of 2 attention slots and a ring of 3 MoE-dense slots, each large enough for a full layer. At setup, dense DWDP points the module tensors of each layer into that layer’s slots, once. The model keeps reading its weights through its usual attributes, so no kernel and no model math changes.</p></li>
+<li><p><strong>Gathers two layers ahead.</strong> After the attention of layer <code class="docutils literal notranslate"><span class="pre">l</span></code>, each rank gathers the rows of layer <code class="docutils literal notranslate"><span class="pre">l+2</span></code> from every rank, its own included, into its slots. The gather is the SM fabric gather kernel that expert DWDP already uses (<code class="docutils literal notranslate"><span class="pre">trtllm::dwdp_fabric_gather</span></code>), on expert DWDP’s copy stream.</p></li>
+</ul>
+<p>Figure 2 shows the idea for a group of four GPUs.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog31_overview.svg" alt="Overview of dense DWDP with a DWDP group of four GPUs" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 2. Dense DWDP with a DWDP group of four GPUs. Each GPU stores one row of every layer's dense weights and gathers full layers into a few staging slots; the figure shows GPU 0 gathering layer l+2. Every GPU does the same for its own slots.</em></sub></p>
+</section>
+<section id="two-modes">
+<h3>Two Modes<a class="headerlink" href="#two-modes" title="Link to this heading">#</a></h3>
+<p>Dense DWDP runs either on top of expert DWDP or without it (Table 2). The launch gate picks the mode when a server starts.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>Attached</p></th>
+<th class="head"><p>Standalone</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Where</p></td>
+<td><p>context servers of a DWDP group, one GPU per worker</p></td>
+<td><p>one attention-DP context instance, for example DEP16</p></td>
+</tr>
+<tr class="row-odd"><td><p>Group that shares the rows</p></td>
+<td><p>the DWDP group</p></td>
+<td><p>the attention-DP ranks of the instance</p></td>
+</tr>
+<tr class="row-even"><td><p>Copies</p></td>
+<td><p>the expert prefetch’s copy stream and transfer</p></td>
+<td><p>a copy stream of its own</p></td>
+</tr>
+<tr class="row-odd"><td><p>Configuration</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dwdp_config.enable_dense:</span> <span class="pre">true</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dwdp_config:</span> <span class="pre">{enable_experts:</span> <span class="pre">false,</span> <span class="pre">enable_dense:</span> <span class="pre">true}</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>Table 2. The two modes of dense DWDP. All results in this blog use the attached mode.</em></p>
+</section>
+<section id="transfer-budget">
+<h3>Transfer Budget<a class="headerlink" href="#transfer-budget" title="Link to this heading">#</a></h3>
+<p>As Tech Blog 19 did with its roofline analysis, we first check whether the extra transfers can hide behind compute. Table 3 compares the bytes each GPU of a DWDP16 group receives per MoE layer.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Per MoE layer, per GPU (DWDP16)</p></th>
+<th class="head text-right"><p>Expert prefetch <code class="docutils literal notranslate"><span class="pre">E(l)</span></code></p></th>
+<th class="head text-right"><p>Dense gather <code class="docutils literal notranslate"><span class="pre">L(l)</span></code></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Bytes received</p></td>
+<td class="text-right"><p>840 experts × 18.58 MB = 15.6 GB</p></td>
+<td class="text-right"><p>0.59 GB (mean over 92 layers)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Time at about 1.1 TB/s</p></td>
+<td class="text-right"><p>about 14 ms</p></td>
+<td class="text-right"><p>about 0.5 ms</p></td>
+</tr>
+<tr class="row-even"><td><p>Per forward (92 layers)</p></td>
+<td class="text-right"><p>about 1.44 TB, 1.3 s</p></td>
+<td class="text-right"><p>about 55 GB, 50 ms</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>Table 3. Transfers per MoE layer of a Kimi-K3 DWDP16 context worker. The rate is the one the TMA gather sustains in production on Vera Rubin.</em></p>
+<p>The dense gathers add about 4% to the bytes that each context forward already moves for the experts. Two consequences follow. First, the dense gathers need no compute window of their own: a forward whose compute hides the expert prefetch with 4% to spare hides both. Second, the transfer has to be fast, which favors the SM gather over the copy engines: in a microbenchmark on four Vera Rubin GPUs that pulled 184 MB from three peers, the TMA gather kernel reached 1,151 GB/s, the register gather kernel 819 GB/s and the copy engines about 565 GB/s. The gather occupies about 30 SMs while it runs, as it already does for the experts.</p>
+</section>
+</section>
+<section id="dense-dwdp-implementation">
+<h2>Dense DWDP Implementation<a class="headerlink" href="#dense-dwdp-implementation" title="Link to this heading">#</a></h2>
+<section id="configuration">
+<h3>Configuration<a class="headerlink" href="#configuration" title="Link to this heading">#</a></h3>
+<p>Dense DWDP is a prototype feature, off by default, configured through four new fields of <code class="docutils literal notranslate"><span class="pre">DwdpConfig</span></code> in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/abb78b8afd/tensorrt_llm/llmapi/llm_args.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/llmapi/llm_args.py</span></code></a>:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">enable_dense</span></code> (default <code class="docutils literal notranslate"><span class="pre">false</span></code>): turns dense DWDP on. Set it on the context servers only, with the same value on every server of the group.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">enable_experts</span></code> (default <code class="docutils literal notranslate"><span class="pre">true</span></code>): expert DWDP. <code class="docutils literal notranslate"><span class="pre">false</span></code> together with <code class="docutils literal notranslate"><span class="pre">enable_dense:</span> <span class="pre">true</span></code> selects the standalone mode.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">copy_mode</span></code> (default unset): the transfer of every DWDP copy, expert prefetch and dense gathers alike: <code class="docutils literal notranslate"><span class="pre">per_slice</span></code>, <code class="docutils literal notranslate"><span class="pre">batched</span></code> (copy engines) or <code class="docutils literal notranslate"><span class="pre">gather</span></code> (the SM fabric gather).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">gather_kernel</span></code> (default unset): with <code class="docutils literal notranslate"><span class="pre">copy_mode:</span> <span class="pre">gather</span></code>, the gather kernel, <code class="docutils literal notranslate"><span class="pre">register</span></code> or <code class="docutils literal notranslate"><span class="pre">tma</span></code>.</p></li>
+</ul>
+<p>The context server configuration of the attached mode, one GPU per worker in a DWDP group of 16, looks like this:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">tensor_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="nt">disable_overlap_scheduler</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">cuda_graph_config</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span>
+<span class="nt">moe_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CUTEDSL</span>
+<span class="nt">dwdp_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">dwdp_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="w">  </span><span class="nt">enable_dense</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">copy_mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gather</span>
+<span class="w">  </span><span class="nt">gather_kernel</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tma</span>
+</pre></div>
+</div>
+<p>And the standalone mode on one DEP16 context instance:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">tensor_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="nt">moe_expert_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">cuda_graph_config</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span>
+<span class="nt">dwdp_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">enable_experts</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">  </span><span class="nt">enable_dense</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">copy_mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gather</span>
+<span class="w">  </span><span class="nt">gather_kernel</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tma</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">LLM()</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> check these settings when they build the LLM arguments (<code class="docutils literal notranslate"><span class="pre">TorchLlmArgs.validate_dwdp_launch</span></code>), and each worker checks its host before the model is built. The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/moe-perf-guide.md#dense-dwdp">MoE performance guide</a> lists every requirement.</p>
+</section>
+<section id="key-components">
+<h3>Key Components<a class="headerlink" href="#key-components" title="Link to this heading">#</a></h3>
+<p>Dense DWDP lives in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/abb78b8afd/tensorrt_llm/_torch/modules/dwdp/dense"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/modules/dwdp/dense/</span></code></a>. Its parts follow the life of a dense weight:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">gate.py</span></code></strong>, the launch gate: checks what dense DWDP needs from the host (FABRIC peer memory; in standalone mode, the MPI backend and the gather op) and picks the mode, before the model exists.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">layout.py</span></code></strong>: collects each layer’s dense tensors from the roots its decoder layer declares (<code class="docutils literal notranslate"><span class="pre">dense_dwdp_roots</span></code>), checks them and lays them out as the <code class="docutils literal notranslate"><span class="pre">A</span></code> and <code class="docutils literal notranslate"><span class="pre">D</span></code> blobs. A digest of the layout lets the ranks compare their layouts.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">store.py</span></code></strong>: the row store, one virtual-memory allocation per rank, exported as a FABRIC handle and mapped read-only by the peers.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">plan.py</span></code></strong>: the per-layer copy plans, one gather per layer that covers the <code class="docutils literal notranslate"><span class="pre">A</span></code> and <code class="docutils literal notranslate"><span class="pre">D</span></code> rows of every peer and the local rows, and the launcher that runs them with the selected transfer.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">repoint.py</span></code></strong>: points module tensors into the staging slots and restores them if setup fails.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">runtime.py</span></code></strong>: the slot rings, the CUDA events and the per-layer hooks.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">setup.py</span></code></strong>: the setup phases P1-P6.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">manager.py</span></code></strong>: <code class="docutils literal notranslate"><span class="pre">DenseDwdpManager</span></code>, the owner of the committed runtime in both modes. In attached mode the expert DWDP manager, <code class="docutils literal notranslate"><span class="pre">DwdpManager</span></code> in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/abb78b8afd/tensorrt_llm/_torch/pyexecutor/dwdp.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/pyexecutor/dwdp.py</span></code></a>, creates it and sets it up first.</p></li>
+</ul>
+<p>On the model side, Kimi-K3’s decoder layers in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/abb78b8afd/tensorrt_llm/_torch/models/modeling_kimi_linear.py"><code class="docutils literal notranslate"><span class="pre">modeling_kimi_linear.py</span></code></a> declare their dense roots and call four hooks (Table 4).</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Hook</p></th>
+<th class="head"><p>Where</p></th>
+<th class="head"><p>What</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>H0</p></td>
+<td><p>model forward entry</p></td>
+<td><p>Enqueues the gathers of the first two layers unless the previous forward already did; after an aborted forward, first waits for every slot’s readers (a write-after-read barrier).</p></td>
+</tr>
+<tr class="row-odd"><td><p>H1</p></td>
+<td><p>decoder layer entry</p></td>
+<td><p>Makes compute wait for the layer’s slots (read after write).</p></td>
+</tr>
+<tr class="row-even"><td><p>H2</p></td>
+<td><p>after the attention call</p></td>
+<td><p>Closes the attention read window and enqueues the gathers of the next layers whose slots are free: <code class="docutils literal notranslate"><span class="pre">L(l+2)</span></code> within a forward.</p></td>
+</tr>
+<tr class="row-odd"><td><p>H3</p></td>
+<td><p>after the MoE block</p></td>
+<td><p>Closes the MoE-dense read window and fills free slots the same way.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>Table 4. The hooks that Kimi-K3’s decoder layers call.</em></p>
+</section>
+<section id="runtime-flow">
+<h3>Runtime Flow<a class="headerlink" href="#runtime-flow" title="Link to this heading">#</a></h3>
+<ol class="arabic">
+<li><p><strong>Launch checks and managers.</strong> The LLM arguments are checked when they are built. Before the model is built, the creator runs the gate and creates the managers: in attached mode, <code class="docutils literal notranslate"><span class="pre">DwdpManager</span></code> creates the <code class="docutils literal notranslate"><span class="pre">DenseDwdpManager</span></code>. Decoder layers capture the dense manager when they are constructed.</p></li>
+<li><p><strong>Setup, once, after the weights are loaded.</strong> Setup runs six phases with one collective after each of the first five and a sixth that agrees on the outcome:</p>
+<ul class="simple">
+<li><p>P1 collects the layout, its digest and per-blob checksums, compares them across ranks and checks that the free memory covers the store and the slots;</p></li>
+<li><p>P2 allocates the row store and the slots and writes this rank’s rows;</p></li>
+<li><p>P3 maps the peers’ rows and builds the copy plans;</p></li>
+<li><p>P4 gathers every layer and checks the bytes in the slots against the original weights;</p></li>
+<li><p>P5 repoints the module tensors and checks every layer again;</p></li>
+<li><p>P6 drops the original weights and scans for tensors that still hold them.</p></li>
+</ul>
+<p>If any rank fails, every rank restores its weights (P1-P5) or releases the dense state (P6) and raises: there is no fallback to replicated weights. In attached mode, the expert DWDP setup runs only after dense DWDP has committed, and the KV cache is sized after both, so it receives the freed memory. Setup takes about 7 s.</p>
+</li>
+<li><p><strong>Every forward.</strong> H0 primes the first two layers. In every layer, H1 waits for the slots, H2 enqueues <code class="docutils literal notranslate"><span class="pre">L(l+2)</span></code> once the attention of layer <code class="docutils literal notranslate"><span class="pre">l</span></code> has released the attention slot that <code class="docutils literal notranslate"><span class="pre">l+2</span></code> reuses, and H3 releases the MoE-dense slot. Expert DWDP enqueues <code class="docutils literal notranslate"><span class="pre">E(l+2)</span></code> right after the routed experts of layer <code class="docutils literal notranslate"><span class="pre">l</span></code>, inside the MoE block and before H3: the routed experts are the only kernels that read the expert slot that <code class="docutils literal notranslate"><span class="pre">E(l+2)</span></code> reuses, and the copy waits for them. Within a forward, the shared copy stream therefore runs <code class="docutils literal notranslate"><span class="pre">...</span> <span class="pre">E(l+1),</span> <span class="pre">L(l+2),</span> <span class="pre">E(l+2),</span> <span class="pre">L(l+3)</span> <span class="pre">...</span></code>, each copy enqueued in the order its data is needed (Figure 3). At the end of a forward, the copies of the first layers of the next forward are already enqueued, so the next forward starts primed.</p></li>
+</ol>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog31_layer_pipeline.svg" alt="Per-layer pipeline of the compute stream and the shared copy stream" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 3. Per-layer pipeline of attached dense DWDP. The dense gather of layer l+2 starts after the attention of layer l has released its slot and finishes long before layer l+2 needs it. The expert prefetch of layer l+2 reuses the expert slot of layer l and starts once the routed experts of layer l have read it, before the MoE block ends. Copies are drawn to scale with each other; the compute lane is schematic.</em></sub></p>
+<p>Every dependency in this flow is a CUDA event between the compute stream and the copy stream. Between setup and teardown, the host never waits for the GPU.</p>
+</section>
+<section id="correctness">
+<h3>Correctness<a class="headerlink" href="#correctness" title="Link to this heading">#</a></h3>
+<p>Dense DWDP replaces the weights of a running model, so its protocol is built around one invariant: a slot is written only when no kernel can read it, and read only after its copy has finished.</p>
+<ul class="simple">
+<li><p><strong>Read windows.</strong> All reads of <code class="docutils literal notranslate"><span class="pre">A(l)</span></code> happen between H1 and H2 of layer <code class="docutils literal notranslate"><span class="pre">l</span></code>, and all reads of <code class="docutils literal notranslate"><span class="pre">D(l)</span></code> between H1 and H3. A copy into a slot waits for the end of the read window of the layer that held it (write after read), and compute waits for the copy (read after write). Expert DWDP applies the same rule to its two expert slots, where the routed experts of a layer are the only readers.</p></li>
+<li><p><strong>All or nothing.</strong> Setup compares layouts, checks every gathered byte before and after the repointing, and commits only if every rank agrees.</p></li>
+<li><p><strong>Guards.</strong> Weight reloads and incremental weight updates refuse a model whose dense weights dense DWDP has moved.</p></li>
+</ul>
+<p>During development we also served the workload with a debug watchdog that checksummed each slot when its layer started: about 3.95 million checks on 16 ranks found no mismatch. The merged version keeps the protocol and drops the watchdog.</p>
+</section>
+<section id="current-code-level-constraints">
+<h3>Current Code-Level Constraints<a class="headerlink" href="#current-code-level-constraints" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>Dense DWDP supports Kimi-K3, the only model whose decoder layers declare dense roots today.</p></li>
+<li><p>It runs on eager context servers: no CUDA graphs or <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>, no LoRA, speculative decoding or sleep mode, and pipeline and context parallel size 1.</p></li>
+<li><p>It needs FABRIC peer memory handles, as on NVL72 systems.</p></li>
+<li><p>It runs on context servers only: <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> refuses <code class="docutils literal notranslate"><span class="pre">enable_dense</span></code> on a generation server.</p></li>
+<li><p>The attached mode needs tensor parallel size 1 and the overlap scheduler off, as expert DWDP does. The standalone mode needs the MPI backend.</p></li>
+<li><p>Weights cannot be reloaded or updated once dense DWDP has sharded them.</p></li>
+</ul>
+</section>
+</section>
+<section id="key-optimizations">
+<h2>Key Optimizations<a class="headerlink" href="#key-optimizations" title="Link to this heading">#</a></h2>
+<section id="sharing-the-expert-prefetch-pipeline">
+<h3>Sharing the Expert Prefetch Pipeline<a class="headerlink" href="#sharing-the-expert-prefetch-pipeline" title="Link to this heading">#</a></h3>
+<p>A separate pipeline for the dense weights, for example copy engines on a second stream, looks simpler but would compete with the expert prefetch for NVLink, without a common order, and the copy engines are about half as fast as the SM gather. Dense DWDP instead adds its gathers to the expert prefetch’s copy stream and uses its transfer. One FIFO in deadline order keeps each copy ahead of its first reader, adds no SM reservation beyond the expert gather’s, and adds no synchronization. At the same settings, dense DWDP costs no measurable throughput (<a class="reference internal" href="#no-overhead-at-the-same-settings">No Overhead at the Same Settings</a>).</p>
+</section>
+<section id="committing-dense-weights-before-the-expert-prefetch-ring">
+<h3>Committing Dense Weights Before the Expert Prefetch Ring<a class="headerlink" href="#committing-dense-weights-before-the-expert-prefetch-ring" title="Link to this heading">#</a></h3>
+<p>The order of the two setups matters for the peak memory. The expert prefetch ring is large: two slots for the remote experts of one layer each, 27 GiB per GPU at DWDP8 and 29 GiB at DWDP16. If the ring were allocated while the replicated dense weights are still resident, the setup peak would be the sum of both. Dense DWDP therefore commits first and returns the replicated weights to the allocator before the ring is allocated, so the peak is the larger of the two phases.</p>
+<p>This is what makes small DWDP groups possible. A DWDP8 context GPU stores 112 experts per layer; after dense DWDP commits it has about 64 GiB free for the 27 GiB ring, which leaves about 30 GiB of KV cache. With the dense weights still replicated, the same GPU would have about 17 GiB, not enough for the ring.</p>
+</section>
+<section id="a-balanced-expert-partition-for-any-group-size">
+<h3>A Balanced Expert Partition for Any Group Size<a class="headerlink" href="#a-balanced-expert-partition-for-any-group-size" title="Link to this heading">#</a></h3>
+<p>Once memory no longer dictates group sizes, the expert partition must allow any <code class="docutils literal notranslate"><span class="pre">dwdp_size</span></code>. Expert DWDP required <code class="docutils literal notranslate"><span class="pre">(dwdp_size</span> <span class="pre">-</span> <span class="pre">1)</span> <span class="pre">*</span> <span class="pre">stride</span> <span class="pre">+</span> <span class="pre">size</span> <span class="pre">==</span> <span class="pre">num_experts</span></code>, so a group size that does not divide the expert count needed overlapping ranges: Kimi-K3 on DWDP12 used ranges of 82 experts with a stride of 74 and stored 88 experts twice in every MoE layer. With <code class="docutils literal notranslate"><span class="pre">num_experts_per_worker</span></code> and <code class="docutils literal notranslate"><span class="pre">num_prefetch_experts</span></code> left at 0, expert DWDP now gives each rank <code class="docutils literal notranslate"><span class="pre">floor</span></code> or <code class="docutils literal notranslate"><span class="pre">ceil</span></code> of <code class="docutils literal notranslate"><span class="pre">num_experts</span> <span class="pre">/</span> <span class="pre">dwdp_size</span></code> contiguous experts: 8 ranks of 75 and 4 of 74 at DWDP12, 16 ranks of 45 and 4 of 44 at DWDP20. On DWDP12 this frees 10.7 to 12.5 GiB per GPU.</p>
+</section>
+</section>
+<section id="evaluation">
+<h2>Evaluation<a class="headerlink" href="#evaluation" title="Link to this heading">#</a></h2>
+<section id="experimental-setup">
+<h3>Experimental Setup<a class="headerlink" href="#experimental-setup" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Hardware:</strong> NVIDIA Vera Rubin NVL72, 278.5 GiB of usable HBM per GPU; the context and generation servers of a deployment share one NVLink domain.</p></li>
+<li><p><strong>Model:</strong> <a class="reference external" href="https://huggingface.co/nvidia/Kimi-K3-NVFP4">NVIDIA Kimi-K3 NVFP4</a>.</p></li>
+<li><p><strong>KV cache:</strong> NVFP4 (the last two MLA layers in FP8), 128-token pages, KV cache manager V2, per-conversation block reuse.</p></li>
+<li><p><strong>Serving:</strong> disaggregated. Context servers are one-GPU workers in a DWDP group, with the CuTeDSL MoE backend, the TMA gather and chunked prefill. Generation servers use Helix parallelism (<a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html"><span class="std std-doc">Tech Blog 22</span></a>) or DEP16, with DSpark speculative decoding (5 or 7 draft tokens).</p></li>
+<li><p><strong>Workload:</strong> the AgentX coding traces, replayed with AIPerf at a fixed concurrency for one hour per run. Each configuration ran once; no request failed. The replayed requests carry random token IDs, so the generation servers fix the speculative acceptance: 2.84 accepted draft tokens per step with 7 draft tokens, and 2.62 with 5, the same in both arms of every comparison.</p></li>
+<li><p><strong>Metrics:</strong> tokens per second per user is <code class="docutils literal notranslate"><span class="pre">1000</span> <span class="pre">/</span> <span class="pre">p90</span> <span class="pre">inter-token</span> <span class="pre">latency</span></code>. Throughput per GPU divides by all GPUs of the deployment, context and generation. TTFT includes queueing.</p></li>
+<li><p><strong>Code:</strong> the measurements ran an earlier revision of the dense DWDP code of PR #21012 on a development branch of TensorRT LLM, which supported Kimi-K3’s NVFP4 KV cache before main did. The runtime protocol (read windows, events, copy plans, repointing) is the same as in the merged version, which replaces the earlier environment variables with the <code class="docutils literal notranslate"><span class="pre">dwdp_config</span></code> fields above and tightens the setup checks.</p></li>
+</ul>
+</section>
+<section id="no-overhead-at-the-same-settings">
+<h3>No Overhead at the Same Settings<a class="headerlink" href="#no-overhead-at-the-same-settings" title="Link to this heading">#</a></h3>
+<p>Dense DWDP should cost nothing when its memory is not used. Table 5 compares runs that differ only in <code class="docutils literal notranslate"><span class="pre">enable_dense</span></code>, at the recipe’s 16K-token chunk.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Comparison (16K-token chunks)</p></th>
+<th class="head text-right"><p>Dense DWDP off</p></th>
+<th class="head text-right"><p>Dense DWDP on</p></th>
+<th class="head text-right"><p>Change</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Context only, DWDP16, concurrency 128: requests/s</p></td>
+<td class="text-right"><p>13.25</p></td>
+<td class="text-right"><p>13.25</p></td>
+<td class="text-right"><p>0.0%</p></td>
+</tr>
+<tr class="row-odd"><td><p>End to end, 32 GPUs, concurrency 383: output tokens/s/GPU</p></td>
+<td class="text-right"><p>362.2</p></td>
+<td class="text-right"><p>363.3</p></td>
+<td class="text-right"><p>+0.3%</p></td>
+</tr>
+<tr class="row-even"><td><p>End to end, 32 GPUs, concurrency 383: total tokens/s/GPU</p></td>
+<td class="text-right"><p>47,771</p></td>
+<td class="text-right"><p>47,783</p></td>
+<td class="text-right"><p>+0.0%</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>Table 5. Same configuration with and without dense DWDP. The context-only row runs one DWDP16 context tier (16 GPUs) on its own, with a generation side that only receives the KV cache. Total tokens include the prompt tokens served from the prefix cache.</em></p>
+<p>The dense gathers hide behind compute, so all of the gain comes from spending the freed memory.</p>
+</section>
+<section id="end-to-end-evaluation">
+<h3>End-to-End Evaluation<a class="headerlink" href="#end-to-end-evaluation" title="Link to this heading">#</a></h3>
+<p>The end-to-end study takes eight points of a Kimi-K3 Pareto curve, from concurrency 24 to 623. At each point, the base runs the recipe’s context tier: 16 GPUs as a DWDP16 group with 16K-token chunks, or 24 GPUs as a DWDP24 group at concurrency 623. The dense DWDP arm keeps the generation servers and the client unchanged and replaces the context tier with a smaller one: 8 GPUs (DWDP8, 16K-token chunks), 12 GPUs (DWDP12, 32K) or 16 GPUs (DWDP16, 32K). With fewer context GPUs, each GPU serves more conversations, so at concurrency 24 to 240 the dense arm gives the KDA states 45% of the KV cache pool instead of the recipe’s 14%, which keeps prefix reuse at the base’s level (Table 6). The recipes at concurrency 330 to 623 use 45% in both arms.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog31_e2e_pareto.svg" alt="End-to-end Pareto of Kimi-K3 on Vera Rubin: dense DWDP context tier against the base context tier" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 4. End-to-end Pareto of Kimi-K3 on Vera Rubin NVL72. Each pair of points shares its generation servers and client; labels give the output throughput gain per GPU and the GPU counts of the deployment.</em></sub></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-right"><p>Concurrency</p></th>
+<th class="head"><p>Generation</p></th>
+<th class="head"><p>GPUs (context)</p></th>
+<th class="head"><p>Tokens/s/user</p></th>
+<th class="head"><p>Output tokens/s/GPU</p></th>
+<th class="head text-right"><p>Gain</p></th>
+<th class="head"><p>Prefix reuse</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-right"><p>24</p></td>
+<td><p>3 × Helix16, batch 1</p></td>
+<td><p>64 (16) → 56 (8)</p></td>
+<td><p>300.3 → 299.4</p></td>
+<td><p>10.97 → 12.38</p></td>
+<td class="text-right"><p>+12.9%</p></td>
+<td><p>95.9% → 96.0%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>42</p></td>
+<td><p>6 × Helix8, batch 1</p></td>
+<td><p>64 (16) → 56 (8)</p></td>
+<td><p>280.1 → 280.1</p></td>
+<td><p>18.08 → 21.14</p></td>
+<td class="text-right"><p>+16.9%</p></td>
+<td><p>96.3% → 96.3%</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>75</p></td>
+<td><p>3 × Helix16, batch 4</p></td>
+<td><p>64 (16) → 56 (8)</p></td>
+<td><p>246.9 → 246.9</p></td>
+<td><p>41.39 → 46.93</p></td>
+<td class="text-right"><p>+13.4%</p></td>
+<td><p>95.4% → 95.3%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>174</p></td>
+<td><p>3 × Helix16, batch 8</p></td>
+<td><p>64 (16) → 60 (12)</p></td>
+<td><p>221.7 → 220.3</p></td>
+<td><p>77.85 → 82.63</p></td>
+<td class="text-right"><p>+6.1%</p></td>
+<td><p>95.3% → 95.5%</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>240</p></td>
+<td><p>3 × Helix16, batch 16</p></td>
+<td><p>64 (16) → 60 (12)</p></td>
+<td><p>183.5 → 183.5</p></td>
+<td><p>126.06 → 134.50</p></td>
+<td class="text-right"><p>+6.7%</p></td>
+<td><p>95.1% → 95.7%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>330</p></td>
+<td><p>5 × Helix8, batch 16</p></td>
+<td><p>56 (16) → 52 (12)</p></td>
+<td><p>141.8 → 142.5</p></td>
+<td><p>184.81 → 198.73</p></td>
+<td class="text-right"><p>+7.5%</p></td>
+<td><p>95.4% → 95.3%</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>383</p></td>
+<td><p>1 × DEP16, batch 8</p></td>
+<td><p>32 (16) → 28 (12)</p></td>
+<td><p>91.4 → 91.7</p></td>
+<td><p>362.45 → 406.65</p></td>
+<td class="text-right"><p>+12.2%</p></td>
+<td><p>95.3% → 95.1%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>623</p></td>
+<td><p>1 × DEP16, batch 16</p></td>
+<td><p>40 (24) → 32 (16)</p></td>
+<td><p>72.9 → 74.4</p></td>
+<td><p>440.52 → 524.79</p></td>
+<td class="text-right"><p>+19.1%</p></td>
+<td><p>95.3% → 94.9%</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>Table 6. End-to-end results, base → dense DWDP. Gain is the change of output tokens per second per GPU.</em></p>
+<p>Dense DWDP raises the output throughput per GPU at every point, by 6.1% to 19.1% with a median of 12.5%, while tokens per second per user stay within 2.1%. The gain comes from serving the same load with fewer GPUs, not from faster ones: at seven of the eight points the total output throughput of the deployment stays within -1.8% to +2.3% of the base, so the gain follows the share of GPUs that the smaller context tier saves. Removing 8 of 64 GPUs gives +13% to +17%, 4 of 64 or 56 gives +6% to +8% and 4 of 32 gives +12%. The eighth point is concurrency 623: removing 8 of 40 GPUs would give +25% at equal output, but the 16-GPU context tier becomes the bottleneck there and the total output falls by 4.7% (from 17,621 to 16,793 tokens per second), which leaves +19.1% (<a class="reference internal" href="#trading-throughput-for-time-to-first-token">Trading Throughput for Time to First Token</a>).</p>
+<p>A smaller context tier keeps up because, at most points, compute does not set its size. At concurrency 24 to 240 the base tier serves 0.7 to 7.7 requests per second, while a saturated 16-GPU DWDP16 tier sustains about 13 (measured with the context tier on its own at concurrency 128). Memory sets the floor instead. A DWDP8 group fits only with dense DWDP (<a class="reference internal" href="#committing-dense-weights-before-the-expert-prefetch-ring">Committing Dense Weights Before the Expert Prefetch Ring</a>), and with fewer context GPUs each GPU holds the KV pages and KDA states of more conversations, which the freed memory pays for. Only close to saturation, at concurrency 383 and 623, does a smaller tier lengthen the TTFT tail.</p>
+</section>
+<section id="trading-throughput-for-time-to-first-token">
+<h3>Trading Throughput for Time to First Token<a class="headerlink" href="#trading-throughput-for-time-to-first-token" title="Link to this heading">#</a></h3>
+<p>A smaller context tier carries more load per GPU, which shows first in the TTFT tail. TTFT p90 stays within 2 s of the base at six of the eight points, and rises at concurrency 383 (14.6 to 18.0 s) and 623 (15.9 to 23.0 s). Table 7 shows the choices at concurrency 623, the throughput end of the curve, where we ran three context tiers with dense DWDP.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Context tier</p></th>
+<th class="head text-right"><p>GPUs</p></th>
+<th class="head text-right"><p>Output tokens/s/GPU</p></th>
+<th class="head text-right"><p>Total tokens/s/GPU</p></th>
+<th class="head"><p>TTFT p50 / p90 / p99 (s)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Base: 24 GPUs, DWDP24, 16K</p></td>
+<td class="text-right"><p>40</p></td>
+<td class="text-right"><p>440.5</p></td>
+<td class="text-right"><p>59,272</p></td>
+<td><p>6.5 / 15.9 / 78.7</p></td>
+</tr>
+<tr class="row-odd"><td><p>Dense DWDP: 24 GPUs, 32K</p></td>
+<td class="text-right"><p>40</p></td>
+<td class="text-right"><p>449.0 (+1.9%)</p></td>
+<td class="text-right"><p>60,531 (+2.1%)</p></td>
+<td><p>6.7 / 11.7 / 60.5</p></td>
+</tr>
+<tr class="row-even"><td><p>Dense DWDP: 20 GPUs, 32K</p></td>
+<td class="text-right"><p>36</p></td>
+<td class="text-right"><p>490.2 (+11.3%)</p></td>
+<td class="text-right"><p>65,689 (+10.8%)</p></td>
+<td><p>6.8 / 14.3 / 71.6</p></td>
+</tr>
+<tr class="row-odd"><td><p>Dense DWDP: 16 GPUs, 32K</p></td>
+<td class="text-right"><p>32</p></td>
+<td class="text-right"><p>524.8 (+19.1%)</p></td>
+<td class="text-right"><p>70,156 (+18.4%)</p></td>
+<td><p>6.8 / 23.0 / 107.3</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>Table 7. Context tiers at concurrency 623; the generation server (DEP16, batch 16) is the same in all four.</em></p>
+<p>Dense DWDP moves the whole trade-off between throughput and latency:</p>
+<ul class="simple">
+<li><p><strong>Same GPUs, lower latency.</strong> With 24 context GPUs, dense DWDP raises the KV cache from 67.7 to 97.4 GiB per GPU and doubles the chunk; TTFT p90 falls from 15.9 to 11.7 s and p99 from 78.7 to 60.5 s.</p></li>
+<li><p><strong>Fewer GPUs, same latency.</strong> With 20 context GPUs, output throughput per GPU rises by 11.3% while TTFT p90 (14.3 s) and p99 (71.6 s) stay below the base’s.</p></li>
+<li><p><strong>Fewest GPUs, longer tail.</strong> With 16 context GPUs, output throughput per GPU rises by 19.1%, but the context tier becomes the bottleneck: the p90 of the time requests wait in the context queue grows from 8.4 s to 13.8 s, and the generation server, which ran 13.8 of 16 requests per step on average in the base, runs 12.6. TTFT p90 grows to 23.0 s.</p></li>
+</ul>
+<p>Under a TTFT p90 target of 20 s, the 20-GPU context tier is the best choice at this point.</p>
+</section>
+<section id="accuracy">
+<h3>Accuracy<a class="headerlink" href="#accuracy" title="Link to this heading">#</a></h3>
+<p>Dense DWDP moves weights; it does not change them. On GSM8K (1,319 questions) with an attached DWDP16 context server, two runs without dense DWDP scored 96.13% and 96.21% and two runs with it scored 97.35% and 96.13%. The runs with and without dense DWDP differ in 38 to 50 answers, fewer than the 54 answers in which the two runs without it differ from each other.</p>
+</section>
+<section id="reproducing-steps">
+<h3>Reproducing Steps<a class="headerlink" href="#reproducing-steps" title="Link to this heading">#</a></h3>
+<p>The context server of the concurrency-623 point with 16 dense DWDP context GPUs used this configuration on each of its 16 one-GPU workers, written here with the merged <code class="docutils literal notranslate"><span class="pre">dwdp_config</span></code> fields:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">tensor_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="nt">moe_expert_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">attention_dp_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">kv_cache_routing_conversation_affinity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">kv_cache_routing_new_conv_placement</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">least_queued</span>
+<span class="nt">disable_overlap_scheduler</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">cuda_graph_config</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span>
+<span class="nt">enable_chunked_prefill</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="nt">max_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32768</span>
+<span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">996672</span>
+<span class="nt">moe_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CUTEDSL</span>
+<span class="w">  </span><span class="nt">use_low_precision_moe_combine</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">dwdp_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">dwdp_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="w">  </span><span class="nt">enable_dense</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">copy_mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gather</span>
+<span class="w">  </span><span class="nt">gather_kernel</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tma</span>
+<span class="nt">kv_cache_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">nvfp4</span>
+<span class="w">  </span><span class="nt">tokens_per_block</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span>
+<span class="w">  </span><span class="nt">use_kv_cache_manager_v2</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">block_reuse_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">policy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">per_conversation</span>
+<span class="w">    </span><span class="nt">max_num_turns</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5</span>
+<span class="w">  </span><span class="nt">free_gpu_memory_fraction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.7</span>
+<span class="w">  </span><span class="nt">pool_ratio</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0.13</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">0.02</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">0.40</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">0.45</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">host_cache_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">171798691840</span><span class="w">  </span><span class="c1"># 160 GiB</span>
+<span class="w">  </span><span class="nt">mamba_ssm_cache_dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">bfloat16</span>
+<span class="w">  </span><span class="nt">mamba_state_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">additional_snapshot_offsets_from_end</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]</span>
+<span class="nt">cache_transceiver_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NIXL</span>
+</pre></div>
+</div>
+<p>The generation server was one DEP16 instance:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">tensor_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="nt">moe_expert_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="nt">max_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">96</span>
+<span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">997696</span>
+<span class="nt">cuda_graph_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">batch_sizes</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">1</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">2</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">4</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">8</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">16</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">moe_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">MEGAMOE_CUTEDSL</span>
+<span class="w">  </span><span class="nt">use_low_precision_moe_combine</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">speculative_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">DSpark</span>
+<span class="w">  </span><span class="nt">max_draft_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5</span>
+<span class="w">  </span><span class="nt">block_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5</span>
+<span class="w">  </span><span class="nt">speculative_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;Kimi-K3 DSpark draft checkpoint&gt;</span>
+<span class="nt">kv_cache_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">nvfp4</span>
+<span class="w">  </span><span class="nt">tokens_per_block</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span>
+<span class="w">  </span><span class="nt">use_kv_cache_manager_v2</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">  </span><span class="nt">free_gpu_memory_fraction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.9</span>
+<span class="w">  </span><span class="nt">host_cache_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">68719476736</span><span class="w">  </span><span class="c1"># 64 GiB</span>
+<span class="w">  </span><span class="nt">mamba_ssm_cache_dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">bfloat16</span>
+<span class="nt">cache_transceiver_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NIXL</span>
+</pre></div>
+</div>
+<p>Launch the context workers with <code class="docutils literal notranslate"><span class="pre">--server_role</span> <span class="pre">CONTEXT</span></code>, then replay the AgentX traces against the disaggregated endpoint at concurrency 623 for one hour. The generation workers ran with <code class="docutils literal notranslate"><span class="pre">TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.62</span></code>, the fixed acceptance described in the setup; do not set it when you serve real traffic.</p>
+</section>
+</section>
+<section id="summary">
+<h2>Summary<a class="headerlink" href="#summary" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>On hybrid MoE models, the dense weights that expert DWDP leaves replicated are large: about 54 GiB per Kimi-K3 context GPU. Dense DWDP shards them and gives each GPU 52.7 GiB of HBM back.</p></li>
+<li><p>The dense gathers add about 4% to the bytes that expert DWDP already moves, ride the same copy stream in deadline order, and cost no measurable throughput at the same settings.</p></li>
+<li><p>The freed memory is worth what it buys: longer prefill chunks and a larger KV cache. On Vera Rubin NVL72 this lets the context tier serve the same agentic load with fewer GPUs, for 6.1% to 19.1% more output throughput per GPU along the Pareto curve.</p></li>
+<li><p>Fewer context GPUs means more load per GPU. At the throughput end the context tier can be sized to the TTFT budget, from lower latency at the same GPUs to the most throughput with a longer tail.</p></li>
+<li><p>Dense DWDP needs high-bandwidth peer memory access and a compute window that covers the expert prefetch, which is why it targets context servers on NVL72 systems.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog30_KV_Cache_Compression_in_TensorRT-LLM.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">KV Cache Compression in TensorRT LLM</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal" tabindex="-1"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#motivation">Motivation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-memory-that-expert-dwdp-leaves-replicated">The Memory That Expert DWDP Leaves Replicated</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#why-memory-turns-into-throughput-on-agentic-workloads">Why Memory Turns into Throughput on Agentic Workloads</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-dwdp-overview">Dense DWDP Overview</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#high-level-design">High-Level Design</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#two-modes">Two Modes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#transfer-budget">Transfer Budget</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-dwdp-implementation">Dense DWDP Implementation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration">Configuration</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#key-components">Key Components</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-flow">Runtime Flow</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#correctness">Correctness</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#current-code-level-constraints">Current Code-Level Constraints</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-optimizations">Key Optimizations</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sharing-the-expert-prefetch-pipeline">Sharing the Expert Prefetch Pipeline</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#committing-dense-weights-before-the-expert-prefetch-ring">Committing Dense Weights Before the Expert Prefetch Ring</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#a-balanced-expert-partition-for-any-group-size">A Balanced Expert Partition for Any Group Size</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#evaluation">Evaluation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#experimental-setup">Experimental Setup</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#no-overhead-at-the-same-settings">No Overhead at the Same Settings</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-evaluation">End-to-End Evaluation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#trading-throughput-for-time-to-first-token">Trading Throughput for Time to First Token</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#accuracy">Accuracy</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#reproducing-steps">Reproducing Steps</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#summary">Summary</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=75c7c72ae941e8b558d8"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=75c7c72ae941e8b558d8"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on November 16, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

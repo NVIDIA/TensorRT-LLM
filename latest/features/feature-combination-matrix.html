@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -471,6 +471,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -500,11 +502,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -519,6 +523,7 @@
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
@@ -530,6 +535,7 @@
 <li class="toctree-l1"><a class="reference internal" href="parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
@@ -571,6 +577,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -680,7 +688,7 @@ For DeepSeek-V4.1 CSA2, use these additional limits:</p>
 </thead>
 <tbody>
 <tr class="row-even"><td><p>Hardware / shape</p></td>
-<td><p>SM90, SM100 family or SM120/121; one KV head, head dimension 512, checkpoint-owned compression and source layout</p></td>
+<td><p>SM100 family; SM90 or SM120/121 only for checkpoints without candidate-consumer layers (the released checkpoint has them); one KV head, head dimension 512, checkpoint-owned compression and source layout</p></td>
 </tr>
 <tr class="row-odd"><td><p>TP / EP / attention DP</p></td>
 <td><p>Supported by the model integration</p></td>
@@ -701,7 +709,7 @@ For DeepSeek-V4.1 CSA2, use these additional limits:</p>
 <td><p>Role mappings and cache transfer have component coverage; end-to-end serving requires separate validation</p></td>
 </tr>
 <tr class="row-odd"><td><p>Bounded replay</p></td>
-<td><p>Approximate Decoder replay defaults on for eligible layouts; Encoder recovery is opt-in</p></td>
+<td><p>Approximate Decoder replay and Encoder recovery default on for eligible layouts</p></td>
 </tr>
 </tbody>
 </table>
@@ -729,11 +737,13 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <th class="head"><p>Logits Post Processor</p></th>
 <th class="head"><p>Guided Decoding</p></th>
 <th class="head"><p>LoRA</p></th>
+<th class="head"><p>Text Watermarking</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td><p>Overlap Scheduler</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -771,11 +781,13 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Tensor Parallelism</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -811,6 +823,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Expert Parallelism</p></td>
 <td><p>Yes</p></td>
@@ -818,6 +831,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -851,6 +865,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Attention Data Parallelism</p></td>
 <td><p>Yes</p></td>
@@ -860,6 +875,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p>Yes</p></td>
 <td><p>Known issues</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -891,6 +907,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Chunked Prefill</p></td>
 <td><p>Yes</p></td>
@@ -902,6 +919,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -931,6 +949,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Speculative Decoding — Dynamic Trees</p></td>
 <td><p>Yes</p></td>
@@ -944,6 +963,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -971,6 +991,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Torch Sampler</p></td>
 <td><p>Yes</p></td>
@@ -986,6 +1007,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p>Yes (MTP dynamic tree: greedy only)</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -1011,6 +1033,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Sliding Window Attention</p></td>
 <td><p>Yes</p></td>
@@ -1028,6 +1051,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -1051,6 +1075,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p>—</p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Guided Decoding</p></td>
 <td><p>Yes</p></td>
@@ -1071,6 +1096,7 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p>LoRA</p></td>
 <td><p>Yes</p></td>
@@ -1089,6 +1115,28 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>Untested</p></td>
+<td><p>—</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p>Text Watermarking</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes (plain decoding)</p></td>
+<td><p>Yes</p></td>
+<td><p>Untested</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes (one-model)</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Untested</p></td>
+<td><p>Yes</p></td>
+<td><p>Untested</p></td>
 <td><p>Untested</p></td>
 <td><p>—</p></td>
 </tr>
@@ -1229,9 +1277,9 @@ dtypes, replay environment variables, and accuracy-validation requirements.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -986,7 +994,7 @@ encoding a Page, are runtime transform state rather than model calibration.</p>
 <section id="adding-a-compression-method">
 <h2>Adding a compression method<a class="headerlink" href="#adding-a-compression-method" title="Link to this heading">#</a></h2>
 <section id="define-the-configuration-and-telemetry">
-<h3>1. Define the configuration and telemetry<a class="headerlink" href="#define-the-configuration-and-telemetry" title="Link to this heading">#</a></h3>
+<span id="1-define-the-configuration-and-telemetry"></span><h3>1. Define the configuration and telemetry<a class="headerlink" href="#define-the-configuration-and-telemetry" title="Link to this heading">#</a></h3>
 <ol class="arabic simple">
 <li><p>Add a <code class="docutils literal notranslate"><span class="pre">KvCacheCompressionConfig</span></code> subclass in <code class="docutils literal notranslate"><span class="pre">llm_args.py</span></code>.</p></li>
 <li><p>Choose a unique <code class="docutils literal notranslate"><span class="pre">algorithm</span></code> value and keep method-specific fields on the
@@ -1005,7 +1013,7 @@ configuration is not complete until the manifest is updated deliberately.</p></l
 </ol>
 </section>
 <section id="register-python-admission-and-construction">
-<h3>2. Register Python admission and construction<a class="headerlink" href="#register-python-admission-and-construction" title="Link to this heading">#</a></h3>
+<span id="2-register-python-admission-and-construction"></span><h3>2. Register Python admission and construction<a class="headerlink" href="#register-python-admission-and-construction" title="Link to this heading">#</a></h3>
 <ol class="arabic simple">
 <li><p>Extend <code class="docutils literal notranslate"><span class="pre">validate_kv_cache_compression_compatibility()</span></code> with only the
 method’s real unsupported combinations.</p></li>
@@ -1025,7 +1033,7 @@ Change those shared components only when extending an algorithm-neutral
 framework contract.</p>
 </section>
 <section id="a-implement-an-iteration-driven-method">
-<h3>3A. Implement an iteration-driven method<a class="headerlink" href="#a-implement-an-iteration-driven-method" title="Link to this heading">#</a></h3>
+<span id="3a-implement-an-iteration-driven-method"></span><h3>3A. Implement an iteration-driven method<a class="headerlink" href="#a-implement-an-iteration-driven-method" title="Link to this heading">#</a></h3>
 <ol class="arabic simple">
 <li><p>Subclass <code class="docutils literal notranslate"><span class="pre">KVCacheCompressionManager</span></code>; retain the default
 <code class="docutils literal notranslate"><span class="pre">uses_iteration_lifecycle</span> <span class="pre">=</span> <span class="pre">True</span></code>.</p></li>
@@ -1036,7 +1044,7 @@ framework contract.</p>
 </ol>
 </section>
 <section id="b-implement-a-storage-bound-method">
-<h3>3B. Implement a storage-bound method<a class="headerlink" href="#b-implement-a-storage-bound-method" title="Link to this heading">#</a></h3>
+<span id="3b-implement-a-storage-bound-method"></span><h3>3B. Implement a storage-bound method<a class="headerlink" href="#b-implement-a-storage-bound-method" title="Link to this heading">#</a></h3>
 <ol class="arabic simple">
 <li><p>Set <code class="docutils literal notranslate"><span class="pre">provides_cold_page_codec</span> <span class="pre">=</span> <span class="pre">True</span></code>. Set
 <code class="docutils literal notranslate"><span class="pre">uses_iteration_lifecycle</span> <span class="pre">=</span> <span class="pre">False</span></code> when the method does not use iteration
@@ -1089,7 +1097,7 @@ rotary factors, never from theta or <code class="docutils literal notranslate"><
 </section>
 </section>
 <section id="add-method-specific-kernels">
-<h3>4. Add method-specific kernels<a class="headerlink" href="#add-method-specific-kernels" title="Link to this heading">#</a></h3>
+<span id="4-add-method-specific-kernels"></span><h3>4. Add method-specific kernels<a class="headerlink" href="#add-method-specific-kernels" title="Link to this heading">#</a></h3>
 <p>Keep the manager responsible for policy and the kernel responsible for a
 batched transform. Put Python launchers with the method implementation. Triton
 and CuTe DSL kernels can live in the method package; a CUDA implementation can
@@ -1106,7 +1114,7 @@ architecture error, and test the launcher separately before wiring it into a
 manager lifecycle.</p>
 </section>
 <section id="preserve-reuse-and-serving-compatibility-where-possible">
-<h3>5. Preserve reuse and serving compatibility where possible<a class="headerlink" href="#preserve-reuse-and-serving-compatibility-where-possible" title="Link to this heading">#</a></h3>
+<span id="5-preserve-reuse-and-serving-compatibility-where-possible"></span><h3>5. Preserve reuse and serving compatibility where possible<a class="headerlink" href="#preserve-reuse-and-serving-compatibility-where-possible" title="Link to this heading">#</a></h3>
 <p>KV-cache block reuse and disaggregated serving are important compression use
 cases. Preserve and test them when the algorithm’s semantics permit it; they
 are not unconditional requirements for every method. Declare
@@ -1116,7 +1124,7 @@ either feature. If a combination cannot be supported, reject it during
 compatibility validation and document the limitation.</p>
 </section>
 <section id="document-the-method">
-<h3>6. Document the method<a class="headerlink" href="#document-the-method" title="Link to this heading">#</a></h3>
+<span id="6-document-the-method"></span><h3>6. Document the method<a class="headerlink" href="#document-the-method" title="Link to this heading">#</a></h3>
 <p>Add a concise method section to the user-facing feature page and a complete,
 runnable example under <code class="docutils literal notranslate"><span class="pre">examples/kv_cache_compression/</span></code>. Document the method’s
 measured accuracy or output-quality impact, tested model and workload scope,
@@ -1137,7 +1145,7 @@ with automated regression tests.</p>
 </pre></div>
 </div>
 <section id="establish-the-accuracy-and-output-quality-contract">
-<h3>1. Establish the accuracy and output-quality contract<a class="headerlink" href="#establish-the-accuracy-and-output-quality-contract" title="Link to this heading">#</a></h3>
+<span id="1-establish-the-accuracy-and-output-quality-contract"></span><h3>1. Establish the accuracy and output-quality contract<a class="headerlink" href="#establish-the-accuracy-and-output-quality-contract" title="Link to this heading">#</a></h3>
 <p>Choose the uncompressed or full-KV path as the reference before measuring
 performance. Define the method’s acceptance criterion and evaluate the real
 end-to-end model path on representative models, cache layouts, context lengths,
@@ -1162,7 +1170,7 @@ limitations in the user-facing method documentation so users do not have to
 infer them from unit tests.</p>
 </section>
 <section id="prove-real-end-to-end-behavior-and-compatibility">
-<h3>2. Prove real end-to-end behavior and compatibility<a class="headerlink" href="#prove-real-end-to-end-behavior-and-compatibility" title="Link to this heading">#</a></h3>
+<span id="2-prove-real-end-to-end-behavior-and-compatibility"></span><h3>2. Prove real end-to-end behavior and compatibility<a class="headerlink" href="#prove-real-end-to-end-behavior-and-compatibility" title="Link to this heading">#</a></h3>
 <p>Run supported models through the production executor, model engine, KVCM, and
 native kernels. Prove that compression actually activated; a successfully
 parsed configuration is not activation evidence. Use counters, traces, or
@@ -1187,7 +1195,7 @@ limitation instead of silently disabling the feature. A kernel round-trip test
 alone does not establish end-to-end compatibility.</p>
 </section>
 <section id="measure-end-to-end-performance">
-<h3>3. Measure end-to-end performance<a class="headerlink" href="#measure-end-to-end-performance" title="Link to this heading">#</a></h3>
+<span id="3-measure-end-to-end-performance"></span><h3>3. Measure end-to-end performance<a class="headerlink" href="#measure-end-to-end-performance" title="Link to this heading">#</a></h3>
 <p>Measure performance only after the accuracy and functional gates pass. Start
 with an uninstrumented A/B comparison against the uncompressed path in which
 only the compression setting changes. Hold the model, workload, sampling
@@ -1205,7 +1213,7 @@ application wall time. Preserve the raw profiler artifacts and distinguish
 work that overlaps model execution from latency exposed to the request.</p>
 </section>
 <section id="turn-validated-behavior-into-regression-gates">
-<h3>4. Turn validated behavior into regression gates<a class="headerlink" href="#turn-validated-behavior-into-regression-gates" title="Link to this heading">#</a></h3>
+<span id="4-turn-validated-behavior-into-regression-gates"></span><h3>4. Turn validated behavior into regression gates<a class="headerlink" href="#turn-validated-behavior-into-regression-gates" title="Link to this heading">#</a></h3>
 <p>Automated tests should protect the contracts established above. Keep focused
 CPU tests fast, add native and kernel tests for data-path contracts, and retain
 small end-to-end smoke gates for activation and integration. These tests catch
@@ -1431,9 +1439,9 @@ declared lossless;</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

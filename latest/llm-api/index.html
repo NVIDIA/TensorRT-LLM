@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -715,13 +723,13 @@
 <span class="linenos">33</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
-<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/llm-api/README.md">README</a>.</p>
+<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/examples/llm-api/README.md">README</a>.</p>
 </section>
 <section id="model-input">
 <h2>Model Input<a class="headerlink" href="#model-input" title="Link to this heading">#</a></h2>
 <p>The <code class="docutils literal notranslate"><span class="pre">LLM()</span></code> constructor accepts either a Hugging Face model ID or a local model path as input.</p>
 <section id="using-a-model-from-the-hugging-face-hub">
-<h3>1. Using a Model from the Hugging Face Hub<a class="headerlink" href="#using-a-model-from-the-hugging-face-hub" title="Link to this heading">#</a></h3>
+<span id="1-using-a-model-from-the-hugging-face-hub"></span><h3>1. Using a Model from the Hugging Face Hub<a class="headerlink" href="#using-a-model-from-the-hugging-face-hub" title="Link to this heading">#</a></h3>
 <p>To load a model directly from the <a class="reference external" href="https://huggingface.co/">Hugging Face Model Hub</a>, simply pass its model ID (i.e., repository name) to the LLM constructor. The model will be automatically downloaded:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"TinyLlama/TinyLlama-1.1B-Chat-v1.0"</span><span class="p">)</span>
 </pre></div>
@@ -729,7 +737,7 @@
 <p>You can also use <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">quantized checkpoints</a> (FP4, FP8, etc) of popular models provided by NVIDIA in the same way.</p>
 </section>
 <section id="using-a-local-hugging-face-model">
-<h3>2. Using a Local Hugging Face Model<a class="headerlink" href="#using-a-local-hugging-face-model" title="Link to this heading">#</a></h3>
+<span id="2-using-a-local-hugging-face-model"></span><h3>2. Using a Local Hugging Face Model<a class="headerlink" href="#using-a-local-hugging-face-model" title="Link to this heading">#</a></h3>
 <p>To use a model from local storage, first download it manually:</p>
 <div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">git lfs install</span>
 <span class="go">git clone https://huggingface.co/meta-llama/Meta-Llama-3.1-8B</span>
@@ -1023,11 +1031,15 @@ configured environment variable takes precedence.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">$HOME/.deep_gemm</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">deep_gemm</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_DG_CACHE_DIR</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TLLM_JIT_SHARE_DIR</span></code></p></td>
+<td><p>Disabled</p></td>
+<td><p>Not set (one directory per launch, see below)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_DG_CACHE_DIR</span></code></p></td>
 <td><p>Disabled</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">trtllm_deep_gemm</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CUDA_CACHE_PATH</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CUDA_CACHE_PATH</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">$HOME/.nv/ComputeCache</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">cuda</span></code></p></td>
 </tr>
@@ -1050,8 +1062,21 @@ configured values are forwarded to dynamically spawned MPI workers.</p>
 <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code>, also defaults <code class="docutils literal notranslate"><span class="pre">TRTLLM_DG_JIT_DUMP_CUBIN</span></code> to <code class="docutils literal notranslate"><span class="pre">1</span></code> so its
 NVRTC-generated cubins are persisted. An explicitly configured dump setting
 still takes precedence. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/examples/models/core/deepseek_v3/README.md">DeepGEMM environment variables</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/examples/models/core/deepseek_v3/README.md">DeepGEMM environment variables</a>
 for details.</p>
+<p>Set <code class="docutils literal notranslate"><span class="pre">TLLM_JIT_SHARE_DIR</span></code> to a directory that every process of a launch can see
+(on a multi-node launch, a shared file system; use a fresh directory per
+launch) to build each DeepGEMM and CuTe DSL kernel that warmup tunes once
+across the processes: the first process to claim a kernel builds it, and the
+others load the result. Unless <code class="docutils literal notranslate"><span class="pre">DG_JIT_CACHE_DIR</span></code> is set, it also places
+DeepGEMM’s disk cache in <code class="docutils literal notranslate"><span class="pre">&lt;TLLM_JIT_SHARE_DIR&gt;/deep_gemm</span></code>, ahead of the
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code> default. Every process runs the kernels it finds there, so
+the directory must belong to you and other users must not be able to write to
+it (group members who can write to it must be trusted); otherwise TensorRT-LLM
+ignores the setting with a warning. A process waits for another process’s build
+at most <code class="docutils literal notranslate"><span class="pre">TLLM_JIT_SHARE_WAIT_S</span></code> seconds (default 60) and then builds the kernel
+itself, as it does whenever the directory cannot be used.
+<code class="docutils literal notranslate"><span class="pre">TLLM_JIT_SHARE_LOG=1</span></code> records each kernel in <code class="docutils literal notranslate"><span class="pre">&lt;TLLM_JIT_SHARE_DIR&gt;/log</span></code>.</p>
 <p>Note that, when <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code> is set, the FlashInfer workspace isolation
 mechanism described below still applies. This will prevent race conditions
 during cache read/writes, at the cost of limiting cache sharing. To disable
@@ -1163,6 +1188,14 @@ concurrent MPI processes never write to each other’s compiler inputs while JIT
 artifacts stay warm across launches. Set
 <code class="docutils literal notranslate"><span class="pre">TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0</span></code> before invoking the launcher or
 creating the LLM instance to disable this behavior.</p>
+<p>Downloaded TRTLLM-Gen FMHA kernel cubins are the exception: FlashInfer only
+loads them and never compiles them, so ranks with persistent slots share them
+through a <code class="docutils literal notranslate"><span class="pre">cubins</span></code> directory next to the slots. A rank looks a kernel cubin up
+in its own slot, then in the shared directory, and downloads it only when
+neither has it, publishing the download to the shared directory with an atomic
+rename. Every cubin read from the shared directory is checked against its
+SHA-256. Headers and other compiler inputs are never shared. Set
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_FLASHINFER_SHARED_CUBINS=0</span></code> to keep these cubins per-rank as well.</p>
 <p>Persistent slots are not pruned automatically, so their count can grow with
 peak job concurrency. When no TensorRT-LLM processes are using the cache, the
 slots may be deleted safely; subsequent launches rebuild the removed JIT
@@ -1193,7 +1226,7 @@ instead of being downloaded concurrently into the shared directory.</p>
 <p>For example, try <code class="docutils literal notranslate"><span class="pre">mpirun</span> <span class="pre">-n</span> <span class="pre">1</span> <span class="pre">--oversubscribe</span> <span class="pre">--allow-run-as-root</span> <span class="pre">python</span> <span class="pre">llm_inference_distributed.py</span></code>.</p>
 </section>
 <section id="mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1">
-<h3>MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.<a class="headerlink" href="#mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1" title="Link to this heading">#</a></h3>
+<span id="mpi_abort-was-invoked-on-rank-1-in-communicator-mpi_comm_world-with-errorcode-1"></span><h3>MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.<a class="headerlink" href="#mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1" title="Link to this heading">#</a></h3>
 <p>Because the LLM API relies on the <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code> library, put the LLM class in a function and protect the main entrypoint to the program under the <code class="docutils literal notranslate"><span class="pre">__main__</span></code> namespace to avoid a <a class="reference external" href="https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor">recursive spawn</a> process in <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code>.</p>
 <p>This limitation is applicable for multi-GPU inference only.</p>
 </section>
@@ -1230,7 +1263,7 @@ shutdown timeouts retain the supervisor behavior described above. The module
 stop command uses the same acknowledged protocol and unacknowledged exit code.</p>
 </section>
 <section id="single-node-hanging-when-using-docker-run-net-host">
-<h3>Single node hanging when using <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">run</span> <span class="pre">--net=host</span></code><a class="headerlink" href="#single-node-hanging-when-using-docker-run-net-host" title="Link to this heading">#</a></h3>
+<span id="single-node-hanging-when-using-docker-run---nethost"></span><h3>Single node hanging when using <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">run</span> <span class="pre">--net=host</span></code><a class="headerlink" href="#single-node-hanging-when-using-docker-run-net-host" title="Link to this heading">#</a></h3>
 <p>The root cause may be related to <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code>. There is a <a class="reference external" href="https://github.com/mpi4py/mpi4py/discussions/491#discussioncomment-12660609">workaround</a> suggesting a change from <code class="docutils literal notranslate"><span class="pre">--net=host</span></code> to <code class="docutils literal notranslate"><span class="pre">--ipc=host</span></code>, or setting the following environment variables:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">OMPI_MCA_btl_tcp_if_include</span><span class="o">=</span>lo
 <span class="nb">export</span><span class="w"> </span><span class="nv">OMPI_MCA_oob_tcp_if_include</span><span class="o">=</span>lo
@@ -1409,9 +1442,9 @@ stop command uses the same acknowledged protocol and unacknowledged exit code.</
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

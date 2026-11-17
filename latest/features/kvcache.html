@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="KV hint request metadata" href="kv-hints.html" />
-    <link rel="prev" title="Embeddings (Encoder-Only Models)" href="embeddings.html" />
+    <link rel="prev" title="Reranking" href="reranking.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="reranking.html">Reranking</a></li>
 <li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -703,7 +711,7 @@
 <p>TensorRT LLM takes advantage of layers with limited attention window size in order to reduce computations and memory usage. Blocks that leave the attention window are freed and placed on the radix search tree so they can be reused.</p>
 </section>
 <section id="mqa-gqa">
-<h2>MQA / GQA<a class="headerlink" href="#mqa-gqa" title="Link to this heading">#</a></h2>
+<span id="mqa--gqa"></span><h2>MQA / GQA<a class="headerlink" href="#mqa-gqa" title="Link to this heading">#</a></h2>
 <p>TensorRT LLM takes advantage of grouped query attention in order to save memory. KV cache will create blocks with only enough space to store state for the discrete query head groups. For MHA, there is one group per head, for MQA there is a single group for all the heads. GQA strikes a balance between these two.</p>
 </section>
 <section id="controlling-kv-cache-behavior">
@@ -719,7 +727,7 @@
 <p>Property <code class="docutils literal notranslate"><span class="pre">free_gpu_memory_fraction</span></code> is a ratio &gt; 0 and &lt; 1 that specifies how much of free GPU memory should be allocated to KV cache. The default is 90% (ratio of 0.9). If <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> is also set, KV cache will determine how much memory is needed to hold <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> and will allocate the lesser of <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> and <code class="docutils literal notranslate"><span class="pre">free_gpu_memory_fraction</span></code>.</p>
 </section>
 <section id="enable-disable-cross-request-reuse">
-<h3>Enable/Disable Cross Request Reuse<a class="headerlink" href="#enable-disable-cross-request-reuse" title="Link to this heading">#</a></h3>
+<span id="enabledisable-cross-request-reuse"></span><h3>Enable/Disable Cross Request Reuse<a class="headerlink" href="#enable-disable-cross-request-reuse" title="Link to this heading">#</a></h3>
 <p>Block reuse across requests is enabled by default, but can be disabled by setting <code class="docutils literal notranslate"><span class="pre">enable_block_reuse</span></code> to False.</p>
 <p><code class="docutils literal notranslate"><span class="pre">scheduler_config.enable_prefix_aware_scheduling</span></code> controls only scheduler-side use of prefix-reuse estimates. When it is
 <code class="docutils literal notranslate"><span class="pre">True</span></code> (the default), schedulers can use estimated reusable KV tokens to defer duplicate first-chunk context requests and
@@ -737,6 +745,10 @@ credit:</p>
 </section>
 <section id="selecting-the-kv-cache-manager">
 <h3>Selecting the KV Cache Manager<a class="headerlink" href="#selecting-the-kv-cache-manager" title="Link to this heading">#</a></h3>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>KV cache manager V1 (<code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2:</span> <span class="pre">false</span></code>, or <code class="docutils literal notranslate"><span class="pre">auto</span></code> when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (<code class="docutils literal notranslate"><span class="pre">sleep_config</span></code>), RocketKV, and skip-softmax still require V1 until V2 support is available; keep V1 for these features during migration.</p>
+</div>
 <p>TensorRT LLM ships two KV cache manager implementations. <code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2</span></code>
 selects between them and defaults to <code class="docutils literal notranslate"><span class="pre">true</span></code>, which selects the V2 manager. Set it
 to <code class="docutils literal notranslate"><span class="pre">false</span></code> to select the V1 C++ manager for models that support it. Set it to
@@ -814,16 +826,16 @@ Select it through <code class="docutils literal notranslate"><span class="pre">d
 </div>
 <p>The first part of the dtype names the history storage (NVFP4 values with one
 FP8 scale per 16 elements); the second part is the dtype attention computes
-in and the retained tokens are stored in. Like <code class="docutils literal notranslate"><span class="pre">dtype:</span> <span class="pre">fp8</span></code>, it overrides the
+in and the first/last tokens are stored in. Like <code class="docutils literal notranslate"><span class="pre">dtype:</span> <span class="pre">fp8</span></code>, it overrides the
 checkpoint’s KV quantization: <code class="docutils literal notranslate"><span class="pre">fp8</span></code> selects FP8 KV, <code class="docutils literal notranslate"><span class="pre">float16</span></code> and <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code>
-select the unquantized model dtype. Retention follows the
-cache page granularity, and at least one of <code class="docutils literal notranslate"><span class="pre">mixed_precision_first_n</span></code> and
+select the unquantized model dtype. The first/last tokens are kept in
+whole cache pages, and at least one of <code class="docutils literal notranslate"><span class="pre">mixed_precision_first_n</span></code> and
 <code class="docutils literal notranslate"><span class="pre">mixed_precision_last_n</span></code> must be positive.</p>
-<p>Each mixed-precision layer owns two pools: its original pool holds the NVFP4
-history, and a second layer group, appended after the model’s own layer
-groups, holds the retained tokens. When <code class="docutils literal notranslate"><span class="pre">pool_ratio</span></code> is set it must therefore
-carry one more entry than the model has layer groups, with the retained-token
-group last; leave it unset to size all groups automatically. Sliding-window
+<p>Each mixed-precision layer keeps two pools: the mixed-precision low pool holds
+the NVFP4 history and the mixed-precision high pool holds the first/last tokens.
+The mixed-precision high pools form one extra layer group after the model’s own,
+so a <code class="docutils literal notranslate"><span class="pre">pool_ratio</span></code> must carry one more entry than the model has layer groups, with
+the mixed-precision high group last; leave it unset to size all groups automatically. Sliding-window
 layers and layers whose KV is shared with another layer stay native.</p>
 <p>Before a mixed-precision layer runs, the attention metadata gathers the two
 pools into a staging copy in the attention dtype and writes the new tokens
@@ -835,9 +847,35 @@ logged at startup and the KV budget profiling run accounts for it. Each
 forward converts up to the longest sequence in the batch for every
 mixed-precision layer (the full span inside CUDA graphs), which is the
 feature’s per-step cost.</p>
-<p>The prototype requires the TRTLLM or FlashInfer attention backend with
-<code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2:</span> <span class="pre">true</span></code>, and does not support speculative decoding,
-beam search, sparse attention, cold-page compression or context parallelism.</p>
+<p>The prototype requires <code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2:</span> <span class="pre">true</span></code> with the TRTLLM or
+FlashInfer attention backend. It supports the standard V2 manager (dense
+models), the hybrid Mamba manager (Qwen3.5, Kimi-K3) and the sparse MLA
+backends (DSA, DeepSeek-V4), and the speculative decoding modes below. Beam
+search, cold-page compression, KV connectors and context parallelism are not
+supported.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Speculative decoding</p></th>
+<th class="head"><p>Status</p></th>
+<th class="head"><p>KV cache of the drafter layers</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>MTP (one-model)</p></td>
+<td><p>Supported</p></td>
+<td><p>Mixed-precision high and low pools, like the model’s own layers</p></td>
+</tr>
+<tr class="row-odd"><td><p>EAGLE3 (one-model) and other drafters with their own architecture</p></td>
+<td><p>Supported</p></td>
+<td><p>Plain cache: the mixed-precision high dtype on dense backends, NVFP4 (the mixed-precision low dtype) on DSA and DeepSeek-V4</p></td>
+</tr>
+<tr class="row-even"><td><p>Dynamic-tree drafting</p></td>
+<td><p>Not supported</p></td>
+<td><p>Rejected at startup</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 </section>
 <section id="swa-endpoint-retention">
 <h3>SWA Endpoint Retention<a class="headerlink" href="#swa-endpoint-retention" title="Link to this heading">#</a></h3>
@@ -979,14 +1017,82 @@ snapshots the recurrent state at the fork. The deprecated
 provides the routing format version and token-ID offset. The extension can accompany
 video and audio keys as well as image keys; the OpenEngine capability flag advertises
 only the currently validated image-routing support. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb/tensorrt_llm/grpc/openengine/README.md">OpenEngine image routing contract</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb/tensorrt_llm/grpc/openengine/README.md">OpenEngine image routing contract</a>
 for capability requirements and consumer handling.</p>
 </section>
 <section id="enable-offloading-to-host-memory">
 <h3>Enable Offloading to Host Memory<a class="headerlink" href="#enable-offloading-to-host-memory" title="Link to this heading">#</a></h3>
 <p>Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property <code class="docutils literal notranslate"><span class="pre">host_cache_size</span></code> which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.</p>
 <p>When offloading is enabled, <code class="docutils literal notranslate"><span class="pre">KvCacheConfig.cold_tier_offload_min_priority</span></code> controls which unreferenced blocks can be offloaded. Blocks below the threshold are discarded from GPU memory; blocks at or above it can move to a cold tier. The default threshold is 30. The old name, <code class="docutils literal notranslate"><span class="pre">secondary_offload_min_priority</span></code>, remains accepted as a deprecated alias.</p>
+<p>With the V2 KV cache manager, <code class="docutils literal notranslate"><span class="pre">host_cache_bind_to_gpu_numa_node:</span> <span class="pre">true</span></code> (prototype) allocates the host tier only on the GPU’s host NUMA node, reclaiming page cache there instead of spilling to another node. When the binding cannot be honored, startup fails instead of falling back, for example when a GPU reports no host NUMA node or a node cannot hold the host tiers of all the ranks bound to it.</p>
 <p>Here is an <a class="reference download internal" download="" href="../_downloads/289baa7eb9a76c4944f3e2800f51f4c4/llm_kv_cache_offloading.py"><span class="xref download myst">example</span></a> to show how to enable host offloading.</p>
+</section>
+<section id="offloading-to-disk-kv-cache-manager-v2">
+<h3>Offloading to Disk (KV Cache Manager V2)<a class="headerlink" href="#offloading-to-disk-kv-cache-manager-v2" title="Link to this heading">#</a></h3>
+<p>KV cache manager V2 can add a disk tier below host memory. Blocks evicted from host memory are written to
+files in <code class="docutils literal notranslate"><span class="pre">disk_cache_path</span></code> and stay reusable until they are evicted from disk; reusing one copies it back
+through host memory. The disk tier is enabled with <code class="docutils literal notranslate"><span class="pre">disk_cache_size</span></code> (bytes, per rank) and
+<code class="docutils literal notranslate"><span class="pre">disk_cache_path</span></code>, and requires <code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2:</span> <span class="pre">true</span></code>. A disk tier without a host tier is
+allowed, but the options below that involve the host tier then have no effect.
+<code class="docutils literal notranslate"><span class="pre">disk_prefetch_num_reqs</span></code> starts copying the disk-resident prefix blocks of that many queued context
+requests to host memory ahead of time (0 disables it; it requires block reuse).</p>
+<p>Four prototype options reduce the cost of disk I/O. The first three are off by default:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Option</p></th>
+<th class="head"><p>Effect</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">disk_io_threads</span></code></p></td>
+<td><p>Runs disk reads and writes on this many worker threads instead of in a CUDA host callback, so several transfers proceed at once and a restore does not wait behind an eviction write. Reads are served first, then eviction writes, then background (write-through) writes; a write that has waited too long is served ahead of that order. Range 0-256.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">disk_keep_copy_after_restore</span></code></p></td>
+<td><p>When a block is restored from disk, its disk copy is kept. If the block is evicted to disk again, it takes that copy back instead of being written again.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">disk_write_through</span></code></p></td>
+<td><p>When a block is evicted from GPU to host memory, it is also copied to disk in the background, so its later host-to-disk eviction writes nothing. These copies use free disk space only: on a full disk the copy is skipped and the block is written when it is evicted, as without this option. If the block is evicted to disk while its copy is still being written, the eviction takes the copy and waits for that write, which then runs ahead of other background writes, instead of writing the block again. Requires <code class="docutils literal notranslate"><span class="pre">disk_io_threads</span></code> &gt; 0 and a host tier (<code class="docutils literal notranslate"><span class="pre">host_cache_size</span></code> &gt; 0); without a host tier it is turned off with a warning.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">disk_protected_copy_fraction</span></code></p></td>
+<td><p>Share of the disk tier, 0.0-1.0 (default 1.0), that the copies kept by the two options above may hold ahead of blocks whose only copy is on disk. See below.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">disk_keep_copy_after_restore</span></code> and <code class="docutils literal notranslate"><span class="pre">disk_write_through</span></code> are independent; either can be used alone. They act
+only on blocks that are fully computed and reusable, so they have no effect when block reuse is disabled.
+A disk copy kept by either option is a duplicate of a block that lives in a hotter tier. It saves a disk
+write, but it takes disk space that could hold a block whose only copy is on disk, so the two compete
+when the disk tier is full. <code class="docutils literal notranslate"><span class="pre">disk_protected_copy_fraction</span></code> sets the balance:</p>
+<ul class="simple">
+<li><p>Copies within the share (<code class="docutils literal notranslate"><span class="pre">disk_protected_copy_fraction</span></code> x the disk tier’s blocks) come first. When the
+disk tier is full, it drops the least recently used blocks whose only copy is on disk, and releases
+these copies (oldest first) only when that is not enough.</p></li>
+<li><p>Copies beyond the share are released first, before any of those blocks, and write-through makes no
+copy beyond it.</p></li>
+</ul>
+<p>The default of 1.0 protects every copy, which saves the most writes and suits deployments limited by disk
+write bandwidth. A lower value keeps more distinct blocks on disk, which suits deployments whose reuse is
+limited by disk capacity. 0.0 keeps copies only while there is free disk space.</p>
+<p>Disk-tier storage statistics report the copies apart from evictable blocks (<code class="docutils literal notranslate"><span class="pre">retained_copies</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">secondaryRetainedCopyNumBlocks</span></code> in the per-iteration KV cache statistics), and count them as available,
+since the tier releases them when it needs the room.</p>
+<p>The worker pool is shared by the whole process: the first KV cache manager that sets a nonzero
+<code class="docutils literal notranslate"><span class="pre">disk_io_threads</span></code> starts it, and later values, including 0, do not change it (a warning is logged when a
+value is ignored).</p>
+<p>Setting any of these options to a non-default value without <code class="docutils literal notranslate"><span class="pre">disk_cache_size</span></code> &gt; 0, or with KV cache manager
+V1, is rejected, and <code class="docutils literal notranslate"><span class="pre">disk_write_through</span></code> without <code class="docutils literal notranslate"><span class="pre">disk_io_threads</span></code> &gt; 0 is rejected.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">kv_cache_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">use_kv_cache_manager_v2</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">host_cache_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">171798691840</span><span class="w">   </span><span class="c1"># 160 GiB</span>
+<span class="w">  </span><span class="nt">disk_cache_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1099511627776</span><span class="w">  </span><span class="c1"># 1 TiB</span>
+<span class="w">  </span><span class="nt">disk_cache_path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/raid/kv_cache</span>
+<span class="w">  </span><span class="nt">disk_io_threads</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="w">  </span><span class="nt">disk_keep_copy_after_restore</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">disk_write_through</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
 <p>KV cache compression can reduce the storage and transfer cost of offloaded
 Pages, or reduce the amount of KV retained by an algorithm. Compression is
 configured separately from <code class="docutils literal notranslate"><span class="pre">KvCacheConfig</span></code>; see
@@ -995,8 +1101,10 @@ their activation points.</p>
 </section>
 <section id="partial-reuse">
 <h3>Partial Reuse<a class="headerlink" href="#partial-reuse" title="Link to this heading">#</a></h3>
-<p>Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default, but can be disabled by setting <code class="docutils literal notranslate"><span class="pre">enable_partial_reuse</span></code> to False.</p>
-<p>The property <code class="docutils literal notranslate"><span class="pre">copy_on_partial_reuse</span></code> specifies whether a block should be copied or not in order to allow partial reuse. If copying is disabled, a partially matched block can only be reused if no other request is using it. If copying is enabled, partially matched blocks are not reused directly, instead a new block is created and the matched tokens are copied into the new block. This allows multiple requests to partially reuse a block.</p>
+<p>Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default. Set <code class="docutils literal notranslate"><span class="pre">enable_partial_reuse=False</span></code> to stop matching part of a cached block.</p>
+<p>KV cache manager V2 (the default; see <a class="reference internal" href="#selecting-the-kv-cache-manager">Selecting the KV Cache Manager</a>) ignores <code class="docutils literal notranslate"><span class="pre">copy_on_partial_reuse</span></code>. Before extending a reused partial tail page, V2 copies it into a new page owned by the request, even for an unreferenced leaf that V1 could reuse directly. The cached page stays in the reuse tree, so multiple requests can partially reuse it.</p>
+<p>With one-model speculative decoding, V2’s draft-lookahead backoff can still shorten a block-aligned reuse match (by <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> for vanilla MTP, or one token for the EAGLE3 and MTP-Eagle one-model modes), leaving a partial tail page that is copied even when <code class="docutils literal notranslate"><span class="pre">enable_partial_reuse=False</span></code>.</p>
+<p>KV cache manager V1 can reuse an unreferenced leaf directly, even with <code class="docutils literal notranslate"><span class="pre">copy_on_partial_reuse=True</span></code>. When direct reuse is not possible, enabling this property allows a new block to be allocated and the matched tokens to be copied into it. With <code class="docutils literal notranslate"><span class="pre">copy_on_partial_reuse=False</span></code>, partial matching is restricted to unreferenced leaves. If two requests in one batch partially match the same unreferenced leaf, V1 copies the matched tokens for the earlier request even with <code class="docutils literal notranslate"><span class="pre">copy_on_partial_reuse=False</span></code>.</p>
 </section>
 <section id="attention-window-size">
 <h3>Attention Window Size<a class="headerlink" href="#attention-window-size" title="Link to this heading">#</a></h3>
@@ -1156,12 +1264,12 @@ dropped before reaching the executor.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="embeddings.html"
+       href="reranking.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Embeddings (Encoder-Only Models)</p>
+        <p class="prev-next-title">Reranking</p>
       </div>
     </a>
     <a class="right-next"
@@ -1214,6 +1322,7 @@ dropped before reaching the executor.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-salting-for-secure-reuse">KV Cache Salting for Secure Reuse</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-uuid-support-for-cache-identification">Multimodal UUID Support for Cache Identification</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-offloading-to-host-memory">Enable Offloading to Host Memory</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#offloading-to-disk-kv-cache-manager-v2">Offloading to Disk (KV Cache Manager V2)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#partial-reuse">Partial Reuse</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-window-size">Attention Window Size</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#debugging-aids">Debugging Aids</a></li>
@@ -1316,9 +1425,9 @@ dropped before reaching the executor.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       

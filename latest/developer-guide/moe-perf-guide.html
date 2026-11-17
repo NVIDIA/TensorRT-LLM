@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.24.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc3" />
+  <meta name="docsearch:version" content="1.4.0rc4" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,8 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointIOPolicy.html">CheckpointIOPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CheckpointFormat.html">CheckpointFormat</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
@@ -504,11 +506,13 @@
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SparseKvCacheOffloadConfig.html">SparseKvCacheOffloadConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PromptTokenCacheConfig.html">PromptTokenCacheConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
@@ -523,6 +527,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/subagent-routing.html">Sub-agent Routing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/reranking.html">Reranking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-hints.html">KV hint request metadata</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-compression.html">KV Cache Compression</a></li>
@@ -534,6 +539,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/watermarking.html">Text Watermarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
@@ -575,6 +581,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.html">ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.html">Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
@@ -672,8 +680,8 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="moe-performance-guide">
-<span id="moe-perf-guide"></span><h1>MoE Performance Guide<a class="headerlink" href="#moe-performance-guide" title="Link to this heading">#</a></h1>
+  <section class="tex2jax_ignore mathjax_ignore" id="moe-perf-guide">
+<span id="moe-performance-guide"></span><h1>MoE Performance Guide<a class="headerlink" href="#moe-perf-guide" title="Link to this heading">#</a></h1>
 <section id="moe-architecture">
 <h2>MoE Architecture<a class="headerlink" href="#moe-architecture" title="Link to this heading">#</a></h2>
 <p>An MoE module contains <code class="docutils literal notranslate"><span class="pre">num_experts</span></code> experts and a router that selects <code class="docutils literal notranslate"><span class="pre">top_k</span></code> of them for each token. To accelerate LLM execution, a multi-GPU deployment usually partitions these experts across ranks, which makes each rank hold only part of them. The module therefore additionally pays for a <strong>dispatch</strong> (send each token to the rank that owns its target expert) and a <strong>combine</strong> (bring the results back).</p>
@@ -860,6 +868,38 @@
 </pre></div>
 </div>
 <p>The value must be one of the strategy names in the table above.</p>
+</section>
+<section id="nvlink-one-sided-how-arrival-is-detected">
+<span id="nvlink_one_sided-how-arrival-is-detected"></span><h5><code class="docutils literal notranslate"><span class="pre">NVLINK_ONE_SIDED</span></code>: how arrival is detected<a class="headerlink" href="#nvlink-one-sided-how-arrival-is-detected" title="Link to this heading">#</a></h5>
+<p><code class="docutils literal notranslate"><span class="pre">NVLINK_ONE_SIDED</span></code> has two ways for a rank to learn that a step’s rows have arrived, selected per step:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Protocol</p></th>
+<th class="head"><p>Mechanism</p></th>
+<th class="head"><p>Used for</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fence</span></code></p></td>
+<td><p>Completion flags behind a system-scope fence</p></td>
+<td><p>Every step it is selected for; always available</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sentinel</span></code></p></td>
+<td><p>Landing rows are pre-filled with a sentinel word; receivers poll the data itself, so neither dispatch nor combine waits on a flag or fence</p></td>
+<td><p>Small steps on SM100, SM103 and SM107</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL</span></code> chooses the policy on every rank:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">auto</span></code> (default): sentinel for each step it can carry, fence for the others.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fence</span></code>: fence only.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">sentinel</span></code>: same as <code class="docutils literal notranslate"><span class="pre">auto</span></code>, but logs a warning naming the reason when sentinel cannot be used.</p></li>
+</ul>
+<p>A step is carried by sentinel when its busiest rank sends at most <code class="docutils literal notranslate"><span class="pre">sentinel_max_tokens</span></code> tokens, it gathers no EPLB statistics, and its payload matches the layer’s format (BF16, MXFP8 or NVFP4 rows). Sentinel is off for FP8 low-precision combine (<code class="docutils literal notranslate"><span class="pre">use_low_precision_moe_combine</span></code>), for communicators with the AlltoAll watchdog or EP-group health, for more than 64 EP ranks, and for the FP8 per-tensor, <code class="docutils literal notranslate"><span class="pre">W4A8_MXFP4_FP8</span></code> and <code class="docutils literal notranslate"><span class="pre">W4A8_NVFP4_FP8</span></code> activation formats.</p>
+<p>The default <code class="docutils literal notranslate"><span class="pre">sentinel_max_tokens</span></code> is between 159 and 512 tokens per rank (capped at <code class="docutils literal notranslate"><span class="pre">max_num_tokens_per_rank</span></code>); <code class="docutils literal notranslate"><span class="pre">TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS</span></code> overrides it. The sentinel landing rows are added to the workspace, <code class="docutils literal notranslate"><span class="pre">ep_size</span> <span class="pre">×</span> <span class="pre">sentinel_max_tokens</span></code> of them per rank: for hidden 7168, top-8 BF16 rows this is about 52 / 105 / 210 / 419 MiB per rank at EP 8 / 16 / 32 / 64. If a <code class="docutils literal notranslate"><span class="pre">TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB</span></code> override cannot hold them, sentinel is turned off with a warning.</p>
+<p>The settings must be the same on every rank; an invalid or mismatched value raises an error at model construction on every rank. <code class="docutils literal notranslate"><span class="pre">TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT</span></code>, <code class="docutils literal notranslate"><span class="pre">..._CFT_MAX_BATCH_FOR_DISPATCH</span></code> and <code class="docutils literal notranslate"><span class="pre">..._CFT_MAX_BATCH_FOR_COMBINE</span></code> are no longer read and log a warning; <code class="docutils literal notranslate"><span class="pre">FORCE_CFT=0</span></code> still selects <code class="docutils literal notranslate"><span class="pre">fence</span></code> for one release.</p>
 <p>Implementation Notes: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md"><code class="docutils literal notranslate"><span class="pre">MOE_DEVELOPER_GUIDE.md</span></code></a>.</p>
 </section>
 </section>
@@ -880,7 +920,7 @@
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
 <td><p>SM100 / SM103</p></td>
-<td><p>NVFP4, FP8 block-scale, W4A8_NVFP4_FP8, W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8, BF16 (a separate FlashInfer path)</p></td>
+<td><p>NVFP4, FP8 block-scale, W4A8_NVFP4_FP8, W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8, BF16</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
 <td><p>SM100 / SM103 / SM107, SM120 / SM121 (CUTLASS prefill / FlashInfer decode)</p></td>
@@ -926,6 +966,265 @@
 </pre></div>
 </div>
 <p>The <em>Backend Capability Matrix</em> and <em>Quantization Support</em> tables: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md"><code class="docutils literal notranslate"><span class="pre">MOE_DEVELOPER_GUIDE.md</span></code></a>.</p>
+<p>For DeepSeek-V4 and DeepSeek-V4.1 on <code class="docutils literal notranslate"><span class="pre">MEGAMOE_CUTEDSL</span></code>, <code class="docutils literal notranslate"><span class="pre">moe_config.megamoe_fuse_shared_expert:</span> <span class="pre">true</span></code> (prototype) runs the model’s single FP8 block-scale shared expert inside the MegaMoE kernel instead of as a separate MLP. It applies on SM100 / SM103 under attention DP with <code class="docutils literal notranslate"><span class="pre">moe_tensor_parallel_size</span></code> 1, to the target, one-model MTP and draft MoE layers together: either all of them fuse or none does. Otherwise the shared expert stays separate, and on <code class="docutils literal notranslate"><span class="pre">MEGAMOE_CUTEDSL</span></code> a warning names the reason.</p>
+</section>
+<section id="how-to-pin-an-implementation-with-tactic-prototype">
+<h5>How to pin an implementation with <code class="docutils literal notranslate"><span class="pre">tactic</span></code>? (prototype)<a class="headerlink" href="#how-to-pin-an-implementation-with-tactic-prototype" title="Link to this heading">#</a></h5>
+<p>A backend names a family of implementations, picks one of them per layer, and falls back to CUTLASS when none of them can serve the layer. <code class="docutils literal notranslate"><span class="pre">moe_config.tactic</span></code> names the implementations themselves, by their id <code class="docutils literal notranslate"><span class="pre">provider.technique.kernel_name.quant</span></code>, and never falls back: a layer it applies to runs one of them or fails to build. (A MoE tactic selects implementations; it is unrelated to the autotuner’s kernel tactics, which are still tuned inside the chosen implementation.)</p>
+<p>A tactic is the recommended way to pin an implementation, and choosing a <code class="docutils literal notranslate"><span class="pre">backend</span></code> other than <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> is planned for deprecation where a tactic can replace it. Which tactic replaces a backend depends on the checkpoint’s format, so read it from the <em>Family</em> column of the catalog below: the <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> family also covers the <code class="docutils literal notranslate"><span class="pre">hopper_grouped_gemm</span></code> and <code class="docutils literal notranslate"><span class="pre">triton</span></code> FP8 block-scale implementations, so on an FP8 block-scale checkpoint <code class="docutils literal notranslate"><span class="pre">tactic:</span> <span class="pre">cutlass</span></code> names none of them; the deprecated <code class="docutils literal notranslate"><span class="pre">TRITON</span></code> backend maps to <code class="docutils literal notranslate"><span class="pre">cutlass</span></code>; <code class="docutils literal notranslate"><span class="pre">VANILLA</span></code> has no tactic; and <code class="docutils literal notranslate"><span class="pre">DEEPGEMM</span></code> on SM90 relies on falling back to the <code class="docutils literal notranslate"><span class="pre">hopper_grouped_gemm</span></code> implementation, which a tactic does not do.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">moe_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">tactic</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cutedsl.grouped_gemm</span><span class="w">   </span><span class="c1"># leave backend at AUTO, the default</span>
+</pre></div>
+</div>
+<p>How a value is matched:</p>
+<ul class="simple">
+<li><p>Write the full id, or any of its four segments joined by <code class="docutils literal notranslate"><span class="pre">.</span></code>, in any order and in any case. Every segment value belongs to one field only, so <code class="docutils literal notranslate"><span class="pre">mega_moe</span></code> alone is a valid tactic. <code class="docutils literal notranslate"><span class="pre">*</span></code> leaves a field open; quote a value that starts with it (<code class="docutils literal notranslate"><span class="pre">tactic:</span> <span class="pre">'*.nvfp4'</span></code>), since YAML reads a leading <code class="docutils literal notranslate"><span class="pre">*</span></code> as an alias.</p></li>
+<li><p>Every implementation the segments match is a candidate. The candidates are narrowed to the format of the checkpoint’s MoE experts, and the first of them in catalog order (<em>Priority</em> 1 is tried first) that can serve the layer runs. Its own requirements still apply: SM, activation, EPLB, LoRA, and optional packages such as FlashInfer for <code class="docutils literal notranslate"><span class="pre">flashinfer.cutedsl.b12x.nvfp4</span></code>.</p></li>
+<li><p>After that narrowing the candidates must belong to one <code class="docutils literal notranslate"><span class="pre">backend</span></code> family, because the rest of the model is built for one family. <code class="docutils literal notranslate"><span class="pre">grouped_gemm.nvfp4</span></code> matches a CUTLASS and a CuteDSL implementation and is refused when the model is loaded; <code class="docutils literal notranslate"><span class="pre">cutlass.grouped_gemm.nvfp4</span></code> is not. A tactic with no implementation of the experts’ format fails every MoE layer of that format: if its matches belong to one family, such as <code class="docutils literal notranslate"><span class="pre">trtllm.mega_moe</span></code>, the model is built for that family; if they span several, such as <code class="docutils literal notranslate"><span class="pre">mega_moe</span></code> on a BF16 model, it is built for the family <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> resolves to, with a warning.</p></li>
+<li><p>A layer no candidate can serve fails to build, and the error lists each candidate’s reason.</p></li>
+<li><p>A tactic applies to every MoE layer of the target model, including layers whose experts the checkpoint excludes from quantization, which run as BF16. For such a checkpoint, name a tactic whose family covers both formats, such as <code class="docutils literal notranslate"><span class="pre">trtllm_gen</span></code> or <code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm</span></code> for NVFP4 and BF16 on SM100, or <code class="docutils literal notranslate"><span class="pre">cutlass</span></code> for W4A16_NVFP4 and BF16 on SM90; if none exists on the GPU, select by <code class="docutils literal notranslate"><span class="pre">backend</span></code>. The error names the tactics that would. Qwen3-Next and MuseSpark Open are exceptions: their model code builds those target layers on CUTLASS, and on the model’s backend or on TRTLLM under a MegaMoE family, and logs a warning that names the tactic. An MTP layer is a draft layer: <code class="docutils literal notranslate"><span class="pre">speculative_config.moe_tactic</span></code> pins it, excluded or not.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tactic</span></code> cannot be combined with a <code class="docutils literal notranslate"><span class="pre">backend</span></code> other than <code class="docutils literal notranslate"><span class="pre">AUTO</span></code>. It governs the target model only; <code class="docutils literal notranslate"><span class="pre">speculative_config.moe_tactic</span></code> pins draft models and MTP layers, replacement-head MTP checkpoints included. With both draft fields unset, a draft inherits the target’s backend, or resolves <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> for its own weights when <code class="docutils literal notranslate"><span class="pre">tactic</span></code> pins the target. Replacing <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">X</span></code> by a tactic therefore also changes the draft’s default; to keep the draft on the same family, also set <code class="docutils literal notranslate"><span class="pre">speculative_config.moe_backend:</span> <span class="pre">X</span></code> or a <code class="docutils literal notranslate"><span class="pre">speculative_config.moe_tactic</span></code>. Nemotron-H embedded MTP layers must run <code class="docutils literal notranslate"><span class="pre">VANILLA</span></code> exactly when the target does.</p></li>
+</ul>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">tactic</span></code></p></th>
+<th class="head"><p>Runs</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm.nvfp4</span></code></p></td>
+<td><p>exactly that implementation</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cutedsl.grouped_gemm</span></code></p></td>
+<td><p>the CuteDSL grouped GEMM of the checkpoint’s expert format</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm_gen</span></code></p></td>
+<td><p>the TRTLLM-Gen fused MoE of the checkpoint’s expert format</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mega_moe</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutedsl.mega_moe.nvfp4</span></code> on an NVFP4 checkpoint, <code class="docutils literal notranslate"><span class="pre">deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8</span></code> on an MXFP4 one</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>How a partial tactic resolves, step by step, for <code class="docutils literal notranslate"><span class="pre">tactic:</span> <span class="pre">trtllm_gen</span></code> on an NVFP4 checkpoint and an SM100 GPU:</p>
+<ol class="arabic simple">
+<li><p>When the configuration is validated, each segment finds its field by value: <code class="docutils literal notranslate"><span class="pre">trtllm_gen</span></code> is a <code class="docutils literal notranslate"><span class="pre">technique</span></code>, and it matches every <code class="docutils literal notranslate"><span class="pre">trtllm_gen</span></code> implementation in the catalog below, one per format. A mistyped segment, or a tactic that matches nothing, fails here, before the model loads.</p></li>
+<li><p>When the model loads, the matches are narrowed to the format the checkpoint declares for its MoE experts. NVFP4 leaves <code class="docutils literal notranslate"><span class="pre">trtllm.trtllm_gen.fused_moe.nvfp4</span></code>, of the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> family, so the model is built for <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>.</p></li>
+<li><p>When each MoE layer is built, the candidates left are tried in catalog order and the first that can serve the layer runs; here that is <code class="docutils literal notranslate"><span class="pre">trtllm.trtllm_gen.fused_moe.nvfp4</span></code>, the only one.</p></li>
+<li><p>If no candidate can serve the layer, for example on an SM90 GPU, the layer fails to build and the error lists each candidate’s reason. Nothing falls back to CUTLASS.</p></li>
+</ol>
+<p><code class="docutils literal notranslate"><span class="pre">tactic:</span> <span class="pre">cutedsl</span></code> on the same checkpoint stops at step 2 instead: narrowed to NVFP4 it still matches implementations of four families (<code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, <code class="docutils literal notranslate"><span class="pre">CUTEDSL_FC12</span></code>, <code class="docutils literal notranslate"><span class="pre">DENSEGEMM</span></code> and <code class="docutils literal notranslate"><span class="pre">MEGAMOE_CUTEDSL</span></code>), and the error lists them by family. Adding a segment that leaves one family, such as <code class="docutils literal notranslate"><span class="pre">cutedsl.grouped_gemm</span></code>, resolves it.</p>
+<p>To find the id of what a run uses today, run it once without a tactic: the log reports each MoE implementation it builds, once, as <code class="docutils literal notranslate"><span class="pre">MoE</span> <span class="pre">layers</span> <span class="pre">run</span> <span class="pre">&lt;class&gt;,</span> <span class="pre">MoE</span> <span class="pre">implementation</span> <span class="pre">id</span> <span class="pre">&lt;id&gt;</span> <span class="pre">(moe_backend</span> <span class="pre">&lt;family&gt;)</span></code>.</p>
+<p>Every implementation a tactic can pin, generated from the implementation registry by <code class="docutils literal notranslate"><span class="pre">scripts/generate_moe_impl_catalog.py</span></code>. <em>Shortest tactic</em> is the fewest segments that match that implementation and no other, ties going to the earlier fields of the id, so it pins the implementation whatever the checkpoint. On a given checkpoint fewer segments can do, since the matches are narrowed to its expert format first: <code class="docutils literal notranslate"><span class="pre">mega_moe</span></code> runs <code class="docutils literal notranslate"><span class="pre">trtllm.cutedsl.mega_moe.nvfp4</span></code> on an NVFP4 checkpoint. An implementation added in a later release can match a shortest tactic too, so a configuration that must keep its kernel across releases gives the full id.</p>
+<!-- BEGIN GENERATED MOE IMPL CATALOG: scripts/generate_moe_impl_catalog.py -->
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Implementation id</p></th>
+<th class="head"><p>Shortest tactic</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> family</p></th>
+<th class="head"><p>Priority</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">hopper_grouped_gemm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>20</p></td>
+<td><p>DeepGEMM grouped GEMM over FP8 block scales, driven by CutlassMoeFCRunner, SM90.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.triton.grouped_gemm.fp8_block_scales</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">triton</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>21</p></td>
+<td><p>Internal Triton FP8 block-scale grouped GEMM, SM120/121.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cutlass.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>22</p></td>
+<td><p>CUTLASS grouped GEMM over NVFP4 weights and activations, Blackwell.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm.w4a16_nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm.w4a16_nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>23</p></td>
+<td><p>NVFP4 weights dequantized to the activation dtype every forward, SM80+.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm.mxfp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mxfp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>24</p></td>
+<td><p>CUTLASS grouped GEMM over MXFP8 weights and dynamic MXFP8 activations.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm.w4a8_mxfp4_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cutlass.w4a8_mxfp4_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>25</p></td>
+<td><p>CUTLASS grouped GEMM over MXFP4 weights with static FP8 activations.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm.w4a8_mxfp4_mxfp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cutlass.w4a8_mxfp4_mxfp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>26</p></td>
+<td><p>CUTLASS grouped GEMM over MXFP4 weights with dynamic MXFP8 activations.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm.w4a16_mxfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cutlass.w4a16_mxfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>27</p></td>
+<td><p>CUTLASS grouped GEMM over MXFP4 weights with high-precision activations, SM90.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm.w4a8_awq</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">w4a8_awq</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>28</p></td>
+<td><p>CUTLASS grouped GEMM over INT4 group-scaled weights with FP8 activations.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm.w8a16</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">w8a16</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>29</p></td>
+<td><p>CUTLASS grouped GEMM over INT8 per-channel weight-only, SM80+.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm.fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>30</p></td>
+<td><p>CUTLASS grouped GEMM over per-tensor FP8 (qdq) weights, SM89+.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutlass.grouped_gemm.none</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cutlass.none</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code></p></td>
+<td><p>31</p></td>
+<td><p>CUTLASS grouped GEMM over unquantized fp16/bf16 weights, SM80+.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">marlin.cuda.fused_moe.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">marlin.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MARLIN</span></code></p></td>
+<td><p>18</p></td>
+<td><p>Marlin fused W4A16 MoE GEMM over NVFP4 weights, SM89-SM99 (Ada/Hopper).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">marlin.cuda.fused_moe.w4a16_nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">marlin.w4a16_nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MARLIN</span></code></p></td>
+<td><p>19</p></td>
+<td><p>Marlin fused W4A16 MoE GEMM over W4A16-NVFP4 weights, SM89-SM99 (Ada/Hopper).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flashinfer.cutedsl.b12x.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">flashinfer.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+<td><p>1</p></td>
+<td><p>FlashInfer CuTe DSL SM12x fused MoE for decode, CUTLASS NVFP4 grouped GEMM for prefill; SM120/SM121.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flashinfer.cutedsl.b12x.w4a16_nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">flashinfer.w4a16_nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+<td><p>2</p></td>
+<td><p>FlashInfer CuTe DSL SM12x fused MoE, BF16 activations and NVFP4 weights; SM120/SM121.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutedsl.grouped_gemm.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cutedsl.grouped_gemm.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+<td><p>5</p></td>
+<td><p>CuTe DSL NVFP4 grouped GEMM: gather + FC1 + fused activation, then FC2 + finalize; SM100/SM103/SM107.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutedsl.grouped_gemm.nvfp4_plus</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvfp4_plus</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+<td><p>6</p></td>
+<td><p>CuTe DSL NVFP4_PLUS (E2M1 with UE5M3 scales per 32 values) grouped GEMM: gather + FC1 + fused SwiGLU, then FC2 + finalize; SM107.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutedsl.grouped_gemm.none</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cutedsl.none</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+<td><p>7</p></td>
+<td><p>CuTe DSL BF16 grouped GEMM on Rubin (SM107): gather + FC1 + fused SwiGLU, then FC2 + fused finalize.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutedsl.fused_fc12.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fused_fc12</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL_FC12</span></code></p></td>
+<td><p>8</p></td>
+<td><p>Rubin (SM107) NVFP4 fused FC1 + SwiGLU/SiTU + FC2 + finalize persistent CuTe DSL grouped GEMM.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">deepgemm.cuda.grouped_gemm.fp8_block_scales</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">deepgemm.grouped_gemm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DEEPGEMM</span></code></p></td>
+<td><p>16</p></td>
+<td><p>DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutedsl.dense_gemm.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dense_gemm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DENSEGEMM</span></code></p></td>
+<td><p>17</p></td>
+<td><p>CuTe DSL dense GEMM with fused SwiGLU over NVFP4, SM100/SM103 min-latency.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.trtllm_gen.fused_moe.none</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm_gen.none</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p>9</p></td>
+<td><p>TRTLLM-Gen batched-GEMM cubins, BF16 activations and weights, SM100 family.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.trtllm_gen.fused_moe.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm_gen.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p>10</p></td>
+<td><p>TRTLLM-Gen batched-GEMM cubins over NVFP4, SM100 family.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.trtllm_gen.fused_moe.fp8_block_scales</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm_gen.fp8_block_scales</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p>11</p></td>
+<td><p>TRTLLM-Gen batched-GEMM cubins over FP8 1x128 block scales, SM100 family.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.trtllm_gen.fused_moe.w4a16_mxfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm_gen.w4a16_mxfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p>12</p></td>
+<td><p>TRTLLM-Gen batched-GEMM cubins over MXFP4 weights with bf16 activations.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm_gen.w4a8_mxfp4_mxfp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p>13</p></td>
+<td><p>TRTLLM-Gen batched-GEMM cubins over MXFP4 weights with MXFP8 activations.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">w4a8_nvfp4_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p>14</p></td>
+<td><p>TRTLLM-Gen fp8_fp4 block-scale runner: NVFP4 weights, FP8 activations.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm_gen.w4a8_mxfp4_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+<td><p>15</p></td>
+<td><p>TRTLLM-Gen e4m3_mxe2m1 block-scale runner: MXFP4 weights, FP8 activations.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">deepgemm.mega_moe</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MEGAMOE_DEEPGEMM</span></code></p></td>
+<td><p>3</p></td>
+<td><p>DeepGEMM fused fp8_fp4_mega_moe: MXFP4 weights, MXFP8 activations, SM100/SM103/SM107.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">trtllm.cutedsl.mega_moe.nvfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm.mega_moe</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MEGAMOE_CUTEDSL</span></code></p></td>
+<td><p>4</p></td>
+<td><p>MegaMoE CuteDSL fused NVFP4 kernels: NVFP4 weights and activations, SM100/103/107.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Segment values a tactic can use, by field:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">provider</span></code>: <code class="docutils literal notranslate"><span class="pre">deepgemm</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>, <code class="docutils literal notranslate"><span class="pre">marlin</span></code>, <code class="docutils literal notranslate"><span class="pre">trtllm</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">technique</span></code>: <code class="docutils literal notranslate"><span class="pre">cuda</span></code>, <code class="docutils literal notranslate"><span class="pre">cutedsl</span></code>, <code class="docutils literal notranslate"><span class="pre">cutlass</span></code>, <code class="docutils literal notranslate"><span class="pre">triton</span></code>, <code class="docutils literal notranslate"><span class="pre">trtllm_gen</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">kernel_name</span></code>: <code class="docutils literal notranslate"><span class="pre">b12x</span></code>, <code class="docutils literal notranslate"><span class="pre">dense_gemm</span></code>, <code class="docutils literal notranslate"><span class="pre">fused_fc12</span></code>, <code class="docutils literal notranslate"><span class="pre">fused_moe</span></code>, <code class="docutils literal notranslate"><span class="pre">grouped_gemm</span></code>, <code class="docutils literal notranslate"><span class="pre">hopper_grouped_gemm</span></code>, <code class="docutils literal notranslate"><span class="pre">mega_moe</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">quant</span></code>: <code class="docutils literal notranslate"><span class="pre">fp8</span></code>, <code class="docutils literal notranslate"><span class="pre">fp8_block_scales</span></code>, <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code>, <code class="docutils literal notranslate"><span class="pre">none</span></code>, <code class="docutils literal notranslate"><span class="pre">nvfp4</span></code>, <code class="docutils literal notranslate"><span class="pre">nvfp4_plus</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a16_mxfp4</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a16_nvfp4</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a8_awq</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a8_mxfp4_fp8</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a8_mxfp4_mxfp8</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a8_nvfp4_fp8</span></code>, <code class="docutils literal notranslate"><span class="pre">w8a16</span></code></p></li>
+</ul>
+<!-- END GENERATED MOE IMPL CATALOG -->
 </section>
 </section>
 </section>
@@ -1061,7 +1360,7 @@ selects the strategy itself.</p>
 <p><strong>The MoE layout is always expert parallelism.</strong> Under attention DP, expert parallelism is always the optimum at every workload point in the sweep. Under attention TP, a hybrid TP x EP layout can be slightly better at small token counts, but the gain is small (0.3% at the median and 4% at the 90th percentile). A deployment that is squeezing the last few percent out of a low-latency configuration should still measure <code class="docutils literal notranslate"><span class="pre">TP&lt;k&gt;EP&lt;m&gt;</span></code>.</p>
 <p><strong>The fused path is not always the best choice.</strong> The fused scheme carries a fixed setup cost: three cross-rank NVLink barriers inside the kernel, plus metadata preparation whose cost follows the token bucket size rather than the number of tokens actually present. With few tokens in flight that cost exceeds the overlapped dispatch and combine cost, and fusion only takes off once the workload is large enough for the cost to be amortised and for the overlap to repay it. The threshold <code class="docutils literal notranslate"><span class="pre">activated_tokens_per_rank</span> <span class="pre">=</span> <span class="pre">512</span></code> with CUDA graph on is derived from the <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> sweep over typical workloads.</p>
 <p><strong>We prefer <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> over <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> when <code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">&lt;=</span> <span class="pre">8</span></code>.</strong> A small world size leaves many experts on each rank (<code class="docutils literal notranslate"><span class="pre">num_experts</span> <span class="pre">/</span> <span class="pre">world_size</span></code> can be 32 to 224), so the grouped GEMM has many groups with a small <code class="docutils literal notranslate"><span class="pre">M</span></code> dimension. In these cases, TRTLLM-Gen’s tuned kernels fit that shape better than the generic CuteDSL grouped GEMM.</p>
-<p><strong>The crossover moves out much further with CUDA graph off.</strong> A CUDA graph replays a recorded launch sequence and reduces the kernel launch overhead during forward. Without CUDA graph, <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> drives its whole MoE from one host-side call that issues its kernels internally, while the fused path is a chain of separate host-side steps, including quantize, staging copies, the fused kernel, and a separate top-k reduce, each carrying its own dispatch and tactic lookup. With CUDA graph off, the host overhead dominates the execution of the MoE module. The fused path’s expert-GEMM advantage therefore stays out of the comparison until <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>’s GPU work has grown past that dispatch cost, which moves the crossover point much further out. In a disaggregated deployment, CUDA graph off maps to the prefill phase.</p>
+<p><strong>The crossover moves out much further with CUDA graph off.</strong> A CUDA graph replays a recorded launch sequence and reduces the kernel launch overhead during forward. Without CUDA graph, <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> drives its whole MoE from one host-side call that issues its kernels internally, while the fused path is a chain of separate host-side steps, including quantize, staging copies, the fused kernel, and a separate top-k reduce, each carrying its own dispatch and autotuner lookup. With CUDA graph off, the host overhead dominates the execution of the MoE module. The fused path’s expert-GEMM advantage therefore stays out of the comparison until <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>’s GPU work has grown past that dispatch cost, which moves the crossover point much further out. In a disaggregated deployment, CUDA graph off maps to the prefill phase.</p>
 <p><strong>Attention TP always uses <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>.</strong> Attention TP is a low-latency choice, and the MoE forward never gets a large batch: across the disaggregated-serving workloads behind this guide, attention TP appears only in the decode phase and <code class="docutils literal notranslate"><span class="pre">activated_tokens_per_rank</span></code> never exceeds 64. <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> does overtake <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> once the expert GEMM becomes compute bound, but that only happens above roughly 24576 activated tokens per rank, which attention TP does not reach in a disaggregated deployment.</p>
 </section>
 <section id="impacts-of-crossing-the-nvlink-domain">
@@ -1193,7 +1492,55 @@ mpirun<span class="w"> </span>--allow-run-as-root<span class="w"> </span>--overs
 <h3>Distributed Weight Data Parallelism (DWDP)<a class="headerlink" href="#distributed-weight-data-parallelism-dwdp" title="Link to this heading">#</a></h3>
 <p><a class="reference external" href="https://doi.org/10.48550/arXiv.2604.01621">Distributed Weight Data Parallelism (DWDP)</a> targets layer-wise synchronization and token-exchange overhead in the prefill phase, where differences in sequence lengths and KV-cache hits can leave workers waiting for the slowest rank. DWDP keeps a resident subset of experts on each worker and asynchronously prefetches the remaining expert weights from its NVLink peers. Each worker computes on its own tokens, replacing synchronized token dispatch/combine with weight transfers that overlap with computation.</p>
 <p>DWDP can be applied to the prefill phase of a serving system when the context batch is large enough for computation to hide the weight prefetch. Decode typically has too little computation to hide these transfers, so generation keeps the normal EP dispatch. Experimental cost of DWDP is a TTFT regression, from a lower service rate on the context stage, plus extra prefetch memory: each rank stores only its local experts, but adds <code class="docutils literal notranslate"><span class="pre">num_prefetch_slots</span></code> prefetch slots (two by default) of about one layer of remote experts each; more slots let the prefetch run further ahead of the compute. DWDP cannot run on the same MoE path as EPLB. A disaggregated deployment can use DWDP on context servers and EPLB on generation servers.</p>
+<p>Each worker of a DWDP group stores a contiguous range of the routed experts and prefetches the others. Leave <code class="docutils literal notranslate"><span class="pre">dwdp_config.num_experts_per_worker</span></code> and <code class="docutils literal notranslate"><span class="pre">num_prefetch_experts</span></code> at 0 (the default) for the balanced partition: each worker stores <code class="docutils literal notranslate"><span class="pre">floor</span></code> or <code class="docutils literal notranslate"><span class="pre">ceil</span></code> of <code class="docutils literal notranslate"><span class="pre">num_experts</span> <span class="pre">/</span> <span class="pre">dwdp_size</span></code> experts, the lower ranks the larger count, and no expert is stored twice. Set both for a strided partition, where worker <code class="docutils literal notranslate"><span class="pre">r</span></code> stores the experts <code class="docutils literal notranslate"><span class="pre">[r</span> <span class="pre">*</span> <span class="pre">num_prefetch_experts,</span> <span class="pre">r</span> <span class="pre">*</span> <span class="pre">num_prefetch_experts</span> <span class="pre">+</span> <span class="pre">num_experts_per_worker)</span></code>: <code class="docutils literal notranslate"><span class="pre">num_prefetch_experts</span></code> is the stride between consecutive workers, not a number of prefetched experts. With <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">=</span> <span class="pre">dwdp_size</span></code>, a strided partition takes one of three forms:</p>
+<ul class="simple">
+<li><p>equal values whose ranges cover the experts exactly: <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">*</span> <span class="pre">num_experts_per_worker</span> <span class="pre">==</span> <span class="pre">num_experts</span></code>;</p></li>
+<li><p>equal values whose last range is cut short at <code class="docutils literal notranslate"><span class="pre">num_experts</span></code> and still holds at least one expert: <code class="docutils literal notranslate"><span class="pre">(N</span> <span class="pre">-</span> <span class="pre">1)</span> <span class="pre">*</span> <span class="pre">num_experts_per_worker</span> <span class="pre">&lt;</span> <span class="pre">num_experts</span> <span class="pre">&lt;</span> <span class="pre">N</span> <span class="pre">*</span> <span class="pre">num_experts_per_worker</span></code>;</p></li>
+<li><p>a smaller stride, whose ranges overlap, only when the last range ends exactly at <code class="docutils literal notranslate"><span class="pre">num_experts</span></code>: <code class="docutils literal notranslate"><span class="pre">(N</span> <span class="pre">-</span> <span class="pre">1)</span> <span class="pre">*</span> <span class="pre">num_prefetch_experts</span> <span class="pre">+</span> <span class="pre">num_experts_per_worker</span> <span class="pre">==</span> <span class="pre">num_experts</span></code>.</p></li>
+</ul>
+<p>Any other combination raises on every rank when the model is built, since the expert count comes from the model.</p>
+<p>DWDP needs <code class="docutils literal notranslate"><span class="pre">moe_config.backend:</span> <span class="pre">CUTEDSL</span></code> (or <code class="docutils literal notranslate"><span class="pre">CUTEDSL_FC12</span></code>), or a tactic that names a CuteDSL NVFP4 implementation such as <code class="docutils literal notranslate"><span class="pre">cutedsl.grouped_gemm.nvfp4</span></code> or <code class="docutils literal notranslate"><span class="pre">fused_fc12</span></code>, and the launch is refused otherwise: it manages the MoE layers that run it with NVFP4 weights and no locality domains. Any other MoE layer, such as a BF16 MTP layer, keeps every expert on every rank, in memory the KV cache would otherwise get; the first such layer of each backend and reason logs a warning, and DWDP setup logs how many layers each reason covers.</p>
 <p>Usage: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/dwdp/README.md"><code class="docutils literal notranslate"><span class="pre">examples/dwdp/README.md</span></code></a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md">blog19</a>.</p>
+<section id="dense-dwdp">
+<h4>Dense DWDP<a class="headerlink" href="#dense-dwdp" title="Link to this heading">#</a></h4>
+<p>Dense DWDP (prototype) applies the same idea to the dense weights of the MoE decoder layers: the attention, the shared expert, the router and the other dense weights of the MoE block, which every context rank otherwise holds in full. Each rank of the group keeps one row-shard of every covered layer, and dense DWDP gathers each layer into small staging slots two layers ahead of its use. Most of the replicated dense weights are freed for the KV cache. It applies to models whose decoder layers provide dense DWDP roots, currently Kimi-K3.</p>
+<p>Dense DWDP frees memory; it does not by itself make a server faster. The gathers overlap with the compute of the layers before them, so with the same settings a server runs at about the speed it had without dense DWDP. The gain comes from spending the freed memory: raise <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> or the KV-cache share (<code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction</span></code>) with it.</p>
+<p>It runs in one of two modes:</p>
+<ul>
+<li><p>With expert DWDP, on the context servers of a DWDP group: the dense rows are sharded over the DWDP group, and the dense copies run on the copy stream of the expert prefetch, with its transfer.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">dwdp_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">dwdp_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="w">  </span><span class="nt">enable_dense</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">moe_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CUTEDSL</span>
+<span class="nt">disable_overlap_scheduler</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">cuda_graph_config</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span>
+</pre></div>
+</div>
+</li>
+<li><p>Without expert DWDP, on one attention-DP context instance: the dense rows are sharded over the attention-DP ranks of the instance, the copies run on a copy stream of their own, and the overlap scheduler may stay on.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">tensor_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">dwdp_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">enable_experts</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">  </span><span class="nt">enable_dense</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">cuda_graph_config</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span>
+</pre></div>
+</div>
+</li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">dwdp_config.copy_mode</span></code> picks the transfer of every DWDP copy, the expert prefetch and the dense gathers alike: <code class="docutils literal notranslate"><span class="pre">per_slice</span></code> (one copy-engine copy per slice), <code class="docutils literal notranslate"><span class="pre">batched</span></code> (one batched copy-engine copy per layer) or <code class="docutils literal notranslate"><span class="pre">gather</span></code> (the SM fabric gather kernel, which keeps SMs from the compute kernels while it runs). Left unset, the expert prefetch keeps its usual selection (<code class="docutils literal notranslate"><span class="pre">per_slice</span></code>, <code class="docutils literal notranslate"><span class="pre">batched</span></code> with <code class="docutils literal notranslate"><span class="pre">contention_opt</span></code>, <code class="docutils literal notranslate"><span class="pre">gather</span></code> with the <code class="docutils literal notranslate"><span class="pre">TRTLLM_DWDP_PREFETCH_GATHER</span></code> environment variable, which is deprecated), the dense copies follow it, and dense DWDP without expert DWDP uses <code class="docutils literal notranslate"><span class="pre">batched</span></code>. With <code class="docutils literal notranslate"><span class="pre">copy_mode:</span> <span class="pre">gather</span></code>, <code class="docutils literal notranslate"><span class="pre">dwdp_config.gather_kernel</span></code> picks the gather kernel: <code class="docutils literal notranslate"><span class="pre">register</span></code> or <code class="docutils literal notranslate"><span class="pre">tma</span></code> (bulk copies staged in shared memory, SM90 or newer). It replaces the deprecated <code class="docutils literal notranslate"><span class="pre">TRTLLM_DWDP_GATHER_KERNEL</span></code> environment variable, which still applies while <code class="docutils literal notranslate"><span class="pre">gather_kernel</span></code> is unset.</p>
+<p><code class="docutils literal notranslate"><span class="pre">LLM()</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> check these settings when they build the LLM arguments, and each worker checks its host before the model is built. Dense DWDP needs:</p>
+<ul class="simple">
+<li><p>eager execution: no <code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code>, <code class="docutils literal notranslate"><span class="pre">torch_compile_config</span></code> or prefill CUDA graphs;</p></li>
+<li><p>no <code class="docutils literal notranslate"><span class="pre">sleep_config</span></code>, <code class="docutils literal notranslate"><span class="pre">lora_config</span></code> or <code class="docutils literal notranslate"><span class="pre">speculative_config</span></code>;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">enable_locality_domains</span></code> off, and pipeline and context parallel size 1;</p></li>
+<li><p>FABRIC peer memory handles (multi-node NVLink systems);</p></li>
+<li><p>with expert DWDP, <code class="docutils literal notranslate"><span class="pre">dwdp_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> and <code class="docutils literal notranslate"><span class="pre">disable_overlap_scheduler:</span> <span class="pre">true</span></code>, as expert DWDP requires, and tensor parallel size 1;</p></li>
+<li><p>without expert DWDP, <code class="docutils literal notranslate"><span class="pre">enable_attention_dp:</span> <span class="pre">true</span></code> with <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, the MPI backend, and the gather kernel when <code class="docutils literal notranslate"><span class="pre">copy_mode</span></code> is <code class="docutils literal notranslate"><span class="pre">gather</span></code>. The expert DWDP fields (<code class="docutils literal notranslate"><span class="pre">dwdp_size</span></code>, <code class="docutils literal notranslate"><span class="pre">num_groups</span></code>, <code class="docutils literal notranslate"><span class="pre">num_experts_per_worker</span></code>, <code class="docutils literal notranslate"><span class="pre">num_prefetch_experts</span></code>, <code class="docutils literal notranslate"><span class="pre">contention_opt</span></code>, <code class="docutils literal notranslate"><span class="pre">num_prefetch_slots</span></code>) keep their defaults.</p></li>
+</ul>
+<p>Every server of a DWDP group must set the same <code class="docutils literal notranslate"><span class="pre">enable_dense</span></code>: setup compares it in its first collective, and a disagreement, or a setup failure on any rank, makes every rank of the group raise. A server whose launch is refused exits before it reaches that collective, and its DWDP peers wait for it there: with the store rendezvous until <code class="docutils literal notranslate"><span class="pre">TRTLLM_DWDP_RENDEZVOUS_TIMEOUT_S</span></code> (1800 s by default), under MPI without a limit. When a group does not come up, look for a refused server among its logs. Dense DWDP is meant for context servers; on a generation server every decode step would gather every covered layer. <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> refuses <code class="docutils literal notranslate"><span class="pre">enable_dense</span></code> on a generation server (<code class="docutils literal notranslate"><span class="pre">--server_role</span> <span class="pre">GENERATION</span></code>, <code class="docutils literal notranslate"><span class="pre">TRTLLM_DISAGG_ROLE=generation</span></code>, or a generation server of a disaggregated MPI launch, on every rank before the launch splits) and warns on a server without the context role, so launch context servers with <code class="docutils literal notranslate"><span class="pre">--server_role</span> <span class="pre">CONTEXT</span></code> (a gRPC server, which takes no <code class="docutils literal notranslate"><span class="pre">--server_role</span></code>, with <code class="docutils literal notranslate"><span class="pre">TRTLLM_DISAGG_ROLE=context</span></code>). A Kimi-K3 server with expert DWDP and <code class="docutils literal notranslate"><span class="pre">enable_dense</span></code> off still runs the first collective of dense setup at startup, so that a group whose servers disagree fails at once.</p>
+</section>
 </section>
 </section>
 <section id="appendix">
@@ -1260,7 +1607,7 @@ mpirun<span class="w"> </span>--allow-run-as-root<span class="w"> </span>--overs
 </ul>
 </section>
 <section id="how-a-pareto-point-is-compared-to-bench-moe-microbenchmark">
-<h4>How a Pareto point is compared to <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> microbenchmark?<a class="headerlink" href="#how-a-pareto-point-is-compared-to-bench-moe-microbenchmark" title="Link to this heading">#</a></h4>
+<span id="how-a-pareto-point-is-compared-to-bench_moe-microbenchmark"></span><h4>How a Pareto point is compared to <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> microbenchmark?<a class="headerlink" href="#how-a-pareto-point-is-compared-to-bench-moe-microbenchmark" title="Link to this heading">#</a></h4>
 <p>Each serving case <code class="docutils literal notranslate"><span class="pre">(ISL,</span> <span class="pre">OSL,</span> <span class="pre">instance</span> <span class="pre">layout,</span> <span class="pre">batch,</span> <span class="pre">MTP,</span> <span class="pre">concurrency)</span></code> is mapped to a <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> shape: the same model configuration, quantization, hardware, world size, <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> of the MoE forward, and CUDA Graph on or off. Candidates with the same deployed attention parallelism (DP or TP) are then ranked by module latency (<code class="docutils literal notranslate"><span class="pre">score_ms</span></code>, lower is better).</p>
 <p>The deployed MoE config is compared with that best <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> candidate and labeled <strong>Match</strong> if they are the same, <strong>Mismatch</strong> otherwise. Each Mismatch is evaluated in disaggregated serving with both the Pareto-curve configuration and the <code class="docutils literal notranslate"><span class="pre">bench_moe</span></code> candidate, and compared on <code class="docutils literal notranslate"><span class="pre">tps_per_user</span></code> (tokens per second per user).</p>
 <ul class="simple">
@@ -1400,10 +1747,12 @@ mpirun<span class="w"> </span>--allow-run-as-root<span class="w"> </span>--overs
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#parallelism">Parallelism</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a><ul class="nav section-nav flex-column">
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-assign-a-communication-strategy">How to assign a communication strategy?</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#nvlink-one-sided-how-arrival-is-detected"><code class="docutils literal notranslate"><span class="pre">NVLINK_ONE_SIDED</span></code>: how arrival is detected</a></li>
 </ul>
 </li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#backend">Backend</a><ul class="nav section-nav flex-column">
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-assign-a-backend">How to assign a backend?</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-pin-an-implementation-with-tactic-prototype">How to pin an implementation with <code class="docutils literal notranslate"><span class="pre">tactic</span></code>? (prototype)</a></li>
 </ul>
 </li>
 </ul>
@@ -1431,7 +1780,10 @@ mpirun<span class="w"> </span>--allow-run-as-root<span class="w"> </span>--overs
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tuning-a-specific-workload">Tuning a Specific Workload</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-techniques">Advanced Techniques</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#expert-parallelism-load-balancer-eplb">Expert Parallelism Load Balancer (EPLB)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#distributed-weight-data-parallelism-dwdp">Distributed Weight Data Parallelism (DWDP)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#distributed-weight-data-parallelism-dwdp">Distributed Weight Data Parallelism (DWDP)</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-dwdp">Dense DWDP</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#appendix">Appendix</a><ul class="nav section-nav flex-column">
@@ -1534,9 +1886,9 @@ mpirun<span class="w"> </span>--allow-run-as-root<span class="w"> </span>--overs
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on November 03, 2026.</p>
+  <p>Last updated on November 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9e334fb">9e334fb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ab2dfeb">ab2dfeb</a>.</p>
   
 </div></div>
       
