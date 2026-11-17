@@ -312,7 +312,7 @@ def test_llm_prefix_cache_reuse(attn_backend):
 @skip_ray
 @pytest.mark.part3
 def test_llm_kv_reuse_deterministic_logits(monkeypatch):
-    monkeypatch.setenv("FORCE_KV_REUSE_DETERMINISTIC", "1")
+    monkeypatch.setenv("FORCE_BATCH_INVARIANT", "1")
     model_path = get_model_path("Qwen3/Qwen3-0.6B")
     prompt = "The future of AI is " * 20
     sampling_params = SamplingParams(temperature=0,

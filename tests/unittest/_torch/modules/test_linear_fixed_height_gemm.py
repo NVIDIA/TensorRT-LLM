@@ -16,7 +16,7 @@ ROW_COUNTS = [
     FIXED_GEMM_HEIGHT + 1,
     3 * FIXED_GEMM_HEIGHT + 5,
 ]
-SWITCHES = ["FORCE_DETERMINISTIC", "FORCE_KV_REUSE_DETERMINISTIC"]
+SWITCHES = ["FORCE_DETERMINISTIC", "FORCE_BATCH_INVARIANT"]
 
 
 @pytest.mark.cpu_only
@@ -69,7 +69,7 @@ def test_each_switch_enables_fixed_height(monkeypatch, switch):
 @pytest.mark.parametrize("in_features,out_features", [(2048, 3072), (4096, 6144), (2048, 128256)])
 @torch.inference_mode()
 def test_row_bits_do_not_depend_on_batch_height(monkeypatch, dtype, in_features, out_features):
-    monkeypatch.setenv("FORCE_KV_REUSE_DETERMINISTIC", "1")
+    monkeypatch.setenv("FORCE_BATCH_INVARIANT", "1")
     torch.manual_seed(42)
     with torch.device("cuda"):
         linear = Linear(in_features, out_features, bias=False, dtype=dtype)

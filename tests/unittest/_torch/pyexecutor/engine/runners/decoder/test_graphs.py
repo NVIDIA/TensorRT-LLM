@@ -58,7 +58,7 @@ def test_cuda_graph_factory_preserves_input_preparer(
     assert graphs is graphs_type.return_value
 
 
-BATCH_SHAPE_SWITCHES = ("FORCE_DETERMINISTIC", "FORCE_KV_REUSE_DETERMINISTIC")
+BATCH_SHAPE_SWITCHES = ("FORCE_DETERMINISTIC", "FORCE_BATCH_INVARIANT")
 
 
 @pytest.mark.cpu_only

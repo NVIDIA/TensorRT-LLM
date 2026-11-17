@@ -60,7 +60,7 @@ def tunable(monkeypatch):
         "PYTORCH_TUNABLEOP_ENABLED",
         "PYTORCH_TUNABLEOP_FILENAME",
         "FORCE_DETERMINISTIC",
-        "FORCE_KV_REUSE_DETERMINISTIC",
+        "FORCE_BATCH_INVARIANT",
     ):
         monkeypatch.delenv(env, raising=False)
     return fake
@@ -124,7 +124,7 @@ def test_ignored_with_multiple_ranks_or_user_tunableop(tunable, monkeypatch, ext
     assert tunable.state() == before
 
 
-@pytest.mark.parametrize("switch", ["FORCE_DETERMINISTIC", "FORCE_KV_REUSE_DETERMINISTIC"])
+@pytest.mark.parametrize("switch", ["FORCE_DETERMINISTIC", "FORCE_BATCH_INVARIANT"])
 def test_ignored_with_batch_shape_determinism(tunable, monkeypatch, switch):
     monkeypatch.setenv(CUDA_GRAPH_GEMM_TUNING_ENV, "1")
     monkeypatch.setenv(switch, "1")

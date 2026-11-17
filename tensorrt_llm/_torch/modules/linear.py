@@ -3812,7 +3812,7 @@ def cuda_graph_gemm_tuning(tune: bool, world_size: int = 1) -> Iterator[None]:
     With ``world_size > 1`` the knob is ignored.
 
     It is also ignored when a row's output must not depend on its batch shape
-    (``FORCE_KV_REUSE_DETERMINISTIC`` or ``FORCE_DETERMINISTIC``): a decode row would then round
+    (``FORCE_BATCH_INVARIANT`` or ``FORCE_DETERMINISTIC``): a decode row would then round
     differently in a captured graph than in an eager mixed batch.
     """
     if not cuda_graph_gemm_tuning_enabled():
