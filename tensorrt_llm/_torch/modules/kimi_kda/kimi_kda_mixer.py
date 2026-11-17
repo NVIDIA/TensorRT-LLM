@@ -1174,11 +1174,11 @@ class KimiKDALinearAttention(nn.Module):
         output: Optional[torch.Tensor] = None,
         replay_slot_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Portable or unfused decode with the production pool contract."""
-        if output is not None:
-            raise NotImplementedError(
-                "Breakable CUDA graph KDA requires the optimized decode kernel"
-            )
+        """Portable or unfused decode with the production pool contract.
+
+        ``output`` is the breakable-CUDA-graph core buffer; when supplied, the
+        core is copied into it.
+        """
         from einops import rearrange
 
         d = self.proj_size
@@ -1340,7 +1340,7 @@ class KimiKDALinearAttention(nn.Module):
           windows **in place** after the golden token and caching the new
           drafts. ``update_mamba_states()`` afterwards only records the
           accepted count for the next round's replay.
-        * Legacy (sequential per-step FLA): per-step states go to the
+        * Legacy FLA (:meth:`forward_verify_fla`): per-step states go to the
           manager's batch-row-indexed intermediate scratch buffers and
           ``update_mamba_states()`` promotes the accepted step's state
           after sampling.
@@ -1362,7 +1362,7 @@ class KimiKDALinearAttention(nn.Module):
                 replay_slot_indices=replay_slot_indices,
                 prequantized_input=prequantized_input,
             )
-        return self.forward_verify_sequential(
+        return self.forward_verify_fla(
             x2d,
             num_steps,
             layer_cache,
@@ -1620,7 +1620,7 @@ class KimiKDALinearAttention(nn.Module):
             )
         return cached
 
-    def forward_verify_sequential(
+    def forward_verify_fla(
         self,
         x2d,
         num_steps,
@@ -1631,9 +1631,13 @@ class KimiKDALinearAttention(nn.Module):
         output: Optional[torch.Tensor] = None,
         prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Sequential per-step FLA verification (legacy intermediate-buffer
-        path). Live pools are read-only here; ``update_mamba_states()``
-        commits the accepted step's state after sampling.
+        """FLA verification on the legacy intermediate-buffer path.
+
+        Runs every request's steps in one batched launch
+        (:meth:`_forward_verify_batched`) when the packed conv weight exists
+        and the intermediate state dtype allows it, and per step otherwise.
+        Live pools are read-only here; ``update_mamba_states()`` commits the
+        accepted step's state after sampling.
         """
         from einops import rearrange
         from fla.ops.kda import fused_recurrent_kda
@@ -1748,7 +1752,7 @@ class KimiKDALinearAttention(nn.Module):
     ) -> torch.Tensor:
         """All verify steps in one convolution and one recurrent launch.
 
-        Same contract as the per-step loop of :meth:`forward_verify_sequential`:
+        Same contract as the per-step loop of :meth:`forward_verify_fla`:
         the live pools are only read, and step ``t``'s convolution window and
         recurrent state land in ``intermediate_conv[:B, t]`` and
         ``intermediate_ssm[:B, t]`` for ``update_mamba_states()``.
@@ -1798,8 +1802,8 @@ class KimiKDALinearAttention(nn.Module):
             head_dim=self.head_dim,
         )
 
-        # Step t of request b reads its state from row (b, 0), seeded with the
-        # pool state, and writes it to row (b, t) of intermediate_ssm.
+        # Seed each request's initial state at (b, 0). The kernel carries the
+        # state in FP32 and stores each step's result at (b, t).
         intermediate_ssm[:num_generations, 0].copy_(ssm_pool.index_select(0, slot_indices.long()))
         o, _ = fused_recurrent_kda_fwd(
             q=q,
