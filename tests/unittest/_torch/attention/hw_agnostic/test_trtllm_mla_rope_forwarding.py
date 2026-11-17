@@ -43,11 +43,27 @@ def test_mla_rope_generation_forwards_kernel_controls(helix_spec_tokens_valid: b
         quant_scale_qkv=scale,
         q_rope_applied=True,
     )
+    call_fused_q, call_q_pe, call_latent_cache = tensors[:3]
+    (
+        call_cu_q_seqlens,
+        call_cu_kv_seqlens,
+        call_fmha_scheduler_counter,
+        call_mla_bmm1_scale,
+        call_mla_bmm2_scale,
+        call_quant_q_buffer,
+    ) = tensors[3:]
     TrtllmAttention.mla_rope_generation(
         attention,
-        *tensors[:3],
+        call_fused_q,
+        call_q_pe,
+        call_latent_cache,
         metadata,
-        *tensors[3:],
+        call_cu_q_seqlens,
+        call_cu_kv_seqlens,
+        call_fmha_scheduler_counter,
+        call_mla_bmm1_scale,
+        call_mla_bmm2_scale,
+        call_quant_q_buffer,
         **controls,
     )
     attention._ensure_rope_table_size.assert_called_once_with(1024)

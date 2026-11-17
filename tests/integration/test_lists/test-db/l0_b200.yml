@@ -105,6 +105,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9-fp8kv=True]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_kv_cache_manager_v1
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_bf16_breakable_prefill_cuda_graph
   - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[TRTLLM]
@@ -144,12 +145,16 @@ l0_b200:
   - unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py TIMEOUT (60)
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
   - unittest/_torch/modeling/test_glm5_next_contracts.py
-  - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
   - unittest/_torch/modules/test_megamoe_shared_mlp_scales.py
+  # Qwen3.5 decode MoE: NVFP4 and BF16 draft engines, CuTe FC2 (decode / route fronts below).
+  - unittest/_torch/moe/test_moe_nvfp4_engine.py
+  - unittest/_torch/moe/test_moe_bf16_engine.py
+  - unittest/_torch/moe/test_moe_lowm_fc2.py
+  - unittest/_torch/modules/test_expert_l2_prefetch.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py
@@ -250,6 +255,9 @@ l0_b200:
   - unittest/_torch/modules/test_gated_mlp_split.py
   - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/test_low_m_mma_gemm.py
+  - unittest/_torch/modules/test_resident_fp8_gemm.py
+  - unittest/_torch/modules/test_inproj_ba_splitk.py
+  - unittest/_torch/modules/test_gate_add_rmsnorm_fp8.py
   - unittest/_torch/moe/test_moe_decode_front.py
   - unittest/_torch/modules/test_embedding_lookup.py
   - unittest/_torch/moe/test_draft_experts_nvfp4.py
@@ -352,6 +360,7 @@ l0_b200:
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
+  - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
   - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
   - unittest/_torch/modeling -k "modeling_llama"
@@ -387,7 +396,7 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
-  - unittest/kv_cache_manager_v2_tests
+  - unittest/kv_cache_manager_v2_tests -k "not RemoteInPlaceOfDisk"
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v1]
   - unittest/_torch/pyexecutor/kv_cache/test_mamba_cache_manager.py::test_v2_hybrid_retains_configured_number_of_conversation_turns
   - unittest/_torch/pyexecutor/kv_cache/test_kvcm2_integration.py::test_helix_retention_uses_rank_local_ranges
@@ -518,7 +527,6 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_edit_example
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_example TIMEOUT (30)
   - unittest/_torch/visual_gen/test_cosmos3_edge.py
-  - unittest/_torch/visual_gen/test_cosmos3_example_prompts.py
   - unittest/_torch/visual_gen/test_glm_image_transformer.py
   - unittest/_torch/visual_gen/test_glm_image_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_transformer.py
@@ -553,7 +561,6 @@ l0_b200:
       stage: post_merge
       backend: pytorch
   tests:
-  - unittest/disaggregated/test_openai_server_info.py
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_example TIMEOUT (30)

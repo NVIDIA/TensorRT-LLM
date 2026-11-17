@@ -14,23 +14,23 @@ import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401  (registers torch.ops.trtllm)
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.kernels.attention.triton_sparse_decode_mq import (  # noqa: E501
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
+    minimax_m3_sparse_attn_decode as stock_decode,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.attention.triton_sparse_decode_mq import (  # noqa: E501
     launch_mq_producer,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8 import (
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8 import (
     modeling,  # noqa: E501
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
     m3_attn_lc8,
     m3_prequant,
     m3_report,
     triton_sparse_decode,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.attention.m3_sparse_decode import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.attention.m3_sparse_decode import (  # noqa: E501
     m3_sparse_decode as op,
-)
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
-    minimax_m3_sparse_attn_decode as stock_decode,
 )
 
 __extra_import_path__ = ["../../../..", "."]
@@ -598,7 +598,7 @@ def test_lc_fails_closed_on_ids_past_the_row(requests) -> None:
     """A selected id past the token's row (a stale table, e.g. a padded row keeping a 500K request's n_valid) is
     skipped, as the Triton producer skips it: the rows equal those with that slot at -1, bit for bit, and stay finite
     even though the block-table tail it would reach points at a page whose block scales are NaN (0xFF)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
         m3_prequant,
     )
 

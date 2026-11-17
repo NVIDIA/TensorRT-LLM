@@ -20,14 +20,14 @@ import torch
 from torch import nn
 
 import tensorrt_llm.bindings.internal.runtime as _tbr
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe import eplb as eplb_module
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.eplb import (
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.moe import eplb as eplb_module
+from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import (
     EplbLayer,
     EplbSlots,
     rows_within,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.eplb import eplb_route as op
+from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import eplb_route as op
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
