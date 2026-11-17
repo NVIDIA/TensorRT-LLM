@@ -115,7 +115,7 @@ _workspaces = {}
 def _workspace(heads):
     """This module's attention workspace for ``heads`` (heads / 6 head groups): one per group count on the current
     device, made on first use and shared by every call of that shape, as a target shares one across its layers."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op
 
     groups = heads // H
     if groups not in _workspaces:
@@ -126,9 +126,7 @@ def _workspace(heads):
 
 
 def _attn_out(q, pool, row_stride, page_table, page_offset, seq_len, workspace=None):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
-        op,  # noqa: F401
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op  # noqa: F401
 
     m, heads = q.shape[0], q.shape[1]
     out = torch.empty(m, heads * LAT, dtype=torch.bfloat16, device="cuda")
@@ -142,9 +140,7 @@ def _attn_out(q, pool, row_stride, page_table, page_offset, seq_len, workspace=N
 def _attn_vb(
     q, pool, row_stride, page_table, page_offset, seq_len, w_vb, gate=None, workspace=None
 ):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
-        op,  # noqa: F401
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op  # noqa: F401
 
     m, heads = q.shape[0], q.shape[1]
     y = torch.empty(m, heads * V, dtype=torch.bfloat16, device="cuda")
@@ -193,9 +189,7 @@ def test_attn_out(num_requests, tokens, heads):
 @pytest.mark.parametrize("num_requests,tokens", SPLITS, ids=SPLIT_IDS)
 def test_attn_returns(num_requests, tokens):
     """k3_mla_attn (its own output; a flat page-table row when R = 1) gives k3_mla_attn_out's bits."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
-        op,  # noqa: F401
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op  # noqa: F401
 
     q, pool, page_table, _, seq_len = _make_case(5 + num_requests, num_requests, tokens)
     m = q.shape[0]
@@ -276,7 +270,7 @@ def test_attn_vs_stock(num_requests, tokens):
 def test_attn_rejects():
     """Calls outside R <= 8 requests of T <= 8 tokens, or page-table rows / lengths that do not match, are refused;
     so is a workspace that is not one for the call's head groups and device (its words are left as they were)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op
 
     q, pool, page_table, _, seq_len = _make_case(1, 2, 4)
     q2, flat = q.view(8, -1), pool.view(-1)
@@ -308,7 +302,7 @@ POISON_CASES = [(1, 1, H), (3, 5, H), (8, 1, H), (8, 8, H), (1, 8, 4 * H), (2, 4
 def _fill_workspace(ws, heads, value):
     """Fill the data words of an attention workspace: the per-CTA partial slots (fp16) and the no_cluster (m, l)
     exchange (fp32). The arrival counters after them keep their values."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
         k3_mla_attn_kernel as kernel,
     )
 
@@ -327,7 +321,7 @@ def test_attn_workspace_poison(num_requests, tokens, heads):
     """A call reads only workspace words it wrote itself: with the partial slots and the (m, l) exchange refilled
     with NaN before each call, k3_mla_attn_out and the gated k3_mla_attn_vb_out give the bits of the same calls on a
     zero-filled workspace."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op
 
     seed = 13 * num_requests + tokens
     q, pool, page_table, page_offset, seq_len = _make_case(seed, num_requests, tokens, heads)
@@ -355,7 +349,7 @@ WRAP_CASES = [(8, 1, H), (8, 8, H), (2, 4, 4 * H)]
 
 def _set_counters(ws, heads, value):
     """Set every no_cluster arrival counter of an attention workspace (int32 words after the (m, l) exchange)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
         k3_mla_attn_kernel as kernel,
     )
 
@@ -373,7 +367,7 @@ def _set_counters(ws, heads, value):
 def test_attn_counter_wrap(num_requests, tokens, heads):
     """The no_cluster arrival counters only grow (16 per launch) and are compared by signed difference: calls with the
     counters just below the int32 wrap (2^31 - 16, and -16 just below 0) give the bits of calls on zeroed ones."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op
 
     seed = 19 * num_requests + tokens
     q, pool, page_table, page_offset, seq_len = _make_case(seed, num_requests, tokens, heads)

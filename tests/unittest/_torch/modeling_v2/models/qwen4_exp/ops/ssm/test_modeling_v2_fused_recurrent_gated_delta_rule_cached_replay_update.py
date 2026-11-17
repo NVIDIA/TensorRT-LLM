@@ -40,7 +40,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
     ALL_LAYER_COMMIT_MIN_BATCH,
     HEAD_K_DIM,
     HEAD_V_DIM,
@@ -50,7 +50,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.fuse
     PACKED_QKV_WIDTH,
     RANK_V_HEADS,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
     fused_recurrent_gated_delta_rule_cached_replay_update as op,
 )
 from tensorrt_llm._torch.modules.fla.cache_manager import (
@@ -61,7 +61,10 @@ from tensorrt_llm._torch.modules.fla.cached_replay import (
     CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
     commit_gdn_cached_replay_history_layers,
 )
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import _build_replay_work_items_triton
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+    REPLAY_WORK_ITEM_WIDTH,
+    _build_replay_work_items_triton,
+)
 
 __extra_import_path__ = ["../../../.."]
 from _validating import ULP, certifying, validating  # noqa: E402,F401 — path above; fixture by name
@@ -411,7 +414,7 @@ class _Bench:
         self.meta = ReplayStateUpdateMetadata(self.pnat, self.buf, t, HIST)
         self.work_items = self.n_writes = None
         if self.path == "all_layer":
-            self.work_items = torch.zeros(n, 4, dtype=torch.int32, device=DEV)
+            self.work_items = torch.zeros(n, REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device=DEV)
             self.n_writes = torch.zeros(1, dtype=torch.int32, device=DEV)
 
         self.exact = exact

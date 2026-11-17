@@ -26,11 +26,11 @@ import torch
 from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import should_use_cp_host
 from flashinfer.utils import get_compute_capability, get_device_name, get_device_sm_count
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
     INPLACE_MAX_TOKENS,
     RANK4_GEOMETRY,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
     flashinfer_chunk_gated_delta_rule as op,
 )
 
@@ -306,6 +306,7 @@ def _build(spec, seed):
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
+    pool = pool_before = None
     args, engine = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))
     try:
         if engine is None:

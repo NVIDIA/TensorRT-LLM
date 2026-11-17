@@ -188,7 +188,8 @@ def _register_fake():
           rmsnorm_fusion,
           scale=None,
           fusion_op: int = 0,
-          fp8_payload: bool = False):
+          fp8_payload: bool = False,
+          trigger_completion_at_end: bool = True):
         from tensorrt_llm.functional import AllReduceFusionOp
         op = AllReduceFusionOp(fusion_op)
         if op == AllReduceFusionOp.NONE and rmsnorm_fusion:
@@ -503,6 +504,43 @@ def _register_fake():
           scale: float, onorm_eps: float, output: torch.Tensor) -> None:
         # Inplace-only: the kernel writes into ``output``, so there is nothing
         # to allocate and nothing to return.
+        return None
+
+    @torch.library.register_fake("trtllm::csa2_sparse_context")
+    def _(bank: torch.Tensor,
+          q: torch.Tensor,
+          q_scale: Optional[torch.Tensor],
+          indices: torch.Tensor,
+          lens: torch.Tensor,
+          bmm1_scale: torch.Tensor,
+          bmm2_scale: torch.Tensor,
+          attn_sinks: Optional[torch.Tensor],
+          output: torch.Tensor,
+          output_scale: Optional[torch.Tensor] = None,
+          positions: Optional[torch.Tensor] = None,
+          rope_cos_sin: Optional[torch.Tensor] = None) -> None:
+        # Writes ``output`` (and ``output_scale``) in place.
+        return None
+
+    @torch.library.register_fake("trtllm::csa2_sparse_decode")
+    def _(q: torch.Tensor,
+          swa_pool: torch.Tensor,
+          swa_indices: torch.Tensor,
+          main_pool: Optional[torch.Tensor],
+          main_indices: Optional[torch.Tensor],
+          main_page_table: Optional[torch.Tensor],
+          token_requests: Optional[torch.Tensor],
+          token_visible: Optional[torch.Tensor],
+          main_page_size: int,
+          main_max_positions: int,
+          attn_sinks: torch.Tensor,
+          softmax_scale: float,
+          output: torch.Tensor,
+          workspace: torch.Tensor,
+          output_scale: Optional[torch.Tensor] = None,
+          positions: Optional[torch.Tensor] = None,
+          rope_cos_sin: Optional[torch.Tensor] = None) -> None:
+        # Writes ``output`` (and ``output_scale``) in place and uses ``workspace`` as scratch.
         return None
 
     @torch.library.register_fake("trtllm::minimax_m3_fp8_indexer_qk_norm_rope")
@@ -829,8 +867,11 @@ def _register_fake():
         top_k: int,
         num_experts: int,
         eplb_local_stats: Optional[torch.Tensor] = None,
+        expert_id_payload_index: Optional[int] = None,
+        invalid_token_expert_id: Optional[int] = None,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        use_sentinel: bool = False,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
@@ -863,6 +904,7 @@ def _register_fake():
         use_low_precision: bool = False,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        use_sentinel: bool = False,
     ) -> torch.Tensor:
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
@@ -1214,6 +1256,7 @@ def _register_fake():
         old_g: torch.Tensor,
         cache_buf_idx: torch.Tensor,
         prev_num_accepted_tokens: torch.Tensor,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         dtype = torch.float8_e4m3fn if fp8_scale is not None else qkv.dtype
         return qkv.new_empty((qkv.shape[0], z.shape[1] * z.shape[2]),
@@ -1602,6 +1645,11 @@ def _register_fake():
             sz, dtype=torch.int32), router_logits.new_empty(sz,
                                                             dtype=output_dtype)
 
+    @torch.library.register_fake("trtllm::alltoallv_tokens")
+    def _(input: torch.Tensor, counts: list[int], group: list[int],
+          rank: int) -> torch.Tensor:
+        return input.new_empty((len(group), counts[rank], input.shape[1]))
+
     @torch.library.register_fake("trtllm::alltoall_helix")
     def _(input_list, group, num_lists):
         num_ranks = len(group)
@@ -1928,6 +1976,26 @@ def _register_fake():
         out_dtype: torch.dtype,
     ):
         return q.new_empty(q.shape, dtype=out_dtype)
+
+    @torch.library.register_fake("trtllm::fmha_paged_context_fp8")
+    def _(
+        q: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens_kv: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
+        out: torch.Tensor,
+        scale_bmm1: torch.Tensor,
+        scale_out: torch.Tensor,
+        max_q_len: int,
+        max_kv_len: int,
+        head_dim_per_stage_kv: int,
+        allow_nvrtc: bool = False,
+    ) -> bool:
+        # The fail-safe answer: whether a cubin exists is known only at run
+        # time, and on False the caller runs FlashInfer, which is always valid.
+        return False
 
     @torch.library.register_fake("trtllm::dit_v_amax")
     def _(qkv: torch.Tensor, num_heads: int, head_dim: int):

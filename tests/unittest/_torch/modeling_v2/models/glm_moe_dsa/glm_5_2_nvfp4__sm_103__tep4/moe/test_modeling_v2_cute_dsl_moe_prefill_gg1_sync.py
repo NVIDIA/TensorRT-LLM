@@ -19,7 +19,6 @@ import tensorrt_llm
 _KERNEL = (
     Path(tensorrt_llm.__file__).parent
     / "_torch"
-    / "_experimental"
     / "modeling_v2"
     / "models"
     / "glm_moe_dsa"

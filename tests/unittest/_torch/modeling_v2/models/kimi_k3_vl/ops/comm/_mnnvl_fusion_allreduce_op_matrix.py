@@ -33,12 +33,16 @@ import random
 import sys
 import zlib
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "comm"))
-import _lockstep as ls  # noqa: E402
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _lockstep as ls
+else:
+    import _lockstep as ls  # noqa: E402
 
 assert torch.cuda.is_available(), "mnnvl_fusion_allreduce requires CUDA devices"
 
@@ -776,13 +780,13 @@ def _run_one_rank(args) -> int:
     global validating
     R = ls.Rank(args)
     assert R.world in (2, 4, 8, 16), f"K3's shapes shard over 2, 4, 8 or 16 ranks, not {R.world}"
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_allgather_split as gather_module,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_allreduce_attn_res as attn_res_module,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_fusion_allreduce as module,
     )
 
