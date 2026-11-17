@@ -369,7 +369,6 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_deepseekv41_multimodal.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
   - unittest/_torch/modeling/test_modeling_gemma4.py
-  - unittest/_torch/modeling/test_modeling_gemma4_unified.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
   - unittest/_torch/modeling/test_gemma4_assistant.py
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
@@ -441,7 +440,6 @@ l0_b200:
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/kernels/test_nvfp4_conv3d.py
   - unittest/_torch/visual_gen/test_media_decode.py
-  - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
