@@ -942,22 +942,8 @@ def launchReleaseCheck(pipeline, globalVars)
         }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py ${precommitArgs} || (git restore . && false)")
 
-        // Step 4: Run license check
-        withEnv(['GONOSUMDB=*.nvidia.com']) {
-            withCredentials([
-                gitUsernamePassword(
-                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
-                    gitToolName: 'git-tool'
-                ),
-                string(
-                    credentialsId: 'default-git-url',
-                    variable: 'DEFAULT_GIT_URL'
-                )
-            ]) {
-                sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
-            }
-        }
-        sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
+        // Step 4: Share the license implementation and policy with GitHub Actions.
+        sh "python3 ${LLM_ROOT}/scripts/check_cpp_licenses.py"
     }
 
     def image = "artifactory.pdx.nvidia.com/docker-remote/golang:1.23"

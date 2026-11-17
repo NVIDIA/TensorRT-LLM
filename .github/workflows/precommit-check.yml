@@ -68,6 +68,9 @@ jobs:
           fi
           python3 -u scripts/release_check.py $args
 
+      - name: Check C++ license headers
+        run: python3 scripts/check_cpp_licenses.py
+
       # Informational only: list test-list entries whose parametrize IDs cannot
       # be verified statically (runtime-computed argvalues/ids), grouped by
       # reason, so they can be swept without rerunning the analysis locally. The

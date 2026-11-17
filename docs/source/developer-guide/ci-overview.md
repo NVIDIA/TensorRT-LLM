@@ -35,6 +35,28 @@ Pull requests do not start testing by themselves. Developers trigger the CI by c
 
 `stage` tags live in the YAML files under `tests/integration/test_lists/test-db/`. Searching those files for `stage: pre_merge` shows exactly which tests the merge-request pipeline covers.
 
+### C++ license checks
+
+The **Release Checks** GitHub Actions workflow checks C++ license headers after
+the pre-commit checks, within the **Pre-commit Check** job. It scans `cpp/include`
+and `cpp/tensorrt_llm`, including the Python helpers in those directories. It
+checks full Apache license headers and uses the filters and exceptions in
+`jenkins/license_cpp.json`. Jenkins Release-Check runs the same
+`scripts/check_cpp_licenses.py` entry point, so both checks share the implementation
+and policy. Run it locally without installing dependencies:
+
+```bash
+python3 scripts/check_cpp_licenses.py
+```
+
+The workflow runs on pull requests and supports manual runs against a specified
+ref. A license failure fails the same job as a pre-commit failure. Before replacing
+the Jenkins skip checks with GHA alone, make **Pre-commit Check** and **Check Test
+List** required checks in the repository ruleset, and ensure the Check Test List
+workflow has landed. The bot implementation in `trtllm-github-ci` must be updated
+separately to stop triggering Jenkins ReleaseCheck_PR; changing the Release Checks
+workflow does not change the bot's skip behavior.
+
 ## Test definitions
 
 Integration tests are listed under `tests/integration/test_lists/test-db/`. Most YAML files are named after the GPU or configuration they run on (for example `l0_a100.yml`). Some files, like `l0_sanity_check.yml`, use wildcards and can run on multiple hardware types. Entries contain conditions and a list of tests. Two important terms in each entry are:

@@ -459,6 +459,7 @@
 /cpp/cmake/** @NVIDIA/trt-llm-oss-compliance
 /docker/common/** @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /jenkins/license_cpp.json @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
+/scripts/check_cpp_licenses.py @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /pyproject.toml @NVIDIA/trt-llm-oss-compliance
 /requirements-dev.txt @NVIDIA/trt-llm-oss-compliance
 /requirements-grpc-smg.txt @NVIDIA/trt-llm-oss-compliance
