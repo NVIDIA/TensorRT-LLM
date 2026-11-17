@@ -47,8 +47,10 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.cutedsl_common import (
     FP4_MLA_P_GLOBAL_SCALE,
     LOG2_6,
     _as_shared_cta,
+    _compute_smem_p4_lazy_rebase_scale,
     _derive_qk_scale_burst_kblocks,
     _fence_async_shared_cta,
+    _lookup_physical_page,
     _mapa_shared_cluster,
     _mask_invalid_score,
     _mbarrier_arrive_release_cta_shared_cluster,
@@ -60,6 +62,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.cutedsl_common import (
     _pack_e4m3x4_natural,
     _qk_compact_sfb_cols_per_scale_chunk,
     _qk_sfb_smem_nchunks_per_cta,
+    _rescale_smem_p4_resident_o_in_tmem,
     _scale_pack_e4m3x4_natural_from_f16x2,
     _scale_words_for_k,
     _sfa_tmem_cols_for_scale_chunks,
@@ -67,7 +70,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.cutedsl_common import (
     _softmax_exp2_pair_packed_f16x2,
     _tcgen05_ld_red_32x32b_x16_max_f32,
     nvvm_fma_packed_f32x2,
-    nvvm_mul_packed_f32x2,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cutedsl_common import LOG2_E as LOG2_E
 
@@ -1198,21 +1200,6 @@ def fp4_mla_4x_full_ctm(
 
 
 @cute.jit
-def _lookup_physical_page(
-    mPageTable_pl: cute.Tensor,
-    logical_page: ctm.Int32,
-    batch: ctm.Int32,
-    page_begin: ctm.Int32,
-    page_count: ctm.Int32,
-) -> ctm.Int32:
-    has_pages = ctm.Int32(page_count > ctm.Int32(0))
-    last_logical_page = ctm.max(page_count - ctm.Int32(1), ctm.Int32(0))
-    safe_logical_page = ctm.min(logical_page, last_logical_page)
-    page_table_idx = (page_begin + safe_logical_page) * has_pages
-    return ctm.Int32(mPageTable_pl[page_table_idx])
-
-
-@cute.jit
 def _pack_p4_16_scores_from_group(
     group_scores,
     group_base: ctm.Int32,
@@ -1366,38 +1353,6 @@ def _select_smem_p4_lazy_anchor_with_validity(
         & (anchor_delta_log2 > ctm.Float32(SMEM_P4_LAZY_ANCHOR_REBASE_LOG2))
     )
     return (new_row_anchor, lane_rebase, anchor_delta_log2)
-
-
-@cute.jit
-def _compute_smem_p4_lazy_rebase_scale(
-    lane_rebase: ctm.Boolean, anchor_delta_log2: ctm.Float32
-) -> ctm.Float32:
-    rebase_scale = ctm.Float32(1.0)
-    if lane_rebase:
-        rebase_scale = cute.exp2(-anchor_delta_log2, fastmath=True)
-    return rebase_scale
-
-
-@cute.jit
-def _rescale_smem_p4_resident_o_in_tmem(o_acc_tmem, old_scale: ctm.Float32) -> None:
-    scaled_accum = ctm.Array(ctm.Float32, 128, space=ctm.AddressSpace.rmem)
-    c_rmem = prims.tcgen05_ld(prims.Tcgen05LdStShape.SHAPE_32X32B, o_acc_tmem, num=128)
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-    old_scale_f32x2 = (old_scale, old_scale)
-    for pair_idx in ctm.range_constexpr(64):
-        elem_idx: ctm.Constexpr = pair_idx * 2
-        scaled_pair = nvvm_mul_packed_f32x2(
-            (c_rmem[elem_idx], c_rmem[elem_idx + 1]), old_scale_f32x2
-        )
-        scaled_accum[elem_idx] = scaled_pair[0]
-        scaled_accum[elem_idx + 1] = scaled_pair[1]
-    prims.tcgen05_st(
-        prims.Tcgen05LdStShape.SHAPE_32X32B,
-        o_acc_tmem,
-        scaled_accum.load(0, 128, alignment=32),
-    )
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
 
 
 @cute.jit

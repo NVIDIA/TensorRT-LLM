@@ -32,10 +32,12 @@ from .cutedsl_common import (
     _ceil_div,
     _compact_sfb_copy_cols_per_scale_chunk,
     _compact_sfb_mma_cols_per_scale_chunk,
+    _compute_smem_p4_lazy_rebase_scale,
     _cutlass_output_dtype,
     _derive_qk_scale_burst_kblocks,
     _fence_async_shared_cta,
     _float_to_ordered_u32_for_atomic_max,
+    _lookup_physical_page,
     _mapa_shared_cluster,
     _mask_invalid_score,
     _mbarrier_arrive_release_cta_shared_cluster,
@@ -51,6 +53,7 @@ from .cutedsl_common import (
     _publish_p4_n256_atomic_rowmax,
     _qk_compact_sfb_cols_per_scale_chunk,
     _qk_sfb_smem_nchunks_per_cta,
+    _rescale_smem_p4_resident_o_in_tmem,
     _scale_pack_e4m3x4_natural_from_f16x2,
     _scale_words_for_k,
     _sfa_tmem_cols_for_scale_chunks,
@@ -1255,21 +1258,6 @@ def _load_qk_qonly_kblock_stage(
             while not prims.mbarrier_try_wait_parity(q_tma_mbar, q_tma_phase, time_limit=10000000):
                 pass
         prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-
-
-@cute.jit
-def _lookup_physical_page(
-    mPageTable_pl: cute.Tensor,
-    logical_page: ctm.Int32,
-    batch: ctm.Int32,
-    page_begin: ctm.Int32,
-    page_count: ctm.Int32,
-) -> ctm.Int32:
-    has_pages = ctm.Int32(page_count > ctm.Int32(0))
-    last_logical_page = ctm.max(page_count - ctm.Int32(1), ctm.Int32(0))
-    safe_logical_page = ctm.min(logical_page, last_logical_page)
-    page_table_idx = (page_begin + safe_logical_page) * has_pages
-    return ctm.Int32(mPageTable_pl[page_table_idx])
 
 
 @cute.jit
@@ -3285,16 +3273,6 @@ def _select_smem_p4_lazy_anchor_runtime(
 
 
 @cute.jit
-def _compute_smem_p4_lazy_rebase_scale(
-    lane_rebase: ctm.Boolean, anchor_delta_log2: ctm.Float32
-) -> ctm.Float32:
-    rebase_scale = ctm.Float32(1.0)
-    if lane_rebase:
-        rebase_scale = cute.exp2(-anchor_delta_log2, fastmath=True)
-    return rebase_scale
-
-
-@cute.jit
 def _smem_p4_direct_a_word_offset(
     p_stage_base: ctm.Int32,
     score_half_idx: ctm.Int32,
@@ -3720,28 +3698,6 @@ def _issue_smem_p4_pv_score_slot_from_base(
         a_sf_layout=SMEM_P4_P_SFA_LAYOUT,
         a_collector_op=a_collector_op,
     )
-
-
-@cute.jit
-def _rescale_smem_p4_resident_o_in_tmem(o_acc_tmem, old_scale: ctm.Float32) -> None:
-    scaled_accum = ctm.Array(ctm.Float32, 128, space=ctm.AddressSpace.rmem)
-    c_rmem = prims.tcgen05_ld(prims.Tcgen05LdStShape.SHAPE_32X32B, o_acc_tmem, num=128)
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-    old_scale_f32x2 = (old_scale, old_scale)
-    for pair_idx in ctm.range_constexpr(64):
-        elem_idx: ctm.Constexpr = pair_idx * 2
-        scaled_pair = nvvm_mul_packed_f32x2(
-            (c_rmem[elem_idx], c_rmem[elem_idx + 1]), old_scale_f32x2
-        )
-        scaled_accum[elem_idx] = scaled_pair[0]
-        scaled_accum[elem_idx + 1] = scaled_pair[1]
-    prims.tcgen05_st(
-        prims.Tcgen05LdStShape.SHAPE_32X32B,
-        o_acc_tmem,
-        scaled_accum.load(0, 128, alignment=32),
-    )
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
 
 
 @cute.jit

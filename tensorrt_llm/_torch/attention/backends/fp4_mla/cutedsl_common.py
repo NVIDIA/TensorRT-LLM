@@ -528,3 +528,50 @@ def _publish_p4_n256_atomic_rowmax(
 @cute.jit
 def _fence_async_shared_cta() -> None:
     prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
+
+
+@cute.jit
+def _lookup_physical_page(
+    mPageTable_pl: cute.Tensor,
+    logical_page: ctm.Int32,
+    batch: ctm.Int32,
+    page_begin: ctm.Int32,
+    page_count: ctm.Int32,
+) -> ctm.Int32:
+    has_pages = ctm.Int32(page_count > ctm.Int32(0))
+    last_logical_page = ctm.max(page_count - ctm.Int32(1), ctm.Int32(0))
+    safe_logical_page = ctm.min(logical_page, last_logical_page)
+    page_table_idx = (page_begin + safe_logical_page) * has_pages
+    return ctm.Int32(mPageTable_pl[page_table_idx])
+
+
+@cute.jit
+def _compute_smem_p4_lazy_rebase_scale(
+    lane_rebase: ctm.Boolean, anchor_delta_log2: ctm.Float32
+) -> ctm.Float32:
+    rebase_scale = ctm.Float32(1.0)
+    if lane_rebase:
+        rebase_scale = cute.exp2(-anchor_delta_log2, fastmath=True)
+    return rebase_scale
+
+
+@cute.jit
+def _rescale_smem_p4_resident_o_in_tmem(o_acc_tmem, old_scale: ctm.Float32) -> None:
+    scaled_accum = ctm.Array(ctm.Float32, 128, space=ctm.AddressSpace.rmem)
+    c_rmem = prims.tcgen05_ld(prims.Tcgen05LdStShape.SHAPE_32X32B, o_acc_tmem, num=128)
+    prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+    old_scale_f32x2 = (old_scale, old_scale)
+    for pair_idx in ctm.range_constexpr(64):
+        elem_idx: ctm.Constexpr = pair_idx * 2
+        scaled_pair = nvvm_mul_packed_f32x2(
+            (c_rmem[elem_idx], c_rmem[elem_idx + 1]), old_scale_f32x2
+        )
+        scaled_accum[elem_idx] = scaled_pair[0]
+        scaled_accum[elem_idx + 1] = scaled_pair[1]
+    prims.tcgen05_st(
+        prims.Tcgen05LdStShape.SHAPE_32X32B,
+        o_acc_tmem,
+        scaled_accum.load(0, 128, alignment=32),
+    )
+    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
