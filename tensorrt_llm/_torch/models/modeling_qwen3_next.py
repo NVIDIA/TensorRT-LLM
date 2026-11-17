@@ -21,6 +21,7 @@
 # limitations under the License.
 
 import os
+import platform
 from types import SimpleNamespace
 from typing import (TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional,
                     Sequence, Tuple, Union)
@@ -132,9 +133,14 @@ def _decode_kernels_layout(model_config: ModelConfig) -> bool:
     mapping = model_config.mapping
     if mapping.enable_attention_dp:
         return True
-    return MNNVLAllReduce.is_mnnvl(mapping,
-                                   model_config.pretrained_config.torch_dtype,
-                                   explicitly_requested=True)
+    from ..distributed.mnnvl_memory import MnnvlMemory
+
+    # These model-level fast paths are tuned for Grace NVLink fabrics;
+    # explicit MNNVL all-reduce has broader hardware eligibility.
+    return ("aarch64" in platform.machine().lower()
+            and model_config.pretrained_config.torch_dtype
+            in MNNVLAllReduce.get_supported_dtypes() and not mapping.has_cp()
+            and MnnvlMemory.supports_mnnvl())
 
 
 def _uses_prefill_kernels(model_config: ModelConfig) -> bool:

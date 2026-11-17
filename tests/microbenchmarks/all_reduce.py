@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -557,9 +557,6 @@ def allreduce_benchmark_all(
 
     torch_dtype = tllm._utils.str_dtype_to_torch(dtype)
     elem_size = torch.finfo(torch_dtype).bits // 8
-
-    # Enable MNNVL testing on single-node (bypasses multi-node NVLink check)
-    os.environ["TLLM_TEST_MNNVL"] = "1"
 
     # strategies
     if strategy_names is None:

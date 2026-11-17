@@ -31,7 +31,6 @@ Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
 """
 
 import hashlib
-import os
 import pickle
 import sys
 import traceback
@@ -106,8 +105,7 @@ def _rel(a, b) -> float:
 
 def _context():
     """One process per GPU, ranks filling the nodes in order (gpus_per_node = the node's GPU count, so a rank's
-    local_rank is its device on every node); the multicast buffers use fabric handles within a tray as across trays."""
-    os.environ.setdefault("TRTLLM_FORCE_MNNVL_AR", "1")
+    local_rank is its device on every node); the multicast transport follows the TP group placement."""
     comm = MPI.COMM_WORLD
     rank, world = comm.Get_rank(), comm.Get_size()
     gpus = torch.cuda.device_count()

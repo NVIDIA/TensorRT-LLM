@@ -33,7 +33,6 @@ on success; if any step fails on any rank, every rank records the failure and
 keeps the native path, so the collective count and order stay identical.
 """
 
-import os
 import threading
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
@@ -169,6 +168,7 @@ def _create(mapping, prepare=None, local_reason="") -> Tuple[Optional[CpWorkspac
         _get_mnnvl_workspace_comm,
         _mnnvl_device_index,
         _mnnvl_workspace_all_succeeded,
+        use_mnnvl_fabric_handle,
     )
     from tensorrt_llm._utils import mpi_disabled
 
@@ -188,7 +188,7 @@ def _create(mapping, prepare=None, local_reason="") -> Tuple[Optional[CpWorkspac
     try:
         from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 
-        use_fabric = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
+        use_fabric = use_mnnvl_fabric_handle(mapping)
         device = _mnnvl_device_index(mapping)
         handle = McastGPUBuffer(
             words * 4, mapping.tp_size, mapping.tp_rank, device, use_fabric, comm.py2f()

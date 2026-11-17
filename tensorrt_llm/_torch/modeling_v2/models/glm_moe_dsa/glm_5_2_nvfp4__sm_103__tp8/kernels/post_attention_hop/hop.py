@@ -60,7 +60,6 @@ counters (:func:`engagement_counts`) record engaged and native-fallback calls
 per Python call, i.e. eager runs and CUDA graph captures, not graph replays.
 """
 
-import os
 import threading
 from typing import Any, Dict, Optional, Tuple
 
@@ -233,6 +232,7 @@ class PostAttnHop:
             _get_mnnvl_workspace_comm,
             _make_mnnvl_mcast_buffer,
             _mnnvl_device_index,
+            use_mnnvl_fabric_handle,
         )
         from tensorrt_llm._utils import mpi_comm
 
@@ -268,12 +268,11 @@ class PostAttnHop:
         comm = _get_mnnvl_workspace_comm(mapping)
         error: Optional[Exception] = None
         try:
-            force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
             self.handle = _make_mnnvl_mcast_buffer(
                 comm,
                 WORKSPACE_BYTES,
                 mapping,
-                use_fabric_handle=force_mn or mapping.is_multi_node(),
+                use_fabric_handle=use_mnnvl_fabric_handle(mapping),
             )
             self.uc_buffer = self.handle.get_uc_buffer(
                 mapping.tp_rank, (WORKSPACE_BYTES // 4,), torch.float32, 0

@@ -16,10 +16,9 @@
  */
 
 #include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/csrc/glmDsaHistTopK.h"
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/modeling_v2/common/namespace.h"
 #include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
-#include "tensorrt_llm/runtime/mcastDeviceMemory.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -41,8 +40,11 @@ namespace torch_ext
 void glmDsaHistTopK(at::Tensor const& logits, at::Tensor const& kvLens, at::Tensor& out, at::Tensor& commBuffer,
     at::Tensor& state, int64_t nextN, int64_t groupSize)
 {
-    auto* mcastMem = tensorrt_llm::common::findMcastDevMemBuffer(commBuffer.data_ptr());
+    auto mcastMem = tensorrt_llm::runtime::getMcastDevMemBuffer(commBuffer);
     TORCH_CHECK(mcastMem != nullptr, "glm_dsa_hist_topk: comm_buffer must come from a McastGPUBuffer");
+    TORCH_CHECK(mcastMem->isMapped(), "glm_dsa_hist_topk: the MNNVL workspace handles are not attached");
+    TORCH_CHECK(commBuffer.data_ptr() == mcastMem->getUnicastPtr(mcastMem->getRank()),
+        "glm_dsa_hist_topk: comm_buffer must start at the local unicast allocation base");
     TORCH_CHECK(static_cast<int64_t>(mcastMem->getWorldSize()) == groupSize, "glm_dsa_hist_topk: group_size ",
         groupSize, " does not match the workspace group of ", mcastMem->getWorldSize(), " ranks");
     CHECK_TH_CUDA(logits);

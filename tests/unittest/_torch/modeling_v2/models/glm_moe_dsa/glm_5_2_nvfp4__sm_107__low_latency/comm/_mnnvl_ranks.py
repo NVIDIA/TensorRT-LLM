@@ -145,7 +145,6 @@ def init_rank() -> Tuple[int, int, Any]:
     records = [None] * world
     dist.all_gather_object(records, record)
     if os.environ.get("TLLM_TEST_EXPECT_WORLD_SIZE") == "8":
-        assert os.environ.get("TLLM_TEST_MNNVL", "0") != "1"
         hosts = {item["host"] for item in records}
         assert len(hosts) == 2, records
         for host in hosts:

@@ -376,6 +376,7 @@ class MnnvlAllReduceNorm:
             and dtype == torch.bfloat16
             and mapping.tp_size in (2, 4, 8, 16)
             and not mapping.enable_attention_dp
+            and hidden_size > 0
             and hidden_size % 2048 == 0
             and warps_per_cta & (warps_per_cta - 1) == 0
             and hidden_size // 64 <= 1024

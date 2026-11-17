@@ -16,10 +16,9 @@
  */
 
 #include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/csrc/glmMtpHeadGather.h"
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/modeling_v2/common/namespace.h"
 #include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
-#include "tensorrt_llm/runtime/mcastDeviceMemory.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -39,9 +38,12 @@ namespace torch_ext
 at::Tensor rubinMtpHeadGather(
     at::Tensor const& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, int64_t group_size, bool float_output)
 {
-    auto* mcastMem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    auto mcastMem = tensorrt_llm::runtime::getMcastDevMemBuffer(comm_buffer);
     TORCH_CHECK(
         mcastMem != nullptr, "glm_rubin_mtp_head_gather: comm_buffer must be obtained from a McastGPUBuffer instance");
+    TORCH_CHECK(mcastMem->isMapped(), "glm_rubin_mtp_head_gather: the MNNVL workspace handles are not attached");
+    TORCH_CHECK(comm_buffer.data_ptr() == mcastMem->getUnicastPtr(mcastMem->getRank()),
+        "glm_rubin_mtp_head_gather: comm_buffer must start at the local unicast allocation base");
     CHECK_TH_CUDA(input);
     CHECK_CONTIGUOUS(input);
     TORCH_CHECK(input.dim() >= 1, "glm_rubin_mtp_head_gather: input must have at least one dimension");
