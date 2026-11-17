@@ -18,7 +18,9 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
 pytestmark = pytest.mark.cpu_only
 
 M3_SHAPE = (64, 6144, 6144)  # (m, n, k): a table entry
-M3_TARGETS = "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__{}.modeling"
+M3_TARGETS = (
+    "tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__{}.modeling"
+)
 
 
 class _PlainModel(torch.nn.Module):
