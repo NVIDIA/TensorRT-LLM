@@ -223,6 +223,18 @@ public:
     }
 };
 
+// A remote cache level could not reach its donors, or a transfer to or from one failed or timed out
+// (storage/remoteMem.h). Not an out-of-pages error: the level's contents can no longer be trusted, which no retry
+// fixes.
+class RemoteMemError : public std::runtime_error
+{
+public:
+    explicit RemoteMemError(std::string const& msg)
+        : std::runtime_error(msg)
+    {
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Helper: unwrap a weak_ptr, throw LogicError on dangling reference.
 // Mirrors Python's unwrap_rawref(_utils.py:163).

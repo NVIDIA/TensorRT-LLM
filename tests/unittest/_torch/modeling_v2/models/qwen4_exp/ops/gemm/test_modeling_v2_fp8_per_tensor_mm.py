@@ -8,7 +8,7 @@ activation."""
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.gemm.fp8_per_tensor_mm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.fp8_per_tensor_mm import (  # noqa: E501
     E4M3_MAX,
     fp8_per_tensor_mm,
     fp8_per_tensor_weight,

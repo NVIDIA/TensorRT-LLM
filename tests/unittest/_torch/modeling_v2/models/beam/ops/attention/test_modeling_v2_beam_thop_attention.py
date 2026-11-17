@@ -4,11 +4,9 @@
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import STANDARD
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    thop_attention as op,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import STANDARD
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention as op
 
 __extra_import_path__ = ["../../../../attention", "../../../.."]
 import test_modeling_v2_thop_attention as shared  # noqa: E402

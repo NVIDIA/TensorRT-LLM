@@ -208,8 +208,8 @@ Jenkins runs a full-project check with path/module and symbol exclusions.
 Whole-project checks always return success; file-list checks can opt into
 `--strict`. Jenkins and pre-commit checks are advisory. The `[tool.pyrefly]`
 section in `pyproject.toml` defines product roots, diagnostics, and native exclusions.
-`[tool.pyrefly-tests]` in the same file defines test roots, helper search paths,
-and diagnostic overrides. The wrapper generates a temporary test configuration
+`[tool.pyrefly-tests]` in the same file defines test roots and helper search paths.
+The wrapper generates a temporary test configuration
 that inherits shared rules and exclusions, runs each scope separately, and
 combines the diagnostics into one report. Temporary configurations are removed
 after the check. Mixed file
@@ -221,20 +221,44 @@ PyTorch, generated bindings, and configured third-party libraries. In test file-
 mode, missing imports of declared dependencies that are not installed are also
 filtered; full-project scans retain them. Release-Check installs pytest so that
 `pytest.skip()` remains recognizable as a terminating call.
-The test configuration disables `missing-argument`, `unexpected-keyword`, and
-`bad-argument-count`; these diagnostics remain enabled for product code. Other
-configured diagnostics, including `unbound-name` and `missing-import`, remain
-enabled for tests. Product import resolution uses only the project root as its
-search path, with fallback resolution disabled. The broader helper search paths
+Tests use the same diagnostics as product code, including `missing-argument`,
+`unexpected-keyword`, and `bad-argument-count`. The wrapper reads literal
+`__extra_import_path__` lists or tuples under `tests/` without running test code and adds
+existing directories to the shared search path for all test files. Ancestors of
+the declaring file are skipped because fallback searches them per file. Product
+checks use only the project root, with fallback disabled. The broader helper search paths
 and fallback resolution apply only to the test pass. `--no-path-module-filter`
 disables exclusions in both passes while preserving their separate search paths
-and diagnostic settings.
+and shared diagnostics.
 
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
 for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
 CI controls test concurrency through `parallel_run_ctest`. `google-tests`
 continues to build all C++ tests; component aggregate targets build migrated tests.
+C++ integration fixtures build the collected tests with incremental native targets.
+`cpp-tests-<directory>` targets (for example `cpp-tests-common` or
+`cpp-tests-executor-bounce`) mirror recursive CTest directory coverage, including
+legacy and full-stack executables. OWNER aggregates are component subsets and
+are not interchangeable with these directory targets.
+The Linux Release source-build fixture reuses the installed CI library for the
+RNN formatter test. CI source and wheel use the same commit and image per
+architecture. Link/load errors fail the tests. Direct CMake builds use source
+libraries unless explicitly configured otherwise.
+`CONFIG_LINUX_X86_64_VANILLA` also builds `google-tests`
+and publishes the `cpp_test_bundle` CMake component as a separate
+`cpp-tests-<main-tar-name>` artifact. The main package does not include the test
+programs. Only `-CPP-` stages using this build configuration fetch and unpack
+the companion into `src/cpp/build`, including fat-image consumers. Build reuse
+requires both artifacts. Linux Release integration fixtures use this bundle
+directly, retaining CTest selection and retries. The two FMHA tests share a
+test-only library packaged next to their executables; other runtime libraries
+come from the matching installed wheel. Test artifacts keep symbols but omit
+BOLT's extra relocation records.
+CPP stages collect only `tests/integration/defs/cpp` and use the standard test
+environment setup. CTest discovers cases on the test node, so the build stage
+does not need a GPU. Without a bundle, or with
+an explicit `TRTLLM_BUILD_ROOT`, fixtures retain the incremental build path.
 
 ### Vendor source tools and promotion
 

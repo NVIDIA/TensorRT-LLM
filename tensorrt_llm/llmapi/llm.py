@@ -1777,7 +1777,7 @@ class BaseLLM:
             output_dir (str, optional): Directory where chrome traces are
                 written. If ``None``, falls back to the
                 ``TLLM_TORCH_PROFILER_DIR`` environment variable and finally
-                to ``/tmp``. Defaults to None.
+                to a temporary directory. Defaults to None.
             num_steps (int, optional): Number of engine iterations to
                 capture. When set, the engine stops the window automatically
                 and ``stop_profile`` does not need to be called. When
@@ -2185,6 +2185,7 @@ class _TorchLLM(BaseLLM):
             checkpoint_format,
             trust_remote_code=self.args.trust_remote_code,
             enable_tokenization_cache=self.args.enable_tokenization_cache,
+            prompt_token_cache_config=self.args.prompt_token_cache_config,
             **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
 
