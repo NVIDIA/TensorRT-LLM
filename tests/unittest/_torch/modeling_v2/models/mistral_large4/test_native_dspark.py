@@ -56,6 +56,20 @@ def _draft(modeling, core):
     return modeling.DraftModel(shell, SimpleNamespace(pretrained_config=SimpleNamespace()))
 
 
+def _draft_ops(modeling):
+    """The module of the target's fused DSpark draft ops, or None for a target whose draft runs
+    the torch chain itself."""
+    op = getattr(modeling, "triton_latent_tail", None)
+    return None if op is None else importlib.import_module(type(op).__module__)
+
+
+def _run_references(modeling, monkeypatch, *names):
+    """Swap the target's fused draft ops for their torch references, which the kernels are
+    checked against on the GPU (`dspark/test_modeling_v2_draft_ops.py`)."""
+    for name in names:
+        monkeypatch.setattr(modeling, name, getattr(modeling, name).reference)
+
+
 @pytest.mark.parametrize("next_n", [1, 4])
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("max_seq_len", [32768, 1048576])
@@ -182,6 +196,7 @@ def test_target_image_embeddings_preserve_worker_token_ids(
         softcap=8.0,
         lm_head=object(),
         logits_processor=Mock(return_value=logits),
+        capped_logits=Mock(return_value=logits),
     )
     monkeypatch.setattr(modeling, "_image_rows", lambda *args: image_rows)
     monkeypatch.setattr(modeling, "tanh_softcap", lambda x, cap: cap * torch.tanh(x / cap))
@@ -226,6 +241,14 @@ def test_rnn_uses_hidden_and_resets_each_proposal(modeling, monkeypatch):
     monkeypatch.setattr(
         modeling, "cublas_mm", lambda x, w, bias, dtype: x @ w + (0 if bias is None else bias)
     )
+    if _draft_ops(modeling) is not None:
+        _run_references(
+            modeling,
+            monkeypatch,
+            "triton_markov_input",
+            "triton_markov_gate",
+            "triton_markov_logits",
+        )
     # Rank-one head with explicit scalar equations: the candidate reads the
     # token and h0, the output reads the previous state, token and h1.
     weights = {
@@ -304,7 +327,11 @@ def test_rotary_positions_match_complex_rotation(modeling, layout, dtype):
         phase = phase.unsqueeze(-2)
     pairs = torch.view_as_complex(x.float().reshape(*shape[:-1], 4, 2))
     expected = torch.view_as_real(pairs * phase).flatten(-2).to(dtype)
-    actual = draft._rotate(x, positions)
+    ops = _draft_ops(modeling)
+    if ops is None:
+        actual = draft._rotate(x, positions)
+    else:
+        actual = ops._rotate(x, draft._rope.indexer, positions)
     assert actual.dtype == dtype
     torch.testing.assert_close(actual, expected)
 
@@ -393,6 +420,12 @@ def test_block_attention_matches_explicit_kv_and_obeys_window(modeling, monkeypa
         rope_rows=32,
         w={},
     )
+    ops = _draft_ops(modeling)
+    if ops is not None:
+        # The references slice the latent and rope halves at the model's widths.
+        monkeypatch.setattr(ops, "LAT", core.kv_lora)
+        monkeypatch.setattr(ops, "PE", core.rope_dim)
+        _run_references(modeling, monkeypatch, "triton_latent_tail", "triton_draft_attention")
     draft = _draft(modeling, core)
     draft._rope = SimpleNamespace(rows=32, indexer=torch.tensor([[1.0, 0.0]] * 32))
     draft._layers = [
