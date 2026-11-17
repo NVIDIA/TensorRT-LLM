@@ -348,8 +348,8 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
 
     mapping = model_config.mapping
     encoder_dp_size = mm_config.encoder_data_parallel_size
-    # TorchLlmArgs validates user configs; these checks also cover callers
-    # that construct ModelConfig directly.
+    # TorchLlmArgs.validate_encoder_data_parallel rejects these at startup;
+    # the checks here cover callers that build ModelConfig directly.
     if mapping.pp_size != 1 or mapping.cp_size != 1:
         raise NotImplementedError(
             "Explicit multimodal encoder parallelism requires pipeline "
@@ -371,12 +371,7 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
         tp_size=encoder_tp_size,
         pp_size=mapping.world_size // encoder_tp_size,
     )
-    # ModelConfig is a dataclass with a custom assignment guard. Unlock only
-    # the encoder copy while replacing its mapping, then restore its state.
-    encoder_config._frozen = False
-    encoder_config.mapping = encoder_mapping
-    encoder_config._frozen = model_config._frozen
-    return encoder_config
+    return encoder_config.copy_with(mapping=encoder_mapping)
 
 
 def _build_request_multimodal_input(

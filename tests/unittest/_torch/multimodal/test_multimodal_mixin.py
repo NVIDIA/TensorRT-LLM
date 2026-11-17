@@ -280,17 +280,21 @@ def make_encoder_dp_param_with_input_costs() -> MultimodalParams:
     return param
 
 
+@pytest.mark.parametrize("frozen", [False, True], ids=["unfrozen", "frozen"])
 @pytest.mark.parametrize("world_size,rank", [(2, 1), (4, 3)])
 @pytest.mark.cpu_only
-def test_make_multimodal_encoder_model_config_replicates_encoder_mapping(world_size, rank):
+def test_make_multimodal_encoder_model_config_replicates_encoder_mapping(world_size, rank, frozen):
     model_config = ModelConfig(
         mapping=Mapping(world_size=world_size, rank=rank, tp_size=world_size),
         multimodal_config=MultimodalConfig(encoder_data_parallel_size=world_size),
     )
+    # Configs from ModelConfig.from_pretrained are frozen.
+    model_config._frozen = frozen
 
     encoder_config = make_multimodal_encoder_model_config(model_config)
 
     assert encoder_config is not model_config
+    assert encoder_config._frozen == frozen
     assert encoder_config.extra_attrs is model_config.extra_attrs
     assert model_config.mapping.tp_size == world_size
     assert encoder_config.mapping.tp_size == 1
