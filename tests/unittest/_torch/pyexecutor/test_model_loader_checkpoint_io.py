@@ -1031,12 +1031,13 @@ def test_mtp_draft_reuses_target_mapper(
     assert events == expected_events
 
 
+@pytest.mark.parametrize("headers", ["readable", "one_unreadable", "no_draft_keys"])
 @pytest.mark.parametrize(
     "load_format, policy",
     [("auto", "native"), ("auto", "rank_striped_read_ahead"), ("gms", "native")],
 )
 def test_draft_load_reads_only_the_shards_holding_draft_keys(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, load_format: str, policy: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, load_format: str, policy: str, headers: str
 ) -> None:
     # One CPU rank without MPI, as in the rank-striped read-ahead tests.
     monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
@@ -1078,6 +1079,20 @@ def test_draft_load_reads_only_the_shards_holding_draft_keys(
             "mtp.2.norm.weight": torch.randn(8),
         },
     }
+    if headers == "no_draft_keys":
+        shards = {
+            file_name: {key.replace("mtp.", "nextn."): value for key, value in tensors.items()}
+            for file_name, tensors in shards.items()
+        }
+    elif headers == "one_unreadable":
+        read_header = weight_loader_module._read_safetensors_header
+
+        def read_header_or_fail(path: str):
+            if Path(path).name == "model-00003-of-00005.safetensors":
+                raise ValueError("failed to read SafeTensors header")
+            return read_header(path)
+
+        monkeypatch.setattr(weight_loader_module, "_read_safetensors_header", read_header_or_fail)
     checkpoint_dir = tmp_path / "checkpoint"
     checkpoint_dir.mkdir()
     for file_name, tensors in shards.items():
@@ -1158,8 +1173,9 @@ def test_draft_load_reads_only_the_shards_holding_draft_keys(
     assert sorted(read_files) == sorted(shards)
     assert set(full) == {key for tensors in shards.values() for key in tensors}
     draft, effective = load_draft(dspark)
-    assert effective == policy
-    assert sorted(read_files) == holders
+    # An unreadable header sends the rank-striped preflight to the native fallback.
+    assert effective == ("native" if headers == "one_unreadable" else policy)
+    assert sorted(read_files) == (holders if headers == "readable" else sorted(shards))
     assert_same_draft_tensors(draft, full)
 
     # With the raw weight cache on, the draft keeps the full file set and reuses the cached entry.
