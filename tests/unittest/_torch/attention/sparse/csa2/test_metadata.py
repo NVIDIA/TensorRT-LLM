@@ -1245,6 +1245,7 @@ def test_prims_ts_workspace_reservation_honors_packed_sources_and_head_sharding(
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import backend, prims_ts
     from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_bank import (
         main_bank_reserved_rows,
+        main_record_owners_reserved_rows,
         main_records_rows_limit,
     )
 
@@ -1273,14 +1274,14 @@ def test_prims_ts_workspace_reservation_honors_packed_sources_and_head_sharding(
         arena_bytes = 4096 + 4 * queries * (width + 2)
         # Widths with MAIN rows also retain the reserved rows of the device's context MAIN
         # bank and its one-byte row marks, and the selection bank of the largest generation
-        # tile with an INT64 owner slot per MAIN pool row.
+        # tile with an INT64 owner slot per MAIN pool row, up to the reserved owner rows.
         bank_bytes = 0
         if width > 128:
             selections = generation_queries * (width - 128)
             bank_bytes = main_bank_reserved_rows() * 513 + 512 * min(
                 max(selections, main_bank_reserved_rows()), main_records_rows_limit()
             )
-            bank_bytes += 8 * (main_pool_rows + 1)
+            bank_bytes += 8 * (min(main_pool_rows, main_record_owners_reserved_rows()) + 1)
         assert (
             reserve(
                 device,

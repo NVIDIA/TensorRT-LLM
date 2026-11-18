@@ -846,6 +846,38 @@ def _run_gather_case(packed, case: dict, *, valid_prefix: bool) -> tuple:
     return wrapper, out, wrapper._state.buffers["lse"].clone()
 
 
+@torch.inference_mode()
+def test_prims_ts_large_plan_rounds_bf16_query_outside_the_arena(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plan of more rows than the arena's E4M3 Q holds rounds a BF16 Q into a buffer of the
+    run's own, exactly as the arena copy would, and its arena keeps no Q rows."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+
+    rows = torch.cuda.get_device_properties(0).multi_processor_count + 1
+    case = _gather_case(
+        rows, 64, True, True, _pool("swa_fp8", 512, 300), _pool("main_fp8", 512, 200)
+    )
+    arena, expected, expected_lse = _run_gather_case(packed, case, valid_prefix=True)
+    assert arena._state.query is not None and arena._state.buffers["q8"].shape[0] == rows
+    full = packed.get_packed_sparse_mla_workspace_size(
+        "cuda", rows, 64, max_topk=128, max_extra_topk=149
+    )
+    monkeypatch.setattr(packed, "_Q8_ARENA_ROWS", rows - 1)
+    own, out, lse = _run_gather_case(packed, case, valid_prefix=True)
+    assert own._state.query is None and own._state.buffers["q8"].shape[0] == 0
+    assert (
+        full
+        - packed.get_packed_sparse_mla_workspace_size(
+            "cuda", rows, 64, max_topk=128, max_extra_topk=149
+        )
+        >= rows * 64 * 512
+    )
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
+
+
 def _force_gather(packed, monkeypatch: pytest.MonkeyPatch, **overrides) -> None:
     """Run the gather kernel on the producer's own schedule, with overrides, for every grid."""
     monkeypatch.setattr(
@@ -1608,6 +1640,7 @@ def test_prims_ts_selection_bank_storage_capacity() -> None:
     """
     from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_bank import (
         main_bank_reserved_rows,
+        main_record_owners_reserved_rows,
         main_records_rows_limit,
         main_records_storage,
     )
@@ -1645,6 +1678,10 @@ def test_prims_ts_selection_bank_storage_capacity() -> None:
     assert workspace_reservation_bytes(
         device, 64, 640, 768, generation_queries=768, main_pool_rows=1000
     ) == (base + 768 * 512 * 512 + 8 * 1001)
+    # A larger pool's owner slots beyond the reserved rows grow past the reservation.
+    assert workspace_reservation_bytes(
+        device, 64, 640, 768, generation_queries=768, main_pool_rows=1 << 40
+    ) == (base + 768 * 512 * 512 + 8 * (main_record_owners_reserved_rows() + 1))
     assert workspace_reservation_bytes(device, 64, 128, 768, generation_queries=768) == (
         workspace_reservation_bytes(device, 64, 128, 768)
     )

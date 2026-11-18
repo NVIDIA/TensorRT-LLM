@@ -500,6 +500,14 @@ def decode_main_records(
 _OWNERS_CACHE_KEY = "csa2_prims_ts_main_record_owners"
 _EPOCH_CACHE_KEY = "csa2_prims_ts_main_record_epoch"
 _OWNER_BLOCK = 1024
+# The owner slots the workspace reservation covers; a larger MAIN pool grows them past it, as a
+# context bank grows past its reserved rows.
+_RESERVED_OWNER_BYTES = 256 << 20
+
+
+def main_record_owners_reserved_rows() -> int:
+    """MAIN pool rows whose owner slots the PrimTS workspace reservation covers."""
+    return _RESERVED_OWNER_BYTES // 8
 
 
 def main_record_owners(

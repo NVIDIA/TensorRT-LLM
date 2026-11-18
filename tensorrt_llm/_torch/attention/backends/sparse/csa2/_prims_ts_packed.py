@@ -133,6 +133,12 @@ class _LaunchKernels:
 # _LaunchKernels by everything that selects them (see _resolve_launch).
 _LAUNCH_KERNELS: dict[tuple, _LaunchKernels] = {}
 
+# Plans of at most this many rows keep an arena copy of a BF16 Q rounded to unit-scale E4M3.
+# Larger plans (context tiles, which read the Q projection's E4M3 Q) round a BF16 Q into a buffer
+# of their own, allocated when one first arrives, so the arena does not scale with the context
+# chunk.
+_Q8_ARENA_ROWS = 4096
+
 
 @dataclass(frozen=True)
 class _Launch:
@@ -181,7 +187,8 @@ class _Plan:
     compiled: Callable[..., object] | None
     gather: _GatherPlan | None
     nvfp4: _GatherPlan | None
-    query: UnitScaleQuery
+    # None for plans of more than _Q8_ARENA_ROWS rows (see PackedSparseMLA._own_query).
+    query: UnitScaleQuery | None
     buffers: dict[str, torch.Tensor]
     core: torch.Tensor | None
     lse_kernel: torch.Tensor
@@ -723,7 +730,7 @@ def _resolve_launch(
     for name, shape, dtype in (
         ("core", (max(kernels.core_bytes, native_core),), torch.int8),
         ("lse", (rows, 1, heads), torch.float32),
-        ("q8", (rows, 1, heads, _HEAD_DIM), torch.uint8),
+        ("q8", (rows if rows <= _Q8_ARENA_ROWS else 0, 1, heads, _HEAD_DIM), torch.uint8),
         # One record wide enough for either MAIN format, so both share an arena.
         ("dummy_main", (1, main_row_bytes("main_fp8")), torch.uint8),
         # The gather ABI always binds an extra list and sinks: SWA-only launches
@@ -854,7 +861,7 @@ def get_packed_sparse_mla_workspace_size(
     Includes native split-KV BF16 partial outputs/FP32 statistics for the packed
     producer kernel and, where the geometry has them, the TMA gather and NVFP4 MAIN
     kernels; FP32
-    LSE and unit-scale E4M3 Q; one dummy record, as wide as either MAIN format,
+    LSE and, up to ``_Q8_ARENA_ROWS`` rows, unit-scale E4M3 Q; one dummy record, as wide as either MAIN format,
     for launches without a MAIN pool; and the gather kernel's empty extra lists
     and -inf sinks. The size depends on neither the formats nor a prefix promise, and covers
     plans that run ahead of their preceding launch.
@@ -1195,6 +1202,10 @@ class PackedSparseMLA:
         self._state: _Plan | None = None
         # Producer kernels compiled lazily, keyed by 16-byte row alignment.
         self._packed: dict[bool, Callable[..., object]] = {}
+        # The E4M3 Q and Q rounding of a plan whose Q has no arena copy, made on its first
+        # eager run that needs them.
+        self._q8: torch.Tensor | None = None
+        self._query: UnitScaleQuery | None = None
 
     @property
     def workspace_tensors(self) -> tuple[torch.Tensor, ...]:
@@ -1336,13 +1347,18 @@ class PackedSparseMLA:
             compiled=compiled,
             gather=gather,
             nvfp4=nvfp4,
-            query=UnitScaleQuery.plan(launch.device, rows, heads, buffers["q8"]),
+            query=(
+                UnitScaleQuery.plan(launch.device, rows, heads, buffers["q8"])
+                if rows <= _Q8_ARENA_ROWS
+                else None
+            ),
             buffers=buffers,
             core=buffers["core"] if spec.has_workspace else None,
             lse_kernel=buffers["lse"].permute(2, 1, 0),
             dummy_main=dummy_main,
         )
         self._packed = {}
+        self._q8 = self._query = None
         self.workspace_size_bytes = launch.workspace_bytes
 
     def _packed_kernel(self, aligned: bool) -> Callable[..., object]:
@@ -1385,6 +1401,33 @@ class PackedSparseMLA:
             )
             self._packed[aligned] = kernel
         return kernel
+
+    def _query_buffer(self, state: _Plan) -> torch.Tensor:
+        """The plan's unit-scale E4M3 Q: its arena copy or, for a plan of more rows than the
+        arena holds (_Q8_ARENA_ROWS), a buffer of its own, made on its first eager run that
+        needs it, which a CUDA Graph captured after that run reuses."""
+        if state.query is not None:
+            return state.buffers["q8"]
+        if self._q8 is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Run a PrimTS plan of more than _Q8_ARENA_ROWS rows once before CUDA Graph "
+                    "capture with the Q dtype it captures"
+                )
+            self._q8 = torch.empty(
+                (state.rows, 1, state.heads, _HEAD_DIM),
+                device=state.device,
+                dtype=torch.float8_e4m3fn,
+            )
+        return self._q8
+
+    def _own_query(self, state: _Plan, q8: torch.Tensor) -> UnitScaleQuery:
+        """The plan's Q rounding: planned with the arena, else on the plan's first BF16 Q."""
+        if state.query is not None:
+            return state.query
+        if self._query is None:
+            self._query = UnitScaleQuery.plan(state.device, state.rows, state.heads, q8)
+        return self._query
 
     @staticmethod
     def _pool(tensor: torch.Tensor, width: int, device: torch.device, name: str) -> None:
@@ -1723,10 +1766,10 @@ class PackedSparseMLA:
                     "query_rope needs contiguous INT32[rows] positions and FP32[P, 2, 32] cos/sin"
                 )
             # The kernel stages Q itself; its unused descriptors still need a mapped tensor.
-            q8 = state.buffers["q8"]
+            q8 = self._query_buffer(state)
         elif q.dtype == torch.bfloat16:
-            state.query.run(q, state.buffers["q8"])
-            q8 = state.buffers["q8"]
+            q8 = self._query_buffer(state)
+            self._own_query(state, q8).run(q, q8)
         query = q8.as_strided(kernel_shape, kernel_stride)
         quant_args = None
         if quantized:

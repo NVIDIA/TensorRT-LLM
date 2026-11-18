@@ -6,12 +6,17 @@ from __future__ import annotations
 
 import functools
 import math
+from dataclasses import replace
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
 from ...interface import AttentionForwardArgs, AttentionInputType
-from ._prims_ts_bank import main_bank_reserved_rows, main_records_rows_limit
+from ._prims_ts_bank import (
+    main_bank_reserved_rows,
+    main_record_owners_reserved_rows,
+    main_records_rows_limit,
+)
 from .params import CSA2BackendForwardArgs, CSA2Mode, PrimsTSMainFormat, SwaCacheFormat
 
 if TYPE_CHECKING:
@@ -80,13 +85,15 @@ def workspace_reservation_bytes(
     """Bound one serial arena shared by eager and graph-retained packed plans.
 
     All wrapper Q8/reduction/LSE/dummy storage is carved from the byte
-    workspace. Plans own no additional defaults or cache tensors. Compact
+    workspace (Q8 only for plans of up to ``_Q8_ARENA_ROWS`` rows). Plans own no
+    additional defaults or cache tensors. Compact
     metadata is the only separate allocation, plus, for widths with MAIN rows,
     the reserved storage of the device's decoded context MAIN bank and its
     one-byte row marks (a phase that owns more MAIN rows grows them past the
     reservation), and the selection bank of generation tiles of up to
     ``generation_queries`` rows with its INT64 owner slot per row of a MAIN pool
-    of up to ``main_pool_rows`` rows.
+    of up to ``main_pool_rows`` rows, of which it covers up to
+    ``main_record_owners_reserved_rows()`` (a larger pool grows them past the reservation).
     """
     bank = 0
     if width > _SWA_TILE:
@@ -96,7 +103,7 @@ def workspace_reservation_bytes(
             bank += _HEAD_DIM * min(
                 max(selections, main_bank_reserved_rows()), main_records_rows_limit()
             )
-            bank += 8 * (main_pool_rows + 1)
+            bank += 8 * (min(main_pool_rows, main_record_owners_reserved_rows()) + 1)
     return _workspace_capacity(device, heads, width, queries) + 4 * queries * (width + 2) + bank
 
 
@@ -444,16 +451,24 @@ class CSA2PrimsTS:
         from ._prims_ts_metadata import prepare_prims_ts_metadata
         from .metadata import csa2_side_stream
 
+        raw = forward_args.sparse_backend_args
+        if not isinstance(raw, CSA2BackendForwardArgs):
+            raise TypeError("CSA2 requires CSA2BackendForwardArgs")
         if (
             q.shape != (metadata.num_tokens, self.attention.num_heads * _HEAD_DIM)
             or q.dtype != torch.bfloat16
             or not q.is_cuda
-            or not q.is_contiguous()
+            # A unit-scale context Q is read only as its projected E4M3 copy (_context_query).
+            or not (q.is_contiguous() or raw.projected_q_unit_scale)
         ):
             raise ValueError("CSA2 PrimTS requires contiguous CUDA BF16[T,H*512] queries")
         if metadata.kv_input_mode != "packed":
             raise ValueError("CSA2 PrimTS requires packed KV input metadata without staging")
-        self.attention._validate_helper_output(q, forward_args)
+        mxfp8 = self._mxfp8_output(q, metadata, forward_args)
+        # A plan that writes the grouped MXFP8 O-A input leaves the BF16 output unwritten.
+        self.attention._validate_helper_output(
+            q, forward_args if mxfp8 is None else replace(forward_args, output=None)
+        )
         sinks = forward_args.attention_sinks
         if (
             sinks.shape != (self.attention.num_heads,)
@@ -464,15 +479,11 @@ class CSA2PrimsTS:
             raise ValueError("CSA2 PrimTS sinks must be contiguous CUDA FP32[H]")
         scale = 1.0 / (self.attention.q_scaling * math.sqrt(_HEAD_DIM))
         _validate_softmax_scale(scale)
-        raw = forward_args.sparse_backend_args
-        if not isinstance(raw, CSA2BackendForwardArgs):
-            raise TypeError("CSA2 requires CSA2BackendForwardArgs")
         swa_cache_format = raw.swa_cache_format or self.attention.swa_cache_format
         # An eager context phase reads its MAIN rows from a bank decoded once per
         # row, not per selection: all of its requests' rows, or only the selected
         # ones when its queries select fewer rows than the requests own.
         bank = metadata.prims_ts_main_bank
-        mxfp8 = self._mxfp8_output(q, metadata, forward_args)
         output_groups = None if mxfp8 is None else mxfp8[0].shape[0]
         # A tile without a MAIN bank can still gather unit-scale E4M3 rows: one bank row
         # per selection, decoded after compaction (_uses_selection_bank).
@@ -814,8 +825,6 @@ class CSA2PrimsTS:
         tile is the whole batch; plans whose schedule finalizes in a split-KV reduction keep
         BF16.
         """
-        from ._prims_ts_packed import fuses_mxfp8_output
-
         raw = forward_args.sparse_backend_args
         state = getattr(raw, "state", None)
         mxfp8 = None if state is None else state.output_mxfp8
@@ -828,9 +837,15 @@ class CSA2PrimsTS:
             or mxfp8[0].shape[1] != metadata.num_tokens
         ):
             return None
-        width = metadata.num_sparse_topk
-        if not fuses_mxfp8_output(
-            q.device, metadata.num_tokens, self.attention.num_heads, _SWA_TILE, width - _SWA_TILE
-        ):
+        if not self.writes_mxfp8_output(q.device, metadata.num_tokens, metadata.num_sparse_topk):
             return None
         return mxfp8
+
+    def writes_mxfp8_output(self, device: torch.device, rows: int, width: int) -> bool:
+        """Whether a context-only or generation-only tile of ``rows`` rows and sparse ``width``
+        writes the grouped MXFP8 O-A input it is offered, and then no BF16 output."""
+        from ._prims_ts_packed import fuses_mxfp8_output
+
+        return fuses_mxfp8_output(
+            device, rows, self.attention.num_heads, _SWA_TILE, width - _SWA_TILE
+        )

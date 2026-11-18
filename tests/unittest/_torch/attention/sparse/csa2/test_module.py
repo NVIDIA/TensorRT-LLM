@@ -3433,7 +3433,9 @@ def test_prims_ts_context_reads_projected_unit_scale_query(monkeypatch, fused_co
     """PrimTS context reads the fused Q-B projection's unit-scale E4M3 Q.
 
     That Q is the projection's BF16 Q rounded exactly as PrimTS's own quantization rounds
-    it, so every way of handing PrimTS this projection's Q gives identical outputs.
+    it, so every way of handing PrimTS this projection's Q gives identical outputs. With only
+    the E4M3 Q, PrimTS gets no BF16 Q buffer, and no BF16 output buffer where its plan writes
+    the grouped MXFP8 O-A input.
     """
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import (
         _prims_ts_quantization,
@@ -3462,15 +3464,36 @@ def test_prims_ts_context_reads_projected_unit_scale_query(monkeypatch, fused_co
             return _original(*args, **kwargs)
 
         monkeypatch.setattr(owner, name, spy)
+    buffers = []
+    forward = prims_ts.CSA2PrimsTS._forward_packed
+
+    def record(self, q, metadata, forward_args):
+        writes = forward_args.sparse_backend_args.state.output_mxfp8 is not None and (
+            self.writes_mxfp8_output(q.device, metadata.num_tokens, metadata.num_sparse_topk)
+        )
+        buffers.append((q.stride(0) == 0, forward_args.output.stride(0) == 0, writes))
+        return forward(self, q, metadata, forward_args)
+
+    monkeypatch.setattr(prims_ts.CSA2PrimsTS, "_forward_packed", record)
     # A context-only prefill projects Q to unit-scale E4M3 only, and PrimTS quantizes none.
     unit = _prefill_outputs(layers, manager, requests, hidden)
     assert calls == ["fp8_query_gemm"] * len(layers)
+    assert len(buffers) == len(layers) and any(writes for _, _, writes in buffers)
+    assert all(
+        q_unwritten and out_unwritten == writes for q_unwritten, out_unwritten, writes in buffers
+    )
     calls.clear()
+    buffers.clear()
     # Writing the BF16 Q as well, the projection hands PrimTS the same E4M3 Q.
     for model in layers:
         model._unit_scale_context_query = False
     both = _prefill_outputs(layers, manager, requests, hidden)
     assert calls == ["query_gemm_rope"] * len(layers)
+    # The BF16 Q is now a real buffer; the output still depends only on the MXFP8 plan.
+    assert all(
+        not q_unwritten and out_unwritten == writes
+        for q_unwritten, out_unwritten, writes in buffers
+    )
     calls.clear()
     # Ignoring the projected Q, PrimTS rounds that projection's BF16 Q itself.
     monkeypatch.setattr(

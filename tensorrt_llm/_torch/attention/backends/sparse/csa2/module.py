@@ -36,7 +36,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..deepseek_v4.module import project_sparse_attn_output
 from .compressor import CSA2Compressor, bf16_projection
-from .metadata import CSA2TrtllmMetadata, csa2_side_stream
+from .metadata import _SWA_TILE, CSA2TrtllmMetadata, csa2_side_stream
 from .params import (
     CSA2BackendForwardArgs,
     CSA2ForwardState,
@@ -1965,10 +1965,9 @@ class DeepseekV41Attention(nn.Module):
                     )
                 )
             )
-            # PrimTS keeps a real BF16 Q buffer; only the fused context kernel takes the stand-in.
             q = (
                 unwritten
-                if unit_q and self.backend.compute_backend != "prims_ts"
+                if unit_q
                 else torch.empty(shape, dtype=self.dtype, device=hidden_states.device)
             )
             # Only the index-Q projection reads the normalized latent, as MXFP8 operands.
@@ -2176,8 +2175,16 @@ class DeepseekV41Attention(nn.Module):
             decode_start=self._prefetch_events[0] if prefetch_ctas else None,
             rows_published=publish_rows,
         )
-        if unit_q and output_fp8 is not None:
-            # The fused context kernel writes the O-A input instead of the BF16 output.
+        if (unit_q and output_fp8 is not None) or (
+            output_mxfp8 is not None
+            and self.backend.compute_backend == "prims_ts"
+            and 0 < attn_metadata.num_ctx_tokens == q.shape[0]
+            and self._compute_helper.writes_mxfp8_output(
+                q.device, q.shape[0], _SWA_TILE + pad_up(extra_width, 128)
+            )
+        ):
+            # The fused context kernel, or a PrimTS context plan offered the grouped MXFP8 O-A
+            # input, writes the O-A input instead of the BF16 output.
             output = _unwritten_rows(q.device, q.shape[0], q[0].numel()).view(q.shape)
         else:
             output = torch.empty_like(q, memory_format=torch.contiguous_format)
