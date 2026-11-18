@@ -7259,7 +7259,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
     sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
 
     sh "pwd && ls -alh"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${whlUrl}")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv '${whlUrl}' -O '${wheel_path.tokenize('/').last()}'")
 
     if (reinstall_dependencies) {
         // Test installation in the new environment
@@ -7275,7 +7275,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest tensorrt_llm-*.whl'")
 
     def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv '${pkgUrl}' -O '${linuxPkgName}'")
     sh "tar -zvxf ${linuxPkgName}"
 
     // TODO: The steps below drove the removed TensorRT engine flow (trtllm-build / examples/run.py).
@@ -8249,7 +8249,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         if (values[5] != DLFW_IMAGE) {
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb -O cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             // Match the CUDA the DLFW base image builds the wheel with.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-4")
