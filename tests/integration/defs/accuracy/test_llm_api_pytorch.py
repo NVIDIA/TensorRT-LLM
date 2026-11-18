@@ -2078,7 +2078,8 @@ def _make_deepseekv4_eplb_config(model_path, layer_updates_per_iter, ep_size=8):
 
 
 DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
-# DeepSeek-V4-Pro (~806 GB) fits on 4 GPUs only with 288 GB-class memory.
+# Four-GPU capacity is checked in MiB, not decimal MB.
+# GB300 CUDA mem_get_info total observed at 276.62 GiB (~283259 MiB).
 DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB = 280000
 
 
@@ -2242,8 +2243,8 @@ DEEPSEEKV4_PARALLELISM = pytest.mark.parametrize("tp_size,attention_dp", [
 def _skip_unless_deepseekv4_4gpu_memory(tp_size, min_device_memory_for_4gpus):
     """Skip the 4-GPU case on GPUs too small for the checkpoint.
 
-    ``min_device_memory_for_4gpus`` (MB): e.g. DeepSeek-V4-Pro needs 288
-    GB-class GPUs. The rank count is DEEPSEEKV4_PARALLELISM's marker.
+    ``min_device_memory_for_4gpus`` is in MiB. The rank count is
+    DEEPSEEKV4_PARALLELISM's marker.
     """
     if tp_size == 4:
         # Query the GPUs directly: get_device_memory() falls back to host memory
@@ -2257,7 +2258,7 @@ def _skip_unless_deepseekv4_4gpu_memory(tp_size, min_device_memory_for_4gpus):
             for i in range(local_gpus))
         if gpu_memory_mb < min_device_memory_for_4gpus:
             pytest.skip(
-                f"4 GPUs need at least {min_device_memory_for_4gpus} MB "
+                f"4 GPUs need at least {min_device_memory_for_4gpus} MiB "
                 "each for this DeepSeek-V4 checkpoint")
 
 
@@ -2669,15 +2670,14 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 acceptance_length)
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("tp_size,device_memory_gib,should_skip", [
-    pytest.param(4, 256, True, id="dp4-insufficient-memory"),
-    pytest.param(4, 275, False, id="dp4-sufficient-memory"),
-    pytest.param(8, 256, False, id="dp8-smaller-memory"),
+@pytest.mark.parametrize("tp_size,device_memory_mib,should_skip", [
+    pytest.param(4, 254000, True, id="dp4-insufficient-memory"),
+    pytest.param(4, 283000, False, id="dp4-sufficient-memory"),
+    pytest.param(8, 254000, False, id="dp8-smaller-memory"),
 ])
 def test_deepseekv4_pro_dspark_memory_eligibility(mocker: MockerFixture,
                                                   tp_size: int,
-                                                  device_memory_gib: int,
+                                                  device_memory_mib: int,
                                                   should_skip: bool) -> None:
 
     class CheckpointLoadReached(Exception):
@@ -2687,14 +2687,14 @@ def test_deepseekv4_pro_dspark_memory_eligibility(mocker: MockerFixture,
     mocker.patch.object(
         torch.cuda,
         "get_device_properties",
-        return_value=mocker.Mock(total_memory=device_memory_gib * 1024**3))
+        return_value=mocker.Mock(total_memory=device_memory_mib * 1024**2))
     mocker.patch(f"{__name__}.LLM", side_effect=CheckpointLoadReached)
-    expected_exception = (pytest.skip.Exception
-                          if should_skip else CheckpointLoadReached)
     accuracy_test = TestDeepSeekV4ProDSpark()
-    with pytest.raises(expected_exception):
+    with pytest.raises(
+        (pytest.skip.Exception, CheckpointLoadReached)) as caught:
         accuracy_test.test_gsm8k_megamoe_deepgemm(tp_size=tp_size,
                                                   attention_dp=True)
+    assert isinstance(caught.value, pytest.skip.Exception) is should_skip
 
 
 @pytest.mark.timeout(14400)
