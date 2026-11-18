@@ -39,15 +39,14 @@ from utils.llm_data import get_checkpoint
 import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as pipe_mod
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import resolve_action_content_size
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-    COSMOS3_ACTION_PARAMS,
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
     COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
     COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
     COSMOS3_DEFAULT_SYSTEM_PROMPT,
+    COSMOS3_DEFAULTS,
     COSMOS3_DURATION_TEMPLATE,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
-    COSMOS3_T2I_PARAMS,
     _normalize_condition_video_keep,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
@@ -66,6 +65,9 @@ from tensorrt_llm.media.decoding import video_stream_info
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
+
+QWEN3_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["image"]
+ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["action"]
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -98,7 +100,7 @@ FRAME_RATE = 24.0
 # ``output_type="image"`` still exercises flow_shift and guidance_interval.
 T2I_HEIGHT = 512
 T2I_WIDTH = 512
-T2I_GUIDANCE_SCALE = COSMOS3_T2I_PARAMS["guidance_scale"]
+T2I_GUIDANCE_SCALE = QWEN3_IMAGE_DEFAULTS["guidance_scale"]
 
 COSMOS3_FP8_QUANT_CONFIG = {
     "quant_algo": "FP8",
@@ -1355,7 +1357,7 @@ class TestCosmos3Audio:
 class TestCosmos3Action:
     ACTION_HEIGHT = 480
     ACTION_WIDTH = 832
-    ACTION_CHUNK = COSMOS3_ACTION_PARAMS["action_chunk_size"]
+    ACTION_CHUNK = ACTION_GENERATION_DEFAULTS["action_chunk_size"]
     # Derived, not configured: both references fix the clip at chunk + 1.
     ACTION_FRAMES = ACTION_CHUNK + 1
     RAW_ACTION_DIM = 10
@@ -1369,7 +1371,7 @@ class TestCosmos3Action:
             height=self.ACTION_HEIGHT,
             width=self.ACTION_WIDTH,
             num_frames=self.ACTION_FRAMES,
-            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
             action_mode="policy",
             domain_name="bridge_orig_lerobot",
             raw_action_dim=self.RAW_ACTION_DIM,
@@ -1397,7 +1399,7 @@ class TestCosmos3Action:
             height=self.ACTION_HEIGHT,
             width=self.ACTION_WIDTH,
             num_frames=self.ACTION_FRAMES,
-            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
             action_mode="forward_dynamics",
             domain_name="bridge_orig_lerobot",
             action=action_traj,
@@ -1424,7 +1426,7 @@ class TestCosmos3Action:
             height=self.ACTION_HEIGHT,
             width=self.ACTION_WIDTH,
             num_frames=NUM_FRAMES,
-            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
             action_mode="inverse_dynamics",
             domain_name="bridge_orig_lerobot",
             raw_action_dim=self.RAW_ACTION_DIM,
@@ -1462,7 +1464,7 @@ class TestCosmos3Action:
                 height=self.ACTION_HEIGHT,
                 width=self.ACTION_WIDTH,
                 num_frames=NUM_FRAMES,
-                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
                 action_mode="inverse_dynamics",
                 domain_name="bridge_orig_lerobot",
                 raw_action_dim=self.RAW_ACTION_DIM,
@@ -1481,7 +1483,7 @@ class TestCosmos3Action:
                 height=self.ACTION_HEIGHT,
                 width=self.ACTION_WIDTH,
                 num_frames=NUM_FRAMES,
-                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
                 frame_rate=5.0,
                 action_mode="inverse_dynamics",
                 domain_name="bridge_orig_lerobot",
@@ -1499,7 +1501,7 @@ class TestCosmos3Action:
                 height=self.ACTION_HEIGHT,
                 width=self.ACTION_WIDTH,
                 num_frames=self.ACTION_FRAMES,
-                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
                 action_mode="policy",
                 domain_id=10_000,
                 raw_action_dim=self.RAW_ACTION_DIM,
@@ -1528,7 +1530,7 @@ class TestCosmos3Action:
                 height=self.ACTION_HEIGHT,
                 width=self.ACTION_WIDTH,
                 num_frames=self.ACTION_FRAMES,
-                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
                 action_mode="policy",
                 domain_name="bridge_orig_lerobot",
                 raw_action_dim=self.RAW_ACTION_DIM,

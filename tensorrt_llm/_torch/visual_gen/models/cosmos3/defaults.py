@@ -182,16 +182,183 @@ def resolve_raw_action_dim(
     return widths.pop() if len(widths) == 1 else None
 
 
-# The default video resolution is the 720p 16:9 bucket, ``(width, height)``.
+# Every default a Cosmos3 request can fall back on, in one place. A value here is
+# used only when neither the request nor the checkpoint provides one.
 _DEFAULT_VIDEO_W, _DEFAULT_VIDEO_H = VIDEO_RES_SIZE_INFO["720"]["16,9"]
-COSMOS3_720P_PARAMS = {
-    "height": _DEFAULT_VIDEO_H,
-    "width": _DEFAULT_VIDEO_W,
-    "num_inference_steps": 35,
-    "guidance_scale": 6.0,
-    "max_sequence_length": 4096,
-    "num_frames": 189,
+
+# The action sampling recipe; the canvas, clip length and frame rate come from the
+# embodiment's row under "action". Same recipe for both model families.
+_ACTION_GENERATION = {
+    "action_chunk_size": 16,
+    "num_inference_steps": 30,
+    "guidance_scale": 1.0,
     "frame_rate": 24.0,
+}
+
+COSMOS3_DEFAULTS: dict[str, Any] = {
+    # What a request runs with, by model family (the architecture recipe name from
+    # the transformer config) and then by mode. Mode is the request's output type,
+    # never inferred from the checkpoint name: a task-specialized checkpoint can
+    # still be asked to run any mode. A field a mode omits falls back to the
+    # family's "video" row.
+    "generation": {
+        # Nano and Super.
+        "qwen3": {
+            "video": {
+                "height": _DEFAULT_VIDEO_H,
+                "width": _DEFAULT_VIDEO_W,
+                "num_inference_steps": 35,
+                "guidance_scale": 6.0,
+                "max_sequence_length": 4096,
+                "num_frames": 189,
+                "frame_rate": 24.0,
+            },
+            "image": {
+                "height": 1024,
+                "width": 1024,
+                "num_inference_steps": 50,
+                "guidance_scale": 7.0,
+                "guidance_interval": (400.0, 1000.0),
+            },
+            "action": _ACTION_GENERATION,
+        },
+        # Edge (Nemotron-dense backbone) is 480p-native. Video values follow the
+        # model-card I2V command (T2V mirrors it; the model card documents I2V
+        # only). Image values are the cosmos-framework t2i mode defaults at Edge's
+        # native resolution (480p at 1:1 aspect), with full-range CFG.
+        "nemotron_dense": {
+            "video": {
+                "height": 480,
+                "width": 832,
+                "num_inference_steps": 50,
+                "guidance_scale": 5.0,
+                "max_sequence_length": 4096,
+                "num_frames": 121,
+                "frame_rate": 24.0,
+            },
+            "image": {
+                "height": 640,
+                "width": 640,
+                "num_inference_steps": 50,
+                "guidance_scale": 4.0,
+                "guidance_interval": None,
+            },
+            "action": _ACTION_GENERATION,
+        },
+    },
+    # Action requests, by embodiment: training-aligned sampling settings, mirroring
+    # the Cosmos3 omni ``action_*.json`` inputs where those exist. The embodiment's
+    # action width is not a default; it lives in ``EMBODIMENT_TO_RAW_ACTION_DIM``.
+    "action": {
+        # WidowX bridge.
+        "bridge_orig_lerobot": {
+            "action_chunk_size": 16,
+            "action_resolution": 480,
+            "frame_rate": 5.0,
+        },
+        # Autonomous-vehicle steering/throttle; longer action horizon.
+        "av": {
+            "action_chunk_size": 60,
+            "action_resolution": 480,
+            "frame_rate": 10.0,
+        },
+        # 6-DoF camera pose + shutter; matches AV-style horizon.
+        "camera_pose": {
+            "action_chunk_size": 60,
+            "action_resolution": 480,
+            "frame_rate": 30.0,
+        },
+        # Franka single-arm tabletop; same domain_id as robomind-franka.
+        "droid_lerobot": {
+            "action_chunk_size": 16,
+            "action_resolution": 480,
+            "frame_rate": 15.0,
+        },
+        # LIBERO sim single-arm; lower action resolution bucket.
+        "libero": {
+            "action_chunk_size": 16,
+            "action_resolution": 256,
+            "frame_rate": 10.0,
+        },
+        # MANO hand pose.
+        "hand_pose": {
+            "action_chunk_size": 16,
+            "action_resolution": 480,
+            "frame_rate": 24.0,
+        },
+        # AgiBot humanoid; shared domain_id with agibot_gear_gripper*.
+        "agibotworld": {
+            "action_chunk_size": 16,
+            "action_resolution": 480,
+            "frame_rate": 10.0,
+        },
+        # Google Robot (RT-1 / fractal) single-arm.
+        "fractal": {
+            "action_chunk_size": 16,
+            "action_resolution": 480,
+            "frame_rate": 5.0,
+        },
+        # 2-D planar push task.
+        "pusht": {
+            "action_chunk_size": 16,
+            "action_resolution": 256,
+            "frame_rate": 10.0,
+        },
+        # UMI handheld gripper setup.
+        "umi": {
+            "action_chunk_size": 16,
+            "action_resolution": 480,
+            "frame_rate": 10.0,
+        },
+    },
+    # Policy checkpoints, by embodiment: the recipe facts ``checkpoint.json`` does
+    # not carry (its ``policy`` block owns the horizon, rate and domain).
+    "policy": {
+        # DROID Policy is joint_pos: seven joints plus one gripper channel. The
+        # current 8-D state is a clean leading action row and is not returned as a
+        # predicted command.
+        "droid_lerobot": {
+            "num_inference_steps": 4,
+            "guidance_scale": 3.0,
+            # Apply CFG only to the first, highest-noise UniPC step.
+            "guidance_interval": (960.0, 1001.0),
+            "raw_action_dim": 8,
+            "action_resolution": 480,
+            "use_state": True,
+        },
+    },
+    # Transfer requests. "common" holds the settings every transfer request shares;
+    # the other rows are the guidance tuning per kind of request: the control's own
+    # row for a single control, "mixed" for two or more (``transfer_defaults``).
+    "transfer": {
+        "common": {
+            "num_video_frames_per_chunk": 93,  # frames per autoregressive chunk (4k+1 form)
+            "num_conditional_frames": 1,  # overlap frames reused from the previous chunk
+            "max_frames": 5000,  # hard cap on total input frames
+            "show_control_condition": False,  # debug: also emit the control frames
+            "show_input": False,  # debug: also emit the input frames
+            "num_first_chunk_conditional_frames": 0,  # chunk 0 has no prior chunk to condition on
+            "share_vision_temporal_positions": True,  # control tokens reuse the video patches' positions
+            "emphasize_control_in_prompt": True,  # name the active hints in the user prompt
+        },
+        "edge": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
+        "blur": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
+        "depth": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
+        # Leans harder on control.
+        "seg": {"guidance_scale": 3.0, "control_guidance": 2.0, "flow_shift": 10.0},
+        # Precomputed control; control-only guidance (text off), 10 fps / 101-frame chunks.
+        "wsm": {
+            "guidance_scale": 1.0,
+            "control_guidance": 3.0,
+            "flow_shift": 10.0,
+            "num_frames": 101,
+            "fps": 10,
+            "num_video_frames_per_chunk": 101,
+        },
+        # Two or more controls: the reference runs its general (edge-family) values
+        # rather than combining the controls' rows.
+        "mixed": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
+    },
 }
 
 COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES = (0, 1)
@@ -352,38 +519,6 @@ def _validate_non_negative_frames(value: Any) -> None:
         raise ValueError(f"must be a non-negative frame count, got {value}.")
 
 
-# Text-to-image (``output_type="image"``) defaults.
-COSMOS3_T2I_PARAMS = {
-    "height": 1024,
-    "width": 1024,
-    "num_inference_steps": 50,
-    "guidance_scale": 7.0,
-    "guidance_interval": (400.0, 1000.0),
-}
-
-# Edge (Nemotron-dense backbone) is 480p-native. Video values follow the
-# model-card I2V command (T2V mirrors it — the model card documents I2V only).
-# T2I values are the cosmos-framework t2i mode defaults at Edge's native
-# resolution (480p at 1:1 aspect), with full-range CFG. No table carries a
-# ``flow_shift``: a request that omits it runs at the checkpoint scheduler's.
-COSMOS3_EDGE_VIDEO_PARAMS = {
-    "height": 480,
-    "width": 832,
-    "num_inference_steps": 50,
-    "guidance_scale": 5.0,
-    "max_sequence_length": 4096,
-    "num_frames": 121,
-    "frame_rate": 24.0,
-}
-
-COSMOS3_EDGE_T2I_PARAMS = {
-    "height": 640,
-    "width": 640,
-    "num_inference_steps": 50,
-    "guidance_scale": 4.0,
-    "guidance_interval": None,
-}
-
 # Model-card validated envelope for Edge; advisory only (the reference
 # runtime accepts a wider range), surfaced as a log line per request.
 COSMOS3_EDGE_ENVELOPE = {
@@ -406,43 +541,9 @@ COSMOS3_EDGE_ENVELOPE = {
     ),
 }
 
-# (family, mode) → generation defaults. Family is the architecture recipe
-# name resolved from the transformer config; mode is the request's output
-# type — never inferred from the checkpoint name (a task-specialized
-# checkpoint can still be asked to run any mode).
-COSMOS3_GENERATION_DEFAULTS: Dict = {
-    ("qwen3", "video"): COSMOS3_720P_PARAMS,
-    ("qwen3", "image"): COSMOS3_T2I_PARAMS,
-    ("nemotron_dense", "video"): COSMOS3_EDGE_VIDEO_PARAMS,
-    ("nemotron_dense", "image"): COSMOS3_EDGE_T2I_PARAMS,
-}
-
-# Action's table carries the sampling recipe only; the canvas, clip length and
-# frame rate come from the embodiment preset, and anything missing here falls
-# back to the family's video table in the parameter resolver. Same recipe for
-# both families.
-
-
 # Families without an entry get no envelope advisory.
 COSMOS3_ENVELOPES: Dict = {
     "nemotron_dense": COSMOS3_EDGE_ENVELOPE,
-}
-
-COSMOS3_ACTION_PARAMS = {
-    "action_chunk_size": 16,
-    "num_inference_steps": 30,
-    "guidance_scale": 1.0,
-    "frame_rate": 24.0,
-}
-
-# Released policy checkpoints carry a ``policy`` block in checkpoint.json.
-# The block owns checkpoint-specific horizon/rate/domain values; the remaining
-# recipe facts are keyed by that domain below.
-COSMOS3_POLICY_SAMPLING_PARAMS = {
-    "num_inference_steps": 4,
-    "guidance_scale": 3.0,
-    # Apply CFG only to the first, highest-noise UniPC step.
-    "guidance_interval": (960.0, 1001.0),
 }
 
 
@@ -455,22 +556,6 @@ class Cosmos3PolicyDomainPreset(TypedDict, total=False):
     raw_action_dim: int
     action_resolution: int
     use_state: bool
-
-
-COSMOS3_POLICY_DOMAIN_PRESETS: dict[str, Cosmos3PolicyDomainPreset] = {
-    # DROID Policy is joint_pos: seven joints plus one gripper channel. The
-    # current 8-D state is a clean leading action row and is not returned as a
-    # predicted command.
-    "droid_lerobot": {
-        **COSMOS3_POLICY_SAMPLING_PARAMS,
-        "raw_action_dim": 8,
-        "action_resolution": 480,
-        "use_state": True,
-    },
-}
-
-COSMOS3_GENERATION_DEFAULTS[("qwen3", "action")] = COSMOS3_ACTION_PARAMS
-COSMOS3_GENERATION_DEFAULTS[("nemotron_dense", "action")] = COSMOS3_ACTION_PARAMS
 
 
 def resolve_checkpoint_policy_defaults(policy: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -487,7 +572,7 @@ def resolve_checkpoint_policy_defaults(policy: Mapping[str, Any] | None) -> dict
         if not domain_name:
             raise ValueError("Cosmos3 checkpoint policy domain_name must not be empty.")
         defaults["domain_name"] = domain_name
-        defaults.update(COSMOS3_POLICY_DOMAIN_PRESETS.get(domain_name, {}))
+        defaults.update(COSMOS3_DEFAULTS["policy"].get(domain_name, {}))
 
     if policy.get("action_chunk_size") is not None:
         action_chunk_size = int(policy["action_chunk_size"])
@@ -539,71 +624,6 @@ class Cosmos3DomainPreset(TypedDict, total=False):
     frame_rate: float
 
 
-# Training-aligned defaults, mirroring the Cosmos3 omni ``action_*.json`` inputs
-# (bridge, av, droid, libero, ...) where those exist.
-COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
-    # WidowX bridge.
-    "bridge_orig_lerobot": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 5.0,
-    },
-    # Autonomous-vehicle steering/throttle; longer action horizon.
-    "av": {
-        "action_chunk_size": 60,
-        "action_resolution": 480,
-        "frame_rate": 10.0,
-    },
-    # 6-DoF camera pose + shutter; matches AV-style horizon.
-    "camera_pose": {
-        "action_chunk_size": 60,
-        "action_resolution": 480,
-        "frame_rate": 30.0,
-    },
-    # Franka single-arm tabletop; same domain_id as robomind-franka.
-    "droid_lerobot": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 15.0,
-    },
-    # LIBERO sim single-arm; lower action resolution bucket.
-    "libero": {
-        "action_chunk_size": 16,
-        "action_resolution": 256,
-        "frame_rate": 10.0,
-    },
-    # MANO hand pose.
-    "hand_pose": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 24.0,
-    },
-    # AgiBot humanoid; shared domain_id with agibot_gear_gripper*.
-    "agibotworld": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 10.0,
-    },
-    # Google Robot (RT-1 / fractal) single-arm.
-    "fractal": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 5.0,
-    },
-    # 2-D planar push task.
-    "pusht": {
-        "action_chunk_size": 16,
-        "action_resolution": 256,
-        "frame_rate": 10.0,
-    },
-    # UMI handheld gripper setup.
-    "umi": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 10.0,
-    },
-}
-
 # Map alias domain_name keys to a canonical preset entry. These share *sampling*
 # settings only; each alias keeps its own action width (e.g. robomind-franka-dual
 # is 20-D and galbot is 30-D, unlike the presets they borrow here).
@@ -624,7 +644,7 @@ def canonical_domain_preset_key(
     if domain_name is not None and str(domain_name).strip():
         key = str(domain_name).strip().lower()
         key = COSMOS3_DOMAIN_PRESET_ALIASES.get(key, key)
-        if key in COSMOS3_DOMAIN_PRESETS:
+        if key in COSMOS3_DEFAULTS["action"]:
             return key
         return None
 
@@ -640,7 +660,7 @@ def canonical_domain_preset_key(
         if mapped_id != resolved_id:
             continue
         canon = COSMOS3_DOMAIN_PRESET_ALIASES.get(name, name)
-        if canon in COSMOS3_DOMAIN_PRESETS and canon not in candidates:
+        if canon in COSMOS3_DEFAULTS["action"] and canon not in candidates:
             candidates.append(canon)
 
     if len(candidates) == 1:
@@ -655,7 +675,7 @@ def get_domain_preset(
     key = canonical_domain_preset_key(domain_name, domain_id)
     if key is None:
         return None
-    return COSMOS3_DOMAIN_PRESETS[key]
+    return COSMOS3_DEFAULTS["action"][key]
 
 
 # Prompt format the checkpoints were trained with. The "give" typo is the training
@@ -744,7 +764,7 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         description=(
             "Embodiment domain name for action generation (e.g. bridge_orig_lerobot, av). "
             "When set, omitted raw_action_dim/action_chunk_size/action_resolution/frame_rate "
-            "are filled from COSMOS3_DOMAIN_PRESETS; mismatches are logged as warnings."
+            "are filled from the embodiment's defaults; mismatches are logged as warnings."
         ),
     ),
     "domain_id": ExtraParamSchema(

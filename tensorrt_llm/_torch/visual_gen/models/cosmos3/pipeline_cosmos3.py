@@ -72,10 +72,10 @@ from .defaults import (
     COSMOS3_ASPECT_RATIO_BUCKETS,
     COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
     COSMOS3_DEFAULT_SYSTEM_PROMPT,
+    COSMOS3_DEFAULTS,
     COSMOS3_DURATION_TEMPLATE,
     COSMOS3_ENVELOPES,
     COSMOS3_EXTRA_SPECS,
-    COSMOS3_GENERATION_DEFAULTS,
     COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     COSMOS3_T2I_SYSTEM_PROMPT,
     _normalize_condition_video_keep,
@@ -88,7 +88,6 @@ from .parameter_resolver import ParameterResolver, RequestParameters, select
 from .sampling import DISTILLED_GUIDANCE_SCALE, Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
-    TRANSFER_DEFAULTS,
     Cosmos3TransferConfig,
     decode_media_to_uint8_cthw,
     load_or_compute_control_frames,
@@ -692,7 +691,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         these fields supported during request validation.
         """
         params = self.resolver.request(RequestParameters(mode="video"))
-        return {k: getattr(params, k) for k in COSMOS3_GENERATION_DEFAULTS[(self.family, "video")]}
+        return {k: getattr(params, k) for k in COSMOS3_DEFAULTS["generation"][self.family]["video"]}
 
     def classify_request_failure(self, exc: BaseException) -> Optional[str]:
         """Cosmos3 rejects unusable request content with ``ValueError`` and
@@ -799,7 +798,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         checkpoint_shift = getattr(self.sampling, "checkpoint_flow_shift", None)
         if checkpoint_shift is not None:
             shifts.add(float(checkpoint_shift))
-        for hint_defaults in TRANSFER_DEFAULTS.values():
+        for hint_defaults in COSMOS3_DEFAULTS["transfer"].values():
             hint_shift = hint_defaults.get("flow_shift")
             if hint_shift is not None:
                 shifts.add(float(hint_shift))

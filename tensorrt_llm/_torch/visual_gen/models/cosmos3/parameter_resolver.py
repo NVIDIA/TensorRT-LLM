@@ -45,8 +45,7 @@ from tensorrt_llm.logger import logger
 
 from .action import ACTION_MODE_POLICY
 from .defaults import (
-    COSMOS3_DOMAIN_PRESETS,
-    COSMOS3_GENERATION_DEFAULTS,
+    COSMOS3_DEFAULTS,
     EMBODIMENT_TO_DOMAIN_ID,
     canonical_domain_preset_key,
     normalize_action_resolution,
@@ -558,8 +557,9 @@ class ParameterResolver:
         policy: Mapping[str, Any] = self.policy_defaults if policy_active else {}
 
         mode = "action" if in_action else p.mode
-        table = COSMOS3_GENERATION_DEFAULTS.get((self.family, mode), {})
-        video_table = COSMOS3_GENERATION_DEFAULTS.get((self.family, "video"), {})
+        generation = COSMOS3_DEFAULTS["generation"].get(self.family, {})
+        table = generation.get(mode, {})
+        video_table = generation.get("video", {})
 
         def tables(key: str) -> Any:
             # An explicit ``None`` in the mode's table switches the field off for that
@@ -567,7 +567,9 @@ class ParameterResolver:
             return table[key] if key in table else video_table.get(key)
 
         preset_key = canonical_domain_preset_key(p.domain_name, p.domain_id) if in_action else None
-        preset: Mapping[str, Any] = COSMOS3_DOMAIN_PRESETS.get(preset_key, {}) if preset_key else {}
+        preset: Mapping[str, Any] = (
+            COSMOS3_DEFAULTS["action"].get(preset_key, {}) if preset_key else {}
+        )
         label = (
             repr(preset_key)
             if preset_key

@@ -22,6 +22,8 @@ from tensorrt_llm._torch.visual_gen.triton_kernels import (
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.media.decoding import decode_video_reference_window
 
+from .defaults import COSMOS3_DEFAULTS
+
 # ---------------------------------------------------------------------------
 # Transfer sampling + per-control-hint defaults, ported from vllm-omni's
 # Cosmos3 transfer implementation; the guidance and edge/blur presets are
@@ -33,17 +35,6 @@ from tensorrt_llm.media.decoding import decode_video_reference_window
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
 
 # Chunked-sampling defaults for long-video transfer.
-TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
-    "num_video_frames_per_chunk": 93,  # frames per autoregressive chunk (4k+1 form)
-    "num_conditional_frames": 1,  # overlap frames reused from the previous chunk
-    "max_frames": 5000,  # hard cap on total input frames
-    "show_control_condition": False,  # debug: also emit the control frames
-    "show_input": False,  # debug: also emit the input frames
-    "num_first_chunk_conditional_frames": 0,  # chunk 0 has no prior chunk to condition on
-    "share_vision_temporal_positions": True,  # control tokens reuse the video patches' positions
-    "emphasize_control_in_prompt": True,  # name the active hints in the user prompt
-}
-
 # Appended to the user prompt when ``emphasize_control_in_prompt`` is on, naming
 # the active hint modalities so the model is told which control it is following.
 # The system prompt is left alone, which keeps the text in the training
@@ -54,37 +45,11 @@ CONTROL_DIRECTIVE_TEMPLATE = (
     " signal at every frame."
 )
 
-# Default guidance tuning per kind of transfer request: text guidance_scale,
-# control_guidance, and flow_shift. A request with one control uses that control's
-# row; a request with two or more uses "mixed" (see ``transfer_defaults``).
-TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
-    "edge": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
-    "blur": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
-    "depth": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
-    "seg": {
-        "guidance_scale": 3.0,
-        "control_guidance": 2.0,
-        "flow_shift": 10.0,
-    },  # leans harder on control
-    # Precomputed control; control-only guidance (text off), 10 fps / 101-frame chunks.
-    "wsm": {
-        "guidance_scale": 1.0,
-        "control_guidance": 3.0,
-        "flow_shift": 10.0,
-        "num_frames": 101,
-        "fps": 10,
-        "num_video_frames_per_chunk": 101,
-    },
-    # Two or more controls: the reference runs its general (edge-family) values
-    # rather than combining the controls' rows.
-    "mixed": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
-}
-
 
 def transfer_defaults(hints: Mapping[str, Any]) -> dict[str, Any]:
     """The default row of a transfer request: the control's own row for a single
     control, the ``"mixed"`` row for two or more."""
-    return TRANSFER_DEFAULTS[next(iter(hints)) if len(hints) == 1 else "mixed"]
+    return COSMOS3_DEFAULTS["transfer"][next(iter(hints)) if len(hints) == 1 else "mixed"]
 
 
 # Canny (lower, upper) hysteresis thresholds per edge-strength preset;
@@ -282,38 +247,38 @@ def resolve_transfer_config(
         num_video_frames_per_chunk=_extra_or_default(
             extra_params,
             "num_video_frames_per_chunk",
-            TRANSFER_SAMPLE_DEFAULTS["num_video_frames_per_chunk"],
+            COSMOS3_DEFAULTS["transfer"]["common"]["num_video_frames_per_chunk"],
         ),
         num_conditional_frames=_extra_or_default(
             extra_params,
             "num_conditional_frames",
-            TRANSFER_SAMPLE_DEFAULTS["num_conditional_frames"],
+            COSMOS3_DEFAULTS["transfer"]["common"]["num_conditional_frames"],
         ),
         max_frames=_extra_or_default(
-            extra_params, "max_frames", TRANSFER_SAMPLE_DEFAULTS["max_frames"]
+            extra_params, "max_frames", COSMOS3_DEFAULTS["transfer"]["common"]["max_frames"]
         ),
         show_control_condition=_extra_or_default(
             extra_params,
             "show_control_condition",
-            TRANSFER_SAMPLE_DEFAULTS["show_control_condition"],
+            COSMOS3_DEFAULTS["transfer"]["common"]["show_control_condition"],
         ),
         show_input=_extra_or_default(
-            extra_params, "show_input", TRANSFER_SAMPLE_DEFAULTS["show_input"]
+            extra_params, "show_input", COSMOS3_DEFAULTS["transfer"]["common"]["show_input"]
         ),
         num_first_chunk_conditional_frames=_extra_or_default(
             extra_params,
             "num_first_chunk_conditional_frames",
-            TRANSFER_SAMPLE_DEFAULTS["num_first_chunk_conditional_frames"],
+            COSMOS3_DEFAULTS["transfer"]["common"]["num_first_chunk_conditional_frames"],
         ),
         share_vision_temporal_positions=_extra_or_default(
             extra_params,
             "share_vision_temporal_positions",
-            TRANSFER_SAMPLE_DEFAULTS["share_vision_temporal_positions"],
+            COSMOS3_DEFAULTS["transfer"]["common"]["share_vision_temporal_positions"],
         ),
         emphasize_control_in_prompt=_extra_or_default(
             extra_params,
             "emphasize_control_in_prompt",
-            TRANSFER_SAMPLE_DEFAULTS["emphasize_control_in_prompt"],
+            COSMOS3_DEFAULTS["transfer"]["common"]["emphasize_control_in_prompt"],
         ),
         # `num_frames` and `frame_rate` are request fields, not extra params, so
         # they are read from `req_params` alone: `extra_params` spellings of them

@@ -28,9 +28,8 @@ from cosmos3_fixtures import bare_resolver
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3 as pipeline_module
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import transfer as transfer_module
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-    COSMOS3_720P_PARAMS,
+    COSMOS3_DEFAULTS,
     COSMOS3_EXTRA_SPECS,
-    COSMOS3_GENERATION_DEFAULTS,
     VIDEO_RES_SIZE_INFO,
     find_closest_target_size,
 )
@@ -57,9 +56,11 @@ from tensorrt_llm.visual_gen.params import MediaRef, VisualGenParams
 
 pytestmark = pytest.mark.cosmos3
 
+QWEN3_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["video"]
+
 # What a plain Cosmos3 video request advertises, and so what the executor
 # merges into every request before infer() sees it.
-_ADVERTISED_VIDEO_DEFAULTS = COSMOS3_GENERATION_DEFAULTS[("qwen3", "video")]
+_ADVERTISED_VIDEO_DEFAULTS = QWEN3_VIDEO_DEFAULTS
 
 
 def _ids(value: int) -> torch.Tensor:
@@ -298,7 +299,7 @@ class TestTransferConfig:
     def test_two_or_more_controls_use_the_mixed_row(self, hints):
         """A mixed request does not combine the controls' rows and does not fall
         back to the generic video values: it has its own row."""
-        mixed = transfer_module.TRANSFER_DEFAULTS["mixed"]
+        mixed = COSMOS3_DEFAULTS["transfer"]["mixed"]
         extra = {key: {"control": b"clip"} for key in hints}
         cfg = resolve_transfer_config(extra, _req())
         assert cfg.guidance_scale == mixed["guidance_scale"]
@@ -456,9 +457,9 @@ class TestSourceDerivedDefaults:
             _params
             if _params is not None
             else _merged_req(
-                num_frames=COSMOS3_720P_PARAMS["num_frames"],
-                frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
-                max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
+                num_frames=QWEN3_VIDEO_DEFAULTS["num_frames"],
+                frame_rate=QWEN3_VIDEO_DEFAULTS["frame_rate"],
+                max_sequence_length=QWEN3_VIDEO_DEFAULTS["max_sequence_length"],
                 seed=0,
             )
         )
@@ -513,17 +514,17 @@ class TestSourceDerivedDefaults:
         monkeypatch.setattr(pipeline_module, "video_stream_info", _stub_info(320, 192))
         req = self._infer_req(video=b"stand-in")
         req.params.width = 1280
-        assert self._size(req) == (1280, COSMOS3_720P_PARAMS["height"])
+        assert self._size(req) == (1280, QWEN3_VIDEO_DEFAULTS["height"])
 
     def test_no_reference_keeps_the_mode_defaults(self):
         req = self._infer_req()
-        assert self._size(req) == (COSMOS3_720P_PARAMS["width"], COSMOS3_720P_PARAMS["height"])
+        assert self._size(req) == (QWEN3_VIDEO_DEFAULTS["width"], QWEN3_VIDEO_DEFAULTS["height"])
 
     def test_unreadable_reference_falls_back_to_defaults(self):
         # A convenience probe must not fail the request; the real decode still
         # reports the problem properly.
         req = self._infer_req(video=b"not a video container")
-        assert self._size(req) == (COSMOS3_720P_PARAMS["width"], COSMOS3_720P_PARAMS["height"])
+        assert self._size(req) == (QWEN3_VIDEO_DEFAULTS["width"], QWEN3_VIDEO_DEFAULTS["height"])
 
     def test_transfer_fits_to_a_control_when_there_is_no_video(self, monkeypatch):
         # Transfer can run on precomputed controls alone.
@@ -551,11 +552,11 @@ class TestSourceDerivedDefaults:
     def test_default_stands_without_a_usable_source_rate(self, monkeypatch):
         monkeypatch.setattr(pipeline_module, "video_stream_info", _stub_info(192, 320, None))
         req = self._infer_req(video=b"stand-in")
-        assert self._captured(req)["frame_rate"] == COSMOS3_720P_PARAMS["frame_rate"]
+        assert self._captured(req)["frame_rate"] == QWEN3_VIDEO_DEFAULTS["frame_rate"]
 
     def test_default_stands_without_a_reference(self):
         assert (
-            self._captured(self._infer_req())["frame_rate"] == (COSMOS3_720P_PARAMS["frame_rate"])
+            self._captured(self._infer_req())["frame_rate"] == (QWEN3_VIDEO_DEFAULTS["frame_rate"])
         )
 
 
@@ -1095,7 +1096,7 @@ class TestTransferFrameRateResolution:
         pipeline._tokenize_prompt = lambda *a, **k: next(tokenized)
         pipeline._decode_latents_raw = lambda latents: torch.zeros(1, 3, 5, 16, 16)
 
-        params = _merged_req(frame_rate=COSMOS3_720P_PARAMS["frame_rate"], num_frames=5)
+        params = _merged_req(frame_rate=QWEN3_VIDEO_DEFAULTS["frame_rate"], num_frames=5)
         for key, value in caller.items():
             setattr(params, key, value)  # assignment marks it as caller intent
         cfg = resolve_transfer_config({**hints, "num_video_frames_per_chunk": 5}, params)
@@ -1144,9 +1145,9 @@ class TestTransferFrameRateResolution:
             monkeypatch,
             hints={"edge": {"control": b"clip"}},
             caller={"num_frames": 5},
-            infer_fps=COSMOS3_720P_PARAMS["frame_rate"],
+            infer_fps=QWEN3_VIDEO_DEFAULTS["frame_rate"],
         )
-        assert fps == COSMOS3_720P_PARAMS["frame_rate"]
+        assert fps == QWEN3_VIDEO_DEFAULTS["frame_rate"]
 
     def test_wsm_preset_outranks_the_source(self, monkeypatch):
         fps = self._emitted_fps(
@@ -1219,9 +1220,9 @@ class TestTransferSamplingAndSafety:
         pipeline.scheduler = StubScheduler()
         baseline = pipeline.scheduler
         self._run(pipeline, monkeypatch)
-        assert sampling.flow_shift_calls == [
-            transfer_module.TRANSFER_DEFAULTS["edge"]["flow_shift"]
-        ], "transfer did not program the hint's flow shift"
+        assert sampling.flow_shift_calls == [COSMOS3_DEFAULTS["transfer"]["edge"]["flow_shift"]], (
+            "transfer did not program the hint's flow shift"
+        )
         # Installed, not merely built: a bare call that drops the returned
         # scheduler leaves the previous request's schedule in place.
         assert pipeline.scheduler is not baseline, (
@@ -1246,7 +1247,7 @@ class TestTransferSamplingAndSafety:
             self._run(pipeline, monkeypatch, cfg_extra=cfg_extra)
             return sampling.flow_shift_calls
 
-        assert shift() == [transfer_module.TRANSFER_DEFAULTS[row]["flow_shift"]]
+        assert shift() == [COSMOS3_DEFAULTS["transfer"][row]["flow_shift"]]
         assert shift(checkpoint=1.0) == [1.0]
         assert shift(checkpoint=1.0, request=4.0) == [4.0]
 

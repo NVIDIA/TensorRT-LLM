@@ -28,10 +28,9 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_ASPECT_RATIO_BUCKETS,
+    COSMOS3_DEFAULTS,
     COSMOS3_DOMAIN_PRESET_ALIASES,
-    COSMOS3_DOMAIN_PRESETS,
     COSMOS3_EXTRA_SPECS,
-    COSMOS3_POLICY_SAMPLING_PARAMS,
     EMBODIMENT_TO_DOMAIN_ID,
     EMBODIMENT_TO_RAW_ACTION_DIM,
     VIDEO_RES_SIZE_INFO,
@@ -48,6 +47,9 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
 )
 
 pytestmark = pytest.mark.cosmos3
+
+ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["action"]
+DROID_POLICY_DEFAULTS = COSMOS3_DEFAULTS["policy"]["droid_lerobot"]
 
 
 def resolve_domain_action_config(checkpoint_policy=None, **given) -> dict:
@@ -165,7 +167,7 @@ class TestDomainActionPresets:
 
     def test_presets_carry_sampling_settings_only(self):
         """Width is per-embodiment; aliases share presets, so it must not live there."""
-        for preset in COSMOS3_DOMAIN_PRESETS.values():
+        for preset in COSMOS3_DEFAULTS["action"].values():
             assert "raw_action_dim" not in preset
 
     @pytest.mark.parametrize(
@@ -251,7 +253,7 @@ class TestCheckpointPolicyDefaults:
     def test_edge_policy_metadata_resolves_reference_recipe(self):
         policy = resolve_checkpoint_policy_defaults(self.METADATA)
         assert policy == {
-            **COSMOS3_POLICY_SAMPLING_PARAMS,
+            **DROID_POLICY_DEFAULTS,
             "domain_name": "droid_lerobot",
             "raw_action_dim": 8,
             "action_resolution": 480,
@@ -472,7 +474,7 @@ class TestActionMropePositionIds:
     @pytest.mark.parametrize(
         "action_chunk_size,num_frames,fps",
         [
-            (16, 17, 24.0),  # generic COSMOS3_ACTION_PARAMS default
+            (16, 17, 24.0),  # generic ACTION_GENERATION_DEFAULTS default
             (16, 17, 5.0),  # bridge_orig_lerobot preset
             (60, 61, 10.0),  # av preset
         ],
