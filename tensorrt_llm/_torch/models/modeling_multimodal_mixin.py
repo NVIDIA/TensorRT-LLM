@@ -63,14 +63,11 @@ from .modeling_multimodal_utils import (
 )
 from .multimodal_encoder_data_parallel import (
     EncoderParallelLayout,
+    MultimodalEncoderContractError,
     encoder_dp_error_guard,
     execute_encoder_dp_items,
     iter_encoder_rank_inputs,
 )
-
-
-class MultimodalEncoderContractError(ValueError):
-    """A request-local MM encoder input or output contract violation."""
 
 
 def _assemble_multimodal_encoder_embeddings(
@@ -713,20 +710,31 @@ class MultimodalModelMixin:
             return self._forward_multimodal_encoder_items_local(encoder_inputs)
 
         outputs: list[torch.Tensor] = []
+        owner_error: MultimodalEncoderContractError | None = None
         mapping = self.model_config.mapping
         # Visit one owner's bounded batch at a time. Cache state and returned
         # embeddings remain on the rank that owns the original requests.
         for owner, shared_inputs in iter_encoder_rank_inputs(
             encoder_inputs,
             mapping=mapping,
-            any_rank_failed=self._any_encoder_dp_rank_failed,
+            exchange_status=self.exchange_encoder_status,
         ):
-            with encoder_dp_error_guard(self._any_encoder_dp_rank_failed):
-                shared_outputs = self._forward_multimodal_encoder_items_local(shared_inputs)
-            if owner == mapping.tp_rank:
-                outputs = shared_outputs
+            shared_outputs = None
+            try:
+                with encoder_dp_error_guard(self.exchange_encoder_status):
+                    shared_outputs = self._forward_multimodal_encoder_items_local(shared_inputs)
+            except MultimodalEncoderContractError as error:
+                # Every rank gets the error. Only the owner's requests fail,
+                # and the other owners' batches still run.
+                if owner == mapping.tp_rank:
+                    owner_error = error
+            else:
+                if owner == mapping.tp_rank:
+                    outputs = shared_outputs
             # Drop this owner's inputs and outputs before the next owner's are allocated.
             del shared_inputs, shared_outputs
+        if owner_error is not None:
+            raise owner_error
         return outputs
 
     def _forward_multimodal_encoder_items_local(
@@ -807,9 +815,16 @@ class MultimodalModelMixin:
             ]
         return allgather(tensor, mapping, dim=0, sizes=row_counts)
 
-    def _any_encoder_dp_rank_failed(self, local_failed: bool) -> bool:
-        """Exchange CPU status without waiting for queued encoder CUDA work."""
-        return bool(Distributed.get(self.model_config.mapping).tp_allreduce(int(local_failed)))
+    def exchange_encoder_status(self, values: Sequence[int]) -> Sequence[Sequence[int]]:
+        """Gather a small int vector from every TP rank. Row ``r`` is rank ``r``'s.
+
+        Encoder data parallelism shares status and errors with it. It runs on
+        the CPU, so it does not wait for encoder CUDA work and still works
+        after a CUDA error.
+        """
+        return Distributed.get(self.model_config.mapping).tp_allgather_int64(
+            values, prefer_cpu=True
+        )
 
     @staticmethod
     def _encoder_dp_items(
@@ -872,16 +887,16 @@ class MultimodalModelMixin:
 
         items, costs, row_counts = self._encoder_dp_items(params)
 
-        def encode_local(indices: list[int]) -> torch.Tensor:
+        def prepare_local(indices: list[int]) -> Callable[[], torch.Tensor]:
             local_params = self._prepare_encoder_dp_inputs([items[index] for index in indices])
-            return self.encode_multimodal_inputs(local_params, **encoder_kwargs)
+            return lambda: self.encode_multimodal_inputs(local_params, **encoder_kwargs)
 
         return execute_encoder_dp_items(
             costs,
             row_counts,
             layout=layout,
-            encode_local=encode_local,
-            any_rank_failed=self._any_encoder_dp_rank_failed,
+            prepare_local=prepare_local,
+            exchange_status=self.exchange_encoder_status,
             allgather=self._allgather_encoder_dp_output,
             empty_output=torch.empty(
                 (0, self.embedding_dim),

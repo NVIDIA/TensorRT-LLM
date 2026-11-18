@@ -26,7 +26,10 @@ from mpi4py import MPI
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    MultimodalEncoderContractError,
+    MultimodalModelMixin,
+)
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
@@ -143,35 +146,46 @@ def _run_encoder_dp_rank(enable_attention_dp: bool, lengths: list[int] | None = 
 
 
 @torch.inference_mode()
-def _run_encoder_dp_failure_rank(_):
+def _run_encoder_dp_failure_rank(request_error: bool):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     model = _EncoderDpModel(rank, enable_attention_dp=False)
     param = _make_param([10, 20, 30], [4, 1, 3])
+    error_type = MultimodalEncoderContractError if request_error else ValueError
     failure = (
-        patch.object(model, "encode_multimodal_inputs", side_effect=ValueError("encoder failed"))
+        patch.object(model, "encode_multimodal_inputs", side_effect=error_type("encoder failed"))
         if rank == 0
         else nullcontext()
     )
-    with failure, pytest.raises(RuntimeError) as error:
+    with failure, pytest.raises(Exception) as error:
         model._run_multimodal_encoder([param])
-    message = str(error.value)
-    cause = type(error.value.__cause__).__name__
+    raised = type(error.value).__name__, str(error.value), type(error.value.__cause__).__name__
 
     output = model._run_multimodal_encoder([param])
-    return rank, message, cause, output.cpu()
+    return rank, raised, output.cpu()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_encoder_dp_propagates_rank_failure_and_recovers(mpi_pool_executor):
-    results = sorted(mpi_pool_executor.map(_run_encoder_dp_failure_rank, [None, None]))
+@pytest.mark.parametrize("request_error", [False, True], ids=["system_error", "request_error"])
+def test_encoder_dp_propagates_rank_failure_and_recovers(mpi_pool_executor, request_error):
+    results = sorted(mpi_pool_executor.map(_run_encoder_dp_failure_rank, [request_error] * 2))
+    (_, rank0_raised, rank0_output), (_, rank1_raised, rank1_output) = results
 
-    assert "rank failed" in results[0][1]
-    assert results[0][2] == "ValueError"
-    assert "peer rank failed" in results[1][1]
-    torch.testing.assert_close(results[0][3], results[1][3])
-    assert results[0][3].shape == (8, 2)
+    if request_error:
+        # Rank 0 keeps its own error and rank 1 names rank 0. The caller fails the batch's requests.
+        assert rank0_raised == ("MultimodalEncoderContractError", "encoder failed", "NoneType")
+        assert rank1_raised[:2] == (
+            "MultimodalEncoderContractError",
+            "Multimodal encoder input failed on TP rank(s) [0].",
+        )
+    else:
+        # Both ranks raise the same system error.
+        message = "Multimodal encoder failed on TP rank(s) [0]."
+        assert rank0_raised == ("EncoderDpError", message, "ValueError")
+        assert rank1_raised == ("EncoderDpError", message, "NoneType")
+    torch.testing.assert_close(rank0_output, rank1_output)
+    assert rank0_output.shape == (8, 2)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")

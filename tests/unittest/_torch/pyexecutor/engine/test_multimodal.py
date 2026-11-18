@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -19,6 +21,8 @@ from _torch.pyexecutor.multimodal_utils import (
 )
 
 import tensorrt_llm
+import tensorrt_llm._torch.models.multimodal_encoder_data_parallel as dp_module
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
@@ -27,6 +31,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
 )
 from tensorrt_llm._torch.models.multimodal_encoder_data_parallel import (
     EncoderDpError,
+    EncoderDpStatus,
     encoder_dp_error_guard,
 )
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
@@ -390,6 +395,11 @@ def test_encoder_graph_modality_validation_allows_delegated_encoders() -> None:
     )
 
 
+def _own_status(values: Sequence[int]) -> list[Sequence[int]]:
+    """A one-rank status exchange: only this rank's row."""
+    return [values]
+
+
 def _bind_items(
     mm_item_scheduler: MultimodalItemScheduler, request: LlmRequest, *, row_bytes: int = 8
 ) -> None:
@@ -518,8 +528,7 @@ def test_pipeline_parallel_compatibility_is_checked_only_for_item_scheduled_mode
 @pytest.mark.parametrize("collective", [False, True])
 def test_item_encoder_classifies_request_state_contract_errors(collective: bool) -> None:
     class _Model(MultimodalModelMixin):
-        model_config = SimpleNamespace(mapping=None)
-        _any_encoder_dp_rank_failed = staticmethod(bool)
+        exchange_encoder_status = staticmethod(_own_status)
 
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
     mm_item_scheduler.collective = collective
@@ -528,16 +537,14 @@ def test_item_encoder_classifies_request_state_contract_errors(collective: bool)
     _bind_items(mm_item_scheduler, other)
     scheduled_items = {request.request_id: [0], other.request_id: [0]}
 
-    with patch("tensorrt_llm._torch.pyexecutor.engine.multimodal.Distributed.get") as get_dist:
-        get_dist.return_value.tp_allreduce.return_value = 1
-        with pytest.raises(MultimodalEncoderRequestError, match="no longer active") as error:
-            mm_item_scheduler.forward_items([other], scheduled_items)
-        assert error.value.request_ids == {request.request_id}
-        assert error.value.__cause__ is None
+    with pytest.raises(MultimodalEncoderRequestError, match="no longer active") as error:
+        mm_item_scheduler.forward_items([other], scheduled_items)
+    assert error.value.request_ids == {request.request_id}
+    assert error.value.__cause__ is None
 
-        with pytest.raises(MultimodalEncoderRequestError, match="no encoder item state") as error:
-            mm_item_scheduler.forward_items([request, other], scheduled_items)
-        assert error.value.request_ids == {request.request_id}
+    with pytest.raises(MultimodalEncoderRequestError, match="no encoder item state") as error:
+        mm_item_scheduler.forward_items([request, other], scheduled_items)
+    assert error.value.request_ids == {request.request_id}
     assert not is_multimodal_encoder_ready(other)
     assert mm_item_scheduler.encoder_cache.current_bytes == 0
 
@@ -603,8 +610,7 @@ def test_item_encoder_translates_model_contract_errors(
     failure_stage: str, collective: bool
 ) -> None:
     class _Model(MultimodalModelMixin):
-        model_config = SimpleNamespace(mapping=None)
-        _any_encoder_dp_rank_failed = staticmethod(bool)
+        exchange_encoder_status = staticmethod(_own_status)
 
         def prepare_multimodal_encoder_inputs(
             self, _: Sequence[tuple[MultimodalParams, int]]
@@ -617,7 +623,7 @@ def test_item_encoder_translates_model_contract_errors(
         def forward_multimodal_encoder_items(
             self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
         ) -> list[torch.Tensor]:
-            with encoder_dp_error_guard(bool) if collective else nullcontext():
+            with encoder_dp_error_guard(_own_status) if collective else nullcontext():
                 raise MultimodalEncoderContractError("bad encoder output rows")
 
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
@@ -631,10 +637,8 @@ def test_item_encoder_translates_model_contract_errors(
     follower.py_mm_encoder_state.set_item_cache_key(0, shared_key, ready=False)
 
     expected = "bad request metadata" if failure_stage == "prepare" else "bad encoder output rows"
-    with patch("tensorrt_llm._torch.pyexecutor.engine.multimodal.Distributed.get") as get_dist:
-        get_dist.return_value.tp_allreduce.return_value = 1
-        with pytest.raises(MultimodalEncoderRequestError, match=expected) as error:
-            mm_item_scheduler.forward_items([request, follower], {request.request_id: [0]})
+    with pytest.raises(MultimodalEncoderRequestError, match=expected) as error:
+        mm_item_scheduler.forward_items([request, follower], {request.request_id: [0]})
 
     assert error.value.request_ids == {request.request_id}
 
@@ -647,8 +651,7 @@ def test_item_encoder_does_not_translate_system_errors(
     failure = torch.cuda.OutOfMemoryError("encoder OOM")
 
     class _Model(MultimodalModelMixin):
-        model_config = SimpleNamespace(mapping=None)
-        _any_encoder_dp_rank_failed = staticmethod(bool)
+        exchange_encoder_status = staticmethod(_own_status)
 
         def prepare_multimodal_encoder_inputs(
             self, _: Sequence[tuple[MultimodalParams, int]]
@@ -661,8 +664,8 @@ def test_item_encoder_does_not_translate_system_errors(
         def forward_multimodal_encoder_items(
             self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
         ) -> list[torch.Tensor]:
-            with encoder_dp_error_guard(bool) if collective else nullcontext():
-                with encoder_dp_error_guard(bool) if collective else nullcontext():
+            with encoder_dp_error_guard(_own_status) if collective else nullcontext():
+                with encoder_dp_error_guard(_own_status) if collective else nullcontext():
                     raise failure
 
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
@@ -670,35 +673,55 @@ def test_item_encoder_does_not_translate_system_errors(
     request = make_mm_request(1, [4])
     _bind_items(mm_item_scheduler, request)
 
-    with patch("tensorrt_llm._torch.pyexecutor.engine.multimodal.Distributed.get") as get_dist:
-        get_dist.return_value.tp_allreduce.return_value = 1
-        with pytest.raises(torch.cuda.OutOfMemoryError, match="encoder OOM") as error:
-            mm_item_scheduler.forward_items([request], {request.request_id: [0]})
-    assert error.value is failure
-    assert error.value.__cause__ is None
+    # With a shared pass, every rank raises the same EncoderDpError; nested
+    # guards do not wrap it again.
+    expected = EncoderDpError if collective else torch.cuda.OutOfMemoryError
+    with pytest.raises(expected) as error:
+        mm_item_scheduler.forward_items([request], {request.request_id: [0]})
+    assert (error.value.__cause__ if collective else error.value) is failure
+    assert failure.__cause__ is None
 
 
-def test_item_encoder_scopes_peer_failure_to_local_producers() -> None:
+@pytest.mark.parametrize(
+    "peer_status", [EncoderDpStatus.REQUEST_ERROR, EncoderDpStatus.SYSTEM_ERROR]
+)
+def test_item_encoder_scopes_peer_prepare_failure(peer_status: EncoderDpStatus) -> None:
+    statuses = []
+
     class _Model(MultimodalModelMixin):
-        model_config = SimpleNamespace(mapping=None)
-        _any_encoder_dp_rank_failed = staticmethod(lambda failed: True)
-        forward_multimodal_encoder_items = Mock()
+        embedding_dtype = torch.float32
+
+        def exchange_encoder_status(self, values):
+            statuses.append(list(values))
+            # The peer failed to prepare, so it has no inputs.
+            return [values, [0, peer_status]]
+
+        def prepare_multimodal_encoder_inputs(
+            self, _: Sequence[tuple[MultimodalParams, int]]
+        ) -> list[tuple[SimpleNamespace, list[int], str]]:
+            encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
+            return [(encoder_input, [1], "image")]
+
+        forward_multimodal_encoder_items = Mock(return_value=[torch.ones(1, 2)])
 
     model = _Model()
     scheduler = bare_mm_item_scheduler(model)
     scheduler.collective = True
+    scheduler.bytes_per_embedding = 8
     producer = make_mm_request(1, [4])
-    follower = make_mm_request(2, [4])
     _bind_items(scheduler, producer)
-    with patch("tensorrt_llm._torch.pyexecutor.engine.multimodal.Distributed.get") as get_dist:
-        get_dist.return_value.tp_allreduce.return_value = 1
-        with patch.object(scheduler, "_prepare_items", return_value=([], [], set())):
-            with pytest.raises(MultimodalEncoderRequestError, match="peer rank failed") as error:
-                scheduler.forward_items([producer, follower], {producer.request_id: [0]})
-    assert error.value.request_ids == {producer.request_id}
-    assert isinstance(error.value.__cause__, EncoderDpError)
-    model.forward_multimodal_encoder_items.assert_not_called()
-    assert scheduler.encoder_cache.current_bytes == 0
+
+    if peer_status == EncoderDpStatus.REQUEST_ERROR:
+        # A peer's bad request stays on the peer: this rank encodes its own items.
+        scheduler.forward_items([producer], {producer.request_id: [0]})
+        assert is_multimodal_encoder_ready(producer)
+    else:
+        with pytest.raises(EncoderDpError, match=r"rank\(s\) \[1\]"):
+            scheduler.forward_items([producer], {producer.request_id: [0]})
+        model.forward_multimodal_encoder_items.assert_not_called()
+        assert scheduler.encoder_cache.current_bytes == 0
+    # One exchange carries this rank's inputs and preparation status.
+    assert statuses == [[1, EncoderDpStatus.OK]]
 
 
 @pytest.mark.parametrize(
@@ -708,8 +731,8 @@ def test_item_encoder_scopes_peer_failure_to_local_producers() -> None:
         ("contract", MultimodalEncoderRequestError, False),
         ("system", torch.cuda.OutOfMemoryError, True),
         ("wrapped_contract", MultimodalEncoderRequestError, False),
-        ("wrapped_system", torch.cuda.OutOfMemoryError, True),
-        ("wrapped_request", MultimodalEncoderRequestError, False),
+        ("wrapped_system", EncoderDpError, True),
+        ("request", MultimodalEncoderRequestError, False),
     ],
 )
 def test_item_encoder_closes_window_scope_before_request_errors(
@@ -726,7 +749,7 @@ def test_item_encoder_closes_window_scope_before_request_errors(
             self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
         ) -> list[torch.Tensor]:
             with (
-                encoder_dp_error_guard(bool)
+                encoder_dp_error_guard(_own_status)
                 if forward_failure.startswith("wrapped_")
                 else nullcontext()
             ):
@@ -734,7 +757,7 @@ def test_item_encoder_closes_window_scope_before_request_errors(
                     raise MultimodalEncoderContractError("bad encoder output rows")
                 if forward_failure.endswith("system"):
                     raise torch.cuda.OutOfMemoryError("encoder OOM")
-                if forward_failure == "wrapped_request":
+                if forward_failure == "request":
                     raise MultimodalEncoderRequestError("bad request", request_ids={17})
             return []
 
@@ -770,7 +793,7 @@ def test_item_encoder_closes_window_scope_before_request_errors(
     # Request-level failures leave the scope normally so its window leases are
     # released; anything else still fails the scope and quarantines them.
     assert _RecordingScope.exits == [scope_failed]
-    if forward_failure == "wrapped_request":
+    if forward_failure == "request":
         assert error.value.request_ids == {17}
 
 
@@ -1042,11 +1065,11 @@ class MultimodalSetupTestCase(unittest.TestCase):
 def test_empty_rank_participates_in_collective_encoder_step(collective):
     class _Model(MultimodalModelMixin):
         embedding_dtype = torch.float32
-        model_config = SimpleNamespace(mapping=None)
+        peer_has_inputs = 1
 
-        def _any_encoder_dp_rank_failed(self, failed):
-            assert not failed
-            return False
+        def exchange_encoder_status(self, values):
+            assert values == [0, EncoderDpStatus.OK]
+            return [values, [self.peer_has_inputs, EncoderDpStatus.OK]]
 
         forward_multimodal_encoder_items = Mock(return_value=[])
 
@@ -1054,11 +1077,130 @@ def test_empty_rank_participates_in_collective_encoder_step(collective):
     scheduler = bare_mm_item_scheduler(model)
     scheduler.collective = collective
     scheduler.bytes_per_embedding = 4
-    with patch("tensorrt_llm._torch.pyexecutor.engine.multimodal.Distributed.get") as get_dist:
-        get_dist.return_value.tp_allreduce.return_value = 1  # A peer has work.
-        scheduler.forward_items([], {})
-        assert model.forward_multimodal_encoder_items.call_count == int(collective)
-        model.forward_multimodal_encoder_items.reset_mock()
-        get_dist.return_value.tp_allreduce.return_value = 0
-        scheduler.forward_items([], {})
-        model.forward_multimodal_encoder_items.assert_not_called()
+    scheduler.forward_items([], {})
+    assert model.forward_multimodal_encoder_items.call_count == int(collective)
+    model.forward_multimodal_encoder_items.reset_mock()
+    model.peer_has_inputs = 0
+    scheduler.forward_items([], {})
+    model.forward_multimodal_encoder_items.assert_not_called()
+
+
+class _ThreadTpGroup:
+    """A TP group of thread ranks. A broken barrier means a real run would hang."""
+
+    def __init__(self, size: int) -> None:
+        self.barrier = threading.Barrier(size, timeout=10)
+        self.slots: list[object] = [None] * size
+
+    def allgather(self, rank: int, value: object) -> list[object]:
+        self.slots[rank] = value
+        self.barrier.wait()
+        gathered = list(self.slots)
+        self.barrier.wait()
+        return gathered
+
+    def get(self, mapping: Mapping) -> SimpleNamespace:
+        """Stands in for ``Distributed.get``."""
+        return SimpleNamespace(tp_allgather=lambda obj, **_: self.allgather(mapping.tp_rank, obj))
+
+
+class _SharedEncoderTpModel(MultimodalModelMixin):
+    """TP2 with attention DP: both ranks encode each owner's batch together.
+
+    An item encodes to rows filled with its pixel value. The encoder raises a
+    request error for ``bad_value``, and preparation raises ``prepare_error``.
+    """
+
+    embedding_dtype = torch.float32
+    multimodal_data_device_paths: list[str] = []  # Keep the inputs on the CPU.
+
+    def __init__(self, rank: int, group: _ThreadTpGroup, **failures: object) -> None:
+        self.model_config = ModelConfig(
+            mapping=Mapping(world_size=2, rank=rank, tp_size=2, enable_attention_dp=True),
+            multimodal_config=MultimodalConfig(
+                encoder_data_parallel_size=1, encoder_cache_max_bytes=0
+            ),
+        )
+        self.group = group
+        self.bad_value = failures.get("bad_value")
+        self.prepare_error = failures.get("prepare_error")
+        self.encoded_values: list[float] = []
+
+    def exchange_encoder_status(self, values: Sequence[int]) -> list[object]:
+        return self.group.allgather(self.model_config.mapping.tp_rank, list(values))
+
+    def prepare_multimodal_encoder_inputs(
+        self, selected_items: Sequence[tuple[MultimodalParams, int]]
+    ) -> list[tuple[MultimodalParams, list[int], str]]:
+        if self.prepare_error is not None:
+            raise self.prepare_error
+        return [
+            (param, [param.item_metadata.output_embedding_lengths[index]], "image")
+            for param, index in selected_items
+        ]
+
+    def encode_multimodal_inputs(self, multimodal_params, **_) -> torch.Tensor:
+        rows = []
+        for param in multimodal_params:
+            value = float(param.multimodal_data["image"]["pixel_values"][0, 0])
+            self.encoded_values.append(value)
+            if value == self.bad_value:
+                raise MultimodalEncoderContractError(f"bad item {value}")
+            rows.append(torch.full((1, 2), value))
+        return torch.cat(rows)
+
+
+@pytest.mark.parametrize("failure", ["prepare_request", "prepare_system", "encode_request"])
+def test_shared_encoder_tp_fails_only_the_requests_that_failed(failure: str) -> None:
+    """Rank 0's request 100 fails; rank 1's request 200 is good."""
+    group = _ThreadTpGroup(2)
+    rank0_failure = {
+        "prepare_request": {"prepare_error": MultimodalEncoderContractError("bad request 100")},
+        "prepare_system": {"prepare_error": RuntimeError("CUDA error on rank 0")},
+        # Both ranks encode owner 0's batch, so both see the bad item.
+        "encode_request": {"bad_value": 100.0},
+    }[failure]
+    models = [
+        _SharedEncoderTpModel(0, group, **rank0_failure),
+        _SharedEncoderTpModel(1, group, bad_value=rank0_failure.get("bad_value")),
+    ]
+    schedulers, requests = [], []
+    for model, request_id in zip(models, (100, 200)):
+        scheduler = bare_mm_item_scheduler(model)
+        scheduler.collective = True
+        scheduler.bytes_per_embedding = 8
+        request = make_mm_request(request_id, [4])
+        request.py_multimodal_params.multimodal_data["image"]["pixel_values"].fill_(request_id)
+        _bind_items(scheduler, request)
+        schedulers.append(scheduler)
+        requests.append(request)
+
+    outcomes: list[BaseException | None] = [None, None]
+
+    def run(rank: int) -> None:
+        try:
+            request = requests[rank]
+            schedulers[rank].forward_items([request], {request.request_id: [0]})
+        except BaseException as error:  # noqa: BLE001 - record every outcome
+            outcomes[rank] = error
+
+    with patch.object(dp_module, "Distributed", group), ThreadPoolExecutor(2) as ranks:
+        list(ranks.map(run, range(2)))
+
+    if failure == "prepare_system":
+        # Every rank raises the same error, and nothing is encoded.
+        assert all(isinstance(outcome, EncoderDpError) for outcome in outcomes)
+        assert str(outcomes[0]) == str(outcomes[1])
+        assert outcomes[0].__cause__ is rank0_failure["prepare_error"]
+        assert models[1].encoded_values == []
+        assert not is_multimodal_encoder_ready(requests[1])
+        return
+    # Only rank 0's own producer fails. Rank 1's batch is still encoded, by
+    # both ranks, and committed.
+    assert isinstance(outcomes[0], MultimodalEncoderRequestError)
+    assert outcomes[0].request_ids == {100}
+    assert outcomes[1] is None
+    expected_values = [100.0, 200.0] if failure == "encode_request" else [200.0]
+    assert [model.encoded_values for model in models] == [expected_values] * 2
+    assert not is_multimodal_encoder_ready(requests[0])
+    assert is_multimodal_encoder_ready(requests[1])

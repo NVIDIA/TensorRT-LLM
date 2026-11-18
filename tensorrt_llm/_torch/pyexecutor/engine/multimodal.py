@@ -9,14 +9,12 @@ byte budget before each decode step. This is a capability facet, orthogonal to
 the runner family axis -- it has no warmup or graph-capture phase.
 """
 
-from collections.abc import Hashable, Mapping, Sequence
-from contextlib import nullcontext
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from typing import Any
 
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.hostfunc import drain_captured_hostfuncs
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
@@ -25,8 +23,8 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
 )
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
 from tensorrt_llm._torch.models.multimodal_encoder_data_parallel import (
-    EncoderDpError,
-    encoder_dp_error_guard,
+    EncoderDpStatus,
+    raise_shared_system_error,
 )
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
@@ -516,51 +514,70 @@ class MultimodalItemScheduler:
             state.stable_item_cache_keys = keys
         return keys
 
+    @staticmethod
+    def _to_request_error(
+        error: Exception, request_ids: Iterable[int]
+    ) -> MultimodalEncoderRequestError | None:
+        """Scope a request-level encoder error to ``request_ids``; ``None`` for a system error."""
+        if isinstance(error, MultimodalEncoderRequestError):
+            return error
+        if isinstance(error, MultimodalEncoderContractError):
+            request_error = MultimodalEncoderRequestError(str(error), request_ids=request_ids)
+            request_error.__cause__ = error
+            return request_error
+        return None
+
     @torch.inference_mode()
     def forward_items(
         self,
         requests: list[LlmRequest],
         scheduled_items: dict[int, list[int]],
     ) -> None:
-        """Encode selected producer items into their reserved cache entries."""
+        """Encode selected producer items into their reserved cache entries.
+
+        With a shared encoder pass, every TP rank enters, also with no items.
+        A request error then fails only this rank's producers, and a system
+        error on any rank makes every rank raise the same ``EncoderDpError``.
+        """
         if not isinstance(self.model, MultimodalModelMixin):
             raise TypeError("Item-level MM scheduling requires MultimodalModelMixin")
-        collective = self.collective
-        if collective:
-            has_work = Distributed.get(self.model.model_config.mapping).tp_allreduce(
-                int(bool(scheduled_items))
-            )
-            if not has_work:
-                return
-        elif not scheduled_items:
+        if not scheduled_items and not self.collective:
             return
         encoder_cache = self.encoder_cache
         if encoder_cache is None:
             raise RuntimeError("MM item scheduling requires a model-owned encoder cache")
 
-        # Empty/cache-hit ADP ranks must rendezvous with ranks that have work.
-        # Exchange preparation failures before any peer starts GPU transport.
-        guard = (
-            encoder_dp_error_guard(self.model._any_encoder_dp_rank_failed)
-            if collective
-            else nullcontext()
-        )
+        # A batch-level error cannot be traced to one output, so fail only the
+        # scheduled producers. Requests that only share a scheduled entry keep
+        # their references, and the next scheduling pass picks a new producer.
         producer_request_ids = scheduled_items.keys()
+        prepare_error: Exception | None = None
+        request_error: MultimodalEncoderRequestError | None = None
         try:
-            with guard:
-                encoder_inputs, output_targets, scheduled_cache_keys = self._prepare_items(
-                    requests, scheduled_items
-                )
-        except (MultimodalEncoderContractError, EncoderDpError) as error:
-            # Nested DP guards must preserve local request scope and system errors.
-            cause: BaseException = error
-            while isinstance(cause, EncoderDpError) and cause.__cause__ is not None:
-                cause = cause.__cause__
-            if not isinstance(cause, (MultimodalEncoderContractError, EncoderDpError)):
-                raise cause
-            raise MultimodalEncoderRequestError(
-                str(cause), request_ids=producer_request_ids
-            ) from error
+            encoder_inputs, output_targets, scheduled_cache_keys = self._prepare_items(
+                requests, scheduled_items
+            )
+        except Exception as error:
+            request_error = self._to_request_error(error, producer_request_ids)
+            if not self.collective:
+                raise request_error or error
+            # This rank sends nothing, but still takes part in the shared pass.
+            prepare_error = error
+            encoder_inputs, output_targets, scheduled_cache_keys = [], [], set()
+        if self.collective:
+            # One CPU exchange per step shares which ranks have inputs and
+            # which failed to prepare them, before any encoder TP work.
+            status = (
+                EncoderDpStatus.of(prepare_error)
+                if request_error is None
+                else EncoderDpStatus.REQUEST_ERROR
+            )
+            rows = self.model.exchange_encoder_status([int(bool(encoder_inputs)), status])
+            raise_shared_system_error([row[1] for row in rows], prepare_error)
+            if not any(row[0] for row in rows):
+                if request_error is not None:
+                    raise request_error
+                return
 
         def requests_using_cache_keys(cache_keys: set[Hashable]) -> set[int]:
             return {
@@ -581,27 +598,18 @@ class MultimodalItemScheduler:
         # The vision tower runs outside ModelCaller, so its TP all-reduces can
         # return NCCL window tensors here. The cache stores clones, so every
         # window lease produced by this batch ends with the scope. Request-level
-        # failures are raised only after the forward returned and are identical
-        # on every rank, so they are raised once the scope has closed normally:
-        # a failed scope would quarantine this batch's window buffers for the
-        # communicator's lifetime while the executor keeps serving.
-        pending_error: MultimodalEncoderRequestError | None = None
+        # failures, including this rank's own preparation failure, are raised
+        # only after the scope has closed normally: a failed scope would
+        # quarantine this batch's window buffers for the communicator's
+        # lifetime while the executor keeps serving.
+        pending_error = request_error
         with discard_nccl_window_tensor_outputs(encoder_inputs):
             try:
                 outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
-            except (MultimodalEncoderContractError, EncoderDpError) as error:
-                cause = error
-                while isinstance(cause, EncoderDpError) and cause.__cause__ is not None:
-                    cause = cause.__cause__
-                if isinstance(cause, MultimodalEncoderRequestError):
-                    pending_error = cause
-                elif isinstance(cause, (MultimodalEncoderContractError, EncoderDpError)):
-                    pending_error = MultimodalEncoderRequestError(
-                        str(cause), request_ids=producer_request_ids
-                    )
-                    pending_error.__cause__ = error
-                else:
-                    raise cause
+            except Exception as error:
+                pending_error = self._to_request_error(error, producer_request_ids)
+                if pending_error is None:
+                    raise
             if pending_error is None and len(outputs) != len(output_targets):
                 pending_error = MultimodalEncoderRequestError(
                     "MM item encoder must return one output per item",
@@ -701,16 +709,7 @@ class MultimodalItemScheduler:
                 encoder_items.append((multimodal_param, item_idx))
                 output_targets.append((item_idx, cache_key, embedding_lengths[item_idx]))
 
-        # A batch-level error cannot be traced to one output, so fail only the
-        # scheduled producers. Requests that only share a scheduled entry keep
-        # their references, and the next scheduling pass picks a new producer.
-        producer_request_ids = scheduled_items.keys()
-        try:
-            encoder_inputs = self.model.prepare_multimodal_encoder_inputs(encoder_items)
-        except MultimodalEncoderContractError as error:
-            raise MultimodalEncoderRequestError(
-                str(error), request_ids=producer_request_ids
-            ) from error
+        encoder_inputs = self.model.prepare_multimodal_encoder_inputs(encoder_items)
         for encoder_input, _, _ in encoder_inputs:
             encoder_input.to_device(
                 "multimodal_data",

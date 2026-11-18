@@ -189,8 +189,15 @@ class DataParallelEncoderMultimodalModel(DummyMultimodalModel):
         assert [output.shape[0] for output in outputs] == row_counts
         return torch.cat(outputs)
 
-    def _any_encoder_dp_rank_failed(self, local_failed: bool) -> bool:
-        return local_failed
+    def exchange_encoder_status(self, values: Sequence[int]) -> list[list[int]]:
+        return _status_rows_with_ok_peer(self.model_config.mapping.tp_rank, values)
+
+
+def _status_rows_with_ok_peer(tp_rank: int, values: Sequence[int]) -> list[list[int]]:
+    """A TP2 status exchange where the peer rank reports success."""
+    rows = [[0] * len(values) for _ in range(2)]
+    rows[tp_rank] = list(values)
+    return rows
 
 
 def make_cached_multimodal_param(mm_embeds: torch.Tensor) -> MultimodalParams:
@@ -568,8 +575,8 @@ class _SharedEncoderTpModel(torch.nn.Module, MultimodalModelMixin):
         self.encoded_ids: list[int] = []
         self.outputs: list[weakref.ref] = []
 
-    def _any_encoder_dp_rank_failed(self, local_failed: bool) -> bool:
-        return local_failed
+    def exchange_encoder_status(self, values: Sequence[int]) -> list[list[int]]:
+        return _status_rows_with_ok_peer(self.model_config.mapping.tp_rank, values)
 
     def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs) -> torch.Tensor:
         self.encoded_keys.extend(set(param.multimodal_data) for param in multimodal_params)
@@ -720,9 +727,7 @@ def test_default_or_disabled_encoder_does_not_require_parallel_integration(disab
         disable_mm_encoder=disabled,
         multimodal_config=MultimodalConfig(encoder_data_parallel_size=1 if disabled else None),
     )
-    with patch.object(
-        DummyMultimodalModel, "get_supported_encoder_parallel_modes"
-    ) as capabilities:
+    with patch.object(DummyMultimodalModel, "get_supported_encoder_parallel_modes") as capabilities:
         DummyMultimodalModel.validate_multimodal_encoder_parallelism(config)
     capabilities.assert_not_called()
 
@@ -735,7 +740,9 @@ def test_shared_encoder_tp_checks_item_scheduling_before_construction():
     )
     with (
         patch.object(AutoModelForCausalLM, "_resolve_class", return_value=DummyMultimodalModel),
-        patch.object(DummyMultimodalModel, "supported_encoder_parallel_modes", frozenset({"tp", "dp"})),
+        patch.object(
+            DummyMultimodalModel, "supported_encoder_parallel_modes", frozenset({"tp", "dp"})
+        ),
         patch.object(ModelLoader, "_load_and_validate_config", return_value=config),
         patch.object(AutoModelForCausalLM, "from_config") as constructor,
     ):

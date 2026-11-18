@@ -25,6 +25,7 @@ for reconstruction.
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import IntEnum
 from itertools import accumulate, pairwise
 from typing import TYPE_CHECKING, Callable, Iterator, Sequence
 
@@ -94,28 +95,75 @@ def plan_encoder_dp_items(costs: Sequence[int], num_ranks: int) -> tuple[int, ..
     return tuple(ranks)
 
 
+class MultimodalEncoderContractError(ValueError):
+    """A request-local MM encoder input or output contract violation."""
+
+
 class EncoderDpError(RuntimeError):
-    """A coordinated Python failure, propagated before the next GPU collective."""
+    """A system error in shared encoder work. Every rank raises the same one."""
+
+
+class EncoderDpStatus(IntEnum):
+    """The status code each rank shares before the next encoder collective."""
+
+    OK = 0
+    REQUEST_ERROR = 1
+    """Only the requests of the failed batch fail."""
+    SYSTEM_ERROR = 2
+    """Every rank raises the same ``EncoderDpError``."""
+
+    @classmethod
+    def of(cls, error: Exception | None) -> "EncoderDpStatus":
+        """The status of this rank's error, or ``OK`` without one."""
+        if error is None:
+            return cls.OK
+        if isinstance(error, MultimodalEncoderContractError):
+            return cls.REQUEST_ERROR
+        return cls.SYSTEM_ERROR
+
+
+ExchangeStatus = Callable[[list[int]], Sequence[Sequence[int]]]
+"""Gathers a small int vector from every TP rank, on the CPU. Row ``r`` is rank ``r``'s."""
+
+
+def raise_shared_system_error(statuses: Sequence[int], local_error: Exception | None) -> None:
+    """Raise the same ``EncoderDpError`` on every rank if any rank had a system error."""
+    failed = [
+        rank for rank, status in enumerate(statuses) if status == EncoderDpStatus.SYSTEM_ERROR
+    ]
+    if failed:
+        raise EncoderDpError(f"Multimodal encoder failed on TP rank(s) {failed}.") from local_error
 
 
 @contextmanager
-def encoder_dp_error_guard(any_rank_failed: Callable[[bool], bool]) -> Iterator[None]:
-    """Propagate rank-local Python failures before the next GPU collective.
+def encoder_dp_error_guard(exchange_status: ExchangeStatus) -> Iterator[None]:
+    """Share rank-local failures before the next collective.
 
-    The callback exchanges CPU status and must not synchronize encoder CUDA
-    work. It must return true on every rank if any rank reports a failure.
+    If any rank had a system error, every rank raises the same
+    ``EncoderDpError``. Otherwise, if any rank had a request error, every rank
+    raises a ``MultimodalEncoderContractError`` (its own one, or one that
+    names the failed ranks), and the caller decides whose requests fail. An
+    ``EncoderDpError`` from an inner guard is re-raised as is, because every
+    rank already raises it. The exchange must not wait for encoder CUDA work.
     """
     local_error: Exception | None = None
     try:
         yield
+    except EncoderDpError:
+        raise
     except Exception as error:
         # Every rank must reach the status exchange even after a local failure.
         local_error = error
 
-    if any_rank_failed(local_error is not None):
-        if local_error is not None:
-            raise EncoderDpError("Multimodal encoder data-parallel rank failed.") from local_error
-        raise EncoderDpError("Multimodal encoder data-parallel peer rank failed.")
+    statuses = [int(row[0]) for row in exchange_status([EncoderDpStatus.of(local_error)])]
+    raise_shared_system_error(statuses, local_error)
+    if local_error is not None:
+        raise local_error
+    failed = [rank for rank, status in enumerate(statuses) if status]
+    if failed:
+        raise MultimodalEncoderContractError(
+            f"Multimodal encoder input failed on TP rank(s) {failed}."
+        )
 
 
 def execute_encoder_dp_items(
@@ -123,37 +171,44 @@ def execute_encoder_dp_items(
     row_counts: Sequence[int],
     *,
     layout: EncoderParallelLayout,
-    encode_local: Callable[[list[int]], torch.Tensor],
-    any_rank_failed: Callable[[bool], bool],
+    prepare_local: Callable[[list[int]], Callable[[], torch.Tensor]],
+    exchange_status: ExchangeStatus,
     allgather: Callable[[torch.Tensor, list[int]], torch.Tensor],
     empty_output: torch.Tensor,
 ) -> torch.Tensor:
     """Place, run, and reorder atomic multimodal encoder items.
 
     Every rank derives the same plan from ``costs`` (physical encoder input
-    tokens). ``encode_local`` gets the indices placed on this replica, in item
-    order, and returns their output rows. A replica with no items skips it and
-    sends ``empty_output``, a ``[0, dim]`` tensor with the output dtype and
-    device. A CPU status exchange shares local failures before the output
-    gather. ``allgather`` concatenates the per-replica outputs in replica order
-    using the given row counts, including zero rows.
+    tokens). ``prepare_local`` gets the indices placed on this replica, in
+    item order, and returns a function that encodes them into their output
+    rows. Every rank shares its preparation status before any rank encodes,
+    so no rank starts encoder TP work while a peer of its replica has failed.
+    A replica with no items sends ``empty_output``, a ``[0, dim]`` tensor with
+    the output dtype and device. A second status exchange shares encoder
+    failures before the output gather. ``allgather`` concatenates the
+    per-replica outputs in replica order using the given row counts,
+    including zero rows.
 
     Returns one dense tensor with each item's ``row_counts`` rows, in item order.
     """
-    with encoder_dp_error_guard(any_rank_failed):
+    with encoder_dp_error_guard(exchange_status):
         ranks = plan_encoder_dp_items(costs, layout.dp_size)
         local = [index for index, rank in enumerate(ranks) if rank == layout.dp_rank]
-        if local:
-            local_output = encode_local(local)
+        encode_local = prepare_local(local) if local else None
+    with encoder_dp_error_guard(exchange_status):
+        if encode_local is None:
+            local_output = empty_output
+        else:
+            local_output = encode_local()
+            # Free the prepared inputs before the output gather.
+            del encode_local
             expected_shape = (sum(row_counts[index] for index in local), empty_output.shape[1])
             if local_output.shape != expected_shape:
-                raise ValueError(
+                raise MultimodalEncoderContractError(
                     "Multimodal encoder output shape does not match its local DP assignment: "
                     f"expected {expected_shape}, got {tuple(local_output.shape)}."
                 )
             local_output = local_output.to(empty_output).contiguous()
-        else:
-            local_output = empty_output
 
     rank_row_counts = [0] * layout.dp_size
     for rank, rows in zip(ranks, row_counts, strict=True):
@@ -179,7 +234,7 @@ def _owner_leaves(
     owner_descriptors: list[tuple[int, tuple[int, ...], torch.dtype]],
     local_cuda_leaves: dict[torch.dtype, list[torch.Tensor]],
     mapping: Mapping,
-    any_rank_failed: Callable[[bool], bool],
+    exchange_status: ExchangeStatus,
 ) -> list:
     """Send or receive one owner's CUDA tensors, one allgather per dtype.
 
@@ -191,7 +246,7 @@ def _owner_leaves(
     for index, shape, dtype in owner_descriptors:
         by_dtype.setdefault(dtype, []).append((index, shape))
     for dtype, entries in by_dtype.items():
-        with encoder_dp_error_guard(any_rank_failed):
+        with encoder_dp_error_guard(exchange_status):
             total_elements = sum(torch.Size(shape).numel() for _, shape in entries)
             if mapping.tp_rank == owner:
                 payload = torch.cat([tensor.reshape(-1) for tensor in local_cuda_leaves[dtype]])
@@ -218,7 +273,7 @@ def iter_encoder_rank_inputs(
     encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
     *,
     mapping: Mapping,
-    any_rank_failed: Callable[[bool], bool],
+    exchange_status: ExchangeStatus,
 ) -> Iterator[tuple[int, Sequence[tuple[MultimodalParams, Sequence[int], str]]]]:
     """Share one ADP owner's prepared encoder batch at a time for encoder TP.
 
@@ -230,7 +285,7 @@ def iter_encoder_rank_inputs(
     each yielded batch before asking for the next one, so temporary GPU
     storage stays bounded by one owner's encoder budget.
     """
-    with encoder_dp_error_guard(any_rank_failed):
+    with encoder_dp_error_guard(exchange_status):
         leaves, spec = tree_flatten(
             [
                 (param.multimodal_data[modality], param.item_metadata, lengths, modality)
@@ -250,7 +305,7 @@ def iter_encoder_rank_inputs(
         if not owner_descriptors and not tree_unflatten(owner_leaves, owner_spec):
             continue
         shared_leaves = _owner_leaves(
-            owner, owner_leaves, owner_descriptors, local_cuda_leaves, mapping, any_rank_failed
+            owner, owner_leaves, owner_descriptors, local_cuda_leaves, mapping, exchange_status
         )
         if owner == mapping.tp_rank:
             shared_inputs = encoder_inputs
