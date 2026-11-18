@@ -16,16 +16,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Sequence
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence
 
+import torch
+
+from ..backends.sparse.csa2.decoder_replay import apply_decoder_swa_floor
 from ..backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from ..backends.sparse.csa2.params import CSA2MetadataParams
-from .base import UnsupportedMetadataConfiguration, _Registry
+from .base import _Registry
 from .core import TrtllmCoreMetadata
 from .sparse import SparseMetadata
 
 if TYPE_CHECKING:
+    from ..backends.sparse.csa2.decoder_replay import DecoderReplayPlan
     from .batch_inputs import BatchInputs
 
 
@@ -150,6 +154,8 @@ class CSA2Metadata(SparseMetadata):
         self.csa2_remote_tail_starts: List[int] = []
         self._csa2_steady_snapshot = None
         self._csa2_ready_for_kv_update = False
+        # The step's description while the decoder layers run on replayed rows.
+        self._csa2_step_before_replay = None
 
     def share_state_with(self, graph_metadata: "CSA2Metadata") -> None:
         """Start the metadata of a CUDA graph batch size from this request state.
@@ -174,8 +180,6 @@ class CSA2Metadata(SparseMetadata):
                 self.prepare_context_replay(
                     list(step.context_requests), allow_final_window=step.allow_final_window
                 )
-            if hasattr(self, "_csa2_pending_replay") or hasattr(self, "_csa2_source_batch"):
-                raise UnsupportedMetadataConfiguration("CSA2 bounded replay")
             self._csa2_deferred_decode_outputs = False
             self._csa2_context_geometry = None
             self._csa2_ready_for_kv_update = False
@@ -185,6 +189,96 @@ class CSA2Metadata(SparseMetadata):
             self.prepare_csa2(swa_publication=self.swa_publication)
         if self._csa2_ready_for_kv_update:
             self._refresh_live_endpoints()
+
+    def enter_decoder_replay(self, plan: "DecoderReplayPlan", first_layer: Optional[int]) -> None:
+        """Re-describe the step for the decoder layers, which run on the replayed rows.
+
+        Called inside the forward, between the encoder and the decoder layers.
+        The replayed rows are a second description of the same step, so the
+        whole set is prepared again with it; what the encoder layers published
+        for the decoder is carried across, narrowed to the replayed rows.
+        ``exit_decoder_replay`` restores the step's rows.
+        """
+        if plan.replay_all_rank_num_tokens is not None:
+            self.all_rank_num_tokens = plan.replay_all_rank_num_tokens
+        if not plan.updates_local_metadata:
+            return
+        core = self.get_metadata(CSA2CoreMetadata)
+        step = core.inputs
+        self._csa2_step_before_replay = step
+        saved_indices = dict(self.csa2_indices)
+        saved_candidates = {
+            name: dict(getattr(self, name))
+            for name in ("csa2_candidates", "csa2_candidate_blocks", "csa2_candidate_counts")
+        }
+        saved_last_layer = self._csa2_last_layer
+        precomputed = set(self.csa2_precomputed_kv_layers)
+        num_cached = self.kv_cache_params.num_cached_tokens_per_seq
+        num_cached[: len(plan.replay_num_cached)] = plan.replay_num_cached
+        self.prompt_lens = plan.replay_prompt_lens
+        core._set_rows(plan.replay_seq_lens, core.num_contexts)
+        if plan.num_replay_tokens == 0:
+            # No local attention runs: keep what was published and the live
+            # KV lengths, and prepare nothing for an empty query batch.
+            self.reset_routing()
+            self.csa2_precomputed_kv_layers = precomputed
+            self.csa2_replay_query_rows = plan.rows
+            return
+        if first_layer is not None:
+            self.set_decoder_query_boundary(first_layer)
+        padding = step.padding
+        if padding is not None and plan.replay_all_rank_num_tokens is not None:
+            padding = replace(padding, all_rank_num_tokens=plan.replay_all_rank_num_tokens)
+        # The step's device corrections of the KV lengths stay in the
+        # description, so the replayed rows keep their live endpoints.
+        core.prepare_all(
+            replace(
+                step,
+                seq_lens=plan.replay_seq_lens,
+                prompt_lens=plan.replay_prompt_lens,
+                padding=padding,
+                backend_inputs=None,
+                stage_host=True,
+            )
+        )
+        self.csa2_precomputed_kv_layers = precomputed
+        self.csa2_replay_query_rows = plan.rows
+        for layer, indices in saved_indices.items():
+            self.csa2_indices[layer] = indices.index_select(0, plan.rows)
+        for name, published in saved_candidates.items():
+            target = getattr(self, name)
+            for layer, value in published.items():
+                target[layer] = value.index_select(0, plan.rows)
+        self._csa2_last_layer = saved_last_layer
+        # Only the sliding window of the context rows is truncated. Generation
+        # rows and the global visibility keep their positions and history.
+        apply_decoder_swa_floor(
+            self,
+            self._copy_csa2_tensor(
+                "decoder_starts", torch.tensor(plan.swa_floors, dtype=torch.int64, device="cpu")
+            ),
+        )
+
+    def exit_decoder_replay(self, plan: "DecoderReplayPlan") -> None:
+        """Restore the rows of the step ``enter_decoder_replay`` re-described.
+
+        Only the host description is restored. The device buffers keep the
+        replay values: the next step prepares them again.
+        """
+        if plan.saved_all_rank_num_tokens is not None:
+            self.all_rank_num_tokens = plan.saved_all_rank_num_tokens
+        if not plan.updates_local_metadata:
+            return
+        core = self.get_metadata(CSA2CoreMetadata)
+        num_cached = self.kv_cache_params.num_cached_tokens_per_seq
+        num_cached[: len(plan.saved_num_cached)] = plan.saved_num_cached
+        self.prompt_lens = plan.saved_prompt_lens
+        core._set_rows(plan.saved_seq_lens, core.num_contexts)
+        core.inputs = self._csa2_step_before_replay
+        self._csa2_step_before_replay = None
+        self.csa2_replay_query_rows = None
+        # What was published is indexed by the replayed rows.
+        self.reset_routing()
 
     @staticmethod
     def for_query_tile(*args, **kwargs) -> CSA2TrtllmMetadata:

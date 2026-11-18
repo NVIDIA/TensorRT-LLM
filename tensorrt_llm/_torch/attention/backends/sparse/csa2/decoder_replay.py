@@ -221,12 +221,25 @@ def _swa_is_reused(metadata: "CSA2TrtllmMetadata") -> bool:
     return bool(getattr(manager, "enable_block_reuse", True))
 
 
+def _feature_split_request_state(metadata):
+    """The CSA2 request state of the feature-split metadata, which re-describes the step itself."""
+    # Imported here: the feature-split metadata import this module.
+    from ....metadata.base import Metadata
+    from ....metadata.csa2 import CSA2Metadata
+
+    return metadata.get_metadata(CSA2Metadata) if isinstance(metadata, Metadata) else None
+
+
 def enter_decoder_replay(
     metadata: "CSA2TrtllmMetadata",
     plan: DecoderReplayPlan,
     first_layer: Optional[int] = None,
 ) -> None:
     """Rebuild query views and carry encoder publications across the boundary."""
+    request_state = _feature_split_request_state(metadata)
+    if request_state is not None:
+        request_state.enter_decoder_replay(plan, first_layer)
+        return
     if plan.replay_all_rank_num_tokens is not None:
         metadata.all_rank_num_tokens = plan.replay_all_rank_num_tokens
     if not plan.updates_local_metadata:
@@ -277,7 +290,7 @@ def enter_decoder_replay(
             device="cpu",
         ),
     )
-    _apply_decoder_swa_floor(metadata, starts)
+    apply_decoder_swa_floor(metadata, starts)
 
 
 def enter_remote_tail_decoder(metadata: "CSA2TrtllmMetadata", context_starts: List[int]) -> None:
@@ -298,10 +311,10 @@ def enter_remote_tail_decoder(metadata: "CSA2TrtllmMetadata", context_starts: Li
             device="cpu",
         ),
     )
-    _apply_decoder_swa_floor(metadata, starts)
+    apply_decoder_swa_floor(metadata, starts)
 
 
-def _apply_decoder_swa_floor(metadata: "CSA2TrtllmMetadata", starts: torch.Tensor) -> None:
+def apply_decoder_swa_floor(metadata: "CSA2TrtllmMetadata", starts: torch.Tensor) -> None:
     """Hide cached SWA positions below one logical floor per request from reads.
 
     Writes keep the prepared floors: query rows below the floor still store
@@ -330,6 +343,10 @@ def exit_decoder_replay(
     values: every forward rebuilds them from these inputs in ``prepare()``, and
     copying them back would cost a second rebuild to no observable end.
     """
+    request_state = _feature_split_request_state(metadata)
+    if request_state is not None:
+        request_state.exit_decoder_replay(plan)
+        return
     if plan.saved_all_rank_num_tokens is not None:
         metadata.all_rank_num_tokens = plan.saved_all_rank_num_tokens
     if not plan.updates_local_metadata:
