@@ -1024,7 +1024,11 @@ def test_graph_keys_separate_greedy_temperature_and_stock_sampling():
     batch.generation_requests = [_make_request_stub(1), _make_request_stub(2)]
 
     def key(greedy, temperature_only):
-        md = SimpleNamespace(is_all_greedy_sample=greedy, temperature_only=temperature_only)
+        md = SimpleNamespace(
+            is_all_greedy_sample=greedy,
+            temperature_only=temperature_only,
+            is_all_temperature_only=False,  # the vocabulary-shard sampler's (DSpark) bit
+        )
         return CUDAGraphRunner.get_graph_key(runner, batch, spec_metadata=md)
 
     greedy, temperature, stock = key(True, False), key(False, True), key(False, False)
