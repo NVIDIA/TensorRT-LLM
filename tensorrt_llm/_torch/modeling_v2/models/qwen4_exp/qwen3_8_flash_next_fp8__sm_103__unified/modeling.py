@@ -321,6 +321,7 @@ from .ops.moe.moe_prefill_grouped__prefill import (
     prefill_grouped_ready,
     warm_prefill_grouped,
 )
+from .ops.moe.moe_sp_routing_rows__prefill import pack_routing_rows, unpack_routing_rows
 from .ops.moe.moe_tpb_decode__decode import MAX_ROWS as _MOE_TPB_ROWS
 from .ops.moe.moe_tpb_decode__decode import BlockExperts as _BlockExperts
 from .ops.moe.moe_tpb_decode__decode import SharedBlocks as _TpbShared
@@ -656,6 +657,11 @@ PREFILL_SP_MOE_CE_GATHER_ENV = "TRTLLM_PREFILL_SP_MOE_CE_GATHER"
 #: Receive-buffer bytes a step row keeps for the MoE block's `[scales | ids | weights]` row
 #: (`PREFILL_SP_MOE_CE_GATHER_ENV`), after the codes of every row.
 _MOE_CE_META_ROW_BYTES = 256
+#: Opt-in switch (`weights.switch`): a sequence-parallel MoE block packs its
+#: `[scales | ids | weights]` rows and unpacks the gathered ones in one launch each
+#: (`ops/moe/moe_sp_routing_rows__prefill`) instead of four and three slice copies. The same
+#: bytes either way. Read once, when the target is built.
+PREFILL_SP_MOE_FUSED_ROUTING_ROWS_ENV = "TRTLLM_PREFILL_SP_MOE_FUSED_ROUTING_ROWS"
 # cuBLASLt picks a bf16 projection's kernel by its exact row count up to this many rows, and
 # past them by the 8-row group the row count falls in (`_projection_warm_rows`).
 _KERNEL_CHOICE_EACH_ROW = 16
@@ -2999,10 +3005,14 @@ def _routed_experts_sp(
     rows = x_rows.shape[0]
     # bf16 columns: nb fp32 scales, topk int32 ids, topk bf16 weights (the width stays even).
     c0, c1, c2 = 2 * nb, 2 * nb + 2 * topk, 2 * nb + 3 * topk
+    # `PREFILL_SP_MOE_FUSED_ROUTING_ROWS_ENV`: one launch packs the rows, one unpacks them.
+    fused = getattr(gather, "fused_routing_rows", False)
 
     def routing() -> torch.Tensor:
         logits = cublas_mm(x_rows, router)
         topk_ids, topk_w = renorm_moe_routing_op(logits, topk=topk, output_dtype=x_rows.dtype)
+        if fused:
+            return pack_routing_rows(xsf, topk_ids, topk_w, pad_mask, _NO_EXPERT)
         if pad_mask is not None:
             topk_ids.masked_fill_(pad_mask, _NO_EXPERT)
         meta = torch.empty([rows, c2 + (c2 & 1)], dtype=torch.bfloat16, device=x_rows.device)
@@ -3018,9 +3028,12 @@ def _routed_experts_sp(
         meta = routing()
         codes = gather(xq.view(torch.bfloat16)).view(xq.dtype)
         every = gather(meta)
-    scales = every[:, :c0].view(torch.float32).t()
-    ids = every[:, c0:c1].contiguous().view(torch.int32)
-    weights = every[:, c1:c2].contiguous()
+    if fused:
+        scales, ids, weights = unpack_routing_rows(every, nb, topk)
+    else:
+        scales = every[:, :c0].view(torch.float32).t()
+        ids = every[:, c0:c1].contiguous().view(torch.int32)
+        weights = every[:, c1:c2].contiguous()
     total = codes.shape[0]
     step = getattr(core, "moe_max_rows", _MOE_MAX_ROWS)
     if after_first is not None and total <= step:
@@ -4218,6 +4231,10 @@ class PrefillTarget:
         self._block_sum = core.tp_sum
         # `(lo, hi, gather)` of a sequence-parallel forward, or None.
         self._sp_rows = None
+        # Whether `_routed_experts_sp` packs and unpacks its routing rows in one launch each.
+        self._sp_moe_fused_rows = split is not None and _weights.switch(
+            PREFILL_SP_MOE_FUSED_ROUTING_ROWS_ENV
+        )
         # Highest priority: in a CUDA graph a default-priority stream's gather waits for the
         # main stream's persistent GEMM, which holds every SM.
         self._comm_stream = None
@@ -4269,6 +4286,7 @@ class PrefillTarget:
         def gather(t: torch.Tensor) -> torch.Tensor:
             return allgather(t, None, group, process_group)
 
+        gather.fused_routing_rows = getattr(self, "_sp_moe_fused_rows", False)
         ce = getattr(self, "_ce_exchange", None) if world == 2 else None
 
         def scatter(t: torch.Tensor) -> torch.Tensor:
