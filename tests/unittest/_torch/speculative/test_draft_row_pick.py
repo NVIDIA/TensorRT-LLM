@@ -200,6 +200,7 @@ def _worker(is_mtp_eagle, fast_paths):
     w.model_config = None
     w.mapping = None
     w.draft_head = None
+    w.fused_draft_head = None
     w._d2t = None
     w._vocab_parallel_argmax = False
     w._draft_folds_kv_lens_increment = False
@@ -348,6 +349,7 @@ def _mtp_worker(mapping=None):
     w = object.__new__(MTPWorker)
     w.guided_decoder = None
     w.sa_enhancer = None
+    w.fused_draft_head = None
     w.mapping = mapping
     w._auxiliary_state_handlers = []
     w._row_pick = DraftRowPick("test MTP layers")
