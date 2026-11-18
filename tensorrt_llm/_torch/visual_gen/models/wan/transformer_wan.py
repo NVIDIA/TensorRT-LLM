@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+from collections import Counter
 from typing import Optional, Tuple
 
 import torch
@@ -394,6 +395,8 @@ class WanBlock(nn.Module):
         self._fused_ln_supported = hidden_size == 5120
         # Static-FP8 block fusions, decided by plan_fp8_fusions() after weights are loaded.
         self._fp8_block = False
+        # Why plan_fp8_fusions() left this block unfused (empty when it fused or never ran).
+        self.fp8_fusion_blockers: list[str] = []
         self._tp_size = tp_size
         # expand_timesteps (e.g. TI2V-5B) always hands blocks a per-token [B, S, 6, H] temb,
         # which the fused path does not take.
@@ -560,6 +563,7 @@ class WanBlock(nn.Module):
             reasons.append("norm2 without affine weights")
         if not reasons and not ffn.enable_fp8_gelu_fusion():
             reasons.append("FFN GELU epilogue unsupported")
+        self.fp8_fusion_blockers = reasons
         if reasons:
             if log:
                 logger.info(f"Wan FP8 block fusions off: {'; '.join(reasons)}.")
@@ -1243,9 +1247,21 @@ class WanTransformer3DModel(BaseDiffusionModel):
             block._norm3_fp4_scale = get_nvfp4_input_scale(getattr(block.ffn, "up_proj", None))
 
         if self.model_config.extra_attrs.get("enable_fp8_block_fusions", False):
-            planned = [
-                block.plan_fp8_fusions(log=idx == 0)
-                for idx, block in enumerate(self.blocks)
-                if isinstance(block, WanBlock)
-            ]
-            logger.info(f"Wan FP8 block fusions: {sum(planned)} of {len(planned)} blocks.")
+            blocks = [block for block in self.blocks if isinstance(block, WanBlock)]
+            planned = [block.plan_fp8_fusions() for block in blocks]
+            if all(planned):
+                logger.info(f"Wan FP8 block fusions on all {len(planned)} blocks.")
+            else:
+                blockers = Counter(
+                    reason
+                    for block, fused in zip(blocks, planned)
+                    if not fused
+                    for reason in block.fp8_fusion_blockers
+                )
+                details = "; ".join(
+                    f"{reason} ({count} blocks)" for reason, count in blockers.items()
+                )
+                logger.warning(
+                    f"enable_fp8_block_fusions is set, but {len(planned) - sum(planned)} of "
+                    f"{len(planned)} Wan blocks run unfused: {details or 'not planned'}."
+                )

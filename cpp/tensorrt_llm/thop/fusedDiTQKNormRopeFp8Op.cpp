@@ -170,9 +170,9 @@ bool fused_dit_qk_norm_rope_fp8_supported(int64_t num_heads, int64_t head_dim)
     }
     int const device = at::cuda::current_device();
     return tensorrt_llm::kernels::fusedDiTQKNormRopeFp8Supported(
-               static_cast<int>(num_heads), static_cast<int>(head_dim), false, device)
+               static_cast<int>(num_heads), static_cast<int>(head_dim), /*per_head_cos=*/false, device)
         && tensorrt_llm::kernels::fusedDiTQKNormRopeFp8Supported(
-            static_cast<int>(num_heads), static_cast<int>(head_dim), true, device);
+            static_cast<int>(num_heads), static_cast<int>(head_dim), /*per_head_cos=*/true, device);
 }
 
 } // namespace torch_ext

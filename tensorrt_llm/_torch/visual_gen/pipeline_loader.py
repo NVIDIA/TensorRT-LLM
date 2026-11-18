@@ -199,6 +199,15 @@ class PipelineLoader:
                 f"Unknown pipeline_config keys for {class_name} ({checkpoint_dir}): "
                 f"{sorted(unknown)}. Valid keys: {sorted(entry.defaults)}"
             )
+        wrong_type = sorted(
+            key
+            for key, value in user_pipeline_config.items()
+            if isinstance(entry.defaults[key], bool) and not isinstance(value, bool)
+        )
+        if wrong_type:
+            raise ValueError(
+                f"pipeline_config keys for {class_name} must be true or false: {wrong_type}"
+            )
         return {**entry.defaults, **user_pipeline_config}
 
     def _setup_visual_gen_mapping(self, config: DiffusionPipelineConfig) -> None:

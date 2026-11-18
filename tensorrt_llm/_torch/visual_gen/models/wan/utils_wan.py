@@ -308,7 +308,9 @@ def residual_norm_quant(
     shape = x.shape
     hidden = shape[-1]
 
-    def rows(t, dtype=None):
+    def rows(
+        t: Optional[torch.Tensor], dtype: Optional[torch.dtype] = None
+    ) -> Optional[torch.Tensor]:
         """Contiguous [rows, hidden] view, optionally cast; None passes through."""
         return None if t is None else t.to(dtype or t.dtype).reshape(-1, hidden).contiguous()
 

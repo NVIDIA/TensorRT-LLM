@@ -26,47 +26,47 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-// What the row kernel does after the optional residual update.
+//! What the row kernel does after the optional residual update.
 enum class ResidualNormMode : int
 {
-    kResidualOnly = 0, // x_out = x + gate * (y + y_bias); no normalization
-    kLayerNorm = 1,    // LayerNorm with affine weight / bias [hidden]
-    kAdaLayerNorm = 2, // LayerNorm (no affine) * (1 + scale[b]) + shift[b], scale / shift [batch, hidden]
+    kResidualOnly = 0, //!< xOut = x + gate * (y + yBias); no normalization
+    kLayerNorm = 1,    //!< LayerNorm with affine weight / bias [hidden]
+    kAdaLayerNorm = 2, //!< LayerNorm (no affine) * (1 + scale[b]) + shift[b], scale / shift [batch, hidden]
 };
 
 struct ResidualNormQuantParams
 {
-    // bf16 [rows, hidden]
+    //! bf16 [rows, hidden]
     void const* x = nullptr;
-    // Optional bf16 [rows, hidden] update added to x; with y, x_out = x + gate * (y + y_bias).
+    //! Optional bf16 [rows, hidden] update added to x; with y, xOut = x + gate * (y + yBias).
     void const* y = nullptr;
-    // Optional bf16 [hidden] bias of y, added in bf16 before the gate.
-    void const* y_bias = nullptr;
-    // Optional fp32 [batch, hidden] gate.
+    //! Optional bf16 [hidden] bias of y, added in bf16 before the gate.
+    void const* yBias = nullptr;
+    //! Optional fp32 [batch, hidden] gate.
     float const* gate = nullptr;
-    // fp32 LayerNorm weight / bias [hidden] (kLayerNorm), or AdaLN scale / shift [batch, hidden].
+    //! fp32 LayerNorm weight / bias [hidden] (kLayerNorm), or AdaLN scale / shift [batch, hidden].
     float const* weight = nullptr;
     float const* bias = nullptr;
-    // fp32 [1] multiplier applied before the saturating e4m3 store (1 / dequant scale).
-    float const* inv_out_scale = nullptr;
-    // bf16 [rows, hidden] updated residual (needs y), and e4m3 [rows, hidden] normalized output.
-    void* x_out = nullptr;
+    //! fp32 [1] multiplier applied before the saturating e4m3 store (1 / dequant scale).
+    float const* invOutScale = nullptr;
+    //! bf16 [rows, hidden] updated residual (needs y), and e4m3 [rows, hidden] normalized output.
+    void* xOut = nullptr;
     void* normed = nullptr;
     int rows = 0;
     int hidden = 0;
-    // Rows that share one batch entry of gate / scale / shift.
-    int rows_per_batch = 0;
-    float eps = 1e-6f;
+    //! Rows that share one batch entry of gate / scale / shift.
+    int rowsPerBatch = 0;
+    float eps = 1e-6F;
     ResidualNormMode mode = ResidualNormMode::kResidualOnly;
 };
 
-// Gated residual update and LayerNorm / AdaLN + static per-tensor FP8 quantization of each row,
-// in one pass (diffusion transformer blocks). The residual rounds y + y_bias to bf16 and then
-// computes x + gate * y with separately rounded multiply and add; the normalized value is rounded
-// to bf16 before the FP8 multiply, so results do not depend on fast-math flags.
+//! Gated residual update and LayerNorm / AdaLN + static per-tensor FP8 quantization of each row,
+//! in one pass (diffusion transformer blocks). The residual rounds y + y_bias to bf16 and then
+//! computes x + gate * y with separately rounded multiply and add; the normalized value is rounded
+//! to bf16 before the FP8 multiply, so results do not depend on fast-math flags.
 void launchResidualNormQuant(ResidualNormQuantParams const& params, cudaStream_t stream);
 
-// Whether launchResidualNormQuant has a kernel for this hidden size: a multiple of 1024 up to 8192.
+//! Whether launchResidualNormQuant has a kernel for this hidden size: a multiple of 1024 up to 8192.
 bool residualNormQuantSupportsHidden(int hidden);
 
 } // namespace kernels

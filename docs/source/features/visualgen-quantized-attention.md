@@ -31,6 +31,7 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 | `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (FP8 QK) for Blackwell |
 | `TRTLLM` | `bf16` | `fp8` | `(0, 0, 0)` | PrimTS QK16PV8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
 | `TRTLLM` | `fp8` | `fp8` | `(0, 0, 0)` | PrimTS FP8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
+| `TRTLLM` | `fp8` | `fp8` | `(0, 0, 0)` | trtllm-gen dense FP8 for Rubin (SM107), no environment variable needed |
 | `TRTLLM` | `bf16` | `fp8` | `(0, 0, 1)` | VC-Attention-QK16 for Blackwell, V as E4M3 tile residuals with per-channel scales (`vc_attention: true`, `TLLM_FMHA_LIBS=+prims_ts`) |
 | `TRTLLM` | `fp8` | `fp8` | `(128, 128, 1)` | VC-Attention-QK8 for Blackwell, Hadamard-rotated E4M3 Q/K scaled per 128 tokens and the same V treatment (`vc_attention: true`, `TLLM_FMHA_LIBS=+prims_ts`) |
 | `CUDNN` | `fp8` | `fp8` | `(0, 0, 0)` | cuDNN FP8 |
@@ -42,7 +43,7 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 | `FLASHINFER` | `nvfp4` | `fp8` | `(0, 0, 0)` | NVFP4 Q/K |
 | `FLASHINFER` | `nvfp4` | `nvfp4` | `(0, 0, 0)` | NVFP4 Attention |
 
-The `TRTLLM` backend picks the kernel from the block sizes: SageAttention quantizes per block, and the `(0, 0, 0)` per-tensor recipes run on the PrimTS FMHA library, which `TLLM_FMHA_LIBS=+prims_ts` enables. VC-Attention fixes its block sizes to the recipe's scaling granularity; leave them at `0` and the validator sets them, see [VC-Attention in the `TRTLLM` backend](#vc-attention-in-the-trtllm-backend).
+The `TRTLLM` backend picks the kernel from the block sizes: SageAttention quantizes per block, and the `(0, 0, 0)` per-tensor recipes run on the PrimTS FMHA library, which `TLLM_FMHA_LIBS=+prims_ts` enables. On SM107, the per-tensor FP8 recipe runs on the trtllm-gen dense FP8 library, which is enabled by default; enabled PrimTS keeps precedence. That library serves self-attention only and returns no LSE, so with it the cross-attention layers and context-parallel (Attention2D, Ring) layers run the same recipe on the `CUDNN` backend, and cross-attention calls that pass a key padding mask run unquantized on `VANILLA`. Sparse attention (for example SkipSoftmax) is not supported with this recipe on SM107. VC-Attention fixes its block sizes to the recipe's scaling granularity; leave them at `0` and the validator sets them, see [VC-Attention in the `TRTLLM` backend](#vc-attention-in-the-trtllm-backend).
 
 ### Choosing and Tuning a Recipe
 
@@ -218,7 +219,7 @@ Omit `quant_attention_config` to use the same backend for unquantized FP16 or BF
 
 **Requirements and behavior.**
 
-- Quantized cuDNN attention requires an SM100 or SM103 Blackwell GPU.
+- Quantized cuDNN attention requires an SM100, SM103 or SM107 GPU.
 - The cuDNN backend requires cuDNN 9.1 or later. MXFP8 additionally requires cuDNN 9.21 or later.
 - Quantized attention supports head dimensions of 32, 64, 96, and 128.
 - Self-attention, cross-attention, MHA, GQA, MQA, full attention, and causal attention are supported. Key padding masks are not supported.

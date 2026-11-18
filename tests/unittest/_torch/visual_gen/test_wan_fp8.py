@@ -522,6 +522,16 @@ def test_unknown_pipeline_config_key_is_rejected(wan_checkpoint: str) -> None:
 
 
 @pytest.mark.cpu_only
+def test_block_fusions_key_takes_a_bool_only(wan_checkpoint: str) -> None:
+    """A quoted "false" is rejected instead of being read as true."""
+    args = VisualGenArgs(
+        model=wan_checkpoint, pipeline_config={"enable_fp8_block_fusions": "false"}
+    )
+    with pytest.raises(ValueError, match="must be true or false"):
+        PipelineLoader(args, device="cpu")._resolve_pipeline_config(wan_checkpoint)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("enabled", [False, True])
 def test_post_load_weights_plans_block_fusions_only_when_enabled(monkeypatch, enabled) -> None:
     """post_load_weights plans block fusions only when enabled."""

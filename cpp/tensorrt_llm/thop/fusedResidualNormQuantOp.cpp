@@ -99,7 +99,7 @@ std::tuple<torch::Tensor, torch::Tensor> fused_residual_norm_quant(torch::Tensor
         TORCH_CHECK(
             y_bias->scalar_type() == torch::kBFloat16 && y_bias->numel() == hidden, "y_bias must be bfloat16 [hidden]");
         checkContiguousAligned(*y_bias, "y_bias", x.device());
-        p.y_bias = y_bias->data_ptr();
+        p.yBias = y_bias->data_ptr();
     }
     p.gate = fp32Rows(gate, batch, hidden, "gate", x.device());
     int64_t const modRows = mode == 2 ? batch : 1;
@@ -113,17 +113,17 @@ std::tuple<torch::Tensor, torch::Tensor> fused_residual_norm_quant(torch::Tensor
             "inv_out_scale must be float32 [1]");
         TORCH_CHECK(inv_out_scale->is_cuda() && inv_out_scale->device() == x.device(),
             "inv_out_scale must be a CUDA tensor on the device of x");
-        p.inv_out_scale = inv_out_scale->data_ptr<float>();
+        p.invOutScale = inv_out_scale->data_ptr<float>();
     }
 
     auto x_out = y.has_value() ? torch::empty_like(x) : x.new_empty({0});
     auto normed = normalizes ? torch::empty(x.sizes(), x.options().dtype(torch::kFloat8_e4m3fn))
                              : x.new_empty({0}, x.options().dtype(torch::kFloat8_e4m3fn));
-    p.x_out = y.has_value() ? x_out.data_ptr() : nullptr;
+    p.xOut = y.has_value() ? x_out.data_ptr() : nullptr;
     p.normed = normalizes ? normed.data_ptr() : nullptr;
     p.rows = static_cast<int>(rows);
     p.hidden = static_cast<int>(hidden);
-    p.rows_per_batch = static_cast<int>(rows_per_batch);
+    p.rowsPerBatch = static_cast<int>(rows_per_batch);
     p.eps = static_cast<float>(eps);
     p.mode = static_cast<tk::ResidualNormMode>(mode);
     tk::launchResidualNormQuant(p, at::cuda::getCurrentCUDAStream(x.get_device()));

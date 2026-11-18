@@ -165,7 +165,7 @@ class Attention(nn.Module):
         if is_separate_qkv_cross_attention and cudnn_fp8_fallback:
             backend_name = "CUDNN"
             masked_fallback_backend = "VANILLA"
-            logger.info_once(
+            logger.warning_once(
                 f"{type(self).__name__}: TRTLLM per-tensor FP8 attention runs cross-attention "
                 "on CUDNN FP8 (VANILLA for calls with a key_padding_mask).",
                 key=(type(self).__name__, "dense_fp8_cross_attention"),
@@ -190,7 +190,7 @@ class Attention(nn.Module):
             # Attention2D and Ring merge partial results by LSE, which the trtllm-gen dense
             # FP8 path does not return; cuDNN FP8 runs the same recipe with LSE.
             backend_name = "CUDNN"
-            logger.info_once(
+            logger.warning_once(
                 f"{type(self).__name__}: TRTLLM per-tensor FP8 attention runs on CUDNN FP8 "
                 f"under context parallelism (cp_size={cp_size}).",
                 key=(type(self).__name__, "dense_fp8_context_parallel"),

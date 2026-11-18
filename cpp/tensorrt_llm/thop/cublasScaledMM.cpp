@@ -457,8 +457,8 @@ void cublaslt_fp8_epilogue_gemm(Tensor& out, Tensor const& a, Tensor const& b, T
         }
         algo = it->second;
     }
-    float const alpha = 1.f;
-    float const beta = 0.f;
+    float const alpha = 1.0F;
+    float const beta = 0.0F;
     void* cPtr = outFp8 ? nullptr : out.data_ptr();
     check_cuda_error(cublasLtMatmul(handle, op, &alpha, b.data_ptr(), layoutA.get(), a.data_ptr(), layoutB.get(), &beta,
         cPtr, layoutC.get(), out.data_ptr(), layoutD.get(), &algo, workspace.data_ptr(), workspaceBytes, stream));

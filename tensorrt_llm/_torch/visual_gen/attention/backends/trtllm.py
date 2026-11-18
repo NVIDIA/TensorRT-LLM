@@ -458,16 +458,19 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         # Compiled callers guard on this flag; testing layer_idx per call would specialize, and
         # recompile, the attention frames for every layer.
         self.is_dense_layer = self.layer_idx in self.dense_layers
-        # The library that serves the per-tensor FP8 recipe also takes pre-quantized Q/K/V
-        # (softmax scale folded into Q/K) when it supports that.
+        # Pre-quantized Q/K/V (softmax scale folded into Q/K) go to the first available library
+        # that takes them; libraries only list themselves for layers they serve, so their
+        # availability rules (SM, sparse layers) also cover this path.
         self._prequantized_fp8_lib: Optional[Fmha] = None
         if is_per_tensor_fp8(quant_attention_config):
-            per_tensor_fp8 = next(
-                (fmha for fmha in self._fmha_manager.fmha_libs if fmha.supports_per_tensor_fp8),
+            self._prequantized_fp8_lib = next(
+                (
+                    fmha
+                    for fmha in self._fmha_manager.fmha_libs
+                    if fmha.supports_per_tensor_fp8 and fmha.supports_prequantized_fp8()
+                ),
                 None,
             )
-            if per_tensor_fp8 is not None and per_tensor_fp8.supports_prequantized_fp8():
-                self._prequantized_fp8_lib = per_tensor_fp8
 
     @property
     def timestep_cutoff(self) -> Optional[float]:

@@ -40,7 +40,7 @@ constexpr int kMaxHidden = 8 * kHiddenStep;
 // fp32 -> bf16 (round to nearest even) -> fp32.
 __device__ __forceinline__ float roundBf16(float v)
 {
-    __nv_bfloat162 const p = __floats2bfloat162_rn(0.f, v);
+    __nv_bfloat162 const p = __floats2bfloat162_rn(0.0F, v);
     return __uint_as_float(*reinterpret_cast<uint32_t const*>(&p));
 }
 
@@ -76,8 +76,8 @@ __global__ void __launch_bounds__(kBlock, 8) residualNormQuantKernel(__nv_bfloat
     }
 
     uint4 xb[kChunks];
-    float sum = 0.f;
-    float sumSq = 0.f;
+    float sum = 0.0F;
+    float sumSq = 0.0F;
 #pragma unroll
     for (int c = 0; c < kChunks; c++)
     {
@@ -157,8 +157,8 @@ __global__ void __launch_bounds__(kBlock, 8) residualNormQuantKernel(__nv_bfloat
         __syncthreads();
         if (warp == 0)
         {
-            float a = lane < kBlock / 32 ? warpSum[lane] : 0.f;
-            float a2 = lane < kBlock / 32 ? warpSumSq[lane] : 0.f;
+            float a = lane < kBlock / 32 ? warpSum[lane] : 0.0F;
+            float a2 = lane < kBlock / 32 ? warpSumSq[lane] : 0.0F;
 #pragma unroll
             for (int o = 16; o > 0; o /= 2)
             {
@@ -167,10 +167,10 @@ __global__ void __launch_bounds__(kBlock, 8) residualNormQuantKernel(__nv_bfloat
             }
             if (lane == 0)
             {
-                float const invHidden = 1.0f / static_cast<float>(HIDDEN);
+                float const invHidden = 1.0F / static_cast<float>(HIDDEN);
                 float const mean = a * invHidden;
                 // Single-pass variance can cancel slightly below zero.
-                float const var = fmaxf(a2 * invHidden - mean * mean, 0.f);
+                float const var = fmaxf(a2 * invHidden - mean * mean, 0.0F);
                 stats[0] = mean;
                 stats[1] = rsqrtf(var + eps);
             }
@@ -205,7 +205,7 @@ __global__ void __launch_bounds__(kBlock, 8) residualNormQuantKernel(__nv_bfloat
                 for (int j = 0; j < 2; j++)
                 {
                     float const xn = (xv[j] - mean) * rstd;
-                    float const ww = kAda ? 1.0f + wv[2 * i + j] : wv[2 * i + j];
+                    float const ww = kAda ? 1.0F + wv[2 * i + j] : wv[2 * i + j];
                     // Round to bf16, then the saturating static FP8 quantization.
                     yv[j] = roundBf16(xn * ww + bv[2 * i + j]) * qmul;
                 }
@@ -221,15 +221,15 @@ void launchKernel(ResidualNormQuantParams const& p, cudaStream_t stream)
 {
     residualNormQuantKernel<HIDDEN, MODE, HAS_Y, HAS_GATE, HAS_YBIAS>
         <<<p.rows, kBlock, 0, stream>>>(static_cast<__nv_bfloat16 const*>(p.x), static_cast<__nv_bfloat16 const*>(p.y),
-            static_cast<__nv_bfloat16 const*>(p.y_bias), p.gate, p.weight, p.bias, p.inv_out_scale, p.rows_per_batch,
-            p.eps, static_cast<__nv_bfloat16*>(p.x_out), static_cast<__nv_fp8_e4m3*>(p.normed));
+            static_cast<__nv_bfloat16 const*>(p.yBias), p.gate, p.weight, p.bias, p.invOutScale, p.rowsPerBatch, p.eps,
+            static_cast<__nv_bfloat16*>(p.xOut), static_cast<__nv_fp8_e4m3*>(p.normed));
 }
 
 template <int HIDDEN, ResidualNormMode MODE>
 void dispatchResidual(ResidualNormQuantParams const& p, cudaStream_t stream)
 {
     bool const hasGate = p.gate != nullptr;
-    bool const hasYBias = p.y_bias != nullptr;
+    bool const hasYBias = p.yBias != nullptr;
     if (p.y == nullptr)
     {
         if constexpr (MODE != ResidualNormMode::kResidualOnly)
@@ -290,12 +290,12 @@ void launchResidualNormQuant(ResidualNormQuantParams const& p, cudaStream_t stre
 {
     TLLM_CHECK_WITH_INFO(
         residualNormQuantSupportsHidden(p.hidden), "residual norm quant: unsupported hidden %d", p.hidden);
-    TLLM_CHECK_WITH_INFO(p.rows_per_batch > 0, "residual norm quant: rows_per_batch must be positive");
+    TLLM_CHECK_WITH_INFO(p.rowsPerBatch > 0, "residual norm quant: rows_per_batch must be positive");
     bool const normalizes = p.mode != ResidualNormMode::kResidualOnly;
     TLLM_CHECK_WITH_INFO(p.y != nullptr || normalizes, "residual norm quant: residual-only mode needs y");
-    TLLM_CHECK_WITH_INFO(p.y == nullptr || p.x_out != nullptr, "residual norm quant: y needs x_out");
+    TLLM_CHECK_WITH_INFO(p.y == nullptr || p.xOut != nullptr, "residual norm quant: y needs x_out");
     TLLM_CHECK_WITH_INFO(
-        !normalizes || (p.weight != nullptr && p.bias != nullptr && p.inv_out_scale != nullptr && p.normed != nullptr),
+        !normalizes || (p.weight != nullptr && p.bias != nullptr && p.invOutScale != nullptr && p.normed != nullptr),
         "residual norm quant: normalization needs weight, bias, inv_out_scale and normed");
     if (p.rows == 0)
     {
