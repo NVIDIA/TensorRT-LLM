@@ -468,10 +468,10 @@ class TestRMSNormBasic:
         )
 
         guarded = torch.full((num_rows + tile, N + pad), 7.0, device=device, dtype=dtype)
-        out, _, _ = layernorm_gated._layer_norm_fwd(
+        layernorm_gated._layer_norm_fwd(
             x, weight, None, 1e-6, z=z_rows, out=guarded[:num_rows, :N], is_rms_norm=True
         )
-        assert torch.equal(out, expected)
+        assert torch.equal(guarded[:num_rows, :N], expected)
         guarded[:num_rows, :N] = 7.0
         assert torch.all(guarded == 7.0)
         assert torch.equal(rms_norm_gated_token_major(x, z, weight, 1e-6), expected)
@@ -489,12 +489,12 @@ class TestRMSNormBasic:
         weight = torch.rand(N, device=device, dtype=dtype) + 0.5
         guarded = torch.full((num_rows + tile, N), 7.0, device=device, dtype=dtype)
 
-        out, _, _ = layernorm_gated._layer_norm_fwd(
+        layernorm_gated._layer_norm_fwd(
             x, weight, None, 1e-6, z=z, out=guarded[:num_rows], is_rms_norm=True
         )
         assert torch.all(guarded[num_rows:] == 7.0)
         expected = reference_rmsnorm_gated(x.float(), weight.float(), z.float(), eps=1e-6)
-        torch.testing.assert_close(out, expected.to(dtype), rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(guarded[:num_rows], expected.to(dtype), rtol=1e-2, atol=1e-2)
 
 
 @skip_no_cuda
