@@ -9210,10 +9210,11 @@ class PyExecutor:
             if self._benchmark_stage_draining:
                 timeout = datetime.timedelta(0)
             elif (self._benchmark_stage_started
-                  and self._benchmark_stage_index < len(self._benchmark_stages)
-                  and timeout is None):
-                timeout = datetime.timedelta(
+                  and not self._benchmark_fill_phase_active and
+                  self._benchmark_stage_index < len(self._benchmark_stages)):
+                wake = datetime.timedelta(
                     seconds=_BENCHMARK_STAGE_STALL_WARN_SECONDS / 2)
+                timeout = wake if timeout is None else min(timeout, wake)
 
         # Fetch requests from rank 0
         new_requests = []
