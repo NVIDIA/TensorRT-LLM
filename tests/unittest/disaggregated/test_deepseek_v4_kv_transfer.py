@@ -441,6 +441,7 @@ def run_deepseek_v4_transfer_test(
         ctx_enable_dp=ctx_enable_dp,
         gen_enable_dp=gen_enable_dp,
         update_before_transfer=update_before_transfer,
+        update_context_history=True,
         manager_factory=lambda tp, pp, enable_dp: _create_managers_for_instance(
             tp, pp, enable_dp, compress_ratios
         ),
@@ -467,22 +468,25 @@ TEST_CONFIGS = [
 ]
 
 
-# @pytest.mark.threadleak(enabled=False)
+def _transfer_cases():
+    for *topology, name in TEST_CONFIGS:
+        # Exercise all four layout/order combinations with request sharding
+        # and a PP boundary. Elsewhere, cover both layouts and both orders.
+        for layout, label, default_before in (
+            ([1, 4, 128], "cr_1_4_128", True),
+            ([128, 1, 4, 128], "cr_128_1_4_128", False),
+        ):
+            orders = (True, False) if name == "tp2_pp2_dp_both" else (default_before,)
+            for before in orders:
+                order = "update_before" if before else "update_after"
+                yield pytest.param(*topology, layout, before, id=f"{order}-{label}-{name}")
+
+
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize(
-    "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp",
-    [(c[0], c[1], c[2], c[3], c[4], c[5]) for c in TEST_CONFIGS],
-    ids=[c[6] for c in TEST_CONFIGS],
-)
-@pytest.mark.parametrize(
-    "compress_ratios",
-    [[1, 4, 128], [128, 1, 4, 128]],
-    ids=["cr_1_4_128", "cr_128_1_4_128"],
-)
-@pytest.mark.parametrize(
-    "update_before_transfer",
-    [True, False],
-    ids=["update_before", "update_after"],
+    "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp,"
+    "compress_ratios,update_before_transfer",
+    list(_transfer_cases()),
 )
 def test_deepseek_v4_kv_transfer(
     ctx_tp,
@@ -776,16 +780,20 @@ UNEVEN_PP_CONFIGS = [
 ]
 
 
+def _uneven_transfer_cases():
+    # Exercise source history movement in both orders on asymmetric transfers
+    # in either direction and on sharded requests spanning pipeline stages.
+    both_orders = {"7L_tp4_to_pp4", "7L_pp4_to_tp4", "5L_tp2_pp2_dp_both"}
+    for *topology_and_layers, name in UNEVEN_PP_CONFIGS:
+        for before in (True, False) if name in both_orders else (True,):
+            order = "update_before" if before else "update_after"
+            yield pytest.param(*topology_and_layers, before, id=f"{order}-{name}")
+
+
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize(
-    "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp,num_layers",
-    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in UNEVEN_PP_CONFIGS],
-    ids=[c[7] for c in UNEVEN_PP_CONFIGS],
-)
-@pytest.mark.parametrize(
-    "update_before_transfer",
-    [True, False],
-    ids=["update_before", "update_after"],
+    "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp,num_layers,update_before_transfer",
+    list(_uneven_transfer_cases()),
 )
 def test_deepseek_v4_kv_transfer_uneven_pp(
     ctx_tp,

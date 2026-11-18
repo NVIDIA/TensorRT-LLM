@@ -321,6 +321,7 @@ def run_kv_transfer_test(
     gen_enable_dp: bool,
     update_before_transfer: bool = True,
     *,
+    update_context_history: bool = False,
     manager_factory: ManagerFactory[_CacheManagerT],
     init_fn: CacheInitializer[_CacheManagerT],
     verify_fn: CacheVerifier[_CacheManagerT],
@@ -465,12 +466,27 @@ def run_kv_transfer_test(
                     req.add_new_token(req.prompt_len, 0)
                     seen.add(req.py_request_id)
 
-        # ===== 5.6. update_resources BEFORE transfer (mode: update_before) =====
-        if update_before_transfer:
+        def update_managers() -> None:
             for rank, batch in ctx_batches.items():
-                ctx_managers[rank].update_resources(batch)
+                manager = ctx_managers[rank]
+                if update_context_history:
+                    # The prefill executor advances context history separately
+                    # from update_resources, which handles generation requests.
+                    for req in batch.context_requests:
+                        assert manager.get_history_length(req) == 0
+                    manager.update_context_resources(batch)
+                    for req in batch.context_requests:
+                        history = manager.get_history_length(req)
+                        assert history == req.prompt_len, (
+                            f"request {req.py_request_id}: source KV history {history}, "
+                            f"expected {req.prompt_len}"
+                        )
+                manager.update_resources(batch)
             for rank, batch in gen_batches.items():
                 gen_managers[rank].update_resources(batch)
+
+        if update_before_transfer:
+            update_managers()
 
         # ===== 6. gen receive + ctx send =====
         for rank in range(gen_world):
@@ -486,12 +502,8 @@ def run_kv_transfer_test(
         )
         run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
 
-        # ===== 7.5. update_resources AFTER transfer (mode: update_after) =====
         if not update_before_transfer:
-            for rank, batch in ctx_batches.items():
-                ctx_managers[rank].update_resources(batch)
-            for rank, batch in gen_batches.items():
-                gen_managers[rank].update_resources(batch)
+            update_managers()
 
         # ===== 8. Verify =====
         verify_fn(

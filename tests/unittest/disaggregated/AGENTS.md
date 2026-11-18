@@ -26,6 +26,9 @@ Scope: this directory and its descendants. Supplements `../../AGENTS.md`.
   containment. Cover backend-free deadline and status permutations in CPU tests;
   retain representative GPU paths for distinct storage layouts and both transfer
   directions. Add a cross-combination when it exercises a distinct interaction.
+- When testing an update before or after transfer, populate the request phase
+  that the update consumes. Assert the state transition on that side of the
+  transfer, such as source history advancing by the prefilled token count.
 - Advance a watchdog's own injectable clock only after the native-transfer and
   ownership gates have been observed. Let the real background watchdog deliver
   the timeout or fatal callback. Keep readiness, process-exit and cleanup waits
