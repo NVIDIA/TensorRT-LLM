@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -178,6 +179,136 @@ def test_multimodal_spans_round_trip_through_openai_json():
     encoded = to_disaggregated_params(original).model_dump_json()
     restored = to_llm_disaggregated_params(OpenAIDisaggregatedParams.model_validate_json(encoded))
     assert restored == original
+
+
+def _multimodal_handoff(request_type):
+    """What a context worker returns for one image: cache identity and portable mRoPE."""
+    from dataclasses import asdict
+
+    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+
+    identity = MultimodalInput.from_components(
+        [[1, 2, 3, 4, 5, 6, 7, 8]], [1], [2], ["image-id"], [0, 2], [1, 3], [1, 1]
+    )
+    return DisaggregatedParams(
+        request_type=request_type,
+        first_gen_tokens=[17],
+        multimodal_positions=[1],
+        multimodal_lengths=[2],
+        multimodal_input=asdict(identity),
+        mrope_position_ids_handle=SharedTensorContainer.from_tensor_bytes(
+            torch.arange(12).reshape(3, 1, 4)
+        ).dump_to_dict(),
+        mrope_position_deltas_handle=SharedTensorContainer.from_tensor_bytes(
+            torch.tensor([-32], dtype=torch.int32)
+        ).dump_to_dict(),
+    )
+
+
+def _handoff_fields():
+    """The handoff fields of _multimodal_handoff(), as protocol keyword arguments."""
+    params = _multimodal_handoff("context_only")
+    return {
+        name: getattr(params, name)
+        for name in (
+            "multimodal_input",
+            "mrope_position_ids_handle",
+            "mrope_position_deltas_handle",
+        )
+    }
+
+
+def test_multimodal_handoff_round_trips_through_openai_json():
+    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+    from tensorrt_llm.serve.openai_protocol import (
+        to_disaggregated_params,
+        to_llm_disaggregated_params,
+    )
+
+    original = _multimodal_handoff("context_only")
+    encoded = to_disaggregated_params(original).model_dump_json()
+    # The router turns the context reply into the generation request.
+    received = OpenAIDisaggregatedParams.model_validate_json(encoded)
+    received.request_type = "generation_only"
+    restored = to_llm_disaggregated_params(received)
+    assert restored == replace(original, request_type="generation_only")
+    positions = SharedTensorContainer.from_dict(restored.mrope_position_ids_handle)
+    assert torch.equal(positions.get_local_view(), torch.arange(12).reshape(3, 1, 4))
+
+
+@pytest.mark.parametrize("request_type", ["context_only", "context_and_generation"])
+def test_only_generation_requests_take_multimodal_handoff(request_type):
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+    from tensorrt_llm.serve.openai_protocol import to_llm_disaggregated_params
+
+    handoff = _handoff_fields()
+    params = to_llm_disaggregated_params(
+        OpenAIDisaggregatedParams(request_type=request_type, **handoff)
+    )
+    assert all(getattr(params, name) is None for name in handoff)
+
+
+def test_absent_multimodal_handoff_is_left_out_of_json():
+    """A router that predates the handoff fields still reads a text-only reply."""
+    from pydantic import ValidationError, create_model
+
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+    from tensorrt_llm.serve.openai_protocol import OpenAIBaseModel, to_disaggregated_params
+
+    handoff = set(_handoff_fields())
+    older = create_model(
+        "OlderDisaggregatedParams",
+        __base__=OpenAIBaseModel,
+        **{
+            name: (field.annotation, field)
+            for name, field in OpenAIDisaggregatedParams.model_fields.items()
+            if name not in handoff
+        },
+    )
+    params = to_disaggregated_params(
+        DisaggregatedParams(request_type="context_only", first_gen_tokens=[17])
+    )
+    assert not handoff & set(params.model_dump())
+    older.model_validate_json(params.model_dump_json())
+    with pytest.raises(ValidationError):
+        older.model_validate({**params.model_dump(), "multimodal_input": None})
+    params = to_disaggregated_params(_multimodal_handoff("context_only"))
+    assert handoff <= set(params.model_dump(mode="json"))
+
+
+def test_generation_response_does_not_echo_multimodal_handoff():
+    from tensorrt_llm.serve.openai_protocol import to_disaggregated_params
+
+    params = to_disaggregated_params(_multimodal_handoff("generation_only"))
+    assert params.multimodal_input is None
+    assert params.mrope_position_ids_handle is None
+    assert params.mrope_position_deltas_handle is None
+    assert params.multimodal_positions == [1]
+
+
+@pytest.mark.parametrize(
+    "field, update",
+    [
+        ("mrope_position_ids_handle", {"method_key": 1}),
+        ("mrope_position_ids_handle", {"storage_handle": "ipc"}),
+        ("mrope_position_ids_handle", {"dtype": "torch.complex32"}),
+        ("mrope_position_deltas_handle", {"tensor_size": [-1]}),
+        ("multimodal_input", {"multimodal_positions": [1, 3]}),
+        ("multimodal_input", {"multimodal_hashes": [["a"] * 8]}),
+        ("multimodal_input", {"extra": 1}),
+    ],
+)
+def test_openai_protocol_rejects_invalid_multimodal_handoff(field, update):
+    from pydantic import ValidationError
+
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+
+    payload = getattr(_multimodal_handoff("generation_only"), field)
+    OpenAIDisaggregatedParams(request_type="generation_only", **{field: payload})
+    with pytest.raises(ValidationError):
+        OpenAIDisaggregatedParams(request_type="generation_only", **{field: {**payload, **update}})
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")
