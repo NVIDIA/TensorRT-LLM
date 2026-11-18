@@ -12,7 +12,13 @@ What a target runs is in its constants (``K3Sm107Constants``) and the family's l
   kernels may read only the engine-wide switches (PDL, forced MNNVL all-reduce);
 * the two family modules only the MXFP4 sm100 targets use for it: ``environment.py`` (the
   targets' own switches, which also predate the rule) and ``ops/attention/flashinfer_mla_decode.py``
-  (the engine-wide PDL switch).
+  (the engine-wide PDL switch);
+* ``DEVICE_TOPOLOGY`` permits reading the device map. The ultra-low-latency
+  target's step shell (``ops/common/k3_ull_runtime.py``) pins its executor thread to a CPU near
+  its GPU and maps the CUDA device to the physical GPU through ``CUDA_VISIBLE_DEVICES``, as the
+  served shell did.
+
+The scan also catches ``environ`` reached another way than ``os.environ`` (``__import__("os")``).
 """
 
 import re
@@ -30,10 +36,12 @@ _EXEMPT_TARGETS = {
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4",
 }
 ENGINE_WIDE = {"TRTLLM_ENABLE_PDL", "TRTLLM_FORCE_MNNVL_AR"}
+#: (file relative to the family directory, variable): device-topology reads (module docstring).
+DEVICE_TOPOLOGY = {(Path("ops/common/k3_ull_runtime.py"), "CUDA_VISIBLE_DEVICES")}
 _ROUTING = Path("routing.py")
 _SM100_ONLY = {Path("environment.py"), Path("ops/attention/flashinfer_mla_decode.py")}
 
-_READ = re.compile(r"\b(?:os\.environ|os\.getenv|getenv)\b")
+_READ = re.compile(r"\b(?:os\.environ|os\.getenv|getenv)\b|\.environ\b|__import__\(\s*[\"']os[\"']")
 _LITERAL = re.compile(
     r"""(?:os\.environ\.get|os\.environ\[|os\.getenv)\(?\s*["']([A-Z0-9_]+)["']"""
 )
@@ -60,6 +68,7 @@ def test_sm107_code_reads_no_environment_variable():
     bad = [
         f"{where}: {line.strip()}"
         for rel, where, line, names in _reads()
-        if not _sm100_kernel(rel) or not names or not set(names) <= ENGINE_WIDE
+        if not (names and all((rel, name) in DEVICE_TOPOLOGY for name in names))
+        and (not _sm100_kernel(rel) or not names or not set(names) <= ENGINE_WIDE)
     ]
     assert not bad, "environment reads in the Kimi K3 family:\n" + "\n".join(bad)

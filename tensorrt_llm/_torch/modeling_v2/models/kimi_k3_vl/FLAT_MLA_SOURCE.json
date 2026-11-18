@@ -1,0 +1,200 @@
+{
+  "area": "mla",
+  "scope": "GEN step of one MLA layer (FP4-KV layers and FP8-KV layers 91 / 92): side gate, q-fused path (<= 16 rows) or absorption path, KV-cache update, packed FP4 decode or CuTe DSL FP8 decode, Helix exchange + fused K3HelixTail, gated o_proj hand-off. The FP8 weight-read linears (q_a|kv_a, q_b, o_proj, gate) are equivalent to served without edits (fp8_weight_read.py, ops/gemm/* unchanged). MLAIN (the fold of the gate into the input projection, released at the producer's entry) follows served ull/mlain.py MlaInAttention through the interface modeling._mla_input (served ChainMlaInput) calls.",
+  "source_commit": "6904cd9672",
+  "source_tree": "user/xguan/k3-rubin-ull-chain-mlamoe-gsm (~/dev/tekit_k3r_mlamoe_gsm)",
+  "measured_run": "1007804",
+  "functions": {
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLAAttention._side_gate_core / gated_o_proj / _forward_side_gate": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/stages.py:350 MlaAttention._side_gate",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:1108 KimiK3MLAAttention._forward_side_gate",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:577 KimiK3MLAAttention._apply_output_gate_and_o_proj"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLAAttention._side_gate_applies": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:629 KimiK3MLAAttention._side_gate_applies"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_parse_ull3_gate_at / ull3_gate_place / _gate_side_stream": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:99 _parse_ull3_gate_at",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:114 ull3_gate_place",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:136 _gate_side_stream"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:helix_gen_zero_kv_mask": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:145 helix_gen_zero_kv_mask",
+      "tensorrt_llm/_torch/attention/attention.py:125 _helix_zero_kv_mask"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:q_fused_applies / q_fused_w_uk / q_fused_qb_exponents / latent_row / _q_fused_latent_row": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:926 KimiK3MLAAttention._q_fused_applies",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:897 KimiK3MLAAttention._q_fused_w_uk",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:905 KimiK3MLAAttention._q_fused_qb_exponents",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:862 KimiK3MLAAttention._latent_row",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:973 KimiK3MLAAttention._q_fused_latent_row"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:forward_gen_q_fused": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:993 KimiK3MLAAttention._forward_gen_q_fused",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/stages.py:444 MlaAttention._q_fused"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:forward_absorption_generation": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:661 KimiK3MLAAttention.forward_absorption_generation",
+      "tensorrt_llm/_torch/attention/mla.py:1827 MLA.forward_absorption_generation"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:attn_forward_gen / _helix_gen / gen_attention": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:696 KimiK3MLAAttention._attn_forward_gen",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:737 KimiK3MLAAttention._attn_forward_gen_helix_hooked",
+      "tensorrt_llm/_torch/attention/mla.py:848 MLA._attn_forward_gen"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_helix_gen_fused_tail / tail_output_buffer / helix_tail_applies": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:779 KimiK3MLAAttention._attn_forward_gen_fused_tail",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:681 KimiK3MLAAttention._tail_output_buffer",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:648 KimiK3MLAAttention._helix_tail_applies"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:project_helix_v_partials": [
+      "tensorrt_llm/_torch/attention/mla.py:1809 MLA._helix_project_v_partials"
+    ],
+    "ops/attention/k3_ull_helix_tail_workspace.py:K3HelixTail / ull2_tail_enabled": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/helix_tail.py:75 K3HelixTail",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/helix_tail.py:199 fold_inputs_of",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/helix_tail.py:55 ull2_tail_enabled",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/helix_tail.py:59 decode_releases_tail_early"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:fold_inputs_of / decode_releases_tail_early": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/helix_tail.py:75 K3HelixTail",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/helix_tail.py:199 fold_inputs_of",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/helix_tail.py:55 ull2_tail_enabled",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/helix_tail.py:59 decode_releases_tail_early"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:fp8_mla_decode": [
+      "tensorrt_llm/_torch/attention/backends/fmha/cute_dsl_mla.py:602 CuteDslMlaFmha._run_mla_decode"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:fp8_mla_split_plan": [
+      "tensorrt_llm/_torch/attention/backends/fmha/cute_dsl_mla.py:750 CuteDslMlaFmha._split_kv_plan"
+    ],
+    "ops/attention/k3_mla_decode_fp8.py:K3MlaDecodeFp8.__call__ / decode_tactic / workspace_bytes": [
+      "tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py:12215 CuteDSLNVMlaDecodeBlackwellRunner (default tactic, forward)",
+      "tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py:13061 cute_dsl_mla_decode_fp8_blackwell"
+    ],
+    "ops/attention/k3_mla_decode_fp8.py:launch_split_plan": [
+      "tensorrt_llm/_torch/attention/backends/fmha/cute_dsl_mla.py:150 launch_mla_split_kv_plan (kernels/mla/cute_dsl_mla.py is the served file, copied)"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:forward_absorption_generation (FP8 RoPE + cache append)": [
+      "tensorrt_llm/_torch/attention/backends/trtllm.py:2943 TrtllmAttention.mla_rope_generation (HEAD wrapper, identical)"
+    ],
+    "ops/attention/_fp4_mla_cache_update.py:rope_generation": [
+      "tensorrt_llm/_torch/attention/backends/trtllm.py:3108 TrtllmAttention._fp4_mla_rope_generation",
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/cache_update.py:767 scatter_fp4_mla_kv_cache (generation branch)",
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/cache_update.py:430 _scatter_fp4_mla_kv_cache_2d_generation"
+    ],
+    "ops/attention/_fp4_mla_cache_update.py:kv_append_generation (ops/attention/fp4_mla_kv_append_ull.py)": [
+      "tensorrt_llm/_torch/attention/backends/trtllm.py:3168 TrtllmAttention.fp4_mla_kv_append_generation"
+    ],
+    "kernels/k3r_fp4_mla/fp4_mla_kernels.py:_fp4_mla_generation_fused_qk_rope_cache_update_kernel": [
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/fp4_mla_kernels.py (copied unchanged by flatten/copy_served_kernels.py)"
+    ],
+    "ops/attention/_fp4_mla_decode_ull.py:packed_plan_geometry / helix_plan_bounds / _launch_packed_plan": [
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/packed_plan.py:111 _fp4_mla_packed_plan_geometry",
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/packed_plan.py:225 _fp4_mla_helix_plan_bounds",
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/packed_plan.py:243 _launch_fp4_mla_packed_plan"
+    ],
+    "ops/attention/_fp4_mla_decode_ull.py:begin_step / prelaunch / uniform_generation_lengths / materialize_page_table": [
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/metadata.py:840 prelaunch_fp4_mla_generation_metadata",
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/metadata.py:749 _fp4_mla_uniform_generation_lengths",
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/metadata.py:876 _materialize_fp4_mla_device_page_table_for_forward",
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/metadata.py:625 materialize_fp4_mla_device_page_table",
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/state.py Fp4MlaState (packed_plan_key, q_rows_external, metadata_launches, query_launch_mark)"
+    ],
+    "ops/attention/_fp4_mla_decode_ull.py:run_generation / _run_packed_decode (ops/attention/k3_fp4_mla_decode_ull.py)": [
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/decode.py:964 run_fp4_mla_attention_decode",
+      "tensorrt_llm/_torch/attention/backends/fp4_mla/decode.py:766 _run_cutedsl_packed_decode",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:179 _install_k3_fp4_mla_decode_kernel"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_install_identity_rope / identity_rope_table": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:251 _install_identity_rope_table",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:233 _write_identity_rope_values"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_kimi_k3_fp8_kv_layer_ids / FP8_KV_LAYERS": [
+      "tensorrt_llm/_torch/kimi_k3_cache_policy.py:28 get_kimi_k3_fp8_kv_layer_ids"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:MLA_MAX_POSITIONS": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:386 _KIMI_K3_MLA_MAX_POSITIONS_ENV (unset in 1007804 -> max_position_embeddings 1048576)"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLARuntime.takes_q_fused": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:212 MlaInAttention.takes_q_fused",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/stages.py:311 MlaAttention._splits"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLARuntime.stages_weights": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:224 MlaInAttention.stages_weights"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLARuntime.released / decode_attention (MLAIN hand-off)": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:191 MlaInAttention.released",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:251 MlaInAttention.run"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLAAttention.mlain_fold / prepare_in_fold / in_fold": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:197 MlaInAttention._fold"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLAAttention.fold_call": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:234 MlaInAttention._fold_call"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLAAttention.project_qkv_a": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:265 MlaInAttention.run project (MLAIN call)",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py:469 KimiK3MLAAttention._project_qkv_a (otherwise)"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLAAttention._gate_of": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:279 MlaInAttention.run forward_sigmoid",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/stages.py:361 MlaAttention._side_gate gate_of"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:FoldedInProj / foldable / MLAIN_MAX_ROWS": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:68 FoldedInProj",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:131 _foldable",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:147 _fold_tactic",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:46 MAX_ROWS"
+    ]
+  },
+  "constants": {
+    "ops/attention/_fp4_mla_decode_ull.py:_SPLITS = 8": "TRTLLM_FP4_MLA_SPLIT_KV=8 (1007804 trtllm env); served packed_plan.py:76",
+    "ops/attention/_fp4_mla_decode_ull.py:_LPT_PLAN = True": "TRTLLM_FP4_MLA_LPT_PLAN=1 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); served config.py:301 _fp4_mla_lpt_plan_enabled",
+    "ops/attention/_fp4_mla_decode_ull.py:_WAVE_PLAN = True": "TRTLLM_FP4_MLA_PACKED_WAVE_PLAN unset; served config.py:308 default on where the kernel module has SUPPORTS_ORDERED_PLAN (the K3 module has it)",
+    "ops/attention/_fp4_mla_decode_ull.py:_ULL3_MLA_TAIL_TRIGGER_EPILOGUE = True": "TRTLLM_K3_ULL3_MLA_TAIL_TRIGGER=epilogue (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); served config.py:325 -> the kernel module's LAUNCH_DEPENDENTS_EPILOGUE",
+    "ops/attention/_fp4_mla_decode_ull.py:_PACKED_Q = True": "TRTLLM_FP4_MLA_PACKED_Q unset; served config.py:186 default on",
+    "ops/attention/_fp4_mla_decode_ull.py:CUTEDSL_BACKEND = \"cutedsl\"": "TRTLLM_FP4_MLA_ATTENTION_BACKEND unset; served config.py:210 picks cutedsl on SM107 when the CuTe DSL backend imports",
+    "ops/attention/_fp4_mla_cache_update.py:_FUSED_V_TRANSPOSE = False": "TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE unset; served config.py:128 default off",
+    "ops/attention/_fp4_mla_cache_update.py:_STORE_K_RESIDUAL = True": "served cache_update.py:656 store_k_residual = backend in _FP4_MLA_K_RESIDUAL_BACKENDS (config.py:80, includes cutedsl)",
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_FP8_SPLIT_PLAN_MAX_REQUESTS = 1024": "served cute_dsl_mla.py:48 _SPLIT_PLAN_MAX_REQUESTS",
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:MLA_MAX_POSITIONS = 1048576": "KIMI_K3_MLA_MAX_POSITIONS unset; served text_model.py:4787 falls back to max_position_embeddings"
+  },
+  "features": {
+    "ull2_mla_decode_pdl": "True. TRTLLM_K3_ULL2_MLA_DEC_PDL=1 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); served config.py:176.",
+    "fp4_mla_page_plan": "True. TRTLLM_FP4_MLA_PAGE_PLAN unset; served config.py:315 default on (\"0\" turns it off).",
+    "fp4_mla_reduce_pdl": "True. TRTLLM_FP4_MLA_REDUCE_PDL=1 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); served fp4_mla_packed_reduce.py:85.",
+    "fp4_mla_f16_partials": "True. TRTLLM_FP4_MLA_F16_PARTIALS=1 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); served fp4_mla_packed_reduce.py:96."
+  },
+  "source_sha256": {
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py": "787b30235c9337081924581350ae1831692f6177b5249f709bbea711fccc267d",
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/helix_tail.py": "a0794f18a8ff4575dfaa4f89bbecaee67949bcd9d38b684effe34d1234aba2d3",
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/stages.py": "e1889e95c6b10872a63f3fb9c14480f20b739c90b6742b08a17456578bd820fe",
+    "tensorrt_llm/_torch/attention/backends/fmha/cute_dsl_mla.py": "a26e432c7fde238c1e1571a39c4fd78e2bafb05024e36225cec6895ade1c5901",
+    "tensorrt_llm/_torch/attention/backends/fp4_mla/cache_update.py": "250563341ff2eaa353f9731d468e947ce852a697865bb71746ee78d0a4fbb485",
+    "tensorrt_llm/_torch/attention/backends/fp4_mla/packed_plan.py": "22adc750c8ba75e4ddf3455ddce92768f7af92b39e05ca8c14c3f1fef8e57557",
+    "tensorrt_llm/_torch/attention/backends/fp4_mla/metadata.py": "62d1acca78e1f0c891b82c5c21ddcc79c5dd16cc319d38e3617d20e3ec86e657",
+    "tensorrt_llm/_torch/attention/backends/fp4_mla/decode.py": "fde6ac67c409da732c5c251d15123e03b97f7362853aba42d99deeded8548363",
+    "tensorrt_llm/_torch/attention/backends/fp4_mla/state.py": "b45a7f90302083a97d41c2e02bc17457e53b93c1328c8f47efcc8542f7f15aed",
+    "tensorrt_llm/_torch/attention/backends/fp4_mla/config.py": "db8e9059a0df26ef176f71c73acd1d21c14e634f6eaea6e71cb4b9ba49c30db9",
+    "tensorrt_llm/_torch/attention/backends/fp4_mla/fp4_mla_kernels.py": "0e18d5d12f5a29ba96d98e6545ac6c95b9c7041d2bd0627618ba3d5fdf26149c",
+    "tensorrt_llm/_torch/attention/mla.py": "8afa4bd09b98fd538f72d3b2cf43ea8a23e9432e9b9b2359e3a4c5150ede4e63",
+    "tensorrt_llm/_torch/attention/backends/trtllm.py": "d2f34751cc2383e31cbd595321a0f7840af3cbada3754ffa235c4c9af4c4f28f",
+    "tensorrt_llm/_torch/attention/attention.py": "88af42a4c46cea6a8de226830f9f03df7f066164378ecd8f554e3717b3808952",
+    "tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py": "c8ebf307e488026ded7fd624f852e711efd518c1112b9cce6b80bc03380a6ba8",
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py": "4629dea04064be8210b196b05f6facde1e875f2d71843d5302866939bf6a0964"
+  },
+  "deliberate_differences": [
+    "Env reads are constants with 1007804's values (see constants and features). The copied kernels/fp4_mla_packed_reduce.py answers TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS / REDUCE_PDL / F16_PARTIALS with 1007804's \"1\" (constants); the glue passes reduce_pdl / f16_partials explicitly, and spread_stats is only read by the standalone reduction, which the deferred fused tail does not launch.",
+    "The served backend dispatch (MLA.forward -> TrtllmAttention.forward -> FP4 / FMHA backend objects, autotuner custom op) is unrolled into explicit calls: FP4 layers call ops/attention/k3_fp4_mla_decode, FP8 layers call ops/attention/k3_mla_decode_fp8 with the served runner's default tactic. Paths the deployment does not reach (non-Helix GEN, no-FP8 non-FP4 KV, layer.mqa.forward fallback) raise instead of falling back.",
+    "The FP4 RoPE + KV append launches the served _fp4_mla_generation_fused_qk_rope_cache_update_kernel (copied file) through the served glue; the old renamed copy kernels/fp4_mla_kv_append.py and the extra plan launch it made are gone. Plan, lengths and page table come from the step state (_fp4_mla_decode) as in served, one launch per step.",
+    "forward_gen_q_fused does not allocate the q_input / q_pe buffers served allocates and never reads (no kernels either way).",
+    "Workspace attribute names on the metadata keep the _k3_* prefix; the FP8 split plan keeps served's _cute_dsl_mla_split_plan / _key names.",
+    "The identity-RoPE table is installed by mla.py's own helper (same values as served _write_identity_rope_values).",
+    "FP8-KV layer selection is the engine's (kimi_k3_cache_policy) and raises for a full NVFP4 model whose selection is not {91, 92}, instead of trusting a hard-coded set.",
+    "TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES=2097152 governs the o_proj allreduce one-shot threshold in served; that lives in the layers / distributed area, not here.",
+    "MLAIN: served shadows mixer._project_qkv_a and g_proj.forward_sigmoid for the call; here K3MLARuntime.decode_attention consumes `released` and, where takes_q_fused holds, hands it to the mixer as mlain_released, which project_qkv_a reads (the same fold_call / forward_mxfp8(stage_weights=True) / BF16 choice) and _gate_of returns the folded gate for the same input object. Served's MlaInAttention wraps only layers that serve MLAIN (_serves, rows <= 16, UllConfig.mlain); takes_q_fused implies an FP4-KV gated layer of <= 16 rows, and with no MXFP8 rows handed over the MLAIN projection is the module projection, so the result is the same.",
+    "MLAIN: no forward-hook fallback (served MlaAttention.fallback): the target registers no forward hooks.",
+    "MLAIN: the fold is also built eagerly in build_chain (prepare_in_fold, outside capture) besides served's build on first use; mlain_fold keeps served's is_current rebuild. FoldedInProj.build returns None where a projection has no packed_weight_scale (served would raise AttributeError there; the deployment's FP8 projections have it)."
+  ]
+}

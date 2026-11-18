@@ -1,0 +1,47 @@
+{
+  "about": "The GEN worker's step shell of the Kimi K3 SM107 Helix16 ULL target (runtime.py), re-sourced from the served tree user/xguan/k3-rubin-ull-chain-mlamoe-gsm @ 6904cd9672 (measured as 1007804), whose target declared ull_step_shell = StepShell(step_prep=True, step_fold=True, pin_executor=True, gil_switch_us=200). Each entry: our name -> served path:function @ 6904cd9672, or the HEAD (#21996) code we reuse. The served kernel files are byte copies listed in kernels/SOURCE.json (kernels/step/).",
+  "served_commit": "6904cd9672",
+  "functions": {
+    "k3_ull_runtime.smt_siblings": "tensorrt_llm/_torch/pyexecutor/ull_shell.py:_smt_siblings",
+    "k3_ull_runtime.physical_gpu_index": "tensorrt_llm/_torch/pyexecutor/ull_shell.py:_physical_gpu_index",
+    "k3_ull_runtime.pin_executor_cpu": "tensorrt_llm/_torch/pyexecutor/ull_shell.py:pin_executor_cpu",
+    "k3_ull_runtime.ExecutorThreadPin": "tensorrt_llm/_torch/pyexecutor/ull_shell.py:ExecutorThreadPin",
+    "k3_ull_runtime.StepFold": "tensorrt_llm/_torch/pyexecutor/ull_shell.py:StepFold",
+    "k3_ull_runtime.STEP_FOLD": "tensorrt_llm/_torch/pyexecutor/ull_shell.py:adopt",
+    "k3_ull_runtime.GIL_SWITCH_US": "tensorrt_llm/_torch/pyexecutor/ull_shell.py:apply_gil_switch_interval",
+    "k3_ull_runtime.StepShellEvents.before_overlap_loop": "tensorrt_llm/_torch/pyexecutor/py_executor.py:PyExecutor._executor_loop_overlap",
+    "k3_ull_runtime.StepShellEvents.on_iteration": "tensorrt_llm/_torch/pyexecutor/py_executor.py:PyExecutor._executor_loop_overlap",
+    "k3_ull_runtime.InputCommitPack": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/runner.py:DecoderRunner._make_input_commit",
+    "k3_ull_runtime.InputCommitPack.flush": "tensorrt_llm/_torch/pyexecutor/input_commit.py:input_commit_step",
+    "k3_ull_runtime.InputCommitPack.set_overlap_fixup": "tensorrt_llm/_torch/pyexecutor/input_commit.py:InputCommit.set_overlap_fixup",
+    "k3_ull_runtime.OverlapFixupFold.gather": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/inputs.py:DecoderInputPreparer._copy_token_ids_to_device",
+    "k3_ull_runtime.fold_block_offsets_copy": "tensorrt_llm/_torch/pyexecutor/input_commit.py:fold_block_offsets_copy",
+    "k3_ull_runtime.make_runtime_hooks": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/runner.py:DecoderRunner._input_commit_for_step"
+  },
+  "staged_uploads": {
+    "about": "Served staged these uploads into the commit (input_commit.stage). Ours reach the pack through #21996's step_inputs.copy_ (already routed in HEAD) or step_inputs.copy_metadata_ (routed here; a plain copy unless the open pack sets issue_after_prepare).",
+    "position_ids": "HEAD step_inputs.copy_ (engine/runners/decoder/inputs.py)",
+    "kv_lens_cuda": "HEAD step_inputs.copy_ (attention/backends/trtllm.py TrtllmAttentionMetadata.prepare)",
+    "spec seeds / offsets": "HEAD step_inputs.copy_ with RuntimeHooks.pack_spec_rng_uploads (speculative/interface.py)",
+    "helix_position_offsets, helix_is_inactive_rank": "copy_metadata_ (attention/backends/trtllm.py update_helix_param)",
+    "prompt_lens_cuda": "copy_metadata_ through h2d_cache.copy_h2d_pool_shared(pack=True) without an H2D skip cache",
+    "input_ids / draft_tokens of requests without a previous batch": "copy_metadata_ (engine/runners/decoder/inputs.py)",
+    "batch_slot_ids (rejection sampling or penalties only)": "copy_metadata_ (speculative/interface.py)",
+    "overlap-scheduler gathers": "OverlapFixupFold.gather -> the commit's overlap fixup (RuntimeHooks.spec_step_fold)"
+  },
+  "shared_hook_points": [
+    "RuntimeHooks.step_input_pack_factory (pyexecutor/runtime_hooks.py; used in engine/runners/decoder/runner.py)",
+    "ExecutorEvents.on_iteration, optional (pyexecutor/runtime_hooks.py; called in py_executor.py _executor_loop_overlap)",
+    "StepInputPack.issue_after_prepare (pyexecutor/step_inputs.py; flush in engine/runners/decoder/runner.py) + step_inputs.copy_metadata_ (pyexecutor/step_inputs.py)"
+  ],
+  "deliberate_differences": [
+    "The pack opens on every replay of an already captured decode graph (#21996's pack condition). Served opened its commit only on a generation-only graph step without padding dummies on a one-model linear speculative engine; on this deployment (graphs 1..4, batch <= 4, DSpark one-model) both cover every steady step.",
+    "The commit's overlap fixup reads the previous step's sequence slots from the engine's device buffer (previous_batch_indices_cuda, uploaded by #21996 only when the slots change) instead of staging them into the arena each step (kernels/step/input_commit.py local edit slots_device).",
+    "Executor pinning and the GIL interval run in ExecutorEvents.before_overlap_loop, on the executor thread right before the loop's profiler and hang-detector scope; served ran them right inside that scope. Same thread, before the first iteration.",
+    "StepFold has no A/B period, no suppress switch and no execution-stream registration: served used the stream only for the mamba state-index upload fold, which needs TRTLLM_STATE_INDEX_COPY_KERNEL (=1 in 1007804 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); it writes only when the indices change, so a steady decode batch never folds it).",
+    "Not ported: the DFlash draft-history snapshot kernel (served step_fold, k3_rubin/spec/history_snapshot.py). #21996's target decodes the draft table on the device and publishes no draft history; owned by the draft-cache area.",
+    "fold_block_offsets_copy is provided, but its caller (the KV cache manager's copy_batch_block_offsets, cache.py) belongs to the KV area and is not wired yet; until it is, the block-offset copy stays #21996's copyBatchBlockOffsetsToDevice launch between the replays.",
+    "physical_gpu_index reads CUDA_VISIBLE_DEVICES as served does (device topology, not a switch).",
+    "With spec_step_fold set, #21996's one-model sampler stores its outputs through _scatter_to_stores (4 index_copy_), which is served's path; without it, SM100/SM103 (GB300) would take #21996's one-launch SlotScatter, and SM107 (Rubin) the same 4 index_copy_ (spec_step_copies.is_supported excludes SM107)."
+  ]
+}

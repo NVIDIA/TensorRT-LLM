@@ -1,0 +1,187 @@
+{
+  "area": "cache",
+  "scope": "KV / recurrent-state / draft-cache / CTX->GEN transfer zone of the GEN target: the KDA checkpoint state over the V2 pools (T/cache.py, T/_kda_checkpoints.py), the drafter's FP8 context cache (draft layers appended to the target's KV cache manager V2, FP8 E4M3, 576 B/token/layer) and its transfer from the context servers.",
+  "source_commit": "6904cd9672",
+  "source_tree": "user/xguan/k3-rubin-ull-chain-mlamoe-gsm (~/dev/tekit_k3r_mlamoe_gsm)",
+  "measured_run": "1007804",
+  "functions": {
+    "ops/cache/k3_ull_kda_checkpoints.py:KDACheckpointLayout": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:156 class KDACheckpointLayout:"
+    ],
+    "ops/cache/k3_ull_kda_checkpoints.py:kda_checkpoint_layout": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:372 def _kda_checkpoint_layout("
+    ],
+    "ops/cache/k3_ull_kda_checkpoints.py:estimate_checkpoint_bytes_per_slot": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:787 def estimate_bytes_per_slot(cls, model_config, mapping: Mapping, **kwargs) -> int:"
+    ],
+    "ops/cache/k3_ull_kda_checkpoints.py:KDACheckpointViews": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:207 class KDACheckpointViews:"
+    ],
+    "ops/cache/k3_ull_kda_checkpoints.py:checkpoint_unit": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:219 def _kda_checkpoint_unit(slot_bytes: int, address: int, state_bytes: int) -> int:"
+    ],
+    "ops/cache/k3_ull_kda_checkpoints.py:kda_checkpoint_views": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:230 def kda_checkpoint_views(raw: torch.Tensor, layout: KDACheckpointLayout) -> KDACheckpointViews:"
+    ],
+    "ops/cache/k3_ull_kda_checkpoints.py:checkpoint_position_rows": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1146 def checkpoint_indices("
+    ],
+    "ops/cache/k3_ull_kda_checkpoints.py:seed_kda_checkpoints": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:277 def seed_kda_checkpoints("
+    ],
+    "ops/cache/k3_ull_kda_checkpoints.py:commit_kda_checkpoints": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:292 def commit_kda_checkpoints("
+    ],
+    "ops/cache/k3_ull_kda_checkpoints.py:checkpoint_indices": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1146 def checkpoint_indices("
+    ],
+    "ops/cache/k3_ull_cache_manager.py:_host_slots_to_device": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:401 def _host_slots_to_device(slots: list[int], device: torch.device) -> torch.Tensor:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:_local_kda_layers": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:787 def estimate_bytes_per_slot(cls, model_config, mapping: Mapping, **kwargs) -> int:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:estimate_kda_checkpoint_bytes_per_slot": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:787 def estimate_bytes_per_slot(cls, model_config, mapping: Mapping, **kwargs) -> int:",
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:391 def _kda_replay_bytes_per_slot("
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaLayerCache": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:87 class KDAReplayLayerCache(MambaLayerCache):"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaLayerCache.commit_conv_window": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:120 def commit_conv_window(self, slot_indices: torch.Tensor, conv_pool: torch.Tensor) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaLayerCache.load_checkpoints": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:142 def load_checkpoints(self, slot_indices: torch.Tensor) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.validate": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:676 def validate(self, context: MambaStateLayout) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.layout": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:719 def _checkpoint_layout(self, context: MambaStateLayout) -> KDACheckpointLayout:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.bind_checkpoints": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1209 def _bind_checkpoint_views("
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.bind": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:837 def bind("
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.make_layer_cache": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:912 def make_layer_cache("
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.seed_checkpoints": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:986 def seed_transferred_slots(self, state_indices: torch.Tensor) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.commit_checkpoints": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1132 def commit_checkpoints(self, slots: torch.Tensor) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.seed_transferred_slots": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:986 def seed_transferred_slots(self, state_indices: torch.Tensor) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.commit_pending_drafts": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1099 def commit_pending_drafts(self, slot: int) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.checkpoint_indices": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1146 def checkpoint_indices("
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.shutdown": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1188 def shutdown(self) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllCacheManager.__init__": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1382 def __init__("
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllCacheManager._initialize_spec_state": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1409 def _initialize_spec_state(self) -> KDAIntermediateState | KDAReplayState | None:",
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1301 def select_kda_replay_state("
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllCacheManager.uses_kda_checkpoints": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1435 def uses_kda_checkpoints(self) -> bool:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllCacheManager._setup_model_state": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1473 def _setup_model_state(self) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllCacheManager.copy_batch_block_offsets": [
+      "tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py:9037 def copy_batch_block_offsets("
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllCacheManager.free_resources": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1788 def free_resources(self, request, pin_on_release: bool = False) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllCacheManager._commit_checkpoints_for_reuse": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1801 def _commit_checkpoints_for_reuse(self, request) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllCacheManager._extra_state_bytes_per_rank": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1830 def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllCacheManager.checkpoint_indices": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1146 def checkpoint_indices("
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllCacheManager.seed_kda_checkpoints": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:986 def seed_transferred_slots(self, state_indices: torch.Tensor) -> None:"
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllCacheManager.commit_kda_checkpoints": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1132 def commit_checkpoints(self, slots: torch.Tensor) -> None:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllForCausalLM.runtime_hooks": [
+      "tensorrt_llm/_torch/pyexecutor/_util.py:228 def get_kv_cache_manager_cls(",
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:1291 def model_uses_kda_checkpoints(model_config) -> bool:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1284 def __init__("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._lazy_init_ctx_buffers": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:1273 def _lazy_init_ctx_buffers("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._managed_ctx_pool": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:981 def _managed_ctx_pool("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM.draft_kv_dtype": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1284 def __init__(",
+      "tensorrt_llm/llmapi/llm_args.py:3741 context_kv_dtype: Literal[\"auto\", \"fp8\"] = Field("
+    ],
+    "ops/cache/k3_ull_cache_manager.py:K3UllKdaCheckpointState.replay_layout": [
+      "tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py:514 def replay_layout"
+    ]
+  },
+  "deliberate_differences": [
+    "1007804's FP8 drafter context (both roles) is the GEN drafter's class constant draft_kv_dtype = torch.float8_e4m3fn: the engine (KvCacheCreator._get_draft_kv_model_config) builds the appended draft layers in FP8 E4M3 for a drafter that declares it, the context servers' family drafter (tp1 target) declares the same, and the transfer handshake rejects peers whose draft-layer dtypes differ (served: _get_unified_draft_cache_kwargs set draft_dtype from a speculative_config setting both servers carried).",
+    "Draft cache = #21996's unified draft cache (draft layers appended to the target's V2 manager as KVCacheLayerSpec(owner=DRAFT), global ids 93..97, transfer ids 2*(93+d) = 186..194) instead of served's CacheDomain + get_draft_block_table: same layers, pages, page size 128 and Helix split (global page g on CP rank g % 16), same bytes (FP8: 576 B/token/layer, 73,728 B/page/layer).",
+    "KDA checkpoint mode is a K3UllKdaCheckpointState subclass of #21996's KDAReplayState (served: checkpoint branches inside KDAReplayState); the per-slot layout, header (256 B), flat-view row stride U and the seed / commit points are served's.",
+    "checkpoint_position_rows is computed once at bind (served: inside every checkpoint_indices call), so the step's index build launches fewer kernels; same indices.",
+    "The accepted-count buffer is declared 256 B per slot (served 16 B) so the coalesced slot stride stays a multiple of the largest flat-view row stride; capacity only (240 B per slot).",
+    "Served env switches of the zone are constants at 1007804's values: TRTLLM_KDA_BATCHED_REPLAY_SEED, TRTLLM_KDA_MIDCHUNK_SNAPSHOT (CTX only, off), TRTLLM_STATE_INDEX_COPY_KERNEL (1007804: =1 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); not wired here: #21996's two DeviceCopyBuffer uploads, which like served's kernel write nothing while the indices are unchanged), TRTLLM_DISAGG_GEN_FAST_SYNC (1007804: =1; off under CP16), TRTLLM_BOUND_UCX_CUDA_IPC_CACHE (off). Sharing the draft KV between the servers is decided by declaration (the drafter reads the manager's pages, the manager accepts appended draft layers), not by served's deployment env switch."
+  ],
+  "runtime_gaps_vs_21996": [
+    {
+      "served": "an FP8 drafter context on the CTX servers",
+      "21996": "the __default drafter does not declare context_kv_fp8 / context_kv_only",
+      "cost": "closed on 21b86d335d: the CTX servers run the tp1 target, whose family drafter declares draft_kv_dtype FP8 E4M3 and stores with the same to_draft_fp8"
+    },
+    {
+      "served": "context_kv_only (llm_args field, CTX: loads only the context projection and latent projections)",
+      "21996": "no field; __default reads getattr(draft_model, 'context_kv_only', False)",
+      "cost": "closed on 21b86d335d: the tp1 target's drafter is context_kv_only (constant dspark_context_kv_only), and the engine reserves for it"
+    },
+    {
+      "served": "managed draft cache: prepare_managed_draft_cache before the replay (host-built draft page table under Helix, uploaded only when changed, 019d90ccc2), snapshot_managed_draft_history after it (one Triton gather + D2H on a side stream, history_snapshot.py), DraftHistoryUpdate.publish after update_requests",
+      "21996": "draft layers share the target's block lifecycle: no draft history to publish; the draft page table is decode_draft_block_table of kv_cache_block_offsets inside the graph",
+      "cost": "not ported (no consumer of the history in #21996); per step served 1 eager gather + D2H + host table build vs ours 1 small in-graph kernel (~2-3 us); same launch count, measure in the A/B"
+    },
+    {
+      "served": "block-offset copy folded into the step-input commit kernel (c78b3f8ef0 / c76e6a5845, step_fold)",
+      "21996": "copy_batch_block_offsets_to_device once per step between the replays",
+      "cost": "closed: K3UllCacheManager.copy_batch_block_offsets hands it to runtime.fold_block_offsets_copy (served's call, same conditions); falls back to the base copy"
+    },
+    {
+      "served": "KIMI_K3_TORCH_MEM_SAFETY_MARGIN 4 GiB (b4413b2b94)",
+      "21996": "1 GiB",
+      "cost": "capacity only"
+    },
+    {
+      "served": "KDA mid-chunk snapshots (d6787144c9), snapshot diagnostics (e22858c234 / 7e5c5b5b17)",
+      "21996": "absent",
+      "cost": "CTX only; not on the GEN step"
+    }
+  ],
+  "classification": "notes/experiments/kimi_k3/1110_k3_ull_v2_target/flatten/runtime_cache/RUNTIME_CACHE.md",
+  "gpu_check": "notes/experiments/kimi_k3/1110_k3_ull_v2_target/flatten/draft/draft_vs_served_gpu.py (drafter on the FP8 context, ocijhb 16 x GB300) + the CTX->GEN draft-bytes check in RUNTIME_CACHE.md; not yet run"
+}

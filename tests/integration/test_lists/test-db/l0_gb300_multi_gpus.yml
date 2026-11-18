@@ -41,6 +41,9 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_comm
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_fp8w_gemm_push_cells.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_core_allreduce.py
+  # The Kimi K3 SM107 ULL target's collective op cells (2 and 4 ranks; SM103 and SM107).
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_k3_lamport_ar_ull.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_fp8w_gemm_push_cells_ull.py
   # qwen4_exp target, post-merge: three drafts over quantized KV -- NVFP4 KV at tp4 with the
   # breakable prefill graph, FP8 KV at dep4 (MTP under attention DP), FP8 KV at tep4 on
   # FlashInfer's ring replay, NVFP4 KV at tep4 without block reuse -- and dep2 context and
