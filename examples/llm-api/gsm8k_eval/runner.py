@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import platform
 import queue
@@ -393,8 +394,11 @@ def run(
         raise EvaluationError(str(error)) from error
     if type(concurrency) is not int or concurrency < 1:
         raise EvaluationError(f"concurrency must be a positive integer, got {concurrency!r}")
-    if not time_budget_s or time_budget_s <= 0:
-        raise EvaluationError(f"a positive time budget is required, got {time_budget_s!r}")
+    for name, value in (("time_budget_s", time_budget_s), ("request_timeout_s", request_timeout_s)):
+        if value is None and name == "request_timeout_s":
+            continue
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise EvaluationError(f"{name} must be finite and positive, got {value!r}")
     if min_correct is not None and (
         type(min_correct) is not int or not 0 <= min_correct <= num_questions
     ):

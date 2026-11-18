@@ -88,7 +88,10 @@ def interpret_reply(
             reasoning, (str, type(None))
         ):
             raise ValueError("content and reasoning_content must be strings or null")
-    except (ValueError, KeyError, TypeError) as error:
+        for value in (content, reasoning):
+            if value is not None:
+                value.encode("utf-8")
+    except (ValueError, KeyError, TypeError, RecursionError) as error:
         return ERROR, f"malformed reply: {error}", fields
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
     finish = choices[0].get("finish_reason")
@@ -142,9 +145,16 @@ def make_record(
     latency_s: float,
 ) -> dict[str, Any]:
     """One durable line: the attempt, its request fields, raw final content and score."""
-    if status in COMPLETED:
-        score = protocol.score_content(fields.get("content"), problem.gold)
-    else:
+    try:
+        # Endpoint metadata must also be safe to serialize into the ledger.
+        json.dumps(fields, ensure_ascii=True)
+        score = (
+            protocol.score_content(fields.get("content"), problem.gold)
+            if status in COMPLETED
+            else protocol.NO_RESPONSE
+        )
+    except (ValueError, TypeError, RecursionError) as exc:
+        status, error, fields = ERROR, f"malformed reply: {exc}", {}
         score = protocol.NO_RESPONSE
     record = {
         "schema": RECORD_SCHEMA,
@@ -208,6 +218,7 @@ class Ledger:
         self.expected = dict(expected)
         self._lock = threading.Lock()
         self._completed: set[str] = set()
+        self._write_failed = False
 
     def _validate(self, record: Mapping[str, Any], where: str) -> None:
         if record.get("run_identity") != self.identity:
@@ -231,6 +242,7 @@ class Ledger:
         state = LedgerState()
         if not self.path.exists():
             self._completed = set()
+            self._write_failed = False
             return state
         data = self.path.read_bytes()
         complete, _, tail = data.rpartition(b"\n")
@@ -262,21 +274,44 @@ class Ledger:
             state.latest[qid] = record
             state.records.append(record)
         self._completed = set(state.completed)
+        self._write_failed = False
         return state
 
     def append(self, record: Mapping[str, Any]) -> None:
         """Write one record durably; a completed question can never be written again."""
         self._validate(record, "new record")
-        line = (json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+        line = (json.dumps(record, sort_keys=True, ensure_ascii=True) + "\n").encode("utf-8")
         with self._lock:
+            if self._write_failed:
+                raise LedgerError(
+                    "previous write rollback failed; reload the ledger before appending"
+                )
             if record["id"] in self._completed:
                 raise LedgerError(f"{record['id']} already has a completed reply")
-            if record["status"] in COMPLETED:
-                self._completed.add(record["id"])
             fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
             try:
-                os.write(fd, line)
-                os.fsync(fd)
+                original_size = os.fstat(fd).st_size
+                try:
+                    remaining = memoryview(line)
+                    while remaining:
+                        count = os.write(fd, remaining)
+                        if count <= 0:
+                            raise OSError("ledger write made no progress")
+                        remaining = remaining[count:]
+                    os.fsync(fd)
+                except OSError:
+                    self._write_failed = True
+                    try:
+                        os.ftruncate(fd, original_size)
+                        os.fsync(fd)
+                    except OSError as rollback_error:
+                        raise OSError(
+                            "ledger write and rollback failed; reload before retrying"
+                        ) from rollback_error
+                    self._write_failed = False
+                    raise
+                if record["status"] in COMPLETED:
+                    self._completed.add(record["id"])
             finally:
                 os.close(fd)
 

@@ -19,16 +19,21 @@ inventory, reply classification, and ledger resume rules. No GPU, checkpoint, da
 download or model server is used.
 """
 
+import argparse
 import dataclasses
+import errno
 import json
+import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "examples" / "llm-api"
 sys.path.insert(0, str(EXAMPLES_DIR))
-from gsm8k_eval import protocol, records  # noqa: E402
+import eval_gsm8k  # noqa: E402
+from gsm8k_eval import protocol, records, runner  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -536,3 +541,135 @@ def test_non_object_reply_is_recorded_as_error(payload):
     assert status == records.ERROR
     assert error.startswith("malformed reply:")
     assert fields == {"http_status": 200}
+
+
+@pytest.mark.parametrize("value", ["inf", "-inf", "nan", "0", "-1"])
+def test_time_budgets_refuse_invalid_values_before_setup(tmp_path, value):
+    with pytest.raises(argparse.ArgumentTypeError, match="finite and positive"):
+        eval_gsm8k._positive_float(value)
+    for name in ("time_budget_s", "request_timeout_s"):
+        budgets = {"time_budget_s": 60, name: float(value)}
+        with pytest.raises(runner.EvaluationError, match=name + " must be finite and positive"):
+            runner.run(
+                dataset_dir=tmp_path / "absent",
+                output_dir=tmp_path / "output",
+                endpoint="http://unused",
+                concurrency=1,
+                **budgets,
+            )
+    assert not (tmp_path / "output").exists()
+    assert eval_gsm8k._positive_float("0.5") == 0.5
+
+
+@pytest.mark.parametrize(
+    "bad_reply",
+    [
+        _payload(content="\ud800"),
+        _payload().replace("analysis 9", "\\udfff"),
+        "[" * 2000 + "0" + "]" * 2000,
+    ],
+)
+def test_malformed_reply_is_recorded_and_next_question_continues(tmp_path, bad_reply):
+    problems = [_problem(0), _problem(1)]
+    ledger = _ledger(tmp_path / "results.jsonl", problems)
+    replies = iter([bad_reply, _payload()])
+    deps = runner.RunDeps(
+        post=lambda *args, **kwargs: SimpleNamespace(status_code=200, text=next(replies)),
+        monotonic=lambda: 0,
+    )
+    session = runner._Session(
+        pending=problems,
+        ledger=ledger,
+        identity="run",
+        attempt=1,
+        max_seq_len=69632,
+        concurrency=1,
+        deadline=60,
+        request_timeout_s=None,
+    )
+    runner._ask(session, "http://unused", "served", SimpleNamespace(poll=lambda: None), deps)
+    state = ledger.load()
+    assert [r["status"] for r in state.records] == [records.ERROR, records.OK]
+    assert "malformed reply" in state.records[0]["error"]
+    assert set(state.completed) == {problems[1].id}
+
+
+def test_record_construction_contains_unserializable_endpoint_metadata(tmp_path):
+    problem = _problem(0)
+    record = records.make_record(
+        problem,
+        protocol.build_request("served", problem.prompt),
+        records.OK,
+        None,
+        {"usage": {"bad": object()}},
+        identity="run",
+        attempt=1,
+        started_at="t0",
+        finished_at="t1",
+        latency_s=0,
+    )
+    ledger = _ledger(tmp_path / "results.jsonl", [problem])
+    ledger.append(record)
+    assert ledger.load().records[0]["status"] == records.ERROR
+
+
+def test_ledger_finishes_short_writes_and_escapes_unicode(tmp_path, monkeypatch):
+    problem = _problem(0)
+    ledger = _ledger(tmp_path / "results.jsonl", [problem])
+    record = _record(problem)
+    record["stop_reason"] = "\ud800"
+    write = os.write
+    monkeypatch.setattr(os, "write", lambda fd, data: write(fd, data[:17]))
+    ledger.append(record)
+    assert ledger.load().completed[problem.id] == record
+    assert ledger.path.read_bytes().endswith(b"\n")
+
+
+@pytest.mark.parametrize("failure", ["write", "zero", "fsync", "rollback"])
+def test_failed_append_does_not_complete_or_corrupt_previous_record(tmp_path, monkeypatch, failure):
+    problems = [_problem(0), _problem(1)]
+    ledger = _ledger(tmp_path / "results.jsonl", problems)
+    ledger.append(_record(problems[0]))
+    original = ledger.path.read_bytes()
+    write, fsync = os.write, os.fsync
+    calls = 0
+
+    def fail_write(fd, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return write(fd, data[:17])
+        if failure == "zero":
+            return 0
+        raise OSError(errno.ENOSPC, "disk full")
+
+    def fail_fsync(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(errno.EIO, "sync failed")
+        return fsync(fd)
+
+    with monkeypatch.context() as patch:
+        if failure == "fsync":
+            patch.setattr(os, "fsync", fail_fsync)
+        else:
+            patch.setattr(os, "write", fail_write)
+        if failure == "rollback":
+
+            def fail_truncate(fd, size):
+                raise OSError(errno.EIO, "truncate failed")
+
+            patch.setattr(os, "ftruncate", fail_truncate)
+        with pytest.raises(OSError):
+            ledger.append(_record(problems[1]))
+        assert problems[1].id not in ledger._completed
+        if failure == "rollback":
+            with pytest.raises(records.LedgerError, match="reload"):
+                ledger.append(_record(problems[1]))
+        else:
+            assert ledger.path.read_bytes() == original
+    # Resume repairs a torn tail if rollback failed; no completed result is lost.
+    assert set(ledger.load().completed) == {problems[0].id}
+    ledger.append(_record(problems[1]))
+    assert set(ledger.load().completed) == {p.id for p in problems}

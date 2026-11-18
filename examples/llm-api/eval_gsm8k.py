@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import os
 import signal
 import sys
@@ -83,8 +84,8 @@ def _positive_float(text: str) -> float:
         value = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
-    if not value > 0:
-        raise argparse.ArgumentTypeError(f"must be positive, got {value}")
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"must be finite and positive, got {value}")
     return value
 
 
