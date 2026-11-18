@@ -36,6 +36,7 @@ profiles:
 | `qwen3-moe-for-causal-lm-bf16-cutlass-target-v1` | `Qwen3MoeForCausalLM` | `Qwen3MoeForCausalLM` / `qwen3_moe` | Target model | 1 | `trtllm-qwen3-moe-cutlass-target-layout-v1` | Single-node MoE BF16, unquantized weights and KV cache, TRTLLM attention, CUTLASS MoE backend, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, MoE TP=1 or 2 and MoE EP=1 or 2 with MoE TP x MoE EP = TP, MoE cluster=1, PP/CP=1, no LoRA, sparse attention, attention DP, MoE load balancer, DWDP, speculative mode, or separately loaded draft model |
 | `deepseek-v3-for-causal-lm-bf16-cutlass-target-v1` | `DeepseekV3ForCausalLM` | `DeepseekV3ForCausalLM` / `deepseek_v3` | Target model | 1 | `trtllm-deepseek-v3-mla-cutlass-target-layout-v1` | Single-node MoE BF16, unquantized weights and KV cache, TRTLLM attention, CUTLASS MoE backend, a dense first layer and MoE in every later layer, default fused RoPE, untied embeddings, TP=1 or 2, MoE TP=1 or 2 and MoE EP=1 or 2 with MoE TP x MoE EP = TP, MoE cluster=1, PP/CP=1, no LoRA, sparse attention, attention DP, MoE load balancer, DWDP, speculative mode, or separately loaded draft model |
 | `qwen3_5-moe-for-conditional-generation-bf16-cutlass-complete-v1` | `Qwen3_5MoeVLModel` | `Qwen3_5MoeForConditionalGeneration` / `qwen3_5_moe` | Complete model | 1 | `trtllm-qwen3_5-moe-vl-cutlass-complete-layout-v1` | Single-node MoE BF16 vision-language model with its vision encoder, unquantized weights and KV cache, TRTLLM attention, CUTLASS MoE backend, fused QK-norm/M-RoPE, untied embeddings, TP=1 or 2, MoE TP=1 or 2 and MoE EP=1 or 2 with MoE TP x MoE EP = TP, MoE cluster=1, PP/CP=1, no LoRA, sparse attention, attention DP, MoE load balancer, DWDP, speculative mode, or separately loaded draft model |
+| `glm-moe-dsa-for-causal-lm-fp8-block-sm90-cutlass-target-v1` | `GlmMoeDsaForCausalLM` | `GlmMoeDsaForCausalLM` / `glm_moe_dsa` | Target model | 1 | `trtllm-glm5-dsa-fp8-block-sm90-target-layout-v1` | Single-node MoE BF16, FP8 block-scale (128x128) weights and unquantized KV cache, SM90 only, TRTLLM DSA sparse attention with an indexer in every layer and fp32 indexer projections, CUTLASS MoE backend, dense first three layers and MoE in every later layer, default fused RoPE, untied embeddings, TP=1 or 2, MoE TP=1 or 2 and MoE EP=1 or 2 with MoE TP x MoE EP = TP, MoE cluster=1, PP/CP=1, no LoRA, attention DP, MoE load balancer, DWDP, speculative mode, or separately loaded draft model |
 
 The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, the transfer scope that
@@ -189,15 +190,40 @@ RoPE scaling, FP8 weights, three dense layers, and TP=8, so the RoPE,
 quantization, layer-layout, and TP constraints exclude them. Checkpoints with another model type or root do not
 match even though they reuse this implementation: Kimi K2 declares
 `DeepseekV3ForCausalLM` with `model_type` `kimi_k2`, DeepSeek-V3.2 declares
-`DeepseekV32ForCausalLM`, and GLM-5 (`GlmMoeDsaForCausalLM`) and Mistral Large 3
-(`MistralLarge3ForCausalLM`) are subclasses of the root, which the exact-class
-match excludes. The profile pins the CUTLASS MoE backend like the Qwen3 MoE
+`DeepseekV32ForCausalLM`, and GLM-5 (`GlmMoeDsaForCausalLM`, which has its own
+profile below) and Mistral Large 3 (`MistralLarge3ForCausalLM`) are subclasses
+of the root, which the exact-class match excludes. The profile pins the CUTLASS
+MoE backend like the Qwen3 MoE
 profile, which also keeps the router correction bias in FP32 and the shared
 experts separate from the routed experts; the same TP=2 MoE TP and MoE EP
 partitions apply. Multi-token prediction (MTP) and other speculative decoding,
 context parallelism, attention DP, FP8, and the TRTLLM MoE backend fall back.
 The checkpoint's MTP tensors are never read when no speculative configuration
 builds the MTP layers.
+
+The GLM-5 identity covers Hugging Face-format FP8 checkpoints that resolve to
+the exact `GlmMoeDsaForCausalLM` / `glm_moe_dsa` pair. MX captures the pair
+before construction, because the constructor rewrites the model type to
+`deepseek_v32`. The root runs the DeepSeek-V3 MLA and MoE layers with DeepSeek
+Sparse Attention (DSA): every layer owns a DSA indexer (an FP8 `wq_b`, fp32 `wk`
+and `weights_proj` projections, and an fp32 `k_norm`), the first three layers
+run dense MLPs, and every later layer is MoE (`first_k_dense_replace: 3` and
+`moe_layer_freq: 1` in the checkpoint config). The quantization must resolve to
+`FP8_BLOCK_SCALES` with a declared `weight_block_size: [128, 128]`, and the load
+must run on SM90: there the FP8 Linears keep the checkpoint layout, and the
+pinned CUTLASS MoE backend realizes the DeepGEMM Hopper FP8 block-scale routed
+experts. `kv_b_proj` is dequantized to BF16 at load, so the receiver rebinds
+`v_b_proj` as for DeepSeek-V3, and each receiver rebuilds its indexers' fused
+`wk`/`weights_proj` projection in `cache_derived_state()` instead of receiving
+it. Two realized dimensions pin the indexer layout: `dsa_indexer_sharing`
+rejects checkpoints whose layers reuse another layer's top-k
+(`index_topk_freq`, `index_skip_topk_offset`, or `index_topk_pattern`), and
+`dsa_indexer_projection_dtype` rejects loads that set
+`TRTLLM_DSA_INDEXER_BF16=1`, which builds BF16 indexer projections. GLM-5-FP8 is
+the qualified canary. A full instance needs eight H200 GPUs, so the
+donor/receiver rows load only its first four layers, and the profile's TP limit
+of 2 keeps full-size deployments on the Hugging Face path until wider TP is
+qualified.
 
 The Qwen3 FP8 block-scale identity covers `Qwen3ForCausalLM` / `qwen3`
 checkpoints whose quantization resolves to `FP8_BLOCK_SCALES`, whose Hugging
@@ -234,28 +260,29 @@ standard checkpoint path. Target-plus-draft post-transform transfer remains
 disabled until layout state is tracked and qualified independently for each
 submodel.
 
-The Llama, Qwen2, Qwen3, Mistral, Phi3, Qwen3 MoE, and DeepSeek-V3 profiles are
-text-only and do not enable reward-model, embedding, or vision-language roots;
-Qwen3 MoE, DeepSeek-V3, and the Qwen3.5 MoE vision-language root are the only
-qualified MoE roots. FP16, quantized weight formats other than SM90 FP8 block
-scales on Qwen3, a quantized KV cache, alternate attention backends, YaRN or
-LongRoPE scaling, tied embeddings, TP greater than 2, PP greater than 1, CP
-greater than 1, LoRA, sparse attention, attention DP, multi-node transfer, and
+The Llama, Qwen2, Qwen3, Mistral, Phi3, Qwen3 MoE, DeepSeek-V3, and GLM-5
+profiles are text-only and do not enable reward-model, embedding, or
+vision-language roots; Qwen3 MoE, DeepSeek-V3, GLM-5, and the Qwen3.5 MoE
+vision-language root are the only qualified MoE roots. FP16, quantized weight
+formats other than SM90 FP8 block scales on Qwen3 and GLM-5, a quantized KV
+cache, alternate attention backends, YaRN or LongRoPE scaling, tied embeddings,
+TP greater than 2, PP greater than 1, CP greater than 1, LoRA, sparse attention
+other than the GLM-5 DSA layout, attention DP, multi-node transfer, and
 speculative decoding require separate qualification rows. The Qwen3 FP8
-block-scale profile is pinned to SM90 because its realized weight and scale
-layout differs on other GPU architectures. Each profile also pins its qualified
-RoPE realization: Llama, Qwen2, Mistral, Phi3, and DeepSeek-V3 require the
-default fused RoPE path, so unfused RoPE requires separate qualification for
-them, while Qwen3 and Qwen3 MoE fuse RoPE into the QK-norm kernel and therefore
-require `rope_fusion=False` in the realized configuration. The Mistral profile
-additionally pins the realized attention window: every attention layer must run
-without a sliding window, so sliding-window checkpoints such as Ministral fall
-back to the Hugging Face path until they are qualified separately. The dense
-profiles do not constrain MoE-only backend and mapping settings because dense
-roots do not consume them; the Qwen3 MoE and Qwen3.5 MoE profiles pin them as
-the table above lists, and the DeepSeek-V3 profile pins the same MoE settings
-plus its MoE layer layout. `SourceIdentity` still requires donor and receiver
-configurations to match.
+block-scale and GLM-5 profiles are pinned to SM90 because their realized weight
+and scale layouts differ on other GPU architectures. Each profile also pins its
+qualified RoPE realization: Llama, Qwen2, Mistral, Phi3, DeepSeek-V3, and GLM-5
+require the default fused RoPE path, so unfused RoPE requires separate
+qualification for them, while Qwen3 and Qwen3 MoE fuse RoPE into the QK-norm
+kernel and therefore require `rope_fusion=False` in the realized configuration.
+The Mistral profile additionally pins the realized attention window: every
+attention layer must run without a sliding window, so sliding-window
+checkpoints such as Ministral fall back to the Hugging Face path until they are
+qualified separately. The dense profiles do not constrain MoE-only backend and
+mapping settings because dense roots do not consume them; the Qwen3 MoE and
+Qwen3.5 MoE profiles pin them as the table above lists, and the DeepSeek-V3 and
+GLM-5 profiles pin the same MoE settings plus their MoE layer layouts.
+`SourceIdentity` still requires donor and receiver configurations to match.
 
 The Qwen3.5 dense vision-language profile carries the vision encoder together
 with the language model and realizes interleaved M-RoPE (`rope_type=mrope`),
@@ -398,8 +425,16 @@ MoE rows use `qwen3_5-moe-bf16-tp1`, `qwen3_5-moe-bf16-tp2` (MoE TP=2), and
 `qwen3_5-moe-bf16-tp2-ep2` (MoE EP=2), with `TRTLLM_MX_QWEN3_5_MOE_MODEL`
 overriding the default `Qwen3.5-35B-A3B` checkpoint; they probe with images, and
 their TP=1 row holds about 66 GiB of weights after loading (about 71 GiB at the
-memory-profiling peak), so it also needs an 80 GB GPU. All roles of these rows
-set `moe_config.disable_finalize_fusion=True`: the CUTLASS
+memory-profiling peak), so it also needs an 80 GB GPU. The GLM-5 rows use
+`glm5-fp8-block-tp1`, `glm5-fp8-block-tp2` (MoE TP=2), and
+`glm5-fp8-block-tp2-ep2` (MoE EP=2), with `TRTLLM_MX_GLM5_MODEL` overriding the
+default `GLM-5-FP8` checkpoint. Every role of these rows loads only the first
+four decoder layers (`model_kwargs={"num_hidden_layers": 4}`), and the donor
+snapshot links only the checkpoint shards that hold the embedding, those
+layers, the final norm, and the LM head, with a SafeTensors index restricted to
+them, so the test never reads the rest of the checkpoint. Like the Qwen3 FP8
+block-scale rows, they run only on SM90 GPUs and skip elsewhere. All roles of
+the MoE rows set `moe_config.disable_finalize_fusion=True`: the CUTLASS
 FC2+finalize fusion is not deterministic for top-k greater than 2, and the test
 requires exact token equality. MoE rows also require every rank's routed-expert
 tensor shapes in the final manifests to match the row's MoE EP x MoE TP
@@ -480,8 +515,8 @@ Qwen2, Mistral, Phi3, Qwen3.5, or tied Qwen3 checkpoint has such a reference
 today, so those profiles are covered by their smoke rows until one is added. The
 bare Qwen3-30B-A3B GSM8K and MMLU entries are shared with its quantized variants
 and have no recorded PyTorch-backend measurement, so Qwen3 MoE is covered by its
-smoke rows too, as is DeepSeek-V3, and the Qwen3 FP8 block-scale profile has no
-accuracy canary either. A Qwen3.5 canary must also size its donor exactly like
+smoke rows too, as are DeepSeek-V3 and the four-layer GLM-5 rows, and the Qwen3
+FP8 block-scale profile has no accuracy canary either. A Qwen3.5 canary must also size its donor exactly like
 its receiver, because `SourceIdentity` binds `max_num_tokens` for that root.
 
 The rows are registered as `stage: post_merge` entries in
@@ -555,7 +590,9 @@ backend that gains a second implementation for the pinned quantization needs a
 realized-implementation constraint before its profile stays exact.
 The Qwen3 MoE, Qwen3.5 MoE, and DeepSeek-V3 profiles all realize the CUTLASS
 implementation for unquantized weights, yet keep separate ABI IDs because each
-root's tensor set, aliases, and finalization differ.
+root's tensor set, aliases, and finalization differ. The GLM-5 profile pins the
+same CUTLASS literal with FP8 block-scale weights, which realizes the DeepGEMM
+Hopper implementation on SM90 only, so the profile also pins the SM version.
 
 ## Installation
 
@@ -650,9 +687,9 @@ path.
 - Post-transform MX reception is currently limited to the exact Llama,
   Qwen2/Qwen2.5 dense, Qwen3 dense (BF16 or SM90 FP8 block-scale), Mistral
   dense, Phi3 dense, Qwen3.5 dense vision-language, Qwen3 MoE, DeepSeek-V3 MoE,
-  and Qwen3.5 MoE profiles above. Other roots and variants that do not match the
-  documented identity and runtime envelope safely fall back to Hugging Face
-  loading until explicitly qualified.
+  Qwen3.5 MoE, and GLM-5 MoE (SM90 FP8 block-scale) profiles above. Other roots
+  and variants that do not match the documented identity and runtime envelope
+  safely fall back to Hugging Face loading until explicitly qualified.
 - Mistral checkpoints served through the native `mistral` checkpoint format
   (`mistral_common` model type), sliding-window or Ministral `layer_types`
   variants, YaRN variants, Mistral3 vision-language roots, and Mistral Large 3
@@ -669,8 +706,15 @@ path.
   quantized weights, a quantized KV cache, YaRN scaling (the full DeepSeek-V3,
   R1, and V3.1 checkpoints), a layer layout other than a dense first layer
   followed by MoE layers, TP greater than 2, or an explicitly requested MoE
-  backend other than CUTLASS. Kimi K2, DeepSeek-V3.2, GLM-5, and
-  Mistral Large 3 use the Hugging Face fallback.
+  backend other than CUTLASS. Kimi K2, DeepSeek-V3.2, and Mistral Large 3 use
+  the Hugging Face fallback; GLM-5 has its own profile.
+- GLM-5 checkpoints fall back when they load on a GPU other than SM90
+  (including Blackwell), with BF16 or NVFP4 weights, with TP greater than 2 (a
+  full GLM-5-FP8 instance needs TP=8 on H200), with layers that reuse another
+  layer's DSA top-k, with `TRTLLM_DSA_INDEXER_BF16=1`, with MTP or other
+  speculative decoding, context parallelism, attention DP, a quantized KV
+  cache, or an explicitly requested MoE backend other than CUTLASS. On
+  Blackwell, `AUTO` also selects the TRTLLM MoE backend for these checkpoints.
 - The MX server and Redis lifecycle is external to TensorRT LLM. Every
   TensorRT LLM instance must be able to reach the configured MX server URL.
 - The MX server coordinates source discovery but does not store model weights.
