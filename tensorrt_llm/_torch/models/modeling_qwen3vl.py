@@ -1732,14 +1732,8 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         llm_arch = vlm_to_llm_arch.get(self.original_arch)
         if llm_arch is None:
             raise ValueError(f"Unsupported architecture: {self.original_arch}")
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.deepcopy_with_shared_extra_attrs()
         llm_model_config.pretrained_config = config.text_config
-        # The LM attention modules use extra_attrs through the outer wrapper.
-        # Share the dict after deepcopy so compiled LM attention lookups see
-        # the same per-layer metadata as DecoderRunner._model_forward.
-        # Vision attention stays out of this dict (register_to_config=False),
-        # so it does not pollute LM lookups.
-        llm_model_config.extra_attrs = model_config.extra_attrs
         llm_model_config.pretrained_config.architectures = [llm_arch]
         # Qwen3ForCausalLM.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)

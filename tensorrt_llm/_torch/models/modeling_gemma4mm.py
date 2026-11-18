@@ -20,7 +20,6 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 ``AutoModel.from_config()`` HF fallback (requires transformers>=5.5.0).
 """
 
-import copy
 import dataclasses
 import math
 from collections.abc import Mapping
@@ -1448,8 +1447,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
             _mm_ids.append(config.video_token_id)
         self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
 
-        model_config_cp = copy.deepcopy(model_config)
-        model_config_cp.extra_attrs = model_config.extra_attrs
+        model_config_cp = model_config.deepcopy_with_shared_extra_attrs()
         self.model_config = model_config_cp
 
         # --- Language model ---

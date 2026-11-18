@@ -2407,24 +2407,13 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
                             device='cuda'),
                 persistent=False)
 
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.deepcopy_with_shared_extra_attrs()
         text_config = getattr(llm_model_config.pretrained_config, 'text_config',
                               None)
         if text_config is not None:
             llm_model_config.pretrained_config = text_config
         llm_model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
-        # The LM's attention modules look themselves up in the global
-        # `extra_attrs` that `DecoderRunner._model_forward` binds via
-        # `with_model_extra_attrs(self._model.extra_attrs)` -- the
-        # outer wrapper's dict. Without sharing, `llm_model_config`
-        # carries a deep-copied dict, so LM `attn_custom_op_inplace`
-        # (used under `set_torch_compiling(True)`) fails its layer
-        # lookup and the piecewise-CUDA-graph dynamo trace blows up
-        # at the LM's `o_proj` call. Vision attention stays out of
-        # this dict (`register_to_config=False` in
-        # `Qwen2_5_VLVisionAttention`) so it does not poison LM lookups.
-        llm_model_config.extra_attrs = model_config.extra_attrs
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         # Normal worker owns encoder. MM E/P prefill worker gets attached embeddings.

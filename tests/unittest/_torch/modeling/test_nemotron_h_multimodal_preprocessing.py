@@ -14,6 +14,7 @@ import torch
 import transformers
 from PIL import Image
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_utils import fuse_input_embeds
 from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
     AUDIO_PLACEHOLDER,
@@ -1346,9 +1347,7 @@ class TestEvsVideoContextTokenId:
             video_context_token_id=video_context_token_id,
             sound_context_token_id=None,
         )
-        model_config = SimpleNamespace(
-            pretrained_config=config, video_pruning_rate=0.5, extra_attrs={}
-        )
+        model_config = ModelConfig(pretrained_config=config, video_pruning_rate=0.5)
         with (
             mock.patch.object(NemotronHMultimodalModel, "_update_config_for_quantization"),
             mock.patch.object(NemotronHMultimodalModel, "post_config"),

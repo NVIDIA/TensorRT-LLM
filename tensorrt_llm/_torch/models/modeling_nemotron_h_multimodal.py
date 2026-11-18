@@ -2916,7 +2916,7 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         super().__init__(config)
 
         self.model_config = model_config
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.deepcopy_with_shared_extra_attrs()
         if hasattr(self, "llm"):
             return
 
@@ -2939,9 +2939,6 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
 
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
         self._update_config_for_quantization(llm_model_config)
-        # Share the wrapper's dict, not a copy: the LM's attention and Mamba layers register
-        # in it as they are built, and the engine looks them up there.
-        llm_model_config.extra_attrs = model_config.extra_attrs
 
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 

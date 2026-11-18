@@ -49,7 +49,6 @@ not ship them natively — the full model (text + image + audio + video) runs on
 the repo's pinned transformers.
 """
 
-import copy
 import json
 import math
 import os
@@ -293,10 +292,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
         self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
 
         # --- Text backbone (reused verbatim) ---
-        model_config_cp = copy.deepcopy(model_config)
-        # Share the wrapper's dict, not a copy: the text model's attention layers register
-        # in it as they are built, and the engine looks them up there.
-        model_config_cp.extra_attrs = model_config.extra_attrs
+        model_config_cp = model_config.deepcopy_with_shared_extra_attrs()
         self.model_config = model_config_cp
         # Mirror the parent's quant exclude_modules remap so quantized unified
         # checkpoints exclude the right text modules.

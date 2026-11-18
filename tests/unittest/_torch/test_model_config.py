@@ -869,3 +869,18 @@ def test_copy_with_refuses_half_a_moe_selection(changes):
 def test_copy_with_refuses_an_attribute_model_config_lacks():
     with pytest.raises(AttributeError, match="no attribute 'quant_cfg_dict'"):
         ModelConfig().copy_with(quant_cfg_dict={})
+
+
+def test_deepcopy_with_shared_extra_attrs_keeps_only_the_layer_registry_shared():
+    """A sub-model's layers register in the outer model's dict; its nested configs are its own."""
+    config = ModelConfig()
+    config.pretrained_config = types.SimpleNamespace(architectures=["Outer"])
+    config.extra_attrs["attn_layers"] = {}
+    config._frozen = True
+
+    copied = config.deepcopy_with_shared_extra_attrs()
+    copied.pretrained_config.architectures = ["Inner"]
+
+    assert copied.extra_attrs is config.extra_attrs
+    assert config.pretrained_config.architectures == ["Outer"]
+    assert copied._frozen

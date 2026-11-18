@@ -1043,10 +1043,7 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
         super().__init__(config)
         self.model_config = model_config
 
-        llm_model_config = copy.deepcopy(model_config)
-        # Share the live extra_attrs dict: the LM attention layers register
-        # their per-layer metadata there and model_engine reads the same dict.
-        llm_model_config.extra_attrs = model_config.extra_attrs
+        llm_model_config = model_config.deepcopy_with_shared_extra_attrs()
         llm_model_config.pretrained_config.architectures = ["Glm5NextForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
