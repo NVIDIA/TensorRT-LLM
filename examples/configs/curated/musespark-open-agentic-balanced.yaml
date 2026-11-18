@@ -6,6 +6,8 @@
 # Balanced recipe, measured with the AgentX benchmark at 24 concurrent sessions.
 # Pass to trtllm-serve with --config. See "Agentic Workloads" in ../../../docs/source/deployment-guide/
 # deployment-guide-for-musespark-open-on-trtllm.md for the walkthrough and the measurements.
+# Apart from max_batch_size and cuda_graph_config, the settings match
+# musespark-open-agentic-max-throughput.yaml: apply any other tuning to both recipes.
 tensor_parallel_size: 4
 moe_expert_parallel_size: 4
 max_batch_size: 24
