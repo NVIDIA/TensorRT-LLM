@@ -3630,7 +3630,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
                 std::optional<kv::RequestIdType> id, nb::object customPriorityCallback,
                 std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats,
-                std::optional<executor::KvCacheRetentionConfig> retentionConfig, std::optional<int> localityDomainId, int optionalReuseMaxBacktrack)
+                std::optional<executor::KvCacheRetentionConfig> retentionConfig, std::optional<int> localityDomainId,
+                int optionalReuseMaxBacktrack)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
@@ -3657,7 +3658,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         }
                         nb::gil_scoped_release release;
                         return self->createKvCache(std::move(reuseScope), view, id, std::move(priorityCb), promptLen,
-                            textOnly, enableRequestStats, std::move(retentionConfig), knownNoDigest, domain, optionalReuseMaxBacktrack);
+                            textOnly, enableRequestStats, std::move(retentionConfig), knownNoDigest, domain,
+                            optionalReuseMaxBacktrack);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,

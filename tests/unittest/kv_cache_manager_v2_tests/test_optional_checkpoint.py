@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Python bindings for native OPTIONAL selection; storage contracts live in C++."""
 
+import array
 import time
 from datetime import timedelta
 
@@ -231,6 +232,61 @@ def test_reuse_status_and_optional_selection_bindings(
             assert (reader.get_base_page_indices(encoder)[1] == source_indices[1][1]) == (
                 match_end % 4 == 0
             )
+    finally:
+        for cache in reversed(caches):
+            cache.close()
+        manager.shutdown()
+
+
+def test_locality_domain_and_optional_backtrack_bindings(monkeypatch):
+    """Mock domains exercise argument forwarding together with earlier OPTIONAL selection."""
+    monkeypatch.setenv("TRT_LLM_MOCK_LOCALIZATION_SUPPORT", "1")
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=64 << 20, enable_locality_domains=True)],
+        layers=[
+            kv.AttentionLayerConfig(layer_id=0, buffers=[kv.BufferConfig(role="key", size=4096)]),
+            kv.AttentionLayerConfig(
+                layer_id=1,
+                buffers=[kv.BufferConfig(role="key", size=4096)],
+                sliding_window_size=8,
+                reuse_policy=kv.ReusePolicy.OPTIONAL,
+            ),
+        ],
+    )
+    stream = torch.cuda.Stream()
+    manager = kv.KVCacheManager(config)
+    caches = []
+    tokens = list(range(8))
+    try:
+        assert manager.num_locality_domains == 2
+        source = manager.create_kv_cache(locality_domain_id=1, optional_reuse_max_backtrack=8)
+        caches.append(source)
+        assert source.locality_domain_id == 1
+        assert source.resume(stream.cuda_stream) and source.resize(8)
+        source.commit(tokens, is_end=True)
+        source.close()
+        encoder = manager.get_layer_group_id(1)
+        for inputs in (None, tokens, array.array("i", tokens)):
+            with pytest.raises(ValueError, match="backtrack"):
+                manager.create_kv_cache(
+                    input_tokens=inputs, locality_domain_id=1, optional_reuse_max_backtrack=-1
+                )
+            reader = manager.create_kv_cache(
+                input_tokens=inputs, locality_domain_id=1, optional_reuse_max_backtrack=8
+            )
+            caches.append(reader)
+            assert reader.locality_domain_id == 1
+            if inputs is None:
+                assert reader.resume(stream.cuda_stream)
+            else:
+                assert reader.num_committed_tokens == 8
+                assert any(
+                    first <= 7 < end for first, end in reader.reuse_status[encoder].endpoint_ranges
+                )
+                assert reader.resume(stream.cuda_stream, optional_reuse_endpoints={encoder: 7})
+                assert reader.reuse_status[encoder].endpoint == 7
+            reader.close()
     finally:
         for cache in reversed(caches):
             cache.close()

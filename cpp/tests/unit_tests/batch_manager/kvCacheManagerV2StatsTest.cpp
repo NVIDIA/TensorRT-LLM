@@ -1251,7 +1251,7 @@ TEST_F(ReplayCacheTest, OptionalPartialCopyPreservesSharedRetentionAcrossAdmissi
             {
                 retention.emplace(std::vector{RetentionConfig::TokenRangeRetentionConfig{0, {}, kReaderPriority}});
             }
-            auto reader = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, retention, false, 8);
+            auto reader = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, retention, false, std::nullopt, 8);
             std::map<LifeCycleId, int> const endpoints{{encoder, endpoint}};
             auto& storage = manager->storage();
             auto const pool = storage.getPoolGroupIndex(kHotLevel, encoder);
@@ -1338,8 +1338,8 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
                 for (int ordinal = (optionalEnd + 3) / 4; ordinal < c.prefix / 4; ++ordinal)
                     source->blocks()[BlockOrdinal{ordinal}].treeBlock->unlinkPage(encoder);
             }
-            auto reader
-                = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, std::nullopt, c.knownNoDigest, std::nullopt, c.prefix);
+            auto reader = manager->createKvCache(
+                {}, prefix, 2, {}, {}, {}, false, std::nullopt, c.knownNoDigest, std::nullopt, c.prefix);
             EXPECT_EQ(reader->numCommittedTokens(), c.prefix);
             ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
             EXPECT_EQ(reader->reuseStatus()[encoder.value()].endpoint, optionalEnd);
@@ -1363,8 +1363,8 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
             declined->close();
             source->blocks()[BlockOrdinal{victim}].treeBlock->unlinkPage(encoder);
             source->close();
-            auto missing
-                = manager->createKvCache({}, prefix, 4, {}, {}, {}, false, std::nullopt, c.knownNoDigest, std::nullopt, c.prefix);
+            auto missing = manager->createKvCache(
+                {}, prefix, 4, {}, {}, {}, false, std::nullopt, c.knownNoDigest, std::nullopt, c.prefix);
             EXPECT_EQ(missing->numCommittedTokens(), c.prefix);
             auto const& missingStatus = missing->reuseStatus()[encoder.value()];
             std::vector<HalfOpenRange<int>> const earlierRanges = c.sinks > 0 && victim != 0
@@ -1496,7 +1496,8 @@ TEST_F(ReplayCacheTest, DecliningOptionalPartialClaimOnRetryReleasesCapacityBefo
         source->commit(span);
         source->close();
         TokenSpan const prefix{tokens.data(), prefixLength};
-        auto reader = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, {}, false, prefixLength - 7);
+        auto reader
+            = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, {}, false, std::nullopt, prefixLength - 7);
         ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
         auto& storage = manager->storage();
         auto const group = storage.getPoolGroupIndex(kHotLevel, encoder);
