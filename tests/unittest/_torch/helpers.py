@@ -467,20 +467,37 @@ def late_copy(src: torch.Tensor, dst: torch.Tensor, delay_ns: int) -> None:
 def chi_square(counts: torch.Tensor,
                probs: torch.Tensor,
                z: float = 5.0) -> Tuple[float, float]:
-    """Pearson statistic of ``counts`` against ``probs`` (bins under 5
-    expected draws merged) and its critical value at ``z`` standard deviations
-    (Wilson-Hilferty; z = 5 rejects a correct sampler with probability 3e-7).
+    """Pearson statistic of ``counts`` against ``probs`` and its critical value
+    at ``z`` standard deviations (Wilson-Hilferty; z = 5 rejects a correct
+    sampler with probability 3e-7).
+
+    Tokens of at least 5 expected draws keep their own bin. The others are
+    grouped in index order into consecutive bins of at least 5 expected draws
+    each (a short tail joins the last group), so a nearly uniform
+    distribution over many tokens is still tested on many bins.
     """
     expected = probs.double() * counts.sum()
     big = expected >= 5
-    obs, exp = counts[big].double(), expected[big]
-    rest_obs, rest_exp = counts[~big].sum().double(), expected[~big].sum()
-    if rest_exp >= 5:
-        obs = torch.cat([obs, rest_obs.view(1)])
-        exp = torch.cat([exp, rest_exp.view(1)])
+    obs, exp = list(counts[big].double().tolist()), list(expected[big].tolist())
+    group_obs = group_exp = 0.0
+    small_obs, small_exp = [], []
+    for o, e in zip(counts[~big].double().tolist(), expected[~big].tolist()):
+        group_obs += o
+        group_exp += e
+        if group_exp >= 5:
+            small_obs.append(group_obs)
+            small_exp.append(group_exp)
+            group_obs = group_exp = 0.0
+    if small_exp:
+        small_obs[-1] += group_obs
+        small_exp[-1] += group_exp
+    elif exp:
+        obs[-1] += group_obs
+        exp[-1] += group_exp
     else:
-        obs[-1] += rest_obs
-        exp[-1] += rest_exp
+        small_obs, small_exp = [group_obs], [group_exp]
+    obs = torch.tensor(obs + small_obs, dtype=torch.float64)
+    exp = torch.tensor(exp + small_exp, dtype=torch.float64)
     stat = float(((obs - exp)**2 / exp).sum())
     dof = obs.numel() - 1
     if dof == 0:  # a single bin holds every draw: nothing to test
