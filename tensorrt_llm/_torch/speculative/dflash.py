@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
 import weakref
 from collections import deque
@@ -30,6 +31,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
+from ..attention.metadata.core import TrtllmCoreMetadata
 from ..modules.logits_processor import LogitsProcessor
 from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
@@ -2347,10 +2349,14 @@ class DFlashWorker(SpecWorkerBase):
                 state_indices=attn_metadata.mamba_metadata.state_indices,
             )
 
-        self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
-        self._prepare_kv_for_draft_forward(
-            attn_metadata, num_accepted_tokens, num_contexts, batch_size
-        )
+        # The feature-split metadata are not rewritten for the draft: the
+        # drafter takes its positions and lengths from this worker's own state.
+        rewrites_attn_metadata = not isinstance(attn_metadata, TrtllmCoreMetadata)
+        if rewrites_attn_metadata:
+            self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
+            self._prepare_kv_for_draft_forward(
+                attn_metadata, num_accepted_tokens, num_contexts, batch_size
+            )
 
         # Collapse mrope [3, 1, N] to 1D by taking the first (temporal) dimension.
         # The draft model uses standard 1D RoPE, so only scalar positions are needed.
@@ -2385,7 +2391,11 @@ class DFlashWorker(SpecWorkerBase):
         )
 
         if num_gens > 0:
-            with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+            with (
+                self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager)
+                if rewrites_attn_metadata
+                else contextlib.nullcontext()
+            ):
                 hidden_states_out = draft_model.dflash_forward(
                     noise_embedding=inputs["noise_embedding"],
                     query_positions=inputs["query_positions"],
@@ -2508,8 +2518,9 @@ class DFlashWorker(SpecWorkerBase):
         else:
             next_draft_tokens = gen_draft_tokens
 
-        self._restore_attn_metadata_from_spec_dec(attn_metadata)
-        self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
+        if rewrites_attn_metadata:
+            self._restore_attn_metadata_from_spec_dec(attn_metadata)
+            self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
 
         self._rollback_guided_decoder_after_verify(num_accepted_tokens)
 
@@ -2908,10 +2919,13 @@ class DFlashWorker(SpecWorkerBase):
 
             # Update seq_lens for gen requests to K+1 (the number of tokens
             # the target forward actually processed).
-            attn_metadata._seq_lens_cuda[num_contexts : num_contexts + num_gens] = (
-                total_tokens_per_req
-            )
-            attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = total_tokens_per_req
+            if not isinstance(attn_metadata, TrtllmCoreMetadata):
+                attn_metadata._seq_lens_cuda[num_contexts : num_contexts + num_gens] = (
+                    total_tokens_per_req
+                )
+                attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = (
+                    total_tokens_per_req
+                )
         else:
             noise_embedding = hidden_states.new_empty(0, 0, hidden_dim)
             query_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
@@ -2997,7 +3011,8 @@ class DFlashWorker(SpecWorkerBase):
             block_size,
             width,
         )
-        attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = width
+        if not isinstance(attn_metadata, TrtllmCoreMetadata):
+            attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = width
 
         noise_embedding = dflash_noise_block_embedding(
             draft_model.draft_model_full.model.embed_tokens,

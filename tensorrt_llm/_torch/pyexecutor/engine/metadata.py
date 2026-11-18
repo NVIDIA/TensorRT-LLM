@@ -155,6 +155,7 @@ def build_feature_attention_metadata(
         EmbeddedDSparkDraftMetadata,
         LinearDraftMetadata,
         SharedKVCacheLinearDraftMetadata,
+        SharedKVCacheStandaloneDSparkDraftMetadata,
     )
     from tensorrt_llm._torch.attention.metadata.mla_context import MlaContextMetadata
     from tensorrt_llm._torch.attention.metadata.sparse import SparseMetadata
@@ -195,11 +196,10 @@ def build_feature_attention_metadata(
         spec_dec_mode = spec_config.spec_dec_mode
         if getattr(spec_config, "enable_confidence_scheduling", False):
             raise UnsupportedMetadataConfiguration("ragged verification")
+        has_separate_draft_cache = (
+            draft_kv_cache_manager is not None and draft_kv_cache_manager is not kv_cache_manager
+        )
         if spec_dec_mode.is_mtp_eagle_one_model() and spec_config.is_linear_tree:
-            has_separate_draft_cache = (
-                draft_kv_cache_manager is not None
-                and draft_kv_cache_manager is not kv_cache_manager
-            )
             metadata_types.append(
                 LinearDraftMetadata
                 if has_separate_draft_cache
@@ -207,10 +207,13 @@ def build_feature_attention_metadata(
             )
         elif spec_dec_mode.is_dspark() and spec_config.draft_is_embedded_in_target:
             metadata_types.append(EmbeddedDSparkDraftMetadata)
+        elif spec_dec_mode.is_dspark() and not has_separate_draft_cache:
+            metadata_types.append(SharedKVCacheStandaloneDSparkDraftMetadata)
         else:
             raise UnsupportedMetadataConfiguration(
                 f"the speculative decoding mode {spec_dec_mode.name} (linear MTP-Eagle "
-                "one-model and DSpark embedded in the target are covered)"
+                "one-model and DSpark are covered; standalone DSpark with a separate draft KV "
+                "cache is not)"
             )
         max_draft_tokens = spec_config.max_draft_len
 

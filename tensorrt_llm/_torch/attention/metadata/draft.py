@@ -263,3 +263,14 @@ class EmbeddedDSparkDraftMetadata(DraftMetadata):
     attention metadata and has no draft KV cache, so this mode holds nothing
     and its hooks do nothing.
     """
+
+
+class SharedKVCacheStandaloneDSparkDraftMetadata(DraftMetadata):
+    """A standalone DSpark drafter without a draft KV cache of its own.
+
+    The drafter runs once per target step, on the generation rows, with its
+    own attention. Its layers are extra layers of the target's KV cache, which
+    it addresses through the target's block offsets, or it keeps its context
+    in a buffer of the spec worker. Either way it reads nothing that the
+    target's metadata do not already hold, so this mode holds nothing.
+    """
