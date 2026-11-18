@@ -53,8 +53,13 @@ class DeepseekV32Tokenizer(TransformersTokenizer):
         messages = messages.copy()
         drop_thinking = True
         if tools is not None and len(tools) > 0:
-            messages.insert(0, {"role": "system"})
-            messages[0]["tools"] = tools
+            # The checkpoint's encoder renders tools from the system or developer
+            # message that leads the conversation, after its content.
+            first_role = messages[0].get("role") if messages else None
+            if first_role in ("system", "developer") and not messages[0].get("tools"):
+                messages[0] = {**messages[0], "tools": tools}
+            else:
+                messages.insert(0, {"role": "system", "tools": tools})
             drop_thinking = False
         encode_config = dict(thinking_mode=thinking_mode, drop_thinking=drop_thinking)
         prompt_str = encode_messages(messages, **encode_config)  # type: ignore

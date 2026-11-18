@@ -85,7 +85,7 @@ def test_llmapi_backend(
     model_config["triton_config"]["decoupled"] = DECOUPLED_MODE
     model_config["triton_config"]["max_batch_size"] = int(TRITON_MAX_BATCH_SIZE)
     model_config["tensor_parallel_size"] = int(TENSOR_PARALLEL_SIZE)
-    model_config["kv_cache_config"] = {"free_gpu_memory_fraction": 0.8}
+    model_config["kv_cache_config"] = {"free_gpu_memory_fraction": 0.8, "enable_block_reuse": False}
     model_config["model"] = qwen_model_root
     with open(model_config_path, "w") as f:
         yaml.dump(model_config, f)

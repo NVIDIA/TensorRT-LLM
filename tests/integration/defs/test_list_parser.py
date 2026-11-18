@@ -1,4 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Logic for parsing test lists."""
 
 import array
@@ -9,7 +25,7 @@ import time
 import traceback
 from collections import defaultdict
 from textwrap import dedent
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 import pytest
 from mako.template import Template
@@ -294,30 +310,6 @@ def strip_prefix(test_prefix, test_name):
     return test_name
 
 
-def get_test_name_corrections(
-        test_names: Sequence[str],
-        items: Sequence[Any],
-        test_prefix: Optional[str] = None) -> Dict[str, Optional[str]]:
-    """Provided for backwards compatibility with tests which rely on this interface.  Use get_test_name_corrections_v2 instead."""
-
-    all_valid_tests = set(
-        strip_prefix(test_prefix, test.nodeid) for test in items)
-    no_pfx_test_names = set(
-        strip_prefix(test_prefix, test_name) for test_name in test_names)
-
-    corr = get_test_name_corrections_v2(no_pfx_test_names, all_valid_tests,
-                                        TestCorrectionMode.EXACT_MATCH)
-
-    ret = {}
-    for test_name, corrections in corr.items():
-        if corrections:
-            ret[test_name] = corrections[0]
-        else:
-            ret[test_name] = None
-
-    return ret
-
-
 class TestCorrectionMode:
     """Enum describing the different test correction modes supported by get_test_name_corrections_v2."""
 
@@ -515,8 +507,7 @@ def apply_test_list_corrections(test_list,
 
     Args:
         test_list (str): The path to a test list.
-        corrections (Dict[str, str]): A mapping of invalid test names to valid tests, as returned by
-                get_test_name_corrections().
+        corrections (Dict[str, str]): A mapping of invalid test names to their replacements.
         test_prefix (Optional[str]): The value of the --test-prefix option, or None if this option isn't set.
     """
     print_info("Applying corrections to: {}".format(test_list))
@@ -619,7 +610,7 @@ def parse_and_validate_test_list(
                                         test_prefix)
 
         output_dir = config.getoption("--output-dir")
-        if record_invalid_tests and corrections:
+        if record_invalid_tests and corrections and output_dir:
             record_invalid_tests(
                 os.path.join(output_dir, "invalid_tests.json"),
                 corrections,

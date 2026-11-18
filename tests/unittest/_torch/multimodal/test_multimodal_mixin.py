@@ -15,7 +15,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -26,7 +26,13 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     _assemble_multimodal_encoder_embeddings,
 )
 from tensorrt_llm._torch.modules.embedding import Embedding
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalInput,
+    MultimodalItemMetadata,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 
 
@@ -117,7 +123,7 @@ class CountingEncoderMultimodalModel(DummyMultimodalModel):
             if param.multimodal_runtime is not None:
                 total_rows += param.multimodal_runtime.total_embeds_in_request
             else:
-                total_rows += sum(param.multimodal_data["multimodal_embedding_lengths"])
+                total_rows += sum(param.get_item_layout()[1])
         return torch.full(
             (total_rows, self.embedding.embedding_dim),
             float(self.encode_calls),
@@ -164,7 +170,10 @@ def make_keyed_multimodal_param(
             ),
             "image_sizes": [[2, 2]] * n_items,
         },
-        "multimodal_embedding_lengths": embedding_lengths,
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("image", i) for i in range(len(embedding_lengths))],
+            output_embedding_lengths=embedding_lengths,
+        ),
         "mm_processor_kwargs_hash": kwargs_hash,
     }
     if local_embedding is not None:
@@ -267,6 +276,40 @@ def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cpu():
 
 def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cuda():
     _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cuda")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_declared_qwen_fields_reuse_host_costs_for_device_grids():
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+    )
+
+    class QwenModel(DummyMultimodalModel):
+        get_multimodal_item_partitions = Qwen3VLModelBase.get_multimodal_item_partitions
+
+    pixels = torch.arange(10, device="cuda").reshape(5, 2)
+    grids = torch.tensor([[1, 1, 2], [1, 1, 3]], device="cuda")
+    param = MultimodalParams(
+        multimodal_data={
+            "image": {"pixel_values": pixels, "image_grid_thw": grids},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 1), ("image", 0)], [3, 2], [3, 2]
+            ),
+        }
+    )
+    model = QwenModel(make_embedding(hidden_size=1), torch.tensor([0]))
+
+    with patch.object(
+        torch.Tensor, "tolist", side_effect=AssertionError("Device grids must not be read back")
+    ):
+        selected = model.build_multimodal_encoder_input(param, [1, 0])
+
+    torch.testing.assert_close(
+        selected.multimodal_data["image"]["pixel_values"], torch.cat([pixels[2:], pixels[:2]])
+    )
+    torch.testing.assert_close(selected.multimodal_data["image"]["image_grid_thw"], grids[[1, 0]])
 
 
 def test_encoder_cache_first_request_writes_per_item_entries():
@@ -372,6 +415,7 @@ def test_encoder_cache_creation_logs_byte_capacity_without_embedding_metadata():
     )
 
 
+@pytest.mark.cpu_only
 def test_encoder_cache_repeated_item_across_requests_skips_encoder():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
@@ -380,11 +424,15 @@ def test_encoder_cache_repeated_item_across_requests_skips_encoder():
     )
     first = make_keyed_multimodal_param()
     second = make_keyed_multimodal_param()
+    model._encoder_forward_context = MagicMock()
 
     first_embeddings = model._get_or_encode_multimodal_embeddings([first])
     second_embeddings = model._get_or_encode_multimodal_embeddings([second])
 
     assert model.encode_calls == 1
+    model._encoder_forward_context.assert_called_once_with()
+    model._encoder_forward_context.return_value.__enter__.assert_called_once_with()
+    model._encoder_forward_context.return_value.__exit__.assert_called_once()
     torch.testing.assert_close(second_embeddings, first_embeddings)
 
 
@@ -676,7 +724,9 @@ def test_disabled_encoder_cache_preserves_current_behavior():
         MultimodalParams(
             multimodal_data={
                 "image": {"pixel_values": torch.empty(1)},
-                "multimodal_embedding_lengths": [2],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
                 "mm_processor_kwargs_hash": "kwargs-a",
             },
             multimodal_runtime=make_runtime(2),
@@ -795,7 +845,9 @@ def test_build_multimodal_encoder_input_slices_packed_grid_thw():
                 "per_item_list": ["a", "b", "c"],
                 "per_request_scalar": torch.tensor(42.0),
             },
-            "multimodal_embedding_lengths": [2, 3, 1],
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 0), ("image", 1), ("image", 2)], output_embedding_lengths=[2, 3, 1]
+            ),
             "mm_processor_kwargs_hash": "kw",
         },
     )
@@ -832,7 +884,9 @@ def test_build_multimodal_encoder_input_stacked_crops_padding_to_miss_max_size()
                 "pixel_values": pixels,
                 "image_sizes": [[3, 4], [5, 5]],
             },
-            "multimodal_embedding_lengths": [1, 1],
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 0), ("image", 1)], output_embedding_lengths=[1, 1]
+            ),
             "mm_processor_kwargs_hash": "kw",
         },
     )
@@ -865,7 +919,9 @@ def test_build_multimodal_encoder_input_slices_audio_input_features():
                 "input_features": features,
                 "input_features_mask": mask,
             },
-            "multimodal_embedding_lengths": [1, 1],
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("audio", 0), ("audio", 1)], output_embedding_lengths=[1, 1]
+            ),
             "mm_processor_kwargs_hash": "kw",
         },
     )

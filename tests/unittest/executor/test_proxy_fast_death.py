@@ -23,6 +23,13 @@ from unittest.mock import Mock as _Mock
 
 import pytest
 
+from tensorrt_llm._startup_errors import (
+    StartupErrorInfo,
+    classify_startup_error,
+    is_worker_startup_error,
+    log_startup_error,
+    wrap_worker_startup_error,
+)
 from tensorrt_llm.executor import EngineDeadError
 from tensorrt_llm.executor import proxy as proxy_module
 from tensorrt_llm.executor import worker as worker_module
@@ -290,7 +297,6 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
         result_queue_addr=("result", b"key"),
     )
     worker_module.worker_main(
-        engine=object(),
         worker_queues=worker_queues,
         log_level=worker_module.logger.level,
         worker_cls=_FailingWorker,
@@ -307,7 +313,6 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
     init_status_queue.succeeds = False
     with pytest.raises(RuntimeError, match="Failed to deliver worker process identities to proxy"):
         worker_module.worker_main(
-            engine=object(),
             worker_queues=worker_queues,
             log_level=worker_module.logger.level,
             worker_cls=_FailingWorker,
@@ -318,6 +323,59 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
         )
 
     assert events == [("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL)]
+
+
+def test_non_leader_worker_raises_its_classified_error(monkeypatch):
+    """A non-leader has no status queue, so it reports through its MPI future."""
+
+    class _FakeComm:
+        def barrier(self):
+            pass
+
+        def allgather(self, captured_identity):
+            return [captured_identity]
+
+    class _OomWorker:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("CUDA Runtime API error: cudaErrorMemoryAllocation")
+
+    monkeypatch.setattr(worker_module, "mpi_comm", lambda: _FakeComm())
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 1)
+    monkeypatch.setattr(worker_module, "capture_worker_process_identity", lambda rank: None)
+    monkeypatch.setattr(worker_module, "set_mpi_session_cpp", lambda comm: None)
+
+    with pytest.raises(RuntimeError, match="^Executor worker returned error on rank 1: ") as e:
+        worker_module.worker_main(
+            worker_queues=_Mock(frontend_result_queue_addrs=None),
+            log_level=worker_module.logger.level,
+            worker_cls=_OomWorker,
+            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+        )
+
+    assert is_worker_startup_error(e.value)
+    assert classify_startup_error(e.value).category == "resource"
+
+
+def test_non_leader_classified_error_during_init_is_raised_as_is():
+    info = StartupErrorInfo(
+        "resource",
+        "RuntimeError: cudaErrorMemoryAllocation",
+        "Lower it.",
+        "executor_creation/model",
+        1,
+    )
+    error = wrap_worker_startup_error("Executor worker returned error", info)
+    proxy = _proxy_awaiting_worker_init(owns_session=True, future_exception=error)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        proxy._start_executor_workers({})
+
+    assert excinfo.value is error
+    assert str(error).startswith(
+        "Executor worker returned error on rank 1 during executor_creation/model"
+    )
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    assert proxy._engine_dead is True
 
 
 def test_result_step_raises_on_engine_dead():
@@ -455,32 +513,6 @@ def test_remote_worker_death_roundtrip():
     assert isinstance(exc, RuntimeError)
     assert "ValueError" in str(exc)
     assert "rank 3 exploded" in str(exc)
-
-
-def test_server_async_callback_forwards_only_failures():
-    from concurrent.futures import Future
-
-    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer, RemoteWorkerDeath
-
-    server = object.__new__(RemoteMpiCommSessionServer)
-    sent = []
-    server.queue = type("Q", (), {"put": lambda self, m: sent.append(m)})()
-
-    ok = Future()
-    ok.set_result(42)
-    server.mpi_async_error_callback(ok)
-    assert sent == []
-
-    cancelled = Future()
-    cancelled.cancel()
-    server.mpi_async_error_callback(cancelled)
-    assert sent == []
-
-    failed = Future()
-    failed.set_exception(RuntimeError("worker segfault"))
-    server.mpi_async_error_callback(failed)
-    assert len(sent) == 1 and isinstance(sent[0], RemoteWorkerDeath)
-    assert sent[0].message == "worker segfault"
 
 
 class _FakeZmqQueue:
@@ -715,6 +747,16 @@ def test_abandon_mpi_pool_threads_tolerates_missing_pool():
 
     _abandon_mpi_pool_threads(None)
     _abandon_mpi_pool_threads(object())  # no _pool attribute
+
+
+def test_pool_session_reports_dead_manager_thread():
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    session = object.__new__(MpiPoolSession)
+    session.mpi_pool = _Mock(_shutdown=False)
+    session.mpi_pool._pool.thread.is_alive.return_value = False
+    assert isinstance(session.check_worker_error(), RuntimeError)
+    session.mpi_pool = None  # keep __del__ from shutting down the fake pool
 
 
 def test_mark_engine_dead_releases_exit_joins_immediately():
@@ -1000,6 +1042,35 @@ def test_non_ready_status_during_init_aborts_then_marks_dead():
     assert called.index("shutdown_abort") < called.index("release_exit_joins")
     # Pending work fails fast on this path too.
     assert isinstance(r.queue.get_nowait(), EngineDeadError)
+
+
+def test_non_ready_status_reports_worker_rank_stage_and_root_cause():
+    """The raised error names the rank, stage and root cause the worker classified.
+
+    Pickling drops the worker exception's cause chain and traceback, so the
+    worker sends its classification along and the proxy error carries it.
+    """
+    err = KeyError("lm_head.weight")
+    info = StartupErrorInfo(
+        "model_load",
+        "KeyError: 'lm_head.weight'",
+        "Check the checkpoint.",
+        "executor_creation/model",
+        0,
+    )
+    proxy = _proxy_awaiting_worker_init(owns_session=True, ready_status=(err, "trace", info))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        proxy._start_executor_workers({})
+
+    assert str(excinfo.value) == (
+        "Executor worker returned error on rank 0 during executor_creation/model: "
+        "[model_load] KeyError: 'lm_head.weight'"
+    )
+    assert excinfo.value.__cause__ is err
+    assert classify_startup_error(excinfo.value) == info
+    # The hint was logged before the abort, which can end the process.
+    assert log_startup_error(excinfo.value, "LLM initialization failed") is None
 
 
 def test_non_ready_status_during_init_does_not_abort_borrowed_session():

@@ -26,12 +26,16 @@ namespace tensorrt_llm::executor
 {
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(KvCacheStats, maxNumBlocks, freeNumBlocks, usedNumBlocks, tokensPerBlock,
-    allocTotalBlocks, allocNewBlocks, reusedBlocks, missedBlocks, cacheHitRate);
+    allocTotalBlocks, allocNewBlocks, reusedBlocks, missedBlocks, cacheHitRate, hostSlabBytes, numPageTableReuses,
+    numPageTableRowUpdates, numPageTableFullBuilds, pageTableFullBuildMs);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     StaticBatchingStats, numScheduledRequests, numContextRequests, numCtxTokens, numGenTokens, emptyGenSlots);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InflightBatchingStats, numScheduledRequests, numContextRequests, numGenRequests,
     numPausedRequests, numCtxTokens, microBatchId, avgNumDecodedTokensPerIter, numCtxKvTokens, numGenKvTokens,
-    numQueuedContextRequests, numQueuedCtxTokens, numQueuedGenRequests, numQueuedGenKvTokens, numPausedKvTokens);
+    numQueuedContextRequests, numQueuedCtxTokens, numQueuedGenRequests, numQueuedGenKvTokens, numPausedKvTokens,
+    numSkippedForwardCtxChunks, numDroppedCtxChunks, numRevertedCtxTokens, numDeferredGenReceives,
+    genReceiveReadyWaitMs, numGenInitCapHolds, numGenInitTransferBudgetHolds, numCtxDecoderHoldPasses,
+    numCtxDecoderHeldRequests);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(SpecDecodingStats, numDraftTokens, numAcceptedTokens, numRequestsWithDraftTokens,
     acceptanceLength, iterLatencyMS, draftOverhead);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(IterationStats, timestamp, iter, iterLatencyMS, newActiveRequestsQueueLatencyMS,

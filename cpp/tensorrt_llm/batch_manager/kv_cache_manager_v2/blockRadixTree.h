@@ -32,6 +32,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -52,7 +53,7 @@ struct Block;
 struct ReuseScope
 {
     std::optional<LoraTaskIdType> loraId;
-    std::optional<std::uint64_t> salt;
+    std::optional<std::string> salt;
 
     bool operator==(ReuseScope const& other) const noexcept
     {
@@ -66,15 +67,18 @@ struct ReuseScope
 //
 // SECURITY INVARIANT: the block hash MUST remain cryptographically
 // collision-resistant and >= 256-bit. The radix tree is a globally shared,
-// cross-request/cross-tenant cache index, prefix matching is decided purely by
-// digest equality with NO re-verification of the underlying tokens, and the
-// hashed input (tokens, the user-supplied cache_salt in ReuseScope, multimodal
-// content bytes) is attacker-influenceable. A hash collision therefore silently
-// reuses another request's KV blocks (cross-request corruption / data leak),
-// and tenant isolation via cache_salt relies entirely on this hash's collision
-// resistance. Do NOT substitute a non-cryptographic hash (xxHash, HighwayHash,
-// City, ...) or truncate below 256 bits without first adding a token-content
-// equality check on match.
+// cross-request/cross-tenant cache index. A match finds its root by the reuse
+// scope's digest, and each block by digest equality with NO re-verification of
+// the underlying tokens; only a digest-free query at a node with at most
+// kTokenScanMaxChildren (8) children compares the children's tokens instead
+// (matchTokenPath, blockRadixTree.cpp). The hashed input
+// (tokens, the salt string in ReuseScope, multimodal content bytes) is
+// attacker-influenceable. A hash collision therefore silently reuses another
+// request's KV blocks (cross-request corruption / data leak), and tenant
+// isolation via cache_salt relies entirely on this hash's collision resistance.
+// Do NOT substitute a non-cryptographic hash (xxHash, HighwayHash, City, ...)
+// or truncate below 256 bits without first adding a scope and token-content
+// equality check to every digest match.
 // ---------------------------------------------------------------------------
 using BlockKey = Digest;
 static_assert(kDIGEST_LEN == CSHA256::OUTPUT_SIZE); // 32 bytes
@@ -122,8 +126,9 @@ struct BlockchainKeyStep
 // the first call yields the root (reuseScope digest, empty [0,0) range), then one
 // step per tokensPerBlock chunk chained on the previous digest. Mirrors Python's
 // sequence_to_blockchain_keys(). Lazy so a caller that stops early (e.g. on the
-// first mismatch) skips the remaining hashing. Inline so both the tree
-// (matchTokenPath) and the nanobind layer drive the same generator.
+// first mismatch) skips the remaining hashing. Inline so the nanobind key iterator
+// holds the closure type directly. matchTokenPath does not use it: it derives each
+// block's key with Block::makeKey only where it needs a keyed lookup.
 // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
 // ---------------------------------------------------------------------------
 inline auto sequenceToBlockchainKeys(
@@ -160,8 +165,8 @@ inline auto sequenceToBlockchainKeys(
 }
 
 // Generate multi-modal token IDs (mirrors gen_multimodal_cache_key_tokens in Python).
-std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
-    int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset = 0);
+std::vector<TokenIdExt> genMultimodalCacheKeyTokens(int idOffset, std::vector<uint8_t> const& multiModalDataDigest,
+    int numTokens, int tokenOffset = 0, std::optional<std::string> uuid = std::nullopt);
 
 // ---------------------------------------------------------------------------
 // NodeBase — common base for RootBlock and Block (nodes in the radix tree).
@@ -244,6 +249,8 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
     // Previous node in the chain (RootBlock or Block). Null after detaching from the tree.
     // Raw non-owning pointer: while attached, the prev node's `next` map owns us via shared_ptr.
     NodeBase* prev{nullptr};
+    //! Non-owning scope access while attached; cleared together with prev on detachment.
+    RootBlock* root{nullptr};
 
     TypedVec<LifeCycleId, CommittedPage*> storage;
 
@@ -273,10 +280,10 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
         return storage.size();
     }
 
-    //! Latest digest token in this block's prefix, when requested by the event sink.
-    std::shared_ptr<Digest const> const& getLastTokenDigest() const noexcept
+    //! Latest multimodal item context in this block's prefix, when requested by the event sink.
+    std::shared_ptr<MmItemContext const> const& getLastMmItemContext() const noexcept
     {
-        return mLastTokenDigest;
+        return mLastMmItemContext;
     }
 
     bool isFull() const noexcept
@@ -344,7 +351,7 @@ private:
     BlockOrdinal mOrdinal;
     // Share an immutable value through descendants without retaining any ancestor block.
     // Unlike prev, this context remains valid while the block is detached from the tree.
-    std::shared_ptr<Digest const> mLastTokenDigest;
+    std::shared_ptr<MmItemContext const> mLastMmItemContext;
 };
 
 // ---------------------------------------------------------------------------

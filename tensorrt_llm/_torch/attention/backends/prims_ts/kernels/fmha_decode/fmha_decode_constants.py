@@ -18,8 +18,6 @@ Keep non-obvious constants here with their rationale so config, resource, and
 reduction code can use named values without duplicating comments.
 """
 
-import math
-
 # B200 has 148 SMs. Use this only when the runtime SM query is unavailable,
 # so auto split-KV selection remains deterministic in offline/test flows.
 FALLBACK_SM_COUNT_B200 = 148
@@ -58,10 +56,17 @@ KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM = (0, 2, 1, 3)
 # letting an intermediate probability exceed 2**8; the softmax identity is
 # unchanged apart from normal finite-precision rounding. As in the
 # FlashInfer/TRT-LLM policy, this assumes normal model logits rather than
-# adversarial values outside the qualified probability bound. Streamed KV256
-# and block-sparse Keeps profiles apply it; see
-# ``FmhaDecodeConfig.defers_softmax_anchor_updates``.
+# adversarial values outside the qualified probability bound. Keeps profiles
+# apply it; see ``FmhaDecodeConfig.defers_softmax_anchor_updates``. It bounds
+# ``FmhaDecodeConfig.softmax_rescale_threshold_log2``, is its 16-bit default,
+# and is the block-sparse plans' default for every P dtype.
 SOFTMAX_RESCALE_THRESHOLD_LOG2 = 8.0
+
+# KV256 tiles run at most this many score pairs of a streamed K32 fragment as
+# FMA polynomials, below the share that KV128 tiles take on SM100: their
+# 16-bit fragment loops slow down with a larger share. See
+# ``FmhaDecodeConfig.fragment_ex2_emulated_pairs``.
+KV_TILE_256_MAX_EX2_EMULATED_PAIRS = 4
 
 # A launch bound makes ptxas honor warpgroup ``setmaxnreg`` allocations, but
 # the resulting register hand-off has a fixed cost. Paired B200 measurements
@@ -156,10 +161,11 @@ FP16_VALUES_PER_REG = 2
 # one-byte or 16 two-byte K elements.
 MMA_K_STEP_BYTES = 32
 
-# FP8 probabilities are quantized as 448 * p (the E4M3 maximum); row sums and
-# sink terms share the scale, and the output normalization divides it out.
-FP8_P_QUANT_SCALE = 448.0
-FP8_P_QUANT_LOG2_SCALE = math.log2(FP8_P_QUANT_SCALE)
+# FP8 probabilities are quantized as ``p * FmhaDecodeConfig.fp8_p_quant_scale``:
+# the E4M3 maximum, less the binades a deferred exponent anchor may lag the
+# row maximum (``FmhaDecodeConfig.softmax_anchor_headroom_log2``). Row sums
+# and sink terms share the scale, and the output normalization divides it out.
+E4M3_MAX = 448.0
 
 # tcgen05 SMEM descriptor geometry: address offsets count 16-byte units and a
 # 128-byte swizzle atom spans one 128-byte row per K or MN index.
@@ -185,33 +191,24 @@ REDUCTION_BYTES_PER_SLICE = REDUCTION_THREADS_PER_CTA * REDUCTION_BYTES_PER_THRE
 
 # Clustered standalone reducer shape. One 128-thread CTA covers a contiguous
 # 2 KiB partial-O slice with one 16-byte vector per thread. Each cluster rank
-# owns a compile-time 2, 4, or 8 split slots. Loads are batched in groups of at
-# most four; padded split slots remain neutral and never form GMEM pointers.
+# owns a compile-time 2, 4, or 8 split slots. Padded and unpublished slots
+# remain neutral and never form GMEM pointers.
 PARALLEL_REDUCTION_THREADS_PER_CTA = 128
 PARALLEL_REDUCTION_BYTES_PER_SLICE = (
     PARALLEL_REDUCTION_THREADS_PER_CTA * REDUCTION_BYTES_PER_THREAD
 )
-PARALLEL_REDUCTION_LOAD_BATCH = 4
+# Batch independent published-slot loads before the serial fold.
+PARALLEL_REDUCTION_LOAD_BATCH = 16
 PARALLEL_REDUCTION_FINAL_REDUCERS = 4
+# Single-CTA reducer profiles spread one output fragment's split slots
+# over this many adjacent lanes and merge them with warp shuffles. The fold is
+# a serial chain of dependent FP32 instructions at very low occupancy, so more
+# lanes with fewer slots shorten that per-lane dependency chain. Must divide
+# the slots owned by each CTA.
+PARALLEL_REDUCTION_SLOT_LANES = 4
 
 # Each reduction thread produces an 8-element O vector backed by four packed
 # 16-bit registers.
 OUTPUT_VALUES_PER_THREAD = 8
 FP8_PACKED_OUTPUT_REGS_PER_THREAD = 2
 PACKED_OUTPUT_REGS_PER_THREAD = 4
-
-# INT8 Q/K scores accumulate onto the bit pattern of ``1.5 * 2**23``. Integers
-# in ``[2**23, 2**24)`` are FP32 numbers with unit spacing and every D = 128
-# INT8 dot product has ``|score| <= 2**21``, so the INT32 accumulator is the
-# exact FP32 number ``12582912.0 + score`` and the softmax reads it without a
-# conversion, removing the bias once per scale group.
-INT32_SCORE_BIAS = 12582912.0
-# One ``kind::f16`` MMA step writes the bias before the INT8 K steps: both
-# operands read one BF16 tile whose K = 16 rows repeat
-# ``[1024, 1024, 1024, 0]``, so the twelve products ``2**20`` sum exactly to
-# ``1.5 * 2**23``. The tile is unswizzled K-major 32-byte rows with 128-byte
-# LBO and 256-byte SBO core-matrix strides.
-INT32_SCORE_SEED_MMA_K = 16
-INT32_SCORE_SEED_TILE_WORDS = (0x44804480, 0x00004480)
-INT32_SCORE_SEED_TILE_LBO = 128
-INT32_SCORE_SEED_TILE_SBO = 256

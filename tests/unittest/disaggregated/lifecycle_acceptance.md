@@ -116,7 +116,7 @@ has passed. Track those results separately for each exact revision/configuration
 | A-ADMISSION | Cancel before publication; retain partial publication | Ownership: `test_pre_cancelled_rx_session_never_publishes_destination`, `test_aborted_publication_cannot_complete_during_failure_unwind`, `test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission` | Actual executor/allocator lifetime and publication-race qualification |
 | A-CANCEL-REUSE | Repeated cancellation/status polling cannot release active destinations | Acceptance: `test_cancelled_receive_retains_destinations_until_all_accessors_settle` (4 cases); default-off companion has 2 strict xfails | Real allocator reuse under delayed remote writes and actual executor cancellation/timeout cleanup |
 | A-SOURCE | Exact backend completion protects the source | Ownership: `test_sender_physical_operation_rejects_unproven_retirement`, `test_sender_retires_only_after_backend_done`, `test_ambiguous_sender_result_retains_source_and_reports_in_doubt` | Backend conformance and real source-page retention |
-| A-COHORT | All writers and independent holds must settle | Ownership: `test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group`, `test_gen_first_aux_owner_uses_anonymous_no_retry_writer_count`, `test_failed_receive_consensus_waits_for_every_rank_to_drain` | Multi-rank cohort, local CUDA completion, and manager-hold composition |
+| A-COHORT | All writers and independent holds must settle | Ownership: `test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group`, `test_gen_first_aux_owner_uses_anonymous_no_retry_writer_count`, `test_failed_receive_consensus_waits_for_every_rank_to_drain` | Multi-rank cohort and manager-hold composition |
 | B-OUTCOME | Stable event-time logical outcomes | Outcome: `test_receive_outcome_does_not_depend_on_polling_before_late_completion`, `test_receive_cancel_keeps_its_outcome_when_a_writer_later_fails`, `test_sender_cancel_survives_late_kv_and_aux_exceptions` | Same semantics through native executor/backend paths |
 | B-LATE-DONE | Exact retained-handle settlement, idempotence, no revival/reopening | Merged [PR #19378](https://github.com/NVIDIA/TensorRT-LLM/pull/19378); Late settlement: `test_late_settlement_requires_positive_retained_status`, `test_concurrent_late_done_retires_once_without_changing_failure`, `test_late_done_does_not_retire_active_sibling` | Qualify retained-handle completion and actual source/destination reuse with the real backend |
 | B-DEADLINE | Non-resettable quiescence clock, independent progress, sticky fatal expiry | Merged [PR #19673](https://github.com/NVIDIA/TensorRT-LLM/pull/19673); Deadline: `test_first_drain_trigger_cannot_be_extended`, `test_blocked_backend_cannot_delay_fatal_deadline`, `test_receiver_deadline_retains_kv_aux_and_registration` | Real outstanding GPU/NIXL access through deadline expiry; coordinator request timeout alone does not test the drain clock |
@@ -159,10 +159,10 @@ four-B200, CTX2/GEN2, C++ NIXL profile described below.
 
 | Revision / run | Suite and stage | Observed result | Native evidence |
 | --- | --- | --- | --- |
-| `2886217a8aec42236dffb2d4bd195a1a2d27ba59` / [#62874](https://nv/trt-llm-cicd/job/main/job/L0_MergeRequest_PR/62874/) | Acceptance, `CPU-Generic-x86-1-cbts` and `CPU-Generic-arm-1-cbts` | 4 passed + 2 strict XFAILs on each architecture | [x86 log][cpu-x86-evidence], [ARM log][cpu-arm-evidence] |
+| `2886217a8aec42236dffb2d4bd195a1a2d27ba59` / #62874 | Acceptance, `CPU-Generic-x86-1-cbts` and `CPU-Generic-arm-1-cbts` | 4 passed + 2 strict XFAILs on each architecture | [x86 log][cpu-x86-evidence], [ARM log][cpu-arm-evidence] |
 | Same revision / #62874 | Startup and exit-observer helpers, same CPU stages | 20 passed + 1 setup error on each architecture: startup `capsys` conflicted with the autouse `capfd` fixture | [x86 log][cpu-x86-evidence], [ARM log][cpu-arm-evidence] |
 | Same revision / #62874 | GPU qualification | Not executed: the CPU failure blocked multi-GPU dispatch; no GPU pass is claimed | [Dispatch log][gpu-dispatch-evidence] |
-| `a16bc402a7302d02edb9ec9eb84985b5cd123a14` / [#62774](https://nv/trt-llm-cicd/job/main/job/L0_MergeRequest_PR/62774/) | GPU qualification, `DGX_B200-4_GPUs-PyTorch-1-cbts` | 6 passed; `timeout_late_aux` failed during four-rank startup, before transfer assertions | [B200 log][gpu-evidence] |
+| `a16bc402a7302d02edb9ec9eb84985b5cd123a14` / #62774 | GPU qualification, `DGX_B200-4_GPUs-PyTorch-1-cbts` | 6 passed; `timeout_late_aux` failed during four-rank startup, before transfer assertions | [B200 log][gpu-evidence] |
 
 The CPU setup conflict is corrected by using `capfd`; later startup changes need
 fresh native execution. The [PR verification section](https://github.com/NVIDIA/TensorRT-LLM/pull/19663)
@@ -182,8 +182,10 @@ worlds. Each world has an active attention-DP rank and an idle peer. The tests
 use generic `KVCacheManagerV2` NVFP4/`SELFKONLY` allocations with explicit key and
 block-scale coverage and real KV/AUX transfers, without loading a model or
 introducing production fault-injection hooks. This deliberately excludes the
-unfinished dense FP4 MLA manager/serving integration: its high-precision tail,
-V-scale/packed-V roles, and replicated-role mapping are not qualified here.
+dense FP4 MLA manager's high-precision tail, local-only V-scale/packed-V roles,
+and replicated-role mapping, which are not qualified here under the bridge;
+[test_fp4_mla_kv_transfer.py](test_fp4_mla_kv_transfer.py) covers their transfer
+without it.
 A minimally initialized
 `PyExecutor` exercises its real cancellation gate and termination methods through
 the production coordinator and resource manager; no scheduler/serving loop or
@@ -209,7 +211,7 @@ or reused identities mean the original process no longer executes; a live or
 unobservable rank fails. This process observation is not GPU/RDMA fencing proof.
 The [exit-observer tests](test_transfer_lifecycle_process_exit.py) exercise all
 nine scenarios on each rank. The [startup tests](test_transfer_lifecycle_startup.py)
-check that both workers and the supervisor share one 120-second startup deadline,
+check that both workers and the supervisor share one 600-second startup deadline,
 reject readiness observed at or after expiry, and leave relative transfer waits
 unchanged; startup failures print bounded worker logs and missing readiness
 markers before cleanup.

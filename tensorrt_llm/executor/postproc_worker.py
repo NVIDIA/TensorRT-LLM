@@ -1,6 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
 import traceback
-from collections import deque
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
                     Optional, Union)
@@ -100,6 +101,9 @@ class PostprocWorker:
         decoding_iter: int = 0
         avg_decoded_tokens_per_iter: Optional[float] = None
         cached_tokens: int = 0
+        ctx_computed_tokens: int = 0
+        ctx_first_begin: int = -1
+        ctx_num_chunks: int = 0
 
     def __init__(
         self,
@@ -138,8 +142,6 @@ class PostprocWorker:
         ]
         self._to_stop = asyncio.Event()
 
-        self._q = deque()
-
         # Load the tokenizer and share in all records.
         # Guard against a None tokenizer_dir: transformers'
         # PreTrainedConfig._get_config_dict coerces it via str(None) → "None",
@@ -170,8 +172,10 @@ class PostprocWorker:
         self, input: Union["PostprocWorker.Input", "ResponseWrapper"]
     ) -> [Any, Optional[dict[str, float]]]:
         ''' Handle a single response from await_response worker. '''
-        if input.rsp.result.context_logits is not None or \
-              input.rsp.result.generation_logits is not None:
+        result = input.rsp.result
+        if not isinstance(result, tllm.Result) and (
+                result.context_logits is not None
+                or result.generation_logits is not None):
             raise ValueError(
                 "Context logits or generation logits are not supposed to be "
                 "sent to postprocessing workers.")
@@ -284,6 +288,12 @@ class PostprocWorker:
                             None),
                         cached_tokens=getattr(response_result, "cached_tokens",
                                               0),
+                        ctx_computed_tokens=getattr(response_result,
+                                                    "ctx_computed_tokens", 0),
+                        ctx_first_begin=getattr(response_result,
+                                                "ctx_first_begin", -1),
+                        ctx_num_chunks=getattr(response_result,
+                                               "ctx_num_chunks", 0),
                     ))
                 if is_final:
                     self._records.pop(client_id, None)

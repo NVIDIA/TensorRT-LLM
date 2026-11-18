@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.usage import schema, usage_lib
 
 pytestmark = pytest.mark.cpu_only
@@ -159,11 +160,18 @@ class TestModelInfo:
         assert "num_attention_heads" not in fields
         assert "model_type" not in fields
 
-    def test_public_architecture_is_reported_by_name(self) -> None:
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "LlamaForCausalLM",
+            "Cosmos3EdgeForConditionalGeneration",
+        ],
+    )
+    def test_public_architecture_is_reported_by_name(self, architecture: str) -> None:
         """Allowlisted public names use plaintext and no hash."""
         mock = MagicMock(spec=[])
-        mock.architectures = ["LlamaForCausalLM"]
-        assert usage_lib._architecture_telemetry_fields(mock) == ("LlamaForCausalLM", "")
+        mock.architectures = [architecture]
+        assert usage_lib._architecture_telemetry_fields(mock) == (architecture, "")
 
     def test_unknown_architecture_is_hashed(self) -> None:
         """Unknown names use a stable domain-separated SHA-256 digest."""
@@ -548,12 +556,13 @@ class TestFeatureExtraction:
         assert result["load_format"] == "GMS"
 
     def test_checkpoint_and_load_format_enums(self):
-        """Enum-like objects are captured via their ``name`` attribute."""
+        """String enums keep their value; other enums use their ``name``."""
         mock = MagicMock()
-        mock.checkpoint_format = None
+        # MISTRAL has the value "mistral", so the name would be the wrong value.
+        mock.checkpoint_format = CheckpointFormat.MISTRAL
         mock.load_format.name = "AUTO"
         result = json.loads(usage_lib._collect_features(mock))
-        assert result["checkpoint_format"] == "HF"
+        assert result["checkpoint_format"] == "mistral"
         assert result["load_format"] == "AUTO"
 
     # --- Output format ---

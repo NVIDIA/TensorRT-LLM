@@ -137,16 +137,16 @@ def compare_logits(
         assert logits_list[i].shape == ref_logits_list[i].shape
         lhs_idx = torch.topk(logits_list[i], topk, dim=-1).indices
         rhs_idx = torch.topk(ref_logits_list[i], topk, dim=-1).indices
-        # Token wise comparison
-        ratios = []
+        # Token wise comparison. Sum integer overlaps so a ratio exactly at the
+        # threshold (e.g. 144/160) compares equal instead of off by an ulp.
+        num_overlap = 0
         for j in range(lhs_idx.shape[0]):
             lhs_idx_j = lhs_idx[j].tolist()
             rhs_idx_j = rhs_idx[j].tolist()
-            overlap = set(lhs_idx_j) & set(rhs_idx_j)
-            ratios.append(len(overlap) / len(lhs_idx_j))
+            num_overlap += len(set(lhs_idx_j) & set(rhs_idx_j))
 
-        mean_ratio = sum(ratios) / len(ratios)
-        assert mean_ratio > threshold, (
+        mean_ratio = num_overlap / lhs_idx.numel()
+        assert mean_ratio >= threshold, (
             f"Prompt {i}: overlap ratio: {mean_ratio:.2%} is less than {threshold:.2%}"
         )
 

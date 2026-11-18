@@ -24,16 +24,18 @@ import re
 import sqlite3
 import tempfile
 from collections import defaultdict
+from fnmatch import fnmatchcase
 from html import escape
 
 import click
 
 from cbts.coverage.collection.compact_db import SCHEMA_VERSION, canonicalize_path, merge_databases
+from cbts.coverage.collection.pystart import read_source_config
 
 
-def canon(path: str) -> str:
-    """Collapse an absolute install/src path to the ``tensorrt_llm/...`` product-relative form."""
-    return canonicalize_path(path)
+def canon(path: str, repository_root: str | None = None) -> str:
+    """Collapse an absolute install/src path to the repository-relative form."""
+    return canonicalize_path(path, repository_root)
 
 
 def merge_to_sqlite(pattern: str, out_path: str) -> tuple[sqlite3.Connection, int]:
@@ -45,10 +47,11 @@ def merge_to_sqlite(pattern: str, out_path: str) -> tuple[sqlite3.Connection, in
 
 
 def _collect_defs(node: ast.AST, prefix: str, rel: str, funcs: set[tuple[str, str]]) -> None:
-    """Record functions/methods reachable through class and control-flow nesting (matches PY_START co_qualname)."""
+    """Record functions/methods reachable through class, closure and control flow (matches PY_START co_qualname)."""
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             funcs.add((rel, prefix + child.name))
+            _collect_defs(child, f"{prefix}{child.name}.<locals>.", rel, funcs)
         elif isinstance(child, ast.ClassDef):
             _collect_defs(child, f"{prefix}{child.name}.", rel, funcs)
         else:
@@ -58,12 +61,26 @@ def _collect_defs(node: ast.AST, prefix: str, rel: str, funcs: set[tuple[str, st
 def enumerate_defs(source_root: str) -> tuple[set[str], set[tuple[str, str]]]:
     """Return (coverable_files, funcs) for the coverage-rate denominator, matching what the tracker records."""
     funcs: set[tuple[str, str]] = set()
-    for dirpath, _dirs, names in os.walk(source_root):
+    patterns = read_source_config().get("run", "include", fallback="").split()
+    source_root = os.path.realpath(source_root)
+    repository_root = source_root
+    if os.path.basename(repository_root) == "tensorrt_llm":
+        repository_root = os.path.dirname(repository_root)
+    top_levels = {pattern.split("/", 1)[0] for pattern in patterns}
+    # A wildcard before the first slash can match files in any subtree.
+    prune_top_level = bool(patterns) and not any(
+        char in top for top in top_levels for char in "*?["
+    )
+    for dirpath, dirs, names in os.walk(source_root):
+        if dirpath == repository_root and prune_top_level:
+            dirs[:] = [name for name in dirs if name in top_levels]
         for nm in names:
             if not nm.endswith(".py"):
                 continue
             full = os.path.join(dirpath, nm)
-            rel = canon(os.path.abspath(full))
+            rel = canon(os.path.abspath(full), repository_root)
+            if patterns and not any(fnmatchcase(rel, pattern) for pattern in patterns):
+                continue
             try:
                 tree = ast.parse(open(full, encoding="utf-8").read())
             except (OSError, SyntaxError):
@@ -215,7 +232,7 @@ def write_json(con: sqlite3.Connection, out_path: str) -> None:
 @click.option(
     "--source-root",
     default=None,
-    help="product tree (…/tensorrt_llm); when given, compute file/function coverage rate",
+    help="source tree; when given, compute file/function coverage rate",
 )
 def main(glob_pattern, out_sqlite, out_dir, out_json, source_root):
     """Merge compact CBTS coverage databases into a compact touch DB and reports."""
@@ -242,16 +259,15 @@ def main(glob_pattern, out_sqlite, out_dir, out_json, source_root):
         f"{n_tests} tests, {n_files} product files, {n_funcs} functions touched"
     )
 
-    # Completeness: a (test, stage) is safe to skip only if it passed and every expected
-    # process saved (saved_procs >= expected_workers + 1, the +1 being the coordinator).
+    # Completeness: a (test, stage) is safe to skip only if it passed and is untainted.
     n_meta = con.execute("SELECT COUNT(*) FROM test_case_meta WHERE test != ''").fetchone()[0]
     n_unsafe = con.execute(
         "SELECT COUNT(*) FROM test_case_meta WHERE test != '' AND "
-        "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1)"
+        "(outcome IS NULL OR outcome != 'passed' OR tainted != 0)"
     ).fetchone()[0]
     print(
         f"CBTS completeness: {n_meta} (test, stage) rows, "
-        f"{n_unsafe} not safe to skip (non-passed or saved_procs < expected_workers + 1)"
+        f"{n_unsafe} not safe to skip (non-passed or tainted)"
     )
 
     meta = {

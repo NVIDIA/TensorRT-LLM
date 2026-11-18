@@ -21,8 +21,7 @@ Four groups, each self-contained and free of ``TorchSampler`` state:
   buffers the sampler scatters results into.
 * **Stop criteria** -- the ``meet_*`` / ``handle_stop_criteria`` predicates
   deciding when a request is finished.
-* **Logit adjustments** -- embedding bias, d2t remapping and the fused greedy
-  sampling kernel.
+* **Logit adjustments** -- embedding bias and the fused greedy sampling kernel.
 * **Async D2H** -- ``AsyncWorkerMixin`` (used by ``TorchSampler``), its
   private side-stream copier, and the ``SamplerEvent`` that bundles the
   resulting worker futures / CUDA events for callers to await.
@@ -40,7 +39,7 @@ from concurrent import futures
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import repeat
-from typing import Any, Iterator, Optional, cast
+from typing import Any, Callable, Iterator, Optional, cast
 
 import torch
 
@@ -62,11 +61,12 @@ __all__ = [
     "_StepIndexTranslator",
     "_StridedStepIndexTranslator",
     "_UnpackedStepIndexer",
-    "apply_d2t",
     "apply_embedding_bias",
     "check_stop_words_length",
     "fast_greedy_sample_kernel",
+    "first_stop_reason",
     "handle_stop_criteria",
+    "max_token_room",
     "meet_max_token_stop_criteria",
     "meet_stop_token_criteria",
     "scatter_new_tokens",
@@ -345,6 +345,21 @@ def meet_max_token_stop_criteria(
     )
 
 
+def max_token_room(request: LlmRequest, max_seq_len: int, beam_idx: int = DEFAULT_BEAM_IDX) -> int:
+    """How many more tokens ``request`` can take before ``meet_max_token_stop_criteria``.
+
+    Its ``n``-th new token meets it exactly when ``n >=`` this value, read before the first.
+    """
+    num_tokens = request.get_num_tokens(beam_idx)
+    return cast(
+        int,
+        min(
+            request.py_max_new_tokens - (num_tokens - request.py_orig_prompt_len),
+            max_seq_len - num_tokens,
+        ),
+    )
+
+
 def meet_stop_token_criteria(
     request: LlmRequest, new_token: int, beam_idx: int = DEFAULT_BEAM_IDX
 ) -> bool:
@@ -388,6 +403,55 @@ def handle_stop_criteria(
     return False
 
 
+def first_stop_reason(
+    request: LlmRequest,
+    new_token: int,
+    *,
+    num_generated_tokens: int,
+    num_tokens: int,
+    max_seq_len: Optional[int],
+    stop_word_history: Callable[[int], list[int]],
+) -> Optional[FinishReason]:
+    """The reason ``new_token`` ends ``request``, without appending it.
+
+    Applies the checks of ``handle_stop_criteria`` in its order: END_ID,
+    LENGTH, STOP_WORDS. Meant for a token checked outside the per-step
+    sampler path, which keeps its own inlined checks.
+
+    Args:
+        request: The request ``new_token`` would extend.
+        new_token: The token to check.
+        num_generated_tokens: Generated tokens, ``new_token`` included.
+        num_tokens: Sequence length, ``new_token`` included.
+        max_seq_len: The engine's sequence length limit; None leaves it
+            unchecked.
+        stop_word_history: Returns the last ``n`` tokens before
+            ``new_token``; called only when a multi-token stop word needs
+            them.
+
+    Returns:
+        The finish reason, or None if ``new_token`` does not end the request.
+    """
+    if new_token == request.py_end_id:
+        return FinishReason.END_ID
+    if num_generated_tokens >= request.py_max_new_tokens or (
+        max_seq_len is not None and num_tokens >= max_seq_len
+    ):
+        return FinishReason.LENGTH
+    stop_words = request.py_stop_words_list
+    if not stop_words:
+        return None
+    if all(len(word) == 1 for word in stop_words):
+        matched = any(word[0] == new_token for word in stop_words)
+    else:
+        tokens = list(stop_word_history(max(len(word) for word in stop_words) - 1))
+        tokens.append(new_token)
+        matched = any(
+            len(word) <= len(tokens) and tokens[-len(word) :] == word for word in stop_words
+        )
+    return FinishReason.STOP_WORDS if matched else None
+
+
 def check_stop_words_length(request: LlmRequest) -> bool:
     """Check if the stop words length is greater than 1"""
     # TODO: cache this on the request (e.g. as `request._py_has_multi_token_stop_words`)
@@ -400,16 +464,6 @@ def check_stop_words_length(request: LlmRequest) -> bool:
 # --------------------------------------------------------------------------
 # Logit adjustments
 # --------------------------------------------------------------------------
-
-
-def apply_d2t(tokens: torch.Tensor, model_outputs: dict[str, Any]) -> None:
-    """Applies draft-to-target token translation table.
-
-    Modifies tokens in-place.
-    """
-    if "d2t" in model_outputs:
-        d2t = model_outputs["d2t"][tokens]
-        tokens += d2t
 
 
 def scatter_new_tokens(
@@ -437,19 +491,14 @@ def fast_greedy_sample_kernel(
     new_tokens_cuda: torch.Tensor,
     batch_dest_indices: torch.Tensor,
     max_beam_width: int,
-    d2t: torch.Tensor | None,
 ) -> torch.Tensor:
     """Applies fast greedy sampling to the logits.
 
-    Performs argmax, applies d2t translation if present, and scatters
-    tokens into the output buffer. All operations are in-place.
+    Performs argmax and scatters tokens into the output buffer. All operations
+    are in-place.
     """
     # Simple argmax for greedy sampling
     next_tokens = torch.argmax(logits_cuda, dim=-1).to(dtype=new_tokens_cuda.dtype)
-
-    # Apply draft-to-target token translation if present (for Eagle3)
-    if d2t is not None:
-        next_tokens += d2t[next_tokens]
 
     # Scatter tokens into output buffer
     scatter_new_tokens(next_tokens, new_tokens_cuda, batch_dest_indices, max_beam_width)

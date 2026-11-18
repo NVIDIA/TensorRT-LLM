@@ -1,23 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Adapter around NVIDIA Matmul Heuristics (nvMatmulHeuristics) for the CuTe DSL
-GEMM autotuner.
+"""nvMatmulHeuristics (nvMMH) guidance for the CuTe DSL GEMM/BMM autotuner.
 
-The autotuner enumerates every valid CuTe DSL tactic and then compiles +
-benchmarks all of them, which dominates autotuning wall-time. This module uses
-nvMatmulHeuristics' analytical performance model to rank the candidate
-(CTA-tile, cluster) configurations so the runner can keep only the top-K before
-profiling.
+The autotuner normally compiles and benchmarks every tactic a CuTe DSL GEMM or
+BMM runner enumerates. When ``autotuner_nvmmh_config`` installs an
+:class:`~tensorrt_llm._torch.autotuner.NvMMHConfig` on the AutoTuner, runners
+instead build their tactics from the kernel configurations nvMMH's analytical
+model ranks highest for the problem. Every field nvMMH models (CTA tile,
+cluster shape, split-K, rasterization order, swizzle) is taken as returned;
+runners only sweep knobs nvMMH does not model.
 
-Everything here is best-effort and opt-in: if the library is missing, the
-problem is unsupported, or the query fails, the public helpers return an empty
-ranking so callers fall back to the full tactic list and never regress.
+Each runner describes what its kernel can execute through a validity check, so
+nvMMH ranks implementable configurations only. Both the 0.1.0.x wheels (the
+``nvidia-matmul-heuristics`` requirement) and newer libheuristics builds are
+supported. If the library is missing or a query fails, :func:`query` returns
+an empty list and the runner falls back to its full tactic space.
 """
 
-import os
+import ctypes
+import importlib.metadata
+import inspect
 import re
+import threading
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, Hashable, List, NamedTuple, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -25,253 +32,358 @@ try:
     import nvMatmulHeuristics as _nvmmh
 
     IS_NVMMH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     _nvmmh = None
     IS_NVMMH_AVAILABLE = False
 
-# NVFP4 dense GEMM precision/layout for nvMatmulHeuristics, fixed to the
-# CuteDSLNVFP4BlackwellRunner kernel: A/B are Float4E2M1FN (fp4), the output is
-# BFloat16, and A/B are K-major (see the can_implement call in
-# cute_dsl_custom_ops.py). "F4F4T" is the cuBLAS-style token (fp4 A, fp4 B,
-# bf16 output; bf16->T) and TN_ROW_MAJOR is the K-major A/B layout enum name on
-# NvMatmulHeuristicsMatmulLayout. The whole path is best-effort: if the token is
-# ever rejected by the installed wheel, rank_configs degrades to an empty
-# ranking and the caller falls back to the full tactic sweep.
-NVFP4_PRECISION = "F4F4T"
-NVFP4_LAYOUT = "TN_ROW_MAJOR"
+# nvMMH precision strings name one data type per character (T = BF16,
+# S = FP32, H = FP16, Q = FP8 E4M3, O = FP4 E2M1). Three characters are
+# (A/B, compute, C/D); five are (A, B, C, compute, D).
+BF16_PRECISION = "TST"
+BF16_FP32_OUTPUT_PRECISION = "TSS"
+BF16_FP8_OUTPUT_PRECISION = "TTQSQ"
+FP8_PRECISION = "QQTST"
+FP8_FP16_OUTPUT_PRECISION = "QQHSH"
+FP4_PRECISION = "OOTST"
 
-CtaCluster = Tuple[Tuple[int, int], Tuple[int, int]]
+# Layouts of the CuTe DSL GEMMs: A [M, K] and B [N, K] are K-major ("TN") and
+# C [M, N] is row-major. Swapping A and B computes C^T, a column-major [N, M].
+LAYOUT_ROW_MAJOR_C = "TN_ROW_MAJOR"
+LAYOUT_COL_MAJOR_C = "TN_COL_MAJOR"
 
-# The knobs a caller may let nvMatmulHeuristics drive (instead of sweeping the
-# runner's candidate list). A field named here is supplied by the model; a field
-# not named is swept. "tile" and "cluster" are a coupled pair (the 2-SM encoding
-# maps the joint (cta, cluster)), so selecting either drives both jointly.
-# "swizzle" (swizzle_factor) and "cta_order" (rasterization order) are per-knob.
-NVMMH_OPTIONAL_FIELDS = frozenset({"tile", "cluster", "swizzle", "cta_order"})
+# nvMMH backend split-K kinds, by name so callers need not import nvMMH.
+SPLIT_K_IN_PLACE = "IN_PLACE"
+SPLIT_K_OUT_OF_PLACE = "OUT_OF_PLACE"
 
-# Accepted spellings that normalize onto a canonical field name.
-_NVMMH_FIELD_ALIASES = {"cta_tile": "tile", "mma_tiler": "tile"}
+# Configurations requested from nvMMH per kept tactic: several returned
+# configurations differ only in fields a CuTe DSL kernel does not expose
+# (e.g. the warp tile) and collapse onto one tactic.
+QUERY_OVERSAMPLING = 8
+MIN_QUERY_COUNT = 32
 
 
-class HeuristicConfig(NamedTuple):
-    """One nvMatmulHeuristics candidate, reduced to the knobs we can map to a
-    CuTe DSL NVFP4 tactic. ``swizzle_factor``/``cta_order`` default to the
-    kernel's neutral values (no swizzle, M-major raster) when absent."""
+class KernelConfig(NamedTuple):
+    """One nvMMH kernel configuration (a CUTLASS3 ``nvmmhKernelConfiguration``).
 
-    cta: Tuple[int, int]
+    ``cta`` is the per-CTA (M, N, K) tile. On Blackwell-class GPUs nvMMH runs
+    2-CTA MMA instructions whenever ``cluster[0]`` is even (see
+    :func:`pairs_ctas`). ``cta_order`` 0 rasterizes along M and 1 along N
+    (see :func:`cta_order_to_raster`).
+    ``score`` is the value nvMMH ranks configurations by (lower is better),
+    comparable across problems that compute the same product (see
+    :func:`query`).
+    """
+
+    cta: Tuple[int, int, int]
     cluster: Tuple[int, int]
-    swizzle_factor: int = 1
-    cta_order: int = 0
+    split_k: int
+    swizzle: int
+    cta_order: int
+    stages: int
+    warp: Tuple[int, int, int]
+    instr: Tuple[int, int, int]
+    score: float
 
 
-def nvmmh_fields() -> set:
-    """Which knobs nvMatmulHeuristics drives (vs. the runner sweeping them).
+@dataclass(frozen=True)
+class Problem:
+    """A GEMM/BMM problem in nvMMH terms (after any A/B swap)."""
 
-    Read from TRTLLM_CUTEDSL_NVMMH_FIELDS (comma-separated). Recognized tokens
-    are ``NVMMH_OPTIONAL_FIELDS`` (plus the ``cta_tile``/``mma_tiler`` aliases
-    for "tile"); unknown tokens are warned about once and ignored. Because the
-    2-SM encoding maps the joint (cta, cluster), "tile" and "cluster" are
-    coupled -- naming either drives both. Default: "tile,cluster" (today's
-    behavior: heuristic tile+cluster, swept swizzle/cta_order).
+    m: int
+    n: int
+    k: int
+    batch: int
+    precision: str
+    layout: str = LAYOUT_ROW_MAJOR_C
+
+
+@dataclass(frozen=True)
+class Backend:
+    """CUTLASS3 backend properties describing a CuTe DSL kernel family.
+
+    Properties left as None keep nvMMH's CUTLASS3 defaults.
     """
-    raw = os.environ.get("TRTLLM_CUTEDSL_NVMMH_FIELDS", "tile,cluster")
-    fields = set()
-    for tok in (f.strip().lower() for f in raw.split(",")):
-        if not tok:
-            continue
-        canonical = _NVMMH_FIELD_ALIASES.get(tok, tok)
-        if canonical not in NVMMH_OPTIONAL_FIELDS:
-            logger.warning_once(
-                f"[nvMatmulHeuristics] Ignoring unknown field '{tok}' in "
-                f"TRTLLM_CUTEDSL_NVMMH_FIELDS. Recognized: "
-                f"{sorted(NVMMH_OPTIONAL_FIELDS)} (aliases: "
-                f"{sorted(_NVMMH_FIELD_ALIASES)}).",
-                key=f"nvmmh_unknown_field_{tok}",
-            )
-            continue
-        fields.add(canonical)
-    # tile/cluster are a coupled pair: naming either drives both.
-    if fields & {"tile", "cluster"}:
-        fields.update({"tile", "cluster"})
-    return fields
+
+    split_k_kind: Optional[str] = None
+    supports_col_major_raster: Optional[bool] = None
+    supports_odd_cluster_n: Optional[bool] = None
+    # The kernel launches a 2-CTA cluster above two CTAs with a 2x1 fallback
+    # cluster (preferred-cluster launch).
+    supports_fallback_cluster: Optional[bool] = None
+    cta_tile_m_div: Optional[int] = None
+    cta_tile_n_div: Optional[int] = None
 
 
-def nvmmh_enabled() -> bool:
-    """Master opt-in switch for heuristic tactic pruning."""
-    return IS_NVMMH_AVAILABLE and os.environ.get("TRTLLM_CUTEDSL_NVMMH_ENABLE", "0") == "1"
-
-
-def nvmmh_enabled_for_nvfp4() -> bool:
-    """Whether heuristic pruning applies to the NVFP4 dense GEMM. Gated solely
-    by the master switch (TRTLLM_CUTEDSL_NVMMH_ENABLE)."""
-    return nvmmh_enabled()
-
-
-def nvmmh_max_tactics() -> int:
-    """Number of heuristic-ranked (tile, cluster) configs to keep per problem.
-
-    Mirrors TorchInductor's nvgemm_max_profiling_configs. Both use_prefetch
-    variants of a kept config are profiled on top of this (prefetch is not
-    modeled by the heuristic), so the final tactic count is up to ~2x this.
-    """
+@lru_cache(maxsize=1)
+def library_version() -> str:
+    """Installed nvMMH distribution version (part of cache keys)."""
     try:
-        return max(1, int(os.environ.get("TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS", "5")))
-    except ValueError:
-        return 5
+        return importlib.metadata.version("nvidia-matmul-heuristics")
+    except importlib.metadata.PackageNotFoundError:
+        return str(getattr(_nvmmh, "__version__", "unknown"))
 
 
-@lru_cache(maxsize=None)
+def cta_order_to_raster(cta_order: int) -> str:
+    """nvMMH CUTLASS3 CTA order -> CuTe DSL raster ("m": M-fastest).
+
+    0 rasterizes along M and 1 along N, as in CUTLASS's own nvMMH provider for
+    the same CUTLASS3 target (``raster_order``):
+    https://github.com/NVIDIA/cutlass/blob/d4bbf728ca52ce23a549a299e229666e734ffb7c/python/cutlass_library/heuristics_provider.py#L222
+    """
+    return "n" if int(cta_order) else "m"
+
+
+@lru_cache(maxsize=1)
+def _pairs_only_cluster_m_2() -> bool:
+    """0.1.0.x PyPI releases model 2-CTA MMA for cluster M == 2 only.
+
+    An installation without version metadata is a 0.1.0.x release if its
+    interface lacks the per-backend silicon-metric API newer builds add.
+    """
+    version = library_version()
+    if version == "unknown":
+        interface = _interface_class()
+        old = not (
+            hasattr(interface, "estimateSiliconMetricEx")
+            and hasattr(interface, "setBackendPropertyValue")
+        )
+        logger.warning_once(
+            "nvMatmulHeuristics reports no version; assuming "
+            f"{'a 0.1.0.x release' if old else 'a libheuristics build'} "
+            "from its API.",
+            key="nvmmh_unknown_version",
+        )
+        return old
+    match = re.fullmatch(r"0\.1\.0\.(\d+)", version)
+    return match is not None and int(match.group(1)) < 10000
+
+
+def pairs_ctas(config: KernelConfig) -> bool:
+    """Whether nvMMH models this config with 2-CTA (CTA pair) MMA.
+
+    nvMMH's CUTLASS3 target pairs CTAs along an even cluster M extent on
+    Blackwell-class GPUs (only cluster M == 2 before libheuristics 0.2), so a
+    CuTe DSL kernel realizes the config with ``use_2cta_instrs`` and an MMA
+    tile of twice the per-CTA M.
+    """
+    cluster_m = int(config.cluster[0])
+    if _pairs_only_cluster_m_2():
+        return cluster_m == 2
+    return cluster_m % 2 == 0
+
+
+def _interface_class():
+    """The interface class that manages discovery sets implicitly.
+
+    0.1.0.x names it NvMatmulHeuristicsInterfaceEx; newer wheels moved the
+    implicit discovery handling to NvMatmulHeuristicsInterface.
+    """
+    interface = _nvmmh.NvMatmulHeuristicsInterface
+    if hasattr(interface, "_ensure_discovery_loaded"):
+        return interface
+    return _nvmmh.NvMatmulHeuristicsInterfaceEx
+
+
+_interfaces: Dict[Tuple[int, str], object] = {}
+_interfaces_lock = threading.Lock()
+
+
 def _get_interface(precision: str):
-    """Build and cache an interface for a given precision (None on failure)."""
-    if not IS_NVMMH_AVAILABLE:
-        return None
-    try:
-        return _nvmmh.NvMatmulHeuristicsInterface(
-            _nvmmh.NvMatmulHeuristicsTarget.CUTLASS3,
-            precision=precision,
-            flags=_nvmmh.NvMatmulHeuristicsFlags.PERF_MODEL_BASED_AUTO_TUNING,
-        )
-    except Exception as e:  # noqa: BLE001 - any failure must degrade gracefully
-        logger.warning_once(
-            f"[nvMatmulHeuristics] Failed to build interface for "
-            f"precision={precision}: {e}. Falling back to full tactic list.",
-            key="nvmmh_interface_init_failure",
-        )
-        return None
+    """One interface per (thread, precision); nvMMH handles are not shared."""
+    key = (threading.get_ident(), precision)
+    with _interfaces_lock:
+        interface = _interfaces.get(key)
+    if interface is not None:
+        return interface
+    cls = _interface_class()
+    kwargs = dict(flags=_nvmmh.NvMatmulHeuristicsFlags.PERF_MODEL_BASED_AUTO_TUNING)
+    if "precision" in inspect.signature(cls.__init__).parameters:
+        kwargs["precision"] = precision
+    interface = cls(_nvmmh.NvMatmulHeuristicsTarget.CUTLASS3, **kwargs)
+    with _interfaces_lock:
+        _interfaces[key] = interface
+    return interface
 
 
-def _get_layout(name: str):
-    try:
-        return getattr(_nvmmh.NvMatmulHeuristicsMatmulLayout, name)
-    except AttributeError:
-        logger.warning_once(
-            f"[nvMatmulHeuristics] Unknown layout '{name}'. Falling back to full tactic list.",
-            key="nvmmh_unknown_layout",
-        )
-        return None
+def _make_problem(interface, problem: Problem):
+    layout = getattr(_nvmmh.NvMatmulHeuristicsMatmulLayout, problem.layout)
+    make = interface.makeNvMatmulHeuristicsProblem
+    if "mnk" in inspect.signature(make).parameters:
+        return make((problem.m, problem.n, problem.k), layout, batch_size=problem.batch)
+    return make(problem.m, problem.n, problem.k, layout, batch_size=problem.batch)
 
 
-def _as_int_pair(values) -> Optional[Tuple[int, int]]:
-    try:
-        nums = [int(v) for v in values]
-    except (TypeError, ValueError):
-        return None
-    if len(nums) < 2:
-        return None
-    return (nums[0], nums[1])
+def _set_property(interface, backend, name: str, value: int) -> None:
+    prop = getattr(_nvmmh.NvMatmulHeuristicsBackendProperty, name)
+    setter = getattr(interface, "setBackendPropertyValue", None)
+    if setter is not None:
+        setter(backend, prop, int(value))
+        return
+    # 0.1.0.x takes a raw value buffer.
+    buffer = ctypes.c_int32(int(value))
+    interface.setBackendValueProperty(backend, prop, ctypes.byref(buffer), ctypes.sizeof(buffer))
 
 
-def _extract_int(config, kernel, dict_key: str, attr: str, str_re: str, default: int) -> int:
-    """Read one scalar field, tolerant of dict / object / printable-string."""
-    if isinstance(config, dict) and dict_key in config:
-        try:
-            return int(config[dict_key])
-        except (TypeError, ValueError):
-            pass
-    if hasattr(kernel, attr):
-        try:
-            return int(getattr(kernel, attr))
-        except (TypeError, ValueError):
-            pass
-    m = re.search(str_re, kernel if isinstance(kernel, str) else str(kernel))
-    if m:
-        try:
-            return int(m.group(1))
-        except (TypeError, ValueError):
-            pass
-    return default
-
-
-def _extract_config(config) -> Optional[HeuristicConfig]:
-    """Pull (cta, cluster, swizzle_factor, cta_order) out of one heuristic
-    config. Tolerant of the several shapes the config may take across versions:
-    a dict with flat fields, a dict whose ``kernel`` is an object with
-    attributes, or a dict whose ``kernel`` is a printable string.
-    """
-    kernel = config.get("kernel") if isinstance(config, dict) else config
-    cta = cluster = None
-
-    # Form 1: flat dict fields (DKG getEx-style wrapper).
-    if isinstance(config, dict) and "cta_tile_m" in config:
-        cta = _as_int_pair((config["cta_tile_m"], config["cta_tile_n"]))
-        cluster = _as_int_pair((config.get("cluster_m", 1), config.get("cluster_n", 1)))
-
-    # Form 2: kernel object with attributes (public wheel's GemmConfig uses
-    # cluster_m/cluster_n; the DKG internal wrapper used cga_m/cga_n).
-    if (cta is None or cluster is None) and hasattr(kernel, "cta_tile_m"):
-        cta = _as_int_pair((kernel.cta_tile_m, kernel.cta_tile_n))
-        cluster_m = getattr(kernel, "cluster_m", getattr(kernel, "cga_m", 1))
-        cluster_n = getattr(kernel, "cluster_n", getattr(kernel, "cga_n", 1))
-        cluster = _as_int_pair((cluster_m, cluster_n))
-
-    # Form 3: printable string like "... cta(128 16 128) ... cluster(2 1) ...".
-    if cta is None or cluster is None:
-        text = kernel if isinstance(kernel, str) else str(kernel)
-        cta_m = re.search(r"cta\(\s*([\d\s]+?)\)", text)
-        cluster_m = re.search(r"cluster\(\s*([\d\s]+?)\)", text)
-        if cta_m:
-            cta = _as_int_pair(cta_m.group(1).split())
-            cluster = _as_int_pair(cluster_m.group(1).split()) if cluster_m else (1, 1)
-
-    if cta is None or cluster is None:
-        return None
-
-    # swizzle_factor -> "swizz(N)"; cta_order -> "ctaOrder(N)". Default to the
-    # kernel's neutral values (no swizzle, M-major raster) when the field is
-    # absent so an unselected knob never changes behavior.
-    swizzle = _extract_int(
-        config, kernel, "swizzle_factor", "swizzle_factor", r"swizz\(\s*(\d+)\)", 1
+def _set_validity_check(interface, backend, accept: Callable[[object], bool]) -> None:
+    """Register ``accept(raw_config) -> bool`` as the additional validity check."""
+    kind = _nvmmh.NvMatmulHeuristicsBackendPropertyCallbackKind.KERNEL_ADDITIONAL_VALIDITY_CHECK
+    setter = getattr(interface, "backendSetCallbackProperty", None)
+    if setter is not None:
+        setter(backend, kind, lambda config: int(bool(accept(config))))
+        return
+    # 0.1.0.x passes a configuration pointer and an unused problem pointer.
+    interface.setBackendCallbackProperty(
+        backend, kind, lambda config_ptr, _problem_ptr: int(bool(accept(config_ptr.contents)))
     )
-    cta_order = _extract_int(config, kernel, "cta_order", "cta_order", r"ctaOrder\(\s*(\d+)\)", 0)
-    return HeuristicConfig(cta, cluster, max(1, swizzle), cta_order)
 
 
-def rank_configs(m: int, n: int, k: int, precision: str, count: int) -> List[HeuristicConfig]:
-    """Return up to ``count`` HeuristicConfig entries ranked best-first.
-
-    Returns an empty list if heuristics are unavailable or the query fails, so
-    callers can fall back to their full tactic list.
-    """
-    interface = _get_interface(precision)
-    if interface is None:
-        return []
-    layout = _get_layout(NVFP4_LAYOUT)
-    if layout is None:
-        return []
-    try:
-        # hw=None targets the current GPU.
-        try:
-            interface.loadInternalDiscoverySet(layout, None)
-        except Exception as e:  # noqa: BLE001 - discovery data is optional
-            logger.debug(f"[nvMatmulHeuristics] loadInternalDiscoverySet skipped: {e}")
-        configs = interface.get_with_mnk(int(m), int(n), int(k), layout, int(count), None)
-    except Exception as e:  # noqa: BLE001 - any failure must degrade gracefully
-        logger.warning_once(
-            f"[nvMatmulHeuristics] Query failed for "
-            f"precision={precision}, mnk=({m},{n},{k}): {e}. "
-            f"Falling back to full tactic list.",
-            key="nvmmh_query_failure",
+def _configure_backend(interface, backend, spec: Backend) -> None:
+    if spec.split_k_kind is not None:
+        _set_property(
+            interface,
+            backend,
+            "SPLIT_K_KIND",
+            int(getattr(_nvmmh.NvMatmulHeuristicsSplitKKind, spec.split_k_kind)),
         )
-        return []
+    for name, value in (
+        ("HAS_COL_MAJOR_RASTER", spec.supports_col_major_raster),
+        ("SUPPORTS_ODD_CLUSTER_N", spec.supports_odd_cluster_n),
+        ("SUPPORTS_FALLBACK_CLUSTER", spec.supports_fallback_cluster),
+        ("CTA_TILE_M_DIV_REQUIREMENT", spec.cta_tile_m_div),
+        ("CTA_TILE_N_DIV_REQUIREMENT", spec.cta_tile_n_div),
+    ):
+        if value is not None:
+            _set_property(interface, backend, name, int(value))
 
-    if not configs:
-        return []
 
-    # Sort by estimated runtime when present; the API may already be ranked.
-    def _runtime(c):
-        return c.get("runtime", float("inf")) if isinstance(c, dict) else float("inf")
+def _to_kernel_config(raw, score: float) -> KernelConfig:
+    return KernelConfig(
+        cta=tuple(int(v) for v in raw.cta),
+        cluster=(max(1, int(raw.cluster[0])), max(1, int(raw.cluster[1]))),
+        split_k=max(1, int(raw.splitK)),
+        swizzle=max(1, int(raw.gridSwizzle)),
+        cta_order=int(raw.ctaOrder),
+        stages=int(raw.loadStages),
+        warp=tuple(int(v) for v in raw.warp),
+        instr=tuple(int(v) for v in raw.instr),
+        score=float(score),
+    )
 
-    ordered = sorted(configs, key=_runtime)
-    ranked: List[HeuristicConfig] = []
-    for c in ordered:
-        cfg = _extract_config(c)
-        if cfg is not None and cfg not in ranked:
-            ranked.append(cfg)
+
+def _ranking_score(interface, backend, nv_problem, raw, precision: str, fallback: float) -> float:
+    """The score nvMMH ranks ``raw`` by, with this backend's properties.
+
+    Libraries with ``RANKING_SCORE`` report it directly; older libheuristics
+    builds approximate it with ``RUNTIME_RELATIVE_FAST_S`` (their ranking
+    metric without the Rubin L2 simulation). 0.1.0.x has no per-backend
+    estimate: ``fallback`` is the wrapper's ``runtime`` field, a default-backend
+    absolute runtime.
+    """
+    estimate = getattr(interface, "estimateSiliconMetricEx", None)
+    if estimate is None or not hasattr(interface, "setBackendPropertyValue"):
+        return fallback
+    metrics = _nvmmh.NvMatmulHeuristicsSiliconMetric
+    metric = getattr(metrics, "RANKING_SCORE", metrics.RUNTIME_RELATIVE_FAST_S)
+    try:
+        value = estimate(precision, backend, nv_problem, raw, int(metric))
+    except Exception:  # noqa: BLE001 - only orders merged rankings
+        return fallback
+    return float(value) if value and value > 0 else fallback
+
+
+def _query_uncached(
+    problem: Problem, count: int, backend_spec: Backend, is_valid: Callable[[KernelConfig], bool]
+) -> List[KernelConfig]:
+    interface = _get_interface(problem.precision)
+    backend = interface.createBackend(_nvmmh.NvMatmulHeuristicsTarget.CUTLASS3)
+    try:
+        _configure_backend(interface, backend, backend_spec)
+        _set_validity_check(interface, backend, lambda raw: is_valid(_to_kernel_config(raw, 0.0)))
+        nv_problem = _make_problem(interface, problem)
+        configs = interface.getEx(nv_problem, int(count), backend, problem.precision)
+        ranked = []
+        for entry in configs:
+            raw = entry["nvmmhKernelConfiguration"]
+            score = _ranking_score(
+                interface, backend, nv_problem, raw, problem.precision, entry.get("runtime", 0.0)
+            )
+            config = _to_kernel_config(raw, score)
+            # Wrappers that drop the callback's verdict still return only
+            # nvMMH-ranked configs; re-check them here.
+            if is_valid(config):
+                ranked.append(config)
+    finally:
+        interface.destroyBackend(backend)
     return ranked
 
 
-def rank_tile_cluster_configs(
-    m: int, n: int, k: int, precision: str, count: int
-) -> List[CtaCluster]:
-    """Back-compat helper: (cta, cluster) pairs only, ranked best-first."""
-    return [(c.cta, c.cluster) for c in rank_configs(m, n, k, precision, count)]
+_query_cache: Dict[Hashable, List[KernelConfig]] = {}
+_query_cache_lock = threading.Lock()
+
+
+def query(
+    problem: Problem,
+    count: int,
+    is_valid: Callable[[KernelConfig], bool],
+    backend: Backend = Backend(),
+    cache_key: Optional[Hashable] = None,
+) -> List[KernelConfig]:
+    """Return up to ``count`` valid nvMMH configs in nvMMH's ranking order.
+
+    nvMMH's own order is kept. Each config carries its ranking ``score``, so
+    rankings of several problems computing the same product (e.g. both A/B
+    orientations) can be merged consistently with that order.
+    ``cache_key`` identifies the validity check; results are memoized per
+    (problem, count, backend, cache_key) when it is given. Failures are
+    logged once and yield an empty list.
+    """
+    if not IS_NVMMH_AVAILABLE:
+        return []
+    key = None
+    if cache_key is not None:
+        key = (problem, int(count), backend, cache_key)
+        with _query_cache_lock:
+            cached = _query_cache.get(key)
+        if cached is not None:
+            return list(cached)
+    try:
+        ranked = _query_uncached(problem, count, backend, is_valid)
+    except Exception as e:  # noqa: BLE001 - guidance must never break tuning
+        logger.warning_once(
+            f"[nvMatmulHeuristics] Query failed for {problem} with nvMMH "
+            f"{library_version()}: {e}. Falling back to the full tactic list.",
+            key="nvmmh_query_failure",
+        )
+        return []
+    if key is not None:
+        with _query_cache_lock:
+            _query_cache[key] = list(ranked)
+    return ranked
+
+
+def query_count(max_tactics: int) -> int:
+    """How many configs to request so ``max_tactics`` distinct tactics remain."""
+    return max(MIN_QUERY_COUNT, QUERY_OVERSAMPLING * int(max_tactics))
+
+
+def select_tactics(ranked: List[Tuple[KernelConfig, List[tuple]]], max_tactics: int) -> List[tuple]:
+    """Expand the top ``max_tactics`` nvMMH configs into runner tactics.
+
+    ``ranked`` pairs each config (nvMMH order) with the tactics realizing it:
+    one per combination of the knobs nvMMH does not model. Configs that map
+    onto an already kept realization (e.g. differing only in warp tile) do not
+    count against ``max_tactics``.
+    """
+    selected: List[tuple] = []
+    seen = set()
+    kept = 0
+    for _, tactics in ranked:
+        fresh = [t for t in tactics if t not in seen]
+        if not fresh:
+            continue
+        selected.extend(fresh)
+        seen.update(fresh)
+        kept += 1
+        if kept >= max_tactics:
+            break
+    return selected

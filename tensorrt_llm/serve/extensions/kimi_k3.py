@@ -73,6 +73,23 @@ def enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
         raise ValueError(f"n is fixed at 1 for this model; got {request.n}.")
 
 
+def _derive_from_reasoning_effort(kwargs: dict[str, Any], effort: object) -> None:
+    """Derive the K3 ``thinking`` / ``thinking_effort`` kwargs from a reasoning effort.
+
+    A no-op when ``kwargs`` turns thinking off. Otherwise ``"none"`` turns
+    thinking off unless ``kwargs`` sets it, ``"low"``, ``"high"`` and ``"max"``
+    set the effort unless ``kwargs`` sets one, and other values (e.g. harmony's
+    ``"medium"``) have no K3 equivalent and leave the template default.
+    """
+    if not isinstance(effort, str) or kwargs.get("thinking") is False:
+        return
+    effort = effort.lower()
+    if effort == "none":
+        kwargs.setdefault("thinking", False)
+    elif effort in ("low", "high", "max"):
+        kwargs.setdefault("thinking_effort", effort)
+
+
 def dynamic_tool_dicts(messages: Optional[List[ChatCompletionMessageParam]]) -> list[dict]:
     """Collect message-level (dynamic) tool declarations from system messages."""
     tools: list[dict] = []
@@ -124,6 +141,47 @@ def validate_kimi_dynamic_tools(request: ChatCompletionRequest) -> None:
 class KimiK3ServingExtension(ServingExtension):
     """Kimi/Moonshot API semantics for kimi_k3 chat requests."""
 
+    render_version = 2
+
+    # Trailing tokens of the native K3 generation prompt (the channel opener
+    # ``<|open|>think|response<|sep|>``) that are not reported as prompt usage.
+    _GENERATION_CHANNEL_OPENER_TOKENS = 3
+
+    def allows_required_tool_choice(self) -> bool:
+        """K3 enforces ``tool_choice="required"`` through its template."""
+        return True
+
+    def serialize_tool(self, tool) -> Dict[str, Any]:
+        """Drop pydantic-injected null defaults (strict, description, parameters).
+
+        They would otherwise leak into the rendered tool-declaration JSON and
+        skew prompt-token parity with the reference renderer.
+        """
+        return tool.model_dump(exclude_none=True)
+
+    def dynamic_tools(self, messages: Optional[List[ChatCompletionMessageParam]]) -> List[dict]:
+        """Message-level (dynamic) tools are a Kimi API extension."""
+        return dynamic_tool_dicts(messages)
+
+    def prompt_tokens_excluded_from_usage(
+        self,
+        *,
+        add_generation_prompt: bool,
+        pre_tokenized: bool,
+        request_chat_template: Optional[str],
+    ) -> int:
+        """Exclude the generation channel opener from prompt usage.
+
+        Kimi's prompt-token accounting excludes the trailing generation channel
+        opener; the model still sees the full rendered prompt. A pre-tokenized
+        prompt is not rendered here, so there is no opener to exclude. A
+        request-level template may end differently, so report unadjusted usage
+        for it.
+        """
+        if add_generation_prompt and not pre_tokenized and request_chat_template is None:
+            return self._GENERATION_CHANNEL_OPENER_TOKENS
+        return 0
+
     def apply_chat_extensions(self, request: ChatCompletionRequest) -> None:
         """Derive chat-template kwargs and defaults from request-level fields.
 
@@ -131,7 +189,10 @@ class KimiK3ServingExtension(ServingExtension):
         effort, tool_choice, and response_format, but only reads them from
         chat-template kwargs. Derive those kwargs from the request-level
         fields so the OpenAI-style API surface drives the template; explicit
-        client-supplied ``chat_template_kwargs`` win over derived values. The
+        client-supplied ``chat_template_kwargs`` win over derived values.
+        The template reads ``thinking`` / ``thinking_effort``, not the
+        ``enable_thinking`` / ``reasoning_effort`` kwargs most other chat
+        templates read, so those generic kwargs are translated as well. The
         merged kwargs also steer the kimi_k3 reasoning parser's initial
         channel, the guided-decoding structural tag, and the thinking-budget
         logits processor downstream.
@@ -144,32 +205,28 @@ class KimiK3ServingExtension(ServingExtension):
         if request.stream and request.stream_options is None:
             # StreamOptions defaults: include_usage=True, continuous off.
             request.stream_options = StreamOptions()
+        # Sources of the ``thinking`` / ``thinking_effort`` kwargs, highest
+        # precedence first; each one only sets what no source above it set:
+        #   1. those two keys in the client's ``chat_template_kwargs``;
+        #   2. the request-level ``thinking`` object;
+        #   3. the request-level ``reasoning_effort``;
+        #   4. the generic ``enable_thinking`` / ``reasoning_effort`` keys in
+        #      ``chat_template_kwargs`` (the Anthropic adapter maps ``thinking``
+        #      and ``output_config.effort`` onto them);
+        #   5. the template default: thinking on, effort ``max``.
+        # An effort of ``"none"`` turns thinking off. No effort is derived for a
+        # request whose thinking is off; a ``thinking_effort`` the client sets is
+        # passed through, and the template ignores it while thinking is off.
         derived: dict[str, Any] = {}
         if request.thinking is not None:
             enabled = request.thinking.type != "disabled"
             derived["thinking"] = enabled
             if enabled and request.thinking.effort is not None:
                 derived["thinking_effort"] = request.thinking.effort
-        if (
-            "reasoning_effort" in request.model_fields_set
-            and request.reasoning_effort is not None
-            and "thinking_effort" not in derived
-            and (request.thinking is None or request.thinking.type != "disabled")
-        ):
-            # An explicit thinking.effort wins, and an explicit thinking
-            # object also wins the on/off axis: reasoning_effort only supplies
-            # the effort when thinking.effort is absent, and
-            # reasoning_effort="none" only disables thinking when no thinking
-            # object was sent. No effort is ever derived for an explicitly
-            # disabled request.
-            effort = getattr(request.reasoning_effort, "value", request.reasoning_effort).lower()
-            if effort == "none":
-                if request.thinking is None:
-                    derived["thinking"] = False
-            elif effort in ("low", "high", "max"):
-                derived["thinking_effort"] = effort
-            # Other efforts (e.g. harmony's "medium") have no K3 equivalent;
-            # leave the template default.
+        if "reasoning_effort" in request.model_fields_set and request.reasoning_effort is not None:
+            _derive_from_reasoning_effort(
+                derived, getattr(request.reasoning_effort, "value", request.reasoning_effort)
+            )
         if (
             "tool_choice" in request.model_fields_set
             and (request.tools or dynamic_tool_dicts(request.messages))
@@ -195,11 +252,33 @@ class KimiK3ServingExtension(ServingExtension):
                 if "strict" in json_schema and not isinstance(json_schema["strict"], bool):
                     raise ValueError("response_format.json_schema.strict must be a boolean.")
                 derived["response_schema"] = json_schema["schema"]
-        if derived:
-            request.chat_template_kwargs = {
-                **derived,
-                **(request.chat_template_kwargs or {}),
-            }
+        chat_template_kwargs = {**derived, **(request.chat_template_kwargs or {})}
+        unset = {"thinking", "thinking_effort"} - chat_template_kwargs.keys()
+        enable_thinking = chat_template_kwargs.get("enable_thinking")
+        if isinstance(enable_thinking, bool):
+            chat_template_kwargs.setdefault("thinking", enable_thinking)
+        _derive_from_reasoning_effort(
+            chat_template_kwargs, chat_template_kwargs.get("reasoning_effort")
+        )
+        translated = unset & chat_template_kwargs.keys()
+        exempted = set(translated)
+        generic_effort = chat_template_kwargs.get("reasoning_effort")
+        if isinstance(generic_effort, str) and generic_effort.lower() in (
+            "none",
+            "low",
+            "high",
+            "max",
+        ):
+            # The extension consumes this control even if a higher-precedence
+            # K3 setting wins. Keep it available to custom templates as well.
+            exempted.add("reasoning_effort")
+        if exempted:
+            # Derived and consumed controls need not be read again by a Jinja template.
+            request.injected_chat_template_kwargs = sorted(
+                {*(request.injected_chat_template_kwargs or ()), *exempted}
+            )
+        if derived or translated:
+            request.chat_template_kwargs = chat_template_kwargs
 
     def structured_output_format(
         self, content: Dict[str, Any], chat_template_kwargs: Optional[Dict[str, Any]]

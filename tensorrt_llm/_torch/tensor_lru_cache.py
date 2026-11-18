@@ -16,8 +16,8 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from collections.abc import Hashable
+from collections import Counter, OrderedDict
+from collections.abc import Hashable, Iterable
 from dataclasses import dataclass
 from enum import Enum, auto
 from threading import RLock
@@ -402,6 +402,22 @@ class TensorLRUCache(Generic[K]):
                 del self._items[cache_key]
                 self._current_bytes -= entry.size_bytes
             self._counters.evictions += len(entries_to_evict)
+
+    def releasable_bytes(self, keys: Iterable[K]) -> int:
+        """Return claimed bytes freed by releasing the given references.
+
+        Shared entries count once, and only when every live reference is
+        included. READY entries then become evictable or are removed;
+        reservations are removed. This query leaves the cache unchanged.
+        """
+        counts = Counter(keys)
+        with self._lock:
+            return sum(
+                entry.size_bytes
+                for key, count in counts.items()
+                if (entry := self._items.get(key)) is not None
+                and 0 < entry.reference_count <= count
+            )
 
     def release(self, key: K) -> None:
         """Release one acquired reference and apply retention policy.

@@ -38,7 +38,7 @@ logger = logging.getLogger("report_cbts_decision")
 
 
 _MULTI_GPU_RE = re.compile(r"\d+_GPUs")
-_STAGE_SHARD_SUFFIX_RE = re.compile(r"-\d+$")
+_STAGE_SHARD_SUFFIX_RE = re.compile(r"-\d+(_of_\d+)?(-cbts)?$")
 _ON_DEMAND_MARKER = "-OnDemand-"
 _POST_MERGE_MARKER = "Post-Merge"
 _PERF_SANITY_MARKER = "PerfSanity"
@@ -210,6 +210,7 @@ def build_document(
         "s_build_url": os.getenv("BUILD_URL", ""),
         "s_cbts_status": status,
         "s_scope": str(scope) if scope is not None else "",
+        "s_shadow_selection_artifact_path": decision.get("shadow_selection_artifact_path") or "",
         "s_reason": reason,
         "l_hit_stages": len(affected),
         "l_total_cases": total_cases,

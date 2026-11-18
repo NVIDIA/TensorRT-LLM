@@ -270,10 +270,9 @@ class _BatchedSamplingResult:
     # Next tokens for all requests:
     next_tokens_cuda_int: torch.Tensor
 
-    # Processed and raw logprobs buffer. The tensor is sized to accommodate logprobs for all requests currently being
-    # processed by the sampler and slice(0, processed_logprobs_end) contains processed logprobs, ordered consistently
-    # with processed_logprobs_reqs_indices. Excludes beam search requests, which have a separate path for logprobs
-    # handling.
+    # Processed logprobs for single-beam token rows, ordered consistently with
+    # processed_logprobs_reqs_indices after excluding beam-search requests.
+    # Raw logprobs are selected directly from logits; beam search uses its own history.
     logprobs_cuda: torch.Tensor | None = None
 
     # Requests requesting processed logprobs (incl. beam-search requests), same ordering as req_indices.
@@ -284,6 +283,7 @@ class _BatchedSamplingResult:
     # Requests requesting raw logprobs (incl. beam-search requests), ordered consistently with original
     # (unpermuted) requests
     raw_logprobs_reqs_indices: list[int] = field(default_factory=list)
-    # Indices into logits tensor, ordered consistently with raw_logprobs_reqs_indices.
-    # Excludes beam search requests, which have a separate path for logprobs handling.
+    # Indices into logits for the single-beam subset of raw_logprobs_reqs_indices,
+    # preserving request order. Multi-beam requests only need their sampled token IDs
+    # scattered; their logprob values come from beam search.
     raw_logprobs_logit_indices_cuda: torch.Tensor | None = None

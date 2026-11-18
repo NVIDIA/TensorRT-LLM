@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # AGENTS.md
 
 This file provides guidance to coding agents when working with code in this directory.
@@ -5,7 +10,7 @@ This file provides guidance to coding agents when working with code in this dire
 ## What This Is
 
 The Python surface of KVCacheManagerV2, the KV cache management subsystem for TensorRT-LLM.
-It manages GPU/host/disk memory for key-value caches used during LLM inference, handling page
+It manages GPU/host/disk/remote memory for key-value caches used during LLM inference, handling page
 allocation, eviction, multi-tier caching, radix-tree-based prefix sharing, and disaggregated
 serving.
 
@@ -21,7 +26,9 @@ This directory contains only:
   means adding a rebind here and an entry in `__all__`.
 - `_introspection.py` — white-box hooks for tests and accuracy harnesses. Every function
   forwards to the bindings' native `_introspection` submodule; the indirection exists so callers
-  import a stable Python path and get plain Python containers back.
+  import a stable Python path and get plain Python containers back. The one exception is
+  `batch_gpu_coalesced_page_table`, which returns a DLPack view: its callers check the
+  device-array contract and pointer stability, which a host copy would erase.
 
 ## Commands
 
@@ -66,6 +73,19 @@ Set `TLLM_DEBUG_MODE=1` to enable debug assertions (`NDEBUG=False`). Default is 
 
 ## Gotchas
 
+- **The disk I/O pool is process-wide.** `DiskCacheTierConfig.num_io_threads` starts one pool
+  per process at the first nonzero value; later managers, including ones that pass 0, share it.
+  In a test process, tests after a disk-options test run with the pool even if they set 0, and
+  `_introspection.async_disk_io_enabled()` tells which path ran. `_introspection.disk_copy_counters()`
+  reports the retained-copy counters, `inject_disk_write_failures_for_testing()` forces write
+  failures, and `delay_background_disk_writes_for_testing(seconds)` keeps write-through writes in flight
+  for that long (reset it to 0 in a `finally`).
+- **String salt participates directly in matching.** `ReuseScope.salt` is an
+  optional string used by scope equality, hashing, indexing, and prefix reuse.
+  Hash its full UTF-8 bytes with a length prefix; distinguish `None`, `""`, and
+  `"0"`. Stored events copy the scope salt through the attached block's root.
+  Integer salt conversion belongs only to V1 event hashing and must agree with
+  the router. Keep Unicode and embedded-NUL regression cases.
 - **Dual import trick.** `_load_cpp_module()` reaches the bindings two ways: through
   `tensorrt_llm.bindings...` when `tensorrt_llm` is already imported, otherwise by walking up
   from `find_spec("kv_cache_manager_v2")` to the `tensorrt_llm` root and importing

@@ -16,14 +16,12 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
-    gvr_topk_decode_self_sampling_host as ss,
-)
+from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling_host as ss
 from tensorrt_llm._utils import get_sm_version
 
-skip_not_sm100 = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() not in (100, 103),
-    reason="self-sampling GVR kernels target sm_100a",
+skip_not_supported = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() not in ss.SUPPORTED_SM_VERSIONS,
+    reason="self-sampling GVR kernels target sm_90a, sm_100a and sm_103a",
 )
 
 # (batch, n, k): one shape per kernel family (reg, reg_clus, clus, main R=1, main SPLIT)
@@ -37,6 +35,7 @@ _SHAPES = [
     (512, 32783, 2048),
     (256, 131087, 2048),
     (512, 131075, 1024),
+    (4, 32771, 2048),  # reg_clus with K=2048
 ]
 _PATTERNS = ["unique", "quantized", "equal", "boundary", "clustered"]
 
@@ -78,7 +77,7 @@ def _run(scores, k, n, **kw):
     return out
 
 
-@skip_not_sm100
+@skip_not_supported
 @pytest.mark.parametrize("pattern", _PATTERNS)
 @pytest.mark.parametrize("b,n,k", _SHAPES)
 def test_deterministic_set_and_order(b, n, k, pattern):
@@ -92,7 +91,7 @@ def test_deterministic_set_and_order(b, n, k, pattern):
             assert set(out[r].tolist()) == oracle  # fixed selected set, smaller index wins ties
 
 
-@skip_not_sm100
+@skip_not_supported
 @pytest.mark.parametrize("b,n,k", _SHAPES[::2])
 def test_deterministic_sorted(b, n, k):
     row = _row(n, k, "quantized")
@@ -102,7 +101,7 @@ def test_deterministic_sorted(b, n, k):
     assert set(out[0].tolist()) == _oracle(row, k)
 
 
-@skip_not_sm100
+@skip_not_supported
 @pytest.mark.parametrize("rows,n,k", [(1, 8192, 512), (149, 32768, 1024), (297, 32768, 2048)])
 def test_deterministic_prefill(rows, n, k):
     """Prefill windows [ks, ke) per row: oracle set in the local frame, fixed order, ascending option."""
@@ -126,7 +125,7 @@ def test_deterministic_prefill(rows, n, k):
     assert torch.equal(out.sort(dim=1).values, runs[0].sort(dim=1).values)
 
 
-@skip_not_sm100
+@skip_not_supported
 def test_default_path_is_the_original_kernel():
     b, n, k = _SHAPES[2]
     row = _row(n, k, "unique")

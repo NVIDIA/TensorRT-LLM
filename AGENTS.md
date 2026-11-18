@@ -23,10 +23,17 @@ Python and C++ codebase with a PyTorch execution path.
   affected accepted/rejected values. Run
   `pytest -m cpu_only tests/unittest/llmapi/test_trtllm_serve_config_schemas.py`.
   Commit the generated `tensorrt_llm/schemas/*.json` snapshots; never hand-edit them.
-  Version bumps in `tensorrt_llm/version.py` also require regeneration: the snapshots
-  include the package version in their `$id` and `title`.
+  The snapshots also include the package version in their `$id` and `title`;
+  `python3 scripts/bump_version.py <version>` updates that metadata with
+  `python3 scripts/generate_trtllm_serve_schemas.py --sync-version`, which does not import
+  TensorRT-LLM or require a matching build.
   `python3 scripts/generate_trtllm_serve_schemas.py --check` and the CPU schema tests
   reject missing or stale snapshots. Wheels and HTML docs publish these same files.
+- Change the package version only with `python3 scripts/bump_version.py <version>`, which updates
+  every file that records it. When a file starts recording the package version (for example a
+  `tensorrt_llm==<version>` pin), add it to `VERSION_PATTERNS` in that script in the same change.
+  The `version-records-check` pre-commit hook (`bump_version.py --check`) rejects records that do
+  not match `tensorrt_llm/version.py`.
 - When adding or renaming a public model architecture identifier, update
   `tensorrt_llm/usage/architecture_allowlist.py` with its exact identifier. It must be publicly
   documented by the upstream model provider or in `docs/source/models/supported-models.md`; never add
@@ -93,6 +100,12 @@ HuggingFace Model → LLM API → PyTorch Executor
 - **Disaggregated serving**: separates prefill (context) and decode (generation) across GPUs
   - KV cache exchange via NIXL (default), UCX, or MPI
 
+### Multimodal request data
+
+Read the [multimodal developer guide](docs/source/developer-guide/multimodal.md) before changing multimodal paths.
+Reuse `MultimodalParams`; request Params own cache references.
+Encoder and LLM forward Params are execution views.
+
 ## Key Files
 
 | File | Role |
@@ -106,6 +119,7 @@ HuggingFace Model → LLM API → PyTorch Executor
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from the top-level `models/` package) |
 | `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying anything under `tensorrt_llm/_torch/attention/`** |
 | `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
+| `tensorrt_llm/_torch/pyexecutor/kv_cache/REGIONS_DEVELOPER_GUIDE.md` | KV cache regions: persistent state declared with a life cycle of its own and laid out as native regions — **read before adding model- or backend-specific state to the KV cache managers** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns
@@ -183,10 +197,69 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+Pass product or test Python file paths to `scripts/run_pyrefly.sh` for a file-list static
+check; pre-commit supplies these paths with `pass_filenames: true`. If none are
+eligible, the script skips the check. `--full-project` requests a scan of all
+configured Python files under `tensorrt_llm/` and `tests/`. For supplied files,
+diagnostics are filtered to added and modified lines when Git provides them and
+retained at file level otherwise.
+File-list checks print every remaining diagnostic; full-project checks save the
+report and print its absolute path.
+Jenkins runs a full-project check with path/module and symbol exclusions.
+Whole-project checks always return success; file-list checks can opt into
+`--strict`. Jenkins and pre-commit checks are advisory. The `[tool.pyrefly]`
+section in `pyproject.toml` defines product roots, diagnostics, and native exclusions.
+`[tool.pyrefly-tests]` in the same file defines test roots and helper search paths.
+The wrapper generates a temporary test configuration
+that inherits shared rules and exclusions, runs each scope separately, and
+combines the diagnostics into one report. Temporary configurations are removed
+after the check. Mixed file
+lists are selected from each configuration's `project-includes`; full-project mode
+runs both passes.
+`[tool.pyrefly-exclusions]` defines additional symbol exclusions for the wrapper.
+Pyrefly is pinned in `requirements-dev.txt`. Missing imports are reported except for
+PyTorch, generated bindings, and configured third-party libraries. In test file-list
+mode, missing imports of declared dependencies that are not installed are also
+filtered; full-project scans retain them. Release-Check installs pytest so that
+`pytest.skip()` remains recognizable as a terminating call.
+Tests use the same diagnostics as product code, including `missing-argument`,
+`unexpected-keyword`, and `bad-argument-count`. The wrapper reads literal
+`__extra_import_path__` lists or tuples under `tests/` without running test code and adds
+existing directories to the shared search path for all test files. Ancestors of
+the declaring file are skipped because fallback searches them per file. Product
+checks use only the project root, with fallback disabled. The broader helper search paths
+and fallback resolution apply only to the test pass. `--no-path-module-filter`
+disables exclusions in both passes while preserving their separate search paths
+and shared diagnostics.
+
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
-for integration tests and `REQUIRES_GPU` for tests that need a GPU. `google-tests`
+for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
+CI controls test concurrency through `parallel_run_ctest`. `google-tests`
 continues to build all C++ tests; component aggregate targets build migrated tests.
+C++ integration fixtures build the collected tests with incremental native targets.
+`cpp-tests-<directory>` targets (for example `cpp-tests-common` or
+`cpp-tests-executor-bounce`) mirror recursive CTest directory coverage, including
+legacy and full-stack executables. OWNER aggregates are component subsets and
+are not interchangeable with these directory targets.
+The Linux Release source-build fixture reuses the installed CI library for the
+RNN formatter test. CI source and wheel use the same commit and image per
+architecture. Link/load errors fail the tests. Direct CMake builds use source
+libraries unless explicitly configured otherwise.
+`CONFIG_LINUX_X86_64_VANILLA` also builds `google-tests`
+and publishes the `cpp_test_bundle` CMake component as a separate
+`cpp-tests-<main-tar-name>` artifact. The main package does not include the test
+programs. Only `-CPP-` stages using this build configuration fetch and unpack
+the companion into `src/cpp/build`, including fat-image consumers. Build reuse
+requires both artifacts. Linux Release integration fixtures use this bundle
+directly, retaining CTest selection and retries. The two FMHA tests share a
+test-only library packaged next to their executables; other runtime libraries
+come from the matching installed wheel. Test artifacts keep symbols but omit
+BOLT's extra relocation records.
+CPP stages collect only `tests/integration/defs/cpp` and use the standard test
+environment setup. CTest discovers cases on the test node, so the build stage
+does not need a GPU. Without a bundle, or with
+an explicit `TRTLLM_BUILD_ROOT`, fixtures retain the incremental build path.
 
 ### Specification archive checks
 
@@ -195,11 +268,12 @@ concurrent-push retry and transient-root boundary regression checks. Shared CLI,
 provider and dashboard tests live in the private `TensorRT/poc/spec-archive`
 tools project and run with `python3 -m unittest discover -s tests -v`.
 
-### Advisory semantic review
+### Vendor source tools and promotion
 
-The bot-to-bot semantic review workflow is disabled. See
-[.github/semantic-review.md](.github/semantic-review.md) for its current status and
-historical implementation details.
+Use the tools under `scripts/vendor/` to manage locked vendor sources, prepare
+lock-only promotions, and optionally monitor source-update PRs. Read
+[Vendored Sources](3rdparty/vendor-sources.md) for commands, contributor metadata,
+and operator guidance before changing vendor state or publishing promotions.
 
 ### Triggering CI
 
@@ -221,6 +295,7 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 | Architecture overview | `docs/source/developer-guide/overview.md` |
 | PyTorch backend | `docs/source/torch/arch_overview.md` |
 | Adding a new model | `docs/source/torch/adding_new_model.md` |
+| ModelExpress (MX) checkpoint loading | `docs/source/features/model-express.md` |
 | Disaggregated serving | `docs/source/features/disagg-serving.md` |
 | Speculative decoding | `docs/source/features/speculative-decoding.md` |
 | Quantization | `docs/source/features/quantization.md` |

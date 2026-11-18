@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import time
 
 import pytest
@@ -32,7 +34,6 @@ class TestRpcProxy:
 
         proxy = GenerationExecutorRpcProxy(
             worker_kwargs={
-                "engine": model_path,
                 "llm_args": llm_args,
                 "model_world_size": tp_size,
                 "hf_model_dir": model_path,

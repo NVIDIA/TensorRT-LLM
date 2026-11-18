@@ -121,6 +121,8 @@ def _fwd_kernel(
     # Scalars
     sm_scale,
     kv_group_num,
+    kv_scale_quant_orig,
+    out_scale,
     # Extend tensor strides
     stride_qbs,
     stride_qh,
@@ -190,6 +192,9 @@ def _fwd_kernel(
         + offs_d[None, :]
     )
     q = tl.load(Q_Extend + offs_q, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+    kv_scale = 1.0
+    if kv_scale_quant_orig is not None:
+        kv_scale = tl.load(kv_scale_quant_orig)
 
     # Online softmax accumulators
     acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
@@ -271,7 +276,8 @@ def _fwd_kernel(
                 K_Buffer + offs_buf_k,
                 mask=mask_n[None, :] & mask_d[:, None] & valid_page[None, :],
                 other=0.0,
-            ).to(q.dtype)
+            )
+            k = (k.to(tl.float32) * kv_scale).to(q.dtype)
 
             qk = tl.dot(q, k)
             qk *= sm_scale
@@ -300,7 +306,8 @@ def _fwd_kernel(
                 V_Buffer + offs_buf_v,
                 mask=mask_n[:, None] & mask_dv[None, :] & valid_page[:, None],
                 other=0.0,
-            ).to(q.dtype)
+            )
+            v = (v.to(tl.float32) * kv_scale).to(q.dtype)
             p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v)
             e_max = n_e_max
@@ -395,9 +402,14 @@ def _fwd_kernel(
         + cur_head * stride_oh
         + offs_dv[None, :]
     )
+    result = acc / deno[:, None]
+    if out_scale is not None:
+        result *= tl.load(out_scale)
+    if O_Extend.dtype.element_ty == tl.float8e4nv:
+        result = tl.minimum(tl.maximum(result, -448.0), 448.0)
     tl.store(
         O_Extend + offs_o,
-        acc / deno[:, None],
+        result.to(O_Extend.dtype.element_ty),
         mask=mask_m[:, None] & mask_dv[None, :],
     )
 
@@ -422,6 +434,8 @@ def _extend_attention_fwd(
     logit_cap: float = 0.0,
     skip_prefix_custom_mask: bool = False,
     window_left: int = -1,
+    kv_scale_quant_orig: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
 ):
     """Launch the Triton extend attention kernel.
 
@@ -446,6 +460,8 @@ def _extend_attention_fwd(
         skip_prefix_custom_mask: Skip custom mask for prefix (stage 1)
         window_left: Sliding window radius (inclusive), -1 to disable.
             A query at position p attends to keys in [p - window_left, p].
+        kv_scale_quant_orig: Optional FP32 scalar dequantization scale for cached K/V.
+        out_scale: Optional FP32 scalar quantization multiplier for the output.
     """
     Lq = q_extend.shape[-1]
     Lv = v_extend.shape[-1]
@@ -473,6 +489,8 @@ def _extend_attention_fwd(
         mask_indptr,
         sm_scale,
         kv_group_num,
+        kv_scale_quant_orig,
+        out_scale,
         # Extend tensor strides
         q_extend.stride(0),
         q_extend.stride(1),
@@ -526,6 +544,8 @@ def triton_prefill_with_custom_mask(
     custom_mask: Optional[torch.Tensor],
     sm_scale: float,
     window_left: int = -1,
+    kv_scale_quant_orig: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> None:
     """Triton prefill attention with optional custom mask and paged KV cache.
 
@@ -558,6 +578,9 @@ def triton_prefill_with_custom_mask(
             A query at position p attends to keys in [p - window_left, p].
             Use (attention_window_size - 1) since TRTLLM window size is
             exclusive while flashinfer/triton convention is inclusive.
+        kv_scale_quant_orig: Optional FP32 scalar dequantization scale for cached K/V.
+            Contiguous K/V for new tokens are already in the compute dtype.
+        out_scale: Optional FP32 scalar quantization multiplier for the output.
     """
     device = q.device
     num_contexts = qo_indptr.shape[0] - 1
@@ -624,4 +647,6 @@ def triton_prefill_with_custom_mask(
         logit_cap=0.0,
         skip_prefix_custom_mask=False,
         window_left=window_left,
+        kv_scale_quant_orig=kv_scale_quant_orig,
+        out_scale=out_scale,
     )

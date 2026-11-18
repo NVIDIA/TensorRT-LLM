@@ -172,6 +172,54 @@ def test_translation_is_the_converted_config():
     assert translate_speculators_dspark_config(SPECULATORS_CONFIG) == CONVERTED_CONFIG
 
 
+@pytest.mark.parametrize(
+    "aux_layer_ids",
+    [
+        None,
+        [],
+        1,
+        1.9,
+        True,
+        "1",
+        {"1": 2},
+        (1, 2),
+        [True],
+        [False],
+        [1.9],
+        [1.0],
+        ["1"],
+        [1, "2"],
+        [1, 2.0],
+        [1, True],
+        [[1]],
+        [None],
+        [0],
+        [-1],
+        [1, 0],
+        [1, -1],
+    ],
+)
+def test_translation_rejects_invalid_aux_layer_ids(aux_layer_ids):
+    config = copy.deepcopy(SPECULATORS_CONFIG)
+    config["aux_hidden_state_layer_ids"] = aux_layer_ids
+
+    with pytest.raises(ValueError):
+        translate_speculators_dspark_config(config)
+
+
+@pytest.mark.parametrize(
+    "aux_layer_ids, target_layer_ids",
+    [([1], [0]), ([3, 1, 3], [2, 0, 2])],
+)
+def test_translation_preserves_positive_integer_layer_ids(aux_layer_ids, target_layer_ids):
+    config = copy.deepcopy(SPECULATORS_CONFIG)
+    config["aux_hidden_state_layer_ids"] = aux_layer_ids
+    expected = copy.deepcopy(CONVERTED_CONFIG)
+    expected["dflash_config"]["target_layer_ids"] = target_layer_ids
+
+    assert translate_speculators_dspark_config(config) == expected
+
+
 def test_drafter_config_matches_the_converted_checkpoint(tmp_path):
     native = load_pretrained_config(_checkpoint(tmp_path, "native", SPECULATORS_CONFIG))
     converted = load_pretrained_config(_checkpoint(tmp_path, "converted", CONVERTED_CONFIG))

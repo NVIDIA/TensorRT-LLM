@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include <climits>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -248,6 +249,8 @@ struct TllmGenFmhaRunnerParams
     TileScheduler mTileScheduler;
     // The multiCtasKvMode (i.e. multiBlockMode).
     bool mMultiCtasKvMode;
+    // Optional caller limit; the default preserves autotuner selection.
+    int32_t mMaxNumCtasPerSeqKv{INT_MAX};
     // Use block sparse attention.
     bool mUseBlockSparseAttention;
 
@@ -255,6 +258,8 @@ struct TllmGenFmhaRunnerParams
     void const* qPtr;
     void const* kPtr;
     void const* vPtr;
+    // Zero derives the separate V token stride from the layout.
+    int64_t mVTokenStrideInBytes = 0;
     // Packed KV buffer
     void const* kvPtr;
     // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
@@ -269,6 +274,8 @@ struct TllmGenFmhaRunnerParams
     int32_t const* generalPackedCustoMaskPtr;
     // The custom mask ptr.
     uint32_t* customMaskPtr;
+    // The number of uint32 elements behind customMaskPtr.
+    int64_t customMaskCapacity = 0;
     // The packed custom mask's offsets of each sequence.
     int64_t* customMaskOffsetsPtr;
     // The first sparseMask offsets in the Kv sequence dimension.
@@ -383,6 +390,9 @@ struct TllmGenFmhaRunnerParams
     bool mFp16Softmax{false};
     // Whether the kernel consumes 2:4 structured-sparse (compressed) inputs (Rubin FMHA feature).
     bool mUsesSpcompress{false};
+    // Head dimension per K/V shared-memory stage; 0 lets the autotuner choose. A caller-chosen value is kept; its
+    // kernel comes from the stage-KV cubin table (kernelMetaInfoStageKv.h) when one matches, else from NVRTC.
+    int mHeadDimPerStageKv{0};
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)

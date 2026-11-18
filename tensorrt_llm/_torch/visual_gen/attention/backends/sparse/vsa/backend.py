@@ -143,8 +143,6 @@ class VSATrtllmAttention(TrtllmAttention):
             isinstance(fmha, PrimsTSBlockSparseFmha) for fmha in self._fmha_manager.fmha_libs
         )
         unsupported_reason = _get_unsupported_primts_reason(q, k, v, metadata)
-        if self.quant_attention_config is not None:
-            unsupported_reason = "VSA PrimTS does not support quant_attention_config"
         if not use_primts:
             logger.warning_once(
                 "TRTLLM VSA cannot use PrimTS block-sparse attention because the "

@@ -9,6 +9,8 @@ import pytest
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("helix_spec_tokens_valid", [False, True])
 def test_mla_rope_generation_forwards_kernel_controls(helix_spec_tokens_valid: bool) -> None:
@@ -39,12 +41,29 @@ def test_mla_rope_generation_forwards_kernel_controls(helix_spec_tokens_valid: b
         kv_only=True,
         kv_done_elsewhere=False,
         quant_scale_qkv=scale,
+        q_rope_applied=True,
     )
+    call_fused_q, call_q_pe, call_latent_cache = tensors[:3]
+    (
+        call_cu_q_seqlens,
+        call_cu_kv_seqlens,
+        call_fmha_scheduler_counter,
+        call_mla_bmm1_scale,
+        call_mla_bmm2_scale,
+        call_quant_q_buffer,
+    ) = tensors[3:]
     TrtllmAttention.mla_rope_generation(
         attention,
-        *tensors[:3],
+        call_fused_q,
+        call_q_pe,
+        call_latent_cache,
         metadata,
-        *tensors[3:],
+        call_cu_q_seqlens,
+        call_cu_kv_seqlens,
+        call_fmha_scheduler_counter,
+        call_mla_bmm1_scale,
+        call_mla_bmm2_scale,
+        call_quant_q_buffer,
         **controls,
     )
     attention._ensure_rope_table_size.assert_called_once_with(1024)
@@ -56,4 +75,4 @@ def test_mla_rope_generation_forwards_kernel_controls(helix_spec_tokens_valid: b
     if helix_spec_tokens_valid:
         helix_tensor_params.append(metadata.helix_local_slots)
     assert dispatch.call_args.args[11] == helix_tensor_params
-    assert dispatch.call_args.args[-7:] == tuple(controls.values())
+    assert dispatch.call_args.args[-len(controls) :] == tuple(controls.values())

@@ -18,7 +18,8 @@ NCCL neutralizes empty rows in the compiled input reformat, while fifo v2 does
 it in the native sender before protocol packing. These tests poison empty rows
 with NaN, drive the complete exchange and combine, and compare with a float64
 reference. A negative control proves that the poison is observable when the
-mask is withheld.
+mask is withheld. A single-process case checks that the native op rejects a
+mask on another device than its inputs.
 """
 
 import pickle
@@ -163,6 +164,7 @@ def _zero_kv_rank(
                     NUM_HEADS,
                     VALUE_DIM,
                     zero_kv_mask=zero_kv_mask,
+                    is_cuda_graph=True,
                 )
         torch.cuda.current_stream().wait_stream(side_stream)
         torch.cuda.synchronize()
@@ -176,6 +178,7 @@ def _zero_kv_rank(
                 NUM_HEADS,
                 VALUE_DIM,
                 zero_kv_mask=zero_kv_mask,
+                is_cuda_graph=True,
             )
         torch.cuda.synchronize()
         _bounded_barrier(comm, "after capture")
@@ -230,9 +233,10 @@ def test_zero_kv_rows_are_neutral(comms_medium: str, num_tokens: int) -> None:
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @skip_pre_blackwell
-def test_zero_kv_rows_are_neutral_under_cuda_graph() -> None:
-    """The fifo-v2 sender must preserve the contract under graph replay."""
-    _assert_neutral(_launch(96, "fifo_v2", use_cuda_graph=True))
+@pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v2"])
+def test_zero_kv_rows_are_neutral_under_cuda_graph(comms_medium: str) -> None:
+    """The compiled NCCL reformat and the fifo-v2 sender must hold under graph replay."""
+    _assert_neutral(_launch(96, comms_medium, use_cuda_graph=True))
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
@@ -243,3 +247,18 @@ def test_zero_kv_negative_control() -> None:
     assert any(nan_count > 0 for nan_count, _ in results), (
         "no NaN with the mask withheld, so the positive tests cannot detect a missing sanitize"
     )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
+def test_alltoall_helix_native_rejects_cross_device_zero_kv_mask() -> None:
+    """Reject a mask whose pointer cannot be dereferenced on the input device."""
+    num_tokens, cp_size, value_dim = 8, 2, 64
+    partial_o = torch.randn(num_tokens, cp_size, value_dim, dtype=torch.float16, device="cuda:0")
+    softmax_stats = torch.randn(num_tokens, cp_size, 2, dtype=torch.float32, device="cuda:0")
+    workspace = torch.zeros(cp_size, 8, dtype=torch.uint64, device="cuda:0")
+    mask = torch.zeros(num_tokens, dtype=torch.bool, device="cuda:1")
+
+    with pytest.raises(RuntimeError, match="same device as partial_o"):
+        torch.ops.trtllm.alltoall_helix_native(
+            partial_o, softmax_stats, workspace, 0, cp_size, mask
+        )

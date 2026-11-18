@@ -16,6 +16,7 @@
 # yapf: disable
 import asyncio
 import json
+import os
 import signal
 import socket
 import traceback
@@ -54,22 +55,28 @@ from tensorrt_llm.serve.cluster_storage import (
     validate_http_cluster_storage_scope)
 from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
+from tensorrt_llm.serve.coordinator_server import SHUTDOWN_POLL_S
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
-from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
+from tensorrt_llm.serve.kv_hints import KvHintsRoute
+from tensorrt_llm.serve.openai_client import (OpenAIClient, OpenAIHttpClient,
+                                              _server_base_url)
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
-    ConversationParams, ErrorResponse, UCompletionRequest, UCompletionResponse,
-    ensure_request_chat_template_allowed)
+    ConversationParams, ErrorResponse, ResponsesRequest, UCompletionRequest,
+    UCompletionResponse, ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                get_steady_clock_now_in_seconds)
+                                                get_steady_clock_now_in_seconds,
+                                                guard_responses_stream,
+                                                stream_error_event)
 from tensorrt_llm.serve.router import Router
+from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -134,6 +141,9 @@ class RawRequestResponseHooks(ResponseHooks):
     def on_disagg_request_id(self, disagg_request_id: int):
         self.disagg_request_id = disagg_request_id
         self.request_id = str(disagg_request_id)
+        # A route that names its reply after the request (Anthropic Messages)
+        # reads it here, the id the perf metrics record.
+        self.raw_req.state.disagg_request_id = disagg_request_id
 
     def on_ctx_dispatch(self, request: UCompletionRequest):
         self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
@@ -210,6 +220,13 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
 
 
 class OpenAIDisaggServer:
+    # Per-request hooks class instantiated by the entry-point wrapper.
+    # Subclasses may substitute a ResponseHooks implementation with the same
+    # constructor signature to observe the request lifecycle (e.g. relay
+    # context-leg fields onto the final response) without overriding the
+    # wrapper itself.
+    response_hooks_cls = RawRequestResponseHooks
+
     def __init__(self,
                  config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
@@ -242,9 +259,13 @@ class OpenAIDisaggServer:
         if config.disagg_cluster_config:
             validate_http_cluster_storage_scope(
                 config.disagg_cluster_config.cluster_uri, config.hostname)
-            self._disagg_cluster_storage = create_cluster_storage(
-                config.disagg_cluster_config.cluster_uri,
-                config.disagg_cluster_config.cluster_name)
+            # This app serves only an HTTP cluster storage; an etcd one is used
+            # by the coordinator alone.
+            if not config.disagg_cluster_config.cluster_uri.startswith(
+                    "etcd://"):
+                self._disagg_cluster_storage = create_cluster_storage(
+                    config.disagg_cluster_config.cluster_uri,
+                    config.disagg_cluster_config.cluster_name)
         # The server doesn't build routers -- the coordinator object does:
         # DisaggCoordinatorService (owner) or CoordinatorClient (delegating). The
         # server just reads .ctx_router / .gen_router off whichever it holds.
@@ -288,6 +309,8 @@ class OpenAIDisaggServer:
             await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
+        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS", "0") == "1"
+        self.app.router.route_class = KvHintsRoute
 
         if self._collect_perf_metrics:
             self.app.add_middleware(
@@ -334,7 +357,8 @@ class OpenAIDisaggServer:
             disagg_id_generator=disagg_id_generator,
             request_perf_metrics=self._collect_perf_metrics,
             internal_disagg_auth_key=self._config.internal_request_auth_key,
-            bounded_replay_on_generation=self._config.bounded_replay_on_generation)
+            bounded_replay_on_generation=self._config.bounded_replay_on_generation,
+            frontend_affinity=self._config.ctx_frontend_affinity)
         return client
 
     def register_routes(self):
@@ -345,6 +369,8 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
         self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
         self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
+        self.app.add_api_route("/v1/responses", self._wrap_entry_point(self._service.openai_responses, ResponsesRequest), methods=["POST"])
+        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -406,8 +432,8 @@ class OpenAIDisaggServer:
 
         # Give parent-only requests an independent conversation identity.
         if req.conversation_params is None:
-            req.conversation_params = ConversationParams(
-                conversation_id=f"subagent:{uuid.uuid4()}")
+            req.conversation_params = ConversationParams.for_one_request(
+                f"subagent:{uuid.uuid4()}")
         req.conversation_params.subagent_affinity_id = parent
 
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
@@ -431,16 +457,24 @@ class OpenAIDisaggServer:
                 self._extract_conversation_id(
                     req, raw_req,
                     self._config.conversation_affinity_header_for_subagents)
-                hooks = RawRequestResponseHooks(
+                hooks = self.response_hooks_cls(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
+                    stream = response_or_generator
+                    if isinstance(req, ResponsesRequest):
+                        # A relayed Responses stream that fails early ends with
+                        # an `error` event; other protocols end on a sentinel.
+                        stream = guard_responses_stream(stream,
+                                                        stream_error_event)
                     return StreamingResponse(
-                        content=response_or_generator,
+                        content=stream,
                         media_type="text/event-stream")
-                return JSONResponse(content=response_or_generator.model_dump())
+                # by_alias: e.g. text.format.schema goes out under its wire name.
+                return JSONResponse(
+                    content=response_or_generator.model_dump(by_alias=True))
             except Exception as e:
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
@@ -465,10 +499,15 @@ class OpenAIDisaggServer:
             return anthropic_error_response(str(e.detail), error_type,
                                             e.status_code)
 
+        # The reply is named after the disaggregated request rather than the
+        # worker's own id for it (see anthropic_message_id).
+        disagg_request_id = getattr(raw_request.state, "disagg_request_id",
+                                    None)
         if isinstance(openai_response, StreamingResponse):
             return StreamingResponse(
                 content=reframe_openai_stream(openai_response.body_iterator,
-                                              model=request.model),
+                                              model=request.model,
+                                              request_id=disagg_request_id),
                 media_type="text/event-stream",
             )
 
@@ -487,7 +526,8 @@ class OpenAIDisaggServer:
         try:
             chat_response = ChatCompletionResponse(
                 **json.loads(openai_response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            anthropic_response = convert_chat_response(
+                chat_response, request_id=disagg_request_id)
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error(
                 "Invalid response from OpenAI chat pipeline:\n"
@@ -496,6 +536,26 @@ class OpenAIDisaggServer:
                                             "api_error", 500)
         return JSONResponse(content=anthropic_response.model_dump(
             exclude_none=True))
+
+    async def get_model(self) -> Response:
+        """List the served model, as a context worker reports it."""
+        try:
+            return JSONResponse(
+                content=(await self._service.get_model()).model_dump())
+        except aiohttp.ClientResponseError as error:
+            status, message = error.status or 500, _upstream_error_message(
+                error)
+        except (RuntimeError, ValueError) as error:
+            # No context worker yet; the client may retry.
+            status, message = 503, str(error)
+        return JSONResponse(
+            status_code=status,
+            content=ErrorResponse(
+                message=message,
+                type=("invalid_request_error"
+                      if 400 <= status < 500 else "api_error"),
+                code=status,
+            ).model_dump())
 
     async def anthropic_count_tokens(
             self, request: AnthropicCountTokensRequest) -> Response:
@@ -557,6 +617,12 @@ class OpenAIDisaggServer:
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
             raise exception
+        elif isinstance(exception, NoGenerationSeatError):
+            # Overload (no generation seat in time, or shutdown): the client
+            # should retry, so 503 without a traceback.
+            self._perf_metrics_collector.http_exceptions.inc()
+            logger.warning(f"Generation request rejected: {exception}")
+            raise HTTPException(status_code=503, detail=str(exception)) from exception
         elif isinstance(exception, UnusedChatTemplateKwargsError):
             # Raised while this server tokenizes a chat request for routing.
             # It is a client mistake (a chat_template_kwargs key the template
@@ -588,7 +654,29 @@ class OpenAIDisaggServer:
                                 port=port,
                                 log_level=logger.level,
                                 timeout_keep_alive=keep_alive_timeout)
-        await create_uvicorn_server(config).serve(sockets=sockets)
+        server = create_uvicorn_server(config)
+        if not isinstance(self._coordinator, DisaggCoordinatorService):
+            await server.serve(sockets=sockets)
+            return
+        watcher = asyncio.create_task(
+            self._fail_seat_waiters_at_shutdown(server))
+        try:
+            await server.serve(sockets=sockets)
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    async def _fail_seat_waiters_at_shutdown(self,
+                                             server: uvicorn.Server) -> None:
+        """Fail the requests waiting for a generation seat once shutdown begins.
+
+        uvicorn's graceful shutdown waits for every request in flight, so the
+        lifespan teardown that also fails them would run only after they got a
+        seat or their KV transfer deadline (as in ``CoordinatorServer``).
+        """
+        while not server.should_exit:
+            await asyncio.sleep(SHUTDOWN_POLL_S)
+        await self._coordinator.fail_seat_waiters()
 
     async def _sync_server_clock(self, server: str):
         """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running).
@@ -681,8 +769,7 @@ class OpenAIDisaggServer:
             # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
             await set_steady_clock_offset(session, server_url, -offset)
 
-        server_scheme = "http://" if not server.startswith("http://") else ""
-        server_url = f"{server_scheme}{server}/steady_clock_offset"
+        server_url = f"{_server_base_url(server)}/steady_clock_offset"
 
         try:
             async with aiohttp.ClientSession(

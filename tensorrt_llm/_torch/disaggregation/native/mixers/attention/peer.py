@@ -26,7 +26,12 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegionPair,
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    CacheKind,
+    KVCachePageTable,
+    MapperKind,
+    PoolView,
+)
 from tensorrt_llm._torch.disaggregation.resource.utils import find_replicated_role_mismatch
 from tensorrt_llm._utils import nvtx_range
 
@@ -146,6 +151,133 @@ class ReplicatedMapper(IntactMapper):
         )
 
 
+class RingMapper(RegionMapperBase):
+    """Copy a replicated per-layer token ring between differently sized rings.
+
+    Each layer's region holds ``num_slots`` token slots of ``slot_bytes``, and
+    the token at global position ``p`` lives in slot ``p % num_slots`` of the
+    ring in the page holding ``p``. Sender and receiver may size the ring
+    differently (a generation worker reserves extra slots for speculative
+    rewind), so the same position can sit in different slots on each side.
+    The mapper therefore moves positions, not regions: each position range
+    is split wherever either ring wraps, giving at most three runs per layer.
+
+    The positions to move depend on the request, so this mapper is driven
+    through :meth:`map_positions` instead of :meth:`map`.
+    """
+
+    def __init__(
+        self,
+        src_layer_offsets: Sequence[int] | np.ndarray,
+        dst_layer_offsets: Sequence[int] | np.ndarray,
+        *,
+        slot_bytes: int,
+        src_num_slots: int,
+        dst_num_slots: int,
+    ) -> None:
+        src = np.asarray(src_layer_offsets, dtype=np.int64)
+        dst = np.asarray(dst_layer_offsets, dtype=np.int64)
+        if src.size == 0 or src.size != dst.size:
+            raise ValueError(
+                "Ring layer offsets must be non-empty and equal-length: "
+                f"src={src.size}, dst={dst.size}"
+            )
+        if slot_bytes <= 0 or src_num_slots <= 0 or dst_num_slots <= 0:
+            raise ValueError(
+                "Ring geometry must be positive: "
+                f"slot_bytes={slot_bytes}, src_num_slots={src_num_slots}, "
+                f"dst_num_slots={dst_num_slots}"
+            )
+        self._src_layer_offsets = src
+        self._dst_layer_offsets = dst
+        self.slot_bytes = int(slot_bytes)
+        self.src_num_slots = int(src_num_slots)
+        self.dst_num_slots = int(dst_num_slots)
+
+    @property
+    def retained_positions(self) -> int:
+        """Number of most recent positions both rings can hold."""
+        return min(self.src_num_slots, self.dst_num_slots)
+
+    def map(self, src_regions: SpecRegion, dst_regions: SpecRegion):
+        raise NotImplementedError("RingMapper needs token positions; use map_positions().")
+
+    def _slot_runs(self, start: int, end: int) -> list[tuple[int, int, int]]:
+        """Split ``[start, end)`` into ``(src_slot, dst_slot, num_slots)`` runs."""
+        runs = []
+        position = start
+        while position < end:
+            src_slot = position % self.src_num_slots
+            dst_slot = position % self.dst_num_slots
+            length = min(
+                end - position,
+                self.src_num_slots - src_slot,
+                self.dst_num_slots - dst_slot,
+            )
+            runs.append((src_slot, dst_slot, length))
+            position += length
+        return runs
+
+    @nvtx_range("RingMapper.map_positions")
+    def map_positions(
+        self,
+        src_block_ptrs: np.ndarray,
+        dst_block_ptrs: np.ndarray,
+        position_ranges: Sequence[tuple[int, int]],
+    ) -> list[SpecRegionPair]:
+        """Fragments that move ``position_ranges[i]`` of block pair ``i``.
+
+        Args:
+            src_block_ptrs: Base address of each source block.
+            dst_block_ptrs: Base address of each paired destination block.
+            position_ranges: Global ``[start, end)`` token positions to move
+                for each block pair; each range must lie within that block's
+                page and span at most ``retained_positions`` tokens.
+
+        Returns:
+            One region pair per distinct run length; empty ranges contribute
+            nothing.
+        """
+        src_block_ptrs = np.asarray(src_block_ptrs, dtype=np.int64)
+        dst_block_ptrs = np.asarray(dst_block_ptrs, dtype=np.int64)
+        if not src_block_ptrs.size == dst_block_ptrs.size == len(position_ranges):
+            raise ValueError(
+                "Ring blocks and position ranges must pair one to one: "
+                f"src={src_block_ptrs.size}, dst={dst_block_ptrs.size}, "
+                f"ranges={len(position_ranges)}"
+            )
+        by_length: dict[int, tuple[list[np.ndarray], list[np.ndarray]]] = {}
+        for src_base, dst_base, (start, end) in zip(
+            src_block_ptrs, dst_block_ptrs, position_ranges
+        ):
+            if end - start > self.retained_positions:
+                raise ValueError(
+                    f"Ring range [{start}, {end}) exceeds the {self.retained_positions} "
+                    "positions both rings retain"
+                )
+            for src_slot, dst_slot, length in self._slot_runs(int(start), int(end)):
+                src_parts, dst_parts = by_length.setdefault(length, ([], []))
+                src_parts.append(src_base + self._src_layer_offsets + src_slot * self.slot_bytes)
+                dst_parts.append(dst_base + self._dst_layer_offsets + dst_slot * self.slot_bytes)
+        return [
+            SpecRegionPair(
+                src=SpecRegion(
+                    memory=MemRegionGroup(
+                        ptrs=np.concatenate(src_parts),
+                        bytes_per_region=length * self.slot_bytes,
+                    )
+                ),
+                dst=SpecRegion(
+                    memory=MemRegionGroup(
+                        ptrs=np.concatenate(dst_parts),
+                        bytes_per_region=length * self.slot_bytes,
+                    )
+                ),
+            )
+            for length, (src_parts, dst_parts) in sorted(by_length.items())
+        ]
+
+
 class HNDHeadMismatchMapper(RegionMapperBase):
     """
     ---- mapper_hnd_head_mismatch ----
@@ -179,6 +311,8 @@ class HNDHeadMismatchMapper(RegionMapperBase):
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int,
         peer_buffers_per_layer: int,
+        self_kv_heads: int,
+        peer_kv_heads: int,
     ):
         self._ri = self_ri
         self._peer_ri = peer_ri
@@ -214,28 +348,21 @@ class HNDHeadMismatchMapper(RegionMapperBase):
             buffers_per_layer=peer_buffers_per_layer,
             side="peer",
         )
-        bytes_per_head = self._bytes_per_head(
-            src_buffer_bytes, self._ri.attention.kv_heads_per_rank, side="local"
-        )
-        peer_bytes_per_head = self._bytes_per_head(
-            dst_buffer_bytes, peer_ri.attention.kv_heads_per_rank, side="peer"
-        )
+        bytes_per_head = self._bytes_per_head(src_buffer_bytes, self_kv_heads, side="local")
+        peer_bytes_per_head = self._bytes_per_head(dst_buffer_bytes, peer_kv_heads, side="peer")
         if bytes_per_head != peer_bytes_per_head:
             raise ValueError(
                 f"HND bytes per head mismatch: local={bytes_per_head}, peer={peer_bytes_per_head}"
             )
-        self._bytes_cont_heads = (
-            min(self._ri.attention.kv_heads_per_rank, peer_ri.attention.kv_heads_per_rank)
-            * bytes_per_head
-        )
+        self._bytes_cont_heads = min(self_kv_heads, peer_kv_heads) * bytes_per_head
 
         self._src_head_off, self._dst_head_off = self._compute_head_offsets(
             self_tp_per_dp,
             peer_tp_per_dp,
             self_tp_rank,
             peer_tp_rank,
-            self_kv_heads=self._ri.attention.kv_heads_per_rank,
-            peer_kv_heads=peer_ri.attention.kv_heads_per_rank,
+            self_kv_heads=self_kv_heads,
+            peer_kv_heads=peer_kv_heads,
             bytes_per_head=bytes_per_head,
         )
 
@@ -365,6 +492,8 @@ class NHDHeadMismatchMapper(HNDHeadMismatchMapper):
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int,
         peer_buffers_per_layer: int,
+        self_kv_heads: int,
+        peer_kv_heads: int,
     ) -> None:
         # Deliberately do not call HNDHeadMismatchMapper.__init__: its offsets
         # assume HND-contiguous heads. Initialize the three attributes consumed
@@ -377,8 +506,8 @@ class NHDHeadMismatchMapper(HNDHeadMismatchMapper):
                 f"local={self_tpb}, peer={peer_tpb}"
             )
 
-        self_heads = self_ri.attention.kv_heads_per_rank
-        peer_heads = peer_ri.attention.kv_heads_per_rank
+        self_heads = self_kv_heads
+        peer_heads = peer_kv_heads
         if self_buffers_per_layer != peer_buffers_per_layer:
             raise ValueError(
                 "NHD buffer count per layer mismatch: "
@@ -484,16 +613,28 @@ class AttentionPolicy:
         self._ri = self_rank_info
 
     def should_send(
-        self, peer_overlap, peer_rank_info, *, mapper_kind: Optional[MapperKind] = None
+        self,
+        peer_overlap,
+        peer_rank_info,
+        *,
+        mapper_kind: Optional[MapperKind] = None,
+        duplicate_head_factor: Optional[int] = None,
     ) -> "bool | None":
         """Attention uses head-duplication routing.
 
-        REPLICATED views (index-key side caches) hold identical bytes on every
-        TP rank, so they return None to defer to fan-in election instead.
+        ``duplicate_head_factor`` is the sending-side factor of the matched
+        view pair; the overlap's rank-wide factor is the default for callers
+        without a view pair. REPLICATED views (index-key side caches) hold
+        identical bytes on every TP rank, so they return None to defer to
+        fan-in election instead.
         """
         if mapper_kind == MapperKind.REPLICATED:
             return None
-        dup = peer_overlap.duplicate_head_factor
+        dup = (
+            peer_overlap.duplicate_head_factor
+            if duplicate_head_factor is None
+            else duplicate_head_factor
+        )
         if dup <= 1:
             return True
         tp_rank = self._ri.tp_rank % self._ri.tp_size_per_dp_group
@@ -615,30 +756,72 @@ class AttentionPolicy:
             )
         )
 
-    def _head_factors(self, peer_ri: RankInfo) -> tuple[int, int]:
+    @staticmethod
+    def view_kv_heads(pool_view: PoolView) -> int:
+        """Require the per-rank head count published by an attention view."""
+        heads = pool_view.num_kv_heads
+        if heads is None or heads <= 0:
+            raise ValueError(
+                "Attention pool views must publish a positive num_kv_heads; "
+                f"pool={pool_view.pool_idx}, role={sorted(pool_view.pool_role)}, "
+                f"num_kv_heads={heads}"
+            )
+        return heads
+
+    def _head_counts(
+        self,
+        peer_ri: RankInfo,
+        self_pv: Optional[PoolView],
+        peer_pv: Optional[PoolView],
+    ) -> tuple[int, int]:
+        if self_pv is None and peer_pv is None:
+            # Topology checks without a view pair use whole-rank metadata.
+            return self._ri.attention.kv_heads_per_rank, peer_ri.attention.kv_heads_per_rank
+        if self_pv is None or peer_pv is None:
+            raise ValueError("Both pool views are required for per-view head geometry")
+        return self.view_kv_heads(self_pv), self.view_kv_heads(peer_pv)
+
+    def _head_factors(
+        self,
+        peer_ri: RankInfo,
+        self_pv: Optional[PoolView] = None,
+        peer_pv: Optional[PoolView] = None,
+    ) -> tuple[int, int]:
         self_tp = self._tp_per_dp(self._ri)
         peer_tp = self._tp_per_dp(peer_ri)
-        a = self._ri.attention
-        b = peer_ri.attention
-        return a.kv_heads_per_rank * self_tp, b.kv_heads_per_rank * peer_tp
+        self_heads, peer_heads = self._head_counts(peer_ri, self_pv, peer_pv)
+        return self_heads * self_tp, peer_heads * peer_tp
 
-    def head_match(self, peer_ri: RankInfo) -> tuple[bool, bool]:
-        factor_self, factor_peer = self._head_factors(peer_ri)
+    def head_match(
+        self,
+        peer_ri: RankInfo,
+        self_pv: Optional[PoolView] = None,
+        peer_pv: Optional[PoolView] = None,
+    ) -> tuple[bool, bool]:
+        """Whether the matched views hold the same heads per rank.
+
+        Without a view pair this compares the rank-wide head counts.
+        """
+        factor_self, factor_peer = self._head_factors(peer_ri, self_pv, peer_pv)
         is_dup_head = factor_self != factor_peer
         # Slot layout is compatible if kv_heads_per_rank matches (same slot size).
-        head_match = (
-            self._ri.attention.is_mla
-            or self._ri.attention.kv_heads_per_rank == peer_ri.attention.kv_heads_per_rank
-        )
+        self_heads, peer_heads = self._head_counts(peer_ri, self_pv, peer_pv)
+        head_match = self._ri.attention.is_mla or self_heads == peer_heads
         return head_match, is_dup_head
 
-    def duplicate_head_factors(self, peer_ri: RankInfo) -> tuple[int, int]:
+    def duplicate_head_factors(
+        self,
+        peer_ri: RankInfo,
+        self_pv: Optional[PoolView] = None,
+        peer_pv: Optional[PoolView] = None,
+    ) -> tuple[int, int]:
         # Head duplication only applies to attention KV.  In particular, do
         # not divide 0 / 0 for an attention-free hybrid PP stage; MambaPolicy
         # computes its TP mapping separately.
-        if self._ri.attention.kv_heads_per_rank == 0 or peer_ri.attention.kv_heads_per_rank == 0:
+        self_heads, peer_heads = self._head_counts(peer_ri, self_pv, peer_pv)
+        if self_heads == 0 or peer_heads == 0:
             return 1, 1
-        factor_self, factor_peer = self._head_factors(peer_ri)
+        factor_self, factor_peer = self._head_factors(peer_ri, self_pv, peer_pv)
         dup_head = max(1, factor_self // factor_peer)
         peer_dup_head = max(1, factor_peer // factor_self)
         return dup_head, peer_dup_head
@@ -675,6 +858,28 @@ class AttentionPolicy:
         whose run merging degrades to a single whole-region copy per block
         when the selected layers are contiguous on both sides.
         """
+        self_ring = getattr(self_pv, "ring_slot_bytes", None)
+        peer_ring = getattr(peer_pv, "ring_slot_bytes", None)
+        if mapper_kind == MapperKind.REPLICATED and (self_ring or peer_ring):
+            if self_ring != peer_ring:
+                raise ValueError(
+                    f"Ring cache slot size mismatch: local={self_ring}, peer={peer_ring}"
+                )
+        if (
+            mapper_kind == MapperKind.REPLICATED
+            and self_ring
+            and self_bytes_per_layer != peer_bytes_per_layer
+        ):
+            # Equal rings place every position in the same slot, so the
+            # region copy below already moves them; only unequal rings need
+            # the position-wise copy.
+            return RingMapper(
+                self_layer_offsets,
+                peer_layer_offsets,
+                slot_bytes=self_ring,
+                src_num_slots=self_bytes_per_layer // self_ring,
+                dst_num_slots=peer_bytes_per_layer // peer_ring,
+            )
         if mapper_kind == MapperKind.REPLICATED:
             return ReplicatedMapper(
                 self_layer_offsets,
@@ -683,7 +888,9 @@ class AttentionPolicy:
                 peer_bytes_per_layer,
             )
 
-        head_match, _ = self.head_match(peer_ri)
+        if self_pv is None or peer_pv is None:
+            raise ValueError("Both pool views are required for per-view head geometry")
+        head_match, _ = self.head_match(peer_ri, self_pv, peer_pv)
         if head_match:
             return IntactMapper(
                 self_layer_offsets,
@@ -703,6 +910,8 @@ class AttentionPolicy:
                 peer_bytes_per_layer=peer_bytes_per_layer,
                 self_buffers_per_layer=self_buffers_per_layer,
                 peer_buffers_per_layer=peer_buffers_per_layer,
+                self_kv_heads=self.view_kv_heads(self_pv),
+                peer_kv_heads=self.view_kv_heads(peer_pv),
             )
 
         return HNDHeadMismatchMapper(
@@ -714,4 +923,6 @@ class AttentionPolicy:
             peer_bytes_per_layer=peer_bytes_per_layer,
             self_buffers_per_layer=self_buffers_per_layer,
             peer_buffers_per_layer=peer_buffers_per_layer,
+            self_kv_heads=self.view_kv_heads(self_pv),
+            peer_kv_heads=self.view_kv_heads(peer_pv),
         )

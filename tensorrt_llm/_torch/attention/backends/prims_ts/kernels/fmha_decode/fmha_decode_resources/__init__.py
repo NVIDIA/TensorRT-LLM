@@ -58,6 +58,17 @@ SMEM resources
                             Q-side MMA input type. Consumer (MmaTask): uses the
                             same descriptor labels as SmemKvResource.
 
+- SageKScalesResource     : One softmax instance's ring of ``sfK`` tiles.
+                            Producer (LoadTask): ``cp.async`` copies of the
+                            tile's atoms from the prepared scales, a dense
+                            tile's or a block-sparse route's, after each K
+                            tile. Consumer (Softmax): reads the waited stage
+                            in place during the max and P passes.
+
+- SageVScalesResource     : The work tile's per-channel ``sfV`` (and
+                            ``v_mean``) staged in SMEM by the correction warps
+                            before the output epilogue reads them.
+
 - SmemPResource           : P operand for BMM2.  The validated one-instance
                             staged-D256 Keeps profile places P in two TMEM views
                             aliased with the matching S stages; other profiles
@@ -125,6 +136,7 @@ dynamic-if serialization).
 """
 
 from .helpers_common import DecodeGenResourceBase
+from .sage_scales import SageKScalesResource, SageVScalesResource
 from .smem_resources import (
     SmemKvTileResource,
     SmemKvResource,
@@ -150,6 +162,8 @@ from .tmem_transformed_kv import TmemTransformedKvResource
 
 __all__ = [
     "DecodeGenResourceBase",
+    "SageKScalesResource",
+    "SageVScalesResource",
     "SmemKvResource",
     "SmemKvTileResource",
     "SmemPageOffsetsKvResource",

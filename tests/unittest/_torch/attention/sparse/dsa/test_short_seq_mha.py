@@ -331,7 +331,6 @@ def _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, devi
             request_ids=[req_idx],
             token_nums=[seq_len],
             is_gen=False,
-            prepare_resource=True,
         )
     return kv_cache_manager
 

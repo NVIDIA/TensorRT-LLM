@@ -16,6 +16,8 @@ from unittest.mock import Mock
 import grpc
 import pytest
 
+pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
+
 from tensorrt_llm.grpc.openengine import server as openengine_server
 from tensorrt_llm.grpc.openengine.bindings import lifecycle_pb2 as lifecycle
 from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc as rpc

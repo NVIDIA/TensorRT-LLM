@@ -21,15 +21,25 @@ class TextPrompt(TypedDict):
     """
     Optional user-provided UUIDs for multimodal items.
     Structure mirrors multi_modal_data: {"image": ["uuid1", None, "uuid3"]}.
-    When a UUID is provided for an item, it will be returned in KV cache events
-    instead of the computed content hash. Use None to fall back to content
-    hashing for specific items.
+    When a UUID is provided for an item, it is preserved in KV cache events.
+    V1 uses it as the legacy hash value; V2 returns it in the optional uuid
+    field while retaining the derived digest as hash. Use None for specific
+    items that need content-only hashing.
     """
 
     mm_processor_kwargs: NotRequired[Dict[str, Any]]
     """
     Optional multi-modal processor kwargs to be forwarded to the
     input processor for mm input processing.
+    """
+
+    chat_template_applied: NotRequired[bool]
+    """
+    True when ``prompt`` is the chat template's output with one registered
+    multimodal placeholder per media item already in it. Set by trtllm-serve
+    and by the prompt builders in ``tensorrt_llm.inputs.utils``; input
+    processors that otherwise render a raw ``prompt`` through the model's chat
+    template use it verbatim when this is set.
     """
 
 
@@ -49,9 +59,10 @@ class TokensPrompt(TypedDict):
     """
     Optional user-provided UUIDs for multimodal items.
     Structure mirrors multi_modal_data: {"image": ["uuid1", None, "uuid3"]}.
-    When a UUID is provided for an item, it will be returned in KV cache events
-    instead of the computed content hash. Use None to fall back to content
-    hashing for specific items.
+    When a UUID is provided for an item, it is preserved in KV cache events.
+    V1 uses it as the legacy hash value; V2 returns it in the optional uuid
+    field while retaining the derived digest as hash. Use None for specific
+    items that need content-only hashing.
     """
 
     mm_processor_kwargs: NotRequired[Dict[str, Any]]

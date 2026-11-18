@@ -14,6 +14,8 @@
 
 """Reusable low-level operations for MLA decode TS kernels."""
 
+import math
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
@@ -224,9 +226,47 @@ def fp8_log2_quant_scale():
 
 
 @cute.jit
+def fp8_quant_scale():
+    """Return the E4M3 probability scale used by sink normalization."""
+    return Float32(448.0)
+
+
+@cute.jit
 def fp8_quant_scale_rcp():
     """Return the reciprocal of the shared E4M3 probability scale."""
     return Float32(1.0 / 448.0)
+
+
+# A positive ``softmax_rescale_threshold_log2`` T keeps a row's max anchor while
+# a K tile raises it by at most T binades, so P reaches 2**T. E4M3 P then uses
+# the scale 448 * 2**-T, as Prims-TS FMHA decode does (``fp8_p_quant_scale``),
+# so the scaled P stays within 448. This equals the trtllm-gen FMHA
+# ``getSoftmaxPScale`` at T = 0 (448) and at T = 8 (1.75). T is a compile-time
+# config value, so these are plain Python helpers rather than ``cute.jit``
+# functions.
+def _fp8_rescale_threshold_p_scale(cfg) -> float:
+    return 448.0 * 2.0**-cfg.softmax_rescale_threshold_log2
+
+
+def fp8_log2_p_scale(cfg):
+    """Return log2 of the E4M3 P scale selected by the config."""
+    if cfg.softmax_rescale_threshold_log2 > 0.0:
+        return Float32(math.log2(_fp8_rescale_threshold_p_scale(cfg)))
+    return fp8_log2_quant_scale()
+
+
+def fp8_p_scale(cfg):
+    """Return the E4M3 P scale selected by the config (``448 * 2**-T``)."""
+    if cfg.softmax_rescale_threshold_log2 > 0.0:
+        return Float32(_fp8_rescale_threshold_p_scale(cfg))
+    return fp8_quant_scale()
+
+
+def fp8_p_scale_rcp(cfg):
+    """Return the reciprocal of ``fp8_p_scale``."""
+    if cfg.softmax_rescale_threshold_log2 > 0.0:
+        return Float32(1.0 / _fp8_rescale_threshold_p_scale(cfg))
+    return fp8_quant_scale_rcp()
 
 
 @cute.jit
@@ -334,14 +374,19 @@ def store_transposed_smem8b_x4(
 
 
 @cute.jit
-def tcgen05_store_p_16x32bx2_x16(tmem_addr, regs_p, start_idx: cutlass.Constexpr[int]):
+def tcgen05_store_p_16x32bx2_x16(
+    tmem_addr,
+    regs_p,
+    start_idx: cutlass.Constexpr[int],
+    stride: cutlass.Constexpr[int] = TCGEN05_16X32BX2_BF16_P_STRIDE,
+):
     """Store 16 packed BF16 P registers to a split TMEM-P tile."""
     # The stride immediate is the BF16 lane-to-column spacing for the split
     # 16x32bx2 P layout; keep it named because the FP8 path uses a different
     # immediate with the same instruction shape.
     inline_ptx(
         "tcgen05.st.sync.aligned.16x32bx2.x16.b32 "
-        f"[{{$r0}}], {TCGEN05_16X32BX2_BF16_P_STRIDE}, "
+        f"[{{$r0}}], {stride}, "
         "{ {$r1}, {$r2}, {$r3}, {$r4}, {$r5}, {$r6}, {$r7}, {$r8}, "
         "{$r9}, {$r10}, {$r11}, {$r12}, {$r13}, {$r14}, {$r15}, {$r16} };",
         read_only_args=[

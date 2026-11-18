@@ -1,0 +1,84 @@
+# Canonical → synonym map.
+#
+# Purpose: QUERY-TIME normalization. Before grepping case frontmatter,
+# translate the terms in your head (or the user's words / profiler output /
+# bug title) to the canonical term. Frontmatter itself must contain
+# canonical terms only (tags.yaml); a synonym in frontmatter is a
+# validation error.
+#
+# Namespaces mirror tags.yaml. Every key below must be a canonical term in
+# tags.yaml; no synonym may collide with a canonical term or another
+# synonym (a colliding synonym would make normalization ambiguous).
+#
+# Collision is checked WITHIN a namespace — the maps are independent, so one
+# word may be canonical in one namespace and a synonym in another:
+# `communication` is canonical in both `module:` and `subsystems:`, and
+# `kv-cache-manager` is a `module:` term as well as a `subsystems: kv-cache`
+# synonym. Normalize with the namespace you are querying in mind.
+
+regression_class:
+  host-work-added: [host-overhead-introduced, cpu-overhead-added, python-overhead-added, host-regression, gil-contention]
+  sync-introduced: [new-sync, blocking-sync-added, stream-sync-added, device-sync-added, d2h-sync]
+  fusion-broken: [fusion-not-happening, unfused, fusion-pattern-miss, broken-fusion, pattern-match-failure]
+  kernel-swap-regressed: [kernel-slowdown, slow-kernel-shipped, kernel-perf-regression, optimization-backfired]
+  kernel-selection-regression: [wrong-kernel, slower-tactic, backend-selection-regression, heuristic-regression, tactic-regression]
+  fast-path-fallback: [slow-path-fallback, fast-path-disabled, silent-fallback, gating-regression, missing-instantiation]
+  cuda-graph-regression: [graph-capture-broken, graph-fallback, eager-fallback, replay-broken, capture-coverage-gap]
+  warmup-jit-gap: [jit-at-runtime, runtime-compile-stall, missing-warmup, warmup-coverage, compile-on-hot-path]
+  capacity-accounting-error: [size-estimate-bug, budget-double-count, over-allocation, under-count, kv-budget-shrink]
+  memory-footprint-regression: [memory-regression, memory-leak, workspace-growth, footprint-growth]
+  scheduler-batching-regression: [batching-regression, overlap-scheduler-regression, chunked-prefill-regression, admission-throttle]
+  communication-regression: [comm-regression, allreduce-regression, alltoall-regression, nccl-regression, collective-regression]
+  dependency-regression: [dep-bump-regression, upgrade-regression, torch-bump, cutlass-bump]
+  redundant-cross-rank-work: [duplicated-per-rank, per-rank-duplication, wasted-cross-rank-compute]
+  optimization-lost-in-port: [fix-dropped-in-branch, missing-cherry-pick, port-regression]
+  measurement-artifact: [test-config-regression, benchmark-artifact, false-regression, bar-misconfigured]
+
+signals:
+  throughput-drop: [tps-drop, lower-throughput, tokens-per-sec-down, perf-drop]
+  ttft-increase: [first-token-slow, prefill-latency-up, time-to-first-token]
+  itl-increase: [tpot-increase, inter-token-latency-up, decode-latency-up]
+  perf-ci-bar-failure: [perf-sanity-failure, perf-bar-miss, perf-test-failure]
+  gpu-idle-between-steps: [inter-step-gap, gpu-bubble, gpu-starved]
+  many-small-kernels: [kernel-fragmentation, launch-storm, unfused-kernel-stream]
+  eager-fallback-in-log: [graph-fallback-warning, fallback-log, fallback-warning]
+  slower-kernel-in-trace: [kernel-swap-in-trace, different-kernel-selected, simt-fallback-in-trace]
+  midrun-stall: [sporadic-stall, jit-stall, mid-run-spike, long-iteration-outlier]
+  kv-capacity-drop: [fewer-kv-blocks, kv-budget-drop, smaller-batch-achievable]
+  memory-usage-increase: [oom, peak-memory-up, footprint-up]
+  startup-time-increase: [slow-startup, warmup-time-up, load-time-up]
+  host-time-increase: [cpu-time-up, host-span-growth, host-bound]
+  acceptance-length-drop: [acceptance-rate-drop, fewer-accepted-tokens, spec-decode-speedup-loss]
+
+# This block is identical in both cookbooks — the two `subsystems:`
+# vocabularies had drifted, and a query-time map that differs per cookbook
+# cannot answer a cross-cookbook question.
+#
+# `module:` deliberately has no alias block: the module a case lives in is
+# answered by the routing table in SKILL.md and by data/modules.yaml, which
+# also carries the many-to-one crosswalk to the coarser module ids used in
+# the NVBug/PR corpus summary (a synonym map cannot express many-to-one).
+subsystems:
+  attention-kernel: [attention, xqa, trtllm-gen-attention]
+  fmha-kernel: [fmha, trtllm-gen-fmha]
+  mla-attention: [mla, mla-kernel, deepseek-attention]
+  dsa-attention: [dsa, dsa-indexer, sparse-attention, paged-mqa-logits]
+  moe: [mixture-of-experts, fused-moe, expert, grouped-gemm, router-gemm]
+  gemm-kernel: [cutlass-gemm, deepgemm, linear-layer]
+  cuda-graph: [graph, cudagraph, piecewise-graph, graph-capture]
+  scheduler-executor: [py-executor, overlap-scheduler, batch-scheduler, executor]
+  model-engine: [pytorch-model-engine]
+  spec-decode: [mtp, eagle, eagle3, speculative-decoding, draft-model]
+  communication: [allreduce, alltoall, nccl, nccl-symmetric, deepep, userbuffers, mnnvl, nvls, symm-mem]
+  kv-cache: [kv-cache-manager, block-manager, cache-transceiver]
+  autotuner: [tuner, tactic-selection, tunable-runner]
+  tokenizer: [input-processor, detokenizer]
+  sampler: [decoder, beam-search]
+  serve-endpoint: [trtllm-serve, openai-endpoint, media-io]
+  runtime-python: [llm-api, llmapi]
+  visual-gen-pipeline: [visualgen, flux, wan, ltx2, video-pipeline]
+  adp-router: [kv-aware-adp-router, attention-dp-router]
+  perf-test-config: [perf-sanity-config, model-test-config, bench-config]
+  perf-test-harness: [perf-sanity-harness, benchmark-driver, perf-harness]
+  unit-test-infra: [test-infra, pytest-infra]
+  build-dependency: [dep, third-party, third-party-dep, dependency-loader, flashinfer, cutlass-dep, torch-dep]

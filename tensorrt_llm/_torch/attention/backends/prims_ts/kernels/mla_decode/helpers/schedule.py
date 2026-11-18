@@ -150,10 +150,18 @@ def staged_kv_load(
     section: MlaStage,
     smem_page_offsets=None,
     cached_page_ids=None,
+    whole_kv=False,
+    pre_acquire_label=None,
 ):
-    """Issue all K/V producer stages for one logical K or V tile."""
+    """Issue all K/V producer stages for one logical K or V tile.
+
+    ``pre_acquire_label`` names optional auxiliary producer work that runs
+    after the page offsets are consumed but before the first KV acquire.
+    """
     cached_page_ids = page_offsets_consume(smem_page_offsets, cached_page_ids)
-    for stage_idx in range(head_dim_stages):
+    if pre_acquire_label is not None:
+        getattr(smem_kv, pre_acquire_label)(cached_page_ids=cached_page_ids)
+    for stage_idx in range(1 if whole_kv else head_dim_stages):
         smem_kv.acquire()
         getattr(smem_kv, producer_label)(
             stage_idx=stage_idx,
@@ -173,6 +181,8 @@ def staged_qk_mma(
     head_dim_stages=None,
     consumer_label=None,
     include_acquire=True,
+    release_k=True,
+    whole_kv=False,
 ):
     """Consume staged K descriptors and produce one QK MMA score tile."""
     if consumer_label is None:
@@ -188,12 +198,18 @@ def staged_qk_mma(
 
     if include_acquire:
         tmem_s.acquire()
-    for k_subtile_idx in range(head_dim_stages):
+    if whole_kv:
         smem_kv.wait()
+    for k_subtile_idx in range(head_dim_stages):
+        if not whole_kv:
+            smem_kv.wait()
         kv_desc = getattr(smem_kv, consumer_label)(k_subtile_idx=k_subtile_idx)
         tmem_s.qk_mma(kv_desc=kv_desc, k_subtile_idx=k_subtile_idx)
-        smem_kv.release()
+        if release_k and not whole_kv:
+            smem_kv.release()
     tmem_s.commit()
+    if whole_kv and release_k:
+        smem_kv.release()
 
 
 def staged_pv_mma(
@@ -206,6 +222,9 @@ def staged_pv_mma(
     consumer_label=None,
     producer_label=None,
     is_tail: bool = False,
+    reuse_k=False,
+    retained_k_stages=0,
+    whole_kv=False,
 ):
     """Consume staged V descriptors and produce one PV MMA output tile."""
     smem_p.wait()
@@ -232,7 +251,8 @@ def staged_pv_mma(
         producer_label is not None and producer_label.find("tail") >= 0
     )
     for v_subtile_idx in range(head_dim_stages):
-        smem_kv.wait()
+        if not reuse_k:
+            smem_kv.wait()
         if producer_label.endswith("_0"):
             v_desc_0 = getattr(smem_kv, consumer_label)(v_subtile_idx=v_subtile_idx)
             getattr(tmem_o, producer_label)(
@@ -247,7 +267,16 @@ def staged_pv_mma(
                 v_subtile_idx=v_subtile_idx,
                 is_tail=is_tail,
             )
+        if not whole_kv:
+            smem_kv.release()
+    if whole_kv:
+        # QK and every PV feature slice consume the same complete latent tile.
         smem_kv.release()
+    elif reuse_k:
+        # QK-only RoPE stages follow the retained V channels. They were
+        # consumed by QK and must retire before the next tile's V slices.
+        for _ in range(retained_k_stages - head_dim_stages):
+            smem_kv.release()
     tmem_o.commit()
     smem_p.release()
 
@@ -316,14 +345,20 @@ def staged_pv_mma_tmem_p(
     head_dim_stages,
     consumer_label,
     producer_label="pv_mma_loop_tmem_p",
+    reuse_k=False,
+    retained_k_stages=0,
+    ws_pair=False,
+    whole_kv=False,
 ):
     """Consume TMEM P and staged V descriptors to produce one PV output tile."""
     tmem_p.wait()
     p_stage_idx = tmem_p.p_stage()
     tmem_o.acquire()
     is_tail = producer_label == "pv_mma_tail_tmem_p"
-    for v_subtile_idx in range(head_dim_stages):
-        smem_kv.wait()
+    assert not ws_pair or reuse_k
+    for v_subtile_idx in range(0, head_dim_stages, 2 if ws_pair else 1):
+        if not reuse_k:
+            smem_kv.wait()
         v_desc_0 = getattr(smem_kv, consumer_label)(v_subtile_idx=v_subtile_idx)
         getattr(tmem_o, producer_label)(
             p_stage_idx=p_stage_idx,
@@ -331,6 +366,18 @@ def staged_pv_mma_tmem_p(
             v_subtile_idx=v_subtile_idx,
             is_tail=is_tail,
         )
+        # Both retained128-column panels were acquired by QK and remain live.
+        # Issue the combined PV before returning either panel to the producer.
+        if not whole_kv:
+            smem_kv.release()
+            if ws_pair:
+                smem_kv.release()
+    if whole_kv:
         smem_kv.release()
+    elif reuse_k:
+        # QK-only RoPE stages follow the retained V channels. They were
+        # consumed by QK and must retire before the next tile's V slices.
+        for _ in range(retained_k_stages - head_dim_stages):
+            smem_kv.release()
     tmem_o.commit()
     tmem_p.release()

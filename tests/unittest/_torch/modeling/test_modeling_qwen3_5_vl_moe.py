@@ -188,7 +188,9 @@ def test_qwen35_moe_model_defaults(
     )
 
     expected_moe_backend = "MARLIN" if use_marlin else "AUTO"
-    expected_gemm_backends = ["marlin"] if use_marlin else ["cutlass", "cublaslt", "cuda_core"]
+    expected_gemm_backends = (
+        ["marlin"] if use_marlin else ["cutlass", "cublaslt", "cutedsl", "cuda_core"]
+    )
     for model_cls in (Qwen3_5MoeForCausalLM, Qwen3_5MoeVLModel):
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")
         llm_args.quant_config = QuantConfig(quant_algo=quant_algo)
@@ -447,7 +449,7 @@ class TestQwen3_5MoeVL(TestModelingMultimodal):
             )
         else:
             # Mrope position ids. For chunked prefill / KV cache reuse we must
-            # mirror production `PyTorchModelEngine` and slice each request's
+            # mirror production `ModelEngine` and slice each request's
             # full `mrope_position_ids` to the current chunk's token range —
             # the fused QK-norm-RoPE op requires position_ids tokens to match
             # the QKV token count.

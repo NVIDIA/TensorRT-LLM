@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import time
 from pathlib import Path
@@ -184,11 +187,15 @@ def validate_timing_metrics(perf_metrics_item, request_context="", time_toleranc
         f"gen arrival_time > first_token_time in {request_context}"
     )
 
+    # JSONL omits zero-byte transfers' size; header-derived records also lack
+    # this worker-local field. Timestamps remain valid in either case.
+    if "kv_cache_size" in gen_metrics:
+        assert gen_metrics["kv_cache_size"] >= 0, f"negative kv_cache_size in {request_context}"
+
     # Test KV cache transfer timing (if present)
     if "kv_cache_transfer_start" in gen_metrics and "kv_cache_transfer_end" in gen_metrics:
         kv_start = gen_metrics["kv_cache_transfer_start"]
         kv_end = gen_metrics["kv_cache_transfer_end"]
-        assert gen_metrics["kv_cache_size"] > 0
         assert kv_start <= kv_end, (
             f"kv_cache_transfer_start > kv_cache_transfer_end in {request_context}"
         )

@@ -23,7 +23,7 @@ assert torch.cuda.is_available(), "allgather requires CUDA devices"
 # Each case spawns its own 4 rank processes over every visible device. Under
 # xdist several workers would fight for the same GPUs, so this must run
 # alone -- the same reason the other collective entry in this repo
-# (_torch/thop/serial/test_moe_alltoall.py) carries the marker.
+# (_torch/moe/kernels/serial/test_moe_alltoall.py) carries the marker.
 @pytest.mark.no_xdist
 def test_allgather_op_matrix() -> None:
     _rank_job.run("allgather")

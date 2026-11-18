@@ -53,6 +53,7 @@ from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, local_address, pool_config
+from .gpudirect import PEERMEM_ENV, allocation_range, format_diagnosis, select_registration_path
 from .keys import KeyNamespace
 from .ledger import record_segment
 from .metadata import MooncakeStoreMetadata, RequestTransfers
@@ -68,6 +69,8 @@ from .staging import sync_stream as _sync_stream
 from .validation import validate_layout, validate_llm_args, validate_node_budget
 
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
+
+_GIB = 1 << 30
 
 #: Set by the worker's constructor so the leader, which the executor builds in
 #: the same process on rank 0, can reach the store handle without a second
@@ -104,6 +107,17 @@ def _open_store(config: MooncakeStoreConnectorConfig):
     Returns:
         The store handle, and the host the segment is registered under.
     """
+    # Every role selects, since the first client in the process fixes the path
+    # for all of them.
+    if select_registration_path(
+        config.protocol,
+        registers_device_memory=not (config.capacity_only or config.stage_through_host),
+    ):
+        logger.warning(
+            "mooncake-store: no peer-memory module is loaded and every visible "
+            f"device supports dma-buf, so {PEERMEM_ENV}=0 is set to register the "
+            "KV pools through dma-buf. Set it explicitly to choose otherwise."
+        )
     try:
         from mooncake.store import MooncakeDistributedStore
     except ImportError as exc:
@@ -207,6 +221,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         #: whether or not that succeeded.
         self._save_started = threading.Event()
         self._save_lock = threading.Lock()
+        # KV pool ranges registered with the store, in registration order.
+        self._registered_ranges: List[Tuple[int, int]] = []
         # Host staging, when the pool cannot register device memory.
         self._load_staging: Optional[HostStagingPool] = None
         self._save_staging: Optional[HostStagingPool] = None
@@ -242,7 +258,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             logger.warning(
                 f"mooncake-store worker rank {self._rank}: capacity-only. Its "
                 "memory is in the pool and its KV cache is not: no lookups, no "
-                "loads, no saves, and no staging buffers pinned for them."
+                "loads, no saves, and no KV registration, so this rank needs no "
+                "GPUDirect RDMA."
             )
 
     # ---- registration ----
@@ -287,14 +304,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             return
 
         validate_layout(layout)
-        addressing = PageAddressing(layout)
         # Torch's current device is thread-local, so read it here on the
         # executor thread; the save thread would otherwise see device 0.
         if torch.cuda.is_available():
             self._device_index = torch.cuda.current_device()
-        # Host staging is the only transfer path, which is why
-        # stage_through_host is forced True upstream rather than read here.
-        self._open_staging(addressing)
+        if self._config.stage_through_host:
+            addressing = PageAddressing(layout)
+            self._open_staging(addressing)
+        else:
+            addressing = PageAddressing(layout, allocation_lookup=allocation_range)
+            self._register_pools(addressing)
 
         self._addressing = addressing
         for layer_group_id in addressing.layer_group_ids:
@@ -329,6 +348,66 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         logger.warning(
             f"mooncake-store worker rank {self._rank} registered layout: {addressing.describe()}"
         )
+
+    def _register_pools(self, addressing: PageAddressing) -> None:
+        """Register the KV pools with Mooncake, one call per allocation.
+
+        All or nothing: a failed piece unregisters the pieces before it.
+
+        Registered once for the life of the worker, which is valid only while
+        the pool memory stays mapped. KV pool rebalance would remap it, so
+        `PyExecutor._can_pause_for_rebalance` refuses it under a connector.
+        """
+        ranges = addressing.registration_ranges()
+        logger.info(
+            f"mooncake-store rank {self._rank} registering {len(ranges)} range(s) "
+            f"covering {sum(end - start for start, end in ranges) / _GIB:.1f} GiB"
+        )
+        if addressing.unresolved_ranges:
+            logger.warning(
+                f"mooncake-store rank {self._rank} could not ask the driver which "
+                "cuMemCreate allocations back "
+                f"{len(addressing.unresolved_ranges)} KV pool range(s), so they "
+                "are registered whole. A range spanning several allocations "
+                "fails registration below."
+            )
+        # The report queries the driver per range, so build it only when shown.
+        if logger.is_debug_enabled():
+            logger.debug(format_diagnosis(ranges, self._rank))
+        for start, end in ranges:
+            status = self._store.register_buffer(start, end - start)
+            if status != 0:
+                self._unregister_pools()
+                # Collected only on failure, so the common path pays nothing.
+                raise RuntimeError(
+                    f"MooncakeDistributedStore.register_buffer failed with status "
+                    f"{status} for [{start:#x}, {end:#x}). Without registration "
+                    "the store cannot read or write these pages. Registering "
+                    "device memory needs GPUDirect RDMA, and what that requires "
+                    f"depends on {PEERMEM_ENV}. Unless it is 0, Mooncake calls "
+                    "ibv_reg_mr, which needs the nvidia_peermem module and KV "
+                    "pools allocated with gpuDirectRDMACapable=1; either missing "
+                    "fails with EFAULT, as does a range crossing two allocations. "
+                    f"With {PEERMEM_ENV}=0 it registers through dma-buf, which "
+                    "needs neither and fails a crossing range with EINVAL. Set "
+                    "stage_through_host to pass pages through pinned host memory "
+                    "instead.\n"
+                    f"{format_diagnosis(ranges, self._rank)}"
+                )
+            self._registered_ranges.append((start, end))
+
+    def _unregister_pools(self) -> None:
+        """Hand back every KV pool registration, latest first. Idempotent."""
+        while self._registered_ranges:
+            start, end = self._registered_ranges.pop()
+            status = self._store.unregister_buffer(start)
+            if status != 0:
+                # The memory is the cache manager's, so there is nothing to
+                # keep alive here. Log the leak.
+                logger.error(
+                    f"mooncake-store rank {self._rank}: unregister_buffer failed "
+                    f"with status {status} for [{start:#x}, {end:#x})."
+                )
 
     def _open_staging(self, addressing: PageAddressing) -> None:
         """Allocate and register the pinned slots pages will pass through.
@@ -454,6 +533,20 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         staging = self._load_staging
         handle = _stream_handle(stream) if staging is not None else 0
+        if staging is None:
+            # The previous pass may still write a recycled target page, e.g. the
+            # last token of a request that stopped there. Only the loading
+            # requests' pages are waited for, so a load into free pages still
+            # overlaps that pass.
+            fence = self.get_allocation_fence()
+            if fence is None:
+                raise RuntimeError(
+                    "mooncake-store: a zero-copy load has no allocation fence to "
+                    "wait on, so the NIC could write pages earlier GPU work still "
+                    "owns. The KV cache manager must offer wait_allocation_fences; "
+                    "KVCacheManagerV2 does."
+                )
+            fence({entry.request_id for entry in metadata.loads})
 
         for batch in zip(
             _batched(keys, self._batch_size),
@@ -703,6 +796,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 )
                 return
             self._save_thread = None
+        if self._store is not None:
+            # Before the store closes and the cache manager frees the pools,
+            # so the fabric holds no registration over memory handed out again.
+            self._unregister_pools()
         store, self._store = self._store, None
         if store is not None:
             try:

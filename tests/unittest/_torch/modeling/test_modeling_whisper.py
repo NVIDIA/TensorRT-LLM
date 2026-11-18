@@ -25,7 +25,12 @@ import pytest
 import torch
 from transformers import WhisperConfig, WhisperFeatureExtractor
 
-from tensorrt_llm._torch.models.modeling_whisper import WhisperLogMelFrontend
+from tensorrt_llm._torch.models.modeling_whisper import WhisperInputProcessor, WhisperLogMelFrontend
+
+
+def test_whisper_input_processor_declares_input_capabilities():
+    assert WhisperInputProcessor.requires_encoder_features
+    assert WhisperInputProcessor.supports_token_ids_input is False
 
 
 def _synthetic_waveform_batch(n_samples: int, seed: int = 1234) -> np.ndarray:

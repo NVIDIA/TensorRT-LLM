@@ -293,6 +293,7 @@ class MistralTokenizer(TransformersTokenizer):
         prev_text: str | None = None,
         states: dict | None = None,
         *,
+        flush: bool = False,
         skip_special_tokens: bool = False,
         clean_up_tokenization_spaces: bool | None = None,
     ) -> tuple[str, dict]:

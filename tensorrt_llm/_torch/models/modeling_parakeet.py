@@ -250,11 +250,11 @@ class ParakeetExtractor:
             audio_clips.extend(clips)
             audio_num_clips.append(len(clips))
 
-        audio_lengths = torch.tensor(
+        audio_lengths_cpu = torch.tensor(
             [len(speech) for speech in audio_clips],
             dtype=torch.long,
-            device=device,
         )
+        audio_lengths = audio_lengths_cpu.to(device, non_blocking=True)
         max_length = max(len(speech) for speech in audio_clips)
         input_features = self._pad_raw_speech(audio_clips, max_length, device)
         if self.config.preemphasis is not None:
@@ -262,10 +262,24 @@ class ParakeetExtractor:
         input_features = self._torch_extract_fbank_features(input_features, device)
         input_features, attention_mask = self._normalize_mel_features(input_features, audio_lengths)
 
+        # Keep clip geometry on the host: the forward slices encoder outputs
+        # using these lengths, even when feature extraction runs on CUDA.
+        feature_lengths = torch.floor_divide(
+            audio_lengths_cpu + self.config.n_fft // 2 * 2 - self.config.n_fft,
+            self.config.hop_length,
+        ).clamp_(min=0, max=input_features.shape[1])
+        output_lengths = _subsampling_output_length(
+            feature_lengths,
+            self.config.subsampling_factor,
+            self.config.subsampling_conv_kernel_size,
+            self.config.subsampling_conv_stride,
+        )
+
         return {
             "input_audio_features": input_features,
             "feature_attention_mask": attention_mask,
-            "audio_num_clips": torch.tensor(audio_num_clips, dtype=torch.long, device=device),
+            "audio_num_clips": torch.tensor(audio_num_clips, dtype=torch.long),
+            "audio_output_lengths": output_lengths,
         }
 
     def audio_length(self, audio_tokens: int) -> int:

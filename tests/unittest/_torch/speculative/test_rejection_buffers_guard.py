@@ -14,6 +14,9 @@ attribute stand-ins (``types.SimpleNamespace``), so they do not construct a full
   ``spec_metadata`` attributes (no ``self`` use), so it can be called unbound.
 - ``SpecWorkerBase._zero_padding_rows`` is a staticmethod over plain tensors.
 
+The CUDA-graph view test builds a bare ``SpecMetadata`` (no model) because it
+checks that its shallow-copied views share the slot-indexed buffers.
+
 Requires CUDA because the buffers are allocated on ``device='cuda'``.
 """
 
@@ -31,7 +34,7 @@ pytestmark = pytest.mark.skipif(
 R, K, V = 8, 4, 32  # max_num_requests, max_draft_len, vocab_size
 
 
-def _alloc_meta(**over):
+def _alloc_meta(**over: object) -> types.SimpleNamespace:
     base = dict(
         use_rejection_sampling=True,
         draft_probs=None,
@@ -46,6 +49,25 @@ def _alloc_meta(**over):
     )
     base.update(over)
     return types.SimpleNamespace(**base)
+
+
+def test_padding_onehot_rejects_the_scratch_row() -> None:
+    m = _alloc_meta(draft_probs_last_dim=0, dummy_slot_row=0, is_cuda_graph=False)
+    SpecMetadata.prepare_rejection_sampling_buffers(m)
+    assert m.dummy_slot_row == R
+    m.draft_probs.fill_(0.5)
+
+    SpecMetadata.write_padding_onehot_draft_probs(m, [0, R - 1], 2)
+    for slot in (0, R - 1):
+        assert torch.all(m.draft_probs[slot, :2, 0] == 1.0)
+        assert torch.all(m.draft_probs[slot, :2, 1:] == 0.0)
+        assert torch.all(m.draft_probs[slot, 2:] == 0.5)
+    assert torch.all(m.draft_probs[1 : R - 1] == 0.5)
+
+    for bad_slot in (R, -1):
+        with pytest.raises(RuntimeError, match="padding slot ids"):
+            SpecMetadata.write_padding_onehot_draft_probs(m, [bad_slot], 2)
+    assert torch.all(m.draft_probs[R] == 0.5)
 
 
 def test_prepare_buffers_allocates_when_enabled():
@@ -82,6 +104,38 @@ def test_prepare_buffers_span_seq_slot_pool():
     SpecMetadata.prepare_rejection_sampling_buffers(m)
     assert tuple(m.draft_probs.shape) == (pool + 1, K, V)
     assert m.dummy_slot_row == pool
+
+
+@pytest.mark.parametrize("enable_penalty", [False, True], ids=["rejection", "rejection_penalty"])
+def test_cuda_graph_views_share_slot_buffers(enable_penalty: bool) -> None:
+    # A graph view created before the first prepare() must not allocate its own
+    # slot-indexed state: the drafter scatters into the buffer of the view that
+    # ran this step, and the next step's rejection kernel (eager or another
+    # graph) must read that same buffer.
+    pool = 2 * R
+    meta = SpecMetadata(
+        max_num_requests=R,
+        max_draft_len=K,
+        max_total_draft_tokens=K,
+        use_rejection_sampling=True,
+        enable_penalty=enable_penalty,
+        vocab_size=V,
+        draft_vocab_size=V,
+        num_seq_slots=pool,
+    )
+    graph_small = meta.create_cuda_graph_metadata(2)
+    graph_large = meta.create_cuda_graph_metadata(4)
+    for view in (graph_small, graph_large, meta):
+        view.prepare_rejection_sampling_buffers()
+        view.prepare_penalty_buffers()
+
+    assert tuple(meta.draft_probs.shape) == (pool + 1, K, V)
+    assert graph_small.draft_probs is meta.draft_probs
+    assert graph_large.draft_probs is meta.draft_probs
+    assert graph_small.dummy_slot_row == graph_large.dummy_slot_row == pool
+    if enable_penalty:
+        assert graph_small.penalty_state is meta.penalty_state
+        assert graph_large.penalty_state is meta.penalty_state
 
 
 def test_prepare_buffers_noop_when_disabled():

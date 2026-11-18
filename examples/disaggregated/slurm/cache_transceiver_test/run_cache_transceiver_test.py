@@ -53,10 +53,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
-    create_kv_cache_transceiver,
-    maybe_enable_fabric_memory_for_python_transceiver,
-)
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import create_kv_cache_transceiver
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -66,6 +63,7 @@ from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
     CacheTransceiverConfig,
     KvPoolRebalanceConfig,
+    RemoteCacheConfig,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -102,11 +100,16 @@ class KvCacheConfigV2:
     sink_token_length: Optional[int] = None
     free_gpu_memory_fraction: Optional[float] = None
     host_cache_size: Optional[int] = None
+    host_cache_bind_to_gpu_numa_node: bool = False
     disk_cache_size: Optional[int] = None
     disk_cache_path: Optional[str] = None
+    disk_io_threads: int = 0
+    disk_keep_copy_after_restore: bool = False
+    disk_write_through: bool = False
+    disk_protected_copy_fraction: float = 1.0
     onboard_blocks: bool = True
     cross_kv_cache_fraction: Optional[float] = None
-    secondary_offload_min_priority: Optional[int] = None
+    cold_tier_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
     kv_cache_event_hash_algo: str = "auto"
     max_gpu_total_bytes: Optional[int] = None
@@ -123,6 +126,9 @@ class KvCacheConfigV2:
     # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
     # reads it unconditionally.
     kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
+    # Mirrors KvCacheConfig.remote_cache_config; read by KVCacheManagerV2.__init__.
+    remote_cache_config: Optional[RemoteCacheConfig] = None
+    enable_kv_pool_rebalance: bool = False
 
 
 class _Timeout(Exception):
@@ -841,28 +847,6 @@ def main():
     zmq_sock = open_sock()
 
     cases = build_cases(cfg)
-    # The C++ fabric-memory env getter is cached on its first KV pool
-    # allocation. Enable the default before any matrix case builds a pool, even
-    # when a C++ transceiver case appears before Python+V1 in the matrix.
-    python_v1_case = next(
-        (case for case in cases if case["runtime"] == "PYTHON" and case["cache_manager"] == "V1"),
-        None,
-    )
-    if python_v1_case is not None:
-        maybe_enable_fabric_memory_for_python_transceiver(
-            CacheTransceiverConfig(
-                backend=python_v1_case["backend"],
-                transceiver_runtime="PYTHON",
-            ),
-            KVCacheManager,
-        )
-        print(
-            f"[{role} rank={rank}] PYTHON+V1 case in matrix: "
-            "TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY="
-            f"{os.environ.get('TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY')} "
-            "applies to every case in this run, including C++ transceiver ones",
-            flush=True,
-        )
     req_lens = cfg["test_matrix"]["request_lengths"]
     warmup = cfg["test_matrix"]["warmup_requests"]
     num_req = cfg["test_matrix"]["num_requests_per_length"]
@@ -1033,12 +1017,16 @@ def main():
             backend=backend,
             transceiver_runtime=(None if runtime == "CPP" else "PYTHON"),
             max_tokens_in_buffer=cfg["kv_cache"]["max_tokens_in_buffer"],
-            # PYTHON (V2) only; 0 keeps bounce off. With bounce on, the KV data
-            # rides a fabric-VMM staging buffer (CU_MEM_HANDLE_TYPE_FABRIC), which
-            # is what lets UCX pick cuda_ipc across NVL72 nodes -- direct
-            # pool-to-pool transfers from non-fabric allocations fall back to
-            # much slower host-staged tcp, so enable bounce for cross-node
-            # transfers inside an NVLink domain.
+            # PYTHON (V2) only; 0 keeps bounce off. A positive size enables the C++
+            # transfer-agent bounce buffer (a fabric-memory arena where available). Its
+            # default admission gate only admits writes with >= 1024 descriptors averaging
+            # <= 16 KiB (head-mismatch layouts). This harness is symmetric, so it sends one
+            # descriptor per block (far above 16 KiB) and at most a few hundred blocks per
+            # request: with the default gate every transfer is declined. To exercise the
+            # bounce, set TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT=1 and
+            # TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES=4MB on both sides (this
+            # harness has no agent_bounce_params passthrough); bounce_submit_count in the
+            # shutdown log shows engagement.
             kv_cache_bounce_size_mb=int(cfg["kv_cache"].get("bounce_size_mb", 0)),
             # For the Python sender, leave deterministic headroom for the
             # signal handler and final CTX/GEN ownership handshake after its

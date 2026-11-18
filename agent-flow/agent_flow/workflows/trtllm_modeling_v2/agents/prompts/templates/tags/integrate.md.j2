@@ -1,0 +1,10 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Tag `integrate` — land work that did not integrate on its own
+
+Your task lands changes that conflicted with the target as it moved: the
+tasks and branches its goal names. Read each side's receipt and report first,
+then resolve every conflict so that both intents stand. Prove the join on the
+merged tree: the source-level gates, and the tests of every entry and target
+file the merged changes touched. If the two cannot both stand, block, naming
+the files and why.
