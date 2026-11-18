@@ -523,8 +523,8 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     return mRunner.getDefaultValidConfigIndex(numTokens, is_gated_activation ? 2 * intermediateSize : intermediateSize,
-        hiddenSize, {}, numTokens, numExperts, maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize,
-        validHiddenSize);
+        hiddenSize, {}, numTokens, numExperts, maxNumCgasInBatchDim, numTokens,
+        is_gated_activation ? 2 * validIntermediateSize : validIntermediateSize, validHiddenSize);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -534,7 +534,8 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens,
         is_gated_activation ? 2 * intermediateSize : intermediateSize, hiddenSize, {}, numTokens, numExperts,
-        maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize, validHiddenSize);
+        maxNumCgasInBatchDim, numTokens, is_gated_activation ? 2 * validIntermediateSize : validIntermediateSize,
+        validHiddenSize);
 
     return isValid;
 }

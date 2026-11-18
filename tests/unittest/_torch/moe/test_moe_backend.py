@@ -7494,9 +7494,11 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(
     [(512, 352), (352, 512), (2880, 2880)],
     ids=["h512_i352", "h352_i512", "h2880_i2880"],
 )
-def test_moe_mxe2m1_weights_valid_dimensions(valid_hidden_size, valid_intermediate_size):
+def test_moe_mxe2m1_weights_valid_dimensions(
+    valid_hidden_size: int, valid_intermediate_size: int
+) -> None:
     """Exercise C++ TMA alignment with lean sizes and zero-padded weights."""
-    from _torch.moe.kernels.serial.test_moe import test_moe_mxe2m1_weights as run_direct_case
+    from _torch.moe.kernels.serial.test_moe import _run_moe_mxe2m1_weights as run_direct_case
 
     from tensorrt_llm.quantization.utils.fp4_utils import pad_up
 

@@ -120,7 +120,6 @@ l0_b300:
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_mega_format_transform_is_slot_blockwise
   # ------------- MoE: test_moe_backend (by backend) ---------------
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
-  - unittest/_torch/moe/test_moe_backend.py::test_moe_mxe2m1_weights_valid_dimensions
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method

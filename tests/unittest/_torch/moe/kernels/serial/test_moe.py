@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from enum import Enum
-from typing import Tuple
+from typing import Tuple, TypedDict
 
 import pytest
 import torch
@@ -80,6 +80,18 @@ def test_situ_runner_has_valid_configs(num_tokens, get_tactics):
     """
     assert get_tactics(
         num_tokens), f"No valid SiTu tactic for num_tokens={num_tokens}"
+
+
+class _Mxfp4RoutingInfo(TypedDict):
+    """Routing parameters for the MXFP4 direct-op numerical reference."""
+
+    num_experts: int
+    top_k: int
+    n_groups: int | None
+    top_k_groups: int | None
+    routed_scaling: float | None
+    has_routing_bias: bool
+    routing_method_type: RoutingMethodType
 
 
 class moe_args:
@@ -2250,72 +2262,19 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
                    percent=0.925)
 
 
-@pytest.mark.skip(
-    reason=
-    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
-)
-@pytest.mark.skipif(
-    getSMVersion() != 100,
-    reason="The kernel only supports Blackwell. Current SM is %d." %
-    getSMVersion(),
-)
-@pytest.mark.parametrize("num_tokens", [1, 256, 1024])
-@pytest.mark.parametrize("hidden_size", [512])
-@pytest.mark.parametrize("intermediate_size", [512])
-@pytest.mark.parametrize(
-    "routing_info",
-    [
-        pytest.param(
-            {
-                "num_experts": 16,
-                "top_k": 10,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Renormalize
-            },
-            id="RoutingRenormalize_qwen_next"),
-        pytest.param(
-            {
-                "num_experts": 16,
-                "top_k": 8,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Renormalize
-            },
-            id="RoutingRenormalize_topk_8"),
-        pytest.param(
-            {
-                "num_experts": 16,
-                "top_k": 4,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Renormalize
-            },
-            id="RoutingRenormalize_topk_4"),
-    ],
-)
-@pytest.mark.parametrize("dtype_activation", ["mxfp8", "bf16", "fp8"])
-@pytest.mark.parametrize("act_type_str", ["SwiGlu", "GatedSilu"])
-@pytest.mark.parametrize("use_autotune", [True, False],
-                         ids=["autotune", "no_autotune"])
-@pytest.mark.parametrize("use_topk_as_input", [False, True],
-                         ids=["use_score_as_input", "use_topk_as_input"])
-def test_moe_mxe2m1_weights(num_tokens,
-                            hidden_size,
-                            intermediate_size,
-                            routing_info,
-                            dtype_activation,
-                            act_type_str,
-                            use_autotune,
-                            use_topk_as_input,
-                            valid_hidden_size=None,
-                            valid_intermediate_size=None):
+def _run_moe_mxe2m1_weights(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    routing_info: _Mxfp4RoutingInfo,
+    dtype_activation: str,
+    act_type_str: str,
+    use_autotune: bool,
+    use_topk_as_input: bool,
+    valid_hidden_size: int | None = None,
+    valid_intermediate_size: int | None = None,
+) -> None:
+    """Run the MXFP4 direct op and its numerical reference on the same inputs."""
     torch.random.manual_seed(0)
 
     #
@@ -2729,18 +2688,96 @@ def test_moe_mxe2m1_weights(num_tokens,
     assert torch.isfinite(output_dequant_reference).all(
     ), "MoE reference contains non-finite values"
     if act_type == ActType.SiTu:
-        check_accuracy(output_dequant_reference,
-                       output_dequant_actual,
-                       atol=0.1,
-                       rtol=0.15,
-                       percent=0.95)
+        atol, rtol, percent = 0.1, 0.15, 0.95
     else:
+        atol, rtol = 0.0, 0.10
         percent = 0.8 if dtype_activation == "mxfp8" else 0.85
-        check_accuracy(output_dequant_reference,
-                       output_dequant_actual,
-                       atol=0.0,
-                       rtol=0.10,
+    check_accuracy(output_dequant_reference,
+                   output_dequant_actual,
+                   atol=atol,
+                   rtol=rtol,
+                   percent=percent)
+    if valid_hidden_size is not None:
+        # A dropped final shuffle block must not hide in the global error budget.
+        check_accuracy(output_dequant_reference[:, -32:],
+                       output_dequant_actual[:, -32:],
+                       atol=atol,
+                       rtol=rtol,
                        percent=percent)
+
+
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
+@pytest.mark.skipif(
+    getSMVersion() != 100,
+    reason="The kernel only supports Blackwell. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("num_tokens", [1, 256, 1024])
+@pytest.mark.parametrize("hidden_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize(
+    "routing_info",
+    [
+        pytest.param(
+            {
+                "num_experts": 16,
+                "top_k": 10,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_qwen_next"),
+        pytest.param(
+            {
+                "num_experts": 16,
+                "top_k": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_topk_8"),
+        pytest.param(
+            {
+                "num_experts": 16,
+                "top_k": 4,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_topk_4"),
+    ],
+)
+@pytest.mark.parametrize("dtype_activation", ["mxfp8", "bf16", "fp8"])
+@pytest.mark.parametrize("act_type_str", ["SwiGlu", "GatedSilu"])
+@pytest.mark.parametrize("use_autotune", [True, False],
+                         ids=["autotune", "no_autotune"])
+@pytest.mark.parametrize("use_topk_as_input", [False, True],
+                         ids=["use_score_as_input", "use_topk_as_input"])
+def test_moe_mxe2m1_weights(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    routing_info: _Mxfp4RoutingInfo,
+    dtype_activation: str,
+    act_type_str: str,
+    use_autotune: bool,
+    use_topk_as_input: bool,
+    valid_hidden_size: int | None = None,
+    valid_intermediate_size: int | None = None,
+) -> None:
+    _run_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
+                            routing_info, dtype_activation, act_type_str,
+                            use_autotune, use_topk_as_input, valid_hidden_size,
+                            valid_intermediate_size)
 
 
 @pytest.mark.skipif(
