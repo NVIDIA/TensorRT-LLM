@@ -598,6 +598,8 @@ class BaseWorker(GenerationExecutor):
                     arrival_time=request.arrival_time,
                     watermarking=request.sampling_params.watermarking,
                     prompt_trimmed_prefix=trimmed_prefix,
+                    apply_batched_logits_processor=request.sampling_params.
+                    apply_batched_logits_processor,
                 ),
             )
 
