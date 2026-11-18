@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.utils import ActivationType
     from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -50,6 +52,10 @@ class MoEStaticCapability:
     # Whether the backend consumes a per-forward helper-slot plan whose live
     # weights may be published concurrently with shared-expert computation.
     supports_per_layer_dynamic_eplb: bool = False
+    # Whether the backend runs with the unbacked spare EPLB slots of Wide-EP
+    # fault tolerance: its autotuner profiles and its workspaces cover only the
+    # active slots.
+    supports_spare_slots: bool = False
     # Legacy gate: the ``assert moe_cls in [...]`` bias allow-list in
     # ``create_moe_backend``. Per-expert FC bias from the checkpoint, added
     # before the activation functor runs -- not an activation constant.
@@ -316,6 +322,9 @@ class MoEDeployment:
     eplb_enabled: bool = False
     # Unified EPLB mode: disabled, standard, or per_layer_dynamic.
     eplb_mode: str = "disabled"
+    # True only when the registered load balancer adds unbacked spare slots
+    # (Wide-EP fault tolerance).
+    spare_slots_enabled: bool = False
     # True only for routed-expert LoRA targets.
     moe_lora_enabled: bool = False
     # False when ``moe_disable_finalize_fusion`` is set or any LoRA is
@@ -363,6 +372,9 @@ class MoERejectReason(str, Enum):
     # EPLB is registered for this layer and the impl cannot lay out slots for
     # it. Distinct from TOPOLOGY_UNSUPPORTED: the parallel sizes are fine.
     EPLB_UNSUPPORTED = "eplb_unsupported"
+    # The load balancer adds the unbacked spare slots of Wide-EP fault
+    # tolerance, and the impl would autotune or allocate for them.
+    SPARE_SLOTS_UNSUPPORTED = "spare_slots_unsupported"
     # The deployment forces per-call activation scales
     # (``force_dynamic_quantization``) and the impl quantizes against scales
     # fixed at load time. Distinct from QUANT_UNSUPPORTED: the impl serves the
@@ -488,6 +500,22 @@ def require_layer_quant_format(impl: "MoEImplBase", expected: str) -> None:
             f"Pass the layer's final quantization to create_moe as "
             f"override_quant_config."
         )
+
+
+def spare_slots_rejection(cls: type, d: "MoEDeployment") -> Optional[MoEEligibility]:
+    """Reject the unbacked spare EPLB slots on an impl without ``supports_spare_slots``, else None.
+
+    The resolver applies it to every candidate that ``can_implement`` accepts; a
+    family whose leaves differ also composes it into ``can_implement``, which a
+    direct call reaches.
+    """
+    if d.spare_slots_enabled and not cls.capabilities.supports_spare_slots:
+        return MoEEligibility.no(
+            MoERejectReason.SPARE_SLOTS_UNSUPPORTED,
+            f"Wide-EP fault tolerance: {cls.__name__} does not support spare EPLB slots; "
+            f"select a MoE backend that does, or {TURN_FAULT_TOLERANCE_OFF}",
+        )
+    return None
 
 
 def nvfp4_fc1_row_alignment_rejection(
@@ -653,6 +681,7 @@ class MoEResolutionReport:
                 "num_slots": self.deployment.num_slots,
                 "eplb_enabled": self.deployment.eplb_enabled,
                 "eplb_mode": self.deployment.eplb_mode,
+                "spare_slots_enabled": self.deployment.spare_slots_enabled,
                 "moe_lora_enabled": self.deployment.moe_lora_enabled,
                 "force_dynamic_quantization": self.deployment.force_dynamic_quantization,
                 "oss_cutlass_moe": self.deployment.env.oss_cutlass_moe,

@@ -30,6 +30,7 @@ from ..impl_contract import (
     MoEProblem,
     MoERejectReason,
     check_quant_matches_identity,
+    spare_slots_rejection,
 )
 from ..interface import _reject
 
@@ -181,6 +182,7 @@ def check_cutlass_leaf(
         check_dtype(cls, p),
         check_gptoss_activation(cls, p),
         check_moe_lora(cls, d),
+        spare_slots_rejection(cls, d),
         *leaf_gates,
         check_oss_cutlass_build(cls, p, d),
     ):

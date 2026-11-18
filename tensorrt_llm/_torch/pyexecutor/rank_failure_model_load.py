@@ -23,13 +23,12 @@ from typing import List
 
 import torch
 
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
+
 from ..moe.fused_moe.communication.execution_state import MoeExecutionState
 from ..moe.fused_moe.ep_group_health import EPGroupHealth
 from ..moe.fused_moe.fused_moe_vanilla import VanillaMoE
 from ..moe.fused_moe.interface import MoE
-
-# The alternative that each error about an unmet fault tolerance requirement offers.
-_TURN_FAULT_TOLERANCE_OFF = "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)"
 
 
 def prepare_model(model: torch.nn.Module) -> None:
@@ -65,11 +64,11 @@ def moe_comms(model: torch.nn.Module) -> List[object]:
             raise ValueError(
                 f"MoE layer {name} ({type(layer).__name__}) uses {uses}, but Wide-EP fault "
                 "tolerance requires NVLinkOneSided, the only MoE communication that can leave "
-                f"out a failed rank. Select it or {_TURN_FAULT_TOLERANCE_OFF}."
+                f"out a failed rank. Select it or {TURN_FAULT_TOLERANCE_OFF}."
             )
         comms[id(comm)] = comm
     if not comms:
         raise ValueError(
-            f"Wide-EP fault tolerance requires a model with MoE layers; {_TURN_FAULT_TOLERANCE_OFF}"
+            f"Wide-EP fault tolerance requires a model with MoE layers; {TURN_FAULT_TOLERANCE_OFF}"
         )
     return list(comms.values())

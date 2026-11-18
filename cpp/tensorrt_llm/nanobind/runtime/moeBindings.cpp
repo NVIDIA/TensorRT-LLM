@@ -95,12 +95,16 @@ void initMoeBindings(nb::module_& m)
         .def("get_layer_id", &tr::SingleLayerMoeLoadBalancer::getLayerId,
             "Get the layer id of the SingleLayerMoeLoadBalancer", nb::call_guard<nb::gil_scoped_release>())
         .def("get_old_rank_expert_ids", &tr::SingleLayerMoeLoadBalancer::getOldRankExpertIds,
-            "Get the old rank expert ids of the SingleLayerMoeLoadBalancer", nb::call_guard<nb::gil_scoped_release>());
+            "Get the old rank expert ids of the SingleLayerMoeLoadBalancer", nb::call_guard<nb::gil_scoped_release>())
+        .def("get_unusable_local_slots", &tr::SingleLayerMoeLoadBalancer::getUnusableLocalSlots,
+            "Get the local slots that EPLB updates leave empty", nb::call_guard<nb::gil_scoped_release>());
 
     // Bind MoeLoadBalancer class
     nb::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")
-        .def(nb::init<int, int, int>(), nb::arg("ep_rank"), nb::arg("ep_size"), nb::arg("layer_updates_per_iter"),
-            "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, and update frequency",
+        .def(nb::init<int, int, int, bool>(), nb::arg("ep_rank"), nb::arg("ep_size"), nb::arg("layer_updates_per_iter"),
+            nb::arg("fault_tolerance") = false,
+            "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, update frequency and "
+            "whether Wide-EP fault tolerance is enabled",
             nb::call_guard<nb::gil_scoped_release>())
         .def("set_use_gpu_memcpy", &tr::MoeLoadBalancer::setUseGpuMemcpy, nb::arg("use_gpu_memcpy"),
             "Set whether to use GPU memcpy for weight updates", nb::call_guard<nb::gil_scoped_release>())
@@ -120,11 +124,29 @@ void initMoeBindings(nb::module_& m)
         .def("reconfigure_mask_only", &tr::MoeLoadBalancer::reconfigureMaskOnly, nb::arg("dead_ranks"),
             "Reconfigure EPLB routing metadata so slots on dead EP ranks are unreachable",
             nb::call_guard<nb::gil_scoped_release>())
+        .def("restore_placement", &tr::MoeLoadBalancer::restorePlacement, nb::arg("dead_ranks"),
+            nb::arg("layer_rank_expert_ids"),
+            "Under Wide-EP fault tolerance, set the failed EP ranks and install a placement per layer whose changed "
+            "local slots the caller loaded",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("abandon_iterations", &tr::MoeLoadBalancer::abandonIterations,
+            "Under Wide-EP fault tolerance, after a rank failure interrupted the forward, end the online EPLB work of "
+            "the iterations started so far and restart the statistics and the update plan",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("check_slots_writable", &tr::MoeLoadBalancer::checkSlotsWritable,
+            "Under Wide-EP fault tolerance, raise unless no iteration runs or is queued and the online EPLB worker is "
+            "done with the last one",
+            nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources",
             nb::call_guard<nb::gil_scoped_release>());
 
     m.def("is_host_accessible_device_memory_supported", &tr::HostAccessibleDeviceAllocator::isSupported,
         "If current system support host accessible device memory");
+    m.def(
+        "host_accessible_device_memory_uses_gdrcopy",
+        [] { return tr::HostAccessibleDeviceAllocator::getInstance().usesGdrCopy(); },
+        "Whether host accessible device memory is device memory that GDRCopy maps for the host, which spare EPLB "
+        "slots of online EPLB need under Wide-EP fault tolerance; only while a load balancer exists");
 
     // Bind do_replication function for testing
     m.def("do_replication", &pyDoReplication, nb::arg("meta_info"), nb::arg("expert_load_factor"),

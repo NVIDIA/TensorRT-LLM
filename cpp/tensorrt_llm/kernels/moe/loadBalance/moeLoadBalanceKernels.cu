@@ -624,7 +624,8 @@ __global__ void moeComputeRouteSortKernel(MoeLoadBalanceMetaInfo metaInfo, MoePl
 }
 
 void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
-    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream)
+    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream,
+    bool singleReplicaPerExpert)
 {
     constexpr int kThreadCount = 256;
     constexpr int kEltPerThread = 4;
@@ -635,7 +636,9 @@ void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo pla
         return;
     }
     int dynamicShmSize = sizeof(int16_t) * metaInfo.epSize * metaInfo.slotCountPerRank;
-    if (metaInfo.expertCount == metaInfo.epSize * metaInfo.slotCountPerRank)
+    // With a single replica per expert, expertReplicaStartOffset[e] is e, so globalSlotIds[e] is expert e's only slot.
+    // The direct kernel is then correct even when empty spare slots make the slots outnumber the experts.
+    if (singleReplicaPerExpert || metaInfo.expertCount == metaInfo.epSize * metaInfo.slotCountPerRank)
     {
         auto* kernelFn = moeComputeRouteNoRedundantKernel<1024, kThreadCount, kEltPerThread>;
         // no redundant expert, so we don't need complex routing, but just assign to the correct solt.
@@ -650,15 +653,20 @@ void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo pla
     }
 }
 
-void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal)
+bool moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, std::atomic<bool> const* stop)
 {
     bool ready = false;
     do
     {
         auto loaded = __atomic_load_n(&signal->stepAndOwner, __ATOMIC_ACQUIRE);
         ready = getOwnerDevice(loaded) == MoeLoadBalanceSingleLayerSignal::kCPU;
+        if (!ready && stop != nullptr && stop->load(std::memory_order_relaxed))
+        {
+            return false;
+        }
     } while (!ready);
     std::atomic_thread_fence(std::memory_order_acquire);
+    return true;
 }
 
 void moeSetSignalForGpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, int64_t iterId, bool enableStatistic)

@@ -114,13 +114,19 @@ def create_moe_backend(
     # Backstop for the direct-``moe_cls`` callers that bypass resolution: a
     # backend that cannot run under a load balancer already declines in
     # ``can_implement``.
-    eplb_enabled = get_moe_load_balancer() is not None
+    balancer = get_moe_load_balancer()
+    eplb_enabled = balancer is not None
     load_balancer_config = getattr(model_config, "moe_load_balancer", None)
     eplb_mode = (getattr(load_balancer_config, "mode", "standard")
                  if eplb_enabled else "disabled")
     if eplb_enabled and not moe_cls.capabilities.supports_eplb:
         raise ValueError(
             f"{moe_cls.__name__} does not support the MoE load balancer.")
+    if (eplb_enabled and balancer.adds_spare_slots
+            and not moe_cls.capabilities.supports_spare_slots):
+        raise ValueError(
+            f"{moe_cls.__name__} does not support the unbacked spare EPLB slots "
+            "of Wide-EP fault tolerance.")
     if (eplb_mode == "per_layer_dynamic"
             and not moe_cls.capabilities.supports_per_layer_dynamic_eplb):
         raise ValueError(

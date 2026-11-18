@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
+import gc
 import os
 import unittest
 from collections.abc import Iterator
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,6 +15,11 @@ from mpi4py import MPI
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
+    EplbExpertRestore, FaultTolerantMoeLoadBalancer, create_spare_slot_storage,
+    spare_slot_bytes_to_back, use_spare_slot_storage)
+from tensorrt_llm._torch.moe.fused_moe.impl_blocks import (
+    MoEEplbWeightLayoutMixin, MoEWeightOwnerMixin)
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
     get_moe_load_balancer, maybe_create_moe_load_balancer,
@@ -44,8 +52,10 @@ class TestMoeLoadBalancer(unittest.TestCase):
         balancer = MoeLoadBalancer(ep_rank, ep_size, layer_updates_per_iter)
 
         # Verify
-        mock_load_balancer_impl.assert_called_once_with(ep_rank, ep_size,
-                                                        layer_updates_per_iter)
+        mock_load_balancer_impl.assert_called_once_with(ep_rank,
+                                                        ep_size,
+                                                        layer_updates_per_iter,
+                                                        fault_tolerance=False)
         self.assertEqual(balancer.ep_rank, ep_rank)
         self.assertEqual(balancer.ep_size, ep_size)
         self.assertEqual(balancer.layer_updates_per_iter,
@@ -166,7 +176,10 @@ class TestMoeLoadBalancer(unittest.TestCase):
                              104)
             self.assertEqual(get_moe_load_balancer(), balancer)
 
-        mock_load_balancer_impl.assert_called_once_with(0, 4, 2)
+        mock_load_balancer_impl.assert_called_once_with(0,
+                                                        4,
+                                                        2,
+                                                        fault_tolerance=False)
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_exception_in_context(self, mock_load_balancer_impl):
@@ -602,6 +615,439 @@ def test_shutdown_stops_cpp_before_closing_host_weights(
 
     assert balancer.shutdown()
     assert order == ["C++ shutdown", "host weights closed"]
+
+
+class _WeightLayout(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin,
+                    torch.nn.Module):
+    """A MoE weight owner whose quantization method creates no weights."""
+
+    def _get_quant_method(self):
+        return MagicMock()
+
+
+def _skip_without_gdrcopy_slots():
+    """Skip unless online EPLB's slots are GDRCopy mappings."""
+    from tensorrt_llm.bindings.internal import runtime
+
+    # A load balancer initializes host accessible device memory.
+    balancer = runtime.MoeLoadBalancer(0, 1, 0)
+    uses_gdrcopy = runtime.host_accessible_device_memory_uses_gdrcopy()
+    balancer.shutdown()
+    del balancer
+    if not uses_gdrcopy:
+        pytest.skip("host accessible EPLB slots are not GDRCopy mappings here")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("layer_updates_per_iter", [0, 1],
+                         ids=["static", "online"])
+def test_lost_expert_restored_into_spare_slot(monkeypatch,
+                                              layer_updates_per_iter):
+    """Restore rank 1's expert 3 into rank 0's spare slot, then release it on rejoin."""
+    if layer_updates_per_iter:
+        _skip_without_gdrcopy_slots()
+    monkeypatch.setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1")
+    # Two ranks on two nodes. Rank 0 gets three spare slots after EPLB's
+    # three, since rank 1's slots may hold three experts rank 0 does not.
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 1])
+    torch.cuda.set_device(0)
+    expert_count = 4
+    # Slots of 8 MiB (whole VMM chunks), of 3 MiB + 4 bytes (chunks shared
+    # with the neighbor slots) and of 4 bytes (a per-slot scale, whose spare
+    # slot fills no whole chunk, so it keeps its storage without spare slots).
+    slot_elements = {"w": 1 << 21, "s": (3 << 18) + 1, "alpha": 1}
+    mib = 1 << 20
+    # The one VMM chunk all unbacked pieces of the process map: released once no piece maps it.
+    scratch = 2 * mib
+    balancer = FaultTolerantMoeLoadBalancer(
+        0,
+        2,
+        layer_updates_per_iter,
+        shared_memory_base_name=f"test_restore_{os.getpid()}",
+        mapping=None)
+    try:
+        # Top-1: route() selects one expert per token.
+        layer = balancer.add_layer(expert_count, 1, 3)
+        assert layer.total_slot_count_per_rank == 6
+        assert layer.spare_slot_count == 3
+        slot_count = layer.total_slot_count_per_rank
+        assignments = layer.with_spare_slots([0, 1, 2, 3, 0, 1])
+        local_experts = assignments[:slot_count]
+        host = {
+            name: [torch.randn(elements) for _ in range(expert_count)]
+            for name, elements in slot_elements.items()
+        }
+        weights = {}
+        active = layer.active_slot_count_per_rank
+        for name, elements in slot_elements.items():
+            # As loaded: the active slots hold their experts, the spare slots nothing.
+            loaded = torch.stack(
+                [host[name][e] for e in local_experts[:active]] +
+                [torch.zeros(elements)] * (slot_count - active))
+            storage = create_spare_slot_storage(layer, name, loaded)
+            weights[name] = loaded.cuda() if storage is None else storage
+        for name in slot_elements:
+            for expert_id in range(expert_count):
+                layer.host_tensor_sharer.share_host_tensor_with_shape(
+                    expert_id, name, host[name][expert_id])
+            layer.add_to_migrate_weight_fn(use_spare_slot_storage,
+                                           (layer, weights[name], name))
+            for slot in range(layer.total_slot_count_per_rank):
+                if layer_updates_per_iter:
+                    layer.add_register_weight_fn(
+                        lambda slot=slot, name=name: layer.register_weight_slot(
+                            slot, name, weights[name][slot]), ())
+        layer.host_tensor_sharer.finalize_layer_weights()
+        layer.set_initial_weight_assignments(assignments)
+
+        def weight_owner():
+            # A MoE layer's weight owner, whose MoE ops take the tuner layout
+            # of its layer's spare slots.
+            owner = _WeightLayout()
+            owner.layer_load_balancer, owner.num_experts = layer, expert_count
+            owner.expert_size_per_partition = layer.total_slot_count_per_rank
+            owner.initial_local_expert_ids = local_experts
+            owner.create_weights()
+            owner.register_all_parameter_slot_and_to_fix_weight_fns({})
+            return owner
+
+        # The tactics are tuned on EPLB's three slots.
+        owner = weight_owner()
+        tuner_layout = {"tuner_num_local_experts": 3}
+        assert owner.tuner_layout_kwargs == tuner_layout
+        alpha_storage = weights["alpha"].data_ptr()
+        balancer.register_weight_slots_after_to_cuda()
+        balancer.finalize_model()
+        balancer.set_warm_up_iter_count(0)
+        assert {
+            name: id(tensor)
+            for name, tensor in layer.unbacked_slot_tensors.items()
+        } == {
+            "w": id(weights["w"]),
+            "s": id(weights["s"])
+        }
+        if not layer_updates_per_iter:
+            assert weights["alpha"].data_ptr() == alpha_storage
+
+        def route(experts, update=False):
+            """Route ``experts`` and return their slots, or update EPLB by them."""
+            selected = torch.tensor(experts, dtype=torch.int32,
+                                    device="cuda")[:, None]
+            slots = None
+            with MoeLoadBalancerIterContext(balancer, update, update):
+                layer.start_wait_gpu_stage()
+                layer.done_wait_gpu_stage()
+                if update:
+                    layer.update_statistic_with_global_ids(selected, True, True)
+                else:
+                    slots = layer.route(selected).flatten().tolist()
+                layer.start_set_cpu_stage()
+                layer.done_set_cpu_stage()
+            return slots
+
+        def assert_loaded(expert_ids):
+            for name in slot_elements:
+                for slot, expert_id in enumerate(expert_ids):
+                    assert torch.equal(weights[name][slot].cpu(),
+                                       host[name][expert_id]), (name, slot)
+
+        # Expert 3 is in rank 1's first slot.
+        assert set(route([3] * 8)) == {slot_count}
+
+        if layer_updates_per_iter:
+            # A rank failure stopped the forward before its MoE layer, so the
+            # EPLB worker still waits for the layer. A restore writes no slot.
+            with MoeLoadBalancerIterContext(balancer, True, True):
+                pass
+            early = balancer.expert_restore.plan_expert_restore(
+                [True, False], [layer.get_old_rank_expert_ids()])
+            spare = {name: weights[name][3].clone() for name in slot_elements}
+            with pytest.raises(RuntimeError,
+                               match="abandonIterations|iterations are queued"):
+                balancer.expert_restore.restore_lost_experts(early)
+            assert all(
+                torch.equal(weights[name][3], spare[name])
+                for name in slot_elements)
+        balancer.abandon_iterations()
+        plan = balancer.expert_restore.plan_expert_restore(
+            [True, False], [layer.get_old_rank_expert_ids()])
+        # Backing spare slot 3 maps its four whole "w" chunks and the two "s"
+        # chunks holding its bytes, one shared with spare slot 4. Spare slots 4
+        # and 5 stay unbacked.
+        assert plan.device_bytes == 8 * mib + 4 * mib
+        free = torch.cuda.mem_get_info()[0]
+        assert balancer.expert_restore.restore_lost_experts(
+            plan) == plan.device_bytes
+        assert free - torch.cuda.mem_get_info(
+        )[0] >= plan.device_bytes - scratch
+        # Only spare slot 3 is backed: backing it again maps nothing, backing slot 4 or 5 would.
+        assert spare_slot_bytes_to_back(layer, [3]) == 0
+        assert all(
+            spare_slot_bytes_to_back(layer, [slot]) > 0 for slot in (4, 5))
+        assert layer.get_old_rank_expert_ids()[0] == [0, 1, 2, 3, -1, -1]
+        assert_loaded(range(4))
+        assert set(route([3] * 8)) == {3}
+        assert route([0, 1, 2]) == [0, 1, 2]
+        # A restore moves experts, never the tuner layout the tactics were tuned with.
+        assert owner.tuner_layout_kwargs == tuner_layout
+        assert weight_owner().tuner_layout_kwargs == tuner_layout
+
+        if layer_updates_per_iter:
+            # Online EPLB balances over the restored spare slot as over the
+            # others. By load, experts 3, 0, 1 and 2 go to slots 0 to 3, so
+            # only the spare slot holds expert 2.
+            route([3] * 4 + [0] * 3 + [1] * 2, update=True)
+        balancer.abandon_iterations()
+        if layer_updates_per_iter:
+            assert layer.get_old_rank_expert_ids()[0] == [3, 0, 1, 2, -1, -1]
+        rejoin = balancer.expert_restore.plan_expert_restore(
+            [True, True], [layer.get_old_rank_expert_ids()],
+            rejoining=[False, True])
+        assert rejoin.device_bytes == 0
+        assert balancer.expert_restore.restore_lost_experts(rejoin) == 0
+        free = torch.cuda.mem_get_info()[0]
+        assert balancer.expert_restore.release_empty_spare_slots(
+        ) == plan.device_bytes
+        assert torch.cuda.mem_get_info(
+        )[0] - free >= plan.device_bytes - scratch
+        # No spare slot is backed.
+        assert all(
+            spare_slot_bytes_to_back(layer, [slot]) > 0
+            for slot in layer.spare_slots)
+        # The initial placement again: rank 0's active slots are loaded with their experts of it.
+        expected = [[0, 1, 2, -1, -1, -1], [3, 0, 1, -1, -1, -1]]
+        assert layer.get_old_rank_expert_ids() == expected
+        assert_loaded(range(3))
+        # The expert in rank 1's first slot has no other replica.
+        assert set(route([expected[1][0]] * 8)) == {slot_count}
+
+        if layer_updates_per_iter:
+            # The next iteration updates again, over the active slots of both
+            # ranks only. Expert 3 gets three replicas, then the experts go to
+            # the least loaded rank by load per replica: 2, 3, 3, 3, 1, 0.
+            route([3] * 10 + [2] * 4 + [1] * 2 + [0], update=True)
+            # The next forward waits for the update and routes by its placement.
+            assert route([2, 0, 1]) == [0, 2, slot_count + 2]
+            assert set(route([3] * 8)) <= {1, slot_count, slot_count + 1}
+            assert layer.get_old_rank_expert_ids() == [[2, 3, 0, -1, -1, -1],
+                                                       [3, 3, 1, -1, -1, -1]]
+            assert_loaded([2, 3, 0])
+    finally:
+        balancer.shutdown()
+
+
+_EXPERTS, _HIDDEN, _INTERMEDIATE = 4, 2048, 2048
+
+
+def _vmm_granularity() -> int:
+    """The VMM granularity of the unbacked slot memory on the current device."""
+    from cuda.bindings import driver
+
+    prop = driver.CUmemAllocationProp()
+    prop.type = driver.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = torch.cuda.current_device()
+    error, granularity = driver.cuMemGetAllocationGranularity(
+        prop, driver.CUmemAllocationGranularity_flags.
+        CU_MEM_ALLOC_GRANULARITY_MINIMUM)
+    assert error == driver.CUresult.CUDA_SUCCESS
+    return granularity
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_unbacked_slots_back_and_unback():
+    """Back a spare slot in place and unback it, taking device memory only while it is backed."""
+    from tensorrt_llm.bindings import MemoryCounters
+
+    torch.cuda.set_device(0)
+    chunk = _vmm_granularity()
+    counters = MemoryCounters.instance()
+    before = counters.gpu
+    # Four slots of one VMM chunk each, of which slots 2 and 3 are spare.
+    slots = torch.ops.trtllm.moe_unbacked_slot_tensor([4, chunk], torch.uint8,
+                                                      [2, 3])
+    address = slots.data_ptr()
+    # The two backed slots and at most the scratch chunk the spare slots share.
+    assert counters.gpu - before <= 3 * chunk
+    assert torch.ops.trtllm.moe_unbacked_slots_bytes_to_back(slots,
+                                                             [2]) == chunk
+    assert torch.ops.trtllm.moe_unbacked_slots_set_backed([slots], [2], [1],
+                                                          True) == chunk
+    assert slots.data_ptr() == address
+    slots[2].fill_(7)
+    slots[3].fill_(1)
+    assert bool(slots[2].eq(7).all())
+    backed = counters.gpu
+    assert torch.ops.trtllm.moe_unbacked_slots_set_backed([slots], [2], [1],
+                                                          False) == chunk
+    assert backed - counters.gpu == chunk
+    del slots
+    assert counters.gpu == before
+
+
+def _load_moe_layer(monkeypatch, fault_tolerance: bool,
+                    meta_init: bool) -> dict:
+    """Load one Cutlass BF16 MoE layer as the model loader does and measure its memory.
+
+    The memory counts the caching allocator's allocations and the unbacked slot
+    memory that VMM maps outside it.
+    """
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+    from tensorrt_llm._torch.moe.fused_moe import (RenormalizeMoeRoutingMethod,
+                                                   create_moe)
+    from tensorrt_llm.bindings import MemoryCounters
+
+    # Two ranks on two nodes. With fault tolerance, rank 0 alone must hold the
+    # four experts, two slots more than EPLB's two.
+    monkeypatch.setattr(EplbExpertRestore, "_rank_nodes", lambda self: [0, 1])
+    eplb_config = MoeLoadBalancerConfig(num_slots=_EXPERTS,
+                                        layer_updates_per_iter=0)
+    eplb_config.setup(ep_rank=0, ep_size=2)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = _EXPERTS
+    pretrained_config.hidden_size = _HIDDEN
+    pretrained_config.intermediate_size = _INTERMEDIATE
+    pretrained_config.torch_dtype = torch.bfloat16
+    model_config = ModelConfig(pretrained_config=pretrained_config,
+                               mapping=Mapping(world_size=2,
+                                               rank=0,
+                                               tp_size=2,
+                                               moe_ep_size=2,
+                                               enable_attention_dp=True),
+                               moe_backend="CUTLASS",
+                               moe_load_balancer=eplb_config)
+    shapes = {
+        "w1": (_INTERMEDIATE, _HIDDEN),
+        "w3": (_INTERMEDIATE, _HIDDEN),
+        "w2": (_HIDDEN, _INTERMEDIATE)
+    }
+    weights = {
+        f"{expert_id}.{name}.weight":
+        torch.full(shape, expert_id + 1.0, dtype=torch.bfloat16)
+        for expert_id in range(_EXPERTS)
+        for name, shape in shapes.items()
+    }
+    counters = MemoryCounters.instance()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    allocated = torch.cuda.memory_allocated()
+    unbacked_before = counters.gpu
+    balancer_cls = MoeLoadBalancer
+    if fault_tolerance:
+        balancer_cls = functools.partial(FaultTolerantMoeLoadBalancer,
+                                         mapping=None)
+    balancer = balancer_cls(
+        0, 2, 0, shared_memory_base_name=f"test_load_memory_{os.getpid()}")
+    try:
+        with balancer, MetaInitMode() if meta_init else nullcontext():
+            moe = create_moe(
+                routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+                model_config=model_config,
+                layer_idx=0,
+                communication_method="ALLGATHER")
+        # The model loader puts the model on the device before it loads the weights.
+        moe._apply(lambda t: torch.empty_like(t, device="cuda")
+                   if t.device.type == "meta" else t)
+        moe.to("cuda")
+        moe.load_weights([weights])
+        moe.post_load_weights()
+        balancer.register_weight_slots_after_to_cuda()
+        balancer.finalize_model()
+        torch.cuda.synchronize()
+        unbacked = counters.gpu - unbacked_before
+        peak = torch.cuda.max_memory_allocated() - allocated + unbacked
+        (layer, ) = balancer.single_layer_load_balancers
+        return {
+            "peak": peak,
+            "after": torch.cuda.memory_allocated() - allocated + unbacked,
+            "unbacked": sorted(layer.unbacked_slot_tensors),
+            "loaded": list(moe.backend.initial_local_expert_ids),
+            "w2": moe.backend.w2_weight[:2].float().mean(dim=(1, 2)).tolist(),
+        }
+    finally:
+        balancer.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("meta_init", [True, False],
+                         ids=["meta_init", "regular_init"])
+def test_spare_slots_unbacked_while_loading(monkeypatch, meta_init):
+    """Load a layer in the device memory it takes without fault tolerance."""
+    torch.cuda.set_device(0)
+    # The first load also makes what a process allocates once.
+    _load_moe_layer(monkeypatch, fault_tolerance=False, meta_init=meta_init)
+    gc.collect()
+    with_spares = _load_moe_layer(monkeypatch,
+                                  fault_tolerance=True,
+                                  meta_init=meta_init)
+    gc.collect()
+    without = _load_moe_layer(monkeypatch,
+                              fault_tolerance=False,
+                              meta_init=meta_init)
+    # Rank 0 loads its two experts; its two spare slots stay empty.
+    assert with_spares["loaded"] == without["loaded"] == [0, 1]
+    assert with_spares["w2"] == without["w2"] == [1.0, 2.0]
+    assert with_spares["unbacked"] == ["w2_weight", "w3_w1_weight"]
+    assert without["unbacked"] == []
+    tolerance = (len(with_spares["unbacked"]) + 1) * _vmm_granularity()
+    # Two spare slots of w3_w1 and w2 in bfloat16, which loading took before.
+    assert 2 * 3 * _HIDDEN * _INTERMEDIATE * 2 > 4 * tolerance
+    for key in ("peak", "after"):
+        assert abs(with_spares[key] -
+                   without[key]) <= tolerance, (key, with_spares[key],
+                                                without[key])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("fault_tolerance, slot_memory", [
+    (False, "device"),
+    (True, "device"),
+    (True, "backed"),
+    (True, "unbacked_device"),
+    (True, "unbacked"),
+])
+def test_cpu_copied_slot_outside_host_accessible_memory(fault_tolerance,
+                                                        slot_memory):
+    """Reject a CPU-copied slot outside host accessible memory at finalize."""
+    from tensorrt_llm.bindings.internal import runtime
+
+    if slot_memory == "unbacked":
+        _skip_without_gdrcopy_slots()
+    torch.cuda.set_device(0)
+    host = torch.ones(16, dtype=torch.uint8)
+
+    def weight(t: torch.Tensor) -> runtime.MoeWeight:
+        moe_weight = runtime.MoeWeight()
+        moe_weight.weight_ptr = t.data_ptr()
+        moe_weight.height, moe_weight.width, moe_weight.pitch = 1, 16, 16
+        return moe_weight
+
+    # The load balancer initializes host accessible device memory first.
+    balancer = runtime.MoeLoadBalancer(0, 1, 1, fault_tolerance=fault_tolerance)
+    storage = None
+    try:
+        if slot_memory == "device":
+            slot = torch.zeros(16, dtype=torch.uint8, device="cuda")
+        else:
+            # Slots larger than the mapping granularity, so slot 1 maps no
+            # memory.
+            storage = torch.ops.trtllm.moe_unbacked_slot_tensor(
+                [2, 4 << 20], torch.uint8, [1], slot_memory == "unbacked")
+            slot = storage[0 if slot_memory == "backed" else 1]
+        layer = balancer.add_layer(1, 1, 1)
+        layer.add_single_host_weight(0, "w", weight(host))
+        layer.add_single_weight_slot(0, "w", weight(slot))
+        layer.set_initial_weight_assignments([0])
+        if slot_memory == "unbacked":
+            balancer.finalize_model()
+        else:
+            with pytest.raises(RuntimeError,
+                               match="slotId=0, name=w not added"):
+                balancer.finalize_model()
+    finally:
+        # Release the slots while host accessible device memory is set up.
+        slot = storage = None
+        balancer.shutdown()
 
 
 if __name__ == '__main__':

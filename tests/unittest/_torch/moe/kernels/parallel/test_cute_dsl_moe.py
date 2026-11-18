@@ -246,6 +246,30 @@ def test_grouped_gemm_inputs_helper_fixed_expert_capacity(tile_size: int):
         helper.get_expert_capacity_num_permuted_tokens(0)
 
 
+@pytest.mark.cpu_only
+def test_inputs_helper_tunes_only_active_slots():
+    """Tune rank 1's four active slots as without spare slots, and pad rows for all six slots."""
+    num_tokens, tile_size = 256, 128
+    helper = GroupedGemmInputsHelper(
+        num_experts=12,
+        top_k=4,
+        num_local_experts=6,
+        local_expert_offset=6,
+        tile_size=tile_size,
+        tuner_num_local_experts=4,
+    )
+    without_spare_slots = GroupedGemmInputsHelper(
+        num_experts=8, top_k=4, num_local_experts=4, local_expert_offset=4, tile_size=tile_size
+    )
+
+    def tuning_routing(h: GroupedGemmInputsHelper) -> torch.Tensor:
+        num_tokens_per_expert = h.generate_num_tokens_per_expert(num_tokens, approx_max_load=True)
+        return h.generate_token_selected_experts(num_tokens, num_tokens_per_expert)
+
+    assert torch.equal(tuning_routing(helper), tuning_routing(without_spare_slots))
+    assert helper.get_expert_capacity_num_permuted_tokens(tile_size) == 6 * tile_size
+
+
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
