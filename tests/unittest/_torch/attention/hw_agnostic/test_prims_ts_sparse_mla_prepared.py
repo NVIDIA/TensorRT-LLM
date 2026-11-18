@@ -62,8 +62,7 @@ def test_prepared_sparse_mla_matches_full_launch_abi(extra_pool: bool, has_works
         output_scale: float,
         output_quant_args: tuple | None,
         max_q_len: int,
-        softmax_stats: torch.Tensor | None,
-        kv_bounds: torch.Tensor | None,
+        cp_rank: int,
     ) -> None:
         # The exported TVM-FFI callable has no Python defaults for these slots.
         calls.append(
@@ -84,8 +83,7 @@ def test_prepared_sparse_mla_matches_full_launch_abi(extra_pool: bool, has_works
                 output_scale,
                 output_quant_args,
                 max_q_len,
-                softmax_stats,
-                kv_bounds,
+                cp_rank,
             )
         )
 
@@ -122,7 +120,7 @@ def test_prepared_sparse_mla_matches_full_launch_abi(extra_pool: bool, has_works
         is out
     )
     assert len(calls) == 1
-    assert calls[0][-4:] == (None, 1, None, None)
+    assert calls[0][-3:] == (None, 1, 0)
 
     runtime = mla_decode._MLARuntime(
         query=query,

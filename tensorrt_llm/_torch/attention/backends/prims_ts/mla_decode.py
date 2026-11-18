@@ -3823,8 +3823,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             bmm2,
             None,
             1,
-            None,
-            None,
+            0,
         )
         return out
 

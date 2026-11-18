@@ -32,7 +32,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import binding_to_torch_dtype, get_sm_version
+from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
@@ -511,13 +511,14 @@ class PrimsTSFmha(PhasedFmha):
 
         if q.dtype not in self.SUPPORTED_DTYPES:
             return False, f"query dtype {q.dtype} is unsupported."
-        cache_dtype = binding_to_torch_dtype(meta.kv_cache_manager.dtype)
-        if is_fp8_kv and cache_dtype != torch.float8_e4m3fn:
-            return False, "FP8 attention requires an FP8 E4M3 KV cache."
+        cache_dtype = meta.kv_cache_manager.dtype
+        expected_dtype = torch.float8_e4m3fn if is_fp8_kv else q.dtype
+        if cache_dtype != torch_dtype_to_binding(expected_dtype):
+            if is_fp8_kv:
+                return False, "FP8 attention requires an FP8 E4M3 KV cache."
+            return False, f"query and KV-cache dtypes must match, got {q.dtype} and {cache_dtype}."
         if is_fp8_mla and getattr(meta.kv_cache_manager, "mla_kv_cache_residual_dim", 0):
             return False, "FP8 MLA requires a full FP8 KV cache without a high-precision residual."
-        if not is_fp8_kv and cache_dtype != q.dtype:
-            return False, f"query and KV-cache dtypes must match, got {q.dtype} and {cache_dtype}."
         if output.dtype != q.dtype:
             return False, f"output dtype must match query dtype, got {output.dtype} and {q.dtype}."
 
