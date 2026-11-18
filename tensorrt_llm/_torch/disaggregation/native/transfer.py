@@ -1615,6 +1615,11 @@ class Sender(SenderBase):
                     task.fail(error)
             except _TransferNotSubmittedError as error:
                 # Backend admission failed, so local resources are safe to retire.
+                logger.error(
+                    "KV transfer rejected before backend submission: "
+                    f"unique_rid={write_meta.unique_rid} slice={write_meta.slice_id} "
+                    f"peer_rank={write_meta.peer_rank}: {error}; cause={error.__cause__}"
+                )
                 agent_result = AgentResult.FAILED
                 task.fail(error)
         elif owned:
@@ -1749,6 +1754,11 @@ class Sender(SenderBase):
                     agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
                     session.set_exception(f"aux transfer agent request failed: {last_status}")
             except _TransferNotSubmittedError as error:
+                logger.error(
+                    "Aux transfer rejected before backend submission: "
+                    f"unique_rid={write_meta.unique_rid} peer_rank={write_meta.peer_rank}: "
+                    f"{error}; cause={error.__cause__}"
+                )
                 agent_result = AgentResult.FAILED
                 aux_task.fail(error)
             if timer:
