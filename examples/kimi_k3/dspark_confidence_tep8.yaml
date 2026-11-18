@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kimi K3 TEP8 (TP8 attention, EP8 MoE; 8 GPUs on two GB300 nodes) with a
+# standalone DSpark drafter and confidence scheduling. The keys outside
+# speculative_config follow the TEP8 recipe of perf_sweep/perf_sweep.sbatch;
+# see "DSpark confidence scheduling" in README.md for the cost table.
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+enable_attention_dp: false
+max_batch_size: 16
+max_num_tokens: 8192
+max_seq_len: 8192
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 16
+  # Confidence scheduling runs on the captured decode graphs, and the cost
+  # table needs a row for every batch size listed here.
+  batch_sizes: [1, 2, 4, 8, 16]
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64
+speculative_config:
+  decoding_type: DSpark
+  # A standalone DSpark drafter checkpoint with a confidence head.
+  speculative_model: /path/to/kimi-k3-dspark-drafter
+  max_draft_len: 7
+  # Verify fewer draft tokens for the requests whose drafts are unlikely to
+  # be accepted, on the steps where the cost table predicts a faster step.
+  enable_confidence_scheduling: true
+  confidence_cost_table_path: /path/to/kimi-k3-dspark-costs.json

@@ -218,6 +218,84 @@ server with `examples/kimi_k3/disagg/gen_config.yaml`, and see
 The configuration restrictions that apply to SA are listed under "Current
 limitations" below.
 
+## DSpark confidence scheduling (prototype)
+
+Kimi K3 can run with a standalone DSpark drafter, for example
+[Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark),
+which proposes a block of `max_draft_len` tokens per step for the target to
+verify. With confidence scheduling, decode-only steps may verify fewer of
+the drafted tokens, chosen by the drafter's confidence head and a cost table
+of measured step times. The feature, its options and the cost table are
+described in the DeepSeek-V4
+[DSpark confidence scheduling](../models/core/deepseek_v4/README.md#dspark-confidence-scheduling-prototype)
+section. It is off by default; this section covers what is specific to
+Kimi K3.
+
+### Enable it
+
+Set the drafter and the confidence fields in the extra LLM API options:
+
+```yaml
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1, 2, 4, 8, 16]   # the cost table must cover every entry
+speculative_config:
+  decoding_type: DSpark
+  speculative_model: /path/to/kimi-k3-dspark-drafter
+  max_draft_len: 7
+  enable_confidence_scheduling: true
+  confidence_cost_table_path: /path/to/kimi-k3-dspark-costs.json
+```
+
+The drafter checkpoint must include a confidence head.
+`dspark_confidence_tep8.yaml` is a complete TEP8 configuration.
+
+### Get a cost table
+
+Generate the table on the nodes and with the configuration you serve with.
+Kimi K3 is launched through `trtllm-llmapi-launch`, so run the profiling
+tool the same way: use the `srun` command of the
+[deployment guide](../../docs/source/deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.md#launch-the-tensorrt-llm-server)
+with one task per GPU (`-N 2 --ntasks 8` for TEP8), add the drafter, the
+output directory and the work directory to `--container-mounts`, and replace
+the `trtllm-serve` command:
+
+```bash
+exec ${REPO}/tensorrt_llm/llmapi/trtllm-llmapi-launch \
+    python -m tensorrt_llm.tools.dspark_profile_costs \
+        --model ${MODEL} --config ${EXTRA_LLM_API_FILE} --k 7 \
+        --tier-fractions 0.29 0.43 0.57 0.71 \
+        --output /path/to/kimi-k3-dspark-costs.json \
+        --workdir /path/to/profile-workdir
+```
+
+Every rank reads `--workdir` and the cost table, so both have to be on the
+shared filesystem.
+
+`--tier-fractions` sets the budgets the table measures, as the average
+fraction of the `K` drafted tokens verified per request: 2, 3, 4 and 5 of 7
+here. The defaults start at half of the block, and a TEP8 table measured
+with them gave no gain over the best fixed draft length.
+
+Profile and serve in the same environment. The TEP8 recipe in
+`perf_sweep/perf_sweep.sbatch` exports
+`TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1`, and a table measured without it
+does not describe the step times of a server that runs with it.
+
+### Results and limitations
+
+On GB300 with the MXFP4 checkpoint, confidence scheduling raised output
+throughput over the best fixed draft length by 1.8% to 5.2% for TEP8 at
+concurrency 16, and by 3.2% to 4.3% for DEP16 at concurrency 512
+(`trtllm-bench`, Arena-Hard prompts). GSM8K accuracy matched the fixed draft
+length within noise. No gain was measured for TEP8 at 8 or fewer concurrent
+requests, or for TEP16.
+
+Confidence scheduling is validated for TEP8 and DEP16 on GB300. The
+limitations of the DeepSeek-V4 section apply. In addition, an NVFP4 or
+mixed-precision KV cache is rejected when confidence scheduling is enabled
+for Kimi K3.
+
 ## Current limitations
 
 - Pipeline parallelism is not supported.
