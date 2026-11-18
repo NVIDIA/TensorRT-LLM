@@ -323,6 +323,38 @@ def test_mxfp8_single_projection_refit_after_finalize_matches_fresh_load(leaf, b
 
 
 @requires_mxfp8_moe
+def test_mxfp8_cutedsl_whole_fc1_refit_skips_layout_round_trips(monkeypatch):
+    """When w1 and w3 arrive together they overwrite the whole slot, so a refit
+    must not first return finalized slots to the plain layout, and the scale
+    interleave must ride on the raw bytes ahead of the single swizzle rather
+    than unswizzle and swizzle each slot again. The result still has to match
+    a fresh load."""
+    torch.manual_seed(20260821)
+    weights_a = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(1))
+    weights_b = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(2))
+    expected = _fresh_load(_make_module("CUTEDSL"), weights_b)
+
+    module = _make_module("CUTEDSL")
+    refit_moe_in_buckets(module, [weights_a])
+
+    quant_method = _backend(module).quant_method
+    assert isinstance(quant_method, MXFP8CuteDslFusedMoEMethod)
+    calls = []
+    for name in ("_deinterleave_w3_w1_weight", "_permute_w3_w1_weight_scale_rows"):
+        # Bound on the instance, so the shadowing wrapper takes no self.
+        original = getattr(quant_method, name)
+
+        def counted(*args, _name=name, _original=original, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(quant_method, name, counted)
+    refit_moe_in_buckets(module, [_split(weights_b, {"w1", "w3"}), _split(weights_b, {"w2"})])
+    assert not calls, f"whole-FC1 refit ran per-slot layout round trips: {sorted(set(calls))}"
+    _assert_matches(module, expected, "whole-FC1 refit after finalize")
+
+
+@requires_mxfp8_moe
 def test_mxfp8_cutedsl_layout_is_single_interleave_of_cutlass_layout():
     """The CuTe DSL storage must be exactly one gate/up interleave (granularity
     64 along the expanded intermediate dim) of the Cutlass storage, for the
