@@ -355,9 +355,9 @@ COSMOS3_DEFAULTS: dict[str, Any] = {
             "fps": 10,
             "num_video_frames_per_chunk": 101,
         },
-        # Two or more controls: the reference runs its general (edge-family) values
-        # rather than combining the controls' rows.
-        "mixed": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
+        # Two or more controls: the controls' rows are not combined. Text guidance is
+        # the Nano/Super video value and control guidance is neutral.
+        "mixed": {"guidance_scale": 6.0, "control_guidance": 1.0, "flow_shift": 10.0},
     },
 }
 

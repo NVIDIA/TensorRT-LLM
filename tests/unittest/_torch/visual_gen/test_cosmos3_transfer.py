@@ -306,9 +306,9 @@ class TestTransferConfig:
         assert cfg.control_guidance == mixed["control_guidance"]
         assert transfer_module.transfer_defaults(cfg.hints) is mixed
         explicit = resolve_transfer_config(
-            {**extra, "control_guidance": 2.5}, _req(guidance_scale=6.0)
+            {**extra, "control_guidance": 2.5}, _req(guidance_scale=4.0)
         )
-        assert (explicit.guidance_scale, explicit.control_guidance) == (6.0, 2.5)
+        assert (explicit.guidance_scale, explicit.control_guidance) == (4.0, 2.5)
 
     def test_control_directive_is_appended_by_default(self):
         """Reference parity: cosmos-framework names the active control modality
