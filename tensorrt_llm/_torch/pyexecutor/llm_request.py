@@ -934,6 +934,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
         self.py_kv_transfer_outcome: str | None = None
+        # Set once a received generation request's first token is found not
+        # to end it, so the executor does not recheck it while it waits.
+        self.py_first_token_checked = False
         # Prevent recreation after a send session drops peer registration.
         self.py_kv_send_session_retired = False
 
@@ -996,6 +999,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Prompt tokens beyond the conversation's previous turn, set by the
         # conversation-aware attention-DP router; None when not estimated.
         self.py_uncached_prefill_tokens: int | None = None
+        # Set once the V2 scheduler has checked that estimate against the prefix cache.
+        self.py_uncached_prefill_probed = False
         self.py_original_end_id = self.py_end_id
         self.py_bad_words = None
         self.py_no_repeat_ngram_size = None
@@ -1166,6 +1171,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self._initialize_execution_state(seq_slot=None,
                                          orig_prompt_len=self.prompt_len,
                                          clear_draft_tokens=True)
+        # The replay prefills against the prefix cache as it is now.
+        self.py_uncached_prefill_probed = False
 
     @property
     def is_generation_only_request(self):

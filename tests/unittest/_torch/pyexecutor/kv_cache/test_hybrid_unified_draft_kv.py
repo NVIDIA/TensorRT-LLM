@@ -27,14 +27,16 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import common as mamba_common
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import mamba_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
     _insert_draft_pool_ratio,
 )
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.mode import QuantMode
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -181,6 +183,54 @@ def test_hybrid_cache_size_per_token_adds_the_draft_layer_bytes(monkeypatch):
         assert "shared_draft_block_width" not in kwargs
 
 
+@pytest.mark.parametrize(
+    ("target_attention_bytes", "expected_scratch_bytes"),
+    # Kimi K3 c383: context server 9072 + 2880 = 11952 B per token, generation
+    # server 15408 + 2880 = 18288 B per token.
+    [(9072, 1147392), (15408, 1755648)],
+    ids=["c383_ctx", "c383_gen"],
+)
+def test_hybrid_cache_size_reserves_the_draft_scratch_of_every_request(
+    monkeypatch, target_attention_bytes, expected_scratch_bytes
+):
+    """Each of max_batch_size requests holds max_draft_len + 1 tokens beyond
+    its history in the target's attention layers and the draft layers."""
+    monkeypatch.setattr(
+        mamba_common.KVCacheManager,
+        "get_cache_size_per_token",
+        lambda *args, **kwargs: target_attention_bytes,
+    )
+    monkeypatch.setattr(
+        mamba_common,
+        "_get_local_mamba_cache_layout",
+        lambda *args, **kwargs: (
+            SimpleNamespace(get_states_bytes_per_layer=lambda mapping: 1 << 20),
+            3,
+            1,
+        ),
+    )
+    max_batch_size, max_draft_len = 16, 5
+    specs = tuple(_draft_spec(_NUM_TARGET_LAYERS + i) for i in range(5))
+    common = dict(
+        max_batch_size=max_batch_size,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        tokens_per_block=128,
+        spec_config=MTPDecodingConfig(max_draft_len=max_draft_len),
+    )
+
+    without_draft = MambaHybridCacheManagerV2.get_cache_size_per_token(
+        object(), Mapping(), **common
+    )
+    with_draft = MambaHybridCacheManagerV2.get_cache_size_per_token(
+        object(), Mapping(), layer_specs=specs, shared_draft_block_width=5, **common
+    )
+
+    bytes_per_token = with_draft[0]
+    assert bytes_per_token == target_attention_bytes + 5 * 576
+    assert expected_scratch_bytes == max_batch_size * (max_draft_len + 1) * bytes_per_token
+    assert with_draft[1] - without_draft[1] == expected_scratch_bytes
+
+
 def test_plain_target_still_gets_target_and_draft_specs():
     creator = _creator(manager_cls=KVCacheManagerV2)
     specs = creator._build_unified_dflash_layer_specs(SimpleNamespace(max_attention_window=[4096]))
@@ -191,6 +241,63 @@ def test_plain_target_still_gets_target_and_draft_specs():
         == [KVCacheLayerOwner.TARGET] * _NUM_TARGET_LAYERS
         + [KVCacheLayerOwner.DRAFT] * _NUM_DRAFT_LAYERS
     )
+
+
+def _declaring_creator(draft_kv_dtype):
+    """A creator whose drafter config inherits the target's NVFP4 KV algo."""
+    creator = _creator()
+    del creator._get_draft_kv_model_config  # the real resolution
+    creator._draft_config = SimpleNamespace(
+        pretrained_config=creator._draft_config.pretrained_config,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
+    )
+    if draft_kv_dtype is not None:
+        creator._model_engine.model.draft_model.draft_kv_dtype = draft_kv_dtype
+    return creator
+
+
+@pytest.mark.parametrize(
+    ("draft_kv_dtype", "expected"),
+    [(torch.float8_e4m3fn, DataType.FP8), (None, DataType.BF16), (torch.bfloat16, DataType.BF16)],
+)
+def test_drafter_declared_kv_dtype_sets_the_draft_pool_dtype(draft_kv_dtype, expected):
+    """The drafter's draft_kv_dtype wins over the KV algo the target stamps on
+    its config; without a declaration the pool keeps the drafter's weights dtype."""
+    creator = _declaring_creator(draft_kv_dtype)
+
+    config = creator._get_draft_kv_model_config()
+
+    assert creator._layer_spec_dtype(config, torch.bfloat16) == expected
+    # The loaded drafter's own config is not modified.
+    assert creator._draft_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+    specs = creator._build_unified_dflash_layer_specs(SimpleNamespace(max_attention_window=None))
+    assert {spec.dtype for spec in specs} == {expected}
+    # One MLA latent row per token and layer: 576 bytes in FP8.
+    assert {(spec.num_kv_heads, spec.head_dim, tuple(spec.buffer_roles)) for spec in specs} == {
+        (1, 576, (Role.KEY,))
+    }
+
+
+def test_unsupported_declared_draft_kv_dtype_is_rejected():
+    creator = _declaring_creator(torch.float32)
+
+    with pytest.raises(ValueError, match="Unsupported draft_kv_dtype"):
+        creator._get_draft_kv_model_config()
+
+
+def test_declared_draft_kv_dtype_other_than_the_weights_dtype_is_rejected():
+    """An unquantized draft pool is stored in the drafter's weights dtype (bf16 here)."""
+    creator = _declaring_creator(torch.float16)
+
+    with pytest.raises(ValueError, match="weights dtype"):
+        creator._get_draft_kv_model_config()
+
+
+def test_declared_draft_kv_dtype_must_be_a_torch_dtype():
+    creator = _declaring_creator("fp8")
+
+    with pytest.raises(ValueError, match="must be a torch.dtype"):
+        creator._get_draft_kv_model_config()
 
 
 def test_k3_like_drafter_shares_the_hybrid_manager_in_disagg():

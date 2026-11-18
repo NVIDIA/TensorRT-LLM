@@ -8,5 +8,6 @@ trtllm-serve
    kv-cache-metrics
    trtllm-serve
    render-endpoints
+   performance-metrics-collection
    run-benchmark-with-trtllm-serve
    prometheus-metrics

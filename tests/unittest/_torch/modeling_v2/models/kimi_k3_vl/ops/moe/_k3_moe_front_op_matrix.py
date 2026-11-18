@@ -370,7 +370,7 @@ def check_workspace_is_armed_and_sized() -> None:
     Flags and ready words zero; the front supports this W at the certified widths (checked at setup); the two
     K3MoeStates are the plain and the head_flags build.
     """
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
         k3_route_quant_ag as layout,
     )
 
@@ -726,9 +726,7 @@ def check_create_and_first_compile_refuse_capture() -> None:
     raises RuntimeError under capture before any launch. The workspace keeps its bits and the next call returns the
     bits of the same call made alone.
     """
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
-        mnnvl_workspace,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import mnnvl_workspace
 
     nxt = Call(7500, 4, layer=1, kind="front")
     want = alone_results([nxt], WS_A, "before the capture refusals")[0]
@@ -946,12 +944,8 @@ def _run_one_rank(args) -> int:
         "k3_moe_front and k3_moe need sm_100"
     )
     import tensorrt_llm._torch.custom_ops  # noqa: F401 -- registers the stock path's ops
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe import (
-        k3_moe as moe,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe import (
-        k3_moe_front as front,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe import k3_moe as moe
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe import k3_moe_front as front
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
     from _validating import validating

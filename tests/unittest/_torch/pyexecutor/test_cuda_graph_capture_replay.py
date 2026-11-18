@@ -36,6 +36,7 @@ import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as cuda_graph_runner_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -656,19 +657,24 @@ class TestStrictBufferCheckEnvVar:
 class _AttnMetadataStub:
     """Stand-in for create_cuda_graph_metadata(); returns a copy with is_cuda_graph=True."""
 
-    def __init__(self, is_cuda_graph: bool = False):
+    def __init__(self, is_cuda_graph: bool = False) -> None:
         self.is_cuda_graph = is_cuda_graph
+        self.forward_scratch_buffers: Buffers | None = None
 
     def create_cuda_graph_metadata(
         self,
-        max_batch_size,
-        sub_cross_metadata=False,
-        max_draft_tokens=0,
-        buffers=None,
-        encode_only=False,
-    ):
+        max_batch_size: int,
+        sub_cross_metadata: bool = False,
+        max_draft_tokens: int = 0,
+        buffers: Buffers | None = None,
+        encode_only: bool = False,
+        *,
+        forward_scratch_buffers: Buffers | None = None,
+    ) -> "_AttnMetadataStub":
         del max_batch_size, sub_cross_metadata, max_draft_tokens, buffers, encode_only
-        return _AttnMetadataStub(is_cuda_graph=True)
+        metadata = _AttnMetadataStub(is_cuda_graph=True)
+        metadata.forward_scratch_buffers = forward_scratch_buffers
+        return metadata
 
 
 def _make_generation_only_batch(req_id: int = 1) -> ScheduledRequests:
@@ -698,7 +704,7 @@ class TestCaptureAllowedGate:
 
         assert result == (None, None, None)
 
-    def test_maybe_get_cuda_graph_prepares_capture_inside_allow_capture(self):
+    def test_maybe_get_cuda_graph_prepares_capture_inside_allow_capture(self) -> None:
         """The same key inside allow_capture() returns graph metadata and a key."""
         runner = create_mock_cuda_graph_runner(batch_size=1)
         batch = _make_generation_only_batch()
@@ -710,6 +716,7 @@ class TestCaptureAllowedGate:
 
         assert key is not None
         assert attn_metadata is not None and attn_metadata.is_cuda_graph
+        assert attn_metadata.forward_scratch_buffers is runner.forward_scratch_buffers
         assert spec_metadata is None
 
     def test_allow_capture_resets_flag_on_exception(self):

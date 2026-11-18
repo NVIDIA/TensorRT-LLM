@@ -16,12 +16,17 @@
 """Report and diff helpers used by the Pyrefly shell workflow."""
 
 import argparse
+import ast
 import glob
 import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from test_common.import_paths import declared_paths, resolve_entry  # noqa: E402
 
 try:
     import tomllib
@@ -64,7 +69,96 @@ def toml_value(value: object) -> str:
     return json.dumps(value)
 
 
-def write_test_config(source_path: Path, destination_path: Path) -> None:
+def test_import_path_sources(project_root: Path) -> list[Path]:
+    """Find declarations in tracked and untracked test files, or walk outside Git."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(project_root),
+                "grep",
+                "--full-name",
+                "-l",
+                "-z",
+                "-F",
+                "--untracked",
+                "--no-exclude-standard",
+                "__extra_import_path__",
+                "--",
+                ":(glob)tests/**/*.py",
+            ],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        result = None
+    if result is not None and result.returncode in (0, 1):
+        return sorted(
+            project_root / os.fsdecode(path) for path in result.stdout.split(b"\0") if path
+        )
+    return sorted((project_root / "tests").rglob("*.py"))
+
+
+def extra_test_import_paths(project_root: Path, *, skip_ancestor_paths: bool) -> list[str]:
+    """Collect resolved literal import paths; the config writer deduplicates them."""
+    paths = []
+    for source_path in test_import_path_sources(project_root):
+        try:
+            source = source_path.read_text(encoding="utf-8")
+            if "__extra_import_path__" not in source:
+                continue
+            module = ast.parse(source)
+            ancestors = source_path.resolve().parents if skip_ancestor_paths else ()
+        except (
+            OSError,
+            UnicodeError,
+            SyntaxError,
+            ValueError,
+            RecursionError,
+            MemoryError,
+            RuntimeError,
+        ) as error:
+            print(f"Skipping __extra_import_path__ in {source_path}: {error}", file=sys.stderr)
+            continue
+        for node in module.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
+                continue
+            if not any(
+                isinstance(target, ast.Name) and target.id == "__extra_import_path__"
+                for target in targets
+            ):
+                continue
+            try:
+                entries = declared_paths(ast.literal_eval(node.value), str(source_path))
+            except (ValueError, TypeError, RecursionError, MemoryError) as error:
+                print(
+                    f"Skipping __extra_import_path__ at {source_path}:{node.lineno}: {error}",
+                    file=sys.stderr,
+                )
+                continue
+            for entry in entries:
+                try:
+                    path = Path(
+                        resolve_entry(entry, str(source_path.parent), str(project_root))
+                    ).resolve()
+                    if path not in ancestors and path.is_dir():
+                        paths.append(str(path))
+                except (OSError, ValueError, TypeError, RuntimeError, MemoryError) as error:
+                    print(
+                        f"Skipping __extra_import_path__ entry {entry!r} at {source_path}:{node.lineno}: {error}",
+                        file=sys.stderr,
+                    )
+    return paths
+
+
+def write_test_config(
+    source_path: Path, destination_path: Path, *, discover_import_paths: bool = True
+) -> None:
     """Generate an isolated native test config from the wrapper's custom section."""
     source_path = source_path.resolve()
     config = tomllib.loads(source_path.read_text())["tool"]["pyrefly-tests"]
@@ -72,6 +166,18 @@ def write_test_config(source_path: Path, destination_path: Path) -> None:
     for key in ("project-includes", "project-excludes", "search-path"):
         if key in config:
             config[key] = [str(source_path.parent / path) for path in config[key]]
+    extra_paths = (
+        extra_test_import_paths(
+            source_path.parent,
+            skip_ancestor_paths=config.get("enable-fallback-search-path", False),
+        )
+        if discover_import_paths
+        else []
+    )
+    configured_paths = [
+        str(Path(path).resolve()) for path in config.get("search-path", [str(source_path.parent)])
+    ]
+    config["search-path"] = list(dict.fromkeys([*configured_paths, *extra_paths]))
     destination_path.write_text(
         "".join(f"{key} = {toml_value(value)}\n" for key, value in config.items())
     )
@@ -122,9 +228,11 @@ def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
                 kind = error.get("name", "error")
                 message = (
                     error.get("description") or error.get("concise_description", "")
-                    if all_diagnostics
+                    if all_diagnostics and kind != "missing-import"
                     else error.get("concise_description") or error.get("description", "")
                 )
+                if kind == "missing-import":
+                    message = str(message).split("Looked in these locations", 1)[0].rstrip()
                 if not all_diagnostics:
                     message = str(message).replace("\n", " ")
                 print(f"{location}: [{kind}] {message}")
@@ -352,6 +460,7 @@ def main() -> int:
     tests_config_parser = subparsers.add_parser("write-test-config")
     tests_config_parser.add_argument("source", type=Path)
     tests_config_parser.add_argument("destination", type=Path)
+    tests_config_parser.add_argument("--no-extra-import-paths", action="store_true")
 
     files_parser = subparsers.add_parser("select-project-files")
     files_parser.add_argument("input", type=Path)
@@ -385,7 +494,9 @@ def main() -> int:
     elif args.command == "clear-exclusions-config":
         clear_path_module_exclusions(args.source, args.destination)
     elif args.command == "write-test-config":
-        write_test_config(args.source, args.destination)
+        write_test_config(
+            args.source, args.destination, discover_import_paths=not args.no_extra_import_paths
+        )
     elif args.command == "select-project-files":
         select_project_files(args.input, args.output, args.configs)
     elif args.command == "merge-reports":

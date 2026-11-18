@@ -40,7 +40,6 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16-kv", "fp8-kv"])
-@pytest.mark.parametrize("replay", [False, True], ids=["no-replay", "replay"])
 @pytest.mark.parametrize(
     "snapshot_options,retains_page",
     [
@@ -65,8 +64,18 @@ pytestmark = pytest.mark.cpu_only
     ],
 )
 @pytest.mark.parametrize(
-    "layout,expected_sparse_layers",
-    [("tp", 1), ("adp", 1), ("mtp", 2), ("pp-linear", 0), ("pp-mtp", 2), ("draft-only", 1)],
+    "layout,expected_sparse_layers,replay",
+    [
+        ("tp", 1, False),
+        ("adp", 1, False),
+        ("pp-linear", 0, False),
+        ("mtp", 2, False),
+        ("mtp", 2, True),
+        ("pp-mtp", 2, False),
+        ("pp-mtp", 2, True),
+        ("draft-only", 1, False),
+        ("draft-only", 1, True),
+    ],
 )
 def test_indexer_static_cache_cost(
     monkeypatch, fp8, replay, snapshot_options, retains_page, layout, expected_sparse_layers
@@ -460,12 +469,14 @@ def test_derived_geometry_follows_the_checkpoint_defaults():
     assert params.select_k == 2048 // 4
     # topk positions plus the always-visible incomplete tail (kpool - 1 rows).
     assert params.output_width == 2048 + 3
-    # Padded to the FlashMLA top-k tile.
-    assert params.kernel_output_width == 2112
+    # Padded to the FlashMLA top-k tile (64), or to two tiles for its SM90 prefill.
+    assert params.kernel_output_width(64) == 2112
+    assert params.kernel_output_width(128) == 2176
     assert params.packed_state_dim == 2 * 128
     assert params.cache_row_dim == 3 * 128
     small = GlmKpoolSparseParams(index_topk=64, index_kpool=8)
-    assert (small.select_k, small.output_width, small.kernel_output_width) == (8, 71, 128)
+    assert (small.select_k, small.output_width) == (8, 71)
+    assert small.kernel_output_width(64) == small.kernel_output_width(128) == 128
 
 
 def test_paged_slot_indices_returns_page_and_offset_pairs():

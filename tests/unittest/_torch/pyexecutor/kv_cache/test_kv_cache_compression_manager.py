@@ -37,6 +37,7 @@ class _RecordingMixin:
     translation without real algorithm side-effects."""
 
     def __init__(self, kv_cache_manager, record_list, name="m"):
+        # pyrefly: ignore [bad-argument-count]
         super().__init__(_compression_config())
         self.bind_kv_cache_managers(kv_cache_manager)
         self._record_list = record_list

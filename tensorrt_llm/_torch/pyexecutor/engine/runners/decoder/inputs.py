@@ -69,7 +69,11 @@ from tensorrt_llm.inputs.multimodal import (
     check_mm_embed_cumsum_if_needed,
     strip_mm_data_for_generation,
 )
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    DSparkDecodingConfig,
+    PrefillCudaGraphBackend,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -104,6 +108,13 @@ def resolve_runtime_draft_len(
     if spec_config is not None and not spec_config.is_linear_tree:
         return get_static_draft_len(spec_config)
     return runtime_draft_len
+
+
+def dspark_schedules_draft_len(spec_config: DecodingBaseConfig | None) -> bool:
+    """Whether a DSpark draft length schedule can shorten a step's uniform verify window."""
+    return (
+        isinstance(spec_config, DSparkDecodingConfig) and spec_config.draft_len_schedule is not None
+    )
 
 
 def uses_full_generation_page_table(
@@ -595,6 +606,10 @@ class DecoderInputPreparer:
         ``spec_metadata.num_tokens``, ``num_generations`` and ``seq_lens`` for
         this batch before calling this. ``num_generations`` counts every
         generation request, CUDA-graph dummies included.
+
+        The step's draft length rides along: each rank picks it from its own
+        batch, and a drafter that crosses a cross-rank barrier has to know
+        whether any peer drafts this step.
         """
         if not self._config.enable_attention_dp:
             return None, None
@@ -602,6 +617,7 @@ class DecoderInputPreparer:
             spec_metadata.dp_num_tokens(),
             len(spec_metadata.seq_lens),
             spec_metadata.num_generations,
+            spec_metadata.runtime_draft_len,
         )
         if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
             # attn counts span TP only while spec counts span TP*CP; keep the
@@ -1106,10 +1122,13 @@ class DecoderInputPreparer:
 
         # Must be before the update of py_batch_idx
         if self.guided_decoder is not None:
+            # Prefill CUDA graphs can also capture guided decoding.
             self.guided_decoder.add_batch(
                 scheduled_requests,
                 new_tokens=new_tokens_device,
                 runtime_draft_len=runtime_draft_len,
+                is_cuda_graph=maybe_graph
+                or self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED,
             )
 
         spec_config = self._config.spec_config if enable_spec_decode else None
@@ -1655,11 +1674,12 @@ class DecoderInputPreparer:
                 return helix_local_len(global_len, _helix_phys, _helix_cp_size, _helix_cp_rank)
 
             def _helix_pack_extend(request, group: int) -> int:
-                # A helix gen worker's token list is the rank-LOCAL
-                # round-robin subset, so max_beam_num_tokens is not a global
-                # base; rebuild it from the global prompt length plus the
-                # rank-invariant generated count. Also repacks position_ids,
-                # which the caller filled from the local base.
+                # On a disaggregated helix gen worker the token list is the
+                # rank-LOCAL round-robin subset, so max_beam_num_tokens is not
+                # a global base. Rebuilding it from the global prompt length
+                # plus the rank-invariant generated count is exact in both
+                # helix modes. Also repacks position_ids, which the caller
+                # filled from the token-list base.
                 generated_len = request.max_beam_num_tokens - request.py_prompt_len
                 base = request.total_input_len_cp + generated_len - 1
                 helix_position_offsets.extend(range(base, base + group))
@@ -1819,13 +1839,13 @@ class DecoderInputPreparer:
                 )
                 if _has_cp_helix:
                     # Verify group [base, base+group) in GLOBAL positions.
-                    # On a helix gen worker the request's token list is the
-                    # rank-LOCAL round-robin subset, so max_beam_num_tokens
-                    # (= local_prompt + generated) must NOT be used as a
-                    # global base; reconstruct it from the global prompt
-                    # length plus the (rank-invariant) generated count. This
-                    # branch has no in-flight predecessor, so every value is
-                    # exact (no device correction needed).
+                    # On a disaggregated helix gen worker the request's token
+                    # list is the rank-LOCAL round-robin subset, so
+                    # max_beam_num_tokens (= local_prompt + generated) must NOT
+                    # be used as a global base; reconstruct it from the global
+                    # prompt length plus the (rank-invariant) generated count.
+                    # This branch has no in-flight predecessor, so every value
+                    # is exact (no device correction needed).
                     group = 1 + num_draft_tokens
                     base = _helix_pack_extend(request, group)
                     local_cached = _helix_local_len_host(base)
@@ -2696,7 +2716,10 @@ class DecoderInputPreparer:
                 ),
             )
 
-        if self._dspark_trims_submitted_tokens:
+        # Attention sizes its generation rows by the static draft ceiling
+        # unless told the step's window, which both the confidence scheduler
+        # and a draft length schedule can shorten.
+        if self._dspark_trims_submitted_tokens or dspark_schedules_draft_len(spec_config):
             self._publish_gen_token_layout(
                 attn_metadata,
                 scheduled_requests.generation_requests,

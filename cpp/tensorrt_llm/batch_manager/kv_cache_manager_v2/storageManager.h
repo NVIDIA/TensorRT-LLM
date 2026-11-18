@@ -149,7 +149,8 @@ public:
         std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
         std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
         std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f,
-        Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority, bool enableStats = false);
+        Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority,
+        std::optional<BatchDesc> const& coldTypicalBatch = std::nullopt, bool enableStats = false);
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
@@ -158,6 +159,12 @@ public:
     void destroy();
     //! Drain completed samples; leave incomplete samples pending and return a cumulative skipped count.
     std::pair<MigrationTimingSamples, int64_t> takeMigrationTimings();
+
+    //! A fresh Page::visitStamp value; callers hold the manager's exclusive API lock.
+    uint64_t nextVisitStamp() noexcept
+    {
+        return ++mVisitStamp;
+    }
 
     // ---- Allocation -------------------------------------------------------
 
@@ -429,7 +436,8 @@ public:
     friend class KvCacheIntrospection;
 
 private:
-    using PageQueue = std::deque<SharedPtr<Page>>;
+    uint64_t mVisitStamp = 0;
+    using PageQueue = std::deque<SharedPtr<Page>, PoolAllocator<SharedPtr<Page>>>;
     using PagesByLifeCycle = TypedVec<LifeCycleId, PageQueue>;
     using MigrationBatchKey = std::pair<CacheLevel, LayerGroupId>;
 
@@ -452,6 +460,12 @@ private:
     TypedVec<LifeCycleId, float> ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
         std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t deviceGranularity,
         TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const;
+    // Slots a typical batch weighs a life cycle with: its pages plus one optional endpoint per request.
+    TypedVec<LifeCycleId, SlotCount> typicalSlotsForBatch(
+        BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
+    // Pool-group ratio of a cold level from a typical batch: its slots at that level's slot sizes.
+    TypedVec<PoolGroupIndex, float> coldPoolGroupRatioFromBatch(
+        CacheLevel level, BatchDesc const& batch, int tokensPerBlock) const;
     // Project source-level lifecycle byte weights onto destination pool groups while preserving the implied
     // lifecycle slot-count proportions.
     TypedVec<PoolGroupIndex, float> projectPoolGroupRatio(
