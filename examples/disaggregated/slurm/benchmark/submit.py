@@ -20,6 +20,7 @@ import glob
 import json
 import math
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -407,8 +408,14 @@ def _parse_positive_concurrency(value):
     return concurrency
 
 
-def build_worker_environment(worker_config, env_config, role, benchmark_mode,
-                             nsys_on, profile_range, concurrency):
+def build_worker_environment(worker_config,
+                             env_config,
+                             role,
+                             benchmark_mode,
+                             nsys_on,
+                             profile_range,
+                             concurrency,
+                             multi_round=1):
     """Build complete environment dictionary for worker processes.
 
     Args:
@@ -418,7 +425,8 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         benchmark_mode: Benchmark mode string
         nsys_on: Whether nsys profiling is enabled
         profile_range: Profile range string (e.g., "10-30")
-        concurrency: Concurrency level
+        concurrency: Concurrency level or comma-separated levels
+        multi_round: Number of requests per concurrency slot
 
     Returns:
         Dictionary of environment variables
@@ -442,10 +450,20 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         upsert_env_config(env_config, 'gen_worker_env_var',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1')
-        concurrency = _parse_positive_concurrency(concurrency)
+        values = concurrency.split(',') if isinstance(concurrency,
+                                                      str) else [concurrency]
+        levels = [_parse_positive_concurrency(value) for value in values]
+        rounds = _parse_positive_concurrency(multi_round)
+        if len(levels) == 1:
+            queue_sizes = str(levels[0])
+        elif rounds == 1:
+            queue_sizes = ','.join(str(level) for level in levels)
+        else:
+            queue_sizes = ','.join(f'{level}/{level * rounds}'
+                                   for level in levels)
         upsert_env_config(env_config, 'gen_worker_env_var',
                           'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
-                          f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
+                          f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_sizes}')
 
     # 2. Add profiling env vars to env_config (conditional)
     if nsys_on:
@@ -629,6 +647,11 @@ def submit_job(config, log_dir, dry_run):
         'enable_attention_dp', False) else 1
     gen_dp_size = gen_tp_size if worker_config['gen'].get(
         'enable_attention_dp', False) else 1
+    if (benchmark_config['mode'] == "gen_only" and gen_num != 1
+            and len(str(benchmark_config['concurrency_list']).split(',')) > 1):
+        raise ValueError(
+            "Gen-only concurrency sweeps require exactly one GEN worker")
+
     ucx_warmup_requests = 2 * ctx_num * ctx_dp_size * gen_num * gen_dp_size \
         if benchmark_config['mode'] == "e2e" else 0
 
@@ -825,8 +848,6 @@ def submit_job(config, log_dir, dry_run):
                 config_path = server_cfg['config_path']
 
             concurrency_list = benchmark_config['concurrency_list']
-            concurrency = (concurrency_list.split(',')[0] if isinstance(
-                concurrency_list, str) else concurrency_list)
             worker_env = build_worker_environment(
                 worker_config=worker_config,
                 env_config=env_config,
@@ -834,8 +855,16 @@ def submit_job(config, log_dir, dry_run):
                 benchmark_mode=benchmark_config['mode'],
                 nsys_on=profiling_config['nsys_on'],
                 profile_range=server_cfg['profile_range'],
-                concurrency=concurrency,
+                concurrency=concurrency_list,
+                multi_round=benchmark_config['multi_round'],
             )
+            # Set the schedule inside the container: srun --export splits commas
+            # even when a value is shell-quoted.
+            queue_sizes = worker_env.pop('TLLM_BENCHMARK_REQ_QUEUES_SIZE', None)
+            benchmark_env = (
+                "env " +
+                shlex.quote('TLLM_BENCHMARK_REQ_QUEUES_SIZE=' + queue_sizes) +
+                " " if queue_sizes is not None else "")
             export_str = format_export_string(worker_env)
 
             if compact_packing:
@@ -859,7 +888,7 @@ def submit_job(config, log_dir, dry_run):
                 f"--container-name {container_name}",
                 f"--container-mounts {container_mount_str}",
                 "--no-container-mount-home --mpi=pmix --overlap",
-                f"bash {os.path.join(script_dir, 'start_worker.sh')}",
+                f"{benchmark_env}bash {os.path.join(script_dir, 'start_worker.sh')}",
                 server_type,
                 str(server_id),
                 env_config['model_path'],

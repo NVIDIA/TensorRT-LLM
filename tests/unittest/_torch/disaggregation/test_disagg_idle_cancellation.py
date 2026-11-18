@@ -132,6 +132,7 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
     monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
     engine = object.__new__(PyExecutor)
+    engine.is_benchmark_disagg = False
     engine.active_requests = []
     engine.canceled_req_ids = []
     engine.waiting_queue = FCFSWaitingQueue()

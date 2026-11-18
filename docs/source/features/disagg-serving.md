@@ -536,6 +536,33 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, the generation worker will not overlap KV cache transfer with model inference. The default value is `0`.
 
+* `TLLM_BENCHMARK_REQ_QUEUES_SIZE`: Controls the generation worker's gen-only benchmark fill gate.
+  The default, `0`, disables it. A scalar such as `64` gates the first decode batch only, preserving
+  the one-shot behavior.
+
+  A comma-separated schedule such as `64,128,256` measures successive stages, each with `C` requests
+  and an initial fill target of `C`. Use `C/N` to specify an initial fill target of `C` and a total
+  request budget of `N`, for example `64/128,128/256,256/512` for two rounds at each concurrency.
+  Bare and budgeted entries may be mixed. Every stage requires `0 < C <= N`; fill targets are
+  clamped to the executor's request admission capacity while budgets remain unchanged.
+
+  Each stage opens its gate once, allows subsequent requests to replenish normally, and advances
+  only after its budget has been admitted and all live requests, previous batches, and receive
+  sessions have drained across model-parallel ranks. After the schedule finishes, ordinary
+  disaggregated scheduling resumes. Send exactly the declared requests in order, without extra
+  warmup, probe, or retry requests. Use a single generation worker with pipeline parallelism
+  disabled for a schedule; attention DP, TP and CP remain supported.
+
+  Scheduling can produce an initial partial decode batch after the transfer-readiness gate
+  opens. Use full-size steady-state iterations for fixed-batch measurements. A `C/N` stage
+  gates its initial fill once; subsequent client replenishment can also produce partial batches.
+
+  The Slurm benchmark example generates schedules from `concurrency_list` and `multi_round`. When
+  launching manually through Slurm, set this variable inside the container using `env
+  TLLM_BENCHMARK_REQ_QUEUES_SIZE=64,128,256 ...`; `srun --export` splits comma-separated values.
+  Stage transitions are logged as `[BENCH-STAGE]`. Existing fill-stall and insufficient-KV errors
+  fail the run rather than silently opening a partial batch.
+
 * `TRTLLM_NIXL_KVCACHE_BACKEND`: Selects the transport NIXL itself uses. Valid values are `UCX` (default) and `LIBFABRIC`; an unsupported value logs a warning and falls back to `UCX`. `LIBFABRIC` additionally requires a NIXL build carrying the libfabric plugin — see the [disaggregated serving examples](source:examples/disaggregated/README.md).
 
 * `TRTLLM_GPU_KEEPALIVE`: If set to `1`, a generation worker that is waiting at the benchmark fill gate (`TLLM_BENCHMARK_REQ_QUEUES_SIZE`) keeps a resident warp on every SM in ~100 ms chunks instead of idling through the wait, so GPU-activity metrics do not read idle while the context tier fills it. The work is drained when the gate opens and never overlaps a forward pass. The default value is `0`.

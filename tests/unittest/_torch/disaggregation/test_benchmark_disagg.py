@@ -32,6 +32,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.benchmark_request_stages import (
+    BenchmarkRequestStage,
+    parse_benchmark_request_stages,
+)
 from tensorrt_llm._torch.pyexecutor.error_classification import ErrorBudget
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
@@ -166,6 +170,9 @@ class MockBenchmarkExecutor:
         active_requests=None,
         max_num_active_requests: int = 8,
     ):
+        self._benchmark_sweep = False
+        self._benchmark_stage_base_fetch = 0
+        self._benchmark_gate_rearm_pending = False
         self.benchmark_req_queues_size = benchmark_req_queues_size
         self.kv_cache_transceiver = kv_cache_transceiver
         self.is_benchmark_disagg = (
@@ -202,6 +209,9 @@ class MockBenchmarkExecutor:
     _dist_size = staticmethod(PyExecutor._dist_size)
     _allgather_model_parallel_status = PyExecutor._allgather_model_parallel_status
     _get_request_admission_capacity = PyExecutor._get_request_admission_capacity
+    _benchmark_stage_fetched = PyExecutor._benchmark_stage_fetched
+    _maybe_advance_benchmark_stage = PyExecutor._maybe_advance_benchmark_stage
+    _log_benchmark_stage = PyExecutor._log_benchmark_stage
     _configure_benchmark_req_queues_size = PyExecutor._configure_benchmark_req_queues_size
     _is_benchmark_disagg_fill_complete = PyExecutor._is_benchmark_disagg_fill_complete
     _check_benchmark_disagg_gate = PyExecutor._check_benchmark_disagg_gate
@@ -779,10 +789,8 @@ class MockPadDummyExecutor:
             LlmRequestState.CONTEXT_INIT,
             LlmRequestState.GENERATION_TO_COMPLETE,
         )
-        self.scheduler.is_request_in_schedulable_state.side_effect = (
-            lambda request: RequestScheduler.is_request_in_schedulable_state(
-                self.scheduler, request
-            )
+        self.scheduler.is_request_in_schedulable_state.side_effect = lambda request: (
+            RequestScheduler.is_request_in_schedulable_state(self.scheduler, request)
         )
 
         self.kv_cache_manager = Mock()
@@ -892,6 +900,9 @@ class TestPrepareAndScheduleBatchNoBlock:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex._benchmark_sweep = False
+        ex._benchmark_stage_base_fetch = 0
+        ex._benchmark_gate_rearm_pending = False
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
         ex.kv_cache_manager = _make_v2_kv_cache_manager()
@@ -940,6 +951,9 @@ class TestBenchmarkFillAdmissionFlowControl:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex._benchmark_sweep = False
+        ex._benchmark_stage_base_fetch = 0
+        ex._benchmark_gate_rearm_pending = False
         ex.enable_attention_dp = True
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = fill_phase_active
@@ -1303,6 +1317,9 @@ class TestFailFastDuringBenchmarkFill:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex._benchmark_sweep = False
+        ex._benchmark_stage_base_fetch = 0
+        ex._benchmark_gate_rearm_pending = False
         ex.sampler = Mock(spec=["release_request"])
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
@@ -1688,6 +1705,9 @@ class TestFillPhaseEndToEnd:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex._benchmark_sweep = False
+        ex._benchmark_stage_base_fetch = 0
+        ex._benchmark_gate_rearm_pending = False
         ex.benchmark_req_queues_size = self.TOTAL_REQUESTS
         ex.kv_cache_transceiver = _make_transceiver(transfer_complete=False)
         ex.kv_cache_manager = _make_v2_kv_cache_manager()
@@ -1791,3 +1811,175 @@ class TestFillPhaseEndToEnd:
         assert result is not None
         ex.dist.tp_allgather.assert_not_called()
         ex._handle_errors.assert_not_called()
+
+
+class TestBenchmarkRequestStages:
+    """Protect parsing, stage boundaries, warmup isolation and gate rearming."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("0", [(0, 0)]),
+            ("64", [(64, 64)]),
+            ("64,128,256", [(64, 64), (128, 128), (256, 256)]),
+            ("64/128,128/256,256/512", [(64, 128), (128, 256), (256, 512)]),
+            (" 8 / 16 , 4,8/8 ", [(8, 16), (4, 4), (8, 8)]),
+        ],
+    )
+    def test_parse(self, value: str, expected: list[tuple[int, int]]) -> None:
+        assert parse_benchmark_request_stages(value) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "-1",
+            "1.5",
+            "8,",
+            ",8",
+            "0,8",
+            "0/8",
+            "8/0",
+            "8/4",
+            "8//16",
+            "[8,16]",
+            "True",
+            "8/a",
+            "８",
+        ],
+    )
+    def test_reject_invalid(self, value: str) -> None:
+        with pytest.raises(ValueError, match="TLLM_BENCHMARK_REQ_QUEUES_SIZE"):
+            parse_benchmark_request_stages(value)
+
+    @staticmethod
+    def _executor(monkeypatch: pytest.MonkeyPatch, value: str) -> MockBenchmarkExecutor:
+        monkeypatch.setenv("TLLM_BENCHMARK_REQ_QUEUES_SIZE", value)
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=8,
+            kv_cache_transceiver=_make_transceiver(),
+            max_num_active_requests=16,
+        )
+        ex.previous_batch = None
+        ex._configure_benchmark_req_queues_size()
+        return ex
+
+    def test_scalar_never_rearms(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ex = self._executor(monkeypatch, "8")
+        ex._allgather_model_parallel_status = Mock(side_effect=AssertionError("unexpected vote"))
+        ex.num_fetch_requests = 100
+        ex._maybe_advance_benchmark_stage(0)
+        assert ex._benchmark_stage_index == 0
+        assert not ex._benchmark_gate_rearm_pending
+        assert ex._benchmark_stage_fetched() == 100
+
+    def test_sweep_preserves_budget_after_clamping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ex = self._executor(monkeypatch, "8/16,64/128")
+        assert ex._benchmark_stages == [
+            BenchmarkRequestStage(8, 16),
+            BenchmarkRequestStage(16, 128),
+        ]
+
+    def test_sweep_rejects_pipeline_parallelism(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ex = self._executor(monkeypatch, "8")
+        ex.dist.pp_size = 2
+        monkeypatch.setenv("TLLM_BENCHMARK_REQ_QUEUES_SIZE", "8,16")
+        with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
+            ex._configure_benchmark_req_queues_size()
+
+    def test_advance_requires_budget_and_global_drain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ex = self._executor(monkeypatch, "8/16,4,8")
+        ex.is_warmup = True
+        ex.num_fetch_requests = 12
+        ex._maybe_advance_benchmark_stage(0)
+        assert not ex._benchmark_stage_started
+        ex.is_warmup = False
+        ex._maybe_advance_benchmark_stage(0)
+        assert ex._benchmark_stage_fetched() == 0
+
+        # A transient empty executor before the whole client's budget is
+        # admitted must not advance or close the already-open gate.
+        ex.num_fetch_requests += 8
+        ex._benchmark_fill_phase_active = False
+        ex._allgather_model_parallel_status = Mock(return_value=[(1, False), (0, False)])
+        ex._maybe_advance_benchmark_stage(0)
+        ex._allgather_model_parallel_status.assert_not_called()
+        assert ex._benchmark_stage_index == 0
+        ex.num_fetch_requests += 8
+        ex._maybe_advance_benchmark_stage(0)
+        assert ex._benchmark_stage_index == 0
+        ex._allgather_model_parallel_status.return_value = [(1, False), (1, False)]
+        ex._maybe_advance_benchmark_stage(0)
+        assert ex._benchmark_stage_index == 1
+        assert ex.benchmark_req_queues_size == 4
+        assert ex._benchmark_stage_fetched() == 0
+        assert ex._benchmark_fill_phase_active
+        assert ex._benchmark_gate_rearm_pending
+        assert ex._fill_admit_cap == 0
+
+        # Opening the previous gate must not allow a partial new stage through.
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.time.sleep"):
+            ex._allgather_model_parallel_status.side_effect = lambda status: [status]
+            assert ex._check_benchmark_disagg_gate(ScheduledRequests(), True) == (False, True)
+        ex.num_fetch_requests += 4
+        assert ex._check_benchmark_disagg_gate(ScheduledRequests(), False) == (True, False)
+        ex._maybe_advance_benchmark_stage(0)
+        assert ex._benchmark_stage_index == 2
+        assert ex.benchmark_req_queues_size == 8
+        ex.num_fetch_requests += 8
+        assert ex._check_benchmark_disagg_gate(ScheduledRequests(), True) == (True, False)
+        ex._maybe_advance_benchmark_stage(0)
+        assert ex._benchmark_stage_index == 3
+        assert not ex._benchmark_fill_phase_active
+        assert not ex._benchmark_gate_rearm_pending
+
+    @pytest.mark.parametrize("blocker", ["live", "batch", "transfer", "fill"])
+    def test_local_blocker_still_votes_symmetrically(
+        self, monkeypatch: pytest.MonkeyPatch, blocker: str
+    ) -> None:
+        ex = self._executor(monkeypatch, "8,4")
+        ex._maybe_advance_benchmark_stage(0)
+        ex.num_fetch_requests = 8
+        ex._benchmark_fill_phase_active = blocker == "fill"
+        ex.previous_batch = object() if blocker == "batch" else None
+        ex.kv_cache_transceiver.check_gen_transfer_complete.return_value = blocker != "transfer"
+        ex._allgather_model_parallel_status = Mock(side_effect=lambda status: [status])
+        ex._maybe_advance_benchmark_stage(1 if blocker == "live" else 0)
+        assert ex._benchmark_stage_index == 0
+        if blocker in ("fill", "live"):
+            ex._allgather_model_parallel_status.assert_not_called()
+        else:
+            ex._allgather_model_parallel_status.assert_called_once_with((0, 0))
+
+    def test_admission_stops_at_stage_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ex = TestBenchmarkFillAdmissionFlowControl._make_executor()
+        ex._is_warmup = False
+        ex.dist.pp_size = 1
+        monkeypatch.setenv("TLLM_BENCHMARK_REQ_QUEUES_SIZE", "8/16,4")
+        ex._configure_benchmark_req_queues_size()
+        ex._benchmark_fill_phase_active = False
+        ex._benchmark_stage_base_fetch = 100
+        ex.num_fetch_requests = 115
+        ex._pop_from_waiting_queue(Mock(), 0)
+        assert TestBenchmarkFillAdmissionFlowControl._admitted_cap(ex) == 1
+        ex.num_fetch_requests = 116
+        ex._pop_from_waiting_queue(Mock(), 0)
+        assert TestBenchmarkFillAdmissionFlowControl._admitted_cap(ex) == 0
+
+    def test_concurrency_one_does_not_advance_between_replenishments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ex = self._executor(monkeypatch, "1/3,2/4")
+        ex._maybe_advance_benchmark_stage(0)
+        ex._benchmark_fill_phase_active = False
+        for fetched in (1, 2):
+            ex.num_fetch_requests = fetched
+            ex._maybe_advance_benchmark_stage(0)
+            assert ex._benchmark_stage_index == 0
+            assert not ex._benchmark_gate_rearm_pending
+        ex.num_fetch_requests = 3
+        ex._maybe_advance_benchmark_stage(0)
+        assert ex._benchmark_stage_index == 1
+        assert ex._benchmark_gate_rearm_pending

@@ -92,6 +92,8 @@ from ..speculative.spec_sampler_base import SpecSampler
 from ..speculative.speculation_gate import SpeculationGate
 from ..speculative.utils import get_static_draft_len, update_draft_len
 from .adp_iter_stats import ADPIterStatsBuffer
+from .benchmark_request_stages import (BenchmarkRequestStage,
+                                       parse_benchmark_request_stages)
 from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
@@ -5985,7 +5987,7 @@ class PyExecutor:
 
         local_has_stuck = any(req.is_disagg_generation_init_state
                               for req in self.active_requests)
-        local_all_fetched = (self.num_fetch_requests
+        local_all_fetched = (self._benchmark_stage_fetched()
                              >= self.benchmark_req_queues_size)
         local_terminal_no_fit = (local_has_stuck and
                                  not scheduler_fitting_disagg_gen_init_requests
@@ -6525,7 +6527,7 @@ class PyExecutor:
         The gate opens when all three conditions hold globally:
 
         (A) The executor has fetched at least ``benchmark_req_queues_size``
-            requests cumulatively.
+            requests in the current benchmark stage (cumulatively for scalar mode).
         (B) Every request in ``active_requests`` on this rank completed the
             KV-transfer phase (not in INIT, TRANS_IN_PROGRESS, or ERROR).
         (C) The KV cache transceiver has no pending receive sessions.
@@ -6554,13 +6556,13 @@ class PyExecutor:
         # (A) All benchmark requests have been fetched from the queue. Keep
         # going to the shared allgather even when this rank is not done so
         # model-parallel ranks cannot diverge in collective order.
-        local_all_fetched = (self.num_fetch_requests
+        local_all_fetched = (self._benchmark_stage_fetched()
                              >= self.benchmark_req_queues_size)
         if not local_all_fetched:
             if self.dist.rank == 0:
                 logger.debug(
                     f"Benchmark disagg fill: fetching "
-                    f"{self.num_fetch_requests}/{self.benchmark_req_queues_size}"
+                    f"{self._benchmark_stage_fetched()}/{self.benchmark_req_queues_size}"
                 )
 
         # (B) Every active request on this rank is past KV-transfer states.
@@ -6635,6 +6637,9 @@ class PyExecutor:
             ``(can_forward, should_retry)`` — when *should_retry* is True
             the caller should ``continue`` to the next loop iteration.
         """
+        if not self.is_warmup and self._benchmark_gate_rearm_pending:
+            can_forward = False
+            self._benchmark_gate_rearm_pending = False
         if not self.is_warmup and not can_forward:
             transfer_made_progress = self._benchmark_gen_transfer_made_progress(
             )
@@ -6643,6 +6648,8 @@ class PyExecutor:
             transfer_made_progress = self._benchmark_transfer_progress_global
             keepalive = getattr(self, "_gpu_keepalive", None)
             if can_forward:
+                if self._benchmark_sweep:
+                    self._log_benchmark_stage("gate_open")
                 self._benchmark_fill_phase_active = False
                 self._fill_admit_cap = 0
                 self._benchmark_fill_stall_since = None
@@ -9190,6 +9197,12 @@ class PyExecutor:
         else:
             timeout = datetime.timedelta(0)
 
+        # Let the overlap loop retire its previous batch before arming the
+        # next stage, even when no further client request has arrived yet.
+        if (self.is_benchmark_disagg and self._benchmark_sweep
+                and self._benchmark_stage_draining and not self.is_warmup):
+            timeout = datetime.timedelta(0)
+
         # Fetch requests from rank 0
         new_requests = []
         if control_pending:
@@ -9511,22 +9524,99 @@ class PyExecutor:
         return self.max_num_active_requests
 
     def _configure_benchmark_req_queues_size(self) -> None:
-        """Clamp the benchmark fill target to the request admission ceiling."""
-        requested_fill_target = int(
-            os.environ.get(BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME, 0))
+        """Configure scalar gating or a bounded, ordered benchmark schedule."""
+        value = os.environ.get(BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME, "0")
+        requested_stages = parse_benchmark_request_stages(value)
+        self._benchmark_sweep = "," in value or "/" in value
+        if self._benchmark_sweep and self.dist.pp_size > 1:
+            raise ValueError(
+                "Benchmark request stages require pipeline_parallel_size=1")
         admission_capacity = self._get_request_admission_capacity()
-        self.benchmark_req_queues_size = min(requested_fill_target,
-                                             admission_capacity)
+        self._benchmark_stages = [
+            BenchmarkRequestStage(min(stage.fill_target, admission_capacity),
+                                  stage.num_requests)
+            for stage in requested_stages
+        ]
+        self._benchmark_stage_index = 0
+        self._benchmark_stage_base_fetch = 0
+        self._benchmark_stage_started = False
+        self._benchmark_gate_rearm_pending = False
+        self._benchmark_stage_draining = False
+        self.benchmark_req_queues_size = self._benchmark_stages[0].fill_target
+        for index, (requested, effective) in enumerate(
+                zip(requested_stages, self._benchmark_stages)):
+            if requested.fill_target > effective.fill_target and self.dist.rank == 0:
+                logger.warning(
+                    f"[PyExecutor] {BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME} "
+                    f"stage {index}: requested fill target {requested.fill_target} "
+                    f"exceeds the executor request admission capacity {admission_capacity}; "
+                    f"using effective fill target {effective.fill_target}.")
 
-        if (requested_fill_target > self.benchmark_req_queues_size
-                and self.dist.rank == 0):
-            logger.warning(
-                f"[PyExecutor] {BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME} "
-                f"requested fill target {requested_fill_target} exceeds the "
-                f"executor request admission capacity {admission_capacity}; "
-                f"using effective fill target "
-                f"{self.benchmark_req_queues_size} to prevent an unreachable "
-                f"benchmark disagg fill gate.")
+    def _benchmark_stage_fetched(self) -> int:
+        """Count admitted requests relative to the current measurement."""
+        return self.num_fetch_requests - self._benchmark_stage_base_fetch
+
+    def _maybe_advance_benchmark_stage(self,
+                                       total_num_live_requests: int) -> None:
+        """Advance at a model-parallel drain boundary, before a blocking fetch.
+
+        Admission counts are replicated before attention-DP routing. Use only
+        those counts to decide whether to enter the vote; local batch and
+        transceiver state can differ between ranks.
+        """
+        if not self._benchmark_sweep or self.is_warmup or not self.is_benchmark_disagg:
+            return
+        if self._benchmark_stage_index == len(self._benchmark_stages):
+            return
+        if not self._benchmark_stage_started:
+            self._benchmark_stage_started = True
+            self._benchmark_stage_base_fetch = self.num_fetch_requests
+            self._log_benchmark_stage("armed")
+            return
+        stage = self._benchmark_stages[self._benchmark_stage_index]
+        self._benchmark_stage_draining = self._benchmark_stage_fetched(
+        ) >= stage.num_requests
+        if (not self._benchmark_stage_draining
+                or self._benchmark_fill_phase_active
+                or total_num_live_requests != 0):
+            return
+
+        # The replicated live count also selects the idle fetch transport.
+        # Only vote at that boundary, never on a steady-state decode step.
+        # A future stage may already be queued, but cannot have been admitted:
+        # _pop_from_waiting_queue caps each stage at its original request budget.
+        local_drained = (
+            total_num_live_requests == 0 and self.previous_batch is None
+            and self.kv_cache_transceiver.check_gen_transfer_complete())
+        status = self._allgather_model_parallel_status((int(local_drained), 0))
+        if not all(item[0] for item in status):
+            return
+        self._log_benchmark_stage("drained")
+        self._benchmark_stage_index += 1
+        self._benchmark_stage_draining = False
+        self._benchmark_stage_base_fetch = self.num_fetch_requests
+        if self._benchmark_stage_index == len(self._benchmark_stages):
+            self._benchmark_fill_phase_active = False
+            self._benchmark_gate_rearm_pending = False
+            self._log_benchmark_stage("finished")
+            return
+        self.benchmark_req_queues_size = self._benchmark_stages[
+            self._benchmark_stage_index].fill_target
+        self._benchmark_fill_phase_active = True
+        self._benchmark_gate_rearm_pending = True
+        self._fill_admit_cap = 0
+        self._benchmark_transfer_progress_global = False
+        self._benchmark_fill_stall_since = None
+        self._benchmark_completed_gen_transfer_ids.clear()
+        self._benchmark_first_token_finished_ids.clear()
+        self._log_benchmark_stage("armed")
+
+    def _log_benchmark_stage(self, event: str) -> None:
+        """Emit stage boundaries for matching client results to executor logs."""
+        if self.dist.rank == 0:
+            logger.info(f"[BENCH-STAGE] index={self._benchmark_stage_index} "
+                        f"event={event} fill={self.benchmark_req_queues_size} "
+                        f"admitted={self._benchmark_stage_fetched()}")
 
     def _apply_mm_encoder_admission(
             self, waiting_queue: WaitingQueue,
@@ -9642,6 +9732,14 @@ class PyExecutor:
                 self._fill_admit_cap = min(self._fill_admit_cap * 2,
                                            admission_capacity)
             max_new_requests = min(max_new_requests, self._fill_admit_cap)
+
+        if (self.is_benchmark_disagg and self._benchmark_sweep
+                and not self.is_warmup
+                and self._benchmark_stage_index < len(self._benchmark_stages)):
+            remaining = (
+                self._benchmark_stages[self._benchmark_stage_index].num_requests
+                - self._benchmark_stage_fetched())
+            max_new_requests = min(max_new_requests, remaining)
 
         if self.enable_attention_dp:
             # FIFO in warmup and the benchmark fill phase, where every request
@@ -9840,6 +9938,9 @@ class PyExecutor:
                     LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION)
             all_rank_states = None
             new_requests_hint = None
+
+        if self.kv_cache_transceiver is not None and self.is_benchmark_disagg:
+            self._maybe_advance_benchmark_stage(total_num_live_requests)
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue,

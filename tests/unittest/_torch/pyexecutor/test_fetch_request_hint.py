@@ -27,6 +27,8 @@ import datetime
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     CONTROL_REQUEST_ID,
     RequestQueueItem,
@@ -38,6 +40,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 def _make_stub_executor(rank=0, queued_items=None):
     queued_items = queued_items if queued_items is not None else []
     stub = SimpleNamespace()
+    stub.is_benchmark_disagg = False
     stub.control_requests = []
     stub.request_accumulated = []
     stub.active_requests = []
@@ -202,4 +205,19 @@ def test_idle_transfer_poll_is_tp_wide_under_attention_dp():
     assert stub.dist.tp_allreduce.call_args.args[0] == 0
     stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
         datetime.timedelta(milliseconds=5000), wait_for_batch=True
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("draining", [False, True])
+def test_benchmark_stage_drain_keeps_idle_fetch_nonblocking(draining: bool) -> None:
+    stub = _make_stub_executor()
+    stub.is_benchmark_disagg = True
+    stub.is_warmup = False
+    stub._benchmark_sweep = True
+    stub._benchmark_stage_draining = draining
+    _fetch(stub, FCFSWaitingQueue(), total_num_active_requests=0, new_requests_hint=None)
+    expected_timeout = datetime.timedelta(0) if draining else None
+    stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
+        expected_timeout, wait_for_batch=True
     )
