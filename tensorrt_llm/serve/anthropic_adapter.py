@@ -1247,8 +1247,8 @@ async def reframe_openai_stream(
     """
     reframer = AnthropicStreamReframer(model=model, request_id=request_id)
     done = False
-    # The frames that close the message, held from [DONE] until the upstream
-    # has been read to its end.
+    # The frames that end the message (finish at [DONE], an error frame at an
+    # upstream error event), held until the upstream has been read to its end.
     closing_frames: List[str] = []
     loop = asyncio.get_running_loop()
     last_event = loop.time()
@@ -1286,8 +1286,22 @@ async def reframe_openai_stream(
                 done = True
                 continue
             try:
-                chunk = ChatCompletionStreamResponse(**json.loads(data))
-            except (json.JSONDecodeError, ValueError) as e:
+                payload = json.loads(data)
+            except json.JSONDecodeError as e:
+                raise AnthropicResponseError("Malformed upstream stream chunk") from e
+            if isinstance(payload, dict) and "error" in payload:
+                # The upstream request failed after the stream started. Its error text can hold
+                # internal detail, so it is only logged. The Anthropic message ends with a
+                # generic error frame once the rest of the upstream is read.
+                logger.error(
+                    f"Chat stream behind /v1/messages ended with an error: {payload['error']}"
+                )
+                closing_frames = reframer.error("Internal server error")
+                done = True
+                continue
+            try:
+                chunk = ChatCompletionStreamResponse(**payload)
+            except ValueError as e:  # pydantic's ValidationError is a ValueError.
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
             for frame in reframer.process_chunk(chunk):
                 yield frame
@@ -1314,8 +1328,8 @@ async def reframe_openai_stream(
     except Exception as e:  # noqa: BLE001 - stream must end with an event
         logger.error(f"Anthropic stream reframing failed: {e}\n{traceback.format_exc()}")
         if done:
-            # The response was complete at [DONE], so a failure while reading
-            # the rest of the upstream is logged and the message still closes.
+            # The message's ending is already known, so a failure while reading
+            # the rest of the upstream is only logged.
             for frame in closing_frames:
                 yield frame
             return
