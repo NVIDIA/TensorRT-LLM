@@ -229,6 +229,21 @@ _RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
 _MIXED_PRECISION_LOW_DTYPES = {"nvfp4": DataType.NVFP4}
 
 
+def _max_admissible_sequences(
+    max_batch_size: int,
+    mapping: Mapping,
+    *,
+    is_disagg: bool,
+    disable_overlap_scheduler: bool,
+    gen_preemption_headroom: int = 0,
+) -> int:
+    """Return how many sequences can hold KV at once; see _compute_index_mapper_capacity."""
+    needs_extra_slots = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
+    return max_batch_size * mapping.pp_size * (2 if needs_extra_slots else 1) + (
+        gen_preemption_headroom
+    )
+
+
 def _compute_index_mapper_capacity(
     max_batch_size: int,
     mapping: Mapping,
@@ -259,10 +274,13 @@ def _compute_index_mapper_capacity(
     attention Batch hold one.
     """
     assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
-    max_num_sequences = max_batch_size * mapping.pp_size
-    needs_extra_index_slots = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
-    max_admissible_sequences = max_num_sequences * (2 if needs_extra_index_slots else 1)
-    max_admissible_sequences += gen_preemption_headroom
+    max_admissible_sequences = _max_admissible_sequences(
+        max_batch_size,
+        mapping,
+        is_disagg=is_disagg,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        gen_preemption_headroom=gen_preemption_headroom,
+    )
     capacity = max_admissible_sequences + num_reserved_index_slots + int(has_guard_page)
     return max_admissible_sequences, capacity
 
@@ -2313,6 +2331,12 @@ class KVCacheManagerV2(BaseResourceManager):
     # need snapshotted (request_prefix_snapshot); kept apart from the request's
     # own expect_snapshot_points, which other code rewrites. Created on first use.
     _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
+    # Declared on the class so managers built without __init__ have no layer specs.
+    layer_specs: Optional[Tuple["KVCacheLayerSpec", ...]] = None
+    # A subclass whose extra buffers may join explicit layer specs (draft layers then get their own lifecycle).
+    hosts_unified_draft_layers: bool = False
+    # Layer specs coalesce NVFP4 data and scales apart; a subclass addressing its pools by size opts out.
+    _separate_nvfp4_coalescing: bool = True
     # Declared regions and, once laid out, the ownership of their buffers; see region_layout.
     _region_layout: Optional[RegionLayout] = None
     # In-flight prefix sharing counters, logged by managers that report them:
@@ -2421,6 +2445,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if (
             self.layer_specs is not None
             and type(self)._extra_buffers_per_layer is not KVCacheManagerV2._extra_buffers_per_layer
+            and not self.hosts_unified_draft_layers
         ):
             raise ValueError(
                 f"{type(self).__name__} does not support layer_specs with "
@@ -2455,6 +2480,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self._sparse_kv_offload = sparse_kv_offload_config
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
+        # Read by _windowed_draft_pool_ratio, which runs before max_admissible_sequences is set.
+        self._disable_overlap_scheduler = disable_overlap_scheduler
         self.kv_connector_manager = kv_connector_manager
         codec_config = getattr(cold_page_codec_provider, "config", None)
         self._has_lossy_cold_page_codec = (
@@ -4143,8 +4170,18 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[List[int], List[Optional[int]]]:
         if self.layer_specs is not None:
+            # A spec covers K/V and scales; the manager's extra buffers (e.g. MiniMax-M3's
+            # index-K) share the layer's pages, so they cost the same tokens.
+            extra_buffers = (
+                self._extra_buffers_per_layer(tokens_per_block=self.tokens_per_block) or {}
+            )
             return (
-                [layer.bytes_per_token() for layer in self.layer_specs],
+                [
+                    layer.bytes_per_token()
+                    + sum(buffer.size for buffer in extra_buffers.get(local_layer_id, ()))
+                    // self.tokens_per_block
+                    for local_layer_id, layer in enumerate(self.layer_specs)
+                ],
                 list(self.max_attention_window_vec),
             )
         layer_sizes = []
@@ -4607,7 +4644,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return roles
 
     def _explicit_layer_config(
-        self, local_layer_id: int, layer: KVCacheLayerSpec, tokens_per_block: int
+        self,
+        local_layer_id: int,
+        layer: KVCacheLayerSpec,
+        tokens_per_block: int,
+        extra_buffers: Sequence[BufferConfig] = (),
     ) -> AttentionLayerConfig:
         """Storage config of a layer described by an explicit layer spec."""
         scale_roles = (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
@@ -4620,12 +4661,15 @@ class KVCacheManagerV2(BaseResourceManager):
                     # Keep NVFP4 data (1), its scales (2), and other data (0)
                     # separate while preserving matching K/V page order.
                     coalescing_group=(
-                        1 + int(role in scale_roles) if layer.dtype == DataType.NVFP4 else 0
+                        1 + int(role in scale_roles)
+                        if layer.dtype == DataType.NVFP4 and self._separate_nvfp4_coalescing
+                        else 0
                     ),
                 )
                 for role in (Role.KEY, Role.VALUE, *scale_roles)
                 if role in layer.buffer_roles
-            ],
+            ]
+            + list(extra_buffers),
             sliding_window_size=self.max_attention_window_vec[local_layer_id],
             num_sink_tokens=layer.num_sink_tokens,
             reuse_policy=layer.reuse_policy,
@@ -4723,11 +4767,47 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
                         )
 
+        initial_pool_ratio = kv_cache_config.pool_ratio
         if self.layer_specs is not None:
+            # Subclass buffers beyond K/V/scales (e.g. MiniMax-M3's index-K) follow the spec-built ones.
+            extra_buffers_per_layer = (
+                self._extra_buffers_per_layer(tokens_per_block=tokens_per_block) or {}
+            )
             layer_configs = [
-                self._explicit_layer_config(local_layer_id, layer, tokens_per_block)
+                self._explicit_layer_config(
+                    local_layer_id,
+                    layer,
+                    tokens_per_block,
+                    extra_buffers=extra_buffers_per_layer.get(local_layer_id, ()),
+                )
                 for local_layer_id, layer in enumerate(self.layer_specs)
             ]
+            # Only a manager hosting draft layers sizes their windowed lifecycle itself; other
+            # layer-spec managers keep the backend's split.
+            if (
+                self.hosts_unified_draft_layers
+                and initial_pool_ratio is None
+                and typical_step is None
+            ):
+                initial_pool_ratio = self._windowed_draft_pool_ratio(
+                    layer_configs,
+                    cache_tiers[0].quota,
+                    tokens_per_block,
+                    kv_cache_config.max_util_for_resume,
+                )
+                if initial_pool_ratio is not None:
+                    # Allocation rounds the ratio's byte target; this floor keeps one fresh
+                    # context chunk admissible in every lifecycle.
+                    constraints.append(
+                        BatchDesc(
+                            [
+                                KVCacheDesc(
+                                    capacity=self.max_num_tokens + self._kv_alloc_extra_tokens,
+                                    history_length=0,
+                                )
+                            ]
+                        )
+                    )
         else:
             # Subclasses (e.g. MiniMax-M3 sparse cache) can register additional
             # per-layer BufferConfig entries — for example a sparse index-K
@@ -4808,7 +4888,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache_config.enable_block_reuse
                 and self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
             ),
-            initial_pool_ratio=kv_cache_config.pool_ratio,
+            initial_pool_ratio=initial_pool_ratio,
             pool_rebalance=PoolRebalanceConfig(
                 min_sampled_kv_caches=rebalance_cfg.min_sampled_kv_caches,
                 cooldown_secs=rebalance_cfg.cooldown_secs,
@@ -4871,6 +4951,87 @@ class KVCacheManagerV2(BaseResourceManager):
             "The GPU cache quota cannot accommodate native pools and "
             f"external cache storage ({external_bytes} bytes)."
         )
+
+    def _windowed_draft_pool_ratio(
+        self,
+        layer_configs: List[AttentionLayerConfig],
+        gpu_quota: int,
+        tokens_per_block: int,
+        max_util_for_resume: float = 1.0,
+    ) -> Optional[List[float]]:
+        """Hot-tier ``[target, draft]`` byte ratios when the draft layers form one windowed lifecycle.
+
+        Without a pool ratio or typical step the backend splits the hot tier for one 2048-token
+        request, which says nothing about how many sequences hold a draft window at once. The
+        draft layers get a window for every sequence that can hold KV at once (as
+        max_admissible_sequences counts them, which can exceed the max_batch_size windows the KV
+        cache cost charges) plus one context chunk, over the resume watermark and capped at an
+        equal-token share.
+        """
+        if self.max_num_tokens is None or gpu_quota <= 0:
+            # Without a context-chunk bound or a quota the backend's split is the safe one.
+            return None
+        owners = [spec.owner for spec in self.layer_specs]
+        # Key layers as the backend groups them into lifecycles (sinks count in whole blocks).
+        life_cycles = [
+            AttnLifeCycle.make(
+                c.sliding_window_size, c.num_sink_tokens, tokens_per_block, c.reuse_policy
+            )
+            for c in layer_configs
+        ]
+        keys = [(lc.window_size, lc.num_sink_blocks, lc.reuse_policy) for lc in life_cycles]
+        target_keys = {key for key, owner in zip(keys, owners) if owner is KVCacheLayerOwner.TARGET}
+        draft_keys = {key for key, owner in zip(keys, owners) if owner is KVCacheLayerOwner.DRAFT}
+        # Lifecycle ids follow first appearance, so the target's must come first.
+        if (
+            len(target_keys) != 1
+            or len(draft_keys) != 1
+            or target_keys == draft_keys
+            or not next(iter(draft_keys))[0]
+            or owners[0] is not KVCacheLayerOwner.TARGET
+        ):
+            return None
+        draft_specs = [spec for spec in self.layer_specs if spec.owner is KVCacheLayerOwner.DRAFT]
+        draft_sizes = [spec.bytes_per_token() for spec in draft_specs]
+        _, window_bytes_per_sequence = _estimate_swa_cache_size(
+            draft_sizes,
+            [next(iter(draft_keys))[0]] * len(draft_specs),
+            tokens_per_block,
+            context=False,
+            scratch=False,
+            generation_capacity_headroom=self._generation_kv_capacity_headroom,
+            layer_specs=draft_specs,
+        )
+        # Sequences that can hold KV at once, as max_admissible_sequences counts them.
+        num_sequences = _max_admissible_sequences(
+            self.max_batch_size,
+            self.mapping,
+            is_disagg=self.is_disagg,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
+            gen_preemption_headroom=self.gen_preemption_headroom,
+        )
+        draft_bytes = (
+            window_bytes_per_sequence * num_sequences + sum(draft_sizes) * self.max_num_tokens
+        ) / max_util_for_resume
+        bytes_per_block = {KVCacheLayerOwner.TARGET: 0, KVCacheLayerOwner.DRAFT: 0}
+        for config, owner in zip(layer_configs, owners):
+            bytes_per_block[owner] += sum(buffer.size for buffer in config.buffers)
+        # The context-chunk floor declared with this ratio: every lifecycle holds one fresh chunk
+        # below the resume watermark, each pool rounded to the allocation granularity (bounded
+        # here per buffer). Without room for it the backend keeps its own split.
+        chunk_blocks = -(-(self.max_num_tokens + self._kv_alloc_extra_tokens) // tokens_per_block)
+        floor_slots = math.ceil(chunk_blocks / float(np.float32(max_util_for_resume)))
+        granularity = _gpu_alloc_granularity(gpu_quota)
+        floor_bytes = sum(
+            -(-floor_slots * buffer.size // granularity) * granularity
+            for config in layer_configs
+            for buffer in config.buffers
+        )
+        if floor_bytes > gpu_quota:
+            return None
+        token_share = bytes_per_block[KVCacheLayerOwner.DRAFT] / sum(bytes_per_block.values())
+        draft_ratio = min(draft_bytes / gpu_quota, token_share)
+        return [1.0 - draft_ratio, draft_ratio]
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager.
@@ -7004,8 +7165,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         # prompt_len is the full incoming prompt length, robust to block
         # reuse (which may leave a non-zero context_current_position).
-        # Helix requests carry the rank-local strided slice in prompt_len;
-        # the global ledger sizes off the full prompt instead.
+        # Disaggregated helix requests carry the rank-local strided slice in
+        # prompt_len; total_input_len_cp holds the full prompt under both
+        # helix modes, so the global ledger sizes off it.
         remote_tail_start = getattr(req, "py_csa2_remote_tail_start", None)
         history_len = (
             remote_tail_start
@@ -8934,7 +9096,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
-            if self._has_cp_helix:
+            if self._has_cp_helix and is_gen:
                 # Keep the frozen dummy fields self-consistent (the active
                 # rank's past_seen = seqlen - 1 must stay >= 1).
                 token_num = max(token_num, 2)
@@ -10320,8 +10482,9 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             history_length = (
                 None
-                # Reuse (history's consumer) is disabled under helix, and
-                # max_beam_num_tokens mixes rank-local and global counts.
+                # Reuse (history's consumer) is disabled under helix, and under
+                # disaggregated helix max_beam_num_tokens mixes rank-local and
+                # global counts.
                 if self.kv_compression_manages_history or self._has_cp_helix
                 else req.max_beam_num_tokens - 1
             )

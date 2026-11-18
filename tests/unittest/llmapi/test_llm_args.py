@@ -855,7 +855,8 @@ def test_context_parallelism_mapping_keeps_cp_config():
         "cp_type": CpType.HELIX,
         "tokens_per_block": 32
     }
-    assert not args._kv_cache_estimation_runs()
+    # Aggregated Helix (no cache transceiver) profiles a forward to size KV.
+    assert args._kv_cache_estimation_runs()
 
 
 @pytest.mark.cpu_only
@@ -6897,6 +6898,26 @@ class TestDSparkConfidenceScheduling:
         with pytest.raises(ValidationError,
                            match="confidence_min_predicted_gain"):
             self._scheduled(confidence_min_predicted_gain=-0.01)
+
+    @pytest.mark.parametrize("kw", [
+        {
+            "draft_len_schedule": {
+                4: 5,
+                8: 2
+            }
+        },
+        {
+            "max_concurrency": 8
+        },
+    ])
+    def test_scheduling_excludes_a_draft_len_schedule(self, kw):
+        with pytest.raises(ValueError,
+                           match="draft_len_schedule or max_concurrency"):
+            self._scheduled(**kw)
+
+    def test_draft_len_schedule_is_accepted_without_scheduling(self):
+        c = self._cfg(draft_len_schedule={8: 2, 4: 5})
+        assert c.draft_len_schedule == {4: 5, 8: 2}
 
     @pytest.mark.parametrize("field", [
         "validate_confidence_artifact_freshness",
