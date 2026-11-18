@@ -43,6 +43,7 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync
   - accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_mismatched_block_reuse
+  - accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_mtp_py_transceiver
   - unittest/llmapi/apps/test_disagg_serving_perf_metrics.py
   - disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
   # ------------- Model specific tests ---------------

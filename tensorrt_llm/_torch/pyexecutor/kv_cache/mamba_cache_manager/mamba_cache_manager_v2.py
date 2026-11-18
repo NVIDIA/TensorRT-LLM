@@ -158,6 +158,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # subclass selects one (see _configure_attention_cache_layout); the
     # manager forwards attention-layout operations to it.
     _attention_cache_layout_policy = None
+    # Set by a model manager that keeps no speculative recurrent state on a
+    # disaggregated context server: that server never verifies drafts, so it
+    # runs no generation rows (``is_context_only_kv_cache``).
+    recurrent_context_only = False
     # Construction and cache configuration
 
     @override
@@ -1472,7 +1476,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         state_indices: Optional[torch.Tensor] = None,
         accepted_leaf_positions: Optional[torch.Tensor] = None,
     ):
-        if self.local_num_mamba_layers == 0:
+        if self.local_num_mamba_layers == 0 or self.recurrent_context_only:
             return
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts

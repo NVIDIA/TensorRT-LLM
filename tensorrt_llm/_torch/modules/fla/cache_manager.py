@@ -1041,7 +1041,12 @@ class Qwen35HybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV2)
         self._plan_inforward_snapshots(scheduled_batch)
 
     @override
-    def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
+    def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState | None:
+        if self._context_only and self.spec_config is not None:
+            # A disaggregated context server never verifies drafts: it keeps
+            # neither the replay history nor the intermediate buffers.
+            self.recurrent_context_only = True
+            return None
         state = create_gdn_state(self, self._requested_replay, allow_flashinfer_ring=True)
 
         validate_gdn_layout(self, state)

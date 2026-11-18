@@ -74,7 +74,7 @@ Every provider follows the same contract:
 |---|---|
 | Own slots (Mamba2, GDN Triton / CuTe / fused verify, KDA) | `replay_state` (`REQUEST`, `NEVER`) over the local recurrent layers, `fixed_slot_count = ceil(IndexMapper capacity / max_util_for_resume)` |
 | Shared slots (GDN FlashInfer ring, the Kimi K3 engine's draft records) | No region: `shared_buffers()` adds the replay buffers to the layer's `SsmLayerConfig`, and they follow the recurrent state's life cycle |
-| Disaggregated context server | Neither: the manager creates no provider |
+| Disaggregated context server | Neither: the manager keeps no speculative recurrent state and creates no provider |
 
 The provider binds the replay views (`bind_replay_pool`) before the state's `bind()`, keeps each
 request's replay slot (the manager's `replay_layer_group_id`, `get_replay_state_indices` and
@@ -148,7 +148,12 @@ the first time is reset (`reset_replay_slots`). The provider tracks replay-slot 
 of the recurrent-state upload, so a moved replay page refreshes its index even when the recurrent
 slot stays fixed. Release clears the request's initialization marker; suspend retains it.
 
-A disaggregated context server declares no replay region. When the kernels address the replay
+A disaggregated context server declares no replay region. It never verifies drafts, so the model
+managers drop their draft-verification state there: the KDA managers their replay state
+(`kda_context_only`), and the Mamba2 and GDN managers all of their speculative recurrent state,
+neither the replay history nor the intermediate buffers (`recurrent_context_only`). Such a manager
+is context-only (`is_context_only_kv_cache`): warmup, CUDA graphs and attention-DP padding run no
+generation rows on it. When the kernels address the replay
 buffers by the recurrent-state slot (`replay_shares_state_slot`, the experimental Kimi K3 engine's
 draft-records mode), the KDA provider supplies buffers for the recurrent `SsmLayerConfig` and
 declares no region; the replay slot then equals the state slot.

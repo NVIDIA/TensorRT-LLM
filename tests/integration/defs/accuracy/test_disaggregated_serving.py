@@ -2196,6 +2196,64 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             llm.args.quant_config.kv_cache_quant_algo = "FP8"
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
+    @pytest.mark.skip_less_device(2)
+    def test_mtp_py_transceiver(self, mocker):
+        # MTP on both servers with the Python NIXL transceiver (KV cache
+        # manager V2). The context server never verifies drafts, so it keeps
+        # no GDN speculative state and runs no generation warmup.
+        mocker.patch.object(GSM8K, "NUM_SAMPLES", 100)
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "max_batch_size": 32,
+            "trust_remote_code": True,
+            "kv_cache_config": {
+                "enable_block_reuse": False
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+            },
+            "speculative_config": {
+                "decoding_type": "MTP",
+                "max_draft_len": 3
+            },
+        }
+        gen_server_config = {
+            "max_batch_size": 32,
+            "trust_remote_code": True,
+            "cuda_graph_config": {
+                "max_batch_size": 32,
+                "enable_padding": True,
+            },
+            "kv_cache_config": {
+                "enable_block_reuse": False
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+            },
+            "speculative_config": {
+                "decoding_type": "MTP",
+                "max_draft_len": 3
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            llm.args.quant_config.quant_algo = "FP8_BLOCK_SCALES"
+            llm.args.quant_config.kv_cache_quant_algo = "FP8"
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
     @pytest.mark.skip_less_device(4)
     def test_ctx_pp_gen_tp_asymmetric(self, mocker):
         # Replaces the waived TestQwen3_30B_A3B::test_mixed_ctx_gen_model

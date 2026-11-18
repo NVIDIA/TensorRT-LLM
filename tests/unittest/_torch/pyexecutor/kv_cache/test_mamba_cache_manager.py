@@ -114,6 +114,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
+    MambaLayerCache,
     _stack_state_views,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
@@ -134,6 +135,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     DataType,
     KVCacheManager,
     get_pp_layers,
+    is_context_only_kv_cache,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
@@ -6974,7 +6976,7 @@ def test_v2_mamba2_replay_history_uses_private_kvcm_buffers():
 @skip_no_cuda
 def test_v2_mamba2_replay_without_speculative_replay_declares_no_private_buffers(monkeypatch):
     """Managers without Mamba2 replay, and disaggregated context servers, keep replay slots equal to state slots and
-    declare no replay region."""
+    declare no replay region; a context server keeps no speculative state at all."""
     plain = _build_v2_hybrid_with_mamba_layer(num_mamba_layers=2)
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     context_server = _build_v2_mamba2_replay_manager(is_disagg=True)
@@ -6986,10 +6988,9 @@ def test_v2_mamba2_replay_without_speculative_replay_declares_no_private_buffers
             assert mgr.cuda_replay_state_indices is mgr.cuda_state_indices
             mgr.add_dummy_requests([3], token_nums=[8], is_gen=False)
             assert mgr.get_replay_state_indices([3]) == mgr.get_state_indices([3], [False])
-        # The context server's replay history is standalone and indexed by state slot.
-        replay = context_server._speculative_state
-        assert isinstance(replay, ReplayHistory)
-        assert replay.old_x.shape[1] == context_server.all_ssm_states[0].shape[0]
+        assert context_server._speculative_state is None
+        assert context_server.recurrent_context_only and is_context_only_kv_cache(context_server)
+        assert not plain.recurrent_context_only and not is_context_only_kv_cache(plain)
     finally:
         plain.shutdown()
         context_server.shutdown()
@@ -9048,6 +9049,63 @@ def test_v2_kda_worker_role_cache(monkeypatch, role, is_disagg, manager_cls):
             ]
             slot = mgr.get_replay_state_indices([123])[0]
             assert cache.prev_num_accepted_tokens[slot].item() == 0
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(_build_v2_mamba2_replay_manager, id="mamba2-replay"),
+        pytest.param(
+            lambda **kwargs: _build_v2_hybrid_with_mamba_layer(
+                num_mamba_layers=2,
+                spec_config=MTPDecodingConfig(max_draft_len=2),
+                use_replay_state_update=False,
+                **kwargs,
+            ),
+            id="mamba2-intermediate",
+        ),
+        pytest.param(lambda **kwargs: _build_v2_gdn_replay_manager(**kwargs), id="qwen35-replay"),
+        pytest.param(
+            lambda **kwargs: _build_v2_gdn_replay_manager(
+                manager_cls=Qwen4ExpHybridCacheManager, **kwargs
+            ),
+            id="qwen4exp-replay",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "role,is_disagg", [("context", True), ("generation", True), (None, True), ("context", False)]
+)
+def test_v2_recurrent_worker_role_cache(monkeypatch, build, role, is_disagg):
+    """Only a disaggregated context server keeps no Mamba2 or GDN speculative state: it never verifies drafts, so it
+    allocates neither the replay history nor the intermediate buffers and serves context requests only."""
+    if role is None:
+        monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
+    mgr = build(is_disagg=is_disagg)
+    try:
+        ctx_only = is_disagg and role == "context"
+        assert mgr.recurrent_context_only == ctx_only
+        assert is_context_only_kv_cache(mgr) == ctx_only
+        assert (mgr._speculative_state is None) == ctx_only
+        _run_v2_hybrid_context(mgr, _make_v2_conversation_request(123, list(range(8)), "role"))
+        cache = mgr.mamba_layer_cache(0)
+        assert (type(cache) is MambaLayerCache) == ctx_only
+        if ctx_only:
+            assert mgr.intermediate_ssm_states is None
+            assert mgr.intermediate_conv_states is None
+            assert mgr.replay_layer_group_id is None
+            assert not mgr.kv_cache_manager_py_config.regions
+            assert mgr.get_replay_state_update_metadata() is None
+            # The server never verifies drafts, so it records no acceptance.
+            mgr.update_mamba_states(
+                SimpleNamespace(num_seqs=1, num_contexts=1),
+                torch.ones(1, device="cuda", dtype=torch.int32),
+            )
     finally:
         mgr.shutdown()
 
