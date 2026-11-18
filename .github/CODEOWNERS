@@ -392,8 +392,8 @@
 /tests/unittest/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 
 # ===== SCAFFOLDING =====
-/tensorrt_llm/scaffolding @WeiHaocheng @dc3671
-/tests/unittest/scaffolding @WeiHaocheng @dc3671
+/tensorrt_llm/scaffolding @WeiHaocheng @dc3671 @NVIDIA/trt-llm-devs
+/tests/unittest/scaffolding @WeiHaocheng @dc3671 @NVIDIA/trt-llm-devs
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
