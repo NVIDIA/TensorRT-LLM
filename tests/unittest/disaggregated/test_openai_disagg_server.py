@@ -368,13 +368,17 @@ def test_disagg_config_rejects_non_bool_request_chat_template_opt_in(value):
         )
 
 
-def _streaming_server():
-    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
-    server._perf_metrics_collector = MagicMock()
-    server._allow_request_chat_template = False
-    server._collect_perf_metrics = False
-    server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
-    return server
+@pytest.fixture
+def streaming_server(tmp_path):
+    from test_common.serve.app_factory import DisaggConfig, isolated_serve_env
+
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_disagg_server(DisaggConfig())
+        server._perf_metrics_collector = MagicMock()
+        server._allow_request_chat_template = False
+        server._collect_perf_metrics = False
+        server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
+        yield server
 
 
 def _streaming_raw_request() -> Request:
@@ -458,6 +462,8 @@ async def test_first_chunk_wait_releases_receive_listener_before_streaming() -> 
 def _stream_request(kind):
     if kind == "completion":
         return CompletionRequest(model="test-model", prompt="hello", stream=True)
+    if kind == "responses":
+        return ResponsesRequest.model_validate({"model": "m", "input": "hi", "stream": True})
     assert kind == "chat"
     return ChatCompletionRequest(
         model="test-model", messages=[{"role": "user", "content": "hello"}], stream=True
@@ -471,14 +477,14 @@ async def _failing_generation_stream():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["completion", "chat"])
-async def test_stream_failing_before_first_chunk_returns_http_error(kind):
+async def test_stream_failing_before_first_chunk_returns_http_error(kind, streaming_server):
     """A generation server that fails its KV transfer yields no chunk; answer 500, not a cut 200."""
 
     async def entry_point(request, hooks):
         return _failing_generation_stream()
 
     request = _stream_request(kind)
-    wrapper = _streaming_server()._wrap_entry_point(entry_point, type(request))
+    wrapper = streaming_server._wrap_entry_point(entry_point, type(request))
 
     with pytest.raises(HTTPException) as exc_info:
         await wrapper(request, _streaming_raw_request())
@@ -489,7 +495,7 @@ async def test_stream_failing_before_first_chunk_returns_http_error(kind):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("chunks", [[b"data: 1\n\n", b"data: 2\n\n", b"data: [DONE]\n\n"], []])
-async def test_stream_forwards_every_chunk(chunks):
+async def test_stream_forwards_every_chunk(chunks, streaming_server):
     closed = []
 
     async def generation_stream():
@@ -502,7 +508,7 @@ async def test_stream_forwards_every_chunk(chunks):
     async def entry_point(request, hooks):
         return generation_stream()
 
-    wrapper = _streaming_server()._wrap_entry_point(entry_point, CompletionRequest)
+    wrapper = streaming_server._wrap_entry_point(entry_point, CompletionRequest)
     request = CompletionRequest(model="test-model", prompt="hello", stream=True)
 
     response = await wrapper(request, _streaming_raw_request())
@@ -512,11 +518,9 @@ async def test_stream_forwards_every_chunk(chunks):
     assert closed == [True]
 
 
-# Responses streams are left out: guard_responses_stream does not close its
-# source when it is itself closed before the end.
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["completion", "chat"])
-async def test_stream_closed_before_iteration_closes_upstream(kind):
+@pytest.mark.parametrize("kind", ["completion", "chat", "responses"])
+async def test_stream_closed_before_iteration_closes_upstream(kind, streaming_server):
     """A client that leaves before the body is sent still releases the upstream stream."""
     closed = []
 
@@ -531,7 +535,7 @@ async def test_stream_closed_before_iteration_closes_upstream(kind):
         return generation_stream()
 
     request = _stream_request(kind)
-    wrapper = _streaming_server()._wrap_entry_point(entry_point, type(request))
+    wrapper = streaming_server._wrap_entry_point(entry_point, type(request))
 
     response = await wrapper(request, _streaming_raw_request())
     assert isinstance(response, StreamingResponse)
@@ -541,7 +545,7 @@ async def test_stream_closed_before_iteration_closes_upstream(kind):
 
 
 @pytest.mark.asyncio
-async def test_stream_error_after_first_chunk_propagates():
+async def test_stream_error_after_first_chunk_propagates(streaming_server):
     closed = []
 
     async def generation_stream():
@@ -554,7 +558,7 @@ async def test_stream_error_after_first_chunk_propagates():
     async def entry_point(request, hooks):
         return generation_stream()
 
-    wrapper = _streaming_server()._wrap_entry_point(entry_point, CompletionRequest)
+    wrapper = streaming_server._wrap_entry_point(entry_point, CompletionRequest)
 
     response = await wrapper(_stream_request("completion"), _streaming_raw_request())
 
@@ -568,7 +572,7 @@ async def test_stream_error_after_first_chunk_propagates():
 
 
 @pytest.mark.asyncio
-async def test_stream_upstream_error_status_keeps_worker_status():
+async def test_stream_upstream_error_status_keeps_worker_status(streaming_server):
     async def rejected_stream():
         raise aiohttp.ClientResponseError(
             MagicMock(),
@@ -581,7 +585,7 @@ async def test_stream_upstream_error_status_keeps_worker_status():
     async def entry_point(request, hooks):
         return rejected_stream()
 
-    wrapper = _streaming_server()._wrap_entry_point(entry_point, CompletionRequest)
+    wrapper = streaming_server._wrap_entry_point(entry_point, CompletionRequest)
 
     with pytest.raises(HTTPException) as exc_info:
         await wrapper(_stream_request("completion"), _streaming_raw_request())
@@ -591,7 +595,7 @@ async def test_stream_upstream_error_status_keeps_worker_status():
 
 
 @pytest.mark.asyncio
-async def test_responses_stream_failing_before_first_frame_ends_with_error_event():
+async def test_responses_stream_failing_before_first_frame_ends_with_error_event(streaming_server):
     """A Responses relay keeps its 200 and ends with an `error` event."""
 
     async def failing_relay():
@@ -601,7 +605,7 @@ async def test_responses_stream_failing_before_first_frame_ends_with_error_event
     async def entry_point(request, hooks):
         return failing_relay()
 
-    wrapper = _streaming_server()._wrap_entry_point(entry_point, ResponsesRequest)
+    wrapper = streaming_server._wrap_entry_point(entry_point, ResponsesRequest)
     request = ResponsesRequest.model_validate({"model": "m", "input": "hi", "stream": True})
 
     response = await wrapper(request, _streaming_raw_request())
@@ -617,7 +621,7 @@ async def test_responses_stream_failing_before_first_frame_ends_with_error_event
 
 
 @pytest.mark.asyncio
-async def test_failed_stream_is_not_counted_as_response():
+async def test_failed_stream_is_not_counted_as_response(streaming_server):
     async def ok_stream():
         yield b"data: 1\n\n"
 
@@ -626,7 +630,7 @@ async def test_failed_stream_is_not_counted_as_response():
     async def entry_point(request, hooks):
         return next(streams)
 
-    server = _streaming_server()
+    server = streaming_server
     metrics = server._perf_metrics_collector
     wrapper = server._wrap_entry_point(entry_point, CompletionRequest)
 
@@ -654,9 +658,11 @@ def _anthropic_stream_request():
 
 
 @pytest.mark.asyncio
-async def test_anthropic_stream_failing_before_first_chunk_ends_with_error_event():
+async def test_anthropic_stream_failing_before_first_chunk_ends_with_error_event(
+    streaming_server,
+):
     """/v1/messages keeps its 200 and ends a stream that fails before its first chunk with an error."""
-    server = _streaming_server()
+    server = streaming_server
     server._service = SimpleNamespace(
         openai_chat_completion=AsyncMock(return_value=_failing_generation_stream())
     )
@@ -672,7 +678,9 @@ async def test_anthropic_stream_failing_before_first_chunk_ends_with_error_event
 
 
 @pytest.mark.asyncio
-async def test_anthropic_stream_pings_while_the_first_chunk_is_pending(monkeypatch):
+async def test_anthropic_stream_pings_while_the_first_chunk_is_pending(
+    monkeypatch, streaming_server
+):
     """/v1/messages does not wait for the first chunk, so pings keep a slow stream alive."""
     monkeypatch.setattr(anthropic_adapter, "STREAM_PING_INTERVAL_S", 0.01)
     release = asyncio.Event()
@@ -682,7 +690,7 @@ async def test_anthropic_stream_pings_while_the_first_chunk_is_pending(monkeypat
         raise aiohttp.ClientPayloadError("Response payload is not completed")
         yield b"unreachable"
 
-    server = _streaming_server()
+    server = streaming_server
     server._service = SimpleNamespace(
         openai_chat_completion=AsyncMock(return_value=slow_generation_stream())
     )
