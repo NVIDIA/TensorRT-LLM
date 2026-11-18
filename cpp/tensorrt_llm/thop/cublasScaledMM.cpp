@@ -17,6 +17,7 @@
 #include "cublasScaledMMLut.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/outputTensor.h"
@@ -28,9 +29,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <torch/extension.h>
 #include <tuple>
-#include <type_traits>
 #include <unordered_map>
 
 using torch::Tensor;
@@ -344,15 +345,16 @@ struct EpilogueAlgoKey
     }
 };
 
-// FP8 x FP8 GEMM through cuBLASLt with a GELU / bias epilogue and an optional e4m3 output scaled by
-// d_scale. The algorithm is the cuBLASLt heuristic's first choice, cached per problem.
+// FP8 x FP8 GEMM with a GELU / bias epilogue and an optional e4m3 output scaled by d_scale, on the
+// same CublasMMWrapper pipeline as cublas_gemm_caller: a tuned LUT algorithm when one exists and
+// passes checkTactic, otherwise the heuristic's first choice, cached per problem.
 void cublaslt_fp8_epilogue_gemm(Tensor& out, Tensor const& a, Tensor const& b, Tensor const& scale_a,
     Tensor const& scale_b, std::optional<at::Tensor> const& bias, ScaledMmEpilogue epilogue,
     std::optional<at::Tensor> const& d_scale)
 {
-    int64_t const m = a.size(0);
-    int64_t const n = b.size(1);
-    int64_t const k = a.size(1);
+    int32_t const m = a.size(0);
+    int32_t const n = b.size(1);
+    int32_t const k = a.size(1);
     bool const outFp8 = out.scalar_type() == torch::kFloat8_e4m3fn;
     TORCH_CHECK(outFp8 || out.scalar_type() == torch::kBFloat16, "cublas_scaled_mm epilogues output bf16 or e4m3");
     TORCH_CHECK(outFp8 == d_scale.has_value(), "e4m3 output needs d_scale, and d_scale needs e4m3 output");
@@ -365,103 +367,89 @@ void cublaslt_fp8_epilogue_gemm(Tensor& out, Tensor const& a, Tensor const& b, T
     TORCH_CHECK(scale_a.numel() == 1 && scale_b.numel() == 1, "cublas_scaled_mm epilogues need per-tensor scales");
     TORCH_CHECK(scale_a.scalar_type() == torch::kFloat32 && scale_b.scalar_type() == torch::kFloat32,
         "cublas_scaled_mm epilogues need float32 scales");
-
-    at::cuda::CUDAGuard deviceGuard(a.device());
-    auto const handle = getCublasWrapper()->getCublasLtHandle();
-    auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
-    auto const& workspace = getWorkspaceTensor(a.device(), stream.stream());
-    size_t const workspaceBytes = CUBLAS_WORKSPACE_SIZE;
-
-    cublasLtMatmulDesc_t op;
-    check_cuda_error(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    std::unique_ptr<std::remove_pointer_t<cublasLtMatmulDesc_t>, decltype(&cublasLtMatmulDescDestroy)> opGuard(
-        op, &cublasLtMatmulDescDestroy);
-    // Row-major out = a @ b is column-major out^T = b^T (A, transposed) x a^T (B).
-    cublasOperation_t const transA = CUBLAS_OP_T;
-    cublasOperation_t const transB = CUBLAS_OP_N;
-    check_cuda_error(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
-    check_cuda_error(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
-    void const* scaleAPtr = scale_b.data_ptr();
-    void const* scaleBPtr = scale_a.data_ptr();
-    check_cuda_error(
-        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleAPtr, sizeof(scaleAPtr)));
-    check_cuda_error(
-        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleBPtr, sizeof(scaleBPtr)));
-    int8_t const fastAccum = 1;
-    check_cuda_error(
-        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fastAccum, sizeof(fastAccum)));
-    if (outFp8)
-    {
-        void const* dScalePtr = d_scale->data_ptr();
-        check_cuda_error(
-            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, &dScalePtr, sizeof(dScalePtr)));
-    }
-    bool const gelu = epilogue == ScaledMmEpilogue::kGelu;
-    cublasLtEpilogue_t const epi = bias.has_value() ? (gelu ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS)
-                                                    : (gelu ? CUBLASLT_EPILOGUE_GELU : CUBLASLT_EPILOGUE_DEFAULT);
-    check_cuda_error(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
     cudaDataType_t biasType = CUDA_R_16BF;
     if (bias.has_value())
     {
         TORCH_CHECK(bias->numel() == n && bias->is_contiguous(), "bias must be contiguous [n]");
         TORCH_CHECK(bias->is_cuda() && bias->device() == a.device(), "bias must be on the device of mat_a");
         biasType = convert_torch_dtype(bias->scalar_type());
-        void const* biasPtr = bias->data_ptr();
-        check_cuda_error(
-            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &biasPtr, sizeof(biasPtr)));
-        check_cuda_error(
-            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &biasType, sizeof(biasType)));
     }
 
-    int64_t const lda = b.stride(1);
-    int64_t const ldb = a.stride(0);
-    int64_t const ldd = out.stride(0);
-    cudaDataType_t const outType = convert_torch_dtype(out.scalar_type());
-    using LayoutGuard
-        = std::unique_ptr<std::remove_pointer_t<cublasLtMatrixLayout_t>, decltype(&cublasLtMatrixLayoutDestroy)>;
-    auto makeLayout = [](cudaDataType_t type, int64_t rows, int64_t cols, int64_t ld)
-    {
-        cublasLtMatrixLayout_t layout;
-        check_cuda_error(cublasLtMatrixLayoutCreate(&layout, type, rows, cols, ld));
-        return LayoutGuard(layout, &cublasLtMatrixLayoutDestroy);
-    };
-    auto const layoutA = makeLayout(CUDA_R_8F_E4M3, k, n, lda);
-    auto const layoutB = makeLayout(CUDA_R_8F_E4M3, k, m, ldb);
-    // An e4m3 D still takes a bf16 C descriptor; C is unused with beta = 0.
-    auto const layoutC = makeLayout(CUDA_R_16BF, n, m, ldd);
-    auto const layoutD = makeLayout(outType, n, m, ldd);
+    at::cuda::CUDAGuard deviceGuard(a.device());
+    auto cublasWrapper = getCublasWrapper();
+    auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+    auto const& workspace = getWorkspaceTensor(a.device(), stream.stream());
 
-    static std::mutex algoMutex;
-    static std::map<EpilogueAlgoKey, cublasLtMatmulAlgo_t> algos;
-    cublasLtMatmulAlgo_t algo;
+    cudaDataType_t const outType = convert_torch_dtype(out.scalar_type());
+    cublasComputeType_t const compType = CUBLAS_COMPUTE_32F;
+    cudaDataType_t const scaleType = CUDA_R_32F;
+    // An e4m3 D still takes a bf16 C descriptor; C is not read with beta = 0.
+    cublasWrapper->setGemmConfig(CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, CUDA_R_16BF, /*computeType=*/scaleType);
+    cublasWrapper->setStream(stream);
+    cublasWrapper->setWorkspace(workspace.data_ptr());
+
+    int32_t const lda = b.stride(1);
+    int32_t const ldb = a.stride(0);
+    int32_t const ldd = out.stride(0);
+    // Row-major out = a @ b is column-major out^T = b^T (A, transposed) x a^T (B).
+    cublasWrapper->createDescriptors(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, lda, ldb, ldd, /*fastAcc=*/1);
+    cublasWrapper->setScaleDescriptors(scale_b.data_ptr(), scale_a.data_ptr());
+    bool const gelu = epilogue == ScaledMmEpilogue::kGelu;
+    cublasLtEpilogue_t const epi = bias.has_value() ? (gelu ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS)
+                                                    : (gelu ? CUBLASLT_EPILOGUE_GELU : CUBLASLT_EPILOGUE_DEFAULT);
+    cublasWrapper->setEpilogueDescriptor(epi, bias.has_value() ? bias->data_ptr() : nullptr, biasType);
+    if (outFp8)
     {
+        cublasWrapper->setOutputDescriptor(outType);
+        cublasWrapper->setDScaleDescriptor(d_scale->data_ptr());
+    }
+
+    cublasLtMatmulAlgo_t algo;
+#if CUDART_VERSION < 12080
+    bool hasAlgo = find_special_algo_deprecated(
+        algo, cublasWrapper, m, n, k, compType, scaleType, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, outType);
+#else
+    bool hasAlgo
+        = find_special_algo(algo, cublasWrapper, m, n, k, compType, scaleType, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, outType);
+#endif
+    // Gemm() checks a LUT algorithm against these descriptors and falls back to the heuristic if it fails.
+    if (!hasAlgo)
+    {
+        static std::mutex algoMutex;
+        // The first valid heuristic per problem; absent when none fits the workspace.
+        static std::map<EpilogueAlgoKey, std::optional<cublasLtMatmulAlgo_t>> algos;
         std::lock_guard<std::mutex> lock(algoMutex);
         EpilogueAlgoKey const key{a.get_device(), m, n, k, lda, ldb, ldd, static_cast<int>(epi),
             static_cast<int>(outType), static_cast<int>(biasType)};
         auto it = algos.find(key);
         if (it == algos.end())
         {
-            cublasLtMatmulPreference_t pref;
-            check_cuda_error(cublasLtMatmulPreferenceCreate(&pref));
-            check_cuda_error(cublasLtMatmulPreferenceSetAttribute(
-                pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceBytes, sizeof(workspaceBytes)));
-            cublasLtMatmulHeuristicResult_t result{};
-            int found = 0;
-            check_cuda_error(cublasLtMatmulAlgoGetHeuristic(
-                handle, op, layoutA.get(), layoutB.get(), layoutC.get(), layoutD.get(), pref, 1, &result, &found));
-            check_cuda_error(cublasLtMatmulPreferenceDestroy(pref));
-            TORCH_CHECK(found > 0 && result.state == CUBLAS_STATUS_SUCCESS,
-                "cublas_scaled_mm: no cuBLASLt algorithm for m=", m, " n=", n, " k=", k,
-                " epilogue=", static_cast<int>(epi));
-            it = algos.emplace(key, result.algo).first;
+            std::optional<cublasLtMatmulAlgo_t> best;
+            for (auto const& h : cublasWrapper->getTactics(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, lda, ldb, ldd))
+            {
+                if (h.state == CUBLAS_STATUS_SUCCESS && h.workspaceSize <= CUBLAS_WORKSPACE_SIZE)
+                {
+                    best = h.algo;
+                    break;
+                }
+            }
+            if (!best)
+            {
+                TLLM_LOG_WARNING(
+                    "cublas_scaled_mm: no cuBLASLt algorithm for m=%d, n=%d, k=%d, epilogue=%d; using the default", m,
+                    n, k, static_cast<int>(epi));
+            }
+            it = algos.emplace(key, best).first;
         }
-        algo = it->second;
+        hasAlgo = it->second.has_value();
+        if (hasAlgo)
+        {
+            algo = *it->second;
+        }
     }
-    float const alpha = 1.0F;
-    float const beta = 0.0F;
-    void* cPtr = outFp8 ? nullptr : out.data_ptr();
-    check_cuda_error(cublasLtMatmul(handle, op, &alpha, b.data_ptr(), layoutA.get(), a.data_ptr(), layoutB.get(), &beta,
-        cPtr, layoutC.get(), out.data_ptr(), layoutD.get(), &algo, workspace.data_ptr(), workspaceBytes, stream));
+    cublasWrapper->Gemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, /*A=*/b.data_ptr(), lda, /*B=*/a.data_ptr(), ldb,
+        out.data_ptr(), ldd, 1.0F, 0.0F, algo, hasAlgo, /*usingCublasLt=*/true);
+    cublasWrapper->destroyDescriptors();
 }
 
 } // namespace

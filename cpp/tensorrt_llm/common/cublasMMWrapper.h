@@ -46,6 +46,8 @@ protected:
     cublasLtMatrixLayout_t mADesc{NULL};
     cublasLtMatrixLayout_t mBDesc{NULL};
     cublasLtMatrixLayout_t mCDesc{NULL};
+    //! Optional D layout when D differs from C in type (setOutputDescriptor); NULL means D uses mCDesc.
+    cublasLtMatrixLayout_t mDDesc{NULL};
 
     cudaStream_t mStream;
 
@@ -151,6 +153,14 @@ public:
         int const lda, int const ldb, int const ldc, int8_t fastAcc = 0);
     void setScaleDescriptors(void* scale_a, void* scale_b);
     void setBiasDescriptor(void* bias);
+    //! Sets the epilogue and, when given, its bias vector and bias type (e.g. GELU_BIAS with a bf16 bias).
+    void setEpilogueDescriptor(
+        cublasLtEpilogue_t epilogue, void const* bias = nullptr, cudaDataType_t biasType = CUDA_R_16BF);
+    //! Scales D by dScale (device fp32 [1]) before the conversion to an FP8 D type.
+    void setDScaleDescriptor(void const* dScale);
+    //! Gives D its own type with C's shape, e.g. an e4m3 D with a bf16 C. C is then not read, so only
+    //! beta = 0 is supported. Call after createDescriptors.
+    void setOutputDescriptor(cudaDataType_t dType);
     void destroyDescriptors();
 
     cublasHandle_t getCublasHandle()

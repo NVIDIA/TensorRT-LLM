@@ -128,16 +128,58 @@ void CublasMMWrapper::setBiasDescriptor(void* bias)
         cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
 }
 
+void CublasMMWrapper::setEpilogueDescriptor(cublasLtEpilogue_t epilogue, void const* bias, cudaDataType_t biasType)
+{
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+    if (bias != nullptr)
+    {
+        check_cuda_error(
+            cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+        check_cuda_error(cublasLtMatmulDescSetAttribute(
+            mOperationDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &biasType, sizeof(biasType)));
+    }
+}
+
+void CublasMMWrapper::setDScaleDescriptor(void const* dScale)
+{
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, &dScale, sizeof(dScale)));
+}
+
+void CublasMMWrapper::setOutputDescriptor(cudaDataType_t dType)
+{
+    TLLM_CHECK_WITH_INFO(mCDesc != NULL, "Call createDescriptors before setOutputDescriptor");
+    uint64_t rows = 0;
+    uint64_t cols = 0;
+    int64_t ld = 0;
+    check_cuda_error(
+        cublasLtMatrixLayoutGetAttribute(mCDesc, CUBLASLT_MATRIX_LAYOUT_ROWS, &rows, sizeof(rows), nullptr));
+    check_cuda_error(
+        cublasLtMatrixLayoutGetAttribute(mCDesc, CUBLASLT_MATRIX_LAYOUT_COLS, &cols, sizeof(cols), nullptr));
+    check_cuda_error(cublasLtMatrixLayoutGetAttribute(mCDesc, CUBLASLT_MATRIX_LAYOUT_LD, &ld, sizeof(ld), nullptr));
+    if (mDDesc != NULL)
+    {
+        check_cuda_error(cublasLtMatrixLayoutDestroy(mDDesc));
+    }
+    check_cuda_error(cublasLtMatrixLayoutCreate(&mDDesc, dType, rows, cols, ld));
+}
+
 void CublasMMWrapper::destroyDescriptors()
 {
     check_cuda_error(cublasLtMatmulDescDestroy(mOperationDesc));
     check_cuda_error(cublasLtMatrixLayoutDestroy(mADesc));
     check_cuda_error(cublasLtMatrixLayoutDestroy(mBDesc));
     check_cuda_error(cublasLtMatrixLayoutDestroy(mCDesc));
+    if (mDDesc != NULL)
+    {
+        check_cuda_error(cublasLtMatrixLayoutDestroy(mDDesc));
+    }
     mOperationDesc = NULL;
     mADesc = NULL;
     mBDesc = NULL;
     mCDesc = NULL;
+    mDDesc = NULL;
 }
 
 void CublasMMWrapper::Gemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
@@ -212,8 +254,12 @@ void CublasMMWrapper::Gemm(cublasOperation_t transa, cublasOperation_t transb, i
             hasAlgo = checkTactic(transa, transb, m, n, k, lda, ldb, ldc, algo);
         }
 
-        check_cuda_error(cublasLtMatmul(getCublasLtHandle(), mOperationDesc, alpha, A, mADesc, B, mBDesc, beta, C,
-            mCDesc, C, mCDesc, (hasAlgo ? (&algo) : NULL), mCublasWorkspace, workspaceSize, mStream));
+        // With a separate D layout, C is not read (beta = 0) and D must not alias it.
+        TLLM_CHECK_WITH_INFO(mDDesc == NULL || f_beta == 0.0F, "A separate D layout needs beta = 0");
+        void const* cPtr = mDDesc == NULL ? C : nullptr;
+        cublasLtMatrixLayout_t const dDesc = mDDesc == NULL ? mCDesc : mDDesc;
+        check_cuda_error(cublasLtMatmul(getCublasLtHandle(), mOperationDesc, alpha, A, mADesc, B, mBDesc, beta, cPtr,
+            mCDesc, C, dDesc, (hasAlgo ? (&algo) : NULL), mCublasWorkspace, workspaceSize, mStream));
 
         sync_check_cuda_error(mStream);
     }
@@ -476,8 +522,8 @@ bool CublasMMWrapper::checkTactic(cublasOperation_t transa, cublasOperation_t tr
         descriptorsCreated(), "Descriptors are not created! Call createDescriptors before calling this function");
 
     cublasLtMatmulHeuristicResult_t heurResult;
-    cublasStatus_t algoStatus = cublasLtMatmulAlgoCheck(
-        getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc, mCDesc, &algo, &heurResult);
+    cublasStatus_t algoStatus = cublasLtMatmulAlgoCheck(getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc,
+        mDDesc == NULL ? mCDesc : mDDesc, &algo, &heurResult);
 
     if (algoStatus != CUBLAS_STATUS_SUCCESS || heurResult.state != CUBLAS_STATUS_SUCCESS
         || heurResult.workspaceSize > CUBLAS_WORKSPACE_SIZE)
@@ -498,7 +544,8 @@ std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasO
     TLLM_CHECK_WITH_INFO(
         descriptorsCreated(), "Descriptors are not created! Call createDescriptors before calling this function");
 
-    auto const heuristics = getTactics(getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc, mCDesc);
+    auto const heuristics
+        = getTactics(getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc, mDDesc == NULL ? mCDesc : mDDesc);
 
     sync_check_cuda_error(mStream);
 
