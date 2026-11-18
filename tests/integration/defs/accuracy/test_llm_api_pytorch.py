@@ -1185,9 +1185,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             batch_wait_timeout_iters=batch_wait_timeout_iters,
             batch_wait_max_tokens_ratio=batch_wait_max_tokens_ratio,
             moe_config=MoeConfig(tactic=moe_tactic))
-        mtp_config = None
-        if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+        mtp_config = _deepseek_v3_mtp_config(mtp_nextn, moe_tactic)
         if fp8kv:
             kv_cache_config.dtype = "fp8"
         with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
@@ -1898,9 +1896,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         if fp8kv:
             kv_cache_config.dtype = "fp8"
 
-        mtp_config = None
-        if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+        mtp_config = _deepseek_v3_mtp_config(mtp_nextn, moe_tactic)
         with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -7149,7 +7145,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_8gpus_mtp(self):
         # Test MTP (Multi-Token Prediction) accuracy with nvfp4-fp8kv model.
         # This test uses MTP with max_draft_len=3 and one_model mode.
-        mtp_config = MTPDecodingConfig(max_draft_len=3, )
+        mtp_config = MTPDecodingConfig(max_draft_len=3, moe_tactic="cutlass")
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with LLM(
                 model_path,
@@ -7186,7 +7182,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(80000)
     def test_nvfp4_4gpu_mtp_ar(self):
         max_draft_len = 7
-        mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len, )
+        mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len,
+                                       moe_tactic="cutlass")
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
         llm_common_config = dict(
@@ -7249,7 +7246,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpu_mtp_ar_custom_op(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "1")
         max_draft_len = 7
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len, )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len,
+                                       moe_tactic="cutlass")
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
         llm_common_config = dict(
@@ -7311,7 +7309,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_8gpus_mtp_custom_op(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "1")
         # Test MTP accuracy with nvfp4-fp8kv model using custom op path.
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+                                       moe_tactic="cutlass")
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with LLM(
                 model_path,
