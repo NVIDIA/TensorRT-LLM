@@ -117,7 +117,8 @@ class BF16DraftHead:
         rank, of ``x`` ``[M, hidden]`` in the head's dtype; written into ``out`` (contiguous int32 ``[M]``) when
         given. Every TP rank must call it with the same ``M``."""
         if x.stride(-1) != 1 or x.data_ptr() % 16 or (x.stride(0) * x.element_size()) % 16:
-            x = x.contiguous()
+            # A fresh allocation: contiguous() would return a contiguous but misaligned view as is.
+            x = x.clone(memory_format=torch.contiguous_format)
         if out is None:
             out = torch.empty(x.shape[0], dtype=torch.int32, device=x.device)
         torch.ops.trtllm.lm_head_argmax(
