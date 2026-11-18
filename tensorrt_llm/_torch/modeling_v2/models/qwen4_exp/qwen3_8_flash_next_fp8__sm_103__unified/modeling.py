@@ -99,6 +99,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.qsa.index_plane_layout import slot_rows
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
@@ -1522,7 +1523,7 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         bound = _Bound(cm, rank_pools, stage=_inforward_stage(cm, self.gdn_layers, self.ple_layer))
         if self.spec_rollback is not None:
             self.spec_rollback.set_index_planes(
-                [rank_pools.index_cache[i] for i in self.attn_layers]
+                [rank_pools.index_cache[i] for i in self.attn_layers], self.compress_ratio
             )
         if self.mtp_enabled:
             bound = bound._replace(**self._bind_step_buffers(cm, g, rank_pools, md))
@@ -6597,11 +6598,16 @@ class SpeculativeRollback:
         self._pending: dict | None = None
         # (base addresses, page strides, plane count) of the index-K planes, once bound.
         self._planes: tuple | None = None
+        self._index_rows = 0
+        self._compress_ratio = 0
 
-    def set_index_planes(self, planes: list) -> None:
-        """Bind the attention layers' index-K planes (static for the manager's lifetime)."""
+    def set_index_planes(self, planes: list, compress_ratio: int) -> None:
+        """Bind the attention layers' index-K planes (static for the manager's lifetime) and
+        their page rows (`index_plane_layout`)."""
         ptrs, strides = _plane_table(planes)
         self._planes = (ptrs, strides, len(planes))
+        self._index_rows = int(planes[0].shape[1])
+        self._compress_ratio = int(compress_ratio)
 
     # ------------------------------------------------------------- staging ---
 
@@ -6654,6 +6660,8 @@ class SpeculativeRollback:
                 ptrs,
                 strides,
                 position_cache,
+                self._index_rows,
+                self._compress_ratio,
             )
             self._pending = dict(
                 num_contexts=num_contexts,
@@ -6663,6 +6671,8 @@ class SpeculativeRollback:
                 slots=slots.to(torch.long),
                 pages=pages,
                 within=within,
+                index_within=None,
+                tpb=tokens_per_block,
                 staged_layers=0,
                 position=(position_cache, position_old),
                 index_all=index_all,
@@ -6674,6 +6684,7 @@ class SpeculativeRollback:
         pages = block_table[request_indices.to(torch.long), positions // tokens_per_block]
         pages = pages.to(torch.long)
         within = positions % tokens_per_block
+        index_within = slot_rows(within, tokens_per_block, self._compress_ratio, self._index_rows)
         self._pending = dict(
             num_contexts=num_contexts,
             prefix=prefix_tokens,
@@ -6682,9 +6693,11 @@ class SpeculativeRollback:
             slots=slots.to(torch.long),
             pages=pages,
             within=within,
+            index_within=index_within,
+            tpb=tokens_per_block,
             staged_layers=0,
             position=None,
-            index_all=qsa_rollback_gather(ptrs, strides, pages, within, count),
+            index_all=qsa_rollback_gather(ptrs, strides, pages, index_within, count),
             fused=fused,
             ngram_stream=None,
         )
@@ -6780,6 +6793,9 @@ class SpeculativeRollback:
                 ptrs,
                 strides,
                 pending["index_all"],
+                pending["tpb"],
+                self._compress_ratio,
+                self._index_rows if self._index_rows != pending["tpb"] else 0,
             )
             return
         accepted = num_accepted_tokens[num_contexts : num_contexts + n].to(torch.long)
@@ -6795,7 +6811,9 @@ class SpeculativeRollback:
         rejected = torch.reshape(
             torch.arange(p, device=accepted.device).unsqueeze(0) >= accepted.unsqueeze(1), [-1]
         )
-        qsa_rollback_restore(ptrs, strides, pages, within, rejected, pending["index_all"])
+        qsa_rollback_restore(
+            ptrs, strides, pages, pending["index_within"], rejected, pending["index_all"]
+        )
         position[pages, within] = torch.where(
             rejected[:, None], position_old, position[pages, within]
         )

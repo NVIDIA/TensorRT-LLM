@@ -230,7 +230,7 @@ def _mode_args(mode):
 
 def _rollback(b):
     rollback = SpeculativeRollback()
-    rollback.set_index_planes(b.index)
+    rollback.set_index_planes(b.index, COMPRESS)
     return rollback
 
 
