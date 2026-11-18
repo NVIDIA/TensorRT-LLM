@@ -29,6 +29,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancerIterContext,
     get_moe_load_balancer,
 )
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 
 __extra_import_path__ = [".."]
@@ -39,6 +40,11 @@ requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a
 requires_host_accessible = pytest.mark.skipif(
     not torch.cuda.is_available() or not _tbr.is_host_accessible_device_memory_supported(),
     reason="online EPLB needs host-accessible device memory",
+)
+# The NVFP4 MoE runner the numerical test drives is certified on sm_100 and sm_103 only.
+requires_sm10x = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() not in (100, 103),
+    reason="the NVFP4 MoE runner runs on sm_100 and sm_103 only",
 )
 
 
@@ -487,7 +493,7 @@ def test_an_id_outside_the_experts_routes_to_no_slot() -> None:
 # --- a slot-routed layer sums to the layer (GPU) ---------------------------------------------
 
 
-@requires_gpu
+@requires_sm10x
 def test_slot_windows_sum_to_the_layer() -> None:
     """Under EPLB each rank runs its slot window on slot-routed ids, and the windows add up
     to the layer: the DeepSeek-V3-Lite routed geometry (72 experts, H 2560, I 1536, top-6)
