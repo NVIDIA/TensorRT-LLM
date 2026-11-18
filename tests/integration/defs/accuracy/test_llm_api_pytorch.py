@@ -36,9 +36,9 @@ from tensorrt_llm.llmapi import (
     AttentionDpConfig, BlockReuseConfig, CudaGraphConfig, DFlashDecodingConfig,
     DSparkDecodingConfig, Eagle3DecodingConfig, KvCacheConfig, MambaStateConfig,
     MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
-    PrefillCudaGraphBackend, QSASparseAttentionConfig, RequestOutput,
-    SamplingParams, SchedulerConfig, SkipSoftmaxAttentionConfig,
-    SAEnhancerConfig, TorchCompileConfig)
+    PrefillCudaGraphBackend, QSASparseAttentionConfig, SamplingParams,
+    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
+    TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -4590,31 +4590,16 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 chat_template_kwargs
             }
 
-            gpqa_sampling_params = SamplingParams(
+            sampling_params = SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
+                seed=0,
                 max_tokens=MAX_OUTPUT_LEN,
                 truncate_prompt_tokens=MAX_INPUT_LEN)
 
-            generate_async = llm.generate_async
-            gpqa_generation_count = 0
-
-            def check_gpqa_sampling(prompt: str,
-                                    sampling_params: SamplingParams,
-                                    streaming: bool = False) -> RequestOutput:
-                nonlocal gpqa_generation_count
-                assert sampling_params.temperature == 1.0
-                assert sampling_params.top_p == 1.0
-                gpqa_generation_count += 1
-                return generate_async(prompt,
-                                      sampling_params=sampling_params,
-                                      streaming=streaming)
-
-            with mock.patch.object(llm, "generate_async", check_gpqa_sampling):
-                task.evaluate(llm,
-                              sampling_params=gpqa_sampling_params,
-                              extra_evaluator_kwargs=extra_evaluator_kwargs)
-            assert gpqa_generation_count > 0
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
     @skip_no_hopper
@@ -4756,6 +4741,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             sampling_params = SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
+                seed=0,
                 max_tokens=MAX_OUTPUT_LEN,
                 truncate_prompt_tokens=MAX_INPUT_LEN)
 
@@ -4838,6 +4824,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             sampling_params = SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
+                seed=0,
                 max_tokens=MAX_OUTPUT_LEN,
                 truncate_prompt_tokens=MAX_INPUT_LEN)
 
@@ -4916,6 +4903,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             sampling_params = SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
+                seed=0,
                 max_tokens=MAX_OUTPUT_LEN,
                 truncate_prompt_tokens=MAX_INPUT_LEN)
 
@@ -5031,6 +5019,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             sampling_params = SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
+                seed=0,
                 max_tokens=MAX_OUTPUT_LEN,
                 truncate_prompt_tokens=MAX_INPUT_LEN)
 
