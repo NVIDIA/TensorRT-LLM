@@ -2988,15 +2988,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     // stability promise: the native disaggregated bounce buffer reserves one contiguous fabric
     // region with them and maps physical chunks into it up front.
     nb::class_<kv::PooledPhysMemAllocator>(mIntrospection, "PooledPhysMemAllocator")
-        .def(nb::init<size_t>(), nb::arg("phys_mem_size"))
-        .def_prop_ro("device_id", &kv::PooledPhysMemAllocator::deviceId);
+        .def(nb::init<size_t, size_t>(), nb::arg("phys_mem_size"), nb::arg("max_chunk_size") = 0)
+        .def_prop_ro("device_id", &kv::PooledPhysMemAllocator::deviceId)
+        .def_prop_ro("max_chunk_size", &kv::PooledPhysMemAllocator::maxChunkSize);
     nb::class_<kv::VirtMem>(mIntrospection, "VirtMem")
         // keep_alive<1, 3>: VirtMem holds PooledPhysMemAllocator by reference, so the allocator
         // must outlive it. Argument 3 is the allocator (1 is self, 2 is vm_size).
         .def(nb::init<size_t, kv::PooledPhysMemAllocator&, size_t>(), nb::arg("vm_size"), nb::arg("phys_mem_allocator"),
             nb::arg("init_num_phys_mem") = 0, nb::keep_alive<1, 3>())
         .def("destroy", &kv::VirtMem::destroy)
-        .def_prop_ro("address", &kv::VirtMem::address);
+        .def("realloc", &kv::VirtMem::realloc, nb::arg("num_bytes"))
+        .def_prop_ro("address", &kv::VirtMem::address)
+        .def_prop_ro("mapped_bytes", &kv::VirtMem::mappedBytes)
+        .def_prop_ro("usable_bytes", &kv::VirtMem::usableBytes)
+        .def_prop_ro("num_phys_mem", &kv::VirtMem::numPhysMem);
 
     // ---- Cold-page codec --------------------------------------------------
     nb::class_<kv::IKvCacheColdPageCodec>(m, "IKvCacheColdPageCodec");

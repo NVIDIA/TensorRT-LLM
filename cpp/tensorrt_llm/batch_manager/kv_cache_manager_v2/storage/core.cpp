@@ -22,9 +22,11 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
@@ -32,12 +34,40 @@
 #include <ranges>
 #include <set>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <tuple>
 #include <unistd.h>
 #include <unordered_map>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+namespace
+{
+
+//! Bytes kGpuChunkSizeEnvVar asks for, or 0 when it is unset or empty.
+size_t requestedGpuChunkBytes()
+{
+    char const* const value = std::getenv(kGpuChunkSizeEnvVar);
+    if (value == nullptr || *value == '\0')
+    {
+        return 0;
+    }
+    std::string_view const text(value);
+    bool const digitsOnly = std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; });
+    errno = 0;
+    unsigned long long const mib = digitsOnly ? std::strtoull(value, nullptr, 10) : 0;
+    constexpr unsigned long long kMaxMib = std::numeric_limits<size_t>::max() >> 20;
+    if (!digitsOnly || errno == ERANGE || mib > kMaxMib)
+    {
+        throw std::invalid_argument(
+            std::string(kGpuChunkSizeEnvVar) + " must be a non-negative integer number of MiB, got '" + value + "'");
+    }
+    return static_cast<size_t>(mib) << 20;
+}
+
+} // namespace
 
 size_t tierAllocationGranularity(CacheTier tier, size_t quota)
 {
@@ -61,6 +91,17 @@ size_t tierAllocationGranularity(CacheTier tier, size_t quota)
     case CacheTier::REMOTE: return kRemotePoolSizeGranularity;
     default: throw std::invalid_argument("Invalid cache tier");
     }
+}
+
+size_t gpuMaxChunkSize(size_t unit)
+{
+    size_t const requested = requestedGpuChunkBytes();
+    if (requested <= unit)
+    {
+        return unit;
+    }
+    // unit is a power of two (tierAllocationGranularity), so this is unit << k.
+    return std::bit_floor(requested);
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +406,7 @@ SlotCount GpuSlotPool::computeNumSlots(size_t slotSize, size_t numPhysMem, size_
 
 SlotCount GpuSlotPool::numSlots() const noexcept
 {
-    return computeNumSlots(mSlotSize, mVirtMem.numPhysMem(), mVirtMem.physMemSize());
+    return slotCountValueFromSize(mVirtMem.usableBytes() / mSlotSize);
 }
 
 void GpuSlotPool::destroy()

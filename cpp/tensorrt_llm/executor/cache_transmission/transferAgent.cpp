@@ -181,8 +181,15 @@ MemoryDescs VmmDescSplitter::splitDescsWithRegionMap(MemoryDescs const& descs, V
 
         while (remaining > 0)
         {
-            size_t offsetInChunk = static_cast<size_t>((addr - regionBase) % chunkSize);
-            size_t pieceSize = std::min(remaining, chunkSize - offsetInChunk);
+            // A region is one run of equal chunks; a pool mapped from chunks of several sizes is
+            // several adjacent regions, so the region is looked up again for every piece.
+            auto [pieceChunkSize, pieceBase] = lookupChunkInfo(addr, regionMap);
+            size_t pieceSize = remaining;
+            if (pieceChunkSize > 0)
+            {
+                size_t offsetInChunk = static_cast<size_t>((addr - pieceBase) % pieceChunkSize);
+                pieceSize = std::min(remaining, pieceChunkSize - offsetInChunk);
+            }
             result.emplace_back(addr, pieceSize, deviceId);
             addr += pieceSize;
             remaining -= pieceSize;
@@ -301,8 +308,6 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
     {
         auto const& src = srcVec[idx];
         auto const& dst = dstVec[idx];
-        auto [srcChunkSize, srcBase, srcFound] = cachedLookup(src.getAddr(), localRegionMap, srcCache);
-        auto [dstChunkSize, dstBase, dstFound] = cachedLookup(dst.getAddr(), remoteRegionMap, dstCache);
 
         uintptr_t srcAddr = src.getAddr();
         uintptr_t dstAddr = dst.getAddr();
@@ -310,6 +315,10 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
 
         while (remaining > 0)
         {
+            // Looked up per piece: a pool mapped from chunks of several sizes is several adjacent
+            // regions, and a pair can cross from one into the next.
+            auto [srcChunkSize, srcBase, srcFound] = cachedLookup(srcAddr, localRegionMap, srcCache);
+            auto [dstChunkSize, dstBase, dstFound] = cachedLookup(dstAddr, remoteRegionMap, dstCache);
             size_t srcPieceSize = remaining;
             if (srcChunkSize > 0)
             {
@@ -341,6 +350,67 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
     return {MemoryDescs{srcDescs.getType(), std::move(outSrc)}, MemoryDescs{dstDescs.getType(), std::move(outDst)}};
 }
 
+namespace
+{
+
+//! One run of equal-size VMM chunks inside a descriptor: [base, base + len), chunks of chunkSize
+//! bytes from base (chunkSize 0: the descriptor lies inside one allocation and is not split).
+struct VmmRun
+{
+    uintptr_t base;
+    size_t len;
+    size_t chunkSize;
+};
+
+//! The runs of `desc`, found by walking its allocations with cuMemGetAddressRange. A descriptor
+//! inside one allocation (or not VMM memory) is one run with chunkSize 0. Chunk sizes may differ
+//! from run to run (a KV-V2 pool mapped from larger chunks where its offsets allow it).
+std::vector<VmmRun> vmmRunsOf(MemoryDesc const& desc)
+{
+    uintptr_t const addr = desc.getAddr();
+    size_t const len = desc.getLen();
+    CUdeviceptr startBase = 0, endBase = 0;
+    size_t startSize = 0, endSize = 0;
+    CUresult const startErr = cuMemGetAddressRange(&startBase, &startSize, static_cast<CUdeviceptr>(addr));
+    CUresult const endErr = cuMemGetAddressRange(&endBase, &endSize, static_cast<CUdeviceptr>(addr + len - 1));
+    // If either query fails, or both are in the same allocation -> no split needed
+    if (startErr != CUDA_SUCCESS || endErr != CUDA_SUCCESS || startBase == endBase)
+    {
+        return {VmmRun{addr, len, 0}};
+    }
+    TLLM_CHECK_WITH_INFO(addr == static_cast<uintptr_t>(startBase),
+        "VMM descriptor start address 0x%lx does not match chunk base 0x%lx. "
+        "Descriptor must start at a chunk boundary.",
+        static_cast<unsigned long>(addr), static_cast<unsigned long>(startBase));
+
+    std::vector<VmmRun> runs;
+    uintptr_t const end = addr + len;
+    uintptr_t cur = addr;
+    while (cur < end)
+    {
+        CUdeviceptr base = 0;
+        size_t size = 0;
+        CUresult const err = cuMemGetAddressRange(&base, &size, static_cast<CUdeviceptr>(cur));
+        TLLM_CHECK_WITH_INFO(err == CUDA_SUCCESS && static_cast<uintptr_t>(base) == cur && size > 0,
+            "VMM descriptor [0x%lx, 0x%lx) has an unmapped hole or misaligned chunk at 0x%lx.",
+            static_cast<unsigned long>(addr), static_cast<unsigned long>(end), static_cast<unsigned long>(cur));
+        size_t const piece = std::min(size, static_cast<size_t>(end - cur));
+        if (!runs.empty() && runs.back().chunkSize == size && runs.back().base + runs.back().len == cur
+            && runs.back().len % size == 0)
+        {
+            runs.back().len += piece;
+        }
+        else
+        {
+            runs.push_back(VmmRun{cur, piece, size});
+        }
+        cur += piece;
+    }
+    return runs;
+}
+
+} // namespace
+
 MemoryDescs VmmDescSplitter::splitVmmDescs(MemoryDescs const& descs, size_t& detectedChunkSize)
 {
     detectedChunkSize = 0;
@@ -353,68 +423,30 @@ MemoryDescs VmmDescSplitter::splitVmmDescs(MemoryDescs const& descs, size_t& det
 
     for (auto const& desc : descVec)
     {
-        uintptr_t addr = desc.getAddr();
-        size_t len = desc.getLen();
         uint32_t deviceId = desc.getDeviceId();
-
-        if (len == 0)
+        if (desc.getLen() == 0)
             continue;
 
-        // Query start and end of the descriptor
-        CUdeviceptr startBase = 0;
-        size_t startSize = 0;
-        CUresult startErr = cuMemGetAddressRange(&startBase, &startSize, static_cast<CUdeviceptr>(addr));
-
-        CUdeviceptr endBase = 0;
-        size_t endSize = 0;
-        CUresult endErr = cuMemGetAddressRange(&endBase, &endSize, static_cast<CUdeviceptr>(addr + len - 1));
-
-        // If either query fails, or both are in the same allocation -> no split needed
-        if (startErr != CUDA_SUCCESS || endErr != CUDA_SUCCESS || startBase == endBase)
+        for (auto const& run : vmmRunsOf(desc))
         {
-            result.emplace_back(addr, len, deviceId);
-            continue;
-        }
-
-        // Multi-chunk VMM detected: use first chunk's size as uniform chunk size
-        size_t chunkSize = startSize;
-
-        TLLM_CHECK_WITH_INFO(endSize == chunkSize,
-            "VMM chunk size mismatch: first chunk %zu bytes, last chunk %zu bytes. "
-            "All VMM chunks must be the same size.",
-            chunkSize, endSize);
-
-        TLLM_CHECK_WITH_INFO(addr == static_cast<uintptr_t>(startBase),
-            "VMM descriptor start address 0x%lx does not match chunk base 0x%lx. "
-            "Descriptor must start at a chunk boundary.",
-            static_cast<unsigned long>(addr), static_cast<unsigned long>(startBase));
-
-        if (detectedChunkSize > 0)
-        {
-            TLLM_CHECK_WITH_INFO(chunkSize == detectedChunkSize,
-                "Inconsistent VMM chunk sizes across descriptors: %zu vs %zu. "
-                "All VMM pools must use the same chunk size.",
-                chunkSize, detectedChunkSize);
-        }
-        detectedChunkSize = chunkSize;
-
-        uintptr_t current = addr;
-        size_t remaining = len;
-
-        while (remaining > 0)
-        {
-            size_t offsetInChunk = static_cast<size_t>((current - static_cast<uintptr_t>(startBase)) % chunkSize);
-            size_t pieceSize = std::min(remaining, chunkSize - offsetInChunk);
-            result.emplace_back(current, pieceSize, deviceId);
-            current += pieceSize;
-            remaining -= pieceSize;
+            if (run.chunkSize == 0)
+            {
+                result.emplace_back(run.base, run.len, deviceId);
+                continue;
+            }
+            // The largest chunk seen, for logging: chunks may differ in size within and across descs.
+            detectedChunkSize = std::max(detectedChunkSize, run.chunkSize);
+            for (size_t off = 0; off < run.len; off += run.chunkSize)
+            {
+                result.emplace_back(run.base + off, std::min(run.chunkSize, run.len - off), deviceId);
+            }
         }
     }
 
     if (result.size() != descVec.size())
     {
-        TLLM_LOG_DEBUG("VmmDescSplitter::splitVmmDescs: split %zu -> %zu VRAM entries (chunkSize=%zu)", descVec.size(),
-            result.size(), detectedChunkSize);
+        TLLM_LOG_DEBUG("VmmDescSplitter::splitVmmDescs: split %zu -> %zu VRAM entries (max chunkSize=%zu)",
+            descVec.size(), result.size(), detectedChunkSize);
     }
 
     return MemoryDescs{descs.getType(), std::move(result)};
@@ -428,23 +460,16 @@ VramRegionMap VmmDescSplitter::detectVramRegionMap(MemoryDescs const& descs)
 
     for (auto const& desc : descs.getDescs())
     {
-        uintptr_t addr = desc.getAddr();
-        size_t len = desc.getLen();
-        size_t chunkSize = 0;
-
-        if (len > 1)
+        if (desc.getLen() <= 1)
         {
-            CUdeviceptr startBase = 0, endBase = 0;
-            size_t startSize = 0, endSize = 0;
-            CUresult startErr = cuMemGetAddressRange(&startBase, &startSize, static_cast<CUdeviceptr>(addr));
-            CUresult endErr = cuMemGetAddressRange(&endBase, &endSize, static_cast<CUdeviceptr>(addr + len - 1));
-            if (startErr == CUDA_SUCCESS && endErr == CUDA_SUCCESS && startBase != endBase)
-            {
-                chunkSize = startSize;
-            }
+            regionMap[desc.getAddr()] = {desc.getLen(), 0};
+            continue;
         }
-
-        regionMap[addr] = {len, chunkSize};
+        // One region per run of equal chunks; a pool mapped from one chunk size is one region.
+        for (auto const& run : vmmRunsOf(desc))
+        {
+            regionMap[run.base] = {run.len, run.chunkSize};
+        }
     }
     return regionMap;
 }

@@ -236,6 +236,28 @@ inline size_t hotPoolSizeGranularity(CacheTier medium, size_t deviceGranularity)
 //! shares one allocator.
 [[nodiscard]] size_t tierAllocationGranularity(CacheTier tier, size_t quota);
 
+//! Largest physical chunk, in MiB, the GPU pools map (rounded down to a power-of-two
+//! multiple of the tier's unit). Unset, empty, 0, or a value at or below the unit keeps
+//! one chunk per unit.
+//!
+//! Only the mapping changes: pools are still sized and resized in units of
+//! tierAllocationGranularity, and are mapped from the largest chunks their offsets
+//! allow (PooledPhysMemAllocator::chunkSizeAt), so pool sizes and slot counts are the
+//! same as without it. Every chunk is one cuMemCreate allocation, which a transfer
+//! agent registers -- and every peer writing into it imports and maps -- separately
+//! (NIXL/UCX cuda_ipc). Disaggregated serving with many peers per pool can raise it
+//! to cut that count.
+//!
+//! A shrink unmaps only whole chunks: when a pool's new end falls inside a larger
+//! chunk, that chunk stays mapped, so after a resize a pool can hold up to one
+//! largest chunk minus one unit above its size until it grows again. Leave that
+//! headroom per GPU pool when resizing close to the device memory limit.
+inline constexpr char const* kGpuChunkSizeEnvVar = "TLLM_KV_CACHE_MANAGER_V2_GPU_CHUNK_MB";
+
+//! The largest chunk kGpuChunkSizeEnvVar asks for a GPU tier with allocation unit
+//! `unit`: `unit` when it is unset or at most `unit`. Throws on a malformed value.
+[[nodiscard]] size_t gpuMaxChunkSize(size_t unit);
+
 // ---------------------------------------------------------------------------
 // SlotPoolBase — abstract base for a single memory pool.
 // Mirrors _storage/_core.py::SlotPoolBase.

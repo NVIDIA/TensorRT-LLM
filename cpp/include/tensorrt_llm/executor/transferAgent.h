@@ -232,12 +232,14 @@ struct VmmDescSplitter
         bool enableCoalesce = true);
 
     /// @brief Split VRAM descs at VMM chunk boundaries detected via cuMemGetAddressRange.
-    /// For cudaMalloc memory (single allocation), descs pass through unchanged.
-    /// @param[out] detectedChunkSize Set to the VMM chunk size if detected, 0 otherwise.
+    /// For cudaMalloc memory (single allocation), descs pass through unchanged. Chunks may differ
+    /// in size within and across descs; every output desc lies within one cuMemCreate allocation.
+    /// @param[out] detectedChunkSize Set to the largest VMM chunk size detected, 0 if none.
     [[nodiscard]] static MemoryDescs splitVmmDescs(MemoryDescs const& descs, size_t& detectedChunkSize);
 
     /// @brief Build a VramRegionMap by probing each VRAM descriptor with cuMemGetAddressRange.
-    /// For each descriptor, detects whether it spans multiple VMM chunks and records {totalLen, chunkSize}.
+    /// For each descriptor, detects whether it spans multiple VMM chunks and records one {totalLen, chunkSize}
+    /// entry per run of equal-size chunks (one entry when all its chunks are the same size).
     /// @param descs VRAM memory descriptors to probe.
     /// @return Region map with per-descriptor VMM info (chunkSize=0 for cudaMalloc memory).
     [[nodiscard]] static VramRegionMap detectVramRegionMap(MemoryDescs const& descs);
