@@ -190,3 +190,55 @@ def test_finished_choice_streams_its_held_decoder_text_once(monkeypatch):
         (0, "stop"),
         (1, "length"),
     ]
+
+
+# A streamed request with best_of > n cannot keep the finish-once guard honest:
+# the executor re-ranks the candidates by cumulative logprob on every response,
+# so a candidate that finished early (index 0, "A") can be overtaken by a later
+# winner ("BB") whose text the guard would then skip. The request is rejected up
+# front instead.
+_BEST_OF_ERROR = "best_of greater than n is not supported with stream=true"
+
+
+def _completion(**kwargs):
+    return CompletionRequest(model="m", prompt="hi", **kwargs)
+
+
+def _chat(**kwargs):
+    return ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], **kwargs)
+
+
+@pytest.mark.parametrize("make", [_completion, _chat])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        # The reported scenario: n=1, best_of=2 with logprobs enabled.
+        {"n": 1, "best_of": 2, "logprobs": 1},
+        {"best_of": 2},
+        {"n": 2, "best_of": 3},
+    ],
+)
+def test_stream_with_best_of_above_n_is_rejected(make, extra):
+    extra = dict(extra)
+    if make is _chat and "logprobs" in extra:
+        extra["logprobs"] = True
+        extra["top_logprobs"] = 1
+    with pytest.raises(ValueError, match=_BEST_OF_ERROR):
+        make(stream=True, **extra)
+
+
+@pytest.mark.parametrize("make", [_completion, _chat])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"stream": True, "n": 2},
+        {"stream": True, "n": 2, "best_of": 2},
+        {"stream": True, "best_of": 1},
+        {"stream": False, "n": 1, "best_of": 2},
+        {"n": 1, "best_of": 2},
+        {"stream": True, "n": 1, "best_of": 2, "use_beam_search": True},
+    ],
+)
+def test_best_of_is_still_accepted_when_not_streamed_above_n(make, kwargs):
+    request = make(**kwargs)
+    assert request.stream == bool(kwargs.get("stream"))
