@@ -979,6 +979,73 @@ def test_stage_inputs_share_only_views_with_the_layout_of_a_clone():
         torch.testing.assert_close(staged[name], value, rtol=0, atol=0)
 
 
+def test_runner_prepared_inputs_read_model_buffers_in_place():
+    """Inputs that view a model buffer are not staged: each bucket graph reads the buffer, which
+    the model writes before every step. A step that passes other memory there runs eagerly."""
+    body = _PreparedBody().cuda()
+    buffer = torch.zeros((2, 8, 4), device="cuda")
+    votes = []
+    runner = BreakableCUDAGraphRunner(
+        body,
+        prepare_inputs=lambda inputs: inputs,
+        agree_replay=lambda replayable: votes.append(replayable) or replayable,
+        input_buffers=lambda: (buffer,),
+    )
+    inputs = {}
+
+    def set_inputs(num_tokens, value):
+        buffer.fill_(value)  # as the model does before the body call
+        rows = buffer[:, :num_tokens]
+        inputs.update(
+            value=torch.full((num_tokens, 4), float(value), device="cuda"),
+            config={"features": list(rows.unbind(0)), "offset": (rows[0],)},
+        )
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(**inputs))
+        return body(**inputs)
+
+    for num_tokens in (8, 4):
+        set_inputs(num_tokens, 0)
+        assert runner.capture(num_tokens, engine_forward)
+        staged = runner._inputs[num_tokens]["config"]
+        assert [feature.data_ptr() for feature in staged["features"]] == [
+            buffer[0].data_ptr(),
+            buffer[1].data_ptr(),
+        ]
+        assert staged["offset"][0].data_ptr() == buffer.data_ptr()
+    calls_after_capture = body.forward_calls
+    for num_tokens, value in [(8, 5), (4, 11), (8, 17)]:
+        set_inputs(num_tokens, value)
+        actual = runner.execute(num_tokens, engine_forward)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, torch.full_like(actual, 4.0 * value), rtol=0, atol=0)
+    assert body.forward_calls == calls_after_capture
+    assert votes == [True, True, True]
+
+    set_inputs(4, 23)
+    inputs["config"]["features"][0] = inputs["config"]["features"][0].clone()
+    buffer.zero_()
+    expected = body(**inputs)
+    actual = runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert votes[-1] is False and runner.num_eager_fallbacks == 1
+
+    # Growing the buffer's storage moves it and the captured views with it, while the graphs
+    # still read the old address.
+    buffer.untyped_storage().resize_(2 * buffer.untyped_storage().nbytes())
+    set_inputs(4, 29)
+    actual = runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, torch.full_like(actual, 4.0 * 29), rtol=0, atol=0)
+    assert votes[-1] is False and runner.num_eager_fallbacks == 2
+    runner.clear()
+
+
 @pytest.mark.parametrize(
     "change, mismatch",
     [

@@ -772,16 +772,17 @@ def test_breakable_multimodal_gate_and_runner_agree(
     )
     from _torch.helpers import make_breakable_prefill_runner
 
-    layer_model, prepare_replay, prepare_inputs, agree_replay = make_breakable_prefill_runner(
-        owner, 4
-    ).args
+    layer_model, prepare_replay, prepare_inputs, agree_replay, input_buffers = (
+        make_breakable_prefill_runner(owner, 4).args
+    )
     assert layer_model is decoder.model
     assert prepare_replay == decoder.prepare_breakable_cuda_graph_replay
     assert agree_replay is None
     if expected == "staged":
         assert prepare_inputs == owner.prepare_breakable_cuda_graph_inputs
+        assert input_buffers == owner.breakable_cuda_graph_input_buffers
     else:
-        assert prepare_inputs is None
+        assert prepare_inputs is None and input_buffers is None
 
 
 class ModelEngineTestCase(unittest.TestCase):

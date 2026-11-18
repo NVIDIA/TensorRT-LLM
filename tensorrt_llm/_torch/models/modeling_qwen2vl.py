@@ -2477,6 +2477,11 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         return _pad_qwen_vl_mrope_deltas(
             super().prepare_breakable_cuda_graph_inputs(inputs))
 
+    def breakable_cuda_graph_input_buffers(self) -> tuple[torch.Tensor, ...]:
+        if hasattr(self, 'mrope_rotary_cos_sin_workspace'):
+            return (self.mrope_rotary_cos_sin_workspace, )
+        return ()
+
     def encode_multimodal_inputs(self,
                                  multimodal_params: List[MultimodalParams],
                                  **encoder_kwargs: Any) -> torch.Tensor:

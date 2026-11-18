@@ -569,9 +569,58 @@ def test_qwenvl_opted_in_decoder_captures_and_refreshes(family, num_levels):
 
     inputs = {
         "inputs_embeds": torch.zeros((4, 4), device="cuda"),
-        "deepstack_embeds": [torch.ones((4, 4), device="cuda") for _ in range(num_levels)],
+        "deepstack_embeds": list(owner.deepstack_input_embeds.fill_(1.0).unbind(0)),
     }
     check_stand_in_body_replay(runner, body, inputs, [image_step, text_step], num_tokens=4)
+
+
+@pytest.mark.cpu_only
+def test_qwenvl_breakable_graphs_read_model_buffers_in_place():
+    """The DeepStack and MRoPE cos/sin inputs view model buffers that are written before each
+    body call, so graphs read them in place and a step must pass that same memory."""
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import _find_input_mismatch
+
+    model = Qwen3VLModel.__new__(Qwen3VLModel)
+    torch.nn.Module.__init__(model)
+    model.deepstack_num_level = 2
+    model.register_buffer("deepstack_input_embeds", torch.zeros(2, 8, 4), persistent=False)
+    model.register_buffer("mrope_rotary_cos_sin_workspace", torch.zeros(1, 64), persistent=False)
+    qwen2_5 = Qwen2_5_VLModel.__new__(Qwen2_5_VLModel)
+    torch.nn.Module.__init__(qwen2_5)
+    qwen2_5.register_buffer("mrope_rotary_cos_sin_workspace", torch.zeros(1, 64), persistent=False)
+
+    deepstack, cos_sin = model.breakable_cuda_graph_input_buffers()
+    assert deepstack is model.deepstack_input_embeds
+    assert cos_sin is model.mrope_rotary_cos_sin_workspace
+    (cos_sin,) = qwen2_5.breakable_cuda_graph_input_buffers()
+    assert cos_sin is qwen2_5.mrope_rotary_cos_sin_workspace
+
+    def text_step():
+        # The hook clears the DeepStack buffer rows and passes views of them.
+        return model.prepare_breakable_cuda_graph_inputs({"inputs_embeds": torch.zeros(4, 4)})
+
+    captured = text_step()
+    # As the runner records at capture: each view's address and strides.
+    buffer_inputs = {
+        id(feature): (feature.data_ptr(), feature.stride())
+        for feature in captured["deepstack_embeds"]
+    }
+    moved = text_step()
+    moved["deepstack_embeds"] = [feature.clone() for feature in moved["deepstack_embeds"]]
+
+    assert _find_input_mismatch(captured, text_step(), buffer_inputs=buffer_inputs) is None
+    assert (
+        _find_input_mismatch(captured, moved, buffer_inputs=buffer_inputs)
+        == "inputs['deepstack_embeds'][0]"
+    )
+    # Growing the buffer's storage moves the captured views with it, but a graph keeps the
+    # address it captured.
+    storage = model.deepstack_input_embeds.untyped_storage()
+    storage.resize_(2 * storage.nbytes())
+    assert (
+        _find_input_mismatch(captured, text_step(), buffer_inputs=buffer_inputs)
+        == "inputs['deepstack_embeds'][0]"
+    )
 
 
 @pytest.mark.cpu_only

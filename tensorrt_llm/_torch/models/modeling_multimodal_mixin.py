@@ -673,6 +673,11 @@ class MultimodalModelMixin:
         prepared_inputs["input_ids"] = None
         return prepared_inputs
 
+    def breakable_cuda_graph_input_buffers(self) -> tuple[torch.Tensor, ...]:
+        """Return buffers that prepared body inputs view and that the model writes before each
+        body call. Breakable prefill graphs read them in place instead of a staged copy."""
+        return ()
+
     @property
     def embedding_dim(self) -> int:
         """Return the width of each cached multimodal embedding row."""

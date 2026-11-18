@@ -584,13 +584,14 @@ class DecoderRunner(ScheduledModelRunner):
         if self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
             return None
 
-        prepare_inputs = None
+        prepare_inputs = input_buffers = None
         if isinstance(self._model, MultimodalModelMixin) and not keeps_text_prefill_body(
             self._model, self._model.model_config.disable_mm_encoder
         ):
             # Fused embeddings are new tensors every step, so replay must refresh them.
             decoder_model = self._model.language_model
             prepare_inputs = self._model.prepare_breakable_cuda_graph_inputs
+            input_buffers = self._model.breakable_cuda_graph_input_buffers
         else:
             decoder_model = (
                 self._model
@@ -612,6 +613,7 @@ class DecoderRunner(ScheduledModelRunner):
             and self._config.enable_attention_dp
             and self._mapping.tp_size > 1
             else None,
+            input_buffers,
         )
 
     def _all_ranks_replay(self, replayable: bool) -> bool:
