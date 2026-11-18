@@ -288,6 +288,8 @@ class CSA2Metadata(SparseMetadata):
 
 def _take_over_request_state() -> None:
     """Give CSA2Metadata the request-state logic and defaults of CSA2TrtllmMetadata."""
+    # FIXME: move these functions from CSA2TrtllmMetadata into CSA2Metadata once the
+    # feature-split metadata is the only path, and build the query tiles from them.
     for name, value in vars(CSA2TrtllmMetadata).items():
         if name.startswith("__") or name in _NOT_TAKEN or name in vars(CSA2Metadata):
             continue
