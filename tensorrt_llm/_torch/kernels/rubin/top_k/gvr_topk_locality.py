@@ -46,7 +46,11 @@ class _Domain:
 
 
 class LocalityDomainExecutor:
-    """Own dynamically queried domain green contexts; prepare outside capture."""
+    """Own dynamically queried domain green contexts; prepare outside capture.
+
+    Grouping bounds cluster scheduling, not total domain SMs. BACKFILL preserves
+    budget proportions but does not guarantee physical locality of added SMs.
+    """
 
     def __init__(
         self,
@@ -309,6 +313,9 @@ def _allocation_rows(x: torch.Tensor, device: int) -> tuple[int, ...] | None:
 class PreparedRowTopK:
     """Non-reentrant, graph-capturable top-k over caller-owned row allocations.
 
+    Verify complete padded-row ownership before applying the full-batch plan to
+    domain slices; ordinary or ineligible inputs retain tuned global execution.
+    Preparation never copies logits. Separate concurrent calls need separate instances.
     Prepare and warm before capture; retain allocations and executor until graphs
     are destroyed. Values and lengths may change, but addresses and ownership may not.
     ``co_local=True`` requires verified ownership; ``False`` disables locality.
