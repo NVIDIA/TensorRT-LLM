@@ -2315,11 +2315,56 @@ def test_qwen_encoder_backend_declarations_preserve_fixed_hf_encoder() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("distributes_items", [False, True])
-def test_qwen2vl_encoder_forward_fn_follows_encoder_data_parallelism(distributes_items: bool):
-    # Qwen2-VL, Qwen2.5-VL and EXAONE 4.5 share this entry. Encoder DP needs the shared one.
-    model = object.__new__(modeling_qwen2vl.Qwen2VLModelBase)
-    model.mm_encoder = SimpleNamespace(forward=MagicMock())
-    model.__dict__["encoder_parallel_layout"] = SimpleNamespace(distributes_items=distributes_items)
+@pytest.mark.parametrize("model_name", ["Qwen2VLModelBase", "Exaone4_5_ForConditionalGeneration"])
+def test_qwen2vl_forward_encodes_mixed_items_in_prompt_order(
+    model_name: str, distributes_items: bool, monkeypatch: pytest.MonkeyPatch
+):
+    # Qwen2-VL, Qwen2.5-VL and EXAONE 4.5 have their own forward. It reaches the encoder only
+    # through the mixin entry, so encoder DP is used and the rows are in prompt order either way.
+    from tensorrt_llm._torch.models import modeling_exaone4_5
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+    )
 
-    expected = model._run_multimodal_encoder if distributes_items else model.mm_encoder.forward
-    assert model._encoder_forward_fn == expected
+    module = modeling_exaone4_5 if model_name.startswith("Exaone") else modeling_qwen2vl
+    image_rows, video_rows = torch.full((2, 4), 1.0), torch.full((3, 4), 2.0)
+    param = MultimodalParams(
+        multimodal_data={
+            "image": {"pixel_values": torch.zeros(1)},
+            "video": {"pixel_values_videos": torch.zeros(1)},
+            # The prompt has the video first.
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("video", 0), ("image", 0)], output_embedding_lengths=[3, 2]
+            ),
+        }
+    )
+    model = object.__new__(getattr(module, model_name))
+    # Like the real vision encoder: one tensor per modality, images first.
+    model.mm_encoder = SimpleNamespace(forward=MagicMock(return_value=[image_rows, video_rows]))
+    model.llm = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=None), forward=MagicMock(return_value=torch.zeros(1))
+    )
+    model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(disable_fuse_rope=True))
+    model._mm_token_ids = torch.tensor([1])
+    model.__dict__["encoder_parallel_layout"] = SimpleNamespace(distributes_items=distributes_items)
+    # One replica that gets every item stands in for the real DP split.
+    model._encode_multimodal_input_runs_dp = MagicMock(
+        side_effect=lambda runs, **_: model.encode_multimodal_inputs(runs[0]).split([3, 2])
+    )
+    fused = []
+
+    def fuse_input_embeds(_, input_ids, mm_embeds, **__):
+        fused.append(mm_embeds)
+        return input_ids, None
+
+    monkeypatch.setattr(module, "fuse_input_embeds", fuse_input_embeds)
+
+    model.forward(
+        SimpleNamespace(num_contexts=1, num_generations=0),
+        input_ids=torch.zeros(5, dtype=torch.int32),
+        multimodal_params=[param],
+    )
+
+    assert model._encode_multimodal_input_runs_dp.called == distributes_items
+    torch.testing.assert_close(torch.cat(fused[0]), torch.cat([video_rows, image_rows]))

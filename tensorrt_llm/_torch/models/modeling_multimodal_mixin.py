@@ -565,11 +565,13 @@ class MultimodalModelMixin:
         self,
         multimodal_params: Sequence[MultimodalParams],
     ) -> torch.Tensor:
-        """Run model-specific multimodal encoder work.
+        """Run model-specific multimodal encoder work (the local encode hook).
 
         Returns the single primary multimodal embedding tensor for the supplied params. Rows are
-        expected to be concatenated in request order, and special multimodal tokens occupy token
-        positions but do not have rows here.
+        expected in request order and, within a request, in prompt order; special multimodal
+        tokens occupy token positions but do not have rows here. Forward paths call it through
+        `_run_multimodal_encoder`, which owns the encoder DP dispatch; only the startup memory
+        profiler calls it directly.
         """
         raise NotImplementedError
 
@@ -589,7 +591,12 @@ class MultimodalModelMixin:
         multimodal_params: Sequence[MultimodalParams],
         **encoder_kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Run encoder work with optional runtime instrumentation after H2D."""
+        """The one encoder entry: encode locally, or split the items between DP replicas.
+
+        Rows come back in prompt order either way: one tensor from the local
+        hook, or one view per item with encoder DP. Runtime instrumentation,
+        when set, wraps the encoder work after H2D.
+        """
         if self._encoder_forward_context is None:
             return self._encode_multimodal_inputs_dp(multimodal_params, **encoder_kwargs)
         with self._encoder_forward_context():

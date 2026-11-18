@@ -143,10 +143,17 @@ the shared execution path. If the enabled encoders change the answer (for
 example, an audio encoder that supports only `dp`), override
 `get_supported_encoder_parallel_modes(model_config)`. The loader checks the
 declaration before constructing weights. See [multimodal encoder parallelism](../features/parallel-strategy.md#multimodal-encoders)
-for the configuration. A model with its own `forward` gets encoder DP only if
-it encodes through `_run_multimodal_encoder`, as the shared
-`prepare_multimodal_inputs` path does; otherwise every replica encodes the
-whole batch.
+for the configuration.
+
+A model gives one encoder hook, `encode_multimodal_inputs`: it encodes the
+params it gets and returns their rows in prompt order. The mixin owns the
+dispatch. `_run_multimodal_encoder` calls the hook directly, or splits the items
+between encoder DP replicas first, so the rows are the same with and without
+DP. The shared `prepare_multimodal_inputs` path uses it. A model with its own
+`forward` must also get its embeddings through it, for example
+`get_multimodal_embeddings(encoder_forward_fn=self._run_multimodal_encoder, ...)`,
+and never call its encoder module directly; otherwise every DP replica encodes
+the whole batch.
 
 `supports_mm_encoder_item_scheduling` describes the separate item scheduling
 contract. Shared encoder TP across attention-DP ranks requires it. Validate

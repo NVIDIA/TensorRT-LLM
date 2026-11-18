@@ -6,7 +6,7 @@ import copy
 import math
 import re
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -2481,13 +2481,12 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     def encode_multimodal_inputs(self,
                                  multimodal_params: List[MultimodalParams],
                                  **encoder_kwargs: Any) -> torch.Tensor:
-        """Uniform encoder entry (``MultimodalModelMixin`` contract).
+        """Local encode hook (``MultimodalModelMixin`` contract).
 
-        Runs the vision encoder over ``multimodal_params`` and returns the
-        embeddings as a single tensor (Qwen folds any deepstack streams into
-        the hidden dim, so the single-tensor contract holds). Used by the
-        startup memory profiler to invoke the encoder directly; the model's
-        own ``forward`` keeps its custom deepstack fusion path.
+        Runs the vision encoder over ``multimodal_params`` and returns one
+        tensor with the rows in prompt order. ``forward`` reaches it through
+        the mixin entry ``_run_multimodal_encoder``, which also splits the
+        items between encoder DP replicas.
         """
         params = list(multimodal_params)
         modalities = tuple(modality for modality in ("image", "video") if any(
@@ -2499,19 +2498,6 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
             modalities,
             encoder_outputs,
         )
-
-    @property
-    def _encoder_forward_fn(self) -> Callable[[List[MultimodalParams]], Any]:
-        """The encoder entry of ``forward``.
-
-        With encoder DP, the shared entry splits the items between replicas
-        and returns prompt-ordered item views. Otherwise the legacy encoder
-        returns one tensor per modality. ``get_multimodal_embeddings`` takes
-        both.
-        """
-        if self.encoder_parallel_layout.distributes_items:
-            return self._run_multimodal_encoder
-        return self.mm_encoder.forward
 
     def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool) -> None:
         # TODO: Move this hook to MultimodalModelMixin once multimodal models
@@ -2573,7 +2559,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
             # Local encoder present: raw pixels/videos become embeddings here.
             if self.mm_encoder is not None:
                 mm_embeds = get_multimodal_embeddings(
-                    encoder_forward_fn=self._encoder_forward_fn,
+                    encoder_forward_fn=self._run_multimodal_encoder,
                     multimodal_params=mm_multimodal_params)
             elif not getattr(self, "support_mm_disagg", False):
                 raise NotImplementedError(

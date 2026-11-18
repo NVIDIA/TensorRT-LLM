@@ -264,7 +264,7 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
         if len(mm_multimodal_params) > 0:
             if not _is_mm_disagg():
                 mm_embeds = get_multimodal_embeddings(
-                    encoder_forward_fn=self._encoder_forward_fn,
+                    encoder_forward_fn=self._run_multimodal_encoder,
                     multimodal_params=mm_multimodal_params,
                 )
             else:
