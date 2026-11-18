@@ -196,44 +196,58 @@ def test_remap_through_placeholder_expansion() -> None:
     # 50 = vision start, 51 = image placeholder (expanded to 3 rows), 52 = end.
     original = [1, 50, 51, 52, 2, 3]
     expanded = [1, 50, 51, 51, 51, 52, 2, 3]
-    mm_rows = torch.tensor([False, True, True, True, True, True, False, False])
+    spans = [(2, 5)]
     _, pe = build_prompt_embeds(original, _rows(2), [True, False, False, False, False, True])
-    moved = remap_prompt_embeds(pe, original, expanded, mm_rows)
+    moved = remap_prompt_embeds(pe, original, expanded, spans)
     assert moved.positions.tolist() == [0, 7]
     assert moved.row_digests == pe.row_digests
     assert moved.digest != pe.digest
     _, on_image = build_prompt_embeds(original, _rows(1), [False, False, True, False, False, False])
     with pytest.raises(ValueError, match="multimodal placeholder"):
-        remap_prompt_embeds(on_image, original, expanded, mm_rows)
+        remap_prompt_embeds(on_image, original, expanded, spans)
     with pytest.raises(ValueError, match="did not survive"):
-        remap_prompt_embeds(
-            pe,
-            original,
-            [1, 50, 51, 51, 51, 52, 2, 3, 9],
-            torch.cat([mm_rows, torch.tensor([False])]),
-        )
+        remap_prompt_embeds(pe, original, [1, 50, 51, 51, 51, 52, 2, 9, 3], spans)
+
+
+# Video notation: 50/52 = vision start/end, 53 = video placeholder rows,
+# 60/61 = timestamp text inserted before each frame.
 
 
 def test_remap_through_framed_video_expansion() -> None:
     from tensorrt_llm.inputs.prompt_embeds import remap_prompt_embeds
 
-    # 50/52 = vision start/end, 53 = video placeholder; 60/61 = timestamp text
-    # the processor inserts before each frame.
     original = [1, 50, 53, 52, 2, 3]
     expanded = [1, 60, 50, 53, 53, 52, 61, 50, 53, 53, 52, 2, 3]
-    mm_rows = torch.zeros(len(expanded), dtype=torch.bool)
-    mm_rows[[3, 4, 8, 9]] = True
     _, pe = build_prompt_embeds(original, _rows(2), [True, False, False, False, True, False])
-    moved = remap_prompt_embeds(pe, original, expanded, mm_rows)
-    assert moved.positions.tolist() == [0, 11]
-    # Text inserted away from any placeholder is still rejected.
+    assert remap_prompt_embeds(pe, original, expanded, [(3, 10)]).positions.tolist() == [0, 11]
+    # Text inserted away from the item's framing is rejected.
     original = [1, 2, 50, 53, 52, 3, 4]
     shifted = [1, 70, 2, 60, 50, 53, 53, 52, 3, 4]
-    shifted_rows = torch.zeros(len(shifted), dtype=torch.bool)
-    shifted_rows[[5, 6]] = True
     _, pe = build_prompt_embeds(original, _rows(1), [False] * 6 + [True])
     with pytest.raises(ValueError, match="did not survive"):
-        remap_prompt_embeds(pe, original, shifted, shifted_rows)
-    # The same layout without the stray token maps.
+        remap_prompt_embeds(pe, original, shifted, [(5, 7)])
     del shifted[1]
-    assert remap_prompt_embeds(pe, original, shifted, shifted_rows[1:]).positions.tolist() == [8]
+    assert remap_prompt_embeds(pe, original, shifted, [(4, 6)]).positions.tolist() == [8]
+
+
+def test_remap_text_between_videos_matching_timestamps() -> None:
+    from tensorrt_llm.inputs.prompt_embeds import remap_prompt_embeds
+
+    # The text between the videos (61) equals a timestamp token inside each video.
+    original = [1, 50, 53, 52, 61, 50, 53, 52, 2]
+    expanded = [1, 60, 50, 53, 53, 52, 61, 50, 53, 53, 52, 61,
+                60, 50, 53, 53, 52, 61, 50, 53, 53, 52, 2]  # fmt: skip
+    spans = [(3, 10), (14, 21)]
+    _, pe = build_prompt_embeds(
+        original, _rows(2), [False, False, False, False, True] + [False] * 3 + [True]
+    )
+    assert remap_prompt_embeds(pe, original, expanded, spans).positions.tolist() == [11, 22]
+
+
+def test_remap_text_after_video_matching_timestamp() -> None:
+    from tensorrt_llm.inputs.prompt_embeds import remap_prompt_embeds
+
+    original = [1, 50, 53, 52, 61, 2]
+    expanded = [1, 60, 50, 53, 53, 52, 61, 50, 53, 53, 52, 61, 2]
+    _, pe = build_prompt_embeds(original, _rows(1), [False] * 4 + [True, False])
+    assert remap_prompt_embeds(pe, original, expanded, [(3, 10)]).positions.tolist() == [11]

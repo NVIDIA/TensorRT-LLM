@@ -5,7 +5,7 @@
 import json
 import os
 import uuid
-from typing import Iterator, List
+from typing import Iterator, List, Tuple
 
 import numpy as np
 import pytest
@@ -143,7 +143,7 @@ def _video_request(llm: LLM) -> dict:
         frame[:, :, 0 if index < 120 else 2] = 255
         frames.append(frame)
     video = VideoData(
-        frames=frames,
+        frames=np.stack(frames),
         metadata={
             "fps": 24.0,
             "total_num_frames": 240,
@@ -186,3 +186,36 @@ def test_prompt_embeds_with_video_in_one_request(llm: LLM, model_dir: str) -> No
         "prompt_embeds_mask": mask,
     }
     assert _run(llm, [request]) == expected
+
+    # Rows the model can tell apart: swap two words around the video through
+    # embeddings only; the reference swaps the ids themselves.
+    before, after = _swappable_positions(llm, ids, vision_ids)
+    swapped_ids = list(ids)
+    swapped_ids[before], swapped_ids[after] = ids[after], ids[before]
+    swapped = {
+        **plain,
+        "prompt_embeds": table[torch.tensor([ids[after], ids[before]])],
+        "prompt_embeds_mask": [p in (before, after) for p in range(len(ids))],
+    }
+    expected_swap = _run(llm, [{**plain, "prompt_token_ids": swapped_ids}])
+    assert expected_swap != expected
+    assert _run(llm, [swapped]) == expected_swap
+
+
+def _swappable_positions(llm: LLM, ids: List[int], vision_ids: set) -> Tuple[int, int]:
+    """Pick a word before and one after the vision tokens whose swap re-tokenizes stably."""
+    first_vision = min(p for p, t in enumerate(ids) if t in vision_ids)
+    last_vision = max(p for p, t in enumerate(ids) if t in vision_ids)
+    words = [
+        p
+        for p, t in enumerate(ids)
+        if t not in vision_ids and llm.tokenizer.decode([t]).strip().isalpha()
+    ]
+    for before in (p for p in words if p < first_vision):
+        for after in (p for p in words if p > last_vision):
+            swapped = list(ids)
+            swapped[before], swapped[after] = ids[after], ids[before]
+            text = llm.tokenizer.decode(swapped)
+            if llm.tokenizer.encode(text, add_special_tokens=False) == swapped:
+                return before, after
+    pytest.skip("no stably re-tokenizing word swap in the prompt")

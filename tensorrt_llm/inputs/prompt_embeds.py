@@ -240,52 +240,54 @@ def remap_prompt_embeds(
     prompt_embeds: PromptEmbeds,
     original_ids: Sequence[int],
     expanded_ids: Sequence[int],
-    multimodal_rows: torch.Tensor,
+    item_spans: Sequence[Tuple[int, int]],
 ) -> PromptEmbeds:
     """Move prompt-embedding positions through multimodal placeholder expansion.
 
-    Input processors replace each multimodal placeholder with its expanded
-    tokens, possibly with framing text around them (for example per-frame
-    timestamps). Every original token is matched, in order, to the next equal
-    expanded token. An unmatched expanded token must be a multimodal row or lie
-    within two original tokens of a placeholder; no embedding position may land
-    on a multimodal row.
+    Input processors replace each multimodal placeholder with that item's rows,
+    possibly framed by extra tokens (for example Qwen3-VL per-frame timestamps
+    and vision markers). The ``k``-th placeholder in ``original_ids`` (the token
+    at item ``k``'s first row) anchors to that row. The original tokens between
+    two placeholders are matched, in order, only within the expanded tokens
+    between the two items' spans; unmatched tokens there may only be framing
+    inserted right before the next item. No embedding position may be a
+    placeholder.
 
     Args:
         prompt_embeds: Snapshot whose positions index ``original_ids``.
         original_ids: Prompt ids before expansion.
         expanded_ids: Prompt ids the engine schedules.
-        multimodal_rows: ``[len(expanded_ids)]`` bool mask of multimodal rows.
+        item_spans: ``[start, end)`` expanded rows of each multimodal item, in
+            prompt order, from its first multimodal row to its last.
 
     Returns:
         A snapshot with the same rows whose positions index ``expanded_ids``.
     """
     if prompt_embeds.embeds is None:
         raise ValueError("Remapping prompt_embeds needs the rows.")
-    matched = torch.zeros(len(expanded_ids), dtype=torch.bool)
-    mapping = []
-    j = 0
-    for token in original_ids:
-        while j < len(expanded_ids) and expanded_ids[j] != token:
-            j += 1
-        if j == len(expanded_ids):
-            break
-        mapping.append(j)
-        matched[j] = True
-        j += 1
-    if len(mapping) != len(original_ids) or not _unmatched_tokens_frame_placeholders(
-        mapping, matched, multimodal_rows
-    ):
-        raise ValueError(
-            "prompt_token_ids did not survive multimodal processing unchanged "
-            "outside the multimodal placeholders; use placeholder ids that "
-            "detokenize and retokenize to themselves (for example the ids of "
-            "the replaced tokens)."
-        )
-    mapping_t = torch.tensor(mapping, dtype=torch.int64)
-    positions = mapping_t[prompt_embeds.positions]
-    if bool(multimodal_rows[positions].any()):
+    mapping: List[int] = []
+    placeholders = set()
+    gap_start = 0
+    for start, end in list(item_spans) + [(len(expanded_ids), len(expanded_ids))]:
+        is_item = start < len(expanded_ids)
+        token = expanded_ids[start] if is_item else None
+        segment_end = len(original_ids)
+        if is_item:
+            segment_end = len(mapping)
+            while segment_end < len(original_ids) and original_ids[segment_end] != token:
+                segment_end += 1
+            if segment_end == len(original_ids):
+                _raise_unaligned()
+        segment = original_ids[len(mapping) : segment_end]
+        mapping.extend(_align_gap(segment, expanded_ids, gap_start, start, framed=is_item))
+        if is_item:
+            placeholders.add(len(mapping))
+            mapping.append(start)
+            gap_start = end
+    rows = prompt_embeds.positions.tolist()
+    if any(p in placeholders for p in rows):
         raise ValueError("prompt_embeds_mask selects a multimodal placeholder position.")
+    positions = torch.tensor([mapping[p] for p in rows], dtype=torch.int64)
     embeds = prompt_embeds.embeds
     return PromptEmbeds(
         embeds=embeds,
@@ -296,46 +298,80 @@ def remap_prompt_embeds(
     )
 
 
-def _unmatched_tokens_frame_placeholders(
-    mapping: List[int], matched: torch.Tensor, multimodal_rows: torch.Tensor
-) -> bool:
-    """Return whether every unmatched expanded token is placeholder expansion.
+def _raise_unaligned() -> None:
+    """Raise the error for ids that processing changed outside placeholders."""
+    raise ValueError(
+        "prompt_token_ids did not survive multimodal processing unchanged "
+        "outside the multimodal placeholders; use placeholder ids that "
+        "detokenize and retokenize to themselves (for example the ids of the "
+        "replaced tokens)."
+    )
+
+
+def _align_gap(
+    segment: Sequence[int], expanded_ids: Sequence[int], begin: int, end: int, framed: bool
+) -> List[int]:
+    """Match ``segment`` in order within ``expanded_ids[begin:end]``.
 
     Args:
-        mapping: Expanded index of each original token.
-        matched: ``[len(expanded_ids)]`` bool mask of matched expanded tokens.
-        multimodal_rows: ``[len(expanded_ids)]`` bool mask of multimodal rows.
+        segment: Original tokens between two placeholders.
+        expanded_ids: Expanded prompt ids.
+        begin: First expanded row after the previous item (or 0).
+        end: First row of the next item (or the prompt length).
+        framed: Whether an item follows, whose framing may precede its rows.
+
+    Returns:
+        The expanded index of each token of ``segment``.
     """
-    is_placeholder = [bool(multimodal_rows[j]) for j in mapping]
-    stray = (~matched & ~multimodal_rows).tolist()
-    bounds = [-1] + mapping + [len(stray)]
-    # Gap g lies between original tokens g - 1 and g.
-    for gap in range(len(mapping) + 1):
-        if not any(stray[bounds[gap] + 1 : bounds[gap + 1]]):
-            continue
-        near = range(max(gap - 2, 0), min(gap + 2, len(mapping)))
-        if not any(is_placeholder[i] for i in near):
-            return False
-    return True
+    mapping = []
+    j = begin
+    for token in segment:
+        while j < end and expanded_ids[j] != token:
+            j += 1
+        if j == end:
+            _raise_unaligned()
+        mapping.append(j)
+        j += 1
+    # Unmatched tokens may only be the next item's framing: after the
+    # second-to-last matched token, i.e. around the item's start marker.
+    if not framed:
+        framing_from = end
+    elif len(mapping) >= 2:
+        framing_from = mapping[-2] + 1
+    else:
+        framing_from = begin
+    matched = set(mapping)
+    if any(k not in matched for k in range(begin, framing_from)):
+        _raise_unaligned()
+    return mapping
 
 
-def multimodal_row_mask(multimodal_input: "MultimodalInput", num_tokens: int) -> torch.Tensor:
-    """Return a ``[num_tokens]`` bool mask of a request's multimodal rows.
+def multimodal_item_spans(multimodal_input: "MultimodalInput") -> List[Tuple[int, int]]:
+    """Return each multimodal item's ``[first row, last row + 1)`` in prompt order.
 
     Args:
         multimodal_input: Multimodal layout of the request.
-        num_tokens: Prompt length.
     """
-    mask = torch.zeros(num_tokens, dtype=torch.bool)
-    if multimodal_input.multimodal_run_positions is not None:
+    offsets = multimodal_input.multimodal_item_run_cu_offsets
+    if multimodal_input.multimodal_run_positions is not None and offsets is not None:
         starts = multimodal_input.multimodal_run_positions
         lengths = multimodal_input.multimodal_run_lengths
+        spans = [
+            (
+                int(starts[offsets[k]]),
+                int(starts[offsets[k + 1] - 1]) + int(lengths[offsets[k + 1] - 1]),
+            )
+            for k in range(len(offsets) - 1)
+            if offsets[k + 1] > offsets[k]
+        ]
     else:
-        starts = multimodal_input.multimodal_positions
-        lengths = multimodal_input.multimodal_lengths
-    for start, length in zip(starts, lengths):
-        mask[int(start) : int(start) + int(length)] = True
-    return mask
+        spans = [
+            (int(start), int(start) + int(length))
+            for start, length in zip(
+                multimodal_input.multimodal_positions, multimodal_input.multimodal_lengths
+            )
+        ]
+    return sorted(spans)
 
 
 def prompt_embeds_block_key(row_digest: bytes, placeholder_id: int) -> bytes:
