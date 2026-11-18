@@ -22,6 +22,14 @@ All published functionality in the Release Notes has been fully tested and verif
 
 - `/v1/responses`: a response cut short by `max_output_tokens` now reports `incomplete_details.reason` `max_output_tokens`, and when streamed it ends with `response.incomplete` instead of `response.completed`, as in the OpenAI API.
 - <span style="color: red">**[BREAKING CHANGE] Removed obsolete C++ executor orchestration helpers.**</span> The internal `RequestWithId` type, its `serializeReqWithIds` / `deserializeReqWithIds` functions, all production `insertRequestInOrder` overloads, and the unused `requestUtils.h` and `orchestratorUtils.h` helpers have been removed. These helpers belonged to the retired C++ executor orchestration path; downstream code linking their exported symbols must stop using them and rebuild. The current `Request` / `Response` interfaces and serialization remain available. Executor factory and worker constructors no longer accept the unused `engine` and `batched_logits_processor` arguments; callers should omit them and continue passing model configuration through `llm_args` and `hf_model_dir`. Unused decoder, request-cancellation, executor, legacy-model, orchestration, and speculative-decoding MPI tag names have also been removed; values 1–23, 127–129, and 1023–1025 are retired. The default, KV-cache event, and context-transfer tags retain their existing values. Internal `LogprobParams` and `LogProbsResult` tuples now contain only prompt-logprob fields; generation logprobs remain supplied by the sampler. The unused `TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT` environment variable has been removed.
+- <span style="color: red">**[BREAKING CHANGE] `internal_request_auth_key` must be at least 16 bytes with the Python cache transceiver.**</span>
+  Context and generation servers that use the Python cache transceiver
+  (`cache_transceiver_config.transceiver_runtime="PYTHON"`, the default) now fail at startup when
+  `internal_request_auth_key` is shorter than 16 bytes (UTF-8 encoded); earlier releases accepted
+  any non-empty value. Replace a shorter key on all servers before upgrading; 32 random bytes are
+  recommended. With a key set, context and generation workers also sign the native control
+  messages they exchange, so upgrade the workers that share a key together. See
+  `examples/disaggregated/README.md`.
 - <span style="color: red">**[BREAKING CHANGE] Unified multimodal processor metadata.**</span>
   Multimodal processor extensions now use `get_mm_item_metadata()` and
   `MultimodalItemMetadata`, replacing `get_mm_encoder_item_metadata()` and
