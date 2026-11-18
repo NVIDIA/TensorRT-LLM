@@ -975,7 +975,7 @@ class ExecutionStage:
     def _mark_correct(
         self, marker: str, evaluation: contract_mod.Evaluation
     ) -> contract_mod.Milestone | None:
-        """Every required check holds on the target (``marker``): name its commit, record it.
+        """Every required check passed and the final tree is confirmed: name its commit, record it.
 
         The branch is ``<target branch>-correct`` (:meth:`_deliver_milestone`).
         """
@@ -984,8 +984,8 @@ class ExecutionStage:
             marker,
             evaluation,
             self.workflow._contract.required(),
-            f"all {len(evaluation.passed)} required checks of the contract hold on it, "
-            "the delivery tier's included",
+            f"all {len(evaluation.passed)} required checks of the contract passed, the "
+            "delivery tier's included, and a check that passed on it confirms it",
         )
 
     def _take_stage_notes(self) -> list[str]:
