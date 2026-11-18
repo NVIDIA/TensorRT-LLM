@@ -28,13 +28,16 @@ Provides:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
+import dataclasses
+import os
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
     KVCacheManagerV2,
     Role,
     _BasePageTableMaterializer,
@@ -64,6 +67,7 @@ from .common import get_sparse_layer_ids
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
@@ -154,6 +158,11 @@ class MiniMaxM3SparseIndexCache:
                 f"[N, 1, {self.sparse_index_dim}], got {tuple(idx_v.shape)}"
             )
         buf.index_copy_(0, out_cache_loc.to(torch.long), idx_v.to(buf.dtype))
+
+
+# SM107: price M3's real per-token footprint in the pre-allocation estimate (index-K on every sparse layer, FP8 dense
+# and shared Eagle layers) instead of the generic all-NVFP4 K/V sum. Kill switch: False keeps the generic estimate.
+_SM107_EXACT_KV_SIZE_ESTIMATE = True
 
 
 def shared_draft_layer_count(spec_config, layer_mask) -> int:
@@ -270,6 +279,11 @@ def extend_attention_op_pools_for_shared_draft_layers(
     )
 
 
+# Zero every KV pool view (NVFP4 + FP8 K/V, NVFP4 block scales, paged index keys) once at allocation, so no reader
+# ever sees uninitialized bytes. Kill switch (diagnostics only): TRTLLM_M3_KV_POOL_ZERO_INIT=0.
+_KV_POOL_ZERO_INIT = os.environ.get("TRTLLM_M3_KV_POOL_ZERO_INIT", "1") == "1"
+
+
 def _require_trtllm_gen_extra_page_route(tokens_per_block: int) -> None:
     """Fail at setup, not at the first prefill, when the P128 opt-in has no FMHA (SM107).
 
@@ -341,6 +355,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # Extra page sizes trtllm-gen may use with this manager (see
     # FlashInferTrtllmGenFmha); set with the virtual pools.
     trtllm_gen_extra_tokens_per_block: frozenset = frozenset()
+    # A standalone DFlash/DSpark drafter's layers may join as explicit draft layer specs: their own
+    # lifecycle keeps them out of the index-K pools, and size-only coalescing keeps the target pools.
+    hosts_unified_draft_layers = True
+    _separate_nvfp4_coalescing = False
 
     def __init__(
         self,
@@ -363,7 +381,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         implementation = getattr(sparse_attention_config, "implementation", "triton")
         self._main_kv_view_layout = "HND" if implementation == "msa" else "NHD"
         native_dense_cache = kwargs.get("dtype") not in (DataType.FP8, DataType.NVFP4)
-        if implementation == "triton" and not native_dense_cache:
+        if not self.main_kv_is_head_major(sparse_attention_config, kwargs.get("dtype")):
             self._main_kv_mapper_kind = MapperKind.NHD
 
         if sparse_index_dim is None:
@@ -382,10 +400,26 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             kwargs.get("num_kv_heads"),
             shared_draft_layer_count(kwargs.get("spec_config"), kwargs.get("layer_mask")),
         )
+        layer_specs = kwargs.get("layer_specs")
+        # Explicit specs declare the draft layers, which are never sparse or native target layers.
+        draft_ids = {
+            spec.global_layer_id
+            for spec in (layer_specs or ())
+            if spec.owner is KVCacheLayerOwner.DRAFT
+        }
+        if layer_specs is not None:
+            # Layer specs may be a PP rank's subset: the checkpoint's layer count is the global
+            # target count, and without it draft layers still follow every target layer.
+            num_hidden_layers = getattr(kwargs.get("pretrained_config"), "num_hidden_layers", None)
+            if num_hidden_layers is not None:
+                num_target_layers = int(num_hidden_layers)
+            elif draft_ids:
+                num_target_layers = min(draft_ids)
         if sparse_layer_ids is None:
             sparse_layer_ids = default_sparse_layer_ids(
                 kwargs.get("pretrained_config"), num_target_layers
             )
+        sparse_layer_ids = [i for i in sparse_layer_ids if int(i) not in draft_ids]
         if disable_index_value_layer_ids is None:
             disable_index_value_layer_ids = list(sparse_layer_ids)
 
@@ -395,7 +429,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         if implementation == "triton" and native_dense_cache and num_target_layers is not None:
             self._dense_native_layer_ids = tuple(
-                i for i in range(num_target_layers) if i not in self.sparse_layer_ids
+                i
+                for i in range(num_target_layers)
+                if i not in self.sparse_layer_ids and i not in draft_ids
             )
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
         self.sparse_index_dim = sparse_index_dim
@@ -408,14 +444,56 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # Filled at the end of __init__; the base __init__ may already call get_buffers.
         self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
         self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
+        if layer_specs is not None and any(
+            spec.owner is KVCacheLayerOwner.DRAFT and spec.dtype == DataType.NVFP4
+            for spec in layer_specs
+        ):
+            # Block scales here belong to the MSA sparse target layers only.
+            raise ValueError(f"{type(self).__name__} does not host NVFP4 draft layers.")
+        hosts_draft_layers = layer_specs is not None and any(
+            spec.owner is KVCacheLayerOwner.DRAFT for spec in layer_specs
+        )
+        if (
+            hosts_draft_layers
+            and kwargs.get("is_disagg")
+            and self._main_kv_mapper_kind != MapperKind.HND
+        ):
+            # Drafters write head-major K/V, but transfer reads every K/V buffer with the main mapper.
+            raise ValueError(
+                f"{type(self).__name__} transfers draft layers only with the HND K/V layout."
+            )
+        if layer_specs is not None and kwargs.get("dtype") == DataType.NVFP4:
+            # The hybrid layout of _build_cache_config as specs: FP8 on the dense target layers.
+            kwargs["layer_specs"] = tuple(
+                dataclasses.replace(spec, dtype=DataType.FP8, buffer_roles=(Role.KEY, Role.VALUE))
+                if spec.owner is KVCacheLayerOwner.TARGET
+                and spec.dtype == DataType.NVFP4
+                and spec.global_layer_id not in self.sparse_layer_ids
+                else spec
+                for spec in layer_specs
+            )
         super().__init__(*args, **kwargs)
         self._unchanged_copies: Dict[int, DeviceCopyBuffer] = {}
         self._pool_views: Dict[tuple, torch.Tensor] = {}
 
+        if hosts_draft_layers:
+            groups = self.layer_to_pool_mapping_dict
+            target_groups = {groups[self.layer_offsets[layer]] for layer in self.target_layer_ids}
+            if any(
+                groups[self.layer_offsets[layer]] in target_groups for layer in self.draft_layer_ids
+            ):
+                # Coalesced with target buffers, draft layers would get target-relative pool offsets.
+                self.shutdown()
+                raise ValueError(
+                    f"{type(self).__name__} hosts draft layers only in their own lifecycle."
+                )
+
         if self.dtype == DataType.NVFP4:
             dense_target_layers = [
                 layer
-                for layer in self.layer_offsets
+                for layer in (
+                    self.target_layer_ids if self.layer_specs is not None else self.layer_offsets
+                )
                 if layer not in self.sparse_layer_ids and layer not in self._shared_draft_layer_ids
             ]
             logger.info(
@@ -472,18 +550,28 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 self._block_scale_buffers[layer_idx, kv_layout] = self.get_block_scale_buffers(
                     layer_idx, kv_layout
                 )
-        # The KV pools are written only at live slots, and readers that consume a whole block or page (the CSR
-        # sparse prefill's V dequant, the full-context decode on a last page's tail) would turn uninitialized
-        # bytes into 0 * NaN = NaN. Zero every layer's K/V bytes (NVFP4 sparse, FP8 dense, the drafter's in its
-        # own manager), the NVFP4 block scales and the paged index keys once, before any request runs: every
-        # byte a kernel writes is unchanged.
-        for view in (
-            *self._kv_buffers.values(),
-            *self._block_scale_buffers.values(),
-            *self._index_k_buffers.values(),
-        ):
-            if view is not None:
-                view.zero_()
+        if _KV_POOL_ZERO_INIT:
+            # The KV pools are written only at live slots, and readers that consume a whole block or page (the CSR
+            # sparse prefill's V dequant, the full-context decode on a last page's tail) would turn uninitialized
+            # bytes into 0 * NaN = NaN. Zero every layer's K/V bytes (NVFP4 sparse, FP8 dense, the drafter's in its
+            # own manager), the NVFP4 block scales and the paged index keys once, before any request runs: every
+            # byte a kernel writes is unchanged.
+            for view in (
+                *self._kv_buffers.values(),
+                *self._block_scale_buffers.values(),
+                *self._index_k_buffers.values(),
+            ):
+                if view is not None:
+                    view.zero_()
+
+    @staticmethod
+    def main_kv_is_head_major(sparse_attention_config: Any, dtype: Optional[DataType]) -> bool:
+        """Whether the main K/V buffers use the HND mapper.
+
+        The Triton implementation keeps an FP8 or NVFP4 cache NHD.
+        """
+        implementation = getattr(sparse_attention_config, "implementation", "triton")
+        return not (implementation == "triton" and dtype in (DataType.FP8, DataType.NVFP4))
 
     def _validate_speculative_config(self, spec_config: DecodingBaseConfig | None) -> None:
         # Dynamic-tree relocation moves packed K/V bytes without their NVFP4
@@ -520,27 +608,117 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             ]
         return super()._build_cache_config(config)
 
-    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
+    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
         """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
-        if self.dtype != DataType.NVFP4:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
         global_layer_idx = int(self.pp_layers[int(local_layer_idx)])
-        if global_layer_idx in self.sparse_layer_ids:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+        has_index_k = global_layer_idx in self.sparse_layer_ids
+        if data_role == Role.INDEX_KEY:
+            return self._index_k_bytes_per_token() if has_index_k else 0
 
-        if data_role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
-            return 0
-        if data_role == Role.ALL:
-            kv_factor = self.kv_factor
-        elif data_role in (Role.KEY, Role.VALUE):
-            kv_factor = 1
+        if self.layer_specs is not None or self.dtype != DataType.NVFP4 or has_index_k:
+            # Explicit layer specs carry K/V and scales; index-K is this manager's extra buffer.
+            cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
         else:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
-        return (
-            kv_factor
-            * self.num_kv_heads_per_layer[int(local_layer_idx)]
-            * self.head_dim_per_layer[int(local_layer_idx)]
+            # NVFP4 dense-target / shared-Eagle FP8 cache calculation.
+            if data_role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
+                return 0
+            if data_role == Role.ALL:
+                kv_factor = self.kv_factor
+            elif data_role in (Role.KEY, Role.VALUE):
+                kv_factor = 1
+            else:
+                return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+            cache_bytes = (
+                kv_factor
+                * self.num_kv_heads_per_layer[int(local_layer_idx)]
+                * self.head_dim_per_layer[int(local_layer_idx)]
+            )
+
+        if data_role == Role.ALL and has_index_k:
+            cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
+        return cache_bytes
+
+    def get_cache_bytes_per_token(self) -> int:
+        """Bytes per token across the local layers, the sparse layers' index-K included.
+
+        The base sums the K/V roles only; the per-sparse-layer ``Role.INDEX_KEY``
+        buffers live in the same tiers, so the cache-created event's block count
+        divides each tier quota by this total. Layer specs carry no index-K either.
+        """
+        return super().get_cache_bytes_per_token() + sum(
+            self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
+            for local_layer_idx in range(self.num_local_layers)
         )
+
+    @classmethod
+    def get_cache_size_per_token(cls, model_config, mapping, num_layers=None, **kwargs):
+        """Pre-allocation bytes per token, including what the generic estimate leaves out.
+
+        The base classmethod sums K/V for the target layers only, all at the cache dtype. This manager also holds
+        one index-K head per sparse layer (replicated on every TP rank), keeps the dense target layers and the
+        appended one-model Eagle layers in FP8 when the cache is NVFP4 (see :meth:`_build_cache_config`), and
+        allocates those shared draft layers itself. On SM107 the difference is added to the per-token term.
+        """
+        base = super().get_cache_size_per_token(model_config, mapping, num_layers, **kwargs)
+        if (
+            not _SM107_EXACT_KV_SIZE_ESTIMATE
+            or get_sm_version() != 107
+            or kwargs.get("is_draft", False)
+        ):
+            return base
+        extra = cls._extra_bytes_per_token(model_config, mapping, num_layers, kwargs)
+        if isinstance(base, tuple):
+            return (base[0] + extra,) + tuple(base[1:])
+        return base + extra
+
+    @classmethod
+    def _extra_bytes_per_token(cls, model_config, mapping, num_layers, kwargs) -> int:
+        config = model_config.pretrained_config
+        config = getattr(config, "text_config", None) or config
+        num_target_layers = int(num_layers if num_layers is not None else config.num_hidden_layers)
+        local_layers = (
+            list(mapping.pp_layers(num_target_layers))
+            if mapping.pp_size > 1
+            else list(range(num_target_layers))
+        )
+        sparse_layer_ids = kwargs.get("sparse_layer_ids")
+        if sparse_layer_ids is None:
+            sparse_layer_ids = default_sparse_layer_ids(config, num_target_layers)
+        sparse_layer_ids = set(int(layer) for layer in sparse_layer_ids)
+        sparse_layers = [layer for layer in local_layers if layer in sparse_layer_ids]
+        dense_layers = [layer for layer in local_layers if layer not in sparse_layer_ids]
+        tp = 1 if mapping.enable_attention_dp else mapping.tp_size
+        kv_heads = max(1, int(config.num_key_value_heads) // tp)
+        head_dim = int(
+            getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        )
+
+        sparse_config = getattr(model_config, "sparse_attention_config", None)
+        index_dim = int(getattr(sparse_config, "sparse_index_dim", None) or 128)
+        index_elem = 1 if str(getattr(sparse_config, "indexer_kv_dtype", "bf16")) == "fp8" else 2
+        extra = len(sparse_layers) * index_dim * index_elem
+
+        kv_elems = 2 * kv_heads * head_dim  # K and V
+        quant_config = model_config.quant_config
+        nvfp4 = quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache()
+        if nvfp4:
+            # The base prices every layer as NVFP4 data + block scales; dense layers are FP8.
+            extra += len(dense_layers) * (kv_elems - (kv_elems // 2 + kv_elems // 16))
+            draft_layer_bytes = kv_elems
+        else:
+            draft_layer_bytes = None
+        spec_config = kwargs.get("spec_config")
+        if spec_config is not None and not kwargs.get("use_separate_draft_kv_cache", False):
+            num_draft = shared_draft_layer_count(spec_config, None)
+            if draft_layer_bytes is None:
+                elem = (
+                    1
+                    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache()
+                    else 2
+                )
+                draft_layer_bytes = kv_elems * elem
+            extra += num_draft * draft_layer_bytes
+        return extra
 
     def is_nvfp4_layer(self, layer_idx: int) -> bool:
         """Whether ``layer_idx`` stores packed NVFP4 data and block scales."""
@@ -563,17 +741,23 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             return None
         return super()._get_block_scale_role(role_a, layer_id)
 
-    def get_draft_kv_cache_view(self) -> Optional["MiniMaxM3DraftKVCacheView"]:
+    def get_draft_kv_cache_view(
+        self,
+    ) -> Optional[Union["MiniMaxM3DraftKVCacheView", "MiniMaxM3KVCacheManagerV2"]]:
         """FP8/P128 view of the shared draft layer in a hybrid NVFP4 cache, or None.
 
         FP8/BF16 caches address the draft layer through this manager's own
-        attention-op pools instead.
+        attention-op pools instead. With explicit draft layer specs, this
+        manager itself is the draft view.
 
         Only meaningful on a target manager carrying appended one-model
         draft layers; built lazily so the manager's page tables exist. A
         method rather than a property so ``getattr`` fetches it without
         executing it (see ``get_draft_kv_cache_manager``).
         """
+        if self.layer_specs is not None:
+            # Explicit draft layers are addressed through this manager itself.
+            return super().get_draft_kv_cache_view()
         if self.dtype != DataType.NVFP4 or self.is_draft or not self._shared_draft_layer_ids:
             return None
         if self.enable_swa_scratch_reuse:
@@ -596,15 +780,33 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             )
         return self._draft_kv_cache_view
 
-    def add_dummy_requests(self, *args, **kwargs):
+    def _iter_cache_buffers_for_invalid_check(self) -> Iterator[Tuple[int, torch.Tensor]]:
+        """Scan target layers through their slot-indexed views, which cover only that layer.
+
+        The base class's explicit-spec path selects rows of a base view, which only draft layers
+        keep here.
+        """
+        for layer_id, buffer in super()._iter_cache_buffers_for_invalid_check():
+            if self.layer_specs is None or (
+                self.get_layer_owner(layer_id) is KVCacheLayerOwner.DRAFT
+            ):
+                yield layer_id, buffer
+            else:
+                yield layer_id, self.get_buffers(layer_id)
+
+    def add_dummy_requests(self, *args: Any, **kwargs: Any) -> Optional[List[LlmRequest]]:
         """Drop the draft KV cache view before delegating.
 
         The base method mirrors dummy KV caches into a *separate* draft
         manager. With shared draft layers a dummy request's blocks already
         span the drafter's pool (pools allocate in lockstep per logical
-        block), and the view owns no block lifecycle.
+        block), and the view owns no block lifecycle. Explicit draft layers
+        are this manager's own, so their view is this manager itself.
         """
-        if isinstance(kwargs.get("draft_kv_cache_manager"), MiniMaxM3DraftKVCacheView):
+        draft_kv_cache_manager = kwargs.get("draft_kv_cache_manager")
+        if draft_kv_cache_manager is self or isinstance(
+            draft_kv_cache_manager, MiniMaxM3DraftKVCacheView
+        ):
             kwargs["draft_kv_cache_manager"] = None
         return super().add_dummy_requests(*args, **kwargs)
 
@@ -615,7 +817,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         pool's slot ids; :meth:`copy_batch_block_offsets` scales them.
         """
         super()._prepare_page_table_tensor(index_mapper_capacity)
-        if self.dtype == DataType.NVFP4:
+        # Explicit draft layers keep the pools: the unified drafter reads their block offsets.
+        if self.dtype == DataType.NVFP4 and self.layer_specs is None:
             # Nothing reads a hybrid cache's own block offsets: MSA layers address pages
             # by slot id and the shared draft layer reads MiniMaxM3DraftKVCacheView's
             # table. Without pools, a new reader fails instead of reading unfilled offsets.
@@ -690,9 +893,45 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
 
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
-        # Staging for the per-layer block-offset copy, which a hybrid NVFP4 cache never runs.
-        if self.dtype != DataType.NVFP4:
+        # Staging for the per-layer block-offset copy, which a pool-less hybrid NVFP4 cache never runs.
+        self._draft_attention_op_rows: Optional[slice] = None
+        if self.dtype != DataType.NVFP4 or self.layer_specs is not None:
             super()._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
+        if self.dtype != DataType.NVFP4 or self.layer_specs is None:
+            return
+        # A hybrid cache's target layers address pages by slot id, so only the explicit
+        # draft layers read attention-op block offsets: build just their rows each step.
+        rows = sorted(
+            int(self.layer_offsets[layer])
+            for layer in self.draft_layer_ids
+            if layer in self.layer_offsets
+        )
+        if not rows or rows != list(range(rows[0], rows[-1] + 1)):
+            return
+        sl = slice(rows[0], rows[-1] + 1)
+        self._draft_attention_op_rows = sl
+        self._device_attention_op_pool_ids = self._device_attention_op_pool_ids[sl].contiguous()
+        self._device_attention_op_scales = self._device_attention_op_scales[sl].contiguous()
+        self._device_attention_op_layer_offsets = self._device_attention_op_layer_offsets[
+            sl
+        ].contiguous()
+        self._device_attention_op_scratch_pages = self._device_attention_op_scratch_pages[
+            sl
+        ].contiguous()
+        self._device_attention_op_block_offsets_staging = (
+            self._device_attention_op_block_offsets_staging[sl].clone()
+        )
+
+    def _copy_batch_block_offsets_per_layer(
+        self, dst_tensor: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> None:
+        """Fill only the draft layers' rows when the staging holds just those."""
+        rows = getattr(self, "_draft_attention_op_rows", None)
+        # The base slices dst and staging to num_attention_op_pools rows; both views
+        # here have exactly the draft rows, so the slices keep them whole.
+        super()._copy_batch_block_offsets_per_layer(
+            dst_tensor if rows is None else dst_tensor[rows], *args, **kwargs
+        )
 
     def copy_batch_block_offsets(
         self,
@@ -765,19 +1004,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             raise NotImplementedError("MiniMax-M3 does not relocate accepted draft tokens.")
         super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
 
-    def _extra_buffers_per_layer(self, *, tokens_per_block):
+    def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         """Register a per-sparse-layer ``Role.INDEX_KEY`` :class:`BufferConfig`.
 
-        ``size`` is bytes per **block**: ``1 * sparse_index_dim *
-        elem_bytes * tokens_per_block``. Keyed by **local** layer id —
-        the base ``_build_base_config`` iterates local ids, so keying
+        ``size`` is bytes per **block**: :meth:`_index_k_bytes_per_token`
+        times ``tokens_per_block``, the same per-token size
+        :meth:`get_layer_bytes_per_token` reports. Keyed by **local** layer
+        id — the base ``_build_base_config`` iterates local ids, so keying
         by global ids would silently skip registration on non-trivial
         PP ranks.
         """
-        torch_dtype = self._torch_dtype_for_index_cache()
-        elem_bytes = torch.tensor([], dtype=torch_dtype).element_size()
-        bytes_per_token = 1 * self.sparse_index_dim * elem_bytes
-        size_per_block = bytes_per_token * tokens_per_block
+        size_per_block = self._index_k_bytes_per_token() * tokens_per_block
         return {
             self.layer_offsets[layer_id]: [BufferConfig(role=Role.INDEX_KEY, size=size_per_block)]
             for layer_id in self.sparse_layer_ids
@@ -808,6 +1045,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         page_upper = self.impl.get_page_index_upper_bound(any_layer_offset, Role.KEY)
         kv_factor = 1 if self.kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         return int((page_upper // kv_factor) * self.tokens_per_block)
+
+    def _index_k_bytes_per_token(self) -> int:
+        """Bytes of one token's index-K row on a sparse layer."""
+        index_dtype = self._torch_dtype_for_index_cache()
+        return self.sparse_index_dim * torch.empty(0, dtype=index_dtype).element_size()
 
     def _torch_dtype_for_index_cache(self) -> torch.dtype:
         """Return the independently configured index-cache storage dtype."""
@@ -931,7 +1173,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         at K's base, then slices ``[:, :2]`` to extract K+V. The slice
         preserves the dim-0 stride (``scale * page_stride``), so
         ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
+
+        Explicit draft layers keep the base view: their own lifecycle's pool holds only their K/V.
         """
+        if self.layer_specs is not None and self.get_layer_owner(layer_idx) is (
+            KVCacheLayerOwner.DRAFT
+        ):
+            return super().get_buffers(
+                layer_idx, kv_layout if kv_layout is not None else self._main_kv_layout_name()
+            )
         if kv_layout is None:
             kv_layout = self._main_kv_view_layout
         if kv_layout not in ("HND", "NHD"):
@@ -955,7 +1205,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
 
     def configure_decode_shortcuts(
-        self, skip_unchanged_block_offsets: bool, reuse_pool_views: bool
+        self,
+        skip_unchanged_block_offsets: bool,
+        reuse_pool_views: bool,
     ) -> None:
         """Turn on the decode-step shortcuts a model opted into.
 
@@ -1132,6 +1384,37 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
         return layers_by_addr.index(int(layer_id))
 
+    def get_batch_cache_indices(
+        self,
+        request_ids: List[int],
+        layer_idx: Optional[int] = None,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
+        *,
+        raw_indices: bool = False,
+    ) -> List[List[int]]:
+        """Return indices into a layer's :meth:`get_buffers` view.
+
+        Explicit draft layers keep the base view, so their indices take the base
+        conversion; every other layer gets raw slot ids.
+        """
+        if (
+            self.layer_specs is None
+            or layer_idx is None
+            or self.get_layer_owner(layer_idx) is not KVCacheLayerOwner.DRAFT
+        ):
+            return super().get_batch_cache_indices(
+                request_ids, layer_idx, num_blocks_per_seq, raw_indices=raw_indices
+            )
+        return KVCacheManagerV2._get_batch_cache_indices_by_pool_id(
+            self,
+            request_ids,
+            pool_id=self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]],
+            is_kv_aggregate=not raw_indices,
+            num_blocks_per_seq=num_blocks_per_seq,
+            index_scale=1 if raw_indices else self.get_layer_page_index_scale(layer_idx),
+            kv_factor=self.get_layer_kv_factor(layer_idx),
+        )
+
     def _get_batch_cache_indices_by_pool_id(
         self,
         request_ids,
@@ -1191,17 +1474,21 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         The rows are written through a numpy view of a single zero-filled,
         pinned result, so the attention metadata builders ship it to the device
-        in one asynchronous copy.
+        in one asynchronous copy. Each row is slice-copied from the request's
+        pool-0 page-index view (an int32 array), the same row
+        :meth:`get_batch_cache_indices` returns: the view spans the whole
+        ``max_seq_len`` capacity, so building it as a Python list would cost
+        host time on every decode step in proportion to ``max_seq_len``, not
+        to the live context.
         """
-        block_ids_per_seq = self.get_batch_cache_indices(request_ids)
-        batch = len(block_ids_per_seq)
-        max_blocks = max((len(block_ids) for block_ids in block_ids_per_seq), default=0)
+        views = [self.kv_cache_map[req_id].get_base_page_indices(0) for req_id in request_ids]
+        max_blocks = max((len(view) for view in views), default=0)
         padded_tensor = torch.zeros(
-            (batch, max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
+            (len(views), max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
         )
         rows = padded_tensor.numpy()
-        for row, block_ids in zip(rows, block_ids_per_seq):
-            row[: len(block_ids)] = block_ids
+        for row, view in zip(rows, views):
+            row[: len(view)] = view
         # BAD_PAGE_INDEX marks padding, which this tensor reports as 0.
         rows[rows == BAD_PAGE_INDEX] = 0
         return padded_tensor

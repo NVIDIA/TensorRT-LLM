@@ -56,6 +56,7 @@ enum class CacheTier : int
     GPU_MEM = 0,
     HOST_MEM = 1,
     DISK = 2,
+    REMOTE = 3,
 };
 
 // PageIndexMode — how converted page indices relate to layers within a layer group.
@@ -118,6 +119,9 @@ inline constexpr FileDescriptor kBadFileDescriptor = -1;
 // Index into a page table.
 using PageIndex = StrongIndex<int, struct PageIndexTag, -1>;
 inline constexpr PageIndex kBadPageIndex{-1};
+
+// Index of a GPU locality domain.
+using LocalityDomainId = StrongIndex<int, struct LocalityDomainIdTag>;
 
 // Eviction priority (0 = highest priority to evict, 100 = lowest).
 using Priority = int;

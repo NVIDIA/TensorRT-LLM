@@ -1394,16 +1394,27 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         pixel_values = processed_inputs.get('pixel_values', None)
         if pixel_values is not None:
             multimodal_data["image"] = {
-                "pixel_values": pixel_values.to(self.dtype),
-                "image_grid_thw": processed_inputs.get('image_grid_thw')
+                "pixel_values":
+                pixel_values.to(torch.uint8 if "image" in processed_inputs.get(
+                    "vision_normalization", {}) else self.dtype),
+                "image_grid_thw":
+                processed_inputs.get('image_grid_thw')
             }
 
         pixel_values_videos = processed_inputs.get('pixel_values_videos', None)
         if pixel_values_videos is not None:
             multimodal_data["video"] = {
-                "pixel_values_videos": pixel_values_videos.to(self.dtype),
-                "video_grid_thw": processed_inputs.get('video_grid_thw')
+                "pixel_values_videos":
+                pixel_values_videos.to(
+                    torch.uint8 if "video" in processed_inputs.
+                    get("vision_normalization", {}) else self.dtype),
+                "video_grid_thw":
+                processed_inputs.get('video_grid_thw')
             }
+
+        for modality, normalization in processed_inputs.get(
+                "vision_normalization", {}).items():
+            multimodal_data[modality]["vision_normalization"] = normalization
 
         # Computed from the fused ids so the vision spans get their per-axis
         # coordinates; the text-only path above returns before reaching here.
@@ -1450,6 +1461,13 @@ class Qwen2VisionModelBase(nn.Module):
                 model_class(model_config.pretrained_config.vision_config),
                 self.model_dtype).eval()
         elif model_class == Qwen2_5_VisionModel:
+            vision_config = self.model_config.with_encoder_attention_backend(
+                "vision")
+            if vision_config is not self.model_config:
+                # The encoder keeps no KV cache, and FlashInfer rejects FP8
+                # KV-cache quantization without one.
+                vision_config.quant_config = QuantConfig()
+            self.model_config = vision_config
             self.visual = MultimodalModelMixin._cast_multimodal_encoder_dtype(
                 model_class(self.model_config), self.model_dtype)
         else:
@@ -2306,6 +2324,10 @@ def _qwen_vision_input_partitions(
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+    }
+
     supports_mm_encoder_item_scheduling = True
 
     def get_multimodal_item_partitions(
@@ -2589,6 +2611,8 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     ))
 class Qwen2VLModel(Qwen2VLModelBase):
 
+    supported_encoder_attention_backends = {"vision": frozenset()}
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
         # NOTE: Since Qwen2-VL is outdated model, we leave it as HF implementation.
@@ -2724,6 +2748,8 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         content_format=ContentFormat.STRING,
     ))
 class Qwen2_5_VLModel(Qwen2VLModelBase):
+
+    supported_encoder_attention_backends = Qwen2VLModelBase.supported_encoder_attention_backends
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):

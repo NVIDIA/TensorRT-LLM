@@ -41,7 +41,7 @@ from .sparse_attention import (
 # Type aliases
 # =============================================================================
 
-CacheBackendName = Literal["teacache", "cache_dit"]
+CacheBackendName = Literal["teacache", "cache_dit", "seacache"]
 
 # =============================================================================
 # Sub-configuration classes for VisualGenArgs
@@ -112,6 +112,26 @@ class QuantAttentionConfig(StrictBaseModel):
             "the trtllm-gen kernels quantize V without it."
         ),
     )
+    vc_attention: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Run the recipe as VC-Attention on the TRTLLM backend. V is stored as E4M3 residuals "
+            "around 128-token tile means with one scale per channel; fp8 Q/K are Hadamard-rotated "
+            "with one scale per 128 tokens. Requires TLLM_FMHA_LIBS=+prims_ts."
+        ),
+    )
+    vc_repair_budget: float = Field(
+        0.0,
+        ge=0.0,
+        lt=1.0,
+        status="prototype",
+        description=(
+            "Fraction of tokens VC-Attention appends as V repair rows instead of restoring "
+            "tile means; 0 restores the means. 0.005 to 0.02 are the useful range, 0.005 is the "
+            "fastest setting measured at unchanged quality. vc_attention only."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -180,6 +200,20 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (0, 0, 0)),
             },
         }
+        # VC-Attention stores V as E4M3 residuals around tile means with one scale per channel.
+        # VC-Attention-QK16 keeps Q/K in BF16, VC-Attention-QK8 quantizes the Hadamard-rotated
+        # Q/K to E4M3 with one scale per 128 tokens. The recipe fixes these block sizes, so the
+        # config names only the element formats.
+        VC_ATTENTION_RECIPES = {
+            100: {
+                ("bf16", "fp8"),
+                ("fp8", "fp8"),
+            },
+            103: {
+                ("bf16", "fp8"),
+                ("fp8", "fp8"),
+            },
+        }
         # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
@@ -203,30 +237,55 @@ class AttentionConfig(StrictBaseModel):
             return self
 
         q_config = self.quant_attention_config
-        recipe = (
-            q_config.qk_dtype,
-            q_config.v_dtype,
-            (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
-        )
+        block_sizes = (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size)
+        recipe = (q_config.qk_dtype, q_config.v_dtype, block_sizes)
         if self.backend == "TRTLLM":
             sm_version = get_sm_version()
-            recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(sm_version, set())
+            if q_config.vc_attention:
+                # The recipe fixes its scaling granularity. QK16 keeps bf16 Q/K with one V
+                # scale per channel, QK8 scales Q and K per 128-token block. The block size
+                # fields take the defaults or exactly those values and are set to them.
+                vc_block_sizes = (0, 0, 1) if q_config.qk_dtype == "bf16" else (128, 128, 1)
+                if block_sizes not in ((0, 0, 0), vc_block_sizes):
+                    raise ValueError(
+                        f"VC-Attention with qk_dtype={q_config.qk_dtype!r} fixes the block sizes "
+                        f"to {vc_block_sizes!r}. Leave them at 0, got {block_sizes!r}."
+                    )
+                q_config.q_block_size, q_config.k_block_size, q_config.v_block_size = vc_block_sizes
+                recipe = (q_config.qk_dtype, q_config.v_dtype)
+                recipes = VC_ATTENTION_RECIPES.get(sm_version, set())
+                family = "VC-Attention"
+            else:
+                recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(
+                    sm_version, set()
+                )
+                family = "SAGE and PrimTS"
             if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE and PrimTS recipes on this device: "
+                    f"for backend='TRTLLM'. Supported {family} recipes on this device: "
                     f"{sorted(recipes)}."
                 )
-            if (q_config.smooth_k or q_config.smooth_v) and q_config.q_block_size == 0:
+            if (q_config.smooth_k or q_config.smooth_v) and (
+                q_config.q_block_size == 0 or q_config.vc_attention
+            ):
                 raise ValueError(
                     "smooth_k and smooth_v are SageAttention options and do not apply to the "
-                    f"per-tensor recipe {recipe!r}."
+                    f"recipe {recipe!r}."
                 )
             if q_config.smooth_v and sm_version not in (100, 103):
                 raise ValueError(
                     "smooth_v needs the PrimTS kernels, which add the V mean back to the "
                     f"attention output and run on SM100 and SM103 only; got SM{sm_version}."
                 )
+            if q_config.vc_repair_budget and not q_config.vc_attention:
+                raise ValueError(
+                    "vc_repair_budget is a VC-Attention option and requires vc_attention=True."
+                )
+        elif q_config.vc_attention or q_config.vc_repair_budget:
+            raise ValueError(
+                f"vc_attention is a TRTLLM backend option, got backend='{self.backend}'."
+            )
         elif q_config.smooth_k or q_config.smooth_v:
             raise ValueError(
                 f"smooth_k and smooth_v are SageAttention options and require backend='TRTLLM', "
@@ -299,6 +358,10 @@ class AttentionConfig(StrictBaseModel):
         # The other backends never consume quant_attention_config on that path,
         # so accepting a recipe there would silently ignore user configuration.
         # SkipSoftmax is part of the dense path itself and can compose.
+        # VC-Attention is a dense recipe of the PrimTS kernels and is not
+        # composed with any sparse algorithm.
+        if self.quant_attention_config.vc_attention:
+            raise ValueError("vc_attention does not compose with sparse_attention_config.")
         if self.backend == "TRTLLM":
             return self
         algorithm = self.sparse_attention_config.algorithm
@@ -622,8 +685,49 @@ class CacheDiTConfig(BaseCacheConfig):
     )
 
 
+class SeaCacheConfig(BaseCacheConfig):
+    """SeaCache step-caching acceleration config (https://arxiv.org/abs/2602.18993).
+
+    Skips the generator transformer stack on steps whose spectrally filtered
+    input latents changed little since the last computed step, and predicts the
+    stack's residual by linear extrapolation from the last two computed steps.
+    The first ``max(max_warmup_steps, 1)`` and the last denoising steps are always
+    computed.
+    """
+
+    cache_backend: Literal["seacache"] = Field(
+        "seacache", description="Selects the SeaCache backend in `cache_config`."
+    )
+    threshold: float = Field(
+        0.25,
+        gt=0.0,
+        status="prototype",
+        description=(
+            "Accumulated relative-L1 change of the filtered latents below which a step "
+            "reuses the cache; larger values skip more steps."
+        ),
+    )
+    max_warmup_steps: int = Field(
+        12,
+        ge=0,
+        status="prototype",
+        description=(
+            "Leading denoising steps that always run the full stack; the first step always does."
+        ),
+    )
+    max_continuous_cached_steps: int = Field(
+        2,
+        ge=-1,
+        status="prototype",
+        description=(
+            "Maximum number of consecutive cached steps before a full step is forced; "
+            "-1 removes the limit and 0 disables caching."
+        ),
+    )
+
+
 CacheConfig = Annotated[
-    Union[TeaCacheConfig, CacheDiTConfig],
+    Union[TeaCacheConfig, CacheDiTConfig, SeaCacheConfig],
     Field(discriminator="cache_backend"),
 ]
 
@@ -913,6 +1017,10 @@ class VisualGenArgs(StrictBaseModel):
     def cache_dit(self) -> Optional[CacheDiTConfig]:
         return self.cache_config if isinstance(self.cache_config, CacheDiTConfig) else None
 
+    @property
+    def seacache(self) -> Optional[SeaCacheConfig]:
+        return self.cache_config if isinstance(self.cache_config, SeaCacheConfig) else None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return self.model_dump()
@@ -961,6 +1069,7 @@ __all__ = [
     "BaseCacheConfig",
     "TeaCacheConfig",
     "CacheDiTConfig",
+    "SeaCacheConfig",
     "CacheConfig",
     "TorchCompileConfig",
     "CudaGraphConfig",

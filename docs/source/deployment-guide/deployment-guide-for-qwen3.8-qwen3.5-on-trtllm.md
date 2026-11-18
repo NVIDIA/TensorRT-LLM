@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware
 
 ## Introduction
@@ -146,6 +151,14 @@ The MTP draft length is configurable through `speculative_config.max_draft_len`;
 
 Each file assigns expert IDs to 544 global slots for every MoE layer. Repeated expert IDs create replicas of heavily routed experts. `layer_updates_per_iter: 0` keeps the assignment static. The no-MTP map covers the 92 target-model layers, while the MTP3 map also includes the MTP layer. These placements are specific to Qwen3.8-2.4T-A95B, EP32, the selected MTP mode, and the benchmark traffic distribution. Generate a new placement when any of those inputs changes. See the [EPLB example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer) for collecting routing statistics and generating a placement file.
 
+### Experimental QKV Preprocessing Tiling
+
+`TRTLLM_ENABLE_QKV_ROPE_TILING=1` enables experimental eight-token tiling for fused Q/K normalization, rotary embedding, and gate extraction. It is disabled by default. Set the environment variable before starting `trtllm-serve` or importing TensorRT LLM in Python.
+
+Tiling applies to preprocessing batches with at least 256 tokens, at least 3,072 token/head pairs across Q/K/V (using local head counts after tensor parallelism), and `(head dimension, rotary dimension)` of `(128, 128)` or `(256, 64)`. Other workloads use the single-token path. Performance has been measured on B200 and Rubin; other GPU architectures can opt in, but their performance has not been established by those measurements.
+
+Tiling can change Q/K rounding. Changing batch size across a dispatch boundary can therefore change cached K values and generated tokens. Leave the flag unset when batch-invariant results are required.
+
 ### Launch the TensorRT LLM Server
 
 Below is an example command to launch the TensorRT LLM server from within the container with the checkpoint that matches the configuration file you selected above.
@@ -196,6 +209,15 @@ node, plus memory for weights, loading, staging, and the operating system. The
 source system has 840 GiB of host memory per four-GPU node. A fully occupied
 four-rank node reserves 512 GiB for host KV cache. Check the remaining host-memory
 budget before increasing worker count or cache size.
+
+These profiles do not use the
+[remote KV cache level](../features/kvcache.md#remote-cache-level-in-donated-host-memory-prototype).
+If you add it, every rank with `remote_cache_config.donor.size` also holds that
+many bytes of host memory for the life of its process, on top of its
+`host_cache_size`. For example, decode ranks that donate 100 GiB each on a full
+four-rank node with 128 GiB host caches use 912 GiB, which exceeds the 840 GiB of
+the source system. Lower `host_cache_size` or `donor.size` on the donating ranks
+so that host cache plus donation fits each node's budget.
 
 Use a GB300 NVL72 system with working GPU peer access and NIXL/UCX transport.
 For workers spanning nodes, the hosts must share the required NVLink fabric and
@@ -290,6 +312,14 @@ mpirun --allow-run-as-root -np 2 --bind-to none \
     --extra-engine-args "$CONFIG_DIR/qwen3.5-gb300-agentic-decode.yaml" \
     --publish-metrics
 ```
+
+If you also enable MTP (`speculative_config`) on the prefill worker, add
+`export TRTLLM_DISAGG_ROLE=context` to the prefill shell. Ranks started by
+`trtllm-llmapi-launch` do not receive a server role, so without it the prefill
+worker reserves the GDN replay-state KV region that only decode uses. With
+`pool_ratio` set, startup then fails with `initial_pool_ratio length must match
+number of layer groups`. The profile above runs MTP on decode only and needs no
+role setting.
 
 The container runs as root; omit `--allow-run-as-root` when using a non-root user.
 The rank counts must

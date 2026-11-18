@@ -136,6 +136,22 @@ class TestCtxBufferBudget:
         assert f"max_batch_size estimated to fit is {fitting}" in message
         assert "max_batch_size + 1 slots" in message  # the formula
 
+    def test_preemption_rows_can_exceed_an_otherwise_fitting_budget(self):
+        budget = 9 * PER_SLOT_BYTES_MSL  # batch 8 plus scratch, no paused rows
+        _validate(max_batch_size=8, memory_budget_bytes=budget)
+        with pytest.raises(ValueError, match="max_batch_size estimated to fit is 6") as excinfo:
+            _validate(max_batch_size=8, memory_budget_bytes=budget, gen_preemption_enabled=True)
+        assert "resident_headroom" in str(excinfo.value)
+        assert f"{12 * PER_SLOT_BYTES_MSL / GIB:.2f} GiB" in str(excinfo.value)
+
+    def test_pipeline_parallel_pool_spans_every_micro_batch(self):
+        budget = 9 * PER_SLOT_BYTES_MSL  # batch 8 plus scratch at one micro-batch
+        _validate(max_batch_size=8, memory_budget_bytes=budget)
+        with pytest.raises(ValueError, match="max_batch_size estimated to fit is 4") as excinfo:
+            _validate(max_batch_size=8, memory_budget_bytes=budget, seq_slot_micro_batches=2)
+        assert "2 x max_batch_size + 1 slots" in str(excinfo.value)
+        assert f"{17 * PER_SLOT_BYTES_MSL / GIB:.2f} GiB" in str(excinfo.value)
+
     def test_unset_max_seq_len_skips_the_buffer_check(self):
         # max_seq_len is unset at config time and resolved later from the model
         # config; falling back to the drafter's 1M positions would refuse every
@@ -307,6 +323,7 @@ class TestBudgetDerivation:
 
     def test_mode_is_keyword_only(self):
         with pytest.raises(TypeError):
+            # pyrefly: ignore [missing-argument]
             derive_dflash_ctx_memory_budget_bytes(100 * GIB, 0.8, None)
 
 
@@ -461,11 +478,21 @@ class TestLlmArgsWiring:
         args = self._args(tmp_path, max_batch_size=8, attn_backend="VANILLA")
         assert args._kv_cache_estimation_runs() is False
 
-    def test_estimation_skipped_for_context_parallelism(self, tmp_path, monkeypatch):
-        from tensorrt_llm.llmapi.llm_args import CpConfig
+    def test_estimation_skipped_for_disagg_helix(self, tmp_path, monkeypatch):
+        from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, CpConfig
 
         monkeypatch.delenv(SKIP_EST_ENV, raising=False)
-        args = self._args(tmp_path, max_batch_size=8, cp_config=CpConfig())
+        # A cp_config counts as context parallelism only with more than
+        # one CP rank; with one rank the Mapping drops it and estimation
+        # runs as without a cp_config. Aggregated Helix estimates;
+        # disaggregated Helix sizes the pool by fraction.
+        args = self._args(
+            tmp_path,
+            max_batch_size=8,
+            context_parallel_size=2,
+            cp_config=CpConfig(cp_type="HELIX"),
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+        )
         assert args._kv_cache_estimation_runs() is False
 
     def test_oversized_batch_rejected_through_llm_args(self, tmp_path):
@@ -474,6 +501,42 @@ class TestLlmArgsWiring:
         args = self._args(tmp_path, max_batch_size=32)
         with pytest.raises(ValueError, match="max_batch_size estimated to fit"):
             args._validate_dflash_ctx_budget(memory_budget_bytes=10 * PER_SLOT_BYTES_MSL)
+
+    def test_pipeline_parallel_pool_is_counted_through_llm_args(self, tmp_path):
+        budget = 9 * PER_SLOT_BYTES_MSL
+        self._args(tmp_path, max_batch_size=8)._validate_dflash_ctx_budget(
+            memory_budget_bytes=budget
+        )
+        args = self._args(tmp_path, max_batch_size=8, pipeline_parallel_size=2)
+        with pytest.raises(ValueError, match="2 x max_batch_size"):
+            args._validate_dflash_ctx_budget(memory_budget_bytes=budget)
+
+    @pytest.mark.parametrize("percentile", [None, "0", "99", "90"])
+    @pytest.mark.parametrize(
+        "use_v2,sleep", [(True, False), (False, False), ("auto", False), (True, True)]
+    )
+    def test_preemption_budget_matches_admission_policy(
+        self, tmp_path, monkeypatch, percentile, use_v2, sleep
+    ):
+        from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig, SleepConfig
+
+        if percentile is None:
+            monkeypatch.delenv("TLLM_GEN_ADMISSION_TTFT_PERCENTILE", raising=False)
+        else:
+            monkeypatch.setenv("TLLM_GEN_ADMISSION_TTFT_PERCENTILE", percentile)
+        args = self._args(
+            tmp_path,
+            max_batch_size=32,
+            max_seq_len=8192,
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=use_v2),
+            sleep_config=SleepConfig() if sleep else None,
+            scheduler_config=SchedulerConfig(gen_preemption={"tpot_budget": 0.1}),
+        )
+        if percentile == "90" and use_v2 is not False and not sleep:
+            with pytest.raises(ValueError, match="max_batch_size estimated to fit"):
+                args._validate_dflash_ctx_budget(memory_budget_bytes=1_600_000_000)
+        else:
+            args._validate_dflash_ctx_budget(memory_budget_bytes=1_600_000_000)
 
     def test_default_batch_is_clamped_not_rejected(self, tmp_path):
         # max_batch_size left at its default overruns a tight token budget;

@@ -26,12 +26,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import wait_for_endpoint_ready
 
 from defs.trt_test_alternative import print_info
-from tensorrt_llm._utils import get_free_port
+from tensorrt_llm._utils import get_free_port, get_sm_version
 
 from ..conftest import get_llm_root, llm_models_root
 from .perf_regression_utils import process_and_upload_test_results
@@ -42,6 +43,7 @@ from .visual_gen_perf_utils import (
     build_visual_gen_db_entry,
     get_visual_gen_match_keys,
     get_visual_gen_num_gpus_from_server_config,
+    result_metric_paths,
 )
 
 DEFAULT_TIMEOUT = 5400
@@ -56,6 +58,7 @@ SUPPORTED_GPU_MAPPING = {
     "B200": "b200",
     "B300": "b300",
     "H200": "h200",
+    "VR200": "vr200",
 }
 
 
@@ -71,23 +74,20 @@ def to_env_dict(env_vars: str) -> dict[str, str]:
 
 
 def get_gpu_types() -> tuple[str, str]:
-    """Return the raw GPU name token and the normalized perf-sanity GPU type."""
-    try:
-        output = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError("Failed to get GPU type from nvidia-smi") from exc
-
-    gpu_name = output.splitlines()[0].strip()
+    """Identify the first CUDA-visible GPU by model name or Rubin capability."""
+    gpu_name = torch.cuda.get_device_name(0).strip()
     for raw_gpu_type, normalized_gpu_type in SUPPORTED_GPU_MAPPING.items():
         if raw_gpu_type.lower() in gpu_name.lower():
             return raw_gpu_type, normalized_gpu_type
 
+    # Rubin engineering samples can expose a generic or pre-production name.
+    sm_version = get_sm_version()
+    if sm_version == 107:
+        return "VR200", SUPPORTED_GPU_MAPPING["VR200"]
+
     raise RuntimeError(
-        f"Unsupported GPU type for VisualGen perf sanity. nvidia-smi reported: {gpu_name}"
+        "Unsupported GPU type for VisualGen perf sanity. "
+        f"CUDA device 0 reported: {gpu_name} (SM{sm_version})"
     )
 
 
@@ -568,7 +568,9 @@ class VisualGenPerfSanityTestConfig:
         result_path: str,
     ) -> None:
         """Validate the saved benchmark JSON before it is used as the source of truth."""
-        is_video = str(result_data.get("backend")) == "openai-videos"
+        generation_path = result_metric_paths(str(result_data.get("backend")))[
+            "d_median_generation"
+        ].partition(".")[0]
         required_keys = [
             "backend",
             "model",
@@ -578,8 +580,8 @@ class VisualGenPerfSanityTestConfig:
             "e2e_latency",
             "timings",
         ]
-        if is_video:
-            required_keys.append("gen_latency")
+        if generation_path not in required_keys:
+            required_keys.append(generation_path)
         missing_keys = [key for key in required_keys if key not in result_data]
         if missing_keys:
             raise ValueError(f"Missing keys in benchmark result {result_path}: {missing_keys}")
@@ -611,10 +613,7 @@ class VisualGenPerfSanityTestConfig:
                 f"completed={completed_requests}, total={total_requests}"
             )
 
-        # The image route has no separate generation series: its whole request is one.
-        series = {"e2e_latency": result_data["e2e_latency"]}
-        if is_video:
-            series["gen_latency"] = result_data["gen_latency"]
+        series = {name: result_data[name] for name in ("e2e_latency", generation_path)}
         for name, stats in series.items():
             for percentile in ("p90", "p99"):
                 if percentile not in stats.get("percentiles", {}):

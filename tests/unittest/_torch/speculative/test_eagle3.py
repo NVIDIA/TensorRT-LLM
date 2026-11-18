@@ -81,7 +81,9 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
     metadata = _Metadata()
 
     @contextmanager
-    def draft_context(attn_metadata, manager):
+    def draft_context(attn_metadata,
+                      manager,
+                      enable_draft_locality_domain_forkjoin=False):
         assert attn_metadata is metadata
         assert manager is draft_manager
         events.append("switch")
@@ -96,8 +98,10 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
 
     worker = SimpleNamespace(
         is_mtp_eagle=True,
+        _draft_takes_kept_rows=False,
         draft_kv_cache_context=draft_context,
         _run_draft_forward=run_draft_forward,
+        _step0_draft_layer_picks_rows=lambda draft_model, use_epilogue: False,
     )
 
     from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
@@ -441,6 +445,43 @@ def test_mtp_eagle_context_input_uses_prompt_lookahead() -> None:
 
 
 @skip_num_gpus_less_than(1)
+@pytest.mark.parametrize("fast_paths", [False, True])
+def test_mtp_eagle_generation_only_draft_input_ids(fast_paths) -> None:
+    """A generation-only step's draft input ids are the accepted tokens: read
+    in place on the speculative fast paths, else a concatenated copy."""
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+    spec_metadata = Eagle3OneModelSpecMetadata(
+        max_num_requests=2,
+        max_draft_len=3,
+        max_total_draft_tokens=3,
+        spec_dec_mode=spec_config.spec_dec_mode,
+        num_layers=1,
+        hidden_size=4,
+        max_num_tokens=8,
+    )
+    spec_metadata.gather_ids = torch.tensor([3, 7],
+                                            dtype=torch.int32,
+                                            device="cuda")
+    spec_metadata.runtime_draft_len = 3
+    accepted = torch.arange(8, dtype=torch.int32, device="cuda").view(2, 4)
+    worker = MTPEagleWorker(spec_config, spec_decode_fast_paths=fast_paths)
+    draft_inputs = worker.prepare_1st_drafter_inputs(
+        input_ids=torch.zeros(8, dtype=torch.int32, device="cuda"),
+        position_ids=torch.arange(8, dtype=torch.int32,
+                                  device="cuda").unsqueeze(0),
+        hidden_states=torch.zeros((8, 4), device="cuda"),
+        accepted_tokens=accepted,
+        attn_metadata=SimpleNamespace(num_contexts=0, num_ctx_tokens=0),
+        spec_metadata=spec_metadata,
+        draft_model=SimpleNamespace(),
+    )
+    input_ids = draft_inputs["input_ids"]
+    assert input_ids.dtype == torch.int32
+    assert torch.equal(input_ids, accepted.flatten())
+    assert (input_ids.data_ptr() == accepted.data_ptr()) == fast_paths
+
+
+@skip_num_gpus_less_than(1)
 def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
     invalid = INVALID_PROMPT_LOOKAHEAD_TOKEN
     worker = object.__new__(MTPEagleDynamicTreeWorker)
@@ -616,6 +657,7 @@ def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
     # MagicMock fabricates every attribute; metadata detects an FP4 MLA cache
     # layout from this hook, so a plain (non-FP4) manager must not expose it.
     mock_kv_cache_manager.get_fp4_mla_page_table_spec = None
+    mock_kv_cache_manager.mixed_precision_high_layers = {}
     return mock_kv_cache_manager
 
 

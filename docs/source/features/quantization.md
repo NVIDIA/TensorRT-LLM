@@ -75,6 +75,31 @@ This configures an active NVFP4 KV cache on the GPU. To keep the active GPU KV
 cache in its normal runtime type and use NVFP4 only while Pages reside in Host
 or Disk storage, see [KV Cache Compression](kv-cache-compression.md).
 
+#### NVFP4_PLUS MoE from MXFP4 Checkpoints
+
+On Rubin (SM107), the routed experts of an MXFP4 checkpoint can run as NVFP4_PLUS:
+E2M1 values with one UE5M3 scale per 32 values and no FP32 global scale. The E2M1
+weights load unchanged, every E8M0 scale becomes the UE5M3 scale of the same power
+of two, and the expert activations are quantized to the same format, so both MoE
+GEMMs run in FP4 without requantizing the checkpoint.
+
+Set `OVERRIDE_QUANT_ALGO=NVFP4_PLUS` and use the CuteDSL MoE backend. Under this
+override, `moe_config.backend: AUTO` selects `CUTEDSL`, and any other backend is
+rejected.
+
+```bash
+OVERRIDE_QUANT_ALGO=NVFP4_PLUS trtllm-serve <MXFP4 checkpoint> --config config.yaml
+```
+
+```yaml
+moe_config:
+  backend: CUTEDSL
+```
+
+NVFP4_PLUS supports bias-free SwiGLU experts, such as the routed experts of
+DeepSeek-V4. It needs `hidden_size` to be a multiple of 512 and the per-rank MoE
+intermediate size to be a multiple of 128.
+
 
 ### Offline Quantization with ModelOpt
 
@@ -98,14 +123,16 @@ cd Model-Optimizer/examples/llm_ptq
 scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --kv_cache_quant nvfp4
 ```
 
-Note that currently TRT-LLM only supports FP8 weight/activation quantization when NVFP4 KV cache is enabled. Therefore, `--quant fp8` is required here.
+The example above uses FP8 weight/activation quantization with an NVFP4 KV cache.
+Dense FP4 MLA also has model-specific checkpoint recipes, including NVFP4 MoE
+weights; its KV-cache precision is configured separately.
 
 ## Model Support Matrix
 
 | Model          |  NVFP4  | MXFP4  | FP8(per tensor)| FP8(block scaling) | FP8(rowwise) | FP8 KV Cache | NVFP4 KV Cache | W4A8 AWQ  | W4A16 AWQ | W4A8 GPTQ  | W4A16 GPTQ |
 | :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: |:---:| :-------: | :-------: | :--------: | :--------: |
 | BERT           |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
-| DeepSeek-R1    |   Y     |   .    |   .   |   Y   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
+| DeepSeek-R1    |   Y     |   .    |   .   |   Y   |   .   |   Y   | Y[^fp4-mla] |     .     |     .     |     .      |     .      |
 | EXAONE         |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |     Y     |     Y     |     .      |     .      |
 | Gemma 3        |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |     Y     |     Y     |     .      |     .      |
 | GPT-OSS        |   .     |   Y    |   .   |   .   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
@@ -131,6 +158,11 @@ The vision component of multi-modal models (BLIP2-OPT/BLIP2-T5/LLaVA/VILA/Nougat
 The language component decides which quantization methods are supported by a given multi-modal model.
 ```
 
+
+[^fp4-mla]: Dense DeepSeek-family MLA generation with an NVFP4 KV cache uses
+    Triton on SM100/SM103, or Triton/CuTe DSL on SM107. Model loading validates
+    the worker and context-parallel configuration. The existing
+    `TestDeepSeekV3Lite::test_nvfp4_mla` accuracy case covers the Triton path on B300.
 
 ## Hardware Support Matrix
 

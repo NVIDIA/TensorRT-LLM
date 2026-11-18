@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.2 target routing, driven by synthetic configs on CPU."""
 
+import sys
+from types import ModuleType
+
 import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MTPDecodingConfig,
@@ -33,6 +36,15 @@ def _qualified(target) -> str:
 @pytest.fixture(autouse=True)
 def _on_sm103(monkeypatch):
     """Route as if this were a GB300, wherever the test actually runs."""
+    # Routing selects a class; these synthetic CPU configs do not construct it.
+    module = ModuleType(
+        "tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa."
+        "glm_5_2_nvfp4__sm_107__low_latency.modeling"
+    )
+    module.ModelingV2Glm52Nvfp4Sm107LowLatency = type(
+        "ModelingV2Glm52Nvfp4Sm107LowLatency", (), {"__module__": module.__name__}
+    )
+    monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: _SM103)
 
@@ -59,7 +71,8 @@ def _model_config(
 
 
 _GLM52_TARGET = (
-    "models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__tp16.modeling.ModelingV2Glm52Nvfp4Sm107Tp16"
+    "models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.modeling."
+    "ModelingV2Glm52Nvfp4Sm107LowLatency"
 )
 _TP16 = dict(world_size=16, tp_size=16, moe_ep_size=1, moe_tp_size=16)
 
@@ -79,20 +92,29 @@ def _glm52_config(**overrides):
         hidden_size=6144,
         n_routed_experts=256,
         q_lora_rank=2048,
+        index_n_heads=32,
     )
     fields.update(overrides)
     return PretrainedConfig(**fields)
 
 
+@pytest.mark.parametrize("tp", [4, 8, 16])
 @pytest.mark.parametrize("mode", ["auto", "require"])
 @pytest.mark.parametrize(
     "spec_config",
     [None, MTPDecodingConfig(max_draft_len=7), MTPDecodingConfig(max_draft_len=3)],
     ids=["no-spec", "mtp7", "mtp3"],
 )
-def test_glm52_tp16_matches(_on_sm107, spec_config, mode):
+def test_glm52_supported_tp_matches(_on_sm107, spec_config, mode, tp):
     """Any draft length: the draft loop replays the one MTP module per step."""
-    config = _model_config(_glm52_config(), spec_config=spec_config, **_TP16)
+    config = _model_config(
+        _glm52_config(),
+        spec_config=spec_config,
+        world_size=tp,
+        tp_size=tp,
+        moe_ep_size=1,
+        moe_tp_size=tp,
+    )
     assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _GLM52_TARGET
 
 
@@ -100,13 +122,14 @@ def test_glm52_tp16_matches(_on_sm107, spec_config, mode):
     "config_kwargs, mapping_kwargs, spec_config, missed",
     [
         (dict(num_hidden_layers=92), _TP16, None, r"shape \(92, 6144, 256, 2048\)"),
+        (dict(index_n_heads=64), _TP16, None, "index_n_heads=64"),
         (dict(), dict(_TP16, enable_attention_dp=True), None, "attention_dp=True"),
         (dict(), dict(_TP16, moe_ep_size=16, moe_tp_size=1), None, "moe_ep=16"),
-        (dict(), dict(world_size=8, tp_size=8, moe_tp_size=8), None, "world_size=8"),
+        (dict(), dict(world_size=2, tp_size=2, moe_tp_size=2), None, "world_size=2"),
         (dict(), _TP16, MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True), "MTP"),
         (dict(), _TP16, _NGRAM, "NGRAM"),
     ],
-    ids=["other-shape", "attention-dp", "expert-parallel", "tp8", "vanilla-mtp", "ngram"],
+    ids=["other-shape", "heads", "attention-dp", "expert-parallel", "tp2", "vanilla-mtp", "ngram"],
 )
 def test_glm52_near_misses_do_not_match(
     _on_sm107, config_kwargs, mapping_kwargs, spec_config, missed
@@ -150,3 +173,84 @@ def test_glm52_unsupported_kv_cache_does_not_match(_on_sm107, checkpoint_algo, d
     assert modeling_v2_resolve(config, _llm_args("auto", **args)) is None
     with pytest.raises(ValueError, match="KV cache"):
         modeling_v2_resolve(config, _llm_args("require", **args))
+
+
+_GLM52_HIGH_THROUGHPUT_TARGET = (
+    "models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__high_throughput.modeling."
+    "ModelingV2Glm52Nvfp4Sm107HighThroughput"
+)
+_DEP16 = dict(world_size=16, tp_size=16, moe_ep_size=16, moe_tp_size=1, enable_attention_dp=True)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("draft_len", [None, 5, 7])
+@pytest.mark.parametrize("world_size", [4, 16])
+def test_glm52_high_throughput_matches(_on_sm107, monkeypatch, mode, draft_len, world_size):
+    # Exercise the real routing predicates on CPU without requiring the target's
+    # native library. Native loading and execution are covered by GPU tests.
+    module_name, class_name = _GLM52_HIGH_THROUGHPUT_TARGET.rsplit(".", 1)
+    stub = ModuleType(f"tensorrt_llm._torch.modeling_v2.{module_name}")
+    setattr(stub, class_name, type(class_name, (), {"__module__": stub.__name__}))
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    config = _model_config(
+        _glm52_config(index_n_heads=32),
+        spec_config=MTPDecodingConfig(max_draft_len=draft_len) if draft_len is not None else None,
+        **dict(_DEP16, world_size=world_size, tp_size=world_size, moe_ep_size=world_size),
+    )
+    config.moe_backend = "MEGAMOE_CUTEDSL"
+    args = _llm_args(mode, kv_cache_config=KvCacheConfig(dtype="nvfp4"))
+    assert _qualified(modeling_v2_resolve(config, args)) == _GLM52_HIGH_THROUGHPUT_TARGET
+
+
+@pytest.mark.parametrize(
+    "mapping_overrides, kv_dtype, backend, index_n_heads, missed",
+    [
+        (dict(enable_attention_dp=False), "nvfp4", "MEGAMOE_CUTEDSL", 32, "attention_dp=False"),
+        (dict(moe_ep_size=1, moe_tp_size=16), "nvfp4", "MEGAMOE_CUTEDSL", 32, r"moe_ep=1\b"),
+        (
+            dict(world_size=8, tp_size=8, moe_ep_size=8),
+            "nvfp4",
+            "MEGAMOE_CUTEDSL",
+            32,
+            "world_size=8",
+        ),
+        (dict(), "fp8", "MEGAMOE_CUTEDSL", 32, r"KV cache .*FP8"),
+        (dict(), "nvfp4", "CUTLASS", 32, "moe_backend=CUTLASS"),
+        (dict(), "nvfp4", "MEGAMOE_CUTEDSL", 64, "index_n_heads=64"),
+    ],
+    ids=[
+        "no-attention-dp",
+        "no-expert-parallel",
+        "dep8",
+        "fp8-kv",
+        "other-backend",
+        "other-index-heads",
+    ],
+)
+def test_glm52_high_throughput_near_misses(
+    _on_sm107,
+    mapping_overrides: dict,
+    kv_dtype: str,
+    backend: str,
+    index_n_heads: int,
+    missed: str,
+) -> None:
+    config = _model_config(
+        _glm52_config(index_n_heads=index_n_heads), **dict(_DEP16, **mapping_overrides)
+    )
+    config.moe_backend = backend
+    kwargs = dict(kv_cache_config=KvCacheConfig(dtype=kv_dtype))
+    assert modeling_v2_resolve(config, _llm_args("auto", **kwargs)) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require", **kwargs))
+
+
+def test_glm52_high_throughput_declines_sm103() -> None:
+    config = _model_config(_glm52_config(index_n_heads=32), **_DEP16)
+    config.moe_backend = "MEGAMOE_CUTEDSL"
+    args = _llm_args("auto", kv_cache_config=KvCacheConfig(dtype="nvfp4"))
+    assert modeling_v2_resolve(config, args) is None
+    with pytest.raises(ValueError, match=r"compute capability \(10, 3\)"):
+        modeling_v2_resolve(
+            config, _llm_args("require", kv_cache_config=KvCacheConfig(dtype="nvfp4"))
+        )

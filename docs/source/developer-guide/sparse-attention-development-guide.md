@@ -358,6 +358,10 @@ three prediction methods. A `VanillaAttention` implementation instead overrides
   (BSR `block_indptr`/`block_indices` or a packed `exact_block_bits`
   bitmask), optional K/V summaries for proxy routes, and optional
   `kv_valid_bits` masking ragged KV tails.
+- **Summary contract**: both `k_summary` and `v_summary` are arithmetic means
+  over the tokens present in each KV block, excluding padding in a partial
+  final block. The kernel applies the represented token count to each proxy;
+  do not pass V sums or pre-weight the summaries.
 - **Default**: hands through `SparseBackendForwardArgs.block_sparse_inputs`,
   so modules that predict before the core forward do not override it.
   Override it to predict inside the backend from the flattened Q/K/V,
@@ -413,6 +417,15 @@ framework wiring is:
   `_torch/attention/backends/trtllm.py` or an implementation under
   `_torch/attention/backends/fmha/`, that reads the lowered params and enables
   the kernel-side fast path.
+
+Because the KV cache keeps the dense layout, the config subclass sets
+`uses_dense_kv_cache = True`. The KV cache manager selection then treats the
+model as a dense model: `use_kv_cache_manager_v2` selects V1 or V2, a model with
+variable per-layer KV geometry always uses V2, and the dense V2 compatibility
+rules apply. The algorithm still needs a branch in
+`get_trtllm_sparse_attn_attention_backend`
+(`_torch/attention/backends/sparse/registry.py`) that returns its attention
+backend class.
 
 Skip Softmax Attention follows this pattern — see the
 [BLASST tech blog](../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md)

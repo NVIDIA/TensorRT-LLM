@@ -1742,6 +1742,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
 
 class DeepseekV3MTP(DeepseekV3DecoderLayer):
+    # forward takes ``pick_rows`` (see speculative.interface.draft_layer_picks_rows).
+    supports_pick_rows = True
 
     def __init__(self,
                  model_config: ModelConfig[PretrainedConfig],
@@ -1807,8 +1809,13 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        pick_rows: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        """With ``pick_rows`` (indices into the input rows) the attention
+        runs on every input row and the rest of the layer, which is per-token,
+        on ``pick_rows`` only; the output then has ``len(pick_rows)`` rows and
+        ``all_rank_num_tokens`` counts those rows."""
 
         def norm_embeds():
             return self.enorm(embed_tokens(input_ids))  #emdedding
@@ -1846,6 +1853,11 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+        if pick_rows is not None:
+            # Row-wise: a TP partial sum not yet all-reduced (PRE_MOE_FUSION)
+            # picks the same as the reduced rows.
+            hidden_states = hidden_states[pick_rows]
+            residual = residual[pick_rows]
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:
@@ -2095,6 +2107,20 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
     def load_weights(self, weights: ConsumableWeightsDict):
         weight_loader = DeepseekV3WeightLoader(self)
         weight_loader.load_weights(weights)
+
+    def setup_post_transform_receiver_aliases(self) -> None:
+        """Bind each MLA `v_b_proj` as a view of the V rows of `kv_b_proj.weight`.
+
+        `DeepseekV3WeightLoader` makes that binding while it loads. A staged MX
+        receiver gets its weights without the loader, so MX receiver
+        preparation (`model_hooks.prepare_post_transform_receiver`) calls this
+        before the weights arrive, and only for a root that qualified for
+        post-transform weights. No other load path calls it, so GMS read-only
+        peers and ordinary loads keep the binding their own path made.
+        """
+        for module in self.modules():
+            if isinstance(module, MLA):
+                module.alias_v_b_proj_to_kv_b_proj()
 
     def setup_aliases(self) -> None:
         for idx, layer in enumerate(
