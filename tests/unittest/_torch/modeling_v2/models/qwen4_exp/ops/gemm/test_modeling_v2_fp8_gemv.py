@@ -8,8 +8,8 @@ strided activations; CUDA-graph replay of `fp8_gemv` and the verify entry."""
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.gemm.fp8_gemv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.fp8_gemv import (  # noqa: E501
     dequantize_fp8_block,
     fp8_gemv_conv1d_op,
     fp8_gemv_conv1d_verify_op,
@@ -17,7 +17,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.gemm.fp8
     pack_weight,
     quantize_fp8_block,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_triton_update import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_triton_update import (  # noqa: E501
     causal_conv1d_triton_update,
 )
 

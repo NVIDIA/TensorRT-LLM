@@ -12,16 +12,16 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
         "cute_dsl_indexer_q_side_k_cache runs an sm_103 CuTe DSL kernel", allow_module_level=True
     )
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
     cute_dsl_indexer_k_cache_update as k_module,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
     cute_dsl_indexer_q_side_fused as q_module,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_q_side_k_cache import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_q_side_k_cache import (  # noqa: E402, E501
     build,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_q_side_k_cache import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_q_side_k_cache import (  # noqa: E402, E501
     cute_dsl_indexer_q_side_k_cache as op,
 )
 
@@ -98,7 +98,7 @@ def _inputs(tokens: int, pad_rows: int, pool_layers: int, seed: int) -> dict:
     )  # fmt: skip
 
 
-def _outputs(tokens: int):
+def _outputs(tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     """`(q_fp8, weights)` filled with a pattern no launch writes."""
     q8 = torch.empty(tokens, HEADS, HEAD_DIM, dtype=torch.float8_e4m3fn, device="cuda")
     q8.view(torch.uint8).fill_(0x5A)

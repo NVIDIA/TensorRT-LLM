@@ -70,7 +70,7 @@ def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):
     worker = DFlashWorker(config, Mapping())
     draft_model = _FakeDraftModel()
     worker.set_draft_model(draft_model)
-    spec_metadata = SimpleNamespace(max_num_requests=2)
+    spec_metadata = SimpleNamespace(max_num_requests=2, num_seq_slots=2)
     attn_metadata = SimpleNamespace(max_seq_len=64)
 
     worker._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
@@ -86,6 +86,29 @@ def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):
         [3, 4, 5],
         [6, 7, 8],
     ]
+
+
+def test_context_cache_spans_the_full_seq_slot_pool_on_a_graph_bucket(monkeypatch):
+    """The context cache is sized by num_seq_slots, not by a narrowed graph bucket."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.dflash.validate_dflash_trtllm_gen_runtime",
+        lambda **kwargs: None,
+    )
+    config = DFlashDecodingConfig(max_draft_len=7, attention_backend="TRTLLM")
+    worker = DFlashWorker(config, Mapping())
+    draft_model = _FakeDraftModel()
+    worker.set_draft_model(draft_model)
+    spec_metadata = SimpleNamespace(max_num_requests=1, num_seq_slots=4)
+    attn_metadata = SimpleNamespace(max_seq_len=64)
+
+    worker._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
+
+    # Four request slots plus one scratch slot, three pages each.
+    assert worker._dummy_slot == 4
+    assert list(worker._free_slots) == [0, 1, 2, 3]
+    assert worker._ctx_kv_buf.shape == (2, 15, 2, 1, 32, 64)
+    assert worker._ctx_len.shape == (5,)
+    assert worker._batch_to_slot_buffer.tensor.shape == (4,)
 
 
 def test_generation_step_keeps_the_dummy_slot_context_empty():

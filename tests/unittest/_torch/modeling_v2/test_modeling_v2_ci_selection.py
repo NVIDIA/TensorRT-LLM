@@ -39,7 +39,7 @@ import yaml
 
 pytestmark = pytest.mark.cpu_only
 
-_PY = "tensorrt_llm/_torch/_experimental/modeling_v2"
+_PY = "tensorrt_llm/_torch/modeling_v2"
 _CPP = "cpp/tensorrt_llm/modeling_v2"
 _UNIT = "tests/unittest/_torch/modeling_v2"
 _ACC = "tests/integration/defs/accuracy/modeling_v2"

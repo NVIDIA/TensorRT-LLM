@@ -84,11 +84,15 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    PAGE_PRIORITY_DEFAULT,
+    PAGE_PRIORITY_MIN,
     BlockReusePolicy,
     KVCacheLayerOwner,
-    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerSpec as KVCacheStorageLayerSpec,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
@@ -151,6 +155,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GPU_LEVEL,
     AttentionLayerConfig,
+    AttnLifeCycle,
     BatchDesc,
     BufferConfig,
     DataRole,
@@ -158,6 +163,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     KVCacheManagerConfig,
     LayerId,
+    ReuseScope,
     SsmLayerConfig,
     _introspection,
 )
@@ -2345,6 +2351,43 @@ def test_v2_hybrid_snapshot_sizing_scales_with_pp_and_explicit_rules():
 
 
 @pytest.mark.parametrize(
+    "states, num_tiers, reuse, pool_ratio, expected",
+    [
+        (None, 2, True, None, None),
+        (1, 1, True, None, None),
+        (1, 2, False, None, None),
+        (1, 2, True, None, [128]),
+        (2, 3, True, None, [64, 64]),
+        (3, 2, True, None, [43, 43, 42]),
+        # An explicit pool_ratio keeps its slot-count ratios in the cold tiers too.
+        (2, 2, True, [0.5, 0.5], None),
+    ],
+)
+def test_v2_hybrid_cold_typical_step(states, num_tiers, reuse, pool_ratio, expected) -> None:
+    """cold_tier_states_per_request sizes the cold tiers from that many states per typical request."""
+    config = KvCacheConfig(
+        max_gpu_total_bytes=32 << 20,
+        host_cache_size=0,
+        avg_seq_len=128,
+        enable_block_reuse=reuse,
+        pool_ratio=pool_ratio,
+        mamba_state_config=MambaStateConfig(
+            additional_snapshot_offsets_from_start=[32, 64],
+            additional_snapshot_offsets_from_end=[2],
+            cold_tier_states_per_request=states,
+        ),
+    )
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.max_seq_len = 256
+    step = mgr._cold_typical_step(config, num_tiers)
+    if expected is None:
+        assert step is None
+    else:
+        assert [desc.capacity for desc in step.kv_caches] == expected
+        assert [desc.history_length for desc in step.kv_caches] == [c - 1 for c in expected]
+
+
+@pytest.mark.parametrize(
     "capacity, interval, from_start, from_end, reuse, branch, expected_states",
     [
         (128, 0, [], [], True, False, 1),
@@ -2989,8 +3032,8 @@ def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
         mgr.shutdown()
 
 
-def _fp8_draft_layer_spec(global_layer_id: int) -> KVCacheLayerSpec:
-    return KVCacheLayerSpec(
+def _fp8_draft_layer_spec(global_layer_id: int) -> KVCacheStorageLayerSpec:
+    return KVCacheStorageLayerSpec(
         global_layer_id=global_layer_id,
         owner=KVCacheLayerOwner.DRAFT,
         dtype=DataType.FP8,
@@ -3953,6 +3996,7 @@ def _build_v2_hybrid_with_mamba_layer(
     max_num_tokens: int = 8192,
     is_draft: bool = False,
     joint_kv_cache_reuse: bool = False,
+    cold_page_codec_provider=None,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
     # Draft layers of a combined speculative manager follow the model's layers in both masks.
@@ -4045,6 +4089,11 @@ def _build_v2_hybrid_with_mamba_layer(
         spec_config=spec_config,
         layer_mask=attn_mask,
         **({"pretrained_config": pretrained_config} if pretrained_config is not None else {}),
+        **(
+            {"cold_page_codec_provider": cold_page_codec_provider}
+            if cold_page_codec_provider is not None
+            else {}
+        ),
         vocab_size=1024,
         use_replay_state_update=use_replay_state_update,
         dtype=dtype,
@@ -4220,6 +4269,48 @@ def test_v2_inforward_snapshot_commits_point_and_restores_prompt_end_state():
         for layer in range(2):
             assert torch.all(mgr.get_ssm_states(layer)[sibling_slot] == 1.0)
             assert torch.all(mgr.get_conv_states(layer)[sibling_slot] == 1.0)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("reverse", [False, True], ids=["staging order", "reversed batch"])
+def test_v2_inforward_snapshot_restores_every_planned_request_in_one_pass(reverse):
+    # Each planned request's live slot gets its own staging row back, whether the rows come in
+    # staging order (slice) or not (gather).
+    mgr = _build_v2_inforward_snapshot_manager()
+    try:
+        requests = [
+            _make_v2_prompt_request(rid, [rid * 1000 + t for t in range(66)]) for rid in (1, 2)
+        ]
+        mgr.prepare_expect_snapshot_points(requests)
+        batch = ScheduledRequests()
+        for request in requests:
+            assert mgr.prepare_context(request)
+            assert mgr.resize_context(request, num_tokens=66)
+            request.context_chunk_size = 66
+            request.py_mamba_inforward_snapshot_point = 64
+            batch.append_context_request(request)
+        mgr.prepare_resources(batch)
+        rows = {rid: entry.row for rid, entry in mgr.inforward_snapshot_plan.items()}
+        assert sorted(rows.values()) == [0, 1]
+        slots = {rid: mgr.state_index(rid) for rid in (1, 2)}
+        for layer in range(2):
+            stage_ssm, stage_conv = mgr.inforward_snapshot_stage_views(layer)
+            for rid in (1, 2):
+                mgr.get_ssm_states(layer)[slots[rid]].fill_(1.0)
+                mgr.get_conv_states(layer)[slots[rid]].fill_(1.0)
+                stage_ssm[rows[rid]].fill_(10.0 * rid + layer)
+                stage_conv[rows[rid]].fill_(10.0 * rid + layer)
+        visit = ScheduledRequests()
+        for request in reversed(requests) if reverse else requests:
+            visit.append_context_request(request)
+        mgr.finish_inforward_snapshots(visit)
+        torch.cuda.synchronize()
+        for layer in range(2):
+            for rid in (1, 2):
+                assert torch.all(mgr.get_ssm_states(layer)[slots[rid]] == 10.0 * rid + layer)
+                assert torch.all(mgr.get_conv_states(layer)[slots[rid]] == 10.0 * rid + layer)
     finally:
         mgr.shutdown()
 
@@ -4682,7 +4773,9 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
             "snapshot_pruned_tokens=640 page_pruned_tokens=128 "
             "branch_snapshots_taken=3 branch_snapshots_skipped=3 "
             "branch_snapshots_skipped_by_reason="
-            "{'already_reused': 1, 'no_divergence': 2}"
+            "{'already_reused': 1, 'no_divergence': 2} "
+            "inflight_prefix_deferrals=0 inflight_prefix_points_requested=0 "
+            "inflight_prefix_points_taken=0"
         )
 
 
@@ -4884,6 +4977,124 @@ def test_v2_hybrid_waiter_points_after_history_advanced_commit():
             mgr.free_resources(probe)
     finally:
         for request in (owner, *probes):
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
+        mgr.shutdown()
+
+
+def _is_recurrent(life_cycle) -> bool:
+    return not isinstance(life_cycle, AttnLifeCycle)
+
+
+def _recurrent_state_lowest(_ordinal: int, life_cycle) -> int:
+    """Lowest eviction priority for recurrent-state pages, the default for attention pages."""
+    return PAGE_PRIORITY_MIN if _is_recurrent(life_cycle) else PAGE_PRIORITY_DEFAULT
+
+
+class _ShortPromptStateLowest(MambaHybridCacheManagerV2):
+    """Commits the recurrent-state pages of prompts shorter than 48 tokens at the lowest priority."""
+
+    def _context_priority_callback(self, req):
+        return _recurrent_state_lowest if req.prompt_len < 48 else None
+
+
+@skip_no_cuda
+def test_v2_hybrid_context_priority_callback_reaches_backend():
+    """A subclass's callback is asked for both the recurrent-state and the attention pages."""
+    calls = []
+
+    def recording_callback(ordinal, life_cycle):
+        priority = _recurrent_state_lowest(ordinal, life_cycle)
+        calls.append((_is_recurrent(life_cycle), priority))
+        return priority
+
+    class _Recording(MambaHybridCacheManagerV2):
+        def _context_priority_callback(self, req):
+            return recording_callback if req.prompt_len < 48 else None
+
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True,
+        block_reuse_policy="per_conversation",
+        additional_snapshot_offsets_from_end=[0],
+        model_manager_cls=_Recording,
+    )
+    long = _make_v2_conversation_request(1, [1] + list(range(100, 163)), "conv-1")
+    short = _make_v2_conversation_request(2, [2] + list(range(100, 131)), "conv-2")
+    try:
+        _run_v2_hybrid_context(mgr, long)
+        mgr.free_resources(long)
+        assert calls == []
+
+        _run_v2_hybrid_context(mgr, short)
+        mgr.free_resources(short)
+        assert (True, PAGE_PRIORITY_MIN) in calls
+        assert (False, PAGE_PRIORITY_DEFAULT) in calls
+        assert set(calls) <= {(True, PAGE_PRIORITY_MIN), (False, PAGE_PRIORITY_DEFAULT)}
+    finally:
+        for request in (long, short):
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
+        mgr.shutdown()
+
+
+def _has_prompt_end_snapshot(mgr: MambaHybridCacheManagerV2, tokens: list[int]) -> bool:
+    """Whether the radix tree holds the recurrent-state snapshot at the end of ``tokens``."""
+    ssm_life_cycle = _introspection.ssm_life_cycle_id(mgr.impl)
+    num_tokens, pages = _introspection.reuse_match_pages(
+        mgr.impl, ReuseScope(lora_id=None, salt=None), tokens, ssm_life_cycle
+    )
+    last_block = (len(tokens) - 1) // mgr.tokens_per_block
+    return num_tokens >= len(tokens) and len(pages) > last_block and pages[last_block] is not None
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("demote_short_prompts", [False, True])
+def test_v2_hybrid_short_prompt_snapshot_eviction_order(demote_short_prompts):
+    """Short-prompt snapshots go before older long-prompt ones once demoted; plain LRU otherwise."""
+    # Large recurrent states (4 layers of 256 heads) make the recurrent-state
+    # pool, not the attention pool, the one that evicts.
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=4,
+        mamba_num_heads=256,
+        enable_block_reuse=True,
+        block_reuse_policy="per_conversation",
+        max_num_turns=3,
+        additional_snapshot_offsets_from_end=[0],
+        model_manager_cls=_ShortPromptStateLowest if demote_short_prompts else None,
+    )
+    old_long_tokens = [1] + list(range(100, 163))
+    short_tokens = [2] + list(range(100, 131))
+    requests = [
+        _make_v2_conversation_request(1, old_long_tokens, "conv-1"),
+        _make_v2_conversation_request(2, short_tokens, "conv-2"),
+    ]
+    try:
+        for request in requests:
+            _run_v2_hybrid_context(mgr, request)
+            mgr.free_resources(request)
+        assert _has_prompt_end_snapshot(mgr, old_long_tokens)
+        assert _has_prompt_end_snapshot(mgr, short_tokens)
+
+        for request_id in range(3, 256):
+            request = _make_v2_conversation_request(
+                request_id, [request_id] + list(range(100, 163)), f"conv-{request_id}"
+            )
+            requests.append(request)
+            _run_v2_hybrid_context(mgr, request)
+            mgr.free_resources(request)
+            old_long_kept = _has_prompt_end_snapshot(mgr, old_long_tokens)
+            short_kept = _has_prompt_end_snapshot(mgr, short_tokens)
+            if not (old_long_kept and short_kept):
+                break
+        else:
+            pytest.fail("the recurrent-state pool never evicted a snapshot")
+
+        if demote_short_prompts:
+            assert old_long_kept and not short_kept
+        else:
+            assert short_kept and not old_long_kept
+    finally:
+        for request in requests:
             if request.py_request_id in mgr.kv_cache_map:
                 mgr.free_resources(request)
         mgr.shutdown()
@@ -9068,6 +9279,31 @@ def _assert_gdn_replay_slot_reset(mgr, replay_slot):
     bookkeeping, history = _gdn_replay_rows(mgr, replay_slot)
     assert bookkeeping == (0, 0, 0)
     assert all(torch.count_nonzero(rows) == 0 for rows in history)
+
+
+@skip_no_cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision KV requires Blackwell",
+)
+def test_v2_gdn_replay_manager_builds_the_cold_page_window():
+    """With MTP replay each GDN layer keeps its replay history in a layer group of its own, so its
+    buffers sit in two groups. The cold-page first/last-N window of the attention layer still
+    builds, and points its blocks at the group attention runs the layer in."""
+    provider = SimpleNamespace(
+        config=SimpleNamespace(algorithm="quantization_for_cold_page"),
+        mixed_precision_high_window=(1, 33),
+        create_cold_page_codec=lambda cache_config, **kwargs: None,
+    )
+    mgr = _build_v2_gdn_replay_manager(cold_page_codec_provider=provider)
+    try:
+        assert mgr.replay_layer_group_id not in (None, mgr.ssm_layer_group_id)
+        (attention_layer,) = mgr.mixed_precision_high_layers
+        (pool_id,) = mgr.mixed_precision_high_block_deltas
+        assert pool_id == mgr._get_layer_execution_group(attention_layer)
+        assert mgr.mixed_precision_high_block_deltas[pool_id] is not None
+    finally:
+        mgr.shutdown()
 
 
 @skip_no_cuda

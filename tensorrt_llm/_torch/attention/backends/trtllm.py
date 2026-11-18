@@ -55,16 +55,17 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
+from .fmha.registry import is_fmha_lib_enabled
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams,
-                        merge_attention_forward_args)
+                        AttentionRuntimeFeatures, KVCacheParams, MLAParams,
+                        PositionalEmbeddingParams, PredefinedAttentionMask,
+                        RopeParams, merge_attention_forward_args)
 from .mixed_precision_rows import store_mixed_precision_low_rows
-from .sparse.hooks import prepare_sparse_runtime_params
+from .sparse.hooks import has_sparse_mla_hooks, prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
@@ -240,9 +241,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # Plan caches of the FMHA libraries, keyed by library. A planned wrapper owns
     # workspaces that CUDA graphs capture, so it lives exactly as long as this
     # metadata; every layer that runs with this metadata reuses it.
-    fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
-                                              init=False,
-                                              repr=False)
+    fmha_plan_caches: Dict[str, Any] = field(default_factory=dict,
+                                             init=False,
+                                             repr=False)
+    # Whether TLLM_FMHA_LIBS enables beam_shared_prefix, read once per metadata so that
+    # prepare() does no per-step work for it when the library is off.
+    beam_shared_prefix_enabled: bool = field(default=False,
+                                             init=False,
+                                             repr=False)
     # Context-only plan shared by the layers of one forward (TrtllmAttention.cache_context_plan).
     context_plan: Optional[_ContextPlan] = field(init=False,
                                                  default=None,
@@ -550,6 +556,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
+        self.beam_shared_prefix_enabled = is_fmha_lib_enabled(
+            "beam_shared_prefix")
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
@@ -1761,17 +1769,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # every block-table access, so the staged/H2D width can be capped
             # at the batch's maximum instead of max_seq_len's worth of
             # columns. Speculative decoding must stage the full width:
-            # draft/tree sub-steps and the overlap scheduler advance
-            # kv_lens_cuda on device past the host snapshot, and their
-            # kernels dereference block columns a host-derived cap would
+            # its kernels dereference block columns a host-derived cap would
             # leave unstaged (uninitialized in this buffer).
-            spec_active = (self.draft_kv_cache_manager is not None
-                           or self.is_spec_decoding_enabled
-                           or bool(self.kv_cache_params.num_extra_kv_tokens) or
-                           (self.runtime_features is not None and
-                            self.runtime_features.has_speculative_draft_tokens))
             max_blocks = None
-            if not spec_active and self.kv_cache_manager.tokens_per_block:
+            if (not self._generation_block_offsets_need_capacity()
+                    and self.kv_cache_manager.tokens_per_block):
                 max_blocks = ceil_div(max_kv_len,
                                       self.kv_cache_manager.tokens_per_block)
             self.kv_cache_manager.copy_batch_block_offsets(
@@ -1816,6 +1818,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             prompt_lens_cpu=prompt_lens_cpu_runtime,
             host_request_types=self.host_request_types[:self.num_seqs],
         )
+
+        # Per-step host planning of the opt-in wide-beam generation library.
+        # It must run here, ahead of every forward of the step, so that under
+        # CUDA graphs it precedes both capture and replay.
+        # Also runs for single-beam steps, where it only drops the previous step's plan.
+        if self.beam_shared_prefix_enabled:
+            from .fmha.beam_shared_prefix import plan_step
+            plan_step(self)
 
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
@@ -2054,6 +2064,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:num_seqs],
         )
 
+    def _generation_block_offsets_need_capacity(self) -> bool:
+        """Whether generation block-offset rows need their configured capacity."""
+        return (self.draft_kv_cache_manager is not None
+                or self.is_spec_decoding_enabled
+                or bool(self.kv_cache_params.num_extra_kv_tokens)
+                or (self.runtime_features is not None
+                    and self.runtime_features.has_speculative_draft_tokens))
+
     @property
     def supports_steady_decode_step(self) -> bool:
         """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
@@ -2137,7 +2155,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         (the sparse-attention subclasses keep per-step state in their own
         ``prepare()``), no FP4-MLA state, no helix / cross attention / locality
         domains / flash-MLA / MLA cached-kv prefill handling, no mixed-precision
-        KV staging, and a KV cache manager with a known block size.
+        KV staging or cold-page window (prepare() redirects its block offsets),
+        and a KV cache manager with a known block size.
         """
         return (type(self) is TrtllmAttentionMetadata
                 and self.fp4_mla_state is None
@@ -2148,6 +2167,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 and not self.enable_flash_mla
                 and not self.enable_context_mla_with_cached_kv
                 and not self._has_mixed_precision_staging()
+                and self.mixed_precision_high_block_table is None
                 and self.kv_cache_params is not None
                 and self.kv_cache_params.use_cache)
 
@@ -3056,6 +3076,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # mNumAttnHeads).
         attn_tp = 1 if mapping.enable_attention_dp else mapping.tp_size
         num_attn_heads = config.num_attention_heads // attn_tp
+        # Helix context attention splits the heads further across CP, except
+        # under a sparse MLA adapter (mirrors MLA.num_context_heads); this
+        # workspace is staged only by context.
+        sparse_mla_adapter = has_sparse_mla_hooks(sparse_algorithm)
+        if mapping.has_cp_helix() and not sparse_mla_adapter:
+            num_attn_heads //= mapping.cp_size
         # The buffer is skipped only where AttentionOp::useSparseMLA() holds, which needs all three of:
         #   * DSA / DeepSeek-V4 -- only these lower to the absorption path that reads K/V from the paged
         #     cache. Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer,
@@ -3067,8 +3093,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # under-reserving OOMs mid-forward.
         sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
                       and is_sm_100f())
-        short_seq_mha_enabled = int(
-            os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
+        from .sparse.dsa.module import _get_short_seq_mha_threshold
+
+        short_seq_mha_enabled = _get_short_seq_mha_threshold() > 0
         stages_no_buffer = sparse_mla and not short_seq_mha_enabled
         return int(
             thop.get_context_mla_workspace_bytes_per_token(
@@ -3081,6 +3108,47 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 separate_q_and_kv_input=True,
                 sparse_mla=stages_no_buffer,
             ))
+
+    @classmethod
+    def runtime_workspace_min_tokens(
+        cls,
+        model_config: "ModelConfig",
+        mapping: "Mapping",
+        *,
+        max_num_tokens: int,
+        runtime_features: AttentionRuntimeFeatures,
+    ) -> int:
+        """Dense FP8 context MLA's complete chunked-prefill K/V staging capacity."""
+        if (not is_mla(model_config.pretrained_config)
+                or not runtime_features.chunked_prefill):
+            return 0
+        if not cls.runtime_workspace_is_chunked_prefill_bounded(model_config):
+            return 0
+        # Mirrors MLA::contextWorkspaceLayout's buffer_batch_size * query_tokens floor
+        # and the cached-partition capacity prepared by this backend's metadata.
+        return runtime_features.chunked_prefill_buffer_batch_size * max_num_tokens
+
+    @classmethod
+    def runtime_workspace_profiled_tokens(
+        cls,
+        model_config: "ModelConfig",
+        *,
+        profiled_prompt_len: int,
+        max_num_tokens: int,
+        max_batch_size: int,
+    ) -> int:
+        """Credit only the dense staging used by the profiling attention route."""
+        sparse_algorithm = getattr(model_config.sparse_attention_config,
+                                   "algorithm", None)
+        if (sparse_algorithm == "dsa"
+                and model_config.quant_config.quant_mode.has_fp8_kv_cache()
+                and is_sm_100f(get_sm_version())):
+            from .sparse.dsa.module import _get_short_seq_mha_threshold
+
+            threshold = _get_short_seq_mha_threshold()
+            if 0 < threshold < profiled_prompt_len:
+                return 0
+        return min(max_num_tokens, max_batch_size * profiled_prompt_len)
 
     @classmethod
     def runtime_workspace_fixed_bytes(cls, model_config: "ModelConfig",

@@ -20,13 +20,13 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention import (
+from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import triton_qsa_paged_sparse_gqa
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (
     qsa_paged_sparse_gqa_nvfp4 as _nvfp4_module,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import (  # noqa: E501
     qsa_paged_sparse_gqa_nvfp4_decode as op,
 )
-from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import triton_qsa_paged_sparse_gqa
 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying  # noqa: E402,F401 — path above; fixture by name
