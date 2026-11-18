@@ -40,12 +40,12 @@ import torch.nn.functional as F
 
 from tensorrt_llm.logger import logger
 
+from ..ops.comm.m3_mc_allreduce_norm import swizzle_sf
 from . import dspark_draft_head as _dhead8
 from .drafter_mxfp8 import mxfp8_from_bf16
 from .kernels import m3_report
 from .kernels.mx_gemv import op as _gemv
 from .m31_switches import m31_enabled
-from .ops.comm.m3_mc_allreduce_norm import swizzle_sf
 
 DMLP_MX14 = m31_enabled("DRAFT_MLP_MXFP8_14_ROWS")
 #: Draft rows taken: B x K for the draft-length-7 batch-2 block.

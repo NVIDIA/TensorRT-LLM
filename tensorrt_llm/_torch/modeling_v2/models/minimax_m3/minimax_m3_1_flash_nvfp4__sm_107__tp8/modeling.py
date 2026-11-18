@@ -163,8 +163,18 @@ from .. import cute_aot, m31_capture_fork, runtime_hooks_compat
 from ..msa import engine as _msa_engine
 from ..ops import m3_fsel_topk as _fsel
 from ..ops.attention.m3_select_blocks import m3_select_blocks
+from ..ops.attention.m31_fp8_indexer_qk_norm_rope import m3_fp8_indexer_qk_norm_rope
+from ..ops.attention.m31_qk_norm_rope_fp8 import m3_qk_norm_rope_fp8
+from ..ops.attention.m31_qkv_insert import m3_qkv_insert
+from ..ops.comm.m31_allreduce import m3_allreduce
+from ..ops.embedding.m31_embedding import m3_embedding
 from ..ops.gemm.m3_fp32_linear import m3_fp32_linear
+from ..ops.gemm.m31_bf16_linear import m3_bf16_linear
+from ..ops.gemm.m31_mxfp8_gemm import m3_mxfp8_gemm
+from ..ops.gemm.m31_mxfp8_linear import m3_mxfp8_linear
 from ..ops.spec.m3_draft_input import m3_draft_input
+from ..ops.spec.m31_capture_norm import m3_capture_norm
+from ..ops.spec.m31_chunk_norm import m3_chunk_norm
 from . import dspark as _dspark
 from . import weights as _weights
 from .kernels import m3_draft_step as m3_draft_step_kernel
@@ -190,22 +200,16 @@ from .ops import gqamix_sparse_decode as _gqamix_kernel
 from .ops.activation.m3_shared_swiglu_mxfp8 import m3_shared_swiglu_mxfp8
 from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
 from .ops.attention.m3_draft_attention import m3_draft_attention
-from .ops.attention.m3_fp8_indexer_qk_norm_rope import m3_fp8_indexer_qk_norm_rope
 from .ops.attention.m3_fullctx_decode import m3_fullctx_decode
 from .ops.attention.m3_index_score import m3_index_score
 from .ops.attention.m3_msa_attention import m3_msa_attention
 from .ops.attention.m3_producer import m3_producer
-from .ops.attention.m3_qk_norm_rope_fp8 import m3_qk_norm_rope_fp8
-from .ops.attention.m3_qkv_insert import m3_qkv_insert
 from .ops.attention.m3_select_long import m3_select_long
 from .ops.attention.m3_select_long_dsl import m3_select_long_dsl
 from .ops.attention.m3_sparse_decode import m3_sparse_decode
 from .ops.attention.m3_sparse_decode_lc8 import m3_sparse_decode_lc8
-from .ops.comm.m3_allreduce import m3_allreduce
 from .ops.comm.m3_mc_allreduce_norm import m3_mc_allreduce_norm
-from .ops.embedding.m3_embedding import m3_embedding
 from .ops.gemm import m3_mxfp8_cublaslt as mxfp8_cublaslt
-from .ops.gemm.m3_bf16_linear import m3_bf16_linear
 from .ops.gemm.m3_dense_swiglu import ALPHA as DENSE_ALPHA
 from .ops.gemm.m3_dense_swiglu import BETA as DENSE_BETA
 from .ops.gemm.m3_dense_swiglu import LIMIT as DENSE_LIMIT
@@ -226,16 +230,12 @@ from .ops.gemm.m3_mx_gemv import (
 )
 from .ops.gemm.m3_mx_gemv_bf16 import m3_mx_gemv_bf16
 from .ops.gemm.m3_mxfp8_cublaslt import m3_mxfp8_cublaslt
-from .ops.gemm.m3_mxfp8_gemm import m3_mxfp8_gemm
-from .ops.gemm.m3_mxfp8_linear import m3_mxfp8_linear
 from .ops.moe.m3_moe_engine import M3MoeState, ar_push_desc, m3_moe_engine, shared_ctas_for
 from .ops.moe.m3_router_tc import m3_router_tc
 from .ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
 from .ops.sampling import m31_chain_spec_mc as _chain_spec_mc
 from .ops.sampling import m31_softmax_mc as _softmax_mc
 from .ops.sampling import m31_topp_det as _topp_det
-from .ops.spec.m3_capture_norm import m3_capture_norm
-from .ops.spec.m3_chunk_norm import m3_chunk_norm
 from .ops.spec.m3_draft_silu import m3_draft_silu
 from .ops.spec.m3_draft_step import m3_draft_step
 from .ops.spec.m3_force_vec import m3_force_vec, m3_force_vec_req
@@ -828,7 +828,9 @@ class RowRange:
         return key in self.keys
 
     def certified(self) -> FrozenSet[Key]:
-        return frozenset(k for cell in self.entry.CELLS for k in self.certifies(cell.spec))
+        cells_by_tp = getattr(self.entry, "CELLS_BY_TP", None)
+        cells = self.entry.CELLS if cells_by_tp is None else cells_by_tp[8]
+        return frozenset(k for cell in cells for k in self.certifies(cell.spec))
 
 
 def _rows(lo: int, hi: int) -> FrozenSet[int]:

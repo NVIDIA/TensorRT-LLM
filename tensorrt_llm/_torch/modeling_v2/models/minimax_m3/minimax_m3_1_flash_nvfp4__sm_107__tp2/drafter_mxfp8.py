@@ -26,10 +26,10 @@ from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm.logger import logger
 
 from ..m31_drafter_layout import route_his_layout as _route_his_layout
+from ..ops.comm.m3_mc_allreduce_norm import swizzle_sf
 from .kernels import m3_report
 from .kernels.mx_gemv import op as _gemv
 from .m31_switches import m31_disabled
-from .ops.comm.m3_mc_allreduce_norm import swizzle_sf
 from .ops.gemm.m3_mxfp8_pinned_quantize import m3_mxfp8_pinned_quantize
 
 E4M3_MAX = 448.0

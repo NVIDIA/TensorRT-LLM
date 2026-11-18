@@ -74,6 +74,8 @@ from tensorrt_llm.logger import logger
 
 from .. import m31_capture_fork
 from ..m31_tail_bookkeep import TailBookkeepMixin
+from ..ops.embedding.m31_embedding import m3_embedding
+from ..ops.spec.m31_force_vec import m3_force_vec
 from . import dspark_draft_head as _dhead8
 from . import dspark_tailfold as _tfold
 from .drafter_mxfp8 import route_mx_linears, route_projection_layout
@@ -83,9 +85,7 @@ from .dspark_tailfork import copy_captures, ctx_store_launch, ctx_store_prep, vi
 from .gen_glue import glue_disabled
 from .kernels import m3_mc_allreduce, m3_nnt_fold, m3_report
 from .m31_switches import m31_disabled, m31_enabled
-from .ops.embedding.m3_embedding import m3_embedding
 from .ops.gemm.m31_fc_shard import FcShard
-from .ops.spec.m3_force_vec import m3_force_vec
 
 # S9BVR: the drafter's row-parallel all-reduces (each layer's o_proj and MLP down projection) of up to this many
 # rows run the one-shot all-reduce instead of AUTO. On this target AUTO resolves to NCCL at every row count: the AR

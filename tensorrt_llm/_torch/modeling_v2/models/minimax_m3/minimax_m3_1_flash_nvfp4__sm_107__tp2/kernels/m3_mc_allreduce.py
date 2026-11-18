@@ -33,8 +33,8 @@ from typing import Any
 
 import torch
 
-from ..ops.comm.m3_mc_allreduce_norm import m3_mc_allreduce_norm as _allreduce_norm_op
-from ..ops.comm.m3_mc_finalize_allreduce_norm import (
+from ...ops.comm.m3_mc_allreduce_norm import m3_mc_allreduce_norm as _allreduce_norm_op
+from ...ops.comm.m3_mc_finalize_allreduce_norm import (
     m3_mc_finalize_allreduce_norm as _finalize_allreduce_norm_op,
 )
 

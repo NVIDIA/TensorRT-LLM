@@ -164,8 +164,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .. import cute_aot, m31_capture_fork, runtime_hooks_compat
-from ..kernels import m3_fold_tail
+from ..kernels import m3_fold_tail, m3_spec_tail
 from ..kernels import m3_index_score as _index_score_kernel
+from ..kernels import msa_kv_update as _msa_kv_update_kernel
 from ..kernels.m3ll import tp4_moe_engine as m31_tp4_moe_engine
 from ..msa import engine as _msa_engine
 from ..ops import drafter_sliding_fi as _drafter_sliding_fi
@@ -175,19 +176,37 @@ from ..ops.attention.m3_dense_qk_norm_rope_fp8 import m3_dense_qk_norm_rope_fp8
 from ..ops.attention.m3_draft_attention import m3_draft_attention
 from ..ops.attention.m3_select_blocks import m3_select_blocks
 from ..ops.attention.m3_select_long import m3_select_long
+from ..ops.attention.m31_dense_decode import m3_dense_decode
+from ..ops.attention.m31_fp8_indexer_qk_norm_rope import m3_fp8_indexer_qk_norm_rope
+from ..ops.attention.m31_index_score import SPLIT_K as INDEX_SCORE_SPLIT_K
+from ..ops.attention.m31_index_score import m3_index_score
+from ..ops.attention.m31_qk_norm_rope_fp8 import m3_qk_norm_rope_fp8
+from ..ops.attention.m31_qkv_insert import m3_qkv_insert
+from ..ops.comm.m3_mc_allreduce_norm import m3_mc_allreduce_norm
+from ..ops.comm.m3_mc_finalize_allreduce_norm import m3_mc_finalize_allreduce_norm
+from ..ops.comm.m31_allreduce import m3_allreduce
+from ..ops.embedding.m31_embedding import m3_embedding
 from ..ops.gemm.m3_draft_lowm import ROWS as DRAFT_LOWM_TACTIC_ROWS
 from ..ops.gemm.m3_draft_lowm import m3_draft_lowm
 from ..ops.gemm.m3_fp32_linear import m3_fp32_linear
 from ..ops.gemm.m3_target_head import MAX_ROWS as TARGET_HEAD_KERNEL_MAX_ROWS
 from ..ops.gemm.m3_target_head import m3_target_head
+from ..ops.gemm.m31_bf16_linear import m3_bf16_linear
+from ..ops.gemm.m31_dense_swiglu import m3_dense_swiglu
+from ..ops.gemm.m31_mxfp8_gemm import m3_mxfp8_gemm
+from ..ops.gemm.m31_mxfp8_linear import m3_mxfp8_linear
+from ..ops.moe.m31_router_tc import m3_router_tc
+from ..ops.spec.m3_draft_silu import m3_draft_silu
 from ..ops.spec.m3_draft_step import MAX_TOKENS as DRAFT_STEP_KERNEL_MAX_TOKENS
 from ..ops.spec.m3_draft_step import m3_draft_step
 from ..ops.spec.m3_force_vec_req import m3_force_vec_req
 from ..ops.spec.m3_shard_accept import m3_shard_accept
 from ..ops.spec.m3_step_prologue import m3_step_prologue
+from ..ops.spec.m31_draft_input import m3_draft_input
+from ..ops.spec.m31_force_vec import m3_force_vec
 from . import dspark as _dspark
 from . import weights as _weights
-from .kernels import m3_attn_lc, m3_mc_allreduce, m3_nnt_fold, m3_prequant, m3_report, m3_spec_tail
+from .kernels import m3_attn_lc, m3_mc_allreduce, m3_nnt_fold, m3_prequant, m3_report
 from .kernels import m3_draft_lowm as _draft_lowm_kernel
 from .kernels import m3_draft_step as m3_draft_step_kernel
 from .kernels import m3_drafter_attn as _drafter_attn_kernel
@@ -198,31 +217,18 @@ from .kernels import m3_select_long_dsl as _select_long_dsl_kernel
 from .kernels import m3_shard_accept as m3_shard_accept_kernel
 from .kernels import m3_target_head as m3_target_head_kernel
 from .kernels import m3_tokmap_guard as _tokmap_guard
-from .kernels import msa_kv_update as _msa_kv_update_kernel
 from .kernels.long_select import long_select_blocks
 from .kernels.mx_gemv import op as mx_gemv
 from .kernels.triton_sparse_decode import MERGE_MXFP8, MERGE_MXFP8_MIN_TOKENS
 from .m31_switches import m31_disabled, m31_enabled
 from .ops import qkv_front as m31_qkv_front
 from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
-from .ops.attention.m3_dense_decode import m3_dense_decode
-from .ops.attention.m3_fp8_indexer_qk_norm_rope import m3_fp8_indexer_qk_norm_rope
 from .ops.attention.m3_fullctx_decode import m3_fullctx_decode
-from .ops.attention.m3_index_score import SPLIT_K as INDEX_SCORE_SPLIT_K
-from .ops.attention.m3_index_score import m3_index_score
 from .ops.attention.m3_index_score_t2sc import m3_index_score_t2sc
 from .ops.attention.m3_msa_attention import m3_msa_attention
 from .ops.attention.m3_producer import m3_producer
-from .ops.attention.m3_qk_norm_rope_fp8 import m3_qk_norm_rope_fp8
-from .ops.attention.m3_qkv_insert import m3_qkv_insert
 from .ops.attention.m3_select_long_dsl import m3_select_long_dsl
 from .ops.attention.m3_sparse_decode import m3_sparse_decode
-from .ops.comm.m3_allreduce import m3_allreduce
-from .ops.comm.m3_mc_allreduce_norm import m3_mc_allreduce_norm
-from .ops.comm.m3_mc_finalize_allreduce_norm import m3_mc_finalize_allreduce_norm
-from .ops.embedding.m3_embedding import m3_embedding
-from .ops.gemm.m3_bf16_linear import m3_bf16_linear
-from .ops.gemm.m3_dense_swiglu import m3_dense_swiglu
 from .ops.gemm.m3_mx_gemv import (
     DENSE_DOWN,
     DENSE_GATE_UP,
@@ -234,13 +240,10 @@ from .ops.gemm.m3_mx_gemv import (
     m3_mx_gemv,
 )
 from .ops.gemm.m3_mx_gemv_bf16 import m3_mx_gemv_bf16
-from .ops.gemm.m3_mxfp8_gemm import m3_mxfp8_gemm
-from .ops.gemm.m3_mxfp8_linear import m3_mxfp8_linear
 from .ops.gemm.m3_mxfp8_pinned_gemm import m3_mxfp8_pinned_gemm
 from .ops.gemm.m3_mxfp8_pinned_quantize import m3_mxfp8_pinned_quantize
 from .ops.moe.m3_moe16_engine import M3Moe16State, m3_moe16_engine
 from .ops.moe.m3_moe_engine import M3MoeState, ar_push_desc, m3_moe_engine
-from .ops.moe.m3_router_tc import m3_router_tc
 from .ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
 
 # REJ_MC: this target's copy of the rejection-sampling override module.
@@ -249,9 +252,6 @@ from .ops.sampling import m31_chain_spec_mc as _chain_spec_mc
 # SOFTMAX_MC: this target's copy of the softmax override module.
 from .ops.sampling import m31_softmax_mc as _softmax_mc
 from .ops.sampling import m31_topp_det as _topp_det
-from .ops.spec.m3_draft_input import m3_draft_input
-from .ops.spec.m3_draft_silu import m3_draft_silu
-from .ops.spec.m3_force_vec import m3_force_vec
 from .ops.spec.m3_spec_offsets import m3_spec_offsets
 
 # The sampler and rejection-sampler override registries the target installs its sampling kernels through; None on a
@@ -943,7 +943,9 @@ class RowRange:
         return key in self.keys
 
     def certified(self) -> FrozenSet[Key]:
-        return frozenset(k for cell in self.entry.CELLS for k in self.certifies(cell.spec))
+        cells_by_tp = getattr(self.entry, "CELLS_BY_TP", None)
+        cells = self.entry.CELLS if cells_by_tp is None else cells_by_tp[4]
+        return frozenset(k for cell in cells for k in self.certifies(cell.spec))
 
 
 def _rows(lo: int, hi: int) -> FrozenSet[int]:
@@ -1891,7 +1893,7 @@ def _dense_swiglu(core, gu: torch.Tensor) -> torch.Tensor:
     kernel."""
     rows = int(gu.shape[0])
     path = DENSE_SWIGLU_CPP_PATH
-    max_rows = max(cell.spec["rows"] for cell in m3_dense_swiglu.CELLS)
+    max_rows = max(cell.spec["rows"] for cell in m3_dense_swiglu.CELLS_BY_TP[4])
     if DENSE_SWIGLU_CPP and not is_torch_compiling():
         if rows > max_rows:
             uncovered(path, f"the dense swigluoai op: {rows} rows, past its certified {max_rows}")

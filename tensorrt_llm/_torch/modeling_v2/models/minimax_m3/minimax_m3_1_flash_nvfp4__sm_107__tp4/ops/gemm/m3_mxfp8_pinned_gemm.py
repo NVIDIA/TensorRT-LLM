@@ -11,7 +11,7 @@ import torch
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import FlashInferMXFP8GemmRunner
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from .m3_mxfp8_linear import mxfp8_reference
+from ....ops.gemm.m31_mxfp8_linear import mxfp8_reference
 
 # One runner per output dtype (a runner holds no per-call state).
 _RUNNERS: Dict[Tuple[type, torch.dtype], object] = {}

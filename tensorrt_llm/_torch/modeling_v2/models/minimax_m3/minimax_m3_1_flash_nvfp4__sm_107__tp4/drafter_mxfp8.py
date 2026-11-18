@@ -19,8 +19,8 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from ..ops.comm.m3_mc_allreduce_norm import swizzle_sf
 from .kernels.mx_gemv import op as _gemv
-from .ops.comm.m3_mc_allreduce_norm import swizzle_sf
 
 E4M3_MAX = 448.0
 BLOCK = 32

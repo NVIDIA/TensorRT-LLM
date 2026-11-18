@@ -15,8 +15,8 @@ import torch
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8QuantizeRunner
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ....ops.gemm.m31_mxfp8_linear import mxfp8_reference
 from .m3_mx_gemv import DENSE_DOWN, DENSE_GATE_UP, O_PROJ, QKV_SPARSE, SHARED_DOWN, SHARED_GATE_UP
-from .m3_mxfp8_linear import mxfp8_reference
 
 # The projections the cuBLASLt GEMM takes, and its rows: past the 32-row decode bound (DECODE_LAYER_WIDE_ROWS) up to
 # the verify rows of 8 requests at draft length 7 (64), on the same MXFP8 activation as FlashInfer's GEMM.

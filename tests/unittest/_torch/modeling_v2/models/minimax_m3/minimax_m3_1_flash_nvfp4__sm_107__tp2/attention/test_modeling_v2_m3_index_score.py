@@ -18,11 +18,11 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 try:
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.ops.attention.m3_index_score import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.attention.m31_index_score import (  # noqa: E501
         PAGE,
         SPLIT_K,
     )
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.ops.attention.m3_index_score import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.attention.m31_index_score import (  # noqa: E501
         m3_index_score as op,
     )
 except NoTarget as exc:

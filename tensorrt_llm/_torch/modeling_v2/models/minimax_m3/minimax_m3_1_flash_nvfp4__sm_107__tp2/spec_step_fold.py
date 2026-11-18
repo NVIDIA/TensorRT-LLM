@@ -13,8 +13,7 @@ from tensorrt_llm._torch.pyexecutor.h2d_cache import copy_h2d_if_changed
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
-from ..kernels import m3_fold_tail
-from .kernels import m3_spec_tail
+from ..kernels import m3_fold_tail, m3_spec_tail
 
 
 class M3SpecStepFold:

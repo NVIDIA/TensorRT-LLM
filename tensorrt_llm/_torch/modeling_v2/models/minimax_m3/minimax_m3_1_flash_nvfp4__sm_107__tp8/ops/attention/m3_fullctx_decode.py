@@ -12,8 +12,8 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cach
 )
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ....ops.attention.m31_dense_decode import dense_attention_reference, gather_paged_kv
 from ...kernels import m3_fullctx_decode as kernel
-from .m3_dense_decode import dense_attention_reference, gather_paged_kv
 
 __all__ = ["m3_fullctx_decode"]
 
