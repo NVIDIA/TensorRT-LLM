@@ -127,7 +127,7 @@ def test_midchunk_fetch():
 
 @pytest.mark.cpu_only
 def test_inforward_split():
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import InforwardSnapshotEntry
+    from tensorrt_llm._torch.modules.fla.inforward_snapshot import InforwardSnapshotEntry
 
     fam = _fam()
     manager = SimpleNamespace(conv_state_shape=(12, 3), state_index={11: 7, 13: 2}.__getitem__)
@@ -151,11 +151,15 @@ def test_inforward_split():
 
 
 def _fake_mamba_prepare(self, attn_metadata):
-    """``Mamba2Metadata.prepare``'s part the KDA metadata reads: slots aliasing a manager buffer."""
+    """``Mamba2Metadata.prepare``'s part the KDA metadata reads: slots aliasing a manager buffer and
+    the int64 cumulative sequence lengths."""
     n = attn_metadata.seq_lens.shape[0]
     self.state_indices = attn_metadata.slots[:n]
     self.state_indices_cpu = attn_metadata.slots.cpu()
     self._state_indices_aliased_ptr = self.state_indices.data_ptr()
+    self.query_start_loc_long = torch.nn.functional.pad(
+        attn_metadata.seq_lens_cuda[:n].long().cumsum(0), (1, 0)
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the metadata buffers live on the GPU")
