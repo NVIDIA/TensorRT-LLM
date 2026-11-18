@@ -44,6 +44,7 @@ from .engine.lora import resolve_lora_owner
 from .engine.model_setup import (
     apply_torch_compile,
     compile_model,
+    configure_autotuner_nvmmh,
     create_model_loader,
     init_process_setup,
     prepare_loaded_model,
@@ -171,6 +172,7 @@ class ModelEngine:
                 "encode_only models run through EncoderExecutor, which does not use ModelEngine."
             )
         init_process_setup(mapping, dist)
+        configure_autotuner_nvmmh(llm_args)
 
         (
             max_beam_width,
@@ -543,6 +545,8 @@ class ModelEngine:
     def _decoder_runner_config(
         self, config_cls: type[DecoderRunnerConfig] = DecoderRunnerConfig, **extra_fields: Any
     ) -> DecoderRunnerConfig:
+        from ._util import is_disagg_enabled
+
         return config_cls(
             max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
@@ -586,8 +590,13 @@ class ModelEngine:
                 self.llm_args.lora_config is not None
                 and self.llm_args.lora_config.cuda_graph_specialize_lora
             ),
+            samples_from_vocab_shards=(
+                isinstance(self.model, (DecoderModelForCausalLM, MultimodalModelMixin))
+                and self.model.samples_from_vocab_shards
+            ),
             spec_decode_fast_paths=self.spec_decode_fast_paths,
             watermark_config=self.llm_args.watermark_config,
+            is_disagg=is_disagg_enabled(self.llm_args.cache_transceiver_config),
             **extra_fields,
         )
 
@@ -622,6 +631,11 @@ class ModelEngine:
         )
 
     @property
+    def uses_torch_compile(self) -> bool:
+        """Whether the model forward runs under torch.compile."""
+        return self._torch_compile_backend is not None
+
+    @property
     def attn_metadata(self) -> AttentionMetadata | None:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.attn_metadata
@@ -632,6 +646,10 @@ class ModelEngine:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.spec_metadata
         return None
+
+    def replays_final_windows_only(self) -> bool:
+        """See ``DecoderRunner.replays_final_windows_only``."""
+        return isinstance(self._runner, DecoderRunner) and self._runner.replays_final_windows_only()
 
     @property
     def cuda_graph_runner(self) -> CUDAGraphRunner | None:

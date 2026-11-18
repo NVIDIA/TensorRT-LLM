@@ -17,18 +17,20 @@
 import logging
 import os
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from itertools import product
-from typing import Callable, Optional
+from typing import Callable, Optional, cast
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE
+from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE, RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ACTIVATION_PAYLOAD,
+    MoEActivation,
     SimpleActivation,
     SiTuActivation,
     SwigluActivation,
@@ -45,8 +47,8 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     find_cutlass_leaf,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
-    CuteDslB12xNvfp4FusedMoE,
-    CuteDslB12xW4a16Nvfp4FusedMoE,
+    FlashinferCutedslNvfp4Impl,
+    FlashinferCutedslW4a16Nvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
@@ -60,6 +62,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEProblem,
     canonical_activation,
     canonical_quant,
+    identity_quant_of,
     normalize_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
@@ -145,14 +148,14 @@ def find_backend_class(
         return find_cutedsl_grouped_gemm_leaf(quant_algo)
     if backend_type is MoeBackendType.CUTE_DSL_B12X:
         # Two leaves, one format each: NVFP4 keeps the CUTLASS prefill path,
-        # W4A16_NVFP4 never leaves the b12x kernel. Compared after
-        # canonical_quant, as the leaves' can_implement sees the format.
-        quant = canonical_quant(quant_algo)
+        # W4A16_NVFP4 never leaves the b12x kernel. Compared as identities
+        # spell the format, as the leaves' can_implement sees it.
+        quant = normalize_quant(canonical_quant(quant_algo))
         return next(
             (
                 leaf
-                for leaf in (CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE)
-                if canonical_quant(leaf.b12x_quant_algo) == quant
+                for leaf in (FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl)
+                if identity_quant_of(leaf) == quant
             ),
             None,
         )
@@ -266,6 +269,8 @@ def should_skip_trtllm(
     seq_len: Optional[int] = None,
     moe_tp_size: int = 1,
     parallel_mode: Optional[str] = None,
+    dtype: Optional[torch.dtype] = None,
+    activation_type: Optional[ActivationType] = None,
 ) -> Optional[str]:
     """
     Check TRTLLM Gen backend specific constraints.
@@ -284,6 +289,8 @@ def should_skip_trtllm(
         moe_tp_size: MoE TP parallelism size (default: 1, no TP sharding)
         parallel_mode: Optional multi-GPU parallel mode label (e.g. "DEP",
             "DTP", "TTP", "TEP") for parallel-mode-specific constraints.
+        dtype: Activation dtype for configuration-specific accuracy skips.
+        activation_type: Activation kind for configuration-specific accuracy skips.
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
@@ -431,22 +438,30 @@ def should_skip_trtllm(
                 f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large intermediate_size "
                 f"has known accuracy issues (intermediate_size={intermediate_size} >= 14336)."
             )
-        # NVFP4 flaky tactic failures with large model configs at seq=8.
-        # For example of observed failures:
-        #   - act=Relu2-e60_k4_h2048_i1408-seq=8: tactic[28] tile [32,36],
-        #     12.79% mismatch, 187/188 tactics pass.
+        # Keep unvalidated NVFP4 seq=8 configurations skipped, except for
+        # the restored Relu2 case below. This exemption assumes the single-GPU
+        # generators in test_moe_backend.py; multi-GPU sweeps use SwiGLU.
+        is_restored_relu2_seq8_case = (
+            model_config == MoeModelConfig(60, 4, 2048, 1408)
+            and dtype == torch.bfloat16
+            and activation_type == ActivationType.Relu2
+            and routing_method_cls is RenormalizeMoeRoutingMethod
+            and not swiglu_gptoss_style
+        )
         if (
             num_experts >= 60
             and model_config.top_k >= 4
             and model_config.hidden_size >= 2048
             and model_config.intermediate_size >= 1408
             and seq_len == 8
+            and not is_restored_relu2_seq8_case
         ):
             return (
-                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model config"
+                f"TRTLLMGenFusedMoE NVFP4 seq_len=8 with large model config "
                 f"(num_experts={num_experts}, top_k={model_config.top_k}, "
-                f"hidden_size={model_config.hidden_size}, intermediate_size={model_config.intermediate_size})"
-                f"and seq_len=8: flaky happen tactics failure with tactic[24] and tactic[28]"
+                f"hidden_size={model_config.hidden_size}, intermediate_size={model_config.intermediate_size}) "
+                "is not yet validated on B200/B300; lift it per configuration once all tactics "
+                "pass the accuracy check"
             )
         # Issue: NVFP4 with large expert count + large hidden_size
         # has a single FP4BlockScaleMoERunner tactic with accuracy failure.
@@ -482,46 +497,18 @@ def should_skip_trtllm(
                 f"(mismatch ~20-22%). CUTLASS backend with the same config passes."
             )
 
-    # W4A8_MXFP4_FP8 used to share the GatedMLP+W4A8MXFP4FP8LinearMethod
-    # reference path with W4A8_MXFP4_MXFP8 and hit a ~50-70x ref-vs-fused gap
-    # caused by the ref module's dynamic FP8 quantization being miswired to
-    # ``trtllm::w4a8_mxfp4_fp8_gemm`` (FP4GemmType.W4A8_MXFP4_MXFP8, which
-    # expects per-block activation scales with alpha=1). The reference now
-    # dequantizes the MXFP4 weights at load time AND emulates the kernel's
-    # static per-tensor FP8 round-trip on FC1 and FC2 inputs (see
-    # ``MXFP4FP8RefGatedMLPFusedMoE.forward``), so the generic / default
-    # SwiGLU configs (any top_k, any model shape) see the same FP8 noise as
-    # the fused kernel and pass.
-    #
-    # The remaining failure surface is
-    # W4A8_MXFP4_FP8 + TRTLLM-Gen + ``swiglu_gptoss_style=True`` (any top_k,
-    # any model shape, single- or multi-GPU). The element-wise reproducer at
-    # ``tests/unittest/_torch/moe/test_w4a8_mxfp4_fp8_divergence_repro.py``
-    # holds the model config / weights / input identical and only toggles
-    # the SwiGLU shape; on ``e60_k4_h2048_i1408 seq=1`` it shows:
-    #   * default SwiGLU (alpha=1, beta=0, limit=inf):
-    #       kernel ~ ref (1.00x magnitude, 0% mismatch_frac, PASS)
-    #   * gpt-oss SwiGLU (alpha=1.702, beta=1.0, limit=7.0):
-    #       kernel ~ 600-800x SMALLER than ref (94% mismatch_frac, FAIL)
-    # Eight ref variants that toggle gate clamp single/double-sided, drop
-    # the ``+beta`` term, drop the limit clamp, or skip the FC1/FC2 FP8
-    # round-trip all stay at ~94% mismatch, so the ref activation algebra
-    # is not the source. The CUTLASS backend with the same gpt-oss SwiGLU
-    # passes (Phase B verification, 16 passed / 0 failed). The bug is
-    # therefore in the TRTLLM-Gen kernel's gpt-oss SwiGLU code path itself
-    # (likely a wrong scale wired into the gpt-oss epilogue path - see
-    # ``GemmGatedActOptions.h`` ``scaleC`` / ``dequantScaleAb`` plumbing).
-    #
-    # Skip removal must be tied to the kernel bug fix tracked in
-    # https://nvbugspro.nvidia.com/bug/6178914.
-    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8 and swiglu_gptoss_style:
+    # Packed FP4 TMA descriptors require a 128-aligned logical K dimension.
+    # MXFP4 passes the TP shard width rather than its padded width.
+    if (
+        quant_algo == QuantAlgo.W4A8_MXFP4_FP8
+        and moe_tp_size > 1
+        and intermediate_size % moe_tp_size == 0
+        and (intermediate_size // moe_tp_size) % 128 != 0
+    ):
         return (
-            "[Kernel Bug NVBUG-6178914] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with "
-            "swiglu_gptoss_style: the kernel produces output ~600-800x smaller "
-            "than the bf16 reference across all top_k / model shapes / "
-            "parallel modes, while the same kernel matches ref under default "
-            "SwiGLU and CUTLASS matches ref under gpt-oss SwiGLU. Bug is "
-            "isolated to the TRTLLM-Gen gpt-oss SwiGLU epilogue scale path."
+            "[NVBUG-7085659] W4A8_MXFP4_FP8 TP uses a non-128-aligned "
+            f"logical TMA dimension (intermediate_size={intermediate_size}, "
+            f"moe_tp_size={moe_tp_size})."
         )
 
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
@@ -1111,7 +1098,11 @@ def build_test_activation(
     # cover the kinds this sweep supplies constants for, and a kind added to
     # ``ACTIVATION_PAYLOAD`` with a carrier of its own has to get that carrier.
     payload = ACTIVATION_PAYLOAD[kind]
-    return SimpleActivation(kind=kind) if payload is SimpleActivation else payload()
+    return (
+        SimpleActivation(kind=kind)
+        if payload is SimpleActivation
+        else cast(Callable[[], MoEActivation], payload)()
+    )
 
 
 def get_quick_skip_reason(
@@ -1129,8 +1120,8 @@ def get_quick_skip_reason(
     ``activation_type`` is a parameter rather than a constant because it is a
     selection input: a leaf declares which kinds it reaches, so a caller that
     parametrizes over Relu2 or SiTu and does not pass it here would prune its
-    sweep against the verdict for SwiGLU. Defaulted because today's callers
-    sweep SwiGLU only, and that is the historical shape of every MoE signature.
+    sweep against the verdict for SwiGLU. The default preserves SwiGLU-only
+    callers; generators sweeping other activations must pass their current kind.
     """
     import logging as _logging
 
@@ -1224,6 +1215,8 @@ def get_quick_skip_reason(
                 routing_method_cls,
                 swiglu_gptoss_style,
                 seq_len=seq_len,
+                dtype=dtype,
+                activation_type=activation_type,
             ),
             lambda: should_skip_cutlass(
                 backend_type,
@@ -1564,8 +1557,30 @@ def module_timer(request):
 # Base Test Config Iterator
 # ============================================================================
 def iter_base_test_configs(
-    swiglu_combos, model_configs, seq_lens, dtypes, backend_types, quant_algos, routing_methods=None
-):
+    swiglu_combos: list[tuple[float, float, float]],
+    model_configs: list[MoeModelConfig],
+    seq_lens: list[int],
+    dtypes: list[torch.dtype],
+    backend_types: list[MoeBackendType],
+    quant_algos: list[QuantAlgo | None],
+    routing_methods: list[type] | None = None,
+    *,
+    activation_type: ActivationType = ActivationType.Swiglu,
+) -> Iterator[
+    tuple[
+        float,
+        float,
+        float,
+        MoeModelConfig,
+        int,
+        torch.dtype,
+        MoeBackendType,
+        QuantAlgo | None,
+        type,
+        str | None,
+        str,
+    ]
+]:
     """
     Iterate over base test configurations using itertools.product.
 
@@ -1580,14 +1595,13 @@ def iter_base_test_configs(
         backend_types: List of backend types
         quant_algos: List of quantization algorithms
         routing_methods: List of routing method classes (default: [RenormalizeMoeRoutingMethod])
+        activation_type: Activation kind for eligibility and accuracy skip checks.
 
     Yields:
         Tuple of (swiglu_alpha, swiglu_beta, swiglu_limit, model_config, seq_len,
                   dtype, backend_type, quant_algo, routing_method_cls, skip_reason, base_test_id)
     """
     if routing_methods is None:
-        from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
-
         routing_methods = [RenormalizeMoeRoutingMethod]
 
     for (
@@ -1606,6 +1620,7 @@ def iter_base_test_configs(
             routing_method_cls,
             swiglu_gptoss_style=swiglu_gptoss_style,
             seq_len=seq_len,
+            activation_type=activation_type,
         )
         routing_name = routing_method_cls.__name__.replace("MoeRoutingMethod", "")
         swiglu_id = (

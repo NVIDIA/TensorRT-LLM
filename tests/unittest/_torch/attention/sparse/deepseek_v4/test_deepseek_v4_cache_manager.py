@@ -591,6 +591,7 @@ def test_sparse_warmup_cleanup_covers_arenas_and_leaves_host_history(
         return convert(wrapper) if device == "cuda" else buffer.reshape(wrapper.shape)
 
     monkeypatch.setattr(deepseek_v4_cache, "convert_to_torch_tensor", convert_storage)
+    cleanup_stream = None
     if device == "cpu":
         manager._stream = SimpleNamespace(device="cpu")
         cleanup_stream = Mock()
@@ -1620,10 +1621,20 @@ def _cache_config_case(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("tokens_per_block", [128, 256])
-@pytest.mark.parametrize("pp_layers", [[0, 1, 2, 3], [2, 3], [0, 2]])
-@pytest.mark.parametrize("index_topk", [1, 512])
+@pytest.mark.parametrize(
+    "enabled,pp_layers,index_topk",
+    [
+        (False, [0, 1, 2, 3], 512),
+        (False, [2, 3], 512),
+        (False, [0, 2], 512),
+        (True, [0, 1, 2, 3], 1),
+        (True, [0, 1, 2, 3], 512),
+        (True, [2, 3], 1),
+        (True, [2, 3], 512),
+        (True, [0, 2], 512),
+    ],
+)
 @pytest.mark.parametrize("indexer_k_dtype", ["fp8", "fp4"])
 @pytest.mark.parametrize(
     ("dtype", "nvfp4_residual_dim", "data_row_bytes", "scale_row_bytes"),

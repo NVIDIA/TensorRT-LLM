@@ -46,6 +46,7 @@ from ..activation import (
     MoEActivationSupport,
 )
 from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
+from ..impl_contract import MoEDecodeOptions
 from ..impl_identity import MOE_IMPL_REGISTRY
 from ..interface import FORCE_SEPARATED_ROUTING, MoEWeightLoadingMode
 from ..moe_op_backend import MoEOpBackend, get_op_backend
@@ -110,6 +111,9 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
     # variable. Their type comes from that declaration.
     capabilities = TRTLLM_GEN_CAPABILITIES
     input_requirement = TRTLLM_GEN_INPUT_REQUIREMENT
+
+    decode_tuning: bool = False
+    decode_early_release_rows: int = 0
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         """Take the provider off the descriptor a leaf already publishes.
@@ -211,9 +215,10 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
         self.max_num_tokens = model_config.max_num_tokens
-        # Declared by the model: the FP4 block-scale op tunes for its decode steps
-        # (FP4BlockScaleMoERunner.get_tuning_config).
-        self.decode_tuning = bool(model_config.extra_attrs.get("moe_decode_tuning", False))
+        # Declared by the model (MoEDecodeOptions): the FP4 block-scale op's decode tuning and kernels.
+        decode = MoEDecodeOptions.of(model_config.extra_attrs)
+        self.decode_tuning = decode.tuning
+        self.decode_early_release_rows = decode.early_release_rows
 
         self.op_backend: MoEOpBackend = get_op_backend(self.provider)
 

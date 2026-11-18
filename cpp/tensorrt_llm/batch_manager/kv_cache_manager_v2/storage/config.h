@@ -247,6 +247,8 @@ struct StorageConfig
     //! Host bytes the GPU tier's host-backed pools may take, or unset for unbounded.
     std::optional<size_t> hostSparsePoolQuota;
 
+    HostMemBackingConfig hostMemBacking;
+
     // Expansion factor per buffer (for heterogeneous tokens_per_block).
     std::unordered_map<BufferId, int, BufferIdHash> expansion;
 

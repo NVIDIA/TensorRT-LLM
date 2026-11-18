@@ -7,14 +7,14 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback_planes import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback_planes import (  # noqa: E501
     plane_table,
     qsa_rollback_gather,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.verify_step_setup import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.verify_step_setup import (  # noqa: E501
     verify_step_setup,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.cu_seqlens_from_seq_lens import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.cu_seqlens_from_seq_lens import (  # noqa: E501
     cu_seqlens_from_seq_lens,
 )
 

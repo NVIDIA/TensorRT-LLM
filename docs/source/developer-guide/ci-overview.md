@@ -31,7 +31,7 @@ This page explains how TensorRT‑LLM's CI is organized and how individual tests
 
 ## CI pipelines
 
-Pull requests do not start testing by themselves. Developers trigger the CI by commenting `/bot run` (optionally with arguments) on the pull request (see [Pull Request Template](source:.github/pull_request_template.md) for more details). That kicks off the **merge-request pipeline** (defined in `jenkins/L0_MergeRequest.groovy`), which runs unit tests and integration tests whose YAML entries specify `stage: pre_merge`. Once a pull request is merged, the **post-merge pipeline** runs the same `jenkins/L0_MergeRequest.groovy` as a separate Jenkins job. It runs the pre-merge stages plus the multi-GPU stages and every stage with `Post-Merge` in its name. In both pipelines, the test stages run in child jobs defined by `jenkins/L0_Test.groovy`, which maps each stage name to a test-db YAML file.
+Pull requests do not start testing by themselves. Developers trigger the CI by commenting `/bot run` (optionally with arguments) on the pull request (see [Pull Request Template](source:.github/pull_request_template.md) for more details). That kicks off the **merge-request pipeline** (defined in `jenkins/L0_MergeRequest.groovy`), which runs unit tests and integration tests whose YAML entries specify `stage: pre_merge`. Once a pull request is merged, the **post-merge pipeline** runs the same `jenkins/L0_MergeRequest.groovy` as a separate Jenkins job. It runs the pre-merge stages plus the multi-GPU stages and every stage with `Post-Merge` in its name, except that a stage whose name ends in `-k_of_N` runs only on the post-merge builds whose `BUILD_NUMBER % N == k % N`. In both pipelines, the test stages run in child jobs defined by `jenkins/L0_Test.groovy`, which maps each stage name to a test list: a top-level key of a test-db YAML file (usually the file's own name; a file may hold several lists).
 
 `stage` tags live in the YAML files under `tests/integration/test_lists/test-db/`. Searching those files for `stage: pre_merge` shows exactly which tests the merge-request pipeline covers.
 
@@ -65,7 +65,7 @@ Unit tests live under `tests/unittest/`. They are listed in the same test-db YAM
     "A100X-PyTorch-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
 ```
 
-The array elements are: GPU type, YAML file (without extension), shard index, and total number of shards. Only tests with `stage: post_merge` from that YAML file are selected when a `Post-Merge` stage runs.
+The array elements are: GPU type, test list (here the YAML file name without extension), shard index, and total number of shards. Only tests with `stage: post_merge` from that YAML file are selected when a `Post-Merge` stage runs.
 
 Stage names are unbracketed, with `Post-Merge` embedded directly in the name. Copy the name exactly as it appears in the Groovy map. Jenkins `stage_list` matches names without a `*` wildcard exactly, so a stale spelling such as `A100X-Triton-[Post-Merge]-1` silently selects nothing. The mapping script's `--stages` option is stricter: it reports unknown names and near-match suggestions on stderr.
 
@@ -200,21 +200,21 @@ inner unittest name; platform scope does not change its matching rules.
 | --- | --- |
 | `<test>` | All platforms where the test matches and the waive file is supplied. The current prefix is added if set; unprefixed integration waives also work locally without `--test-prefix`. |
 | `full:DGX_H100/<test>` | `DGX_H100` stages, e.g. `DGX_H100-PyTorch-1`. |
-| `full:H100_PCIe/<test>` | `H100_PCIe` stages, e.g. `H100_PCIe-CPP-1`. |
+| `full:GH200/<test>` | `GH200` stages, e.g. `GH200-PyTorch-Post-Merge-1`. |
 | `full:A100X/<test>` | `A100X` stages, e.g. `A100X-PyTorch-1`. |
 | `full:CPU/<test>` | Standard `CPU-Generic-x86-*` and `CPU-Generic-arm-*` stages (`l0_cpu.yml`, zero GPUs), without GPU detection. |
-| `full:sm90/<test>` | Exact SM90 detected by the collecting pytest process; can cover both `DGX_H100` and `H100_PCIe`. See detection limits below. |
+| `full:sm90/<test>` | Exact SM90 detected by the collecting pytest process; can cover both `DGX_H100` and `GH200`. See detection limits below. |
 
 `full:` supplies a prefix instead of having one prepended. For a matching
 platform, the parser expands the part before the first `-` in `--test-prefix`
 to that full prefix. Names are case-sensitive: `H100` is not an alias for
-`DGX_H100` or `H100_PCIe`, nor is `A100` an alias for `A100X`. Copy the name from
+`DGX_H100`, nor is `A100` an alias for `A100X`. Copy the name from
 the actual invocation or [stage definitions](source:jenkins/L0_Test.groovy),
 not the GPU model or test-db filename. A bare `DGX_H100/<test>` without `full:`
 gets the current prefix prepended again.
 
 For several platforms, use one line each, such as `full:A100X/<test>` and
-`full:DGX_H100/<test>`; these exclude `H100_PCIe`. Comma lists and `*` are not
+`full:DGX_H100/<test>`; these exclude `GH200`. Comma lists and `*` are not
 expanded. Remove any unprefixed `SKIP` for that test when narrowing its scope,
 or it will still skip on other platforms.
 
@@ -299,6 +299,11 @@ actor and normally removes invalid approvals. This is a best-effort resource
 governance guard, not a strict authorization boundary. The label remains in
 place when new commits are pushed and can be removed manually when the approval
 no longer applies.
+
+Post-merge perf-sanity stages (stage names containing both `PerfSanity` and
+`Post-Merge`) run automatically only in the official post-merge pipeline. In
+any other pipeline, including a `/bot run --post-merge` run, such a stage runs
+only when `--stage-list` or `--extra-stage` names it.
 
 When you only need to verify a handful of post-merge tests, specify exactly
 which stages to run:

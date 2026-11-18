@@ -302,8 +302,13 @@ def _install_fake_selfsampling_runner(monkeypatch) -> Mock:
     return runner
 
 
-def _sm100_or_sm103() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+def _gvr_v2_device() -> bool:
+    """Hopper or datacenter Blackwell: the devices the self-sampling GVR engine runs on."""
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in (
+        (9, 0),
+        (10, 0),
+        (10, 3),
+    )
 
 
 def _run_gvr_v2_decode(top_k: TopK, out_width: int = 2) -> None:
@@ -573,7 +578,7 @@ def test_gvr_v2_decode_wide_16bit_radix_fallback_widens_to_fp32(monkeypatch, rea
     assert kwargs["radix_aux_indices"] is not None and kwargs["radix_aux_logits"] is not None
 
 
-@pytest.mark.skipif(not _sm100_or_sm103(), reason="requires SM100 or SM103")
+@pytest.mark.skipif(not _gvr_v2_device(), reason="requires SM90, SM100 or SM103")
 def test_gvr_v2_decode_deterministic_16bit_capture_replays_fp32_warmup() -> None:
     """A deterministic BF16 decode captured on a padded arena view runs the FP32 launcher that
     warmup compiled at the arena row stride, with the eager engine's indices and order."""
@@ -624,7 +629,7 @@ def test_gvr_v2_decode_deterministic_16bit_capture_replays_fp32_warmup() -> None
     assert torch.equal(output, expected)
 
 
-@pytest.mark.skipif(not _sm100_or_sm103(), reason="requires SM100 or SM103")
+@pytest.mark.skipif(not _gvr_v2_device(), reason="requires SM90, SM100 or SM103")
 def test_gvr_v2_decode_16bit_capture_without_warmup_uses_radix(monkeypatch) -> None:
     """A BF16 decode captured without a 16-bit warmup runs the CUDA radix decode in the graph
     instead of raising, and replays exact."""

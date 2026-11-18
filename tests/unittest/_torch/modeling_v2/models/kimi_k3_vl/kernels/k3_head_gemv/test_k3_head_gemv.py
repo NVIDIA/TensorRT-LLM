@@ -48,7 +48,7 @@ _FEW_TILES_CHILD = r"""
 import sys
 import torch
 import tensorrt_llm  # noqa: F401
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_head_gemv import op  # noqa: F401
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_head_gemv import op  # noqa: F401
 gen = torch.Generator(device="cuda").manual_seed(20261002)
 for shape in sys.argv[1:]:
     n, k = map(int, shape.split("x"))
@@ -66,7 +66,7 @@ for shape in sys.argv[1:]:
 
 def _ops():
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_head_gemv import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_head_gemv import (
         op,  # noqa: F401
     )
 
@@ -129,9 +129,7 @@ def test_k3_head_gemv_few_tiles():
 @pytest.mark.parametrize("m", [0, 9, 16])
 def test_token_limit(m):
     _ops()
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_head_gemv import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_head_gemv import op
 
     w, _ = _inputs()
     assert not op.supports(torch.zeros(m, HIDDEN, dtype=torch.bfloat16, device="cuda"), w)

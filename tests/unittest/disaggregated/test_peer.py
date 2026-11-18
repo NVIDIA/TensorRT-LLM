@@ -660,7 +660,7 @@ def _make_receiver_for_view_validation(
     [
         ("missing_heads", "must publish a positive num_kv_heads"),
         ("pool_roles", "has no peer view with the same roles"),
-        ("draft_layers", "unified draft KV layer count differs"),
+        ("draft_layers", "unified draft KV layer count differs (local=5, peer=0)"),
     ],
 )
 def test_receiver_rejects_view_mismatch_before_registration(
@@ -694,8 +694,9 @@ def test_receiver_rejects_view_mismatch_before_registration(
     elif mismatch == "pool_roles":
         bad_view.pool_role = frozenset({"other_kv"})
     else:
-        # A sender sharing draft KV with a receiver that keeps a separate cache.
-        bad_ri.num_draft_layers = 2
+        # A generation worker sharing draft KV with a context worker that has no draft layers
+        # (no speculative_config, or the launcher's TRTLLM_DISAGG_SHARED_DRAFT_KV=0).
+        local_ri.num_draft_layers = good_ri.num_draft_layers = 5
     bad_ri.sender_endpoints = ["tcp://bad-sender"]
     good_ri.sender_endpoints = ["tcp://good-sender"]
     bad_endpoint = "tcp://bad-info"
@@ -728,6 +729,9 @@ def test_receiver_rejects_view_mismatch_before_registration(
             assert task.is_done
             assert isinstance(task._exception, PeerIncompatibleError)
             assert diagnostic in str(task._exception)
+            if mismatch == "draft_layers":
+                assert "TRTLLM_DISAGG_SHARED_DRAFT_KV=0" in str(task._exception)
+                assert "speculative_config" in str(task._exception)
             if enforce_physical_ownership:
                 assert task.resources_drained
 
@@ -755,6 +759,39 @@ def test_receiver_rejects_view_mismatch_before_registration(
         messengers[good_endpoint].receive.assert_called_once_with(timeout_ms=ANY)
         with pytest.raises(KeyError):
             registrar.get_peer_rank_info(good_ri.instance_name, good_ri.instance_rank)
+    finally:
+        receiver.shutdown()
+
+
+def test_receiver_registers_with_sender_lacking_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A generation rank with a drafter layer the context server does not send
+    # still registers; only the shared layers are transferred.
+    from tensorrt_llm._torch.disaggregation.native.transfer import MessageType
+
+    local_ri, sender_ri = [
+        make_rankinfo(
+            instance_name=name,
+            tp_size=1,
+            tokens_per_block=2,
+            dims_per_head=2,
+            layer_num_per_pp=layers,
+            page_table=_make_per_view_page_table([2, 1], MapperKind.INDEXED),
+        )
+        for name, layers in (("receiver", [3]), ("sender", [2]))
+    ]
+    sender_ri.sender_endpoints = ["tcp://sender"]
+    registrar = _make_peer_registrar(local_ri)
+    receiver, messengers, _ = _make_receiver_for_view_validation(
+        monkeypatch, registrar, {"tcp://info": sender_ri}, enforce_physical_ownership=False
+    )
+    try:
+        params = SimpleNamespace(ctx_info_endpoint="tcp://info", ctx_dp_rank=0)
+        sender_info = receiver._get_sender_info(params)
+        assert sender_info.layer_num_per_pp == [2]
+        assert receiver._incompatible_peers == {}
+        messengers["tcp://sender"].send.assert_called_once_with(
+            [MessageType.REGISTER_RANK_INFO, local_ri.to_bytes()]
+        )
     finally:
         receiver.shutdown()
 
@@ -933,6 +970,33 @@ def test_peer_registrar_rejects_mismatched_protocol_version():
     peer_ri.protocol_version = NATIVE_TRANSFER_PROTOCOL_VERSION + 1
     with pytest.raises(ValueError, match="protocol version"):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+@pytest.mark.parametrize(("self_layers", "peer_layers"), [([3], [2]), ([2], [3]), ([3], [1, 1])])
+def test_peer_registrar_layer_count_mismatch_warns(monkeypatch, self_layers, peer_layers):
+    # Either side may hold layers the other lacks, e.g. a drafter whose cache the
+    # context server does not transfer; only the shared layers are mapped.
+    reg = _make_peer_registrar(make_rankinfo(instance_name="gen", layer_num_per_pp=self_layers))
+    peer_ri = make_rankinfo(
+        instance_name="ctx",
+        instance_rank=1,
+        pp_size=len(peer_layers),
+        layer_num_per_pp=peer_layers,
+        page_table=make_page_table(),
+    )
+    warnings = []
+    monkeypatch.setattr(peer_module.logger, "warning", lambda *message: warnings.append(message))
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+    assert reg.get_peer_rank_info("ctx", 1) is peer_ri
+    assert [m for m in warnings if "layer count differs" in " ".join(map(str, m))] == [
+        (
+            "PeerRegistrar: layer count differs "
+            f"(local={sum(self_layers)}, peer={sum(peer_layers)}), "
+            "allowing partial layer transfer.",
+        )
+    ]
 
 
 def test_peer_registrar_self_rank_info_property():
@@ -1869,6 +1933,33 @@ def test_peer_registrar_requires_matching_unified_draft_layers(
     assert reg.get_peer_rank_info("peer", 1) == peer_ri
 
 
+@pytest.mark.parametrize(("local_dtype", "peer_dtype"), [("FP8", "FP8"), ("FP8", "BF16")])
+def test_peer_registrar_requires_matching_unified_draft_kv_dtype(
+    local_dtype: str, peer_dtype: str
+) -> None:
+    self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.num_draft_layers = 1
+    self_rankinfo.draft_kv_dtype = local_dtype
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    peer_ri.num_draft_layers = 1
+    peer_ri.draft_kv_dtype = peer_dtype
+    if local_dtype != peer_dtype:
+        with pytest.raises(
+            ValueError, match=f"draft KV dtype differs.*local={local_dtype}, peer={peer_dtype}"
+        ):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        return
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info("peer", 1) == peer_ri
+
+
 @pytest.mark.parametrize(
     ("self_kwargs", "peer_kwargs", "compatible"),
     [
@@ -1912,6 +2003,52 @@ def test_peer_registrar_shares_draft_layers_when_heads_per_rank_agree(
     )
     peer_ri.num_draft_layers = 5
     if not compatible:
+        with pytest.raises(ValueError, match="same attention TP size"):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        return
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info("peer", 1) == peer_ri
+
+
+@pytest.mark.parametrize("peer_hosts_draft_layers", [True, False], ids=["both_host", "local_hosts"])
+@pytest.mark.parametrize(
+    ("peer_tp_size", "peer_dp_size", "peer_kv_heads", "peer_attention_dp"),
+    [(4, 1, 1, False), (2, 2, 2, True)],
+    ids=["tp_mismatch", "attention_dp_mismatch"],
+)
+def test_peer_registrar_accepts_hosted_draft_layers_across_tp_and_attention_dp(
+    peer_tp_size: int,
+    peer_dp_size: int,
+    peer_kv_heads: int,
+    peer_attention_dp: bool,
+    peer_hosts_draft_layers: bool,
+) -> None:
+    """Managers hosting draft layers share them across attention TP; the views reshard.
+
+    A peer with appended draft layers still needs the same attention TP.
+    """
+    self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.num_draft_layers = 1
+    self_rankinfo.draft_layers_reshard_across_tp = True
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        tp_size=peer_tp_size,
+        dp_size=peer_dp_size,
+        kv_heads_per_rank=peer_kv_heads,
+        enable_attention_dp=peer_attention_dp,
+        layer_num_per_pp=[2],
+        # Same bytes per KV head as the local side's 2 heads in 1024-byte blocks.
+        page_table=make_page_table(
+            block_bytes=[512 * peer_kv_heads],
+            mamba_tp=1 if peer_attention_dp else peer_tp_size,
+            kv_heads=peer_kv_heads,
+        ),
+    )
+    peer_ri.num_draft_layers = 1
+    peer_ri.draft_layers_reshard_across_tp = peer_hosts_draft_layers
+    if not peer_hosts_draft_layers:
         with pytest.raises(ValueError, match="same attention TP size"):
             reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
         return
