@@ -90,23 +90,8 @@ WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD = 0.30
 # trajectory), so this bound intentionally has large headroom and exists
 # only to catch outputs that are far from everything.
 WAN_MULTI_GPU_GOLDEN_BACKSTOP_LPIPS_THRESHOLD = 0.32
-# MiniMax-H3 Ulysses is in the REDUCTION-REORDERING class: unlike Wan, its
-# multi-GPU run is not bit-exact with the single-GPU run. Historical calibration
-# with 27 denoising forwards amplified the one-ULP seed to a saturation band
-# instead of a fixed value. Same-seed draws of the 384x384 L0 case measured 0.1180, 0.1528 and
-# 0.1732 on two GPUs and 0.0926, 0.1528, 0.1732, 0.1858 and 0.2033 on four
-# (FA4 gives the same output on two and four GPUs); the fusion toggle alone
-# moves the video 0.1776 on one GPU.  That fusion (QK-norm + RoPE) is lossless
-# in accuracy but not in bits: it keeps FP32 and rounds to BF16 once where
-# eager rounds after each of five ops, so 39 % of its outputs differ from
-# eager by one BF16 ULP (rel. L2 3.5e-3; the torch.compile'd unfused path is
-# equally far from eager, 3.6e-3).  Any such whole-build rounding change
-# re-draws from the band, so a bound taken from one draw is not stable.
-# In that historical calibration, 0.30 kept ~0.10 over the worst benign draw;
-# broken output (other seed
-# 0.585, time-reversed video 0.459) lands above it.
-# The current 50-point (49-forward) schedule still needs validation against this
-# unchanged bound; the historical draws above do not establish its headroom.
+# MiniMax-H3 distributed reduction ordering can introduce numerical drift,
+# so multi-GPU parity is perceptual rather than bit-exact.
 MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLD = WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD
 WAN22_MULTI_GPU_LPIPS_ATTENTION_BACKEND = "FA4"
 WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO = "wan22_t2v_fa4_fully_eager_lpips_golden_video.mp4"
