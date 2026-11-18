@@ -286,8 +286,7 @@ TEST_P(HostDropRingTest, RingCopiesDroppedPagesAndRecyclesSlots)
 
     // The synchronous hook is not called once the ring is up.
     int hookCalls = 0;
-    (void) storage.setHostDropHook(
-        [&](std::vector<HostDropRecord> const&) { ++hookCalls; });
+    (void) storage.setHostDropHook([&](std::vector<HostDropRecord> const&) { ++hookCalls; });
 
     auto const first = commitRound();
     commitRound();

@@ -27,8 +27,8 @@
 #include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
-#include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 #include "kv_cache_manager_v2/utils/staticHostMem.h"
 #include "tensorrt_llm/common/logger.h"
 
