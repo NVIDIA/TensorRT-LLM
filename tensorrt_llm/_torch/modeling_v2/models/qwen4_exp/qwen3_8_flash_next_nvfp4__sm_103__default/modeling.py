@@ -1570,7 +1570,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
                 or list(group) != list(range(4))
                 or torch.cuda.get_device_capability() != (10, 3)
             ):
-                raise ValueError("the Lamport MoE round trip is certified on a pure SM103 DEP4 worker")
+                raise ValueError(
+                    "the Lamport MoE round trip is certified on a pure SM103 DEP4 worker"
+                )
             import torch.distributed as dist
 
             from tensorrt_llm._torch.distributed.initialization import (

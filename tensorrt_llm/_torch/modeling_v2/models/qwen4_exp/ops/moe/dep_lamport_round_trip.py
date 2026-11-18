@@ -294,7 +294,10 @@ def _compile(rank: int, world: int, device_id: int, hidden: int, reduce: bool, s
     numel = cute.sym_int32(divisibility=_VEC)
     fake_buffers = [
         make_fake_compact_tensor(
-            cutlass.BFloat16, (_PING_PONG, world, numel), stride_order=(2, 1, 0), assumed_align=_ALIGN
+            cutlass.BFloat16,
+            (_PING_PONG, world, numel),
+            stride_order=(2, 1, 0),
+            assumed_align=_ALIGN,
         )
         for _ in range(world)
     ]
@@ -343,7 +346,9 @@ class DepRoundTrip:
 
     def takes(self, rows: int, x: torch.Tensor) -> bool:
         """Every rank answers the same: the padded row count and the dtype are the group's."""
-        return 1 <= rows <= self.max_rows and x.dtype is torch.bfloat16 and x.shape[1] == self.hidden
+        return (
+            1 <= rows <= self.max_rows and x.dtype is torch.bfloat16 and x.shape[1] == self.hidden
+        )
 
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """`[R, H]` on every rank -> the group's rows `[world * R, H]`, rank-major."""
@@ -371,7 +376,9 @@ def build(hidden: int, max_rows: int, rank: int, world: int, sum_order=None) -> 
     assert hidden % _VEC == 0, hidden
     assert dist.is_initialized() and dist.get_world_size() == world and dist.get_rank() == rank
     dev = torch.device("cuda", torch.cuda.current_device())
-    buffer = symm_mem.empty((_PING_PONG, world, max_rows * hidden), dtype=torch.bfloat16, device=dev)
+    buffer = symm_mem.empty(
+        (_PING_PONG, world, max_rows * hidden), dtype=torch.bfloat16, device=dev
+    )
     # Every slot starts not-ready, or the first exchange reads uninitialized memory as data.
     buffer.view(torch.int16).fill_(_NEG_ZERO)
     group = dist.group.WORLD
