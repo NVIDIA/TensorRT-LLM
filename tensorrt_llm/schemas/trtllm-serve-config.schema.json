@@ -8214,7 +8214,7 @@
       "type": "object"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc5/_static/schemas/trtllm-serve-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "allOf": [
@@ -10135,6 +10135,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc4 trtllm-serve --config",
+  "title": "TensorRT-LLM 1.4.0rc5 trtllm-serve --config",
   "type": "object"
 }

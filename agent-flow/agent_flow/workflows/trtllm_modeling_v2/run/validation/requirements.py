@@ -80,7 +80,6 @@ class Matrix:
     features: tuple[str, ...]
     members: tuple[str, ...]
     cells: tuple[Cell, ...]
-    workload: str = ""
     accepted: tuple[str, ...] = field(default_factory=tuple)
 
     def cell(self, feature: str, member: str) -> Cell | None:
@@ -115,16 +114,12 @@ class Matrix:
             for c in self.cells
             if c.status != CERTIFIED
         ]
-        workload = f"Workload: {self.workload}.\n\n" if self.workload else ""
-        return (
-            workload + "\n".join([head, rule, *rows]) + ("\n\n" + "\n".join(notes) if notes else "")
-        )
+        return "\n".join([head, rule, *rows]) + ("\n\n" + "\n".join(notes) if notes else "")
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "features": list(self.features),
             "members": list(self.members),
-            "workload": self.workload,
             "accepted": list(self.accepted),
             "cells": [asdict(c) for c in self.cells],
         }
@@ -154,14 +149,6 @@ def _judges(gate: str, feature: str) -> bool:
     if gate.startswith("accuracy[") and gate.endswith("]"):
         return feature_evidence.judges_images(gate[len("accuracy[") : -1])
     return False
-
-
-def _workload(task_data: Mapping[str, Any]) -> str:
-    perf = task_data.get("perf") or {}
-    load = perf.get("workload") if isinstance(perf, Mapping) else None
-    if isinstance(load, Mapping) and load.get("isl") and load.get("osl"):
-        return f"ISL {load['isl']} / OSL {load['osl']}"
-    return ""
 
 
 def requirements_matrix(
@@ -270,7 +257,6 @@ def requirements_matrix(
         features=tuple(features),
         members=tuple(members),
         cells=tuple(cells),
-        workload=_workload(task_data),
         accepted=rules,
     )
 

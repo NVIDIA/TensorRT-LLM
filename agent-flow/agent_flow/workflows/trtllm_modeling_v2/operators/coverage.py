@@ -99,8 +99,7 @@ TIER_DESCRIPTION: dict[int, str] = {
     ),
     TIER_NATIVE_TORCH: (
         "no engine implementation exists, so compose one from torch ops. Correct "
-        "first and slow is acceptable for a functionality onboarding; the tuning "
-        "phase replaces it"
+        "first and slow is acceptable for a functionality onboarding"
     ),
     TIER_TRITON: (
         "native torch cannot express it, or does so at a cost that breaks the "
