@@ -131,6 +131,18 @@ def require_nsys_cuda_tracing():
         )
 
 
+def _assert_logged_nvmmh_config(llm_root: Path, profile_dir: str, world_size: int, expected: str):
+    log_path = (
+        llm_root
+        / "examples"
+        / "layer_wise_benchmarks"
+        / profile_dir
+        / f"report_np{world_size}_rank0.log"
+    )
+    marker = f"Layer-wise benchmarks: Autotuner nvmmh_config={expected}"
+    assert marker in log_path.read_text(), f"Missing {marker!r} in {log_path}"
+
+
 # The pinned DeepSeek FP4 checkpoint requires SM100+, so this is guarded with
 # skip_pre_blackwell like its siblings below. https://nvbugs/6337228 was exactly
 # this test aborting (rc 134/1) on the A10 pre-merge stage.
@@ -148,6 +160,7 @@ def test_deepseek_r1_ctx_dep(llm_root, world_size):
             "config_ctx.yaml",
             "--model",
             model_root / "DeepSeek-R1" / "DeepSeek-R1-0528-FP4-v2",
+            "--enable-autotuner-nvmmh",
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
@@ -156,6 +169,7 @@ def test_deepseek_r1_ctx_dep(llm_root, world_size):
             "PROFILE_DIR": profile_dir,
         },
     )
+    _assert_logged_nvmmh_config(llm_root, profile_dir, world_size, "NvMMHConfig(max_tactics=5)")
     check_call(
         ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
@@ -179,6 +193,7 @@ def test_deepseek_r1_ctx_tep(llm_root, world_size):
             model_root / "DeepSeek-R1" / "DeepSeek-R1-0528-FP4-v2",
             "--no-enable-attention-dp",
             "--moe-backend=TRTLLM",
+            "--enable-autotuner-nvmmh",
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
@@ -187,6 +202,7 @@ def test_deepseek_r1_ctx_tep(llm_root, world_size):
             "PROFILE_DIR": profile_dir,
         },
     )
+    _assert_logged_nvmmh_config(llm_root, profile_dir, world_size, "NvMMHConfig(max_tactics=5)")
     check_call(
         ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
@@ -286,6 +302,7 @@ def test_nemotron_gen_dep(llm_root, world_size):
             "PROFILE_DIR": profile_dir,
         },
     )
+    _assert_logged_nvmmh_config(llm_root, profile_dir, world_size, "None")
     check_call(
         ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",

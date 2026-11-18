@@ -19,6 +19,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch.configs import KimiK3Config, KimiLinearConfig
 from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
 from tensorrt_llm.llmapi import (
+    AutoTunerNvMMHConfig,
     CudaGraphConfig,
     DSparkDecodingConfig,
     KvCacheConfig,
@@ -104,6 +105,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             enable_iter_perf_stats=True,
             max_stats_len=256,
             return_perf_metrics=True,
+            autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
         )
         if mode == "baseline":
             llm_kwargs["guided_decoding_backend"] = "xgrammar"
@@ -491,6 +493,7 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             kv_cache_config=kv_cache_config,
             max_stats_len=-1,
             enable_iter_perf_stats=True,
+            autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
             speculative_config=spec_config,
         ) as llm:
             # Unlike TestKimiK3's MXFP4 weights, the requant ships

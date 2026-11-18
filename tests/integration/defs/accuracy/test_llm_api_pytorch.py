@@ -38,12 +38,12 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 
 # isort: off
 from tensorrt_llm.llmapi import (
-    AttentionDpConfig, BlockReuseConfig, CudaGraphConfig, DFlashDecodingConfig,
-    DSparkDecodingConfig, Eagle3DecodingConfig, KvCacheConfig, MambaStateConfig,
-    MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
-    PrefillCudaGraphBackend, QSASparseAttentionConfig, SamplingParams,
-    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
-    TorchCompileConfig)
+    AttentionDpConfig, AutoTunerNvMMHConfig, BlockReuseConfig, CudaGraphConfig,
+    DFlashDecodingConfig, DSparkDecodingConfig, Eagle3DecodingConfig,
+    KvCacheConfig, MambaStateConfig, MiniMaxM3SparseAttentionConfig, MoeConfig,
+    MTPDecodingConfig, PrefillCudaGraphBackend, QSASparseAttentionConfig,
+    SamplingParams, SchedulerConfig, SkipSoftmaxAttentionConfig,
+    SAEnhancerConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -379,6 +379,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 kv_cache_config=kv_cache_config,
                 enable_chunked_prefill=enable_chunked_prefill,
                 cuda_graph_config=CudaGraphConfig(),
+                autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                 max_num_tokens=8192,
                 max_batch_size=1350,
         ) as llm:
@@ -674,6 +675,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
+                 autotuner_nvmmh_config=(AutoTunerNvMMHConfig()
+                                         if pp_size > 1 else None),
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -1096,6 +1099,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  speculative_config=mtp_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
@@ -1319,6 +1323,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 kv_cache_config=kv_cache_config,
                 **pytorch_config,
                 enable_attention_dp=attention_dp,
+                autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                 speculative_config=mtp_config,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
@@ -1469,6 +1474,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  max_num_tokens=512,
                  **pytorch_config,
                  enable_attention_dp=True,
+                 autotuner_nvmmh_config=(AutoTunerNvMMHConfig()
+                                         if quant_dtype == "nvfp4" else None),
                  speculative_config=mtp_config) as llm:
 
             if quant_dtype == "fp8":
@@ -1737,6 +1744,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp,
                  enable_iter_perf_stats=check_acceptance,
                  max_stats_len=-1,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  speculative_config=mtp_config) as llm:
 
             assert llm.args.moe_config.tactic == moe_tactic
@@ -1963,6 +1971,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  enable_chunked_prefill=True,
                  max_num_tokens=512) as llm:
 
@@ -2001,6 +2010,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=False,
                  speculative_config=mtp_config,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  max_seq_len=5120,
                  max_num_tokens=5120) as llm:
 
@@ -2413,6 +2423,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                  max_seq_len=4096,
                  max_num_tokens=4096,
                  guided_decoding_backend="xgrammar",
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  kv_cache_config=kv_cache_config) as llm:
             assert_guided_decoding_regex(llm)
             task = MMLU(self.MODEL_NAME)
@@ -2616,10 +2627,10 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
         _skip_unless_deepseekv4_4gpu_memory(
             tp_size,
             min_device_memory_for_4gpus=DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
-        with LLM(
-                self.MODEL_PATH,
-                **_deepseekv4_pro_agg_llm_kwargs(
-                    tp_size=tp_size, attention_dp=attention_dp)) as llm:
+        with LLM(self.MODEL_PATH,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
+                 **_deepseekv4_pro_agg_llm_kwargs(
+                     tp_size=tp_size, attention_dp=attention_dp)) as llm:
             task = GSM8K(self.MODEL_NAME)
             acc_params = task.get_hypothesis_testing_params(
                 dtype=llm.args.dtype,
@@ -2674,6 +2685,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                  custom_tokenizer="deepseek_v4",
                  max_stats_len=-1,
                  enable_iter_perf_stats=True,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  speculative_config=spec_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             acc_params = task.get_hypothesis_testing_params(
@@ -2780,6 +2792,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                  custom_tokenizer="deepseek_v4",
                  max_stats_len=-1,
                  enable_iter_perf_stats=True,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  speculative_config=spec_config) as llm:
             acc_params = task.get_hypothesis_testing_params(
                 dtype=llm.args.dtype,
@@ -3049,6 +3062,7 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  enable_attention_dp=attention_dp,
                  trust_remote_code=True,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  speculative_config=None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
@@ -6073,6 +6087,7 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
                  enable_chunked_prefill=chunked_prefill,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  moe_config=moe_config) as llm:
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
@@ -6129,6 +6144,7 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
                  moe_config=MoeConfig(tactic="trtllm_gen"),
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  speculative_config=spec_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             assert llm.args.speculative_config.decoding_type == 'DFlash'
@@ -6195,6 +6211,7 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  moe_config=MoeConfig(tactic=moe_tactic),
                  enable_attention_dp=attention_dp,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  cuda_graph_config=cuda_graph_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMLU(self.MODEL_NAME)
@@ -6236,6 +6253,7 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
                  cuda_graph_config=cuda_graph_config,
                  moe_config=MoeConfig(tactic=moe_tactic),
                  enable_attention_dp=False,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  speculative_config=mtp_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
@@ -6265,6 +6283,7 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  moe_config=moe_config,
                  enable_attention_dp=True,
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  cuda_graph_config=cuda_graph_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
@@ -6433,6 +6452,7 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
                  moe_config=MoeConfig(tactic=moe_tactic),
+                 autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                  speculative_config=mtp_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
@@ -6503,6 +6523,7 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         enable_block_reuse: bool = False,
         sparse_attention_config: Optional[QSASparseAttentionConfig] = None,
         kv_cache_dtype: str = "auto",
+        enable_nvmmh: bool = False,
     ) -> LLM:
         """Construct the engine shared by both evaluation tasks.
 
@@ -6545,6 +6566,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             # Qwen3.8-Flash-Next target, which honors no tactic, so a
             # tactic would build the built-in model instead.
             moe_config=MoeConfig(backend=moe_backend),
+            autotuner_nvmmh_config=(AutoTunerNvMMHConfig()
+                                    if enable_nvmmh else None),
             speculative_config=mtp_config,
             **sparse_args,
             **stats_args,
@@ -6566,7 +6589,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             sparse_attention_config: Optional[QSASparseAttentionConfig] = None,
             acceptance_length_key: Optional[str] = None,
             kv_cache_dtype: str = "auto",
-            ple_host_offload: bool = True) -> None:
+            ple_host_offload: bool = True,
+            enable_nvmmh: bool = False) -> None:
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
@@ -6586,7 +6610,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                              cover_guided_decoding=cover_guided_decoding,
                              enable_block_reuse=enable_block_reuse,
                              sparse_attention_config=sparse_attention_config,
-                             kv_cache_dtype=kv_cache_dtype) as llm:
+                             kv_cache_dtype=kv_cache_dtype,
+                             enable_nvmmh=enable_nvmmh) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
             if cover_guided_decoding:
                 assert_guided_decoding_regex(llm)
@@ -6692,7 +6717,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                             enable_heuristic_topk=True,
                             index_share_for_mtp_iteration=True),
                         acceptance_length_key="test_nvfp4_adp4_mtp3_trtllm",
-                        ple_host_offload=False)
+                        ple_host_offload=False,
+                        enable_nvmmh=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
@@ -6710,7 +6736,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         monkeypatch=monkeypatch,
                         mocker=mocker,
                         moe_expert_parallel_size=4,
-                        enable_attention_dp=True)
+                        enable_attention_dp=True,
+                        enable_nvmmh=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(100000)
@@ -6729,7 +6756,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         max_draft_len=None,
                         expected_quant_algo=QuantAlgo.MIXED_PRECISION,
                         monkeypatch=monkeypatch,
-                        mocker=mocker)
+                        mocker=mocker,
+                        enable_nvmmh=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
@@ -6750,7 +6778,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         monkeypatch=monkeypatch,
                         mocker=mocker,
                         moe_expert_parallel_size=4,
-                        enable_attention_dp=True)
+                        enable_attention_dp=True,
+                        enable_nvmmh=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
@@ -6771,7 +6800,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         monkeypatch=monkeypatch,
                         mocker=mocker,
                         moe_expert_parallel_size=4,
-                        kv_cache_dtype="fp8")
+                        kv_cache_dtype="fp8",
+                        enable_nvmmh=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
@@ -6794,7 +6824,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         mocker=mocker,
                         moe_expert_parallel_size=4,
                         enable_attention_dp=True,
-                        kv_cache_dtype="nvfp4")
+                        kv_cache_dtype="nvfp4",
+                        enable_nvmmh=True)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -7013,6 +7044,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 **pytorch_config,
                 enable_attention_dp=attention_dp,
                 kv_cache_config=kv_cache_config,
+                autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                 speculative_config=spec_config) as llm:
 
             task = MMLU(self.MODEL_NAME)
@@ -7172,6 +7204,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 tensor_parallel_size=4,
                 moe_expert_parallel_size=4,
                 enable_attention_dp=True,
+                autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                 **pytorch_config,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -7390,6 +7423,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(tactic=moe_tactic),
                 speculative_config=mtp_config if use_mtp else None,
+                autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                 max_stats_len=-1,
                 enable_iter_perf_stats=True,
         ) as llm:
@@ -7473,6 +7507,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(tactic="cutlass"),
+                autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                 speculative_config=mtp_config,
         ) as llm:
             assert isinstance(llm.args.speculative_config, MTPDecodingConfig)
@@ -7508,6 +7543,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                               enable_padding=True),
             disable_overlap_scheduler=False,
             moe_config=MoeConfig(tactic="cutlass"),
+            autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
         )
 
         with LLM(**llm_common_config,
@@ -7572,6 +7608,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                               enable_padding=True),
             disable_overlap_scheduler=False,
             moe_config=MoeConfig(tactic="cutlass"),
+            autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
         )
 
         with LLM(**llm_common_config,
@@ -7680,6 +7717,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                 tensor_parallel_size=4,
                 moe_expert_parallel_size=4,
                 enable_attention_dp=True,
+                autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                 **pytorch_config,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -7793,6 +7831,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(tactic=moe_tactic),
+                autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
         ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
@@ -7836,6 +7875,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                 moe_expert_parallel_size=ep_size,
                 pipeline_parallel_size=1,
                 enable_attention_dp=attention_dp,
+                autotuner_nvmmh_config=AutoTunerNvMMHConfig(),
                 cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,

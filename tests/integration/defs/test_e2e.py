@@ -1382,9 +1382,11 @@ def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
                           eval_task: str, mmlu_dataset_root: str) -> None:
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm.evaluate import MMLU
+    from tensorrt_llm.llmapi import AutoTunerNvMMHConfig
 
     mmlu_threshold = 81.5
     llm_kwargs = dict(llm_api_config or {})
+    llm_kwargs.setdefault("autotuner_nvmmh_config", AutoTunerNvMMHConfig())
     # The LLM is built in the pytest process so it binds to the MPI workers
     # pre-spawned by trtllm-llmapi-launch; a trtllm-eval subprocess cannot,
     # because the launcher's IPC HMAC key is consumed by the first in-process
