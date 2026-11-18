@@ -2549,7 +2549,7 @@ def _tallws_launcher(
 def _route_fp32_varlen(
     num_rows: int, n: int, npad: int, k: int, num_sms: int, sm_version: int, *, det: bool = False, r_cap: int = 0
 ) -> dict:
-    """Apply resource-aware Rubin tuning only to the production FP32 varlen entry."""
+    """Apply Rubin tuning to FP32 variable-length dispatch."""
     if sm_version == 107 and not det and r_cap == 0:
         try:
             from .gvr_topk_rubin_dispatch import make_plan, select_tuning
@@ -2561,6 +2561,17 @@ def _route_fp32_varlen(
                 tuning, num_rows, n, npad, k, num_sms, route, route_streaming, route_dynamic
             )
     return route(num_rows, n, npad, k, num_sms, sm_version, det=det, r_cap=r_cap)
+
+
+class _LowpLauncher(tuple):
+    """Tuple-compatible launcher carrying its actual CUDA cluster requirement."""
+
+    cluster_size: int
+
+    def __new__(cls, launcher: tuple, cluster_size: int) -> "_LowpLauncher":
+        result = super().__new__(cls, launcher)
+        result.cluster_size = cluster_size
+        return result
 
 
 def _varlen_launcher(
@@ -2604,12 +2615,17 @@ def _varlen_launcher(
         key = (num_rows, npad, k, n_env, next_n, cr, profile) + _varlen_key_flags(
             det, wide_cta_rows, pdl, r_cap
         )
-        if not use_rubin_tuning:
-            key += ("original_route",)
+    if not use_rubin_tuning:
+        key += ("original_route",)
     cache = _varlen_cache_for(dtype)
     hit = cache.get(key)
     if hit is not None:
         return hit
+    rubin_lowp = low and use_rubin_tuning and sm_version == 107 and k in (512, 1024, 2048)
+    cluster_size = 1
+    if rubin_lowp:
+        # Select host options without changing the compilation target or cache identity.
+        sm_version = 100
     # The device envelope never exceeds the physical row stride. The router
     # needs a k+1 floor to select a family even when every row is short.
     n_kernel = min(n_env, npad)
@@ -2634,6 +2650,7 @@ def _varlen_launcher(
                 k, n_kernel, next_n, cr_shift, block_threads=complement_threads, **dtype_options
             )
         lc = ("complement", fn, n_kernel)
+        lc = _LowpLauncher(lc, 1)
         cache[key] = lc
         return lc
     if low:
@@ -2729,6 +2746,8 @@ def _varlen_launcher(
     )
     if crc is not None:
         crc_blk, crc_vpt, crc_cs, crc_list = crc
+        if rubin_lowp and crc_blk == 512 and crc_cs == 16 and num_rows * crc_cs * 2 <= num_sms:
+            crc_blk, crc_vpt = 1024, crc_vpt // 2
         crc_blk, crc_vpt, _ = _fit_row_window_16bit(crc_blk, crc_vpt, 1, n_kernel, crc_cs)
         fn = dev.get_compiled__reg(
             (crc_blk, crc_vpt, 1, 1, True, False, False, 1024),
@@ -2746,6 +2765,7 @@ def _varlen_launcher(
         )
         crc_words = 1024 + 512 * crc_cs + (6 * crc_blk * crc_vpt + crc_blk if crc_list else 0)
         lc = ("reg", fn, (n_kernel, 0, 0, 4 * crc_words))
+        lc = _LowpLauncher(lc, crc_cs)
         cache[key] = lc
         return lc
     if plan_free["kernel"] == "reg_clus":
@@ -2847,6 +2867,7 @@ def _varlen_launcher(
             **cluster_options,
         )
         lc = ("reg_clus", fn, n_kernel)
+        cluster_size = int(cluster_tpl[2])
     elif plan_free["kernel"] in ("reg", "regimg"):
         reg_options = dict(dtype_options)
         pcw = False
@@ -2955,6 +2976,7 @@ def _varlen_launcher(
         if low:
             reg_options["cr2"] = bool(
                 dtype is torch.float16
+                and (not rubin_lowp or k != 2048 or num_rows > num_sms)
                 and reg_options["code_radix"]
                 and sm_version in _TUNED_SM_VERSIONS
                 and (
@@ -3007,7 +3029,9 @@ def _varlen_launcher(
                 dtype is torch.bfloat16
                 and _REG_CODE_RADIX_FORCE is None
                 and plan_free["kernel"] == "reg"
-                and npad % 64 == 0
+                and (
+                    npad % 64 == 0 or (rubin_lowp and n_kernel > 2048 and npad % 8 == 0)
+                )
                 and num_rows <= 64
                 and 2 * num_rows <= num_sms
                 and (
@@ -3400,6 +3424,9 @@ def _varlen_launcher(
                 + 4 * (reg_parts - 1) * tpl_r[7],
             ),
         )
+        if dtype is torch.bfloat16 and reg_parts > 1:
+            if not pcw or reg_parts < 8 or reg_parts * num_rows <= 64:
+                cluster_size = reg_parts
     elif plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]
         clus_options = dict(dtype_options)
@@ -3466,6 +3493,7 @@ def _varlen_launcher(
             (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], e_smp, e_tgt, 0, e_ss2, e_tgt2),
             (tuple(plan_free["tpl"]), compile_kwargs),
         )
+        cluster_size = int(plan_free["tpl"][4])
     else:
         if low:
             plan = _route_streaming_16bit(
@@ -3741,6 +3769,8 @@ def _varlen_launcher(
             )
         tail = (aim_base, sfac, amin, sd_en, tsh_en)
         lc = ("main", fn, pre, tail)
+    if low:
+        lc = _LowpLauncher(lc, cluster_size)
     cache[key] = lc
     return lc
 

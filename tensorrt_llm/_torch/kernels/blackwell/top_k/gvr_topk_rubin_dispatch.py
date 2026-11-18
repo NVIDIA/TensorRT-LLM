@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shape-only FP32 GVR tuning for Rubin's production variable-length entry."""
+"""Shape-based FP32 GVR dispatch for Rubin."""
 
 import math
 from collections.abc import Callable
@@ -418,7 +418,7 @@ def make_plan(
         )
     else:
         assert family == "main"
-        plan = streaming_route(rows, n, npad, k, force_main=True)
+        plan = streaming_route(rows, n, npad, k, force_main=True, num_sms=num_sms, sm_version=107)
         block = tuning.block
         parts = tuning.parts
         # Keep one-wave split geometry inside the actual stream's SM resources.
