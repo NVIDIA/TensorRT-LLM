@@ -1609,7 +1609,8 @@ def _multi_processor_count(device_index: int) -> int:
 
 
 class ShardedFp8MultiHeadEmbedding(nn.Module):
-    """Sharded E4M3 n-gram rows with one E8M0 scale per ``block_size`` lanes.
+    """Sharded E4M3 (MXFP8) or, with ``mxfp4``, packed E2M1 (MXFP4) n-gram rows with one E8M0 scale
+    per ``block_size`` lanes; lookups return the same values and packed rows for both formats.
 
     With TP > 1 and ``num_heads % tp_size == 0``, each rank owns contiguous heads
     and their buckets. Lookup returns local heads for the caller's all-gather.
@@ -1632,11 +1633,12 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         tp_size: int = 1,
         tp_rank: int = 0,
         share_key: Optional[str] = None,
+        mxfp4: bool = False,
     ):
         super().__init__()
         if D % block_size != 0:
             raise ValueError(
-                f"Engram embedding dim {D} is not a multiple of the fp8 block size "
+                f"Engram embedding dim {D} is not a multiple of the block size "
                 f"{block_size}; the checkpoint stores one exponent per block, so a "
                 "partial trailing block has no scale to dequantize it with."
             )
@@ -1644,11 +1646,15 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         self.num_heads = len(list_of_N)
         self.embedding_dim = D
         self.block_size = block_size
+        self.mxfp4 = mxfp4
+        self._row_bytes = D // 2 if mxfp4 else D
+        self._weight_dtype = torch.uint8 if mxfp4 else torch.float8_e4m3fn
         self.dtype = dtype if dtype is not None else torch.bfloat16
         self.tp_size = tp_size
         self.tp_rank = tp_rank
-        # The HF loader fills pinned allocations in place; other loaders may replace them.
-        self._requires_standard_hf_loading = True
+        # Regular checkpoint loading fills pinned allocations in place; other loaders may
+        # replace them.
+        self._requires_regular_checkpoint_loading = True
         # Rebuild UVA views when host addresses change to avoid stale pointers.
         self._views: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._views_src: Optional[Tuple[int, int]] = None
@@ -1689,7 +1695,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         if share_key is not None:
             self._share_spec = (
                 f"{share_key} heads {self.num_heads} rows {self.num_embeddings} "
-                f"tp {tp_rank}/{tp_size} dim {D} block {block_size}"
+                f"tp {tp_rank}/{tp_size} dim {D} block {block_size} {'e2m1' if mxfp4 else 'e4m3'}"
             )
             digest = hashlib.blake2b(f"{os.getuid()} {self._share_spec}".encode(), digest_size=16)
             self._share_name = f"trtllm-engram-{digest.hexdigest()}"
@@ -1697,14 +1703,14 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         # Override the model's CUDA construction context for table storage.
         if not prefer_pinned():
             raise RuntimeError("Engram tables require the pinned-memory runtime policy")
-        weight_shape = (self.part_num_embeddings, D)
+        weight_shape = (self.part_num_embeddings, self._row_bytes)
         scale_shape = (self.part_num_embeddings, D // block_size)
         if share_key is None:
-            weight = _pinned_host_table(weight_shape, torch.float8_e4m3fn)
+            weight = _pinned_host_table(weight_shape, self._weight_dtype)
             scale = _pinned_host_table(scale_shape, torch.float8_e8m0fnu)
         else:
             # load_weights places a node-shared table once its owner is elected.
-            weight = torch.empty(weight_shape, dtype=torch.float8_e4m3fn, device="meta")
+            weight = torch.empty(weight_shape, dtype=self._weight_dtype, device="meta")
             scale = torch.empty(scale_shape, dtype=torch.float8_e8m0fnu, device="meta")
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
@@ -1862,16 +1868,14 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         self._views = self._views_src = None
 
     def _table_bytes(self) -> int:
-        return self.part_num_embeddings * (
-            self.embedding_dim + self.embedding_dim // self.block_size
-        )
+        return self.part_num_embeddings * (self._row_bytes + self.embedding_dim // self.block_size)
 
     def _table_views(self, host: object) -> Tuple[torch.Tensor, torch.Tensor]:
         """Weight rows, then scale rows, of one host mapping."""
         data = _host_bytes(host, self._table_bytes())
-        split = self.part_num_embeddings * self.embedding_dim
+        split = self.part_num_embeddings * self._row_bytes
         return (
-            data[:split].view(torch.float8_e4m3fn).view(self.part_num_embeddings, -1),
+            data[:split].view(self._weight_dtype).view(self.part_num_embeddings, -1),
             data[split:].view(torch.float8_e8m0fnu).view(self.part_num_embeddings, -1),
         )
 
@@ -1955,6 +1959,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
             # head shards own every lookup and need no ownership mask.
             not self.shard_heads,
             self.dtype,
+            mxfp4=self.mxfp4,
         )(
             weight.view(torch.uint8),
             scale.view(torch.uint8),
@@ -2012,6 +2017,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
             False,
             torch.uint8,
             packed=True,
+            mxfp4=self.mxfp4,
         )(
             weight.view(torch.uint8),
             scale.view(torch.uint8),

@@ -4556,6 +4556,13 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 "native K1 layout; using the feature-off static K1 path.")
             self.enable_confidence_scheduling = False
             return self
+        if (self.draft_len_schedule is not None
+                or self.max_concurrency is not None):
+            raise ValueError(
+                "DSpark confidence scheduling cannot be combined with "
+                "draft_len_schedule or max_concurrency: each one selects how "
+                "many draft tokens a step verifies. Unset them or disable "
+                "confidence scheduling.")
         if not self.confidence_cost_table_path:
             raise ValueError(
                 "DSpark confidence scheduling requires confidence_cost_table_path. "
@@ -5675,6 +5682,20 @@ class MambaStateConfig(StrictBaseModel):
         "kv_cache_config.block_reuse_config.enable_branch_snapshot. It takes "
         "effect only when block reuse is enabled.")
 
+    cold_tier_states_per_request: Optional[_StrictPositiveInt] = Field(
+        default=None,
+        status="prototype",
+        telemetry=False,
+        description=
+        "Recurrent states that one typical request (kv_cache_config.avg_seq_len "
+        "tokens) keeps in the host and disk tiers of KV cache manager V2, which "
+        "split their quota between recurrent-state and attention pages by it. "
+        "None keeps the GPU tier's split, whose typical request counts the live "
+        "state and every retained snapshot. A cold tier holds released "
+        "conversations, which mostly come back through their latest endpoint, "
+        "so a small value (1 or 2) gives more of the tier to attention pages. "
+        "Takes effect only with block reuse and a host or disk tier.")
+
 
 class KVEventsConfig(StrictBaseModel):
     """Configuration for streaming (push-based) KV cache event publishing."""
@@ -6255,6 +6276,20 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "the mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept "
         "in whole cache pages.")
 
+    mixed_precision_reuse: Literal["default", "strict", "recompute"] = Field(
+        default="default",
+        status="prototype",
+        description=
+        "Block reuse of a cached prefix whose high-precision copy of its last N tokens was evicted "
+        "(mixed-precision KV and the cold-page first/last-N window). 'default' reuses the prefix "
+        "down to its last block boundary and reads those tokens from the history (the "
+        "low-precision pool, or with the cold-page window the layer's own pages) until they leave "
+        "the window, so they keep the history's precision. 'recompute' reuses the prefix only up "
+        "to before them and recomputes them in high precision, reading the N tokens before them "
+        "from the history. 'strict' reuses the prefix only where its high-precision copy is "
+        "complete and recomputes the rest; without first-N sink tokens, reuse is always strict."
+    )
+
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
         "auto", "float16", "bfloat16", "float32"] = Field(
@@ -6380,12 +6415,18 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description=
         "Override, in tokens, for the max summed attended-KV length (total_kv_len) per forward step that "
-        "the fp8 context-MLA attention workspace is reserved and scheduled for. Only affects fp8 "
-        "context-MLA models (e.g. DeepSeek / Kimi with an fp8 KV cache). None (default) reserves for the "
-        "never-stall worst case min(max_batch_size, max_num_tokens) * max_seq_len. A smaller value reserves "
-        "less workspace (freeing KV cache) and defers context requests whose summed attended KV would "
-        "exceed it; it is floored at max_seq_len and capped at the worst case. Safe at any value -- the "
-        "scheduler enforces it -- trading prefill batching under heavy reuse for KV cache capacity."
+        "the context-MLA attention workspace is reserved and scheduled for. Applies to backends "
+        "that declare attended-KV workspace, including dense FP8-KV and NVFP4-KV MLA and sparse "
+        "MLA gathers. None (default) requests the never-stall worst case "
+        "min(max_batch_size, max_num_tokens) * max_seq_len; the memory budget may reduce the "
+        "admitted capacity. The override is floored at max_seq_len and capped at that worst case. "
+        "Smaller values may leave more memory for KV cache, but the reserve cannot drop below the backend's "
+        "staging floor after crediting staging actually measured during profiling. An override "
+        "below that floor still limits admission without necessarily freeing more memory. "
+        "Takes effect only when the estimator reserves this workspace: block reuse without "
+        "chunked prefill, or chunked prefill whose staging profiling could not measure. "
+        "It is ignored otherwise, including on decode-only workers. "
+        "The scheduler defers context requests whose summed attended KV exceeds the admitted cap."
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
@@ -9197,7 +9238,8 @@ class TorchLlmArgs(BaseLlmArgs):
         Mirrors the config-time-knowable conditions of
         ``KvCacheCreator.try_prepare_estimation``: the
         ``TRTLLM_SKIP_KV_CACHE_ESTIMATION`` env var, a VANILLA target
-        attention backend, and context parallelism all skip estimation.
+        attention backend, and context parallelism other than aggregated
+        Helix all skip estimation.
         Encoder-decoder targets also skip it but are only known from the
         model config at load time; they are treated as estimating here,
         which errs toward the looser arena budget.
@@ -9207,7 +9249,12 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.attn_backend == "VANILLA":
             return False
         if self.context_parallel_size > 1 and self.cp_config is not None:
-            return False
+            # Estimation profiles aggregated Helix only; disaggregated Helix
+            # sizes the pool by fraction.
+            is_disagg = (self.cache_transceiver_config is not None
+                         and self.cache_transceiver_config.backend is not None)
+            if self.cp_config.cp_type != CpType.HELIX or is_disagg:
+                return False
         return True
 
     def _validate_dflash_ctx_budget(self,

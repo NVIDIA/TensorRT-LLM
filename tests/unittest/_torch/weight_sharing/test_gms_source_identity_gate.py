@@ -14,17 +14,17 @@
 # limitations under the License.
 """Exercise the real GMS read-only pre-materialize SourceIdentity gate.
 
-These tests drive `ModelLoader._check_gms_source_identity` directly -- the
-single decision point the GMS RO path consults before `materialize_module`.
-Unlike MX, GMS has no disk fallback, so a verified mismatch must *raise* under
-`STRICT` rather than fall back. The `ModelLoader` is constructed via
-`__new__` to bypass its heavy `__init__`; the GMS backend is a stub
-exposing only `get_source_identity` so no GMS pool, GPU, or model is touched.
+These tests drive `check_gms_source_identity` directly -- the single decision
+point the GMS RO path consults before `materialize_module`. Unlike MX, GMS has
+no disk fallback, so a verified mismatch must *raise* under `STRICT` rather
+than fall back. The GMS backend is a stub exposing only `get_source_identity`
+so no GMS pool, GPU, or model is touched.
 """
 
 import pytest
 from _source_identity_fakes import make_identity as _identity
 
+from tensorrt_llm._torch.models.checkpoints.gms.model_loading import check_gms_source_identity
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import SourceIdentityMismatchError
 from tensorrt_llm.llmapi.llm_args import LoadFormat
@@ -49,13 +49,6 @@ class _FakeGMSBackend:
         return self._source_identity
 
 
-def _new_loader(local_identity):
-    """Construct a loader bypassing heavy base __init__, wire the local id."""
-    loader = ModelLoader.__new__(ModelLoader)
-    loader._source_identity = local_identity
-    return loader
-
-
 def test_source_identity_is_only_needed_for_mx_or_gms():
     # Default HF/AUTO loading should be a strict no-op: no SourceIdentity
     # construction, no tensor-layout traversal, no behavior change.
@@ -67,32 +60,28 @@ def test_source_identity_is_only_needed_for_mx_or_gms():
 def test_gate_passes_on_matching_identity():
     local = _identity(attn_backend="TRTLLM")
     writer = _identity(attn_backend="TRTLLM")
-    loader = _new_loader(local)
     # Compatible writer: the gate is a no-op (no raise).
-    loader._check_gms_source_identity(_FakeGMSBackend(writer))
+    check_gms_source_identity(local, _FakeGMSBackend(writer))
 
 
 def test_gate_raises_on_mismatch():
     local = _identity(attn_backend="TRTLLM")
     writer = _identity(attn_backend="FLASHINFER")
-    loader = _new_loader(local)
     # No disk fallback for GMS: an incompatible writer must raise.
     with pytest.raises(SourceIdentityMismatchError):
-        loader._check_gms_source_identity(_FakeGMSBackend(writer))
+        check_gms_source_identity(local, _FakeGMSBackend(writer))
 
 
 def test_gate_raises_on_checkpoint_artifact_mismatch():
     local = _identity(artifact_key="fine-tune-a")
     writer = _identity(artifact_key="fine-tune-b")
-    loader = _new_loader(local)
     with pytest.raises(SourceIdentityMismatchError):
-        loader._check_gms_source_identity(_FakeGMSBackend(writer))
+        check_gms_source_identity(local, _FakeGMSBackend(writer))
 
 
 def test_gate_raises_when_writer_identity_unavailable():
     # Publisher metadata not wired yet (get_source_identity returns None);
     # GMS has no disk fallback, so unverified sharing must raise.
     local = _identity()
-    loader = _new_loader(local)
     with pytest.raises(SourceIdentityMismatchError):
-        loader._check_gms_source_identity(_FakeGMSBackend(None))
+        check_gms_source_identity(local, _FakeGMSBackend(None))

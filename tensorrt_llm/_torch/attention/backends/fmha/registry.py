@@ -16,6 +16,7 @@
 import os
 from typing import TypeAlias
 
+from .beam_shared_prefix import BeamSharedPrefixFmha
 from .cute_dsl_mla import CuteDslMlaFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
@@ -77,6 +78,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "gqa_segmented": GqaSegmentedFmha,
         "gqa_decode": GqaDecodeFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
+<<<<<<< HEAD
         # The native attention op's libraries. One order serves MHA and MLA:
         # fmha_v2 serves no MHA generation and XQA no context phase.
         "trtllm_gen": TrtllmGenFmha,
@@ -85,11 +87,20 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "fmha_v2": FmhaV2Fmha,
         "mmha": MmhaFmha,
         "unfused": UnfusedFmha,
+=======
+        # Opt-in wide-beam generation path (TLLM_FMHA_LIBS=+beam_shared_prefix);
+        # takes generation-only beam-search batches ahead of the fallback.
+        "beam_shared_prefix": BeamSharedPrefixFmha,
+        "fallback": FallbackFmha,
+>>>>>>> origin/main
     }
 
 
 FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
-_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts"})
+# Libraries left out of the default set and enabled explicitly through
+# TLLM_FMHA_LIBS: dense PrimTS can add host overhead; beam_shared_prefix is a
+# narrow-scope beam-search path.
+_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts", "beam_shared_prefix"})
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
     name for name in FMHA_LIBS if name not in _OPT_IN_FMHA_LIBS
 )
@@ -151,6 +162,11 @@ def get_enabled_fmha_lib_classes() -> list[FmhaCls]:
     return [FMHA_LIBS[name] for name in _parse_fmha_libs_env()]
 
 
+def is_fmha_lib_enabled(name: str) -> bool:
+    """Whether ``TLLM_FMHA_LIBS`` enables the library registered as ``name``."""
+    return name in _parse_fmha_libs_env()
+
+
 __all__ = [
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIB_GROUPS",
@@ -158,4 +174,5 @@ __all__ = [
     "FmhaCls",
     "get_enabled_fmha_lib_classes",
     "init_fmha_libs",
+    "is_fmha_lib_enabled",
 ]

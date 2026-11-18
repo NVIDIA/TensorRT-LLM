@@ -88,9 +88,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     PAGE_PRIORITY_MIN,
     BlockReusePolicy,
     KVCacheLayerOwner,
-    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerSpec as KVCacheStorageLayerSpec,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
@@ -2343,6 +2345,43 @@ def test_v2_hybrid_snapshot_sizing_scales_with_pp_and_explicit_rules():
 
 
 @pytest.mark.parametrize(
+    "states, num_tiers, reuse, pool_ratio, expected",
+    [
+        (None, 2, True, None, None),
+        (1, 1, True, None, None),
+        (1, 2, False, None, None),
+        (1, 2, True, None, [128]),
+        (2, 3, True, None, [64, 64]),
+        (3, 2, True, None, [43, 43, 42]),
+        # An explicit pool_ratio keeps its slot-count ratios in the cold tiers too.
+        (2, 2, True, [0.5, 0.5], None),
+    ],
+)
+def test_v2_hybrid_cold_typical_step(states, num_tiers, reuse, pool_ratio, expected) -> None:
+    """cold_tier_states_per_request sizes the cold tiers from that many states per typical request."""
+    config = KvCacheConfig(
+        max_gpu_total_bytes=32 << 20,
+        host_cache_size=0,
+        avg_seq_len=128,
+        enable_block_reuse=reuse,
+        pool_ratio=pool_ratio,
+        mamba_state_config=MambaStateConfig(
+            additional_snapshot_offsets_from_start=[32, 64],
+            additional_snapshot_offsets_from_end=[2],
+            cold_tier_states_per_request=states,
+        ),
+    )
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.max_seq_len = 256
+    step = mgr._cold_typical_step(config, num_tiers)
+    if expected is None:
+        assert step is None
+    else:
+        assert [desc.capacity for desc in step.kv_caches] == expected
+        assert [desc.history_length for desc in step.kv_caches] == [c - 1 for c in expected]
+
+
+@pytest.mark.parametrize(
     "capacity, interval, from_start, from_end, reuse, branch, expected_states",
     [
         (128, 0, [], [], True, False, 1),
@@ -2987,8 +3026,8 @@ def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
         mgr.shutdown()
 
 
-def _fp8_draft_layer_spec(global_layer_id: int) -> KVCacheLayerSpec:
-    return KVCacheLayerSpec(
+def _fp8_draft_layer_spec(global_layer_id: int) -> KVCacheStorageLayerSpec:
+    return KVCacheStorageLayerSpec(
         global_layer_id=global_layer_id,
         owner=KVCacheLayerOwner.DRAFT,
         dtype=DataType.FP8,
@@ -3951,6 +3990,7 @@ def _build_v2_hybrid_with_mamba_layer(
     max_num_tokens: int = 8192,
     is_draft: bool = False,
     joint_kv_cache_reuse: bool = False,
+    cold_page_codec_provider=None,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
     # Draft layers of a combined speculative manager follow the model's layers in both masks.
@@ -4043,6 +4083,11 @@ def _build_v2_hybrid_with_mamba_layer(
         spec_config=spec_config,
         layer_mask=attn_mask,
         **({"pretrained_config": pretrained_config} if pretrained_config is not None else {}),
+        **(
+            {"cold_page_codec_provider": cold_page_codec_provider}
+            if cold_page_codec_provider is not None
+            else {}
+        ),
         vocab_size=1024,
         use_replay_state_update=use_replay_state_update,
         dtype=dtype,
@@ -4218,6 +4263,48 @@ def test_v2_inforward_snapshot_commits_point_and_restores_prompt_end_state():
         for layer in range(2):
             assert torch.all(mgr.get_ssm_states(layer)[sibling_slot] == 1.0)
             assert torch.all(mgr.get_conv_states(layer)[sibling_slot] == 1.0)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("reverse", [False, True], ids=["staging order", "reversed batch"])
+def test_v2_inforward_snapshot_restores_every_planned_request_in_one_pass(reverse):
+    # Each planned request's live slot gets its own staging row back, whether the rows come in
+    # staging order (slice) or not (gather).
+    mgr = _build_v2_inforward_snapshot_manager()
+    try:
+        requests = [
+            _make_v2_prompt_request(rid, [rid * 1000 + t for t in range(66)]) for rid in (1, 2)
+        ]
+        mgr.prepare_expect_snapshot_points(requests)
+        batch = ScheduledRequests()
+        for request in requests:
+            assert mgr.prepare_context(request)
+            assert mgr.resize_context(request, num_tokens=66)
+            request.context_chunk_size = 66
+            request.py_mamba_inforward_snapshot_point = 64
+            batch.append_context_request(request)
+        mgr.prepare_resources(batch)
+        rows = {rid: entry.row for rid, entry in mgr.inforward_snapshot_plan.items()}
+        assert sorted(rows.values()) == [0, 1]
+        slots = {rid: mgr.state_index(rid) for rid in (1, 2)}
+        for layer in range(2):
+            stage_ssm, stage_conv = mgr.inforward_snapshot_stage_views(layer)
+            for rid in (1, 2):
+                mgr.get_ssm_states(layer)[slots[rid]].fill_(1.0)
+                mgr.get_conv_states(layer)[slots[rid]].fill_(1.0)
+                stage_ssm[rows[rid]].fill_(10.0 * rid + layer)
+                stage_conv[rows[rid]].fill_(10.0 * rid + layer)
+        visit = ScheduledRequests()
+        for request in reversed(requests) if reverse else requests:
+            visit.append_context_request(request)
+        mgr.finish_inforward_snapshots(visit)
+        torch.cuda.synchronize()
+        for layer in range(2):
+            for rid in (1, 2):
+                assert torch.all(mgr.get_ssm_states(layer)[slots[rid]] == 10.0 * rid + layer)
+                assert torch.all(mgr.get_conv_states(layer)[slots[rid]] == 10.0 * rid + layer)
     finally:
         mgr.shutdown()
 
@@ -9186,6 +9273,31 @@ def _assert_gdn_replay_slot_reset(mgr, replay_slot):
     bookkeeping, history = _gdn_replay_rows(mgr, replay_slot)
     assert bookkeeping == (0, 0, 0)
     assert all(torch.count_nonzero(rows) == 0 for rows in history)
+
+
+@skip_no_cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision KV requires Blackwell",
+)
+def test_v2_gdn_replay_manager_builds_the_cold_page_window():
+    """With MTP replay each GDN layer keeps its replay history in a layer group of its own, so its
+    buffers sit in two groups. The cold-page first/last-N window of the attention layer still
+    builds, and points its blocks at the group attention runs the layer in."""
+    provider = SimpleNamespace(
+        config=SimpleNamespace(algorithm="quantization_for_cold_page"),
+        mixed_precision_high_window=(1, 33),
+        create_cold_page_codec=lambda cache_config, **kwargs: None,
+    )
+    mgr = _build_v2_gdn_replay_manager(cold_page_codec_provider=provider)
+    try:
+        assert mgr.replay_layer_group_id not in (None, mgr.ssm_layer_group_id)
+        (attention_layer,) = mgr.mixed_precision_high_layers
+        (pool_id,) = mgr.mixed_precision_high_block_deltas
+        assert pool_id == mgr._get_layer_execution_group(attention_layer)
+        assert mgr.mixed_precision_high_block_deltas[pool_id] is not None
+    finally:
+        mgr.shutdown()
 
 
 @skip_no_cuda

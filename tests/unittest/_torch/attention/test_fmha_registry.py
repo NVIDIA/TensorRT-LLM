@@ -116,6 +116,7 @@ def test_empty_delta_fmha_lib_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -
         registry.get_enabled_fmha_lib_classes()
 
 
+<<<<<<< HEAD
 def test_fallback_group_names_the_native_libraries(monkeypatch: pytest.MonkeyPatch) -> None:
     native = registry.FMHA_LIB_GROUPS["fallback"]
     monkeypatch.setenv("TLLM_FMHA_LIBS", f"{PRIMS_TS},fallback")
@@ -145,3 +146,20 @@ def test_registry_order_matches_native_priority(is_mla: bool, is_gen: bool) -> N
     native_priority = [library for library, _ in native_libraries]
     registry_order = [registry.FMHA_LIBS[name] for name in registry.FMHA_LIB_GROUPS["fallback"]]
     assert serving(registry_order) == serving(native_priority)
+=======
+def test_beam_shared_prefix_is_opt_in_and_precedes_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    beam = "beam_shared_prefix"
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    assert beam not in registry.DEFAULT_FMHA_LIBS
+    assert beam not in _enabled_names()
+
+    names = _canonical_names()
+    assert names.index(beam) < names.index("fallback")
+
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{beam}")
+    enabled = _enabled_names()
+    assert beam in enabled
+    assert enabled.index(beam) < enabled.index("fallback")
+>>>>>>> origin/main

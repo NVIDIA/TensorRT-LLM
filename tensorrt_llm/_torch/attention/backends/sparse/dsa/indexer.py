@@ -1974,8 +1974,12 @@ class Indexer(nn.Module):
         scheduler_metadata_buffer: torch.Tensor,
         max_seq_len: int,
         q_scale: Optional[torch.Tensor],
+        page_mask: bool = False,
     ) -> torch.Tensor:
-        """Dispatch fp8_paged_mqa_logits vs fp8_fp4_paged_mqa_logits."""
+        """Dispatch fp8_paged_mqa_logits vs fp8_fp4_paged_mqa_logits; ``page_mask`` decodes masked
+        block-table entries (bits 31..30 = 01: -inf below the row's context length)."""
+        # Unmasked calls keep main's arguments.
+        mask_kwargs = {"page_mask": True} if page_mask else {}
         if self.use_fp4:
             return fp8_fp4_paged_mqa_logits(
                 (q_decode, q_scale),
@@ -1985,6 +1989,7 @@ class Indexer(nn.Module):
                 block_table,
                 scheduler_metadata_buffer,
                 max_seq_len,
+                **mask_kwargs,
             )
         return fp8_paged_mqa_logits(
             q_decode,
@@ -1994,6 +1999,7 @@ class Indexer(nn.Module):
             block_table,
             scheduler_metadata_buffer,
             max_seq_len,
+            **mask_kwargs,
         )
 
     def sparse_attn_indexer(
