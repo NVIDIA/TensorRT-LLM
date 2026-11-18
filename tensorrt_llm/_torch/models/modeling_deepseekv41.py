@@ -61,9 +61,12 @@ from ..modules.engram import Engram, ShardedFp8MultiHeadEmbedding, adp_exchange,
 from ..modules.engram.projection import EngramFp8Projection
 from ..modules.mhc.hyper_connection import HCState, mHC
 from ..modules.mhc.mhc_lowm import (
+    LOWM_MAX_TOKENS,
+    MMA_SYNC_MAX_TOKENS,
     MoeUnfinalized,
     mhc_allreduce_post_collapse_norm,
     mhc_lamport_allreduce,
+    mhc_post_collapse_norm,
     mhc_split_enabled,
 )
 from ..modules.multi_stream_utils import do_multi_stream
@@ -1020,17 +1023,38 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         eager_on_graph(apply)(residual)
         return residual
 
-    def _mhc_split(self, num_tokens: int) -> bool:
-        """Split this layer's boundaries: decode-sized rows under CUDA-graph multi-stream.
+    def _mhc_split(
+        self,
+        num_tokens: int,
+        post_update: bool = True,
+        coefficients: bool = True,
+        ffn: bool = False,
+    ) -> bool:
+        """Split a boundary of this layer: decode-sized rows under CUDA-graph multi-stream.
 
         The critical half then runs in one launch and the coefficients overlap the sublayer on
         the coefficient stream; without multi-stream they would serialize, and the fused
-        boundary is faster.
+        boundary is faster. Attention entries with a post update keep ``mega_mhc`` from 1024 rows
+        (see ``split_max_tokens``): their coefficient kernel would hold SMs the query projection
+        needs. Above ``LOWM_MAX_TOKENS`` rows the coefficients need the CuTe DSL coefficient
+        kernel of the boundary's module; above ``MMA_SYNC_MAX_TOKENS`` rows the boundary must not
+        all-reduce the sublayer output itself.
         """
         return (
             self._mhc_coeff_stream is not None
             and do_multi_stream()
-            and mhc_split_enabled(num_tokens, self.hidden_size, self.hc_attn.mult)
+            and mhc_split_enabled(
+                num_tokens,
+                self.hidden_size,
+                self.hc_attn.mult,
+                post_update and coefficients and not ffn,
+            )
+            and (
+                not coefficients
+                or num_tokens <= LOWM_MAX_TOKENS
+                or (self.hc_ffn if ffn else self.hc_attn).coefficient_kernel_ready(num_tokens)
+            )
+            and (num_tokens <= MMA_SYNC_MAX_TOKENS or self._mhc_fused_allreduce() is None)
         )
 
     def _mhc_fused_allreduce(self):
@@ -1162,7 +1186,8 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         # (mHC.fused_hc_lagged / pre_mapping_lagged). Decode-sized rows under multi-stream split
         # it: post update + collapse + RMSNorm in one launch, the coefficients on the coefficient
         # stream until the next boundary (mHC.split_hc_lagged).
-        split = self._mhc_split(residual.shape[0])
+        split = self._mhc_split(residual.shape[0], post_update=deferred)
+        ffn_split = self._mhc_split(residual.shape[0], ffn=True)
         # Split boundaries can also all-reduce the sublayer output in their own launch.
         lamport = self._mhc_fused_allreduce() if split else None
         attn_coeff_event = None
@@ -1249,9 +1274,9 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         nvfp4_scale = (
             self.mlp.experts.backend.fc31_input_scale.view(1) if self._moe_nvfp4_input else None
         )
-        if split:
-            if attn_coeff_event is not None:
-                torch.cuda.current_stream().wait_event(attn_coeff_event)
+        if attn_coeff_event is not None:
+            torch.cuda.current_stream().wait_event(attn_coeff_event)
+        if ffn_split:
             residual, ffn_pre, post_mix, comb_mix, layer_input, ffn_coeff_event = (
                 self.hc_ffn.split_hc_lagged(
                     x_attn,
@@ -1265,6 +1290,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                     events=self._mhc_ffn_events,
                     allreduce=lamport,
                     nvfp4_scale=nvfp4_scale,
+                    residual_after_wait=attn_coeff_event is None,
                 )
             )
         else:
@@ -1279,9 +1305,11 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 nvfp4_scale=nvfp4_scale,
                 fp8_1x128=self._shared_fp8_1x128,
             )
-        # The next layer's split entry prefetches like the FFN boundary above, or all-reduces
-        # the MoE output itself.
-        trigger_allreduce_at_end = not (split and self._v41_defer_post_mapping)
+        # The next layer's split entry loads its residual before its PDL wait, or all-reduces the
+        # MoE output itself.
+        trigger_allreduce_at_end = not (
+            self._mhc_split(residual.shape[0]) and self._v41_defer_post_mapping
+        )
         moe_allreduce = getattr(self.mlp, "allreduce", None)
         moe_partial = (
             lamport is not None and self._v41_defer_post_mapping and moe_allreduce is not None
@@ -2255,21 +2283,35 @@ class DeepseekV41Model(DeepseekV4Model):
         return mHC.collapse(hc_state.residual, hc_state.pre_mix)
 
     def _fused_final_close(self, hc_state: HCState) -> Optional[torch.Tensor]:
-        """``norm(h)`` from one boundary launch (all-reduce of the last MoE partial, post
+        """``norm(h)`` from one boundary launch (all-reduce of the last MoE partial under TP, post
         update, collapse with the last ``pre``, final RMSNorm), or None where it does not apply:
-        the forward reads the un-normalized final state (``_final_close_allowed``), or the last
-        layer left no partial for an in-boundary all-reduce."""
-        if (
-            not self._final_close_allowed
-            or not hc_state.is_deferred
-            or hc_state.x_prev_allreduce is None
-            or hc_state.pre_mix is None
-        ):
+        the forward reads the un-normalized final state (``_final_close_allowed``), the state is
+        resolved, its rows do not take split boundaries, or a TP layer left no partial for an
+        in-boundary all-reduce."""
+        if not self._final_close_allowed or not hc_state.is_deferred or hc_state.pre_mix is None:
             return None
         rows = hc_state.residual.shape[0]
         last = self.layers[self.num_hidden_layers - 1]
-        if not last._mhc_split(rows):
+        if not last._mhc_split(rows, coefficients=False):
             return None
+        if hc_state.x_prev_allreduce is None:
+            if not self.model_config.mapping.enable_attention_dp:
+                return None
+            # Attention DP leaves no partial to all-reduce: the plain critical half closes the state.
+            joined = hc_state.coeff_event is not None
+            hc_state.wait_coefficients()
+            _, normalized = mhc_post_collapse_norm(
+                hc_state.x_prev,
+                hc_state.residual,
+                hc_state.post_mix,
+                hc_state.comb_mix,
+                hc_state.pre_mix,
+                self.norm.weight,
+                self.norm.variance_epsilon,
+                residual_after_wait=not joined,
+            )
+            self._final_close_fused = True
+            return normalized
         allreduce = last._mhc_fused_allreduce()
         if allreduce is None:
             return None
