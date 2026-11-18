@@ -15,6 +15,7 @@
 """Tests of the checkpoint I/O CI experiment report, on synthetic rows without OpenSearch."""
 
 import copy
+import csv
 import dataclasses
 import importlib.util
 import json
@@ -517,10 +518,39 @@ def test_main_writes_the_report_from_a_rows_cache(report: ModuleType, tmp_path: 
     assert "## Effective policy: RANK-STRIPED activated vs NATIVE control" in text
     assert "| qwen3_32b_fp8_tp2_6k1k-con96_iter10_6k1k | h200 | server | 10 | -20.0% |" in text
     assert "pipeline or runtime image: 2 (runtime image 2)." in text
-    pairs_csv = (out_dir / "pairs.csv").read_text().splitlines()
-    assert pairs_csv[0] == ",".join(field.name for field in dataclasses.fields(report.PairRecord))
-    assert len(pairs_csv) == 21
-    assert (out_dir / "per_test.csv").exists()
+    with (out_dir / "pairs.csv").open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        pairs = list(reader)
+    assert reader.fieldnames == [field.name for field in dataclasses.fields(report.PairRecord)]
+    # Both comparisons pair every odd build with the next even one: 8 s against 10 s.
+    assert sorted(
+        (pair["comparison"], int(pair["treatment_root_build"]), int(pair["control_root_build"]))
+        for pair in pairs
+    ) == [
+        (comparison, build, build + 1)
+        for comparison in ("effective", "intent_to_treat")
+        for build in range(1, 21, 2)
+    ]
+    for pair in pairs:
+        assert (pair["image"], pair["pipeline"], pair["branch"]) == (IMAGE, "main", "main")
+        assert (float(pair["treatment_seconds"]), float(pair["control_seconds"])) == (8.0, 10.0)
+        assert float(pair["change"]) == pytest.approx(-0.2)
+        assert pair["treatment_startup_id"] == f"startup-{pair['treatment_root_build']}"
+        assert pair["control_startup_id"] == f"startup-{pair['control_root_build']}"
+    with (out_dir / "per_test.csv").open(newline="") as handle:
+        summaries = {summary["comparison"]: summary for summary in csv.DictReader(handle)}
+    assert set(summaries) == {"effective", "intent_to_treat"}
+    for summary in summaries.values():
+        assert (summary["test_case"], summary["gpu_type"], summary["role"], summary["model"]) == (
+            "qwen3_32b_fp8_tp2_6k1k-con96_iter10_6k1k",
+            "h200",
+            "server",
+            "qwen3_32b_fp8",
+        )
+        assert [int(summary[name]) for name in ("n_treatment", "n_control", "n_pairs")] == [10] * 3
+        assert float(summary["change"]) == pytest.approx(-0.2)
+        assert float(summary["treatment_median"]) == 8.0
+        assert float(summary["control_median"]) == 10.0
     # No startup fell back, so fallbacks.csv holds only its header.
     assert (out_dir / "fallbacks.csv").read_text().splitlines() == [
         ",".join(field.name for field in dataclasses.fields(report.FallbackSummary))
