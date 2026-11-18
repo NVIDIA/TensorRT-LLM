@@ -23,7 +23,7 @@ from test_minimax_h3_transformer import (  # noqa: I001  (sibling test module, p
 )
 
 import tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 as h3
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_adaln import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.fused_adaln import (
     h3_adaln_supported,
     h3_gate_res_norm_mod,
     h3_norm_mod,

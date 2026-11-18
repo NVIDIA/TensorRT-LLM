@@ -13,8 +13,8 @@ AutoencoderKLMiniMaxH3 = pytest.importorskip(
     "diffusers.models.autoencoders.autoencoder_kl_minimax_h3"
 ).AutoencoderKLMiniMaxH3
 
-import tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel_vae as parallel_vae  # noqa: E402
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel_vae import (  # noqa: E402
+import tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel.vae as parallel_vae  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel.vae import (  # noqa: E402
     TiledAutoencoderKLMiniMaxH3,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (  # noqa: E402

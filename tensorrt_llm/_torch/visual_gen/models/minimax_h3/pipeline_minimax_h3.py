@@ -78,7 +78,7 @@ from .packing import (
     unpatchify_video_tokens,
     video_latent_num_frames,
 )
-from .parallel_vae import TiledAutoencoderKLMiniMaxH3
+from .parallel.vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel

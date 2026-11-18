@@ -37,7 +37,7 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.fused_rope import (
     apply_minimax_h3_qk_norm_rope_bf16,
 )
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
@@ -46,7 +46,7 @@ from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
+from .kernels.fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
 from .vsa import get_h3_vsa_context, h3_vsa_attention
 
 MINIMAX_H3_MODALITY_NUM = 3
