@@ -89,7 +89,7 @@ def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) 
 
     Not by where jobs queue: of the sessions only the env and setup lines
     their processes start with count, as a set (a session added like the
-    others adds nothing), and not the spools the perf block names. Not by the
+    others adds nothing). Not by the
     checkout's content: the tree changes with every integration, and every
     gate of the run measures it on this same substrate under the tree's own
     marker.
@@ -100,7 +100,7 @@ def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) 
     if options and Path(str(options)).is_file():
         options_text = Path(str(options)).read_text(encoding="utf-8", errors="replace")
     block = dict(task_data.get("environment") or {})
-    resolved = dataclasses.asdict(dataclasses.replace(environment, sessions=(), dev_spools=()))
+    resolved = dataclasses.asdict(dataclasses.replace(environment, sessions=()))
     parts: dict[str, Any] = {
         "environment": {
             **resolved,
