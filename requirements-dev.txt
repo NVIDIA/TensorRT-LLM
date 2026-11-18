@@ -78,7 +78,9 @@ opentelemetry-api>=1.26.0
 opentelemetry-exporter-otlp>=1.26.0
 opentelemetry-semantic-conventions-ai>=0.4.1
 rapidfuzz==3.14.5
-aiperf==0.8.0; python_version < "3.11"
+# aiperf 0.8.0-0.11.0 (the last releases for Python 3.10) pin aiohttp~=3.13.3, below the
+# aiohttp>=3.14.4 floor in constraints.txt, and 0.12.0+ require Python 3.11. Install
+# aiperf on Python 3.11+ only, so the aiohttp floor applies on every Python version.
 aiperf==0.13.0; python_version >= "3.11"
 nanobind>=2.9.0
 nixl-cu13==1.5.2

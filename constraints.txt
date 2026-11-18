@@ -27,4 +27,4 @@ certifi>=2026.10.18
 # WAR against https://github.com/advisories/GHSA-27vj-qcqg-25rc
 fsspec>=2026.6.0
 # WAR against https://github.com/advisories/GHSA-jm3w-gw2p-xjfj
-aiohttp>=3.14.4; python_version >= "3.11"
+aiohttp>=3.14.4
