@@ -41,6 +41,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified.ops.attention import (  # noqa: E501
     qsa_triton_kernels__stable_jit as _stable,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified.ops.attention import (  # noqa: E501
+    qwen4_exp_attn_decode_prologue__decode as _pro_module,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified.ops.attention.draft_continue_rows__decode import (  # noqa: E501
     draft_continue_select,
     draft_rows_gather,
@@ -977,6 +980,51 @@ def _check_decode_prologue(cell, monkeypatch) -> None:
     _pro_check(got, want)
 
 
+def _pro_offset_metadata(args, offset):
+    """The position ids and the coordinates as the engine passes them in a draft pass: views at
+    `offset` elements into larger buffers (so neither is 16-byte aligned unless `offset` is a
+    multiple of 4), the coordinates the transpose of a `[3, capacity]` buffer."""
+    ids = args["position_ids"]
+    rows = ids.shape[1]
+    flat = torch.zeros(ids.numel() + offset + 8, dtype=ids.dtype, device=DEV)
+    flat[offset : offset + ids.numel()] = ids.reshape(-1)
+    capacity = rows + offset + 7
+    buf = torch.zeros(3, capacity, dtype=torch.int32, device=DEV)
+    buf[:, offset : offset + rows] = args["coords"].transpose(0, 1)
+    return dict(
+        args,
+        position_ids=flat[offset : offset + ids.numel()].view(3, rows),
+        coords=torch.transpose(buf[:, offset : offset + rows], 0, 1),
+    )
+
+
+def test_attn_decode_prologue_compiles_once_across_rows_and_offsets() -> None:
+    """Row counts in every Triton integer class (1, divisible by 16, neither) on all three launch
+    buckets, decode and verify rows, the position ids and coordinates at offsets 0 to 3: the
+    first call of the geometry compiles every bucket, later calls compile nothing, and every call
+    matches the reference."""
+    kernel = _pro_module._attn_decode_prologue_kernel
+    dev = torch.cuda.current_device()
+    for per in (1, 4):
+        counts = []
+        before = len(kernel.device_caches[dev][0])
+        for requests in (1, 4, 5, 16, 17, 40, 64, 70):
+            spec = dict(geom="tp2", pos=tuple(3000 + 731 * r for r in range(requests)))
+            spec["rows_per_request"] = per
+            for offset in (0, 1, 2, 3):
+                args = _pro_offset_metadata(_pro_build(spec, seed=requests + offset), offset)
+                want = _pro_clone(args)
+                _pro_op.reference(**want[0])
+                got = _pro_clone(args)
+                _pro_op(**got[0])
+                torch.cuda.synchronize()
+                _pro_check(got, want)
+                counts.append(len(kernel.device_caches[dev][0]) - before)
+        # At most the three buckets (fewer if an earlier test warmed the geometry), all at the
+        # first call.
+        assert len(set(counts)) == 1 and counts[0] <= 3, counts
+
+
 def _plan_operands(spec, g):
     n, p = spec["requests"], spec["rows_per_request"]
     kind = spec["kind"]
@@ -1874,10 +1922,11 @@ def _index_pool(n_requests, need, seed, pool_pages, slots):
     return gen, pool[:, 11], table, slot_of
 
 
-def _family_index_scores_groups(contexts, monkeypatch) -> None:
-    """The CuTe request-group index scores: within fp32 summation-order noise of the family's
-    kernel, the same top-512 except at near-ties, deterministic, and replayable."""
-    rpr = 3
+def _family_index_scores_groups(case, monkeypatch) -> None:
+    """The CuTe request-group index scores, `case` = (context lengths, verify rows a request: 3
+    at MTP2, 4 at MTP3): within fp32 summation-order noise of the family's kernel, the same
+    top-512 except at near-ties, deterministic, and replayable."""
+    contexts, rpr = case
     gen, cache, table, slot_of = _index_pool(
         len(contexts), [-(-c // 32) for c in contexts], len(contexts) * 7 + 1, 6000, 128
     )
@@ -1960,7 +2009,9 @@ def _family_topk_rows(case, monkeypatch) -> None:
 
 _FAMILY_CASES = [
     *(
-        pytest.param(_family_index_scores_groups, contexts, id=f"index scores groups {name}")
+        pytest.param(_family_index_scores_groups, (contexts, rpr),
+                     id=f"index scores groups {mtp}{name}")
+        for rpr, mtp in ((3, ""), (4, "mtp3 "))
         for name, contexts in (
             ("32x50k", tuple([50000] * 32)),
             ("64x20k", tuple([20000] * 64)),
@@ -2253,6 +2304,39 @@ def _site_gen_rows_order(rows, monkeypatch) -> None:
     assert torch.equal(outs[0][1], outs[1][1]), "token selection"
 
 
+def _site_index_scores_mtp3(requests, monkeypatch) -> None:
+    """`_decode_index_selection` at four rows a request (an MTP3 verify step) scores on the
+    family's request-group kernel unless its caller opted in (`INDEX_SCORES_CUTE_MTP3_ENV`), then
+    on the CuTe one; three rows a request take the CuTe kernel either way."""
+    seen = []
+    cute, family = M.index_scores_groups_cute, M.qsa_paged_index_scores
+
+    def spy_cute(*args):
+        seen.append(("cute", args[-1]))
+        return cute(*args)
+
+    def spy_family(**kwargs):
+        seen.append(("family", kwargs["rows_per_request"]))
+        return family(**kwargs)
+
+    monkeypatch.setattr(M, "index_scores_groups_cute", spy_cute)
+    monkeypatch.setattr(M, "qsa_paged_index_scores", spy_family)
+    ctx = tuple(2400 + 61 * r for r in range(requests))
+    for p in (3, 4):
+        core, _, _, qsa, _, _ = _prl_build(12, 1, ctx, p, PRL_F8, seed=41 + p)
+        rows = requests * p
+        gen = torch.Generator(device=PRL_DEV).manual_seed(rows)
+        q = torch.randn(rows, 6, PRL_ID, generator=gen, device=PRL_DEV).to(PRL_BF)[:, :PRL_IH]
+        cache = core._bound.pools.index_cache[PRL_LAYER]
+        for opted in (False, True):
+            selected = M._decode_index_selection(
+                core, None, q, qsa[:8], rows, p, PRL_DEV, cache, cute_mtp3=opted
+            )
+            assert selected.shape == (rows, core.token_topk + PRL_CR - 1)
+            assert selected.dtype == torch.int32
+    assert seen == [("cute", 3), ("cute", 3), ("family", 4), ("cute", 4)]
+
+
 _SITE_CASES = [
     *(
         pytest.param(_site_prologue, (site, layout), id=f"{site} prologue {layout}")
@@ -2275,6 +2359,7 @@ _SITE_CASES = [
         id="draft index share chunks, 250k",
     ),
     pytest.param(_site_gen_rows_order, 300, id="generation rows in the step's row order"),
+    pytest.param(_site_index_scores_mtp3, 24, id="index scores of four rows a request, opt-in"),
 ]
 
 

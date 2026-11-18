@@ -6,12 +6,12 @@ A CTA (4 warps) walks `TILES` tiles (`BN` keys each) of one request group with `
 flight: the program's page numbers are looked up once into shared memory, each tile's keys go to
 an XOR-swizzled shared ring with `cp.async` (four threads a key), and the scores come from
 `mma.sync` m16n8k16 with the group's query columns as the A fragments (rows 4 t + h: verify row t,
-index head h) and the keys as B. A key's score per row is the family's
-(`qsa_paged_index_scores` with `rows_per_request`): ReLU of each head's dot, summed
+index head h; four rows a request fill all 16) and the keys as B. A key's score per row is the
+family's (`qsa_paged_index_scores` with `rows_per_request`): ReLU of each head's dot, summed
 (h0 + h1) + (h2 + h3), times 128^-0.5. The dot's accumulation order differs from the family
 kernel's, so the scores differ in the last bits.
 
-Precondition (`serves`): verify rows, `rows_per_request` (2 or 3) consecutive rows of one request
+Precondition (`serves`): verify rows, `rows_per_request` (2, 3 or 4) consecutive rows of one request
 each, 4 bf16 index heads of 128; the index pool a `[pages, tokens, 1, 128]` view with token rows
 256 B apart. Columns at and past a row's window are left unwritten.
 """
@@ -94,9 +94,13 @@ def _shfl_xor_f(x, m, *, loc=None, ip=None):
 
 
 class _IdxGroupsKernel:
-    def __init__(self, *, rpr, tpb, cr, tiles, stages, bt_width, num_requests, pdl, bn=BN):
-        assert 2 <= rpr <= 3 and tpb % cr == 0 and bn in (64, 128)
+    def __init__(
+        self, *, rpr, tpb, cr, tiles, stages, bt_width, num_requests, pdl, bn=BN, compact=False
+    ):
+        assert 2 <= rpr <= 4 and tpb % cr == 0 and bn in (64, 128)
         self.T, self.tpb, self.cr = rpr, tpb, cr
+        # Compact index pages (`index_plane_layout`): a page's compressed keys are its first rows.
+        self.compact = compact
         self.bn = bn
         self.tiles, self.stages = tiles, max(2, min(stages, tiles))
         self.bt_width, self.num_requests, self.pdl = bt_width, num_requests, pdl
@@ -162,7 +166,10 @@ class _IdxGroupsKernel:
             page = _lds1(s_pg + (j * bn + k) * 4)
             ok = page >= 0
             n = cutlass.Int32(cutlass.select_(ok, cutlass.Int32(16), cutlass.Int32(0)))
-            tok = (k * cr + cr - 1) % tpb
+            if const_expr(self.compact):
+                tok = k % (tpb // cr)
+            else:
+                tok = (k * cr + cr - 1) % tpb
             src = (
                 cache_base
                 + (
@@ -338,11 +345,11 @@ _COMPILED: dict = {}
 
 
 def serves(q: torch.Tensor, index_cache: torch.Tensor, rows_per_request: int) -> bool:
-    """Verify rows this kernel serves: 2 or 3 rows a request, 4 bf16 index heads of 128 with unit
+    """Verify rows this kernel serves: 2, 3 or 4 rows a request, 4 bf16 index heads of 128 with unit
     dim stride and 16-byte aligned rows, a `[pages, tokens, 1, 128]` bf16 pool view with token rows
     256 B apart and 16-byte aligned pages."""
     return (
-        rows_per_request in (2, 3)
+        rows_per_request in (2, 3, 4)
         and q.ndim == 3
         and q.shape[1] == HEADS
         and q.shape[2] == HEAD_DIM
@@ -386,9 +393,17 @@ def _index_scores_groups(
     if rows == 0:
         return out
     groups = rows // rows_per_request
+    compact = index_cache.shape[1] != tokens_per_block
     col_progs = -(-max_blocks // (BN * TILES))
     pdl = bool(use_pdl and get_env_enable_pdl())
-    key = (rows_per_request, tokens_per_block, compress_ratio, tuple(block_table.shape), pdl)
+    key = (
+        rows_per_request,
+        tokens_per_block,
+        compress_ratio,
+        tuple(block_table.shape),
+        pdl,
+        compact,
+    )
     args = (
         _ptr(q, cutlass.BFloat16),
         _ptr(index_cache, cutlass.BFloat16),
@@ -416,6 +431,7 @@ def _index_scores_groups(
             bt_width=block_table.shape[1],
             num_requests=block_table.shape[0],
             pdl=pdl,
+            compact=compact,
         )
         fn = _COMPILED[key] = cute.compile(kern, *args, options="--opt-level 2 --enable-tvm-ffi")
     fn(

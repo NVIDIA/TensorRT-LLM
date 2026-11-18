@@ -99,6 +99,11 @@ from transformers import PretrainedConfig
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.qsa.index_plane_layout import (
+    COMPACT_ENV,
+    compact_enabled,
+    slot_rows,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
@@ -267,6 +272,7 @@ from . import vision as _vision
 from . import weights as _weights
 from .ops.attention.draft_continue_rows__decode import draft_continue_select, draft_rows_gather
 from .ops.attention.qsa_fp8_pages_to_bf16__prefill import qsa_fp8_pages_to_bf16
+from .ops.attention.qsa_index_compact_plane import qsa_index_compact_plane
 from .ops.attention.qsa_index_scores_cute__prefill import qsa_index_scores_prefill
 from .ops.attention.qsa_index_scores_cute__prefill import supports as _index_scores_cute_supports
 from .ops.attention.qsa_index_scores_groups_cute__decode import (
@@ -515,6 +521,11 @@ _INDEX_SCORES_PDL = get_env_enable_pdl()
 #: kernel (`qsa_index_scores_groups_cute__decode`) over the family's Triton one. It sums in another
 #: order (~7e-8 relative), so a row's top-k can differ only at a near-tie.
 _INDEX_SCORES_CUTE_MIN_GROUPS = 8
+#: Opt-in switch (`weights.switch`): steps of four rows a request (an MTP3 verify step and its
+#: draft-extend step) take that kernel too. Off by default: they stay on the family's kernel and
+#: the CuTe kernel scores two and three rows a request, since moving them changes their scores'
+#: summation order. Read once, when the target is built.
+INDEX_SCORES_CUTE_MTP3_ENV = "TRTLLM_MODELING_V2_INDEX_SCORES_CUTE_MTP3"
 _SOFTPLUS_THRESHOLD = 20.0
 _L2_NORM_EPS = 1e-6
 _PLE_CLAMP_MIN = 1e-6
@@ -1522,7 +1533,7 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         bound = _Bound(cm, rank_pools, stage=_inforward_stage(cm, self.gdn_layers, self.ple_layer))
         if self.spec_rollback is not None:
             self.spec_rollback.set_index_planes(
-                [rank_pools.index_cache[i] for i in self.attn_layers]
+                [rank_pools.index_cache[i] for i in self.attn_layers], self.compress_ratio
             )
         if self.mtp_enabled:
             bound = bound._replace(**self._bind_step_buffers(cm, g, rank_pools, md))
@@ -2309,6 +2320,13 @@ def _mtp_index_branch(core, M: _MtpWeights, proj, index_scratch, draft: _DraftBo
         [core.index_heads, core.index_kv_heads, 1],
         1,
     )[1]
+    if draft.index_cache.shape[1] != tokens_per_block:
+        qsa_index_compact_plane(
+            token_k, coords, draft.index_cache, draft.position_cache, req_idx, logical,
+            block_table, tokens_per_block, core.compress_ratio, M.idx_kn, core._mtp_cos_sin,
+            core.eps, _QSA_MROPE_SECTION,
+        )  # fmt: skip
+        return _index_query(core, index_scratch)
     qsa_paged_index_store(
         token_k,
         coords,
@@ -3221,6 +3239,13 @@ def _index_plane(core, proj, i, L: _LayerWeights, qsa) -> None:
     )[1]
     pools = core._bound.pools
     index_cache = pools.index_cache[i]
+    if index_cache.shape[1] != tokens_per_block:
+        qsa_index_compact_plane(
+            token_k, coords, index_cache, pools.position_cache, req_idx, logical, block_table,
+            tokens_per_block, core.compress_ratio, L.idx_kn, core._cos_sin, core.eps,
+            _QSA_MROPE_SECTION,
+        )  # fmt: skip
+        return
     qsa_paged_index_store(
         token_k,
         coords,
@@ -3329,7 +3354,18 @@ def _index_split_plan(split, qsa, num_tokens: int, rows_per_seq: int):
 
 
 def _decode_index_selection(
-    core, split, q, qsa, num_tokens, p, device, index_cache, plan=None, q_permuted=False, order=None
+    core,
+    split,
+    q,
+    qsa,
+    num_tokens,
+    p,
+    device,
+    index_cache,
+    plan=None,
+    q_permuted=False,
+    order=None,
+    cute_mtp3=False,
 ):
     """A sparse decode layer's int32 `[num_tokens, token_topk + compress_ratio - 1]` selection.
 
@@ -3337,7 +3373,8 @@ def _decode_index_selection(
     over this rank's rows gathered in rank order. `qsa` is `(req_idx, logical, seq_lens_q,
     visible_blocks, topk_indices, topk_row_starts, block_table, tokens_per_block)`. With a `plan`,
     this rank takes its slice of the permuted order (`q_permuted`: `q` is in it already). `order`:
-    the step's `_RowOrder`, shared by its layers."""
+    the step's `_RowOrder`, shared by its layers. `cute_mtp3`: four rows a request take the CuTe
+    scoring kernel too (`INDEX_SCORES_CUTE_MTP3_ENV`)."""
     req_idx, logical, seq_lens_q, visible_blocks, topk_indices, topk_row_starts = qsa[:6]
     block_table, tokens_per_block = qsa[6], qsa[7]
     part = _index_split_rows(split, num_tokens, p)
@@ -3361,6 +3398,7 @@ def _decode_index_selection(
     rpr = _index_rows_per_request(rows, p)
     if (
         rpr > 1
+        and (rpr < 4 or cute_mtp3)
         and rows >= _INDEX_SCORES_CUTE_MIN_GROUPS * rpr
         and logical.dtype == torch.int64
         and req_idx.dtype == torch.int32
@@ -5766,6 +5804,7 @@ class DecodeTarget:
         self._layers = _layer_views(core)
         self._stack = _stack_views(core)
         self._index_split = _index_split_group(core)
+        self._index_cute_mtp3 = _weights.switch(INDEX_SCORES_CUTE_MTP3_ENV)
 
     def _check_step_contract(self, md) -> None:
         if not self._contract_pending:
@@ -5879,6 +5918,7 @@ class DecodeTarget:
                 plan,
                 q_permuted=prologue,
                 order=getattr(self, "_row_order", None),
+                cute_mtp3=getattr(self, "_index_cute_mtp3", False),
             )
             attn = _sparse_gqa(
                 core,
@@ -6435,6 +6475,7 @@ class DecodeTarget:
                     n // gen_seqs,
                     qkv.device,
                     draft.index_cache,
+                    cute_mtp3=getattr(self, "_index_cute_mtp3", False),
                 )  # fmt: skip
                 if share:
                     capture = self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
@@ -6597,11 +6638,16 @@ class SpeculativeRollback:
         self._pending: dict | None = None
         # (base addresses, page strides, plane count) of the index-K planes, once bound.
         self._planes: tuple | None = None
+        self._index_rows = 0
+        self._compress_ratio = 0
 
-    def set_index_planes(self, planes: list) -> None:
-        """Bind the attention layers' index-K planes (static for the manager's lifetime)."""
+    def set_index_planes(self, planes: list, compress_ratio: int) -> None:
+        """Bind the attention layers' index-K planes (static for the manager's lifetime) and
+        their page rows (`index_plane_layout`)."""
         ptrs, strides = _plane_table(planes)
         self._planes = (ptrs, strides, len(planes))
+        self._index_rows = int(planes[0].shape[1])
+        self._compress_ratio = int(compress_ratio)
 
     # ------------------------------------------------------------- staging ---
 
@@ -6654,6 +6700,8 @@ class SpeculativeRollback:
                 ptrs,
                 strides,
                 position_cache,
+                self._index_rows,
+                self._compress_ratio,
             )
             self._pending = dict(
                 num_contexts=num_contexts,
@@ -6663,6 +6711,8 @@ class SpeculativeRollback:
                 slots=slots.to(torch.long),
                 pages=pages,
                 within=within,
+                index_within=None,
+                tpb=tokens_per_block,
                 staged_layers=0,
                 position=(position_cache, position_old),
                 index_all=index_all,
@@ -6674,6 +6724,7 @@ class SpeculativeRollback:
         pages = block_table[request_indices.to(torch.long), positions // tokens_per_block]
         pages = pages.to(torch.long)
         within = positions % tokens_per_block
+        index_within = slot_rows(within, tokens_per_block, self._compress_ratio, self._index_rows)
         self._pending = dict(
             num_contexts=num_contexts,
             prefix=prefix_tokens,
@@ -6682,9 +6733,11 @@ class SpeculativeRollback:
             slots=slots.to(torch.long),
             pages=pages,
             within=within,
+            index_within=index_within,
+            tpb=tokens_per_block,
             staged_layers=0,
             position=None,
-            index_all=qsa_rollback_gather(ptrs, strides, pages, within, count),
+            index_all=qsa_rollback_gather(ptrs, strides, pages, index_within, count),
             fused=fused,
             ngram_stream=None,
         )
@@ -6780,6 +6833,9 @@ class SpeculativeRollback:
                 ptrs,
                 strides,
                 pending["index_all"],
+                pending["tpb"],
+                self._compress_ratio,
+                self._index_rows if self._index_rows != pending["tpb"] else 0,
             )
             return
         accepted = num_accepted_tokens[num_contexts : num_contexts + n].to(torch.long)
@@ -6795,7 +6851,9 @@ class SpeculativeRollback:
         rejected = torch.reshape(
             torch.arange(p, device=accepted.device).unsqueeze(0) >= accepted.unsqueeze(1), [-1]
         )
-        qsa_rollback_restore(ptrs, strides, pages, within, rejected, pending["index_all"])
+        qsa_rollback_restore(
+            ptrs, strides, pages, pending["index_within"], rejected, pending["index_all"]
+        )
         position[pages, within] = torch.where(
             rejected[:, None], position_old, position[pages, within]
         )
@@ -7025,6 +7083,21 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
             raise NoTarget(
                 f"a {kv_cache_quant_algo} KV cache; the target stores K/V as the checkpoint's "
                 "bf16, as FP8 or as NVFP4"
+            )
+        if (
+            spec is not None
+            and kv_cache_quant_algo is not None
+            and compact_enabled()
+            and spec.max_draft_len > text.indexer_compress_ratio
+        ):
+            # A quantized K/V pool packs the QSA side planes, which is where the compact layout
+            # applies (`pool.pool_geometry`); on a bf16 pool the cache manager refuses the switch.
+            raise NoTarget(
+                f"{COMPACT_ENV}=1 with max_draft_len={spec.max_draft_len}: compact index pages "
+                "keep a group's raw keys for at most indexer_compress_ratio + 1 = "
+                f"{text.indexer_compress_ratio + 1} consecutive positions of a request in one "
+                f"step, so the verify step runs at max_draft_len 1..{text.indexer_compress_ratio} "
+                "on them"
             )
         if rowtile_groups and kv_cache_quant_algo != QuantAlgo.FP8:
             stored = "bf16" if kv_cache_quant_algo is None else kv_cache_quant_algo
