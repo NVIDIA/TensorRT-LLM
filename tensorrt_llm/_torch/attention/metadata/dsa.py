@@ -29,9 +29,10 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_num_sms, get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
-from .base import Metadata, UnsupportedMetadataConfiguration, _Registry
+from .base import UnsupportedMetadataConfiguration, _Registry
 from .core import TrtllmCoreMetadata
 from .mla_context import MlaContextMetadata
+from .sparse import SparseMetadata
 
 if TYPE_CHECKING:
     from ..backends.sparse.dsa.indexer import IndexerPrefillChunkMetadata
@@ -49,7 +50,7 @@ def _fused_dsa_metadata_enabled() -> bool:
     return os.environ.get("TRTLLM_DISABLE_FUSED_DSA_METADATA", "0") == "0"
 
 
-class DSAMetadata(Metadata):
+class DSAMetadata(SparseMetadata):
     """Base of DeepSeek-V4's sparse metadata: the indexer's buffers and state.
 
     It holds what the indexer and the top-k index conversion read: the indexer
@@ -90,7 +91,6 @@ class DSAMetadata(Metadata):
             raise UnsupportedMetadataConfiguration("sparse KV cache offload")
         if params.mtp_index_share:
             raise UnsupportedMetadataConfiguration("MTP index sharing")
-        self.sparse_metadata_params = params
         manager = config.kv_cache_manager
         self._core = self.get_metadata(TrtllmCoreMetadata)
         self._mla_context = self.get_metadata(MlaContextMetadata)
