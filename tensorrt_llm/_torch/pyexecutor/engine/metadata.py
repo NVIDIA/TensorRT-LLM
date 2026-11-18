@@ -150,7 +150,7 @@ def build_feature_attention_metadata(
     from tensorrt_llm._torch.attention.metadata.chunked_prefill import ChunkedPrefillMetadata
     from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
     from tensorrt_llm._torch.attention.metadata.deepseek_v4 import DeepseekV4Metadata
-    from tensorrt_llm._torch.attention.metadata.draft import DraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft import LinearDraftMetadata
     from tensorrt_llm._torch.attention.metadata.mla_context import MlaContextMetadata
     from tensorrt_llm._torch.attention.metadata.spec_decoding import SpecDecodingMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
@@ -189,7 +189,7 @@ def build_feature_attention_metadata(
         if getattr(spec_config, "enable_confidence_scheduling", False):
             raise UnsupportedMetadataConfiguration("ragged verification")
         max_draft_tokens = spec_config.max_draft_len
-        metadata_types.append(DraftMetadata)
+        metadata_types.append(LinearDraftMetadata)
 
     sparse_attention_config = model_config.sparse_attention_config
     engine_inputs = BatchInputs(
