@@ -7,6 +7,7 @@ import os
 import uuid
 from typing import Iterator, List
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -14,6 +15,7 @@ from safetensors import safe_open
 
 from tensorrt_llm import LLM
 from tensorrt_llm.inputs import default_multimodal_input_loader
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -130,3 +132,57 @@ def test_prompt_embeds_with_image_in_one_request(llm: LLM, model_dir: str) -> No
         llm.generate(
             {**plain, "prompt_embeds": table[:1], "prompt_embeds_mask": on_image}, _greedy()
         )
+
+
+def _video_request(llm: LLM) -> dict:
+    """Chat prompt with one video placeholder and a short red-then-blue clip."""
+    indices = [0, 80, 160, 239]
+    frames = []
+    for index in indices:
+        frame = np.zeros((224, 224, 3), dtype=np.uint8)
+        frame[:, :, 0 if index < 120 else 2] = 255
+        frames.append(frame)
+    video = VideoData(
+        frames=frames,
+        metadata={
+            "fps": 24.0,
+            "total_num_frames": 240,
+            "duration": 10.0,
+            "frames_indices": indices,
+        },
+    )
+    prompt = llm.tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [{"type": "video"}, {"type": "text", "text": "What happens?"}],
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return {
+        "prompt_token_ids": llm.tokenizer.encode(prompt, add_special_tokens=False),
+        "multi_modal_data": {"video": [video]},
+        "mm_processor_kwargs": {"do_sample_frames": False},
+    }
+
+
+def test_prompt_embeds_with_video_in_one_request(llm: LLM, model_dir: str) -> None:
+    # Qwen3-VL frames each video frame with timestamp text the mask never indexes.
+    if "Qwen3-VL" not in model_dir:
+        pytest.skip("timestamp-framed video layout is Qwen3-VL specific")
+    table = _text_embedding_table(model_dir)
+    plain = _video_request(llm)
+    ids = plain["prompt_token_ids"]
+    expected = _run(llm, [plain])
+    vision_ids = set(
+        llm.tokenizer.convert_tokens_to_ids(["<|vision_start|>", "<|video_pad|>", "<|vision_end|>"])
+    )
+    mask = [t not in vision_ids and p % 2 == 1 for p, t in enumerate(ids)]
+    request = {
+        **plain,
+        "prompt_embeds": table[torch.tensor([t for t, m in zip(ids, mask) if m])],
+        "prompt_embeds_mask": mask,
+    }
+    assert _run(llm, [request]) == expected

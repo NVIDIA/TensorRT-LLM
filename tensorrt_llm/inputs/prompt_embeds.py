@@ -245,9 +245,11 @@ def remap_prompt_embeds(
     """Move prompt-embedding positions through multimodal placeholder expansion.
 
     Input processors replace each multimodal placeholder with its expanded
-    tokens. Every original token is matched, in order, to the next equal
-    expanded token; any expanded token left unmatched must be a multimodal row,
-    and no embedding position may land on one.
+    tokens, possibly with framing text around them (for example per-frame
+    timestamps). Every original token is matched, in order, to the next equal
+    expanded token. An unmatched expanded token must be a multimodal row or lie
+    within two original tokens of a placeholder; no embedding position may land
+    on a multimodal row.
 
     Args:
         prompt_embeds: Snapshot whose positions index ``original_ids``.
@@ -271,7 +273,9 @@ def remap_prompt_embeds(
         mapping.append(j)
         matched[j] = True
         j += 1
-    if len(mapping) != len(original_ids) or bool((~matched & ~multimodal_rows).any()):
+    if len(mapping) != len(original_ids) or not _unmatched_tokens_frame_placeholders(
+        mapping, matched, multimodal_rows
+    ):
         raise ValueError(
             "prompt_token_ids did not survive multimodal processing unchanged "
             "outside the multimodal placeholders; use placeholder ids that "
@@ -290,6 +294,29 @@ def remap_prompt_embeds(
         row_digests=prompt_embeds.row_digests,
         digest=_digest(embeds, positions, prompt_embeds.row_digests),
     )
+
+
+def _unmatched_tokens_frame_placeholders(
+    mapping: List[int], matched: torch.Tensor, multimodal_rows: torch.Tensor
+) -> bool:
+    """Return whether every unmatched expanded token is placeholder expansion.
+
+    Args:
+        mapping: Expanded index of each original token.
+        matched: ``[len(expanded_ids)]`` bool mask of matched expanded tokens.
+        multimodal_rows: ``[len(expanded_ids)]`` bool mask of multimodal rows.
+    """
+    is_placeholder = [bool(multimodal_rows[j]) for j in mapping]
+    stray = (~matched & ~multimodal_rows).tolist()
+    bounds = [-1] + mapping + [len(stray)]
+    # Gap g lies between original tokens g - 1 and g.
+    for gap in range(len(mapping) + 1):
+        if not any(stray[bounds[gap] + 1 : bounds[gap + 1]]):
+            continue
+        near = range(max(gap - 2, 0), min(gap + 2, len(mapping)))
+        if not any(is_placeholder[i] for i in near):
+            return False
+    return True
 
 
 def multimodal_row_mask(multimodal_input: "MultimodalInput", num_tokens: int) -> torch.Tensor:

@@ -209,6 +209,31 @@ def test_remap_through_placeholder_expansion() -> None:
         remap_prompt_embeds(
             pe,
             original,
-            [1, 50, 51, 51, 51, 52, 2, 9, 3],
+            [1, 50, 51, 51, 51, 52, 2, 3, 9],
             torch.cat([mm_rows, torch.tensor([False])]),
         )
+
+
+def test_remap_through_framed_video_expansion() -> None:
+    from tensorrt_llm.inputs.prompt_embeds import remap_prompt_embeds
+
+    # 50/52 = vision start/end, 53 = video placeholder; 60/61 = timestamp text
+    # the processor inserts before each frame.
+    original = [1, 50, 53, 52, 2, 3]
+    expanded = [1, 60, 50, 53, 53, 52, 61, 50, 53, 53, 52, 2, 3]
+    mm_rows = torch.zeros(len(expanded), dtype=torch.bool)
+    mm_rows[[3, 4, 8, 9]] = True
+    _, pe = build_prompt_embeds(original, _rows(2), [True, False, False, False, True, False])
+    moved = remap_prompt_embeds(pe, original, expanded, mm_rows)
+    assert moved.positions.tolist() == [0, 11]
+    # Text inserted away from any placeholder is still rejected.
+    original = [1, 2, 50, 53, 52, 3, 4]
+    shifted = [1, 70, 2, 60, 50, 53, 53, 52, 3, 4]
+    shifted_rows = torch.zeros(len(shifted), dtype=torch.bool)
+    shifted_rows[[5, 6]] = True
+    _, pe = build_prompt_embeds(original, _rows(1), [False] * 6 + [True])
+    with pytest.raises(ValueError, match="did not survive"):
+        remap_prompt_embeds(pe, original, shifted, shifted_rows)
+    # The same layout without the stray token maps.
+    del shifted[1]
+    assert remap_prompt_embeds(pe, original, shifted, shifted_rows[1:]).positions.tolist() == [8]
