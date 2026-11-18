@@ -1027,7 +1027,9 @@ def test_shared_encoder_tp_checks_item_scheduling_before_construction():
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("unified", [False, True])
-@pytest.mark.parametrize("vision,audio", [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize(
+    "vision,audio", [(True, False), (False, True), (True, True), (False, False)]
+)
 def test_gemma_encoder_parallelism_respects_enabled_front_ends(unified, vision, audio):
     from tensorrt_llm._torch.models.modeling_gemma4_unified import (
         Gemma4UnifiedForConditionalGeneration,
@@ -1043,6 +1045,13 @@ def test_gemma_encoder_parallelism_respects_enabled_front_ends(unified, vision, 
         mapping=Mapping(world_size=2, tp_size=2),
         multimodal_config=MultimodalConfig(encoder_data_parallel_size=2),
     )
+    if not vision and not audio:
+        # Without an encoder, explicit encoder parallelism is rejected, as for any model.
+        for size in (2, 1):
+            config.multimodal_config.encoder_data_parallel_size = size
+            with pytest.raises(NotImplementedError, match="does not support explicit"):
+                model_cls.validate_multimodal_encoder_parallelism(config)
+        return
     # Fully replicated front ends work for either variant and modality.
     model_cls.validate_multimodal_encoder_parallelism(config)
     config.multimodal_config.encoder_data_parallel_size = 1

@@ -1005,8 +1005,12 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
 
     @classmethod
     def get_supported_encoder_parallel_modes(cls, model_config: ModelConfig) -> frozenset[str]:
+        config = model_config.pretrained_config
+        # Without a vision or audio encoder there is nothing to split.
+        if config.vision_config is None and config.audio_config is None:
+            return frozenset()
         # The audio encoder does not shard its weights, so it supports DP only.
-        if model_config.pretrained_config.audio_config is not None:
+        if config.audio_config is not None:
             return cls.supported_encoder_parallel_modes & {"dp"}
         return cls.supported_encoder_parallel_modes
 
