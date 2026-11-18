@@ -850,8 +850,11 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
         batch = self._batch(_make_request_stub(1, prompt_len=100))
         runner.set_capture_variant("kv_regime", 32768)
         self.assertEqual(runner.get_graph_key(batch).variants, (32768,))
+        # a pinned or an agreed value is taken without reading the requests
+        self.assertEqual(runner._graph_variants_for_batch(None), (32768,))
         runner.set_capture_variant("kv_regime", None)
         self.assertEqual(runner.get_graph_key(batch).variants, (8192,))
+        self.assertEqual(runner._graph_variants_for_batch(None, forced=(16384,)), (16384,))
         # an agreed (attention-DP) regime wins over the local one
         self.assertEqual(runner.get_graph_key(batch, forced_variants=(16384,)).variants, (16384,))
         # a variant the ranks did not agree keeps the local value

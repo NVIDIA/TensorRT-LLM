@@ -779,9 +779,9 @@ class CUDAGraphRunner:
         """
         if not self.graph_variants:
             return ()
-        draft_len = max((len(request.py_draft_tokens)
-                         for request in batch.generation_requests),
-                        default=0)
+        # Read from the requests only for a variant that is neither agreed
+        # nor pinned.
+        draft_len = None
         kv_lens = None
         values = []
         for index, variant in enumerate(self.graph_variants):
@@ -792,6 +792,10 @@ class CUDAGraphRunner:
             if pinned is not None:
                 values.append(int(pinned))
                 continue
+            if draft_len is None:
+                draft_len = max((len(request.py_draft_tokens)
+                                 for request in batch.generation_requests),
+                                default=0)
             shape_values = variant.values(batch.batch_size, draft_len)
             if len(shape_values) == 1:
                 # Most shapes have one value; the step's KV cannot change it.

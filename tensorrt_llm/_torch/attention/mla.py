@@ -285,7 +285,7 @@ def _run_mla_chunked_prefill_partitions(
     output: torch.Tensor,
     *,
     run_partition: Callable[
-        [torch.Tensor, torch.Tensor, AttentionForwardArgs, Optional[int], int],
+        [torch.Tensor, torch.Tensor, AttentionForwardArgs, Optional[int], Optional[int]],
         torch.Tensor,
     ],
     expand_kv: Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
@@ -297,10 +297,10 @@ def _run_mla_chunked_prefill_partitions(
     attended without a mask, and the current chunk's own KV comes last under
     the causal mask. ``expand_kv(compressed_kv, k_pe)`` up-projects a
     partition's latent KV to per-head K and V, and ``run_partition(k, v,
-    forward_args, loop_idx, total_kv_tokens)`` attends it, with ``loop_idx``
-    None for the current chunk, and returns its output. Every partition's
-    output and softmax statistics are merged into ``output``, which is
-    returned.
+    forward_args, loop_idx, cached_kv_tokens)`` attends it and returns its
+    output. ``loop_idx`` and ``cached_kv_tokens``, the tokens the partition
+    read back, are None for the current chunk. Every partition's output and
+    softmax statistics are merged into ``output``, which is returned.
     """
     chunked_loop_num = attn_metadata.chunked_loop_num
     # Per query token and head: the softmax statistics the merge combines.
@@ -378,15 +378,12 @@ def _run_mla_chunked_prefill_partitions(
 
     # Last, the KV of the current chunk itself.
     current_k, current_v = expand_kv(compressed_kv, current_k_pe)
-    current_total_kv_tokens = int(
-        attn_metadata.prompt_lens_cpu_runtime[: attn_metadata.num_contexts].sum().item()
-    )
     temp_attn_output = run_partition(
         current_k,
         current_v,
         make_partition_forward_args(PredefinedAttentionMask.CAUSAL),
         None,
-        current_total_kv_tokens,
+        None,
     )
     current_k = None
     current_v = None
@@ -1577,9 +1574,9 @@ class MLA(nn.Module):
             partition_v: torch.Tensor,
             forward_args: AttentionForwardArgs,
             loop_idx: Optional[int],
-            total_kv_tokens: int,
+            cached_kv_tokens: Optional[int],
         ) -> torch.Tensor:
-            del total_kv_tokens
+            del cached_kv_tokens
             if loop_idx is None:
                 kv_lens_cuda = attn_metadata.prompt_lens_cuda_runtime
                 kv_lens_cpu = attn_metadata.prompt_lens_cpu_runtime
@@ -1635,16 +1632,20 @@ class MLA(nn.Module):
             partition_v: torch.Tensor,
             forward_args: AttentionForwardArgs,
             loop_idx: Optional[int],
-            total_kv_tokens: int,
+            cached_kv_tokens: Optional[int],
         ) -> torch.Tensor:
             # The attention op reads the partition's KV lengths from the
             # metadata: the current chunk's own lengths, or the cached chunk's.
             if loop_idx is None:
                 attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
                 attn_metadata.kv_lens_cuda_runtime = attn_metadata.prompt_lens_cuda_runtime
+                total_kv_tokens = int(
+                    attn_metadata.prompt_lens_cpu_runtime[: attn_metadata.num_contexts].sum().item()
+                )
             else:
                 attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[loop_idx]
                 attn_metadata.kv_lens_cuda_runtime = attn_metadata.chunked_seq_len[loop_idx]
+                total_kv_tokens = cached_kv_tokens
             attn_metadata.host_total_kv_lens[0] = total_kv_tokens
             return self.mha.forward(
                 q,
