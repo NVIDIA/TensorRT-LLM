@@ -841,6 +841,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_simple_format: bool = False,
             return_routed_experts: bool = False,
             watermarking: Optional[bool] = None,
+            locality_domain_id: Optional[int] = None,
             **kwargs):
         # Cached by OneModelSamplingParams.of_request.
         self.py_spec_sampling_params: "OneModelSamplingParams | None" = None
@@ -939,6 +940,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Set once a received generation request's first token is found not
         # to end it, so the executor does not recheck it while it waits.
         self.py_first_token_checked = False
+        # Python-side locality domain ownership. ``None`` is used for non-localized
+        # execution; localized requests must pass a concrete value at creation.
+        self.py_locality_domain_id = locality_domain_id
         # Prevent recreation after a send session drops peer registration.
         self.py_kv_send_session_retired = False
 
@@ -1014,7 +1018,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_ctx_decoder_held = False
 
         # In-forward Mamba snapshot point P the scheduler let this context
-        # chunk run past (MambaHybridCacheManagerV2 consumes it).
+        # chunk run past (the GDN cache manager consumes it).
         self.py_mamba_inforward_snapshot_point: Optional[int] = None
         # Whether the first GEN step of a generation-only request was streamed.
         self.py_gen_first_emitted = False
@@ -1429,6 +1433,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                        is not None else None),
             py_multimodal_data=deepcopy(self.py_multimodal_data),
             encoder_input_features=self.py_encoder_input_features,
+            locality_domain_id=self.py_locality_domain_id,
         )
         child.py_bad_words = deepcopy(self.py_bad_words)
         child.py_no_repeat_ngram_size = self.py_no_repeat_ngram_size
@@ -1762,7 +1767,8 @@ def executor_request_to_llm_request(
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
         position_ids: Optional[List] = None,
-        track_unique_tokens: bool = True) -> LlmRequest:
+        track_unique_tokens: bool = True,
+        locality_domain_id: Optional[int] = None) -> LlmRequest:
     envelope = ExecutorRequest.adapt(executor_request)
     inputs = envelope.inputs
     executor_request = envelope.request
@@ -1936,6 +1942,7 @@ def executor_request_to_llm_request(
         logprobs_simple_format=inputs.logprobs_simple_format,
         return_routed_experts=inputs.return_routed_experts,
         watermarking=inputs.watermarking,
+        locality_domain_id=locality_domain_id,
     )
 
     # Bad-words list for the TorchSampler path, kept in its native

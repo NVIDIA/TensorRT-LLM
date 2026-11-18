@@ -540,7 +540,8 @@ class SpeculativeDecodingMode(IntEnum):
     def support_dynamic_draft_len(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
         ) or self.is_mtp_eagle_one_model() or self.is_pard() or self.is_dflash(
-        ) or self.is_draft_target_one_model() or self.is_sa()
+        ) or self.is_dspark() or self.is_draft_target_one_model() or self.is_sa(
+        )
 
     def need_load_draft_weights(self):
         """
@@ -753,6 +754,9 @@ class SpecMetadata:
     # whose draft forward processes only generation requests and must size a
     # FUSED_COMM MoE (DeepGEMM MegaMoE) chunk loop identically across EP ranks.
     all_rank_num_gens: Optional[List[int]] = None
+    # The draft length each rank runs this step with. Attention-DP ranks pick
+    # it from their own batch, so it can differ across ranks.
+    all_rank_draft_lens: Optional[List[int]] = None
     # The number of extra kv tokens
     # Some speculative decoding methods need to use different kv lengths for the
     # draft/target layers. But KVCacheManager can only support kv caches with the
@@ -4057,20 +4061,41 @@ class SpecWorkerBase(nn.Module, ABC):
         return None
 
     @contextmanager
-    def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
+    def draft_kv_cache_context(
+            self,
+            attn_metadata,
+            draft_kv_cache_manager,
+            enable_draft_locality_domain_forkjoin: bool = False):
         """
-        Select draft attention metadata for one-engine speculative decoding.
+        Context manager for the draft sub-forward in one-engine speculative decoding.
 
         TRTLLM metadata temporarily swaps its manager and cache-layout-dependent
         buffers, including DSA indexer offsets and slot mappings.
         FlashInfer uses an independently planned metadata view because its page
         tables and kernel wrappers are manager-specific.
+
+        When the caller opts in, keep fork-join/two-stream attention enabled.
+        For separate-draft topology, also swap
+        ``locality_domain_kv_cache_block_offsets`` to the draft cache's
+        per-locality domain offsets so kernels address the draft KV layout.
         """
 
-        # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
+        # draft_kv_cache_manager is None if using two-engine speculative decoding
+        # or not enabling separate draft KV cache.
         if (draft_kv_cache_manager is None
                 or draft_kv_cache_manager is attn_metadata.kv_cache_manager):
-            yield attn_metadata
+            if (enable_draft_locality_domain_forkjoin or not getattr(
+                    attn_metadata, 'locality_domain_enabled', False)):
+                yield attn_metadata
+                return
+            # Draft workers that rewrite seq_lens/num_contexts in place (dynamic
+            # trees) leave the per-domain splits stale; without an explicit
+            # opt-in the draft sub-forward runs unpartitioned.
+            attn_metadata.locality_domain_enabled = False
+            try:
+                yield attn_metadata
+            finally:
+                attn_metadata.locality_domain_enabled = True
             return
 
         from ..attention.backends.flashinfer import FlashInferAttentionMetadata
@@ -4084,13 +4109,39 @@ class SpecWorkerBase(nn.Module, ABC):
 
         saved_state = prepare_attn_metadata_for_draft_replay(
             attn_metadata, draft_kv_cache_manager)
-        if saved_state is None:
-            yield attn_metadata
-            return
+        saved_locality_attrs = []
 
+        def patch_locality_metadata(name, value):
+            saved_locality_attrs.append((name, getattr(attn_metadata, name)))
+            setattr(attn_metadata, name, value)
+
+        draft_manager_supports_locality_domain_forkjoin = getattr(
+            draft_kv_cache_manager, 'fork_join_attn', False)
+        using_separate_draft_cache = saved_state is not None
         try:
+            if attn_metadata.locality_domain_enabled:
+                if not enable_draft_locality_domain_forkjoin:
+                    patch_locality_metadata('locality_domain_enabled', False)
+                elif using_separate_draft_cache:
+                    if draft_manager_supports_locality_domain_forkjoin:
+                        draft_locality_domain_block_offsets = (
+                            attn_metadata.
+                            draft_locality_domain_kv_cache_block_offsets)
+                        if draft_locality_domain_block_offsets is None:
+                            raise RuntimeError(
+                                "locality domain fork-join is enabled for the draft KV "
+                                "cache, but draft_locality_domain_kv_cache_block_offsets "
+                                "was not prepared.")
+                        patch_locality_metadata(
+                            'locality_domain_kv_cache_block_offsets',
+                            draft_locality_domain_block_offsets)
+                    else:
+                        patch_locality_metadata('locality_domain_enabled',
+                                                False)
             yield attn_metadata
         finally:
+            for name, value in reversed(saved_locality_attrs):
+                setattr(attn_metadata, name, value)
             restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
 
     def _sample_sharded_temperature(self, logits: torch.Tensor,

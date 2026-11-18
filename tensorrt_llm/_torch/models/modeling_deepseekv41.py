@@ -52,6 +52,7 @@ from ..configs.deepseek_v41 import (
     decoder_bounded_replay_enabled,
     disagg_context_decoder_skipping_enabled,
     encoder_replay_enabled,
+    engram_table_is_mxfp4,
     quant_role_for_weight_key,
 )
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy, allgather
@@ -60,9 +61,12 @@ from ..modules.engram import Engram, ShardedFp8MultiHeadEmbedding, adp_exchange,
 from ..modules.engram.projection import EngramFp8Projection
 from ..modules.mhc.hyper_connection import HCState, mHC
 from ..modules.mhc.mhc_lowm import (
+    LOWM_MAX_TOKENS,
+    MMA_SYNC_MAX_TOKENS,
     MoeUnfinalized,
     mhc_allreduce_post_collapse_norm,
     mhc_lamport_allreduce,
+    mhc_post_collapse_norm,
     mhc_split_enabled,
 )
 from ..modules.multi_stream_utils import do_multi_stream
@@ -434,7 +438,8 @@ def _engram_table_share_key(checkpoint_dir: Optional[str], layer_id: int) -> Opt
 
 
 class DeepseekV41Engram(Engram):
-    """Pinned-CPU FP8 lookup, keys-first WKV and FP32 gating, without convolution.
+    """Pinned-CPU FP8 or MXFP4 (``table_mxfp4``) lookup, keys-first WKV and FP32 gating, without
+    convolution.
 
     WKV splits as ``[hc_mult * dim, dim] -> (keys, value)``. Table scales are
     UE8M0 per 32 values; the gate and residual update cast only at the output.
@@ -452,6 +457,7 @@ class DeepseekV41Engram(Engram):
         fp8_block_size: int = 32,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         table_share_key: Optional[str] = None,
+        table_mxfp4: bool = False,
     ):
         # The base constructor calls _make_multi_head_embedding with these fields.
         self.mapping = mapping
@@ -464,6 +470,7 @@ class DeepseekV41Engram(Engram):
         # Ranks [exchange_start, exchange_start + exchange_size) hold all heads and swap token rows.
         self.exchange_start, self.exchange_size = 0, self.tp_size
         self.table_share_key = table_share_key
+        self.table_mxfp4 = table_mxfp4
 
         super().__init__(
             layer_id=layer_id,
@@ -538,7 +545,7 @@ class DeepseekV41Engram(Engram):
         return super()._load_from_state_dict(*args, **kwargs)
 
     def _make_multi_head_embedding(self, list_of_N: List[int], D: int) -> nn.Module:
-        """Shard the FP8 table without changing hash indices or checkpoint keys.
+        """Shard the FP8 or MXFP4 table without changing hash indices or checkpoint keys.
 
         Head count and TP size select the cut; table shards stay in pinned CPU memory.
         """
@@ -558,6 +565,7 @@ class DeepseekV41Engram(Engram):
             tp_size=self.exchange_size,
             tp_rank=self.tp_rank - self.exchange_start,
             share_key=self.table_share_key,
+            mxfp4=self.table_mxfp4,
         )
 
     def _exchange_ranks(self) -> list[int]:
@@ -931,8 +939,12 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         )
 
     def _make_engram(self, layer_idx: int, engram_config, vocab_sizes_flat, stream):
-        checkpoint_dir = self.model_config.pretrained_config.name_or_path
+        pretrained = self.model_config.pretrained_config
+        checkpoint_dir = pretrained.name_or_path
         share_key = _engram_table_share_key(checkpoint_dir, layer_idx)
+        # The checkpoint loader reads the same quantization_config to check the table's layout.
+        text = getattr(pretrained, "text_config", pretrained)
+        quantization_config = getattr(text, "quantization_config", None)
         return DeepseekV41Engram(
             layer_id=layer_idx,
             config=engram_config,
@@ -941,6 +953,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             mapping=self.mapping,
             allreduce_strategy=self.model_config.allreduce_strategy,
             table_share_key=share_key,
+            table_mxfp4=engram_table_is_mxfp4(quantization_config, layer_idx),
         )
 
     def __init__(self, *args, **kwargs):
@@ -1010,17 +1023,38 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         eager_on_graph(apply)(residual)
         return residual
 
-    def _mhc_split(self, num_tokens: int) -> bool:
-        """Split this layer's boundaries: decode-sized rows under CUDA-graph multi-stream.
+    def _mhc_split(
+        self,
+        num_tokens: int,
+        post_update: bool = True,
+        coefficients: bool = True,
+        ffn: bool = False,
+    ) -> bool:
+        """Split a boundary of this layer: decode-sized rows under CUDA-graph multi-stream.
 
         The critical half then runs in one launch and the coefficients overlap the sublayer on
         the coefficient stream; without multi-stream they would serialize, and the fused
-        boundary is faster.
+        boundary is faster. Attention entries with a post update keep ``mega_mhc`` from 1024 rows
+        (see ``split_max_tokens``): their coefficient kernel would hold SMs the query projection
+        needs. Above ``LOWM_MAX_TOKENS`` rows the coefficients need the CuTe DSL coefficient
+        kernel of the boundary's module; above ``MMA_SYNC_MAX_TOKENS`` rows the boundary must not
+        all-reduce the sublayer output itself.
         """
         return (
             self._mhc_coeff_stream is not None
             and do_multi_stream()
-            and mhc_split_enabled(num_tokens, self.hidden_size, self.hc_attn.mult)
+            and mhc_split_enabled(
+                num_tokens,
+                self.hidden_size,
+                self.hc_attn.mult,
+                post_update and coefficients and not ffn,
+            )
+            and (
+                not coefficients
+                or num_tokens <= LOWM_MAX_TOKENS
+                or (self.hc_ffn if ffn else self.hc_attn).coefficient_kernel_ready(num_tokens)
+            )
+            and (num_tokens <= MMA_SYNC_MAX_TOKENS or self._mhc_fused_allreduce() is None)
         )
 
     def _mhc_fused_allreduce(self):
@@ -1152,7 +1186,8 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         # (mHC.fused_hc_lagged / pre_mapping_lagged). Decode-sized rows under multi-stream split
         # it: post update + collapse + RMSNorm in one launch, the coefficients on the coefficient
         # stream until the next boundary (mHC.split_hc_lagged).
-        split = self._mhc_split(residual.shape[0])
+        split = self._mhc_split(residual.shape[0], post_update=deferred)
+        ffn_split = self._mhc_split(residual.shape[0], ffn=True)
         # Split boundaries can also all-reduce the sublayer output in their own launch.
         lamport = self._mhc_fused_allreduce() if split else None
         attn_coeff_event = None
@@ -1239,9 +1274,9 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         nvfp4_scale = (
             self.mlp.experts.backend.fc31_input_scale.view(1) if self._moe_nvfp4_input else None
         )
-        if split:
-            if attn_coeff_event is not None:
-                torch.cuda.current_stream().wait_event(attn_coeff_event)
+        if attn_coeff_event is not None:
+            torch.cuda.current_stream().wait_event(attn_coeff_event)
+        if ffn_split:
             residual, ffn_pre, post_mix, comb_mix, layer_input, ffn_coeff_event = (
                 self.hc_ffn.split_hc_lagged(
                     x_attn,
@@ -1255,6 +1290,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                     events=self._mhc_ffn_events,
                     allreduce=lamport,
                     nvfp4_scale=nvfp4_scale,
+                    residual_after_wait=attn_coeff_event is None,
                 )
             )
         else:
@@ -1269,9 +1305,11 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 nvfp4_scale=nvfp4_scale,
                 fp8_1x128=self._shared_fp8_1x128,
             )
-        # The next layer's split entry prefetches like the FFN boundary above, or all-reduces
-        # the MoE output itself.
-        trigger_allreduce_at_end = not (split and self._v41_defer_post_mapping)
+        # The next layer's split entry loads its residual before its PDL wait, or all-reduces the
+        # MoE output itself.
+        trigger_allreduce_at_end = not (
+            self._mhc_split(residual.shape[0]) and self._v41_defer_post_mapping
+        )
         moe_allreduce = getattr(self.mlp, "allreduce", None)
         moe_partial = (
             lamport is not None and self._v41_defer_post_mapping and moe_allreduce is not None
@@ -2245,21 +2283,35 @@ class DeepseekV41Model(DeepseekV4Model):
         return mHC.collapse(hc_state.residual, hc_state.pre_mix)
 
     def _fused_final_close(self, hc_state: HCState) -> Optional[torch.Tensor]:
-        """``norm(h)`` from one boundary launch (all-reduce of the last MoE partial, post
+        """``norm(h)`` from one boundary launch (all-reduce of the last MoE partial under TP, post
         update, collapse with the last ``pre``, final RMSNorm), or None where it does not apply:
-        the forward reads the un-normalized final state (``_final_close_allowed``), or the last
-        layer left no partial for an in-boundary all-reduce."""
-        if (
-            not self._final_close_allowed
-            or not hc_state.is_deferred
-            or hc_state.x_prev_allreduce is None
-            or hc_state.pre_mix is None
-        ):
+        the forward reads the un-normalized final state (``_final_close_allowed``), the state is
+        resolved, its rows do not take split boundaries, or a TP layer left no partial for an
+        in-boundary all-reduce."""
+        if not self._final_close_allowed or not hc_state.is_deferred or hc_state.pre_mix is None:
             return None
         rows = hc_state.residual.shape[0]
         last = self.layers[self.num_hidden_layers - 1]
-        if not last._mhc_split(rows):
+        if not last._mhc_split(rows, coefficients=False):
             return None
+        if hc_state.x_prev_allreduce is None:
+            if not self.model_config.mapping.enable_attention_dp:
+                return None
+            # Attention DP leaves no partial to all-reduce: the plain critical half closes the state.
+            joined = hc_state.coeff_event is not None
+            hc_state.wait_coefficients()
+            _, normalized = mhc_post_collapse_norm(
+                hc_state.x_prev,
+                hc_state.residual,
+                hc_state.post_mix,
+                hc_state.comb_mix,
+                hc_state.pre_mix,
+                self.norm.weight,
+                self.norm.variance_epsilon,
+                residual_after_wait=not joined,
+            )
+            self._final_close_fused = True
+            return normalized
         allreduce = last._mhc_fused_allreduce()
         if allreduce is None:
             return None
@@ -2418,8 +2470,8 @@ _V41_DROP_KEYS = ("image_start", "image_end", "image_newline")
 # Sub-trees whose `.weight`/`.scale` pair must NOT be dequantized:
 #   - routed experts are packed MXFP4 (int8 pairs + a ue8m0 scale per 32 lanes),
 #     consumed quantized by the MoE backend;
-#   - the engram table is 98 GiB of fp8 and stays fp8, row-sharded
-#     (`ShardedFp8MultiHeadEmbedding` dequantizes per lookup).
+#   - each engram table (98 GB of fp8, or half that as MXFP4) stays quantized and
+#     sharded (`ShardedFp8MultiHeadEmbedding` dequantizes per lookup).
 _V41_NO_DEQUANT = (".ffn.experts.", ".engram.embed.")
 
 _V41_FP8_BLOCK_SIZE = 32
@@ -3046,7 +3098,8 @@ class DeepseekV41WeightLoader(DeepseekV4WeightLoader):
       against its role before anything is dequantized, and a mismatch raises.
       V4.1 ships three different quantized layouts under one
       ``quantization_config`` (routed experts MXFP4 element block 1x32 stored
-      1x16, the Engram tables fp8 e4m3 1x32, everything else fp8 e4m3 32x32),
+      1x16, the Engram tables fp8 e4m3 1x32 or MXFP4 like the experts, everything
+      else fp8 e4m3 32x32),
       and ``weight_block_size`` in the config describes only the third.
     * **Census** -- ``consumed + deliberately_ignored`` must equal the number of
       tensors the checkpoint shipped, every ignored group with a name pattern and
@@ -3522,7 +3575,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
                 for e, t in zip(engrams, tables)
             }
             if len(geometry) != 1 or tables[0].dtype != torch.bfloat16:
-                reason = "the Engram tables are not equally shaped BF16-output FP8 head shards"
+                reason = "the Engram tables are not equally shaped BF16-output head shards"
         if reason is not None:
             logger.info(f"DeepSeek-V4.1 Engram ADP exchange off: {reason}")
             return

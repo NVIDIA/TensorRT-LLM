@@ -278,10 +278,11 @@ public:
     // Priority callback: (blockOrdinal, lifeCycleId) → Priority.
     using PriorityCb = std::function<Priority(BlockOrdinal, LifeCycleId)>;
 
-    KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
-        std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
-        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false,
-        std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt, bool isPrefetch = false);
+    KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<LocalityDomainId> localityDomainId,
+        std::optional<BlockRadixTree::ReuseMatch> reuseMatch, std::optional<RequestIdType> id, PriorityCb priorityCb,
+        std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
+        bool enableRequestStats = false, std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt,
+        bool isPrefetch = false);
 
     ~KvCache();
 
@@ -523,6 +524,11 @@ public:
     ReuseScope const& reuseScope() const noexcept
     {
         return mReuseScope;
+    }
+
+    std::optional<LocalityDomainId> localityDomainId() const noexcept
+    {
+        return mLocalityDomainId;
     }
 
     // Plan dropping SWA blocks needed only by the next conversation turn.
@@ -874,6 +880,7 @@ private:
 
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;
+    std::optional<LocalityDomainId> mLocalityDomainId;
     PriorityCb mPriorityCb;
     std::optional<executor::KvCacheRetentionConfig> mRetentionConfig;
     std::vector<executor::RetentionPriorityAndDuration> mPromptRetentions;

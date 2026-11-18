@@ -52,6 +52,7 @@ from .kernel import (
     map_selection_,
     mask_logits_,
     mask_packed_logits_,
+    paged_finalize_sorts,
 )
 from .metadata import CSA2IndexerGroup, CSA2TrtllmMetadata, block_select_batch, csa2_side_stream
 from .params import CSA2ForwardState, CSA2Layout, CSA2Mode, CSA2Params
@@ -70,6 +71,8 @@ _BATCHED_CANDIDATE_ALIGN = 128
 _BATCHED_CANDIDATE_KEYS = 4 << 20  # 4M
 # Candidate publications with at most this many query rows use the cluster radix TopK.
 _CANDIDATE_CLUSTER_TOPK_MAX_ROWS = 64
+# CTAs per row of the attention-TP chain's self-sampling GVR: one 4-CTA cluster.
+_GVR_ROW_CTAS = 4
 # The self-sampling GVR decode engine runs one CTA per row. On the candidate source, whose rows
 # are twice as long, larger decode batches select with the exact radix Top-K.
 _DECODE_GVR_SOURCE_MAX_ROWS = 256
@@ -90,6 +93,16 @@ def _aligned_candidate_blocks() -> bool:
 def _sparse_block(candidate_block_size: int) -> int:
     """DeepGEMM sparse MQA-logits block (16 or 8 positions) dividing the candidate blocks, or 0."""
     return next((block for block in (16, 8) if candidate_block_size % block == 0), 0)
+
+
+# (candidate source, decode rows, candidate columns) -> whether a consumer read the sparse logits
+# schedule there; False only while every consumer at that shape took the fused Reindex select.
+_SCHEDULE_NEEDED: dict = {}
+
+
+def _note_schedule_use(source: int, rows: int, width: int, needed: bool) -> None:
+    key = (int(source), int(rows), int(width))
+    _SCHEDULE_NEEDED[key] = bool(_SCHEDULE_NEEDED.get(key, False) or needed)
 
 
 def candidate_consumer_requirement(
@@ -258,11 +271,14 @@ class CSA2Indexer(Indexer):
         radix_aux_logits: Optional[torch.Tensor] = None,
         candidate: bool = False,
         gvr_prior_indices: Optional[torch.Tensor] = None,
+        gvr_pdl: bool = False,
+        gvr_r_cap: int = 0,
+        gvr_finalize: Optional[dict] = None,
     ) -> torch.Tensor:
         """Invoke the configured main TopK or the candidate-source block TopK.
 
         ``row_starts``/``row_ends`` default to the full score width; decode TopK
-        only consumes the row ends.
+        only consumes the row ends. ``gvr_*``: see ``TopK.forward``'s ``gvr_ext_kwargs``.
         """
         if scores.shape[0] == 0 or scores.shape[1] == 0:
             return output_indices.fill_(-1)
@@ -306,6 +322,16 @@ class CSA2Indexer(Indexer):
                     scores.contiguous(), (0, -scores.shape[1] % vector), value=-torch.inf
                 )
         if not is_prefill:
+            gvr_ext_kwargs = (
+                {"gvr_prior_indices": gvr_prior_indices} if selector.needs_gvr_prior else {}
+            )
+            if selector is self.top_k and selector.gvr_self_sampling:
+                if gvr_pdl:
+                    gvr_ext_kwargs["gvr_pdl"] = True
+                if gvr_r_cap:
+                    gvr_ext_kwargs["gvr_r_cap"] = gvr_r_cap
+                if gvr_finalize is not None:
+                    gvr_ext_kwargs["gvr_finalize"] = gvr_finalize
             return selector(
                 scores,
                 output_indices,
@@ -318,9 +344,7 @@ class CSA2Indexer(Indexer):
                 max_seq_len=scores.shape[1],
                 radix_aux_indices=radix_aux_indices,
                 radix_aux_logits=radix_aux_logits,
-                gvr_ext_kwargs={"gvr_prior_indices": gvr_prior_indices}
-                if selector.needs_gvr_prior
-                else None,
+                gvr_ext_kwargs=gvr_ext_kwargs or None,
             )
         return selector(
             scores, output_indices, is_prefill=True, row_starts=row_starts, row_ends=row_ends
@@ -617,6 +641,67 @@ class CSA2Indexer(Indexer):
         if state.block_max is not None:
             state.block_max[:count].masked_fill_(mask, torch.inf)
 
+    def _fused_reindex_applies(
+        self,
+        count: int,
+        sparse_indices: torch.Tensor,
+        logical_positions: torch.Tensor,
+        output_indices: torch.Tensor,
+    ) -> bool:
+        from .reindex_select import reindex_select_applies
+
+        width = sparse_indices.shape[1] * self.sparse_block
+        return bool(
+            self.top_k.decode_implementation == TopKImplementation.CUTE_DSL_RADIX
+            and output_indices.shape[1] == self.top_k.top_k
+            and self.sparse_block == 8
+            and output_indices.is_contiguous()
+            and logical_positions.is_contiguous()
+            and logical_positions.shape[1] >= width
+            and logical_positions.data_ptr() % 16 == 0
+            and sparse_indices.stride(1) == 1
+            and reindex_select_applies(count, width, output_indices.shape[1])
+        )
+
+    def _fused_reindex_select(
+        self,
+        q_data: torch.Tensor,
+        q_scale: torch.Tensor,
+        weights: torch.Tensor,
+        sparse_indices: torch.Tensor,
+        logical_positions: torch.Tensor,
+        output_indices: torch.Tensor,
+        valid_counts: torch.Tensor,
+        paged: tuple[torch.Tensor, ...],
+    ) -> bool:
+        """``_sparse_candidate_logits`` + ``_select_mapped_logits`` of the decode rows in one launch
+        (``reindex_select.py``) where it reproduces them bit for bit; returns whether it ran."""
+        from .reindex_select import reindex_select_
+
+        count = q_data.shape[0]
+        pages, block_table, _, row_requests, _ = paged
+        if not (
+            self._fused_reindex_applies(count, sparse_indices, logical_positions, output_indices)
+            and pages.dim() == 4
+            and pages.shape[1] == 64
+            and pages.stride(1) == 68
+            and pages.stride(3) == 1
+            and block_table.stride(1) == 1
+        ):
+            return False
+        return reindex_select_(
+            q_data.contiguous(),
+            q_scale.contiguous().view(torch.int32).reshape(count, self.n_heads),
+            weights.to(torch.bfloat16).contiguous(),
+            pages,
+            block_table,
+            row_requests,
+            sparse_indices,
+            valid_counts,
+            logical_positions,
+            output_indices,
+        )
+
     def _select_mapped_logits(
         self,
         logits: torch.Tensor,
@@ -687,16 +772,18 @@ class CSA2Indexer(Indexer):
         output_indices: torch.Tensor,
         gvr_prior_indices: Optional[torch.Tensor],
         after_mask: Optional[Callable[[], None]] = None,
+        masked: bool = False,
     ) -> torch.Tensor:
         """Decode selection over in-place paged logits, as the DSA decode indexer does.
 
         Column ``p`` of the paged logits is logical compressed position ``p``.
         Positions that are not visible or whose page is unallocated are masked
-        by one CuTe launch; with ``candidates`` the same launch gathers the
-        candidate columns instead. TopK runs over the masked scores, then one
-        CuTe launch validates, sorts and pads the selection with ``-1``. Without
-        candidates and with the CuTe DSL Top-K enabled, ``fused_decode_select_`` does
-        all three in one launch for small decode tiles.
+        by one CuTe launch (skipped when the logits launch ``masked`` them); with
+        ``candidates`` the same launch gathers the candidate columns instead. TopK
+        runs over the masked scores, then one CuTe launch validates, sorts and pads
+        the selection with ``-1``. Without candidates and with the CuTe DSL Top-K
+        enabled, ``fused_decode_select_`` does all three in one launch for small
+        decode tiles.
         """
         valid = metadata.csa2_indexer_valid_pages
         visible = metadata.csa2_indexer_visible_lengths
@@ -715,7 +802,19 @@ class CSA2Indexer(Indexer):
                 if after_mask is not None:
                     after_mask()
                 return fused_decode_select_(logits, valid, visible, output_indices, INDEX_PAGE_ROWS)
-            mask_logits_(logits, valid, row_lengths=visible)
+            tp_chain = self._tp_selection_chain(metadata)
+            gvr_chain = (
+                tp_chain
+                and gvr_prior_indices is None
+                and not self.top_k._gvr_emission_armed
+                and self._self_sampling_decode(logits.shape[0])
+            )
+            from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+
+            # The mask releases the Top-K behind it early only where that Top-K waits for it.
+            pdl = gvr_chain and get_env_enable_pdl()
+            if not masked:
+                mask_logits_(logits, valid, row_lengths=visible, pdl=pdl)
             if after_mask is not None:
                 after_mask()
             scores, positions, row_ends = logits, None, visible
@@ -730,6 +829,7 @@ class CSA2Indexer(Indexer):
                 )
                 gvr_prior_indices = torch.where(backed, gvr_prior_indices, -1)
         else:
+            tp_chain = gvr_chain = pdl = False
             scores = torch.empty(candidates.shape, dtype=torch.float32, device=logits.device)
             positions = torch.empty(candidates.shape, dtype=torch.int32, device=logits.device)
             gather_candidate_scores(logits, valid, candidates, visible, scores, positions)
@@ -740,6 +840,21 @@ class CSA2Indexer(Indexer):
             offsets = torch.arange(width, device=logits.device)
             holes = (offsets[None, :] < visible[:, None]) & ~valid[:, offsets // INDEX_PAGE_ROWS]
             self._invalidate_emission_holes(holes.any(dim=1))
+        fold = None
+        if (
+            gvr_chain
+            and paged_finalize_sorts(width)
+            and output_indices.shape[1] % 2 == 0
+            and output_indices.shape[1] <= 1024
+        ):
+            # The cluster GVR may run the finalize below in its launch (setting ``done``).
+            fold = {
+                "valid": valid,
+                "visible": visible,
+                "width": width,
+                "page": INDEX_PAGE_ROWS,
+                "done": False,
+            }
         self.select_prepared_scores(
             scores,
             output_indices,
@@ -749,11 +864,50 @@ class CSA2Indexer(Indexer):
             radix_aux_indices=metadata.csa2_indexer_radix_aux_indices,
             radix_aux_logits=metadata.csa2_indexer_radix_aux_logits,
             gvr_prior_indices=gvr_prior_indices,
+            gvr_pdl=pdl,
+            gvr_r_cap=_GVR_ROW_CTAS if gvr_chain else 0,
+            gvr_finalize=fold,
         )
+        if fold is not None and fold["done"]:
+            return output_indices
         if positions is None:
-            return finalize_selection_(output_indices, width, valid=valid, row_lengths=visible)
+            return finalize_selection_(
+                output_indices,
+                width,
+                valid=valid,
+                row_lengths=visible,
+                shuffle=tp_chain,
+            )
         return finalize_selection_(
             output_indices, positions.shape[1], scores=scores, positions=positions
+        )
+
+    @staticmethod
+    def _tp_selection_chain(metadata: CSA2TrtllmMetadata) -> bool:
+        from tensorrt_llm._utils import is_blackwell_datacenter
+
+        mapping = getattr(metadata, "mapping", None)
+        return mapping is not None and not mapping.enable_attention_dp and is_blackwell_datacenter()
+
+    def _self_sampling_decode(self, count: int) -> bool:
+        selector = self.top_k
+        return (
+            selector.decode_implementation == TopKImplementation.CUTE_DSL_GVR
+            and selector.gvr_self_sampling
+            and not (
+                count > _DECODE_GVR_SOURCE_MAX_ROWS
+                and self.layout.layer(self.layer_idx).candidate_source == self.layer_idx
+            )
+        )
+
+    def _deepgemm_page_mask(self, metadata: CSA2TrtllmMetadata) -> bool:
+        """Whether DeepGEMM's paged logits mask the unallocated pages instead of a mask launch."""
+        return (
+            self._tp_selection_chain(metadata)
+            and getattr(metadata, "csa2_indexer_masked_block_table", None) is not None
+            and self.n_heads <= 32
+            and not getattr(metadata, "csa2_indexer_split_heads", 0)
+            and not (self.options.use_cute_dsl_paged_mqa_logits and IS_CUTLASS_DSL_AVAILABLE)
         )
 
     def forward(self, state: CSA2ForwardState, query_start: int, count: int) -> torch.Tensor:
@@ -826,9 +980,12 @@ class CSA2Indexer(Indexer):
         q_data: torch.Tensor,
         weights: torch.Tensor,
         q_scale: torch.Tensor,
+        page_mask: bool = False,
         emission_kwargs: dict[str, torch.Tensor | int] | None = None,
         block_max: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # ``page_mask``: DeepGEMM writes -inf for the unallocated pages below each row's length (the
+        # flagged block table), as the mask launch would.
         # Existing native paged specializations support 32/64 heads. Zero
         # weighted padding extends smaller CSA2 index geometries exactly.
         use_dsl = self.options.use_cute_dsl_paged_mqa_logits and IS_CUTLASS_DSL_AVAILABLE
@@ -870,15 +1027,21 @@ class CSA2Indexer(Indexer):
                     metadata.csa2_indexer_visible_lengths if block_max is not None else None
                 ),
             )
+        table = (
+            metadata.csa2_indexer_masked_block_table
+            if page_mask
+            else metadata.csa2_indexer_block_table
+        )
         return self._call_paged_mqa_logits(
             q_data.view(requests, next_n, *q_data.shape[2:]),
             metadata.csa2_indexer_k_cache,
             weights,
             metadata.csa2_indexer_context_lengths.view(requests, next_n),
-            metadata.csa2_indexer_block_table.view(requests, next_n, -1)[:, 0],
+            table.view(requests, next_n, -1)[:, 0],
             metadata.csa2_indexer_scheduler_metadata,
             metadata.csa2_indexer_max_seq_len,
             q_scale.view(requests, next_n, -1),
+            page_mask=page_mask,
         )
 
     def _candidate_prefill_tile_size(self, candidate_width: int) -> int:
@@ -1143,8 +1306,23 @@ class CSA2Indexer(Indexer):
         )
         sparse_descriptors = None
         if paged is not None and candidates is not None:
-            # Sparse paged logits read the native index pages in place
-            sparse_descriptors = metadata.prepare_sparse_indexer(self.layer_idx, self.sparse_block)
+            # Sparse paged logits read the native index pages in place. The fused Reindex select
+            # reads no DeepGEMM schedule: it neither builds nor waits for one.
+            fused = self._fused_reindex_applies(
+                count - decode_start,
+                sparse_blocks[decode_start:],
+                candidates[decode_start:],
+                logical[decode_start:],
+            )
+            _note_schedule_use(
+                layer.candidate_source,
+                count - decode_start,
+                int(sparse_blocks.shape[1]) * self.sparse_block,
+                needed=not fused,
+            )
+            sparse_descriptors = metadata.prepare_sparse_indexer(
+                self.layer_idx, self.sparse_block, build=not fused
+            )
             if sparse_descriptors is None:
                 paged = None
         if candidates is None:
@@ -1193,7 +1371,18 @@ class CSA2Indexer(Indexer):
                 logical,
             )
         if paged is not None:
-            if candidates is not None:
+            if candidates is not None and self._fused_reindex_select(
+                q_fp8[decode_start:],
+                q_scale[decode_start:],
+                weights[decode_start:],
+                sparse_blocks[decode_start:],
+                candidates[decode_start:],
+                logical[decode_start:],
+                sparse_counts[decode_start:],
+                sparse_descriptors,
+            ):
+                pass
+            elif candidates is not None:
                 # Score only the published candidate blocks straight from the index pages
                 scores = self._sparse_candidate_logits(
                     q_fp8[decode_start:],
@@ -1229,7 +1418,8 @@ class CSA2Indexer(Indexer):
             # This forward's candidate consumers share one sparse logits schedule over the
             # candidates just published: build it on the side stream now, not in the first
             # consumer's chain.
-            metadata.prebuild_sparse_schedule(self.layer_idx, self.sparse_block)
+            if not self._sparse_schedule_unused(metadata):
+                metadata.prebuild_sparse_schedule(self.layer_idx, self.sparse_block)
         if prior is not None:
             metadata.publish_indexer_prior(self.layer_idx, logical)
         return logical
@@ -1257,6 +1447,16 @@ class CSA2Indexer(Indexer):
         stream while it projects, and its indexer then finds them current."""
         if self._native_decode(metadata, count)[1]:
             metadata.prepare_indexer(self.layer_idx, batch_queries=self._batch_paged_queries())
+
+    def _sparse_schedule_unused(self, metadata: CSA2TrtllmMetadata) -> bool:
+        """Whether every consumer recorded at this decode shape took the fused Reindex select."""
+        blocks = metadata.csa2_candidate_blocks.get(self.layer_idx)
+        table = getattr(metadata, "csa2_indexer_block_table", None)
+        if blocks is None or table is None:
+            return False
+        rows = int(table.shape[0])
+        width = int(blocks.shape[1]) * self.sparse_block
+        return _SCHEDULE_NEEDED.get((self.layer_idx, rows, width)) is False
 
     def _feeds_sparse_consumers(self) -> bool:
         """Whether this candidate source's consumers score its published blocks with the paged
@@ -1510,11 +1710,13 @@ class CSA2Indexer(Indexer):
                 torch.cuda.get_device_properties(q_data.device).multi_processor_count,
                 metadata.csa2_indexer_prior_capacity[self.layer_idx],
             )
+        page_mask = not emission_kwargs and self._deepgemm_page_mask(metadata)
         logits = self._paged_mqa_logits(
             metadata,
             q_data[decode_start:].unsqueeze(1),
             weights[decode_start:],
             decode_scale,
+            page_mask=page_mask,
             emission_kwargs=emission_kwargs,
             block_max=block_max,
         )
@@ -1566,7 +1768,13 @@ class CSA2Indexer(Indexer):
                 )
 
         self._select_paged_logits(
-            metadata, logits, None, output[decode_start:], prior, after_mask=after_mask
+            metadata,
+            logits,
+            None,
+            output[decode_start:],
+            prior,
+            after_mask=after_mask,
+            masked=page_mask,
         )
 
     def _publish_on_side_stream(self, metadata, run, tensors) -> None:
