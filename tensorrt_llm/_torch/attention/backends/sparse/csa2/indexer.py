@@ -401,7 +401,7 @@ class CSA2Indexer(Indexer):
         if torch.cuda.is_current_stream_capturing():
             return get_mqa_logits_metadata(row_starts, row_ends, group.keys, heads)
         groups = metadata.csa2_indexer_groups
-        cached = metadata.__dict__.get("_csa2_packed_group_schedules")
+        cached = getattr(metadata, "_csa2_packed_group_schedules", None)
         if cached is None or cached[0] is not groups:
             cached = metadata._csa2_packed_group_schedules = (groups, {})
         key = (kv_source, group.lo, group.hi, visible.data_ptr(), visible.shape[0])
@@ -1257,7 +1257,7 @@ class CSA2Indexer(Indexer):
         request, an empty prefix or non-contiguous rows. Built once per prepare and sparse block.
         """
         prefixes = metadata.csa2_indexer_prefixes
-        cached = metadata.__dict__.get("_csa2_batched_candidate_plans")
+        cached = getattr(metadata, "_csa2_batched_candidate_plans", None)
         if cached is None or cached[0] is not prefixes:
             cached = metadata._csa2_batched_candidate_plans = (prefixes, {})
         plans = cached[1]

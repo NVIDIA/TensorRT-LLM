@@ -141,6 +141,7 @@ def build_feature_attention_metadata(
         UnsupportedMetadataConfiguration: The configuration is outside what the
             feature-split metadata cover.
     """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4TrtllmAttention
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
     from tensorrt_llm._torch.attention.metadata.base import (
@@ -150,6 +151,7 @@ def build_feature_attention_metadata(
     from tensorrt_llm._torch.attention.metadata.batch_inputs import BatchInputs
     from tensorrt_llm._torch.attention.metadata.chunked_prefill import ChunkedPrefillMetadata
     from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
+    from tensorrt_llm._torch.attention.metadata.csa2 import CSA2CoreMetadata, CSA2Metadata
     from tensorrt_llm._torch.attention.metadata.deepseek_v4 import DeepseekV4Metadata
     from tensorrt_llm._torch.attention.metadata.draft import (
         EmbeddedDSparkDraftMetadata,
@@ -163,11 +165,16 @@ def build_feature_attention_metadata(
     from tensorrt_llm._torch.metadata import KVCacheParams
 
     is_deepseek_v4 = issubclass(attention_backend, DeepseekV4TrtllmAttention)
+    is_csa2 = issubclass(attention_backend, CSA2TrtllmAttention)
     # A backend with metadata of its own keeps state the feature metadata do not carry.
-    if not is_deepseek_v4 and attention_backend.Metadata is not TrtllmAttentionMetadata:
+    if (
+        not is_deepseek_v4
+        and not is_csa2
+        and attention_backend.Metadata is not TrtllmAttentionMetadata
+    ):
         raise UnsupportedMetadataConfiguration(
-            f"the attention backend {attention_backend.__name__} (only TrtllmAttention "
-            "and DeepSeek-V4 are covered)"
+            f"the attention backend {attention_backend.__name__} (only TrtllmAttention, "
+            "DeepSeek-V4 and CSA2 are covered)"
         )
     if model_config.is_generation is False or getattr(
         model_config.pretrained_config, "is_encoder_decoder", False
@@ -180,8 +187,9 @@ def build_feature_attention_metadata(
     if model_config.enable_flash_mla:
         raise UnsupportedMetadataConfiguration("FlashMLA")
 
-    model_is_mla = is_mla(model_config.pretrained_config)
-    metadata_types = [TrtllmCoreMetadata, SpecDecodingMetadata]
+    # CSA2 attends over its own staged selections and reads no MLA context tables.
+    model_is_mla = is_mla(model_config.pretrained_config) and not is_csa2
+    metadata_types = [CSA2CoreMetadata if is_csa2 else TrtllmCoreMetadata, SpecDecodingMetadata]
     enable_context_mla_with_cached_kv = model_is_mla and (
         attention_runtime_features.cache_reuse or attention_runtime_features.chunked_prefill
     )
@@ -189,8 +197,13 @@ def build_feature_attention_metadata(
         metadata_types.append(MlaContextMetadata)
         if attention_runtime_features.chunked_prefill:
             metadata_types.append(ChunkedPrefillMetadata)
-    # DeepSeek-V4's sparse metadata stands in for the dense one.
-    metadata_types.append(DeepseekV4Metadata if is_deepseek_v4 else SparseMetadata)
+    # A sparse algorithm's metadata stands in for the dense one.
+    if is_deepseek_v4:
+        metadata_types.append(DeepseekV4Metadata)
+    elif is_csa2:
+        metadata_types.append(CSA2Metadata)
+    else:
+        metadata_types.append(SparseMetadata)
     max_draft_tokens = 0
     if spec_config is not None:
         spec_dec_mode = spec_config.spec_dec_mode

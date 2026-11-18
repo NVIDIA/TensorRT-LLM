@@ -2855,6 +2855,25 @@ class DecoderInputPreparer:
         host.num_cached_tokens_snapshot = num_cached_tokens_snapshot
         host.remote_tail_modes = remote_tail_modes
 
+    def _backend_step_inputs(
+        self, attn_metadata: TrtllmCoreMetadata, scheduled_requests: ScheduledRequests
+    ) -> Any:
+        """The step inputs that only the attention backend of this metadata reads, or None."""
+        from tensorrt_llm._torch.attention.metadata.base import UnsupportedMetadataConfiguration
+        from tensorrt_llm._torch.attention.metadata.csa2 import CSA2CoreMetadata, CSA2StepInputs
+
+        if not isinstance(attn_metadata, CSA2CoreMetadata):
+            return None
+        if any(
+            getattr(request, "py_csa2_remote_tail_mode", None) is not None
+            for request in scheduled_requests.context_requests
+        ):
+            raise UnsupportedMetadataConfiguration("CSA2 remote-tail replay")
+        return CSA2StepInputs(
+            context_requests=tuple(scheduled_requests.context_requests),
+            allow_final_window=self.replays_final_windows_only(),
+        )
+
     def _prepare_feature_metadata(
         self,
         host: HostInputs,
@@ -2913,6 +2932,7 @@ class DecoderInputPreparer:
             ),
             spec=spec,
             trtllm_gen_jit_warmup=self.trtllm_gen_jit_warmup,
+            backend_inputs=self._backend_step_inputs(attn_metadata, scheduled_requests),
         )
         attn_metadata.padded_num_tokens = None
         attn_metadata.prepare_all(inputs)
