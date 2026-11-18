@@ -121,14 +121,16 @@ class EmbedsPrompt(TypedDict):
 
     prompt_embeds: torch.Tensor
     """``[L, hidden_size]`` input embeddings, one row per prompt position. See
-    ``TokensPrompt.prompt_embeds`` for the contract."""
+    ``TokensPrompt.prompt_embeds`` for the contract. ``LLM.generate`` accepts
+    this dict wherever it accepts a ``TokensPrompt``."""
 
 
-PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt, EmbedsPrompt]
+PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt]
 
 
 def prompt_inputs(
-    inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt, EmbedsPrompt]:
+    inputs: Union[PromptInputs, EmbedsPrompt],
+) -> Union[TextPrompt, TokensPrompt, EmbedsPrompt]:
     if isinstance(inputs, str):
         prompt_inputs = TextPrompt(prompt=inputs)
     elif isinstance(inputs, list):

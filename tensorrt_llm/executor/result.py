@@ -1251,9 +1251,12 @@ class GenerationResult(GenerationResultBase):
         if isinstance(response, EngineDeadError):
             self._terminal_error = response
             self._done = True
+            self._release_prompt_embeds()
             raise response
-        self._handle_response(response)
-        self._release_prompt_embeds()
+        try:
+            self._handle_response(response)
+        finally:
+            self._release_prompt_embeds()
 
     def _release_prompt_embeds(self) -> None:
         """Drop the client copy of prompt-embedding rows once the request is done.
@@ -1274,9 +1277,12 @@ class GenerationResult(GenerationResultBase):
         if isinstance(response, EngineDeadError):
             self._terminal_error = response
             self._done = True
+            self._release_prompt_embeds()
             raise response
-        self._handle_response(response)
-        self._release_prompt_embeds()
+        try:
+            self._handle_response(response)
+        finally:
+            self._release_prompt_embeds()
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         """Wait for the completion of the request, and return the result.

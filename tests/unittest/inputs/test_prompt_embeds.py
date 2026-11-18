@@ -131,14 +131,12 @@ def test_chunk_rows_cover_every_position_once(chunk: int) -> None:
     assert [p for p in range(10) if pe.covers(p)] == [1, 2, 4, 7, 8, 9]
 
 
-def test_identity_only_and_dtype_cast() -> None:
+def test_identity_only() -> None:
     _, pe = build_prompt_embeds([1, 2], _rows(2, torch.float32))
     ident = pe.identity_only()
     assert ident.embeds is None
     assert ident.digest == pe.digest
-    cast = pe.to_dtype(torch.bfloat16)
-    assert cast.embeds.dtype == torch.bfloat16
-    assert cast.digest == pe.digest
+    assert torch.equal(ident.positions, pe.positions)
 
 
 def test_pickle_round_trip() -> None:

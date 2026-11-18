@@ -75,17 +75,6 @@ class PromptEmbeds:
             embeds=None, positions=self.positions, hidden_size=self.hidden_size, digest=self.digest
         )
 
-    def to_dtype(self, dtype: torch.dtype) -> "PromptEmbeds":
-        """Return a copy whose rows are cast to ``dtype``; the identity is unchanged."""
-        if self.embeds is None or self.embeds.dtype == dtype:
-            return self
-        return PromptEmbeds(
-            embeds=self.embeds.to(dtype).contiguous(),
-            positions=self.positions,
-            hidden_size=self.hidden_size,
-            digest=self.digest,
-        )
-
 
 def _digest(embeds: torch.Tensor, positions: torch.Tensor) -> str:
     """Hash the canonical identity of an owned embedding snapshot."""

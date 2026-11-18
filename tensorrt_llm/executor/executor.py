@@ -143,6 +143,11 @@ class GenerationExecutor(ABC):
 
         ``prompt_adapter_request`` is deprecated. Prompt adapters are unsupported;
         omit this argument or pass None.
+
+        ``prompt_embeds`` must come from
+        ``tensorrt_llm.inputs.prompt_embeds.build_prompt_embeds`` and is owned
+        by the request from here on: its digest is trusted as the KV cache
+        identity, so the caller must not modify its tensors.
         """
         assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
             prompt_token_ids[0], int)
