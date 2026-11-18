@@ -129,6 +129,24 @@ def test_body_holds_only_partial_terminators() -> None:
     assert parser.finish().content == ""
 
 
+@pytest.mark.parametrize("long_header", [False, True])
+def test_delimiter_heavy_reply(long_header: bool) -> None:
+    if long_header:
+        text = "<|channel|>final" + "<|constrain|>json" * 4096
+        text += "<|message|>answer<|return|>ignored"
+        expected = ("answer", "")
+    else:
+        cycle = (
+            "<|channel|>analysis<|message|>think<|end|>"
+            "<|channel|>final<|message|>answer<|channel|>literal<|end|>"
+        )
+        text = cycle * 4096 + "<|return|>ignored"
+        expected = ("answer<|channel|>literal" * 4096, "think" * 4096)
+    result = BeamHarmonyTextParser().parse(text)
+    assert (result.content, result.reasoning_content) == expected
+    assert _stream(text, [text[i : i + 257] for i in range(0, len(text), 257)]) == expected
+
+
 def test_parse_is_self_contained_and_repeatable():
     text, content, reasoning = REPLIES["analysis_then_final"]
     parser = BeamHarmonyTextParser()

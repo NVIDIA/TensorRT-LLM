@@ -15,6 +15,7 @@
 
 import importlib
 import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import KeysView
 from dataclasses import dataclass
@@ -1405,6 +1406,9 @@ _BEAM_CONSTRAIN, _BEAM_RETURN, _BEAM_CALL = ("<|constrain|>", "<|return|>",
 _BEAM_TAGS = (_BEAM_START, _BEAM_END, _BEAM_MESSAGE, _BEAM_CHANNEL,
               _BEAM_CONSTRAIN, _BEAM_RETURN, _BEAM_CALL)
 _BEAM_BODY_TERMINATORS = (_BEAM_END, _BEAM_RETURN, _BEAM_CALL)
+_BEAM_TAG_PATTERN = re.compile("|".join(map(re.escape, _BEAM_TAGS)))
+_BEAM_BODY_PATTERN = re.compile("|".join(map(re.escape,
+                                             _BEAM_BODY_TERMINATORS)))
 _BEAM_ANALYSIS, _BEAM_FINAL = "analysis", "final"
 
 
@@ -1449,7 +1453,7 @@ class BeamHarmonyTextParser(BaseReasoningParser):
         # <|return|> or <|call|>.
         self._state = "header"
         self._channel: Optional[str] = None
-        self._header = ""
+        self._header: list[str] = []
         self._buffer = ""
         self._saw_header = False
 
@@ -1466,25 +1470,29 @@ class BeamHarmonyTextParser(BaseReasoningParser):
         out = ([], [])
         data = self._buffer + text
         self._buffer = ""
-        while data:
-            if self._state == "done":
-                data = ""
-                break
-            markers = _BEAM_BODY_TERMINATORS if self._state == "body" else _BEAM_TAGS
-            hits = [(data.find(t), t) for t in markers if t in data]
-            pos, tag = min(hits) if hits else (-1, None)
-            if tag is None:
-                hold = _trailing_partial_marker(data, *markers)
-                chunk = data[:len(data) - hold]
-                self._buffer = data[len(data) - hold:]
-                data = ""
+        cursor = 0
+        while cursor < len(data) and self._state != "done":
+            in_body = self._state == "body"
+            markers = _BEAM_BODY_TERMINATORS if in_body else _BEAM_TAGS
+            pattern = _BEAM_BODY_PATTERN if in_body else _BEAM_TAG_PATTERN
+            # Search forward without rescanning or copying the unconsumed suffix.
+            match = pattern.search(data, cursor)
+            if match is None:
+                tail = data[cursor:]
+                hold = _trailing_partial_marker(tail, *markers)
+                chunk = tail[:len(tail) - hold]
+                self._buffer = tail[len(tail) - hold:]
+                tag = None
             else:
-                chunk, data = data[:pos], data[pos + len(tag):]
+                chunk = data[cursor:match.start()]
+                cursor = match.end()
+                tag = match.group()
             if self._state == "body":
                 self._emit(chunk, out)
             elif self._state == "header":
                 if self._header or self._saw_header:
-                    self._header += chunk
+                    if chunk:
+                        self._header.append(chunk)
                 else:
                     # Text before any header: a reply without channels is
                     # final text.
@@ -1492,17 +1500,17 @@ class BeamHarmonyTextParser(BaseReasoningParser):
             if tag is None:
                 break
             if tag == _BEAM_CHANNEL:
-                self._state, self._header, self._saw_header = "header", "", True
+                self._state, self._header, self._saw_header = "header", [], True
             elif tag == _BEAM_MESSAGE:
                 if self._state == "header":
-                    self._channel = self._header.split(
+                    self._channel = "".join(self._header).split(
                         _BEAM_CONSTRAIN)[0].strip().split(" ")[0] or None
-                    self._header = ""
+                    self._header = []
                 self._state = "body"
             elif tag == _BEAM_CONSTRAIN:
-                self._header += _BEAM_CONSTRAIN
+                self._header.append(_BEAM_CONSTRAIN)
             elif tag in (_BEAM_END, _BEAM_START):
-                self._state, self._channel, self._header = "between", None, ""
+                self._state, self._channel, self._header = "between", None, []
             elif tag in (_BEAM_RETURN, _BEAM_CALL):
                 self._state, self._channel = "done", None
         return ReasoningParserResult(content="".join(out[0]),
