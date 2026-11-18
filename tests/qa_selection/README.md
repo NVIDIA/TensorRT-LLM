@@ -116,12 +116,13 @@ qa_selection/
 ## Tests
 
 ```bash
-pytest tests/qa_selection/tests      # 27 tests, no wheel
+pytest tests/qa_selection/tests      # 34 tests, no wheel
 ```
 
 The tests are the plugin's contracts with its callers: the options and files the QA pipeline's
 collect step uses, the marks it reads as the integration conftest reads them, and L0 never loading
-it. Each test states a command line and the answer expected back.
+it. Most tests state a command line and the answer expected back; the SM120-family regression
+checks the selection rule directly.
 [`test_local_machine.py`](tests/test_local_machine.py) needs `nvidia-smi` and
 [`test_unprobed_host.py`](tests/test_unprobed_host.py) a host without it; run the suite in a
 `docker --gpus all` and a `docker --runtime=runc` container to cover both.
@@ -129,7 +130,7 @@ it. Each test states a command line and the answer expected back.
 | contract | criteria |
 |---|---|
 | Only `-p qa_selection.plugin` loads the plugin; the integration `pytest.ini` does not | [`test_integration_ini.py`](tests/test_integration_ini.py) (1) |
-| A named machine is decided from its catalogue profile, never the collecting host: its architecture, wherever the mark sits | [`test_arch.py`](tests/test_arch.py) (6) |
+| A named machine is decided from its catalogue profile, never the collecting host: its architecture, wherever the mark sits; the SM120-family rule keeps SM121 | [`test_arch.py`](tests/test_arch.py) (13) |
 | A test's GPU count is its markers, read as the integration conftest reads them | [`test_gpu_count.py`](tests/test_gpu_count.py) (4) |
 | Each kept test is on its smallest rung, in the record and in exactly one list; a test above the largest rung is deselected with its reason | [`test_ladder.py`](tests/test_ladder.py) (3), [`test_largest_rung.py`](tests/test_largest_rung.py) (1) |
 | The catalogue is the five cluster machines; without `--ladder`, a run uses the profile's ladder, and the record carries the profile | [`test_profiles.py`](tests/test_profiles.py) (8) |

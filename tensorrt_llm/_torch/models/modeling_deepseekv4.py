@@ -48,7 +48,7 @@ from transformers import PretrainedConfig
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f, is_sm_120f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1708,10 +1708,18 @@ def full_tp_shared_expert_forward(
     x: torch.Tensor, weights, swiglu_limit: Optional[float]
 ) -> torch.Tensor:
     """One rank's piece of the shared expert: its unscaled share of the TP all-reduce's sum."""
-    from ..modules.low_m_gemm import mxfp8_lowm_linear
+    from ..modules.low_m_gemm import mxfp8_lowm_linear, swiglu_out_supported
     from ..modules.swiglu import swiglu
 
     w13, s13, w2, s2 = weights
+    if is_blackwell_datacenter() and swiglu_out_supported(
+        x.shape[0], x.shape[1], w13, swiglu_limit
+    ):
+        # Releases the down GEMM only after x's producer completed (no SwiGLU launch in between).
+        hidden = mxfp8_lowm_linear(
+            x, w13, s13, swiglu_out_limit=swiglu_limit, release_after_wait=True
+        )
+        return mxfp8_lowm_linear(hidden, w2, s2)
     gate_up = mxfp8_lowm_linear(x, w13, s13)
     return mxfp8_lowm_linear(swiglu(gate_up, swiglu_limit=swiglu_limit), w2, s2)
 

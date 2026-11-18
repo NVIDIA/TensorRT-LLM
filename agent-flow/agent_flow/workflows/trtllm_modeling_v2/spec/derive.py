@@ -34,7 +34,6 @@ import yaml
 from ..operators import tree_anchors
 from .schema_keys import reject_unknown_keys
 from .task_schema import (
-    DEFAULT_PERF_CONCURRENCY,
     DISAGG_FEATURE,
     DISAGG_KEYS,
     FEATURE_FAMILIES,
@@ -44,7 +43,6 @@ from .task_schema import (
     PROFILE_STANDARD,
     PROFILES,
     SPECULATORS,
-    parse_parallel_segment,
 )
 
 #: The derived spec and its report, in the workspace.
@@ -110,14 +108,12 @@ SITE_KEYS = (
     "trtllm_repo_path",
     "environment",
     "agents",
-    "perf",
     "commit_policy",
     # The cluster's devices, and what a derived spec takes when its goal is silent.
     "device",
     "defaults",
 )
 SITE_DEVICE_KEYS = ("arch", "gpus_per_node", "nodes")
-SITE_PERF_KEYS = ("spools", "dev_spools", "env_script")
 SITE_DEFAULTS_KEYS = ("members", "workload", "accuracy", "boot", "disagg", "profile")
 #: ``reference`` (how the anchor was measured) is the operator's record; nothing reads it.
 SITE_ACCURACY_KEYS = ("benchmark", "protocol", "reference", "reference_yaml", "model_key")
@@ -171,7 +167,6 @@ class Goal:
     params: dict[str, Any] = field(default_factory=dict)
     accuracy: dict[str, str] = field(default_factory=dict)
     arch: str | None = None
-    tune: bool = False
 
 
 def parse_goal(text: str | None) -> Goal:
@@ -185,9 +180,6 @@ def parse_goal(text: str | None) -> Goal:
             _key_value(goal, word, errors)
             continue
         lowered = word.lower()
-        if lowered == "tune":
-            goal.tune = True
-            continue
         if PARALLEL_PATTERN.match(lowered):
             goal.members.append(lowered)
             continue
@@ -358,7 +350,7 @@ def validate_site(site: Any) -> list[str]:
     for key in ("trtllm_repo_path", "environment"):
         if not site.get(key):
             errors.append(f"site.yaml: '{key}' is required")
-    for key, keys in (("device", SITE_DEVICE_KEYS), ("perf", SITE_PERF_KEYS)):
+    for key, keys in (("device", SITE_DEVICE_KEYS),):
         block = site.get(key)
         if block is not None and not isinstance(block, Mapping):
             errors.append(f"site.yaml: '{key}' must be a mapping")
@@ -464,17 +456,13 @@ def derive_spec(
         if key not in goal.workload and key != "max_batch_size":
             note(f"workload.{key}", value, source)
     workload.update(goal.workload)
-    if goal.tune and not workload.get("concurrency"):
-        workload["concurrency"] = note(
-            "workload.concurrency", list(DEFAULT_PERF_CONCURRENCY), "default"
-        )
     concurrency = workload.get("concurrency") or []
     max_seq_len = workload.get("max_seq_len") or (
         workload["isl"] + workload["osl"] if "isl" in workload and "osl" in workload else None
     )
     max_batch_size = workload.get("max_batch_size") or (max(concurrency) if concurrency else None)
     if concurrency and "max_batch_size" not in goal.workload:
-        # A default batch below the goal's concurrency would queue the perf points it names.
+        # A default batch below the goal's concurrency would queue the requests it names.
         max_batch_size = max(int(max_batch_size or 0), max(concurrency))
     if max_batch_size and "max_batch_size" not in goal.workload:
         # The value the spec carries, not the default it was raised from.
@@ -649,16 +637,6 @@ def derive_spec(
     # The chunk size is the chunked variant's, not core's.
     params = {k: v for k, v in goal.params.items() if not (chunked and k == "chunk_tokens")}
     options = _llm_api_options(runtime, built, kv_dtype, params, snapshot, max_batch_size)
-    if goal.tune:
-        draft = options[built[-1]].get("speculative_config") if built else None
-        spec["perf"] = _perf(site, workload, members, draft)
-        adp = [c["name"] for c in spec["perf"]["configs"] if c["name"].startswith("dep")]
-        if adp:
-            note(
-                f"perf ({', '.join(adp)})",
-                "the high concurrency point, a global total across the attention-DP ranks",
-                "default",
-            )
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     derived = {
         "checkpoint": str(checkpoint),
@@ -842,51 +820,6 @@ def _disagg(
     return block
 
 
-def member_options(member: str) -> dict[str, Any]:
-    """The LLM-API parallelism one member (``tp4``, ``tep4``, ``dep4``) serves at."""
-    match = PARALLEL_PATTERN.match(str(member))
-    if match is None:
-        return {}
-    kind, world = match.group(1), int(match.group(2))
-    options: dict[str, Any] = {"tensor_parallel_size": world}
-    if kind in ("tep", "dep"):
-        options["moe_expert_parallel_size"] = world
-    if kind == "dep":
-        options["enable_attention_dp"] = True
-    return options
-
-
-def _perf(
-    site: Mapping[str, Any],
-    workload: Mapping[str, Any],
-    members: list[str],
-    draft: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    """The tune stage's block: one config per member at the run's workload, with the speculator."""
-    shared = {
-        "isl": workload.get("isl", 1024),
-        "osl": workload.get("osl", 1024),
-        "concurrency": workload.get("concurrency") or list(DEFAULT_PERF_CONCURRENCY),
-    }
-    configs = []
-    for member in members:
-        options = member_options(member)
-        if draft:
-            options["speculative_config"] = dict(draft)
-        load = dict(shared)
-        kind, _ = parse_parallel_segment(member)
-        if kind == "dep":
-            # Attention DP serves throughput: only its high point. A concurrency (and a batch
-            # size) is always the global total; each rank serves its share of it.
-            load["concurrency"] = [max(shared["concurrency"])]
-        configs.append({"name": member, "workload": load, "llm_api_options": options})
-    return {
-        "enabled": True,
-        **dict(site.get("perf") or {}),
-        "configs": configs,
-    }
-
-
 def render_report(derivation: Derivation, spec_path: Path) -> str:
     """``derive.report.md``: what was read, what was defaulted, and what is still open."""
     derived = derivation.derived
@@ -994,7 +927,6 @@ __all__ = [
     "derive_spec",
     "draft_layers",
     "inspect_checkpoint",
-    "member_options",
     "parse_goal",
     "read_config",
     "render_report",
