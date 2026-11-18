@@ -238,11 +238,14 @@ _FUSED_MOE_ACT_SWIGLU = 5
 # `M_k[RMSNorm(h); RMSNorm(e)]`; a flip is silent, only the draft acceptance rate shows it.
 _MTP_EMBED_BLOCK_FIRST = True
 
-# The MoE runner's certified token columns stop at 8192. Under attention DP the gathered set
-# reaches world * max_num_tokens, so the expert call is chunked; every token is independent
-# through routing, quantization and the expert GEMMs, so the chunks re-joined are the whole
-# call.
-_MOE_MAX_T = 8192
+# The widest MoE runner call: at this geometry the runner is certified up to the rows a rank
+# receives at dep32 (32 ranks sending 8192 each), bitwise equal to the same rows run 8192 at
+# a time. Under attention DP the gathered set reaches world * max_num_tokens, so a wider
+# call is chunked; every token is independent through routing, quantization and the expert
+# GEMMs, so the chunks re-joined are the whole call.
+_MOE_MAX_T = 32 * 8192
+# The MTP layer's bf16 `fused_moe` is certified to 8192 rows a call.
+_MTP_MAX_T = 8192
 
 
 def _moe_alltoall(mapping) -> bool:
@@ -865,13 +868,13 @@ def _trunk_runner(
 
 
 def _received_in_runner_calls(
-    run: Callable[..., torch.Tensor], out: torch.Tensor, *received: torch.Tensor
+    run: Callable[..., torch.Tensor], cap: int, out: torch.Tensor, *received: torch.Tensor
 ) -> torch.Tensor:
-    """`run` over the rows an alltoall dispatch received, at most `_MOE_MAX_T` rows a call,
+    """`run` over the rows an alltoall dispatch received, at most `cap` rows a call,
     each call writing its rows of `out`, the combine's rows in the communicator's workspace
     (`moe_alltoall_combine_rows`). Every received row is independent."""
-    for s in range(0, received[0].shape[0], _MOE_MAX_T):
-        run(*(t[s : s + _MOE_MAX_T] for t in received), out=out[s : s + _MOE_MAX_T])
+    for s in range(0, received[0].shape[0], cap):
+        run(*(t[s : s + cap] for t in received), out=out[s : s + cap])
     return out
 
 
@@ -925,7 +928,9 @@ def _experts_alltoall(
         run = functools.partial(_trunk_runner, core, L)
         rows = moe_alltoall_combine_rows(a2a, max(sizes), chunk.shape[1])
         outs.append(
-            moe_alltoall_combine(a2a, _received_in_runner_calls(run, rows, rq, rsf, rids, rw))
+            moe_alltoall_combine(
+                a2a, _received_in_runner_calls(run, _MOE_MAX_T, rows, rq, rsf, rids, rw)
+            )
         )
     if L.eplb is not None:
         L.eplb.close()
@@ -1023,7 +1028,7 @@ def _mtp_experts(
     tokens: Rows | None = None,
 ) -> torch.Tensor:
     """Route and run this rank's bf16 MTP experts -- its expert slots at its moe_tp slice
-    of the intermediate -- over `x`, at most `_MOE_MAX_T` rows a call. The result is this
+    of the intermediate -- over `x`, at most `_MTP_MAX_T` rows a call. The result is this
     rank's partial sum, the trunk's `_experts` at a different dtype, and under EPLB routed
     to slots the same way. It runs once per draft step, so under online EPLB the layer
     goes back to the balancer after the last of them, in `close_draft_eplb`, not here.
@@ -1037,7 +1042,7 @@ def _mtp_experts(
     FC2 bias, and there is none: the moe_tp split is in the weights' shapes alone."""
     cfg = core.model_config.pretrained_config
     parts = []
-    for k, chunk in enumerate(torch.split(x, _MOE_MAX_T, 0)):
+    for k, chunk in enumerate(torch.split(x, _MTP_MAX_T, 0)):
         topk_w, topk_ids = noaux_tc_op(
             cublas_mm(chunk, M.router, None, torch.float32),
             M.router_bias,
@@ -1047,7 +1052,7 @@ def _mtp_experts(
             float(cfg.routed_scaling_factor),
         )
         if M.eplb is not None:
-            start = k * _MOE_MAX_T
+            start = k * _MTP_MAX_T
             topk_ids = M.eplb.route(topk_ids, rows_within(tokens, start, start + chunk.shape[0]))
         parts.append(_mtp_runner(core, M, chunk, topk_ids, topk_w))
     return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
@@ -1135,7 +1140,11 @@ def _mtp_experts_alltoall(
             M.eplb.gathered(moe_alltoall_gathered_statistic(a2a))
         run = functools.partial(_mtp_runner, core, M, alltoall=True, tuner_num_tokens=sum(sizes))
         rows = moe_alltoall_combine_rows(a2a, max(sizes), chunk.shape[1])
-        outs.append(moe_alltoall_combine(a2a, _received_in_runner_calls(run, rows, rx, rids, rw)))
+        outs.append(
+            moe_alltoall_combine(
+                a2a, _received_in_runner_calls(run, _MTP_MAX_T, rows, rx, rids, rw)
+            )
+        )
     return outs[0] if len(outs) == 1 else torch.cat(outs, 0)
 
 
