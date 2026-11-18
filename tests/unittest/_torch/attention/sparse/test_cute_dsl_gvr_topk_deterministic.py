@@ -23,6 +23,10 @@ skip_not_supported = pytest.mark.skipif(
     not torch.cuda.is_available() or get_sm_version() not in ss.SUPPORTED_SM_VERSIONS,
     reason="self-sampling GVR kernels target sm_90a, sm_100a and sm_103a",
 )
+skip_not_sm100 = pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason=f"CuTe DSL GVR Top-K only supports SM 100/103, got SM {get_sm_version()}",
+)
 
 # (batch, n, k): one shape per kernel family (reg, reg_clus, clus, main R=1, main SPLIT)
 _SHAPES = [

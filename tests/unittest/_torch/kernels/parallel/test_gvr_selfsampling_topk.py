@@ -4281,9 +4281,12 @@ def test_selfsampling_topk_varlen_16bit_row_window_edges(
     get_compiled_reg = device.get_compiled__reg
     windows = []
 
-    def record_window(*args: object, **kwargs: object) -> object:
-        windows.append(_device_row_window(*args[0][:2], kwargs.get("clus", 1)))
-        return get_compiled_reg(*args, **kwargs)
+    def record_window(config: tuple[int, ...], *args: object, **kwargs: object) -> object:
+        blk, vpt = config[:2]
+        clus = kwargs.get("clus", 1)
+        assert isinstance(clus, int)
+        windows.append(_device_row_window(blk, vpt, clus))
+        return get_compiled_reg(config, *args, **kwargs)
 
     monkeypatch.setattr(device, "get_compiled__reg", record_window)
     logits, kv_lens, lengths = _make_low_varlen_case(
