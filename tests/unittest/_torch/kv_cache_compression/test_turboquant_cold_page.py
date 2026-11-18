@@ -422,6 +422,7 @@ def test_mla_latent_with_a_lossless_auxiliary_buffer(bits):
     ),
 )
 def test_skip_rope_quantization_keeps_rope_bytes(pretrained_config, roles, head_dim, rope):
+    pretrained_config = dict(pretrained_config)  # pytest passes the same dict to every rerun
     model_type = pretrained_config.pop("model_type")
     config = PretrainedConfig(hidden_size=2048, num_attention_heads=8, **pretrained_config)
     config.model_type = model_type
@@ -537,8 +538,15 @@ def test_partial_page_garbage_does_not_leak_into_valid_tokens(bits):
     codec = _kv_codec(_provider(bits))
     generator = torch.Generator(device="cuda").manual_seed(12)
     values = {key: _vectors("outlier_channels", (4, 2, 32, 128), generator) for key in codec.hot}
-    for value in values.values():  # tokens 20..31 of every Page were never written
-        value[:, :, 20:24] = float("nan")
+    zero_tail = {}
+    for key, value in values.items():  # tokens 20..31 of every Page were never written
+        zero_tail[key] = value.clone()
+        zero_tail[key][:, :, 20:] = 0.0
+        value[:, :, 20:22] = float("nan")
+        # One NaN among zeros, in an outlier channel: the row's largest magnitude is still finite.
+        value[:, :, 22:24] = 0.0
+        value[:, :, 22, 3] = float("nan")
+        value[:, :, 23, 71] = float("nan")
         value[:, :, 24:28] = float("inf")
         value[:, :, 28:] = 0.0
     restored = _round_trip(codec, values)
@@ -546,6 +554,11 @@ def test_partial_page_garbage_does_not_leak_into_valid_tokens(bits):
         error = _nmse(value[:, :, :20].to(codec.dtype), restored[key][:, :, :20])
         assert error < (1.15 * PAPER_MSE[4] if bits == 4 else 0.5 * PAPER_MSE[2]), error
         assert torch.equal(restored[key][:, :, 28:].float(), torch.zeros_like(value[:, :, 28:]))
+    # Non-finite rows do not vote on the fractional split: the valid tokens come back exactly as
+    # they do when the unused tokens are zero.
+    control = _round_trip(codec, zero_tail)
+    for key in values:
+        assert torch.equal(restored[key][:, :, :20], control[key][:, :, :20]), key
 
 
 @requires_cuda

@@ -481,10 +481,14 @@ def run_format(args: argparse.Namespace, fmt: str, env: Dict[str, str]) -> Dict[
         try:
             code = proc.wait(timeout=args.timeout_min * 60)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)  # the engine and its MPI workers
             code = "timeout"
-            proc.wait()
-        reader.join(timeout=30)
+        finally:
+            # On a timeout, and when the driver is interrupted (Ctrl-C): the worker has its own
+            # session, so the terminal's interrupt does not reach it.
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)  # the engine and its MPI workers
+                proc.wait()
+            reader.join(timeout=30)
     try:
         with open(result_path) as f:
             result = json.load(f)
