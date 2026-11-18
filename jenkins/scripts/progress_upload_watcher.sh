@@ -40,7 +40,7 @@
 #   FINAL_LABEL            log label of the final snapshot, e.g. "run1 final snapshot"
 #
 # Optional:
-#   POST_TAG, TIMEOUT_XML_SCRIPT     passed on to progress_snapshot.sh
+#   POST_TAG, TIMEOUT_XML_SCRIPT, TIMEOUT_INPUT_FINAL     passed on to progress_snapshot.sh
 #   XML_PATH            a checkpoint is taken only when this file's mtime has advanced, or while a
 #                       target still lacks the content of the last one
 #   SNAPSHOT_REQUIRES   no checkpoint is taken while the tests run unless this file exists; on a

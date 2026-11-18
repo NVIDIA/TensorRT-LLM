@@ -25,6 +25,9 @@ to the lowest global index). The selected ids are therefore bit-identical to
 Consumers:
 
 * :meth:`VocabParallelHead.argmax` -- greedy target tokens.
+* :func:`sharded_greedy_argmax` -- greedy target tokens of the stock
+  one-model speculative workers: the TP key exchange where it takes the rows,
+  else :func:`shard_argmax`.
 * :meth:`VocabParallelHead.sample` -- temperature-only sampling through the
   Gumbel-max trick: ``argmax(logits / T + G)`` with standard Gumbel noise ``G``
   is a draw from ``softmax(logits / T)``, exact up to the 23-bit uniform
@@ -47,7 +50,8 @@ shapes depend only on ``(rows, shard width)`` and nothing synchronizes with the
 host, so every path is CUDA-graph capturable.
 """
 
-from typing import NamedTuple, Optional
+import os
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -61,6 +65,9 @@ from ..distributed import AllReduce, AllReduceStrategy, allgather
 from ..modules.embedding import LMHead
 from ..modules.linear import TensorParallelMode
 from ..pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+
+if TYPE_CHECKING:
+    from ..distributed.ll_exchange import TPKeyExchange
 
 _INT32_MAX = tl.constexpr(2**31 - 1)
 # Index published by a split without valid columns: exact in float32 and above
@@ -77,6 +84,41 @@ _TARGET_PROGRAMS = 256
 # They are not specialized: a specialization flips when a value becomes 1 or a
 # multiple of 16 and would compile a kernel variant mid-serving.
 _PAIR_LAYOUT_ARGS = ["stride_out", "slot0", "zero_lo", "zero_hi"]
+
+# "0" turns off the vocab-parallel greedy argmax of the stock one-model
+# speculative workers (SpecWorkerBase.enable_vocab_parallel_argmax), which
+# restores the behaviour before it: the gathered target logits, except on the
+# models that take the speculative fast paths, whose workers already selected
+# their greedy and temperature-only target tokens from the shard.
+VOCAB_PARALLEL_ARGMAX_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_ARGMAX"
+
+
+def vocab_parallel_argmax_enabled() -> bool:
+    """Whether the stock one-model speculative workers take their greedy
+    tokens from vocab-sharded logits (``TLLM_SPEC_VOCAB_PARALLEL_ARGMAX``,
+    default on)."""
+    return os.environ.get(VOCAB_PARALLEL_ARGMAX_ENV_VAR, "1").strip() != "0"
+
+
+def _gathers_even_vocab_shards(lm_head: LMHead) -> bool:
+    mapping = lm_head.mapping
+    return (
+        mapping.tp_size > 1
+        and not mapping.enable_attention_dp
+        and lm_head.tp_mode == TensorParallelMode.COLUMN
+        and lm_head.gather_output
+        and lm_head.padding_size == 0
+        and lm_head.gather_output_sizes is None
+        and lm_head.num_embeddings < _MAX_VOCAB
+    )
+
+
+def is_vocab_sharded_lm_head(lm_head: torch.nn.Module) -> bool:
+    """Whether ``lm_head(x, gather_output=False)`` is this rank's contiguous
+    vocab shard of ``lm_head(x)``: a gathered, evenly vocab-sharded TP
+    ``LMHead`` (plain TP, no attention DP, no vocab padding) whose vocab ids
+    are exact in float32. Subclasses (an ``Embedding``) do not qualify."""
+    return type(lm_head) is LMHead and _gathers_even_vocab_shards(lm_head)
 
 
 @triton.jit
@@ -100,6 +142,23 @@ def _gumbel(r):
     # u never rounds to 0 or 1, and the sample lies in about [-2.8, 16.6].
     u = ((r >> 9).to(tl.float32) + 0.5) * (1.0 / 8388608.0)
     return -tl.log(-tl.log(u))
+
+
+@triton.jit
+def _gumbel_fine(ra, rb):
+    # Standard Gumbel sample -log(E), E = -log(1 - w), from 64 random bits.
+    # w = (k_a + (k_b + 0.5) / 2^23) / 2^23 on the top 23 bits of each word
+    # lies in (2^-47, 1); the clamp keeps its float32 rounding below 1. Below
+    # 1/16, E is its series w + w^2/2 + ... + w^6/6 (relative error < 1e-8),
+    # where 1 - w would round away the low bits. The sample lies in about
+    # [-2.8, 32.6], so a token whose probability is at least ~4e-16 of the
+    # row's largest can win the Gumbel-max.
+    frac = ((rb >> 9).to(tl.float32) + 0.5) * (1.0 / 8388608.0)
+    w = ((ra >> 9).to(tl.float32) + frac) * (1.0 / 8388608.0)
+    w = tl.minimum(w, 0.99999994)
+    series = w * (1.0 + w * (0.5 + w * (1.0 / 3.0 + w * (0.25 + w * (0.2 + w * (1.0 / 6.0))))))
+    e = tl.where(w < 0.0625, series, -tl.log(1.0 - w))
+    return -tl.log(e)
 
 
 @triton.jit
@@ -557,6 +616,52 @@ def tp_pair_exchange(mapping: Mapping, strategy: AllReduceStrategy) -> _PairExch
     )
 
 
+def shard_argmax(
+    local: torch.Tensor,
+    col_base: int,
+    exchange: _PairExchange,
+    out_dtype: torch.dtype = torch.int64,
+) -> torch.Tensor:
+    """Global argmax over the vocab of shard logits ``local`` ``[rows, shard]``
+    (unit vocab stride) whose column 0 is global vocab id ``col_base``: the
+    ids ``torch.argmax`` gives on the gathered logits."""
+    return _select_tokens(_local_argmax_kernel, local, (), col_base, exchange, out_dtype)
+
+
+def key_exchange_takes(key_exchange: Optional["TPKeyExchange"], rows: int) -> bool:
+    """Whether ``key_exchange`` (the TP group's ``ll_exchange.TPKeyExchange``,
+    or None) takes a launch of ``rows`` rows."""
+    return key_exchange is not None and 1 <= rows <= key_exchange.MAX_ROWS
+
+
+def sharded_greedy_argmax(
+    logits: torch.Tensor,
+    vocab_offset: int,
+    key_exchange: Optional["TPKeyExchange"],
+    pair_exchange: Optional[_PairExchange],
+    *,
+    channel: int,
+) -> torch.Tensor:
+    """Global greedy tokens (int32) of this rank's vocab shard ``logits``
+    ``[rows, V / tp]`` (unit vocab stride) whose column 0 is global vocab id
+    ``vocab_offset``: for logits without NaN, the ids ``torch.argmax`` gives on
+    the gathered logits (equal maxima go to the lowest global id); the key
+    exchange orders NaN by its bit pattern.
+
+    Collective over the TP group. The key exchange takes the rows where
+    :func:`key_exchange_takes` holds (local first maximum, key packing and the
+    exchange in one launch on ``channel``); the NCCL pair exchange
+    ``pair_exchange`` takes the others and must be given where the key
+    exchange cannot take the rows. The choice depends only on the row count
+    and on whether the group has a key exchange, which
+    ``ll_exchange.create_tp_key_exchange`` makes agree across the group, so
+    every rank takes the same path.
+    """
+    if key_exchange_takes(key_exchange, logits.shape[0]):
+        return key_exchange.argmax_logits(logits, vocab_offset=vocab_offset, channel=channel)
+    return shard_argmax(logits, vocab_offset, pair_exchange, torch.int32)
+
+
 def markov_chain_logits(
     base_logits: torch.Tensor,
     first_prev_tokens: torch.Tensor,
@@ -606,6 +711,344 @@ def markov_chain_logits(
     return biased
 
 
+@triton.jit
+def _markov_sample_local_kernel(
+    base_ptr,
+    stride_base,
+    bias_ptr,
+    stride_bias,
+    out_ptr,
+    stride_out_slot,
+    slots_ptr,
+    n_cols,
+    chunk,
+    temp_ptr,
+    seed_ptr,
+    offset_ptr,
+    greedy_threshold,
+    stats_ptr,
+    stride_stats,
+    HAS_SLOTS: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    # One split of one request's row at one block position: x = base + bias
+    # rounded to the logits dtype, s = x / T stored to the proposal row, and
+    # the split's Gumbel-max winner of s + G plus its softmax statistics
+    # (max, sum of exp(s - max)), published as 4 floats at slot `split`. The
+    # winner's score is kept as (s - max) + G against the split's max, so the
+    # noise is never added to a large s and rounded away.
+    # The noise for vocab id v is _gumbel_fine of Philox(seed, (v // 2,
+    # offset lo, offset hi, 0)) outputs (2 * (v % 2), 2 * (v % 2) + 1). A
+    # greedy row (T <= threshold) takes the plain argmax of x and publishes no
+    # statistics.
+    GROUPS: tl.constexpr = BLOCK_V // 2
+    req = tl.program_id(0)
+    split = tl.program_id(1)
+    lo = split * chunk
+    hi = tl.minimum(lo + chunk, n_cols)
+    offs_g = tl.arange(0, GROUPS)
+    offs_l = tl.arange(0, 2)
+    base_row = base_ptr + req.to(tl.int64) * stride_base
+    bias_row = bias_ptr + req.to(tl.int64) * stride_bias
+    if HAS_SLOTS:
+        out_row = out_ptr + tl.load(slots_ptr + req).to(tl.int64) * stride_out_slot
+    else:
+        out_row = out_ptr + req.to(tl.int64) * stride_out_slot
+    temperature = tl.load(temp_ptr + req).to(tl.float32)
+    is_greedy = temperature <= greedy_threshold
+    inv_t = 1.0 / tl.where(is_greedy, 1.0, temperature)
+    seed = tl.load(seed_ptr + req).to(tl.int64)
+    offset = tl.load(offset_ptr + req).to(tl.int64)
+    c1 = tl.full([GROUPS], 0, tl.uint32) + (offset & 0xFFFFFFFF).to(tl.uint32)
+    c2 = tl.full([GROUPS], 0, tl.uint32) + ((offset >> 32) & 0xFFFFFFFF).to(tl.uint32)
+    c3 = tl.full([GROUPS], 0, tl.uint32)
+    best_val = tl.full([GROUPS, 2], float("-inf"), tl.float32)
+    best_idx = tl.full([GROUPS, 2], _INT32_MAX, tl.int32)
+    run_max = tl.full([GROUPS, 2], float("-inf"), tl.float32)
+    run_sum = tl.zeros([GROUPS, 2], tl.float32)
+    for start in range(lo, hi, BLOCK_V):
+        cols = start + offs_g[:, None] * 2 + offs_l[None, :]
+        mask = cols < hi
+        base = tl.load(base_row + cols, mask=mask, other=0.0)
+        bias = tl.load(bias_row + cols, mask=mask, other=0.0).to(tl.float32)
+        # As `base + bias` in torch: the sum rounded to the logits dtype.
+        x = (base.to(tl.float32) + bias).to(base.dtype).to(tl.float32)
+        s = x * inv_t
+        tl.store(out_row + cols, s, mask=mask)
+        s = tl.where(mask, s, float("-inf"))
+        vals = s
+        if not is_greedy:
+            counter = (start // 2 + offs_g).to(tl.uint32)
+            r0, r1, r2, r3 = tl.philox(seed, counter, c1, c2, c3)
+            noise = tl.join(_gumbel_fine(r0, r1), _gumbel_fine(r2, r3))
+            new_max = tl.maximum(run_max, s)
+            shift = tl.where(new_max == float("-inf"), 0.0, run_max - new_max)
+            run_sum = run_sum * tl.exp(shift) + tl.where(
+                s > float("-inf"), tl.exp(s - new_max), 0.0
+            )
+            # Scores are relative to the lane's running max: re-centre the kept
+            # winner on the new max, then score this block against it.
+            best_val = best_val + shift
+            vals = tl.where(s > float("-inf"), (s - new_max) + noise, float("-inf"))
+            run_max = new_max
+        idx = tl.where(mask, cols, _INT32_MAX)
+        best_val, best_idx = argmax_combine(best_val, best_idx, vals, idx)
+    split_max = tl.max(tl.max(run_max, 1), 0)
+    # Lane scores onto the split's max (a greedy row keeps its plain x / T).
+    best_val = best_val + tl.where(run_max == float("-inf"), 0.0, run_max - split_max)
+    best_val, best_idx = tl.reduce((best_val, best_idx), 1, argmax_combine)
+    val, idx = tl.reduce((best_val, best_idx), 0, argmax_combine)
+    scale = tl.exp(tl.where(run_max == float("-inf"), float("-inf"), run_max - split_max))
+    split_sum = tl.sum(tl.sum(run_sum * scale, 1), 0)
+    stats = stats_ptr + req.to(tl.int64) * stride_stats + 4 * split
+    tl.store(stats, val)
+    tl.store(stats + 1, tl.where(idx == _INT32_MAX, _EMPTY_INDEX, idx).to(tl.float32))
+    tl.store(stats + 2, split_max)
+    tl.store(stats + 3, split_sum)
+
+
+@triton.jit
+def _markov_sample_reduce_kernel(
+    stats_ptr,
+    stride_stats,
+    n_splits,
+    w1_ptr,
+    emb_ptr,
+    tokens_ptr,
+    stride_tokens,
+    norm_ptr,
+    stride_norm,
+    step,
+    RANK: tl.constexpr,
+    BLOCK_SLOTS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    # One request: the Gumbel-max winner over the splits is draft token
+    # `step` (and the next position's previous token, whose markov_w1 row is
+    # gathered), and the splits' statistics merge into the row's softmax
+    # (max, sum), stored for the normalization pass.
+    req = tl.program_id(0)
+    slots = tl.arange(0, BLOCK_SLOTS)
+    smask = slots < n_splits
+    ptrs = stats_ptr + req.to(tl.int64) * stride_stats + slots * 4
+    vals = tl.load(ptrs, mask=smask, other=float("-inf"))
+    gidx = tl.load(ptrs + 1, mask=smask, other=0.0).to(tl.int32)
+    gidx = tl.where(smask, gidx, _INT32_MAX)
+    split_max = tl.load(ptrs + 2, mask=smask, other=float("-inf"))
+    split_sum = tl.load(ptrs + 3, mask=smask, other=0.0)
+    row_max = tl.max(split_max, 0)
+    # Split scores are relative to their split's max; a greedy row's are not.
+    vals = vals + tl.where(split_max == float("-inf"), 0.0, split_max - row_max)
+    _, token = tl.reduce((vals, gidx), 0, argmax_combine)
+    scale = tl.exp(tl.where(split_max == float("-inf"), float("-inf"), split_max - row_max))
+    row_sum = tl.sum(split_sum * scale, 0)
+    tl.store(tokens_ptr + req.to(tl.int64) * stride_tokens + step, token)
+    norm = norm_ptr + req.to(tl.int64) * stride_norm + 2 * step
+    tl.store(norm, row_max)
+    tl.store(norm + 1, row_sum)
+    offs_r = tl.arange(0, BLOCK_R)
+    mask_r = offs_r < RANK
+    w1_row = tl.load(w1_ptr + token.to(tl.int64) * RANK + offs_r, mask=mask_r, other=0.0)
+    tl.store(emb_ptr + req * RANK + offs_r, w1_row, mask=mask_r)
+
+
+@triton.jit
+def _markov_sample_normalize_kernel(
+    out_ptr,
+    stride_out_slot,
+    stride_out_step,
+    slots_ptr,
+    n_cols,
+    chunk,
+    num_steps,
+    temp_ptr,
+    greedy_threshold,
+    norm_ptr,
+    stride_norm,
+    tokens_ptr,
+    stride_tokens,
+    HAS_SLOTS: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    # Turns the stored s = x / T of (request, position) into the proposal
+    # softmax(s) = exp(s - max) / sum, the distribution the Gumbel-max draw
+    # sampled from; a greedy row becomes the one-hot of its argmax token.
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    req = row // num_steps
+    step = row % num_steps
+    lo = split * chunk
+    hi = tl.minimum(lo + chunk, n_cols)
+    offs = tl.arange(0, BLOCK_V)
+    if HAS_SLOTS:
+        slot = tl.load(slots_ptr + req).to(tl.int64)
+    else:
+        slot = req.to(tl.int64)
+    out_row = out_ptr + slot * stride_out_slot + step.to(tl.int64) * stride_out_step
+    temperature = tl.load(temp_ptr + req).to(tl.float32)
+    is_greedy = temperature <= greedy_threshold
+    norm = norm_ptr + req.to(tl.int64) * stride_norm + 2 * step
+    row_max = tl.load(norm)
+    inv_sum = 1.0 / tl.load(norm + 1)
+    token = tl.load(tokens_ptr + req.to(tl.int64) * stride_tokens + step)
+    for start in range(lo, hi, BLOCK_V):
+        cols = start + offs
+        mask = cols < hi
+        if is_greedy:
+            probs = tl.where(cols == token, 1.0, 0.0)
+        else:
+            s = tl.load(out_row + cols, mask=mask, other=float("-inf"))
+            probs = tl.exp(s - row_max) * inv_sum
+        tl.store(out_row + cols, probs, mask=mask)
+
+
+def markov_sampled_chain(
+    block_logits: torch.Tensor,
+    first_prev_tokens: torch.Tensor,
+    markov_w1: torch.Tensor,
+    markov_w2: torch.Tensor,
+    temperatures: torch.Tensor,
+    seeds: torch.Tensor,
+    offsets: torch.Tensor,
+    probs_out: torch.Tensor,
+    slots: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Ancestral, temperature-only DSpark vanilla-Markov block chain over the full vocab.
+
+    Position ``k`` of request ``b`` draws ``d_k`` from
+    ``softmax((base[b, k] + markov_w2 @ markov_w1[d_{k-1}]) / T_b)`` by
+    Gumbel-max on 64 Philox bits per entry (``_gumbel_fine``: only a token
+    below ~4e-16 of its row's largest probability is never drawn, against
+    ~4e-9 for the 23-bit noise of :meth:`VocabParallelHead.sample`), ``d_{-1}``
+    being the anchor, and
+    that softmax is written to ``probs_out``, so every stored row is the
+    distribution its token was drawn from. A row with ``T`` at or below
+    ``GREEDY_TEMPERATURE_THRESHOLD`` takes the argmax and stores its one-hot.
+    Each position takes three launches (bias GEMV, local sample, reduce +
+    gather) and one launch normalizes all rows at the end; nothing
+    synchronizes with the host, so the chain is CUDA-graph capturable.
+
+    Args:
+        block_logits: ``[B, K, vocab]`` block logits, unit vocab stride.
+        first_prev_tokens: ``[B]`` anchor token ids (out of vocab: no bias).
+        markov_w1, markov_w2: ``[vocab, rank]`` Markov head weights,
+            ``markov_w1`` contiguous.
+        temperatures: ``[B]`` float32.
+        seeds: ``[B]`` Philox seeds.
+        offsets: ``[K, B]`` Philox offsets of each position, rows contiguous.
+        probs_out: float32 destination with unit vocab stride, at least
+            ``vocab`` wide: ``[slots, >= K, >= vocab]`` indexed by ``slots``,
+            or ``[B, >= K, >= vocab]`` without them.
+        slots: optional ``[B]`` row of ``probs_out`` per request.
+    Returns:
+        ``[B, K]`` int32 draft tokens.
+    """
+    num_reqs, num_steps, vocab = block_logits.shape
+    # The kernels read every bias column and gather markov_w1 rows of drawn
+    # tokens up to the logits width, so narrower tables would be read past.
+    if markov_w1.shape[0] != vocab or markov_w2.shape[0] != vocab:
+        raise ValueError(
+            f"DSpark Markov head: tables of {markov_w1.shape[0]} / {markov_w2.shape[0]} "
+            f"rows do not match the draft logits width {vocab}."
+        )
+    device = block_logits.device
+    tokens = torch.empty((num_reqs, num_steps), dtype=torch.int32, device=device)
+    if num_reqs == 0 or num_steps == 0:
+        return tokens
+    assert vocab < _MAX_VOCAB and block_logits.stride(-1) == 1
+    assert markov_w1.is_contiguous() and probs_out.dtype == torch.float32
+    assert probs_out.stride(-1) == 1 and probs_out.shape[-1] >= vocab
+    assert offsets.shape == (num_steps, num_reqs) and (num_reqs == 1 or offsets.stride(1) == 1)
+    rank = markov_w1.shape[1]
+    layout = _PairExchange(None, 1, 0).layout(num_reqs, vocab, device)
+    stats = torch.empty((num_reqs, 4 * layout.splits), dtype=torch.float32, device=device)
+    norm = torch.empty((num_reqs, 2 * num_steps), dtype=torch.float32, device=device)
+    emb = torch.empty((num_reqs, rank), dtype=markov_w1.dtype, device=device)
+    has_slots = slots is not None
+    slots_arg = slots if has_slots else tokens
+    block_r = triton.next_power_of_2(rank)
+    _markov_reduce_embed_kernel[(num_reqs,)](
+        first_prev_tokens,
+        0,
+        1,
+        first_prev_tokens,
+        markov_w1,
+        emb,
+        tokens,
+        tokens.stride(0),
+        markov_w1.shape[0],
+        0,
+        RANK=rank,
+        FROM_ANCHOR=True,
+        BLOCK_SLOTS=1,
+        BLOCK_R=block_r,
+        num_warps=4,
+    )
+    for step in range(num_steps):
+        bias = F.linear(emb, markov_w2)
+        step_logits = block_logits[:, step]
+        step_out = probs_out[:, step]
+        _markov_sample_local_kernel[(num_reqs, layout.splits)](
+            step_logits,
+            step_logits.stride(0),
+            bias,
+            bias.stride(0),
+            step_out,
+            step_out.stride(0),
+            slots_arg,
+            vocab,
+            layout.chunk,
+            temperatures,
+            seeds,
+            offsets[step],
+            GREEDY_TEMPERATURE_THRESHOLD,
+            stats,
+            stats.stride(0),
+            HAS_SLOTS=has_slots,
+            BLOCK_V=_LOCAL_BLOCK_V,
+            num_warps=8,
+            # Left alone the compiler takes ~134 registers, so one 256-thread
+            # block per SM; 80 fits three, which is worth the few spills at
+            # batch >= 8.
+            maxnreg=80,
+        )
+        _markov_sample_reduce_kernel[(num_reqs,)](
+            stats,
+            stats.stride(0),
+            layout.splits,
+            markov_w1,
+            emb,
+            tokens,
+            tokens.stride(0),
+            norm,
+            norm.stride(0),
+            step,
+            RANK=rank,
+            BLOCK_SLOTS=triton.next_power_of_2(layout.splits),
+            BLOCK_R=block_r,
+            num_warps=4,
+        )
+    _markov_sample_normalize_kernel[(num_reqs * num_steps, layout.splits)](
+        probs_out,
+        probs_out.stride(0),
+        probs_out.stride(1),
+        slots_arg,
+        vocab,
+        layout.chunk,
+        num_steps,
+        temperatures,
+        GREEDY_TEMPERATURE_THRESHOLD,
+        norm,
+        norm.stride(0),
+        tokens,
+        tokens.stride(0),
+        HAS_SLOTS=has_slots,
+        BLOCK_V=_LOCAL_BLOCK_V,
+        num_warps=8,
+    )
+    return tokens
+
+
 class VocabParallelHead:
     """Token selection over a column-parallel LM head from this rank's vocab shard.
 
@@ -641,18 +1084,10 @@ class VocabParallelHead:
         noise in 4-column groups of the global vocab) and the vocab below
         ``2**24`` (indices travel as float32).
         """
-        if not isinstance(lm_head, LMHead):
-            return False
-        mapping = lm_head.mapping
         return (
-            mapping.tp_size > 1
-            and not mapping.enable_attention_dp
-            and lm_head.tp_mode == TensorParallelMode.COLUMN
-            and lm_head.gather_output
-            and lm_head.padding_size == 0
-            and lm_head.gather_output_sizes is None
+            isinstance(lm_head, LMHead)
+            and _gathers_even_vocab_shards(lm_head)
             and lm_head.out_features % 4 == 0
-            and lm_head.num_embeddings < _MAX_VOCAB
         )
 
     def local_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -670,9 +1105,7 @@ class VocabParallelHead:
 
     def argmax(self, local: torch.Tensor, out_dtype: torch.dtype = torch.int64) -> torch.Tensor:
         """Global argmax over the vocab of shard logits ``[rows, shard]``."""
-        return _select_tokens(
-            _local_argmax_kernel, local, (), self.col_base, self._exchange, out_dtype
-        )
+        return shard_argmax(local, self.col_base, self._exchange, out_dtype)
 
     def sample(
         self,

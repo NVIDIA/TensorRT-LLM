@@ -32,7 +32,6 @@ import fcntl
 import os
 import subprocess
 import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -494,9 +493,8 @@ def native_artifacts(repo: str | Path) -> list[str]:
 def repo_lock(repo: Path):
     """Serialize worktree creation on one repository.
 
-    Concurrent `git worktree add` on one repository (a campaign stacking a candidate
-    while a tuner request opens another) fails with `Could not reset index file to
-    revision 'HEAD'`.
+    Concurrent `git worktree add` on one repository (two tasks opening their worktrees at
+    once) fails with `Could not reset index file to revision 'HEAD'`.
     """
     path = Path(git_checked(repo, "rev-parse", "--git-common-dir"))
     if not path.is_absolute():
@@ -507,29 +505,6 @@ def repo_lock(repo: Path):
             yield
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
-
-
-def add_worktree(repo: Path, tree: Path, *args: str) -> None:
-    """`git worktree add` under the repo lock, retried once after cleaning up a failed attempt.
-
-    Only the registration holds the lock (``--no-checkout``); the checkout, the slow part, runs
-    outside it against the worktree's own index, so several candidates check out at once.
-    """
-    with repo_lock(repo):
-        for attempt in (1, 2):
-            out = subprocess.run(
-                ["git", "-C", str(repo), "worktree", "add", "--no-checkout", *args],
-                capture_output=True,
-                text=True,
-            )
-            if out.returncode == 0:
-                break
-            git_checked(repo, "worktree", "remove", "--force", str(tree), check=False)
-            git_checked(repo, "worktree", "prune", check=False)
-            if attempt == 2:
-                raise RuntimeError(f"git worktree add {' '.join(args)}: {out.stderr.strip()}")
-            time.sleep(5)
-    git_checked(tree, "reset", "--hard", "-q")
 
 
 def link_native(repo: Path, tree: Path) -> None:
@@ -545,7 +520,6 @@ __all__ = [
     "repo_lock",
     "native_artifacts",
     "link_native",
-    "add_worktree",
     "COMMIT_POLICY_FIELD",
     "COMMIT_POLICY_KEYS",
     "CommitFinding",

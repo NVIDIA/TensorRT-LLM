@@ -43,7 +43,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputPreparer,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
-from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -766,43 +765,32 @@ class ModelEngineTestCase(unittest.TestCase):
             max_beam_width=2,
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]),
         )
-        for is_generation in (True, False):
-            with self.subTest(is_generation=is_generation):
-                engine = DummyModelEngine(llm_args, torch.half, is_generation=is_generation)
+        engine = DummyModelEngine(llm_args, torch.half)
 
-                runner = engine._runner
-                if is_generation:
-                    self.assertIsInstance(runner, DecoderRunner)
-                    self.assertIsNotNone(engine.cuda_graph_runner)
-                    self.assertEqual(
-                        tuple(runner._buffers.cache_indirection.shape), (4, 2, engine.max_seq_len)
-                    )
-                else:
-                    self.assertIsInstance(runner, EncoderRunner)
-                    self.assertIsNone(engine.cuda_graph_runner)
-                self.assertEqual(isinstance(runner._buffers, DecoderInputBuffers), is_generation)
+        runner = engine._runner
+        self.assertIsInstance(runner, DecoderRunner)
+        self.assertIsInstance(runner._buffers, DecoderInputBuffers)
+        self.assertIsNotNone(engine.cuda_graph_runner)
+        self.assertEqual(tuple(runner._buffers.cache_indirection.shape), (4, 2, engine.max_seq_len))
+
+    def test_model_engine_rejects_non_generation_models(self) -> None:
+        llm_args = TorchLlmArgs(model="dummy", max_batch_size=4, max_num_tokens=64)
+        with self.assertRaisesRegex(ValueError, "ScheduledEncoderExecutor"):
+            DummyModelEngine(llm_args, torch.half, is_generation=False)
 
     def test_no_kv_cache_runners_reject_speculative_config(self) -> None:
-        for mm_encoder_only, runner_name in (
-            (False, "EncoderRunner"),
-            (True, "MultimodalEncoderRunner"),
+        llm_args = TorchLlmArgs(
+            model="dummy", max_batch_size=4, max_num_tokens=64, mm_encoder_only=True
+        )
+        with self.assertRaisesRegex(
+            ValueError, "MultimodalEncoderRunner does not support speculative decoding"
         ):
-            with self.subTest(runner=runner_name):
-                llm_args = TorchLlmArgs(
-                    model="dummy",
-                    max_batch_size=4,
-                    max_num_tokens=64,
-                    mm_encoder_only=mm_encoder_only,
-                )
-                with self.assertRaisesRegex(
-                    ValueError, f"{runner_name} does not support speculative decoding"
-                ):
-                    DummyModelEngine(
-                        llm_args,
-                        torch.half,
-                        spec_config=SADecodingConfig(max_draft_len=1),
-                        is_generation=False,
-                    )
+            DummyModelEngine(
+                llm_args,
+                torch.half,
+                spec_config=SADecodingConfig(max_draft_len=1),
+                is_generation=False,
+            )
 
     @pytest.mark.cpu_only
     def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:

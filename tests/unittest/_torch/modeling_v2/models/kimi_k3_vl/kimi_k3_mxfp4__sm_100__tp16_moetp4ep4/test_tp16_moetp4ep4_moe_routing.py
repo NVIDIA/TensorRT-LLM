@@ -6,7 +6,7 @@ on SM 10.0 one generic MoE call routed outside the kernel against the same call 
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
     modeling as target,
 )
 

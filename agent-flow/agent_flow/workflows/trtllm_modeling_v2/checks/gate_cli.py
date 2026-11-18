@@ -224,7 +224,7 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         elif tree is not None:
             task_data = {**task_data, "trtllm_repo_path": str(tree.resolve())}
             declared = {**declared, "trtllm_repo_path": str(tree.resolve())}
-        # A worker's own gate run queues after the run's checks and before perf work.
+        # A worker's own gate run queues with the run's other checks.
         executor = select_command_executor(
             environment, name_prefix=f"gate-{args.name}", gpus=str(gpus), tree=tree,
             priority=FEATURE, nodes=spec.nodes if spec else 1,

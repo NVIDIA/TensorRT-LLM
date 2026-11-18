@@ -269,6 +269,7 @@ class CacheTierConfig(Protocol):
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int
+    enable_locality_domains: bool = False
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -598,6 +599,9 @@ class KVCacheManagerConfig:
     # declaration order. A (layer, role) pair belongs to one layer config or one region.
     regions: list[RegionConfig] = ...
     host_mem_backing: HostMemBackingConfig = ...
+    # Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's
+    # per-layer-group slot-count proportions at cold page sizes.
+    cold_typical_step: BatchDesc | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -895,7 +899,12 @@ class _KVCache:
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
         is_end: bool = False,
+        ssm_from_pending: bool = False,
     ) -> None: ...
+    def acquire_ssm_snapshot_slot(self) -> int | None: ...
+    @property
+    def pending_ssm_snapshot_slot(self) -> int | None: ...
+    def release_ssm_snapshot_slot(self) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...
     @property
@@ -907,6 +916,8 @@ class _KVCache:
     def committed_tokens(self) -> list[TokenIdExt]: ...
     @property
     def reuse_scope(self) -> ReuseScope: ...
+    @property
+    def locality_domain_id(self) -> int | None: ...
     def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None:
@@ -970,6 +981,7 @@ class PoolDesc:
     pool_index: PoolIndex
     base_address: MemAddress
     slot_bytes: int
+    mapped_ranges: list[tuple[int, int]]
 
     storage_medium: CacheTier
     """What this pool's pages actually are.
@@ -1869,6 +1881,7 @@ class KVCacheManager:
         text_only: bool | None = None,
         enable_request_stats: bool = False,
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
+        locality_domain_id: int | None = None,
     ) -> _KVCache:
         """Create a suspended cache with a prefill-to-generation boundary.
 
@@ -1890,6 +1903,10 @@ class KVCacheManager:
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
     ) -> int: ...
+    def probe_reuse_domains(
+        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
+    ) -> list[int]:
+        """GPU-resident pages of the reuse match for input_tokens, counted per locality domain."""
     def probe_first_new_block_key(
         self,
         reuse_scope: ReuseScope | None = None,
@@ -1936,6 +1953,11 @@ class KVCacheManager:
         ...
     @property
     def tokens_per_block(self) -> int: ...
+    @property
+    def num_locality_domains(self) -> int: ...
+    def get_mapped_buffer_views(
+        self, layer_id: LayerId, role: DataRole
+    ) -> list[tuple[MemAddress, int]]: ...
     @property
     def event_manager(self) -> Any | None: ...
     @property
