@@ -604,13 +604,13 @@ class ExecutionStage:
         return decision.text
 
     def _take_named_checks(self, task: graph_mod.Task, result: TaskResult) -> None:
-        """What the worker names under ``checks`` is what its landing runs: the task's ``satisfies``.
+        """The ``satisfies`` the worker answers with is the task's: what its landing runs.
 
         The planner names a task's checks before the work; the worker knows what
-        it changed. Without ``checks`` the planner's stand. A key the contract
+        it changed. Without an answer the planner's stand. A key the contract
         does not hold runs nothing, and the planner hears it.
         """
-        named = result.data.get("checks")
+        named = result.data.get("satisfies")
         contract = getattr(self.workflow, "_contract", None)
         if not isinstance(named, list) or contract is None:
             return
@@ -897,10 +897,16 @@ class ExecutionStage:
     ) -> str:
         """What a task's turn carries beside its goal.
 
-        Its dependencies' receipts and, for a task that starts beside its
-        soft dependencies, where each of them stands.
+        Where the run's checks are and the task's ``satisfies``, its
+        dependencies' receipts and, for a task that starts beside its soft
+        dependencies, where each of them stands.
         """
+        contract = self.workflow.workspace / contract_mod.CONTRACT_FILENAME
         blocks = (
+            f"The run's checks are the keys of `{contract}`; this task's `satisfies`: "
+            f"{', '.join(f'`{k}`' for k in task.satisfies) or 'none'}."
+            if task is not None
+            else "",
             handoff_mod.render(receipts),
             self._soft_block(task) if task is not None else "",
         )

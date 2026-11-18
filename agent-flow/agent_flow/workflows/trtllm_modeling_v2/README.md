@@ -112,9 +112,9 @@ must change before that.
    - *A pass is kept.* Every required check passes once. A pass does not run again because
      other code changed; a check that has not passed (it failed, or no landing ran it) runs
      again on what the work left.
-   - *Whoever lands code names its checks.* A worker lists the checks of `contract.yaml` its
-     change can affect (its task's `satisfies` when it lists none); they run on what it
-     landed, passed before or not. A run that gives no result leaves them owed.
+   - *Whoever lands code names its checks.* A task's `satisfies` is the planner's guess; its
+     worker answers with the checks of `contract.yaml` its change can affect, and they run on
+     what it landed, passed before or not. A run that gives no result leaves them owed.
    - *The final code is scored once.* Before delivery a benchmark has passed on the final
      tree; if none has, the cheapest one runs.
 

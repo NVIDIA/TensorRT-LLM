@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -245,7 +246,7 @@ def _naming(services, named):
 
     def name(task):
         if task.id in named:
-            task.satisfies = list(named[task.id])  # what the stage takes from `checks`
+            task.satisfies = list(named[task.id])  # what the stage takes from its answer
         return work(task)
 
     services.work = name
@@ -285,14 +286,18 @@ def test_the_worker_names_the_checks_its_landing_runs():
 
     stage = SimpleNamespace(workflow=SimpleNamespace(_contract=_STANDING))
     task = _task("mtp", "feature", _MTP)
-    said = TaskResult("UNIT_READY", data={"checks": [_MTP[1], _CORE[1], "core:boot@tp9"]})
+    said = TaskResult("UNIT_READY", data={"satisfies": [_MTP[1], _CORE[1], "core:boot@tp9"]})
     ExecutionStage._take_named_checks(stage, task, said)
     assert task.satisfies == [_MTP[1], _CORE[1]]
     assert "named the checks its landing runs" in said.note and "core:boot@tp9" in said.note
-    # Without `checks`, the plan's stand.
+    # Without an answer, the plan's stand.
     task, quiet = _task("mtp", "feature", _MTP), TaskResult("UNIT_READY", data={})
     ExecutionStage._take_named_checks(stage, task, quiet)
     assert task.satisfies == _MTP and quiet.note == ""
+    # The worker is told where the run's checks are and what its task's plan named.
+    stage.workflow.workspace, stage._soft_block = Path("/ws"), lambda task: ""
+    said = ExecutionStage._task_context(stage, [], "mtp", task)
+    assert "`/ws/contract.yaml`" in said and f"`{_MTP[0]}`, `{_MTP[1]}`" in said
 
 
 def test_a_check_task_owes_the_delivery_checks_it_names(tmp_path):
