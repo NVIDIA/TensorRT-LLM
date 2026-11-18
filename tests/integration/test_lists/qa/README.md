@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved. -->
+
 # Description
 
 This folder contains QA test definitions for TensorRT-LLM, which are executed on a daily/release schedule. These tests focus on end-to-end validation, accuracy verification, disaggregated testing, and performance benchmarking.
@@ -47,10 +49,55 @@ pip3 install -r ${TensorRT-LLM_PATH}/requirements-dev.txt
 This directory contains various test configuration files:
 
 ### Functional Test Lists
-- `llm_function_core.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
-- `llm_function_multinode.txt` - Multi-node functional test cases
-- `llm_function_rtx6k.txt` - RTX 6000 series specific tests
-- `llm_function_l20.txt` - L20 specific tests, only contains single gpu cases
+- `functional/llm_function_core.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
+- `functional/llm_function_multinode.yml` - Multi-node functional test cases with per-case launch parameters
+- `functional/llm_function_rtx6k.txt` - RTX 6000 series specific tests
+- `functional/llm_function_stress.txt` - Functional stress test cases
+
+Test lists whose names start with `llm_function` belong in `functional/`.
+Spark, Triton and performance lists keep their existing paths directly in `qa/`.
+The pinned `trt-test-db` reader scans `qa/*.yml` without recursion and parses every
+file before selecting a context; multinode launch YAML must remain outside that
+scan because it uses `defaults` and `tests[].case` rather than the database schema.
+Both QA validators discover text and YAML lists under `functional/`.
+No compatibility links remain in `qa/`.
+
+### Multi-node Launch Parameters
+
+`functional/llm_function_multinode.yml` contains a `tests` sequence. Each entry has an exact
+pytest node ID in `case` and an optional `launch` mapping. Entries without
+`launch` use `defaults.launch`, which specifies `mode: mpi`, `world_size: 16`,
+and `nodes: 2`. Per-case launch fields override the defaults; omit fields whose
+values match the defaults. The shared `nodes` field is inherited in both modes.
+Mode-specific fields are inherited only when the case uses the default mode,
+so `mode: per_node` cases do not inherit an MPI `world_size`.
+
+- `mode: mpi` uses `world_size` for the total MPI rank count and `nodes` for the
+  exact number of hosts on which those ranks must run. The pipeline must honor
+  both fields when deriving tasks per node from the selected platform's GPU
+  capacity. For example, `world_size: 4` inherits `nodes: 2` and runs two ranks
+  on each node even if one node has capacity for all four ranks. Allocating a
+  second node without running ranks on it does not satisfy the node count.
+  Reject launch plans that cannot meet both the world size and node count.
+- `mode: per_node` uses `nodes`, `tasks_per_node`, and `gpus_per_node`.
+  Pytest runs on each node and the test starts its local server workers.
+
+GPU architecture, memory, and NVLink-domain requirements still apply; select a
+platform supported by the test. Account, partition, container, and node placement
+remain pipeline settings.
+
+The Jenkins consumer must parse this YAML, resolve each entry's launch parameters,
+and generate a temporary single-case text list for the existing test runner.
+The QA validator generates temporary text lists from YAML for runtime collection
+and includes those cases when checking membership against `waives.txt`.
+The QA cluster runner is maintained separately in the internal `trt_jenkins`
+repository (`jenkinsfile/llm_test_cluster.groovy`). Its functional list selector
+and any job defaults must use `qa/functional/llm_function_multinode.yml`, relative
+to `tests/integration/test_lists/`. Coordinate that consumer update with this
+layout change. Consumers of the former text list must also parse the YAML launch
+parameters and generate temporary single-case text lists before invoking the runner.
+Do not pass this case list to `trt-test-db`; performance selectors continue to use
+`qa/llm_perf_multinode.yml` and the `qa/` database directory.
 
 ### Performance Test Files
 - `llm_perf_full.yml` - Main performance test configuration
@@ -65,7 +112,7 @@ This directory contains various test configuration files:
 - `llm_triton_integration.txt` - Triton backend integration tests
 
 ### Release-Specific Tests
-- `llm_spark_func.txt` - Functional tests for DGX-Spark release
+- `llm_spark_func.yml` - Functional tests for DGX-Spark release
 - `llm_spark_perf.yml` - Performance tests for DGX-Spark release
 
 ## Test Execution Schedule
@@ -88,7 +135,7 @@ To run specific test categories:
 # direct to defs folder
 cd tests/integration/defs
 # Run all fp8 functional test
-pytest --no-header -vs --test-list=../test_lists/qa/llm_function_full.txt -k fp8
+pytest --no-header -vs --test-list=../test_lists/qa/functional/llm_function_core.txt -k fp8
 # Run a single test case
 pytest -vs accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
 ```
@@ -104,6 +151,6 @@ QA tests are typically executed through CI/CD pipelines with appropriate test se
 ## Test Guidelines
 
 ### Adding New Test Cases
-- **Primary Location**: For functional testing, new test cases should be added to `llm_function_full.txt` first
+- **Primary Location**: For functional testing, new test cases should be added to `functional/llm_function_core.txt` first
 - **Categorization**: Test cases should be categorized based on their scope and execution time
 - **Validation**: Ensure test cases are properly validated before adding to any test list

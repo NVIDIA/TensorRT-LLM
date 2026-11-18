@@ -34,11 +34,10 @@ import importlib.util
 import re
 from pathlib import Path
 
-FAMILY_KERNELS = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels"
+FAMILY_KERNELS = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels"
 # The family's source directory, for checks that locate a kernel by its file instead of importing its package.
 FAMILY_SOURCE = (
-    Path(__file__).resolve().parents[7]
-    / "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl"
+    Path(__file__).resolve().parents[7] / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl"
 )
 
 # ---------------------------------------------------------------------------------------------------------------

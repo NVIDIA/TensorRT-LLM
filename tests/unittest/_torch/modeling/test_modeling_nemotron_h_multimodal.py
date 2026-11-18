@@ -16,6 +16,7 @@ from test_modeling_nemotron_h import extract_decode_logprobs
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.models import modeling_nemotron_h_multimodal as nemotron_h_multimodal
+from tensorrt_llm._torch.models.checkpoints import model_hooks
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
@@ -220,8 +221,6 @@ def _spec_forward_stub():
 
 @pytest.mark.cpu_only
 def test_nemotron_nano_delegates_draft_loading():
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
-
     model = object.__new__(NemotronHMultimodalModel)
     torch.nn.Module.__init__(model)
     model.llm = MagicMock(draft_config=SimpleNamespace(), draft_model=object())
@@ -229,7 +228,7 @@ def test_nemotron_nano_delegates_draft_loading():
 
     assert model.draft_config is model.llm.draft_config
     assert model.draft_model is model.llm.draft_model
-    ModelLoader._call_load_weights(None, model.load_draft_weights, weights, mapper)
+    model_hooks.call_load_weights(model.load_draft_weights, weights, mapper)
     model.llm.load_draft_weights.assert_called_once_with(weights, weight_mapper=mapper)
 
 
@@ -428,9 +427,7 @@ def test_nemotron_nano_v2_vl_input_processor(data_dict_fixture, condition, modal
     prompt_pattern = reference_results[modality][condition]["prompt_pattern"]
     assert prompt_pattern in final_prompt, f"{final_prompt=} is not expected."
 
-    prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
-        inputs[0], sampling_params=None
-    )
+    prompt_token_ids, extra_processed_inputs = input_processor_with_hash(inputs[0], None)
 
     # Check the output of the input processor.
     prompt_token_ids_length = len(prompt_token_ids)

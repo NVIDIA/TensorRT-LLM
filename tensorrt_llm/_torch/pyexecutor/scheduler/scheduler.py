@@ -30,6 +30,7 @@ from ..llm_request import (
     get_mm_items_for_chunk,
     get_mm_pending_items,
     make_mm_encoder_transient_cache_key,
+    release_consumed_mm_items,
 )
 
 RequestList = list[LlmRequest]
@@ -173,13 +174,49 @@ def _get_lora_task_id(req: LlmRequest):
     return (1, lora_id)
 
 
-def _get_forced_context_chunk_size(req: LlmRequest) -> int:
-    next_point = min(
-        (point for point in req.expect_snapshot_points if point > req.context_current_position),
-        default=None,
+def _is_midchunk_snapshot_point(req: LlmRequest, point: int) -> bool:
+    """Whether the cache manager takes the snapshot at ``point`` inside a context step.
+
+    The cache manager sets ``py_midchunk_snapshot_alignment`` when it can store
+    a recurrent-state snapshot at a point inside the step, for the last
+    snapshot point and only at that alignment relative to the step start.
+    """
+    alignment = getattr(req, "py_midchunk_snapshot_alignment", None)
+    return (
+        isinstance(alignment, int)
+        and point < req.prompt_len
+        and point == max(req.expect_snapshot_points)
+        and (point - req.context_current_position) % alignment == 0
     )
-    if next_point is None:
+
+
+def _is_midchunk_pass_point(req: LlmRequest, point: int) -> bool:
+    """Whether a context step may pass the snapshot point ``point``.
+
+    The cache manager sets ``py_midchunk_pass_point`` to a point (not the last
+    one) whose snapshot it can take inside a context step. A step holds at
+    most one such snapshot.
+    """
+    alignment = getattr(req, "py_midchunk_snapshot_alignment", None)
+    return (
+        isinstance(alignment, int)
+        and point == getattr(req, "py_midchunk_pass_point", None)
+        and point < req.prompt_len
+        and (point - req.context_current_position) % alignment == 0
+    )
+
+
+def _get_forced_context_chunk_size(req: LlmRequest) -> int:
+    later_points = sorted(
+        point for point in req.expect_snapshot_points if point > req.context_current_position
+    )
+    if not later_points or _is_midchunk_snapshot_point(req, later_points[0]):
         return req.context_remaining_length
+    next_point = later_points[0]
+    if len(later_points) > 1 and _is_midchunk_pass_point(req, next_point):
+        # The snapshot at the next point is taken inside the step, which ends
+        # at the following point at the latest.
+        next_point = later_points[1]
     next_position = min(next_point, req.prompt_len)
     return max(0, next_position - req.context_current_position)
 
@@ -190,11 +227,12 @@ def _is_forced_context_chunk_boundary(req: LlmRequest, chunk_size: int) -> bool:
 
 
 class RemoteTailPhase(Enum):
-    """Fleet-wide GEN phase for conditional disaggregation with attention DP."""
+    """Fleet-wide GEN admission for remote-tail attention DP."""
 
     NONE = "none"
     CONTEXT = "context"
     DECODE = "decode"
+    MIXED = "mixed"
 
 
 class ScheduledRequests:
@@ -376,6 +414,15 @@ class RequestScheduler(ABC):
         to release; the default is a no-op.
         """
 
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        """Requests whose KV pages a failed remote cache level took, which the
+        executor must fail, with their error messages.
+
+        Only the KV cache manager V2 scheduler loses pages this way; the
+        default has none.
+        """
+        return []
+
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         """Register the executor's disaggregated KV-transfer window
         (DisaggTransferAdmissionController), when it bounds admission.
@@ -384,6 +431,21 @@ class RequestScheduler(ABC):
         the generation-init requests the window would defer; the default is a
         no-op.
         """
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Register a live probe for rank-local receive resources being retired.
+
+        Only schedulers with transfer-aware deadlock detection use it; the
+        default is a no-op.
+
+        Args:
+            probe: Whether cancelled receives still retain local resources.
+        """
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
+        decoder-tail hold passes, and requests whose final window was held."""
+        return (0, 0, 0, 0)
 
 
 @dataclass
@@ -738,6 +800,20 @@ class MultimodalScheduler(RequestScheduler):
 
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         self.scheduler.set_disagg_transfer_admission_controller(controller)
+
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        return self.scheduler.take_lost_kv_requests()
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Forward the local retirement probe to the wrapped scheduler.
+
+        Args:
+            probe: Whether cancelled receives still retain local resources.
+        """
+        self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        return self.scheduler.take_decision_counters()
 
     def _new_encoder_step(self) -> _MultimodalEncoderStep:
         return _MultimodalEncoderStep(
@@ -1109,6 +1185,9 @@ class MultimodalScheduler(RequestScheduler):
         """
         ready_context_requests: RequestList = []
         protected_items: set[tuple[int, int]] = set()
+        # KV reuse can start a prefill past outputs that were bound while it was at zero.
+        for chunk in chunks:
+            release_consumed_mm_items(chunk.request, self.encoder_cache)
         for chunk in chunks:
             request = chunk.request
             state = request.py_mm_encoder_state

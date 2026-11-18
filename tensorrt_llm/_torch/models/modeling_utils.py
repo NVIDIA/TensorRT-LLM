@@ -8,6 +8,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Generic,
                     Iterator, List, Literal, Optional, Tuple, Type, TypeVar,
                     Union)
@@ -58,6 +59,22 @@ def timing_metric(metric_name: str, metric_dict: dict[str,
     finally:
         metric_dict[metric_name] = (metric_dict.get(metric_name, 0.0) +
                                     time.perf_counter() - start)
+
+
+class ModelLoaderMetricNames(Enum):
+    """Names of the model loader's startup timing metrics."""
+
+    TOTAL_MODEL_LOADING_SECONDS = "total_model_loading_seconds"
+    CHECKPOINT_PREPARATION_SECONDS = "checkpoint_preparation_seconds"
+    WEIGHT_POPULATION_SECONDS = "weight_population_seconds"
+    CHECKPOINT_FINALIZATION_SECONDS = "checkpoint_finalization_seconds"
+    DRAFT_CHECKPOINT_PREPARATION_SECONDS = (
+        "draft_checkpoint_preparation_seconds")
+    DRAFT_WEIGHT_POPULATION_SECONDS = "draft_weight_population_seconds"
+    DRAFT_CHECKPOINT_FINALIZATION_SECONDS = (
+        "draft_checkpoint_finalization_seconds")
+    POST_LOAD_PROCESSING_SECONDS = "post_load_processing_seconds"
+    WEIGHT_MANIFEST_SECONDS = "weight_manifest_seconds"
 
 
 @dataclass
@@ -299,6 +316,8 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
     embed_tokens: Embedding
     layers: nn.ModuleList
     norm: RMSNorm
+    # Whether a prefill forward can replay one captured graph of the whole body.
+    supports_prefill_cuda_graph: bool = True
 
     def __init__(self, model_config: ModelConfig):
         super().__init__()
@@ -437,6 +456,22 @@ def layerwise_moe_quant_config(quant_config_dict: dict[str, QuantConfig],
     return None
 
 
+def fused_checkpoint_names(module: nn.Module, name: str) -> list[str]:
+    """Checkpoint names of the projections fused into ``module``.
+
+    A fused ``Linear`` whose parts are not spelled ``gate_proj``/``up_proj`` or
+    ``q_proj``/``k_proj``/``v_proj`` declares their leaf names in a
+    ``fused_checkpoint_names`` attribute, e.g. ``("index_q_proj",
+    "index_k_proj")``. Both quantization passes match those names instead of
+    the fused module's own name. Returns an empty list when none are declared.
+    """
+    leaves = getattr(module, "fused_checkpoint_names", None)
+    if not leaves:
+        return []
+    prefix = name.rsplit('.', 1)[0]
+    return [f"{prefix}.{leaf}" for leaf in leaves]
+
+
 def apply_layerwise_quant_config(
         model_config: ModelConfig,
         named_modules: Iterator[tuple[str, nn.Module]]) -> None:
@@ -452,7 +487,20 @@ def apply_layerwise_quant_config(
             elif isinstance(module, Linear):
                 weight_mode = module.weights_loading_config.weight_mode
                 prefix_name = '.'.join(name.split('.')[:-1])
-                if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                fused_names = fused_checkpoint_names(module, name)
+                if fused_names:
+                    # The parts load into one weight, so they must agree.
+                    configs = [quant_config_dict.get(n) for n in fused_names]
+                    if any(q is not None for q in configs):
+                        if any(q is None
+                               for q in configs) or any(q != configs[0]
+                                                        for q in configs[1:]):
+                            raise ValueError(
+                                f"{', '.join(fused_names)} load into one fused "
+                                f"projection and need the same quantization, "
+                                f"got {configs}.")
+                        module.quant_config = configs[0]
+                elif weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
                     for n, q in quant_config_dict.items():
                         # gate_proj and up_proj share the same quant config
                         if prefix_name + '.gate_proj' in n or prefix_name + '.gate_up_proj' in n:
@@ -492,7 +540,9 @@ def apply_quant_config_exclude_modules(
     kv_cache_quant_algo takes precedence over exclude_modules.
     kv_cache_quant_algo, if not None, is set for non-Attention
     modules too, which is the same practice as when there's no
-    exclude_modules.
+    exclude_modules. An excluded module that sets
+    _preserve_kv_cache_quant_algo keeps its own kv_cache_quant_algo
+    instead of the global one.
     """
     quant_config = model_config.quant_config
     kv_cache_quant_algo = None
@@ -521,12 +571,27 @@ def apply_quant_config_exclude_modules(
                             name.replace('qkv_proj', 'k_proj'),
                             name.replace('qkv_proj', 'v_proj')
                         ]
+                fused_names = fused_checkpoint_names(module, name)
+                fused_excluded = [
+                    quant_config.is_module_excluded_from_quantization(n)
+                    for n in fused_names
+                ]
+                if any(fused_excluded) and not all(fused_excluded):
+                    raise ValueError(
+                        f"{', '.join(fused_names)} load into one fused "
+                        f"projection, but exclude_modules excludes only some "
+                        f"of them.")
                 is_excluded = any(
                     quant_config.is_module_excluded_from_quantization(n)
-                    for n in candidates)
+                    for n in candidates) or any(fused_excluded)
                 if is_excluded and getattr(module, "quant_config",
                                            None) is not None:
-                    module.quant_config = new_config
+                    if getattr(module, '_preserve_kv_cache_quant_algo', False):
+                        module.quant_config = QuantConfig(
+                            kv_cache_quant_algo=module.quant_config.
+                            kv_cache_quant_algo)
+                    else:
+                        module.quant_config = new_config
                     # Reset _weights_created so create_weights() in
                     # __post_init__ will re-create this module's weights
                     # with the updated (non-quantized) config. Some
@@ -591,6 +656,10 @@ class DecoderModelForCausalLM(nn.Module,
 
     # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
     use_fx_for_pcg_fallback: ClassVar[bool] = True
+    # True when a fresh cache slot's recurrent state is reset by the context
+    # forward and not by the decode forward. The CUDA-graph runner then keeps
+    # one-token context requests out of decode graphs.
+    resets_recurrent_state_in_context: ClassVar[bool] = False
     # The model-specific TorchLlmArgs fields this model implements; the loader
     # rejects a set one that is not listed.
     model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
@@ -872,6 +941,12 @@ class DecoderModelForCausalLM(nn.Module,
     @property
     def vocab_size_padded(self) -> int:
         return self.lm_head.vocab_size_padded
+
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        """Whether the speculative worker samples greedy and temperature-only target rows from
+        vocabulary shards; known after weight loading."""
+        return False
 
     def setup_aliases(self) -> None:
         """Wire structural Python references between modules.

@@ -66,9 +66,9 @@ def _trtllm():
 
 def _k3_native():
     """Resolve the family namespace inside each MPI worker."""
-    from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
+    from tensorrt_llm._torch.modeling_v2._native import load_family_ops
 
-    return load_family_ops("tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl")
+    return load_family_ops("tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl")
 
 
 WORLD = 4
@@ -128,13 +128,11 @@ def _context():
     gpus = torch.cuda.device_count()
     torch.cuda.set_device(rank % gpus)
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
         op as _ctm,  # noqa: F401
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import (
-        op as sw_op,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import op as sw_op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
         K3MnnvlAllReduce,
     )
     from tensorrt_llm.mapping import Mapping
@@ -533,12 +531,10 @@ def check_fold_wrap(ctx):
     into slot [rank] of half ``n & 1`` of every rank's exchange buffer through the multicast mapping, as k3_moe does)
     across the wrap of its call count n: the same calls from n preset just below 2**31 give the bits of the calls from
     n as it was, and no call writes a ``lat_flags`` word other than the count and the scale slab."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import (
         k3_sandwich_kernel as kernel,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import (
-        op as sw_op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import op as sw_op
 
     ex = sw_op.K3SandwichLatentExchange.create(ctx.mapping, fabric_handle=True)
     flags = ex.flags
@@ -616,9 +612,7 @@ def test_k3_sandwich(mpi_pool_executor, check):
 def test_workspaces_refuse_graph_capture():
     """The all-reduce buffer and the latent exchange are created collectively: creating either under CUDA-graph
     capture raises instead of entering the collective, which could hang the group."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import op
     from tensorrt_llm.mapping import Mapping
 
     mapping = Mapping(world_size=1, rank=0, tp_size=1)

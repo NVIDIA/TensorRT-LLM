@@ -104,7 +104,7 @@
 /tests/integration/defs/perf @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-perf
 /tests/integration/test_lists/qa @NVIDIA/trt-llm-qa
 /tests/integration/test_lists/qa/llm_perf_* @NVIDIA/trt-llm-qa-perf
-/tests/integration/test_lists/qa/llm_function_* @NVIDIA/trt-llm-qa-function
+/tests/integration/test_lists/qa/functional/ @NVIDIA/trt-llm-qa-function
 
 # ===== RUNTIME =====
 /cpp/include/tensorrt_llm/batch_manager @NVIDIA/trt-llm-runtime-devs
@@ -325,6 +325,7 @@
 /tensorrt_llm/_torch/attention/backends/sparse/*/cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/modules/fla @NVIDIA/trt-llm-torch-attention-devs
 /tests/microbenchmarks/cute_dsl_kernels/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
+/scripts/trtllm_gen_fmha_stage_kv @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
 # The kernel-ownership question this test was waiting on is settled: the top-k
 # kernel has two production consumers (Attention and KV-cache compression), so it
@@ -356,6 +357,8 @@
 /cpp/tensorrt_llm/nanobind/runtime/moe* @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/runtime/moeLoadBalancer @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/moe @NVIDIA/trt-llm-moe-devs
+/tensorrt_llm/_torch/kernels/blackwell/moe_* @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
+/tensorrt_llm/_torch/modules/expert_l2_prefetch.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/bench_moe @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/bench_moe_comm.py @NVIDIA/trt-llm-moe-devs
@@ -477,7 +480,7 @@
 # Scoped ownership follows broad runtime, test, and CMake rules.
 
 # General / shared infrastructure
-/tensorrt_llm/_torch/_experimental/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev
+/tensorrt_llm/_torch/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev
 /cpp/tensorrt_llm/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev
 /cpp/cmake/modules/modeling_v2.cmake @NVIDIA/trt-llm-modeling_v2-dev
 /tests/unittest/_torch/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev
@@ -488,8 +491,8 @@
 /tests/unittest/scripts/test_build_wheel_modeling_v2.py @NVIDIA/trt-llm-modeling_v2-dev
 
 # Shared attention and MoE catalogs and tests are co-owned with their domain teams.
-/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/attention @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/moe @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-moe-devs
+/tensorrt_llm/_torch/modeling_v2/catalog/attention @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/modeling_v2/catalog/moe @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/modeling_v2/attention @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/modeling_v2/moe @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-moe-devs
 
@@ -498,32 +501,39 @@
 # Other model implementations and their tests belong to their submitting authors.
 
 # Qwen4
-/tensorrt_llm/_torch/_experimental/modeling_v2/models/qwen4_exp @Wanli-Jiang
+/tensorrt_llm/_torch/modeling_v2/models/qwen4_exp @Wanli-Jiang
 /tests/unittest/_torch/modeling_v2/models/qwen4_exp @Wanli-Jiang
 /tests/integration/defs/accuracy/modeling_v2/qwen4_exp @Wanli-Jiang
 
 # Kimi K3
-/tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl @vsabavat
+/tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl @vsabavat
 /tests/unittest/_torch/modeling_v2/models/kimi_k3_vl @vsabavat
 /tests/integration/defs/accuracy/modeling_v2/kimi_k3_vl @vsabavat
 
 # MiniMax M3
-/tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3 @peihu-nv
+/tensorrt_llm/_torch/modeling_v2/models/minimax_m3 @peihu-nv
 /tests/unittest/_torch/modeling_v2/models/minimax_m3 @peihu-nv
 /tests/integration/defs/accuracy/modeling_v2/minimax_m3 @peihu-nv
 
 # GLM family routing and accuracy tests are shared by its target owners.
-/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa @dongfengy @Tabrizian @xwang233 @erictsai-nv
+/tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa @dongfengy @Tabrizian @xwang233 @erictsai-nv
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa @dongfengy @Tabrizian @xwang233 @erictsai-nv
 /tests/integration/defs/accuracy/modeling_v2/glm_moe_dsa @dongfengy @Tabrizian @xwang233 @erictsai-nv
 
 # GLM SM103 target: source, ops, kernels, native code, and tests.
-/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4 @erictsai-nv
+/tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4 @erictsai-nv
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4 @erictsai-nv
 
 # GLM SM107 target and its native kernels/bindings
-/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency @dongfengy @Tabrizian @xwang233
+/tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency @dongfengy @Tabrizian @xwang233
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency @dongfengy @Tabrizian @xwang233
+/tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/ @dongfengy @Tabrizian @xwang233
+/tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/ @dongfengy @Tabrizian @xwang233
+
+# GLM-5.3-Flash (glm5_next)
+/tensorrt_llm/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia
+/tests/unittest/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia
+/tests/integration/defs/accuracy/modeling_v2/glm5_next/ @zhaoyangwang-nvidia
 
 # Uncomment only on release branches (e.g. release/0.19):
 # * @NVIDIA/trt-llm-release-branch-approval

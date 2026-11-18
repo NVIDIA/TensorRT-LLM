@@ -49,6 +49,7 @@ from defs.model_express.mx_evidence import (
     DONOR_PROCESS_FAILURE_MARKERS,
     DONOR_PROCESS_FAILURE_OVERLAP,
     check_receiver_log,
+    rdma_transfers_by_rank,
 )
 from defs.trt_test_alternative import cleanup_process_tree, popen
 from tensorrt_llm._torch.weight_sharing import (
@@ -682,6 +683,62 @@ def assert_transfer_evidence(case: MxE2ECase, receiver_log_path: Path) -> None:
         )
 
 
+def mx_transfer_upper_bound(manifest: WeightManifest) -> tuple[int, int]:
+    """Return the most tensors and bytes ModelExpress can move for one rank's manifest.
+
+    ModelExpress registers one tensor per distinct parameter data pointer and
+    no buffers. Non-empty parameters that view one storage at the same offset,
+    such as a tied LM head and its token-embedding table, are one view and
+    count once, at the largest of their sizes, because ModelExpress registers
+    whichever of them comes first in module order. Two cases can count more
+    than ModelExpress registers, so the result bounds the transfer from above:
+    empty parameters, which count once each but can share the null data
+    pointer, and parameters of different dtypes that start at one address,
+    which count once per dtype.
+    """
+    storage_of = {fqn: index for index, group in enumerate(manifest.alias_groups) for fqn in group}
+    views: dict[tuple[object, ...], int] = {}
+    for entry in manifest.entries:
+        if entry.kind != "param":
+            continue
+        storage = storage_of.get(entry.fqn, entry.fqn) if entry.nbytes else entry.fqn
+        view = (storage, entry.dtype, entry.storage_offset)
+        views[view] = max(views.get(view, 0), entry.nbytes)
+    return len(views), sum(views.values())
+
+
+def assert_transfer_within_manifests(
+    case: MxE2ECase,
+    receiver_log_path: Path,
+    manifests: Mapping[ManifestKey, WeightManifest],
+) -> None:
+    """Require no receiver rank's RDMA record to move more than its distinct parameter views.
+
+    Run after `assert_transfer_evidence`, which guarantees one record per rank.
+    A storage that several parameters share must cross the wire once.
+    """
+    transfers = rdma_transfers_by_rank(
+        receiver_log_path.read_text(encoding="utf-8", errors="replace")
+    )
+    problems = []
+    for rank in range(case.tp_size):
+        tensor_count, total_bytes = mx_transfer_upper_bound(
+            manifests[("transfer", "receiver", rank)]
+        )
+        (record,) = transfers[rank]
+        # ModelExpress logs the size in GB rounded to two decimals.
+        if record.tensor_count > tensor_count or record.size_gb > total_bytes / 1e9 + 0.0051:
+            problems.append(
+                f"rank {rank} moved {record.tensor_count} tensors, {record.size_gb} GB; its "
+                f"transfer manifest has at most {tensor_count} distinct parameter views, "
+                f"{total_bytes / 1e9:.4f} GB"
+            )
+    if problems:
+        pytest.fail(
+            "MX receiver moved more than its transfer manifest holds:\n- " + "\n- ".join(problems)
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Weight manifests
 # --------------------------------------------------------------------------- #
@@ -846,6 +903,25 @@ def assert_weight_manifests(
 # Routed-expert tensors of the unquantized CUTLASS MoE backend, the only MoE
 # layout that `assert_moe_partition` knows: `[experts, rows, columns]`.
 _ROUTED_EXPERT_SUFFIXES = (".w3_w1_weight", ".w2_weight")
+# Config keys that name the routed-expert count: Qwen MoE configs use
+# `num_experts`, and DeepSeek-style configs use `n_routed_experts`.
+_ROUTED_EXPERT_COUNT_KEYS = ("num_experts", "n_routed_experts")
+
+
+def _moe_config_section(config: Mapping[str, object]) -> tuple[Mapping[str, object], str] | None:
+    """Return the config section that names the routed-expert count, and that key.
+
+    A vision-language checkpoint keeps its language model's settings in a nested
+    `text_config`, so the count is looked up there after the top level. Returns
+    `None` when neither names a routed-expert count.
+    """
+    text_config = config.get("text_config")
+    sections = (config, text_config) if isinstance(text_config, Mapping) else (config,)
+    for section in sections:
+        for key in _ROUTED_EXPERT_COUNT_KEYS:
+            if key in section:
+                return section, key
+    return None
 
 
 def assert_moe_partition(
@@ -861,11 +937,13 @@ def assert_moe_partition(
     pass them. With MoE EP size `ep` and MoE TP size `tp_size // ep`, each rank
     holds `num_experts // ep` routed experts; `w3_w1_weight` stacks
     `2 * moe_intermediate_size // (tp_size // ep)` rows of `hidden_size`, and
-    `w2_weight` holds `moe_intermediate_size // (tp_size // ep)` columns. A
-    checkpoint without `num_experts` whose manifests hold no routed-expert
-    tensors is dense and needs no check. Any other MoE config or routed-expert
-    layout fails with a request to extend this check rather than with a
-    partition mismatch.
+    `w2_weight` holds `moe_intermediate_size // (tp_size // ep)` columns. These
+    keys come from the config section that names the routed-expert count:
+    `num_experts` or DeepSeek's `n_routed_experts`, at the top level or in a
+    nested `text_config`. A checkpoint whose config names no routed-expert
+    count and whose manifests hold no routed-expert tensors is dense and needs
+    no check. Any other MoE config or routed-expert layout fails with a request
+    to extend this check rather than with a partition mismatch.
     """
     roles = _validated_roles(roles)
     realized = {
@@ -878,14 +956,19 @@ def assert_moe_partition(
         for rank in range(case.tp_size)
     }
     config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
-    if "num_experts" not in config:
+    moe_section = _moe_config_section(config)
+    if moe_section is None:
         assert not any(realized.values()), (
-            "The final manifests hold routed-expert tensors, but the checkpoint config has no "
-            "`num_experts`; teach `assert_moe_partition` this MoE config"
+            "The final manifests hold routed-expert tensors, but the checkpoint config names no "
+            "routed-expert count (`num_experts` or `n_routed_experts`); teach "
+            "`assert_moe_partition` this MoE config"
         )
         return
-    # The expected shapes come from these Qwen3 MoE config keys.
-    missing_keys = [key for key in ("moe_intermediate_size", "hidden_size") if key not in config]
+    moe_config, expert_count_key = moe_section
+    # The expected shapes come from these keys, next to the routed-expert count.
+    missing_keys = [
+        key for key in ("moe_intermediate_size", "hidden_size") if key not in moe_config
+    ]
     assert not missing_keys, (
         f"The MoE checkpoint config has no {missing_keys}; teach `assert_moe_partition` this "
         "MoE config"
@@ -899,15 +982,15 @@ def assert_moe_partition(
     )
 
     moe_tp_size = case.tp_size // case.moe_ep_size
-    num_experts = config["num_experts"]
-    intermediate_size = config["moe_intermediate_size"]
+    num_experts = moe_config[expert_count_key]
+    intermediate_size = moe_config["moe_intermediate_size"]
     assert num_experts % case.moe_ep_size == 0 and intermediate_size % moe_tp_size == 0, (
         f"MoE EP {case.moe_ep_size} x MoE TP {moe_tp_size} does not divide {num_experts} experts "
         f"of intermediate size {intermediate_size}"
     )
     local_experts = num_experts // case.moe_ep_size
     local_intermediate = intermediate_size // moe_tp_size
-    hidden_size = config["hidden_size"]
+    hidden_size = moe_config["hidden_size"]
     w3_w1_suffix, w2_suffix = _ROUTED_EXPERT_SUFFIXES
     expected_shapes = {
         w3_w1_suffix: (local_experts, 2 * local_intermediate, hidden_size),
@@ -1018,6 +1101,7 @@ __all__ = [
     "assert_moe_partition",
     "assert_probe_payload",
     "assert_transfer_evidence",
+    "assert_transfer_within_manifests",
     "assert_weight_manifests",
     "build_canonical_snapshot",
     "build_metadata_only_snapshot",
@@ -1031,6 +1115,7 @@ __all__ = [
     "models_root",
     "moe_worker_args",
     "mx_metadata_ports",
+    "mx_transfer_upper_bound",
     "probe_worker_args",
     "qualification_required",
     "report_timings",

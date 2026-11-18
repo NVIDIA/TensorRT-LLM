@@ -24,24 +24,28 @@ l0_b300:
   - unittest/_torch/modules/test_engram_history_uploads.py
   - unittest/_torch/modules/test_engram_replay.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
-  - unittest/_torch/modules/test_mhc.py::test_fused_hc_lagged_matches_eager_composition
-  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_mma_split_k_deterministic
-  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_small_m_fma_candidates_agree
-  # Covers the GPU cases of tests/unittest/_torch/attention/ on B300, except the paths
-  # ignored below; its cpu_only cases run on CPU (l0_cpu). kernels/ has no entry of its own
-  # on any list, so apart from kernels/parallel_hw_agnostic/ this entry is what runs it
-  # here. multi_gpu/ cases need >= 2 GPUs, so they skip here and run on multi-GPU stages:
-  # l0_gb300_multi_gpus (post_merge) and l0_dgx_b300, which runs test_helix_zero_kv.py in
-  # its pre_merge block and the rest in post_merge. Collecting them still runs their helix
-  # files' import-time rebinding of mpi4py's serializer, which applies to the whole pytest
-  # process.
-  # - kernels/parallel_hw_agnostic/ is ignored: its cases do not depend on the GPU
-  #   architecture, so its GPU cases run on H100 (l0_h100) and its cpu_only ones on CPU
-  #   (l0_cpu). GB300 (l0_gb300_multi_gpus, post_merge) also runs the GPU cases; it is
-  #   the only Blackwell stage that does.
-  # - The other files ignored here have their own entries below.
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic TIMEOUT (90)
-  # Run cold-JIT MSA coverage separately from the attention aggregate.
+  - unittest/_torch/modules/test_mhc.py
+  - unittest/_torch/modules/test_engram.py
+  # SM103 kernels of the DS-V4.1 replay, DSpark draft and DS-V4 MoE routing paths.
+  - unittest/_torch/modeling/test_deepseek_v41_ced.py
+  - unittest/_torch/modeling/test_deepseek_v41_encoder_replay.py
+  - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
+  - unittest/_torch/speculative/test_dspark_draft_step.py
+  - unittest/_torch/speculative/test_dspark_tp1_argmax.py
+  - unittest/_torch/speculative/hw_agnostic/test_dspark_wkv_projection.py
+  - unittest/_torch/moe/test_dsv4_route_quant.py
+  - unittest/_torch/moe/test_moe_module.py::test_dsv4_fused_route_quant_matches_separate_launches
+  - unittest/_torch/modules/test_gated_mlp.py::test_fp8_block_scale_mlp_small_m_matches_deep_gemm
+  # Four disjoint attention batches use the default per-entry timeout.
+  # cpu_only cases run on CPU. kernels/parallel_hw_agnostic GPU cases run on
+  # H100 and GB300; the six excluded sparse files have separate entries below.
+  # Single-GPU Helix checks live directly under attention/; distributed suites
+  # remain on the multi-GPU lists.
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic
+  - unittest/_torch/attention/sparse/dsa --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py
+  - unittest/_torch/attention/sparse/deepseek_v4
+  - unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/sparse/dsa --ignore=unittest/_torch/attention/sparse/deepseek_v4 --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/sparse/csa2
+  # Run cold-JIT MSA coverage separately from the other attention batches.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
   - unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py
@@ -49,8 +53,11 @@ l0_b300:
   - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
+  # CSA2 (DeepSeek-V4.1 sparse attention) keeps the aggregate above inside its 90-minute budget.
+  - unittest/_torch/attention/sparse/csa2
   - unittest/_torch/modeling/test_qsa_runtime_wiring.py
   - unittest/_torch/modeling/test_qwen4_exp_support.py
+  - unittest/_torch/modeling/test_kimi_k3_mla.py -k "nvfp4 or layerwise"
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
@@ -76,6 +83,15 @@ l0_b300:
   - unittest/_torch/modules/test_qwen4_exp_ple_offload.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
+  # Qwen3.5 decode kernels: MoE engines and CuTe FC2; FP8 / BF16 GEMMs with weights loaded before
+  # the PDL wait (bitwise against SM103 cuBLAS).
+  - unittest/_torch/moe/test_moe_nvfp4_engine.py
+  - unittest/_torch/moe/test_moe_bf16_engine.py
+  - unittest/_torch/moe/test_moe_lowm_fc2.py
+  - unittest/_torch/modules/test_resident_fp8_gemm.py
+  - unittest/_torch/modules/test_expert_l2_prefetch.py
+  - unittest/_torch/modules/test_inproj_ba_splitk.py
+  - unittest/_torch/modules/test_gate_add_rmsnorm_fp8.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
@@ -107,8 +123,6 @@ l0_b300:
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[inf_linear]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[zero]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[negative]
-  - unittest/_torch/moe/test_moe_backend.py::test_situ_survives_resolution_not_just_construction[cutlass]
-  - unittest/_torch/moe/test_moe_backend.py::test_situ_survives_resolution_not_just_construction[cutedsl]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_experts_match_situ_reference[CUTLASS-static_1.0]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_experts_match_situ_reference[TRTLLM-static_1.0]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_megamoe_streamed_coverage_survives_per_expert_drain
@@ -137,6 +151,8 @@ l0_b300:
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=DEEPGEMM-quant=FP8_BLOCK_SCALES-routing=Renormalize]
   # ---- end MoE tests ----
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla[unchunked] TIMEOUT (30)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla[chunked] TIMEOUT (30)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=fp8-kv_cache_reuse=True-fp8kv=True-overlap_scheduler=True] # Cover nvbugs 6084445
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=False]
@@ -145,9 +161,12 @@ l0_b300:
   # runs only what a change reaches. The cpu_only files run on the CPU stage; comm needs more
   # GPUs. The whole set took 13m54s on one GB300 (3122 cases), so TIMEOUT (30) per entry is
   # ample.
-  - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/test_modeling_v2_no_stale_claims.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/activation TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/ops TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/test_modeling_v2_beam_cublas_mm.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/test_modeling_v2_beam_nvfp4_gemm.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/test_modeling_v2_beam_fp4_quantize.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/attention TIMEOUT (30)
   - unittest/_torch/modeling_v2/gemm TIMEOUT (30)
   - unittest/_torch/modeling_v2/graph TIMEOUT (30)
@@ -160,6 +179,9 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/qwen4_exp/ops TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified TIMEOUT (30)
+  # qwen4_exp FP8 target at tp1, pre-merge: gsm8k without speculation.
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_tp1_gsm8k TIMEOUT (60)
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py --import-mode=importlib TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
@@ -196,6 +218,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_modeling_v2_k3_kda_decode_attn.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_kda_verify.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_kda_shared_buffers.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_mla_attn_ops.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_mla_attn_vb_out.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_mla_qkv.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3_moe.py
@@ -205,7 +228,6 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3_route_quant.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/activation/test_modeling_v2_k3_situ_mul.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_modeling_v2_kda_decode.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_modeling_v2_kda_post_conv.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_modeling_v2_kda_prefill.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_construction.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_construction.py
@@ -218,6 +240,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_route_b_moe.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_modeling_v2_rms_norm_gated_token_major.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/activation/test_modeling_v2_situ_and_mul.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3r_experts.py
   - accuracy/modeling_v2/gpt_oss/gpt_oss_120b__sm_10x__default/test_accuracy.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp1]
   # qwen4_exp target at tp1, pre-merge: gsm8k without speculation; one MTP engine for gsm8k
   # with its acceptance-length floor, mmmu (the vision tower) and synthetic videos; and one

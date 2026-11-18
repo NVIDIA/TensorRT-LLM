@@ -33,6 +33,9 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConstraints,
     PostTransformTransferScope,
 )
+from tensorrt_llm.logger import logger
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _Model(nn.Module):
@@ -688,6 +691,94 @@ def test_unconstrained_weight_block_size_admits_every_block_size(
     )
 
 
+@pytest.mark.parametrize(
+    "pretrained_config, expected",
+    [
+        pytest.param(
+            SimpleNamespace(first_k_dense_replace=1, moe_layer_freq=1), (1, 1), id="deepseek-v3"
+        ),
+        pytest.param(
+            SimpleNamespace(first_k_dense_replace=3, moe_layer_freq=2), (3, 2), id="other-layout"
+        ),
+        pytest.param(SimpleNamespace(), (None, None), id="undeclared"),
+        pytest.param(
+            SimpleNamespace(first_k_dense_replace="1", moe_layer_freq=[1, 1]),
+            (None, None),
+            id="non-integer",
+        ),
+        pytest.param(
+            SimpleNamespace(first_k_dense_replace=True, moe_layer_freq=False),
+            (None, None),
+            id="bool",
+        ),
+    ],
+)
+def test_runtime_config_records_declared_moe_layer_layout(
+    pretrained_config: object, expected: tuple[int | None, int | None]
+) -> None:
+    runtime_config = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(pretrained_config=pretrained_config)
+    )
+
+    assert (runtime_config.first_k_dense_replace, runtime_config.moe_layer_freq) == expected
+
+
+def test_runtime_config_leaves_moe_layer_layout_unknown_by_default() -> None:
+    runtime_config = PostTransformRuntimeConfig.from_model_config(SimpleNamespace())
+
+    assert runtime_config.first_k_dense_replace is None
+    assert runtime_config.moe_layer_freq is None
+    assert _runtime_config().first_k_dense_replace is None
+    assert _runtime_config().moe_layer_freq is None
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_dimensions",
+    [
+        pytest.param({"first_k_dense_replace": 0}, {"first_k_dense_replace"}, id="moe-first-layer"),
+        pytest.param(
+            {"first_k_dense_replace": 3}, {"first_k_dense_replace"}, id="three-dense-layers"
+        ),
+        pytest.param({"moe_layer_freq": 2}, {"moe_layer_freq"}, id="moe-every-other-layer"),
+        pytest.param(
+            {"first_k_dense_replace": None, "moe_layer_freq": None},
+            {"first_k_dense_replace", "moe_layer_freq"},
+            id="undeclared",
+        ),
+    ],
+)
+def test_moe_layer_layout_constraint_rejects_other_layouts(
+    overrides: dict[str, object], expected_dimensions: set[str]
+) -> None:
+    constraints = PostTransformRuntimeConstraints(
+        first_k_dense_replaces=frozenset({1}), moe_layer_freqs=frozenset({1})
+    )
+    qualified = {"first_k_dense_replace": 1, "moe_layer_freq": 1}
+
+    assert constraints.unsupported_dimensions(_runtime_config(**qualified)) == frozenset()
+    assert constraints.unsupported_dimensions(
+        _runtime_config(**{**qualified, **overrides})
+    ) == frozenset(expected_dimensions)
+
+
+@pytest.mark.parametrize(
+    "first_k_dense_replace, moe_layer_freq", [(None, None), (0, 1), (1, 1), (3, 2)]
+)
+def test_unconstrained_moe_layer_layout_admits_every_layout(
+    first_k_dense_replace: int | None, moe_layer_freq: int | None
+) -> None:
+    constraints = PostTransformRuntimeConstraints(dtypes=frozenset({"bfloat16"}))
+
+    assert (
+        constraints.unsupported_dimensions(
+            _runtime_config(
+                first_k_dense_replace=first_k_dense_replace, moe_layer_freq=moe_layer_freq
+            )
+        )
+        == frozenset()
+    )
+
+
 def test_rows_pinned_to_different_sm_versions_do_not_overlap() -> None:
     sm90 = PostTransformRuntimeConstraints(sm_versions=frozenset({90}))
     sm100 = PostTransformRuntimeConstraints(sm_versions=frozenset({100, 103}))
@@ -713,6 +804,155 @@ def test_rows_pinned_to_different_sm_versions_do_not_overlap() -> None:
     assert decision.qualified
     assert decision.profile is not None
     assert decision.profile.profile_id == "model-sm100-target-v1"
+
+
+class _CausalLM(nn.Module):
+    """An `lm_head` plus a nested `model.embed_tokens`, as in the dense decoder roots."""
+
+    def __init__(self, *, tied: bool, device: str = "cpu") -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.embed_tokens = nn.Embedding(8, 4, device=device)
+        self.lm_head = nn.Linear(4, 8, bias=False, device=device)
+        if tied:
+            self.lm_head.weight = self.model.embed_tokens.weight
+
+
+def _split_tie_parameters(model: _CausalLM) -> _CausalLM:
+    """Give the head its own Parameter over the table's memory, as meta-init materialization can."""
+    model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.data)
+    return model
+
+
+def _model_with_two_heads() -> nn.Module:
+    model = nn.Module()
+    model.target = _CausalLM(tied=True)
+    model.draft = _CausalLM(tied=True)
+    return model
+
+
+def _model_with_head_view() -> _CausalLM:
+    model = _CausalLM(tied=False)
+    table = model.model.embed_tokens.weight
+    model.lm_head.weight = nn.Parameter(table.data[:, :2])
+    return model
+
+
+@pytest.mark.parametrize(
+    "model_factory, expected",
+    [
+        pytest.param(lambda: _CausalLM(tied=True), True, id="shared-parameter"),
+        pytest.param(
+            lambda: _split_tie_parameters(_CausalLM(tied=True)),
+            True,
+            id="shared-memory",
+        ),
+        pytest.param(lambda: _CausalLM(tied=False), False, id="distinct"),
+        pytest.param(lambda: _CausalLM(tied=True, device="meta"), True, id="meta-shared-parameter"),
+        pytest.param(lambda: _CausalLM(tied=False, device="meta"), False, id="meta-distinct"),
+        pytest.param(_model_with_head_view, False, id="different-view"),
+        pytest.param(nn.Module, None, id="no-head"),
+        pytest.param(_model_with_two_heads, None, id="ambiguous-heads"),
+    ],
+)
+def test_runtime_config_realizes_tied_word_embeddings_from_model(
+    model_factory: object,
+    expected: bool | None,
+) -> None:
+    model = model_factory()
+    for declared_tie in (True, False):
+        runtime_config = PostTransformRuntimeConfig.from_model_config(
+            SimpleNamespace(pretrained_config=SimpleNamespace(tie_word_embeddings=declared_tie)),
+            model=model,
+        )
+
+        assert runtime_config.tied_word_embeddings == (
+            declared_tie if declared_tie == expected else None
+        )
+
+
+def test_runtime_config_tie_needs_a_tensor_weight() -> None:
+    model = _CausalLM(tied=False)
+    del model.lm_head.weight
+    model.lm_head.weight = "not a tensor"
+
+    runtime_config = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(pretrained_config=SimpleNamespace(tie_word_embeddings=False)),
+        model=model,
+    )
+
+    assert runtime_config.tied_word_embeddings is None
+
+
+def test_runtime_config_keeps_declared_tie_without_model() -> None:
+    for declared_tie in (True, False):
+        runtime_config = PostTransformRuntimeConfig.from_model_config(
+            SimpleNamespace(pretrained_config=SimpleNamespace(tie_word_embeddings=declared_tie))
+        )
+
+        assert runtime_config.tied_word_embeddings is declared_tie
+
+
+@pytest.mark.parametrize(
+    "model_factory, declared_tie, expected_reason",
+    [
+        pytest.param(
+            lambda: _CausalLM(tied=False),
+            True,
+            "the config declares tie_word_embeddings=True, but the model's lm_head and "
+            "embed_tokens weights are distinct",
+            id="declared-tie-not-realized",
+        ),
+        pytest.param(
+            lambda: _CausalLM(tied=True),
+            None,
+            "the config declares no boolean tie_word_embeddings, and the model's lm_head and "
+            "embed_tokens weights are shared",
+            id="realized-tie-not-declared",
+        ),
+        pytest.param(
+            _model_with_two_heads,
+            False,
+            "the config declares tie_word_embeddings=False, but the model has no single "
+            "lm_head and embed_tokens weight pair to compare",
+            id="ambiguous-heads",
+        ),
+    ],
+)
+def test_runtime_config_logs_why_the_tie_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    model_factory: object,
+    declared_tie: bool | None,
+    expected_reason: str,
+) -> None:
+    messages: list[str] = []
+    monkeypatch.setattr(logger, "debug", messages.append)
+
+    runtime_config = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(pretrained_config=SimpleNamespace(tie_word_embeddings=declared_tie)),
+        model=model_factory(),
+    )
+
+    assert runtime_config.tied_word_embeddings is None
+    assert messages == [
+        f"Post-transform qualification treats tied_word_embeddings as unknown: {expected_reason}"
+    ]
+
+
+def test_runtime_config_logs_nothing_when_the_model_realizes_the_declared_tie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages: list[str] = []
+    monkeypatch.setattr(logger, "debug", messages.append)
+
+    for declared_tie in (True, False):
+        runtime_config = PostTransformRuntimeConfig.from_model_config(
+            SimpleNamespace(pretrained_config=SimpleNamespace(tie_word_embeddings=declared_tie)),
+            model=_CausalLM(tied=declared_tie),
+        )
+
+        assert runtime_config.tied_word_embeddings is declared_tie
+    assert messages == []
 
 
 def test_registry_rejects_duplicate_profile_id() -> None:

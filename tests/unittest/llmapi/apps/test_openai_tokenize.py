@@ -27,9 +27,11 @@ from tensorrt_llm.serve.openai_protocol import TokenizeRequest
 
 def test_missing_prompt_rejected():
     with pytest.raises(ValidationError):
+        # pyrefly: ignore [missing-argument]
         TokenizeRequest()
 
 
 def test_messages_rejected():
     with pytest.raises(ValidationError):
-        TokenizeRequest(messages=[{"role": "user", "content": "hello"}])
+        # pyrefly: ignore [unexpected-keyword]
+        TokenizeRequest(prompt="hello", messages=[{"role": "user", "content": "hello"}])
