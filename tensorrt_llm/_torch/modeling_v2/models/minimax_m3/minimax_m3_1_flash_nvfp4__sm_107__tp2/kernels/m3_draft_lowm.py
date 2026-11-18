@@ -17,7 +17,7 @@ import torch
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm.logger import logger
 
-from ..ops.gemm.m3_draft_lowm import m3_draft_lowm, tactic_for
+from ...ops.gemm.m3_draft_lowm import m3_draft_lowm, tactic_for
 from . import m3_report
 
 PATH = "m3_draft_lowm"
@@ -135,7 +135,7 @@ def prebuild(weights: Iterable[torch.Tensor], keys: Iterable[Tuple[Tuple[int, in
             if kind == "s":
                 # The push variant a boundary all-reduce may arm (o_proj / down): compiled only, never run here
                 # (its pushes need the all-reduce's exchange and a matching call).
-                from .m3_lowm_splitk import compile_push
+                from ...kernels.m3_lowm_splitk import compile_push
 
                 compile_push(x, weight.t(), out, use_pdl, tactic)
             _BUILT.add((n, k, m, use_pdl))

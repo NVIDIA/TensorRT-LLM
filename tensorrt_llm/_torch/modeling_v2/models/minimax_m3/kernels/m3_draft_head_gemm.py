@@ -18,9 +18,9 @@ with rows padded to 128 (``torch.ops.trtllm.mxfp8_quantize(x, True)``). The weig
 A tactic is FlashInfer's (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, split_k) with split_k 1 (the
 split-K kernel needs a contiguous output). Compiled once per (tactic, PDL, max active clusters) through
 ``cute_aot`` (TVM-FFI), outside capture; a forward never compiles. The AOT key's ``sources`` are those of every other
-CuTe DSL kernel of this target (the target package and the shared Blackwell helpers), so all of a run's compiles carry
-one source fingerprint; FlashInfer's kernel files, whose code the kernel body is traced from, enter the key as the
-``flashinfer_kernel`` argument (a digest of their contents) instead.
+CuTe DSL kernel of the M3.1 targets (the model family package and the shared Blackwell helpers), so all of a run's
+compiles carry one source fingerprint; FlashInfer's kernel files, whose code the kernel body is traced from, enter
+the key as the ``flashinfer_kernel`` argument (a digest of their contents) instead.
 """
 
 from __future__ import annotations
@@ -184,11 +184,12 @@ def tactics(n: int, m: int, k: int) -> List[Tactic]:
 
 
 def _aot_sources():
-    """The ``sources`` of the shipped AOT object: the target package (the wrapper) and the shared Blackwell kernel
-    helpers, the same files as every other CuTe DSL kernel of this target (one source fingerprint per run)."""
-    target = Path(__file__).resolve().parents[1]
+    """The ``sources`` of the shipped AOT object: the model family package (the wrapper) and the shared Blackwell
+    kernel helpers, the same files as every other CuTe DSL kernel of the M3.1 targets (one source fingerprint per
+    run)."""
+    family = Path(__file__).resolve().parents[1]
     shared = cute_aot.BLACKWELL_DIR
-    return cute_aot.py_files(str(target), str(shared))
+    return cute_aot.py_files(str(family), str(shared))
 
 
 @functools.lru_cache(maxsize=None)

@@ -28,8 +28,8 @@ from typing import Optional
 
 import torch
 
-from ..ops.spec.m3_sampled_accept import m3_sampled_accept as _sampled_accept_op
-from ..ops.spec.m3_sampled_accept_ws_words import m3_sampled_accept_ws_words as _ws_words_op
+from ...ops.spec.m3_sampled_accept import m3_sampled_accept as _sampled_accept_op
+from ...ops.spec.m3_sampled_accept_ws_words import m3_sampled_accept_ws_words as _ws_words_op
 
 # The kernel is compiled into TensorRT-LLM (cpp/tensorrt_llm/kernels/minimaxM3Sm107Tp4/sampledAccept.cu: a row's CTAs
 # launch as one thread-block cluster, bounded record polls) and reached through the ops/spec entry m3_sampled_accept.

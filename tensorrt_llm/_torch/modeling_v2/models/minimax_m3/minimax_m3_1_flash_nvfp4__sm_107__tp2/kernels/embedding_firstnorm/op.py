@@ -19,7 +19,9 @@ from cutlass.cute.runtime import from_dlpack
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
-from .m3_embedding_firstnorm_kernel import m3_embed_norm as _m3_embed_norm_jit
+from ....kernels.embedding_firstnorm.m3_embedding_firstnorm_kernel import (
+    m3_embed_norm as _m3_embed_norm_jit,
+)
 
 HIDDEN = 6144  # capacity: fixed: the checkpoint's hidden size
 MAX_ROWS = 16  # capacity: fixed: the kernel's built rows (9..16: EMBED16's gather)
@@ -153,8 +155,8 @@ class DecodeEmbedding:
 
 
 def _aot_sources():
-    """The Python files this module's CuTe DSL kernels are traced from (the target package and the shared Blackwell
-    kernel helpers): the ``sources`` of their shipped AOT objects."""
-    target = Path(__file__).resolve().parents[2]
+    """The ``sources`` of this module's shipped AOT objects: the Python files of the model family package (its
+    targets and the family code they import) and of the shared Blackwell kernel helpers."""
+    family = Path(__file__).resolve().parents[3]
     shared = cute_aot.BLACKWELL_DIR
-    return cute_aot.py_files(str(target), str(shared))
+    return cute_aot.py_files(str(family), str(shared))

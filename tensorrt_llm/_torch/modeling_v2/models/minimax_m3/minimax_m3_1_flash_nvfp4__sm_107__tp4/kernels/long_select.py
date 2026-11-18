@@ -20,7 +20,7 @@ from typing import Optional
 
 import torch
 
-from ..ops.attention.m3_select_long import MAX_BLOCKS, m3_select_long
+from ...ops.attention.m3_select_long import MAX_BLOCKS, m3_select_long
 from ..ops.attention.m3_select_long_dsl import m3_select_long_dsl
 
 

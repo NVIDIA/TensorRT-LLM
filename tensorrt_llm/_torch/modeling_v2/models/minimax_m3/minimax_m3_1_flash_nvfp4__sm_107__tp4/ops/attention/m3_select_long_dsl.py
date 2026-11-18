@@ -8,7 +8,7 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from .m3_select_long import _M3, MAX_BLOCKS, M3SelectLong
+from ....ops.attention.m3_select_long import _M3, MAX_BLOCKS, M3SelectLong
 
 
 class M3SelectLongDsl(OpWrapper):

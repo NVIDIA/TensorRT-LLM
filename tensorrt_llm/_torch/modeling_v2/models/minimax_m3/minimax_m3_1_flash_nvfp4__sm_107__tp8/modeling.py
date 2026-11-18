@@ -162,6 +162,9 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from .. import cute_aot, m31_capture_fork, runtime_hooks_compat
 from ..msa import engine as _msa_engine
 from ..ops import m3_fsel_topk as _fsel
+from ..ops.attention.m3_select_blocks import m3_select_blocks
+from ..ops.gemm.m3_fp32_linear import m3_fp32_linear
+from ..ops.spec.m3_draft_input import m3_draft_input
 from . import dspark as _dspark
 from . import weights as _weights
 from .kernels import m3_draft_step as m3_draft_step_kernel
@@ -194,7 +197,6 @@ from .ops.attention.m3_msa_attention import m3_msa_attention
 from .ops.attention.m3_producer import m3_producer
 from .ops.attention.m3_qk_norm_rope_fp8 import m3_qk_norm_rope_fp8
 from .ops.attention.m3_qkv_insert import m3_qkv_insert
-from .ops.attention.m3_select_blocks import m3_select_blocks
 from .ops.attention.m3_select_long import m3_select_long
 from .ops.attention.m3_select_long_dsl import m3_select_long_dsl
 from .ops.attention.m3_sparse_decode import m3_sparse_decode
@@ -210,7 +212,6 @@ from .ops.gemm.m3_dense_swiglu import LIMIT as DENSE_LIMIT
 from .ops.gemm.m3_dense_swiglu import m3_dense_swiglu
 from .ops.gemm.m3_draft_lowm import ROWS as DRAFT_LOWM_TACTIC_ROWS
 from .ops.gemm.m3_draft_lowm import m3_draft_lowm, tactic_for
-from .ops.gemm.m3_fp32_linear import m3_fp32_linear
 from .ops.gemm.m3_mx_gemv import (
     DENSE_DOWN,
     DENSE_GATE_UP,
@@ -235,7 +236,6 @@ from .ops.sampling import m31_softmax_mc as _softmax_mc
 from .ops.sampling import m31_topp_det as _topp_det
 from .ops.spec.m3_capture_norm import m3_capture_norm
 from .ops.spec.m3_chunk_norm import m3_chunk_norm
-from .ops.spec.m3_draft_input import m3_draft_input
 from .ops.spec.m3_draft_silu import m3_draft_silu
 from .ops.spec.m3_draft_step import m3_draft_step
 from .ops.spec.m3_force_vec import m3_force_vec, m3_force_vec_req

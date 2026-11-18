@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 import torch
 
-from ..ops.spec.m3_shard_accept import m3_shard_accept as _shard_accept_op
+from ...ops.spec.m3_shard_accept import m3_shard_accept as _shard_accept_op
 
 #: Verify rows per call, and exchange rows per call half of the workspace.
 SHARD_ROWS = 48  # capacity: fixed: DECODE_MAX_TOKENS verify rows

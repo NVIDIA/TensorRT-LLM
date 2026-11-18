@@ -203,7 +203,7 @@ def unfit(head, shard: Optional[int], k: int, row_stride: Optional[int]) -> Opti
 
 def tactic_invalid(tactic, n: int, rows: Iterable[int], k: int) -> Optional[str]:
     """Why the row-strided GEMM cannot run ``tactic`` at [m, k] x [n, k]^T for some m of ``rows`` (None: it can)."""
-    from .kernels import m3_draft_head_gemm
+    from ..kernels import m3_draft_head_gemm
 
     for m in rows:
         why = m3_draft_head_gemm.why_invalid(tactic, int(n), int(m), int(k))
@@ -285,7 +285,7 @@ class DraftHeadMx4:
     def _real_gemm(self, tactic):
         from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-        from .kernels import m3_draft_head_gemm
+        from ..kernels import m3_draft_head_gemm
 
         why = tactic_invalid(tactic, self.n, self.rows, self.k)
         if why is not None:

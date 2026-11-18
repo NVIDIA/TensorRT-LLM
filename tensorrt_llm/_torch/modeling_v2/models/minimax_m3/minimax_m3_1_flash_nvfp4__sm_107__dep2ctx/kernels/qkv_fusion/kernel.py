@@ -112,9 +112,19 @@ from cutlass.utils.gemm import sm100 as gemm_sm100
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
-from .clc_tile_scheduler import (
+from ....kernels.qkv_fusion.clc_tile_scheduler import (
     ClcDynamicPersistentTileScheduler,
     ClcDynamicPersistentTileSchedulerParams,
+)
+
+# The family's qkv_fusion package, which holds the tile scheduler this kernel traces.
+_FAMILY_QKV_FUSION_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    os.pardir,
+    os.pardir,
+    os.pardir,
+    "kernels",
+    "qkv_fusion",
 )
 
 HEAD_DIM = 128
@@ -1854,7 +1864,9 @@ def compile(
     compiled = cute_aot.compile_or_load(
         f"m31_dep2ctx_qkv_fusion {key!r} --enable-tvm-ffi",
         compile_fn,
-        sources=cute_aot.py_files(os.path.dirname(os.path.abspath(__file__))),
+        sources=cute_aot.py_files(
+            os.path.dirname(os.path.abspath(__file__)), _FAMILY_QKV_FUSION_DIR
+        ),
         tvm_ffi=True,
     )
     _COMPILE_CACHE[key] = (op, compiled)

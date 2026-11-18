@@ -959,8 +959,8 @@ class M3MoeLayer:
 
 
 def _aot_sources():
-    """The Python files this module's CuTe DSL kernels are traced from (the target package and the shared Blackwell
-    kernel helpers): the ``sources`` of their shipped AOT objects."""
-    target = Path(__file__).resolve().parents[2]
+    """The ``sources`` of this module's shipped AOT objects: the Python files of the model family package (its
+    targets and the family code they import) and of the shared Blackwell kernel helpers."""
+    family = Path(__file__).resolve().parents[3]
     shared = cute_aot.BLACKWELL_DIR
-    return tuple(sorted(set(cute_aot.py_files(str(target), str(shared))) | {_ENGINE_PATH}))
+    return tuple(sorted(set(cute_aot.py_files(str(family), str(shared))) | {_ENGINE_PATH}))

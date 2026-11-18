@@ -13,12 +13,12 @@ import torch
 from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 try:
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.ops.attention.m3_select_long import (  # noqa: E501
-        TOPK,
-        m3_select_long,
-    )
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.ops.attention.m3_select_long_dsl import (  # noqa: E501
         m3_select_long_dsl as op,
+    )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.attention.m3_select_long import (  # noqa: E501
+        TOPK,
+        m3_select_long,
     )
 except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)

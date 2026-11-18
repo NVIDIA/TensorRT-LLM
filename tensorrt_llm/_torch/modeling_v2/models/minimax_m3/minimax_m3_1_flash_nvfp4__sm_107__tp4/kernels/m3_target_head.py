@@ -17,8 +17,8 @@ from typing import Optional
 
 import torch
 
-from ..ops.gemm.m3_target_head import CTA_WARPS, MAX_ROWS, encode_chunked, round_trip_ok
-from ..ops.gemm.m3_target_head import m3_target_head as _target_head_op
+from ...ops.gemm.m3_target_head import CTA_WARPS, MAX_ROWS, encode_chunked, round_trip_ok
+from ...ops.gemm.m3_target_head import m3_target_head as _target_head_op
 
 
 @dataclass(eq=False)

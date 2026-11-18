@@ -305,8 +305,8 @@ def prebuild(use_pdl: bool, device) -> bool:
 
 
 def _aot_sources():
-    """The Python files this module's CuTe DSL kernel is traced from (the target package and the shared Blackwell
-    kernel helpers): the ``sources`` of its shipped AOT object."""
-    target = Path(__file__).resolve().parents[1]
+    """The ``sources`` of this module's shipped AOT objects: the Python files of the model family package (its
+    targets and the family code they import) and of the shared Blackwell kernel helpers."""
+    family = Path(__file__).resolve().parents[2]
     shared = cute_aot.BLACKWELL_DIR
-    return cute_aot.py_files(str(target), str(shared))
+    return cute_aot.py_files(str(family), str(shared))
