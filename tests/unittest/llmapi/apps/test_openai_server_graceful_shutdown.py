@@ -61,6 +61,7 @@ def _config_keywords(monkeypatch: pytest.MonkeyPatch, timeout: int | None) -> di
     monkeypatch.setattr(uvicorn, "Config", config)
     server = object.__new__(OpenAIServer)
     server.app = None
+    server._multi_frontend = None
     server.graceful_shutdown_timeout = timeout
     with pytest.raises(_ConfigCalled) as called:
         asyncio.run(server("localhost", 0))
@@ -179,6 +180,7 @@ def _serve_never_finishing_handler(directory: str) -> None:
     server = object.__new__(OpenAIServer)
     server.app = app
     server.disagg_cluster_worker = None
+    server._multi_frontend = None
     server._launcher_watchdog = None
     server.graceful_shutdown_timeout = _BOUND_S
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

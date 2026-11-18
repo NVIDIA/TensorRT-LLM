@@ -15,7 +15,6 @@ import sys
 import tempfile
 import time
 import traceback
-import typing
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -769,16 +768,28 @@ class OpenAIServer(_VideoRoutesMixin):
             perf_metrics_output_dir, server_kind)
         # Multi-frontend serving: see serve/multi_frontend.py.
         self._multi_frontend = multi_frontend_serving
+        self._frontend_affinity_ready = (multi_frontend_serving is None or
+                                         not multi_frontend_serving.is_launcher)
+        self._frontend_affinity_ready_path: Optional[Path] = None
+        if (multi_frontend_serving is not None
+                and multi_frontend_serving.num_frontends > 1
+                and self.generator.args.serve_frontend_affinity_port_stride
+                is not None):
+            self._frontend_affinity_ready_path = Path(
+                multi_frontend_serving.launcher_uds).with_name(
+                    "frontend_affinity_ready")
         self._launcher_forwarder: Optional[LauncherForwarder] = None
         self._launcher_watchdog: Optional[AttachedFrontendWatchdog] = None
         self._launcher_watchdog_task: Optional[asyncio.Task] = None
         if multi_frontend_serving is not None and multi_frontend_serving.is_attached:
+            launcher_pid = multi_frontend_serving.launcher_pid
+            if launcher_pid is None:
+                raise ValueError(
+                    "launcher_pid is required for an attached frontend")
             self._launcher_forwarder = LauncherForwarder(
                 multi_frontend_serving.launcher_uds)
             self._launcher_watchdog = AttachedFrontendWatchdog(
-                self._launcher_forwarder,
-                typing.cast(int, multi_frontend_serving.launcher_pid),
-                self._on_launcher_lost)
+                self._launcher_forwarder, launcher_pid, self._on_launcher_lost)
         self._tokenization_owners: Optional[
             TokenizationOwners] = start_tokenization_owners(
                 multi_frontend_serving,
@@ -1878,7 +1889,11 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def health(self) -> Response:
         if self._check_health():
-            return Response(status_code=200)
+            frontend_ready = self._frontend_affinity_ready
+            if self._frontend_affinity_ready_path is not None:
+                frontend_ready = (frontend_ready and
+                                  self._frontend_affinity_ready_path.exists())
+            return Response(status_code=200 if frontend_ready else 503)
         else:
             # If the engine has a fatal error, trigger server shutdown so the
             # pod doesn't linger as a zombie that accepts connections but never
@@ -4495,6 +4510,10 @@ class OpenAIServer(_VideoRoutesMixin):
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
         self.port = port
+        if (self._multi_frontend is not None
+                and self._multi_frontend.is_launcher
+                and self._frontend_affinity_ready_path is not None):
+            self._frontend_affinity_ready_path.unlink(missing_ok=True)
         # Without graceful_shutdown_timeout, uvicorn keeps its default and
         # waits for every request handler during graceful shutdown.
         config_kwargs = {}
@@ -4523,20 +4542,25 @@ class OpenAIServer(_VideoRoutesMixin):
             with _StartupTimer("http_server_start"):
                 while not server.started:
                     await asyncio.sleep(0.1)
-            if self.disagg_cluster_worker:
-                try:
-                    await self._wait_for_frontend_affinity_ports()
-                    if server.should_exit:
-                        return
+            try:
+                await self._wait_for_frontend_affinity_ports()
+                if server.should_exit:
+                    return
+                if (self._multi_frontend is not None
+                        and self._multi_frontend.is_launcher
+                        and self._frontend_affinity_ready_path is not None):
+                    self._frontend_affinity_ready_path.touch()
+                self._frontend_affinity_ready = True
+                if self.disagg_cluster_worker:
                     with _StartupTimer(
                             f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
                     ):
                         await self.disagg_cluster_worker.register_worker(
                             validator=lambda: not server.should_exit)
-                except Exception as e:
-                    logger.error(f"Worker registration failed: {e}")
-                    server.should_exit = True
-                    raise
+            except Exception as error:
+                logger.error(f"Frontend startup failed: {error}")
+                server.should_exit = True
+                raise
 
         registration_task = asyncio.create_task(_register_after_serving())
         self._registration_task = registration_task

@@ -450,10 +450,12 @@ def _frontend_listener_sockets(
 
 
 @pytest.mark.parametrize("start_attached", [True, False])
+@pytest.mark.parametrize("use_disagg_cluster", [True, False])
 def test_cluster_registration_waits_for_attached_affinity_listeners(
     monkeypatch: pytest.MonkeyPatch,
     frontend_tmp_path: Path,
     start_attached: bool,
+    use_disagg_cluster: bool,
 ) -> None:
     captured = []
     create_server = openai_server.create_uvicorn_server
@@ -477,7 +479,10 @@ def test_cluster_registration_waits_for_attached_affinity_listeners(
         storage.delete.return_value = True
 
         with ExitStack() as stack:
-            port, shared, affinity = stack.enter_context(_frontend_listener_sockets(2, 7))
+            num_frontends = 3 if start_attached and not use_disagg_cluster else 2
+            port, shared, affinity = stack.enter_context(
+                _frontend_listener_sockets(num_frontends, 7)
+            )
             connect = asyncio.open_connection
 
             async def observe_connection(host: str, target_port: int, **kwargs: Any) -> tuple:
@@ -491,7 +496,7 @@ def test_cluster_registration_waits_for_attached_affinity_listeners(
             path = str(frontend_tmp_path / "launcher.sock")
             constructor = openai_server.OpenAIServer
             servers = []
-            for frontend in range(2):
+            for frontend in range(num_frontends):
                 environment = stack.enter_context(
                     isolated_serve_env(frontend_tmp_path / f"frontend-{frontend}")
                 )
@@ -502,10 +507,10 @@ def test_cluster_registration_waits_for_attached_affinity_listeners(
                         is_launcher=frontend == 0,
                         launcher_pid=os.getppid() if frontend else None,
                         frontend_id=frontend,
-                        num_frontends=2,
+                        num_frontends=num_frontends,
                     )
                     kwargs["generator"].args.serve_frontend_affinity_port_stride = 7
-                    if frontend == 0:
+                    if frontend == 0 and use_disagg_cluster:
                         kwargs["disagg_cluster_config"] = DisaggClusterConfig(
                             cluster_uri="http://127.0.0.1:9", cluster_name="test"
                         )
@@ -531,7 +536,10 @@ def test_cluster_registration_waits_for_attached_affinity_listeners(
             async def hold_health(
                 request: Request, call_next: Callable[[Request], Awaitable[Response]]
             ) -> Response:
-                if request.url.path == "/health":
+                if (
+                    request.url.path == "/health"
+                    and request.headers.get("x-test-health-probe") != "1"
+                ):
                     health_entered.set()
                     await release_health.wait()
                 return await call_next(request)
@@ -561,11 +569,40 @@ def test_cluster_registration_waits_for_attached_affinity_listeners(
                 tasks.append(launcher)
                 if start_attached:
                     await asyncio.wait_for(health_entered.wait(), timeout=5)
+                    async with httpx.AsyncClient(
+                        base_url=f"http://127.0.0.1:{port}",
+                        headers={"x-test-health-probe": "1"},
+                    ) as client:
+                        assert (await client.get("/health")).status_code == 503
                     await asyncio.wait_for(affinity_probe_completed.wait(), timeout=5)
                     assert not registered.is_set()
                     release_health.set()
-                    await asyncio.wait_for(registered.wait(), timeout=5)
-                    assert listening_at_registration == [True]
+                    if not use_disagg_cluster:
+                        await _wait_for(lambda: captured[0].started, timeout=5)
+                        async with httpx.AsyncClient(
+                            base_url=f"http://127.0.0.1:{port + 14}"
+                        ) as client:
+                            assert (await client.get("/health")).status_code == 503
+                        tasks.append(
+                            asyncio.create_task(
+                                servers[2]("127.0.0.1", port, sockets=[shared[2], affinity[2]])
+                            )
+                        )
+                    if use_disagg_cluster:
+                        await asyncio.wait_for(registered.wait(), timeout=5)
+                        assert listening_at_registration == [True]
+                    else:
+                        storage.set.assert_not_awaited()
+                    async with httpx.AsyncClient(
+                        base_url=f"http://127.0.0.1:{port}",
+                        headers={"x-test-health-probe": "1"},
+                    ) as client:
+
+                        async def wait_for_ready_health() -> None:
+                            while (await client.get("/health")).status_code != 200:
+                                await asyncio.sleep(0.01)
+
+                        await asyncio.wait_for(wait_for_ready_health(), timeout=5)
                     async with httpx.AsyncClient(
                         base_url=f"http://127.0.0.1:{port + 14}"
                     ) as client:
@@ -584,6 +621,20 @@ def test_cluster_registration_waits_for_attached_affinity_listeners(
 
     with _isolated_uvicorn_logging(frontend_tmp_path):
         asyncio.run(run())
+
+
+def test_attached_frontend_requires_launcher_pid(frontend_tmp_path: Path) -> None:
+    def configure(**kwargs: Any) -> OpenAIServer:
+        kwargs["multi_frontend_serving"] = MultiFrontendServing(
+            launcher_uds=str(frontend_tmp_path / "launcher.sock"),
+            is_launcher=False,
+        )
+        return OpenAIServer(**kwargs)
+
+    with isolated_serve_env(frontend_tmp_path) as environment:
+        with mock.patch.object(app_factory, "OpenAIServer", configure):
+            with pytest.raises(ValueError, match="launcher_pid is required"):
+                environment.build_openai_server(AggConfig())
 
 
 @pytest.mark.parametrize(
