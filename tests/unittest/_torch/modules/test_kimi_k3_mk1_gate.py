@@ -72,3 +72,16 @@ def test_plan_check_raises_on_a_diverged_rank():
 
     with pytest.raises(RuntimeError, match=r"ranks \[5\]"):
         gate.check_mk1_plan(h, diverged, "test")
+
+
+def test_sm103_allowlist_honours_only_portable_switches(monkeypatch):
+    monkeypatch.setattr(gate, "mk1_platform_supported", lambda: False)
+    monkeypatch.setattr(gate, "_sm103_portable_platform", lambda: True)
+    portable = "TRTLLM_K3_KDA_VERIFY_PDL"
+    assert portable in gate.PORTABLE_ON_SM103
+    monkeypatch.setenv(portable, "1")
+    monkeypatch.setenv(SWITCH, "1")
+    assert gate.mk1_enabled(portable)
+    assert not gate.mk1_enabled(SWITCH)
+    monkeypatch.setattr(gate, "_sm103_portable_platform", lambda: False)
+    assert not gate.mk1_enabled(portable)

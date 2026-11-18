@@ -25,6 +25,7 @@ from ..speculative.dflash_attention import (
     get_dflash_trtllm_gen_ops,
 )
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.dflash_gqa_fused import dflash_gqa_qk_prep, gqa_fused_layer_enabled
 from ..speculative.spec_tail_kernels import draft_fusion_enabled
 from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
 
@@ -995,6 +996,199 @@ class DFlashForCausalLM(nn.Module):
             )
             self._dflash_block_offsets = torch.arange(block_size, dtype=torch.int32, device=device)
 
+    def gqa_fused_context_supported(self) -> bool:
+        """Whether ``dflash_gqa_ctx_kv_store`` reproduces ``precompute_context_kv`` here:
+        k_norm + neox RoPE from the flashinfer cos/sin cache, no input-layernorm fold, no bias."""
+        cached = getattr(self, "_gqa_ctx_supported", None)
+        if cached is not None:
+            return cached
+        ok = False
+        if self._fused_kv_weight is not None:
+            nkv, hd = self._num_kv_heads, self._head_dim
+            cache = self._get_cos_sin_cache()
+            ok = (
+                self._k_norm_stacked is not None
+                and self._input_ln_eps is None
+                and self._fused_kv_bias is None
+                and self._is_neox
+                and self._fused_kv_weight.dtype == torch.bfloat16
+                and self._k_norm_stacked.dtype == torch.bfloat16
+                and self._k_norm_stacked.is_contiguous()
+                and hd % 2 == 0
+                and (hd & (hd // 2 - 1)) == 0  # hd / 2 a power of two
+                and (nkv & (nkv - 1)) == 0
+                and cache.shape[-1] == hd
+            )
+        self._gqa_ctx_supported = ok
+        return ok
+
+    def fused_context_kv_gemm(self, projected_hidden: torch.Tensor) -> torch.Tensor:
+        """The one K/V GEMM of ``precompute_context_kv``: ``[N, L * 2 * nkv * hd]``."""
+        if projected_hidden.dtype != self._fused_kv_weight.dtype:
+            projected_hidden = projected_hidden.to(self._fused_kv_weight.dtype)
+        return F.linear(projected_hidden, self._fused_kv_weight)
+
+    def _gqa_fused_layer_applies(self, noise_embedding, ctx_kv_cache) -> bool:
+        """The per-layer fused prologue covers the FP8 paged block decode over a full,
+        non-causal context with q/k RMSNorm + flashinfer-style RoPE (no fused qk-norm-rope)."""
+        if self.dflash_attention_backend != "TRTLLM" or ctx_kv_cache is None:
+            return False
+        if ctx_kv_cache[0].dtype != torch.float8_e4m3fn or noise_embedding.dtype != torch.bfloat16:
+            return False
+        if not (self._has_qk_norm and not self._use_fused_qk_norm_rope):
+            return False
+        if not self.gqa_fused_context_supported():
+            return False
+        attn0 = self.model.layers[0].self_attn
+        if attn0.head_dim != self._head_dim or attn0.num_heads % attn0.num_key_value_heads:
+            return False
+        for layer_idx in range(self._num_attn_layers):
+            causal, window_size = self._get_attention_mask_args(layer_idx)
+            swa = self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
+            if swa != (-1, -1):
+                window_size = swa
+            if causal or window_size[0] != -1:
+                return False
+        return type(self)._post_attention_gate is DFlashForCausalLM._post_attention_gate
+
+    def _draft_fused_all_reduce(self):
+        """The MNNVL all-reduce a drafter layer fuses with residual add + RMSNorm
+        (``TLLM_DSPARK_DRAFT_FUSION=1``), or None."""
+        if not draft_fusion_enabled():
+            return None
+        layers = self.model.layers
+        all_reduce = getattr(layers[0].self_attn.o_proj, "all_reduce", None) if layers else None
+        if all_reduce is None or all_reduce.mnnvl_allreduce is None:
+            return None
+        return all_reduce
+
+    @staticmethod
+    def _fused_ar_residual_norm(all_reduce, partial, residual, norm):
+        """``norm(all_reduce(partial) + residual)`` and the new residual, in one kernel."""
+        return all_reduce(
+            partial,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=norm.weight,
+                eps=norm.variance_epsilon,
+            ),
+        )
+
+    def _dflash_forward_gqa_fused(self, noise_embedding, query_positions, ctx_kv_cache, fixup):
+        """``dflash_forward`` for ``TLLM_DFLASH_GQA_FUSED_LAYER=1``: the same layer loop with the
+        q/k norm, RoPE, FP8 casts, K/V page scatter and head folding of each layer in one kernel
+        (``dflash_gqa_qk_prep``), and, with ``TLLM_DSPARK_DRAFT_FUSION=1`` over MNNVL, each
+        layer's all-reduce fused with the residual add and the next RMSNorm."""
+        trtllm_gen_ops = self._dflash_trtllm_gen_ops
+        attn0 = self.model.layers[0].self_attn
+        q_size, head_dim = attn0.q_size, attn0.head_dim
+        nq, nkv = attn0.num_heads, attn0.num_key_value_heads
+        group = nq // nkv
+        B, block_size = noise_embedding.shape[0], noise_embedding.shape[1]
+        hidden_states = noise_embedding
+        self._prepare_dflash_trtllm_gen_buffers(
+            hidden_states.dtype, hidden_states.device, fixup.block_tables.size(0), block_size, nq, nkv, head_dim
+        )
+        block_tables = fixup.block_tables
+        pages_per_slot = block_tables.size(1)
+        page_size = ctx_kv_cache[0].size(-2)
+        cos_sin = self._get_cos_sin_cache()
+        positions = query_positions.reshape(-1).to(torch.int32)
+        fused_ar = self._draft_fused_all_reduce()
+        no_reduce = AllReduceParams(enable_allreduce=False)
+        residual = None
+        partial = None
+        for layer_idx, layer in enumerate(self.model.layers):
+            attn_mod = layer.self_attn
+            hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            if residual is None:
+                residual = hidden_states.clone()
+                hs_normed = layer.input_layernorm(hs_flat)
+            elif partial is not None:
+                res_flat = residual.reshape(-1, residual.shape[-1])
+                hs_normed, res_flat = self._fused_ar_residual_norm(
+                    fused_ar, partial, res_flat, layer.input_layernorm
+                )
+                residual = res_flat.reshape(B, block_size, -1)
+            else:
+                res_flat = residual.reshape(-1, residual.shape[-1])
+                hs_normed, res_flat = layer.input_layernorm(hs_flat, res_flat)
+                residual = res_flat.reshape(B, block_size, -1)
+
+            qkv = attn_mod.qkv_proj(hs_normed)
+            layer_cache = ctx_kv_cache[layer_idx]
+            q_folded = dflash_gqa_qk_prep(
+                qkv,
+                attn_mod.q_norm.weight,
+                attn_mod.k_norm.weight,
+                attn_mod.q_norm.variance_epsilon,
+                cos_sin,
+                positions,
+                fixup.pages,
+                fixup.offsets,
+                layer_cache,
+                B,
+                block_size,
+                nq,
+                nkv,
+                head_dim,
+            )
+            out = qkv.new_empty((B, block_size, nq, head_dim))
+            out_folded = q_folded.new_empty(q_folded.shape, dtype=out.dtype)
+            trtllm_gen_ops.batch_decode_with_kv_cache(
+                query=q_folded,
+                kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
+                workspace_buffer=self._dflash_trtllm_gen_workspace,
+                block_tables=block_tables,
+                seq_lens=fixup.seq_lens,
+                max_seq_len=pages_per_slot * page_size,
+                bmm1_scale=head_dim**-0.5,
+                bmm2_scale=1.0,
+                window_left=-1,
+                out=out_folded,
+                sinks=None,
+                enable_pdl=False,
+                kv_layout="HND",
+                backend="trtllm-gen",
+                q_len_per_req=1,
+                max_q_len=None,
+                cum_seq_lens_q=None,
+                kv_cache_sf=None,
+                uses_shared_paged_kv_idx=True,
+                bmm1_scale_log2=None,
+                multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
+            )
+            out.view(B, block_size, nkv, group, head_dim).copy_(
+                out_folded.view(B, nkv, block_size, group, head_dim).permute(0, 2, 1, 3, 4)
+            )
+            attn_output = out.reshape(B * block_size, q_size)
+            res_flat = residual.reshape(-1, residual.shape[-1])
+            if fused_ar is not None:
+                hidden_out = attn_mod.o_proj(attn_output, all_reduce_params=no_reduce)
+                hidden_out, res_flat = self._fused_ar_residual_norm(
+                    fused_ar, hidden_out, res_flat, layer.post_attention_layernorm
+                )
+                partial = layer.mlp(hidden_out, final_all_reduce_params=no_reduce)
+                hidden_states = partial
+            else:
+                hidden_out = attn_mod.o_proj(attn_output)
+                hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
+                hidden_out = layer.mlp(hidden_out)
+                hidden_states = hidden_out.reshape(B, block_size, -1)
+            residual = res_flat.reshape(B, block_size, -1)
+
+        if partial is not None:
+            hidden_states_out, _ = self._fused_ar_residual_norm(
+                fused_ar, partial, residual.reshape(-1, residual.shape[-1]), self.model.norm
+            )
+            return hidden_states_out
+        hidden_states_out, _ = self.model.norm(
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            residual.reshape(-1, residual.shape[-1]),
+        )
+        return hidden_states_out
+
     def dflash_forward(
         self,
         noise_embedding: torch.Tensor,
@@ -1005,6 +1199,7 @@ class DFlashForCausalLM(nn.Module):
         ctx_cache_batch_idx: torch.Tensor,
         ctx_kv_cache: Optional[torch.Tensor] = None,
         ctx_page_table: Optional[torch.Tensor] = None,
+        gqa_fixup=None,
     ) -> torch.Tensor:
         """DFlash draft forward with cross-attention over a pooled K/V buffer.
 
@@ -1036,6 +1231,13 @@ class DFlashForCausalLM(nn.Module):
 
         if self._fused_kv_weight is None:
             self._build_fused_kv_buffers()
+
+        if (
+            gqa_fixup is not None
+            and gqa_fused_layer_enabled()
+            and self._gqa_fused_layer_applies(noise_embedding, ctx_kv_cache)
+        ):
+            return self._dflash_forward_gqa_fused(noise_embedding, query_positions, ctx_kv_cache, gqa_fixup)
 
         layer0 = self.model.layers[0]
         attn0 = layer0.self_attn

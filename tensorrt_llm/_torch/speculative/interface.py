@@ -1427,6 +1427,15 @@ class SpecWorkerBase(nn.Module, ABC):
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
 
+    def keeps_state_of_unscheduled_requests(self) -> bool:
+        """Whether a generation request that an iteration does not schedule keeps
+        its drafter state for the next iteration that does.
+
+        Conservative default: a worker opts in once its per-request state is
+        known to survive such an iteration.
+        """
+        return False
+
     def prepare_managed_draft_cache(
         self,
         draft_model: nn.Module | None,

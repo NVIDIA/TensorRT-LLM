@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3 o_proj -> attention residual through a Lamport mailbox (opt-in).
 
-``TRTLLM_K3_OPROJ_LAMPORT=1`` (SM107 with the CuTe DSL Rubin kernels, through ``kimi_k3_mk1_gate``)
+``TRTLLM_K3_OPROJ_LAMPORT=1`` (SM107 with the CuTe DSL Rubin kernels, or SM103 with the CuTe DSL,
+through ``kimi_k3_mk1_gate``; on SM103 the DeepGEMM o_proj output is copied into the slot by the
+publish kernel, ``K3LamportTarget.publish_rows``)
 replaces, at the post-attention site of eligible decoder layers of a pure generation batch of at
 most ``TRTLLM_K3_OPROJ_LAMPORT_MAX_M`` tokens, the chain
 
@@ -109,6 +111,39 @@ class K3LamportTarget:
         cute_dsl_mxfp8_gemm_rubin_lamport(
             act_fp8, weight, act_scale, weight_scale, self.slot_address, self.leading_dim
         )
+        self.published = True
+        return self.delta
+
+
+    def mark_published(self) -> K3LamportDelta:
+        """Record that a GEMM epilogue published this rank's partial into the slot (once) and return
+        the handle.
+
+        Slot contract for such an epilogue: token i, column n of this rank's partial goes to byte
+        ``slot_address + i * leading_dim * 2 + n * 2`` (``slot_address`` already selects the rank's column
+        block); values are the BF16 output the stock GEMM would store, with every ``-0`` written as ``+0``
+        (``-0`` is the armed sentinel); stores are whole 32-bit words or 16-byte fragments, after the
+        kernel's own ``griddepcontrol.wait``; rows past M are not written; each use is published once.
+        """
+        if self.published:
+            raise RuntimeError("an o_proj Lamport target was published twice in one use")
+        self.published = True
+        return self.delta
+
+    def publish_rows(self, out: torch.Tensor) -> K3LamportDelta:
+        """Publish the o_proj partial ``out`` (BF16 ``[M, 7168]``, the output of a GEMM that has no
+        mailbox epilogue: the SM103 DeepGEMM o_proj) into this rank's slot (once) and return the
+        handle. ``run_k3_lamport_publish`` copies it, turning ``-0`` into ``+0``."""
+        from ..cute_dsl_kernels.rubin.k3_lamport_publish import run_k3_lamport_publish
+
+        if self.published:
+            raise RuntimeError("an o_proj Lamport target was published twice in one use")
+        if tuple(out.shape) != (self.delta.m, HIDDEN_SIZE):
+            raise RuntimeError(
+                f"o_proj Lamport publish of {tuple(out.shape)} does not match the planned "
+                f"{self.delta.m} x {HIDDEN_SIZE}"
+            )
+        run_k3_lamport_publish(out, self.slot_address, self.leading_dim)
         self.published = True
         return self.delta
 

@@ -739,8 +739,19 @@ _SF_TILE_BYTES = 512
 _SF_BLOCKS = HIDDEN_SIZE // 128
 
 
+#: ``TRTLLM_K3_ATTN_RES_FP8_DG=1`` (read at import): the FP8 output's scales are written in DeepGEMM's
+#: packed MN-major layout (int32 ``[M, 7168 / 512]`` with strides ``(1, ceil4(M))``: the 1x128 scale of
+#: block ``b`` of row ``r`` is byte ``b % 4`` of word ``(b // 4) * ceil4(M) + r``; rows ``M <= r <
+#: ceil4(M)`` zero) instead of the Rubin R128c4 layout; the codes and scale values are the same. This is
+#: the operand of ``fp8_prequantized_swap_ab_gemm`` (SM100/103).
+SF_DEEPGEMM = os.environ.get("TRTLLM_K3_ATTN_RES_FP8_DG", "0") == "1"
+
+
 def fp8_scale_numel(num_tokens: int) -> int:
-    """Bytes of the R128c4 UE8M0 scale buffer of ``[num_tokens, 7168]`` (rows padded to 128)."""
+    """Bytes of the UE8M0 scale buffer of ``[num_tokens, 7168]``: R128c4 (rows padded to 128), or
+    with ``TRTLLM_K3_ATTN_RES_FP8_DG`` DeepGEMM's packed layout (rows padded to 4)."""
+    if SF_DEEPGEMM:
+        return (num_tokens + 3) // 4 * 4 * (HIDDEN_SIZE // 128)
     return (num_tokens + 127) // 128 * 128 * (HIDDEN_SIZE // 32)
 
 
@@ -875,6 +886,17 @@ def _sf_offset(token, block):
         + Int64(block) * _SF_TILE_BYTES
         + Int64((token & 31) * 16 + ((token & 127) >> 5) * 4)
     )
+
+
+def _sf_dg_offset(token, block, m):
+    """Byte offset of (token, 128-element block) in DeepGEMM's packed MN-major scale layout."""
+    m_pad4 = ((m + 3) >> 2) << 2
+    return (Int64(block >> 2) * Int64(m_pad4) + Int64(token)) * 4 + Int64(block & 3)
+
+
+def _pad_scale_rows_dg(m, token):
+    """Padding rows ``m + token + j * m < ceil4(m)`` that token ``token`` clears (DeepGEMM layout)."""
+    return (((m + 3) >> 2) * 4 - token - 1) // m
 
 
 def _pad_scale_rows(m, token):
@@ -1470,23 +1492,41 @@ class K3AttnResKernel:
                 # thread rather than ``items`` stores by one thread per half.
                 lead = valid_j * Int32((tidx & 127) == j)
                 sf_block = (rank * self.slice + _THREADS * j) // 128 + half
-                _stg_b32_if(lead, sf_addr + _sf_offset(token, sf_block), e8 * 0x01010101)
+                if cutlass.const_expr(SF_DEEPGEMM):
+                    _stg_b8_if(lead, sf_addr + _sf_dg_offset(token, sf_block, m), e8)
+                else:
+                    _stg_b32_if(lead, sf_addr + _sf_offset(token, sf_block), e8 * 0x01010101)
             # Padding scale rows of this token (``_pad_scale_rows``) x this CTA's blocks, spread
             # over all threads (one word each per round; on a poll cluster by its first CTA).
             pad_lead = Int32(1)
             if cutlass.const_expr(poll_cluster):
                 pad_lead = Int32(cta == 0)
             blocks = self.slice // 128
-            pad_words = _pad_scale_rows(m, token) * blocks
+            if cutlass.const_expr(SF_DEEPGEMM):
+                pad_words = _pad_scale_rows_dg(m, token) * blocks
+            else:
+                pad_words = _pad_scale_rows(m, token) * blocks
             for it in cutlass.range(0, (pad_words - tidx + _THREADS - 1) // _THREADS, 1, unroll=1):
                 word = tidx + it * _THREADS
                 pad_row = word // blocks
-                _stg_b32_if(
-                    pad_lead,
-                    sf_addr
-                    + _sf_offset(m + token + pad_row * m, rank * blocks + word - pad_row * blocks),
-                    Int32(0),
-                )
+                if cutlass.const_expr(SF_DEEPGEMM):
+                    _stg_b8_if(
+                        pad_lead,
+                        sf_addr
+                        + _sf_dg_offset(
+                            m + token + pad_row * m, rank * blocks + word - pad_row * blocks, m
+                        ),
+                        Int32(0),
+                    )
+                else:
+                    _stg_b32_if(
+                        pad_lead,
+                        sf_addr
+                        + _sf_offset(
+                            m + token + pad_row * m, rank * blocks + word - pad_row * blocks
+                        ),
+                        Int32(0),
+                    )
 
         if cutlass.const_expr(self.use_pdl and self.trigger == TRIGGER_AT_END):
             _bar_sync(3)
@@ -1891,15 +1931,28 @@ class K3AttnResFastKernel:
             _stg_v2_if(valid, fp8_addr + Int64(token) * HIDDEN_SIZE + Int64(vec) * 8, w0, w1)
             lead = valid * Int32((tidx & 15) == 0)
             sf_block = vec >> 4
-            _stg_b32_if(lead, sf_addr + _sf_offset(token, sf_block), e8 * 0x01010101)
+            if cutlass.const_expr(SF_DEEPGEMM):
+                _stg_b8_if(lead, sf_addr + _sf_dg_offset(token, sf_block, m), e8)
+            else:
+                _stg_b32_if(lead, sf_addr + _sf_offset(token, sf_block), e8 * 0x01010101)
             # Padding scale rows of this token: the block's sixteen threads take every 16th.
             pad_lane = tidx & 15
-            pad_rows = _pad_scale_rows(m, token)
+            if cutlass.const_expr(SF_DEEPGEMM):
+                pad_rows = _pad_scale_rows_dg(m, token)
+            else:
+                pad_rows = _pad_scale_rows(m, token)
             for it in cutlass.range(0, (pad_rows - pad_lane + 15) // 16, 1, unroll=1):
                 pad_row = pad_lane + it * 16
-                _stg_b32_if(
-                    valid, sf_addr + _sf_offset(m + token + pad_row * m, sf_block), Int32(0)
-                )
+                if cutlass.const_expr(SF_DEEPGEMM):
+                    _stg_b8_if(
+                        valid,
+                        sf_addr + _sf_dg_offset(m + token + pad_row * m, sf_block, m),
+                        Int32(0),
+                    )
+                else:
+                    _stg_b32_if(
+                        valid, sf_addr + _sf_offset(m + token + pad_row * m, sf_block), Int32(0)
+                    )
 
         if cutlass.const_expr(self.use_pdl and self.trigger == TRIGGER_AT_END):
             _bar_sync(4, self.threads)

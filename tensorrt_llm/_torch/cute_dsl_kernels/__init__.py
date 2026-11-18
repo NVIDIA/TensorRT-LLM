@@ -21,6 +21,9 @@ _MXFP8_STATIONARY_ENV = "TRTLLM_CUTEDSL_MXFP8_STATIONARY"
 _MOE_WEIGHT_EVICT_FIRST_ENV = "TRTLLM_CUTEDSL_MOE_WEIGHT_EVICT_FIRST"
 _MOE_COMPACT_EPILOGUE_ENV = "TRTLLM_CUTEDSL_MOE_COMPACT_EPILOGUE"
 _MOE_FC2_PDL_ENV = "TRTLLM_CUTEDSL_MOE_FC2_PDL"
+_MOE_BW_EVICT_FIRST_ENV = "TRTLLM_CUTEDSL_MOE_BW_EVICT_FIRST"
+_MOE_DECODE_BUCKETS_ENV = "TRTLLM_CUTEDSL_MOE_DECODE_BUCKETS"
+_K3_DECODE_BUCKETS = (6, 12, 18, 24, 30, 36, 42, 48)
 _EVICT_FIRST_MAX_TOKENS = 512
 _EVICT_FIRST_MAX_LOCAL_EXPERTS = 512
 _announced = set()
@@ -98,6 +101,12 @@ def moe_fc2_pdl() -> bool:
     must be complete when it launches: in the MoE, FC1 waits for the sort that writes them, and the
     FC2 tuning input hook waits for its own sort. 1-CTA FC2 tactics, not the die-local layout; needs
     ``TRTLLM_ENABLE_PDL`` (on by default). Read when a kernel is built and part of its cache key.
+
+    Invariant this relies on: every kernel between ``k3_route_tail`` (the tile-table producer) and
+    FC1 waits (``griddepcontrol.wait`` / ``cudaGridDependencySynchronize``) BEFORE it triggers its
+    dependents; the quant kernels (cpp, Kf, Triton trigger 0/1) do. A kernel that triggers before its
+    wait (Triton quant trigger 2) breaks the transitivity that lets FC1 and FC2 read the tile tables
+    before their own wait.
     """
     return _switch(_MOE_FC2_PDL_ENV)
 
@@ -151,6 +160,78 @@ def moe_weight_evict_first(num_tokens: int,
     if die_local:
         return num_tokens * top_k <= tile_size * num_experts
     return num_tokens <= _EVICT_FIRST_MAX_TOKENS
+
+
+def moe_decode_buckets() -> tuple:
+    """Extra token counts the routed-expert autotuning treats as buckets of their own.
+
+    ``TRTLLM_CUTEDSL_MOE_DECODE_BUCKETS`` (default empty = power-of-2 buckets only): ``1`` adds the
+    verify-row counts of speculative decoding with five draft tokens (6, 12, ..., 48 = 1..8 requests), or a
+    comma list of token counts. The tuner maps a call to the largest bucket not above its token count, so
+    without them 6 tokens are tuned as 4 (and 12 as 8): fewer tiles, a different wave count, and possibly
+    a different FC1 winner than the one that is fastest at 6 tokens. Read when the
+    tuning configs are built and in the bucket mapping.
+    """
+    value = os.environ.get(_MOE_DECODE_BUCKETS_ENV, "").strip()
+    if value in ("", "0"):
+        return ()
+    if value == "1":
+        return _K3_DECODE_BUCKETS
+    return tuple(sorted({int(t) for t in value.split(",") if t.strip()}))
+
+
+def moe_token_buckets(max_tokens: int) -> tuple:
+    """Power-of-2 token buckets up to ``max_tokens`` plus the ``moe_decode_buckets`` not above it."""
+    buckets = set()
+    m = 1 << (max(1, int(max_tokens)).bit_length() - 1)  # last power of 2 <= max_tokens
+    while m >= 1:
+        buckets.add(m)
+        m //= 2
+    buckets.update(t for t in moe_decode_buckets() if t <= max_tokens)
+    return tuple(sorted(buckets))
+
+
+def moe_map_token_bucket(x: int) -> int:
+    """The largest ``moe_token_buckets`` entry not above ``x`` (>= 1)."""
+    x = max(1, int(x))
+    best = 1 << (x.bit_length() - 1)
+    for t in moe_decode_buckets():
+        if best < t <= x:
+            best = t
+    return best
+
+
+def moe_bw_weight_evict_first(num_tokens: int, num_local_experts: int) -> bool:
+    """Whether a Blackwell (SM100/SM103) NVFP4 routed-expert GEMM marks its weight loads L2 evict-first.
+
+    ``TRTLLM_CUTEDSL_MOE_BW_EVICT_FIRST=1`` (default 0 = off) makes the FC1 (gather GEMM + activation) and FC2
+    (GEMM + finalize) kernels of the Blackwell family issue the TMA loads of the weight tile and of its block
+    scales with the CUTLASS ``CacheHintSm90::EVICT_FIRST`` policy, as the Rubin kernels do (see
+    ``moe_weight_evict_first``). It never changes a value. The shape gate follows the Rubin one for the default
+    allocation: at most ``_EVICT_FIRST_MAX_TOKENS`` input rows and ``_EVICT_FIRST_MAX_LOCAL_EXPERTS`` local
+    experts. The result is part of the kernel cache key, so it is read when a kernel is built.
+    """
+    if not _switch(_MOE_BW_EVICT_FIRST_ENV, default="0"):
+        return False
+    return (num_local_experts <= _EVICT_FIRST_MAX_LOCAL_EXPERTS
+            and num_tokens <= _EVICT_FIRST_MAX_TOKENS)
+
+
+def log_moe_bw_weight_evict_first(kernel: str, enabled: bool,
+                                  num_tokens: int) -> None:
+    """Announce once per process, kernel and decision how a Blackwell routed-expert kernel was built."""
+    logger.info_once(
+        f"{_MOE_BW_EVICT_FIRST_ENV}: Blackwell NVFP4 {kernel} weight loads L2 evict-first "
+        f"{'on' if enabled else 'off'} (first build at {num_tokens} tokens)",
+        key=f"moe_bw_weight_evict_first_{kernel}_{enabled}")
+
+
+def log_moe_fc2_pdl_bw(kernel: str, enabled: bool) -> None:
+    """Announce once per process and kernel whether a Blackwell FC1/FC2 kernel was built for the FC2 PDL overlap."""
+    logger.info_once(
+        f"{_MOE_FC2_PDL_ENV}: Blackwell NVFP4 {kernel} FC2 weight pre-wait / FC1 early trigger "
+        f"{'on' if enabled else 'off'}",
+        key=f"moe_fc2_pdl_bw_{kernel}_{enabled}")
 
 
 def log_moe_weight_evict_first(kernel: str, enabled: bool,

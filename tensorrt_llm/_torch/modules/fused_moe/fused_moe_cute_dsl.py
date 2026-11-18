@@ -34,6 +34,7 @@ from ...custom_ops.cute_dsl_custom_ops import (
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmRunner,
     Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+from ...cute_dsl_kernels import moe_map_token_bucket, moe_token_buckets
 from ...cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ...model_config import ModelConfig, QuantConfig
 from ...ugpu import die_local
@@ -60,6 +61,13 @@ from .routing import BaseMoeRoutingMethod
 # Kill switch for CuteDslFusedMoE.quantize_input_async (fork the NVFP4 input
 # quantization onto the MoE aux stream so it overlaps top-k + moe_sort).
 ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
+# TRTLLM_K3_MOE_QUANT_KF_MAX_ROWS=N (default 0 = off): quantize the 3584-wide BF16 MoE input with the Kf kernel
+# (trtllm::fp4_quantize_kf, bitwise equal to fp4_quantize) only for batches of at most N rows, the stock kernel above.
+# Use it with TRTLLM_NVFP4_QUANT_KF=0 (that env switches the kernel for every row count).
+# Per-layer ordering hooks set by the Kimi K3 MoE layer around one routed-expert call (TRTLLM_K3_SHARED_ORDER):
+# "pre_fc1": event the main stream waits on right before FC1; "post_fc1" / "post_fc2": events recorded after FC1 / FC2.
+K3_ORDER_HOOKS: Dict[str, Any] = {}
+K3_MOE_QUANT_KF_MAX_ROWS = int(os.environ.get("TRTLLM_K3_MOE_QUANT_KF_MAX_ROWS", "0"))
 
 # TRTLLM_K3_MOE_SORT_KF=1 (read once at import): run_moe_nvfp4_impl sorts the tokens of a Kimi K3 EP16 rank on SM107 (896
 # experts, top 16, 56 local experts, tile 128, TRTLLM_K3_MOE_SORT_KF_MIN_TOKENS (default 64, not below 16) to 8192 rows, a
@@ -446,8 +454,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                                                       self.local_expert_offset)
             self.__class__.tuning_config_cache[key] = TuningConfig(
                 dynamic_tensor_specs=(DynamicTensorSpec(
-                    0, 0, get_last_power_of_2_num_tokens_buckets,
-                    last_positive_power_of_2), ),
+                    0, 0, moe_token_buckets, moe_map_token_bucket), ),
                 constraint_specs=(ConstraintSpec(1, 0,
                                                  helper.infer_shape_num_tokens),
                                   ConstraintSpec(2, 0,
@@ -1042,9 +1049,17 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 x, x_sf = x.fp4_tensor, x.scaling_factor
             else:
                 x_row = x.shape[0]
-                x, x_sf = torch.ops.trtllm.fp4_quantize(
-                    x, self.fc31_input_scale, self.scaling_vector_size, False,
-                    False)
+                if (K3_MOE_QUANT_KF_MAX_ROWS > 0
+                        and 0 < x_row <= K3_MOE_QUANT_KF_MAX_ROWS
+                        and x.dtype == torch.bfloat16 and x.dim() == 2
+                        and x.shape[1] == 3584 and x.is_contiguous()
+                        and self.scaling_vector_size == 16):
+                    x, x_sf = torch.ops.trtllm.fp4_quantize_kf(
+                        x, self.fc31_input_scale)
+                else:
+                    x, x_sf = torch.ops.trtllm.fp4_quantize(
+                        x, self.fc31_input_scale, self.scaling_vector_size,
+                        False, False)
         elif self.has_deepseek_fp8_block_scales:
             # FP8 block scales doesn't support permutation of quantized inputs.
             # WAR: The quantization is in run_moe_fp8_block_scales.
@@ -1361,6 +1376,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # produced on the aux stream and are first read here, after moe_sort
         # ran on the main stream in parallel with the quantization.
         self._join_pending_x_ready()
+        _ev = K3_ORDER_HOOKS.get("pre_fc1")
+        if _ev is not None:
+            _ev.wait()
         if self._die_local is not None:
             fc1_ws, fc2_ws = self._die_local["ws"].get()
             die_kwargs = dict(gather_act_kwargs)
@@ -1378,6 +1396,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 **die_kwargs)
         else:
             x, x_sf = gather_act_op(**gather_act_kwargs)
+        _ev = K3_ORDER_HOOKS.get("post_fc1")
+        if _ev is not None:
+            _ev.record()
 
         if self.use_fused_finalize:
             if has_aux_streams:
@@ -1463,6 +1484,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 topk_scales=token_final_scales,
             )
+        _ev = K3_ORDER_HOOKS.get("post_fc2")
+        if _ev is not None:
+            _ev.record()
         return moe_output
 
     def run_moe_bf16(

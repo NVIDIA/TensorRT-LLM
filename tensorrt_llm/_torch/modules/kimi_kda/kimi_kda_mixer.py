@@ -26,7 +26,7 @@ import torch
 from fla.modules import ShortConvolution
 from torch import nn
 
-from tensorrt_llm._utils import get_env_flag
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 from tensorrt_llm.logger import logger
 
 from ....models.modeling_utils import QuantConfig
@@ -59,6 +59,12 @@ _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_
 # core split problem from a plain breakable-graph problem. The model still declares its captured
 # body context-only, so the engine replays no batch with generation requests in either mode.
 _KDA_BCG_WHOLE_MIXER = get_env_flag("TRTLLM_K3_BCG_KDA_WHOLE", False)
+# TRTLLM_K3_KDA_OUT_QUANT_DG=1 (read once at import; SM100/103 with DeepGEMM projections): the fused
+# verify kernel quantizes its gated-norm output to E4M3 with DeepGEMM-packed UE8M0 scales in its
+# epilogue and o_proj consumes the pair, instead of a separate quantize kernel after the verify
+# kernel. Same E4M3 codes and scales as the standalone quantizer (the Rubin MXFP8-output epilogue
+# computes them the same way; only the scale layout differs).
+_KDA_OUT_QUANT_DG = get_env_flag("TRTLLM_K3_KDA_OUT_QUANT_DG", False)
 # Heuristic ported from SGLang's Blackwell cutoff:
 # https://github.com/sgl-project/sglang/blob/e84bbf68efb683c9e2eef4168c5198042544599d/python/sglang/srt/models/kimi_k3.py#L946-L954
 # It has not been tuned for TensorRT-LLM; benchmark and retune it for TRT-LLM's
@@ -495,6 +501,23 @@ class KimiKDALinearAttention(nn.Module):
             and proj is not None
             and bool(getattr(proj, "supports_prequantized_input", False))
             and callable(getattr(proj, "forward_prequantized", None))
+        ) or self._prequantized_deepgemm()
+
+    def _prequantized_deepgemm(self) -> bool:
+        """SM100/103: the attn_res kernel writes its FP8 output in DeepGEMM's packed scale layout
+        (``TRTLLM_K3_ATTN_RES_FP8_DG``) and the fused q|k|v|g projection is the DeepGEMM one, so
+        ``forward_prequantized_deepgemm`` consumes it (the input quantize kernel disappears)."""
+        if get_sm_version() not in (100, 103):
+            return False
+        from ...cute_dsl_kernels.blackwell import k3_attn_res
+
+        proj = self.qkvg_proj
+        return bool(
+            getattr(k3_attn_res, "SF_DEEPGEMM", False)
+            and self._qkvg_proj_weight is None
+            and proj is not None
+            and getattr(proj, "supports_deepgemm_prequantized_gate", False)
+            and callable(getattr(proj, "forward_prequantized_deepgemm", None))
         )
 
     def consumes_prequantized_input(self, attn_metadata, num_rows: int) -> bool:
@@ -1279,6 +1302,12 @@ class KimiKDALinearAttention(nn.Module):
             if qkvg_weight is not None:
                 return torch.nn.functional.linear(x, qkvg_weight)
             if x_fp8 is not None:
+                if self._prequantized_deepgemm():
+                    rows = x_fp8.act.shape[0]
+                    padded = (rows + 3) // 4 * 4
+                    words = x_fp8.scale.view(torch.int32)
+                    scale = words.as_strided((rows, words.numel() // padded), (1, padded))
+                    return fused_qkvg.forward_prequantized_deepgemm(x_fp8.act, scale)
                 return fused_qkvg.forward_prequantized(x_fp8.act, x_fp8.scale)
             return fused_qkvg(x)
 
@@ -1386,6 +1415,15 @@ class KimiKDALinearAttention(nn.Module):
         mxfp8_output = self._fp8_resident_projections and bool(
             getattr(self.o_proj, "supports_prequantized_input", False)
         )
+        # SM100/103: the DeepGEMM o_proj takes the E4M3 output with packed scales (opt-in).
+        dg_output = (
+            _KDA_OUT_QUANT_DG
+            and get_sm_version() in (100, 103)
+            and not mxfp8_output
+            and self._fp8_resident_projections
+            and H % 4 == 0
+            and bool(getattr(self.o_proj, "supports_deepgemm_prequantized_input", False))
+        )
         forward_prequantized = None
         if mxfp8_output:
             forward_prequantized = getattr(self.o_proj, "forward_prequantized", None)
@@ -1437,8 +1475,16 @@ class KimiKDALinearAttention(nn.Module):
             onorm_weight=self._onorm_w_f32,
             onorm_eps=self.o_norm.eps,
             fuse_output_norm=True,
-            mxfp8_output=mxfp8_output,
+            mxfp8_output=mxfp8_output or dg_output,
+            sf_deepgemm=dg_output,
         )
+        if dg_output:
+            from ...custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import deepgemm_scale_view
+
+            act, scale_words = out
+            return self.o_proj.forward_prequantized_deepgemm(
+                act, deepgemm_scale_view(scale_words, T_total, H)
+            )
         if mxfp8_output:
             if not isinstance(out, tuple):
                 raise RuntimeError("MXFP8-output MTP KDA must return activation and scale")

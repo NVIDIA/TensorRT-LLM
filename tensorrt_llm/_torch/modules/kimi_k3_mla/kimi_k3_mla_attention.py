@@ -39,6 +39,11 @@ _KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
 # (output_gate_fp8.gate_mul_fp8_r128c4: sigmoid, multiply and quantization in one kernel, the
 # same bytes as quantizing attn_out * sigmoid(gate)), and o_proj skips its quantize kernel.
 _K3_MLA_GATE_FP8 = bool(get_env_flag("TRTLLM_K3_MLA_GATE_FP8", False))
+# TRTLLM_K3_MLA_GATE_FP8_DG=1: the same fusion on SM100/103, where o_proj is the DeepGEMM projection
+# (output_gate_fp8.gate_mul_fp8_deepgemm: the bytes of fp8_quantize_1x128_packed_ue8m0 of
+# attn_out * sigmoid(gate), consumed by forward_prequantized_deepgemm); replaces the sigmoid, the
+# multiply and the quantize kernels of the o_proj input by one.
+_K3_MLA_GATE_FP8_DG = bool(get_env_flag("TRTLLM_K3_MLA_GATE_FP8_DG", False))
 # TRTLLM_K3_MLA_GATE_OVERLAP=1: under CUDA graphs, g_proj (which only reads hidden_states) runs on
 # a side stream while the attention runs instead of after it. Same kernels and inputs.
 _K3_MLA_GATE_OVERLAP = bool(get_env_flag("TRTLLM_K3_MLA_GATE_OVERLAP", False))
@@ -58,6 +63,14 @@ _K3_MLA_FUSE_GATE_A_ENV = "TRTLLM_K3_MLA_FUSE_GATE_A"
 # absorption and RoPE / KV-append kernels. Other batches (context, larger decode batches, a q_b
 # tactic without an in-cluster K split, other KV / attention configurations) take the stock path.
 _K3_MLA_FUSED_QKV = bool(get_env_flag("TRTLLM_K3_MLA_FUSED_QKV", False))
+
+
+# TRTLLM_K3_MLA_FUSED_Q=1: a decode batch of at most 32 rows (FP8 KV cache, TRTLLM_K3_MLA_FP8_Q_ABSORB=1, CuTe DSL FP8
+# decode) builds its FP8 query (q_a RMSNorm, FP8 quantization, q_b_proj, W_UK absorption) in one cluster kernel
+# (k3_mla_query.K3MlaQuery) and the latent cache rows (kv_a RMSNorm + concat) in another, on the side stream next to it;
+# the RoPE / KV-append kernel and the decode are the stock ones. Other batches take the stock path. The query is
+# the stock chain's up to the FP32 summation order of its two GEMMs (see k3_mla_query).
+_K3_MLA_FUSED_Q = bool(get_env_flag("TRTLLM_K3_MLA_FUSED_Q", False))
 
 
 def _qb_gemm_k_splits(q_b_proj: torch.nn.Module, num_tokens: int) -> Optional[int]:
@@ -444,6 +457,129 @@ class KimiK3MLAAttention(MLA):
         # by the model when TRTLLM_K3_MLA_FUSE_GATE_A=1; the two projections then hold row
         # views of its weight.
         self.g_fused_a_proj = None
+        self._fused_q = None
+
+    def prepare_fused_q(self) -> Optional[str]:
+        """Build this layer's fused query kernel (TRTLLM_K3_MLA_FUSED_Q) once the weights are final: compiles it outside
+        CUDA graph capture. Returns ``None`` once armed, else why the layer keeps the stock chain."""
+        from . import k3_mla_query as kq
+
+        q_b = self.q_b_proj
+        w_kc = getattr(self, "k_b_proj_trans", None)
+        if w_kc is None or w_kc.dtype != torch.bfloat16:
+            w_kc = getattr(self, "k_b_proj_trans_dequant", None)
+        if not self.fp8_nope_q_absorb:
+            return "TRTLLM_K3_MLA_FP8_Q_ABSORB is off"
+        if self.sparse_attn_hooks is not None or self.mapping.has_cp_helix() or self.apply_rotary_emb:
+            return "sparse / helix / external RoPE"
+        if (
+            self.num_heads_tp != kq.NUM_HEADS
+            or self.q_lora_rank != kq.Q_LORA
+            or self.kv_lora_rank != kq.LATENT
+            or self.qk_nope_head_dim != kq.NOPE
+            or self.qk_rope_head_dim != kq.ROPE
+        ):
+            return "not the TP8 K3 MLA geometry"
+        weight, scale = getattr(q_b, "weight", None), getattr(q_b, "weight_scale", None)
+        if weight is None or scale is None or weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.int32:
+            return "q_b_proj is not the DeepGEMM FP8 weight read"
+        if w_kc is None or w_kc.dtype != torch.bfloat16 or not w_kc.is_contiguous():
+            return "no BF16 absorption weight"
+        try:
+            self._fused_q = kq.K3MlaQuery(
+                weight,
+                scale,
+                self.q_a_layernorm.weight,
+                self.q_a_layernorm.variance_epsilon,
+                w_kc.data,
+                self.kv_a_layernorm.weight,
+                self.kv_a_layernorm.variance_epsilon,
+            )
+        except (ValueError, RuntimeError) as exc:
+            return f"{type(exc).__name__}: {exc}"
+        if self._fp8_q_unit_scale is None:
+            self._fp8_q_unit_scale = torch.ones(1, dtype=torch.float32, device=weight.device)
+        return None
+
+    def _fused_q_applies(
+        self, attn_metadata: AttentionMetadata, fused_a_output: Optional[torch.Tensor]
+    ) -> bool:
+        mqa = self.mqa
+        num_tokens = attn_metadata.num_tokens
+        return bool(
+            getattr(self, "_fused_q", None) is not None
+            and fused_a_output is not None
+            and attn_metadata.num_contexts == 0
+            and 0 < attn_metadata.num_generations
+            and 0 < num_tokens <= 32
+            and getattr(mqa, "has_fp8_kv_cache", False)
+            and not getattr(mqa, "uses_fp4_mla_attention", False)
+            and not self.llama_4_scaling
+            and fused_a_output.dtype == torch.bfloat16
+            and fused_a_output.shape[-1] == self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+            and fused_a_output.stride(-1) == 1
+            and fused_a_output.stride(0) % 8 == 0
+            and fused_a_output.data_ptr() % 16 == 0
+        )
+
+    def _forward_fused_q(
+        self, attn_metadata: AttentionMetadata, output: torch.Tensor, fused_a_output: torch.Tensor
+    ) -> None:
+        """Decode attention with the FP8 query from ``K3MlaQuery`` (see ``_K3_MLA_FUSED_Q``)."""
+        num_tokens = attn_metadata.num_tokens
+        fused_a = fused_a_output[:num_tokens]
+        q_a = fused_a[:, : self.q_lora_rank]
+        kv_a = fused_a[:, self.q_lora_rank :]
+        device = fused_a.device
+        num_seqs = attn_metadata.num_seqs
+        cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+        cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+        fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=device)
+        mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
+        mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+        row = self.kv_lora_rank + self.qk_rope_head_dim
+        quant_q_buffer = torch.empty((num_tokens, self.num_heads_tp, row), dtype=torch.uint8, device=device)
+        fused_q = torch.empty((num_tokens, self.num_heads_tp, row), dtype=torch.bfloat16, device=device)
+        latent_cache = torch.empty((num_tokens, row), dtype=torch.bfloat16, device=device)
+        fq = self._fused_q
+
+        def query():
+            fq(q_a, quant_q_buffer)
+
+        def kv_and_rope():
+            fq.kv_prep(kv_a, latent_cache)
+            # q_rope_applied: the query is already in quant_q_buffer; this only appends the KV and fills the scheduler
+            # buffers and the BMM scales (q_pe is not read).
+            self.mqa.mla_rope_generation(
+                fused_q,
+                fused_q[..., self.kv_lora_rank :],
+                latent_cache,
+                attn_metadata,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                fmha_scheduler_counter,
+                mla_bmm1_scale,
+                mla_bmm2_scale,
+                quant_q_buffer,
+                quant_scale_qkv=self._fp8_q_unit_scale,
+                q_rope_applied=True,
+            )
+
+        maybe_execute_in_parallel(query, kv_and_rope, self.ln_events[0], self.ln_events[1], self.aux_stream)
+        self._attend_absorbed_generation(
+            fused_q.view(num_tokens, self.num_heads_tp * row),
+            attn_metadata,
+            output[:num_tokens],
+            position_ids=None,
+            latent_cache=latent_cache,
+            q_pe=fused_q[..., self.kv_lora_rank :],
+            cu_q_seqlens=cu_q_seqlens,
+            cu_kv_seqlens=cu_kv_seqlens,
+            fmha_scheduler_counter=fmha_scheduler_counter,
+            mla_bmm1_scale=mla_bmm1_scale,
+            mla_bmm2_scale=mla_bmm2_scale,
+            quant_q_buffer=quant_q_buffer,
+        )
 
     def _o_proj_takes_prequantized(self, attn_out: torch.Tensor, gate: torch.Tensor) -> bool:
         """Whether ``o_proj.forward_prequantized`` can take the fused gate's FP8 output."""
@@ -460,6 +596,21 @@ class KimiK3MLAAttention(MLA):
             and gate.stride(1) == 1
         )
 
+    def _o_proj_takes_deepgemm_prequantized(self, attn_out: torch.Tensor, gate: torch.Tensor) -> bool:
+        """Whether ``o_proj.forward_prequantized_deepgemm`` can take the fused gate's output."""
+        return (
+            bool(getattr(self.o_proj, "supports_deepgemm_prequantized_gate", False))
+            and callable(getattr(self.o_proj, "forward_prequantized_deepgemm", None))
+            and attn_out.dim() == 2
+            and gate.shape == attn_out.shape
+            and attn_out.dtype == torch.bfloat16
+            and gate.dtype == torch.bfloat16
+            and attn_out.shape[0] > 0
+            and attn_out.shape[1] % 512 == 0
+            and attn_out.stride(1) == 1
+            and gate.stride(1) == 1
+        )
+
     def _apply_output_gate_and_o_proj(
         self,
         hidden_states: torch.Tensor,
@@ -472,6 +623,30 @@ class KimiK3MLAAttention(MLA):
             return self.o_proj(attn_out)
         if gate is None:
             gate = self.g_proj(hidden_states)
+        if _K3_MLA_GATE_FP8_DG:
+            takes = self._o_proj_takes_deepgemm_prequantized(attn_out, gate)
+            if takes:
+                logger.info_once(
+                    "Kimi K3 MLA gate*attn FP8 fusion (TRTLLM_K3_MLA_GATE_FP8_DG=1): engaged",
+                    key="k3_mla_gate_fp8_dg_engaged",
+                )
+            else:
+                logger.warning_once(
+                    "Kimi K3 MLA gate*attn FP8 fusion (TRTLLM_K3_MLA_GATE_FP8_DG=1): NOT engaged, "
+                    f"falling back (o_proj={type(self.o_proj).__name__}, "
+                    f"supports_deepgemm_prequantized_gate="
+                    f"{getattr(self.o_proj, 'supports_deepgemm_prequantized_gate', None)}, "
+                    f"attn_out shape={tuple(attn_out.shape)} dtype={attn_out.dtype} "
+                    f"stride={tuple(attn_out.stride())}, gate shape={tuple(gate.shape)} "
+                    f"dtype={gate.dtype})",
+                    key="k3_mla_gate_fp8_dg_not_engaged",
+                )
+        if _K3_MLA_GATE_FP8_DG and takes:
+            from .output_gate_fp8 import gate_mul_fp8_deepgemm
+
+            return self.o_proj.forward_prequantized_deepgemm(
+                *gate_mul_fp8_deepgemm(attn_out, gate)
+            )
         if _K3_MLA_GATE_FP8 and self._o_proj_takes_prequantized(attn_out, gate):
             from .output_gate_fp8 import gate_mul_fp8_r128c4
 
@@ -690,6 +865,9 @@ class KimiK3MLAAttention(MLA):
         latent_cache_gen: Optional[torch.Tensor] = None,
         fused_a_output: Optional[torch.Tensor] = None,
     ) -> None:
+        if _K3_MLA_FUSED_Q and latent_cache_gen is None and self._fused_q_applies(attn_metadata, fused_a_output):
+            self._forward_fused_q(attn_metadata, output, fused_a_output)
+            return
         if _K3_MLA_FUSED_QKV and latent_cache_gen is None:
             plan = self._fused_qkv_plan(attn_metadata, fused_a_output)
             if plan is not None:
@@ -735,10 +913,28 @@ class KimiK3MLAAttention(MLA):
             hidden_states, self.layer_idx_str, attn_outputs[0], fused_a_output
         )
 
+    def consumes_prequantized_input(self, attn_metadata: AttentionMetadata) -> bool:
+        """Whether ``forward(hidden_fp8=...)`` feeds the [g|q_a|kv_a] GEMM a DeepGEMM-layout FP8 operand on
+        this batch (TRTLLM_K3_MLA_ATTN_RES_FP8): pure decode, fused g/a projection, no helix / sparse."""
+        from ...cute_dsl_kernels.blackwell import k3_attn_res
+
+        fused = self.g_fused_a_proj
+        return bool(
+            fused is not None
+            and getattr(k3_attn_res, "SF_DEEPGEMM", False)
+            and getattr(fused, "supports_deepgemm_prequantized_gate", False)
+            and callable(getattr(fused, "forward_prequantized_deepgemm", None))
+            and getattr(attn_metadata, "num_contexts", 1) == 0
+            and self.sparse_attn_hooks is None
+            and not self.mapping.has_cp_helix()
+            and not is_in_breakable_cuda_graph()
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        hidden_fp8=None,
     ) -> torch.Tensor:
         # _create_outputs() rather than create_output(): the base implementation
         # takes a list so a sparse-attention backend can append its own buffers,
@@ -751,7 +947,16 @@ class KimiK3MLAAttention(MLA):
             # MLA slices fused_a_output to the real tokens. _gate_stream is None here
             # (_check_gate_flags).
             gate_width = self.g_proj.out_features
-            gate, fused_a_output = self.g_fused_a_proj(hidden_states).split(
+            if hidden_fp8 is not None:
+                # TRTLLM_K3_MLA_ATTN_RES_FP8: the attn_res kernel wrote DeepGEMM's packed scales.
+                rows = hidden_fp8.act.shape[0]
+                pad4 = (rows + 3) // 4 * 4
+                words = hidden_fp8.scale.view(torch.int32)
+                scale = words.as_strided((rows, words.numel() // pad4), (1, pad4))
+                fused_out = self.g_fused_a_proj.forward_prequantized_deepgemm(hidden_fp8.act, scale)
+            else:
+                fused_out = self.g_fused_a_proj(hidden_states)
+            gate, fused_a_output = fused_out.split(
                 [gate_width, self.g_fused_a_proj.out_features - gate_width], -1
             )
             self._run_attention(hidden_states, attn_metadata, attn_outputs, fused_a_output)

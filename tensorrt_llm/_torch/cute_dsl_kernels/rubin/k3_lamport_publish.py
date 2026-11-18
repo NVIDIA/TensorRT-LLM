@@ -21,6 +21,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64
 
+from ....logger import logger
 from ..blackwell.utils import TRTLLM_ENABLE_PDL
 from .k3_lamport import (
     FRAGMENT_BYTES,
@@ -115,7 +116,14 @@ def run_k3_lamport_publish(
             f"Lamport slot {slot_address:#x} / leading dim {leading_dim} must be 16-byte "
             f"aligned and hold a row of {hidden}"
         )
+    misses = _compiled.cache_info().misses
     compiled = _compiled(hidden, _cta_threads(hidden), use_pdl)
+    if _compiled.cache_info().misses != misses:
+        # First use of this variant: the JIT compile belongs in an eager warmup forward.
+        logger.info(
+            f"[K3 Lamport publish] compiled hidden={hidden} pdl={use_pdl} "
+            f"(under CUDA graph capture: {torch.cuda.is_current_stream_capturing()})"
+        )
     compiled(
         Int64(x.data_ptr()),
         Int64(slot_address),

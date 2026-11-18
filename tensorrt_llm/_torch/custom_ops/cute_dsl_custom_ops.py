@@ -20,10 +20,12 @@ from ...math_utils import ceil_div, pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
-from ..cute_dsl_kernels import (fc1_situ_fast, log_moe_weight_evict_first,
-                                moe_compact_epilogue, moe_fc2_pdl,
-                                moe_weight_evict_first, mxfp8_stationary,
-                                sm_reserve)
+from ..cute_dsl_kernels import (fc1_situ_fast, log_moe_bw_weight_evict_first,
+                                log_moe_fc2_pdl_bw, log_moe_weight_evict_first,
+                                moe_bw_weight_evict_first, moe_compact_epilogue,
+                                moe_fc2_pdl, moe_map_token_bucket,
+                                moe_token_buckets, moe_weight_evict_first,
+                                mxfp8_stationary, sm_reserve)
 from ..cute_dsl_kernels.rubin.streamk_layout import mailbox_bytes
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
@@ -535,14 +537,14 @@ class GroupedGemmInputsHelper:
         return max_num_tiles // self.top_k
 
     def gen_tuning_buckets(self, max_num_tokens: int) -> List[int]:
-        buckets = get_last_power_of_2_num_tokens_buckets(
-            self.infer_num_tokens(max_num_tokens))
+        # moe_token_buckets: powers of 2, plus the TRTLLM_CUTEDSL_MOE_DECODE_BUCKETS token counts (default none)
+        buckets = moe_token_buckets(self.infer_num_tokens(max_num_tokens))
         return sorted(
             list(set(self.get_max_num_permuted_tokens(x) for x in buckets)))
 
     def map_to_tuning_buckets(self, x: int) -> int:
         return self.get_max_num_permuted_tokens(
-            last_positive_power_of_2(self.infer_num_tokens(x)))
+            moe_map_token_bucket(self.infer_num_tokens(x)))
 
     def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
         return self.infer_num_tokens(input_shapes[self.IDX_SHAPE_INFER][0])
@@ -3129,10 +3131,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         ConstraintSpec(
                             8, 0, helper.infer_shape_max_num_permuted_tokens),
                         ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
-                    inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
+                    inputs_pre_hook=self._inputs_pre_hook_fn(helper),
                     use_cold_l2_cache=True,
                 )
             return self.__class__.tuning_config_cache[key]
+
+        @staticmethod
+        def _inputs_pre_hook_fn(helper: GroupedGemmInputsHelper):
+            """The tuning-input hook: with TRTLLM_CUTEDSL_MOE_FC2_PDL the kernel reads its tile tables
+            before its dependency wait, so they must be complete when it launches. In the MoE the FC1
+            GEMM runs between the sort and FC2; while tuning, the sort that writes them is the last kernel
+            before the first profiled run, so the stream is synchronized once the inputs are built."""
+
+            def hook(inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+                inputs = helper.inputs_pre_hook_finalize_fusion(inputs)
+                if moe_fc2_pdl() and _trtllm_pdl_enabled():
+                    torch.cuda.current_stream().synchronize()
+                return inputs
+
+            return hook
 
         def forward(self, inputs: List[torch.Tensor],
                     tactic: Optional[tuple]) -> torch.Tensor:
@@ -3228,14 +3245,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
+            # TRTLLM_CUTEDSL_MOE_FC2_PDL: B / SFB of the first tile before the dependency wait
+            # (1-CTA tactics); TRTLLM_CUTEDSL_MOE_BW_EVICT_FIRST: weight loads L2 evict-first.
+            pdl_preload_weights = (moe_fc2_pdl() and _trtllm_pdl_enabled()
+                                   and mma_tiler_mn[0] == 128)
+            evict_first = moe_bw_weight_evict_first(num_tokens,
+                                                    self.num_local_experts)
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn, raster_along_m)
+            if pdl_preload_weights:
+                cache_key += ("pdl_preload_weights", )
+            if evict_first:
+                cache_key += ("weight_evict_first", )
             if cache_key not in self.__class__.kernel_cache:
+                log_moe_fc2_pdl_bw("FC2", pdl_preload_weights)
+                log_moe_bw_weight_evict_first("FC2", evict_first, num_tokens)
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     raster_along_m=raster_along_m,
+                    pdl_preload_weights=pdl_preload_weights,
+                    weight_evict_first=evict_first,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -4012,12 +4043,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # The SiTU betas are folded into the kernel at trace time, so they
             # are part of the compiled-kernel identity, not just runtime args.
+            # TRTLLM_CUTEDSL_MOE_FC2_PDL: the kernel lets FC2 launch right after its own
+            # dependency wait; TRTLLM_CUTEDSL_MOE_BW_EVICT_FIRST: weight loads L2 evict-first.
+            early_trigger = moe_fc2_pdl() and _trtllm_pdl_enabled()
+            evict_first = moe_bw_weight_evict_first(orig_m,
+                                                    self.num_local_experts)
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
                          self.activation_type, self.swiglu_limit_scalar,
                          self.situ_beta, self.situ_linear_beta)
+            if early_trigger:
+                cache_key += ("early_launch_dependents", )
+            if evict_first:
+                cache_key += ("weight_evict_first", )
 
             if cache_key not in self.__class__.kernel_cache:
+                log_moe_fc2_pdl_bw("FC1", early_trigger)
+                log_moe_bw_weight_evict_first("FC1", evict_first, orig_m)
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
@@ -4029,6 +4071,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     swiglu_limit=self.swiglu_limit_scalar,
                     situ_beta=self.situ_beta,
                     situ_linear_beta=self.situ_linear_beta,
+                    early_launch_dependents=early_trigger,
+                    weight_evict_first=evict_first,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -8723,7 +8767,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # tolerance (a request merges in more pieces), they are not bitwise equal.
         _PLAN_FILL_SPLIT = os.environ.get("TLLM_CUTE_DSL_MLA_FILL_SPLIT",
                                           "0") == "1"
-        _PLAN_FILL_MAX_SPLIT = 64
+        # TLLM_CUTE_DSL_MLA_FILL_MAX_SPLIT (read at import, default 64): the split cap of the
+        # fill switch; a decode of at most _PLAN_FILL_MAX_ROWS rows can use up to one wave of
+        # 2-CTA clusters (max_active_blocks / 2 = 74 on GB300).
+        _PLAN_FILL_MAX_SPLIT = int(
+            os.environ.get("TLLM_CUTE_DSL_MLA_FILL_MAX_SPLIT", "64"))
         _PLAN_FILL_MAX_ROWS = 2
         # FP8 kernel: TRTLLM_MLA_BALANCED_SPLIT=1 runs every batch of up to
         # BALANCED_MAX_REQUESTS requests with the balanced split, 0 keeps the
@@ -9737,6 +9785,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 output_scale,
                 stream,
             ])
+            if kwargs.get("return_launch", False):
+                # Host-trimmed callers (modules/mla_ctx_absorb.py) replay the compiled
+                # kernel with pre-wrapped arguments instead of paying this call's
+                # per-launch planning and tensor adaptation again.
+                return compiled_mla, runtime_args
             compiled_mla(*runtime_args)
             return o
 

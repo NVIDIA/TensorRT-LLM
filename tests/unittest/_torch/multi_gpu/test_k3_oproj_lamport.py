@@ -347,6 +347,223 @@ def _producer_phase(ctx):
     _all_zero(ctx.comm, _bad(got, ref), "cute_dsl_mxfp8_gemm_rubin_lamport")
 
 
+def _producer_phase_sm103(ctx):
+    """SM103 (no Rubin GEMM): the DeepGEMM o_proj publishes through ``K3LamportTarget.publish_rows``
+    (copy kernel) and the slots consumer sums the TP partials; bitwise against the stock o_proj
+    partials summed in the MNNVL order."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+    from tensorrt_llm._torch.modules.kimi_k3_oproj_lamport import K3LamportDelta, K3LamportTarget
+
+    ran = 0
+    for world in (ctx.tp, 2 * ctx.tp):
+        k = K_FULL // world
+        for m in (1, 6, 12, 32):
+            g = torch.Generator(device=ctx.device)
+            g.manual_seed(31 * world + m)
+            mods, xs = [], []
+            for _ in range(world):
+                w = (torch.randn(HIDDEN, k, generator=g, device=ctx.device) * 0.02).to(torch.bfloat16)
+                lin = torch.nn.Linear(k, HIDDEN, bias=False, device=ctx.device, dtype=torch.bfloat16)
+                lin.weight.data.copy_(w)
+                mods.append(_Fp8BlockScaleWeightReadLinear.from_linear(lin))
+                xs.append(torch.randn(m, k, generator=g, device=ctx.device).to(torch.bfloat16))
+            partials = torch.stack([mod(x) for mod, x in zip(mods, xs)])
+            prefix, block = _inputs(world + m, m, 6, ctx.device)
+            ref = ctx.reference(
+                _mnnvl_order_sum(partials, ctx.chunk(world)), prefix, block, False, True
+            )
+            torch.cuda.synchronize()
+            ctx.comm.Barrier()
+            parity = ctx.parity()
+            base = ctx.arena.mc_addr(parity)
+            for vr in range(ctx.rank, world, ctx.tp):
+                delta = K3LamportDelta(ctx.arena.local_addr(parity), world, m)
+                target = K3LamportTarget(base + vr * SLOT_BYTES, world * HIDDEN, delta)
+                mods[vr].lamport_out = target
+                got_delta = mods[vr](xs[vr])
+                mods[vr].lamport_out = None
+                assert got_delta is delta and target.published
+            got = ctx.slots(parity, world, prefix, block, False, True)
+            torch.cuda.synchronize()
+            _all_zero(ctx.comm, _bad(got, ref), f"sm103 producer w{world} m{m}")
+            ran += 1
+    assert ran == 8
+
+
+def _ulp_report(got, ref):
+    """(mismatching elements, max |a - b| in BF16 ulps, first mismatch index) of two BF16 tensors."""
+
+    def ordered(x):
+        b = x.view(torch.int16).to(torch.int32)
+        return torch.where(b < 0, -(b & 0x7FFF), b)
+
+    diff = (ordered(got) - ordered(ref)).abs()
+    bad = int((diff != 0).sum().item())
+    first = None if bad == 0 else tuple(int(i) for i in (diff != 0).nonzero()[0].tolist())
+    return bad, int(diff.max().item()), first
+
+
+def _real_path_phase(ctx, mapping):
+    """The real DeepGEMM o_proj -> real MNNVL all-reduce (AUTO strategy, the stock path) -> stock
+    attn_res, against o_proj -> publish_rows -> Lamport slots -> attn_res, bitwise, eager and in a
+    CUDA graph (3 layers per forward). Run with TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES=1572864 (one-shot
+    up to 13 tokens at TP8, two-shot above)."""
+    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+    from tensorrt_llm._torch.distributed.k3_lamport_mailbox import lamport_parities
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+    from tensorrt_llm._torch.modules.kimi_k3_oproj_lamport import K3LamportDelta, K3LamportTarget
+
+    tp, rank = ctx.tp, ctx.rank
+    ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.AUTO, dtype=torch.bfloat16)
+    k = K_FULL // tp
+    g = torch.Generator(device=ctx.device)
+    g.manual_seed(1000 + rank)
+    lin = torch.nn.Linear(k, HIDDEN, bias=False, device=ctx.device, dtype=torch.bfloat16)
+    lin.weight.data.copy_((torch.randn(HIDDEN, k, generator=g, device=ctx.device) * 0.02).bfloat16())
+    mod = _Fp8BlockScaleWeightReadLinear.from_linear(lin)
+    report = []
+
+    def lamport_forward(x, m, parity, prefix, block):
+        delta = K3LamportDelta(ctx.arena.local_addr(parity), tp, m)
+        mod.lamport_out = K3LamportTarget(
+            ctx.arena.mc_addr(parity) + rank * SLOT_BYTES, tp * HIDDEN, delta
+        )
+        try:
+            mod(x)
+        finally:
+            mod.lamport_out = None
+        return ctx.slots(parity, tp, prefix, block, False, None)
+
+    def stock_forward(x, prefix, block):
+        return ctx.reference(ar(mod(x)), prefix, block, False, None)
+
+    for m in (1, 6, 8, 12, 16, 32):
+        prefix, block = _inputs(m, m, 6, ctx.device)
+        xg = torch.Generator(device=ctx.device)
+        xg.manual_seed(77 * m + rank)
+        x = torch.randn(m, k, generator=xg, device=ctx.device).bfloat16()
+        # eager
+        for rep in range(3):
+            ref = stock_forward(x, prefix, block)
+            torch.cuda.synchronize()
+            ctx.comm.Barrier()
+            got = lamport_forward(x, m, ctx.parity(), prefix, block)
+            torch.cuda.synchronize()
+            stats = [_ulp_report(a, b) for a, b in zip(got[:2], ref[:2])]  # (output, updated)
+            allstats = ctx.comm.allgather(stats)
+            report.append(("eager", m, rep, allstats))
+        # CUDA graph: 3 layers per forward
+        uses = 3
+        parities = lamport_parities(uses)
+        xs = [x.clone() for _ in range(uses)]
+        outs_ref, outs_got = [], []
+
+        def fwd_stock():
+            outs_ref.clear()
+            for u in range(uses):
+                outs_ref.append(stock_forward(xs[u], prefix, block))
+
+        def fwd_lamport():
+            outs_got.clear()
+            for u in range(uses):
+                outs_got.append(lamport_forward(xs[u], m, parities[u], prefix, block))
+
+        fwd_stock()
+        torch.cuda.synchronize()
+        ctx.comm.Barrier()
+        fwd_lamport()
+        torch.cuda.synchronize()
+        ctx.comm.Barrier()
+        gs, gl = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gs):
+            fwd_stock()
+        ref_graph = list(outs_ref)
+        ctx.comm.Barrier()
+        with torch.cuda.graph(gl):
+            fwd_lamport()
+        got_graph = list(outs_got)
+        torch.cuda.synchronize()
+        ctx.comm.Barrier()
+        worst = [0, 0, None]
+        for it in range(20):
+            for u in range(uses):
+                xs[u].copy_(torch.randn(m, k, generator=xg, device=ctx.device).bfloat16())
+            gs.replay()
+            torch.cuda.synchronize()
+            ctx.comm.Barrier()
+            gl.replay()
+            torch.cuda.synchronize()
+            for u in range(uses):
+                for a, b in zip(got_graph[u][:2], ref_graph[u][:2]):
+                    bad, ulp, first = _ulp_report(a, b)
+                    worst[0] += bad
+                    worst[1] = max(worst[1], ulp)
+                    worst[2] = worst[2] or first
+        report.append(("graph", m, 20, ctx.comm.allgather(worst)))
+    bad_total = 0
+    for kind, m, rep, stats in report:
+        if kind == "eager":
+            nbad = sum(b for rank_stats in stats for (b, _u, _f) in rank_stats)
+            ulp = max(u for rank_stats in stats for (_b, u, _f) in rank_stats)
+        else:
+            nbad = sum(w[0] for w in stats)
+            ulp = max(w[1] for w in stats)
+        bad_total += nbad
+        if ctx.rank == 0:
+            print(f"REAL_PATH {kind} m={m} rep={rep} mismatches={nbad} max_ulp={ulp}", flush=True)
+    assert bad_total == 0, f"real-path mismatch: {bad_total} elements"
+
+
+def _trigger_phase(ctx, replays=20000):
+    """attn_res with the early trigger (1) -> DeepGEMM consumer, poisoned output buffer, bitwise
+    against trigger 0 over ``replays`` graph replays (rank-local)."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+
+    m, n = 6, 6
+    prefix, block = _inputs(5, m, n, ctx.device)
+    add = (torch.randn(m, HIDDEN, device=ctx.device) * 2.0).bfloat16()
+    g = torch.Generator(device=ctx.device)
+    g.manual_seed(9)
+    lin = torch.nn.Linear(HIDDEN, 3 * 1024, bias=False, device=ctx.device, dtype=torch.bfloat16)
+    lin.weight.data.copy_((torch.randn(3 * 1024, HIDDEN, generator=g, device=ctx.device) * 0.02).bfloat16())
+    cons = _Fp8BlockScaleWeightReadLinear.from_linear(lin)
+    res = {}
+    for trig in (0, 1):
+        out = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device=ctx.device)
+        upd = torch.empty_like(out)
+        proj = None
+
+        def fwd():
+            out.fill_(float("nan"))  # poison: a consumer that reads early sees NaN
+            ctx.ar.run_k3_attn_res(
+                prefix, (add,), block, *ctx.weights, EPS, EPS, out, upd, trigger=trig
+            )
+            return cons(out)
+
+        fwd()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            proj = fwd()
+        graph.replay()
+        torch.cuda.synchronize()
+        base = proj.clone()
+        bad = 0
+        for i in range(replays):
+            graph.replay()
+            if i % 500 == 499:
+                torch.cuda.synchronize()
+                bad += int((proj.view(torch.uint8) != base.view(torch.uint8)).sum().item())
+        torch.cuda.synchronize()
+        bad += int((proj.view(torch.uint8) != base.view(torch.uint8)).sum().item())
+        res[trig] = (base.clone(), bad)
+    cross = int((res[0][0].view(torch.uint8) != res[1][0].view(torch.uint8)).sum().item())
+    tot = ctx.comm.allgather((res[0][1], res[1][1], cross))
+    if ctx.rank == 0:
+        print(f"TRIGGER_POISON replays={replays} per-rank (drift0, drift1, trig0-vs-trig1)={tot}", flush=True)
+    assert all(t == (0, 0, 0) for t in tot), tot
+
+
 def _graph_phase(ctx):
     """A captured forward of 3 uses (publish + consumer), replayed between eager uses."""
     from tensorrt_llm._torch.distributed.k3_lamport_mailbox import lamport_parities
@@ -417,6 +634,8 @@ def _rank_body(tp, rank, rubin):
     _consumer_phase(ctx)
     if rubin:
         _producer_phase(ctx)
+    elif torch.cuda.get_device_capability() == (10, 3):
+        _producer_phase_sm103(ctx)
     _graph_phase(ctx)
     return True
 

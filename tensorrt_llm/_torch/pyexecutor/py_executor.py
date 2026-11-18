@@ -116,6 +116,13 @@ def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
     return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
 
 
+# TRTLLM_PURE_PREFILL_ITERATION=1: see PyExecutor._maybe_defer_generation_for_prefill_graph.
+_PURE_PREFILL_ITERATION = os.environ.get("TRTLLM_PURE_PREFILL_ITERATION",
+                                         "0") == "1"
+# Context tokens above this still run mixed with generation (0: no limit).
+_PURE_PREFILL_MAX_TOKENS = int(
+    os.environ.get("TRTLLM_PURE_PREFILL_MAX_TOKENS", "0"))
+
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
@@ -4191,6 +4198,63 @@ class PyExecutor:
                 and not scheduler_fitting_disagg_gen_init_requests
                 and not wait_for_disagg_gen_transfer_progress)
 
+    def _maybe_defer_generation_for_prefill_graph(self, scheduled_batch):
+        """TRTLLM_PURE_PREFILL_ITERATION=1: keep prefill iterations context-only.
+
+        A model whose breakable prefill CUDA graph body serves context-only
+        batches runs any mixed (context + generation) batch eagerly. With the
+        flag set, an iteration that schedules context requests next to
+        generation requests defers the generation requests by one iteration,
+        so the prefill replays its captured graph. Aggregated serving only.
+
+        A deferred request resumes after the host has applied its last step
+        (the previous batch is processed while this one runs), so its next
+        forward must build its inputs from the host request state: clearing
+        py_batch_idx selects that path in the model engine, the one a request
+        takes when it has no in-flight predecessor. The device-side per-slot
+        state (sampler store, draft probabilities, recurrent caches) is
+        untouched by an iteration that skips the slot; the speculative-decoding
+        worker must keep its own per-request state as well. The KV capacity the
+        V2 scheduler grew for the deferred requests is given back, as for a
+        batch skipped after scheduling.
+        """
+        if not _PURE_PREFILL_ITERATION:
+            return
+        if (scheduled_batch.num_context_requests == 0
+                or not scheduled_batch.generation_requests
+                or self.kv_cache_transceiver is not None
+                or self.enable_attention_dp or self.guided_decoder is not None):
+            return
+        if not getattr(self.model_engine, "_breakable_cuda_graph_context_only",
+                       False):
+            return
+        if _PURE_PREFILL_MAX_TOKENS > 0 and sum(
+                req.context_chunk_size for req in
+                scheduled_batch.context_requests) > _PURE_PREFILL_MAX_TOKENS:
+            return
+        if not self._spec_state_survives_deferral():
+            return
+        logger.info_once(
+            "TRTLLM_PURE_PREFILL_ITERATION=1: generation requests yield one "
+            "iteration to context-only prefill batches",
+            key="trtllm_pure_prefill_iteration")
+        self._revert_gen_alloc(scheduled_batch)
+        for request in scheduled_batch.generation_requests:
+            request.py_batch_idx = None
+        scheduled_batch.generation_requests = []
+
+    def _spec_state_survives_deferral(self) -> bool:
+        """Whether the one-model speculative-decoding worker, if any, keeps the
+        state of a generation request across an iteration that skips it."""
+        if getattr(self.model_engine, "spec_config", None) is None:
+            return True
+        model = self.model_engine.model
+        worker = getattr(model, "spec_worker", None)
+        if worker is None:
+            worker = getattr(getattr(model, "llm", None), "spec_worker", None)
+        return (worker is not None
+                and worker.keeps_state_of_unscheduled_requests())
+
     def _prepare_and_schedule_batch(self):
         self._sync_disagg_transfer_made_progress = False
         self._benchmark_local_terminal_no_fit = False
@@ -4283,6 +4347,8 @@ class PyExecutor:
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
+
+        self._maybe_defer_generation_for_prefill_graph(scheduled_batch)
 
         # Must run after _schedule(): the empty scheduled batch it repairs does
         # not exist until the capacity scheduler has returned its verdict.

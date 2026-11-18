@@ -16,6 +16,7 @@
 import os
 from collections import deque
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -37,6 +38,7 @@ from .dflash_attention import (
     to_draft_fp8,
     validate_dflash_trtllm_gen_runtime,
 )
+from .dflash_gqa_fused import dflash_gqa_ctx_kv_store, gqa_fused_enabled
 from .interface import SpecMetadata, SpecWorkerBase
 from .spec_tail_kernels import (
     decode_draft_block_table,
@@ -424,6 +426,13 @@ class DFlashWorker(SpecWorkerBase):
 
     def _has_unified_draft_cache(self) -> bool:
         return bool(getattr(self._ctx_kv_manager, "draft_layer_ids", ()))
+
+    def keeps_state_of_unscheduled_requests(self) -> bool:
+        # The unified draft cache keeps each request's history in the draft KV
+        # cache manager and restores it when the request is scheduled again;
+        # the private context buffers free the slot of every request missing
+        # from a batch (DFlashSpecMetadata.prepare).
+        return self._has_unified_draft_cache()
 
     def _prepare_managed_history(self, request_ids: list[int]) -> list[int]:
         """Restore newly resident histories without rewinding overlapping iterations."""
@@ -1735,6 +1744,8 @@ class DFlashWorker(SpecWorkerBase):
                     if "mla_block_fixup" in inputs
                     else {}
                 )
+                if "gqa_fixup" in inputs:
+                    fixup_kwargs["gqa_fixup"] = inputs["gqa_fixup"]
                 hidden_states_out = draft_model.dflash_forward(
                     noise_embedding=inputs["noise_embedding"],
                     query_positions=inputs["query_positions"],
@@ -1954,7 +1965,7 @@ class DFlashWorker(SpecWorkerBase):
             spec_tail_fusion_enabled()
             and self._ctx_paged
             and self._ctx_block_tables is not None
-            and getattr(draft_model, "_kv_factor", 2) == 1
+            and (getattr(draft_model, "_kv_factor", 2) == 1 or self._gqa_fused_applies(draft_model))
             and hasattr(draft_model, "fc")
             and hasattr(draft_model, "hidden_norm")
             # The fused latent store writes in the projection's dtype or FP8.
@@ -1962,6 +1973,18 @@ class DFlashWorker(SpecWorkerBase):
             and spec_metadata.get_hidden_states(0) is not None
             and spec_metadata.runtime_draft_len + 1 == self._draft_tokens_per_req
             and self._resolved_block_size is not None
+        )
+
+    def _gqa_fused_applies(self, draft_model) -> bool:
+        """``TLLM_DFLASH_GQA_FUSED=1`` on a GQA drafter whose context lives in an FP8 paged pool
+        (separate draft cache) and whose K norm / RoPE the fused store reproduces."""
+        return (
+            gqa_fused_enabled()
+            and getattr(draft_model, "_kv_factor", 2) == 2
+            and self._ctx_kv_buf is not None
+            and self._ctx_kv_buf[0].dtype == torch.float8_e4m3fn
+            and hasattr(draft_model, "gqa_fused_context_supported")
+            and draft_model.gqa_fused_context_supported()
         )
 
     def _ctx_kv_pool_ptrs(self) -> torch.Tensor:
@@ -2040,6 +2063,7 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_page_size,
             block_size,
             width,
+            pos_offset=self._ctx_position_offset if self._has_unified_draft_cache() else None,
         )
         attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = width
 
@@ -2055,6 +2079,10 @@ class DFlashWorker(SpecWorkerBase):
         gen_hs = captured_hs[gen_start : gen_start + num_gens * width]
         projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
         projected = projected.to(self._ctx_latent_dtype(draft_model))
+        if getattr(draft_model, "_kv_factor", 2) == 2:
+            return self._finish_gen_prepare_gqa(
+                draft_model, prep, projected, noise_embedding, num_contexts, num_gens, block_size
+            )
         # Layer-major latents skip the per-layer staging copies when the
         # drafter offers them; the values are the same either way.
         layer_major = getattr(draft_model, "precompute_context_kv_layer_major", None)
@@ -2103,6 +2131,46 @@ class DFlashWorker(SpecWorkerBase):
             "ctx_kv_cache": self._ctx_kv_buf,
             "ctx_page_table": self._ctx_block_tables,
             "mla_block_fixup": block_fixup,
+        }
+
+    def _finish_gen_prepare_gqa(
+        self, draft_model, prep, projected, noise_embedding, num_contexts, num_gens, block_size
+    ) -> dict:
+        """GQA tail of ``_prepare_gen_drafter_inputs_fused``: one K/V GEMM and one fused
+        norm / RoPE / mask / FP8 / page-scatter kernel for every layer's context K/V."""
+        kv_flat = draft_model.fused_context_kv_gemm(projected)
+        dflash_gqa_ctx_kv_store(
+            kv_flat,
+            draft_model._k_norm_stacked,
+            draft_model._k_norm_eps,
+            draft_model._get_cos_sin_cache(),
+            prep["ctx_positions"],
+            prep["store_mask"],
+            prep["store_pages"],
+            prep["store_offsets"],
+            self._ctx_kv_pool_ptrs(),
+            self._ctx_kv_buf[0],
+            draft_model._num_kv_heads,
+            draft_model._head_dim,
+        )
+        rows = slice(num_contexts, num_contexts + num_gens)
+        batch_rows = self._block_decode_shape_operands(block_size, num_contexts, num_gens)[1]
+        return {
+            "noise_embedding": noise_embedding,
+            "query_positions": prep["query_positions"],
+            "num_ctx_per_req": prep["num_ctx"],
+            "ctx_k_cache": self._ctx_k_buf,
+            "ctx_v_cache": self._ctx_v_buf,
+            "ctx_cache_batch_idx": batch_rows,
+            "first_prev_tokens": prep["bonus"],
+            "ctx_kv_cache": self._ctx_kv_buf,
+            "ctx_page_table": self._ctx_block_tables,
+            "gqa_fixup": SimpleNamespace(
+                pages=prep["blk_pages"].reshape(-1),
+                offsets=prep["blk_offsets"].reshape(-1),
+                seq_lens=prep["blk_seq_lens"],
+                block_tables=self._ctx_block_tables[rows],
+            ),
         }
 
     def prepare_1st_drafter_inputs(

@@ -269,11 +269,13 @@ def _dflash_gen_prepare_kernel(
     dummy_slot,
     max_ctx,
     mask_token_id,
+    pos_offset_ptr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK_G: tl.constexpr,
     BLOCK_W: tl.constexpr,
+    HAS_POS_OFFSET: tl.constexpr,
 ):
     g = tl.arange(0, BLOCK_G)
     j = tl.arange(0, BLOCK_W)
@@ -313,6 +315,12 @@ def _dflash_gen_prepare_kernel(
     tl.store(store_pages_ptr + flat, page, mask=wmask)
     tl.store(store_offsets_ptr + flat, col % PAGE_SIZE, mask=wmask)
     tl.store(store_mask_ptr + flat, (j[None, :] < nacc[:, None]).to(tl.int8), mask=wmask)
+
+    if HAS_POS_OFFSET:
+        # Unified draft cache: the position offset absorbs what the context length overflows
+        # past max_ctx (``_ctx_position_offset[slots] += (ctx_len - max_ctx).clamp_min(0)``).
+        po = tl.load(pos_offset_ptr + slot, mask=gm, other=0)
+        tl.store(pos_offset_ptr + slot, po + tl.maximum(old + nacc - max_ctx, 0), mask=gm)
 
     # Advance the context length; the shared padding / dummy slot stays empty.
     new_len = tl.where(slot == dummy_slot, 0, now)
@@ -359,6 +367,7 @@ def dflash_gen_prepare(
     page_size: int,
     block_size: int,
     width: int,
+    pos_offset: Optional[torch.Tensor] = None,
 ) -> dict:
     """The DFlash paged-context bookkeeping of one generation step in one launch.
 
@@ -416,11 +425,13 @@ def dflash_gen_prepare(
         dummy_slot,
         max_ctx,
         mask_token_id,
+        pos_offset if pos_offset is not None else ctx_len,
         PAGE_SIZE=page_size,
         BLOCK_SIZE=block_size,
         WIDTH=width,
         BLOCK_G=triton.next_power_of_2(max(num_gens, 1)),
         BLOCK_W=triton.next_power_of_2(max(width, block_size)),
+        HAS_POS_OFFSET=pos_offset is not None,
         num_warps=4,
     )
     return out

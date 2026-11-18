@@ -334,6 +334,7 @@ def kda_decode_mtp_kernel(
     BF16_MMA: cutlass.Constexpr[bool],
     tiled_mma_f32a: cute.TiledMma,
     USE_PDL: cutlass.Constexpr[bool],
+    SF_DEEPGEMM: cutlass.Constexpr[bool],
 ):
     """KDA MTP verify: smem precompute + tensor-core chunk recurrence.
 
@@ -350,6 +351,12 @@ def kda_decode_mtp_kernel(
     stored before the wait. The dependents are released once this CTA holds its tensor-memory
     columns, and the state loads and stores are L2 evict-first (the state is read and rewritten
     once per step, a whole step apart). With ``USE_PDL=False`` the load phase is the plain one.
+
+    ``SF_DEEPGEMM`` (with ``QUANTIZE_OUTPUT``): write the UE8M0 scales in DeepGEMM's packed
+    MN-major layout (int32 words of four consecutive 128-column blocks, ``[HV / 4, ceil4(M)]``
+    words, M = N * (1 + NUM_SPEC)), the layout ``fp8_quantize_1x128_packed_ue8m0(x, False)``
+    returns, instead of the R128c4 layout of the Rubin GEMM. Scale value and E4M3 codes are the
+    same. Needs ``HV % 4 == 0``.
     """
     assert (not USE_PDL) or (FUSE_PRECOMPUTE and not RUNTIME_PRECOMPUTE_FLAG), (
         "USE_PDL needs the fused precompute: only its load phase waits for the producers"
@@ -1953,14 +1960,24 @@ def kda_decode_mtp_kernel(
                                 ),
                                 cute.make_layout(output_scale.shape),
                             )
-                            scale_offset = (
-                                (output_row // 128) * HV * 512
-                                + i_hv * 512
-                                + (output_row % 32) * 16
-                                + ((output_row % 128) // 32) * 4
-                            )
-                            for replica in cutlass.range_constexpr(4):
-                                scale_bytes[scale_offset + replica] = output_sf
+                            if cutlass.const_expr(SF_DEEPGEMM):
+                                _, sf_grid_n, _ = cute.arch.grid_dim()
+                                sf_m_aligned = (
+                                    (sf_grid_n * (1 + NUM_SPEC) + 3) // 4
+                                ) * 4
+                                sf_offset = (
+                                    (i_hv // 4) * sf_m_aligned * 4 + output_row * 4 + (i_hv % 4)
+                                )
+                                scale_bytes[sf_offset] = output_sf
+                            else:
+                                scale_offset = (
+                                    (output_row // 128) * HV * 512
+                                    + i_hv * 512
+                                    + (output_row % 32) * 16
+                                    + ((output_row % 128) // 32) * 4
+                                )
+                                for replica in cutlass.range_constexpr(4):
+                                    scale_bytes[scale_offset + replica] = output_sf
                             if cutlass.const_expr(PROFILE_STAGES):
                                 if tidx == 64:
                                     _tq20 = read_globaltimer()

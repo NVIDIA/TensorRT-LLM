@@ -805,10 +805,13 @@ def test_a_correction_row_without_mass_emits_token_zero():
             )
 
 
-def test_fused_markov_drafts_verified_by_block_verification_follow_the_target():
+@pytest.mark.parametrize("draft_temp", [1.0, 0.5, 0.9, 2.0])
+def test_fused_markov_drafts_verified_by_block_verification_follow_the_target(draft_temp):
     """The production pairing end to end: drafts drawn by the fused Markov-feedback chain (which
     stores its proposals), verified by block verification on the same seeds and offsets, then
-    completed by the target, have the target's joint distribution."""
+    completed by the target, have the target's joint distribution. The drafts may be proposed at
+    a scaled temperature (TLLM_DSPARK_DRAFT_TEMP_SCALE) while the target stays at 1.0: the
+    verifier reads the stored proposal, so the target joint is recovered for any scale."""
     vocab, k, rank = 3, 3, 2
     n = 24000 if ON_GPU else 400
     gen = torch.Generator(device=DEV).manual_seed(24)
@@ -822,8 +825,9 @@ def test_fused_markov_drafts_verified_by_block_verification_follow_the_target():
     buf = torch.zeros((n + 1, K, vocab), dtype=torch.float32, device=DEV)
     seeds = torch.full((n,), 4242, dtype=torch.int64, device=DEV)  # one seed for every request
     offs = torch.zeros(n, dtype=torch.int64, device=DEV)
+    draft_temps = torch.full((n,), draft_temp, device=DEV)
     drafts = frs.fast_rs_draft_markov_feedback(
-        base, anchors, w1, w2, torch.ones(n, device=DEV), slots, -1, buf, seeds, offs, 1
+        base, anchors, w1, w2, draft_temps, slots, -1, buf, seeds, offs, 1
     )
     x = _as_np(drafts, np.int64)
     p = np.stack([target.dist(x[:, :i]) for i in range(k + 1)], axis=1)
@@ -843,7 +847,8 @@ def test_fused_markov_drafts_verified_by_block_verification_follow_the_target():
     )
     stat, dof, pv = _chi2_pvalue(counts, target_joint(target, k).reshape(-1))
     print(
-        f"fused chain + block verification, {n} blocks vs target: chi2={stat:.1f} dof={dof} p={pv:.3f}"
+        f"fused chain (draft temperature {draft_temp}) + block verification, {n} blocks vs "
+        f"target: chi2={stat:.1f} dof={dof} p={pv:.3f}"
     )
     assert pv > (1e-3 if ON_GPU else 1e-4)
 
