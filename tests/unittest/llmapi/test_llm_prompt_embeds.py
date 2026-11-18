@@ -21,7 +21,13 @@ from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds, prompt_embeds_cache_salt
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import (
+    CapacitySchedulerPolicy,
+    CudaGraphConfig,
+    KvCacheConfig,
+    SchedulerConfig,
+    TorchCompileConfig,
+)
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
@@ -358,3 +364,37 @@ def test_connector_keeps_salt_scoping() -> None:
     )
     assert not BaseWorker._kv_cache_keys_prompt_embeds(with_connector)
     assert BaseWorker._kv_cache_keys_prompt_embeds(without)
+
+
+def test_preemption_with_graphs_and_compile(model_dir: str, table: torch.Tensor) -> None:
+    # A small KV pool under MAX_UTILIZATION suspends running requests; their
+    # context, embedding rows included, must come back intact. CUDA graphs and
+    # torch.compile stay on for passes without embedding rows.
+    with LLM(
+        model=model_dir,
+        kv_cache_config=KvCacheConfig(max_tokens=640, enable_block_reuse=False),
+        scheduler_config=SchedulerConfig(
+            capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION
+        ),
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]),
+        torch_compile_config=TorchCompileConfig(),
+        max_batch_size=4,
+    ) as pressured:
+        base = _token_ids(pressured, [LONG_PROMPT])[0][:200]
+        ids = [base[: 200 - 7 * i] for i in range(4)]
+        params = SamplingParams(max_tokens=96, temperature=0.0)
+        expected = [list(o.outputs[0].token_ids) for o in pressured.generate(ids, params)]
+        requests = []
+        for prompt_ids in ids:
+            mask = [p % 3 == 1 for p in range(len(prompt_ids))]
+            requests.append(
+                {
+                    "prompt_token_ids": prompt_ids,
+                    "prompt_embeds": table[
+                        torch.tensor([t for t, m in zip(prompt_ids, mask) if m])
+                    ],
+                    "prompt_embeds_mask": mask,
+                }
+            )
+        got = [list(o.outputs[0].token_ids) for o in pressured.generate(requests, params)]
+        assert got == expected
