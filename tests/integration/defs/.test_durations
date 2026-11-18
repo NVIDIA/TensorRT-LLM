@@ -2109,6 +2109,8 @@
    "test_unittests.py::test_unittests_v2[unittest/_torch/modules/test_low_m_gemm.py]": 25.74966581632653,
    "unittest/_torch/modules/test_low_m_mma_gemm.py": 67.12077297297297,
    "test_unittests.py::test_unittests_v2[unittest/_torch/modules/test_low_m_mma_gemm.py]": 67.12077297297297,
+   "unittest/_torch/modules/test_mega_mhc_pipeline.py::test_mega_mhc_pipeline_changed_input_graph[bf16-shifted-many-task-waves]": 30.0,
+   "test_unittests.py::test_unittests_v2[unittest/_torch/modules/test_mega_mhc_pipeline.py::test_mega_mhc_pipeline_changed_input_graph[bf16-shifted-many-task-waves]]": 30.0,
    "unittest/_torch/modules/test_megamoe_shared_mlp_scales.py": 24.151493693693695,
    "test_unittests.py::test_unittests_v2[unittest/_torch/modules/test_megamoe_shared_mlp_scales.py]": 24.151493693693695,
    "unittest/_torch/modules/test_mhc.py": 56.27440255591054,

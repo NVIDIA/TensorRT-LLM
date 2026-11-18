@@ -149,6 +149,7 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
   - unittest/_torch/modeling/test_glm5_next_contracts.py
   - unittest/_torch/modules/test_mhc.py
+  - unittest/_torch/modules/test_mega_mhc_pipeline.py::test_mega_mhc_pipeline_changed_input_graph[bf16-shifted-many-task-waves]
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
