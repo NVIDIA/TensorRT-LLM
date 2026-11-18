@@ -318,3 +318,14 @@ def test_transfer_views_do_not_depend_on_the_kv_head_split(dtype: DataType) -> N
         assert roles == {str(Role.INDEX_KEY), str(QSA_INDEX_POSITION)}
     else:
         assert roles == {str(QSA_SIDE_PLANES)}
+
+
+def test_a_plain_page_consumer_refuses_the_compact_layout() -> None:
+    """The built-in QSA path addresses an index page by `pos % tokens_per_block`; a manager on
+    the compact layout is refused rather than written past its pages."""
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import index_plane_layout
+
+    index_plane_layout.require_plain_pages(SimpleNamespace())
+    index_plane_layout.require_plain_pages(SimpleNamespace(qsa_index_compact=False))
+    with pytest.raises(RuntimeError, match=index_plane_layout.COMPACT_ENV):
+        index_plane_layout.require_plain_pages(SimpleNamespace(qsa_index_compact=True))
