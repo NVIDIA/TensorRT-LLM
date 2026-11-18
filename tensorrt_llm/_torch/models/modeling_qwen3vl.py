@@ -1961,15 +1961,20 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
             super().prepare_breakable_cuda_graph_inputs(inputs)
         )
         if self.deepstack_num_level > 0 and not prepared_inputs.get("deepstack_embeds"):
-            # Text batches replay the same body as image batches, with zero DeepStack rows.
-            # Image batches scatter their rows into this same scratch buffer (see
-            # `_fuse_multimodal_embeddings`), so clear the last image batch's rows. Replay
-            # copies these views into the graph's own inputs.
+            # Text batches replay the same body as image batches, with zero DeepStack embeddings.
+            # Image batches scatter their features into this same scratch buffer (see
+            # `_fuse_multimodal_embeddings`), so clear the last image batch's features. The graph
+            # reads this buffer in place (see `breakable_cuda_graph_input_buffers`).
             num_tokens = prepared_inputs["inputs_embeds"].shape[0]
             deepstack_buffer = self.deepstack_input_embeds[:, :num_tokens, :]
             deepstack_buffer.zero_()
             prepared_inputs["deepstack_embeds"] = list(deepstack_buffer.unbind(0))
         return prepared_inputs
+
+    def breakable_cuda_graph_input_buffers(self) -> tuple[torch.Tensor, ...]:
+        # The model writes DeepStack embeddings and packed MRoPE cos/sin before each body call.
+        names = ("deepstack_input_embeds", "mrope_rotary_cos_sin_workspace")
+        return tuple(getattr(self, name) for name in names if hasattr(self, name))
 
     def get_language_model_extra_forward_kwargs(
         self,
