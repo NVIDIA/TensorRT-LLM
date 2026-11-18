@@ -13,6 +13,7 @@ from _torch.pyexecutor.multimodal_utils import (
     record_output,
 )
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
@@ -1054,6 +1055,7 @@ def test_item_encoder_slices_and_restores_selected_item_order():
     )
 
     model = _Model()
+    model.model_config = ModelConfig()
     encoder_inputs = model.prepare_multimodal_encoder_inputs(
         [(multimodal_param, 1), (multimodal_param, 0)]
     )

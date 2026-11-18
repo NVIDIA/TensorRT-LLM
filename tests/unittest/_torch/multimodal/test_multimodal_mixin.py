@@ -341,6 +341,43 @@ def test_explicit_encoder_mapping_is_independent_of_llm_attention_dp(attention_d
     assert model_config.mapping.tp_size == 4
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "attention_dp,encoder_dp,tp_size,distributes_items,collective",
+    [
+        (False, None, 4, False, False),
+        (True, None, 4, False, False),
+        (False, 1, 4, False, False),
+        (True, 1, 4, False, True),
+        (False, 2, 2, True, False),
+        (True, 2, 2, True, True),
+        (False, 4, 1, True, False),
+        (True, 4, 1, False, False),
+    ],
+)
+def test_encoder_parallel_layout_is_resolved_once_from_config(
+    attention_dp, encoder_dp, tp_size, distributes_items, collective
+):
+    model = DummyMultimodalModel(make_embedding(), torch.tensor([7]))
+    model.model_config = ModelConfig(
+        mapping=Mapping(world_size=4, rank=3, tp_size=4, enable_attention_dp=attention_dp),
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=encoder_dp),
+    )
+
+    layout = model.encoder_parallel_layout
+
+    assert model.encoder_parallel_layout is layout
+    assert layout.tp_size == tp_size
+    assert layout.dp_size == (encoder_dp or 1)
+    assert layout.dp_rank == 3 // tp_size
+    assert layout.distributes_items == distributes_items
+    assert layout.collective == collective
+    if encoder_dp is None:
+        assert layout.mapping is model.model_config.mapping
+    else:
+        assert layout.mapping.tp_group == list(range(4 - tp_size, 4))
+
+
 @pytest.mark.parametrize(
     "mapping,error_match",
     [

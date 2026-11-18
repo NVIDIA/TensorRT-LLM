@@ -514,45 +514,14 @@ def test_pipeline_parallel_compatibility_is_checked_only_for_item_scheduled_mode
             MultimodalItemScheduler.maybe_create(**create_kwargs)
 
 
-@pytest.mark.parametrize("encoder_dp_size", [None, 1, 2])
-@pytest.mark.parametrize(
-    ("encoder_enabled", "supports_item_scheduling"), [(True, False), (True, True), (False, False)]
-)
-def test_shared_encoder_tp_requires_item_scheduling(
-    encoder_dp_size: int | None, encoder_enabled: bool, supports_item_scheduling: bool
-) -> None:
-    model = MultimodalModelMixin()
-    model.supports_mm_encoder_item_scheduling = supports_item_scheduling
-    mm_config = MultimodalConfig(encoder_data_parallel_size=encoder_dp_size)
-    model.model_config = SimpleNamespace(
-        mapping=Mapping(world_size=2, tp_size=2, enable_attention_dp=True),
-        multimodal_config=mm_config,
-    )
-    args = SimpleNamespace(
-        multimodal_config=mm_config,
-        pipeline_parallel_size=1,
-        disable_mm_encoder=not encoder_enabled,
-        encoder_max_num_tokens=8,
-    )
-    with patch.object(MultimodalItemScheduler, "create") as create:
-        kwargs = dict(llm_args=args, model=model, input_processor=None, encoder_max_num_tokens=8)
-        if encoder_enabled and encoder_dp_size == 1 and not supports_item_scheduling:
-            with pytest.raises(ValueError, match="requires MM encoder item scheduling"):
-                MultimodalItemScheduler.maybe_create(**kwargs)
-        else:
-            scheduler = MultimodalItemScheduler.maybe_create(**kwargs)
-            assert scheduler is (create.return_value if supports_item_scheduling else None)
-        assert create.call_count == int(supports_item_scheduling)
-
-
 @pytest.mark.parametrize("collective", [False, True])
 def test_item_encoder_classifies_request_state_contract_errors(collective: bool) -> None:
     class _Model(MultimodalModelMixin):
-        encoder_collective_required = collective
         model_config = SimpleNamespace(mapping=None)
         _any_encoder_dp_rank_failed = staticmethod(bool)
 
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
+    mm_item_scheduler.collective = collective
     request = make_llm_request(1)
     other = make_mm_request(2, [4])
     _bind_items(mm_item_scheduler, other)
@@ -633,7 +602,6 @@ def test_item_encoder_translates_model_contract_errors(
     failure_stage: str, collective: bool
 ) -> None:
     class _Model(MultimodalModelMixin):
-        encoder_collective_required = collective
         model_config = SimpleNamespace(mapping=None)
         _any_encoder_dp_rank_failed = staticmethod(bool)
 
@@ -652,6 +620,7 @@ def test_item_encoder_translates_model_contract_errors(
                 raise MultimodalEncoderContractError("bad encoder output rows")
 
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
+    mm_item_scheduler.collective = collective
     request = make_mm_request(1, [4])
     _bind_items(mm_item_scheduler, request)
     # A follower of the scheduled entry keeps its reference to produce it later.
@@ -677,7 +646,6 @@ def test_item_encoder_does_not_translate_system_errors(
     failure = torch.cuda.OutOfMemoryError("encoder OOM")
 
     class _Model(MultimodalModelMixin):
-        encoder_collective_required = collective
         model_config = SimpleNamespace(mapping=None)
         _any_encoder_dp_rank_failed = staticmethod(bool)
 
@@ -697,6 +665,7 @@ def test_item_encoder_does_not_translate_system_errors(
                     raise failure
 
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
+    mm_item_scheduler.collective = collective
     request = make_mm_request(1, [4])
     _bind_items(mm_item_scheduler, request)
 
@@ -710,13 +679,13 @@ def test_item_encoder_does_not_translate_system_errors(
 
 def test_item_encoder_scopes_peer_failure_to_local_producers() -> None:
     class _Model(MultimodalModelMixin):
-        encoder_collective_required = True
         model_config = SimpleNamespace(mapping=None)
         _any_encoder_dp_rank_failed = staticmethod(lambda failed: True)
         forward_multimodal_encoder_items = Mock()
 
     model = _Model()
     scheduler = bare_mm_item_scheduler(model)
+    scheduler.collective = True
     producer = make_mm_request(1, [4])
     follower = make_mm_request(2, [4])
     _bind_items(scheduler, producer)
@@ -1071,7 +1040,6 @@ class MultimodalSetupTestCase(unittest.TestCase):
 @pytest.mark.parametrize("collective", [False, True])
 def test_empty_rank_participates_in_collective_encoder_step(collective):
     class _Model(MultimodalModelMixin):
-        encoder_collective_required = collective
         embedding_dtype = torch.float32
         model_config = SimpleNamespace(mapping=None)
 
@@ -1083,6 +1051,7 @@ def test_empty_rank_participates_in_collective_encoder_step(collective):
 
     model = _Model()
     scheduler = bare_mm_item_scheduler(model)
+    scheduler.collective = collective
     scheduler.bytes_per_embedding = 4
     with patch("tensorrt_llm._torch.pyexecutor.engine.multimodal.Distributed.get") as get_dist:
         get_dist.return_value.tp_allreduce.return_value = 1  # A peer has work.

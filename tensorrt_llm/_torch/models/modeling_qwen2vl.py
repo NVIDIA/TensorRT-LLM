@@ -2565,7 +2565,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
             # Local encoder present: raw pixels/videos become embeddings here.
             if self.mm_encoder is not None:
                 encoder_forward_fn = (self._run_multimodal_encoder
-                                      if self.encoder_data_parallel_active else
+                                      if self.encoder_parallel_layout.distributes_items else
                                       self.mm_encoder.forward)
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=encoder_forward_fn,

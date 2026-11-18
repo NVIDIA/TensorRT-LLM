@@ -2214,6 +2214,7 @@ def test_normalization_transport_partial_encoder_cache() -> None:
         }
     )
     model = MultimodalModelMixin()
+    model.model_config = ModelConfig()
     cache = TensorLRUCache(64)
     cache.put("hit", torch.ones(1, 2))
     partition = model.partition_encoder_cache(params, cache, keys=["hit", "miss"])

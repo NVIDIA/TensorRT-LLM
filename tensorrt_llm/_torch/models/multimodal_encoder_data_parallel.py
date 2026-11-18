@@ -26,7 +26,7 @@ for reconstruction.
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import accumulate, pairwise
-from typing import Callable, Iterator, Sequence, TypeVar
+from typing import TYPE_CHECKING, Callable, Iterator, Sequence, TypeVar
 
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
@@ -34,6 +34,48 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 from tensorrt_llm._torch.distributed import Distributed, allgather
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.mapping import Mapping
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+
+@dataclass(frozen=True)
+class EncoderParallelLayout:
+    """Where this rank's multimodal encoder runs inside the LLM TP group.
+
+    Without ``encoder_data_parallel_size``, the encoder keeps the LLM mapping.
+    An explicit size splits the LLM TP group into ``dp_size`` replicas of
+    contiguous ranks; ``mapping`` is then this rank's replica.
+    """
+
+    mapping: Mapping
+    dp_size: int = 1
+    dp_rank: int = 0
+    distributes_items: bool = False
+    """One batch of items is split between the encoder replicas."""
+    collective: bool = False
+    """Attention-DP ranks share one encoder TP pass, so every rank must take part."""
+
+    @property
+    def tp_size(self) -> int:
+        return self.mapping.tp_size
+
+    @classmethod
+    def from_config(cls, model_config: "ModelConfig") -> "EncoderParallelLayout":
+        mapping = model_config.mapping
+        mm_config = model_config.multimodal_config
+        dp_size = None if mm_config is None else mm_config.encoder_data_parallel_size
+        if dp_size is None:
+            return cls(mapping)
+        encoder_mapping = mapping.split_tp(dp_size)
+        shared_tp = mapping.enable_attention_dp and dp_size < mapping.tp_size
+        return cls(
+            mapping=encoder_mapping,
+            dp_size=dp_size,
+            dp_rank=mapping.tp_rank // encoder_mapping.tp_size,
+            distributes_items=dp_size > 1 and (shared_tp or not mapping.enable_attention_dp),
+            collective=shared_tp,
+        )
 
 
 @dataclass(frozen=True)

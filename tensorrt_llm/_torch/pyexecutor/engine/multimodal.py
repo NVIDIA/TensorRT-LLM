@@ -347,6 +347,7 @@ class MultimodalItemScheduler:
         encoder_max_num_tokens: int | None = None,
         output_budget_bytes: int | None = None,
         bytes_per_embedding: int | None = None,
+        collective: bool = False,
     ) -> None:
         self.model = model
         self.input_processor = input_processor
@@ -354,6 +355,9 @@ class MultimodalItemScheduler:
         self.encoder_max_num_tokens = encoder_max_num_tokens
         self.output_budget_bytes = output_budget_bytes
         self.bytes_per_embedding = bytes_per_embedding
+        # Read from the eager model: whole-model torch.compile wraps the engine's model later.
+        self.collective = collective
+        """Every TP rank must enter each encoder step to share one encoder TP pass."""
 
     @classmethod
     def maybe_create(
@@ -377,14 +381,6 @@ class MultimodalItemScheduler:
         enabled = mm_item_scheduling_enabled(llm_args, model)
         validate_mm_encoder_scheduling_compatibility(llm_args, enabled)
         if not enabled:
-            if (
-                not llm_args.disable_mm_encoder
-                and isinstance(model, MultimodalModelMixin)
-                and model.encoder_collective_required
-            ):
-                raise ValueError(
-                    "Encoder TP with attention DP requires MM encoder item scheduling."
-                )
             return None
         assert isinstance(model, MultimodalModelMixin)  # narrowed by the predicate
         return cls.create(
@@ -484,6 +480,7 @@ class MultimodalItemScheduler:
             encoder_max_num_tokens=encoder_max_num_tokens,
             output_budget_bytes=output_budget_bytes,
             bytes_per_embedding=bytes_per_embedding,
+            collective=model.encoder_parallel_layout.collective,
         )
 
     @property
@@ -528,7 +525,7 @@ class MultimodalItemScheduler:
         """Encode selected producer items into their reserved cache entries."""
         if not isinstance(self.model, MultimodalModelMixin):
             raise TypeError("Item-level MM scheduling requires MultimodalModelMixin")
-        collective = self.model.encoder_collective_required
+        collective = self.collective
         if collective:
             has_work = Distributed.get(self.model.model_config.mapping).tp_allreduce(
                 int(bool(scheduled_items))

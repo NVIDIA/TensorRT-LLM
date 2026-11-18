@@ -923,7 +923,8 @@ class ModelEngine:
     ) -> None:
         """Forward selected MM encoder items into the unified output cache."""
         if not scheduled_items and not (
-            isinstance(self.model, MultimodalModelMixin) and self.model.encoder_collective_required
+            isinstance(self.model, MultimodalModelMixin)
+            and self.model.encoder_parallel_layout.collective
         ):
             return
         if self._mm_item_scheduler is None:

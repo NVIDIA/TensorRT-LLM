@@ -270,7 +270,7 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
             if not _is_mm_disagg():
                 encoder_forward_fn = (
                     self._run_multimodal_encoder
-                    if self.encoder_data_parallel_active
+                    if self.encoder_parallel_layout.distributes_items
                     else self.mm_encoder.forward
                 )
                 mm_embeds = get_multimodal_embeddings(

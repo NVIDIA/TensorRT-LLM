@@ -18,6 +18,7 @@ import contextlib
 import copy
 import itertools
 from dataclasses import dataclass
+from functools import cached_property
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -51,7 +52,6 @@ from tensorrt_llm.inputs.multimodal import (
     select_multimodal_fields,
 )
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from ..hostfunc import hostfuncs_pending
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
@@ -64,6 +64,7 @@ from .modeling_multimodal_utils import (
 )
 from .multimodal_encoder_data_parallel import (
     EncoderDpItem,
+    EncoderParallelLayout,
     encoder_dp_error_guard,
     execute_encoder_dp_items,
     iter_encoder_rank_inputs,
@@ -325,13 +326,6 @@ _MM_AUX_STREAM: Optional[tuple[int, torch.cuda.Stream]] = None
 _MM_ENCODER_CACHE_LOG_NAME = "mm_encoder_cache"
 
 
-def _encoder_data_parallel_size(model_config: ModelConfig) -> int:
-    multimodal_config = model_config.multimodal_config
-    if multimodal_config is None:
-        return 1
-    return multimodal_config.encoder_data_parallel_size or 1
-
-
 def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConfig:
     """Resolve encoder TP/DP independently of the language model mapping.
 
@@ -342,35 +336,11 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
     encoder_config = copy.deepcopy(
         model_config, {id(model_config.extra_attrs): model_config.extra_attrs}
     )
-    mm_config = model_config.multimodal_config
-    if mm_config is None or mm_config.encoder_data_parallel_size is None:
+    # TorchLlmArgs.validate_encoder_data_parallel rejects bad sizes at startup;
+    # Mapping.split_tp checks them again for callers that build ModelConfig directly.
+    encoder_mapping = EncoderParallelLayout.from_config(model_config).mapping
+    if encoder_mapping is model_config.mapping:
         return encoder_config
-
-    mapping = model_config.mapping
-    encoder_dp_size = mm_config.encoder_data_parallel_size
-    # TorchLlmArgs.validate_encoder_data_parallel rejects these at startup;
-    # the checks here cover callers that build ModelConfig directly.
-    if mapping.pp_size != 1 or mapping.cp_size != 1:
-        raise NotImplementedError(
-            "Explicit multimodal encoder parallelism requires pipeline "
-            "parallel size 1 and context parallel size 1."
-        )
-    if mapping.tp_size % encoder_dp_size:
-        raise ValueError(
-            "multimodal_config.encoder_data_parallel_size must divide the tensor "
-            f"parallel size ({mapping.tp_size}), got {encoder_dp_size}."
-        )
-
-    encoder_tp_size = mapping.tp_size // encoder_dp_size
-    # pp_size only satisfies Mapping's world-size invariant. The encoder does
-    # not pipeline-partition layers; contiguous TP subgroups are its replicas.
-    encoder_mapping = Mapping(
-        world_size=mapping.world_size,
-        rank=mapping.rank,
-        gpus_per_node=mapping.gpus_per_node,
-        tp_size=encoder_tp_size,
-        pp_size=mapping.world_size // encoder_tp_size,
-    )
     return encoder_config.copy_with(mapping=encoder_mapping)
 
 
@@ -602,12 +572,11 @@ class MultimodalModelMixin:
             raise NotImplementedError(
                 f"{cls.__name__} does not support explicit multimodal encoder parallelism."
             )
-        dp_size = mm_config.encoder_data_parallel_size
-        tp_size = model_config.mapping.tp_size // dp_size
+        layout = EncoderParallelLayout.from_config(model_config)
         required_modes: set[EncoderParallelMode] = set()
-        if dp_size > 1:
+        if layout.dp_size > 1:
             required_modes.add("dp")
-        if tp_size > 1:
+        if layout.tp_size > 1:
             required_modes.add("tp")
         for encoder_name, modes in encoder_modes.items():
             for mode in sorted(required_modes - modes):
@@ -616,11 +585,7 @@ class MultimodalModelMixin:
                     f"{cls.__name__} encoder '{encoder_name}' does not support "
                     f"multimodal encoder {parallelism} parallelism."
                 )
-        if (
-            model_config.mapping.enable_attention_dp
-            and tp_size > 1
-            and not cls.supports_mm_encoder_item_scheduling
-        ):
+        if layout.collective and not cls.supports_mm_encoder_item_scheduling:
             raise ValueError("Encoder TP with attention DP requires MM encoder item scheduling.")
 
     @classmethod
@@ -791,7 +756,7 @@ class MultimodalModelMixin:
             One encoder output tensor **per item** (not per input tuple). Each tensor has the
             declared embedding row count and retains scheduler input order.
         """
-        if not self.encoder_collective_required:
+        if not self.encoder_parallel_layout.collective:
             return self._forward_multimodal_encoder_items_local(encoder_inputs)
 
         outputs: list[torch.Tensor] = []
@@ -867,39 +832,16 @@ class MultimodalModelMixin:
         """Return the dtype of each cached multimodal embedding row."""
         raise NotImplementedError
 
-    @property
-    def encoder_data_parallel_size(self) -> int:
-        """Return the explicitly configured encoder DP size."""
-        return _encoder_data_parallel_size(self.model_config)
-
-    @property
-    def encoder_collective_required(self) -> bool:
-        """Whether rank-local ADP requests must rendezvous for encoder TP."""
-        model_config = getattr(self, "model_config", None)
-        if model_config is None:
-            return False
-        mapping = model_config.mapping
-        mm_config = model_config.multimodal_config
-        return (
-            mapping.enable_attention_dp
-            and mm_config is not None
-            and mm_config.encoder_data_parallel_size is not None
-            and mm_config.encoder_data_parallel_size < mapping.tp_size
-        )
-
-    @property
-    def encoder_data_parallel_active(self) -> bool:
-        """Whether an encoder call distributes items between replicas."""
-        mapping = self.model_config.mapping
-        size = self.encoder_data_parallel_size
-        # Fully replicated ADP encoders consume only their owner's requests.
-        return size > 1 and (not mapping.enable_attention_dp or size < mapping.tp_size)
+    @cached_property
+    def encoder_parallel_layout(self) -> EncoderParallelLayout:
+        """The encoder TP/DP layout, built once from `model_config`."""
+        return EncoderParallelLayout.from_config(self.model_config)
 
     def _allgather_encoder_dp_output(
         self, tensor: torch.Tensor, row_counts: list[int]
     ) -> torch.Tensor:
         mapping = self.model_config.mapping
-        tp_size = mapping.tp_size // self.encoder_data_parallel_size
+        tp_size = self.encoder_parallel_layout.tp_size
         if tp_size > 1:
             # Encoder TP ranks hold identical outputs. Send one copy per DP
             # replica rather than multiplying the gathered output by TP size.
@@ -987,12 +929,8 @@ class MultimodalModelMixin:
     ) -> torch.Tensor:
         """Run the model encoder with the configured multimodal DP behavior."""
         params = list(multimodal_params)
-        model_config = getattr(self, "model_config", None)
-        if model_config is None:
-            return self.encode_multimodal_inputs(params, **encoder_kwargs)
-        mapping = model_config.mapping
-
-        if not self.encoder_data_parallel_active:
+        layout = self.encoder_parallel_layout
+        if not layout.distributes_items:
             return self.encode_multimodal_inputs(params, **encoder_kwargs)
 
         encoder_dp_inputs = self._build_encoder_dp_items(params)
@@ -1014,8 +952,8 @@ class MultimodalModelMixin:
             embedding_weight = self.text_embedding_layer.weight
             return execute_encoder_dp_items(
                 items,
-                rank=mapping.tp_rank // (mapping.tp_size // self.encoder_data_parallel_size),
-                num_ranks=self.encoder_data_parallel_size,
+                rank=layout.dp_rank,
+                num_ranks=layout.dp_size,
                 prepare_local_inputs=prepare_local_inputs,
                 encode_local_inputs=encode_local_inputs,
                 any_rank_failed=self._any_encoder_dp_rank_failed,
