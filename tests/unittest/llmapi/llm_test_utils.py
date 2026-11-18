@@ -117,16 +117,22 @@ class MyLogitsProcessor(LogitsProcessor):
 
 
 def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
+    tp_size = llm_kwargs.get("tensor_parallel_size", 1)
+    pp_size = llm_kwargs.get("pipeline_parallel_size", 1)
+    world_size = tp_size * pp_size
+    if world_size > torch.cuda.device_count():
+        pytest.skip(
+            f"world_size ({world_size}) is greater than available GPUs ({torch.cuda.device_count()})"
+        )
+
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
     max_tokens = 6
-    sampling_params = SamplingParams(
-        max_tokens=max_tokens, logits_processor=MyLogitsProcessor(biased_word_id)
-    )
+    processor = MyLogitsProcessor(biased_word_id)
 
-    prompts = ["A B C"]
+    prompt = "A B C"
     if llm_kwargs.get("enable_chunked_prefill", None):
-        prompts[0] = prompts[0] * 256
+        prompt = prompt * 256
         llm_kwargs["max_num_tokens"] = 256
 
     # The biased token's decoded text (e.g. with or without a leading space)
@@ -134,15 +140,50 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
     # rather than hardcoding a particular tokenizer's rendering.
     expected_output = tokenizer.decode([biased_word_id] * max_tokens)
 
-    llm_test_harness(
+    # Block reuse is off so the batch below prefills its prompts instead of
+    # reusing the blocks of the first run.
+    with assert_resource_freed(
+        LLM,
         llama_model_path,
-        prompts,
-        [expected_output],
-        sampling_params=sampling_params,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        llama_model_path,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4, enable_block_reuse=False),
         backend=backend,
         **llm_kwargs,
-    )
+    ) as llm:
+        # Every token is forced, so the output must match exactly: a fuzzy
+        # match would pass when one token (e.g. the first) misses the
+        # processor.
+        llm_check_output(
+            llm,
+            [prompt],
+            [expected_output],
+            sampling_params=SamplingParams(max_tokens=max_tokens, logits_processor=processor),
+            similar_threshold=1.0,
+        )
+
+        # A processor turns the context-logits plan off, so a step that also
+        # gathers context logits holds a row per prompt token. Each request
+        # must still be sampled from its own row, and the processor must not
+        # edit the returned context logits.
+        processed, unprocessed, plain = llm.generate(
+            [prompt] * 3,
+            [
+                SamplingParams(
+                    max_tokens=max_tokens, logits_processor=processor, return_context_logits=True
+                ),
+                SamplingParams(max_tokens=max_tokens, return_context_logits=True),
+                SamplingParams(max_tokens=max_tokens),
+            ],
+        )
+        assert processed.outputs[0].token_ids == [biased_word_id] * max_tokens
+        # The prompts sit at different rows of one batch and, with chunked
+        # prefill, are split into chunks at different points, so allow BF16
+        # rounding: two requests without a processor differ by up to 0.47
+        # there, with logits up to 23. An edited row would hold -inf.
+        torch.testing.assert_close(
+            processed.context_logits, unprocessed.context_logits, rtol=0.02, atol=1.0
+        )
+        assert unprocessed.outputs[0].token_ids == plain.outputs[0].token_ids
 
 
 def _test_llm_generate_async(model_name=default_model_name, tp_size: int = 1, tokenizer=None):
