@@ -137,7 +137,7 @@ def memory_store(tmp_path, monkeypatch):
     monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(path))
     store = MemoryStore()
     monkeypatch.setattr(worker_module, "_open_store", lambda _config: (store, "10.0.0.1"))
-    monkeypatch.setattr(worker_module, "validate_node_budget", lambda _config: None)
+    monkeypatch.setattr(worker_module, "validate_node_budget", lambda _config, **_kwargs: None)
     yield store
     for worker in store.workers:
         worker.shutdown()
@@ -302,6 +302,7 @@ def test_pages_through_the_pool_match_the_caches_own_codec(memory_store, dtype):
                     saves=[],
                 )
             )
+            worker.bind_allocation_fence(lambda _request_ids: None)
             worker.start_load_kv(torch.cuda.current_stream())
             torch.cuda.synchronize()
 
@@ -319,7 +320,7 @@ def test_pages_through_the_pool_match_the_caches_own_codec(memory_store, dtype):
 
 
 @needs_nvfp4
-def test_decoded_pages_stay_close_to_the_originals(memory_store):
+def test_decoded_pages_stay_close_to_the_originals():
     """NVFP4 is lossy; this bounds the loss so a mangled layout cannot pass."""
     sources, targets = [0, 1], [4, 5]
     with make_cache(DataType.BF16) as manager:
@@ -370,7 +371,81 @@ def test_the_codec_identity_reaches_the_keys(memory_store):
         assert identity.startswith("quantization_for_cold_page-")
         with make_worker(memory_store, layout) as worker:
             key = worker._namespaces[0].key(b"\x00" * 16)
-        assert f"/e{identity}.r{layout.groups[0].bytes_per_page}/" in key
+        assert f"/e{identity}.BF16.r{layout.groups[0].bytes_per_page}/" in key
+
+
+@needs_nvfp4
+def test_the_forward_stream_waits_for_the_decodes_on_the_device(memory_store):
+    """Decodes run on the worker's load stream; the pass reading the pages waits for them there.
+
+    The load stream is held back past the point where the host returns, so a
+    read on the forward stream that is not ordered after the decodes sees the
+    pages as they were before the load.
+    """
+    sources, targets, references = [0, 1], [5, 6], [9, 10]
+    hashes = [bytes([index + 40]) * 16 for index in range(len(sources))]
+    with make_cache(DataType.BF16) as manager:
+        layout = build_kv_cache_layout_v2(manager)
+        fill_pages(layout, sources, DataType.BF16, seed=5)
+        reference_round_trip(layout, sources, references)
+        with make_worker(memory_store, layout) as worker:
+            worker._put(
+                [
+                    RequestTransfers(
+                        1,
+                        [
+                            PageTransfer(block_hash, group.layer_group_id, page)
+                            for block_hash, page in zip(hashes, sources)
+                            for group in layout.groups
+                        ],
+                    )
+                ]
+            )
+            for group in layout.groups:
+                for region in group.regions:
+                    for target in targets:
+                        region.slot_tensor(target).zero_()
+            torch.cuda.synchronize()
+
+            fenced = []
+
+            def fence(request_ids):
+                fenced.append(set(request_ids))
+                with torch.cuda.stream(worker._load_stream):
+                    torch.cuda._sleep(200_000_000)
+
+            worker.bind_allocation_fence(fence)
+            worker.bind_connector_meta(
+                SimpleNamespace(
+                    loads=[
+                        RequestTransfers(
+                            2,
+                            [
+                                PageTransfer(block_hash, group.layer_group_id, page)
+                                for block_hash, page in zip(hashes, targets)
+                                for group in layout.groups
+                            ],
+                        )
+                    ],
+                    saves=[],
+                )
+            )
+            forward = torch.cuda.current_stream()
+            worker.start_load_kv(forward)
+            # Copied on the forward stream with no host wait in between.
+            seen = {
+                (group.layer_group_id, target): page_bytes(layout, group, target)
+                for group in layout.groups
+                for target in targets
+            }
+            torch.cuda.synchronize()
+
+        assert fenced == [{2}]
+        for group in layout.groups:
+            for target, reference in zip(targets, references):
+                assert torch.equal(
+                    seen[(group.layer_group_id, target)], page_bytes(layout, group, reference)
+                ), "the forward stream read a page before its decode finished"
 
 
 def test_a_cache_without_compression_offers_no_codec():
@@ -413,38 +488,24 @@ def test_the_lossless_default_codec_round_trips_bit_exactly():
         assert not impl.encode_cold_pages(99, 0, 0, 0, stream)
 
 
-def _page_nodes(address: int, nbytes: int, step: int = 1 << 20):
-    """The NUMA node each sampled page of a range lives on, as the kernel reports it."""
-    try:
-        libnuma = ctypes.CDLL("libnuma.so.1")
-    except OSError:
-        return None
-    count = max(1, nbytes // step)
-    pages = (ctypes.c_void_p * count)(*[address + index * step for index in range(count)])
-    status = (ctypes.c_int * count)()
-    # With no target nodes, numa_move_pages only reports where each page is.
-    if libnuma.numa_move_pages(0, count, pages, None, status, 0) != 0:
-        return None
-    return set(status)
-
-
 def test_staging_memory_sits_on_the_gpus_numa_node():
     """Staging through the far socket costs every encode and decode the socket link."""
-    from cuda.bindings import driver
-
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.codec_staging import (
         PinnedHostBuffer,
+        gpu_host_numa_node,
+        resident_numa_nodes,
     )
-    from tensorrt_llm._torch.pyexecutor.kv_cache.host_memory import host_numa_node_of
 
+    expected = gpu_host_numa_node(torch.cuda.current_device())
+    if expected is None:
+        pytest.skip("the driver reports no host NUMA node for this GPU")
     buffer = PinnedHostBuffer(8 << 20)
     try:
-        if buffer.numa_node is None:
-            pytest.skip("libnuma is unavailable, so the buffer was not placed")
-        assert buffer.numa_node == host_numa_node_of(driver, torch.cuda.current_device())
-        nodes = _page_nodes(buffer.address, buffer.nbytes)
-        if nodes is not None:
-            assert nodes == {buffer.numa_node}, f"pages landed on nodes {nodes}"
+        placed = resident_numa_nodes(buffer.address, buffer.nbytes)
+        if placed is None:
+            pytest.skip("the kernel does not say where pages live (libnuma or move_pages refused)")
+        assert placed == {expected}, f"pages landed on nodes {placed}, not node {expected}"
+        assert buffer.numa_node == expected
         # The GPU reaches it at its host address, as the codec does.
         values = torch.arange(1024, dtype=torch.int32, device="cuda")
         host = torch.from_numpy(
@@ -458,5 +519,33 @@ def test_staging_memory_sits_on_the_gpus_numa_node():
             buffer.address, values.data_ptr(), 4096, cudart.cudaMemcpyKind.cudaMemcpyDefault
         )
         assert torch.equal(host, values.cpu())
+    finally:
+        buffer.close()
+
+
+def test_staging_falls_back_to_pinned_memory_when_registration_fails(monkeypatch):
+    """A refused cudaHostRegister leaves usable memory and no CUDA error behind."""
+    from cuda.bindings import runtime as cudart
+
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import codec_staging
+
+    monkeypatch.setattr(
+        codec_staging.cudart,
+        "cudaHostRegister",
+        lambda *_args: (cudart.cudaError_t.cudaErrorMemoryAllocation,),
+    )
+    buffer = codec_staging.PinnedHostBuffer(4 << 20)
+    try:
+        assert buffer.numa_node is None
+        assert buffer._map is None, "the mapping is released with the failed registration"
+        values = torch.arange(1024, dtype=torch.int32, device="cuda")
+        cudart.cudaMemcpy(
+            buffer.address, values.data_ptr(), 4096, cudart.cudaMemcpyKind.cudaMemcpyDefault
+        )
+        host = torch.from_numpy(
+            np.ctypeslib.as_array((ctypes.c_int32 * 1024).from_address(buffer.address))
+        )
+        assert torch.equal(host, values.cpu())
+        assert cudart.cudaGetLastError()[0] == cudart.cudaError_t.cudaSuccess
     finally:
         buffer.close()

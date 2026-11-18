@@ -3088,17 +3088,26 @@ class KVCacheCompressionManager(BaseResourceManager):
         """Decode one complete KVCM migration batch from cold storage."""
         raise NotImplementedError
 
+    def cold_page_codec_settings(self) -> dict:
+        """Everything that decides the bytes this method's cold-page codec writes.
+
+        The default is every field of the method's config. A method whose
+        encoding also depends on what it derives at runtime (calibration
+        loaded from a file, flags adjusted for the model, an encoded layout
+        fixed in code) extends it, keeping the result the same on every rank.
+        """
+        return self.config.model_dump(mode="json")
+
     def cold_page_codec_identity(self) -> str:
         """Name the encoded representation this method's cold-page codec writes.
 
         A store that outlives one server, or is shared by several (the
         `mooncake-store` connector's pool), keys its pages by this name, so
         servers whose codecs would decode a page differently never read each
-        other's pages. The default covers the algorithm and every field of its
-        config, which is all a method's settings; a method whose encoding
-        depends on anything else extends it.
+        other's pages. It is the algorithm plus a digest of
+        :meth:`cold_page_codec_settings`.
         """
-        payload = json.dumps(self.config.model_dump(mode="json"),
+        payload = json.dumps(self.cold_page_codec_settings(),
                              sort_keys=True,
                              default=str)
         digest = hashlib.blake2b(payload.encode("utf-8"),

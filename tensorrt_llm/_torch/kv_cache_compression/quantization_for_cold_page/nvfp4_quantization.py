@@ -35,6 +35,10 @@ _MODEL_OPT_LANGUAGE_KV_SCALE_KEY = re.compile(
     r"^model(?:\.language_model)?\.layers\.(?P<layer_id>\d+)\.self_attn\."
     r"(?P<kind>[kv])_proj\.(?P=kind)_scale$"
 )
+#: Version of the encoded page layout this codec writes, part of its cold-page
+#: codec identity. Bump it with any change that makes a page encoded before it
+#: decode differently, so a store that outlives a server never mixes the two.
+_COLD_PAGE_FORMAT_VERSION = 1
 _COLD_PAGE_ALIGNMENT = 16
 _ELEMENTS_PER_BYTE = 2
 _ELEMENTS_PER_SCALE = 16
@@ -223,6 +227,28 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 f"{model_type!r} and turning whole K and V vectors into NVFP4."
             )
             self._skip_rope_quantization = False
+
+    def cold_page_codec_settings(self) -> dict:
+        """The config, adjusted to what the encoded bytes actually depend on.
+
+        The scales are the loaded values rather than the checkpoint path: the
+        same path can hold different calibrations, and `TRTLLM_LOAD_KV_SCALES`
+        or a non-NVFP4 checkpoint leaves them unloaded. Every rank loads the
+        whole model's scales, so the result is the same on each.
+        """
+        settings = super().cold_page_codec_settings()
+        settings.pop("scale_checkpoint_path", None)
+        settings.update(
+            format_version=_COLD_PAGE_FORMAT_VERSION,
+            skip_rope_quantization=self._skip_rope_quantization,
+            model_type=getattr(self.pretrained_config, "model_type", None),
+            kv_scales=[
+                [layer_id, role, list(pair)]
+                for layer_id, layer_scales in sorted(self._model_scales.items())
+                for role, pair in sorted(layer_scales.items())
+            ],
+        )
+        return settings
 
     def _calculate_quantized_range(
         self,

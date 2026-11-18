@@ -447,7 +447,7 @@ public:
     // representation the cold tiers use, through the codec this manager owns. The calls below run that codec
     // against caller-owned memory and touch no cache level, slot or staging buffer of this manager. They are safe
     // from another thread as long as this manager does not run the codec itself at the same time, which is the
-    // case when it has no cold tier.
+    // case when it has no cold tier, and only until destroy(), which frees the pools the codec reads and writes.
 
     //! Bytes of one encoded page of `layerGroup`; zero for an unknown layer group.
     [[nodiscard]] size_t coldPageBytes(LayerGroupId layerGroup) const noexcept;

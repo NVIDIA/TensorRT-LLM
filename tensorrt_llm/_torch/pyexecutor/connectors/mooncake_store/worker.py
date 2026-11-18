@@ -225,7 +225,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Checked before the segment is mounted, since the kernel answers an
         # unaffordable total by killing the process rather than by failing the
         # allocation.
-        validate_node_budget(self._config)
+        validate_node_budget(
+            self._config,
+            # A compression method may give the cache a cold-page codec, which
+            # pages then pass through pinned arenas for (see _open_encoded_staging).
+            may_encode_pages=getattr(llm_args, "kv_cache_compression_config", None) is not None,
+        )
 
         self._store, self._segment_host = _open_store(self._config)
         record_segment(
@@ -347,6 +352,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if codec is not None:
             # Pages pass through the codec and pinned staging, so the store
             # never reaches the KV pools and they are not registered.
+            if self._config.stage_through_host:
+                logger.warning(
+                    "mooncake-store: stage_through_host has no effect while pages go through "
+                    "the KV cache's cold-page codec, which always stages them in pinned memory."
+                )
             addressing = PageAddressing(layout)
             self._codec = codec
             self._open_encoded_staging(addressing)
@@ -685,11 +695,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def _load_encoded(self, transfers: Sequence[RequestTransfers], stream) -> None:
         """Read encoded pages into the arena, then decode them into their GPU slots.
 
-        With the cache's allocation fence, decoding runs on this worker's load
-        stream once the target pages are free of earlier GPU work, and the
+        Decoding runs on this worker's load stream once the cache's allocation
+        fence says the target pages are free of earlier GPU work, and the
         forward stream waits for it on the device: the executor thread never
-        blocks on the pass queued before this one. Without the fence, decoding
-        runs on the forward stream, which orders it the same way.
+        blocks on the pass queued before this one. The fence is waited for only
+        before the first decode, so it overlaps the first read from the store,
+        which writes nothing but the arena.
 
         The arena's two halves alternate, so the store reads a batch into one
         while the GPU decodes the previous batch out of the other. A half is
@@ -699,48 +710,70 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if not items:
             return
         fence = self.get_allocation_fence()
-        if fence is not None and self._load_stream is not None:
-            fence({entry.request_id for entry in transfers})
-            decode_stream = self._load_stream
-        else:
-            # The codec needs a created stream, which the executor always passes.
-            decode_stream = stream if stream is not None else self._load_stream
+        if fence is None:
+            raise RuntimeError(
+                "mooncake-store: an encoded load has no allocation fence to wait on, so "
+                "it could decode into pages earlier GPU work still owns. The KV cache "
+                "manager must offer wait_allocation_fences; KVCacheManagerV2 does."
+            )
+        decode_stream = self._load_stream
         handle = _stream_handle(decode_stream)
         arena = self._load_arena
         half = arena.capacity // 2
+        fenced = False
         last = None
-        for index, batch in enumerate(
-            plan_encoded_batches(items, self._codec.page_bytes, 0, half, self._batch_size)
-        ):
-            which = index % 2
-            base = arena.base + which * half
-            _wait_event(self._load_half_ready[which])
-            results = self._store.batch_get_into_multi_buffers(
-                batch.keys,
-                [[base + address] for address in batch.addresses],
-                [[size] for size in batch.sizes],
-            )
-            failed = [
-                key
-                for key, result in zip(batch.keys, results)
-                if not isinstance(result, int) or result < 0
-            ]
-            if failed or len(results) != len(batch.keys):
-                # As for a raw load: these tokens already count as computed.
-                raise RuntimeError(
-                    f"mooncake-store failed to load {len(failed) or len(batch.keys)} of "
-                    f"{len(batch.keys)} encoded pages; the affected KV slots were already "
-                    f"reported as computed. First failure: {failed[:1]}"
+        try:
+            for index, batch in enumerate(
+                plan_encoded_batches(items, self._codec.page_bytes, 0, half, self._batch_size)
+            ):
+                which = index % 2
+                base = arena.base + which * half
+                _wait_event(self._load_half_ready[which])
+                results = self._store.batch_get_into_multi_buffers(
+                    batch.keys,
+                    [[base + address] for address in batch.addresses],
+                    [[size] for size in batch.sizes],
                 )
-            for group in batch.groups:
-                self._codec.decode(
-                    group.layer_group_id, base + group.base, group.pages, group.slots, handle
-                )
-            last = _record_event(decode_stream)
-            self._load_half_ready[which] = last
-        if decode_stream is not stream and last is not None:
+                # An encoded page has exactly one size, so a short read is as
+                # much a failure as an error: the slot still holds an older page.
+                failed = [
+                    key
+                    for key, size, result in zip(batch.keys, batch.sizes, results)
+                    if not isinstance(result, int) or result != size
+                ]
+                if failed or len(results) != len(batch.keys):
+                    # As for a raw load: these tokens already count as computed.
+                    raise RuntimeError(
+                        f"mooncake-store failed to load {len(failed) or len(batch.keys)} of "
+                        f"{len(batch.keys)} encoded pages; the affected KV slots were already "
+                        f"reported as computed. First failure: {failed[:1]}"
+                    )
+                if not fenced:
+                    fence({entry.request_id for entry in transfers})
+                    fenced = True
+                try:
+                    for group in batch.groups:
+                        self._codec.decode(
+                            group.layer_group_id,
+                            base + group.base,
+                            group.pages,
+                            group.slots,
+                            handle,
+                        )
+                finally:
+                    # Also when a decode raised: the ones enqueued before it
+                    # still read this half.
+                    last = _record_event(decode_stream)
+                    self._load_half_ready[which] = last
+        except BaseException:
+            # Earlier batches may still be decoding out of the arena; nothing
+            # may reuse or free it until they are done.
+            if decode_stream is not None:
+                decode_stream.synchronize()
+            raise
+        if last is not None:
             # The pass reads these pages: order it after the last decode, on the device.
-            (stream if stream is not None else torch.cuda.default_stream()).wait_event(last)
+            (stream if stream is not None else torch.cuda.current_stream()).wait_event(last)
         logger.debug(f"mooncake-store rank {self._rank} loaded {len(items)} encoded pages")
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
@@ -922,6 +955,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         pending: List[Tuple[str, int, int]] = []
         for chunk in _batched(items, self._batch_size):
             present = self._store.batch_is_exist([key for key, _, _ in chunk])
+            if len(present) != len(chunk):
+                # Unreadable as an answer per page: write them all.
+                pending.extend(chunk)
+                continue
             pending.extend(
                 item
                 for item, status in zip(chunk, present)
@@ -1023,6 +1060,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if thread is not None:
             self._save_queue.put(None)
             thread.join(timeout=SAVE_DRAIN_TIMEOUT)
+            if self._codec is not None:
+                # The cache manager frees its pools after this returns; a save
+                # thread still running must not start an encode over them.
+                self._codec.close()
             if thread.is_alive():
                 # The thread reads the KV pools through the store handle and
                 # the staging slots below, so releasing either takes the memory
@@ -1051,7 +1092,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                     f"{traceback.format_exc()}"
                 )
         # Released only after the store is closed, since it holds registrations
-        # against this memory.
+        # against this memory, and after the GPU is done coding through it.
+        for stream in (self._load_stream, self._save_stream):
+            if stream is not None:
+                stream.synchronize()
         self._load_staging = None
         self._save_staging = None
         for arena in (self._load_arena, self._save_arena):

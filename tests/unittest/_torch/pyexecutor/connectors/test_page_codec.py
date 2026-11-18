@@ -160,3 +160,41 @@ def test_from_manager_binds_the_managers_native_handle():
     assert codec.encoding(0) == "nvfp4-abc.r512"
     codec.encode(0, 0x1000, [0], [5], stream=1)
     assert cache.calls == [("encode", 0, 0x1000, [(0, 5)], 1)]
+
+
+def test_the_encoding_names_the_hot_element_type():
+    """FP16 and BF16 pages have the same size; the parts kept as-is read differently."""
+    cache = FakeCache({0: 96})
+    bf16 = make_codec(cache, raw_bytes_per_page={0: 512}, kv_dtype="BF16")
+    fp16 = make_codec(cache, raw_bytes_per_page={0: 512}, kv_dtype="HALF")
+    assert bf16.encoding(0) == "nvfp4-abc.BF16.r512"
+    assert bf16.encoding(0) != fp16.encoding(0)
+
+
+def test_from_manager_folds_in_the_managers_element_type():
+    manager = SimpleNamespace(
+        cold_page_codec_identity="nvfp4-abc",
+        impl=FakeCache({0: 96}),
+        dtype=SimpleNamespace(name="BF16"),
+    )
+    assert KvCachePageCodec.from_manager(manager, {0: 512}).encoding(0) == "nvfp4-abc.BF16.r512"
+
+
+def test_a_layer_group_the_codec_was_not_bound_to_is_refused():
+    cache = FakeCache({0: 96, 1: 96})
+    codec = make_codec(cache, layer_group_ids=[0])
+    with pytest.raises(ValueError, match="layer group 1 is not one this codec was bound to"):
+        codec.encode(1, 0x1000, [0], [5], stream=1)
+    assert cache.calls == []
+
+
+def test_a_closed_codec_refuses_every_call():
+    """The manager frees its pools at shutdown but keeps the codec, which would read them."""
+    cache = FakeCache({0: 96})
+    codec = make_codec(cache)
+    codec.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        codec.encode(0, 0x1000, [0], [5], stream=1)
+    with pytest.raises(RuntimeError, match="closed"):
+        codec.decode(0, 0x1000, [5], [0], stream=1)
+    assert cache.calls == []

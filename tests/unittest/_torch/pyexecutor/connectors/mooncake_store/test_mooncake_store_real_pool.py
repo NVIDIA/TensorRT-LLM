@@ -700,6 +700,11 @@ def test_raw_and_encoded_pages_never_share_a_key(mooncake_pool):
             mooncake_pool, layout=layout, stage_through_host=False, model_key="v2-mixed"
         ) as writer:
             save_page(writer, request_id=1, page_index=1, group_ids=group_ids)
+        with open_worker(
+            mooncake_pool, layout=layout, stage_through_host=False, model_key="v2-mixed"
+        ) as encoded_reader:
+            # The block is in the pool, so the miss below is the keys' doing.
+            assert encoded_reader.count_prefix_hit([BLOCK_HASH]) == 1
         raw_layout = dataclasses.replace(layout, page_codec=None)
         with open_worker(
             mooncake_pool, layout=raw_layout, stage_through_host=True, model_key="v2-mixed"

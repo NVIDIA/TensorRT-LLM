@@ -575,6 +575,15 @@ Two exposed accessors look like they might leak shared state and do not:
   only shared access is the `gDebug` cross-check calling
   `getAggregatedPageIndices()`, which does take the shared lock because it reads
   each `Page`'s slot id, and slot assignment is what migration changes.
+- `cold_page_bytes`, `cold_page_index_location`, `encode_cold_pages` and
+  `decode_cold_pages` run the cold-page codec against caller-owned memory, for a
+  KV connector's store, and take no lock. They read only the codec and its
+  per-layer-group settings, fixed at construction, and the codec may call into
+  Python, so holding the lock across it would order it against the GIL. The
+  codec need not be reentrant, so callers serialize their calls (the connectors'
+  `KvCachePageCodec` does). Use them only while the manager has no cold tier of
+  its own running the codec, and not after `shutdown()`, which frees the pools
+  the codec reads and writes.
 
 **Granularity is deliberate.** Per-block locks would not help: the hazards are
 structural mutation of the radix tree's `unordered_map`s (insert/erase/rehash)

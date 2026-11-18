@@ -57,8 +57,13 @@ from tensorrt_llm.llmapi.llm_args import (
     MooncakeStoreConfig,
 )
 
-from ..conftest import llm_models_root, skip_pre_blackwell
+from ..conftest import is_sm_100f, llm_models_root
 from .test_llm_api_connector import E2E_MIN_TOKEN_AGREEMENT
+
+#: The NVFP4 cold-page kernels are built for the SM100 family only.
+skip_no_nvfp4_cold_pages = pytest.mark.skipif(
+    not is_sm_100f(), reason="NVFP4 cold-page kernels need an SM100-family GPU"
+)
 
 MODEL_PATH = "Qwen3/Qwen3-0.6B"
 #: What the fixture lends the pool. Small enough to pass the node budget check
@@ -380,7 +385,7 @@ def test_mooncake_e2e_cross_engine_prefix_reuse_through_the_page_codec(
     )
 
 
-@skip_pre_blackwell
+@skip_no_nvfp4_cold_pages
 @pytest.mark.threadleak(enabled=False)
 def test_mooncake_e2e_cross_engine_prefix_reuse_with_nvfp4_cold_pages(
     single_process_worker, mooncake_pool, matched_token_counts, codec_calls
@@ -432,7 +437,7 @@ def test_mooncake_e2e_cross_engine_prefix_reuse_with_nvfp4_cold_pages(
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize(
     "cold_pages",
-    [None, pytest.param("nvfp4", marks=skip_pre_blackwell)],
+    [None, pytest.param("nvfp4", marks=skip_no_nvfp4_cold_pages)],
     ids=["raw", "nvfp4_cold_pages"],
 )
 def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool, cold_pages):

@@ -647,10 +647,19 @@ class TestColdPageCodecIdentity:
     """The name a store outside the cache keys encoded pages by."""
 
     @staticmethod
-    def _identity(**fields) -> str:
-        return KVCacheCompressionManager.cold_page_codec_identity(
-            SimpleNamespace(config=ColdPageQuantizationCompressionConfig(**fields))
+    def _provider(model_type: str = "qwen3_5", **fields):
+        from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
+            Nvfp4ColdPageQuantizationCompression,
         )
+
+        return Nvfp4ColdPageQuantizationCompression(
+            ColdPageQuantizationCompressionConfig(**fields),
+            pretrained_config=SimpleNamespace(model_type=model_type),
+        )
+
+    @classmethod
+    def _identity(cls, **fields) -> str:
+        return cls._provider(**fields).cold_page_codec_identity()
 
     def test_equal_settings_give_equal_identities(self):
         assert self._identity() == self._identity()
@@ -666,3 +675,55 @@ class TestColdPageCodecIdentity:
     )
     def test_any_setting_that_changes_the_encoding_changes_the_identity(self, fields):
         assert self._identity(**fields) != self._identity()
+
+    def test_a_setting_the_model_ignores_leaves_the_identity(self):
+        """skip_rope_quantization is dropped for models it does not support, so their pages match."""
+        assert self._identity(model_type="llama", skip_rope_quantization=True) == self._identity(
+            model_type="llama"
+        )
+
+    def test_scales_count_by_value_not_by_where_they_came_from(self, monkeypatch):
+        from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import (
+            nvfp4_quantization,
+        )
+
+        monkeypatch.setattr(nvfp4_quantization, "_load_modelopt_nvfp4_scales", lambda _path: {})
+        uncalibrated = self._identity()
+        # A checkpoint that yields no scales encodes like none at all.
+        assert self._identity(scale_checkpoint_path="/ckpt/a") == uncalibrated
+
+        provider = self._provider(scale_checkpoint_path="/ckpt/a")
+        provider._model_scales = {0: {"k": (0.5, 2.0)}}
+        calibrated = provider.cold_page_codec_identity()
+        assert calibrated != uncalibrated
+        provider._model_scales = {0: {"k": (0.25, 4.0)}}
+        assert provider.cold_page_codec_identity() != calibrated
+
+    def test_the_encoded_format_version_is_part_of_the_identity(self, monkeypatch):
+        from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import (
+            nvfp4_quantization,
+        )
+
+        before = self._identity()
+        monkeypatch.setattr(
+            nvfp4_quantization,
+            "_COLD_PAGE_FORMAT_VERSION",
+            nvfp4_quantization._COLD_PAGE_FORMAT_VERSION + 1,
+        )
+        assert self._identity() != before
+
+    def test_the_default_covers_every_config_field(self):
+        """A method that derives nothing at runtime is named by its config alone."""
+
+        def identity(config) -> str:
+            manager = SimpleNamespace(config=config)
+            manager.cold_page_codec_settings = (
+                lambda: KVCacheCompressionManager.cold_page_codec_settings(manager)
+            )
+            return KVCacheCompressionManager.cold_page_codec_identity(manager)
+
+        default = ColdPageQuantizationCompressionConfig()
+        assert identity(default) == identity(ColdPageQuantizationCompressionConfig())
+        assert identity(default) != identity(
+            ColdPageQuantizationCompressionConfig(mixed_precision_first_n=4)
+        )

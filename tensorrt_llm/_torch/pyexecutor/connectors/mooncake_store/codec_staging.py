@@ -40,7 +40,7 @@ except ImportError:
 
 from tensorrt_llm.logger import logger
 
-from ...kv_cache.host_memory import bind_to_numa_node, host_numa_node_of, populate
+from ...kv_cache.host_memory import MADV_HUGEPAGE, bind_to_numa_node, populate
 
 __all__ = [
     "ENCODED_GROUP_ALIGNMENT",
@@ -161,6 +161,35 @@ def _lay_out(
 _HUGE_PAGE_BYTES = 2 << 20
 
 
+def gpu_host_numa_node(device: int) -> Optional[int]:
+    """The host NUMA node the driver reports closest to `device`, or None when it reports none."""
+    err, node = cuda_driver.cuDeviceGetAttribute(
+        cuda_driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, device
+    )
+    if err != cuda_driver.CUresult.CUDA_SUCCESS or node < 0:
+        return None
+    return int(node)
+
+
+def resident_numa_nodes(address: int, nbytes: int, step: int = 1 << 20) -> Optional[set]:
+    """The NUMA nodes a sample of a range's pages live on, or None when the kernel will not say.
+
+    Binding a range reports no failure (libnuma prints one), so this is how to
+    tell where the pages actually went.
+    """
+    try:
+        libnuma = ctypes.CDLL("libnuma.so.1")
+    except OSError:
+        return None
+    count = max(1, nbytes // step)
+    pages = (ctypes.c_void_p * count)(*[address + index * step for index in range(count)])
+    status = (ctypes.c_int * count)()
+    # With no target nodes, numa_move_pages only reports where each page is.
+    if libnuma.numa_move_pages(0, count, pages, None, status, 0) != 0:
+        return None
+    return set(status)
+
+
 class PinnedHostBuffer:
     """Page-locked host memory on the NUMA node of the current GPU.
 
@@ -176,7 +205,8 @@ class PinnedHostBuffer:
         if nbytes <= 0:
             raise ValueError(f"nbytes must be > 0, got {nbytes}")
         self.nbytes = int(nbytes)
-        #: NUMA node the buffer is bound to, or None when it is not placed.
+        #: NUMA node every sampled page of the buffer was found on after binding,
+        #: or None when it was not placed there (or where it went is unknown).
         self.numa_node: Optional[int] = None
         self._map: Optional[mmap.mmap] = None
         self._registered = 0
@@ -198,18 +228,35 @@ class PinnedHostBuffer:
 
     def _map_on_gpu_node(self) -> None:
         size = -(-self.nbytes // _HUGE_PAGE_BYTES) * _HUGE_PAGE_BYTES
-        node = host_numa_node_of(cuda_driver, torch.cuda.current_device())
+        # Without the driver's answer the pages are left to first touch: a
+        # guessed node can be the far socket.
+        node = gpu_host_numa_node(torch.cuda.current_device())
         self._map = mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
         self.address = ctypes.addressof(ctypes.c_char.from_buffer(self._map))
-        bound = bind_to_numa_node(self.address, size, node)
+        try:
+            # Fewer, larger pages for CUDA and the NIC to register.
+            self._map.madvise(MADV_HUGEPAGE)
+        except OSError:
+            pass
+        bound = node is not None and bind_to_numa_node(self.address, size, node)
         populate(self._map, self.address, size)
         status = cudart.cudaHostRegister(
             self.address, size, cudart.cudaHostRegisterPortable | cudart.cudaHostRegisterMapped
         )[0]
         if status != cudart.cudaError_t.cudaSuccess:
+            # Cleared so a later, unrelated launch check does not report it.
+            cudart.cudaGetLastError()
             raise RuntimeError(f"cudaHostRegister of {size} B failed with {status}")
         self._registered = size
-        self.numa_node = node if bound else None
+        if bound:
+            placed = resident_numa_nodes(self.address, size)
+            if placed == {node}:
+                self.numa_node = node
+            elif placed is not None:
+                logger.warning(
+                    f"mooncake-store: staging bound to NUMA node {node} landed on nodes "
+                    f"{sorted(placed)}; binding memory may not be permitted here"
+                )
 
     def _release_map(self) -> None:
         if self._registered:
@@ -239,8 +286,6 @@ class EncodedStagingArena:
     def __init__(self, *, capacity_bytes: int, store, label: str):
         if capacity_bytes <= 0:
             raise ValueError(f"capacity_bytes must be > 0, got {capacity_bytes}")
-        self._store = store
-        self._label = label
         # Pinned so the store can register it and the codec reach it from the
         # GPU; both read and write it while no Python object refers to it.
         self._buffer: Optional[PinnedHostBuffer] = PinnedHostBuffer(int(capacity_bytes))
@@ -270,25 +315,6 @@ class EncodedStagingArena:
     def capacity(self) -> int:
         """Arena size in bytes."""
         return 0 if self._buffer is None else self._capacity
-
-    @property
-    def numa_node(self) -> Optional[int]:
-        """NUMA node the arena is bound to, or None when it is not placed."""
-        return None if self._buffer is None else self._buffer.numa_node
-
-    def close(self) -> None:
-        """Hand the registration back, then free the buffer. Idempotent."""
-        if self._buffer is None:
-            return
-        status = self._store.unregister_buffer(self._base)
-        if status != 0:
-            raise RuntimeError(
-                f"MooncakeDistributedStore.unregister_buffer failed with status {status} "
-                f"for the {self._label} encoded-page staging arena at {self._base:#x}. "
-                "The buffer is kept alive rather than freed."
-            )
-        self._buffer.close()
-        self._buffer = None
 
     def free_after_store_closed(self) -> None:
         """Free the buffer once the store that registered it is closed. Idempotent.

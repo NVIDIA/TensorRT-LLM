@@ -153,8 +153,8 @@ class KeyNamespace:
     #: Bytes of a stored page: the encoded size when `encoding` is set.
     bytes_per_page: int
     #: The cold-page codec's name for what a stored page holds
-    #: (`KvCachePageCodec.encoding`), or None for the page's raw bytes. Raw
-    #: keys carry no encoding component, so they are spelled as before.
+    #: (`KvCachePageCodec.encoding`), or None for the page's raw bytes, whose
+    #: keys carry no encoding component.
     encoding: Optional[str] = None
 
     @property

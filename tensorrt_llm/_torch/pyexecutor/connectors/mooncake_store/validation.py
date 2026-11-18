@@ -103,6 +103,7 @@ def validate_node_budget(
     *,
     ranks_on_node: Optional[int] = None,
     available_bytes: Optional[int] = None,
+    may_encode_pages: bool = False,
 ) -> None:
     """Reject a segment size this node cannot afford once every rank asks.
 
@@ -118,6 +119,10 @@ def validate_node_budget(
             Defaults to the local MPI communicator's size.
         available_bytes: Host memory to measure against. Defaults to the
             kernel's own figure.
+        may_encode_pages: Whether pages may go through the cache's cold-page
+            codec, whose arenas are pinned staging of the same ceiling whether
+            or not `stage_through_host` is set. Only the cache knows once it is
+            built, so a caller that cannot rule it out passes True.
     """
     from tensorrt_llm._utils import local_mpi_size
 
@@ -131,7 +136,7 @@ def validate_node_budget(
     # Staging is pinned for the process's lifetime and comes out of the same
     # DRAM, so it belongs in the sum even when no segment is mounted.
     staging_claim = 0
-    if config.stage_through_host:
+    if config.stage_through_host or may_encode_pages:
         from .staging import MAX_STAGING_BUFFER_BYTES
 
         # One pool per direction, and a capacity-only rank opens neither.
@@ -172,7 +177,12 @@ def validate_node_budget(
         remedy = (
             f"Lending nothing would not be enough: the {staging_claim / _GIB:.1f} "
             f"GiB of pinned staging buffers alone overruns the budget. Run fewer "
-            f"ranks per node, or turn off stage_through_host."
+            f"ranks per node"
+            + (
+                ", or turn off stage_through_host."
+                if config.stage_through_host and not may_encode_pages
+                else "."
+            )
         )
     raise ValueError(
         f"mooncake-store: this node cannot afford what the pool is configured "

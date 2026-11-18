@@ -317,7 +317,7 @@ def fake_store(monkeypatch):
     monkeypatch.setattr(worker_module, "_open_store", lambda _config: (store, "10.0.0.1"))
     # The node budget is a property of the machine the test happens to run on,
     # which is not what any of these tests are about.
-    monkeypatch.setattr(worker_module, "validate_node_budget", lambda _config: None)
+    monkeypatch.setattr(worker_module, "validate_node_budget", lambda _config, **_kwargs: None)
     yield store
     for worker in store.workers:
         worker.shutdown()
@@ -1570,6 +1570,7 @@ class FakeCodec:
         self._page_bytes = dict(page_bytes)
         self.identity = identity
         self.calls = []
+        self.closed = False
 
     def page_bytes(self, layer_group_id):
         return self._page_bytes[layer_group_id]
@@ -1586,15 +1587,12 @@ class FakeCodec:
     def decode(self, layer_group_id, base, pages, slots, stream):
         self.calls.append(("decode", layer_group_id, base, list(pages), list(slots)))
 
+    def close(self):
+        self.closed = True
+
 
 def codec_layout(codec, **kwargs):
     return dataclasses.replace(make_layout(**kwargs), page_codec=codec)
-
-
-@pytest.fixture
-def no_stream_sync(monkeypatch):
-    """The codec calls are recorded rather than enqueued, so there is nothing to wait for."""
-    monkeypatch.setattr(worker_module, "_sync_stream", lambda _stream: None)
 
 
 def test_codec_worker_registers_its_arenas_and_no_kv_pool(store_config, fake_store):
@@ -1618,7 +1616,7 @@ def test_codec_keys_name_the_encoding_and_the_encoded_size(store_config, fake_st
     assert f"/t{TOKENS_PER_BLOCK}b64/" in raw_key
 
 
-def test_codec_save_encodes_only_the_pages_the_pool_lacks(store_config, fake_store, no_stream_sync):
+def test_codec_save_encodes_only_the_pages_the_pool_lacks(store_config, fake_store):
     codec = FakeCodec({0: 24, 1: 40})
     with make_worker(fake_store, layout=codec_layout(codec, num_groups=2)) as worker:
         stored, fresh, later = b"\x01" * 16, b"\x02" * 16, b"\x03" * 16
@@ -1655,9 +1653,7 @@ def test_codec_save_encodes_only_the_pages_the_pool_lacks(store_config, fake_sto
     assert sizes == [[24], [40], [24]]
 
 
-def test_codec_save_of_pages_already_stored_encodes_nothing(
-    store_config, fake_store, no_stream_sync
-):
+def test_codec_save_of_pages_already_stored_encodes_nothing(store_config, fake_store):
     codec = FakeCodec({0: 24})
     with make_worker(fake_store, layout=codec_layout(codec)) as worker:
         block_hash = b"\x04" * 16
@@ -1667,7 +1663,7 @@ def test_codec_save_of_pages_already_stored_encodes_nothing(
     assert fake_store.put_calls == []
 
 
-def test_codec_load_reads_into_the_arena_then_decodes(store_config, fake_store, no_stream_sync):
+def test_codec_load_reads_into_the_arena_then_decodes(store_config, fake_store):
     codec = FakeCodec({0: 24, 1: 40})
     with make_worker(fake_store, layout=codec_layout(codec, num_groups=2)) as worker:
         first, second = b"\x05" * 16, b"\x06" * 16
@@ -1688,7 +1684,7 @@ def test_codec_load_reads_into_the_arena_then_decodes(store_config, fake_store, 
                 saves=[],
             )
         )
-        # Decoding is ordered on the stream, so no allocation fence is bound.
+        worker.bind_allocation_fence(AllocationFence(fake_store))
         worker.start_load_kv(None)
         arena = worker._load_arena.base
 
@@ -1701,9 +1697,7 @@ def test_codec_load_reads_into_the_arena_then_decodes(store_config, fake_store, 
     ]
 
 
-def test_codec_load_decodes_nothing_when_a_page_is_missing(
-    store_config, fake_store, no_stream_sync
-):
+def test_codec_load_decodes_nothing_when_a_page_is_missing(store_config, fake_store):
     codec = FakeCodec({0: 24})
     with make_worker(fake_store, layout=codec_layout(codec)) as worker:
         worker.bind_connector_meta(
@@ -1711,6 +1705,7 @@ def test_codec_load_decodes_nothing_when_a_page_is_missing(
                 loads=[RequestTransfers(7, [PageTransfer(b"\x07" * 16, 0, 1)])], saves=[]
             )
         )
+        worker.bind_allocation_fence(AllocationFence(fake_store))
         with pytest.raises(RuntimeError, match="already reported as computed"):
             worker.start_load_kv(None)
     assert codec.calls == []
@@ -1780,7 +1775,7 @@ def test_codec_save_alternates_arena_halves(store_config, fake_store):
 
 
 def test_codec_load_waits_for_the_allocation_then_alternates_halves(store_config, fake_store):
-    """With the cache's fence, the load orders itself by it rather than by the forward stream."""
+    """The load orders its decodes by the cache's fence rather than by the forward stream."""
     set_pool_setting(store_config, transfer_batch_size=1)
     codec = FakeCodec({0: 24})
     with make_worker(fake_store, layout=codec_layout(codec)) as worker:
@@ -1802,10 +1797,10 @@ def test_codec_load_waits_for_the_allocation_then_alternates_halves(store_config
         worker.start_load_kv(None)
         arena, half = worker._load_arena.base, worker._load_arena.capacity // 2
 
-    if worker._load_stream is not None:
-        # The fence came before the first read into the arena.
-        assert fence.reads_before_wait == [0]
-        assert fence.waited_for == [{7}]
+    # Once, after the first read: the read only writes the arena, and the
+    # fence wait overlaps it.
+    assert fence.reads_before_wait == [1]
+    assert fence.waited_for == [{7}]
     assert [addresses for _, addresses, _ in fake_store.get_calls] == [
         [[arena]],
         [[arena + half]],
@@ -1816,6 +1811,103 @@ def test_codec_load_waits_for_the_allocation_then_alternates_halves(store_config
         (arena + half, [2]),
         (arena, [3]),
     ]
+
+
+def test_codec_load_without_an_allocation_fence_is_refused(store_config, fake_store):
+    """Nothing else orders a decode after the GPU work that still owns its pages."""
+    codec = FakeCodec({0: 24})
+    with make_worker(fake_store, layout=codec_layout(codec)) as worker:
+        bind_one_load(worker, fake_store, b"\x0a" * 16)
+        with pytest.raises(RuntimeError, match="no allocation fence"):
+            worker.start_load_kv(None)
+    assert fake_store.get_calls == []
+    assert codec.calls == []
+
+
+def test_codec_load_treats_a_short_read_as_a_failure(store_config, fake_store, monkeypatch):
+    """The slot would still hold an older page, which decodes into plausible but wrong KV."""
+    codec = FakeCodec({0: 24})
+    with make_worker(fake_store, layout=codec_layout(codec)) as worker:
+        bind_one_load(worker, fake_store, b"\x0b" * 16)
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        monkeypatch.setattr(
+            fake_store,
+            "batch_get_into_multi_buffers",
+            lambda keys, addresses, sizes: [sum(size) - 1 for size in sizes],
+        )
+        with pytest.raises(RuntimeError, match="already reported as computed"):
+            worker.start_load_kv(None)
+    assert codec.calls == []
+
+
+def test_codec_load_stops_at_the_first_failed_batch(store_config, fake_store):
+    """Batches before the failure are decoded; nothing after it is read or decoded."""
+    set_pool_setting(store_config, transfer_batch_size=1)
+    codec = FakeCodec({0: 24})
+    with make_worker(fake_store, layout=codec_layout(codec)) as worker:
+        hashes = [bytes([index + 20]) * 16 for index in range(3)]
+        for block_hash in hashes:
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        fake_store.fail_gets_for.add(worker._namespaces[0].key(hashes[1]))
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        worker.bind_connector_meta(
+            SimpleNamespace(
+                loads=[
+                    RequestTransfers(
+                        7, [PageTransfer(h, 0, page) for h, page in zip(hashes, [1, 2, 3])]
+                    )
+                ],
+                saves=[],
+            )
+        )
+        with pytest.raises(RuntimeError, match="already reported as computed"):
+            worker.start_load_kv(None)
+    assert len(fake_store.get_calls) == 2
+    assert [call[3] for call in codec.calls] == [[1]]
+
+
+def test_codec_save_writes_every_page_when_the_probe_answers_short(
+    store_config, fake_store, monkeypatch
+):
+    """An existence answer that does not line up with the keys drops no page."""
+    codec = FakeCodec({0: 24})
+    with make_worker(fake_store, layout=codec_layout(codec)) as worker:
+        monkeypatch.setattr(fake_store, "batch_is_exist", lambda keys: [1])
+        hashes = [bytes([index + 12]) * 16 for index in range(2)]
+        worker._put(
+            [RequestTransfers(1, [PageTransfer(h, 0, page) for h, page in zip(hashes, [4, 5])])]
+        )
+        expected = [worker._namespaces[0].key(h) for h in hashes]
+    assert fake_store.put_calls[0][0] == expected
+
+
+def test_codec_is_closed_when_the_worker_shuts_down(store_config, fake_store):
+    """The cache manager frees its pools next; no save may start an encode over them."""
+    codec = FakeCodec({0: 24})
+    with make_worker(fake_store, layout=codec_layout(codec)):
+        pass
+    assert codec.closed
+
+
+def test_node_budget_counts_codec_arenas_without_stage_through_host():
+    """A cold-page codec stages through pinned arenas whatever stage_through_host says."""
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import validation
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import (
+        MAX_STAGING_BUFFER_BYTES,
+    )
+
+    config = SimpleNamespace(
+        global_segment_size=0,
+        stage_through_host=False,
+        role=SimpleNamespace(loads=True, saves=True),
+    )
+    # Room for the reserve and less than one rank's two arenas.
+    available = validation.NODE_BUDGET_RESERVE_BYTES + MAX_STAGING_BUFFER_BYTES
+    validation.validate_node_budget(config, ranks_on_node=1, available_bytes=available)
+    with pytest.raises(ValueError, match="cannot afford"):
+        validation.validate_node_budget(
+            config, ranks_on_node=1, available_bytes=available, may_encode_pages=True
+        )
 
 
 # ---- encoded batch planning ----

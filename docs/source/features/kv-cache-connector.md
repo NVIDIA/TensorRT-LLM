@@ -641,9 +641,12 @@ kv_connector_config:
 - Pages pass through registered pinned staging: encoded on the GPU into it before a write, decoded
   from it after a read. The KV pools are not registered with Mooncake, so this needs no GPUDirect
   RDMA, and `stage_through_host` has no effect.
-- Keys carry the codec's identity (the method and every one of its settings) and both page sizes, so
-  servers whose encodings differ, or that store raw pages, share nothing rather than misread each
-  other's pages.
+- Keys carry the codec's identity (the method, its settings and what it loaded, such as calibration
+  scales), the KV element type and both page sizes, so servers whose encodings differ, or that store
+  raw pages, share nothing rather than misread each other's pages.
+- The staging takes at most 1 GiB of pinned memory per direction per rank, the ceiling of
+  `stage_through_host`'s buffers, and the node memory check counts it whenever
+  `kv_cache_compression_config` is set.
 - `mixed_precision_first_n` and `mixed_precision_last_n` stay rejected with any connector.
 
 ### Restrictions
@@ -702,4 +705,5 @@ again afterwards.
 A host without `nvidia_peermem` usually needs only `WITH_NVIDIA_PEERMEM=0`, which the connector
 selects on its own where it can. When neither path is available, set `stage_through_host: true` to
 copy pages through a pinned host buffer instead, at the cost of a copy each way. A `capacity` server
-needs neither, since it registers no pages.
+needs neither, since it registers no pages, and nor does a server whose pages go through a cold-page
+codec (see [Compressed pages](#compressed-pages)).

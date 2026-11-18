@@ -62,6 +62,7 @@ class KvCachePageCodec:
         identity: str,
         layer_group_ids: Iterable[int],
         raw_bytes_per_page: Optional[Dict[int, int]] = None,
+        kv_dtype: Optional[str] = None,
     ):
         """Bind to a cache manager's native handle.
 
@@ -73,6 +74,8 @@ class KvCachePageCodec:
             layer_group_ids: The layer groups a caller will encode.
             raw_bytes_per_page: Unencoded page size per layer group, folded into
                 :meth:`encoding` so a geometry change is never read as a match.
+            kv_dtype: Name of the hot cache's element type, folded into
+                :meth:`encoding`: pages of the same size can hold FP16 or BF16.
         """
         missing = [
             name
@@ -97,6 +100,8 @@ class KvCachePageCodec:
         self._page_bytes: Dict[int, int] = {}
         self._index_on_device: Dict[int, bool] = {}
         self._raw_bytes = dict(raw_bytes_per_page or {})
+        self._kv_dtype = kv_dtype
+        self._closed = False
         for layer_group_id in layer_group_ids:
             layer_group_id = int(layer_group_id)
             page_bytes = int(cache.cold_page_bytes(layer_group_id))
@@ -132,6 +137,7 @@ class KvCachePageCodec:
             identity=identity,
             layer_group_ids=raw_bytes_per_page.keys(),
             raw_bytes_per_page=raw_bytes_per_page,
+            kv_dtype=getattr(getattr(manager, "dtype", None), "name", None),
         )
 
     @property
@@ -156,12 +162,28 @@ class KvCachePageCodec:
     def encoding(self, layer_group_id: int) -> str:
         """What a stored page of `layer_group_id` holds, for a store key.
 
-        The codec identity plus the unencoded page size: cold pages of the same
-        size can come from different hot layouts, for example the same method
-        over BF16 and over FP8 KV, and decoding one into the other is wrong.
+        The codec identity plus the hot cache's element type and unencoded page
+        size: cold pages of the same size can come from different hot layouts,
+        for example the same method over BF16 and over FP8 KV, and decoding one
+        into the other is wrong.
         """
+        encoding = self._identity
+        if self._kv_dtype is not None:
+            encoding += f".{self._kv_dtype}"
         raw = self._raw_bytes.get(layer_group_id)
-        return self._identity if raw is None else f"{self._identity}.r{raw}"
+        if raw is not None:
+            encoding += f".r{raw}"
+        return encoding
+
+    def close(self) -> None:
+        """Refuse further calls, for a caller whose cache manager is shutting down.
+
+        The manager frees its GPU pools at shutdown while keeping the codec, so
+        a call after it would read or write freed memory. Work already enqueued
+        is not affected; the caller drains its streams before the pools go.
+        """
+        with self._lock:
+            self._closed = True
 
     def describe(self) -> str:
         """A one-line summary for startup logs."""
@@ -238,11 +260,17 @@ class KvCachePageCodec:
             # The codec addresses memory with these unchecked, so a negative
             # index (BAD_PAGE_INDEX) would be a wild write, not an error.
             raise ValueError("page and slot indices must be non-negative")
+        index_on_device = self._index_on_device.get(layer_group_id)
+        if index_on_device is None:
+            raise ValueError(
+                f"layer group {layer_group_id} is not one this codec was bound to "
+                f"({sorted(self._index_on_device)})"
+            )
         keepalive = None
-        if self._index_on_device[layer_group_id]:
+        if index_on_device:
             # The codec reads a device array on the stream, after this returns,
             # so the copy and the array's lifetime are both tied to the stream.
-            target = torch.cuda.ExternalStream(stream) if stream else torch.cuda.default_stream()
+            target = torch.cuda.ExternalStream(stream)
             with torch.cuda.stream(target):
                 keepalive = maybe_pin_memory(torch.from_numpy(pairs)).cuda(non_blocking=True)
             keepalive.record_stream(target)
@@ -252,6 +280,10 @@ class KvCachePageCodec:
             pointer = pairs.ctypes.data
         call = self._cache.encode_cold_pages if encode else self._cache.decode_cold_pages
         with self._lock:
+            if self._closed:
+                raise RuntimeError(
+                    "the cold-page codec was closed because its cache manager is shutting down"
+                )
             ok = call(int(layer_group_id), int(base), int(pointer), len(dst), int(stream))
         del keepalive
         if not ok:

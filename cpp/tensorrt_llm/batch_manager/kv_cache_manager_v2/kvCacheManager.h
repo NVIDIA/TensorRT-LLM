@@ -258,7 +258,7 @@ public:
     // its per-layer-group properties, which are fixed at construction, and take no API lock: the codec may call into
     // Python, and holding the lock across that would order it against the GIL. A codec is not required to be
     // reentrant, so callers serialize their own calls, and use these only while this manager has no cold tier of
-    // its own running the codec.
+    // its own running the codec, and not after shutdown(), which frees the pools the codec reads and writes.
 
     //! Bytes of one encoded page of `layerGroup`; zero for an unknown layer group.
     [[nodiscard]] size_t coldPageBytes(LayerGroupId layerGroup) const noexcept;
