@@ -111,7 +111,7 @@ _DWDP_PORT_ENV = "TRTLLM_DWDP_MASTER_PORT"
 # "0" (tensorrt_llm._torch.build_pool.ENABLE_ENV) leaves a launch without a default directory.
 _KERNEL_BUILDER_ENV = "TLLM_KERNEL_BUILDER"
 # Where the launches' default directories are made: this node's local disk.
-_DEFAULT_ROOT = "/tmp"
+_DEFAULT_ROOT = "/tmp"  # nosec B108 - used through a directory of this user alone (_private_dir)
 # A launch directory is removed once its processes have exited and it is older than this.
 _PRUNE_AFTER_S = 6 * 3600
 

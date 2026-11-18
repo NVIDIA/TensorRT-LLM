@@ -52,11 +52,11 @@ import functools
 import hashlib
 import importlib
 import os
-import pickle
+import pickle  # nosec B403 - messages between this process and its own workers
 import queue
 import shutil
 import struct
-import subprocess
+import subprocess  # nosec B404 - starts its workers: sys.executable, a fixed argv, no shell
 import sys
 import tempfile
 import threading
@@ -820,7 +820,7 @@ def _read(stream: IO[bytes]) -> bytes:
 
 
 def _recv(stream: IO[bytes]) -> Any:
-    return pickle.loads(_read(stream))
+    return pickle.loads(_read(stream))  # nosec B301 - from this process's own worker
 
 
 def _worker_main(task_read: int, result_write: int) -> None:
@@ -834,7 +834,7 @@ def _worker_main(task_read: int, result_write: int) -> None:
             except EOFError:
                 return
             try:
-                message = pickle.loads(data)
+                message = pickle.loads(data)  # nosec B301 - from this worker's parent
             except Exception as e:  # noqa: BLE001 - a build this process cannot load fails alone
                 result = (FAILED, 0.0, f"the worker could not load it: {type(e).__name__}: {e}")
             else:
