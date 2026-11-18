@@ -441,33 +441,6 @@ public:
 
     [[nodiscard]] DiskCopyCounters diskCopyCounters() const noexcept;
 
-    // ---- Cold-page codec, for storage outside this manager -----------------
-    //
-    // A KV connector that keeps pages outside the cache tiers (an external store) can hold them in the encoded
-    // representation the cold tiers use, through the codec this manager owns. The calls below run that codec
-    // against caller-owned memory and touch no cache level, slot or staging buffer of this manager. They are safe
-    // from another thread as long as this manager does not run the codec itself at the same time, which is the
-    // case when it has no cold tier, and only until destroy(), which frees the pools the codec reads and writes.
-
-    //! Bytes of one encoded page of `layerGroup`; zero for an unknown layer group.
-    [[nodiscard]] size_t coldPageBytes(LayerGroupId layerGroup) const noexcept;
-
-    //! Where encodeColdPagesExternal() and decodeColdPagesExternal() read the PageIndexPair array for `layerGroup`;
-    //! PageIndexLocation::kBadLocation for an unknown layer group.
-    [[nodiscard]] PageIndexLocation coldPageIndexLocation(LayerGroupId layerGroup) const noexcept;
-
-    //! Encode hot pages of `layerGroup` (PageIndexPair::src, hot slot index) into encoded pages at
-    //! `dstBase + PageIndexPair::dst * coldPageBytes(layerGroup)`. `dstBase` must be GPU-accessible and
-    //! `pageIndices` must reside where coldPageIndexLocation() says; work is enqueued on `stream`. Returns false for
-    //! an unknown layer group or when the codec rejects the batch.
-    bool encodeColdPagesExternal(
-        LayerGroupId layerGroup, void* dstBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
-
-    //! The reverse of encodeColdPagesExternal(): encoded pages at `srcBase + PageIndexPair::src * coldPageBytes()`
-    //! into hot pages (PageIndexPair::dst).
-    bool decodeColdPagesExternal(LayerGroupId layerGroup, void const* srcBase, PageIndexPair const* pageIndices,
-        size_t numPages, CUstream stream);
-
     friend class KvCacheManager;
     // White-box test introspection reaches computePoolGroupSlotsForBatch() via friendship
     // (mirrors Python's _compute_slots_for_batch).

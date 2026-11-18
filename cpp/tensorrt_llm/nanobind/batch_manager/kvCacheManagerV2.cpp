@@ -3895,16 +3895,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::gil_scoped_release release;
                 return self.poolGroupDescs().raw();
             })
+        // The cold-page codec, run against caller-owned memory for a KV connector's store; see
+        // KvCacheManager::coldPageCodec() for when it may be called.
         .def(
             "cold_page_bytes",
-            [](kv::KvCacheManager const& self, int layerGroupId)
-            { return self.coldPageBytes(kv::LayerGroupId{layerGroupId}); },
+            [](kv::KvCacheManager& self, int layerGroupId)
+            { return self.coldPageCodec().queryColdPageBytes(kv::LayerGroupId{layerGroupId}); },
             nb::arg("layer_group_id"),
             "Bytes of one page of the layer group as the cold-page codec encodes it; 0 for an unknown layer group.")
         .def(
             "cold_page_index_location",
-            [](kv::KvCacheManager const& self, int layerGroupId)
-            { return static_cast<int>(self.coldPageIndexLocation(kv::LayerGroupId{layerGroupId})); },
+            [](kv::KvCacheManager& self, int layerGroupId)
+            { return static_cast<int>(self.coldPageCodec().queryPageIndexLocation(kv::LayerGroupId{layerGroupId})); },
             nb::arg("layer_group_id"),
             "Where encode_cold_pages and decode_cold_pages read the page-index pairs of the layer group: 0 host "
             "memory, 1 device memory, -1 an unknown layer group.")
@@ -3913,9 +3915,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCacheManager& self, int layerGroupId, std::uintptr_t dstBase, std::uintptr_t pageIndices,
                 std::size_t numPages, std::uintptr_t stream)
             {
-                return self.encodeColdPages(kv::LayerGroupId{layerGroupId}, reinterpret_cast<void*>(dstBase),
+                return self.coldPageCodec().encode(kv::LayerGroupId{layerGroupId}, reinterpret_cast<void*>(dstBase),
                     reinterpret_cast<kv::PageIndexPair const*>(pageIndices), numPages,
-                    reinterpret_cast<CUstream>(stream));
+                    reinterpret_cast<cudaStream_t>(stream));
             },
             nb::arg("layer_group_id"), nb::arg("dst_base"), nb::arg("page_indices"), nb::arg("num_pages"),
             nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>(),
@@ -3929,9 +3931,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCacheManager& self, int layerGroupId, std::uintptr_t srcBase, std::uintptr_t pageIndices,
                 std::size_t numPages, std::uintptr_t stream)
             {
-                return self.decodeColdPages(kv::LayerGroupId{layerGroupId}, reinterpret_cast<void const*>(srcBase),
-                    reinterpret_cast<kv::PageIndexPair const*>(pageIndices), numPages,
-                    reinterpret_cast<CUstream>(stream));
+                return self.coldPageCodec().decode(kv::LayerGroupId{layerGroupId},
+                    reinterpret_cast<void const*>(srcBase), reinterpret_cast<kv::PageIndexPair const*>(pageIndices),
+                    numPages, reinterpret_cast<cudaStream_t>(stream));
             },
             nb::arg("layer_group_id"), nb::arg("src_base"), nb::arg("page_indices"), nb::arg("num_pages"),
             nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>(),
