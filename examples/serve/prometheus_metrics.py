@@ -98,12 +98,27 @@ def parse_and_display_metrics(metrics_data: str) -> None:
         f"{METRIC_PREFIX}kv_cache_migration_timing_skipped_total": "Timing samples skipped at capacity",
     }
 
+    samples_by_name: dict[str, list[str]] = {}
+    for raw_line in metrics_data.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        sample_name = line.split("{", 1)[0].split(maxsplit=1)[0]
+        samples_by_name.setdefault(sample_name, []).append(line)
+
     found_metrics = []
     missing_metrics = []
 
     for metric_name, description in metrics_of_interest.items():
-        if metric_name in metrics_data:
-            found_metrics.append((metric_name, description))
+        sample_names = (
+            metric_name,
+            metric_name + "_bucket",
+            metric_name + "_sum",
+            metric_name + "_count",
+        )
+        lines = [line for name in sample_names for line in samples_by_name.get(name, ())]
+        if lines:
+            found_metrics.append((metric_name, description, lines))
         else:
             missing_metrics.append((metric_name, description))
 
@@ -111,13 +126,7 @@ def parse_and_display_metrics(metrics_data: str) -> None:
     if found_metrics:
         print("\n✓ Available Metrics:")
         print("-" * 80)
-        for metric_name, description in found_metrics:
-            # Extract the metric lines from the data
-            lines = [
-                line
-                for line in metrics_data.split("\n")
-                if line.startswith(metric_name) and not line.startswith("#")
-            ]
+        for metric_name, description, lines in found_metrics:
             print(f"\n{description} ({metric_name}):")
             for line in lines:
                 print(f"  {line}")

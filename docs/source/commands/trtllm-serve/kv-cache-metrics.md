@@ -63,17 +63,22 @@ fields, in which case movement/timing samples remain absent.
 | `kv_cache_tier_migration_duration_seconds` | Histogram | Sampled migration-batch CUDA-stream duration with source/destination labels; opt-in as described below. |
 | `kv_cache_migration_timing_skipped_total` | Counter | Eligible timing samples skipped because the manager's pending-event budget was full, by reporting rank. |
 
-`free` means unallocated slots. `evictable` means resident pages the policy
-allows the engine to reclaim; these can still be valuable conversation prefixes.
-`unavailable = capacity - free - evictable` includes held/locked slots and other
-non-reclaimable storage. The three states sum to capacity. Unlike this new
+`free` means unallocated slots. `evictable` means resident pages the eviction
+policy allows the engine to reclaim; these can still be valuable conversation
+prefixes. `unavailable = capacity - free - evictable` includes held/locked slots,
+retained cold-tier copies (duplicates released on demand), and other storage
+outside the first two states. The three states sum to capacity. Retained copies
+are reclaimable: the exported remainder therefore differs from native
+`StorageStatistics::unavailable()`, which subtracts them as well. Unlike this new
 `state="free"`, legacy `kv_cache_free_blocks` includes evictable slots.
 
-Use resident occupancy `(unavailable + evictable) / capacity` to see whether
-prefixes have filled the tier, and `unavailable / capacity` to see immediate
-allocation pressure. Neither alone proves thrashing. Combine them with
-movement/drop rates, recent reused/missed block rates, tiered prompt-cache hits,
-and request TTFT. A fully resident cache with low churn may be working well.
+Use resident occupancy `(unavailable + evictable) / capacity` to see how full the
+tier is, including retained copies. `unavailable / capacity` can overstate
+non-reclaimable occupancy on cold tiers; these three states do not isolate the
+native unavailable fraction. Occupancy alone does not prove allocation pressure
+or thrashing. Combine it with movement/drop rates, recent reused/missed block
+rates, tiered prompt-cache hits, and request TTFT. A fully resident cache with
+low churn may be working well.
 
 Movement operations have explicit attribution:
 
@@ -230,8 +235,11 @@ sum by (instance, dp_rank, cache_level, cache_tier) (
 sum by (instance, dp_rank, cache_level, cache_tier) (trtllm_kv_cache_tier_bytes)
 ```
 
-Select only `state="unavailable"` in the numerator for immediate allocation
-pressure, or `state="evictable"` for the retained reclaimable-prefix fraction.
+Selecting only `state="unavailable"` in the numerator includes reclaimable
+retained cold-tier copies, so it does not directly measure immediate allocation
+pressure. Selecting `state="evictable"` measures the eviction-policy fraction,
+which excludes those retained copies and can understate total reclaimable
+storage. These three states cannot recover the native unavailable fraction.
 An empty zero-capacity pool has an undefined ratio, not measured zero pressure.
 
 ### Per-tier restore/eviction/drop turnover
