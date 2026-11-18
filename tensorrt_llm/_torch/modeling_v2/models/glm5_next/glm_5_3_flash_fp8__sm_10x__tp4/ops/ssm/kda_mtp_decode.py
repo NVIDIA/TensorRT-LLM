@@ -23,11 +23,12 @@ _ALIGN = 16
 class KdaMtpDecode(OpWrapper):
     """Verify ``1 + num_spec`` packed new tokens per request in one launch; return the normalized output.
 
-    Request ``n`` owns slot ``s = ssm_state_indices[n]`` and rows ``n * (1 + num_spec) + j`` of the token inputs.
-    Its slot holds the state after its last golden token, the raw conv inputs ``cs_*[s, :, 0:3]`` before it and,
-    from the previous round, ``num_spec`` drafts: their raw inputs ``cs_*[s, :, 3:3 + num_spec]`` and their
-    normalized k, log-decay g, v and beta in ``k_cache`` / ``g_cache`` / ``v_cache`` / ``beta_cache``. Of those,
-    the first ``a = num_accepted_tokens[s]`` were accepted.
+    Request ``n`` owns state slot ``s = ssm_state_indices[n]``, replay slot ``r = replay_state_indices[n]`` (``s``
+    when not given) and rows ``n * (1 + num_spec) + j`` of the token inputs. State row ``s`` holds the state after
+    its last golden token; replay row ``r`` holds the raw conv inputs ``cs_*[r, :, 0:3]`` before it and, from the
+    previous round, ``num_spec`` drafts: their raw inputs ``cs_*[r, :, 3:3 + num_spec]`` and their normalized k,
+    log-decay g, v and beta in ``k_cache`` / ``g_cache`` / ``v_cache`` / ``beta_cache``. Of those, the first
+    ``a = num_accepted_tokens[r]`` were accepted.
 
     The kernel replays the a accepted drafts on the state (``S <- S * exp(g)``, ``S <- S + beta (v - S k) k^T``
     from the caches), then runs the new tokens: q, k, v are ``silu(sum_j w[:, j] * x[t + j])`` over the raw
@@ -36,10 +37,10 @@ class KdaMtpDecode(OpWrapper):
     dt_bias))``, then the same recurrence and ``o = S q``. The output is
     ``o * rsqrt(mean(o^2) + onorm_eps) * onorm_weight * sigmoid(onorm_g)``.
 
-    In place, at slot s: the state after the golden token (rounded to the pool dtype), the conv window of the
-    three raw inputs ending at the golden token, and for draft ``j >= 1`` its raw inputs in conv column
-    ``2 + j`` and its k, g, v and beta in cache row ``j - 1``. ``num_accepted_tokens`` is read, not written:
-    the runtime records the next round's count after sampling.
+    In place, at state slot s: the state after the golden token (rounded to the pool dtype); at replay slot r:
+    the conv window of the three raw inputs ending at the golden token, and for draft ``j >= 1`` its raw inputs in
+    conv column ``2 + j`` and its k, g, v and beta in cache row ``j - 1``. ``num_accepted_tokens`` is read, not
+    written: the runtime records the next round's count after sampling.
 
     The op's mode is fixed to the runtime's verify: packed token rows (no ``cu_seqlens``), slot-indexed accepted
     counts, the gated RMS norm fused, no metadata hints.
@@ -48,19 +49,23 @@ class KdaMtpDecode(OpWrapper):
         x_q, x_k, x_v: bf16 ``[1, B * (1 + num_spec), H, 128]`` new conv inputs; head and channel axes dense, the
             row stride free (column sections of the fused projection).
         w_q, w_k, w_v: contiguous fp32 ``[H * 128, 4]`` conv taps.
-        cs_q, cs_k, cs_v: bf16 ``[slots, H * 128, >= 3 + num_spec]`` replay conv caches, dim-contiguous (stride 1
-            along channels), updated in place.
+        cs_q, cs_k, cs_v: bf16 ``[replay_slots, H * 128, >= 3 + num_spec]`` replay conv caches, dim-contiguous
+            (stride 1 along channels), updated in place.
         g: bf16 ``[1, T, H, 128]`` raw forget-gate logits; beta: bf16 ``[1, T, H]`` beta logits, unit head stride.
         A_log: fp32 ``[H]``; dt_bias: fp32 ``[H * 128]``.
         recurrent_state: fp32 or bf16 ``[slots, H, 128, 128]`` V-first pool, updated in place.
-        k_cache, v_cache: bf16 (or fp32) ``[slots, num_spec, H * 128]``; g_cache: fp32 ``[slots, num_spec, H * 128]``;
-            beta_cache: bf16 (or fp32) ``[slots, num_spec, H]``; all updated in place.
-        ssm_state_indices: int32 ``[B]`` unique slots.
-        num_accepted_tokens: int32 ``[>= slots]``, slot-indexed (``prev_num_accepted_tokens``), each used entry in
-            ``[0, num_spec]``.
+        k_cache, v_cache: bf16 (or fp32) ``[replay_slots, num_spec, H * 128]``; g_cache: fp32
+            ``[replay_slots, num_spec, H * 128]``; beta_cache: bf16 (or fp32) ``[replay_slots, num_spec, H]``; all
+            updated in place.
+        ssm_state_indices: int32 ``[B]`` unique state slots.
+        num_accepted_tokens: int32 ``[>= replay_slots]``, replay-slot-indexed (``prev_num_accepted_tokens``), each
+            used entry in ``[0, num_spec]``.
         num_spec: drafts per round (at most 7).
         lower_bound: the gate bound; scale: the q scale (``128 ** -0.5``).
         onorm_g: bf16 ``[1, T, H, 128]`` output-gate logits; onorm_weight: fp32 ``[128]``; onorm_eps: its epsilon.
+        replay_state_indices: int32 ``[B]`` unique replay slots, when the replay caches (conv caches, k / g / v /
+            beta caches and the accepted counts) are a pool of their own; ``None`` when they share the state slots,
+            which the replay pools must then cover.
 
     Returns:
         A new contiguous bf16 ``[1, B * (1 + num_spec), H, 128]`` output.
@@ -84,6 +89,17 @@ class KdaMtpDecode(OpWrapper):
                 pending=(0, 1, 2, 3, 4, 5, 6, 7),
                 state_dtype=torch.bfloat16,
                 pool=12,
+            ),
+        ),
+        Cell(
+            why="replay caches in a pool of their own, smaller than the state pool: replay and state slots differ",
+            spec=dict(
+                batch=6,
+                num_spec=3,
+                pending=(3, 0, 2, 1, 3, 2),
+                state_dtype=torch.float32,
+                pool=12,
+                replay_pool=8,
             ),
         ),
     )
@@ -139,6 +155,7 @@ class KdaMtpDecode(OpWrapper):
         onorm_g: torch.Tensor,
         onorm_weight: torch.Tensor,
         onorm_eps: float,
+        replay_state_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return torch.ops.trtllm.kda_mtp_decode(
             x_q=x_q,
@@ -172,6 +189,7 @@ class KdaMtpDecode(OpWrapper):
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
             fuse_output_norm=True,
+            replay_state_indices=replay_state_indices,
         )
 
     def reference(
@@ -202,6 +220,7 @@ class KdaMtpDecode(OpWrapper):
         onorm_g: torch.Tensor,
         onorm_weight: torch.Tensor,
         onorm_eps: float,
+        replay_state_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """``(out, recurrent_state, cs_q, cs_k, cs_v, k_cache, g_cache, v_cache, beta_cache)`` as the call leaves
         them; mutates nothing.
@@ -221,6 +240,10 @@ class KdaMtpDecode(OpWrapper):
         convs_after = [cs.clone() for cs in (cs_q, cs_k, cs_v)]
         caches_after = [cache.clone() for cache in (k_cache, g_cache, v_cache, beta_cache)]
         counts = num_accepted_tokens.tolist()
+        state_slots = ssm_state_indices.tolist()
+        replay_slots = (
+            state_slots if replay_state_indices is None else replay_state_indices.tolist()
+        )
 
         def step(
             state: torch.Tensor,
@@ -233,21 +256,21 @@ class KdaMtpDecode(OpWrapper):
             err = (value - (state * key.unsqueeze(-2)).sum(-1)) * b.unsqueeze(-1)
             return state + err.unsqueeze(-1) * key.unsqueeze(-2)
 
-        for n, slot in enumerate(ssm_state_indices.tolist()):
-            accepted = min(counts[slot], num_spec)
+        for n, (slot, replay) in enumerate(zip(state_slots, replay_slots)):
+            accepted = min(counts[replay], num_spec)
             state = recurrent_state[slot].float()  # [H, V, K]
             for t in range(accepted):
                 state = step(
                     state,
-                    k_cache[slot, t].float().reshape(heads, _HEAD_DIM),
-                    g_cache[slot, t].float().reshape(heads, _HEAD_DIM),
-                    v_cache[slot, t].float().reshape(heads, _HEAD_DIM),
-                    beta_cache[slot, t].float(),
+                    k_cache[replay, t].float().reshape(heads, _HEAD_DIM),
+                    g_cache[replay, t].float().reshape(heads, _HEAD_DIM),
+                    v_cache[replay, t].float().reshape(heads, _HEAD_DIM),
+                    beta_cache[replay, t].float(),
                 )
             # The raw conv inputs in order: the committed window, the accepted drafts, the new tokens.
             rows = slice(n * steps, (n + 1) * steps)
             raw = [
-                torch.cat([cs[slot, :, : _WINDOW + accepted].float().t(), x[rows]], dim=0)
+                torch.cat([cs[replay, :, : _WINDOW + accepted].float().t(), x[rows]], dim=0)
                 for cs, x in zip((cs_q, cs_k, cs_v), tokens)
             ]
             for j in range(steps):
@@ -271,14 +294,14 @@ class KdaMtpDecode(OpWrapper):
                 if j == 0:
                     state_after[slot] = state.to(state_after.dtype)
                     for cs_after, seq in zip(convs_after, raw):
-                        cs_after[slot, :, :_WINDOW] = (
+                        cs_after[replay, :, :_WINDOW] = (
                             seq[t + 1 : t + 1 + _WINDOW].t().to(cs_after.dtype)
                         )
                 else:
                     for cs_after, seq in zip(convs_after, raw):
-                        cs_after[slot, :, _WINDOW + j - 1] = seq[t + _WINDOW].to(cs_after.dtype)
+                        cs_after[replay, :, _WINDOW + j - 1] = seq[t + _WINDOW].to(cs_after.dtype)
                     for cache, value_row in zip(caches_after, (key, log_decay, value, b)):
-                        cache[slot, j - 1] = value_row.reshape(cache.shape[2:]).to(cache.dtype)
+                        cache[replay, j - 1] = value_row.reshape(cache.shape[2:]).to(cache.dtype)
         return (out.unsqueeze(0).to(x_v.dtype), state_after, *convs_after, *caches_after)
 
     def is_valid(
@@ -309,6 +332,7 @@ class KdaMtpDecode(OpWrapper):
         onorm_g: torch.Tensor,
         onorm_weight: torch.Tensor,
         onorm_eps: float,
+        replay_state_indices: torch.Tensor | None = None,
     ) -> None:
         # The op checks shapes, dtypes, unit strides and the vectorized layouts itself; it never reads the
         # metadata on the host and takes the operand alignment on trust.
@@ -319,9 +343,20 @@ class KdaMtpDecode(OpWrapper):
         assert all(0 <= slot < recurrent_state.shape[0] for slot in slots), (
             "ssm_state_indices must lie in the pool: the kernel indexes every pool with them unchecked"
         )
+        replay_slots = slots if replay_state_indices is None else replay_state_indices.tolist()
+        assert len(replay_slots) == len(slots) and len(set(replay_slots)) == len(replay_slots), (
+            "replay_state_indices must name one replay slot per request, each once: two requests on a replay "
+            "slot race on its caches"
+        )
+        replay_pool = min(
+            t.shape[0] for t in (cs_q, cs_k, cs_v, k_cache, g_cache, v_cache, beta_cache)
+        )
+        assert all(0 <= slot < replay_pool for slot in replay_slots), (
+            "the replay slots must lie in the replay pools: the kernel indexes them unchecked"
+        )
         # A count tensor shorter than the pool is the op's own (loud) refusal; only the values are checked here.
         counts = num_accepted_tokens.tolist()
-        assert all(0 <= counts[slot] <= num_spec for slot in slots if slot < len(counts)), (
+        assert all(0 <= counts[slot] <= num_spec for slot in replay_slots if slot < len(counts)), (
             f"num_accepted_tokens of a used slot must be in [0, {num_spec}]: a larger count is clamped and "
             "a negative one shifts the request onto other requests' token rows"
         )

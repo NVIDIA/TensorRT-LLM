@@ -36,8 +36,11 @@ Cache contract (``kv_cache_manager.mamba_layer_cache(layer)``): ``conv`` is the 
 ``[slots, H, 128, 128]`` V-first recurrent pool (FP32: the GLM cache manager allocates no other). With speculative
 decoding the layer cache also carries the verify kernel's replay caches: their committed conv
 window is seeded from the live pool (``commit_conv_window``) after every prefill and plain
-decode, and ``prev_num_accepted_tokens`` (the previous round's accepted drafts per slot, which
-the runtime records after sampling) tells the verify kernel how many cached drafts to replay.
+decode, and ``prev_num_accepted_tokens`` (the previous round's accepted drafts per replay slot,
+which the runtime records after sampling) tells the verify kernel how many cached drafts to
+replay. The replay caches and the accepted counts are indexed by the requests' replay slots
+(``mamba_metadata.replay_state_indices``), which are the state slots unless the cache manager
+keeps the replay caches in a pool of their own.
 """
 
 from __future__ import annotations
@@ -166,12 +169,16 @@ def load_kda(ck: Checkpoint, dims: Dims, layer: int) -> KdaWeights:
 
 
 def _commit_conv_window(
-    cache: MambaLayerCache, slots: torch.Tensor, conv_pool: torch.Tensor
+    cache: MambaLayerCache,
+    slots: torch.Tensor,
+    replay_slots: torch.Tensor,
+    conv_pool: torch.Tensor,
 ) -> None:
-    """Seed the verify kernel's replay conv caches of ``slots`` from the live conv pool, which a
-    prefill or a plain decode just advanced (a layer cache without replay caches has none)."""
+    """Seed the verify kernel's replay conv caches from the live conv pool, which a prefill or a
+    plain decode just advanced: row ``slots[n]`` of the pool goes to replay row
+    ``replay_slots[n]`` (a layer cache without replay caches has none)."""
     if getattr(cache, "has_kda_replay_caches", False):
-        cache.commit_conv_window(slots, conv_pool)
+        cache.commit_conv_window(slots, conv_pool, replay_slots)
 
 
 class KdaLayer:
@@ -216,21 +223,40 @@ class KdaLayer:
         assert x.shape[0] == num_rows, f"{x.shape[0]} rows for a step of {num_rows}"
         hybrid = attn_metadata.mamba_metadata
         cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
-        slots = hybrid.state_indices[: num_contexts + step.num_generations]
+        batch = num_contexts + step.num_generations
+        slots = hybrid.state_indices[:batch]
+        replay_slots = hybrid.replay_state_indices[:batch]
         cores = []
         if num_contexts:
-            cores.append(self._prefill(x[:num_ctx_tokens], hybrid, cache, slots[:num_contexts]))
+            cores.append(
+                self._prefill(
+                    x[:num_ctx_tokens],
+                    hybrid,
+                    cache,
+                    slots[:num_contexts],
+                    replay_slots[:num_contexts],
+                )
+            )
         if step.num_generations:
             # A 16-byte-aligned copy when the verify kernel needs one, else the slots' tail.
             generation_slots = hybrid.generation_state_indices
             if generation_slots is None:
                 generation_slots = slots[num_contexts:]
+            generation_replay_slots = hybrid.generation_replay_state_indices
+            if generation_replay_slots is None:
+                generation_replay_slots = replay_slots[num_contexts:]
             generation = x[num_ctx_tokens:num_rows]
             tokens = step.gen_tokens_per_request
             if tokens == 1:
-                cores.append(self._decode(generation, cache, generation_slots))
+                cores.append(
+                    self._decode(generation, cache, generation_slots, generation_replay_slots)
+                )
             else:
-                cores.append(self._verify(generation, tokens, cache, generation_slots))
+                cores.append(
+                    self._verify(
+                        generation, tokens, cache, generation_slots, generation_replay_slots
+                    )
+                )
         core = cores[0] if len(cores) == 1 else torch.cat(cores)
         return low_m_bf16_gemm(core, self.w.o_proj)
 
@@ -271,9 +297,11 @@ class KdaLayer:
         hybrid: Glm5NextMamba2Metadata,
         cache: MambaLayerCache,
         slots: torch.Tensor,
+        replay_slots: torch.Tensor,
     ) -> torch.Tensor:
         """The gated core ``[T, D]`` of the context rows ``x [T, hidden]`` of ``slots`` (int32
-        ``[num_contexts]``), each sequence continuing from its slot's conv history and state."""
+        ``[num_contexts]``), each sequence continuing from its slot's conv history and state;
+        ``replay_slots`` are the same requests' replay-cache slots."""
         w = self.w
         tokens, num_contexts = x.shape[0], slots.shape[0]
         conv_pool, state_pool = cache.conv, cache.temporal
@@ -313,7 +341,7 @@ class KdaLayer:
             cu_chunks=hybrid.kda_cu_chunks,
             sm_reserve=0,  # feeds the Small-BH route only
         )
-        _commit_conv_window(cache, slots, conv_pool)
+        _commit_conv_window(cache, slots, replay_slots, conv_pool)
         core = rms_norm_gated_token_major(
             o.view(-1, self.head_dim),
             out_gate.view(tokens, self.heads, self.head_dim),
@@ -323,9 +351,16 @@ class KdaLayer:
         )
         return core.view(tokens, self.channels)
 
-    def _decode(self, x: torch.Tensor, cache: MambaLayerCache, slots: torch.Tensor) -> torch.Tensor:
+    def _decode(
+        self,
+        x: torch.Tensor,
+        cache: MambaLayerCache,
+        slots: torch.Tensor,
+        replay_slots: torch.Tensor,
+    ) -> torch.Tensor:
         """The gated core ``[B, D]`` of one new row per request (``x [B, hidden]``, ``slots``
-        int32 ``[B]``); the requests' conv windows and FP32 state rows advance in place."""
+        int32 ``[B]``); the requests' conv windows and FP32 state rows advance in place, and
+        their replay-cache rows ``replay_slots`` take the new conv windows."""
         w = self.w
         d, batch = self.channels, x.shape[0]
         conv_pool, state_pool = cache.conv, cache.temporal
@@ -359,14 +394,20 @@ class KdaLayer:
             onorm_eps=self.norm_eps,
             output=out,
         )
-        _commit_conv_window(cache, slots, conv_pool)
+        _commit_conv_window(cache, slots, replay_slots, conv_pool)
         return out.view(batch, d)
 
     def _verify(
-        self, x: torch.Tensor, tokens_per_request: int, cache: MambaLayerCache, slots: torch.Tensor
+        self,
+        x: torch.Tensor,
+        tokens_per_request: int,
+        cache: MambaLayerCache,
+        slots: torch.Tensor,
+        replay_slots: torch.Tensor,
     ) -> torch.Tensor:
         """The gated core ``[B * T, D]`` of ``T = tokens_per_request`` rows per request (the
-        golden row, then ``T - 1`` drafts; ``x [B * T, hidden]``, ``slots`` int32 ``[B]``)."""
+        golden row, then ``T - 1`` drafts; ``x [B * T, hidden]``, ``slots`` and their replay-cache
+        slots ``replay_slots`` int32 ``[B]``)."""
         if not getattr(cache, "has_kda_replay_caches", False):
             raise RuntimeError(
                 f"KDA layer {self.layer_idx}: a verify step needs the KDA replay caches, which the "
@@ -402,5 +443,6 @@ class KdaLayer:
             onorm_g=self._heads(out_gate),
             onorm_weight=w.o_norm_f32,
             onorm_eps=self.norm_eps,
+            replay_state_indices=replay_slots,
         )
         return out.view(x.shape[0], d)

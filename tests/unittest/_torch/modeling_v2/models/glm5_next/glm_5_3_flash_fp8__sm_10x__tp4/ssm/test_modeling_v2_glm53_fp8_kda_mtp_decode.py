@@ -8,7 +8,9 @@ the batched ``[f_b; g_b]`` GEMM's output, beta the H-wide tail of the ``[f_a | g
 pool (state, replay conv caches, k / g / v / beta caches) is a view into wider per-slot records, as the hybrid
 cache manager lays them out, and the accepted-draft counts are the first int32 of a 16-byte per-slot record. The
 replay caches hold what a previous verify would have left: unit-norm keys, log-decays in (lower_bound, 0), SiLU
-values and sigmoid betas. The reference is fp32 torch, token by token.
+values and sigmoid betas. A cell with a ``replay_pool`` keeps the replay caches and the accepted counts in a pool
+of their own, smaller than the state pool, as the KV cache manager V2 does, and passes each request's replay slot.
+The reference is fp32 torch, token by token.
 """
 
 import math
@@ -99,9 +101,12 @@ def _records(pool: int, width: int, dtype: torch.dtype, values: torch.Tensor) ->
 
 
 def _build(spec: dict, seed: int):
-    """``(records, slots, args)``: the per-slot record buffers, the batch's slots and the op's arguments."""
+    """``(records, slots, replay, args)``: the per-slot record buffers (the state pool's at index 3, the replay
+    pool's elsewhere), the batch's state slots, its replay slots (the state slots without a ``replay_pool``) and
+    the op's arguments."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     batch, num_spec, pool = spec["batch"], spec["num_spec"], spec["pool"]
+    replay_pool = spec.get("replay_pool", pool)
     tokens = batch * (1 + num_spec)
     cols = WINDOW + num_spec
 
@@ -121,31 +126,38 @@ def _build(spec: dict, seed: int):
     onorm_weight = 1 + 0.1 * rnd(HEAD_DIM)
 
     conv_records = [
-        _records(pool, cols * DIM, torch.bfloat16, rnd(pool, cols, DIM, scale=0.5))
+        _records(replay_pool, cols * DIM, torch.bfloat16, rnd(replay_pool, cols, DIM, scale=0.5))
         for _ in range(3)
     ]
-    convs = [r[:, : cols * DIM].view(pool, cols, DIM).transpose(1, 2) for r in conv_records]
+    convs = [r[:, : cols * DIM].view(replay_pool, cols, DIM).transpose(1, 2) for r in conv_records]
     state_record = _records(pool, STATE_ROW, spec["state_dtype"], rnd(pool, STATE_ROW, scale=0.05))
     state = state_record[:, :STATE_ROW].view(pool, HEADS, HEAD_DIM, HEAD_DIM)
-    keys = rnd(pool, num_spec, HEADS, HEAD_DIM)
+    keys = rnd(replay_pool, num_spec, HEADS, HEAD_DIM)
     keys = keys / keys.norm(dim=-1, keepdim=True)
     cache_values = (
         (keys, torch.bfloat16, DIM),
-        (LOWER_BOUND * torch.sigmoid(rnd(pool, num_spec, DIM)), torch.float32, DIM),
-        (torch.nn.functional.silu(rnd(pool, num_spec, DIM)), torch.bfloat16, DIM),
-        (torch.sigmoid(rnd(pool, num_spec, HEADS)), torch.bfloat16, HEADS),
+        (LOWER_BOUND * torch.sigmoid(rnd(replay_pool, num_spec, DIM)), torch.float32, DIM),
+        (torch.nn.functional.silu(rnd(replay_pool, num_spec, DIM)), torch.bfloat16, DIM),
+        (torch.sigmoid(rnd(replay_pool, num_spec, HEADS)), torch.bfloat16, HEADS),
     )
     cache_records = [
-        _records(pool, num_spec * width, dtype, values) for values, dtype, width in cache_values
+        _records(replay_pool, num_spec * width, dtype, values)
+        for values, dtype, width in cache_values
     ]
     caches = [
-        r[:, : num_spec * width].view(pool, num_spec, width)
+        r[:, : num_spec * width].view(replay_pool, num_spec, width)
         for r, (_, _, width) in zip(cache_records, cache_values)
     ]
-    count_record = torch.zeros(pool, 4, dtype=torch.int32, device="cuda")
+    count_record = torch.zeros(replay_pool, 4, dtype=torch.int32, device="cuda")
     num_accepted = count_record[:, 0]
     slots = torch.randperm(pool, generator=gen, device="cuda")[:batch].to(torch.int32)
-    num_accepted[slots.long()] = torch.tensor(spec["pending"], dtype=torch.int32, device="cuda")
+    replay = (
+        torch.randperm(replay_pool, generator=gen, device="cuda")[:batch].to(torch.int32)
+        if "replay_pool" in spec
+        else None
+    )
+    replay_rows = (slots if replay is None else replay).long()
+    num_accepted[replay_rows] = torch.tensor(spec["pending"], dtype=torch.int32, device="cuda")
     args = (
         _heads(qkv[:, :DIM]),
         _heads(qkv[:, DIM : 2 * DIM]),
@@ -166,9 +178,10 @@ def _build(spec: dict, seed: int):
         _heads(gates[1]),
         onorm_weight,
         ONORM_EPS,
+        replay,
     )
     records = [*conv_records, state_record, *cache_records, count_record]
-    return records, slots, args
+    return records, slots, (slots if replay is None else replay), args
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
@@ -190,7 +203,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 -- pytest reso
     equality.
     """
     certifying(op)
-    records, slots, args = _build(cell.spec, zlib.crc32(cell.why.encode()) % 2**31)
+    records, slots, replay, args = _build(cell.spec, zlib.crc32(cell.why.encode()) % 2**31)
     before = [r.clone() for r in records]
     x_v, state = args[2], args[13]
     want = op.reference(*args)
@@ -212,8 +225,9 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 -- pytest reso
     for got, expected in ((k_cache, want[5]), (v_cache, want[7]), (beta_cache, want[8])):
         torch.testing.assert_close(got.float(), expected.float(), rtol=2.0**-7, atol=1e-5)
     torch.testing.assert_close(g_cache, want[6], rtol=0.0, atol=1e-5)
-    untouched = [s for s in range(state.shape[0]) if s not in slots.tolist()]
-    for record, old in zip(records, before):
+    for index, (record, old) in enumerate(zip(records, before)):
+        used = (slots if index == 3 else replay).tolist()
+        untouched = [s for s in range(record.shape[0]) if s not in used]
         assert torch.equal(record[untouched], old[untouched]), "the op wrote an unused slot"
     padding = [r.shape[1] - SLOT_PAD for r in records[:-1]]
     for record, old, width in zip(records, before, padding):
@@ -226,7 +240,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 -- pytest reso
 def test_guard_refuses_a_count_past_num_spec() -> None:
     """A count above num_spec is clamped by the kernel: the request silently replays fewer drafts than the
     runtime accepted."""
-    _, slots, args = _build(
+    _, slots, _, args = _build(
         dict(batch=2, num_spec=3, pending=(0, 1), state_dtype=torch.float32, pool=4), seed=31
     )
     args[19][slots[1].long()] = 4
@@ -237,7 +251,7 @@ def test_guard_refuses_a_count_past_num_spec() -> None:
 
 def test_guard_refuses_a_shared_slot() -> None:
     """Two requests on one slot both replay, commit and cache into it in one launch: a race."""
-    _, _, args = _build(
+    _, _, _, args = _build(
         dict(batch=2, num_spec=3, pending=(0, 1), state_dtype=torch.float32, pool=4), seed=32
     )
     args = list(args)
@@ -247,10 +261,23 @@ def test_guard_refuses_a_shared_slot() -> None:
             op(*args)
 
 
+def test_guard_refuses_a_shared_replay_slot() -> None:
+    """Two requests on one replay slot, with distinct state slots, both replay from and cache into it."""
+    _, _, _, args = _build(
+        dict(batch=2, num_spec=3, pending=(0, 1), state_dtype=torch.float32, pool=6, replay_pool=4),
+        seed=34,
+    )
+    args = list(args)
+    args[-1] = torch.tensor([1, 1], dtype=torch.int32, device="cuda")
+    with pytest.raises(AssertionError, match="each once"):
+        with validating(op):
+            op(*args)
+
+
 def test_guard_refuses_a_misaligned_operand() -> None:
     """The kernels take every token, weight and pool operand as 16-byte aligned without checking: a gate
     starting one element into its buffer would be read from the wrong address."""
-    _, _, args = _build(
+    _, _, _, args = _build(
         dict(batch=2, num_spec=3, pending=(0, 1), state_dtype=torch.float32, pool=4), seed=33
     )
     args = list(args)
