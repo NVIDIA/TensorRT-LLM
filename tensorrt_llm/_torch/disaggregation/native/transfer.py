@@ -5116,6 +5116,14 @@ class TransferWorker:
                 f"inactive on agent {self._agent.name} (init failed); standard "
                 "per-descriptor NIXL transfers are in use."
             )
+        if self._frame_signer is not None and getattr(self._agent, "bounce_enabled", False):
+            logger.warning(
+                "TransferWorker: internal_request_auth_key is configured and the transfer-agent "
+                "bounce buffer is active "
+                f"(kv_cache_bounce_size_mb={self._config.agent_buffer_size_mb}); the control "
+                "channel of the bounce buffer does not use the key and its control messages "
+                "carry no tag."
+            )
         self._registered_mem: list = []
         try:
             self._register_kv_cache()
