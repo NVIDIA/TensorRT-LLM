@@ -142,6 +142,7 @@ def build_feature_attention_metadata(
             feature-split metadata cover.
     """
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
     from tensorrt_llm._torch.attention.metadata.base import (
         UnsupportedMetadataConfiguration,
         build_metadata,
@@ -152,14 +153,21 @@ def build_feature_attention_metadata(
     from tensorrt_llm._torch.attention.metadata.deepseek_v4 import DeepseekV4Metadata
     from tensorrt_llm._torch.attention.metadata.draft import LinearDraftMetadata
     from tensorrt_llm._torch.attention.metadata.mla_context import MlaContextMetadata
+    from tensorrt_llm._torch.attention.metadata.sparse import SparseMetadata
     from tensorrt_llm._torch.attention.metadata.spec_decoding import SpecDecodingMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
-    if not issubclass(attention_backend, DeepseekV4TrtllmAttention):
+    is_deepseek_v4 = issubclass(attention_backend, DeepseekV4TrtllmAttention)
+    # A backend with metadata of its own keeps state the feature metadata do not carry.
+    if not is_deepseek_v4 and attention_backend.Metadata is not TrtllmAttentionMetadata:
         raise UnsupportedMetadataConfiguration(
-            f"the attention backend {attention_backend.__name__} (only DeepSeek-V4 on "
-            "TrtllmAttention is covered)"
+            f"the attention backend {attention_backend.__name__} (only TrtllmAttention "
+            "and DeepSeek-V4 are covered)"
         )
+    if model_config.is_generation is False or getattr(
+        model_config.pretrained_config, "is_encoder_decoder", False
+    ):
+        raise UnsupportedMetadataConfiguration("encoder and encoder-decoder models")
     if max_beam_width != 1:
         raise UnsupportedMetadataConfiguration("beam search")
     if mapping.has_cp_helix():
@@ -167,17 +175,17 @@ def build_feature_attention_metadata(
     if model_config.enable_flash_mla:
         raise UnsupportedMetadataConfiguration("FlashMLA")
 
-    metadata_types = [
-        TrtllmCoreMetadata,
-        MlaContextMetadata,
-        SpecDecodingMetadata,
-        DeepseekV4Metadata,
-    ]
-    enable_context_mla_with_cached_kv = (
+    model_is_mla = is_mla(model_config.pretrained_config)
+    metadata_types = [TrtllmCoreMetadata, SpecDecodingMetadata]
+    enable_context_mla_with_cached_kv = model_is_mla and (
         attention_runtime_features.cache_reuse or attention_runtime_features.chunked_prefill
     )
-    if attention_runtime_features.chunked_prefill:
-        metadata_types.append(ChunkedPrefillMetadata)
+    if model_is_mla:
+        metadata_types.append(MlaContextMetadata)
+        if attention_runtime_features.chunked_prefill:
+            metadata_types.append(ChunkedPrefillMetadata)
+    # DeepSeek-V4's sparse metadata stands in for the dense one.
+    metadata_types.append(DeepseekV4Metadata if is_deepseek_v4 else SparseMetadata)
     max_draft_tokens = 0
     if spec_config is not None:
         spec_dec_mode = spec_config.spec_dec_mode
@@ -206,8 +214,12 @@ def build_feature_attention_metadata(
         mapping=mapping,
         runtime_features=attention_runtime_features,
         max_num_heads_per_kv=_get_max_num_heads_per_kv(model_config),
-        sparse_metadata_params=sparse_attention_config.to_sparse_metadata_params(
-            pretrained_config=model_config.pretrained_config
+        sparse_metadata_params=(
+            sparse_attention_config.to_sparse_metadata_params(
+                pretrained_config=model_config.pretrained_config
+            )
+            if sparse_attention_config is not None
+            else None
         ),
         enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
         max_draft_tokens=max_draft_tokens,
