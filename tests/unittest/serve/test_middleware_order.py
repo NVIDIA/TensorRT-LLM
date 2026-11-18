@@ -51,21 +51,27 @@ EXPECTED = {
         AggConfig(return_perf_metrics=True),
         [
             _ARRIVAL_WITH_CLOCK,
-            _perf(["adjusted_clock", "expose_headers", "writer"], True),
+            _perf(
+                ["adjusted_clock", "expose_headers", "input_processing_observer", "writer"], True
+            ),
         ],
     ),
     "llm_perf_metrics_output_dir_only": (
         AggConfig(perf_metrics_output_dir=True),
         [
             _ARRIVAL_WITH_CLOCK,
-            _perf(["adjusted_clock", "expose_headers", "writer"], False),
+            _perf(
+                ["adjusted_clock", "expose_headers", "input_processing_observer", "writer"], False
+            ),
         ],
     ),
     "llm_perf_metrics_enable_metrics_env": (
         AggConfig(return_perf_metrics=True, env=(("ENABLE_METRICS", "true"),)),
         [
             _ARRIVAL_WITH_CLOCK,
-            _perf(["adjusted_clock", "expose_headers", "writer"], True),
+            _perf(
+                ["adjusted_clock", "expose_headers", "input_processing_observer", "writer"], True
+            ),
             {"class": "PrometheusInstrumentatorMiddleware"},
         ],
     ),

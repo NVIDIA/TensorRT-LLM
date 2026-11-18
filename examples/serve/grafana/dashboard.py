@@ -797,6 +797,8 @@ def deploy(
         if baseline:
             # Preserve unrelated dashboards and metadata in a shared ConfigMap.
             checkpoint["data"] = dict(baseline.get("data", {}), **cm["data"])
+            if "binaryData" in baseline:
+                checkpoint["binaryData"] = deepcopy(baseline["binaryData"])
             checkpoint["metadata"]["labels"] = dict(
                 baseline["metadata"].get("labels", {}), **checkpoint["metadata"].get("labels", {})
             )

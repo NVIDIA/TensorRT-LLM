@@ -107,7 +107,14 @@ def _coordinator(
         transfer_manager=None,
         kv_cache_manager=None,
         dist=SimpleNamespace(
-            rank=4, world_size=8, tp_rank=1, pp_rank=0, cp_rank=0, pp_size=1, cp_size=1
+            rank=4,
+            tp_rank=1,
+            pp_rank=0,
+            cp_rank=0,
+            tp_size=1,
+            pp_size=1,
+            cp_size=1,
+            world_size=1,
         ),
         effects=SimpleNamespace(revert_ctx_alloc=Mock()),
         registry=SimpleNamespace(active_requests=lambda: list(active_requests)),
@@ -1890,9 +1897,10 @@ def test_outcome_transport_extends_refactor_tuple_without_shifting_loop() -> Non
     native = Mock()
     native.to_json_str.return_value = '{"iter": 1}'
     loop = {"kind": "loop", "per_iter": {"iter": 2}}
-    prefix = (native, None, None, None, None, None, None, None, loop)
+    prefix = (native, None, None, None, None, None, None, None, {"gpuTimesMS": [2.5]}, loop)
     plain = IterationStatsRecord.from_tuple(prefix).to_dict()
     assert plain["executorLoop"] == loop
+    assert plain["multimodalEncoderStats"] == {"gpuTimesMS": [2.5]}
     assert "kvTransferOutcomes" not in plain
     extended = IterationStatsRecord.from_tuple((*prefix, (3, 2, 1))).to_dict()
     assert extended["executorLoop"] == loop

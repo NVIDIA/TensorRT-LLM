@@ -143,7 +143,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     mStorage
         = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock, std::move(coldPageCodec),
             mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints, mConfig.initialPoolRatio, mEventSink,
-            mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority, mConfig.enableStats);
+            mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority, mConfig.coldTypicalStep, mConfig.enableStats);
     // The context the storage above lives in; teardown pushes it on threads that have none.
     cuCheck(cuCtxGetCurrent(&mCudaContext));
     TLLM_CHECK_WITH_INFO(mCudaContext != nullptr, "KVCacheManagerV2 requires a current CUDA context");
@@ -520,7 +520,7 @@ void KvCacheManager::clearReusableBlocks()
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats,
-    std::optional<executor::KvCacheRetentionConfig> retentionConfig)
+    std::optional<executor::KvCacheRetentionConfig> retentionConfig, bool inputKnownNoDigest)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
@@ -541,7 +541,7 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     if (inputTokens.size() != 0)
     {
         _unlinkPagesOfFailedRemoteLevels();
-        reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()));
+        reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()) || inputKnownNoDigest);
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),

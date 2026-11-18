@@ -221,21 +221,6 @@ skip_gpu_memory_less_than_138gb = skip_gpu_memory_less_than(138 * 1000 * 1000 *
                                                             1000)
 
 
-def modelopt_installed():
-    try:
-        # isort: off
-        import modelopt.torch.quantization as atq  # NOQA
-        from modelopt.torch.export import export_tensorrt_llm_checkpoint  # NOQA
-        # isort: on
-        return True
-    except Exception:
-        return False
-
-
-skip_no_modelopt = unittest.skipIf(not modelopt_installed(),
-                                   reason="Modelopt is not installed")
-
-
 def check_nvlink():
     "check nvlink is active"
     try:

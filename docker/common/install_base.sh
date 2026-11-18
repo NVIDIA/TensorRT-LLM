@@ -87,6 +87,14 @@ cleanup() {
 
 init_ubuntu() {
   apt-get update
+  # Packages only needed by CI/dev images; NGC release images (IS_NGC_RELEASE=1, set by the
+  # NGC release build in jenkins/BuildDockerImage.groovy) skip them.
+  local ci_only_packages=()
+  if [ "${IS_NGC_RELEASE:-0}" != "1" ]; then
+    ci_only_packages+=(
+      git-lfs
+    )
+  fi
   apt-get install -y --no-install-recommends \
     libtool \
     autoconf \
@@ -94,7 +102,7 @@ init_ubuntu() {
     pkg-config \
     ccache \
     gdb \
-    git-lfs \
+    "${ci_only_packages[@]}" \
     clang \
     graphviz \
     lld \
@@ -110,7 +118,11 @@ init_ubuntu() {
     pigz \
     libzmq3-dev \
     libssl3t64 \
-    openssl
+    openssl \
+    apt \
+    apt-utils \
+    libbrotli1 \
+    libapt-pkg6.0t64
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi

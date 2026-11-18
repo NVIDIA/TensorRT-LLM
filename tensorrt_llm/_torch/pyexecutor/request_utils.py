@@ -263,8 +263,9 @@ def merge_helix_requests(
 ) -> list[LlmRequest]:
     """Merge requests for Helix CP.
 
-    Note: Helix parallelism is a decode-only feature run with disaggregated serving.
-    This function gets called on gen server during initialization of a new request.
+    Called only for disaggregated Helix, on the generation server when a new
+    request is initialized; it slices the prompt across CP ranks. Aggregated
+    Helix keeps the full prompt on every rank (see ``merge_requests``).
 
     Args:
         new_requests: List of RequestQueueItem objects.
@@ -279,8 +280,9 @@ def merge_helix_requests(
     req_with_children = []
 
     for req_item in new_requests:
+        input_token_ids = req_item.request.get_input_token_ids_array()
         input_ids_this_rank, position_ids_this_rank, input_len, _ = partition_context_for_helix(
-            req_item.request.get_input_token_ids_array(), cp_rank, cp_size, tokens_per_block
+            input_token_ids, cp_rank, cp_size, tokens_per_block
         )
 
         req = executor_request_to_llm_request(
@@ -293,6 +295,12 @@ def merge_helix_requests(
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)
+        # The prompt tokens a multi-token stop word ending at the first
+        # generated token can span, which this rank's slice may not hold.
+        tail_len = max((len(word) - 1 for word in req.py_stop_words_list or ()), default=0)
+        prompt_tail = input_token_ids[max(0, len(input_token_ids) - tail_len) :].tolist()
+        for request in (req, *req.child_requests):
+            request.py_helix_prompt_tail = prompt_tail
         req_with_children.append(req)
         if req.child_requests:
             req_with_children.extend(req.child_requests)

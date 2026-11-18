@@ -36,22 +36,22 @@ def _run_one_rank():
         "cuda:nccl,cpu:gloo", init_method="env://", device_id=torch.device("cuda", rank)
     )
     host_group = dist.new_group(backend="gloo")
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allreduce as shared_ar
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency import (
+    from tensorrt_llm._torch.distributed import communicator
+    from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
+    from tensorrt_llm._torch.modeling_v2.catalog.comm import allreduce as shared_ar
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency import (
         native_ops,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.comm.intra_node_moe_finalize import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.comm.intra_node_moe_finalize import (  # noqa: E501
         intra_node_moe_finalize,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.comm.intra_node_reduce import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.comm.intra_node_reduce import (  # noqa: E501
         IpcCollectives,
         intra_node_reduce,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.comm.pre_moe_fp4_linear import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.comm.pre_moe_fp4_linear import (  # noqa: E501
         pre_moe_fp4_linear,
     )
-    from tensorrt_llm._torch.distributed import communicator
-    from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
     from _validating import validating

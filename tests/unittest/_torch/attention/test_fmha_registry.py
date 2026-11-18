@@ -114,3 +114,20 @@ def test_empty_delta_fmha_lib_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(ValueError, match="Invalid empty FMHA library entry"):
         registry.get_enabled_fmha_lib_classes()
+
+
+def test_beam_shared_prefix_is_opt_in_and_precedes_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    beam = "beam_shared_prefix"
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    assert beam not in registry.DEFAULT_FMHA_LIBS
+    assert beam not in _enabled_names()
+
+    names = _canonical_names()
+    assert names.index(beam) < names.index("fallback")
+
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{beam}")
+    enabled = _enabled_names()
+    assert beam in enabled
+    assert enabled.index(beam) < enabled.index("fallback")
