@@ -546,7 +546,7 @@ class TestWanI2VTransformerCorrectness:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("norm", ["adaln", "affine"])
-def test_linear_ignore_steps_keep_fused_norm_output_bf16(norm: str) -> None:
+def test_fixed_bf16_linear_keeps_norm_output_bf16(norm: str) -> None:
     from unittest.mock import patch
 
     from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
@@ -556,8 +556,8 @@ def test_linear_ignore_steps_keep_fused_norm_output_bf16(norm: str) -> None:
     )
 
     projection = SimpleNamespace(
-        quant_config=SimpleNamespace(ignore_steps=[1]),
-        input_scale=torch.ones(()),
+        quant_config=SimpleNamespace(quant_algo=None),
+        input_scale=None,
         scaling_vector_size=16,
         pre_quant_scale=None,
         force_dynamic_quantization=False,
@@ -584,5 +584,5 @@ def test_linear_ignore_steps_keep_fused_norm_output_bf16(norm: str) -> None:
             )
     bf16.assert_called_once()
     assert result.dtype == torch.bfloat16
-    projection.quant_config.ignore_steps = []
+    projection.input_scale = torch.ones(())
     assert get_nvfp4_input_scale(projection) is projection.input_scale

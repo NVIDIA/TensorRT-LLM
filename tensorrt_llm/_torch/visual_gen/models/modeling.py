@@ -100,23 +100,7 @@ class BaseDiffusionModel(nn.Module):
         Subclasses should call ``super()`` unless they intentionally replace
         the shared registrations.
         """
-        linear_quant_ignore_steps = getattr(
-            getattr(self.model_config, "quant_config", None), "ignore_steps", []
-        )
         quant_config = self.model_config.attention.quant_attention_config
-        attention_quant_ignore_steps = getattr(quant_config, "ignore_steps", [])
-        if linear_quant_ignore_steps or attention_quant_ignore_steps:
-            state = self.model_config.attention_metadata_state
-            if state is None:
-                raise ValueError("Step quantization ignore requires per-component attention state.")
-            runner.register_extra_key_fn(
-                "quant_ignored",
-                lambda *args, **kwargs: (
-                    state.get("linear_quant_ignored", False),
-                    state.get("attention_quant_ignored", False),
-                ),
-            )
-
         if (
             quant_config is not None
             and quant_config.vc_attention

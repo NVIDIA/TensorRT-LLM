@@ -483,7 +483,9 @@ class TestRingAttentionInitGuards:
         run_test_in_distributed(world_size=4, test_fn=_logic_ring_init_guard_no_lse, use_cuda=False)
 
 
-def _logic_attention_ignore_steps(rank: int, world_size: int, *, parallelism: str) -> None:
+def _logic_attention_ignore_steps(
+    rank: int, world_size: int, *, parallelism: str, backend: str = "CUTEDSL"
+) -> None:
     """L2: compare sharded attention output with same-input full-sequence FP32 SDPA.
 
     BF16 steps are transparent apart from BF16 rounding and partial-softmax merges;
@@ -519,30 +521,56 @@ def _logic_attention_ignore_steps(rank: int, world_size: int, *, parallelism: st
     expected = F.scaled_dot_product_attention(
         *(value.transpose(1, 2).float() for value in full_values)
     ).transpose(1, 2)[:, start:end]
-    state = {}
-    selected = create_attention(
-        backend="CUTEDSL",
-        layer_idx=0,
-        head_dim=head_dim,
-        dtype=torch.bfloat16,
-        num_heads=heads // world_size if parallelism == "ulysses" else heads,
-        attention_metadata_state=state,
-        attention_config=AttentionConfig(
-            backend="CUTEDSL",
-            quant_attention_config=QuantAttentionConfig(
-                qk_dtype="nvfp4", v_dtype="fp8", ignore_steps=[0, 2]
-            ),
-        ),
+    from tensorrt_llm._torch.visual_gen.quantization.transformer_quant_dispatcher import (
+        TransformerQuantDispatcher,
+        TransformerQuantSchedule,
     )
+
+    holder = TransformerQuantDispatcher(TransformerQuantSchedule(attention=frozenset((0, 2))))
     wrapper = UlyssesAttention if parallelism == "ulysses" else RingAttention
-    holder = torch.nn.Module()
-    holder.attention = torch.nn.Module()
-    holder.attention.attn = wrapper(selected, process_group=dist.group.WORLD)
+    for key in holder.schedule.keys:
+        selected = create_attention(
+            backend=backend,
+            layer_idx=0,
+            head_dim=head_dim,
+            dtype=torch.bfloat16,
+            num_heads=heads // world_size if parallelism == "ulysses" else heads,
+            attention_metadata_state={},
+            attention_config=AttentionConfig(
+                backend=backend,
+                quant_attention_config=None
+                if key[1]
+                else (
+                    QuantAttentionConfig(
+                        qk_dtype="fp8",
+                        v_dtype="fp8",
+                        q_block_size=1,
+                        k_block_size=16,
+                        v_block_size=1,
+                    )
+                    if backend == "TRTLLM"
+                    else QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8")
+                ),
+            ),
+        )
+        model = torch.nn.Module()
+        model.attention = torch.nn.Module()
+        model.attention.attn = wrapper(selected, process_group=dist.group.WORLD)
+        holder.add(key, model)
     with observe_quantization_paths(holder) as trace:
         for step in range(3):
             trace.step = step
-            state["attention_quant_ignored"] = step in (0, 2)
-            actual = holder.attention.attn(*values).float()
+            selected = holder.select(step).attention.attn
+            if backend == "TRTLLM":
+                from unittest.mock import patch
+
+                with patch.object(
+                    selected, "_forward_fused", wraps=selected._forward_fused
+                ) as fused:
+                    selected(*values)
+                    assert fused.call_count == int(step in (0, 2))
+                continue
+            actual = selected(*values).float()
             difference = actual - expected
             reference_norm = expected.norm().item()
             assert reference_norm > 0
@@ -581,6 +609,14 @@ def test_attention_ignore_steps_with_sequence_parallel(wrapper: str) -> None:
         pytest.skip("Quantized CuTe DSL attention requires Blackwell")
     run_test_in_distributed(
         2, functools.partial(_logic_attention_ignore_steps, parallelism=wrapper)
+    )
+
+
+def test_attention_ignore_steps_preserves_trtllm_fused_qkv() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Representative SAGE kernels require Blackwell")
+    run_test_in_distributed(
+        2, functools.partial(_logic_attention_ignore_steps, parallelism="ulysses", backend="TRTLLM")
     )
 
 

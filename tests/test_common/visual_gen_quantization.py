@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, LinearMethodBase, UnquantizedLinearMethod
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import (
@@ -26,15 +27,12 @@ from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
     RingAttention,
     UlyssesAttention,
 )
-from tensorrt_llm._torch.visual_gen.attention.backends.quant_dispatcher import (
-    AttentionQuantDispatcher,
-)
 from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
-from tensorrt_llm._torch.visual_gen.quantization.quant_dispatcher import (
-    LinearQuantDispatcher,
-    install_linear_quant_dispatcher,
+from tensorrt_llm._torch.visual_gen.quantization.transformer_quant_dispatcher import (
+    TransformerQuantDispatcher,
+    TransformerQuantSchedule,
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig, LinearQuantConfig, QuantAttentionConfig
@@ -154,10 +152,6 @@ def observe_quantization_paths(
             if id(backend) in seen:
                 return
             seen.add(id(backend))
-            if isinstance(backend, AttentionQuantDispatcher):
-                observe_attention(backend.unquantized, name, "bf16")
-                observe_attention(backend.quantized, name, "quantized")
-                return
             if isinstance(backend, RingAttention):
                 observe_attention(backend.inner, name, route)
                 return
@@ -196,14 +190,39 @@ def observe_quantization_paths(
             if backend.support_lse():
                 observe_call("forward_with_lse")
 
+        def observe_fused_projection(module: nn.Module, name: str, method_name: str) -> None:
+            original = getattr(module, method_name)
+            projection = module.gate_up_proj
+            route = (
+                "bf16" if type(projection.quant_method) is UnquantizedLinearMethod else "quantized"
+            )
+
+            def fused(inputs, *args, **kwargs):
+                _record_entry(
+                    trace,
+                    name + ".gate_up_proj",
+                    "linear",
+                    route,
+                    type(projection.quant_method).__name__,
+                    (inputs,),
+                    projection.weight,
+                    entry_point=method_name,
+                )
+                return original(inputs, *args, **kwargs)
+
+            stack.enter_context(patch.object(module, method_name, fused))
+
         for name, module in model.named_modules():
             method = getattr(module, "quant_method", None)
-            if isinstance(method, LinearQuantDispatcher):
-                observe_linear(method.quantized_method, name, "quantized")
-                observe_linear(method.unquantized_method, name, "bf16")
-            elif method is not None:
+            if name.startswith("variants."):
+                name = ".".join(name.split(".")[2:])
+            name = name.replace("._orig_mod.", ".")
+            if method is not None:
                 route = "bf16" if type(method) is UnquantizedLinearMethod else "quantized"
                 observe_linear(method, name, route)
+            if isinstance(module, GatedMLP):
+                for method_name in ("_fused_gate_up_swiglu", "_fused_gate_up_swiglu_bf16"):
+                    observe_fused_projection(module, name, method_name)
             for attribute in ("attn", "backend"):
                 backend = getattr(module, attribute, None)
                 if isinstance(backend, AttentionBackend):
@@ -298,16 +317,17 @@ class _ToyLinear(nn.Linear):
     use_custom_cublas_mm = False
     all_reduce = None
 
-    def __init__(self, quantized: bool, retain_weight: bool) -> None:
+    def __init__(self, quantized: bool) -> None:
         super().__init__(128, 128, bias=False, dtype=torch.bfloat16)
         self.weight.requires_grad_(False)
         self.quant_config = QuantConfig(quant_algo="FP8" if quantized else None)
-        if retain_weight and quantized:
-            self.register_buffer(
-                "_unquantized_weight", self.weight.detach().clone(), persistent=False
-            )
         if quantized:
-            self.weight = nn.Parameter(self.weight.to(torch.float8_e4m3fn), requires_grad=False)
+            weight = torch.empty(
+                self.weight.shape, dtype=torch.float8_e4m3fn, device=self.weight.device
+            )
+            if self.weight.device.type != "meta":
+                weight.copy_(self.weight.detach())
+            self.weight = nn.Parameter(weight, requires_grad=False)
         self.quant_method = _ToyQuantizedLinearMethod() if quantized else UnquantizedLinearMethod()
         self.use_fused_gemm_allreduce = False
 
@@ -350,9 +370,7 @@ class ToyDiTBlock(nn.Module):
             )
             self.linear.post_load_weights()
         else:
-            self.linear = _ToyLinear(
-                quant.quant_algo is not None and not excluded, bool(quant.ignore_steps)
-            )
+            self.linear = _ToyLinear(quant.quant_algo is not None and not excluded)
         arguments = dict(
             backend=config.attention.backend,
             layer_idx=index,
@@ -391,7 +409,7 @@ class ToyDiT(nn.Module):
         quantized_linear: bool = True,
         quantized_attention: bool = True,
         real_kernels: bool = False,
-        install_dispatch: bool = True,
+        model_config: DiffusionModelConfig | None = None,
     ) -> None:
         super().__init__()
         self.model_config = DiffusionModelConfig(
@@ -415,14 +433,38 @@ class ToyDiT(nn.Module):
             ),
             attention_metadata_state={},
         )
+        if model_config is not None:
+            self.model_config = model_config
         self.blocks = nn.ModuleList(
             ToyDiTBlock(self.model_config, index, real_kernels=real_kernels)
             for index in range(block_count)
         )
-        if linear_quant_ignore_steps and install_dispatch:
-            install_linear_quant_dispatcher(self, self.model_config.attention_metadata_state)
+        if linear_quant_ignore_steps or attention_quant_ignore_steps:
+            raise ValueError("Construct fixed ToyDiT paths with make_toy_quant_dispatcher")
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
             inputs = block(inputs)
         return inputs
+
+
+def make_toy_quant_dispatcher(
+    *, linear_quant_ignore_steps=(), attention_quant_ignore_steps=(), **kwargs
+):
+    """Build independent fixed DiT paths using the production high-level selector."""
+    schedule = TransformerQuantSchedule(
+        frozenset(linear_quant_ignore_steps), frozenset(attention_quant_ignore_steps)
+    )
+    dispatcher = TransformerQuantDispatcher(schedule)
+    linear = kwargs.pop("quantized_linear", True)
+    attention = kwargs.pop("quantized_attention", True)
+    for key in schedule.keys:
+        dispatcher.add(
+            key,
+            ToyDiT(
+                quantized_linear=linear and not key[0],
+                quantized_attention=attention and not key[1],
+                **kwargs,
+            ),
+        )
+    return dispatcher

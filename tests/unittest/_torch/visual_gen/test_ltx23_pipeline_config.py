@@ -196,16 +196,28 @@ def test_attention_quant_ignore_scope(mode: str) -> None:
         ),
         attention_metadata_state={},
     )
-    with patch(
-        "tensorrt_llm._torch.visual_gen.attention.backends.utils.get_visual_gen_attention_backend",
-        return_value=ToyAttentionBackend,
-    ):
-        block = LTX23TransformerBlock(
-            0,
-            video=TransformerConfig(128, 1, 128, 64),
-            audio=TransformerConfig(64, 1, 64, 64),
-            config=config,
-        )
+    from tensorrt_llm._torch.visual_gen.quantization.transformer_quant_dispatcher import (
+        TransformerQuantDispatcher,
+        TransformerQuantSchedule,
+        fixed_quant_config,
+    )
+
+    schedule = TransformerQuantSchedule.from_config(config)
+    dispatcher = TransformerQuantDispatcher(schedule)
+    for key in schedule.keys:
+        with patch(
+            "tensorrt_llm._torch.visual_gen.attention.backends.utils.get_visual_gen_attention_backend",
+            return_value=ToyAttentionBackend,
+        ):
+            dispatcher.add(
+                key,
+                LTX23TransformerBlock(
+                    0,
+                    video=TransformerConfig(128, 1, 128, 64),
+                    audio=TransformerConfig(64, 1, 64, 64),
+                    config=fixed_quant_config(config, key),
+                ),
+            )
     names = (
         "attn1",
         "attn2",
@@ -214,10 +226,10 @@ def test_attention_quant_ignore_scope(mode: str) -> None:
         "audio_to_video_attn",
         "video_to_audio_attn",
     )
-    with observe_quantization_paths(block) as trace:
+    with observe_quantization_paths(dispatcher) as trace:
         for step in range(2):
             trace.step = step
-            config.attention_metadata_state["attention_quant_ignored"] = step == 1
+            block = dispatcher.select(step)
             for name in names:
                 attention = getattr(block, name)
                 values = torch.randn(1, 8, 1, attention.head_dim, dtype=torch.bfloat16)

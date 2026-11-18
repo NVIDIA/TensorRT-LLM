@@ -379,7 +379,11 @@ class PipelineLoader:
         # Convert meta tensors to their runtime devices. Offloaded submodules
         # stay on CPU until they are explicitly staged.
         cpu_offload_modules = self._get_load_time_cpu_offload_modules(pipeline)
-        self._materialize_meta_tensors(pipeline, cpu_offload_modules)
+        self._materialize_meta_tensors(
+            pipeline,
+            cpu_offload_modules,
+            deferred_tensor_ids=pipeline.deferred_transformer_quant_tensor_ids(),
+        )
 
         # =====================================================================
         # STEP 3: Load Transformer Weights
@@ -392,8 +396,10 @@ class PipelineLoader:
         #   - Copied into model's quantized buffers
         # =====================================================================
         weights = pipeline.load_transformer_weights(checkpoint_dir)
-        pipeline.load_weights(weights)
+        pipeline.load_transformer_quant_weights(weights)
         del weights
+        if pipeline._transformer_quant_dispatchers:
+            pipeline._setup_runtime_lora()
 
         # =====================================================================
         # STEP 4: Load Standard Components (VAE, TextEncoder, etc.)
@@ -408,6 +414,8 @@ class PipelineLoader:
             skip_components=skip_components,
             **extra_kwargs,
         )
+        if pipeline._transformer_quant_dispatchers:
+            pipeline._setup_transformer_quant_graphs()
         logger.info(f"Model loaded successfully in {time.time() - load_start:.2f}s")
 
         # =====================================================================
@@ -419,14 +427,13 @@ class PipelineLoader:
             pipeline.setup_parallel_vae()
 
         if hasattr(pipeline, "post_load_weights"):
-            pipeline.post_load_weights()
-        pipeline._setup_linear_quant_dispatcher()
+            pipeline.run_transformer_quant_hook("post_load_weights")
         pipeline._setup_runtime_lora()
         pipeline.initialize_offload_pipeline()
 
         if config.torch_compile.enable:
             torch._dynamo.config.cache_size_limit = 128
-            pipeline.torch_compile()
+            pipeline.run_transformer_quant_hook("torch_compile")
         else:
             logger.info("torch.compile disabled by config")
 
@@ -450,9 +457,9 @@ class PipelineLoader:
 
             marker = LayerwiseNvtxMarker()
             module_prefix = pipeline.__class__.__name__
-            for transformer_component in pipeline.transformer_components:
+            for transformer_component, transformer in pipeline.transformer_quant_models():
                 logger.info(f"Registering layerwise NVTX markers for {transformer_component}")
-                marker.register_hooks(getattr(pipeline, transformer_component), module_prefix)
+                marker.register_hooks(transformer, module_prefix)
 
         logger.info(
             f"Pipeline loaded: {pipeline.__class__.__name__} "
@@ -468,7 +475,7 @@ class PipelineLoader:
         helper mirrors the pipeline's configured stages so offloaded towers never
         need to materialize on GPU first.
         """
-        available_components = pipeline.offload_pipeline_components()
+        available_components = pipeline.all_offload_pipeline_components()
         modules: list[torch.nn.Module] = []
         seen: set[int] = set()
 
@@ -488,6 +495,8 @@ class PipelineLoader:
         self,
         module: torch.nn.Module,
         cpu_offload_modules: Optional[list[torch.nn.Module]] = None,
+        *,
+        deferred_tensor_ids: Optional[set[int]] = None,
     ) -> None:
         """
         Convert meta tensors to tensors on their runtime devices.
@@ -499,11 +508,14 @@ class PipelineLoader:
         needs the full offloaded tower resident on GPU.
         """
         cpu_offload_modules = cpu_offload_modules or []
+        deferred_tensor_ids = deferred_tensor_ids or set()
         meta_device = torch.device("meta")
 
         cpu_memo = {}
 
         def init_cpu_tensor(t: torch.Tensor) -> torch.Tensor:
+            if id(t) in deferred_tensor_ids:
+                return t
             if t.device != meta_device:
                 return t.to("cpu")
             if t not in cpu_memo:
@@ -517,6 +529,8 @@ class PipelineLoader:
         target_memo = {}
 
         def init_meta_tensor(t: torch.Tensor) -> torch.Tensor:
+            if id(t) in deferred_tensor_ids:
+                return t
             if id(t) in cpu_tensor_ids:
                 return t
             if t.device != meta_device:

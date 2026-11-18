@@ -335,21 +335,16 @@ if __name__ == "__main__":
 
 
 @pytest.mark.cpu_only
-def test_flux_attention_quant_ignore_bypasses_explicit_qkv_quantization() -> None:
+@pytest.mark.parametrize("quantized", [False, True])
+def test_flux_fixed_attention_qkv_quantization(quantized: bool) -> None:
     """Flux QKV preparation uses BF16 when attention quantization is ignored."""
     from unittest.mock import patch
 
     from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
-    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     attention = FluxJointAttention.__new__(FluxJointAttention)
     torch.nn.Module.__init__(attention)
-    attention._quant_attention_config = QuantAttentionConfig(
-        qk_dtype="fp8", v_dtype="fp8", ignore_steps=[0]
-    )
-    attention._quantization_excluded = False
-    attention._quant_ignore_state = {}
-    attention.requires_static_e4m3_attention = True
+    attention.requires_static_e4m3_attention = quantized
     attention._static_e4m3_attention_scales_loaded = True
     attention.added_kv_proj_dim = None
     attention.pre_only = True
@@ -376,16 +371,10 @@ def test_flux_attention_quant_ignore_bypasses_explicit_qkv_quantization() -> Non
         patch.object(attention, "_attn_impl", side_effect=attend),
         patch("torch.ops.trtllm.fused_dit_qk_norm_rope_quant_fp8", return_value=fp8_qkv) as fp8,
     ):
-        for quant_ignored in (False, True, False):
-            attention._quant_ignore_state["attention_quant_ignored"] = quant_ignored
-            attention(x, image_rotary_emb=rotary)
-    assert fp8.call_count == 2 and bf16.call_count == 1
-    assert [dtype for dtype, _ in calls] == [
-        torch.float8_e4m3fn,
-        torch.bfloat16,
-        torch.float8_e4m3fn,
-    ]
-    assert ["static_q_scale" in kwargs for _, kwargs in calls] == [True, False, True]
+        attention(x, image_rotary_emb=rotary)
+    assert fp8.call_count == int(quantized) and bf16.call_count == int(not quantized)
+    assert [dtype for dtype, _ in calls] == [torch.float8_e4m3fn if quantized else torch.bfloat16]
+    assert ["static_q_scale" in kwargs for _, kwargs in calls] == [quantized]
 
 
 @pytest.mark.cpu_only
