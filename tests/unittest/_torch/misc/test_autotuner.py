@@ -37,13 +37,13 @@ from mpi4py import MPI
 import tensorrt_llm
 import tensorrt_llm._torch.autotuner as autotuner
 from tensorrt_llm import _jit_share as jit_share
-from tensorrt_llm._torch.autotuner import (AutoTuner, BuildStrategy,
-                                           DistributedTuningStrategy,
+from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            DynamicDim, DynamicTensorSpec,
                                            FakeTensor, NvMMHConfig,
                                            OptimizationProfile, StaticDim,
                                            TunableRunner, TuningConfig,
                                            autotune)
+from tensorrt_llm._torch.build_pool import BuildStrategy
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.utils import (deep_gemm_jit_warmup_buckets,
                                        get_power_of_2_num_tokens_buckets,
