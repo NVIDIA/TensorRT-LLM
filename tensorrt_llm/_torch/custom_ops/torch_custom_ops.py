@@ -2293,6 +2293,10 @@ class Fp8QuantKernelRunner(TunableRunner):
 # autotuner drives the JIT of a sweep's distinct layouts on a thread pool
 # (TuningConfig.parallel_jit_warmup; -1 sizes it from this rank's CPUs).
 _DEEP_GEMM_JIT_WARMUP_THREADS = -1
+# One DeepGemm build: an nvcc compile of about 2 s on GB300. The BuildPool's
+# workers take the builds (TuningConfig.build_in_workers) only when that repays
+# a worker (TLLM_KERNEL_BUILDER_MIN_BUILD_S); otherwise the thread pool runs them.
+_DEEP_GEMM_BUILD_S = 2.0
 
 
 class fp8SwapABGemmRunner(TunableRunner):
@@ -2315,6 +2319,8 @@ class fp8SwapABGemmRunner(TunableRunner):
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
         build_strategy=BuildStrategy.PARALLEL,
+        build_in_workers=True,
+        build_seconds=_DEEP_GEMM_BUILD_S,
     )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
@@ -2371,6 +2377,8 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
         build_strategy=BuildStrategy.PARALLEL,
+        build_in_workers=True,
+        build_seconds=_DEEP_GEMM_BUILD_S,
     )
 
     def __init__(self, output_dtype: torch.dtype,

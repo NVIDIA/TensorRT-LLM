@@ -67,6 +67,14 @@ def record(path: str, value: int) -> None:
         f.write(f"{value} {os.getpid()}")
 
 
+def span(path: str, seconds: float) -> None:
+    """A build that takes ``seconds`` and records when it started and ended, in ``path``."""
+    start = time.time()
+    time.sleep(seconds)
+    with open(path, "w") as f:
+        f.write(f"{start} {time.time()}")
+
+
 def fail() -> None:
     raise ValueError("a build that fails")
 

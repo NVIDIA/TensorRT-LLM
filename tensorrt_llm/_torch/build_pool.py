@@ -31,6 +31,11 @@ compilers run there too, so every op builds the same way.
   (:meth:`BuildPool.worth_a_worker`): ``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds (default 5), as
   measured so far in this process and its workers, or as the caller expects until one is measured.
   Shorter builds are made in this process.
+* A build that runs a kernel to compile it allocates the kernel's inputs on the rank's GPU. A
+  worker frees what a build allocated once the build ends, and starts a build only while the GPU's
+  free memory covers it beside the builds running, plus ``_MIN_FREE_GPU_BYTES``: how much a build
+  takes is the most a build of its kind took so far in a worker, and a kind not measured yet builds
+  one at a time. A build that does not fit with no other build running is left to the caller.
 * The workers start with ``subprocess`` in an environment of their own: without the launcher's
   MPI, PMIx and Slurm variables, since importing TensorRT-LLM initializes MPI, and with only this
   rank's GPU visible.
@@ -148,11 +153,13 @@ class Build(NamedTuple):
 class BuildResult(NamedTuple):
     """How a build ended: ``status`` ``"built"``, ``"present"`` (built before), ``"claimed"``
     (another rank's worker makes it), ``"failed"``, or ``"refused"`` (no worker took it: its
-    caller builds it); the seconds the worker took; the error of a failed build."""
+    caller builds it); the seconds the worker took; the error of a failed build; the most GPU
+    memory the build allocated at once, in bytes."""
 
     status: str
     seconds: float = 0.0
     error: str = ""
+    peak_bytes: int = 0
 
 
 class _Compiler(NamedTuple):
@@ -284,6 +291,25 @@ def _gpu_has_room() -> bool:
     return free >= _MIN_FREE_GPU_BYTES
 
 
+def _current_device() -> Optional[int]:
+    """This thread's GPU, or None when this process does not use CUDA."""
+    import torch
+
+    if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+        return None
+    return torch.cuda.current_device()
+
+
+def _free_gpu_bytes(device: Optional[int]) -> Optional[int]:
+    """The free memory of GPU ``device``, or None for no GPU."""
+    if device is None:
+        return None
+    import torch
+
+    free, _ = torch.cuda.mem_get_info(device)
+    return free
+
+
 def _default_workers() -> int:
     from .autotuner import _default_parallel_jit_warmup_threads
 
@@ -331,6 +357,8 @@ class BuildPool:
         self.min_build_s = float(os.environ.get(_MIN_BUILD_ENV, _MIN_BUILD_S))
         # family -> [builds measured, their seconds]
         self._build_times: Dict[str, List[float]] = {}
+        # family -> the most GPU memory a build of it allocated at once in a worker
+        self._peak_bytes: Dict[str, int] = {}
 
     @classmethod
     def get(cls) -> "BuildPool":
@@ -418,6 +446,22 @@ class BuildPool:
         measured = self._build_times.setdefault(family, [0, 0.0])
         measured[0] += 1
         measured[1] += seconds
+
+    def peak_bytes(self, family: Optional[str]) -> Optional[int]:
+        """The most GPU memory a build of ``family`` allocated at once in a worker so far, or
+        None before one is measured."""
+        if family is None:
+            return None
+        with self._lock:
+            return self._peak_bytes.get(family)
+
+    def record_peak(self, family: str, nbytes: int) -> None:
+        """Measure a build of ``family`` that allocated ``nbytes`` of GPU memory at once."""
+        with self._lock:
+            self._record_peak(family, nbytes)
+
+    def _record_peak(self, family: str, nbytes: int) -> None:
+        self._peak_bytes[family] = max(nbytes, self._peak_bytes.get(family, 0))
 
     # Builds.
 
@@ -565,6 +609,7 @@ class BuildPool:
                 self._build_s += result.seconds
                 if task.family is not None:
                     self._record_build(task.family, result.seconds)
+                    self._record_peak(task.family, result.peak_bytes)
         task.batch.settle(task.index, result)
 
     def _ensure_pool(self) -> Optional["_Pool"]:
@@ -656,6 +701,11 @@ class _Pool:
         self._stopping = False
         self._processes: List[subprocess.Popen] = []
         self._threads: List[threading.Thread] = []
+        # The rank's GPU, whose free memory the serving threads check before a build starts.
+        self._device = _current_device()
+        self._memory = threading.Condition()
+        # The builds running: their families and the memory they may take.
+        self._running: Dict[int, Tuple[Optional[str], int]] = {}
 
     def put(self, task: _Task) -> None:
         """Queue ``task``, starting a worker when none is idle and the cap and the GPU's free
@@ -678,6 +728,8 @@ class _Pool:
             self._stopping = True
             for _ in self._threads:
                 self.queue.put(None)
+        with self._memory:
+            self._memory.notify_all()
         deadline = time.monotonic() + timeout
         for thread in self._threads:
             thread.join(max(0.0, deadline - time.monotonic()))
@@ -743,6 +795,13 @@ class _Pool:
                     except OSError:
                         pass
                     return
+                if not self._admit(task):
+                    self._owner._settle(
+                        task, BuildResult(REFUSED, 0.0, "the GPU has no room for the build")
+                    )
+                    with self._lock:
+                        self._idle += 1
+                    continue
                 try:
                     _write(to_worker, task.message)
                     result = BuildResult(*_recv(from_worker))
@@ -753,14 +812,49 @@ class _Pool:
                             FAILED, 0.0, f"the worker process ended ({e!r}): {_tail(stderr)}"
                         ),
                     )
+                    self._release(task)
                     self._ended()
                     return
+                # The result records the memory the build took, before the builds waiting for
+                # room look again.
                 self._owner._settle(task, result)
+                self._release(task)
                 if result.status == FAILED and result.error.endswith(_WORKER_ENDS):
                     self._ended()
                     return
                 with self._lock:
                     self._idle += 1
+
+    def _admit(self, task: _Task) -> bool:
+        """Wait until the GPU has room for ``task`` beside the builds running, and count it
+        running; False when it has none with no other build running."""
+        with self._memory:
+            while not self._stopping:
+                free = _free_gpu_bytes(self._device)
+                if free is None:
+                    return True  # No GPU memory to keep.
+                need = self._owner.peak_bytes(task.family)
+                if (
+                    need is None
+                    and task.family is not None
+                    and any(family == task.family for family, _ in self._running.values())
+                ):
+                    fits = False  # A kind of build not measured yet builds one at a time.
+                else:
+                    taken = sum(nbytes for _, nbytes in self._running.values())
+                    fits = free - taken - (need or 0) >= _MIN_FREE_GPU_BYTES
+                if fits:
+                    self._running[id(task)] = (task.family, need or 0)
+                    return True
+                if not self._running:
+                    return False
+                self._memory.wait()
+            return False
+
+    def _release(self, task: _Task) -> None:
+        with self._memory:
+            self._running.pop(id(task), None)
+            self._memory.notify_all()
 
     def _ended(self) -> None:
         """A worker ended: with none left, refuse the builds still queued."""
@@ -843,7 +937,7 @@ def _worker_main(task_read: int, result_write: int) -> None:
                 result = _run(*message)
             ends = result[0] == FAILED and _cuda_context_broken()
             if ends:
-                result = (result[0], result[1], result[2] + _WORKER_ENDS)
+                result = (result[0], result[1], result[2] + _WORKER_ENDS, *result[3:])
             try:
                 _write(results, pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
             except BrokenPipeError:
@@ -902,10 +996,29 @@ def _run(function: str, args: tuple, claim: Optional[Claim]) -> tuple:
         if claim is not None:
             _jit_share._mark_failed(claim.failed, f"{type(e).__name__}: {e}")
         detail = traceback.format_exc()[-_STDERR_TAIL:]
-        return (FAILED, time.perf_counter() - t0, f"{type(e).__name__}: {e}\n{detail}")
+        seconds = time.perf_counter() - t0
+        return (FAILED, seconds, f"{type(e).__name__}: {e}\n{detail}", _release_gpu_memory())
+    seconds = time.perf_counter() - t0
+    peak = _release_gpu_memory()
     if claim is not None and not os.path.exists(claim.done):
         _touch(claim.done)
-    return (BUILT, time.perf_counter() - t0, "")
+    return (BUILT, seconds, "", peak)
+
+
+def _release_gpu_memory() -> int:
+    """In a worker process: free the GPU memory the build that just ended allocated, and return
+    the most it allocated at once (PyTorch's allocator; 0 for a build that did not use CUDA)."""
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_initialized():
+        return 0
+    try:
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    except Exception:  # noqa: BLE001 - a lost CUDA context ends the worker after its report
+        return 0
+    return int(peak)
 
 
 def _build_kernel(function: str, args: tuple, paths: _Paths) -> None:

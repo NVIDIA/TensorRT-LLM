@@ -46,6 +46,23 @@ class FromShapesRunner(RecordingRunner):
             f.write(f"{os.getpid()} {inputs[0].device.type} {inputs[0].shape[1]}\n")
 
 
+def allocate(nbytes: int) -> None:
+    """A build that allocates ``nbytes`` of GPU memory while it runs, as running a kernel at a
+    profile's shape does."""
+    import torch
+
+    torch.ones(nbytes, dtype=torch.uint8, device="cuda")
+    torch.cuda.synchronize()
+
+
+def record_reserved(path: str) -> None:
+    """A build that records the GPU memory its worker's allocator holds when it starts."""
+    import torch
+
+    with open(path, "w") as f:
+        f.write(str(torch.cuda.memory_reserved()))
+
+
 class PrebuiltRunner(TunableRunner):
     """A runner whose kernel ships prebuilt (as cuBLAS's): its build does nothing."""
 

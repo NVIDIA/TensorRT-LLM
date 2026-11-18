@@ -240,6 +240,58 @@ def test_a_worker_takes_only_builds_long_enough_to_repay_it(pool):
         assert pool.worth_a_worker("new") and not pool.unmeasured("other")
 
 
+_SPAN = f"{targets.__name__}:span"
+
+
+def _spans(paths):
+    """The (start, end) times of the builds that wrote ``paths``, in start order."""
+    return sorted(tuple(map(float, path.read_text().split())) for path in paths)
+
+
+def _overlap(spans):
+    return any(later[0] < earlier[1] for earlier, later in zip(spans, spans[1:]))
+
+
+@pytest.fixture
+def gpu(monkeypatch):
+    """The rank's GPU as the pool sees it: ``gpu["free"]`` bytes free."""
+    gpu = {"free": 0}
+    monkeypatch.setattr(build_pool, "_free_gpu_bytes", lambda device: gpu["free"])
+    return gpu
+
+
+def test_builds_that_do_not_fit_together_run_one_at_a_time(pool, gpu, tmp_path):
+    # Room for one 7 GiB build beside the 8 GiB the rank keeps free, not for two.
+    gpu["free"] = 20 << 30
+    pool.record_peak("large", 7 << 30)
+    paths = [tmp_path / f"s{i}" for i in range(2)]
+    with pool.pass_scope():
+        results = pool.build([Build(_SPAN, (str(path), 0.5), "large") for path in paths])
+    assert [result.status for result in results] == ["built", "built"]
+    assert not _overlap(_spans(paths))
+
+
+def test_a_build_that_does_not_fit_alone_is_left_to_the_caller(pool, gpu, tmp_path):
+    gpu["free"] = 10 << 30
+    pool.record_peak("huge", 4 << 30)
+    with pool.pass_scope():
+        [result] = pool.build([Build(_SPAN, (str(tmp_path / "s"), 0.0), "huge")])
+    assert result.status == "refused" and not (tmp_path / "s").exists()
+
+
+def test_a_kind_of_build_not_measured_yet_builds_one_at_a_time(pool, gpu, tmp_path):
+    gpu["free"] = 64 << 30
+    first = [tmp_path / f"s{i}" for i in range(2)]
+    a, b = str(tmp_path / "a"), str(tmp_path / "b")
+    with pool.pass_scope():
+        pool.build([Build(_SPAN, (str(path), 0.5), "new") for path in first])
+        assert not _overlap(_spans(first))
+        # Measured (no GPU memory here): its builds now run together, or neither ends.
+        results = pool.build([Build(_HOLD, (a, b, 60.0), "new"), Build(_HOLD, (b, a, 60.0), "new")])
+    assert [result.status for result in results] == ["built", "built"]
+    assert pool.peak_bytes("new") == 0
+
+
 def test_a_build_in_a_worker_measures_its_kind(pool, tmp_path):
     with pool.pass_scope():
         pool.build([Build(_RECORD, (str(tmp_path / "r"), 1), "recorded")])

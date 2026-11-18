@@ -189,12 +189,13 @@ class TuningConfig:
             memory-profiling warmup), tune mode builds the op's kernels on the rank's worker
             processes (``tensorrt_llm._torch.build_pool``), and profiles once they are built: every
             (profile, runner, tactic) the profiling times, through ``TunableRunner.build``,
-            on inputs of the profile's layout. For runners whose compiler cannot run on
-            several threads (CuTe DSL), which ``parallel_jit_warmup`` cannot take, and whose
-            builds are small: each worker allocates its build's inputs and outputs on the
-            rank's GPU, unless the runner compiles from shapes alone
+            on inputs of the profile's layout. A worker allocates its build's inputs and
+            outputs on the rank's GPU, and the pool starts a build only while the GPU has room
+            for it, unless the runner compiles from shapes alone
             (``TunableRunner.builds_from_shapes``), whose build gets meta tensors. The runners
-            and their tactics must pickle, and must not be collective.
+            and their tactics must pickle, and must not be collective. Without the workers,
+            the op builds as it would without ``build_in_workers`` (``parallel_jit_warmup``
+            included).
             The workers take a runner's builds only when they take long enough to repay a
             worker (``BuildPool.worth_a_worker``): until a runner's builds are measured, tune
             mode builds one of them itself, timed, unless ``build_seconds`` gives their time;
@@ -1744,29 +1745,11 @@ class AutoTuner:
         Returns False, before claiming any item, when the runners cannot go to a worker (they
         do not pickle) and when every runner's builds are too short for one
         (:meth:`_measure_build`), and the caller builds as without workers; the decision takes
-        the inputs of one profile, not of every profile. The items of a runner whose builds are
-        too short, and an item whose inputs cannot go to a worker, are left to the profiling.
+        no inputs when the runners' build times are measured or given (``build_seconds``), and
+        one profile's otherwise. The items of a runner whose builds are too short, and an item
+        whose inputs cannot go to a worker, are left to the profiling.
         """
-        pending = [p for p in profiles if is_pending(p)]
-        if not pending:
-            return True
-        # Runners that build from shapes get meta tensors in the workers: no values to send.
-        keep_values = not all(r.builds_from_shapes for r in runners)
-        kwarg_specs = {
-            k: _TensorSpec.of(v, keep_values)
-            for k, v in kwargs.items()
-        }
         pool = BuildPool.get()
-        if not all(pool.takes((runner, kwarg_specs)) for runner in runners):
-            logger.warning_once(
-                f"[Autotuner] {custom_op}: its runners do not go to worker "
-                "processes; its kernels build as it profiles.",
-                key=(custom_op, "builds_in_pool_refused"))
-            return False
-        prepares = [
-            "do_preparation" in inspect.signature(r.forward).parameters
-            for r in runners
-        ]
         # Each runner's builds are measured, and go to the workers, on their own: a runner
         # whose kernels ship prebuilt (cuBLAS) says nothing of a JIT runner's.
         families = [
@@ -1781,6 +1764,27 @@ class AutoTuner:
         unmeasured = [
             r for r in range(len(runners))
             if pool.unmeasured(families[r], expected_s)
+        ]
+        if not in_workers and not unmeasured:
+            return False
+        pending = [p for p in profiles if is_pending(p)]
+        if not pending:
+            return True
+        # Runners that build from shapes get meta tensors in the workers: no values to send.
+        keep_values = not all(r.builds_from_shapes for r in runners)
+        kwarg_specs = {
+            k: _TensorSpec.of(v, keep_values)
+            for k, v in kwargs.items()
+        }
+        if not all(pool.takes((runner, kwarg_specs)) for runner in runners):
+            logger.warning_once(
+                f"[Autotuner] {custom_op}: its runners do not go to worker "
+                "processes; its kernels build as it profiles.",
+                key=(custom_op, "builds_in_pool_refused"))
+            return False
+        prepares = [
+            "do_preparation" in inspect.signature(r.forward).parameters
+            for r in runners
         ]
         # An unmeasured runner builds a tactic of a profile here, timed. The ranks that share
         # the builds start at different profiles and tactics, so that they measure different

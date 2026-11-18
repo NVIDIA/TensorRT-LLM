@@ -3679,9 +3679,10 @@ def test_ranks_that_share_builds_measure_different_kernels(
 @pytest.mark.parametrize("build_s, in_workers", [(0.1, False), (30.0, True)],
                          ids=["short", "long"])
 def test_an_op_that_gives_its_build_time_is_not_measured(
-        tune_mode_workers, tmp_path, build_s, in_workers):
+        tune_mode_workers, tmp_path, monkeypatch, build_s, in_workers):
     """An op whose TuningConfig gives ``build_seconds`` builds nothing here to measure: the time
-    it gives decides whether the workers build every (profile, tactic)."""
+    it gives decides whether the workers build every (profile, tactic). Builds left to the op
+    cost it no inputs before its profiling."""
     import autotuner_worker_targets as targets
 
     tune_mode_workers.min_build_s = 5.0
@@ -3694,9 +3695,18 @@ def test_an_op_that_gives_its_build_time_is_not_measured(
         build_seconds=build_s,
     )
     x = torch.randn(4, 8, device="cuda")
+    made = []
+    tuning_tensors = AutoTuner._tuning_tensors
+
+    def record_inputs(self, profile, *args):
+        made.append(profile.get_opt_shapes())
+        return tuning_tensors(self, profile, *args)
+
+    monkeypatch.setattr(AutoTuner, "_tuning_tensors", record_inputs)
     with tune_mode_workers.pass_scope(), autotune():
         tuner.choose_one(f"test::expected_build_{build_s}", [runner], config,
                          [x])
+    assert len(made) == (3 if in_workers else 0)
     builders = {
         name: (tmp_path / name).read_text().split()
         for name in os.listdir(tmp_path)
@@ -3705,6 +3715,31 @@ def test_an_op_that_gives_its_build_time_is_not_measured(
     assert sorted(builders) == (sorted(f"m{m}-t{t}" for m in (1, 2, 4)
                                        for t in (0, 1)) if in_workers else [])
     tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_worker_frees_the_gpu_memory_of_a_build_once_it_ends(
+        tune_mode_workers, tmp_path):
+    """A build that runs a kernel to compile it allocates on the rank's GPU in the worker: the
+    worker frees that memory once the build ends, and the pool learns the most a build of the
+    kind allocated, to start the kind's builds only while the GPU has room for them."""
+    import autotuner_worker_targets as targets
+
+    from tensorrt_llm._torch.build_pool import Build
+
+    tune_mode_workers.max_workers = 1  # Both builds run in the same worker.
+    nbytes = 512 << 20
+    with tune_mode_workers.pass_scope():
+        [allocated] = tune_mode_workers.build(
+            [Build(f"{targets.__name__}:allocate", (nbytes, ), "allocate")])
+        [recorded] = tune_mode_workers.build([
+            Build(f"{targets.__name__}:record_reserved",
+                  (str(tmp_path / "reserved"), ), "record")
+        ])
+    assert (allocated.status, recorded.status) == ("built", "built")
+    assert allocated.peak_bytes >= nbytes
+    assert tune_mode_workers.peak_bytes("allocate") >= nbytes
+    assert int((tmp_path / "reserved").read_text()) < nbytes
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
