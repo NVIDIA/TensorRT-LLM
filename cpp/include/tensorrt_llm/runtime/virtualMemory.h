@@ -264,7 +264,24 @@ struct UnicastConfigurator : CUDAVirtualMemoryChunk::Configurator
     void setup(CUmemGenericAllocationHandle handle) override
     {
         TLLM_CU_CHECK(cuMemMap(mAddress, mSize, 0, handle, 0));
-        TLLM_CU_CHECK(cuMemSetAccess(mAddress, mSize, &mDesc, 1));
+        try
+        {
+            TLLM_CU_CHECK(cuMemSetAccess(mAddress, mSize, &mDesc, 1));
+        }
+        catch (...)
+        {
+            // setup() must not leak on failure, and teardown() is not called for a failed setup(), so unmap the
+            // range here. Log instead of TLLM_CU_CHECK_FREE_RESOURCE, which throws, so that the cuMemSetAccess
+            // error is the one that propagates.
+            if (CUresult const result = cuMemUnmap(mAddress, mSize); result != CUDA_SUCCESS)
+            {
+                TLLM_LOG_WARNING(
+                    "UnicastConfigurator: cuMemUnmap(0x%llx, %zu) failed with %d while undoing a failed "
+                    "cuMemSetAccess",
+                    static_cast<unsigned long long>(mAddress), mSize, result);
+            }
+            throw;
+        }
     }
 
     void teardown(CUmemGenericAllocationHandle, bool) override
