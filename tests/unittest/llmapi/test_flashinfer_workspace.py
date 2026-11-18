@@ -211,8 +211,7 @@ _ISOLATED_WORKER_ARGS = [
 @pytest.mark.parametrize(
     "n_workers, env_overrides, expected",
     [
-        (1, {}, _PLAIN_WORKER_ARGS),
-        (1, {_FLASHINFER_ISOLATION_ENV: "1"}, _PLAIN_WORKER_ARGS),
+        (1, {}, _ISOLATED_WORKER_ARGS),
         (4, {}, _ISOLATED_WORKER_ARGS),
         (4, {_FLASHINFER_ISOLATION_ENV: "0"}, _PLAIN_WORKER_ARGS),
         (

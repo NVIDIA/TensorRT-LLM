@@ -390,8 +390,9 @@ Python launcher.
 
 ### FlashInfer JIT workspaces for MPI workers
 
-`trtllm-llmapi-launch` ranks and dynamically spawned `MpiPoolSession` workers
-isolate FlashInfer JIT workspaces by default. Each process claims a locked,
+`trtllm-llmapi-launch` ranks and dynamically spawned `MpiPoolSession` workers,
+single-rank and single-GPU ones included, isolate FlashInfer JIT workspaces by
+default. Each process claims a locked,
 persistent cache slot under `~/.cache/tensorrt_llm/flashinfer` that holds its
 generated sources, compiled modules and downloaded FlashInfer artifacts, so
 concurrent MPI processes never write to each other's compiler inputs while JIT

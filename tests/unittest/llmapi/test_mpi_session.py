@@ -750,10 +750,14 @@ def _run_launcher_env(env: dict) -> subprocess.CompletedProcess:
 
 
 @pytest.mark.cpu_only
-def test_llmapi_launch_isolates_pmi_rank_without_size(tmp_path: Path) -> None:
+@pytest.mark.parametrize("pmi_rank", ["0", None])
+def test_llmapi_launch_isolates_single_rank(tmp_path: Path,
+                                            pmi_rank: str | None) -> None:
     home = tmp_path / "home"
     home.mkdir()
     env = _launcher_env(tmp_path, str(home))
+    if pmi_rank is None:
+        env.pop("PMI_RANK")
 
     result = _run_launcher_env(env)
 
