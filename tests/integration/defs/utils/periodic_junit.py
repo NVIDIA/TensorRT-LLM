@@ -87,8 +87,17 @@ class _PytestTimeoutEvidencePlugin:
         if attempt > 1:
             _emit_timeout_event(_TIMEOUT_ATTEMPT_MARKER, item, attempt)
 
+    def emit_timeout(self, item, timeout) -> None:
+        """Preserve exact attempt evidence for a custom timeout supervisor."""
+        _emit_timeout_event(_TIMEOUT_EVIDENCE_MARKER, item,
+                            self._attempts.get(item.nodeid, 1), timeout)
+
     @pytest.hookimpl(optionalhook=True, tryfirst=True)
     def pytest_timeout_set_timer(self, item, settings):
+        if (item.get_closest_marker("disagg_weight_loading") is not None
+                and item.config.pluginmanager.hasplugin(
+                    "disagg-weight-loading-timeout")):
+            return None
         import pytest_timeout
 
         timeout_method = settings.method
@@ -608,6 +617,11 @@ class PeriodicJUnitXML:
         if not self.dump_hang_traceback or self._hang_file is None:
             return
         self._cancel_hang_timer()  # never leave a stale timer armed
+        if (item.get_closest_marker("disagg_weight_loading") is not None
+                and item.config.pluginmanager.hasplugin(
+                    "disagg-weight-loading-timeout")):
+            # The phase supervisor dumps at the actual active-phase deadline.
+            return
         timeout = self._effective_timeout(item)
         if not timeout or timeout <= 0:
             return

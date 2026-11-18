@@ -43,6 +43,7 @@ from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
+from test_common.disagg_timeout import configure_weight_loading
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics,
                                             wait_for_perf_metrics_jsonl)
@@ -900,6 +901,16 @@ def setup_disagg_cluster(
                     gen_servers.get("pipeline_parallel_size", 1) *
                     gen_servers.get("context_parallel_size", 1))
 
+    context_environments = [(ctx_env or env or os.environ).copy()
+                            for _ in range(num_ctx_instances)]
+    generation_environments = [(gen_env or env or os.environ).copy()
+                               for _ in range(num_gen_instances)]
+    phase_limit = configure_weight_loading(
+        [(worker_env, gpus_per_ctx) for worker_env in context_environments] +
+        [(worker_env, gpus_per_gen) for worker_env in generation_environments])
+    if phase_limit is not None:
+        server_start_timeout = int(phase_limit)
+
     internal_request_auth_key = config.get(
         "internal_request_auth_key") or secrets.token_hex(32)
 
@@ -988,6 +999,8 @@ def setup_disagg_cluster(
         if schedule_style:
             server_config["schedule_style"] = schedule_style
         server_launch_kwargs = dict(save_log=save_log, env=server_env, cwd=cwd)
+        if phase_limit is not None:
+            server_launch_kwargs["server_start_timeout"] = server_start_timeout
         if report_addr is not None:
             # The workers register with the server, so a server on a
             # kernel-assigned port starts first and they get the port it
@@ -1023,7 +1036,7 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=ctx_env or env,
+                               env=context_environments[i],
                                save_log=save_log,
                                worker_index=i)
             ctx_workers.append(w)
@@ -1044,7 +1057,7 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=gen_env or env,
+                               env=generation_environments[i],
                                save_log=save_log,
                                worker_index=i)
             gen_workers.append(w)
@@ -3354,6 +3367,7 @@ def _deepseek_v41_handoff(metrics_dir: str, transfer_dir: str,
 @skip_pre_blackwell
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("model_path", ['DeepSeek-V4.1-Flash-NVFP4'])
+@pytest.mark.disagg_weight_loading(7200)
 def test_disaggregated_deepseek_v41_gsm8k_ctxtp4_gentp4(llm_venv, model_path,
                                                         tmp_path) -> None:
     """Check GSM8K accuracy, DSpark AL, and NIXL handoff on TP4/EP4 workers."""
@@ -3364,6 +3378,7 @@ def test_disaggregated_deepseek_v41_gsm8k_ctxtp4_gentp4(llm_venv, model_path,
 @skip_pre_blackwell
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("model_path", ['DeepSeek-V4.1-Flash-NVFP4'])
+@pytest.mark.disagg_weight_loading(7200)
 def test_disaggregated_deepseek_v41_gsm8k_ctxdp4_gendp4(llm_venv, model_path,
                                                         tmp_path) -> None:
     """Check GSM8K accuracy, DSpark AL, and NIXL handoff on attention DP4/EP4 workers."""
@@ -4701,6 +4716,8 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
 @skip_pre_blackwell
 @pytest.mark.parametrize("model_path",
                          ['NVIDIA-Nemotron-3-Super-120B-A12B-FP8'])
+@pytest.mark.disagg_weight_loading(1800)
+@pytest.mark.timeout(3600)
 def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
                                                    llm_venv, model_path,
                                                    benchmark_root,

@@ -39,6 +39,7 @@ import requests
 import yaml
 from datasets import load_dataset
 from defs.common import wait_for_reported_addr
+from test_common.disagg_timeout import configure_weight_loading
 
 from tensorrt_llm.evaluate import LongBenchV2 as LongBenchV2Evaluator
 from tensorrt_llm.executor.result import GenerationResultBase
@@ -468,6 +469,14 @@ def launch_disaggregated_llm(
                 f"--max_num_tokens={gen_server_config['max_num_tokens']}")
 
         gen_servers.append((env, gen_server_args))
+
+    phase_limit = configure_weight_loading([(worker_env, ctx_total_gpus)
+                                            for worker_env, _ in ctx_servers] +
+                                           [(worker_env, gen_total_gpus)
+                                            for worker_env, _ in gen_servers])
+    if phase_limit is not None:
+        # The phase watchdog enforces the tighter, dynamically switched budget.
+        server_waiting_timeout = int(phase_limit)
 
     worker_log_paths = []
     capture_worker_logs = bool(assert_worker_log_contains
@@ -2276,6 +2285,7 @@ class TestGPTOSS20B(LlmapiAccuracyTestHarness):
 
 @pytest.mark.timeout(10800)
 @skip_pre_blackwell
+@pytest.mark.disagg_weight_loading(7200)
 class TestKimiK25(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2.5"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
@@ -2672,6 +2682,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
                              ids=["cache_mgr_v2"])
+    @pytest.mark.disagg_weight_loading(7200)
     def test_nvfp4_nixl(self, use_kv_cache_manager_v2):
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.7,
@@ -3143,6 +3154,7 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
 @pytest.mark.timeout(14400)
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(140000)
+@pytest.mark.disagg_weight_loading(7200)
 class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash-Base"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash-Base"
