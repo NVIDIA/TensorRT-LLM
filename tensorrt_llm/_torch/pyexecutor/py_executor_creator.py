@@ -465,11 +465,8 @@ def _branch_snapshot_ctx_chunk_config(
     return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
 
 
-def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
-                           is_generation: bool) -> None:
+def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
     """Reject the settings a non-generation model cannot run with; warn on those it ignores."""
-    if is_generation:
-        return
     if mapping.has_pp():
         raise ValueError(
             "Pipeline parallelism is not supported for non-generation models "
@@ -488,7 +485,7 @@ def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
 def _check_scheduled_encoder_support(llm_args: TorchLlmArgs,
                                      mapping: Mapping) -> None:
     """Reject the settings ScheduledEncoderExecutor cannot serve a non-generation model with."""
-    _check_no_kv_execution(llm_args, mapping, is_generation=False)
+    _check_no_kv_execution(llm_args, mapping)
     if mapping.cp_size > 1:
         raise ValueError(
             "Context parallelism is not supported for non-generation models; "
@@ -788,7 +785,6 @@ def _create_py_executor(
     guided_decoding_config = get_guided_decoding_config(
         llm_args.guided_decoding_backend, tokenizer)
 
-    mm_encoder_only = llm_args.mm_encoder_only
     enable_chunked_context = llm_args.enable_chunked_prefill
 
     (
@@ -849,16 +845,6 @@ def _create_py_executor(
         spec_config,
         llm_args.disable_overlap_scheduler,
         sparse_attention_config=llm_args.sparse_attention_config)
-
-    if mm_encoder_only:
-        llm_args.mm_encoder_only = True
-        llm_args.disable_overlap_scheduler = True
-
-        # Disable overlap scheduler for multimodal encoder-only mode
-        logger.warning(
-            "Disabling overlap scheduler for multimodal encoder-only mode. "
-            "The overlap scheduler is designed for generation models and is not needed "
-            "when only processing vision encoder inputs.")
 
     _rank_dspark_on_host_without_overlap(spec_config,
                                          llm_args.disable_overlap_scheduler)
@@ -1055,12 +1041,6 @@ def _create_py_executor(
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
-
-    is_generation = model_engine.model.model_config.is_generation
-    _check_no_kv_execution(llm_args, mapping, is_generation)
-    if not is_generation:
-        enable_chunked_context = False
-        model_engine.attn_runtime_features.chunked_prefill = False
 
     # Model loading can disable reuse after runtime features were created.
     model_engine.attn_runtime_features.cache_reuse = (
@@ -1277,7 +1257,6 @@ def _create_py_executor(
             mapping,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
-            mm_encoder_only=mm_encoder_only,
             speculative_config=spec_config,
             max_num_sequences=max_num_seq_slots,
         )

@@ -34,12 +34,7 @@ def _args():
 )
 def test_non_generation_models_reject_unsupported_loops(mapping, error):
     with pytest.raises(ValueError, match=error):
-        _check_no_kv_execution(_args(), Mapping(**mapping), is_generation=False)
-
-
-@pytest.mark.parametrize("mapping", [_PP2, _ADP], ids=["pp", "adp"])
-def test_generation_models_are_not_checked(mapping):
-    _check_no_kv_execution(_args(), Mapping(**mapping), is_generation=True)
+        _check_no_kv_execution(_args(), Mapping(**mapping))
 
 
 def _encoder_args(**overrides):

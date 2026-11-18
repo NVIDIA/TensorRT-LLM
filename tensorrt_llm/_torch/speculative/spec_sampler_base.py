@@ -194,9 +194,6 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
     SampleState = SampleStateSpec
 
-    def is_generation_model(self) -> bool:
-        return True
-
     def validate_request(self, request: LlmRequest) -> None:
         """Reject sampling parameters the one-model speculative path cannot honor.
 
