@@ -876,6 +876,48 @@ def test_prefill_capture_skips_break_graphs_without_graphable_breaks(
     assert captured == ([16] if graphable_breaks else [])
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("peers_agree", [False, True])
+def test_prefill_capture_gates_are_agreed_across_ranks(peers_agree: bool) -> None:
+    """Each bucket is captured, and its break graphs too, on all ranks or none, so the
+    ranks keep the same buckets and the prefill graph vote picks one for all of them."""
+    dummy_requests = MagicMock()
+    dummy_requests.release_batch_context.return_value.__enter__.return_value = object()
+    graphs = decoder_graphs(
+        decoder_config(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_cuda_graph_num_tokens=[16],
+            max_num_tokens=256,
+        ),
+        dummy_requests=dummy_requests,
+    )
+    graphs._metadata.attn_metadata.decoder_replay_plan = None
+    runner = Mock(metrics={}, num_break_graphs=0)
+    runner.capture.side_effect = lambda num_tokens, forward, scope, can_capture: can_capture()
+    runner.has_graphable_breaks.return_value = True
+    graphs.breakable_cuda_graph_runner = runner
+    graphs._metrics = collections.defaultdict(float)
+    local_flags = []
+
+    def agree_flag(flag: bool) -> bool:
+        # Stand-in for the all-gather: a peer answers peers_agree.
+        local_flags.append(flag)
+        return flag and peers_agree
+
+    with (
+        patch.object(graphs._agreement, "agree_flag", side_effect=agree_flag),
+        patch.object(graphs, "_capture_break_graphs") as capture_break_graphs,
+        patch("torch.cuda.mem_get_info", return_value=(0, 0)),
+        patch("torch.cuda.synchronize"),
+    ):
+        graphs._capture_prefill_cuda_graphs(ResourceManager({}))
+
+    # Capture, then break graphs: this rank says yes to both, and its peer decides.
+    assert local_flags == [True, True]
+    assert capture_break_graphs.call_count == int(peers_agree)
+
+
+
 class _SplitMetadata:
     """resolve_mamba_metadata_cls stand-in: records whether a warmup forward ran under the split knob."""
 
