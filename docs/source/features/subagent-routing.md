@@ -31,7 +31,10 @@ workers. A combined disaggregated launch propagates this key to its workers;
 independently launched workers need it in their own configuration. Forwarding
 sub-agent affinity requires this key, even while KV-transfer authentication still
 permits a missing key with a transitional warning. The edge rejects an affinity
-configuration without an internal key at startup.
+configuration without an internal key at startup. Context and generation workers
+that use the Python cache transceiver (the default) require a key of at least
+16 bytes and fail at startup with a shorter one; see the
+[disaggregated serving examples](source:examples/disaggregated/README.md).
 
 Workers may omit `--server_role`: when no role is configured, affinity
 validation infers context or generation from `disaggregated_params.request_type`.

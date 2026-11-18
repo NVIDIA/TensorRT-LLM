@@ -187,7 +187,7 @@ trtllm-serve <model_path_or_hf_id> --host 0.0.0.0 --port 8002 --config ${TRTLLM_
 trtllm-serve disaggregated -c disagg_config.yaml
 ```
 
-Clients then send OpenAI-compatible requests to the orchestrator on port `8000`. To restrict the worker endpoints to requests coming from the orchestrator, set the same `internal_request_auth_key` value in both worker configs and in the orchestrator config. For the full walkthrough, per-worker GPU placement, and multi-node or SLURM launch, see the [Disaggregated Serving guide](../features/disagg-serving.md).
+Clients then send OpenAI-compatible requests to the orchestrator on port `8000`. To restrict the worker endpoints to requests coming from the orchestrator, set the same `internal_request_auth_key` value in both worker configs and in the orchestrator config. These worker configs use the Python cache transceiver, which requires a key of at least 16 bytes and fails at startup with a shorter one. For the full walkthrough, per-worker GPU placement, and multi-node or SLURM launch, see the [Disaggregated Serving guide](../features/disagg-serving.md).
 
 ### Image-Language Serving
 
