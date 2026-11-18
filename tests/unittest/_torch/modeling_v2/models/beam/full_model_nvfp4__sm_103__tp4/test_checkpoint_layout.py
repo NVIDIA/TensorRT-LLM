@@ -528,11 +528,14 @@ def _sm103() -> bool:
 
 
 @pytest.mark.skipif(not _sm103(), reason="the component is built for sm_103")
-def test_mapping_rejections_and_weight_state_guard() -> None:
+def test_mapping_rejections_and_weight_state_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm._torch.modeling_v2.models.beam._tp4.component_bf16 import (  # noqa: E501
         BeamCheckpointLayoutBf16Sm103Tp4,
     )
     from tensorrt_llm.mapping import Mapping
+
+    # This single-GPU test checks rank-local state, not inter-rank communication.
+    monkeypatch.setattr(BeamCheckpointLayoutBf16Sm103Tp4, "_init_collectives", lambda self: None)
 
     cfg = model_config()
     for bad in (
