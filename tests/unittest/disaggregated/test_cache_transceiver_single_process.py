@@ -65,6 +65,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
@@ -1941,7 +1942,7 @@ def _offload_lifecycle_executor(
     executor._pending_response_terminations = []
     executor._prefetched_request_ids = set()
     executor._disagg_pp_termination_handler = None
-    executor.result_wait_queues = {}
+    executor._response_channel = ResponseChannel()
     executor.gather_all_responses = False
     executor.enable_attention_dp = False
     # PP=1 with eager reuse: terminate the sequence after its response, while
