@@ -328,7 +328,9 @@ from each rank's vocab shard of the target logits instead of gathering them:
 
 `TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=0` keeps the greedy selection on the
 shards but samples temperature-only batches from the gathered logits again;
-`TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0` gathers the logits for both.
+`TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0` gathers the logits for both, except on models
+that take the speculative fast paths (`spec_decode_fast_paths`), whose workers keep
+selecting their greedy and temperature-only target tokens from the shards.
 
 ## Beam search
 

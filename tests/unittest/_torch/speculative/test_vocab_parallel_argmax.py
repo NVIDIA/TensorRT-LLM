@@ -875,6 +875,12 @@ def test_sharded_temperature_draws_follow_softmax(tp, temperature):
     probs = torch.softmax(logits.double() / temperature, dim=-1)
     stat, crit = chi_square(counts.cpu(), probs.cpu())
     assert stat < crit, (stat, crit)
+    # The test rejects a wrong sampler even where no token reaches 5 expected
+    # draws: one draw per token expected from the uniform distribution, all on one token.
+    one_token = torch.zeros(vocab, dtype=torch.int64)
+    one_token[0] = vocab
+    stat, crit = chi_square(one_token, torch.full((vocab,), 1.0 / vocab, dtype=torch.float64))
+    assert stat > crit, (stat, crit)
     total = rows * steps
     tv = 0.5 * float((counts.cpu().double() / total - probs.cpu()).abs().sum())
     # E|count_i / n - p_i| <= sqrt(p_i (1 - p_i) / n), so E[TV] <= bound.
