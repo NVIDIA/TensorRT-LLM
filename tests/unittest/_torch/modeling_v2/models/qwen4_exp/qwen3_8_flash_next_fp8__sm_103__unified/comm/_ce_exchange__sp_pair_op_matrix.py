@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Certification matrix for the FP8 target's `ce_exchange__sp_pair` copy-engine exchange at the
 tep2 / tp2 pair under mpirun: setup failing on one rank yields None on both, then eager exchanges
-and graph replays with new inputs, byte-exact.
+and graph replays with new inputs, byte-exact, then the gather (`begin_gather` / `put_gather` /
+`end_gather`, the MoE block's codes and routing rows) eagerly and replayed from a graph between
+plain exchanges: both ranks' rows in rank order.
 Run as `CUDA_VISIBLE_DEVICES=0,1 python _ce_exchange__sp_pair_op_matrix.py --world-size 2`."""
 
 import argparse
@@ -113,6 +115,91 @@ def _worker() -> None:
             want = torch.empty_like(xs[k])
             fill(want, peer, 100 + rep * CHAIN + k)
             assert torch.equal(outs[k], want), f"rank {rank}: replay {rep} exchange {k} differs"
+    comm.Barrier()
+
+    # check_gather: `begin_gather` / `put_gather` / `end_gather` as `PrefillTarget._moe_ce_gather`
+    # calls them (e4m3 codes as bf16 pairs, then the 70-wide routing rows), between plain
+    # exchanges: each receive buffer holds both ranks' rows in rank order, an all-gather's bytes.
+    def gather_ce(mine):
+        # mine: this rank's tensors, each put at its region (rows in rank order) after the last
+        offsets, at = [], 0
+        for t in mine:
+            nbytes = t.numel() * t.element_size()
+            offsets.append(at)
+            at += -(-(2 * nbytes) // 256) * 256
+        ce.begin_gather()
+        for t, off in zip(mine, offsets):
+            ce.put_gather(t.view(torch.uint8), off + rank * t.numel() * t.element_size())
+        ce.end_gather()
+        views = []
+        for t, off in zip(mine, offsets):
+            nbytes = t.numel() * t.element_size()
+            v = ce.received(off, 2 * nbytes).view(t.dtype).view(2 * t.shape[0], *t.shape[1:])
+            v[rank * t.shape[0] : (rank + 1) * t.shape[0]].copy_(t)
+            views.append(v)
+        return views
+
+    def gathered(t, it):
+        # both ranks' `fill(t, r, it)` in rank order
+        whole = torch.empty(2 * t.shape[0], *t.shape[1:], dtype=t.dtype, device=dev)
+        for r in range(2):
+            fill(whole[r * t.shape[0] : (r + 1) * t.shape[0]], r, it)
+        return whole
+
+    for it in range(8):
+        rows = (4096, 77, 1024, 2048)[it % 4]
+        a = torch.empty(rows, HIDDEN // 2, dtype=torch.bfloat16, device=dev)
+        b = torch.empty(rows, 70, dtype=torch.bfloat16, device=dev)
+        fill(a, rank, 500 + it)
+        fill(b, rank, 600 + it)
+        got = [v.clone() for v in gather_ce([a, b])]
+        want = [gathered(a, 500 + it), gathered(b, 600 + it)]
+        torch.cuda.synchronize()
+        for g, w in zip(got, want):
+            assert torch.equal(g, w), f"rank {rank}: eager gather {it} differs"
+        # a plain exchange between gathers
+        y = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
+        fill(y, rank, 700 + it)
+        got = ce.exchange(y).clone()
+        want = torch.empty_like(y)
+        fill(want, peer, 700 + it)
+        torch.cuda.synchronize()
+        assert torch.equal(got, want), f"rank {rank}: exchange after gather {it} differs"
+    comm.Barrier()
+    ga = torch.empty(4096, HIDDEN // 2, dtype=torch.bfloat16, device=dev)
+    gb = torch.empty(4096, 70, dtype=torch.bfloat16, device=dev)
+    gx = torch.empty(4096, HIDDEN, dtype=torch.bfloat16, device=dev)
+    gouts = [
+        torch.empty(8192, HIDDEN // 2, dtype=torch.bfloat16, device=dev),
+        torch.empty(8192, 70, dtype=torch.bfloat16, device=dev),
+        torch.empty_like(gx),
+    ]
+
+    def gather_body():
+        va, vb = gather_ce([ga, gb])
+        gouts[0].copy_(va)
+        gouts[1].copy_(vb)
+        gouts[2].copy_(ce.exchange(gx))
+
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        gather_body()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    gather_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gather_graph):
+        gather_body()
+    for rep in range(20):
+        fill(ga, rank, 800 + rep)
+        fill(gb, rank, 900 + rep)
+        fill(gx, rank, 1000 + rep)
+        gather_graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(gouts[0], gathered(ga, 800 + rep)), f"rank {rank}: graph gather {rep}"
+        assert torch.equal(gouts[1], gathered(gb, 900 + rep)), f"rank {rank}: graph gather {rep}"
+        want = torch.empty_like(gx)
+        fill(want, peer, 1000 + rep)
+        assert torch.equal(gouts[2], want), f"rank {rank}: graph exchange after gather {rep}"
     comm.Barrier()
 
     if rank == 0:
