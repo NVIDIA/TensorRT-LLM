@@ -138,7 +138,7 @@ TEST(KvCacheManagerV2GpuChunkSizeTest, EnvRaisesOnlyTheLargestChunk)
 
 TEST_F(KvCacheManagerV2VirtMemTest, ChunkSizeAtPicksTheLargestAlignedChunkThatFits)
 {
-    PooledPhysMemAllocator allocator(2 * kMiB, 20 * kMiB); // rounded down to 16 MiB
+    PooledPhysMemAllocator allocator(2 * kMiB, 1, 20 * kMiB); // rounded down to 16 MiB
     EXPECT_EQ(allocator.maxChunkSize(), 16 * kMiB);
     EXPECT_EQ(allocator.chunkSizeAt(0, 64 * kMiB), 16 * kMiB);
     EXPECT_EQ(allocator.chunkSizeAt(0, 6 * kMiB), 4 * kMiB);
@@ -154,7 +154,7 @@ TEST_F(KvCacheManagerV2VirtMemTest, ChunkSizeAtPicksTheLargestAlignedChunkThatFi
 //! above the new end, and the usable size is always what was asked for.
 TEST_F(KvCacheManagerV2VirtMemTest, MapsMixedChunksAndShrinksByWholeChunks)
 {
-    PooledPhysMemAllocator allocator(2 * kMiB, 16 * kMiB);
+    PooledPhysMemAllocator allocator(2 * kMiB, 1, 16 * kMiB);
     VirtMem vm(64 * kMiB, allocator);
 
     vm.realloc(38 * kMiB);

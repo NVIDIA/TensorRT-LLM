@@ -421,8 +421,9 @@ how its package is built; which leaves it holds is the catalog's job.
 Everything CUTLASS lives in this package. `fused_moe_cutlass.py` above it
 defines the family name `CutlassFusedMoE` (the abstract `CutlassFusedMoEBase`,
 parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
-Every leaf but the Triton FP8 block-scale one runs the single
-`torch.ops.trtllm.fused_moe` call in `base.py` (`_run_fused_moe_op`), and only
+Every leaf but the two Triton FP8 block-scale ones runs the single
+`torch.ops.trtllm.fused_moe` call in `base.py` (`_run_fused_moe_op`); the SM90
+one runs it above its row threshold. Only
 the `none` and `fp8` leaves mix in routed-expert LoRA (`CutlassMoeLoraMixin`),
 the two the op can fuse it for. Most formats differ from the base only in how
 they quantize the input: a static per-tensor e4m3 one for `fp8` and
@@ -437,18 +438,28 @@ to 128 at construction, and `run_moe` pads the activation to match.
   copies `scheduler_kind`, `capabilities` and `input_requirement` off the
   descriptor, so the contract has one source, and nothing in the base branches
   on `quant_config`.
-- **FP8 block scales splits by SM.** Its two leaves carry the providers and
+- **FP8 block scales splits by SM.** Its three leaves carry the providers and
   techniques of the kernels they run: on SM90
   `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales`, where
-  `CutlassMoeFCRunner` hands FC1/FC2 to the vendored DeepGEMM; on SM120/121,
+  `CutlassMoeFCRunner` hands FC1/FC2 to the vendored DeepGEMM; also on SM90,
+  opt-in (`TLLM_MOE_ENABLE_SM90_TRITON_FP8_DECODE=1`, else it declines with
+  `PATH_NOT_ENABLED`), `trtllm.triton.fp8_act_grouped_gemm.fp8_block_scales`
+  (`fp8_block_scales_hopper_triton.py`), a subclass of the DeepGEMM leaf for
+  SwiGLU without expert bias. Its `run_moe` runs Triton FP8-activation GEMMs
+  (`run_triton_fp8_block_scale_moe_fp8_act`) when it receives at most
+  `TRITON_FP8_ACT_MAX_TOKENS` rows after dispatch, no `moe_output` buffer (so
+  never under NVLinkOneSided), BF16 input and a clamp uniform across experts
+  (`_takes_triton_path`), and the parent's fused op otherwise; on SM120/121,
   with BF16 activations, `trtllm.triton.grouped_gemm.fp8_block_scales`, a Triton
   grouped GEMM that never enters C++ (`issues_fused_moe_op = False`, so no build
   gate) and runs SwiGLU/GeGLU only, with no expert bias and no activation
-  constant but a uniform pre-SiLU SwiGLU clamp. Both stay in the family because
-  the `CUTLASS` literal serves FP8 block scales on SM90 and SM120/121.
+  constant but a uniform pre-SiLU SwiGLU clamp. All stay in the family because
+  the `CUTLASS` literal serves FP8 block scales on SM90 and SM120/121. The two
+  SM90 leaves overlap: the opt-in Triton FP8-activation leaf ranks first and
+  declines unless its `opt_in_flag` is set.
   `find_cutlass_leaf(quant_algo, *, sm=None)` (and `cutlass_leaf`, which
   raises instead of returning `None`) is a lookup, not an eligibility check, and
-  reads the SM only to choose between those two.
+  reads the SM, and a leaf's `opt_in_flag`, only to choose among those leaves.
 
 ### TRTLLM-Gen leaves (`fused_moe/trtllm_gen/`)
 
@@ -608,7 +619,10 @@ impl_cls = impl_class_for(report)      # raises, with the full trail, if nothing
 
 `MoeConfig` has two user-facing selectors. `backend` names a family; `tactic`
 pins an identity, full or partial (`cutedsl.grouped_gemm`), and is refused next
-to any `backend` other than `AUTO`. Validation is split in two. Parsing a
+to any `backend` other than `AUTO`. A selection is either a pin (a tactic) or
+auto (neither set); `backend` literals other than `AUTO` are planned for
+deprecation (see [Pin or auto](#pin-or-auto-what-a-selection-promises)).
+Validation is split in two. Parsing a
 config refuses what the registry would refuse for any checkpoint (a malformed
 or unknown segment, a field set twice, only `*`, no registered id matching),
 and under per-layer dynamic EPLB a tactic none of whose matches declares
@@ -842,14 +856,85 @@ Add a member to `MoEDep` or `MoEEnvFlag` and a probe function to the table in
 there cannot be read during selection, which is what keeps the environment an
 explicit input instead of a growing set of implicit ones.
 
-### Degradation is allowed, silence is not
+### Pin or auto: what a selection promises
 
-`moe_backend` is a **preference, not a pin**. A requested backend that cannot
-serve the layer is turned down and a substitute runs — production depends on
-this, because an unquantized MTP draft layer in a MIXED_PRECISION checkpoint
-must not take down a model whose other layers are NVFP4.
+A MoE selection is a pin or auto, and the two make opposite promises. A
+`moe_backend` literal is a legacy third kind (below).
 
-What is not allowed is doing it quietly. Every resolution returns a
+- **Pin** (`moe_config.tactic`, `speculative_config.moe_tactic`): the user's
+  choice is honoured exactly. Each layer runs one of the implementations the
+  tactic names, or the model fails to build with every candidate's reason.
+  Nothing is substituted, because running another implementation would answer
+  a question the user did not ask. A tactic whose implementations do not run on
+  the GPU, or decline the layer, is a configuration error to fix, not something
+  to route around. The exception is a layer that model code re-points and
+  warns the tactic does not apply to: Qwen3-Next's excluded (bf16) target
+  expert layers run on CUTLASS, and MuseSpark Open's on the model's literal
+  (see Backend Selection).
+- **Auto** (no tactic, `backend` left at `AUTO`): the code chooses. The goal
+  is that auto always ends on an implementation that runs, because production
+  depends on it: an unquantized MTP draft layer in a MIXED_PRECISION checkpoint
+  must not take down a model whose other layers are NVFP4. The code does not
+  meet that goal yet. `ModelConfig.resolve_moe_backend` turns `AUTO` into one
+  backend literal from the architecture, format and SM, and each layer is then
+  resolved as that literal is: its family first, then `FALLBACK_IMPLS` (the
+  CUTLASS leaves). That falls short in two ways:
+  - The fallback is the CUTLASS leaves alone, and an `AUTO` that resolves to
+    `CUTLASS` has none. A layer that the preferred family and the CUTLASS
+    leaves both decline fails to build, even when another family could serve
+    it. Under per-layer dynamic EPLB, for example, `AUTO` means
+    `MEGAMOE_CUTEDSL` (`auto_moe_backend_for_load_balancer`) and every CUTLASS
+    leaf is turned down as `EPLB_UNSUPPORTED`, so a layer MegaMoE CuteDSL does
+    not serve has nothing to fall back to.
+  - Model code is built for the resolved literal before any layer is resolved
+    and still branches on it: the gate's bias dtype and the routing output
+    dtype, the post-MoE finalize fusion, and TRTLLM-Gen weight preloading. A
+    layer that degrades to a CUTLASS leaf runs under model code built for
+    another family. `resolve_moe_impl` refuses that mismatch for a tactic, but
+    on the auto path it only logs the degradation warning. The preferences in
+    `resolve_moe_backend` do not check that their family runs on the GPU
+    (Kimi K3 resolves to `TRTLLM` on every SM), so on a GPU outside the
+    family's SM range every MoE layer takes this path.
+
+A `moe_backend` literal other than `AUTO` and `VANILLA` (see below) is
+neither. It reads like a choice, but when its family cannot serve a layer it
+degrades to the CUTLASS leaves, so a user who asked for `TRTLLM` can get
+CUTLASS with only a warning. That is a
+legacy behavior, not a design to extend: the literals are planned for
+deprecation in favour of tactics, `MoEImplRequest.fallback` exists only for
+them and for auto, and new request kinds leave it empty, so that what is
+configured is what runs.
+
+Tests that pin a tactic keep its promise and do not rely on a fallback
+(`tests/test_common/moe_tactics.py`):
+
+- A case whose tactic names implementations of the SM100 family only
+  (`SM100F_ONLY_MOE_TACTICS`, which a CPU test checks against their
+  `can_implement`) runs only on that family. Elsewhere it skips when its name
+  or id names the implementation, or when a cutlass case covers those GPUs, and
+  otherwise runs CUTLASS (`sm100f_moe_tactic_or_cutlass`). FP8 block-scale
+  experts set no tactic there instead (`sm100f_moe_tactic_or_auto`): their SM90
+  and SM120/121 leaves are in the CUTLASS family, but `cutlass` names neither.
+  The helpers gate no other tactic, so a case pinning one gates itself (the
+  `b12x` cases carry `skip_no_sm120`).
+- A tactic reaches the target only, so a case whose draft has to stay on the
+  target's implementation pins it as well (`speculative_config.moe_tactic`),
+  for the draft's own format: bf16 MTP layers under a `trtllm_gen` target pin
+  `trtllm_gen`, and FP8 block-scale MTP layers pin
+  `fp8_block_scales_moe_tactic()`. A draft stays unpinned when the target's
+  tactic cannot serve its experts on the case's GPUs (the CuTe DSL grouped GEMM
+  runs bf16 on SM107 only).
+- A deployment that a modeling_v2 target serves keeps its backend literal
+  unless the target honors the tactic (`moe_impls_honored`) and, when its draft
+  has to stay on the target's implementation, a draft tactic as well
+  (`draft_moe_impls_honored`). Under the default `modeling_v2='auto'` an
+  unhonored tactic makes the target decline and the built-in model run, so the
+  case would still pass without covering the target. A draft left unpinned
+  under a target tactic resolves `AUTO` for its own weights instead of following
+  the target (CUTLASS for the MTP layers of the GLM-5.2 SM107 low-latency
+  target).
+
+What is never allowed is substituting quietly. Every resolution returns a
 `MoEResolutionReport` naming the winner, every rejected candidate, its
 `MoERejectReason`, and the environment fingerprint; a degradation additionally
 logs a warning once per layer. `report.degraded_from` is the answer to "why did
@@ -871,8 +956,8 @@ something to route around. Nothing being able to serve the layer is the opposite
 rejection recorded, and `impl_class_for` is what raises. Catch the first, read
 the second.
 
-`NO_FALLBACK_BACKENDS` is the one exception to "degradation is allowed", and
-`VANILLA` is its only member. Vanilla exists to produce reference numerics, so a
+`NO_FALLBACK_BACKENDS` lists the literals that never degrade, and `VANILLA`
+is its only member. Vanilla exists to produce reference numerics, so a
 caller comparing a kernel against it is not helped by getting Cutlass back with a
 warning — that silently answers a different question than the one asked. A
 `VANILLA` request whose gates reject therefore takes the `winner is None` path and
@@ -1175,7 +1260,7 @@ set wrong has a test that catches it:
   other backend abstains).
 - Dropping the gate un-skips the `test_configurable_moe_single_gpu` gpt-oss ×
   CUTLASS matrix, which then fails inside weight loading.
-- Leaving out the unquantized leaf rejects `test_gpt_oss_trtllmgen[CUTLASS]`.
+- Leaving out the unquantized leaf rejects `test_gpt_oss_trtllmgen[cutlass]`.
 - Excluding NVFP4 as "gpt-oss bias" rejects `TestMiniMaxM3::test_nvfp4`.
 
 ### Scheduler / EPLB Constraints
@@ -1348,7 +1433,8 @@ as `<Provider><Technique><Quant>Impl`. The kernel segment enters when two ids
 differ in that segment alone: the class that would otherwise collide spells it
 out between technique and quant, in id order
 (`DeepgemmCudaHopperFp8BlockScalesImpl` next to
-`DeepgemmCudaFp8BlockScalesImpl`). The `trtllm.cutedsl.*.nvfp4` ids
+`DeepgemmCudaFp8BlockScalesImpl`, `TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl`
+next to `TrtllmTritonFp8BlockScalesImpl`). The `trtllm.cutedsl.*.nvfp4` ids
 (`mega_moe`, `fused_fc12`, `dense_gemm`, `grouped_gemm`) differ in
 `kernel_name` alone, so their classes spell the kernel out;
 `TrtllmCutedslGroupedGemmBf16Impl` keeps it to match its NVFP4 sibling. Quant
@@ -1394,7 +1480,7 @@ their real class name.
 - **Do NOT set a communication kernel's timeout directly or through environment variables at runtime** — A backend whose kernels wait for peers under a timeout registers a `MoECommTimeoutProxy` with the timeout guard when it is constructed and unregisters it before releasing what the proxy controls; only the guard decides the value (see [Communication timeouts](#communication-timeouts)). Writing environment variables at runtime races with NCCL threads that read them
 - **Do NOT allocate symmetric memory from `run_moe` in `FUSED_COMM` backends** — Symmetric-memory rendezvous is a build-time collective and is unsafe under PP / layer-skip or CUDA graph capture; allocate from `create_weights()` after `ConfigurableMoE` has synchronized EPLB-derived attributes. See `mega_moe/mega_moe_deepgemm.py` for the DG pattern and `mega_moe/mega_moe_cute_dsl.py:_alloc_symm_provider` for the NVSHMEM-equivalent provider.
 - **Do NOT add a new `FUSED_COMM` backend without a zero-token `quantize_input` regression test** — `FusedCommMoEScheduler` calls `quantize_input` for every chunk (including zero-token chunks) so each backend must return its own empty-tensor layout.
-- **Do NOT use a dataclass for an autotuner tactic without a tested `__repr__` round-trip** — `AutoTuner` serializes tactic values through `json.dumps`/`json.loads` and `eval(repr(tactic))`; a plain dataclass fails the `eval(repr(...))` check. Prefer a JSON-friendly **tuple of primitives or lists of primitives** (lists are JSON-friendly; tuples round-trip via `eval(repr(...))`). See the tactic-representation comment block in `tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py` for the canonical 11-field tactic pattern (with legacy 10- and 8-field compatibility), including token-back READY granularity; `_unpack_tactic` is the single source of truth for field order and compatibility defaults. The fallback tactic is the token-aware `default_megamoe_tactic(num_tokens)` helper, selected by `Sm100MegaMoENvfp4Runner.forward(tactic=-1)`, not a separate `fallback_tactic()` method.
+- **Do NOT use a dataclass for an autotuner tactic without a tested `__repr__` round-trip** — `AutoTuner` serializes tactic values through `json.dumps`/`json.loads` and `eval(repr(tactic))`; a plain dataclass fails the `eval(repr(...))` check. Prefer a JSON-friendly **tuple of primitives or lists of primitives** (lists are JSON-friendly; tuples round-trip via `eval(repr(...))`). See the tactic-representation comment block in `tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py` for the canonical 12-field tactic pattern (with legacy 11-, 10- and 8-field compatibility), including token-back READY granularity and combine dedup; `_unpack_tactic` is the single source of truth for field order and compatibility defaults. The fallback tactic is the token-aware `default_megamoe_tactic(num_tokens)` helper, selected by `Sm100MegaMoENvfp4Runner.forward(tactic=-1)`, not a separate `fallback_tactic()` method.
 - **Use `distributed_tuning_strategy=DistributedTuningStrategy.MERGE` on a multi-rank `FUSED_COMM` backend's `TuningConfig`** — Every EP rank must converge on the same compiled tactic for every chunk, otherwise the in-kernel NVLink dispatch barrier deadlocks. `PARALLEL` can profile different tactics on different ranks and is unsafe for fused collectives. Reference: `Sm100MegaMoENvfp4Runner.get_tuning_config`.
 
 ### CUTLASS eager scratch reclamation

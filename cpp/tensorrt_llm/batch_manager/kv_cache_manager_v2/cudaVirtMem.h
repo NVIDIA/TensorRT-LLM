@@ -19,9 +19,14 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
+#include "kv_cache_manager_v2/utils/math.h"
+#include "tensorrt_llm/runtime/locality_domain/locality_domain_utils.h"
 
 #include <cuda.h>
+#include <map>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -35,6 +40,13 @@ class PhysMemWrapper
 {
 public:
     PhysMemWrapper(size_t size, CUmemAllocationProp const& prop);
+
+    // Adopts a handle created elsewhere (locality-domain allocations).
+    explicit PhysMemWrapper(CUmemGenericAllocationHandle handle) noexcept
+        : mHandle(handle)
+    {
+    }
+
     ~PhysMemWrapper();
 
     PhysMemWrapper(PhysMemWrapper const&) = delete;
@@ -53,12 +65,16 @@ private:
 // PooledPhysMemAllocator — creates and pools physical GPU memory chunks.
 // Mirrors _cuda_virt_mem.py::PooledPhysMemAllocator.
 //
-// Chunks are physMemSize() bytes, the unit sizes are counted in. With a
-// maxChunkSize() above that, the allocator also hands out larger chunks of
-// physMemSize() << k bytes (k >= 1) up to maxChunkSize(), which VirtMem maps
-// wherever a range is aligned to and long enough for one. Sizes, and so the
-// pools built on them, stay multiples of physMemSize(); only the number of
-// separate allocations behind them drops.
+// With more than one locality domain, each domain has its own pool of chunks located in that
+// domain's memory (or ordinary device memory in mock mode) and physMemSize() is rounded up to a
+// multiple of the localized allocation granularity.
+//
+// Chunks are physMemSize() bytes, the unit sizes are counted in. With one
+// locality domain and a maxChunkSize() above that, the allocator also hands out
+// larger chunks of physMemSize() << k bytes (k >= 1) up to maxChunkSize(), which
+// VirtMem maps wherever a range is aligned to and long enough for one. Sizes,
+// and so the pools built on them, stay multiples of physMemSize(); only the
+// number of separate allocations behind them drops.
 // ---------------------------------------------------------------------------
 class PooledPhysMemAllocator
 {
@@ -67,8 +83,8 @@ public:
 
     // physMemSize: size of each physical chunk in bytes.
     // maxChunkSize: largest chunk VirtMem may map; values at or below physMemSize disable larger chunks.
-    //               Rounded down to physMemSize times a power of two.
-    explicit PooledPhysMemAllocator(size_t physMemSize, size_t maxChunkSize = 0);
+    //               Rounded down to physMemSize times a power of two. Ignored with several locality domains.
+    explicit PooledPhysMemAllocator(size_t physMemSize, int numLocalityDomains = 1, size_t maxChunkSize = 0);
     ~PooledPhysMemAllocator();
 
     PooledPhysMemAllocator(PooledPhysMemAllocator const&) = delete;
@@ -76,21 +92,14 @@ public:
 
     // Borrow a physical memory handle of physMemSize() bytes from the pool (or allocate a new one).
     // Dropping the returned PhysMemHandle returns it to the pool.
-    [[nodiscard]] PooledPhysMem acquire();
+    [[nodiscard]] PooledPhysMem acquire(LocalityDomainId localityDomainId = LocalityDomainId{0});
 
     // Same for a chunk of `chunkSize` bytes: physMemSize() << k, at most maxChunkSize().
-    [[nodiscard]] PooledPhysMem acquire(size_t chunkSize);
+    [[nodiscard]] PooledPhysMem acquireChunk(size_t chunkSize);
 
     // Release all cached (unused) physical memory back to the driver.
     // Mirrors Python PooledPhysMemAllocator.clear().
-    void clear()
-    {
-        mPool.clear();
-        for (auto& pool : mLargerPools)
-        {
-            pool->clear();
-        }
-    }
+    void clear();
 
     [[nodiscard]] size_t physMemSize() const noexcept
     {
@@ -112,29 +121,44 @@ public:
         return mDeviceId;
     }
 
+    int numLocalityDomains() const noexcept
+    {
+        return mPools.size().value();
+    }
+
 private:
+    void selectDefaultProp();
+    void selectLocalizedProp(int numLocalityDomains);
+    PhysMemWrapper* createChunk(LocalityDomainId localityDomainId);
+
     size_t mPhysMemSize{};
     int mDeviceId{};
     CUmemAllocationProp mProp{};
-    SimplePool<PhysMemWrapper> mPool;
-    // mLargerPools[k] hands out chunks of mPhysMemSize << (k + 1).
+    // Present only when chunks are really placed per domain; mock mode leaves it empty.
+    std::optional<locality_domain::LocalizationHandle> mLocalization;
+    TypedVec<LocalityDomainId, std::unique_ptr<SimplePool<PhysMemWrapper>>> mPools;
+    // mLargerPools[k] hands out chunks of mPhysMemSize << (k + 1); empty with several locality domains.
     std::vector<std::unique_ptr<SimplePool<PhysMemWrapper>>> mLargerPools;
 };
 
 // ---------------------------------------------------------------------------
 // VirtMem — a virtual address range backed by physical GPU memory chunks.
-// Physical chunks are mapped/unmapped at the end of the range (stack discipline).
 // Mirrors _cuda_virt_mem.py::VirtMem.
 //
-// With an allocator that has larger chunks, a range is mapped from the largest
-// chunks its offsets allow (see PooledPhysMemAllocator::chunkSizeAt), so the
-// chunks need not all be the same size. A shrink unmaps only whole chunks
-// above the new size: when the new end falls inside a larger chunk, that chunk
-// stays mapped and usableBytes() drops below mappedBytes() until a later grow
-// uses it again.
+// Each locality domain keeps its own stack of mappings. With one domain chunks are mapped and
+// unmapped at the end of the range; with several the caller places every chunk at an explicit
+// byte offset so the pools sharing a slot-id space agree on which domain backs which slots.
 //
-// Invariant: usableBytes() <= mappedBytes() <= virtualBytes(), and without
-//            larger chunks mappedBytes() == usableBytes() == numPhysMem() * physMemSize()
+// With one domain and an allocator that has larger chunks, the range is mapped
+// from the largest chunks its offsets allow (see
+// PooledPhysMemAllocator::chunkSizeAt), so the chunks need not all be the same
+// size. A shrink unmaps only whole chunks above the new size: when the new end
+// falls inside a larger chunk, that chunk stays mapped and usableBytes() drops
+// below mappedBytes() until a later grow uses it again.
+//
+// Invariant: usableBytes(d) <= mappedBytes(d) for every domain d, and without
+//            larger chunks mappedBytes(d) == usableBytes(d) == numPhysMem(d) * physMemSize()
+//            sum of mappedBytes(d) <= virtualBytes()
 // ---------------------------------------------------------------------------
 class VirtMem
 {
@@ -142,21 +166,25 @@ public:
     // vmSize: total virtual address space reserved (bytes).
     //         Must be a multiple of physMemSize.
     // physMemAllocator: shared allocator for physical chunks.
-    // initNumPhysMem: number of physMemSize units to map immediately.
+    // initNumPhysMem: number of physical chunks to map immediately (domain 0).
     VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, size_t initNumPhysMem = 0);
     ~VirtMem() noexcept;
 
     VirtMem(VirtMem const&) = delete;
     VirtMem& operator=(VirtMem const&) = delete;
 
-    // Grow the usable range by numPhysMem units of physMemSize at the top of the address range.
-    void extend(size_t numPhysMem);
+    // Grow the usable range of localityDomainId by numPhysMem units of physMemSize, mapped starting at
+    // byte offset `offset`. offset defaults to the end of the usable range and must be given with
+    // several domains. With one domain, growing at the end of the usable range may map larger chunks.
+    void extend(size_t numPhysMem, LocalityDomainId localityDomainId = LocalityDomainId{0},
+        std::optional<size_t> offset = std::nullopt);
 
-    // Shrink the usable range by numPhysMem units (synchronizes CUDA first when it unmaps).
-    void shrink(size_t numPhysMem);
+    // Shrink the usable range of localityDomainId by numPhysMem units, unmapping the most recently
+    // mapped chunks (synchronizes CUDA first when it unmaps).
+    void shrink(size_t numPhysMem, LocalityDomainId localityDomainId = LocalityDomainId{0});
 
-    // Adjust the usable range to numBytes rounded up to physMemSize (extend or shrink).
-    void realloc(size_t numBytes);
+    // Adjust the usable range of localityDomainId to numBytes rounded up to physMemSize (extend or shrink).
+    void realloc(size_t numBytes, LocalityDomainId localityDomainId = LocalityDomainId{0});
 
     void destroy();
 
@@ -170,16 +198,16 @@ public:
         return mPhysMemAllocator.physMemSize();
     }
 
-    // Bytes backed by physical memory.
-    [[nodiscard]] size_t mappedBytes() const noexcept
+    // Bytes of localityDomainId backed by physical memory.
+    [[nodiscard]] size_t mappedBytes(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept
     {
-        return mMappedBytes;
+        return mMappedBytes[localityDomainId];
     }
 
-    // Bytes the owner asked for (a multiple of physMemSize): what it may address.
-    [[nodiscard]] size_t usableBytes() const noexcept
+    // Bytes of localityDomainId the owner asked for (a multiple of physMemSize): what it may address.
+    [[nodiscard]] size_t usableBytes(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept
     {
-        return mUsableBytes;
+        return mUsableBytes[localityDomainId];
     }
 
     [[nodiscard]] size_t virtualBytes() const noexcept
@@ -187,23 +215,42 @@ public:
         return mVmSize;
     }
 
-    // Number of mapped chunks (separate physical allocations).
-    [[nodiscard]] size_t numPhysMem() const noexcept
+    // Number of mapped chunks (separate physical allocations) of localityDomainId.
+    [[nodiscard]] size_t numPhysMem(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept
     {
-        return mPhysHandles.size();
+        return mMappings[localityDomainId].size();
     }
 
+    [[nodiscard]] int numLocalityDomains() const noexcept
+    {
+        return mMappings.size().value();
+    }
+
+    // Merged mapped byte ranges [begin, end) relative to address(), across all domains.
+    [[nodiscard]] std::vector<HalfOpenRange<size_t>> mappedRanges() const;
+
 private:
-    void push(PooledPhysMemAllocator::PooledPhysMem handle, size_t size);
-    void pop();
+    struct Mapping
+    {
+        size_t offset;
+        size_t size;
+        PooledPhysMemAllocator::PooledPhysMem handle;
+    };
+
+    void push(PooledPhysMemAllocator::PooledPhysMem handle, size_t offset, size_t size,
+        LocalityDomainId localityDomainId);
+    void pop(LocalityDomainId localityDomainId);
+    // One domain: map or unmap chunks at the end so the usable range becomes `target` bytes.
+    void resizeAtEnd(size_t target);
 
     CUdeviceptr mAddr = 0;
     size_t mVmSize = 0;
-    size_t mMappedBytes = 0;
-    size_t mUsableBytes = 0;
     PooledPhysMemAllocator& mPhysMemAllocator;
-    std::vector<PooledPhysMemAllocator::PooledPhysMem> mPhysHandles;
-    std::vector<size_t> mChunkSizes;
+    TypedVec<LocalityDomainId, std::vector<Mapping>> mMappings;
+    TypedVec<LocalityDomainId, size_t> mMappedBytes;
+    TypedVec<LocalityDomainId, size_t> mUsableBytes;
+    // Offset -> size of every mapped chunk, across all domains.
+    std::map<size_t, size_t> mMappedOffsets;
     CUmemAccessDesc mAccessDesc{};
 };
 
