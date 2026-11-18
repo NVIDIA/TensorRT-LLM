@@ -1092,6 +1092,28 @@ def test_default_generation_steps() -> None:
         (None, 50),
         ({"schema_version": "fasth3-inference-contract-v1", "num_inference_steps": 9}, 9),
         ({"schema_version": "fasth3-inference-contract-v1"}, 50),
+        (
+            {
+                "schema_version": "fasth3-inference-contract-v1",
+                "dmd_denoising_steps": list(range(999, 972, -1)),
+            },
+            28,
+        ),
+        (
+            {
+                "schema_version": "fasth3-inference-contract-v1",
+                "dmd_denoising_steps": [999, 500],
+            },
+            3,
+        ),
+        (
+            {
+                "schema_version": "fasth3-inference-contract-v1",
+                "dmd_denoising_steps": [999, 500],
+                "num_inference_steps": 9,
+            },
+            9,
+        ),
         ({"schema_version": "other-model-v1", "num_inference_steps": 5}, 50),
     ],
 )
