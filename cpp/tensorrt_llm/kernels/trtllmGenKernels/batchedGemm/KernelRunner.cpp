@@ -489,9 +489,13 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     auto envVarVal = std::getenv("TLLM_BATCHED_GEMM_PRINT_NAME");
     if (envVarVal && std::atoi(envVarVal) == 1)
     {
+        auto const& dims = gemmData.mProblemDimensions;
+        auto const effectiveValidM = transposeMmaOutput ? dims.mValidN : dims.mValidM;
+        auto const effectiveValidN = transposeMmaOutput ? dims.mValidM : dims.mValidN;
         auto msg = fmtstr(
             "[PID %d] NumBatches %d, MaxNumCtasInBatchDim %d, ShapeMNK %d %d %d, ValidShapeMNK %d %d %d, Kernel %s",
-            getpid(), numBatches, maxNumCtasInBatchDim, m, n, k, validM, validN, validK, config.mFunctionName);
+            getpid(), numBatches, maxNumCtasInBatchDim, m, n, k, effectiveValidM, effectiveValidN, dims.mValidK,
+            config.mFunctionName);
         if (printedBmmNames.find(msg) == printedBmmNames.end())
         {
             printedBmmNames.insert(msg);

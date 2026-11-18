@@ -7485,6 +7485,83 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(
             torch.testing.assert_close(restored.w2_bias, module.w2_bias)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "lean_intermediate,padded_intermediate,expected_valid_intermediate",
+    [
+        (352, 384, 352),
+        (192, 256, 192),
+        (128, 128, 128),
+        (None, 384, None),
+    ],
+    ids=["tp4_i1408_lean352", "tp16_i3072_lean192", "aligned_lean128", "unset_lean"],
+)
+def test_mxfp4_fp8_trtllm_gen_forwards_lean_intermediate_size(
+    monkeypatch: pytest.MonkeyPatch,
+    lean_intermediate: int | None,
+    padded_intermediate: int,
+    expected_valid_intermediate: int | None,
+) -> None:
+    """Keep physical padding separate from logical dimensions at the runner boundary."""
+    captured: dict[str, object] = {}
+
+    def fake_runner(*args: object, **kwargs: object) -> torch.Tensor:
+        # Op positions 19..21: physical intermediate, valid hidden, valid intermediate.
+        (
+            captured["intermediate_size"],
+            captured["valid_hidden_size"],
+            captured["valid_intermediate_size"],
+        ) = args[19:22]
+        return torch.zeros((2, 2048), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(torch.ops.trtllm, "e4m3_mxe2m1_block_scale_moe_runner", fake_runner)
+
+    leaf = TrtllmTrtllmGenW4a8Mxfp4Fp8Impl.__new__(TrtllmTrtllmGenW4a8Mxfp4Fp8Impl)
+    torch.nn.Module.__init__(leaf)
+    leaf.w3_w1_weight = torch.zeros((4, padded_intermediate * 2, 1024), dtype=torch.uint8)
+    leaf.w3_w1_weight_scale = torch.zeros((4, padded_intermediate * 2, 64), dtype=torch.uint8)
+    leaf.w3_w1_bias = torch.zeros((4, padded_intermediate * 2), dtype=torch.float32)
+    leaf.act_alpha = None
+    leaf.act_beta = None
+    leaf.act_clamp = None
+    leaf.w2_weight = torch.zeros((4, 2048, padded_intermediate // 2), dtype=torch.uint8)
+    leaf.w2_weight_scale = torch.zeros((4, 2048, padded_intermediate // 32), dtype=torch.uint8)
+    leaf.w2_bias = torch.zeros((4, 2048), dtype=torch.float32)
+    leaf.fc31_input_dequant = torch.ones((4,), dtype=torch.float32)
+    leaf.fc31_input_gate_dequant = torch.ones((4,), dtype=torch.float32)
+    leaf.fc2_input_dequant = torch.ones((4,), dtype=torch.float32)
+    leaf.num_slots = 4
+    leaf.hidden_size = 2048
+    leaf.quant_method = SimpleNamespace(intermediate_size_per_partition_lean=lean_intermediate)
+    leaf.slot_start = 0
+    leaf.expert_size_per_partition = 4
+    leaf.routing_method = RenormalizeMoeRoutingMethod(top_k=2)
+    leaf.max_num_tokens = 256
+    leaf.use_dp = False
+    leaf.parallel_size = 4
+
+    ctx = MoERunContext(
+        x=torch.zeros((2, 2048), dtype=torch.float8_e4m3fn),
+        x_sf=None,
+        router_logits=torch.zeros((2, 4), dtype=torch.bfloat16),
+        token_selected_experts=None,
+        token_final_scales=None,
+        comm_plan=MoECommPlan(
+            input_sf_swizzled=False,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        ),
+        do_finalize=True,
+    )
+    out = leaf.run_moe(ctx)
+
+    assert out.shape == (2, 2048)
+    assert captured["intermediate_size"] == padded_intermediate
+    assert captured["valid_hidden_size"] == 2048
+    assert captured["valid_intermediate_size"] == expected_valid_intermediate
+
+
 @pytest.mark.skipif(
     not (100 <= getSMVersion() < 110),
     reason="The kernel requires Blackwell.",
@@ -7523,4 +7600,5 @@ def test_moe_mxe2m1_weights_valid_dimensions(
         valid_hidden_size=valid_hidden_size,
         valid_intermediate_size=valid_intermediate_size,
         skip_dynamic_tuning_buckets=True,
+        check_all_tactics=True,
     )
