@@ -89,6 +89,7 @@ FP4_MLA_BLOCK_V_ENV = "TRTLLM_FP4_MLA_BLOCK_V"
 FP4_MLA_PAGE_STATS_NUM_WARPS_ENV = "TRTLLM_FP4_MLA_PAGE_STATS_NUM_WARPS"
 FP4_MLA_PV_NUM_WARPS_ENV = "TRTLLM_FP4_MLA_PV_NUM_WARPS"
 FP4_MLA_LAZY_ANCHOR_LOG2_ENV = "TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2"
+CUTEDSL_VERBOSE_COMPILE_ENV = "TRTLLM_CUTEDSL_VERBOSE_COMPILE"
 
 
 _FP4_MLA_CUTEDSL_BACKEND = "cutedsl"
@@ -167,6 +168,11 @@ def has_fp4_mla_cache_layout(kv_cache_manager: object) -> bool:
 
 def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
     return _env_enabled_default(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, False)
+
+
+def _cutedsl_verbose_compile_enabled() -> bool:
+    """Whether a CuTe DSL compilation leaves the PyIR status lines on stdout."""
+    return _env_enabled_default(CUTEDSL_VERBOSE_COMPILE_ENV, False)
 
 
 FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"

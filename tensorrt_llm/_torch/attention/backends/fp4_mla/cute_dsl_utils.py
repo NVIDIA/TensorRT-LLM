@@ -3,7 +3,6 @@
 """Common CuTeDSL compilation and caller-stream handling for FP4 MLA."""
 
 import contextlib
-import os
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -13,7 +12,8 @@ import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.dsl import BaseDSL
 
-_CUTEDSL_VERBOSE_COMPILE_ENV = "TRTLLM_CUTEDSL_VERBOSE_COMPILE"
+from .config import _cutedsl_verbose_compile_enabled
+
 _PYIR_STDOUT_LINES = frozenset(
     {
         "Enabling PyIR, it was False",
@@ -52,8 +52,7 @@ class _PyIRStdoutFilter:
 
 def _compile_cutedsl(*args: object, **kwargs: object) -> Callable[..., object]:
     """Compile the FP4 MLA kernels with their required PyIR frontend."""
-    verbose = os.getenv(_CUTEDSL_VERBOSE_COMPILE_ENV, "").strip().lower()
-    if verbose in {"1", "true", "yes", "on"}:
+    if _cutedsl_verbose_compile_enabled():
         with BaseDSL.enable_pyir():
             return cute.compile(*args, **kwargs)
     stdout_filter = _PyIRStdoutFilter(sys.stdout)
