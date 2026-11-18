@@ -385,6 +385,10 @@ class InforwardSnapshotSplit(NamedTuple):
     cu_tail: torch.Tensor
     tail_slots: torch.Tensor
     conv_win: torch.Tensor
+    # Host ints, set when exactly one request is split: its tail tokens are the
+    # packed rows [tail_lo, tail_hi), so a consumer can slice instead of gather.
+    tail_lo: int = -1
+    tail_hi: int = -1
 
 
 # Fields of InforwardSnapshotSplit, in upload order.
@@ -686,8 +690,14 @@ class Mamba2Metadata:
             name: self._inforward_split_buf[start:start + len(vals[name])]
             for name, start in zip(_INFORWARD_SPLIT_FIELDS, offsets)
         }
+        tail_lo = vals["tail_tok"][0] if k == 1 else -1
+        tail_hi = vals["tail_tok"][-1] + 1 if k == 1 else -1
         self.inforward_split = InforwardSnapshotSplit(
-            k=k, num_tail_tokens=num_tail_tokens, **views)
+            k=k,
+            num_tail_tokens=num_tail_tokens,
+            **views,
+            tail_lo=tail_lo,
+            tail_hi=tail_hi)
 
     @staticmethod
     def _warmup_inforward_split_plan(attn_metadata: AttentionMetadata,

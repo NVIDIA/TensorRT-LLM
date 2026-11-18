@@ -184,8 +184,9 @@ def _zero_fresh_states_kernel(
 
 
 def _chunk_inplace(
-    q, k, v, g, beta, scale, pool, indices, has_initial_state, cu_seqlens, output, linear_gate
-) -> torch.Tensor:
+    q, k, v, g, beta, scale, pool, indices, has_initial_state, cu_seqlens, output, linear_gate,
+    all_carried=False,
+) -> torch.Tensor:  # fmt: skip
     """The short in-place indexed call: the fresh sequences' pool rows zeroed (one launch),
     then FlashInfer's chunked kernel (`use_cp=False`) reading and writing the named rows of
     the pool itself (`state_indices`, `output_state` the pool): no packed copy in or out."""
@@ -193,10 +194,13 @@ def _chunk_inplace(
 
     num_seqs = indices.shape[0]
     _, h, v_dim, k_dim = pool.shape
-    _zero_fresh_states_kernel[(num_seqs, h, triton.cdiv(v_dim * k_dim, _GATHER_BLOCK))](
-        pool, indices, has_initial_state, *pool.stride(),
-        K=k_dim, PLANE=v_dim * k_dim, BLOCK=_GATHER_BLOCK, num_warps=4,
-    )  # fmt: skip
+    # `all_carried`: the caller knows on the host that every sequence carries a state, so
+    # the launch that zeroes the fresh ones would touch nothing.
+    if not all_carried:
+        _zero_fresh_states_kernel[(num_seqs, h, triton.cdiv(v_dim * k_dim, _GATHER_BLOCK))](
+            pool, indices, has_initial_state, *pool.stride(),
+            K=k_dim, PLANE=v_dim * k_dim, BLOCK=_GATHER_BLOCK, num_warps=4,
+        )  # fmt: skip
     q3, k3, v3 = q.squeeze(0).contiguous(), k.squeeze(0).contiguous(), v.squeeze(0).contiguous()
     out = (
         output.squeeze(0)
@@ -255,6 +259,77 @@ def _chunk_carried(
     )
     cast_scatter_fp32_vk_to_vk(final, pool, indices)
     return out.unsqueeze(0)
+
+
+def flashinfer_chunk_gdn_inforward_split(
+    q, k, v, g, beta, pool, *, cu_seqlens, gather, has_initial_state, main_rows, live,
+    tail_tok, cu_tail, tail_slots, stage, stage_rows, stage_idx, output,
+    tail_lo=-1, tail_hi=-1,
+) -> torch.Tensor:  # fmt: skip
+    """A context-only chunk whose planned sequences end with an in-forward snapshot split
+    (`Mamba2Metadata.inforward_split`): what two context iterations compute, the chunk up to
+    the snapshot point P and then the tail `[P, prompt end)`, in one forward.
+
+    `cu_seqlens` cuts every planned sequence at P, its tail a sequence of its own that starts
+    from zeros (`has_initial_state` false at its row of `gather`) and whose result is
+    discarded. The first pass is `_chunk_carried` over those sequences with the final states
+    of the real ones (`main_rows`) scattered to their slots `live`: the state at P. That
+    state is copied to the staging rows (`tail_slots`, int64, to `stage_rows`) and the tails
+    (`tail_tok` rows, `cu_tail`) are recomputed from it THERE by `_chunk_inplace`
+    (`stage_idx`: the staging rows in the pool's index dtype), the call a tail iteration of
+    its own makes, their outputs replacing the first pass's. Every tail carries a state, so
+    the launch that zeroes fresh ones is skipped. When exactly one sequence is split its
+    tail is the row slice `[tail_lo, tail_hi)`, read and written in place of five gathers
+    and a scatter; `(-1, -1)` takes the gathers.
+
+    On return each planned slot holds the state at P, which the cache manager commits, and
+    `stage[stage_rows]` the state at the prompt end, which it copies back into the slot
+    after the commit (`finish_inforward_snapshots`). `g` is the linear gate.
+    """
+    import flashinfer
+
+    q3, k3, v3 = q.squeeze(0).contiguous(), k.squeeze(0).contiguous(), v.squeeze(0).contiguous()
+    g3, beta3 = g.squeeze(0), beta.squeeze(0).to(torch.float32)
+    packed = _gather_carried_states(pool, gather, has_initial_state)
+    out = output.squeeze(0)
+    final = torch.empty_like(packed)
+    flashinfer.chunk_gated_delta_rule(
+        q=q3,
+        k=k3,
+        v=v3,
+        g=g3,
+        beta=beta3,
+        scale=None,
+        initial_state=packed,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=False,
+        output=out,
+        output_state=final,
+    )
+    cast_scatter_fp32_vk_to_vk(final.index_select(0, main_rows), pool, live)
+    # The slots now hold the state at P and keep it: the tail advances the staged copy.
+    stage.index_copy_(0, stage_rows, pool.index_select(0, tail_slots))
+    if tail_lo >= 0:
+        _chunk_inplace(
+            q3[tail_lo:tail_hi].unsqueeze(0), k3[tail_lo:tail_hi].unsqueeze(0),
+            v3[tail_lo:tail_hi].unsqueeze(0), g3[tail_lo:tail_hi].unsqueeze(0),
+            beta3[tail_lo:tail_hi].unsqueeze(0),
+            None, stage, stage_idx, None, cu_tail, out[tail_lo:tail_hi].unsqueeze(0), True,
+            all_carried=True,
+        )  # fmt: skip
+    else:
+        tail_out = _chunk_inplace(
+            q3.index_select(0, tail_tok).unsqueeze(0),
+            k3.index_select(0, tail_tok).unsqueeze(0),
+            v3.index_select(0, tail_tok).unsqueeze(0),
+            g3.index_select(0, tail_tok).unsqueeze(0),
+            beta3.index_select(0, tail_tok).unsqueeze(0),
+            None, stage, stage_idx, None, cu_tail, None, True,
+            all_carried=True,
+        )  # fmt: skip
+        out.index_copy_(0, tail_tok, tail_out.squeeze(0))
+    return output
 
 
 class FlashinferChunkGatedDeltaRule(OpWrapper):
