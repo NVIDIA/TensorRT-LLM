@@ -4556,6 +4556,13 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 "native K1 layout; using the feature-off static K1 path.")
             self.enable_confidence_scheduling = False
             return self
+        if (self.draft_len_schedule is not None
+                or self.max_concurrency is not None):
+            raise ValueError(
+                "DSpark confidence scheduling cannot be combined with "
+                "draft_len_schedule or max_concurrency: each one selects how "
+                "many draft tokens a step verifies. Unset them or disable "
+                "confidence scheduling.")
         if not self.confidence_cost_table_path:
             raise ValueError(
                 "DSpark confidence scheduling requires confidence_cost_table_path. "
@@ -9231,7 +9238,8 @@ class TorchLlmArgs(BaseLlmArgs):
         Mirrors the config-time-knowable conditions of
         ``KvCacheCreator.try_prepare_estimation``: the
         ``TRTLLM_SKIP_KV_CACHE_ESTIMATION`` env var, a VANILLA target
-        attention backend, and context parallelism all skip estimation.
+        attention backend, and context parallelism other than aggregated
+        Helix all skip estimation.
         Encoder-decoder targets also skip it but are only known from the
         model config at load time; they are treated as estimating here,
         which errs toward the looser arena budget.
@@ -9241,7 +9249,12 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.attn_backend == "VANILLA":
             return False
         if self.context_parallel_size > 1 and self.cp_config is not None:
-            return False
+            # Estimation profiles aggregated Helix only; disaggregated Helix
+            # sizes the pool by fraction.
+            is_disagg = (self.cache_transceiver_config is not None
+                         and self.cache_transceiver_config.backend is not None)
+            if self.cp_config.cp_type != CpType.HELIX or is_disagg:
+                return False
         return True
 
     def _validate_dflash_ctx_budget(self,

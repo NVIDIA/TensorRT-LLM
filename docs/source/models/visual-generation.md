@@ -118,7 +118,7 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 
 The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queued` → `generating` (model inference) → `postprocessing` (encode the media and/or write the output file) → `completed`. The `generating` → `postprocessing` transition marks the end of inference; the video is downloadable via `/content` once `completed`.
 
-`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject such requests with HTTP 400; the same switch also rejects a reference sent with `format="path"`, since both ask the server to trust a local filesystem path. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
+`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1` to reject such requests with HTTP 400; a VisualGen server refuses to start if the variable holds any value other than `0`, `1` or empty. The former name `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH` is no longer read: a VisualGen server started with it set to a value other than `0` or empty refuses to start and names the new variable. A reference sent with `format="path"` is the other direction, the server reading a file: it is read only when the server is started with `TRTLLM_MEDIA_ALLOWED_INPUT_DIR=<directory>` and the file is a regular file inside that directory, the same policy `/v1/chat/completions` applies to local media URLs. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
 
 ### Reference Inputs
 
@@ -133,7 +133,7 @@ Conditioning references are supplied through the typed fields `image_reference`,
 
 | `format` | Content | Notes |
 |---|---|---|
-| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. |
+| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. Over HTTP, only a regular file under `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`, of at most 200 MiB, and at most 512 MiB across the `path` references of one request; send a larger file as a multipart upload. |
 | `url` | An `http(s)` URL | Fetched on the coordinator through the SSRF-guarded loader. |
 | `base64` | Base64 text | A `data:` URI is also accepted. |
 | `bytes` | Raw `bytes` | Python API only. |

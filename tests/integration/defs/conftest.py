@@ -766,6 +766,8 @@ skip_no_mxfp4_swizzle = pytest.mark.skipif(
 
 skip_no_sm120 = pytest.mark.skipif(not is_sm_120f(),
                                    reason="This test is for SM120")
+skip_no_sm100f = pytest.mark.skipif(
+    not is_sm_100f(), reason="This test is for the SM100 family (SM100-SM109)")
 
 skip_arm = pytest.mark.skipif(
     "aarch64" in platform.machine(),
