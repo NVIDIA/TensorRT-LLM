@@ -4521,13 +4521,13 @@ def test_skipped_context_chunk_keeps_pages_a_moving_connector_was_told_about(
     PyExecutor._revert_unexecuted_alloc(stub, scheduled_batch)
 
     if reported and not capacity_only:
-        stub.kv_cache_manager.retain_context_allocation.assert_called_once_with(context_request)
+        stub.kv_cache_manager.keep_context_allocation.assert_called_once_with(context_request)
         stub.kv_cache_manager.revert_unexecuted_context_chunk.assert_not_called()
     else:
         stub.kv_cache_manager.revert_unexecuted_context_chunk.assert_called_once_with(
             context_request
         )
-        stub.kv_cache_manager.retain_context_allocation.assert_not_called()
+        stub.kv_cache_manager.keep_context_allocation.assert_not_called()
 
 
 def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():

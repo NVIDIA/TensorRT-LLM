@@ -28,6 +28,7 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay, encoder_replay_tokens
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
+    CompletionCapacityError,
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -62,6 +63,7 @@ def _manager_for_release(request_id: int, is_draft: bool = False):
     manager._deferred_closes = deque()
     manager._pending_preemption = {}
     manager._allocated_draft_lens = {}
+    manager._retained_generation_allocations = {}
     manager._inflight_draft_lens = {}
     manager._request_stats_enabled_ids = set()
     manager._fresh_pages_filled = {}
@@ -2845,6 +2847,70 @@ def test_completion_reservation_deferral_preserves_started_context(chunked: bool
     resumed = scheduler.schedule_request([waiting], set())
     assert ids(resumed.context_requests) == [0]
     manager.preempt_request.assert_not_called()
+
+
+def _too_large_for_the_cache(rejected_id: int) -> CompletionCapacityError:
+    return CompletionCapacityError(
+        f"Request {rejected_id} requires 9 completion blocks, but only 4 fit"
+    )
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_a_context_request_that_no_longer_fits_is_failed_alone(chunked: bool) -> None:
+    """Retained padding can shrink the idle capacity after arrival: that request fails, the others run."""
+    manager = make_kv_cache_manager(has_cache_tier_below_gpu=False)
+
+    def reserve(req):
+        if req.py_request_id == 0:
+            raise _too_large_for_the_cache(0)
+        return True
+
+    manager.reserve_context_completion.side_effect = reserve
+    scheduler = make_scheduler(
+        manager,
+        max_num_tokens=1000,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
+    )
+    rejected = make_ctx_request(0, 100)
+    healthy = make_ctx_request(1, 100)
+
+    batch = scheduler.schedule_request([rejected, healthy], set())
+
+    assert ids(batch.context_requests) == [1]
+    [(failed, message)] = scheduler.take_lost_kv_requests()
+    assert failed is rejected and "completion blocks" in message
+    assert scheduler.take_lost_kv_requests() == []
+
+
+def test_a_disagg_generation_init_request_that_no_longer_fits_is_failed_alone() -> None:
+    def prepare(req):
+        if req.py_request_id == 0:
+            raise _too_large_for_the_cache(0)
+        return True
+
+    manager = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare)
+    scheduler = make_scheduler(manager, max_num_tokens=1000, enable_recompute_pause=False)
+    rejected = make_disagg_request(0)
+    healthy = make_disagg_request(1)
+
+    batch = scheduler.schedule_request([rejected, healthy], set())
+
+    assert ids(batch.fitting_disagg_gen_init_requests) == [1]
+    [(failed, message)] = scheduler.take_lost_kv_requests()
+    assert failed is rejected and "completion blocks" in message
+    assert scheduler.take_lost_kv_requests() == []
+
+
+def test_an_error_that_is_not_a_capacity_rejection_still_stops_scheduling() -> None:
+    def prepare(req):
+        raise ValueError("a bug, not a request problem")
+
+    manager = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare)
+    scheduler = make_scheduler(manager, max_num_tokens=1000, enable_recompute_pause=False)
+
+    with pytest.raises(ValueError, match="a bug"):
+        scheduler.schedule_request([make_disagg_request(0)], set())
+    assert scheduler.take_lost_kv_requests() == []
 
 
 @pytest.mark.parametrize(

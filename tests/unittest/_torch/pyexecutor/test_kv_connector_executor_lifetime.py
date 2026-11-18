@@ -856,6 +856,29 @@ def test_failed_connector_load_batch_preserves_cleanup_order(request_count: int)
         assert calls == []
 
 
+def test_failed_connector_load_releases_the_paired_draft_allocation() -> None:
+    """With joint draft reuse the draft pool holds the request's allocation too, as in `_revert_ctx_alloc`."""
+    executor = object.__new__(PyExecutor)
+    request = SimpleNamespace(request_id=7, py_connector_load_failed=False)
+    calls: list[str] = []
+    executor.execution_stream = SimpleNamespace(synchronize=lambda: calls.append("fence"))
+    executor.kv_connector_manager = SimpleNamespace(
+        drop_bound_saves=Mock(side_effect=lambda reqs: calls.append("drop_saves"))
+    )
+    executor.kv_cache_manager = SimpleNamespace(
+        drop_context_allocation=lambda req: calls.append("drop_allocation")
+    )
+    executor.enable_joint_kv_cache_reuse = True
+    executor.draft_kv_cache_manager = SimpleNamespace(
+        free_resources=lambda req: calls.append("drop_draft")
+    )
+    executor.resource_manager = SimpleNamespace(get_resource_manager=lambda kind: None)
+
+    assert executor._restart_failed_connector_loads([request]) == [7]
+
+    assert calls == ["fence", "drop_saves", "drop_allocation", "drop_draft"]
+
+
 def test_real_request_keeps_failure_marker_across_reset_and_requery() -> None:
     """Reset callbacks and the subsequent connector lookup see the failed-load marker."""
 

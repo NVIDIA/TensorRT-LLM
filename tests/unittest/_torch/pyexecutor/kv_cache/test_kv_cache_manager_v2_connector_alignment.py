@@ -63,8 +63,8 @@ def _dropping_connector(drops: bool | str, *, capacity_only: bool = False) -> Si
     "backoff, partial_reuse, connector, is_draft, expected",
     [
         (1, False, _connector(True), False, TOKENS_PER_BLOCK),
-        # No backoff: matches of whole blocks already end on a boundary.
-        (0, False, _connector(True), False, 1),
+        # No backoff: attention coverage can still end a match mid-block.
+        (0, False, _connector(True), False, TOKENS_PER_BLOCK),
         # Whole-block declarations override the default partial reuse setting.
         (1, True, _connector(True), False, TOKENS_PER_BLOCK),
         # A connector that serves from any position needs nothing.

@@ -1609,8 +1609,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         # under disagg keep their layers in that manager (MTP/Eagle fold them
         # in; DFlash uses explicit draft layer specs). A separate draft manager
         # gets no transfer and no paired-reuse path here.
+        from ..kv_cache.kv_cache_manager_v2 import CompletionCapacityError
+
         try:
             prepared = self.kv_cache_manager.prepare_disagg_gen_init(req)
+        except CompletionCapacityError as error:
+            self._reject_request(req, str(error))
+            return ScheduleAction.SKIP, 0
         except RemoteMemError as error:
             # Its prefix match resumed pages a failed remote cache level took with it: drop the match, and the next
             # pass matches again without them.
@@ -1724,9 +1729,22 @@ class KVCacheV2Scheduler(RequestScheduler):
                 manager.free_resources(req)
         rewind_context_after_cache_drop(req, self.tokens_per_block)
 
+    def _reject_request(self, req: LlmRequest, message: str) -> None:
+        """Hand *req* to the executor to fail alone (``take_lost_kv_requests``); other requests keep scheduling."""
+        logger.error(f"[V2Scheduler] Failing request {req.py_request_id}: {message}")
+        if all(rejected is not req for rejected, _ in self._lost_kv_requests):
+            self._lost_kv_requests = (*self._lost_kv_requests, (req, message))
+
     def _defer_for_completion_headroom(self, req: LlmRequest) -> bool:
-        if self.kv_cache_manager.reserve_context_completion(req):
-            return False
+        from ..kv_cache.kv_cache_manager_v2 import CompletionCapacityError
+
+        try:
+            if self.kv_cache_manager.reserve_context_completion(req):
+                return False
+        except CompletionCapacityError as error:
+            # Padding allocations shrank the idle capacity below what the request needs: it can never be admitted.
+            self._reject_request(req, str(error))
+            return True
         logger.debug(
             "Deferring context request %s: admitted requests hold the completion headroom",
             req.py_request_id,
@@ -2654,8 +2672,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
 
     def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
-        """Requests the last passes could neither schedule nor recompute after a remote cache level failed, with their
-        error messages; the executor fails them."""
+        """Requests the last passes could not schedule, with their error messages; the executor fails each of them
+        alone. They are requests that could neither be scheduled nor recomputed after a remote cache level failed, and
+        requests whose completion no longer fits the KV cache."""
         lost, self._lost_kv_requests = self._lost_kv_requests, ()
         return list(lost)
 
