@@ -299,9 +299,7 @@ class LogitEditState:
             self.ban_tokens.index_copy_(0, slots, upload(ban_tokens, torch.int64))
             self.ban_valid.index_copy_(0, slots, upload(ban_valid, torch.bool))
         if tail_slots:
-            self.tail.index_copy_(
-                0, upload(tail_slots, torch.int64), upload(tails, torch.int32)
-            )
+            self.tail.index_copy_(0, upload(tail_slots, torch.int64), upload(tails, torch.int32))
 
 
 def apply_embedding_bias(

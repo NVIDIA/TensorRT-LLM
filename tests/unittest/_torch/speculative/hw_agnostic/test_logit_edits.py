@@ -276,9 +276,7 @@ def test_padding_requests_are_not_loaded():
     )
 
     logits = torch.zeros((1, VOCAB))
-    logit_edits.apply_bad_words(
-        logits, state, torch.tensor([state.dummy_row]), *_no_drafts(1)
-    )
+    logit_edits.apply_bad_words(logits, state, torch.tensor([state.dummy_row]), *_no_drafts(1))
 
     assert _banned(logits) == [[]]
 
