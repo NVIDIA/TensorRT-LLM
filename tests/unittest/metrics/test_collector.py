@@ -2448,3 +2448,44 @@ def test_conversation_activity_enablement_keeps_retention_independent(monkeypatc
 def test_conversation_activity_rejects_negative_limits(limits):
     with pytest.raises(ValueError, match="nonnegative"):
         _activity_manager(**limits)
+
+
+@pytest.mark.parametrize("include_count", [False, True])
+def test_prometheus_example_keeps_metric_sample_names_distinct(monkeypatch, capsys, include_count):
+    import runpy
+    from pathlib import Path
+    from unittest.mock import Mock
+
+    monkeypatch.setattr("openai.OpenAI", Mock())
+    example = runpy.run_path(
+        str(Path(__file__).resolve().parents[3] / "examples/serve/prometheus_metrics.py")
+    )
+    count = 'trtllm_conversation_unique_seen{window="10m"} 7.0'
+    complete = 'trtllm_conversation_unique_seen_complete{window="10m"} 1.0'
+    # Histograms have derived samples, gauges can lack labels, and HELP/TYPE
+    # metadata alone does not establish that a measurement exists.
+    samples = [
+        complete,
+        "trtllm_kv_cache_hit_rate 0.5",
+        'trtllm_e2e_request_latency_seconds_bucket{le="1.0"} 2.0',
+        "trtllm_e2e_request_latency_seconds_sum 1.5",
+        "trtllm_e2e_request_latency_seconds_count 2.0",
+    ]
+    if include_count:
+        samples.append(count)
+    text = "\n".join(
+        [
+            "# HELP trtllm_kv_cache_transfer_bytes_total Completed transfer bytes",
+            "# TYPE trtllm_kv_cache_transfer_bytes_total counter",
+            *samples,
+        ]
+    )
+    example["parse_and_display_metrics"](text)
+    output = capsys.readouterr().out
+    available, missing = output.split("✗ Not Yet Available:")
+    count_heading = "Unique worker conversations over 10m/1h (trtllm_conversation_unique_seen)"
+    assert (count_heading in available) == include_count
+    assert (count_heading in missing) != include_count
+    assert "Completed-request KV transfer bytes (trtllm_kv_cache_transfer_bytes_total)" in missing
+    for sample in samples:
+        assert output.count("  " + sample + "\n") == 1

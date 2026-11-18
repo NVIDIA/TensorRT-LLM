@@ -6590,7 +6590,7 @@
       "spec": {
         "id": 196,
         "title": "Prefill - Physical tier storage states",
-        "description": "Logical slot bytes, disjoint free/evictable/unavailable states. Retained evictable prefixes occupy storage and may be useful to a later request. Pool groups are byte-weighted; this is not device allocator usage. Reporting-rank coverage can be limited.",
+        "description": "Logical slot bytes in disjoint free/evictable/unavailable states. Evictable prefixes may be useful to later requests. The unavailable remainder also includes reclaimable retained cold-tier copies; it is not a direct allocation-pressure measure. Pool groups are byte-weighted; this is not device allocator usage. Reporting-rank coverage can be limited.",
         "links": [],
         "data": {
           "kind": "QueryGroup",
@@ -7162,7 +7162,7 @@
       "spec": {
         "id": 203,
         "title": "Decode - Physical tier storage states",
-        "description": "Logical slot bytes, disjoint free/evictable/unavailable states. Retained evictable prefixes occupy storage and may be useful to a later request. Pool groups are byte-weighted; this is not device allocator usage. Reporting-rank coverage can be limited.",
+        "description": "Logical slot bytes in disjoint free/evictable/unavailable states. Evictable prefixes may be useful to later requests. The unavailable remainder also includes reclaimable retained cold-tier copies; it is not a direct allocation-pressure measure. Pool groups are byte-weighted; this is not device allocator usage. Reporting-rank coverage can be limited.",
         "links": [],
         "data": {
           "kind": "QueryGroup",
