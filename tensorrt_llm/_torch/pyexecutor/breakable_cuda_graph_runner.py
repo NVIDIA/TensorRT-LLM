@@ -9,7 +9,7 @@ from typing import Any, Callable, Iterator, Optional
 
 import torch
 from torch import nn
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from tensorrt_llm.logger import logger
 
@@ -82,6 +82,42 @@ def _find_input_mismatch(destination: Any, source: Any, path: str = "inputs") ->
         if mismatch is not None:
             return mismatch
     return None
+
+
+def _stage_inputs(inputs: Any, larger: Any) -> Any:
+    """Copy the body's input tensors into storage that the bucket graph owns.
+
+    A device tensor takes the leading rows of the same input of ``larger``, a
+    larger bucket's staged inputs, when the rest of its shape matches, as bucket
+    outputs share the largest output. Only one bucket graph replays at a time and
+    each replay copies all of its inputs first, so buckets can share this storage.
+    Other tensors get a clone.
+    """
+    values, spec = tree_flatten(inputs)
+    larger_values = [None] * len(values)
+    if larger is not None:
+        flat_larger, larger_spec = tree_flatten(larger)
+        if larger_spec == spec:
+            larger_values = flat_larger
+    staged = []
+    for value, larger_value in zip(values, larger_values):
+        if isinstance(value, torch.Tensor):
+            if (
+                isinstance(larger_value, torch.Tensor)
+                and value.device.type != "cpu"
+                and value.dim() > 0
+                and larger_value.device == value.device
+                and larger_value.dtype == value.dtype
+                and larger_value.shape[1:] == value.shape[1:]
+                and larger_value.shape[0] >= value.shape[0]
+            ):
+                view = larger_value[: value.shape[0]]
+                view.copy_(value)
+                value = view
+            else:
+                value = value.clone()
+        staged.append(value)
+    return tree_unflatten(staged, spec)
 
 
 def _copy_inputs(destination: Any, source: Any) -> None:
@@ -357,10 +393,9 @@ class BreakableCUDAGraphRunner:
             nonlocal captured_output
             if self._prepare_inputs is not None:
                 inputs = self._prepare_body_inputs(args, kwargs)
-                static_inputs = tree_map(
-                    lambda value: value.clone() if isinstance(value, torch.Tensor) else value,
-                    inputs,
-                )
+                # Capture runs the largest bucket first (see capture_output).
+                largest = self._inputs[max(self._inputs)] if self._inputs else None
+                static_inputs = _stage_inputs(inputs, largest)
                 self._inputs[self._active_num_tokens] = static_inputs
                 args, kwargs = (), static_inputs
             with self.capture_context():
