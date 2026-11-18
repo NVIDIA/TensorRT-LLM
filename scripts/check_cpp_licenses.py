@@ -86,6 +86,8 @@ def _check_header(path: Path) -> None:
         raise ValueError("license header is missing")
     segments = _segments(header)
     body = _segments(_APACHE_BODY)
+    if not re.search(r"\bcopyright\b|\bSPDX-FileCopyrightText:", segments[0], re.IGNORECASE):
+        raise ValueError("license copyright notice is missing")
     # The copyright paragraph varies; permit one trailing attribution paragraph.
     if len(segments) not in (len(body) + 1, len(body) + 2) or segments[1 : 1 + len(body)] != body:
         raise ValueError("license header does not match Apache-2.0")
@@ -95,9 +97,22 @@ def _raise_walk_error(error: OSError) -> None:
     raise error
 
 
+def _scan_directory(root: Path, directory: str) -> Path:
+    path = root / directory
+    for parent in (path, *path.parents):
+        if parent.is_symlink():
+            raise ValueError(f"scan directory is a symlink: {parent}")
+        if parent == root:
+            break
+    normalized = Path(os.path.abspath(path))
+    if not normalized.is_relative_to(root) or not path.is_dir():
+        raise ValueError(f"scan directory is missing or outside the source root: {path}")
+    return normalized
+
+
 def _source_paths(root: Path, directories: list[str], files: list[Path] | None) -> Iterator[Path]:
+    scan_roots = [_scan_directory(root, directory) for directory in directories]
     if files is not None:
-        scan_roots = [root / directory for directory in directories]
         for path in sorted({Path(os.path.abspath(filename)) for filename in files}):
             if not any(path.is_relative_to(scan_root) for scan_root in scan_roots):
                 continue
@@ -109,10 +124,7 @@ def _source_paths(root: Path, directories: list[str], files: list[Path] | None) 
             yield path
         return
 
-    for directory in directories:
-        scan_root = root / directory
-        if not scan_root.is_dir() or scan_root.is_symlink():
-            raise ValueError(f"scan directory is missing or is a symlink: {scan_root}")
+    for scan_root in scan_roots:
         for current, dirnames, filenames in os.walk(scan_root, onerror=_raise_walk_error):
             for dirname in sorted(dirnames):
                 path = Path(current) / dirname
@@ -163,14 +175,16 @@ def check_licenses(
                 raise ValueError("file matches multiple license policies")
             if matches and matches[0]["license_name"] != "apache":
                 raise ValueError("unsupported license policy; expected Apache-2.0")
-            _check_header(path)
-        except (OSError, ValueError) as error:
-            if relative in skip:
+            try:
+                _check_header(path)
+            except ValueError as error:
+                if relative not in skip:
+                    raise
                 warnings += 1
                 print(f"warning {relative}: {error}")
-            else:
-                failed += 1
-                print(f"error {relative}: {error}")
+        except (OSError, ValueError) as error:
+            failed += 1
+            print(f"error {relative}: {error}")
     if not checked and files is None:
         raise ValueError("no supported source files were checked")
     print(f"filecount: {checked}\nwarncount: {warnings}\nerrcount: {failed}")

@@ -1540,7 +1540,8 @@ repos:
         entry: python scripts/check_cpp_licenses.py --files
         language: python
         files: ^cpp/(include|tensorrt_llm)/.*\.(h|cpp|cuh|cu|inl|map|py)$
-        types: [file]
+        types: []
+        types_or: [file, symlink]
     -   id: ruff-legacy
         name: ruff-legacy (baseline-gated lint for legacy files)
         entry: python scripts/legacy_utils.py lint-precommit

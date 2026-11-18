@@ -73,12 +73,16 @@ def test_scans_both_trees_and_all_jenkins_extensions(scan: tuple[Path, Path, dic
 
 
 @pytest.mark.parametrize(
-    "mutation", ["missing", "spdx_only", "wrong_body", "too_long", "line_comment"]
+    "mutation",
+    ["missing", "missing_copyright", "spdx_only", "wrong_body", "too_long", "line_comment"],
 )
 def test_rejects_missing_or_damaged_license(scan: tuple[Path, Path, dict], mutation: str) -> None:
     root, _, _ = scan
     content = {
         "missing": "int value;\n",
+        "missing_copyright": "\n".join(
+            line for line in HEADER.split("\n") if "Copyright" not in line
+        ),
         "spdx_only": "/* SPDX-License-Identifier: Apache-2.0 */\n",
         "wrong_body": HEADER.replace("WITHOUT WARRANTIES", "WITH WARRANTIES"),
         "too_long": "/*" + "x" * 4096 + "*/\n" + HEADER,
@@ -106,10 +110,13 @@ def test_ignores_line_wrapping_but_preserves_license_paragraphs(
 ) -> None:
     root, _, _ = scan
     path = root / "include/example.h"
+    copyright_line = next(line for line in HEADER.splitlines() if "Copyright" in line)
     for content in (
         HEADER.replace('License");\n * you', 'License"); you'),
         HEADER.replace("Apache License", "Apache\n * License"),
         HEADER.replace("Apache License", "Apache\t  License"),
+        HEADER.replace(copyright_line, " * Copyright (c) 2020-2026, Example Authors."),
+        HEADER.replace(copyright_line, " * SPDX-FileCopyrightText: 2020-2026 Example Authors."),
     ):
         path.write_text(content)
         assert run_scan(scan)[0] == (1, 0, 0)
@@ -144,10 +151,13 @@ def test_filter_exclusions_do_not_hide_missing_headers(
     assert run_scan(scan)[0] == (1, 0, 1)
 
 
-def test_multiple_matching_rules_fail(scan: tuple[Path, Path, dict]) -> None:
+@pytest.mark.parametrize("skip_listed", [False, True])
+def test_multiple_matching_rules_fail(scan: tuple[Path, Path, dict], skip_listed: bool) -> None:
     root, _, policy = scan
     (root / "include/example.h").write_text(HEADER)
     policy["filters"].append({"include_re": "^include/", "license_name": "apache"})
+    if skip_listed:
+        policy["skip"]["include/example.h"] = "third-party"
     assert run_scan(scan)[0] == (1, 0, 1)
 
 
@@ -161,30 +171,54 @@ def test_unknown_policy_fields_fail(scan: tuple[Path, Path, dict]) -> None:
 
 
 @pytest.mark.parametrize("selected_files", [False, True])
-def test_symlink_is_not_read(scan: tuple[Path, Path, dict], selected_files: bool) -> None:
-    root, _, _ = scan
+@pytest.mark.parametrize("skip_listed", [False, True])
+def test_symlink_is_not_read(
+    scan: tuple[Path, Path, dict], selected_files: bool, skip_listed: bool
+) -> None:
+    root, _, policy = scan
     path = root / "include/example.h"
-    path.symlink_to(root / "nonexistent")
-    assert run_scan(scan, files=[path] if selected_files else None)[0] == (1, 0, 1)
+    target = root.parent / "external.h"
+    target.write_text(HEADER)
+    path.symlink_to(target)
+    if skip_listed:
+        policy["skip"]["include/example.h"] = "third-party"
+    counts, output = run_scan(scan, files=[path] if selected_files else None)
+    assert counts == (1, 0, 1)
+    assert "error include/example.h: source file is a symlink" in output
 
 
 @pytest.mark.parametrize("selected_files", [False, True])
+@pytest.mark.parametrize("directory", ["include", "include/linked/nested"])
 def test_nested_directory_symlink_is_rejected(
-    scan: tuple[Path, Path, dict], selected_files: bool
+    scan: tuple[Path, Path, dict], selected_files: bool, directory: str
 ) -> None:
     root, config, _ = scan
     (root / "include/ok.h").write_text(HEADER)
     target = root.parent / "external"
-    target.mkdir()
-    (target / "bad.h").write_text("int value;\n")
+    (target / "nested").mkdir(parents=True)
+    (target / "nested/bad.h").write_text(HEADER)
     (root / "include/linked").symlink_to(target, target_is_directory=True)
     with pytest.raises(ValueError, match="scan directory is a symlink: .*include/linked"):
         checker.check_licenses(
             root,
             config,
-            ["include", "tensorrt_llm"],
-            files=[root / "include/linked/bad.h"] if selected_files else None,
+            [directory],
+            files=[root / "include/linked/nested/bad.h"] if selected_files else None,
         )
+
+
+@pytest.mark.parametrize("selected_files", [False, True])
+@pytest.mark.parametrize("directory", ["include", "include/../include", "include/nested"])
+def test_scan_directory_forms_select_the_same_files(
+    scan: tuple[Path, Path, dict], selected_files: bool, directory: str
+) -> None:
+    root, config, _ = scan
+    (root / "include/nested").mkdir()
+    path = root / "include/nested/bad.h"
+    path.write_text("int value;\n")
+    assert checker.check_licenses(
+        root, config, [directory], files=[path] if selected_files else None
+    ) == (1, 0, 1)
 
 
 def test_missing_or_empty_scan_fails(scan: tuple[Path, Path, dict]) -> None:
@@ -218,16 +252,21 @@ def test_selected_files_do_not_scan_siblings_or_other_trees(scan: tuple[Path, Pa
     sibling.write_text("int value;\n")
     outside = root.parent / "outside.h"
     outside.write_text("int value;\n")
+    other_tree = root / "tests/outside.h"
+    other_tree.parent.mkdir()
+    other_tree.write_text("int value;\n")
     unsupported = root / "include/ignored.txt"
     unsupported.write_text("no license\n")
-    assert run_scan(scan, files=[selected, selected, outside, unsupported])[0] == (1, 0, 0)
+    files = [selected, selected, outside, other_tree, unsupported]
+    assert run_scan(scan, files=files)[0] == (1, 0, 0)
     assert run_scan(scan, files=[sibling])[0] == (1, 0, 1)
     assert run_scan(scan)[0] == (2, 0, 1)
 
 
 def test_empty_selection_does_not_fall_back_to_full_scan(scan: tuple[Path, Path, dict]) -> None:
-    root, _, _ = scan
+    root, _, policy = scan
     (root / "include/bad.h").write_text("int value;\n")
     assert run_scan(scan, files=[])[0] == (0, 0, 0)
     assert run_scan(scan, files=[root.parent / "unrelated.py"])[0] == (0, 0, 0)
+    policy["skip"]["include/missing.h"] = "third-party"
     assert run_scan(scan, files=[root / "include/missing.h"])[0] == (1, 0, 1)
