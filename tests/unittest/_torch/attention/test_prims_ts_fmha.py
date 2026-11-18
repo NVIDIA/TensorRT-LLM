@@ -165,7 +165,7 @@ def _support_result(
     query_width: int = 1,
     query_lens: list[int] | None = None,
     helix: bool = False,
-    helix_bounds_valid: bool = False,
+    helix_spec_valid: bool = False,
     kv_lens_override: list[int] | None = None,
     metadata_overrides: dict | None = None,
     forward_overrides: dict | None = None,
@@ -282,8 +282,9 @@ def _support_result(
     metadata = SimpleNamespace(
         helix_position_offsets=_TensorSpec((num_tokens,), torch.int32) if helix else None,
         helix_context_local_slots=None,
-        helix_kv_bounds=_TensorSpec((num_tokens,), torch.int32) if helix else None,
-        _helix_spec_tokens_valid=helix_bounds_valid,
+        helix_kv_bounds=None,
+        helix_global_kv_lens=_TensorSpec((num_generations,), torch.int32) if helix else None,
+        _helix_spec_tokens_valid=helix_spec_valid,
         num_sparse_topk=0,
         use_spec_decoding=use_spec_decoding,
         is_spec_dec_tree=is_spec_dec_tree,
@@ -537,7 +538,7 @@ def test_supports_uniform_linear_fp8_mla(query_width: int, helix: bool, page_siz
         query_width=query_width,
         tokens_per_block=page_size,
         helix=helix,
-        helix_bounds_valid=query_width > 1,
+        helix_spec_valid=query_width > 1,
         query_lens=[1] + [query_width] * 4 if helix else None,
         metadata_overrides={"num_contexts": 1, "num_ctx_tokens": 1} if helix else None,
         kv_lens_override=[129, 0, 0, 32, 64] if helix else None,
@@ -597,7 +598,7 @@ def test_generation_query_uniformity_uses_only_cpu_metadata(
         ({"is_spec_dec_tree": True}, "tree speculative"),
         ({"metadata_overrides": {"is_spec_dec_dynamic_tree": True}}, "tree speculative"),
         ({"forward_overrides": {"attention_mask_data": torch.empty(1)}}, "custom attention"),
-        ({"helix_bounds_valid": False}, "valid per-token KV bounds"),
+        ({"helix_spec_valid": False}, "prepared global lengths"),
         ({"forward_overrides": {"softmax_stats_tensor": None}}, "requires softmax statistics"),
         (
             {
@@ -608,28 +609,28 @@ def test_generation_query_uniformity_uses_only_cpu_metadata(
             "contiguous FP32",
         ),
         (
-            {"metadata_overrides": {"helix_kv_bounds": _TensorSpec((24,), torch.int64)}},
-            "int32 per-token",
+            {"metadata_overrides": {"helix_global_kv_lens": _TensorSpec((4,), torch.int64)}},
+            "int32 global KV lengths",
         ),
         (
-            {"metadata_overrides": {"helix_kv_bounds": _TensorSpec((23,), torch.int32)}},
-            "int32 per-token",
-        ),
-        (
-            {
-                "metadata_overrides": {
-                    "helix_kv_bounds": _TensorSpec((24,), torch.int32, device="cpu")
-                }
-            },
-            "int32 per-token",
+            {"metadata_overrides": {"helix_global_kv_lens": _TensorSpec((3,), torch.int32)}},
+            "int32 global KV lengths",
         ),
         (
             {
                 "metadata_overrides": {
-                    "helix_kv_bounds": _TensorSpec((24,), torch.int32, contiguous=False)
+                    "helix_global_kv_lens": _TensorSpec((4,), torch.int32, device="cpu")
                 }
             },
-            "int32 per-token",
+            "int32 global KV lengths",
+        ),
+        (
+            {
+                "metadata_overrides": {
+                    "helix_global_kv_lens": _TensorSpec((4,), torch.int32, contiguous=False)
+                }
+            },
+            "int32 global KV lengths",
         ),
         (
             {"forward_overrides": {"attention_mask": PredefinedAttentionMask.FULL}},
@@ -651,7 +652,7 @@ def test_rejects_unsupported_mla_verification_layouts(
         use_spec_decoding=True,
         query_width=6,
         helix=True,
-        helix_bounds_valid=True,
+        helix_spec_valid=True,
     )
     args.update(overrides)
     supported, reason = _support_result(**args)
@@ -2182,7 +2183,7 @@ def _get_test_mla_wrapper(
     mask_type: str = "causal",
     query_width: int = 1,
     store_softmax_stats: bool = False,
-    use_kv_bounds: bool = False,
+    cp_world: int = 1,
 ) -> object:
     return fmha._get_or_plan_mla_decode_wrapper(
         workspace_buffer,
@@ -2198,7 +2199,8 @@ def _get_test_mla_wrapper(
         output_dtype=torch.bfloat16,
         mask_type=mask_type,
         lse_mode="base2" if store_softmax_stats else "none",
-        use_kv_bounds=use_kv_bounds,
+        cp_world=cp_world,
+        cp_interleave_size=32 if cp_world > 1 else 1,
     )
 
 
@@ -2257,8 +2259,8 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
     num_tokens = 2 * query_width
     helix = helix_mode != "none"
     # Include unused capacity to catch accidental context/padded-row offsets.
-    kv_bounds = torch.tensor(
-        [0] * query_width + [page_size - 1] + [page_size] * (query_width - 1) + [999] * 4,
+    global_lengths = torch.tensor(
+        [page_size - 1, 2 * page_size] + [999] * 4,
         dtype=torch.int32,
     )
     stats = torch.empty((num_tokens, attn.num_heads, 2), dtype=torch.float32) if helix else None
@@ -2266,7 +2268,10 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         is_cuda_graph=False,
         helix_position_offsets=torch.empty(num_tokens, dtype=torch.int32) if helix else None,
         _helix_spec_tokens_valid=helix_mode == "token",
-        helix_kv_bounds=kv_bounds,
+        helix_kv_bounds=None,
+        helix_global_kv_lens=global_lengths,
+        mapping=SimpleNamespace(cp_size=2, cp_rank=1),
+        tokens_per_block=page_size,
         beam_width=1,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
@@ -2333,7 +2338,8 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         "out_dtype": torch.bfloat16,
         "mask_type": "causal",
         "lse_mode": "base2" if helix else "none",
-        "use_kv_bounds": helix,
+        "cp_world": 2 if helix else 1,
+        "cp_interleave_size": page_size if helix else 1,
         "zero_empty_rows": False,
     }
     wrapper.run.assert_called_once()
@@ -2351,30 +2357,28 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         run_kwargs["block_tables"],
         torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32),
     )
-    assert run_kwargs["seq_lens_kv"].data_ptr() == sequence_lengths.data_ptr()
-    torch.testing.assert_close(run_kwargs["seq_lens_kv"], sequence_lengths)
+    expected_lengths = global_lengths[:2] if helix else sequence_lengths
+    assert run_kwargs["seq_lens_kv"].data_ptr() == expected_lengths.data_ptr()
+    torch.testing.assert_close(run_kwargs["seq_lens_kv"], expected_lengths)
+    assert run_kwargs["cp_rank"] == (1 if helix else 0)
+    assert "kv_bounds" not in run_kwargs
     assert run_kwargs["out"].shape == (2, query_width, attn.num_heads, 512)
     assert run_kwargs["out"].data_ptr() == output.data_ptr()
     assert run_kwargs["softmax_scale"] == pytest.approx(0.125 if fp8 else 1.0 / math.sqrt(128 + 64))
     assert run_kwargs["output_scale"] == (2.0 if fp8 else 1.0)
     assert run_kwargs["validate"] is False
     if helix:
-        expected_bounds = kv_bounds[:num_tokens] if helix_mode == "token" else sequence_lengths
-        assert run_kwargs["kv_bounds"].data_ptr() == expected_bounds.data_ptr()
-        assert run_kwargs["kv_bounds"].shape == (num_tokens,)
-        torch.testing.assert_close(run_kwargs["kv_bounds"], expected_bounds)
         assert forward_args.softmax_stats_is_lse
         assert run_kwargs["lse"].shape == (2, query_width, attn.num_heads)
         assert run_kwargs["lse"].data_ptr() == stats.data_ptr()
     else:
-        assert run_kwargs["kv_bounds"] is None
         assert not forward_args.softmax_stats_is_lse
         assert run_kwargs["lse"] is None
 
     block_tables[:, 0].add_(20)
     block_tables[:, 1].add_(200)
     sequence_lengths.add_(1)
-    kv_bounds[:num_tokens].add_(1)
+    global_lengths[:2].add_(1)
     with monkeypatch.context() as capture_patch:
         capture_patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
         capture_patch.setattr(torch.Tensor, "item", Mock(side_effect=AssertionError("device read")))
@@ -2391,10 +2395,8 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         run_kwargs["block_tables"],
         torch.tensor([[20, 21, 22], [23, 24, 25]], dtype=torch.int32),
     )
-    assert run_kwargs["seq_lens_kv"].data_ptr() == sequence_lengths.data_ptr()
-    torch.testing.assert_close(run_kwargs["seq_lens_kv"], sequence_lengths)
-    if helix:
-        torch.testing.assert_close(run_kwargs["kv_bounds"], expected_bounds)
+    assert run_kwargs["seq_lens_kv"].data_ptr() == expected_lengths.data_ptr()
+    torch.testing.assert_close(run_kwargs["seq_lens_kv"], expected_lengths)
     assert fmha._mla_decode_wrappers[(2, query_width)] is wrapper
     assert len(fmha._mla_decode_plan_profiles) == 1
     assert asdict(next(iter(fmha._mla_decode_plan_profiles))) == {
@@ -2599,7 +2601,7 @@ def test_mla_wrapper_cache_separates_query_widths(
                 workspace,
                 query_width=query_width,
                 store_softmax_stats=helix,
-                use_kv_bounds=helix,
+                cp_world=2 if helix else 1,
             )
         )
     assert wrapper_factory.call_count == len(widths)
@@ -2614,7 +2616,7 @@ def test_mla_wrapper_cache_separates_query_widths(
                 workspace,
                 query_width=query_width,
                 store_softmax_stats=helix,
-                use_kv_bounds=helix,
+                cp_world=2 if helix else 1,
             )
             is wrapper
         )
@@ -2742,7 +2744,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
 
 
 @pytest.mark.parametrize(
-    "is_cuda_graph,fp8,query_width,with_stats,with_bounds",
+    "is_cuda_graph,fp8,query_width,with_stats,helix",
     [
         (False, False, 1, False, False),
         (True, False, 6, True, True),
@@ -2756,7 +2758,7 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     fp8: bool,
     query_width: int,
     with_stats: bool,
-    with_bounds: bool,
+    helix: bool,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     workspace_size = Mock(return_value=48)
@@ -2772,9 +2774,8 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     q = torch.empty((2 * query_width, attn.num_heads * 576), dtype=torch.bfloat16)
     metadata = SimpleNamespace(
         is_cuda_graph=is_cuda_graph,
-        helix_position_offsets=torch.empty(2 * query_width, dtype=torch.int32)
-        if with_bounds
-        else None,
+        helix_position_offsets=torch.empty(2 * query_width, dtype=torch.int32) if helix else None,
+        mapping=SimpleNamespace(cp_size=2, cp_rank=1),
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         max_num_requests=2,
         num_contexts=0,
@@ -2810,7 +2811,8 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     assert workspace_size.call_args.kwargs["out_dtype"] == torch.bfloat16
     assert workspace_size.call_args.kwargs["max_q_len"] == query_width
     assert "store_softmax_stats" not in workspace_size.call_args.kwargs
-    assert workspace_size.call_args.kwargs["use_kv_bounds"] == with_bounds
+    assert workspace_size.call_args.kwargs["cp_world"] == (2 if helix else 1)
+    assert workspace_size.call_args.kwargs["cp_interleave_size"] == (32 if helix else 1)
     assert workspace_size.call_args.kwargs["validate"] is False
     assert workspace.numel() == 48
 
@@ -2950,7 +2952,8 @@ def test_mla_workspace_size_cache_tracks_request_geometry(
 
     assert workspace_size.call_count == 3
     assert all(call.kwargs["validate"] is False for call in workspace_size.call_args_list)
-    assert all(call.kwargs["use_kv_bounds"] is False for call in workspace_size.call_args_list)
+    assert all(call.kwargs["cp_world"] == 1 for call in workspace_size.call_args_list)
+    assert all(call.kwargs["cp_interleave_size"] == 1 for call in workspace_size.call_args_list)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
     assert workspace_size.call_count == 3

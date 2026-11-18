@@ -1300,6 +1300,7 @@ class TmemCorrResource(MlaResource):
             cta_idx_q_for_stage(self.cta_idx_q, stage_info),
             self.cu_seqlens_q,
             batch,
+            cp_rank=self.cp_rank,
         )
         tile = global_kv_tile_idx(
             cfg, local_tile, length, cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)

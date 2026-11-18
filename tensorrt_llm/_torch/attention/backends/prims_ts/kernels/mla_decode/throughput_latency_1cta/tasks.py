@@ -62,6 +62,7 @@ class MlaDecodeTask(Task):
         self.runtime_split_kv = kwargs.pop("runtime_split_kv", None)
         self.seqlens_kv = kwargs.pop("seqlens_kv", None)
         self.cu_seqlens_q = kwargs.pop("cu_seqlens_q", None)
+        self.cp_rank = kwargs.pop("cp_rank", 0)
         self.domain_bias = kwargs.pop("domain_bias", 0)
         super().__init__(**kwargs)
         self._tmem_base_offset = Int32(0)
@@ -182,6 +183,7 @@ class MlaDecodeTask(Task):
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,
+            cp_rank=self.cp_rank,
         )
         if cutlass.const_expr(self.cfg.fixed_sparse_kv_tiles > 0):
             return Int32(self.domain_bias)

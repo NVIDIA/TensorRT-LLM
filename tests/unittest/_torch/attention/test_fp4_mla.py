@@ -861,6 +861,9 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     )
     metadata.helix_local_slots = torch.full_like(metadata.helix_position_offsets, untouched)
     metadata.helix_kv_bounds = torch.full_like(metadata.helix_position_offsets, untouched)
+    metadata.helix_global_kv_lens = torch.full(
+        (num_seqs + 2,), untouched, dtype=torch.int32, device="cuda"
+    )
     metadata.kv_lens_cuda = torch.full((num_seqs + 3,), untouched, dtype=torch.int32, device="cuda")
 
     metadata.recompute_helix_spec_buffers(num_tokens, tokens_per_seq)
@@ -879,10 +882,15 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
         metadata.kv_lens_cuda[1 : 1 + num_seqs],
         expected_bounds.view(num_seqs, tokens_per_seq)[:, -1],
     )
+    torch.testing.assert_close(
+        metadata.helix_global_kv_lens[:num_seqs],
+        positions.view(num_seqs, tokens_per_seq)[:, -1] + 1,
+    )
     assert (metadata.helix_local_slots[num_tokens:] == untouched).all()
     assert (metadata.helix_kv_bounds[num_tokens:] == untouched).all()
     assert metadata.kv_lens_cuda[0].item() == untouched
     assert (metadata.kv_lens_cuda[1 + num_seqs :] == untouched).all()
+    assert (metadata.helix_global_kv_lens[num_seqs:] == untouched).all()
     # Any group of the sequence that this rank does not own writes no slot.
     assert ((metadata.helix_local_slots[gen] == -1) == (owner != cp_rank)).all()
 
@@ -891,8 +899,8 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
 def test_helix_spec_buffers_reuse_the_compiled_kernel_across_batches() -> None:
     kernel = fp4_mla_metadata._helix_spec_buffers_kernel
     tokens_per_seq = 4
-    positions, local_slots, kv_bounds, kv_lens = (
-        torch.zeros(64, dtype=torch.int32, device="cuda") for _ in range(4)
+    positions, local_slots, kv_bounds, kv_lens, global_kv_lens = (
+        torch.zeros(64, dtype=torch.int32, device="cuda") for _ in range(5)
     )
 
     def populate(num_contexts: int, num_seqs: int) -> None:
@@ -907,6 +915,7 @@ def test_helix_spec_buffers_reuse_the_compiled_kernel_across_batches() -> None:
             tokens_per_block=64,
             cp_size=8,
             cp_rank=3,
+            global_kv_lens=global_kv_lens[:num_seqs],
         )
 
     # Context counts 1-3 misalign the int32 kv_lens view.

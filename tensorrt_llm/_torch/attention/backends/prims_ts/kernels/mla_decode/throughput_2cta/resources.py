@@ -61,7 +61,7 @@ from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
 from ..helpers.sparse_indices import SparseKVIndices, SparseSourceTile
-from ..helpers.kv_bounds import query_kv_bound
+from ..helpers.context_parallel import local_kv_length
 from ..helpers.gather import (
     gather4_cached,
     load_sparse_rows,
@@ -356,7 +356,8 @@ class MlaWorkQueue(WorkQueue):
     """
 
     tile_sched_params: Any = None
-    cache_seqs: Any = None  # cache_seqs tensor for k_tile_count
+    cache_seqs: Any = None  # global lengths for k_tile_count
+    cp_rank: Any = 0
     split_kv: Any = None  # maximum split slots in the launch/workspace
     block_split_kvs: Any = None  # optional per-batch split caps
     is_var_split_kv: cutlass.Constexpr[bool] = False
@@ -378,6 +379,7 @@ class MlaWorkQueue(WorkQueue):
         self,
         tile_sched_params,
         cache_seqs=None,
+        cp_rank=0,
         split_kv=None,
         block_split_kvs=None,
         is_var_split_kv=False,
@@ -406,6 +408,7 @@ class MlaWorkQueue(WorkQueue):
             self.tile_scheduler_config = None
         self.tile_sched_params = tile_sched_params
         self.cache_seqs = cache_seqs
+        self.cp_rank = cp_rank
         self.split_kv = split_kv
         self.block_split_kvs = block_split_kvs
         self.is_var_split_kv = is_var_split_kv
@@ -509,7 +512,7 @@ class MlaWorkQueue(WorkQueue):
         params = self.tile_sched_params
         _, s_idx, b_idx, split_kv_idx = tile_idx
         safe_b_idx = cute.math.min(b_idx, params.problem_shape_b - Int32(1))
-        if cutlass.const_expr(self.static_seq_len_k is not None):
+        if cutlass.const_expr(self.static_seq_len_k is not None and cfg.cp_world == 1):
             K = Int32(self.static_seq_len_k)
         else:
             K = Int32(self.cache_seqs[safe_b_idx])
@@ -532,9 +535,7 @@ class MlaWorkQueue(WorkQueue):
             self.cu_seqlens_q,
             safe_b_idx,
         )
-        if cutlass.const_expr(
-            not cfg.use_kv_bounds and cfg.mask_type == MaskType.CAUSAL.value
-        ):
+        if cutlass.const_expr(cfg.mask_type == MaskType.CAUSAL.value):
             # Split partitioning owns the mask-visible CTA domain. The final
             # physical row resolves to the tile's latest valid Q
             # token. Row-causal softmax narrows earlier rows without changing
@@ -549,6 +550,7 @@ class MlaWorkQueue(WorkQueue):
                 safe_b_idx,
             )
             K = mask_visible_k_length(cfg.mask_type, K, logical_q_idx, q_len)
+        K = local_kv_length(cfg, K, self.cp_rank)
         K = K if query_tile_has_rows else Int32(0)
         k_tile_total = (K + Int32(cfg.mma_qk_tiler[1] - 1)) // Int32(
             cfg.mma_qk_tiler[1]
@@ -2437,7 +2439,7 @@ class TmemSResource(HighThroughputMlaResource):
     scale_softmax_log2: Any = None  # softmax_scale * log2(e)
     page_offsets: Any = None
     cache_seqs: Any = None  # per-batch valid K length
-    kv_bounds: Any = None  # per-logical-query prefix length
+    cp_rank: Any = 0  # runtime context-parallel rank
     cu_seqlens_q: Any = None  # cumulative compact-Q offsets, or None for fixed Q
     split_kv: Any = None  # per-work-tile split count
     logical_num_heads_q: cutlass.Constexpr[int] = 128
@@ -2827,27 +2829,37 @@ class TmemSResource(HighThroughputMlaResource):
         stage_idx = stage_info.stage_idx
 
         work_tile = stage_info.work_tile
-        K = Int32(work_tile.k_len)
+        K = local_kv_length(cfg, Int32(work_tile.k_len), self.cp_rank)
         k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
         tile_offset_k = k_index * Int32(cfg.mma_qk_tiler[1])
         needs_row_causal_mask = cutlass.const_expr(
-            not cfg.use_kv_bounds and cfg.mask_type == MaskType.CAUSAL.value
+            cfg.cp_world == 1 and cfg.mask_type == MaskType.CAUSAL.value
+        )
+        needs_cp_causal_mask = cutlass.const_expr(
+            cfg.cp_world > 1 and cfg.mask_type == MaskType.CAUSAL.value
         )
         row_kv_bound = Int32(0)
-        if cutlass.const_expr(cfg.use_kv_bounds):
+        if cutlass.const_expr(needs_cp_causal_mask):
             row_in_tile = self.cta_rank * Int32(
                 cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
             ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
-            flat_query_row = (
-                Int32(work_tile.tile_idx[1]) * Int32(cfg.mma_qk_tiler[0]) + row_in_tile
+            batch_idx = Int32(work_tile.tile_idx[2])
+            _, logical_seq_len_q = query_batch_bounds(
+                self.cu_seqlens_q, batch_idx, self.logical_seq_len_q
             )
-            row_kv_bound = query_kv_bound(
-                self.kv_bounds,
-                self.cu_seqlens_q,
-                Int32(work_tile.tile_idx[2]),
-                flat_query_row // Int32(self.logical_num_heads_q),
+            _, _, logical_q_idx, _, _ = flat_query_row_state(
+                row_in_tile,
+                Int32(work_tile.tile_idx[1]),
+                cfg.mma_qk_tiler[0],
+                self.logical_num_heads_q,
                 self.logical_seq_len_q,
+                self.cu_seqlens_q,
+                batch_idx,
             )
+            global_bound = mask_visible_k_length(
+                cfg.mask_type, Int32(work_tile.k_len), logical_q_idx, logical_seq_len_q
+            )
+            row_kv_bound = local_kv_length(cfg, global_bound, self.cp_rank)
             group_needs_mask = True
         elif cutlass.const_expr(needs_row_causal_mask):
             batch_idx = Int32(work_tile.tile_idx[2])
@@ -2978,7 +2990,7 @@ class TmemSResource(HighThroughputMlaResource):
             ) << EPILOGUE_COLUMN_GROUP_SHIFT
             for i in cutlass.range_constexpr(64):
                 token_idx = tile_offset_k + tidx_col + Int32(i)
-                if cutlass.const_expr(cfg.use_kv_bounds):
+                if cutlass.const_expr(needs_cp_causal_mask):
                     token_is_visible = token_idx < row_kv_bound
                 elif cutlass.const_expr(needs_row_causal_mask):
                     mask_flat_row = Int32(self.logical_num_heads_q) * (

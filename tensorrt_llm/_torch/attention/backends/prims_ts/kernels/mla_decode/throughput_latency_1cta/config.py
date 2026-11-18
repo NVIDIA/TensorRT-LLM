@@ -114,10 +114,11 @@ class MlaConfig(Nvfp4KVConfig):
     logical_seq_len_q: int = 4
     # True: the Q lengths are compile-time. Sparse flattened Q is always fixed.
     fixed_seqlen: bool = False
-    # Causal is bottom-right aligned for speculative decode. Dense keeps only
-    # the ordinary per-batch KV-tail predicate.
+    # Causal is bottom-right aligned in the global logical sequence. Dense
+    # uses the full global length; both map their prefixes to the local cache.
     mask_type: str = MaskType.CAUSAL.value
-    use_kv_bounds: bool = False
+    cp_world: int = 1
+    cp_interleave_size: int = 1
     # Threshold skip correction in log2 units (binades; 0 disables it): freeze
     # the running row max while a K tile raises it by at most this
     # compile-time amount and skip that tile's O rescale.  E4M3 P then uses

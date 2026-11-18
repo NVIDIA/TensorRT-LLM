@@ -285,11 +285,13 @@ def _helix_spec_buffers_kernel(
     local_slots_ptr,
     kv_bounds_ptr,
     kv_lens_ptr,
+    global_kv_lens_ptr,
     num_tokens,
     tokens_per_seq,
     tokens_per_block,
     cp_size,
     cp_rank,
+    WRITE_GLOBAL_KV_LENS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -315,6 +317,8 @@ def _helix_spec_buffers_kernel(
     # The last token of each verify group sets its sequence's rank-local KV length.
     last_of_seq = offsets % tokens_per_seq == tokens_per_seq - 1
     tl.store(kv_lens_ptr + offsets // tokens_per_seq, bound, mask=mask & last_of_seq)
+    if WRITE_GLOBAL_KV_LENS:
+        tl.store(global_kv_lens_ptr + offsets // tokens_per_seq, after, mask=mask & last_of_seq)
 
 
 def populate_helix_spec_buffers(
@@ -328,6 +332,7 @@ def populate_helix_spec_buffers(
     tokens_per_block: int,
     cp_size: int,
     cp_rank: int,
+    global_kv_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """Derive the Helix speculative per-token buffers in one launch.
 
@@ -335,7 +340,9 @@ def populate_helix_spec_buffers(
     ``local_slots[t]`` is its rank-local KV write slot (-1 when another CP rank
     owns the page), ``kv_bounds[t]`` the rank-local KV entries it attends to
     (the local length of ``position + 1``) and ``kv_lens[s]`` the bound of
-    sequence ``s``'s last token. Static shapes, safe under CUDA graph capture.
+    sequence ``s``'s last token. When supplied, ``global_kv_lens[s]`` stores
+    that token's global position plus one. Static shapes, safe under CUDA
+    graph capture.
     """
     if num_tokens <= 0:
         return
@@ -348,6 +355,8 @@ def populate_helix_spec_buffers(
         raise ValueError("Helix spec buffers need a positive page size and a valid CP rank.")
     num_seqs = num_tokens // tokens_per_seq
     tensors = (positions, local_slots, kv_bounds, kv_lens)
+    if global_kv_lens is not None:
+        tensors += (global_kv_lens,)
     if any(tensor.ndim != 1 or tensor.stride(0) != 1 for tensor in tensors):
         raise ValueError("Helix spec buffers must be contiguous and one-dimensional.")
     if any(tensor.dtype != torch.int32 for tensor in tensors):
@@ -356,6 +365,8 @@ def populate_helix_spec_buffers(
         raise ValueError("Helix spec buffers must be CUDA tensors on one device.")
     if any(tensor.numel() < num_tokens for tensor in tensors[:3]) or kv_lens.numel() < num_seqs:
         raise ValueError("Helix spec buffers are too small for the generation tokens.")
+    if global_kv_lens is not None and global_kv_lens.numel() < num_seqs:
+        raise ValueError("Helix global KV lengths are too small for the generation requests.")
 
     block = 256
     _helix_spec_buffers_kernel[(triton.cdiv(num_tokens, block),)](
@@ -363,11 +374,13 @@ def populate_helix_spec_buffers(
         local_slots,
         kv_bounds,
         kv_lens,
+        global_kv_lens,
         num_tokens,
         tokens_per_seq,
         tokens_per_block,
         cp_size,
         cp_rank,
+        WRITE_GLOBAL_KV_LENS=global_kv_lens is not None,
         BLOCK=block,
         num_warps=4,
     )

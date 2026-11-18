@@ -206,7 +206,7 @@ def planners(
     workspace_size = create_autospec(
         decode_api.get_prims_ts_batch_mla_decode_workspace_size,
         side_effect=lambda **kwargs: (128 - kwargs["batch_size"]) * kwargs["max_q_len"]
-        + 1024 * kwargs["use_kv_bounds"],
+        + 1024 * (kwargs["cp_world"] > 1),
     )
     package.get_prims_ts_batch_mla_decode_workspace_size = workspace_size
     allocations = []
@@ -277,7 +277,8 @@ def _decode_profile(**overrides: object) -> _warmup._MlaDecodePlan:
         out_dtype=torch.bfloat16,
         mask_type="causal",
         lse_mode="none",
-        use_kv_bounds=False,
+        cp_world=1,
+        cp_interleave_size=1,
     )
     return _warmup._MlaDecodePlan(**(fields | overrides))
 
@@ -370,7 +371,7 @@ def test_decode_all_batches_modes_and_devices_share_maximum_workspace(
     base = _decode_profile()
     modes = (
         base,
-        replace(base, lse_mode="base2", use_kv_bounds=True),
+        replace(base, lse_mode="base2", cp_world=2, cp_interleave_size=128),
         replace(base, max_q_len=8),
         replace(base, device=torch.device("cuda:1")),
     )

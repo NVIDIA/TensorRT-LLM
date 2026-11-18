@@ -363,7 +363,7 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
     original_generation = mixer.mqa.mla_rope_generation
     prefill_lengths = list(lengths)
     graph_checked = False
-    empty_bounds_checked = False
+    empty_rows_checked = False
     if scenario.strict_prims_ts:
         assert all(
             len(backend._fmha_manager.fmha_libs) == 1
@@ -374,21 +374,25 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
         run_generation = fmha.run_mla_generation
 
         def check_generation(params: FmhaParams) -> None:
-            nonlocal graph_checked, empty_bounds_checked
+            nonlocal graph_checked, empty_rows_checked
             assert params.input_seq_length == query_width
             assert params.meta._helix_spec_tokens_valid
             run_generation(params)
-            bounds = params.meta.helix_kv_bounds[: params.num_tokens]
-            empty = bounds == 0
+            positions = params.meta.helix_position_offsets[: params.num_tokens]
+            torch.testing.assert_close(
+                params.meta.helix_global_kv_lens[: params.batch_size],
+                positions.view(-1, query_width)[:, -1] + 1,
+            )
+            empty = positions < mapping.cp_rank * page
             active = ~empty
             assert params.fwd.softmax_stats_is_lse
             stats = params.fwd.softmax_stats
             if not graph_checked:
                 assert params.seq_offset == 1
-                positions = params.meta.helix_position_offsets[: params.num_tokens].view(
-                    -1, query_width
+                grouped_positions = positions.view(-1, query_width)
+                assert torch.any(
+                    grouped_positions[:, 0] // page != grouped_positions[:, -1] // page
                 )
-                assert torch.any(positions[:, 0] // page != positions[:, -1] // page)
                 eager = params.output[active].clone()
                 eager_stats = stats[active].clone()
                 graph = torch.cuda.CUDAGraph()
@@ -406,7 +410,7 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
                 # neutralize them before the final output/reference comparison.
                 params.output[empty] = float("nan")
                 stats[empty] = float("nan")
-                empty_bounds_checked = True
+                empty_rows_checked = True
 
         fmha.run_mla_generation = check_generation
 
@@ -646,7 +650,7 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
             lengths = [g + query_width for g in lengths]
         if scenario.strict_prims_ts:
             assert graph_checked
-            assert any(MPI.COMM_WORLD.allgather(empty_bounds_checked))
+            assert any(MPI.COMM_WORLD.allgather(empty_rows_checked))
 
         # Exercise the context writer with nonzero global prefixes and real
         # RoPE, independently of historical-attention gathering.

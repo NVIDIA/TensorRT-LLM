@@ -63,7 +63,8 @@ class _MlaDecodePlan:
     out_dtype: torch.dtype
     mask_type: Literal["causal", "dense"]
     lse_mode: Literal["none", "base2"]
-    use_kv_bounds: bool
+    cp_world: int
+    cp_interleave_size: int
 
 
 def _bucket_minima(limit: int) -> list[int]:
@@ -267,7 +268,8 @@ class PrimsTSDenseMlaWarmup:
                 kv_dtype=profile.kv_dtype,
                 out_dtype=profile.out_dtype,
                 mask_type=profile.mask_type,
-                use_kv_bounds=profile.use_kv_bounds,
+                cp_world=profile.cp_world,
+                cp_interleave_size=profile.cp_interleave_size,
                 device=profile.device,
             )
             workspace_sizes[profile.device] = max(workspace_sizes.get(profile.device, 0), size)

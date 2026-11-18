@@ -876,24 +876,19 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            helix_kv_bounds = getattr(attn_metadata, "helix_kv_bounds", None)
-            # helix_kv_bounds is non-None only on TrtllmAttentionMetadata,
-            # where _helix_spec_tokens_valid is a declared field.
-            if helix_kv_bounds is not None and attn_metadata._helix_spec_tokens_valid:
-                # Speculative verify groups: KV ownership is per-TOKEN. A rank
-                # owning only the tail page of a group has zero visible KV for
-                # the group's leading tokens while its per-sequence kv_len is
-                # nonzero, so the per-sequence mask above misses those rows.
-                # Their decode rows are fully masked with a finite sentinel,
-                # making partial_o an average over (possibly uninitialized)
-                # pool values; the combine multiplies by corr = 0 and
-                # 0 * NaN would poison the token on every CP rank — sanitize
-                # by the per-token bound instead.
-                zero_kv_mask = helix_kv_bounds[: partial_o.shape[0]] == 0
+            positions = getattr(attn_metadata, "helix_position_offsets", None)
+            if positions is not None:
+                # Under cyclic prefix ownership, a rank has no visible KV
+                # before its first page. Corrected positions give this mask
+                # per query, including groups crossing that page boundary.
+                first_owned_position = (
+                    self.mapping.cp_rank * attn_metadata.kv_cache_manager.tokens_per_block
+                )
+                zero_kv_mask = positions[: partial_o.shape[0]] < first_owned_position
             else:
                 # MLA processes only the generation token slice here, so build
-                # the mask from [num_contexts, num_seqs). Skip this expansion
-                # when the more precise per-token bounds above are valid.
+                # the mask from [num_contexts, num_seqs) for metadata without
+                # the per-token global positions.
                 zero_kv_mask = _helix_zero_kv_mask(
                     attn_metadata,
                     partial_o.shape[0],

@@ -120,7 +120,6 @@ class TmemSResource(MlaResource):
     p_ref: Optional[MemoryResource] = None
     global_ref: Optional[MemoryResource] = None
     cache_seqs: object = None
-    kv_bounds: object = None
     page_offsets: object = None
     head_idx: object = None
     batch_idx: object = None
@@ -514,6 +513,7 @@ class TmemSResource(MlaResource):
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,
+            cp_rank=self.cp_rank,
         )
         local_tile_idx = softmax_kv_tile_idx(cfg, stage_info, self.inst_id)
         tile_idx = global_kv_tile_idx(
@@ -622,11 +622,8 @@ class TmemSResource(MlaResource):
             (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
         ) or (next_tile_offset_k > seq_len_kv)
         needs_row_prefix_mask = cutlass.const_expr(
-            cfg.use_kv_bounds
-            or (
-                cfg.mask_type == MaskType.CAUSAL.value
-                and (not cfg.fixed_seqlen or cfg.logical_seq_len_q > 1)
-            )
+            cfg.mask_type == MaskType.CAUSAL.value
+            and (not cfg.fixed_seqlen or cfg.logical_seq_len_q > 1)
         )
         if cutlass.const_expr(needs_row_prefix_mask):
             min_seq_len_kv = runtime_seq_len_kv_for_query_row(
@@ -636,7 +633,7 @@ class TmemSResource(MlaResource):
                 cta_idx_q,
                 Int32(0),
                 self.cu_seqlens_q,
-                self.kv_bounds,
+                self.cp_rank,
             )
             should_apply_dense_mask = should_apply_dense_mask or (
                 next_tile_offset_k > min_seq_len_kv
@@ -653,7 +650,7 @@ class TmemSResource(MlaResource):
             else:
                 should_apply_dense_mask = True
         if should_apply_dense_mask:
-            # Each row's causal or explicit prefix can be narrower than the
+            # Each row's causal prefix can be narrower than the
             # shared CTA domain used by the producer and split reduction.
             warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
             lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
@@ -672,7 +669,7 @@ class TmemSResource(MlaResource):
                         cta_idx_q,
                         local_row_idx,
                         self.cu_seqlens_q,
-                        self.kv_bounds,
+                        self.cp_rank,
                     )
                 for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
                     token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
@@ -710,7 +707,7 @@ class TmemSResource(MlaResource):
                             cta_idx_q,
                             row_in_tile_0,
                             self.cu_seqlens_q,
-                            self.kv_bounds,
+                            self.cp_rank,
                         )
                         seq_len_kv_1 = runtime_seq_len_kv_for_query_row(
                             cfg,
@@ -719,7 +716,7 @@ class TmemSResource(MlaResource):
                             cta_idx_q,
                             row_in_tile_1,
                             self.cu_seqlens_q,
-                            self.kv_bounds,
+                            self.cp_rank,
                         )
                     s_base = repeat_idx * 4
                     s_second_panel_base = q_repeats * 4 + s_base
