@@ -160,6 +160,7 @@ class KVCacheV2IterationStatsReport:
     storage_stats: list[KVCacheV2StorageIterationStats] = field(default_factory=list)
     migration_timings: list[tuple[int, int, int, float]] = field(default_factory=list)
     skipped_migration_timings: int | None = None
+    num_conversations: int | None = None
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -281,6 +282,8 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
             }
             for snapshot in kv_iter_stats.storage_stats
         ]
+    if kv_iter_stats.num_conversations is not None:
+        stats_dict["kvCacheNumConversations"] = kv_iter_stats.num_conversations
     if kv_iter_stats.connector_cached_tokens is not None:
         stats_dict["iterConnectorCachedTokens"] = kv_iter_stats.connector_cached_tokens
 

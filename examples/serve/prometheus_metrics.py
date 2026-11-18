@@ -91,6 +91,7 @@ def parse_and_display_metrics(metrics_data: str) -> None:
         f"{METRIC_PREFIX}kv_cache_tier_moved_blocks_total": "Per-tier moved/dropped blocks",
         f"{METRIC_PREFIX}kv_cache_tier_moved_bytes_total": "Per-tier moved/dropped bytes",
         f"{METRIC_PREFIX}kv_cache_tier_migration_duration_seconds": "Sampled tier migration latency",
+        f"{METRIC_PREFIX}kv_cache_num_conversations": "Tracked KV-cache conversation entries",
         f"{METRIC_PREFIX}kv_cache_migration_timing_skipped_total": "Timing samples skipped at capacity",
     }
 

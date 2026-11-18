@@ -323,3 +323,48 @@ No timing observations can mean timing is disabled, no eligible migration
 occurred, samples are still pending, or source records have not been delivered;
 it is not evidence of zero restore latency. Sparse samples and a saturated
 pending-event budget limit the interpretation of a percentile.
+
+### Tracked conversations and windowed unique activity
+
+`trtllm_kv_cache_num_conversations{model_name="...", dp_rank="..."}` is a gauge of
+entries in KVCM2's conversation map. Each key is `(conversation_id, lora_task_id,
+cache_salt)`: repeated turns in that namespace share one entry; the same ID in
+different namespaces counts separately. Collection reads the map size in O(1)
+on the executor thread. IDs and salts are never exported.
+
+The gauge includes in-flight context requests and entries retaining drop plans
+after completion. It decreases when an entry without retained plans is removed
+or the map is cleared. A retained entry does not guarantee its KV blocks remain
+resident. The metric is absent when conversation tracking is disabled or the
+backend does not supply it. Existing detailed KV statistics determine reporting
+rank ownership; summing replicated workers does not give deployment-wide unique
+sessions. `increase()` on this gauge does not measure unique sessions over time.
+
+The optional Grafana distinct-session panel already counts session IDs observed
+in Dynamo trace logs over a selectable window. That log-based count depends on
+trace coverage and Loki query limits; it does not measure this map or necessarily
+use the same identity namespace.
+
+A follow-up for unique sessions seen during a period as native metrics should:
+
+1. Observe normalized, namespace-scoped identities at request admission, including
+   requests whose conversation entries are later removed. Count a request once;
+   retries and subsequent turns must deduplicate by identity.
+2. Choose fixed reporting windows (for example 5 minutes and 1 hour), and decide
+   whether exact counts or bounded-memory estimates are required. Exact sliding
+   windows need a last-seen map plus expiry and an explicit memory budget. A ring
+   of time-bucketed HyperLogLog sketches provides bounded-memory estimates; document
+   its cardinality error and bucket-boundary timing error. Recompute the union
+   across live buckets because sketches cannot subtract expired observations.
+3. Export only aggregate gauges with a bounded `window` label. Hash identities
+   internally with a deployment-consistent keyed hash; never expose identifiers
+   as labels. Define key rotation, missing-ID behavior and restart warm-up.
+4. For deployment-wide uniqueness, deduplicate before routing or union compatible
+   sketches centrally. Summing per-worker unique counts double-counts sessions
+   routed to multiple workers; Prometheus cannot union sketches from scalar gauges.
+5. Test repeated turns, namespace separation, expiry boundaries, long-idle sessions,
+   reappearance, restarts, cross-worker duplication and memory bounds. Measure
+   request-admission overhead before enabling this tracking by default.
+
+This windowed tracker is a proposed follow-up; the current gauge reuses the
+existing map without adding historical session storage.

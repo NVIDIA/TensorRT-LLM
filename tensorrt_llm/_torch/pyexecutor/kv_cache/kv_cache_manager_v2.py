@@ -556,6 +556,11 @@ class ConversationManager:
         self._max_num_turns = max_num_turns
         self._conversation_states: Dict[tuple[str, int | None, str | None], _ConversationState] = {}
 
+    @property
+    def num_conversations(self) -> int:
+        """Number of tracked conversation IDs scoped by LoRA task and cache salt."""
+        return len(self._conversation_states)
+
     def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
         """Save a completed context's drop plan and apply the preceding plan on success."""
         request_id = request.py_request_id
@@ -8978,6 +8983,11 @@ class KVCacheManagerV2(BaseResourceManager):
             disk_prefetch_blocks=disk_prefetch_blocks,
             cached_tokens_by_level=list(cached_tokens_by_level),
             cache_level_tiers=self._stats_cache_level_tier_names(),
+            num_conversations=(
+                self.conversation_manager.num_conversations
+                if self.conversation_manager is not None
+                else None
+            ),
             migration_timings=migration_timings,
             skipped_migration_timings=skipped_migration_timings,
             storage_stats=[

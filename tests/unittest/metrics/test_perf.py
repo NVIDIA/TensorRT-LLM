@@ -58,6 +58,7 @@ def test_categories_own_the_source_and_preserve_legacy_wire_shape() -> None:
         "requestStats": [{"id": 9, "numGeneratedTokens": 4}],
         "kvCacheStats": {"usedNumBlocks": 2, "maxNumBlocks": 10},
         "kvTransferOutcomes": {"success": 3, "error": 2, "timeout": 1},
+        "kvCacheNumConversations": 4,
         "kvCacheIterationStatsByPoolGroup": [{"slotSize": [64]}],
     }
     record = PerfMetricsCollector.collect_iteration(source)
@@ -68,6 +69,8 @@ def test_categories_own_the_source_and_preserve_legacy_wire_shape() -> None:
     assert "requestStats" in record.per_req
     assert "hostStepTimeMS" in record.per_iter
     assert record.per_rank["kvTransferOutcomes"]["success"] == 3
+    assert record.per_rank["kvCacheNumConversations"] == 4
+    assert "kvCacheNumConversations" not in record.per_iter
     assert "kvTransferOutcomes" not in record.per_iter
     assert "kvCacheStats" in record.per_rank
     assert record.per_iter["attentionDpRank"] == 2

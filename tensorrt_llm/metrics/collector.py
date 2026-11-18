@@ -397,6 +397,12 @@ class PrometheusExposure:
             labelnames=iteration_labelnames)
         self._prev_skipped_migration_timings: dict[str, int] = {}
 
+        self.kv_cache_num_conversations = Gauge(
+            name=self.metric_prefix + "kv_cache_num_conversations",
+            documentation=
+            "Tracked KV-cache conversation entries scoped by LoRA task and cache salt",
+            labelnames=iteration_labelnames)
+
         self.kv_cache_hit_rate = Gauge(name=self.metric_prefix +
                                        "kv_cache_hit_rate",
                                        documentation="KV cache hit rate",
@@ -1622,6 +1628,12 @@ class PrometheusExposure:
             rank: Normalized data-parallel rank label.
         """
         rank_labels = {self.labelname_dp_rank: rank}
+        conversations = iteration_stats.get("kvCacheNumConversations")
+        if (isinstance(conversations, int)
+                and not isinstance(conversations, bool) and conversations >= 0):
+            self._log_gauge(self.kv_cache_num_conversations,
+                            conversations,
+                            labels=rank_labels)
         outcomes = iteration_stats.get("kvTransferOutcomes", {})
         for outcome in ("success", "error", "timeout"):
             value = outcomes.get(outcome)
