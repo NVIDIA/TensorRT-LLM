@@ -330,6 +330,48 @@ _MX_CASES = (
         # Each role holds roughly 33 GiB of BF16 weights per GPU.
         marks=[pytest.mark.skip_less_device(4), pytest.mark.skip_less_device_memory(45000)],
     ),
+    # GLM-5-FP8 needs eight H200 GPUs per instance, so every role loads only the
+    # first four of its 78 decoder layers: the three dense layers and one MoE layer.
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_GLM5_MODEL",
+            default_model_subdir="GLM-5-FP8",
+            repository_cache_prefix="models--trtllm-mx-e2e--glm5-fp8-block-tp1",
+            tp_size=1,
+            moe_disable_finalize_fusion=True,
+            model_kwargs={"num_hidden_layers": 4},
+        ),
+        id="glm5-fp8-block-tp1",
+        # Each role holds about 16 GiB on one GPU.
+        marks=[pytest.mark.skip_less_device(2), skip_no_hopper],
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_GLM5_MODEL",
+            default_model_subdir="GLM-5-FP8",
+            repository_cache_prefix="models--trtllm-mx-e2e--glm5-fp8-block-tp2",
+            tp_size=2,
+            moe_disable_finalize_fusion=True,
+            model_kwargs={"num_hidden_layers": 4},
+        ),
+        id="glm5-fp8-block-tp2",
+        # Each role holds about 10 GiB per GPU.
+        marks=[pytest.mark.skip_less_device(4), skip_no_hopper],
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_GLM5_MODEL",
+            default_model_subdir="GLM-5-FP8",
+            repository_cache_prefix="models--trtllm-mx-e2e--glm5-fp8-block-tp2-ep2",
+            tp_size=2,
+            moe_ep_size=2,
+            moe_disable_finalize_fusion=True,
+            model_kwargs={"num_hidden_layers": 4},
+        ),
+        id="glm5-fp8-block-tp2-ep2",
+        # Each role holds about 10 GiB per GPU.
+        marks=[pytest.mark.skip_less_device(4), skip_no_hopper],
+    ),
 )
 
 

@@ -777,6 +777,26 @@ def _qwen3_5_35b_a3b_expert_config() -> PretrainedConfig:
     )
 
 
+_GLM5_PROFILE_ID = "glm-moe-dsa-for-causal-lm-fp8-block-sm90-cutlass-target-v1"
+
+
+def _glm5_fp8_expert_config() -> PretrainedConfig:
+    # The GLM-5-FP8 expert shapes: 256 routed experts, top-8, MoE intermediate size 2048.
+    return PretrainedConfig(
+        architectures=["GlmMoeDsaForCausalLM"],
+        model_type="glm_moe_dsa",
+        hidden_size=6144,
+        intermediate_size=12288,
+        moe_intermediate_size=2048,
+        n_routed_experts=256,
+        n_shared_experts=1,
+        num_experts_per_tok=8,
+        num_hidden_layers=78,
+        first_k_dense_replace=3,
+        torch_dtype=torch.bfloat16,
+    )
+
+
 # The language-model config, at its canary's expert shapes, that each qualified
 # MoE profile resolves its pinned MoE backend literal with. Every MoE profile
 # needs an entry.
@@ -784,6 +804,7 @@ _MOE_PROFILE_CANARY_CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
     _QWEN3_MOE_PROFILE_ID: _qwen3_30b_a3b_expert_config,
     _DEEPSEEK_V3_PROFILE_ID: _deepseek_v3_lite_expert_config,
     _QWEN3_5_MOE_PROFILE_ID: _qwen3_5_35b_a3b_expert_config,
+    _GLM5_PROFILE_ID: _glm5_fp8_expert_config,
 }
 
 
@@ -1273,11 +1294,22 @@ _DOCUMENTED_SLIDING_WINDOWS = {
 _DOCUMENTED_MOE_LAYER_LAYOUTS = {
     (None, None): "",
     (frozenset({1}), frozenset({1})): "a dense first layer and MoE in every later layer, ",
+    (frozenset({3}), frozenset({1})): "dense first three layers and MoE in every later layer, ",
+}
+# Keyed by the profile's (`sparse_attention_enabled`, `dsa_indexer_sharing`,
+# `dsa_indexer_projection_dtypes`) constraints: the attention description that
+# follows the attention backend, and whether sparse attention is excluded.
+_DOCUMENTED_SPARSE_ATTENTION = {
+    (frozenset({False}), None, None): (" attention", True),
+    (frozenset({True}), frozenset({False}), frozenset({"float32"})): (
+        " DSA sparse attention with an indexer in every layer and fp32 indexer projections",
+        False,
+    ),
 }
 # Documented weight-quantization envelopes, keyed by the quant_algorithms,
-# sm_versions, and weight_block_sizes constraints of a dense row. A row with any
+# sm_versions, and weight_block_sizes constraints of a row. A row with any
 # other combination needs its own description here and in the support table.
-_DOCUMENTED_DENSE_QUANTIZATION = {
+_DOCUMENTED_QUANTIZATION = {
     (frozenset({"none"}), None, None): "unquantized weights and KV cache",
     (
         frozenset({QuantAlgo.FP8_BLOCK_SCALES.value}),
@@ -1292,17 +1324,24 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
 
     A MoE profile also names its pinned MoE backend, MoE layer layout, and
     admitted routed-expert partitions, and adds the MoE load balancer and DWDP
-    to the exclusions.
+    to the exclusions. A profile that admits DSA sparse attention names its
+    indexer layout instead of excluding sparse attention.
     """
     constraints = profile.runtime_constraints
-    quantization = _DOCUMENTED_DENSE_QUANTIZATION[
+    quantization = _DOCUMENTED_QUANTIZATION[
         (constraints.quant_algorithms, constraints.sm_versions, constraints.weight_block_sizes)
+    ]
+    attention_description, sparse_attention_excluded = _DOCUMENTED_SPARSE_ATTENTION[
+        (
+            constraints.sparse_attention_enabled,
+            constraints.dsa_indexer_sharing,
+            constraints.dsa_indexer_projection_dtypes,
+        )
     ]
     assert constraints.kv_cache_quant_algorithms == frozenset({"none"})
     assert constraints.layerwise_quantization == frozenset({False})
     assert constraints.force_dynamic_quantization == frozenset({False})
     assert constraints.lora_enabled == frozenset({False})
-    assert constraints.sparse_attention_enabled == frozenset({False})
     assert constraints.attention_dp == frozenset({False})
     assert constraints.multi_node == frozenset({False})
     # Each profile pins one embedding layout. A family that also qualifies tied
@@ -1360,13 +1399,14 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
         constraints.tied_word_embeddings,
         labels={False: "untied", True: "tied"},
     )
+    sparse_attention_exclusion = "sparse attention, " if sparse_attention_excluded else ""
     return (
         f"Single-node {model_description}, {quantization}, "
-        f"{attention_backends} attention, {moe_backend_description}"
+        f"{attention_backends}{attention_description}, {moe_backend_description}"
         f"{moe_layer_layout_description}{rope_description}"
         f"{sliding_window_description}, {embeddings} embeddings, {partition_description}, "
-        f"PP/CP={pp_cp_sizes}, no LoRA, sparse attention, attention DP, {moe_exclusions}"
-        "speculative mode, or separately loaded draft model"
+        f"PP/CP={pp_cp_sizes}, no LoRA, {sparse_attention_exclusion}attention DP, "
+        f"{moe_exclusions}speculative mode, or separately loaded draft model"
     )
 
 
@@ -1496,6 +1536,7 @@ _MX_FAMILY_DISPLAY_NAMES = {
     "Qwen3MoeForCausalLM": "Qwen3 MoE",
     "DeepseekV3ForCausalLM": "DeepSeek-V3",
     "Qwen3_5MoeForConditionalGeneration": "Qwen3.5 MoE",
+    "GlmMoeDsaForCausalLM": "GLM-5",
 }
 
 
@@ -1555,6 +1596,11 @@ _MX_E2E_ROWS = {
         "qwen3_5-moe-bf16",
         "qwen3_5-moe",
         "TRTLLM_MX_QWEN3_5_MOE_MODEL",
+    ),
+    "glm-moe-dsa-for-causal-lm-fp8-block-sm90-cutlass-target-v1": (
+        "glm5-fp8-block",
+        "glm5-fp8-block",
+        "TRTLLM_MX_GLM5_MODEL",
     ),
     "qwen3-for-causal-lm-fp8-block-sm90-target-v1": (
         "qwen3-fp8-block",

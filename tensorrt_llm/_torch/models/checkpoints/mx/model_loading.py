@@ -28,6 +28,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModel
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm._torch.weight_sharing import (
     DEEPSEEK_V3_MLA_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
+    GLM5_DSA_FP8_BLOCK_SM90_POST_TRANSFORM_LAYOUT_ABI_V1,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -159,21 +160,23 @@ def _with_fp8_block_scale_weights(
     constraints: PostTransformRuntimeConstraints,
     sm_versions: frozenset[int] | set[int],
 ) -> PostTransformRuntimeConstraints:
-    """Admit FP8 block-scale (128x128) weights to an unquantized dense row.
+    """Admit FP8 block-scale (128x128) weights to an unquantized row.
 
     FP8BlockScalesLinearMethod realizes a different weight and scale layout
     per GPU architecture: SM90 keeps checkpoint-layout E4M3 weights and FP32
     block scales, while other architectures can resmooth the weights and
-    repack the scales in transform_weights(). Each FP8 row therefore pins the
-    SM versions whose layout its transform-layout ABI describes. It also
-    requires the checkpoint to declare 128x128 weight blocks in its Hugging
-    Face quantization config, so a source that declares no block size or
-    another one falls back. The KV cache, activation dtype, and every other
-    dimension keep the base row's constraints, so `force_dynamic_quantization`
-    stays excluded.
+    repack the scales in transform_weights(). The routed experts of a MoE row
+    likewise get the FP8 block-scale implementation that the pinned MoE
+    backend selects on each SM. Each FP8 row therefore pins the SM versions
+    whose layout its transform-layout ABI describes. It also requires the
+    checkpoint to declare 128x128 weight blocks in its Hugging Face
+    quantization config, so a source that declares no block size or another
+    one falls back. The KV cache, activation dtype, and every other dimension
+    keep the base row's constraints, so `force_dynamic_quantization` stays
+    excluded.
 
     Args:
-        constraints: An unquantized dense row's runtime constraints.
+        constraints: An unquantized row's runtime constraints.
         sm_versions: SM versions that realize the row's FP8 layout.
 
     Returns:
@@ -190,6 +193,22 @@ def _with_fp8_block_scale_weights(
 
 _MX_QWEN3_FP8_BLOCK_SM90_DENSE_RUNTIME_CONSTRAINTS = _with_fp8_block_scale_weights(
     _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS, {90}
+)
+# GLM-5 runs the DeepSeek-V3 MLA and MoE layers with FP8 block-scale weights and
+# DSA sparse attention. On SM90 its FP8 Linears keep the checkpoint layout, and
+# the CUTLASS pin with FP8 block scales selects the DeepGEMM Hopper routed-expert
+# leaf (`deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales`). The layout ABI has
+# three dense layers and MoE in every later layer, a DSA indexer in every layer,
+# and fp32 indexer `wk` and `weights_proj` projections. The checkpoint
+# config must therefore declare `first_k_dense_replace=3` and
+# `moe_layer_freq=1`, no layer may reuse another layer's top-k, and
+# `TRTLLM_DSA_INDEXER_BF16` must not switch the projections to BF16.
+_MX_GLM5_FP8_BLOCK_SM90_CUTLASS_RUNTIME_CONSTRAINTS = replace(
+    _with_fp8_block_scale_weights(_MX_DEEPSEEK_V3_BF16_CUTLASS_RUNTIME_CONSTRAINTS, {90}),
+    sparse_attention_enabled=frozenset({True}),
+    first_k_dense_replaces=frozenset({3}),
+    dsa_indexer_sharing=frozenset({False}),
+    dsa_indexer_projection_dtypes=frozenset({"float32"}),
 )
 
 # Root classes are named rather than held, so this table costs no model-zoo
@@ -342,6 +361,19 @@ MX_POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
             transform_abi_id=QWEN3_5_MOE_VL_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
             runtime_constraints=_MX_QWEN3_5_MOE_VL_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="glm-moe-dsa-for-causal-lm-fp8-block-sm90-cutlass-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_deepseekv3", "GlmMoeDsaForCausalLM"
+            ),
+            architecture="GlmMoeDsaForCausalLM",
+            model_type="glm_moe_dsa",
+            speculative_mode=None,
+            protocol_version=MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=GLM5_DSA_FP8_BLOCK_SM90_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_GLM5_FP8_BLOCK_SM90_CUTLASS_RUNTIME_CONSTRAINTS,
         ),
     )
 )

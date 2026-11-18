@@ -767,7 +767,9 @@ def test_mx_prepares_only_a_qualified_deepseek_v3_receiver(
     """MX asks for receiver preparation, and so the `v_b_proj` restore, only for a qualified root.
 
     The GLM-5, Mistral Large 3, and other subclasses inherit the receiver hook
-    but never qualify, so no load runs it on them.
+    but do not qualify with this BF16 config, so no load runs it on them. GLM-5
+    qualifies only under its own FP8 DSA profile, which
+    `test_model_loader_mx_glm5.py` covers.
     """
     model = _tiny_model(monkeypatch, model_class=model_class, filled=False)
     decision = _qualify(model)
@@ -912,9 +914,10 @@ def test_deepseek_v3_profile_matches_its_exact_identity(overrides: dict[str, obj
 @pytest.mark.parametrize(
     "overrides, reason",
     [
+        # The GLM-5 root has its own profile, under its own architecture.
         pytest.param(
             {"root_model_class": modeling_deepseekv3_mod.GlmMoeDsaForCausalLM},
-            PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED,
+            PostTransformQualificationReason.ARCHITECTURE_NOT_REGISTERED,
             id="glm-5-root",
         ),
         pytest.param(
