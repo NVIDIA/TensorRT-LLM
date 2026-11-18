@@ -236,7 +236,9 @@ def _gated_rows_store(X, Y, Rstd, FP8_SCALE, x, z, w, r0, M, eps, stride_y_row,
 
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
 @triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
-@triton.jit
+# M follows the batch and only bounds the row masks; specializing it on == 1
+# and % 16 compiled variants mid-serving that ran no faster.
+@triton.jit(do_not_specialize=["M"])
 def _rms_norm_gated_fwd_multirow_kernel(
     X,  # pointer to the input
     Y,  # pointer to the output
@@ -314,6 +316,84 @@ def _rms_norm_gated_fwd_multirow_kernel(
 _MULTIROW_GROUPS = 4
 _MULTIROW_GROUPS_MIN_ROWS = 1 << 16
 
+# Compiled variants of the multi-row kernel whose siblings have been compiled
+# too (see _launch_multirow_kernel).
+_multirow_variants_with_siblings = set()
+
+
+def _launch_multirow_kernel(x,
+                            y,
+                            weight,
+                            z,
+                            rstd,
+                            fp8_scale,
+                            eps,
+                            *,
+                            grouped,
+                            early_trigger=False,
+                            **kwargs) -> None:
+    """Gated RMSNorm of x's rows into y with the multi-row kernel.
+
+    ``grouped`` lets each program run _MULTIROW_GROUPS row tiles from
+    _MULTIROW_GROUPS_MIN_ROWS rows. ``early_trigger`` releases PDL dependents
+    at the start of each program where PDL is allowed (EARLY_TRIGGER).
+    ``kwargs`` are the call's remaining constexprs (HEADS_PER_TOK,
+    GATE_SIGMOID, WEIGHT_IS_DELTA).
+
+    Two compile-time flags follow the row count at every size: EVEN, and
+    LAUNCH_WITH_PDL through the grid size. A server warmed up on some row
+    counts would compile a new variant the first time a serving batch flips
+    one of them, while every request in flight waits. So the first launch of a
+    variant also compiles its siblings, the same call with the other values
+    of these flags. GROUPS changes only from _MULTIROW_GROUPS_MIN_ROWS rows,
+    which a warmup of the largest batch reaches. (Under torch.compile the
+    launch is traced, not run, so there is no variant to pair.)
+    """
+    M, N = x.shape
+    groups = (_MULTIROW_GROUPS
+              if grouped and M >= _MULTIROW_GROUPS_MIN_ROWS else 1)
+    rows_per_program = _MULTIROW_ROWS * groups
+    grid = (triton.cdiv(M, rows_per_program), )
+    device_index = x.device.index
+    launch_with_pdl = _multirow_pdl(grid[0], device_index)
+    early_trigger = early_trigger and _pdl_device_policy(device_index)[0]
+    even = M % rows_per_program == 0
+    stride_x, stride_y = x.stride(0), y.stride(0)
+    args = (x, y, weight, z, rstd, fp8_scale, stride_x, stride_y, z.stride(0),
+            M, eps)
+    kwargs.update(N=N,
+                  ROWS=_MULTIROW_ROWS,
+                  GROUPS=groups,
+                  CONTIG=(stride_x == N and stride_y == N),
+                  EARLY_TRIGGER=early_trigger,
+                  num_warps=_MULTIROW_NUM_WARPS)
+    with torch.cuda.device(device_index):
+        variant = _rms_norm_gated_fwd_multirow_kernel[grid](
+            *args,
+            LAUNCH_WITH_PDL=launch_with_pdl,
+            EVEN=even,
+            launch_pdl=launch_with_pdl,
+            **kwargs)
+        if (torch.compiler.is_compiling()
+                or variant in _multirow_variants_with_siblings):
+            return
+        _multirow_variants_with_siblings.add(variant)
+        # PDL runs only below one wave of programs, which the grids from
+        # _MULTIROW_GROUPS_MIN_ROWS rows may never be.
+        min_rows = 1 if groups == 1 else _MULTIROW_GROUPS_MIN_ROWS
+        min_grid = triton.cdiv(min_rows, rows_per_program)
+        for pdl in {False, _multirow_pdl(min_grid, device_index)}:
+            for even_rows in (False, True):
+                if (pdl, even_rows) != (launch_with_pdl, even):
+                    _multirow_variants_with_siblings.add(
+                        _rms_norm_gated_fwd_multirow_kernel.warmup(
+                            *args,
+                            grid=grid,
+                            LAUNCH_WITH_PDL=pdl,
+                            EVEN=even_rows,
+                            launch_pdl=pdl,
+                            **kwargs))
+
 
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
                                      is_rms_norm):
@@ -372,38 +452,22 @@ def rms_norm_gated_token_major(
     out = torch.empty_like(x, dtype=out_dtype)
     # rstd is not consumed on this path; Rstd=None skips both the scratch
     # allocation and the (measurably expensive) extra store in the kernel.
-    device_index = x.device.index
-    groups = _MULTIROW_GROUPS if M >= _MULTIROW_GROUPS_MIN_ROWS else 1
-    grid_size = triton.cdiv(M, _MULTIROW_ROWS * groups)
-    launch_with_pdl = _multirow_pdl(grid_size, device_index)
-    with torch.cuda.device(device_index):
-        _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
-            x,
-            out,
-            weight,
-            z,
-            None,
-            fp8_scale,
-            x.stride(0),
-            out.stride(0),
-            z.stride(0),
-            M,
-            eps,
-            N=N,
-            ROWS=_MULTIROW_ROWS,
-            HEADS_PER_TOK=heads,
-            GATE_SIGMOID=gate_sigmoid,
-            WEIGHT_IS_DELTA=False,
-            LAUNCH_WITH_PDL=launch_with_pdl,
-            CONTIG=(x.stride(0) == N and out.stride(0) == N),
-            EVEN=(M % (_MULTIROW_ROWS * groups) == 0),
-            num_warps=_MULTIROW_NUM_WARPS,
-            # Dependents (out_proj) prefetch their weights; they read Y only
-            # after their own griddepcontrol.wait.
-            EARLY_TRIGGER=_pdl_device_policy(device_index)[0],
-            GROUPS=groups,
-            launch_pdl=launch_with_pdl,
-        )
+    _launch_multirow_kernel(
+        x,
+        out,
+        weight,
+        z,
+        None,
+        fp8_scale,
+        eps,
+        grouped=True,
+        # Dependents (out_proj) prefetch their weights; they read Y only
+        # after their own griddepcontrol.wait.
+        early_trigger=True,
+        HEADS_PER_TOK=heads,
+        GATE_SIGMOID=gate_sigmoid,
+        WEIGHT_IS_DELTA=False,
+    )
     return out
 
 
@@ -470,34 +534,17 @@ def _layer_norm_fwd(
     rstd = torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
     if _multirow_gated_rmsnorm_eligible(group_size, ngroups, bias, z,
                                         norm_before_gate, is_rms_norm):
-        grid_size = triton.cdiv(M, _MULTIROW_ROWS)
-        device_index = x.device.index
-        launch_with_pdl = _multirow_pdl(grid_size, device_index)
-        with torch.cuda.device(device_index):
-            _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
-                x,
-                out,
-                weight,
-                z,
-                rstd,
-                fp8_scale,
-                x.stride(0),
-                out.stride(0),
-                z.stride(0),
-                M,
-                eps,
-                N=group_size,
-                ROWS=_MULTIROW_ROWS,
-                HEADS_PER_TOK=1,
-                GATE_SIGMOID=gate_sigmoid,
-                WEIGHT_IS_DELTA=weight_is_delta,
-                LAUNCH_WITH_PDL=launch_with_pdl,
-                CONTIG=(x.stride(0) == group_size
-                        and out.stride(0) == group_size),
-                EVEN=(M % _MULTIROW_ROWS == 0),
-                num_warps=_MULTIROW_NUM_WARPS,
-                launch_pdl=launch_with_pdl,
-            )
+        _launch_multirow_kernel(x,
+                                out,
+                                weight,
+                                z,
+                                rstd,
+                                fp8_scale,
+                                eps,
+                                grouped=False,
+                                HEADS_PER_TOK=1,
+                                GATE_SIGMOID=gate_sigmoid,
+                                WEIGHT_IS_DELTA=weight_is_delta)
         return out, mean, rstd
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()

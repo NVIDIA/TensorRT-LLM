@@ -158,9 +158,9 @@ _PIN_SPECS = tuple(
     ],
 )
 def test_direct_launch_is_bitwise_the_registered_op(spec) -> None:
-    """`_direct_launch` is a copy of `torch.ops.trtllm.rms_norm_gated_token_major`'s
-    multi-row launch: it is taken at every shape here and returns the op's bytes, so a
-    change to the op's launch (kernel, rows a program, warps) fails here."""
+    """`_direct_launch` makes `torch.ops.trtllm.rms_norm_gated_token_major`'s multi-row
+    launch without the custom-op dispatch: it is taken at every shape here and returns the
+    op's bytes."""
     x, z, weight, eps, _, act, _ = _build(spec, seed=_seed(f"pin {spec}"))
     assert x.shape[0] < op_module._PREFILL_MIN_ROWS and op_module._multirow(x, z, act)
     expected = torch.ops.trtllm.rms_norm_gated_token_major(x, z, weight, eps, None, act)
