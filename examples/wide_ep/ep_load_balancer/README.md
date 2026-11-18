@@ -314,3 +314,156 @@ Per-layer dynamic EPLB has the following constraints:
 * **Speculative decoding**: a one-model draft's MoE layers follow the same rule as the target's: every MoE layer that runs on `MEGAMOE_CUTEDSL` registers as one more per-layer dynamic layer after the target layers, is planned and load-balanced like them, and, with `per_layer_resident`, gets its own helper slots. DSpark drafters shipped inside an NVFP4 target checkpoint, such as `DeepSeek-V4-Pro-nvfp4-DSpark`, do so with NVFP4 draft experts. A draft layer only computes correctly if its checkpoint experts are NVFP4: the `mtp.*` routed experts of the `DeepSeek-V4-Pro-NVFP4` checkpoint are MXFP4, which `MEGAMOE_CUTEDSL` does not serve, so MTP on that checkpoint is not supported with or without this load balancer.
 * **DWDP**: not supported; `dwdp_config` must keep `dwdp_size` at 1.
 * **Fields**: only `mode`, `num_slots`, `auxiliary_sms` and `helper_slot_mode`. `num_slots` is required, must be greater than the expert count, and must be divisible by the EP size. `layer_updates_per_iter` and `initial_global_assignments` are `standard`-only and rejected in this mode.
+
+## Modeling V2 targets
+
+A [Modeling V2](../../../tensorrt_llm/_torch/modeling_v2/README.md) target runs only the EPLB modes it implements. When a deployment sets `modeling_v2` (`auto` or `require`) together with `moe_config.load_balancer`, the engine builds a target only if the target implements the deployment's EPLB mode. Otherwise `auto` builds the built-in model, which implements every mode above, and `require` fails with the reason.
+
+| Target | EPLB modes | Layouts |
+|---|---|---|
+| DeepSeek-R1-0528 NVFP4 (`deepseek_v3/r1_0528_nvfp4__sm_10x__default`, SM100 and SM103) | static, online | attention DP with pure expert parallelism over 4 or 8 GPUs (dep4, dep8) |
+
+Every other target declines EPLB, so those deployments run the built-in model.
+
+### Run EPLB on the Modeling V2 target
+
+The steps below run the DeepSeek-R1-0528 NVFP4 target with EPLB at dep8: attention DP with 8-way expert parallelism, on two GB200 or GB300 trays. They follow the steps above at the scale the target runs EPLB. `modeling_v2: require` builds the target or fails with the reason it does not fit; with `auto`, a deployment the target does not fit runs the built-in model instead.
+
+Set up the environment:
+
+```bash
+export MODEL_NAME=nvidia/DeepSeek-R1-0528-FP4
+export MODEL_PATH=<YOUR_MODEL_PATH>
+```
+
+Prepare a dataset following the [benchmarking documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-benchmarking.md#preparing-a-dataset), for example:
+
+```bash
+trtllm-bench --model ${MODEL_PATH} prepare-dataset \
+    --output ./dataset.json \
+    token-norm-dist \
+    --num-requests 4096 \
+    --input-mean 1024 --output-mean 1024 \
+    --input-stdev 0 --output-stdev 0
+```
+
+#### Static EPLB
+
+1. Collect the expert statistics on the built-in model. The Modeling V2 target does not record them, and the built-in model routes with the same router, so its statistics describe the same load. Quote `"off"`: YAML reads a bare `off` as `false`.
+
+   ```bash
+   export EXPERT_STATISTIC_PATH=./expert_statistic
+   export EXPERT_STATISTIC_ITER_RANGE=100-200
+
+   cat > ./config_stats.yaml <<EOF
+   modeling_v2: "off"
+   enable_attention_dp: true
+   EOF
+
+   trtllm-llmapi-launch \
+   trtllm-bench --model ${MODEL_NAME} \
+       --model_path ${MODEL_PATH} \
+       throughput \
+       --tp 8 \
+       --ep 8 \
+       --config ./config_stats.yaml \
+       --kv_cache_free_gpu_mem_fraction 0.75 \
+       --dataset ./dataset.json \
+       --warmup 0 \
+       --eos_id -1
+   ```
+
+2. Generate the placement for 8 ranks and 288 slots (36 slots a rank, 32 of them replicas), then stop counting:
+
+   ```bash
+   python report_load_statistics.py --expert_statistic_path $EXPERT_STATISTIC_PATH
+   python generate_eplb_config.py \
+       --ep_size 8 \
+       --num_slots 288 \
+       --expert_statistic_path $EXPERT_STATISTIC_PATH \
+       --output_path ./moe_load_balancer.yaml
+   unset EXPERT_STATISTIC_PATH EXPERT_STATISTIC_ITER_RANGE
+   ```
+
+3. Run the Modeling V2 target with the placement. The target runs an FP8 KV cache only.
+
+   ```bash
+   cat > ./config_v2_static.yaml <<EOF
+   modeling_v2: require
+   enable_attention_dp: true
+   kv_cache_config:
+     dtype: fp8
+   moe_config:
+     load_balancer: ./moe_load_balancer.yaml
+   EOF
+
+   trtllm-llmapi-launch \
+   trtllm-bench --model ${MODEL_NAME} \
+       --model_path ${MODEL_PATH} \
+       throughput \
+       --tp 8 \
+       --ep 8 \
+       --config ./config_v2_static.yaml \
+       --kv_cache_free_gpu_mem_fraction 0.75 \
+       --dataset ./dataset.json \
+       --warmup 0 \
+       --eos_id -1
+   ```
+
+   The log names the target on every rank: `modeling_v2: building tensorrt_llm._torch.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default.modeling.ModelingV2DeepseekR10528Nvfp4Sm10xDefault on all 8 rank(s)`.
+
+   To serve the same deployment:
+
+   ```bash
+   trtllm-llmapi-launch \
+   trtllm-serve ${MODEL_PATH} \
+       --tp_size 8 \
+       --ep_size 8 \
+       --config ./config_v2_static.yaml \
+       --host 0.0.0.0 \
+       --port 8000
+   ```
+
+#### Online EPLB
+
+Online EPLB starts from the default placement and moves experts while serving, two layers an iteration here:
+
+```bash
+cat > ./moe_load_balancer_online.yaml <<EOF
+num_slots: 288
+layer_updates_per_iter: 2
+EOF
+
+cat > ./config_v2_online.yaml <<EOF
+modeling_v2: require
+enable_attention_dp: true
+kv_cache_config:
+  dtype: fp8
+moe_config:
+  load_balancer: ./moe_load_balancer_online.yaml
+EOF
+
+trtllm-llmapi-launch \
+trtllm-bench --model ${MODEL_NAME} \
+    --model_path ${MODEL_PATH} \
+    throughput \
+    --tp 8 \
+    --ep 8 \
+    --config ./config_v2_online.yaml \
+    --kv_cache_free_gpu_mem_fraction 0.75 \
+    --dataset ./dataset.json \
+    --warmup 0 \
+    --eos_id -1
+```
+
+The balancer writes expert weights into GPU memory from the host. Grace systems (GB200, GB300) have that built in; x86 systems need GDRCopy, with a `gdrdrv` kernel module that matches the GDRCopy library.
+
+#### dep4
+
+On one GB200 or GB300 tray, generate the placement with `--ep_size 4` and run with `--tp 4 --ep 4` (`--tp_size 4 --ep_size 4` for `trtllm-serve`). 288 slots give 72 slots a rank.
+
+#### Limits
+
+- The target runs EPLB at dep4 and dep8 only: attention DP with pure expert parallelism over 4 or 8 GPUs. With EPLB at any other layout, including the 32- and 36-way expert parallelism of the steps above, `auto` runs the built-in model and `require` fails, naming the layout.
+- Static and online EPLB only. Per-layer dynamic EPLB runs the built-in model.
+- The statistics in step 1 come from the built-in model.

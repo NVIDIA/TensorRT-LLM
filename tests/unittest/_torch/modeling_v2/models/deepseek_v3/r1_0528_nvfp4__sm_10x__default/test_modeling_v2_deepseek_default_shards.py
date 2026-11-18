@@ -255,6 +255,12 @@ class _Checkpoint(dict):
     def full(self, key) -> torch.Tensor:
         return _full(key, self.cfg)
 
+    def mark_consumed_keys(self, keys) -> int:
+        """The engine dict's release: the keys are gone, so a later read of one fails."""
+        for key in keys:
+            dict.pop(self, key)
+        return len(keys)
+
 
 def _read_first(core, ckpt, param_key):
     """The tensor `load` copies into `param_key`'s first source, through the
@@ -343,8 +349,12 @@ def test_shares_tile_intermediates_and_experts(layout):
 
     for tp_slot in range(layout[2]):
         slot = [d for d in dims if d.moe_tp_rank == tp_slot]
-        experts = sorted(e for d in slot for e in _blocks(d.expert_offset, d.local_experts))
+        experts = sorted(e for d in slot for e in _blocks(d.slot_offset, d.local_slots))
         assert experts == list(range(cfg.n_routed_experts)), (tp_slot, experts[:8])
+        # Without EPLB every expert has one slot, so a rank's slots are its window.
+        for d in slot:
+            for slots in d.slots.values():
+                assert slots.slot_experts == tuple(_blocks(d.slot_offset, d.local_slots))
 
 
 @pytest.mark.parametrize("layout", _ATTN_LAYOUTS, ids=_layout_id)
@@ -446,7 +456,7 @@ def test_expert_operands_are_the_ws1_operands_of_the_rank_share(layout):
         d = core.dims
         share = _cfg(hidden_size=256, moe_intermediate_size=d.moe_inter)
         rows, cols2, cols16 = _intermediate_index(d.moe_tp_rank * d.moe_inter, d.moe_inter, True)
-        for local in (0, d.local_experts - 1):
+        for local in (0, d.local_slots - 1):
             ckpt = _Checkpoint(cfg)
             for name, index in (
                 ("fc1_w", (rows,)),
@@ -500,7 +510,7 @@ def test_mtp_expert_operands_are_the_ws1_operands_of_the_rank_share(layout):
         d = core.dims
         share = _cfg(hidden_size=256, moe_intermediate_size=d.moe_inter)
         rows, cols, _ = _intermediate_index(d.moe_tp_rank * d.moe_inter, d.moe_inter, False)
-        for local in (0, d.local_experts - 1):
+        for local in (0, d.local_slots - 1):
             ckpt = _Checkpoint(cfg)
             for name, index in (("fc1", (rows,)), ("fc2", (slice(None), cols))):
                 param = f"l{layer}_{name}"
@@ -514,7 +524,7 @@ def test_mtp_expert_operands_are_the_ws1_operands_of_the_rank_share(layout):
                 )
             # FC1 is [up ; gate], the order fused_moe reads, opposite to the dense
             # gate_up linear's.
-            q = f"model.layers.{layer}.mlp.experts.{d.expert_offset + local}"
+            q = f"model.layers.{layer}.mlp.experts.{d.slot_offset + local}"
             fc1, _, _ = _read_source(core, _Checkpoint(cfg), f"l{layer}_fc1", local)
             up, gate = _full(f"{q}.up_proj.weight", cfg), _full(f"{q}.gate_proj.weight", cfg)
             assert torch.equal(fc1, torch.cat([up[rows], gate[rows]])), (layout, rank, local)
@@ -698,6 +708,9 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
         )
         ckpt = _Checkpoint(cfg, keys)
         D.MODEL_WEIGHTS.load(model, ckpt)
+        # Every key has left the dict: unread ones at the start, read ones after their last read.
+        assert not set(ckpt.keys()), sorted(ckpt.keys())[:4]
+        _assert_slot_scales_are_the_expert_products(core)
 
         seen = [k for k, _, _ in ckpt.reads]
         assert len(seen) == len(set(seen)), "a checkpoint key was read twice"
@@ -713,8 +726,8 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
             assert not read_mtp, sorted(read_mtp)[:4]
             continue
         # Every lazy key of the layer (the 0-dim KV scales are not reads) but the two
-        # aliased ones and the off-window experts.
-        lo, hi = d.expert_offset, d.expert_offset + d.local_experts
+        # aliased ones and the experts this rank's slots do not hold.
+        lo, hi = d.slot_offset, d.slot_offset + d.local_slots
         want = {
             k
             for k in keys
@@ -724,3 +737,17 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
             and not (".mlp.experts." in k and not lo <= int(k.split(".")[5]) < hi)
         }
         assert read_mtp == want, (sorted(want - read_mtp)[:4], sorted(read_mtp - want)[:4])
+
+
+def _assert_slot_scales_are_the_expert_products(core) -> None:
+    """Each trunk layer's per-slot output scales are bitwise what the forward used to derive
+    from the per-expert scalars: the same products of the same fp32 values, in the same
+    order."""
+    d, w = core.dims, core.w
+    for i in range(d.dense_layers, d.num_layers):
+        held = torch.tensor(d.slots[i].slot_experts)
+        isc1, e_isc2 = w[f"l{i}_mlp_isc1"], w[f"l{i}_e_isc2"][held]
+        gate1 = isc1[0] * w[f"l{i}_e_ws2_1"][held]
+        assert torch.equal(w[f"l{i}_out1_gate_scale"], gate1), i
+        assert torch.equal(w[f"l{i}_out1_scale"], gate1 / e_isc2), i
+        assert torch.equal(w[f"l{i}_out2_scale"], e_isc2 * w[f"l{i}_e_ws2_2"][held]), i
