@@ -19,6 +19,8 @@ l0_gb300_multi_nodes_node2_gpu8:
   - accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_tep8 TIMEOUT (60)
   # Kimi K3.1 Pro TEP8 (FP8 KV, FP8 index keys, DSpark): GSM8K with an acceptance-length gate.
   - accuracy/test_kimi31.py::TestKimiK31::test_gsm8k_tep8 TIMEOUT (60)
+  # Same recipe with the RadixArk DFlash 2 (MLA) drafter, 7 draft tokens.
+  - accuracy/test_kimi31.py::TestKimiK31::test_gsm8k_tep8_dflash2 TIMEOUT (60)
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp8]
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[dep8]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[tp8_moetp2_ep4]

@@ -7768,6 +7768,19 @@ class TorchLlmArgs(BaseLlmArgs):
                     if spec_cfg.block_size is None:
                         block_size = _dspark_get("block_size",
                                                  "dspark_block_size")
+                        # A DFlash 2 checkpoint on the MLA drafter: its
+                        # block_size is its training width, not the draft
+                        # length. max_draft_len decides, and the DFlash worker
+                        # checks the computed width against the checkpoint (a
+                        # block-causal DFlash 2 drafter may run wider than it
+                        # was trained). GQA drafters keep the pin.
+                        if (block_size is not None
+                                and draft_cfg.get("kv_lora_rank")
+                                and draft_cfg.get("qk_rope_head_dim")
+                                and is_dflash2_checkpoint(
+                                    draft_cfg.get("architectures"),
+                                    draft_cfg.get("dflash_config") or {})):
+                            block_size = None
                         if block_size is not None:
                             spec_cfg.block_size = int(block_size)
                     if spec_cfg.markov_rank is None:

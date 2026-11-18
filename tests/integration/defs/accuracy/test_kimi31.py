@@ -43,11 +43,22 @@ class TestKimiK31(LlmapiAccuracyTestHarness):
     keys. Both read as ``kv_cache_quant_algo: FP8`` (``nvfp4_ds_mla`` uses a one-byte container),
     so they share one GSM8K reference. Speculative decoding is lossless, so each GSM8K test also
     gates the acceptance length: a broken drafter scores the same and only runs slower.
+
+    The ``_dflash2`` variant swaps in the RadixArk DFlash 2 (MLA) drafter as released (block_size
+    5, target-shared embedding) and draft 7 tokens, past its trained width.
     """
 
     MODEL_NAME = "moonshotai/Kimi-K3.1-Pro"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K3.1-Pro"
     DSPARK_MODEL_PATH = f"{llm_models_root()}/Inferact-Kimi-K3-DSpark"
+    DFLASH2_MODEL_PATH = f"{llm_models_root()}/RadixArk-Kimi-K3.1-Dflash2-Preview"
+
+    def _dflash2_config(self) -> DSparkDecodingConfig:
+        return DSparkDecodingConfig(
+            max_draft_len=7,
+            speculative_model=self.DFLASH2_MODEL_PATH,
+            attention_backend="CUTEDSL",
+        )
 
     def _dep16_kwargs(self, max_seq_len: int) -> dict:
         return dict(
@@ -79,6 +90,36 @@ class TestKimiK31(LlmapiAccuracyTestHarness):
             speculative_config=DSparkDecodingConfig(
                 max_draft_len=6, speculative_model=self.DSPARK_MODEL_PATH
             ),
+            enable_iter_perf_stats=True,
+            max_stats_len=-1,
+        )
+
+    def _tep8_kwargs(self, speculative_config: DSparkDecodingConfig | None = None) -> dict:
+        return dict(
+            tensor_parallel_size=8,
+            moe_expert_parallel_size=8,
+            enable_attention_dp=False,
+            max_batch_size=8,
+            max_num_tokens=8192,
+            max_seq_len=8192,
+            trust_remote_code=True,
+            disable_overlap_scheduler=True,
+            enable_chunked_prefill=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+            kv_cache_config=KvCacheConfig(
+                use_kv_cache_manager_v2=True,
+                dtype="fp8",
+                tokens_per_block=64,
+                enable_block_reuse=False,
+                free_gpu_memory_fraction=0.5,
+            ),
+            moe_config=MoeConfig(max_num_tokens=33024),
+            sparse_attention_config=DeepSeekSparseAttentionConfig(
+                enable_heuristic_topk=True,
+                gvr_deterministic_topk=True,
+            ),
+            speculative_config=speculative_config
+            or DSparkDecodingConfig(max_draft_len=5, speculative_model=self.DSPARK_MODEL_PATH),
             enable_iter_perf_stats=True,
             max_stats_len=-1,
         )
@@ -116,36 +157,21 @@ class TestKimiK31(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(250000)
     def test_gsm8k_tep8(self):
         """GSM8K plus an acceptance-length gate on the TEP8 configuration."""
-        with LLM(
-            self.MODEL_PATH,
-            tensor_parallel_size=8,
-            moe_expert_parallel_size=8,
-            enable_attention_dp=False,
-            max_batch_size=8,
-            max_num_tokens=8192,
-            max_seq_len=8192,
-            trust_remote_code=True,
-            disable_overlap_scheduler=True,
-            enable_chunked_prefill=False,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=8),
-            kv_cache_config=KvCacheConfig(
-                use_kv_cache_manager_v2=True,
-                dtype="fp8",
-                tokens_per_block=64,
-                enable_block_reuse=False,
-                free_gpu_memory_fraction=0.5,
-            ),
-            moe_config=MoeConfig(max_num_tokens=33024),
-            sparse_attention_config=DeepSeekSparseAttentionConfig(
-                enable_heuristic_topk=True,
-                gvr_deterministic_topk=True,
-            ),
-            speculative_config=DSparkDecodingConfig(
-                max_draft_len=5, speculative_model=self.DSPARK_MODEL_PATH
-            ),
-            enable_iter_perf_stats=True,
-            max_stats_len=-1,
-        ) as llm:
+        with LLM(self.MODEL_PATH, **self._tep8_kwargs()) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             assert_acceptance_length_for_llm("TestKimiK31::test_gsm8k_tep8", llm)
+
+    @pytest.mark.timeout(3600)
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device_memory(250000)
+    def test_gsm8k_tep8_dflash2(self):
+        """GSM8K plus an acceptance-length gate, TEP8 with the DFlash 2 drafter.
+
+        TEP8 runs the drafter TP-split, where the block convolutions take the unfused
+        all-reduce path.
+        """
+        with LLM(self.MODEL_PATH, **self._tep8_kwargs(self._dflash2_config())) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            assert_acceptance_length_for_llm("TestKimiK31::test_gsm8k_tep8_dflash2", llm)

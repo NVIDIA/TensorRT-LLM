@@ -23,6 +23,7 @@ Kimi K3.1 Pro builds on Kimi K3, a hybrid Mixture-of-Experts (MoE) model with 89
 
 * **Kimi K3.1 Pro checkpoint**, [moonshotai/Kimi-K3.1-Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro), in Hugging Face format. This is the model TensorRT LLM serves.
 * **DSpark draft model**: the Kimi K3 DSpark draft, [Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark), a separate checkpoint used for speculative decoding. Support for a Kimi K3.1 Pro DSpark draft model will be added later.
+* **DFlash 2 draft model** (optional): the Kimi K3.1 DFlash 2 draft, [RadixArk/Kimi-K3.1-Dflash2-Preview](https://huggingface.co/RadixArk/Kimi-K3.1-Dflash2-Preview), served through the same DSpark path. See [DFlash 2 Draft Model](#dflash-2-draft-model).
 
 | Checkpoint | Weights | Features | Deployments |
 | :-- | :-- | :-- | :-- |
@@ -381,6 +382,31 @@ generation_servers:
 ```
 
 With one context server, set `context_servers.num_instances: 1` and `context_servers.urls: ['<CTX0_HOST>:65100']`.
+
+#### DFlash 2 Draft Model
+
+The Kimi K3.1 DFlash 2 draft, [RadixArk/Kimi-K3.1-Dflash2-Preview](https://huggingface.co/RadixArk/Kimi-K3.1-Dflash2-Preview), is an MLA draft with block convolutions, a candidate selector and block-causal sliding-window attention. TensorRT LLM serves it with `decoding_type: DSpark`. Download it as published; no conversion is needed:
+
+```bash
+huggingface-cli download RadixArk/Kimi-K3.1-Dflash2-Preview --local-dir <DFLASH2_DRAFT_MODEL_DIR>
+```
+
+To use it, change `speculative_config` in the context and generation server files: point `speculative_model` at the DFlash 2 draft, set the same `max_draft_len` on all servers, remove `block_size` and select the CUTEDSL draft attention. Also remove `context_kv_dtype` and `context_kv_only`: the DFlash 2 draft has been validated with BF16 draft context KV, built by the full draft model on the context servers; FP8 draft context KV and context-KV-only context servers are not yet validated with it. Keep the other keys of the file. For example:
+
+```yaml
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 7
+  speculative_model: <DFLASH2_DRAFT_MODEL_DIR>
+  attention_backend: CUTEDSL
+  # Optional: verify non-greedy requests by rejection sampling instead of exact match.
+  use_rejection_sampling: true
+```
+
+* **Embedding and LM head:** the draft ships neither; it shares the target model's.
+* **Draft length:** the draft's `config.json` sets `block_size: 5`, its trained width (1 current token + 4 draft tokens). With `block_size` unset, `speculative_config.block_size` follows `max_draft_len`. Up to `max_draft_len: 4` the draft runs within its trained width. A larger `max_draft_len`, such as the 7 above (the model card's 8-token verification width), runs past it and logs a warning at startup; the draft is block-causal, so its first 5 block positions are computed as at the trained width.
+* **Attention window:** `VANILLA` applies the draft's 1,024-token sliding window exactly, per position. `attention_backend: CUTEDSL` (the default for this draft) applies it at KV-page granularity: each request attends the context from the page that holds the window's first token, so a draft position sees up to one page plus its offset in the block more context than the trained window. `TRTLLM` cannot apply the window and is rejected at startup. The environment variable `TLLM_DSPARK_DRAFT_ATTN_WINDOW`, when set, replaces the window for CUTEDSL (`0` attends the whole context); `VANILLA` and `TRTLLM` then attend the whole context.
+* **Rejection sampling:** `use_rejection_sampling: true` applies to batches with non-greedy requests; all-greedy batches use exact-match verification either way.
 
 The context and generation servers must be started with `--server_role context` and `--server_role generation`; the remaining Kimi K3.1 Pro settings are derived from the configuration and the server role.
 

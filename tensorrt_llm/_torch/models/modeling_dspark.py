@@ -84,7 +84,7 @@ import math
 import os
 import re
 from functools import lru_cache
-from typing import Callable, Dict, List, NamedTuple, Optional
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -2707,10 +2707,52 @@ def _draft_attn_window() -> int:
     return int(os.environ.get("TLLM_DSPARK_DRAFT_ATTN_WINDOW", "0"))
 
 
-def _windowed_block_decode(variant: str, fixup: Optional[_MLABlockFixup]) -> bool:
-    """Whether this step's block decode takes the attention window: the cute-dsl decode over the
-    whole context, under the context split or over a helix-sharded context."""
-    return _draft_attn_window() > 0 and variant == "cute_dsl" and fixup is not None
+# --- DFlash 2 on the MLA drafter ---------------------------------------------------------------
+# A DFlash 2 checkpoint (DFlashForCausalLM._is_dflash2) on the MLA backbone gets the three things
+# the GQA DFlash 2 block decode already does: the per-sublayer block convolutions, block-causal
+# attention when the checkpoint says is_causal, and the checkpoint's sliding window as the default
+# draft attention window. None of them touches a drafter that is not DFlash 2.
+@lru_cache(maxsize=1)
+def _draft_attn_window_env() -> Optional[int]:
+    """``TLLM_DSPARK_DRAFT_ATTN_WINDOW`` when set (any value, ``0`` included), else None."""
+    value = os.environ.get("TLLM_DSPARK_DRAFT_ATTN_WINDOW")
+    return None if value is None else int(value)
+
+
+def _dflash2_shares_target_embedding(is_dflash2: bool, weight_names: Iterable[str]) -> bool:
+    """Whether the MLA drafter takes the target's embedding instead of its own.
+
+    Only a DFlash 2 checkpoint that ships no ``embed_tokens``: DFlash 2 drafters are trained on
+    the target's embedding (as the GQA DFlash drafters are). Every other MLA DSpark checkpoint
+    must ship its own, because those differ from the target's (Inferact/Kimi-K3-DSpark).
+    """
+    return bool(is_dflash2) and not any(
+        name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight")
+        for name in weight_names
+    )
+
+
+def _causal_block_kv_bounds(
+    kv_bounds_i32: torch.Tensor, block_size: int, owned: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Per-query KV bounds that make the block decode causal inside the block.
+
+    ``kv_bounds_i32`` (``[B * block]``, batch-major) lets every block query see the whole block:
+    the block's own keys are the last ``block_size`` keys of each request. Query ``j`` must see
+    context + block slots ``0..j`` only, so its bound drops by the number of block keys after
+    ``j`` that this rank holds: ``block_size - 1 - j`` without helix, the count of owned slots
+    ``t > j`` with a helix / context-split ``owned`` mask (``[B, block, 1]``; local slots keep
+    the global position order, so the owned block slots are still the last local keys).
+    Device operations on static shapes only (CUDA-graph safe); returns a new tensor.
+    """
+    bounds = kv_bounds_i32.reshape(-1, block_size).long()
+    if owned is None:
+        after = (block_size - 1) - torch.arange(block_size, device=bounds.device)
+        after = after.view(1, block_size)
+    else:
+        mine = owned.reshape(-1, block_size).long()
+        after = mine.sum(-1, keepdim=True) - mine.cumsum(-1)
+    return (bounds - after).clamp_min(0).reshape(-1).to(torch.int32)
 
 
 def _window_mla_block_fixup(
@@ -2826,14 +2868,27 @@ class _DSparkHeadMixin:
     is loaded but unused, and drafting always proposes the full K tokens.
     """
 
+    # Whether a DFlash 2 checkpoint without shift_label gets the DFlash layout (slots 1..K)
+    # instead of the shift_label default. Set by the MLA drafter only.
+    _dflash2_defaults_to_dflash_layout = False
+
     def _init_dspark_heads(self, cfg) -> None:
         # Defaults on, unlike the DFlash base: the shift_label slot layout is
         # part of what DSpark *is*, and both published drafters set
         # block_size == max_draft_len, where the DFlash layout (slots 1..K)
         # runs one slot past the block and reads the next request's anchor.
         # An explicit false still selects the legacy layout.
+        # A DFlash 2 checkpoint on the MLA drafter (e.g.
+        # RadixArk/Kimi-K3.1-Dflash2-Preview) is trained in the DFlash layout
+        # (slot 0 the anchor, slots 1..K the drafts) and ships no shift_label,
+        # so it defaults off there (_dflash2_defaults_to_dflash_layout). The
+        # GQA drafter keeps the default on. An explicit value still wins.
         shift_label = resolve_dspark_head_config(cfg, "shift_label")
-        self._dspark_shift_label = True if shift_label is None else bool(shift_label)
+        if shift_label is None:
+            shift_label = not (
+                self._dflash2_defaults_to_dflash_layout and getattr(self, "_is_dflash2", False)
+            )
+        self._dspark_shift_label = bool(shift_label)
         self._dspark_markov_rank = int(resolve_dspark_head_config(cfg, "markov_rank") or 0)
         self._dspark_markov_head_type = str(
             resolve_dspark_head_config(cfg, "markov_head_type") or "vanilla"
@@ -3097,6 +3152,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # backend field, which is why either value of it works here.
     _paged_ctx_cache = True
 
+    # A DFlash 2 checkpoint without shift_label is trained in the DFlash layout.
+    _dflash2_defaults_to_dflash_layout = True
+
     # Acceptance length is measured with the TP fusions: the split fc, and each
     # o_proj / down_proj all-reduce of the block decode below fused with the
     # residual add and the RMSNorm after it.
@@ -3183,6 +3241,87 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
         if context_kv_only:
             self._keep_context_kv_modules()
+        # Set by load_weights: a DFlash 2 checkpoint without its own embedding.
+        self._shares_target_embedding = False
+        self._init_dflash2_block_attention()
+        self._check_dflash2_window_backend()
+
+    def _init_dflash2_block_attention(self) -> None:
+        """Resolve a DFlash 2 drafter's block attention: causal inside the block, and window.
+
+        Same resolution as the GQA DFlash 2 decode (``_resolve_block_attention``: explicit
+        ``is_causal``, then ``get_layer_attention_window`` over ``sliding_window`` /
+        ``use_sliding_window`` / ``layer_types``, then ``dflash_config.use_swa``). The MLA decode
+        builds one fixup per forward, so the layers must agree. Not DFlash 2: no change at all.
+        """
+        self._dflash2_block_causal = False
+        # Left reach of the window in tokens (W - 1 for an HF sliding_window W), or None.
+        self._dflash2_window_left = None
+        # Read by DFlashWorker: whether the block may run wider than the checkpoint's block_size.
+        self.serves_wider_block = False
+        if not getattr(self, "_is_dflash2", False):
+            return
+        num_layers = len(self.model.layers)
+        specs = [self._resolve_block_attention(i) for i in range(num_layers)]
+        resolved = {(bool(c), int(w[0])) for c, w in specs}
+        if len(resolved) != 1:
+            raise NotImplementedError(
+                "DFlash 2 MLA drafter: the block decode builds one attention fixup for all "
+                f"layers, but the layers resolve to different (causal, window_left) {specs}."
+            )
+        causal, window_left = resolved.pop()
+        self._dflash2_block_causal = causal
+        # Block-causal attention plus the left-looking block convolutions: slot j reads slots
+        # 0..j only, and no weight depends on the block width. So a block wider than the
+        # checkpoint's block_size computes the trained slots exactly as at the trained width and
+        # only adds slots after them (the RadixArk K3.1 draft: block_size 5, served at width 8).
+        self.serves_wider_block = causal
+        if window_left >= 0:
+            self._dflash2_window_left = window_left
+        logger.info(
+            "DFlash 2 MLA drafter: block attention "
+            f"{'causal within the block' if causal else 'non-causal'}, config "
+            f"window_left={window_left} "
+            f"({'used' if self._dflash2_window_left is not None else 'unused'} as the default "
+            "draft attention window; TLLM_DSPARK_DRAFT_ATTN_WINDOW overrides)"
+        )
+
+    def _check_dflash2_window_backend(self) -> None:
+        """Reject a DFlash 2 config window on a backend that cannot apply it.
+
+        The TRTLLM block decode attends the whole context, which the checkpoint was not trained
+        with. Setting ``TLLM_DSPARK_DRAFT_ATTN_WINDOW`` (``0`` for the whole context) takes the
+        window choice out of the config. A context-KV-only drafter never drafts.
+        """
+        if (
+            self._dflash2_window_left is not None
+            and not self.context_kv_only
+            and self.dflash_attention_backend == "TRTLLM"
+            and _draft_attn_window_env() is None
+        ):
+            raise ValueError(
+                "DFlash 2 MLA drafter: the checkpoint's sliding window "
+                f"({self._dflash2_window_left} context tokens) is applied by the CUTEDSL and "
+                "VANILLA block decodes only, but attention_backend is 'TRTLLM', which attends "
+                "the whole context. Use attention_backend CUTEDSL or VANILLA, or set "
+                "TLLM_DSPARK_DRAFT_ATTN_WINDOW=0 to attend the whole context on purpose."
+            )
+
+    def _dflash2_attn_window(self) -> tuple[int, str]:
+        """The draft attention window (context tokens) and where it came from.
+
+        The environment variable wins whenever it is set; otherwise a DFlash 2 checkpoint's
+        sliding window. For any other drafter this is ``_draft_attn_window()`` exactly.
+
+        How the decodes apply a config window: VANILLA exactly, per query (block slot ``j`` at
+        ``ctx_len + j`` sees context keys from ``ctx_len + j - window`` on). CUTEDSL per request
+        and page-granular (``_window_mla_block_fixup``): every slot sees the context from the
+        page holding ``ctx_len - window`` on, so slot ``j`` sees up to ``page_size - 1 + j`` older
+        keys than the exact window. TRTLLM cannot (``_check_dflash2_window_backend``).
+        """
+        if _draft_attn_window_env() is None and self._dflash2_window_left is not None:
+            return self._dflash2_window_left, "config"
+        return _draft_attn_window(), "env"
 
     def _keep_context_kv_modules(self) -> None:
         """Drop every module the context KV build does not read.
@@ -3597,6 +3736,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             lse=lse_lower,
             return_lse=True,
         )
+        if self._dflash2_block_causal:
+            # DFlash 2 block-causal: the kernel's in-block causality is exactly the mask, and
+            # the upper triangle the fixup would add is what the checkpoint must not see.
+            return out_lower
 
         # --- fixup: the block's strict upper triangle, the only thing the
         # kernel's in-block causality hides once the block is in the pool ---
@@ -3924,8 +4067,15 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 page_size,
                 None if helix is None else HelixDraftShard(helix.cp_size, helix.cp_rank, page_size),
             )
-        window = _draft_attn_window()
-        if _windowed_block_decode(variant, fixup):
+        # DFlash 2: the checkpoint's sliding window is the default (the env var still wins);
+        # any other drafter: _draft_attn_window(), as before.
+        window, window_source = self._dflash2_attn_window()
+        window_label = (
+            "(TLLM_DSPARK_DRAFT_ATTN_WINDOW)"
+            if window_source == "env"
+            else "(DFlash 2 config sliding_window - 1, from the page holding its first token)"
+        )
+        if window > 0 and variant == "cute_dsl" and fixup is not None:
             # ``helix`` is the drafter's helix mapping or the split's: either way the fixup is in
             # that CP rank's local page layout.
             if helix is not None:
@@ -3941,7 +4091,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 layout = "context split" if ctx_split else "helix-sharded context"
                 logger.info_once(
                     f"MLA DSpark block decode: attention window {window} context tokens "
-                    f"(TLLM_DSPARK_DRAFT_ATTN_WINDOW) over the {layout}, cp rank {helix.cp_rank} "
+                    f"{window_label} over the {layout}, cp rank {helix.cp_rank} "
                     f"of {helix.cp_size}",
                     key="mla_dspark_draft_attn_window_" + ("ctx_split" if ctx_split else "helix"),
                 )
@@ -3949,9 +4099,19 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 fixup = _window_mla_block_fixup(fixup, window, block_size, page_size)
                 logger.info_once(
                     f"MLA DSpark block decode: attention window {window} context tokens "
-                    "(TLLM_DSPARK_DRAFT_ATTN_WINDOW)",
+                    f"{window_label}",
                     key="mla_dspark_draft_attn_window",
                 )
+        if self._dflash2_block_causal and fixup is not None:
+            # After the window: both only subtract from the bounds, the window uniformly.
+            fixup = fixup._replace(
+                kv_bounds_i32=_causal_block_kv_bounds(fixup.kv_bounds_i32, block_size, fixup.owned)
+            )
+            logger.info_once(
+                f"DFlash 2 MLA block decode: block-causal ({variant}; query j sees the context "
+                "and block slots 0..j)",
+                key="dflash2_mla_block_causal",
+            )
         logger.info_once(
             "MLA DSpark block decode: "
             + {
@@ -3973,6 +4133,31 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             key_valid = torch.cat(
                 [ctx_valid, torch.ones(batch, block_size, dtype=torch.bool, device=device)], dim=1
             )
+        # DFlash 2, eager only: a per-query key mask ([B, block, 1, T]) for the block-causal
+        # mask and the exact sliding window (query j at ctx_len + j sees keys from
+        # ctx_len + j - window on). None keeps the shared [B, 1, 1, T] mask above.
+        dflash2_key_valid = None
+        eager_window = window if window_source == "config" else 0
+        if not use_kernel and (self._dflash2_block_causal or eager_window > 0):
+            q_idx = torch.arange(block_size, device=device).view(1, block_size, 1)
+            ctx_len = num_ctx_per_req[:batch].view(-1, 1, 1)
+            cols = torch.arange(capacity, device=device).view(1, 1, -1)
+            ctx_ok = cols < ctx_len
+            if eager_window > 0:
+                ctx_ok = ctx_ok & (cols >= ctx_len + q_idx - eager_window)
+            blk_ok = torch.arange(block_size, device=device).view(1, 1, block_size)
+            blk_ok = (
+                blk_ok <= q_idx
+                if self._dflash2_block_causal
+                else torch.ones_like(blk_ok, dtype=torch.bool)
+            )
+            dflash2_key_valid = torch.cat(
+                [
+                    ctx_ok.expand(batch, block_size, capacity),
+                    blk_ok.expand(batch, block_size, block_size),
+                ],
+                dim=-1,
+            ).unsqueeze(2)
         # Helix: the tokens this rank holds no key of, layer-invariant. Built
         # once here when the fused draft store is on, else per layer.
         helix_zero_kv = (
@@ -3999,6 +4184,21 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # TLLM_DSPARK_AR_PUSH: o_proj and down_proj push their partials into the
         # all-reduce and one site kernel finishes it with the residual and norm.
         sites = self._draft_ar_sites()
+        # DFlash 2: the block convolutions wrap each sublayer exactly as in the GQA DFlash 2
+        # decode: attention_conv.prepare on the input_layernorm output (what the q_a / kv_a
+        # projections read), attention_conv.finish on the reduced o_proj output before the
+        # residual add, and mlp_conv likewise around the MLP. finish() needs the reduced
+        # sublayer output, so the fused all-reduce + add + norm paths (TP split, pushed sites)
+        # are off while the convolutions are on.
+        block_conv = getattr(self, "_is_dflash2", False) and self.has_block_conv
+        if block_conv:
+            sites = None
+            logger.info_once(
+                f"DFlash 2 MLA block decode: attention_conv / mlp_conv applied in all "
+                f"{len(self.model.layers)} layers"
+                + (" (unfused all-reduce: TP split)" if self._tp_split else ""),
+                key="dflash2_mla_block_conv",
+            )
         # TLLM_DSPARK_L2_PREFETCH: after each layer's [q_a | kv_a] GEMM, a side
         # stream pulls the layer's o_proj / gate_up / down weights and the next
         # layer's [q_a | kv_a] into L2 (hints only; joined before returning).
@@ -4028,6 +4228,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 res_flat = residual.reshape(-1, residual.shape[-1])
                 hs_normed, res_flat = layer.input_layernorm(hs_flat, res_flat)
                 residual = res_flat.reshape(batch, block_size, -1)
+            attn_conv_coefficients = None
+            if block_conv:
+                hs_normed, attn_conv_coefficients = self.attention_convs[layer_idx].prepare(
+                    hs_normed, block_size
+                )
 
             fused_a = self._draft_fused_a_proj(layer_idx) if self._tp_split else None
             if fused_a is not None:
@@ -4183,7 +4388,12 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     scores = (
                         torch.einsum("bshc,btc->bsht", query, kv_full).float() * self.softmax_scale
                     )
-                    scores = scores.masked_fill(~key_valid.view(batch, 1, 1, -1), float("-inf"))
+                    key_mask = (
+                        key_valid.view(batch, 1, 1, -1)
+                        if dflash2_key_valid is None
+                        else dflash2_key_valid
+                    )
+                    scores = scores.masked_fill(~key_mask, float("-inf"))
                     probs = torch.softmax(scores, dim=-1).to(kv_full.dtype)
                     ctx_out = torch.einsum("bsht,btc->bshc", probs, kv_full[..., :latent_dim])
             stats = None
@@ -4224,7 +4434,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             res_flat = residual.reshape(-1, residual.shape[-1])
             # With the TP fusions, o_proj and down_proj reduce their outputs;
             # fuse each all-reduce with the residual add and the RMSNorm after it.
-            if self._tp_split:
+            if self._tp_split and not block_conv:
                 no_reduce = AllReduceParams(enable_allreduce=False)
                 site = None
                 if sites is not None and _plain(attn.o_proj):
@@ -4249,8 +4459,20 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 hidden_states = partial
             else:
                 hidden_out = attn.o_proj(attn_out.reshape(batch * block_size, -1))
+                if block_conv:
+                    hidden_out = self.attention_convs[layer_idx].finish(
+                        hidden_out, attn_conv_coefficients, block_size
+                    )
                 hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
+                if block_conv:
+                    hidden_out, mlp_conv_coefficients = self.mlp_convs[layer_idx].prepare(
+                        hidden_out, block_size
+                    )
                 hidden_out = layer.mlp(hidden_out)
+                if block_conv:
+                    hidden_out = self.mlp_convs[layer_idx].finish(
+                        hidden_out, mlp_conv_coefficients, block_size
+                    )
                 hidden_states = hidden_out.reshape(batch, block_size, -1)
             residual = res_flat.reshape(batch, block_size, -1)
 
@@ -4407,6 +4629,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     #: Only the head is shared. This drafter ships its own embed_tokens whose
     #: values differ from the target's -- see load_weights_from_target_model --
     #: so a checkpoint missing it must fail rather than run on random weights.
+    #: The one exception is a DFlash 2 checkpoint that ships no embedding (see
+    #: _dflash2_shares_target_embedding): load_weights widens this per instance.
     WEIGHTS_SHARED_WITH_TARGET = ("lm_head",)
 
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
@@ -4435,19 +4659,49 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
         weights, _ = self._take_dspark_head_weights(weights)
         weights = {renames.get(k, k): v for k, v in weights.items()}
+        if _dflash2_shares_target_embedding(self._is_dflash2, weights):
+            # Instance attribute: the backbone completeness check below must not
+            # ask the checkpoint for the embedding the target supplies.
+            self._shares_target_embedding = True
+            self.WEIGHTS_SHARED_WITH_TARGET = ("embed_tokens", "lm_head")
+            logger.info(
+                f"{type(self).__name__}: the DFlash 2 checkpoint ships no embed_tokens; "
+                "the drafter shares the target model's embedding."
+            )
         return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
 
+    def _load_dflash2_weights(self, weights: Dict, *, load_selector: bool = True) -> Dict:
+        """A context-KV-only drafter builds no DFlash 2 convolutions or selector.
+
+        The context KV build reads ``fc`` / ``hidden_norm`` and each layer's ``kv_a`` only, and a
+        context server never drafts, so load_weights has already filtered those tensors out.
+        """
+        if self.context_kv_only:
+            return weights
+        return super()._load_dflash2_weights(weights, load_selector=load_selector)
+
     def load_weights_from_target_model(self, target_model: torch.nn.Module) -> None:
-        """Share only ``lm_head``; the drafter has its own trained embedding.
+        """Share ``lm_head``, and the embedding only when the checkpoint has none.
 
         Inferact/Kimi-K3-DSpark ships ``embed_tokens`` whose values differ from
         the target's, so adopting the target's would feed the block decode
         embeddings it was not distilled against -- silently, at some acceptance
-        cost. The GQA drafters ship no embedding and keep the base behavior.
-        A context-KV-only drafter has no LM head.
+        cost. A DFlash 2 checkpoint that ships no embedding (the RadixArk Kimi
+        K3.1 draft: "the target supplies the embeddings and LM head") was
+        trained on the target's, so it takes ``target_model.model.embed_tokens``
+        as the GQA DFlash drafters do. A context-KV-only drafter has neither.
         """
         if self.context_kv_only:
             return
+        if self._shares_target_embedding:
+            embed_tokens = getattr(getattr(target_model, "model", None), "embed_tokens", None)
+            if embed_tokens is None:
+                raise ValueError(
+                    f"{type(self).__name__}: the DFlash 2 checkpoint ships no embed_tokens and "
+                    f"the target model ({type(target_model).__name__}) has no "
+                    "model.embed_tokens to share."
+                )
+            self.draft_model_full.model.embed_tokens = embed_tokens
         self.draft_model_full.lm_head = target_model.lm_head
         self.lm_head = target_model.lm_head
 

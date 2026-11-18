@@ -1755,19 +1755,7 @@ class DFlashWorker(SpecWorkerBase):
         self._managed_cache_bindings = {}
         self._managed_request_ids = ()
 
-        # checkpoint's trained block width
-        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
-            self.max_draft_len + 1
-        )
-        # what the draft forward actually computes
-        self._compute_block_size = self._draft_block_width(draft_model)
-        if self._compute_block_size > self._resolved_block_size:
-            slack = self._compute_block_size - self.max_draft_len
-            raise ValueError(
-                f"DFlash checkpoint was trained with block_size={self._resolved_block_size}."
-                f"Lower max_draft_len to at most {self._resolved_block_size - slack}."
-                f"Current max_draft_len={self.max_draft_len}."
-            )
+        self._resolve_block_widths(draft_model)
 
         # +block_size slack lets each backend append the per-iteration noise
         # K/V after the accumulated request context.
@@ -2976,6 +2964,39 @@ class DFlashWorker(SpecWorkerBase):
             rewind=self._kv_rewind_amount if rewind else None,
             num_contexts=self._kv_rewind_nc if rewind else 0,
             replay=self._take_force_replay(),
+        )
+
+    def _resolve_block_widths(self, draft_model) -> None:
+        """Set the checkpoint's trained block width and the width the draft forward computes.
+
+        The forward may not run wider than the checkpoint was trained, except for a drafter
+        that sets ``serves_wider_block`` (a block-causal DFlash 2 drafter, see
+        ``MLADSparkForCausalLM._init_dflash2_block_attention``): its slots inside the trained
+        width compute exactly what they would at that width, so the wider block only adds
+        slots after them. That is logged, not rejected.
+        """
+        # checkpoint's trained block width
+        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
+            self.max_draft_len + 1
+        )
+        # what the draft forward actually computes
+        self._compute_block_size = self._draft_block_width(draft_model)
+        if self._compute_block_size <= self._resolved_block_size:
+            return
+        if getattr(draft_model, "serves_wider_block", False):
+            logger.warning(
+                f"DFlash drafter: max_draft_len={self.max_draft_len} computes "
+                f"{self._compute_block_size} block slots, wider than the checkpoint's "
+                f"block_size={self._resolved_block_size}. The drafter is block-causal, so the "
+                f"first {self._resolved_block_size} slots are exactly as trained; the slots "
+                "after them run past the trained width."
+            )
+            return
+        slack = self._compute_block_size - self.max_draft_len
+        raise ValueError(
+            f"DFlash checkpoint was trained with block_size={self._resolved_block_size}."
+            f"Lower max_draft_len to at most {self._resolved_block_size - slack}."
+            f"Current max_draft_len={self.max_draft_len}."
         )
 
     def _draft_block_width(self, draft_model) -> int:

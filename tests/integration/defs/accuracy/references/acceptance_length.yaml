@@ -101,6 +101,9 @@ TestKimiK31::test_gsm8k_dep16:
 TestKimiK31::test_gsm8k_tep8:
   ref_al: 3.8917
   min_al: 3.6971
+TestKimiK31::test_gsm8k_tep8_dflash2:
+  ref_al: 5.069
+  min_al: 4.8156
 disagg::TestDeepSeekV3Lite::test_auto_dtype:
   ref_al: 2.581477287026551
   min_al: 2.452403422675223
