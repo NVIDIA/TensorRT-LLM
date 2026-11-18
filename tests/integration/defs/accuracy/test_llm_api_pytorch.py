@@ -5811,8 +5811,10 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
             speculative_model=dflash_model_path,
             attention_backend=dflash_attention_backend)
 
+        # Exercise untuned kernels on VANILLA and tuned kernels on TRTLLM.
         with LLM(self.MODEL_PATH,
                  trust_remote_code=True,
+                 enable_autotuner=dflash_attention_backend != "VANILLA",
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
                  max_seq_len=8192,
