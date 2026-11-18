@@ -322,7 +322,6 @@ class DecoderWarmup:
         # Heads that project context logits eagerly; their workspaces are
         # reserved during warmup.
         self._context_logits_heads = context_logits_heads
-        self._prims_ts_warmed = False
         # Token shape of the last autotuner warmup that ran a forward pass.
         self._completed_autotuner_warmup_num_tokens: int | None = None
         self._prims_ts_dense_mla_warmup = PrimsTSDenseMlaWarmup()
@@ -1083,10 +1082,7 @@ class DecoderWarmup:
                 kv_cache_manager,
                 get_draft_kv_cache_manager(self._config.spec_config, resource_manager),
             )
-            if warmup_prims_ts_sparse_mla(
-                self.model, metadata, use_workers=not self._prims_ts_warmed
-            ):
-                self._prims_ts_warmed = True
+            warmup_prims_ts_sparse_mla(self.model, metadata)
         torch.cuda.synchronize()
         # Compilation is local; align peers before the first collective-bearing forward.
         if self.dist is not None:

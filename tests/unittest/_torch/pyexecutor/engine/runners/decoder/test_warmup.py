@@ -1100,7 +1100,6 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers() -> None:
             attention_backend=SimpleNamespace(Metadata=DeepseekV4TrtllmAttentionMetadata),
             spec_config=None,
         ),
-        _prims_ts_warmed=False,
         _metadata=SimpleNamespace(setup_attention=Mock(side_effect=build_metadata)),
         model=object(),
         mapping=SimpleNamespace(cp_size=1, tp_size=4),
@@ -1112,17 +1111,15 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers() -> None:
         patch.object(
             prims_ts_sparse_mla,
             "warmup_prims_ts_sparse_mla",
-            side_effect=lambda *args, **kwargs: events.append("kernels") or True,
+            side_effect=lambda *args: events.append("kernels"),
         ) as warm,
         patch.object(torch.cuda, "synchronize", side_effect=lambda: events.append("sync")),
     ):
         DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
         assert events == ["metadata", "kernels", "sync", "barrier"]
         assert metadata.cu_seq_lens.is_inference()
-        warm.assert_called_once_with(owner.model, metadata, use_workers=True)
+        warm.assert_called_once_with(owner.model, metadata)
         owner._metadata.setup_attention.assert_called_once_with(manager, None)
-        DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
-        warm.assert_called_with(owner.model, metadata, use_workers=False)
         events.clear()
         manager.context_swa_layer_limit = 1
         DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
