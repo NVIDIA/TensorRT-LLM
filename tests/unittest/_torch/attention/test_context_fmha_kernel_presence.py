@@ -5,18 +5,14 @@
 ``TrtllmAttentionMetadata`` enables ``use_paged_context_fmha`` whenever chunked
 prefill, KV block reuse or speculative draft tokens are configured, and those
 features require the context phase to attend to KV already in the cache. Only
-the fused context FMHA kernel can do that: ``AttentionOp::initialize()`` ends
-with ``mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported()``,
-so a configuration with no compiled kernel silently falls back to the unfused
-path, which attends to the current chunk only and then overwrites the cached
-prefix.
+the fused context FMHA kernels can do that; the unfused library attends to the
+current chunk only and then overwrites the cached prefix.
 
-``get_attention_op`` refuses that combination after initialization. This module
-covers the ``fused_context_fmha_kernel_exists`` diagnostic that reports what the
-running build actually contains, including the case that matters most: that the
-lookup is able to answer "no". Every test here calls into the native kernel
-table, so all of them need a GPU. Missing bindings on a GPU are a failure, not a
-skip.
+``unfused_is_supported`` declines that combination. This module covers the
+``fused_context_fmha_kernel_exists`` diagnostic that reports what the running
+build actually contains, including the case that matters most: that the lookup
+is able to answer "no". Every test here calls into the native kernel table, so
+all of them need a GPU. Missing bindings on a GPU are a failure, not a skip.
 """
 
 import pytest

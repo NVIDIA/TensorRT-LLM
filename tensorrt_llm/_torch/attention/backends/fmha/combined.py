@@ -47,6 +47,10 @@ class CombinedFmha(PhasedFmha):
             context_impl.supports_workspace_reclamation
             and generation_impl.supports_workspace_reclamation
         )
+        self.REQUIRES_PAGED_KV = context_impl.REQUIRES_PAGED_KV or generation_impl.REQUIRES_PAGED_KV
+        self.NEEDS_BLOCK_EXTENT = (
+            context_impl.NEEDS_BLOCK_EXTENT or generation_impl.NEEDS_BLOCK_EXTENT
+        )
 
     def _get_context_impl(self) -> PhasedFmha:
         if self._context_impl is None:

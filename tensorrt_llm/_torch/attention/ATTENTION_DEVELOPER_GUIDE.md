@@ -518,7 +518,8 @@ per-variant priority, for direct callers such as `FallbackFmha.attention`.
 `NATIVE_FMHA_LIBS` lists the wrapper and the libraries, and every `run_*` stays
 eager under `torch.compile`. `XqaFmha` judges its generation
 support at `max_seq_len`, so the choice holds for every KV history length that
-shares a selection cache key. Whether XQA is expected to outrun MMHA weighs the
+shares a selection cache key; beam search with KV history past the cyclic window
+is the exception, and the cache key records it. Whether XQA is expected to outrun MMHA weighs the
 call's batch against its KV history; `XqaFmha.has_perf_gain` asks
 `thop.xqa_has_perf_gain` once per batch, history block, speculative mode and output dtype,
 and `FmhaManager` keys selection on the answer once a selection reaches XQA. The native
@@ -532,7 +533,7 @@ created lazily per phase. `*_is_supported` prepares the call in the op without
 launching or growing the workspace. Workspace sizing, growth and the multi-CTA
 counter live in C++; generation reserves the largest requirement among the op's
 libraries, so a CUDA graph replay can switch library without growth, and
-`prepare_workspace()` is empty. After each launch the holder drops
+`prepare_workspace()` only warns when SageAttention smoothing is requested. After each launch the holder drops
 every tensor reference so cached parameters never pin a layer's activations.
 Streams are not part of the key so CUDA graph capture reuses runners
 initialized during warmup.
@@ -826,7 +827,7 @@ Each offloaded layer runs three steps in a generation step:
 For an offloaded layer, the KV-cache manager's block tables and pool pointers
 do not describe where the history is. The arena-row indices are relative to
 the base of the layer's data arena, and a library must read through that base.
-`FallbackFmha` (TRTLLM-Gen through `thop.run_generation`) uses
+`TrtllmGenFmha` (through `thop.trtllm_gen_run_generation`) uses
 `aux_kv_cache_pool_ptr`. `prims_ts_sparse_mla` passes the DeepSeek-V4
 manager's cached view, `get_sparse_compress_buffers(layer_idx)[0]`, as its
 extra pool. A library must branch on the offload state in both its

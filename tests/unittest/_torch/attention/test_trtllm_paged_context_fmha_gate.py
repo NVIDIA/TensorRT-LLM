@@ -8,7 +8,7 @@ configured. Without a fused context FMHA kernel for the configuration, the
 context phase would reach the unfused library, whose context path builds K/V
 from the current chunk only: the cached prefix would be dropped from attention
 and then overwritten by the chunk's write-back. ``unfused_is_supported``
-refuses that call with an error instead. A page size that only the trtllm-gen
+declines that call instead. A page size that only the trtllm-gen
 kernels outside the op read is declined by every native library, so selection
 continues to those kernels.
 """
@@ -33,14 +33,12 @@ def _is_supported(fmha_cls, batch, **overrides) -> bool:
     return fmha_cls(attn).is_supported(qkv, None, None, metadata, forward_args)
 
 
-def test_paged_context_without_fused_kernel_is_refused():
+def test_paged_context_without_fused_kernel_is_declined():
     with native_batch(
         _UNFUSED_DTYPE, num_contexts=1, num_generations=0, chunked_prefill=True
     ) as batch:
-        with pytest.raises(RuntimeError, match="requires a fused context FMHA kernel"):
-            _is_supported(FallbackFmha, batch)
-        with pytest.raises(RuntimeError, match="requires a fused context FMHA kernel"):
-            _is_supported(UnfusedFmha, batch)
+        assert not _is_supported(FallbackFmha, batch)
+        assert not _is_supported(UnfusedFmha, batch)
 
 
 def test_unfused_context_without_paged_context_is_admitted():
@@ -76,3 +74,16 @@ def test_trtllm_gen_only_page_size_admits_generation():
         extra_page_sizes=frozenset({32}),
     ) as batch:
         assert _is_supported(FallbackFmha, batch)
+
+
+def test_unfused_declines_fp8_output():
+    if torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8 output needs SM89 or newer")
+    with native_batch(torch.bfloat16, num_contexts=1, num_generations=0) as batch:
+        attn, _, qkv = batch
+        output = torch.empty(
+            (qkv.shape[0], attn.num_heads * attn.head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=qkv.device,
+        )
+        assert not _is_supported(UnfusedFmha, batch, output=output)

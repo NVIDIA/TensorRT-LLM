@@ -70,9 +70,7 @@ def test_variable_window_bounds_must_match_query_device():
 
 @pytest.mark.skipif(get_sm_version() not in (100, 103), reason="requires SM100 or SM103")
 def test_variable_window_rejects_unsupported_kernel_configuration():
-    with pytest.raises(
-        RuntimeError, match="requires a supported context FMHA kernel configuration"
-    ):
+    with pytest.raises(RuntimeError, match="No TRT-LLM attention FMHA library supports"):
         _run_variable_window_attention(head_dim=64, bounds_device=torch.device("cuda:0"))
 
 

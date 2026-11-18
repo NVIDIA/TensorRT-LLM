@@ -34,14 +34,18 @@
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <cassert>
 #include <concepts>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <tuple>
 
@@ -137,6 +141,49 @@ struct AttentionForwardArgs
                                                 : nullptr;
     }
 };
+
+struct KvCachePoolMapping
+{
+    int32_t poolIndex{0};
+    int32_t layerIdxInCachePool{0};
+};
+
+KvCachePoolMapping readKvCachePoolMapping(at::Tensor const& hostKvCachePoolMapping, int64_t layerIdx);
+
+namespace detail
+{
+
+/// Accessor over a CPU tensor, checked for device, dtype and rank.
+template <typename T, std::size_t N>
+at::TensorAccessor<T, N> hostAccessor(at::Tensor const& tensor, char const* name)
+{
+    TORCH_CHECK(tensor.device().is_cpu(), name, " must be a CPU tensor.");
+    return tensor.accessor<T, N>();
+}
+
+/// Elements [offset, offset + count) of a contiguous 1-D CPU int32 tensor.
+inline std::span<int32_t const> hostInt32Span(at::Tensor const& tensor, int64_t offset, int64_t count, char const* name)
+{
+    TORCH_CHECK(tensor.device().is_cpu() && tensor.dim() == 1 && tensor.is_contiguous(), name,
+        " must be a contiguous 1-D CPU tensor.");
+    TORCH_CHECK(offset >= 0 && count >= 0 && offset + count <= tensor.size(0), name, " range [", offset, ", ",
+        offset + count, ") is out of bounds for ", tensor.size(0), " elements.");
+    return {tensor.data_ptr<int32_t>() + offset, static_cast<std::size_t>(count)};
+}
+
+template <typename T>
+T* tensorPtr2D(at::Tensor const& tensor, int64_t const row, int64_t const col, char const* tensorName)
+{
+    TORCH_CHECK(tensor.dim() >= 2, tensorName, " must have at least 2 dimensions.");
+    TORCH_CHECK(row >= 0 && row < tensor.size(0), tensorName, " row is out of bounds.");
+    TORCH_CHECK(col >= 0 && col < tensor.size(1), tensorName, " column is out of bounds.");
+
+    using ValueType = std::remove_const_t<T>;
+    auto* data = static_cast<ValueType*>(tensor.data_ptr());
+    return data + row * tensor.stride(0) + col * tensor.stride(1);
+}
+
+} // namespace detail
 
 /// Parameters for phased attention, generated from fmha/phased.py.
 /// Device tensors are phase-local; host tensors, KV-cache block offsets and FP4
@@ -324,9 +371,12 @@ struct FmhaParams
     /// Block offsets for this phase's sequences; `seq_offset` is applied here.
     [[nodiscard]] kernels::KVBlockArray::DataType* getKvCacheBlockOffsets(int32_t poolIndex) const
     {
-        return meta.kv_cache_block_offsets.has_value() ? static_cast<kernels::KVBlockArray::DataType*>(
-                   meta.kv_cache_block_offsets.value().index({poolIndex, seq_offset}).data_ptr())
-                                                       : nullptr;
+        if (!meta.kv_cache_block_offsets.has_value())
+        {
+            return nullptr;
+        }
+        return detail::tensorPtr2D<kernels::KVBlockArray::DataType>(
+            meta.kv_cache_block_offsets.value(), poolIndex, seq_offset, "kv_cache_block_offsets");
     }
 
     // Quantization scales and output quantization.
@@ -368,7 +418,7 @@ struct FmhaParams
         {
             return 0;
         }
-        return meta.kv_lens_runtime.slice(0, seqOffset, seqOffset + numSeqs).max().item<int32_t>();
+        return std::ranges::max(detail::hostInt32Span(meta.kv_lens_runtime, seqOffset, numSeqs, "kv_lens_runtime"));
     }
 
     [[nodiscard]] int32_t getMaxHostContextLength(int64_t seqOffset, int64_t numSeqs) const
@@ -377,7 +427,8 @@ struct FmhaParams
         {
             return 0;
         }
-        return meta.prompt_lens_cpu_runtime.slice(0, seqOffset, seqOffset + numSeqs).max().item<int32_t>();
+        return std::ranges::max(
+            detail::hostInt32Span(meta.prompt_lens_cpu_runtime, seqOffset, numSeqs, "prompt_lens_cpu_runtime"));
     }
 
     /// Total attended-KV length for this phase. Prefer explicit phase totals when
@@ -390,9 +441,12 @@ struct FmhaParams
         }
         if (host_total_kv_lens.has_value())
         {
-            return host_total_kv_lens.value().select(0, isGen ? 1 : 0).item<int32_t>();
+            return detail::hostInt32Span(host_total_kv_lens.value(), isGen ? 1 : 0, 1, "host_total_kv_lens")[0];
         }
-        return meta.kv_lens_runtime.slice(0, seqOffset, seqOffset + numSeqs).sum().item<int32_t>();
+        auto const lens = detail::hostInt32Span(meta.kv_lens_runtime, seqOffset, numSeqs, "kv_lens_runtime");
+        int64_t const total = std::accumulate(lens.begin(), lens.end(), int64_t{0});
+        TORCH_CHECK(total <= std::numeric_limits<int32_t>::max(), "The total KV length ", total, " overflows int32.");
+        return static_cast<int32_t>(total);
     }
 
     [[nodiscard]] int getCacheIndirectionWindowSize(int defaultValue) const
@@ -432,14 +486,14 @@ struct FmhaParams
     [[nodiscard]] int32_t getKvCachePoolIndex(int64_t localLayerIdx) const
     {
         return meta.host_kv_cache_pool_mapping.has_value()
-            ? checkedPoolMapping(localLayerIdx).index({localLayerIdx, 0}).item<int32_t>()
+            ? readKvCachePoolMapping(checkedPoolMapping(localLayerIdx), localLayerIdx).poolIndex
             : 0;
     }
 
     [[nodiscard]] int32_t getLayerIdxInCachePool(int64_t localLayerIdx) const
     {
         return meta.host_kv_cache_pool_mapping.has_value()
-            ? checkedPoolMapping(localLayerIdx).index({localLayerIdx, 1}).item<int32_t>()
+            ? readKvCachePoolMapping(checkedPoolMapping(localLayerIdx), localLayerIdx).layerIdxInCachePool
             : 0;
     }
 
@@ -477,8 +531,11 @@ struct FmhaParams
             return nullptr;
         }
         auto const& poolPointers = meta.host_kv_cache_pool_pointers.value();
-        return reinterpret_cast<char*>(poolPointers.dim() == 3 ? poolPointers.index({poolIndex, 0, 0}).item<int64_t>()
-                                                               : poolPointers.index({poolIndex, 0}).item<int64_t>());
+        TORCH_CHECK(poolIndex >= 0 && poolIndex < poolPointers.size(0), "host_kv_cache_pool_pointers has no pool ",
+            poolIndex, ".");
+        return reinterpret_cast<char*>(poolPointers.dim() == 3
+                ? detail::hostAccessor<int64_t, 3>(poolPointers, "host_kv_cache_pool_pointers")[poolIndex][0][0]
+                : detail::hostAccessor<int64_t, 2>(poolPointers, "host_kv_cache_pool_pointers")[poolIndex][0]);
     }
 
     /// Kernel view of the sparse indices and the KV pools they address. The pool fields
@@ -782,14 +839,6 @@ private:
         int64_t quant_mode, int64_t max_num_requests, int64_t max_context_length, int64_t max_seq_len,
         std::optional<int64_t> attention_chunk_size, bool use_kv_cache, bool use_paged_context_fmha);
 };
-
-struct KvCachePoolMapping
-{
-    int32_t poolIndex{0};
-    int32_t layerIdxInCachePool{0};
-};
-
-KvCachePoolMapping readKvCachePoolMapping(at::Tensor const& hostKvCachePoolMapping, int64_t layerIdx);
 
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
     int64_t intraPoolOffset, int64_t blockSize, int32_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache);

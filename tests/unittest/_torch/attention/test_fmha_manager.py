@@ -706,6 +706,27 @@ def test_fmha_cache_separates_speculative_decoding(speculative_first: bool) -> N
     assert events.count(("support", "fallback", None)) == 1
 
 
+def test_xqa_perf_gain_follows_xqa_after_a_library_is_prepended() -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    xqa = FakeFmha(attn, "xqa", events)
+    xqa.has_perf_gain = lambda *_args: True
+    manager.fmha_libs = [xqa]
+    manager._xqa = xqa
+    manager.fmha_libs.insert(
+        0, FakeFmha(attn, "prepended", events, support_predicate=lambda _args: False)
+    )
+    metadata = _make_metadata(num_contexts=0, num_generations=1)
+    metadata.beam_width = 1
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        for _ in range(2):
+            assert (
+                manager.select(attn, torch.empty((1, 4)), None, None, metadata, forward_args) is xqa
+            )
+
+
 def test_fmha_cache_tracks_lora_output_representation() -> None:
     for lora_first in (True, False):
         events: list[tuple] = []

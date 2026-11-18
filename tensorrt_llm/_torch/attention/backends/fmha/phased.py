@@ -123,6 +123,20 @@ def get_spec_decoding_position_offsets(
     return offsets
 
 
+def _host_max(t: torch.Tensor, start: int, end: int) -> int:
+    """``int(t[start:end].max())``, read through NumPy for a CPU tensor."""
+    if t.is_cpu:
+        return int(t.numpy()[start:end].max())
+    return int(t[start:end].max())
+
+
+def _host_sum(t: torch.Tensor, start: int, end: int) -> int:
+    """``int(t[start:end].sum())``, read through NumPy for a CPU tensor."""
+    if t.is_cpu:
+        return int(t.numpy()[start:end].sum(dtype="int64"))
+    return int(t[start:end].sum())
+
+
 def _leading_rows(t: torch.Tensor, n: int) -> torch.Tensor:
     """``t[:n]``; ``t`` itself when it has n rows."""
     return t if t.shape[0] == n else t[:n]
@@ -327,7 +341,7 @@ class PhasedFmha(Fmha):
         # kv_row_total sums the context batch's KV lengths: a dense k / v spanning
         # that many rows covers the requests' full KV and reaches _kv_rows whole.
         kv_row_total = (
-            int(metadata.kv_lens_runtime[:num_seqs].sum())
+            _host_sum(metadata.kv_lens_runtime, 0, num_seqs)
             if metadata.kv_lens_runtime is not None
             else None
         )
@@ -381,7 +395,7 @@ class PhasedFmha(Fmha):
         token_offset = 0 if is_gen_only else metadata.num_ctx_tokens
         num_seqs = metadata.num_generations
 
-        max_past_kv_len = int(metadata.kv_lens_runtime[seq_offset : seq_offset + num_seqs].max())
+        max_past_kv_len = _host_max(metadata.kv_lens_runtime, seq_offset, seq_offset + num_seqs)
         input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
 
         params.use_spec_decoding = metadata.is_spec_decoding_enabled and metadata.use_spec_decoding
@@ -484,8 +498,8 @@ class PhasedFmha(Fmha):
                 forward_args,
                 workspace,
                 total_num_blocks,
-                max_q_len=int(host_context_lengths[:num_contexts].max()),
-                max_kv_len=int(host_past_key_value_lengths[:num_contexts].max()),
+                max_q_len=_host_max(host_context_lengths, 0, num_contexts),
+                max_kv_len=_host_max(host_past_key_value_lengths, 0, num_contexts),
                 num_gen_tokens=phase_num_gen_tokens,
             )
             if attn.is_mla_enable:

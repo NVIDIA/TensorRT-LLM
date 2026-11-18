@@ -359,8 +359,8 @@ class FmhaManager:
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
         self._layer_idx = getattr(attn, "layer_idx", None)
-        self._xqa_index = next(
-            (i for i, fmha in enumerate(self.fmha_libs) if isinstance(fmha, XqaFmha)), None
+        self._xqa: XqaFmha | None = next(
+            (fmha for fmha in self.fmha_libs if isinstance(fmha, XqaFmha)), None
         )
 
     def prewarm(self, config: FmhaPrewarmConfig, attempted: set[type[Fmha]]) -> None:
@@ -457,7 +457,7 @@ class FmhaManager:
             generation_seq_len_q = _normalize_fmha_cache_grid_value(
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID
             )
-            if self._xqa_index is not None:
+            if self._xqa is not None:
                 xqa_kv_exceeds_beam_search_window = XqaFmha.kv_exceeds_beam_search_window(
                     metadata, forward_args
                 )
@@ -541,13 +541,11 @@ class FmhaManager:
 
     def _reached_xqa(self, cache_key: _FmhaCacheKey, fmha: Fmha) -> bool:
         """Whether selecting ``fmha`` consulted XQA's generation support."""
-        if self._xqa_index is None or cache_key.generation_seq_len_q == 0:
+        xqa = self._xqa
+        if xqa is None or cache_key.generation_seq_len_q == 0 or xqa not in self.fmha_libs:
             return False
-        if isinstance(fmha, CombinedFmha):
-            impls = (fmha._get_context_impl(), fmha._get_generation_impl())
-        else:
-            impls = (fmha,)
-        return max(self.fmha_libs.index(impl) for impl in impls) >= self._xqa_index
+        generation_fmha = fmha._get_generation_impl() if isinstance(fmha, CombinedFmha) else fmha
+        return self.fmha_libs.index(generation_fmha) >= self.fmha_libs.index(xqa)
 
     def _with_xqa_perf_gain(
         self,
@@ -558,9 +556,9 @@ class FmhaManager:
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> _FmhaCacheKey:
-        xqa = self.fmha_libs[self._xqa_index]
+        assert self._xqa is not None
         return cache_key._replace(
-            xqa_has_perf_gain=xqa.has_perf_gain(q, k, v, metadata, forward_args)
+            xqa_has_perf_gain=self._xqa.has_perf_gain(q, k, v, metadata, forward_args)
         )
 
     def _select_uncached(

@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused attention core with fully explicit state: paged KV-cache append + masked FMHA.
 
-Wraps ``FallbackFmha.attention``, which dispatches to the native
-``AttentionOp`` context and generation methods. Every piece of batch state
+Wraps ``FallbackFmha.attention``, which runs each phase on the first native
+FMHA library that serves it. Every piece of batch state
 and layer config arrives as an explicit argument; native runners are cached
 by static configuration, device, and thread.
 """

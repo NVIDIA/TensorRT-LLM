@@ -37,8 +37,6 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm.bindings.internal import thop
 
-pytestmark = pytest.mark.cpu_only
-
 
 class _MinimalFmha(Fmha):
     def forward(
@@ -130,6 +128,7 @@ def test_fallback_rejects_raw_fp8_input() -> None:
         assert not FallbackFmha(attn).is_supported(q, None, None, metadata, forward_args)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("initial_fused_qkv", [False, True])
 @pytest.mark.parametrize(
     "input_type,sparse",
@@ -208,6 +207,7 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     assert output is forward_args.output
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("fmha_cls", FMHA_LIBS.values(), ids=FMHA_LIBS.keys())
 @pytest.mark.parametrize("threshold", [0.0, 0.1])
 @pytest.mark.parametrize("implementation_available", [False, True])
@@ -228,6 +228,7 @@ def test_availability_checks_capabilities_before_implementation(
             hook.assert_not_called()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("phase", [None, FmhaPhase.CONTEXT, FmhaPhase.GENERATION])
 @pytest.mark.parametrize("supported", [False, True])
 def test_support_forwards_request_and_phase(phase: FmhaPhase | None, supported: bool) -> None:
@@ -242,6 +243,7 @@ def test_support_forwards_request_and_phase(phase: FmhaPhase | None, supported: 
         hook.assert_called_once_with(q, k, v, metadata, forward_args, phase=phase)
 
 
+@pytest.mark.cpu_only
 def test_default_hooks_accept_requests() -> None:
     attn = cast(TrtllmAttention, FakeAttention())
     fmha = _MinimalFmha(attn)
@@ -252,6 +254,7 @@ def test_default_hooks_accept_requests() -> None:
     )
 
 
+@pytest.mark.cpu_only
 def test_inherited_availability_hook_uses_subclass_capabilities() -> None:
     class _SkipCorrectionFmha(_MinimalFmha):
         supports_skip_correction = True
@@ -267,6 +270,7 @@ def test_inherited_availability_hook_uses_subclass_capabilities() -> None:
     assert _SkipCorrectionFmha.is_available(attn)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("capability", "request_args"),
     [

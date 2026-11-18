@@ -251,9 +251,9 @@ and publishes the `cpp_test_bundle` CMake component as a separate
 programs. Only `-CPP-` stages using this build configuration fetch and unpack
 the companion into `src/cpp/build`, including fat-image consumers. Build reuse
 requires both artifacts. Linux Release integration fixtures use this bundle
-directly, retaining CTest selection and retries. The two FMHA tests share a
-test-only library packaged next to their executables; other runtime libraries
-come from the matching installed wheel. Test artifacts keep symbols but omit
+directly, retaining CTest selection and retries. The two FMHA tests link the
+FMHA kernel libraries statically; other runtime libraries come from the matching
+installed wheel. Test artifacts keep symbols but omit
 BOLT's extra relocation records.
 CPP stages collect only `tests/integration/defs/cpp` and use the standard test
 environment setup. CTest discovers cases on the test node, so the build stage

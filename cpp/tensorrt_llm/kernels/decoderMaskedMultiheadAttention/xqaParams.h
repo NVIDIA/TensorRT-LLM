@@ -235,7 +235,7 @@ struct XQAParams
     }
 };
 
-constexpr uint32_t xqaMlaCgaXBufSize = 8704 * 2;
+constexpr uint32_t xqaMlaCgaXBufSize = (8192 + 512 * 2) * 2;
 
 } // namespace kernels
 

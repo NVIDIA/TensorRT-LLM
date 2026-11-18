@@ -70,43 +70,6 @@ int64_t exportOffset(tensorrt_llm::common::op::WorkspaceSlice const& slice)
     return static_cast<int64_t>(slice.offset);
 }
 
-template <typename T>
-T readHostTensor2D(at::Tensor const& tensor, int64_t const row, int64_t const col, char const* tensorName)
-{
-    TORCH_CHECK(tensor.device().is_cpu(), tensorName, " must be a CPU tensor.");
-    TORCH_CHECK(tensor.dim() == 2, tensorName, " must be a 2D tensor.");
-    TORCH_CHECK(row >= 0 && row < tensor.size(0), tensorName, " row is out of bounds.");
-    TORCH_CHECK(col >= 0 && col < tensor.size(1), tensorName, " column is out of bounds.");
-
-    auto const* data = tensor.data_ptr<T>();
-    return data[row * tensor.stride(0) + col * tensor.stride(1)];
-}
-
-template <typename T>
-T readHostTensor3D(at::Tensor const& tensor, int64_t const i, int64_t const j, int64_t const k, char const* tensorName)
-{
-    TORCH_CHECK(tensor.device().is_cpu(), tensorName, " must be a CPU tensor.");
-    TORCH_CHECK(tensor.dim() == 3, tensorName, " must be a 3D tensor.");
-    TORCH_CHECK(i >= 0 && i < tensor.size(0), tensorName, " dim 0 index is out of bounds.");
-    TORCH_CHECK(j >= 0 && j < tensor.size(1), tensorName, " dim 1 index is out of bounds.");
-    TORCH_CHECK(k >= 0 && k < tensor.size(2), tensorName, " dim 2 index is out of bounds.");
-
-    auto const* data = tensor.data_ptr<T>();
-    return data[i * tensor.stride(0) + j * tensor.stride(1) + k * tensor.stride(2)];
-}
-
-template <typename T>
-T* tensorPtr2D(at::Tensor const& tensor, int64_t const row, int64_t const col, char const* tensorName)
-{
-    TORCH_CHECK(tensor.dim() >= 2, tensorName, " must have at least 2 dimensions.");
-    TORCH_CHECK(row >= 0 && row < tensor.size(0), tensorName, " row is out of bounds.");
-    TORCH_CHECK(col >= 0 && col < tensor.size(1), tensorName, " column is out of bounds.");
-
-    using ValueType = std::remove_const_t<T>;
-    auto* data = static_cast<ValueType*>(tensor.data_ptr());
-    return data + row * tensor.stride(0) + col * tensor.stride(1);
-}
-
 } // namespace
 
 KvCachePoolMapping readKvCachePoolMapping(at::Tensor const& hostKvCachePoolMapping, int64_t const layerIdx)
@@ -1187,6 +1150,10 @@ void MHA::prepareInputs(FmhaParams& p, bool isGen)
         TORCH_CHECK(p.num_tokens % p.batch_size == 0,
             "seq_len should be same for all generation requests, num_tokens=", p.num_tokens,
             ", num_seqs=", p.batch_size);
+        if (mXqa)
+        {
+            mXqa->prepareGeneration(*this, p);
+        }
     }
 
     if (p.fwd.softmax_stats_tensor.has_value())
@@ -2430,48 +2397,33 @@ int64_t spec_dec_tree_custom_mask_capacity(
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
     int64_t intraPoolOffset, int64_t blockSize, int32_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache)
 {
+    // The table is [num_pools, 2 (primary and secondary)], or [num_pools, 2, 2 (data and scale)] when a pool
+    // also holds NVFP4 block scales; non-FP4 layers read only the data pointers.
+    auto const dims = hostKvCachePoolPointers.dim();
+    TORCH_CHECK(dims == 3 || (dims == 2 && !isFp4KvCache), "host_kv_cache_pool_pointers must be 3-D",
+        isFp4KvCache ? "" : " or 2-D", ".");
+    TORCH_CHECK(poolIndex >= 0 && poolIndex < hostKvCachePoolPointers.size(0) && hostKvCachePoolPointers.size(1) >= 2
+            && (dims == 2 || hostKvCachePoolPointers.size(2) >= (isFp4KvCache ? 2 : 1)),
+        "host_kv_cache_pool_pointers has no entry for pool ", poolIndex, ".");
+    auto const poolPointer = [&](int64_t const pool, int64_t const field, int64_t const offset)
+    {
+        auto const address = dims == 3
+            ? detail::hostAccessor<int64_t, 3>(
+                hostKvCachePoolPointers, "host_kv_cache_pool_pointers")[poolIndex][pool][field]
+            : detail::hostAccessor<int64_t, 2>(hostKvCachePoolPointers, "host_kv_cache_pool_pointers")[poolIndex][pool];
+        return reinterpret_cast<void*>(reinterpret_cast<char*>(address) + offset);
+    };
     KvCachePoolPointers pointers;
+    pointers.primaryPoolPtr = poolPointer(0, 0, intraPoolOffset);
+    pointers.secondaryPoolPtr = poolPointer(1, 0, intraPoolOffset);
     if (isFp4KvCache)
     {
-        // For NVFP4 KV cache, extra block scales are stored in separate pools.
-        // The layout of host_kv_cache_pool_pointers is [num_pools, 2 (primary and secondary), 2 (data
-        // and scale)].
-        TORCH_CHECK(hostKvCachePoolPointers.dim() == 3);
-        pointers.primaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(
-                readHostTensor3D<int64_t>(hostKvCachePoolPointers, poolIndex, 0, 0, "host_kv_cache_pool_pointers"))
-            + intraPoolOffset);
-        pointers.secondaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(
-                readHostTensor3D<int64_t>(hostKvCachePoolPointers, poolIndex, 1, 0, "host_kv_cache_pool_pointers"))
-            + intraPoolOffset);
         // NVFP4 block scaling uses a fixed vector size of 16.
         auto constexpr vectorSize = 16;
         auto const bytesPerBlockSf = blockSize / vectorSize * 1 /*bytes per E4M3 sf*/;
         auto const intraPoolOffsetSf = layerIdxInCachePool * kvFactor * bytesPerBlockSf;
-        pointers.primaryBlockScalePoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(
-                readHostTensor3D<int64_t>(hostKvCachePoolPointers, poolIndex, 0, 1, "host_kv_cache_pool_pointers"))
-            + intraPoolOffsetSf);
-        pointers.secondaryBlockScalePoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(
-                readHostTensor3D<int64_t>(hostKvCachePoolPointers, poolIndex, 1, 1, "host_kv_cache_pool_pointers"))
-            + intraPoolOffsetSf);
-    }
-    else
-    {
-        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2 || hostKvCachePoolPointers.dim() == 3);
-        // Non-FP4 layers use only the data pointers in a mixed-format pool table.
-        auto const dataPointers
-            = hostKvCachePoolPointers.dim() == 3 ? hostKvCachePoolPointers.select(2, 0) : hostKvCachePoolPointers;
-        pointers.primaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(
-                readHostTensor2D<int64_t>(dataPointers, poolIndex, 0, "host_kv_cache_pool_pointers"))
-            + intraPoolOffset);
-        pointers.secondaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(
-                readHostTensor2D<int64_t>(dataPointers, poolIndex, 1, "host_kv_cache_pool_pointers"))
-            + intraPoolOffset);
+        pointers.primaryBlockScalePoolPtr = poolPointer(0, 1, intraPoolOffsetSf);
+        pointers.secondaryBlockScalePoolPtr = poolPointer(1, 1, intraPoolOffsetSf);
     }
     return pointers;
 }
@@ -2496,7 +2448,7 @@ KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
     auto const mapping = readKvCachePoolMapping(host_kv_cache_pool_mapping.value(), layer_idx);
     int32_t const poolIndex = mapping.poolIndex;
     int32_t const layerIdxInCachePool = mapping.layerIdxInCachePool;
-    auto* blockOffsets = tensorPtr2D<KVBlockArray::DataType>(
+    auto* blockOffsets = detail::tensorPtr2D<KVBlockArray::DataType>(
         kv_cache_block_offsets.value(), poolIndex, static_cast<int64_t>(seq_offset), "kv_cache_block_offsets");
 
     int cacheElemBits = kvCacheElemSizeInBits(quantMode, elem_size);

@@ -986,7 +986,7 @@ private:
         }
         // The split cap is only set by the static-scheduler pre-clamp above; the autotuner reads
         // but never sets it. The caller that reaches this clamp with an INT_MAX cap is the
-        // sparse-context FMHA branch of FmhaDispatcher::run(), which enables multiCtasKv so the
+        // sparse-context branch of TrtllmGenFmha::launchContext(), which enables multiCtasKv so the
         // autotuner can promote to CgaSmemReduction; it uses the persistent scheduler, so the
         // Static-only pre-clamp does not apply. Clamp silently: the cap is simply unset here, not
         // an explicitly configured value, so there is nothing actionable to report. Taking the min

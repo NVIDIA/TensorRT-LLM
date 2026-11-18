@@ -279,7 +279,6 @@
 /cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention* @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/kernels/deepseekV4QNormKernel* @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/kernels/flashMLA @NVIDIA/trt-llm-torch-attention-devs
-/cpp/tensorrt_llm/kernels/fmhaDispatcher* @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/kernels/fusedCatFp4* @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/kernels/fusedCatFp8* @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/kernels/fusedQKNormRopeKernel* @NVIDIA/trt-llm-torch-attention-devs
@@ -294,7 +293,6 @@
 /cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/kernels/unfusedAttentionKernels @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/kernels/unfusedAttentionKernels* @NVIDIA/trt-llm-torch-attention-devs
-/cpp/tensorrt_llm/kernels/xqaDispatcher* @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/nanobind/thop @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/thop/IndexerKCache* @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/thop/IndexerTopK* @NVIDIA/trt-llm-torch-attention-devs
@@ -310,6 +308,7 @@
 /cpp/tensorrt_llm/thop/helixPostProcessOp.cpp @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/thop/inverseRopeFp8QuantOp.cpp @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/thop/mla* @NVIDIA/trt-llm-torch-attention-devs
+/cpp/tensorrt_llm/thop/phasedFmha* @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/thop/relativeAttentionBiasOp.cpp @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tensorrt_llm/thop/trtllmGenQKVProcessOp.cpp @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tests/unit_tests/common/attentionWorkspaceTest.cpp @NVIDIA/trt-llm-torch-attention-devs

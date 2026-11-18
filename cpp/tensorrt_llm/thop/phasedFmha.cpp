@@ -635,45 +635,37 @@ bool isHalfOrBf16(tensorrt_llm::DataType type)
 
 } // namespace
 
-int xqaKernelWorkspaceAlignment(int headSize, int numQHeads, int numKvHeads, bool multiBlockMode)
+int xqaKernelWorkspaceAlignment(int headSize, int numQHeads, int numKvHeads)
 {
     constexpr size_t kXQA_OUT_ELEM_SIZE = 2; // fp16 or bf16.
     constexpr int kMaxBeamWidth = 4;
     int group_size = numQHeads / numKvHeads;
-    int32_t const multi_block_workspace_alignment
-        = roundUp<int32_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * headSize, 128);
-    return multiBlockMode ? multi_block_workspace_alignment : 128;
+    return roundUp<int32_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * headSize, 128);
 }
 
-std::size_t xqaKernelWorkspaceSize(
-    int headSize, int numQHeads, int numKvHeads, bool isMLA, bool multiBlockMode, int max_num_tokens)
+std::size_t xqaKernelWorkspaceSize(int headSize, int numQHeads, int numKvHeads, bool isMLA, int max_num_tokens)
 {
     // buffer for RoPE / output quantization.
     constexpr size_t kXQA_OUT_ELEM_SIZE = 2; // fp16 or bf16.
-    constexpr int kMaxBeamWidth = 4;
     size_t workspace_size = roundUp<size_t>(kXQA_OUT_ELEM_SIZE * headSize * numQHeads * max_num_tokens, 128); // rope
     // output conversion.
     workspace_size = roundUp<size_t>(workspace_size + kXQA_OUT_ELEM_SIZE * headSize * numQHeads * max_num_tokens, 128);
     workspace_size = roundUp<size_t>(workspace_size, 128) + xqaMlaCgaXBufSize * max_num_tokens;
-    if (multiBlockMode)
-    {
-        size_t workspaces[4];
-        size_t const nbSubSeq = getXqaMaxNumSubSeq(isMLA);
-        size_t const nbSeq = nbSubSeq / 2;
-        int group_size = numQHeads / numKvHeads;
-        workspaces[0] = sizeof(uint32_t) * nbSeq;                           // semaphores
-        workspaces[1] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowMax
-        workspaces[2] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowSum
-        size_t const multi_block_workspace_alignment
-            = roundUp<size_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * headSize, 128);
-        workspaces[3] = multi_block_workspace_alignment * nbSubSeq;
-        workspace_size = roundUp<size_t>(workspace_size, multi_block_workspace_alignment)
-            + roundUp(workspaces[0], multi_block_workspace_alignment)
-            + roundUp(workspaces[1], multi_block_workspace_alignment)
-            + roundUp(workspaces[2], multi_block_workspace_alignment)
-            + roundUp(workspaces[3], multi_block_workspace_alignment)
-            + multi_block_workspace_alignment; // extra space reserved for alignment
-    }
+    size_t workspaces[4];
+    size_t const nbSubSeq = getXqaMaxNumSubSeq(isMLA);
+    size_t const nbSeq = nbSubSeq / 2;
+    int group_size = numQHeads / numKvHeads;
+    workspaces[0] = sizeof(uint32_t) * nbSeq;                           // semaphores
+    workspaces[1] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowMax
+    workspaces[2] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowSum
+    size_t const multi_block_workspace_alignment = xqaKernelWorkspaceAlignment(headSize, numQHeads, numKvHeads);
+    workspaces[3] = multi_block_workspace_alignment * nbSubSeq;
+    workspace_size = roundUp<size_t>(workspace_size, multi_block_workspace_alignment)
+        + roundUp(workspaces[0], multi_block_workspace_alignment)
+        + roundUp(workspaces[1], multi_block_workspace_alignment)
+        + roundUp(workspaces[2], multi_block_workspace_alignment)
+        + roundUp(workspaces[3], multi_block_workspace_alignment)
+        + multi_block_workspace_alignment; // extra space reserved for alignment
     return workspace_size;
 }
 
@@ -817,9 +809,9 @@ void TrtllmGenFmha<AttentionVariant>::initGeneration(AttentionVariant const& op)
         mGenerationQDataType = mathDataType;
         mGenerationRunner
             = std::make_unique<TllmGenFmhaRunner>(mGenerationQDataType, kvDataType, kvDataType, outputDataType);
-        if (op.isALiBi())
+        if (op.isALiBi() || op.isRelativePosition())
         {
-            TLLM_LOG_WARNING("TRTLLM-GEN does not support ALiBi.");
+            TLLM_LOG_WARNING("TRTLLM-GEN does not support ALiBi or relative position embedding.");
             mGenerationRunner.reset();
             return;
         }
@@ -898,6 +890,7 @@ std::size_t TrtllmGenFmha<AttentionVariant>::getWorkspaceSize(
 template <typename AttentionVariant>
 void TrtllmGenFmha<AttentionVariant>::runContext(AttentionVariant const& op, FmhaParams const& p, cudaStream_t stream)
 {
+    TLLM_CHECK_WITH_INFO(mContextRunner != nullptr, "TRTLLM-Gen has no context kernel for this attention op.");
     dispatchOnDtype(p.getQueryInput().scalar_type(),
         [&]<typename T>(std::type_identity<T>)
         {
@@ -1054,6 +1047,7 @@ template <typename AttentionVariant>
 void TrtllmGenFmha<AttentionVariant>::runGeneration(
     AttentionVariant const& op, FmhaParams const& p, cudaStream_t stream)
 {
+    TLLM_CHECK_WITH_INFO(mGenerationRunner != nullptr, "TRTLLM-Gen has no generation kernel for this attention op.");
     dispatchOnDtype(p.getQueryInput().scalar_type(),
         [&]<typename T>(std::type_identity<T>) { runGenerationImpl<T>(op, p, stream); });
 }
@@ -1681,6 +1675,7 @@ std::size_t FmhaV2Fmha<AttentionVariant>::getWorkspaceSize(
 template <typename AttentionVariant>
 void FmhaV2Fmha<AttentionVariant>::runContext(AttentionVariant const& op, FmhaParams const& p, cudaStream_t stream)
 {
+    TLLM_CHECK_WITH_INFO(mContextRunner != nullptr, "FMHA-v2 has no context kernel for this attention op.");
     dispatchOnDtype(p.getQueryInput().scalar_type(),
         [&]<typename T>(std::type_identity<T>)
         {
@@ -1694,6 +1689,7 @@ void FmhaV2Fmha<AttentionVariant>::runGeneration(AttentionVariant const& op, Fmh
 {
     if constexpr (std::is_same_v<AttentionVariant, MLA>)
     {
+        TLLM_CHECK_WITH_INFO(mGenerationRunner != nullptr, "FMHA-v2 has no generation kernel for this attention op.");
         dispatchOnDtype(p.getQueryInput().scalar_type(),
             [&]<typename T>(std::type_identity<T>) { runGenerationImpl<T>(op, p, stream); });
     }
@@ -1970,11 +1966,11 @@ std::size_t XqaFmha<AttentionVariant>::getWorkspaceSize(
     xqaWorkspaceSizes.bmm2Scale = sizeof(float);
     xqaWorkspaceSizes.sparseAttnCache = sparse_attn_cache_size;
     xqaWorkspaceSizes.kernelWorkspace = xqaKernelWorkspaceSize(op.mHeadSize, op.mNumAttnHeads, op.mNumAttnKVHeads,
-        isMLA, op.mMultiBlockMode,
+        isMLA,
         std::min<uint32_t>(
             op.template feature<torch_ext::SpecDecodingFeature>().maxGenerationLength() * max_num_seq, max_num_tokens));
-    return AttentionWorkspaceManager::buildXqaLayout(xqaWorkspaceSizes,
-        xqaKernelWorkspaceAlignment(op.mHeadSize, op.mNumAttnHeads, op.mNumAttnKVHeads, op.mMultiBlockMode))
+    return AttentionWorkspaceManager::buildXqaLayout(
+        xqaWorkspaceSizes, xqaKernelWorkspaceAlignment(op.mHeadSize, op.mNumAttnHeads, op.mNumAttnKVHeads))
         .totalSize;
 }
 
@@ -2001,6 +1997,16 @@ void XqaFmha<AttentionVariant>::prepare(AttentionVariant const& op, FmhaParams c
         }
         preparedBeamWidth = p.meta.effective_beam_width;
     }
+}
+
+template <typename AttentionVariant>
+void XqaFmha<AttentionVariant>::prepareGeneration(AttentionVariant const& op, FmhaParams const& p)
+{
+    if (mRunner == nullptr)
+    {
+        return;
+    }
+    dispatchOnDtype(p.getQueryInput().scalar_type(), [&]<typename T>(std::type_identity<T>) { prepare<T>(op, p); });
 }
 
 template <typename AttentionVariant>
@@ -2238,10 +2244,14 @@ bool MmhaFmha::isSupported(FmhaParams const& p, bool isGen) const
         return false;
     }
     auto const& op = static_cast<MHA const&>(this->attention);
-    TLLM_CHECK_WITH_INFO(!op.template feature<torch_ext::SpecDecodingFeature>().active(),
-        "No available XQA kernels are found for speculative decoding mode.");
-    TLLM_CHECK_WITH_INFO(!op.is_fp4_out, "No available kernels are found for FP4 output.");
-    TLLM_CHECK_WITH_INFO(!op.quant_mode.hasFp4KvCache(), "No available kernels are found for FP4 KV cache.");
+    if (op.template feature<torch_ext::SpecDecodingFeature>().active() || op.is_fp4_out
+        || op.quant_mode.hasFp4KvCache())
+    {
+        TLLM_LOG_WARNING(
+            "MMHA declines this call: it has no kernels for speculative decoding, NVFP4 output or an "
+            "NVFP4 KV cache.");
+        return false;
+    }
     return true;
 }
 
@@ -2457,18 +2467,54 @@ bool UnfusedFmha::isSupported(FmhaParams const& p, bool isGen) const
     {
         return false;
     }
-    // This library comes last, so the call has no fused context kernel. Refuse what the
-    // unfused path would compute wrongly: variable-window bounds it ignores, and a cached
-    // prefix that unfused self-attention cannot read.
+    auto const decline = [](char const* reason)
+    {
+        TLLM_LOG_WARNING("Unfused attention declines this call: %s", reason);
+        return false;
+    };
     auto const& op = this->attention;
-    TLLM_CHECK_WITH_INFO(
-        !op.use_variable_window, "Variable-window attention requires a supported context FMHA kernel configuration.");
-    bool const needsFusedPagedContext = op.paged_context_fmha && op.use_kv_cache && !op.cross_attention;
-    TLLM_CHECK_WITH_INFO(!needsFusedPagedContext,
-        "Paged-context attention requires a fused context FMHA kernel, and this build has none for this "
-        "configuration. The unfused fallback cannot attend to cached KV. If the device's SM is not named in the "
-        "build's --cuda_architectures then the build carries no kernels for it at all; check that first. Otherwise "
-        "use another attention backend, or disable chunked prefill, KV cache reuse and speculative decoding.");
+    if (op.use_variable_window)
+    {
+        return decline("variable-window attention requires a supported context FMHA kernel configuration.");
+    }
+    if (op.paged_context_fmha && op.use_kv_cache && !op.cross_attention)
+    {
+        return decline(
+            "paged-context attention requires a fused context FMHA kernel, and the unfused path cannot attend to "
+            "cached KV. If the device's SM is not named in the build's --cuda_architectures then the build carries "
+            "no kernels for it at all; check that first. Otherwise use another attention backend, or disable chunked "
+            "prefill, KV cache reuse and speculative decoding.");
+    }
+    if (op.is_fp8_out || op.is_fp4_out)
+    {
+        return decline("FP8 and NVFP4 outputs require a fused context FMHA kernel.");
+    }
+    if (op.quant_mode.hasFp4KvCache())
+    {
+        return decline("an NVFP4 KV cache requires a fused context FMHA kernel.");
+    }
+    if (p.getAttentionSinks() != nullptr)
+    {
+        return decline("attention sinks require a fused context FMHA kernel.");
+    }
+    if (p.attn.attention_chunk_size.has_value())
+    {
+        return decline("chunked attention requires a fused context FMHA kernel.");
+    }
+    if (p.is_cross && !p.fwd.cross_kv.has_value())
+    {
+        return decline(
+            "cross attention without encoder K/V input requires a fused context FMHA kernel to read the "
+            "cached cross KV.");
+    }
+    if (op.sageAttnRequested())
+    {
+        return decline("SageAttention requires the FP8 context FMHA path.");
+    }
+    if (op.useCustomMask())
+    {
+        return decline("a custom mask requires a fused context FMHA kernel.");
+    }
     return true;
 }
 

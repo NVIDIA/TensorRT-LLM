@@ -916,7 +916,7 @@ def test_rejects_non_divisible_head_counts() -> None:
     one to say so: a context-only call at 6q/4kv d128 returns without
     raising, having computed only the first (6 // 4) * 4 = 4 head columns
     and left the other two all-zero (the decode path does raise, from
-    xqaDispatcher: 'numQHeads should be multiple of numKVHeads')."""
+    the XQA library: 'numQHeads should be multiple of numKVHeads')."""
     with pytest.raises(AssertionError, match="must be a multiple of"):
         op.is_valid(num_heads=6, num_kv_heads=4)
 

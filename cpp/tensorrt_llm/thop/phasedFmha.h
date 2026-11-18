@@ -201,6 +201,8 @@ public:
     [[nodiscard]] std::size_t getWorkspaceSize(
         AttentionVariant const& op, FmhaParams const& p, bool isGen) const override;
     void runGeneration(AttentionVariant const& op, FmhaParams const& p, cudaStream_t stream) override;
+    /// Compiles the XQA kernels this generation call would use, whichever library then runs it.
+    void prepareGeneration(AttentionVariant const& op, FmhaParams const& p);
 
 private:
     /// The XQA parameters of this call; false when T has no XQA kernels.
@@ -295,9 +297,9 @@ private:
 
 /// Bytes the XQA kernels need for \p max_num_tokens query tokens.
 [[nodiscard]] std::size_t xqaKernelWorkspaceSize(
-    int headSize, int numQHeads, int numKvHeads, bool isMLA, bool multiBlockMode, int max_num_tokens);
+    int headSize, int numQHeads, int numKvHeads, bool isMLA, int max_num_tokens);
 /// The alignment of the XQA kernel workspace.
-[[nodiscard]] int xqaKernelWorkspaceAlignment(int headSize, int numQHeads, int numKvHeads, bool multiBlockMode);
+[[nodiscard]] int xqaKernelWorkspaceAlignment(int headSize, int numQHeads, int numKvHeads);
 
 extern template class TrtllmGenFmha<MHA>;
 extern template class TrtllmGenFmha<MLA>;
