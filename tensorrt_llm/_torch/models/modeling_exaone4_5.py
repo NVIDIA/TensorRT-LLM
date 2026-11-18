@@ -225,7 +225,8 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.text_config
-        # The LM's attention layers register where the engine looks them up.
+        # Share the wrapper's dict, not a copy: the LM's attention layers register in it as
+        # they are built, and the engine looks them up there (as in Qwen2VLModelBase).
         llm_model_config.extra_attrs = model_config.extra_attrs
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 

@@ -294,6 +294,8 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
 
         # --- Text backbone (reused verbatim) ---
         model_config_cp = copy.deepcopy(model_config)
+        # Share the wrapper's dict, not a copy: the text model's attention layers register
+        # in it as they are built, and the engine looks them up there.
         model_config_cp.extra_attrs = model_config.extra_attrs
         self.model_config = model_config_cp
         # Mirror the parent's quant exclude_modules remap so quantized unified
