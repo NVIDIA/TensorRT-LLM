@@ -16,12 +16,12 @@
 import asyncio
 import os
 import pickle
-import platform
 import sys
 
 import cloudpickle
 import pytest
-from defs.conftest import get_sm_version, skip_no_hopper, skip_pre_hopper
+from defs.common import get_ucx_net_devices, get_ucx_tls
+from defs.conftest import skip_no_hopper, skip_pre_hopper
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
@@ -78,21 +78,6 @@ def unpublish_port_after_test():
         return
     MPI.Unpublish_name('my_port', port_name)
     MPI.Close_port(port_name)
-
-
-def get_ucx_tls():
-    """Get UCX_TLS value based on GPU architecture.
-
-    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
-    On some gb300 cluster, we need to set `cuda_copy,cuda_ipc,sm,self,tcp`
-    for UCX_TLS.
-    """
-    sm = get_sm_version()
-    if sm == 103 and "aarch" in platform.machine().lower():
-        return "cuda_copy,cuda_ipc,sm,self,tcp"
-    if sm < 90:
-        return "^cuda_ipc,ib,gdr_copy"
-    return "^ib,gdr_copy"
 
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -456,6 +441,8 @@ def verify_disaggregated(model: str,
                          env={
                              "UCX_TLS":
                              get_ucx_tls(),
+                             "UCX_NET_DEVICES":
+                             get_ucx_net_devices(),
                              "UCX_MM_ERROR_HANDLING":
                              "y",
                              **({
@@ -598,6 +585,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
     with MPIPoolExecutor(max_workers=2,
                          env={
                              "UCX_TLS": get_ucx_tls(),
+                             "UCX_NET_DEVICES": get_ucx_net_devices(),
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
@@ -705,6 +693,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
     with MPIPoolExecutor(max_workers=2,
                          env={
                              "UCX_TLS": get_ucx_tls(),
+                             "UCX_NET_DEVICES": get_ucx_net_devices(),
                              "UCX_MM_ERROR_HANDLING": "y",
                              "OMPI_MCA_rmaps_base_oversubscribe": "1"
                          },
@@ -796,6 +785,7 @@ def test_disaggregated_logprobs(model, generation_overlap):
     with MPIPoolExecutor(max_workers=2,
                          env={
                              "UCX_TLS": get_ucx_tls(),
+                             "UCX_NET_DEVICES": get_ucx_net_devices(),
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
@@ -905,6 +895,7 @@ def test_disaggregated_cancel_gen_requests(model):
     with MPIPoolExecutor(max_workers=2,
                          env={
                              "UCX_TLS": get_ucx_tls(),
+                             "UCX_NET_DEVICES": get_ucx_net_devices(),
                              "UCX_MM_ERROR_HANDLING": "y",
                          }) as executor:
         futures = []
@@ -1018,6 +1009,7 @@ def test_disaggregated_logits(model, generation_overlap):
     with MPIPoolExecutor(max_workers=2,
                          env={
                              "UCX_TLS": get_ucx_tls(),
+                             "UCX_NET_DEVICES": get_ucx_net_devices(),
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
@@ -1206,6 +1198,7 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
     with MPIPoolExecutor(max_workers=2,
                          env={
                              "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_NET_DEVICES": get_ucx_net_devices(),
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
@@ -1368,6 +1361,7 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
     with MPIPoolExecutor(max_workers=2,
                          env={
                              "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_NET_DEVICES": get_ucx_net_devices(),
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
