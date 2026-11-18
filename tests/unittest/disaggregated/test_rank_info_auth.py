@@ -163,7 +163,7 @@ def test_receiver_rank_info_exchange(key):
     messenger.stop.assert_called_once_with()
 
 
-@pytest.mark.parametrize("key", [b"", b"too-short", "not-bytes"])
+@pytest.mark.parametrize("key", [b"", b"too-short", b"k" * 15, "not-bytes"])
 def test_transfer_worker_rejects_invalid_configured_key_before_native_setup(key):
     with pytest.raises(ValueError, match="internal_request_auth_key"):
         TransferWorker(
@@ -171,6 +171,11 @@ def test_transfer_worker_rejects_invalid_configured_key_before_native_setup(key)
                 kv_cache_manager=Mock(), device_id=0, instance_name="test", native_auth_key=key
             )
         )
+
+
+def test_native_auth_key_of_minimum_length_is_accepted() -> None:
+    key = b"k" * 16
+    assert _validate_native_auth_key(key) == key
 
 
 @pytest.mark.parametrize("ownership", [False, True])
