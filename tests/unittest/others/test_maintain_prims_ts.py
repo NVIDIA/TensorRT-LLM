@@ -1503,7 +1503,7 @@ def test_github_repo_url_parsing(suffix: str) -> None:
         ),
     ],
 )
-def test_cli_invalid_flags(flags: list[str], message: str, capsys: pytest.CaptureFixture) -> None:
+def test_cli_invalid_flags(flags: list[str], message: str, capfd: pytest.CaptureFixture) -> None:
     with pytest.raises(SystemExit) as raised:
         m.main(
             [
@@ -1524,7 +1524,7 @@ def test_cli_invalid_flags(flags: list[str], message: str, capsys: pytest.Captur
             ]
         )
     assert raised.value.code == 2
-    assert message in capsys.readouterr().err
+    assert message in capfd.readouterr().err
 
 
 def test_command_preserves_identity_and_config(monkeypatch: pytest.MonkeyPatch) -> None:
