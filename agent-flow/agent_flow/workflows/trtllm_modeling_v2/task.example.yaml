@@ -64,17 +64,6 @@ features: []
 # run, or per unit and variant over `default`. A switch the spec sets itself keeps its value.
 # profile: {default: standard, multimodal: smoke}
 
-# Checks of the spec's own, beside the flow's: what each is for, and the command that runs it,
-# which passes when it exits 0. Each is a check of the contract (`<covers>:check[<name>]@<member>`)
-# and runs when the flow's own would. `covers` defaults to core, `member` to its cheapest member.
-# checks:
-#   moe_routing:
-#     purpose: the router picks the experts the HF reference picks, on 64 prompts
-#     run: python -m pytest tests/unittest/_torch/modeling_v2/test_moe_routing.py -q
-#     covers: core
-#     member: tp4
-#     timeout: 1800
-
 # REQUIRED: the checkout the target is built in.
 trtllm_repo_path: /path/to/TensorRT-LLM
 
