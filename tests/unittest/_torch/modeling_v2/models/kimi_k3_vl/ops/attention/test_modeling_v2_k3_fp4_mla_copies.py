@@ -54,10 +54,10 @@ INTENTIONAL_DIVERGENCES = {
         "than adopting the backend's new shared-plan workflow wholesale."
     ),
 }
-# Definitions the K3 targets serve with that no backend source module defines as the family does: the
-# Triton V-packed cache and its repack kernels, the device-side generation page count the repack reads
-# under CUDA graphs, the SM107-only Q-quant fusion gate, and the FP8 context SM check. The family owns
-# them; they are not compared.
+# Definitions the K3 targets serve with that no backend module defines as the family does: the Triton
+# V-packed cache and its repack kernels, the device-side generation page count the repack reads under
+# CUDA graphs, the SM107-only Q-quant fusion gate, and the FP8 context SM check. The family owns them;
+# they are not compared, and none may match a definition of any backend module.
 FAMILY_OWNED = {
     "_fp4_mla_generation_num_blocks_device",
     "can_fuse_fp4_mla_q_quant",
@@ -124,6 +124,10 @@ def test_copied_definitions_match_their_sources(copy):
     for name in SOURCES:
         for def_name, node in _definitions(_parse(BACKEND / f"{name}.py")).items():
             sources.setdefault(def_name, []).append((name, node))
+    backend_definitions = {}
+    for path in sorted(BACKEND.glob("*.py")):
+        for def_name, node in _definitions(_parse(path)).items():
+            backend_definitions.setdefault(def_name, []).append((path.stem, node))
     copied = _definitions(_parse(FAMILY / f"{copy}.py"))
     assert copied
     for name, node in copied.items():
@@ -139,7 +143,14 @@ def test_copied_definitions_match_their_sources(copy):
             if _strip_imports(src_node) == _strip_imports(node)
         ]
         if name in FAMILY_OWNED:
-            assert not matches, f"{copy}.{name} matches its source in {matches}; compare it again"
+            owned_matches = [
+                src
+                for src, src_node in backend_definitions.get(name, ())
+                if _strip_imports(src_node) == _strip_imports(node)
+            ]
+            assert not owned_matches, (
+                f"{copy}.{name} matches the backend's {owned_matches}; compare it again"
+            )
             continue
         assert name in sources, f"{copy}.{name} has no source definition"
         if name in INTENTIONAL_DIVERGENCES:
