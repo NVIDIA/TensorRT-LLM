@@ -55,14 +55,17 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     _load_reference_image,
     _normalize_condition_video_latent_indexes,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
+from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
+    Cosmos3SamplingPolicy,
+    SamplingSchedule,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import TRTLLM_USE_DIFFUSER_VAE_ENV
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
 from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.media.decoding import video_stream_info
-from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+from tensorrt_llm.visual_gen.args import CompilationConfig, TorchCompileConfig, VisualGenArgs
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
@@ -869,7 +872,7 @@ class TestCosmos3V2V:
         assert result.frame_rate == FRAME_RATE
         _assert_scheduler_config(
             cosmos3_pipeline,
-            flow_shift=cosmos3_pipeline.sampling.checkpoint_flow_shift,
+            flow_shift=10.0,
             use_karras_sigmas=False,
         )
 
@@ -899,7 +902,7 @@ class TestCosmos3V2V:
         )
         _assert_scheduler_config(
             cosmos3_pipeline,
-            flow_shift=cosmos3_pipeline.sampling.checkpoint_flow_shift,
+            flow_shift=10.0,
             use_karras_sigmas=False,
         )
 
@@ -927,12 +930,15 @@ class TestCosmos3V2V:
             """
 
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 calls.append((target, use_karras_sigmas))
                 return scheduler
 
@@ -987,12 +993,15 @@ class TestCosmos3V2V:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 rebuilt.append((scheduler.name, target, use_karras_sigmas))
                 return scheduler
 
@@ -1025,8 +1034,7 @@ class TestCosmos3V2V:
                 enable_audio=True,
             )
 
-        # Video-to-video keeps the checkpoint shift and forces the uniform sigma grid.
-        assert rebuilt == [("video", 1.0, False), ("audio", 1.0, False)]
+        assert rebuilt == [("video", 10.0, False), ("audio", 10.0, False)]
 
     def test_action_video_is_not_classified_as_v2v(self):
         """An action reference arrives as the same `video` bytes V2V uses, but
@@ -1049,12 +1057,14 @@ class TestCosmos3V2V:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
                 return scheduler
 
         def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
@@ -1085,9 +1095,9 @@ class TestCosmos3V2V:
         assert token_calls[0] is False
 
     def test_action_restores_the_checkpoint_flow_shift(self):
-        """set_flow_shift is a no-op when both knobs are None, and the pipeline
-        instance outlives the request. An action request that followed a V2V one
-        would otherwise keep V2V's uniform sigmas instead of the checkpoint's."""
+        """The pipeline instance outlives the request, so an action request that
+        follows a V2V one must rebuild its schedulers for the checkpoint's Karras
+        grid and shift rather than keep V2V's uniform sigmas."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
         pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(
@@ -1104,12 +1114,15 @@ class TestCosmos3V2V:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = {"use_karras_sigmas": True, "use_flow_sigmas": True}
             checkpoint_flow_shift = 7.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 calls.append((scheduler.name, target, use_karras_sigmas))
                 return scheduler
 
@@ -1139,11 +1152,11 @@ class TestCosmos3V2V:
                 action_chunk_size=NUM_FRAMES - 1,
             )
 
-        assert calls == [("video", 7.0, None), ("action", 7.0, None)]
+        assert calls == [("video", 7.0, True), ("action", 7.0, True)]
 
     def test_scheduler_for_serves_every_stream(self):
         """Video, audio and action denoise in lockstep, so one resolved
-        (shift, karras) configuration must yield a scheduler per stream --
+        schedule must yield a scheduler per stream --
         separate instances (schedulers mutate state on every .step()) built
         from that stream's own base."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
@@ -1154,7 +1167,8 @@ class TestCosmos3V2V:
         class FakeSampling:
             checkpoint_flow_shift = 1.0
 
-            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+            def set_flow_shift(self, scheduler, schedule):
+                target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
                 rebuilt.append((scheduler.name, target, use_karras_sigmas))
                 return scheduler
 
@@ -1164,7 +1178,9 @@ class TestCosmos3V2V:
         pipeline.action_scheduler = SimpleNamespace(name="action")
 
         for stream in ("video", "audio", "action"):
-            pipeline._scheduler_for(10.0, False, stream=stream)
+            pipeline._scheduler_for(
+                SamplingSchedule(grid="diffusers", flow_shift=10.0), stream=stream
+            )
 
         assert rebuilt == [
             ("video", 10.0, False),
@@ -1210,6 +1226,8 @@ class TestCosmos3TransferRouting:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -1263,6 +1281,8 @@ class TestCosmos3TransferRouting:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -1346,7 +1366,7 @@ class TestCosmos3Audio:
         _assert_valid_audio(result.audio, result.audio_sample_rate)
         _assert_scheduler_config(
             cosmos3_pipeline,
-            flow_shift=cosmos3_pipeline.sampling.checkpoint_flow_shift,
+            flow_shift=10.0,
             use_karras_sigmas=False,
         )
 
@@ -1734,3 +1754,64 @@ class TestStepPrecisionSelection:
 
     def test_transformer_without_a_policy_is_left_alone(self):
         self._pipeline(SimpleNamespace())._select_step_precision(0)
+
+
+def _framework_native_timesteps(num_steps: int, flow_shift: float) -> list[int]:
+    """Integer timesteps of the Cosmos framework's shifted-linear flow grid."""
+    import numpy as np
+
+    base = np.linspace(float(np.float32(1.0 - 1.0 / 1000)), 0.0, num_steps + 1)[:-1]
+    shifted = flow_shift * base / (1.0 + (flow_shift - 1.0) * base)
+    return torch.from_numpy(shifted * 1000).to(torch.int64).tolist()
+
+
+@pytest.mark.integration
+@pytest.mark.cosmos3_t2v
+@pytest.mark.high_cuda_memory
+class TestCosmos3SigmaGrid:
+    """Per-request sigma grid selection on a warmed-up pipeline."""
+
+    @pytest.mark.parametrize("compile_enabled", [False, True], ids=["eager", "compile"])
+    def test_karras_native_karras_requests(self, compile_enabled: bool) -> None:
+        """Warm up on the checkpoint's Karras grid, serve a native-grid request,
+        then return to Karras. Each request samples its own grid, and the
+        repeated Karras request reproduces the first exactly (no settings or
+        solver state carried over)."""
+        checkpoint = _require_checkpoint()
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.delenv(TRTLLM_USE_DIFFUSER_VAE_ENV, raising=False)
+            args = VisualGenArgs(
+                model=checkpoint,
+                torch_compile_config=TorchCompileConfig(enable=compile_enabled),
+                compilation_config=CompilationConfig(
+                    resolutions=[(HEIGHT, WIDTH)], num_frames=[NUM_FRAMES]
+                ),
+            )
+            pipeline = PipelineLoader(args).load(skip_warmup=False)
+            try:
+                reference = type(pipeline.scheduler).from_config(
+                    pipeline.sampling.unipc_base_config
+                )
+                reference.set_timesteps(NUM_STEPS, device="cpu")
+                karras_timesteps = reference.timesteps.tolist()
+
+                first = _run_forward(pipeline, num_frames=NUM_FRAMES)
+                first_timesteps = pipeline.scheduler.timesteps.tolist()
+                native = _run_forward(
+                    pipeline, num_frames=NUM_FRAMES, sigma_grid="native", flow_shift=10.0
+                )
+                native_timesteps = pipeline.scheduler.timesteps.tolist()
+                again = _run_forward(pipeline, num_frames=NUM_FRAMES)
+                again_timesteps = pipeline.scheduler.timesteps.tolist()
+
+                assert first_timesteps == karras_timesteps
+                assert native_timesteps == _framework_native_timesteps(NUM_STEPS, 10.0)
+                assert again_timesteps == karras_timesteps
+                _assert_valid_video(native.video, num_frames=NUM_FRAMES)
+                assert not torch.equal(first.video, native.video)
+                assert torch.equal(first.video, again.video)
+                assert pipeline.sampling.unipc_base_config["use_karras_sigmas"] is True
+            finally:
+                del pipeline
+                gc.collect()
+                torch.cuda.empty_cache()

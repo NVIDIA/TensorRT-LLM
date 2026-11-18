@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Every Cosmos3 setting comes from one of three places, tried in this order: the
-request, the checkpoint, a default. :func:`select` is the only thing that orders
-them, and every resolved value remembers which one it came from.
+"""Every Cosmos3 setting comes from one of four places, tried in this order: the
+request, an override (``overrides.py``), the checkpoint, a default. :func:`select` is
+the only thing that orders them, and every resolved value remembers which one it came
+from.
 
 :class:`ParameterResolver` owns one checkpoint's settings and serves two moments:
 
@@ -25,8 +26,8 @@ them, and every resolved value remembers which one it came from.
   wins and what a disagreement means;
 * per request, ``request()`` turns a :class:`RequestParameters` (the caller's values,
   ``None`` = unset) into the same object with every field the mode uses filled: the
-  caller's value, else the checkpoint (the distilled schedule, the policy block), else
-  the per-family tables and the embodiment presets.
+  caller's value, else an override, else the checkpoint (the distilled schedule, the
+  policy block), else the per-family tables and the embodiment presets.
 
 A setting nothing provides is an error, not a guess.
 """
@@ -52,14 +53,14 @@ from .defaults import (
     resolve_checkpoint_policy_defaults,
     resolve_raw_action_dim,
 )
+from .overrides import COSMOS3_OVERRIDES, TRANSFER, VIDEO_TO_VIDEO, ParameterOverride
 from .sampling import DISTILLED_GUIDANCE_SCALE
 
 REQUEST = "request"
+OVERRIDE = "override"
+"""Origin of a field taken from ``COSMOS3_OVERRIDES`` in place of the checkpoint's value."""
 CHECKPOINT = "checkpoint"
 DEFAULT = "default"
-WORKFLOW = "workflow"
-"""Origin of a field the kind of request fixes (transfer, video-to-video) before the
-checkpoint is consulted; only ``use_system_prompt`` has such rules."""
 UNSET = "unset"
 """Origin of a field that none of the three provides and that may stay ``None``."""
 
@@ -68,7 +69,7 @@ UNSET = "unset"
 class Resolved:
     value: Any
     origin: str
-    """``REQUEST``, ``CHECKPOINT``, ``DEFAULT`` or ``WORKFLOW``."""
+    """``REQUEST``, ``OVERRIDE``, ``CHECKPOINT`` or ``DEFAULT``."""
     where: str = ""
     """For checkpoint settings, the file and key that held the value."""
     disagreeing: tuple[str, ...] = ()
@@ -79,10 +80,22 @@ class Resolved:
         return f"{self.origin} ({self.where})" if self.where else self.origin
 
 
-def select(request: Any = None, checkpoint: Any = None, default: Any = None) -> Optional[Resolved]:
-    """The first of request, checkpoint, default that is set (not ``None``), tagged
-    with its origin; ``None`` when nothing is set."""
-    for origin, value in ((REQUEST, request), (CHECKPOINT, checkpoint), (DEFAULT, default)):
+def select(
+    request: Any = None,
+    checkpoint: Any = None,
+    default: Any = None,
+    *,
+    override: Optional[ParameterOverride] = None,
+    where: str = "",
+) -> Optional[Resolved]:
+    """The first of request, override, checkpoint, default that is set (not ``None``),
+    tagged with its origin; ``None`` when nothing is set. ``override`` counts only
+    while it applies to ``checkpoint``; ``where`` names the table row it came from."""
+    if request is not None:
+        return Resolved(request, REQUEST)
+    if override is not None and override.applies(checkpoint):
+        return Resolved(override.value, OVERRIDE, where)
+    for origin, value in ((CHECKPOINT, checkpoint), (DEFAULT, default)):
         if value is not None:
             return Resolved(value, origin)
     return None
@@ -466,9 +479,11 @@ class Candidates(NamedTuple):
     recommended: Any = None
     fallback: Any = None
 
-    def pick(self) -> Optional[Resolved]:
+    def pick(
+        self, override: Optional[ParameterOverride] = None, where: str = ""
+    ) -> Optional[Resolved]:
         default = self.fallback if self.recommended is None else self.recommended
-        return select(self.request, self.checkpoint, default)
+        return select(self.request, self.checkpoint, default, override=override, where=where)
 
 
 def policy_domain(
@@ -515,6 +530,7 @@ class ParameterResolver:
             config.action.policy
         )
         """The normalized ``checkpoint.json`` policy block; empty for non-policy checkpoints."""
+        self._reported_overrides: set[tuple[str, str]] = set()
 
     @classmethod
     def from_checkpoint(
@@ -531,9 +547,77 @@ class ParameterResolver:
     def describe(self) -> str:
         return self._config.describe()
 
+    def override(
+        self,
+        name: str,
+        checkpoint_value: Any = None,
+        *,
+        mode: str = "video",
+        is_v2v: bool = False,
+        is_transfer: bool = False,
+    ) -> tuple[Optional[ParameterOverride], str]:
+        """The override of ``name`` for this kind of request, else for this family and
+        ``mode`` (``"video"``, ``"image"`` or ``"action"``), with the table row it came
+        from; ``(None, "")`` when there is none. One that names
+        another checkpoint value than ``checkpoint_value`` does not apply; that is
+        logged once, since the checkpoint has moved off the value the override corrects."""
+        workflow = TRANSFER if is_transfer else (VIDEO_TO_VIDEO if is_v2v else None)
+        rows = (
+            (workflow, COSMOS3_OVERRIDES["workflow"].get(workflow, {})),
+            (
+                f"{self.family}.{mode}",
+                COSMOS3_OVERRIDES["generation"].get(self.family, {}).get(mode, {}),
+            ),
+        )
+        for key, row in rows:
+            found = row.get(name)
+            if found is None:
+                continue
+            if (
+                self._log
+                and checkpoint_value is not None
+                and not found.applies(checkpoint_value)
+                and (key, name) not in self._reported_overrides
+            ):
+                self._reported_overrides.add((key, name))
+                logger.warning(
+                    f"Cosmos3 override {name}={found.value} for {key!r} replaces checkpoint "
+                    f"value {found.replaces}, but the checkpoint has {checkpoint_value}; "
+                    "using the checkpoint's."
+                )
+            return found, key
+        return None, ""
+
+    def flow_shift(
+        self,
+        requested: Optional[float] = None,
+        *,
+        mode: str = "video",
+        is_v2v: bool = False,
+        is_transfer: bool = False,
+    ) -> Optional[Resolved]:
+        """The flow shift of a request: its own, else the override for this kind of
+        request or for this family and ``mode``, else the checkpoint scheduler's;
+        ``None`` when the checkpoint declares none and no override applies."""
+        checkpoint = self._config.sampling.flow_shift
+        override, where = self.override(
+            "flow_shift", checkpoint, mode=mode, is_v2v=is_v2v, is_transfer=is_transfer
+        )
+        return select(requested, checkpoint, override=override, where=where)
+
+    def use_karras_sigmas(
+        self, *, mode: str = "video", is_v2v: bool = False, is_transfer: bool = False
+    ) -> Optional[bool]:
+        """Whether this kind of request pins the Karras grid on or off; ``None`` to
+        follow the checkpoint's scheduler."""
+        override, _ = self.override(
+            "use_karras_sigmas", mode=mode, is_v2v=is_v2v, is_transfer=is_transfer
+        )
+        return None if override is None else bool(override.value)
+
     def request(self, params: RequestParameters) -> RequestParameters:
         """``params`` with every field this mode uses filled: the caller's value where
-        set, else the checkpoint, else the tables and defaults. ``domain_name`` and
+        set, else an override, else the checkpoint, else the tables and defaults. ``domain_name`` and
         ``policy_active`` come back reconciled with the policy block. Recommendations
         the caller's values differ from are logged as warnings."""
         resolved, warnings, origins = self._resolve(params)
@@ -601,7 +685,6 @@ class ParameterResolver:
                 policy.get("guidance_interval"),
                 fallback=tables("guidance_interval"),
             ),
-            "flow_shift": Candidates(p.flow_shift, self._config.sampling.flow_shift),
             "max_sequence_length": Candidates(
                 p.max_sequence_length, fallback=tables("max_sequence_length")
             ),
@@ -649,18 +732,13 @@ class ParameterResolver:
             candidates["num_frames"] = Candidates(p.num_frames, fallback=tables("num_frames"))
 
         picked: dict[str, Optional[Resolved]] = {name: c.pick() for name, c in candidates.items()}
-        # Transfer never prepends the system prompt and video-to-video always does. Those
-        # rules come from the kind of request, so they sit between the request and the
-        # checkpoint.
-        workflow_prompt = False if p.is_transfer else (True if p.is_v2v else None)
-        if p.use_system_prompt is None and workflow_prompt is not None:
-            picked["use_system_prompt"] = Resolved(
-                workflow_prompt, WORKFLOW, "transfer" if p.is_transfer else "video-to-video"
-            )
-        else:
-            picked["use_system_prompt"] = select(
-                p.use_system_prompt, self._config.prompt.use_system_prompt
-            )
+        kind = {"mode": mode, "is_v2v": p.is_v2v, "is_transfer": p.is_transfer}
+        picked["flow_shift"] = self.flow_shift(p.flow_shift, **kind)
+        checkpoint_prompt = self._config.prompt.use_system_prompt
+        override, where = self.override("use_system_prompt", checkpoint_prompt, **kind)
+        picked["use_system_prompt"] = select(
+            p.use_system_prompt, checkpoint_prompt, override=override, where=where
+        )
         unused = CANVAS_FIELDS if in_action else ACTION_FIELDS
         picked.update({name: None for name in unused})
 

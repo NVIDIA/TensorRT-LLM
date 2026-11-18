@@ -17,6 +17,10 @@
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 

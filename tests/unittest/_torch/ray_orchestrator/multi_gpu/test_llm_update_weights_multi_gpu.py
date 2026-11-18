@@ -18,6 +18,11 @@ from _torch.ray_orchestrator.single_gpu.test_llm_update_weights import (
     run_generate,
 )
 from safetensors import safe_open
+from test_common.moe_tactics import (
+    fp8_block_scales_moe_tactic,
+    sm100f_moe_tactic_or_auto,
+    sm100f_moe_tactic_or_cutlass,
+)
 from torch.multiprocessing.reductions import reduce_tensor
 from transformers import (
     AutoConfig,
@@ -81,6 +86,7 @@ def _run_multi_gpu_update_weights(
     tokenizer_dir: Optional[str] = None,
     warm_before_update: bool = False,
     generate_fn: Callable = run_generate,
+    threshold: float = 0.9,
 ) -> None:
     """Run the shared warm/update/finalize/reference-comparison workflow."""
     if prompts_texts is None:
@@ -122,7 +128,7 @@ def _run_multi_gpu_update_weights(
 
         llm._collective_rpc("update_weights", (None,))
         llm_logits, ref_logits = generate_fn(llm, hf_model, prompts, sampling_params)
-        compare_logits(llm_logits, ref_logits)
+        compare_logits(llm_logits, ref_logits, threshold=threshold)
 
 
 def _run_fp8_update_weights(model_dir: str, fp8_model_dir: str, partial: bool) -> None:
@@ -144,7 +150,7 @@ def _run_fp8_update_weights(model_dir: str, fp8_model_dir: str, partial: bool) -
         },
     }
     if "Qwen3/Qwen3-30B-A3B" in model_dir:
-        llm_kwargs["moe_config"] = {"backend": "DEEPGEMM"}
+        llm_kwargs["moe_config"] = {"tactic": fp8_block_scales_moe_tactic()}
 
     _run_multi_gpu_update_weights(
         model_dir=model_dir,
@@ -279,6 +285,17 @@ def _qwen35_35b_model_kwargs() -> dict:
         },
         "vision_config": {"depth": 1},
     }
+
+
+def _qwen35_35b_bf16_moe_config(tp_size: int) -> MoeConfig:
+    """``MoeConfig`` for the BF16 experts split over ``tp_size`` ranks.
+
+    TRTLLM-Gen's BF16 cubins need a multiple of 128 intermediate columns per
+    rank, and the experts are 512 wide, so TP8 (64 per rank) runs CUTLASS.
+    """
+    if 512 // tp_size % 128 != 0:
+        return MoeConfig(tactic="cutlass")
+    return MoeConfig(tactic=sm100f_moe_tactic_or_cutlass("trtllm_gen"))
 
 
 def _qwen35_35b_sampling_params() -> SamplingParams:
@@ -605,7 +622,7 @@ def _run_qwen35_35b_update(
             ),
             **({"cuda_graph_config": cuda_graph_config} if cuda_graph_config is not None else {}),
             "model_kwargs": _qwen35_35b_model_kwargs(),
-            "moe_config": MoeConfig(backend="TRTLLM"),
+            "moe_config": _qwen35_35b_bf16_moe_config(tp_size),
         },
         sampling_params=_qwen35_35b_sampling_params(),
         partial=partial,
@@ -674,7 +691,7 @@ def _run_qwen35_35b_fp8_update(partial: bool) -> None:
         max_num_tokens=256,
         kv_cache_config=KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.05),
         model_kwargs=_qwen35_35b_model_kwargs(),
-        moe_config=MoeConfig(backend="TRTLLM"),
+        moe_config=MoeConfig(tactic=sm100f_moe_tactic_or_auto("trtllm_gen")),
     ) as llm:
         # Compile CUDA graphs before refit, then use the first exact-checkpoint
         # update as the reference for an identical one-shot or partial update.
@@ -755,7 +772,7 @@ def _run_qwen35_35b_tp8_multinode_update() -> None:
             mamba_ssm_cache_dtype="bfloat16",
         ),
         model_kwargs=_qwen35_35b_model_kwargs(),
-        moe_config=MoeConfig(backend="TRTLLM"),
+        moe_config=_qwen35_35b_bf16_moe_config(_QWEN35_35B_TP8),
     ) as llm:
         device_names = llm._collective_rpc("get_test_device_name")
         assert all("B200" in name.upper() for name in device_names), (
@@ -1316,7 +1333,7 @@ def _run_qwen35_mxfp8_update(
                 mamba_ssm_cache_dtype="bfloat16",
             ),
             "model_kwargs": _qwen35_mxfp8_model_kwargs(),
-            "moe_config": MoeConfig(backend="CUTLASS"),
+            "moe_config": MoeConfig(tactic="cutlass"),
             "torch_compile_config": TorchCompileConfig(enable_piecewise_cuda_graph=True),
             "disable_mm_encoder": True,
         },
@@ -1329,6 +1346,8 @@ def _run_qwen35_mxfp8_update(
         prompts_texts=["Hello, my name is", "The future of AI is"],
         warm_before_update=True,
         generate_fn=_mxfp8_generate_with_stats,
+        # The engine also quantizes activations to MXFP8; the BF16 reference does not.
+        threshold=0.85,
     )
 
 
@@ -1415,7 +1434,7 @@ def _run_qwen35_397b_mxfp8_tp8_multinode(
             mamba_ssm_cache_dtype="float32",
         ),
         model_kwargs=_qwen35_mxfp8_model_kwargs(),
-        moe_config=MoeConfig(backend="CUTLASS"),
+        moe_config=MoeConfig(tactic="cutlass"),
         enable_chunked_prefill=True,
         disable_mm_encoder=True,
         **llm_kwargs,
@@ -1482,7 +1501,7 @@ def _run_qwen35_397b_bf16_tp8_multinode(
             enable_block_reuse=False, free_gpu_memory_fraction=0.05, mamba_ssm_cache_dtype="float32"
         ),
         model_kwargs=_qwen35_35b_model_kwargs(),
-        moe_config=MoeConfig(backend="CUTLASS"),
+        moe_config=MoeConfig(tactic="cutlass"),
         enable_chunked_prefill=True,
         disable_mm_encoder=True,
         **llm_kwargs,
@@ -1805,14 +1824,14 @@ def test_llm_update_weights_nemotron_h():
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     # Nemotron-H's Mamba state dominates the cache budget; 0.25 of free memory
     # leaves enough room for HF (resident on cuda:0 + replicas on cuda:1..3)
-    # plus the TRT-LLM model shard. BF16 model -> CUTLASS MoE backend.
+    # plus the TRT-LLM model shard. BF16 model -> CUTLASS MoE implementation.
     # mamba_ssm_cache_dtype="float32" matches the official Nemotron-Nano
     # accuracy test (TestNemotronV3Nano::test_auto_dtype) — BF16 SSM cache
     # loses precision in long-decode selective_state_update.
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=True, free_gpu_memory_fraction=0.25, mamba_ssm_cache_dtype="float32"
     )
-    moe_config = MoeConfig(backend="CUTLASS")
+    moe_config = MoeConfig(tactic="cutlass")
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",

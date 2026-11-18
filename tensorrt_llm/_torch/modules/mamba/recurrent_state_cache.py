@@ -24,23 +24,25 @@ def _reset_recurrent_state_rows_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     request_idx = tl.program_id(0)
-    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     state_idx = tl.load(state_indices + request_idx).to(tl.int64)
     needs_reset = ~tl.load(has_initial_states + request_idx).to(tl.int1)
     valid_state = (state_idx >= 0) & (state_idx < NUM_CACHE_LINES)
-    recurrent_row_offset = state_idx * recurrent_state_stride.to(tl.int64)
-    tl.store(
-        recurrent_states + recurrent_row_offset + offsets,
-        0.0,
-        mask=needs_reset & valid_state & (offsets < RECURRENT_STATE_SIZE),
-    )
-    if RESET_CONV:
-        conv_row_offset = state_idx * conv_state_stride.to(tl.int64)
+    # Most context requests carry an initial state: their programs leave right away.
+    if needs_reset & valid_state:
+        offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        recurrent_row_offset = state_idx * recurrent_state_stride.to(tl.int64)
         tl.store(
-            conv_states + conv_row_offset + offsets,
+            recurrent_states + recurrent_row_offset + offsets,
             0.0,
-            mask=needs_reset & valid_state & (offsets < CONV_STATE_SIZE),
+            mask=offsets < RECURRENT_STATE_SIZE,
         )
+        if RESET_CONV:
+            conv_row_offset = state_idx * conv_state_stride.to(tl.int64)
+            tl.store(
+                conv_states + conv_row_offset + offsets,
+                0.0,
+                mask=offsets < CONV_STATE_SIZE,
+            )
 
 
 def reset_recurrent_state_rows(
@@ -75,7 +77,7 @@ def reset_recurrent_state_rows(
     if conv_states is not None and conv_states.stride(0) < conv_state_size:
         raise ValueError("convolution state rows must not overlap")
 
-    block_size = 256
+    block_size = 4096
     grid = (
         num_requests,
         triton.cdiv(max(recurrent_state_size, conv_state_size), block_size),

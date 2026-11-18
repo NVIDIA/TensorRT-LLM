@@ -21,20 +21,21 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from cosmos3_fixtures import bare_resolver
+from cosmos3_fixtures import bare_config, bare_resolver
 
+from tensorrt_llm._torch.visual_gen.models.cosmos3.overrides import ParameterOverride
 from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
     CHECKPOINT,
     CHECKPOINT_FILE,
     CONFIG_FILE,
     DEFAULT,
     MODEL_INDEX_FILE,
+    OVERRIDE,
     REQUEST,
     SCHEDULER_FILE,
     TRANSFORMER_FILE,
     UNSET,
     VAE_FILE,
-    WORKFLOW,
     CheckpointFiles,
     Conflict,
     ParameterResolver,
@@ -74,6 +75,20 @@ class TestSelect:
         assert select(None, 2, 3).origin == CHECKPOINT
         assert select(None, None, 3).origin == DEFAULT
         assert select(None, None, None) is None
+
+    def test_an_override_sits_between_the_request_and_the_checkpoint(self):
+        always = ParameterOverride(9)
+        assert select(1, 2, 3, override=always).origin == REQUEST
+        assert select(None, 2, 3, override=always) == select(None, None, None, override=always)
+        assert select(None, 2, 3, override=always, where="row").source == "override (row)"
+        assert select(None, 2, 3, override=always).value == 9
+
+    def test_an_override_that_names_a_value_replaces_only_that_value(self):
+        keyed = ParameterOverride(9, replaces=2)
+        assert select(None, 2, 3, override=keyed).origin == OVERRIDE
+        assert select(None, 5, 3, override=keyed).origin == CHECKPOINT
+        assert select(None, None, 3, override=keyed).origin == DEFAULT
+        assert select(None, None, None, override=keyed) is None
 
     def test_false_and_zero_are_values(self):
         assert select(False, True).value is False
@@ -318,8 +333,43 @@ class TestRequest:
         resolver = _resolver(flow_shift=5.0)
         assert resolver.request(RequestParameters()).flow_shift == 5.0
         assert resolver.request(RequestParameters(mode="image")).flow_shift == 5.0
+        assert resolver.request(RequestParameters(is_v2v=True)).flow_shift == 5.0
+        assert resolver.request(RequestParameters(is_transfer=True)).flow_shift == 5.0
         assert resolver.request(RequestParameters(flow_shift=3.0)).flow_shift == 3.0
         assert _resolver().request(RequestParameters()).flow_shift is None  # distilled
+
+    def test_flow_shift_overrides_replace_the_unread_scheduler_shift(self):
+        """The scheduler configs that ship a Karras or native grid carry flow_shift
+        1.0; the requests that sample a linear grid run at the override instead."""
+        nano = _resolver(flow_shift=1.0)
+        assert nano.request(RequestParameters()).flow_shift == 1.0
+        assert nano.request(RequestParameters(mode="image")).flow_shift == 3.0
+        assert nano.request(RequestParameters(is_v2v=True)).flow_shift == 10.0
+        assert nano.request(RequestParameters(is_transfer=True)).flow_shift == 10.0
+        assert nano.request(RequestParameters(is_v2v=True, flow_shift=4.0)).flow_shift == 4.0
+        edge = _resolver(family="nemotron_dense", flow_shift=1.0)
+        assert edge.request(RequestParameters()).flow_shift == 3.0
+        assert edge.request(RequestParameters(mode="image")).flow_shift == 3.0
+        assert edge.request(RequestParameters(is_v2v=True)).flow_shift == 10.0
+        _, _, origins = edge._resolve(RequestParameters())
+        assert origins["flow_shift"] == OVERRIDE
+
+    def test_only_the_kinds_of_request_pin_the_sigma_grid(self):
+        resolver = _resolver(flow_shift=1.0)
+        assert resolver.use_karras_sigmas() is None
+        assert resolver.use_karras_sigmas(mode="image") is None
+        assert resolver.use_karras_sigmas(is_v2v=True) is False
+        assert resolver.use_karras_sigmas(is_transfer=True) is False
+
+    def test_an_override_the_checkpoint_moved_off_is_reported_once(self, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3 import parameter_resolver
+
+        messages = []
+        monkeypatch.setattr(parameter_resolver.logger, "warning", messages.append)
+        resolver = ParameterResolver("qwen3", bare_config(flow_shift=5.0))
+        for _ in range(2):
+            assert resolver.flow_shift(is_v2v=True).value == 5.0
+        assert len(messages) == 1 and "replaces checkpoint value 1.0" in messages[0]
 
     def test_system_prompt_rule(self):
         resolver = _resolver(use_system_prompt=True)
@@ -339,8 +389,8 @@ class TestRequest:
         assert (r.frame_rate, r.action_fps, r.num_frames) == (10.0, 10.0, 61)
         assert r.preset_key == "av"
 
-    def test_workflow_rules_are_tagged(self):
+    def test_overrides_are_tagged(self):
         _, _, origins = _resolver()._resolve(RequestParameters(is_transfer=True))
-        assert origins["use_system_prompt"] == WORKFLOW
+        assert origins["use_system_prompt"] == OVERRIDE
         _, _, origins = _resolver()._resolve(RequestParameters())
         assert origins["use_system_prompt"] == CHECKPOINT

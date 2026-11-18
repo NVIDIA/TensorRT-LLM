@@ -23,6 +23,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import RequestParameters
 
+pytestmark = pytest.mark.cpu_only
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 _EXAMPLE_DIR = _PROJECT_ROOT / "examples" / "visual_gen" / "models" / "cosmos3"
 

@@ -56,6 +56,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     _resolve_enable_fused_hc,
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.moe.fused_moe.moe_resolution import moe_impl_request
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
@@ -822,7 +823,7 @@ def test_deepseek_v4_routed_moe_quant_config_from_mxfp4_header(tmp_path, monkeyp
     config = DeepseekV4Config(num_hidden_layers=2)
 
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        config, str(tmp_path), "TRTLLM", None
+        config, str(tmp_path), moe_impl_request("TRTLLM"), None
     )
 
     quant_config = layer_quant_config["model.layers.0.mlp.experts"]
@@ -856,7 +857,11 @@ def test_deepseek_v4_routed_moe_quant_config_covers_mtp_layers(tmp_path, monkeyp
         num_nextn_predict_layers = 3
 
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        DeepseekV4Config(num_hidden_layers=2), str(tmp_path), "TRTLLM", None, MTPConfig()
+        DeepseekV4Config(num_hidden_layers=2),
+        str(tmp_path),
+        moe_impl_request("TRTLLM"),
+        None,
+        MTPConfig(),
     )
 
     quant_algo = layer_quant_config["model.layers.0.mlp.experts"].quant_algo
@@ -1169,7 +1174,7 @@ def test_deepseek_v4_routed_moe_quant_config_ignores_fp8_header(tmp_path):
     existing = {"existing": object()}
 
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        DeepseekV4Config(), str(tmp_path), "TRTLLM", existing
+        DeepseekV4Config(), str(tmp_path), moe_impl_request("TRTLLM"), existing
     )
 
     assert layer_quant_config is existing
@@ -1263,6 +1268,40 @@ def test_deepseek_v4_model_config_defaults_to_fp4_indexer(tmp_path, monkeypatch)
     )
 
     assert model_config.sparse_attention_config.indexer_k_dtype == "fp4"
+
+
+@pytest.mark.parametrize("enable_offload", [False, True])
+def test_deepseek_v4_model_config_preserves_sparse_offload(tmp_path, monkeypatch, enable_offload):
+    config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        num_hidden_layers=8,
+        compress_ratios=[0, 0, 4, 128, 4, 128, 4, 128],
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
+    offload_options = (
+        {"gpu_cache_factor": 3.0, "host_history_size": 2 * 1024**3} if enable_offload else {}
+    )
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        enable_kv_cache_offload=enable_offload,
+        kv_cache_offload_config=offload_options,
+    )
+
+    resolved = ModelConfig.from_pretrained(
+        str(tmp_path),
+        sparse_attention_config=sparse_config,
+        attn_backend="TRTLLM",
+        moe_backend="TRTLLM",
+    ).sparse_attention_config
+
+    assert resolved.enable_kv_cache_offload is enable_offload
+    assert resolved.kv_cache_offload_config == sparse_config.kv_cache_offload_config
+    # The checkpoint's eight-layer list overrides the shorter seven-layer default;
+    # its 0 ratios (uncompressed/SWA-only layers) are normalized to 1.
+    assert resolved.compress_ratios == [1, 1, 4, 128, 4, 128, 4, 128]
+    # Resolution creates a new config, leaving the input's seven-layer default unchanged.
+    assert sparse_config.compress_ratios == [1, 1, 4, 128, 4, 128, 4]
 
 
 def test_deepseek_v4_model_config_defaults_to_fp8_before_blackwell(tmp_path, monkeypatch):

@@ -295,7 +295,8 @@ def resolve_transfer_config(
     for field_name, default_value in transfer_defaults(hints).items():
         if field_name == "flow_shift":
             # ``config.flow_shift`` carries only the caller's value: the pipeline
-            # consults the checkpoint scheduler's shift before this default.
+            # consults the overrides and the checkpoint scheduler's shift before
+            # this default.
             continue
         if field_name == "guidance_scale":
             user_set = guidance_scale_user_set
