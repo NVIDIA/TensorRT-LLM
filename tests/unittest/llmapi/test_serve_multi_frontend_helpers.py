@@ -456,7 +456,7 @@ def test_engine_shuts_down_when_stopping_the_attached_frontends_fails(
 
 @pytest.mark.parametrize(
     "graceful_shutdown_timeout_s, killed_at",
-    [(30, 140.0), (None, 110.0)],
+    [(30, 140.0), (None, None)],
     ids=["timeout", "no_timeout"],
 )
 def test_drain_kills_attached_frontends_at_the_graceful_shutdown_deadline(
@@ -464,14 +464,17 @@ def test_drain_kills_attached_frontends_at_the_graceful_shutdown_deadline(
 ) -> None:
     """Check that frontends still running the timeout plus 10 s after SIGTERM are killed.
 
-    Without a timeout, the deadline is 10 s. Every frontend is reaped, including one that
-    exited on SIGTERM.
+    Without a timeout, the drain has no deadline: it waits for a frontend that drains for
+    300 s, as the frontend's own server waits for its requests. Every frontend is reaped,
+    including one that exited on SIGTERM.
     """
     clock = SimpleNamespace(now=100.0)
+    slow_exit_s = None if killed_at is not None else 300.0
 
     async def sleep(seconds: float) -> None:
         clock.now += seconds
-        assert clock.now <= killed_at + 1.0, "the drain waits past its deadline"
+        limit = killed_at if killed_at is not None else 100.0 + slow_exit_s
+        assert clock.now <= limit + 1.0, "the drain waits past its deadline"
 
     class _FakeFrontend:
         def __init__(self, exits_after_s: float | None) -> None:
@@ -503,19 +506,23 @@ def test_drain_kills_attached_frontends_at_the_graceful_shutdown_deadline(
 
     monkeypatch.setattr(_frontend_processes, "time", SimpleNamespace(monotonic=lambda: clock.now))
     monkeypatch.setattr(_frontend_processes, "asyncio", SimpleNamespace(sleep=sleep))
-    exits, ignores_sigterm = _FakeFrontend(exits_after_s=2.0), _FakeFrontend(exits_after_s=None)
+    exits, slow = _FakeFrontend(exits_after_s=2.0), _FakeFrontend(exits_after_s=slow_exit_s)
 
     asyncio.run(
         _frontend_processes._drain_attached_frontends(
-            [exits, ignores_sigterm], graceful_shutdown_timeout_s, lambda: False
+            [exits, slow], graceful_shutdown_timeout_s, lambda: False
         )
     )
 
-    assert exits.terminated_at == ignores_sigterm.terminated_at == 100.0
+    assert exits.terminated_at == slow.terminated_at == 100.0
     assert (exits.killed_at, exits.returncode) == (None, 0)
-    assert killed_at <= ignores_sigterm.killed_at < killed_at + 0.2
-    assert ignores_sigterm.returncode == -signal.SIGKILL
-    assert exits.waits == ignores_sigterm.waits == 1
+    if killed_at is not None:
+        assert killed_at <= slow.killed_at < killed_at + 0.2
+        assert slow.returncode == -signal.SIGKILL
+    else:
+        assert (slow.killed_at, slow.returncode) == (None, 0)
+        assert clock.now >= 100.0 + slow_exit_s
+    assert exits.waits == slow.waits == 1
 
 
 def test_force_exit_kills_attached_frontends_that_still_drain() -> None:
