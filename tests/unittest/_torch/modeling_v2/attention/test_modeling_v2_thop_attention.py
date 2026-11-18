@@ -7533,6 +7533,19 @@ def _qwen4_prefill_chunk(base: dict) -> dict:
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "visual_gen/minimax_h3/default": (
+        Cell(
+            why="H3 full attention: 56 heads with separate packed audio/video sequences per batch row",
+            spec=dict(
+                QWEN4_VISION,
+                num_heads=56,
+                num_kv_heads=56,
+                head_size=128,
+                v_head_dim=128,
+                seg_lens=(65, 65),
+            ),
+        ),
+    ),
     "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
         Cell(
             why="deepseek MLA context: explicit k/v, qk 576 -> v 128, fp8 pool",

@@ -18,14 +18,8 @@ _WORKSPACE_BYTES = 128 * 1024 * 1024
 _BlockScaledQKMode = Literal["mxfp8", "nvfp4"]
 
 
-class FlashInferAttention(AttentionBackend):
-    """Dense FlashInfer attention without an LLM KV cache.
-
-    The backend accepts the VisualGen NHD layout ``[B, S, H, D]``. The FP16/BF16
-    path uses FlashInfer's single-request or batched ragged prefill kernel. Block-scaled
-    MXFP8 or NVFP4 Q/K dispatches to FlashInfer's SM100/SM103 FMHA with FP8 V. The
-    SM120/SM121 path supports dense NVFP4 Q/K/V, according to the validated YAML recipe.
-    """
+class FlashInferPrefillRunner:
+    """Manage ragged-prefill plans and launch FlashInfer prefill kernels."""
 
     def __init__(
         self,
@@ -485,6 +479,16 @@ class FlashInferAttention(AttentionBackend):
         )
         output = output[:, :, :sequence_length].transpose(1, 2).contiguous()
         return output, lse[:, :, :sequence_length]
+
+
+class FlashInferAttention(FlashInferPrefillRunner, AttentionBackend):
+    """Dense FlashInfer attention without an LLM KV cache.
+
+    The backend accepts the VisualGen NHD layout ``[B, S, H, D]``. The FP16/BF16
+    path uses FlashInfer's single-request or batched ragged prefill kernel. Block-scaled
+    MXFP8 or NVFP4 Q/K dispatches to FlashInfer's SM100/SM103 FMHA with FP8 V. The
+    SM120/SM121 path supports dense NVFP4 Q/K/V, according to the validated YAML recipe.
+    """
 
     def forward(
         self,

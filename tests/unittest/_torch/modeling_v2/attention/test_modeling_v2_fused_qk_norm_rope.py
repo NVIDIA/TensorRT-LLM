@@ -115,6 +115,8 @@ def _build(spec, seed):
     max_position = spec.get("max_position")
     if max_position is None:
         position_ids = torch.arange(tokens, dtype=torch.int32, device="cuda")
+        if spec.get("use_mrope", False):
+            position_ids = position_ids.expand(3, -1).contiguous()
     elif spec.get("use_mrope", False):
         position_ids = _distinct_rows(tokens, max_position, g)
     else:
@@ -169,6 +171,26 @@ _QWEN_TP4_MTP = dict(_QWEN_MAIN, num_heads_q=6, num_heads_k=1, num_heads_v=1)
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "minimax_h3/default": (
+        Cell(
+            why="H3 TP2 text encoder, plain QK norm and interleaved text positions",
+            spec=dict(
+                tokens=73,
+                num_heads_q=32,
+                num_heads_k=4,
+                num_heads_v=4,
+                head_dim=128,
+                rotary_dim=128,
+                base=5_000_000.0,
+                is_neox=True,
+                is_qk_norm=True,
+                use_gemma=False,
+                use_mrope=True,
+                mrope_section1=20,
+                mrope_section2=20,
+            ),
+        ),
+    ),
     "gpt_oss/gpt_oss_120b__sm_10x__default": (
         Cell(
             why="default target at attention TP8: 8q/1k/1v heads per rank",
