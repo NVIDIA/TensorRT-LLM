@@ -6,6 +6,7 @@ import json
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -1084,6 +1085,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         return False
 
     def _assert_cuda_graph_safe_lora_bindings(self) -> None:
+        if getattr(self, "_distilled_lora_fixed_paths", False):
+            return
         if not self._is_cuda_graph_enabled():
             return
         if not getattr(self, "_distilled_lora_deltas", {}):
@@ -1217,6 +1220,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # --- Distilled LoRA (pre-compute deltas) ---
         self._distilled_lora_deltas: Dict[str, torch.Tensor] = {}
         self._distilled_lora_weight_cache: Optional[_PersistentLoRAWeightCache] = None
+        self._distilled_lora_fixed_paths = False
         if distilled_lora_path:
             logger.info("Waiting for distilled LoRA pre-compute...")
             if lora_future is None:
@@ -1225,6 +1229,14 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             logger.info(
                 f"Distilled LoRA ready: {len(self._distilled_lora_deltas)} parameter deltas"
             )
+        if getattr(self, "_transformer_quant_dispatchers", {}):
+            self.build_transformer_quant_stage("refinement", self._prepare_refinement_model)
+            for _, model in self._transformer_quant_dispatchers["transformer"].models("refinement"):
+                if model._has_stage2:
+                    model.set_ulysses_topology(is_stage2=True)
+            self._distilled_lora_fixed_paths = True
+            return
+        if distilled_lora_path:
             try:
                 self._distilled_lora_weight_cache = _PersistentLoRAWeightCache.build(
                     self.transformer,
@@ -1245,6 +1257,32 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     f"precision_counts={self._distilled_lora_weight_cache.precision_counts()}"
                 )
         self._assert_cuda_graph_safe_lora_bindings()
+
+    def _prepare_refinement_model(self, model) -> None:
+        """Merge LoRA once into stage-owned parameters, preserving native precision policy."""
+        parameters = dict(model.named_parameters())
+        detached = set()
+        for name in self._distilled_lora_deltas:
+            parameter_name = name if name in parameters else f"{name}.weight"
+            if parameter_name not in parameters:
+                continue
+            parent_name, _, leaf = parameter_name.rpartition(".")
+            owner = model.get_submodule(parent_name) if parent_name else model
+            names = (leaf, "weight_scale", "weight_scale_2")
+            for tensor_name in names:
+                parameter = owner._parameters.get(tensor_name)
+                key = (id(owner), tensor_name)
+                if parameter is not None and key not in detached:
+                    owner.register_parameter(
+                        tensor_name,
+                        torch.nn.Parameter(parameter.detach().clone(), requires_grad=False),
+                    )
+                    metadata = getattr(owner, "rebuild_tensor_metadata", {})
+                    if tensor_name in metadata:
+                        metadata[tensor_name]["param"] = getattr(owner, tensor_name)
+                    detached.add(key)
+        _, saved, _ = _apply_lora_deltas(model, self._distilled_lora_deltas, sign=1.0)
+        del saved
 
     # ------------------------------------------------------------------
     # Inference entry point
@@ -1399,98 +1437,103 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # built at load time. Stage 2 only rebinds pointers and FP4 quant_method
         # state, so no per-request clone, merge, or unmerge math is needed.
         self._assert_cuda_graph_safe_lora_bindings()
-        lora_cache = self._distilled_lora_weight_cache
-        using_persistent_lora = lora_cache is not None
-        saved_lora_state: Dict[str, Any] = {}
-        snapshot_required = 0
-        n = 0
-        dense_lora_merge_completed = False
-        try:
-            if using_persistent_lora:
-                lora_cache.bind_merged()
-                self._lora_cuda_graph_state = "merged"
-                n = lora_cache.applied_count
-                logger.info(f"Bound persistent distilled LoRA ({n} params) for stage 2")
-            else:
-                transformer_device = next(self.transformer.parameters()).device
-                preload_free_gib = getattr(self, "_bf16_snapshot_preload_free_gib", None)
-                save_bf16_weights = _should_save_bf16_weights(
-                    device=transformer_device,
-                    preload_free_gib=preload_free_gib,
-                )
-                n, saved_lora_state, snapshot_required = _apply_lora_deltas(
-                    self.transformer,
-                    self._distilled_lora_deltas,
-                    sign=1.0,
-                    save_bf16_weights=save_bf16_weights,
-                )
-                dense_lora_merge_completed = True
-                self._lora_cuda_graph_state = "merged"
-                logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
-
-            if self.transformer._has_stage2:
-                # The switch atomically moves the graph-key topology with the
-                # attention stacks (the key reads active_topology). It precedes
-                # prepare_text_cache (topology-dependent) inside
-                # _refinement_denoise and is restored in the finally below.
-                self.transformer.set_ulysses_topology(is_stage2=True)
-                if self.rank == 0:
-                    vgm = self.pipeline_config.visual_gen_mapping
-                    logger.info(
-                        f"Stage 2: switched parallel topology from cfg{vgm.cfg_size} "
-                        f"uly{vgm.ulysses_size} to uly {self.transformer._sharder_s2.size} "
-                        "(there is no cfg in stage 2)"
+        fixed_paths = getattr(self, "_distilled_lora_fixed_paths", False)
+        stage_context = self.transformer_quant_stage("refinement") if fixed_paths else nullcontext()
+        with stage_context:
+            lora_cache = self._distilled_lora_weight_cache
+            using_persistent_lora = lora_cache is not None
+            saved_lora_state: Dict[str, Any] = {}
+            snapshot_required = 0
+            n = 0
+            dense_lora_merge_completed = False
+            try:
+                if fixed_paths:
+                    self._lora_cuda_graph_state = "merged"
+                elif using_persistent_lora:
+                    lora_cache.bind_merged()
+                    self._lora_cuda_graph_state = "merged"
+                    n = lora_cache.applied_count
+                    logger.info(f"Bound persistent distilled LoRA ({n} params) for stage 2")
+                else:
+                    transformer_device = next(self.transformer.parameters()).device
+                    preload_free_gib = getattr(self, "_bf16_snapshot_preload_free_gib", None)
+                    save_bf16_weights = _should_save_bf16_weights(
+                        device=transformer_device,
+                        preload_free_gib=preload_free_gib,
                     )
-            video_latents, audio_latents = self._refinement_denoise(
-                video_latents=video_latents,
-                audio_latents=audio_latents,
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=frame_rate,
-                seed=seed,
-                max_sequence_length=max_sequence_length,
-                image=image,
-                image_cond_strength=image_cond_strength,
-                timer=timer,
-            )
-        finally:
-            if self.transformer._has_stage2:
-                self.transformer.set_ulysses_topology(is_stage2=False)
-            if using_persistent_lora:
-                lora_cache.bind_original()
-                self._lora_cuda_graph_state = "original"
-                logger.info("Re-bound persistent distilled LoRA original weights after stage 2")
-            elif dense_lora_merge_completed:
-                if snapshot_required and not saved_lora_state:
-                    raise RuntimeError(
-                        "LoRA state was not saved; cannot safely restore stage 2 weights."
+                    n, saved_lora_state, snapshot_required = _apply_lora_deltas(
+                        self.transformer,
+                        self._distilled_lora_deltas,
+                        sign=1.0,
+                        save_bf16_weights=save_bf16_weights,
                     )
+                    dense_lora_merge_completed = True
+                    self._lora_cuda_graph_state = "merged"
+                    logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
 
-                snapshot_restored = 0
-                if snapshot_required:
-                    # Restore every LoRA-touched parameter from its snapshot. Packed
-                    # FP4 also restores the original quant_method.
-                    _restore_lora_state(self.transformer, saved_lora_state)
-                    snapshot_restored = _count_saved_lora_weight_tensors(saved_lora_state)
-
-                # BF16 weights that were not snapshotted are restored by
-                # subtracting LoRA deltas. FP8 and FP4 are exact snapshot restores.
-                dense_restored = _subtract_dense_lora_deltas(
-                    self.transformer,
-                    self._distilled_lora_deltas,
-                    saved_lora_state,
+                if self.transformer._has_stage2 and not fixed_paths:
+                    # The switch atomically moves the graph-key topology with the
+                    # attention stacks (the key reads active_topology). It precedes
+                    # prepare_text_cache (topology-dependent) inside
+                    # _refinement_denoise and is restored in the finally below.
+                    self.transformer.set_ulysses_topology(is_stage2=True)
+                    if self.rank == 0:
+                        vgm = self.pipeline_config.visual_gen_mapping
+                        logger.info(
+                            f"Stage 2: switched parallel topology from cfg{vgm.cfg_size} "
+                            f"uly{vgm.ulysses_size} to uly {self.transformer._sharder_s2.size} "
+                            "(there is no cfg in stage 2)"
+                        )
+                video_latents, audio_latents = self._refinement_denoise(
+                    video_latents=video_latents,
+                    audio_latents=audio_latents,
+                    prompt=prompt,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=frame_rate,
+                    seed=seed,
+                    max_sequence_length=max_sequence_length,
+                    image=image,
+                    image_cond_strength=image_cond_strength,
+                    timer=timer,
                 )
-                restored = snapshot_restored + dense_restored
-                if restored != n:
-                    raise RuntimeError(
-                        f"Restored {restored} LoRA-touched weights after stage 2, but {n} were applied."
+            finally:
+                if self.transformer._has_stage2 and not fixed_paths:
+                    self.transformer.set_ulysses_topology(is_stage2=False)
+                if using_persistent_lora:
+                    lora_cache.bind_original()
+                    self._lora_cuda_graph_state = "original"
+                    logger.info("Re-bound persistent distilled LoRA original weights after stage 2")
+                elif dense_lora_merge_completed:
+                    if snapshot_required and not saved_lora_state:
+                        raise RuntimeError(
+                            "LoRA state was not saved; cannot safely restore stage 2 weights."
+                        )
+
+                    snapshot_restored = 0
+                    if snapshot_required:
+                        # Restore every LoRA-touched parameter from its snapshot. Packed
+                        # FP4 also restores the original quant_method.
+                        _restore_lora_state(self.transformer, saved_lora_state)
+                        snapshot_restored = _count_saved_lora_weight_tensors(saved_lora_state)
+
+                    # BF16 weights that were not snapshotted are restored by
+                    # subtracting LoRA deltas. FP8 and FP4 are exact snapshot restores.
+                    dense_restored = _subtract_dense_lora_deltas(
+                        self.transformer,
+                        self._distilled_lora_deltas,
+                        saved_lora_state,
                     )
-                self._lora_cuda_graph_state = "original"
-                logger.info("Un-merged distilled LoRA after stage 2")
-            else:
-                self._lora_cuda_graph_state = "original"
+                    restored = snapshot_restored + dense_restored
+                    if restored != n:
+                        raise RuntimeError(
+                            f"Restored {restored} LoRA-touched weights after stage 2, but {n} were applied."
+                        )
+                    self._lora_cuda_graph_state = "original"
+                    logger.info("Un-merged distilled LoRA after stage 2")
+                else:
+                    self._lora_cuda_graph_state = "original"
 
         # Denoise (stage 1 + stage 2) complete; decode is the post phase.
         timer.mark_post_start()
@@ -1744,7 +1787,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             a_working = a_noise * sigma_0 + a_working * (1.0 - sigma_0)
 
         # --- Pre-compute static preproc (context, PE, KV) for Stage 2 ---
-        _s2_static = self.transformer.prepare_text_cache(
+        _s2_static = self.prepare_transformer_inputs(
+            "prepare_text_cache",
             video_context=video_embeds,
             video_context_mask=connector_mask,
             video_positions=video_positions,
@@ -1797,7 +1841,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 vel_v, vel_a = self.transformer(
                     video=video_mod,
                     audio=audio_mod,
-                    text_cache=_s2_static,
+                    text_cache=self.resolve_transformer_inputs(_s2_static),
                     step_index=i,
                     timestep=timestep,
                 )

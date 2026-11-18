@@ -374,6 +374,9 @@ class ModuleOffloadManager:
                         f"got {type(view).__name__}"
                     )
                 spec.owner.register_parameter(spec.name, view)
+                metadata = getattr(spec.owner, "rebuild_tensor_metadata", {})
+                if spec.name in metadata:
+                    metadata[spec.name]["param"] = view
             else:
                 if not isinstance(view, torch.Tensor):
                     raise TypeError(
@@ -643,7 +646,7 @@ class PipelineOffloader:
             return
 
         pipeline = self._pipeline
-        available_components = pipeline.offload_pipeline_components()
+        available_components = pipeline.all_offload_pipeline_components()
         cpu_offload_config = getattr(pipeline.pipeline_config, "cpu_offload_config", None)
         has_user_stages = (
             cpu_offload_config is not None

@@ -531,7 +531,6 @@ class FluxSingleTransformerBlock(nn.Module):
             and qkv_proj is not None
             and all(
                 getattr(projection, "has_nvfp4_activation_quantization", False)
-                and not getattr(getattr(projection, "quant_config", None), "ignore_steps", [])
                 and projection.input_scale is not None
                 and projection.pre_quant_scale is None
                 and not projection.force_dynamic_quantization

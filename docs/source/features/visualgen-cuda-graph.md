@@ -68,6 +68,11 @@ Subclasses can override `register_cuda_graph_extra_key_fns()` to add model-speci
 
 ## Capture and Replay
 
+With Linear or attention `ignore_steps`, the pipeline selects a fixed Transformer
+instance before entering its graph. Each instance has its own runner and metadata;
+warmup visits every reachable instance. Existing shape and sparse-phase keys still
+apply within each runner.
+
 Capture is lazy:
 
 1. On the first call with a new graph key, VisualGen runs a short warmup, captures a CUDA graph, and stores static input buffers for that key.

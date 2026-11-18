@@ -288,7 +288,7 @@ class FluxJointAttention(Attention):
         q_add = self.norm_added_q.weight if hasattr(self, "norm_added_q") else None
         k_add = self.norm_added_k.weight if hasattr(self, "norm_added_k") else None
 
-        if self.requires_static_e4m3_attention and self.attention_quantization_enabled:
+        if self.requires_static_e4m3_attention:
             batch_size, seq_len, _ = qkv.shape
             query, key, value = torch.ops.trtllm.fused_dit_qk_norm_rope_quant_fp8(
                 qkv.view(batch_size * seq_len, -1),
@@ -379,7 +379,7 @@ class FluxJointAttention(Attention):
         )
 
         attention_kwargs = {"timestep": timestep}
-        if self.requires_static_e4m3_attention and self.attention_quantization_enabled:
+        if self.requires_static_e4m3_attention:
             attention_kwargs.update(
                 {
                     "static_q_scale": self._static_q_dequant_scale,

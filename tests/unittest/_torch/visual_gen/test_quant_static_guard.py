@@ -222,20 +222,19 @@ class TestDynamicQuantGuard:
             )
         )
         module = _StubLinear()
-        with patch.object(loader, "_retain_unquantized_weight") as retain:
+        with patch.object(
+            loader, "_maybe_dynamic_quantize", wraps=loader._maybe_dynamic_quantize
+        ) as quantize:
             with pytest.raises(
                 ValueError,
-                match=(
-                    r"ignore_steps.*dynamic: true.*"
-                    f"Load-time weight quantization \\({quant_algo.name}\\).*blocks.0.attn1.to_q"
-                ),
+                match=r"ignore_steps.*dynamic: true",
             ):
                 loader.load_linear_weights(
                     module,
                     "blocks.0.attn1.to_q",
                     [{"weight": torch.zeros(8, 16, dtype=weight_dtype)}],
                 )
-        retain.assert_not_called()
+        quantize.assert_not_called()
         assert module.loaded is None
 
     @pytest.mark.parametrize(
@@ -257,9 +256,11 @@ class TestDynamicQuantGuard:
         )
         module = _StubLinear()
         weights = {"weight": torch.zeros(8, 16, dtype=weight_dtype)}
-        with patch.object(loader, "_retain_unquantized_weight") as retain:
+        with patch.object(
+            loader, "_maybe_dynamic_quantize", wraps=loader._maybe_dynamic_quantize
+        ) as quantize:
             loader.load_linear_weights(module, "blocks.0.attn1.to_q", [weights])
-        retain.assert_not_called()
+        assert quantize.call_count == 1
         assert module.loaded == [weights]
 
 

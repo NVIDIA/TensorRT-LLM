@@ -437,7 +437,7 @@ if __name__ == "__main__":
 
 
 @pytest.mark.cpu_only
-def test_linear_ignore_steps_keep_norm_output_bf16() -> None:
+def test_fixed_bf16_linear_keeps_norm_output_bf16() -> None:
     from types import SimpleNamespace
     from unittest.mock import patch
 
@@ -448,9 +448,9 @@ def test_linear_ignore_steps_keep_norm_output_bf16() -> None:
     )
 
     projection = SimpleNamespace(
-        quant_config=SimpleNamespace(ignore_steps=[1]),
+        quant_config=SimpleNamespace(quant_algo=None),
         quant_method=NVFP4LinearMethod(),
-        input_scale=torch.ones(()),
+        input_scale=None,
         scaling_vector_size=16,
         pre_quant_scale=None,
         force_dynamic_quantization=False,
@@ -475,64 +475,5 @@ def test_linear_ignore_steps_keep_norm_output_bf16() -> None:
     fused.assert_called_once()
     assert "sf_scale" not in fused.call_args.kwargs
     assert output.dtype == torch.bfloat16
-    projection.quant_config.ignore_steps = []
+    projection.input_scale = torch.ones(())
     assert get_nvfp4_input_scale(projection) is projection.input_scale
-
-
-@pytest.mark.cpu_only
-def test_linear_ignore_steps_bypass_async_qkv_quantization() -> None:
-    from unittest.mock import patch
-
-    from test_common.visual_gen_quantization import (
-        assert_quantization_routes,
-        observe_quantization_paths,
-    )
-
-    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTX2Attention
-    from tensorrt_llm._torch.visual_gen.quantization.quant_dispatcher import (
-        install_linear_quant_dispatcher,
-    )
-    from tensorrt_llm.visual_gen.args import LinearQuantConfig
-
-    config = DiffusionModelConfig(
-        quant_config=LinearQuantConfig(quant_algo="NVFP4", ignore_steps=[0]),
-        dynamic_weight_quant=True,
-        force_dynamic_quantization=False,
-        attention=AttentionConfig(backend="VANILLA"),
-    )
-    # Explicit context gives separate projections without requiring a distributed process group.
-    attention = LTX2Attention(query_dim=128, context_dim=128, heads=1, dim_head=128, config=config)
-    assert not attention._maybe_share_qkv_quantize
-    for name, module in attention.named_modules():
-        if hasattr(module, "quant_method"):
-            module.register_buffer(
-                "_unquantized_weight",
-                torch.randn(module.weight.shape[0], module.in_features, dtype=torch.bfloat16)
-                * 0.02,
-                persistent=False,
-            )
-            if module.bias is not None:
-                module.bias.data.zero_()
-    install_linear_quant_dispatcher(attention, {"linear_quant_ignored": True})
-    attention.fuse_qk_norm_rope = attention.qk_norm = False
-
-    def run_async(compute_q, compute_k, compute_v, **kwargs):
-        values = {
-            name: callback()
-            for name, callback in (("q", compute_q), ("k", compute_k), ("v", compute_v))
-        }
-        return values["q"]
-
-    with (
-        patch.object(attention.attn, "forward_async", run_async, create=True),
-        patch(
-            "torch.ops.trtllm.tunable_fp4_quantize",
-            side_effect=AssertionError("Shared FP4 quantization must be bypassed"),
-        ),
-        observe_quantization_paths(attention) as trace,
-    ):
-        trace.step = 0
-        attention.forward_async(torch.randn(1, 8, 128, dtype=torch.bfloat16))
-    assert_quantization_routes(
-        trace, {(0, name, "linear"): "bf16" for name in ("to_q", "to_k", "to_v", "to_out.0")}
-    )

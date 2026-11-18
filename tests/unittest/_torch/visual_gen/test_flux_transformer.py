@@ -94,8 +94,8 @@ def _make_fake_flux2_parallel_attn():
     # same predicate that drives the gate/up interleave, so the stand-in has to
     # expose it. Mirror the predicate's dependence on use_cute_dsl_blockscaling_mm
     # to keep the guard tests below meaningful.
-    gate_up_proj.can_use_cute_dsl_nvfp4_swiglu_blackwell = (
-        lambda: gate_up_proj.use_cute_dsl_blockscaling_mm
+    gate_up_proj.can_use_cute_dsl_nvfp4_swiglu_blackwell = lambda: (
+        gate_up_proj.use_cute_dsl_blockscaling_mm
     )
     attn.to_qkv_mlp_proj = SimpleNamespace(
         tp_size=2,
@@ -797,12 +797,12 @@ if __name__ == "__main__":
 
 
 @pytest.mark.cpu_only
-def test_linear_ignore_steps_disable_shared_nvfp4_quantization() -> None:
+def test_fixed_linear_shared_nvfp4_quantization_eligibility() -> None:
     from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
         FluxSingleTransformerBlock,
     )
 
-    config = SimpleNamespace(ignore_steps=[0])
+    config = SimpleNamespace(quant_algo="NVFP4")
 
     def projection():
         return SimpleNamespace(
@@ -817,6 +817,4 @@ def test_linear_ignore_steps_disable_shared_nvfp4_quantization() -> None:
     block = SimpleNamespace(
         attn=SimpleNamespace(fuse_qk_norm_rope=True, qkv_proj=projection()), proj_mlp=projection()
     )
-    assert not FluxSingleTransformerBlock.configure_shared_nvfp4_quantize(block)
-    config.ignore_steps = []
     assert FluxSingleTransformerBlock.configure_shared_nvfp4_quantize(block)

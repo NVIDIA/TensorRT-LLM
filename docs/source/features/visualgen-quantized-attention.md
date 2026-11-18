@@ -369,6 +369,7 @@ attention_config:
 **By step.** In this example, Linear layers use BF16 at steps 0 and 1, while
 attention uses the backend's native BF16/FP16 path at steps 0 and 2. Each component
 remains quantized at its other steps. Step 0 is the first denoising step.
+Numbering restarts for every denoising loop, including LTX-2 Stage 2.
 
 ```yaml
 quant_config:
@@ -386,9 +387,13 @@ attention_config:
 - Linear step exclusions require quantizing BF16/FP16 checkpoint weights at load
   time; pre-quantized checkpoints are not supported. Set `dynamic: true` to enable
   load-time quantization and retain the original weights for excluded steps.
-  Both weight copies remain in memory, and incompatible fusions are disabled.
+  Both weight formats remain in memory. Fixed Transformer paths retain their
+  original fusion eligibility. See [Linear exclusions](../models/visual-generation.md#layer-and-step-exclusions)
+  for the weight-memory tradeoff.
 - Step exclusions cannot be combined with diffusion caching; Linear step exclusions
   also do not support runtime LoRA fusion.
+- Quantization exclusions preserve sparse-attention settings: an excluded step
+  may still use BF16 sparse attention rather than dense attention.
 
 ## Interaction With Other Features
 

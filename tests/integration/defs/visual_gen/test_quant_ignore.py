@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Seven complete FLUX.2-klein-4B generations with observed quantization routes."""
+"""Complete FLUX.2-klein-4B generations with observed quantization routes."""
 
 import hashlib
 import json
+import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
@@ -101,6 +103,15 @@ class GenerationResult:
     directory: Path
 
 
+def _tensor_storage_bytes(model: torch.nn.Module) -> int:
+    storages = {
+        (tensor.device, tensor.untyped_storage().data_ptr()): tensor.untyped_storage().nbytes()
+        for tensor in (*model.parameters(), *model.buffers())
+        if tensor.device.type != "meta"
+    }
+    return sum(storages.values())
+
+
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
@@ -146,9 +157,15 @@ def _module_inventory(model: torch.nn.Module) -> dict[str, list[str]]:
     assert len(blocks) > 20, f"The fixture must contain target global block 20: {blocks}"
     return {
         "blocks": blocks,
-        "linear": [name for name, module in model.named_modules() if isinstance(module, Linear)],
+        "linear": [
+            name.replace("._orig_mod.", ".")
+            for name, module in model.named_modules()
+            if isinstance(module, Linear)
+        ],
         "attention": [
-            name for name, module in model.named_modules() if isinstance(module, Attention)
+            name.replace("._orig_mod.", ".")
+            for name, module in model.named_modules()
+            if isinstance(module, Attention)
         ],
     }
 
@@ -199,12 +216,28 @@ def _run_generation(
     directory: Path,
     case: QuantIgnoreCase | None = None,
     inventory: dict[str, list[str]] | None = None,
+    *,
+    compiled: bool = False,
 ) -> GenerationResult:
     directory.mkdir(parents=True, exist_ok=True)
     config = _make_case_config(checkpoint, case, inventory or {})
+    if compiled:
+        config.update(
+            torch_compile_config={"enable": True},
+            cuda_graph_config={"enable": True},
+            compilation_config={"resolutions": [[512, 512]], "num_frames": [1]},
+        )
     yaml_path = directory / "config.yaml"
     yaml_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    torch.cuda.reset_peak_memory_stats()
+    started = time.perf_counter()
     pipeline = PipelineLoader(VisualGenArgs.from_yaml(yaml_path)).load(skip_warmup=True)
+    torch.cuda.synchronize()
+    measurements = {
+        "load_seconds": time.perf_counter() - started,
+        "load_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "resident_tensor_storage_bytes": _tensor_storage_bytes(pipeline),
+    }
     try:
         actual_inventory = _module_inventory(pipeline.transformer)
         if inventory is not None:
@@ -220,7 +253,22 @@ def _run_generation(
         initial_noise_hashes = []
         prepare_latents = pipeline._prepare_latents
         publish_step = pipeline._publish_denoise_step
-        with observe_quantization_paths(pipeline.transformer) as trace:
+        observed = pipeline._transformer_quant_dispatchers
+        observed = observed["transformer"] if "transformer" in observed else pipeline.transformer
+        with observe_quantization_paths(observed, device_only=compiled) as trace:
+            if compiled:
+                started = time.perf_counter()
+                pipeline.warmup()
+                torch.cuda.synchronize()
+                measurements["warmup_seconds"] = time.perf_counter() - started
+                assert pipeline._cuda_graph_runners
+                assert all(runner.graphs for runner in pipeline._cuda_graph_runners.values())
+                graph_counts = [
+                    len(runner.graphs) for runner in pipeline._cuda_graph_runners.values()
+                ]
+                trace.reset()
+            device_routes = []
+            previous_step = None
 
             def prepare(*args, **kwargs):
                 latents, ids = prepare_latents(*args, **kwargs)
@@ -232,28 +280,62 @@ def _run_generation(
                 return latents, ids
 
             def publish(value):
+                nonlocal previous_step
+                if compiled and previous_step is not None:
+                    device_routes.append((previous_step, trace.device_counts.cpu().tolist()))
+                    trace.reset()
                 publish_step(value)
                 trace.step = value[0] if value is not None else None
+                previous_step = trace.step
 
             with (
+                ExitStack() as replay_observers,
                 patch.object(pipeline, "_prepare_latents", prepare),
                 patch.object(pipeline, "_publish_denoise_step", publish),
             ):
+                replays = (
+                    [
+                        replay_observers.enter_context(
+                            patch.object(runner, "replay", wraps=runner.replay)
+                        )
+                        for runner in pipeline._cuda_graph_runners.values()
+                    ]
+                    if compiled
+                    else []
+                )
                 image = pipeline.forward(**REQUEST).image.detach().cpu()
+                if compiled:
+                    assert all(replay.call_count > 0 for replay in replays)
         assert image.shape == (1, REQUEST["height"], REQUEST["width"], 3)
         assert image.dtype == torch.uint8 and image.float().std() > 0
         assert len(initial_noise_hashes) == 1
         _save_case_artifacts(directory, config, image, trace, initial_noise_hashes[0])
-        assert_quantization_routes(trace, _expected_routes(case, actual_inventory))
+        if compiled:
+            assert len(device_routes) == STEPS, device_routes
+            for step, counts in device_routes:
+                quantized_linear = case.component == "linear" and step == case.target
+                assert counts[int(quantized_linear)] > 0, (step, counts)
+                assert counts[int(not quantized_linear)] == 0, (step, counts)
+                assert counts[2] > 0 and counts[3] == 0, (step, counts)
+            assert graph_counts == [
+                len(runner.graphs) for runner in pipeline._cuda_graph_runners.values()
+            ]
+            measurements["device_routes"] = device_routes
+        else:
+            assert_quantization_routes(trace, _expected_routes(case, actual_inventory))
+        report_path = directory / "report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["measurements"] = measurements
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         backend_name = case.backend if case is not None else "VANILLA"
         expected_backend = get_visual_gen_attention_backend(backend_name).__name__
         for event in trace.events:
             if event["component"] == "attention":
                 assert event["backend"] == expected_backend, event
-        state = pipeline.transformer.model_config.attention_metadata_state
-        if state is not None:
-            assert state["denoise_step"] is None
-            assert not state["linear_quant_ignored"] and not state["attention_quant_ignored"]
+        for _, model in pipeline.transformer_quant_models():
+            state = model.model_config.attention_metadata_state
+            if state is not None:
+                assert state["denoise_step"] is None
         return GenerationResult(image, actual_inventory, initial_noise_hashes[0], directory)
     finally:
         pipeline.cleanup()
@@ -275,14 +357,11 @@ def test_flux2_klein_bf16_reference(bf16_reference: GenerationResult) -> None:
     assert (bf16_reference.directory / "image.png").is_file()
 
 
-@pytest.mark.parametrize("case", QUANT_IGNORE_CASES, ids=lambda case: case.name)
-def test_flux2_klein_quant_ignore(case: QuantIgnoreCase, bf16_reference: GenerationResult) -> None:
+def _assert_image_quality(
+    case: QuantIgnoreCase, result: GenerationResult, bf16_reference: GenerationResult
+) -> None:
     import lpips
 
-    checkpoint = get_checkpoint("FLUX.2-klein-4B")
-    result = _run_generation(
-        checkpoint, bf16_reference.directory.parent / case.name, case, bf16_reference.inventory
-    )
     assert result.initial_noise_hash == bf16_reference.initial_noise_hash
     metric = lpips.LPIPS(net="alex").eval()
 
@@ -301,3 +380,26 @@ def test_flux2_klein_quant_ignore(case: QuantIgnoreCase, bf16_reference: Generat
     assert score <= LPIPS_LIMIT, (
         f"{case.name}: LPIPS {score:.6f} exceeds {LPIPS_LIMIT:.6f} against the BF16 reference"
     )
+
+
+@pytest.mark.parametrize("case", QUANT_IGNORE_CASES, ids=lambda case: case.name)
+def test_flux2_klein_quant_ignore(case: QuantIgnoreCase, bf16_reference: GenerationResult) -> None:
+    result = _run_generation(
+        get_checkpoint("FLUX.2-klein-4B"),
+        bf16_reference.directory.parent / case.name,
+        case,
+        bf16_reference.inventory,
+    )
+    _assert_image_quality(case, result, bf16_reference)
+
+
+def test_flux2_klein_quant_ignore_compile_cuda_graph(bf16_reference: GenerationResult) -> None:
+    case = QUANT_IGNORE_CASES[1]
+    result = _run_generation(
+        get_checkpoint("FLUX.2-klein-4B"),
+        bf16_reference.directory.parent / "linear_nvfp4_step_compile_cuda_graph",
+        case,
+        bf16_reference.inventory,
+        compiled=True,
+    )
+    _assert_image_quality(case, result, bf16_reference)

@@ -249,7 +249,9 @@ def test_runtime_lora_checks_target_component_quantization(tmp_path, target_comp
         assert config.runtime_lora.target_components == [target_component]
 
 
-def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch):
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("step_quant", [False, True])
+def test_pipeline_loader_orders_runtime_lora_before_stage_construction(monkeypatch, step_quant):
     from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -264,12 +266,26 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
             super().__init__()
             self.pipeline_config = config
             self.offloader = PipelineOffloader(self)
+            self._transformer_quant_dispatchers = {"transformer": object()} if step_quant else {}
+            self._lora_ready = False
 
         def to(self, device):
             return self
 
         def offload_pipeline_components(self):
             return {}
+
+        def all_offload_pipeline_components(self):
+            return self.offload_pipeline_components()
+
+        def deferred_transformer_quant_tensor_ids(self):
+            return set()
+
+        def _setup_transformer_quant_graphs(self):
+            pass
+
+        def run_transformer_quant_hook(self, method):
+            getattr(self, method)()
 
         def load_transformer_weights(self, checkpoint_dir):
             events.append("load_transformer_weights")
@@ -278,6 +294,9 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
         def load_weights(self, weights):
             events.append("load_weights")
 
+        def load_transformer_quant_weights(self, weights):
+            self.load_weights(weights)
+
         def load_standard_components(self, checkpoint_dir, device, skip_components=None, **kwargs):
             events.append("load_standard_components")
 
@@ -285,7 +304,9 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
             events.append("post_load_weights")
 
         def _setup_runtime_lora(self):
-            events.append("runtime_lora")
+            if not self._lora_ready:
+                events.append("runtime_lora")
+                self._lora_ready = True
 
         def initialize_offload_pipeline(self):
             self.offloader.initialize()
@@ -316,12 +337,17 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
     monkeypatch.setattr(
         PipelineLoader,
         "_materialize_meta_tensors",
-        lambda self, pipeline, cpu_offload_modules=None: None,
+        lambda self, pipeline, cpu_offload_modules=None, **kwargs: None,
     )
 
     PipelineLoader(args, device="cpu").load(skip_warmup=True)
 
-    assert events.index("runtime_lora") > events.index("post_load_weights")
+    assert events.count("runtime_lora") == 1
+    if step_quant:
+        assert events.index("load_weights") < events.index("runtime_lora")
+        assert events.index("runtime_lora") < events.index("load_standard_components")
+    else:
+        assert events.index("runtime_lora") > events.index("post_load_weights")
 
 
 def test_vae_conv_quant_config_is_independent_from_transformer(tmp_path):

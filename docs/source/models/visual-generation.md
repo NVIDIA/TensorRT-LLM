@@ -232,6 +232,40 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 
 Omit `quant_config` for BF16/FP16 baseline.
 
+#### Layer and step exclusions
+
+Use `ignore` to keep selected Linear layers, including attention projections,
+in BF16/FP16 at every step:
+
+```yaml
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+  ignore: ["transformer_blocks.0.*", "transformer_blocks.2.*", "transformer_blocks.4.*"]
+```
+
+Or use `ignore_steps` to run all Linear layers without quantization at selected steps:
+
+```yaml
+quant_config:
+  quant_algo: NVFP4
+  dynamic: true
+  ignore_steps: [0, 1]
+```
+
+Nonempty layer and step exclusion lists cannot be combined. Step 0 is the first
+step of each denoising loop; LTX-2 Stage 2 starts at 0 again. Step exclusions
+require a BF16/FP16 checkpoint and load-time quantization (`dynamic: true`).
+They retain both BF16 and quantized Linear weights: roughly 1.5 times the BF16
+weight storage for FP8, or 1.3 times for NVFP4 including scales, before auxiliary
+buffers and loading peaks. These ratios describe weights, not total pipeline memory.
+LoRA-modified stages also retain their own changed weights. Unchanged compatible
+weights are shared between execution paths.
+LTX-2 refinement follows its native LoRA precision policy: NVFP4 LoRA targets
+can use merged BF16 weights.
+
+Attention kernels have separate [layer and step exclusions](../features/visualgen-quantized-attention.md#layer-and-step-exclusions).
+
 #### Wan VAE NVFP4
 
 The VAE can represent a substantial fraction of end-to-end latency in distilled

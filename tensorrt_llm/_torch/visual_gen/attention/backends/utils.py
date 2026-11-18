@@ -170,8 +170,6 @@ def create_attention(
     if recipe is not None and is_quant_excluded(recipe, module_name):
         recipe = None
         kwargs["quant_attention_config"] = None
-    if recipe is not None and recipe.ignore_steps and attention_metadata_state is None:
-        raise ValueError("Attention ignore_steps requires per-component attention state.")
 
     sparse_config = (
         attention_config.sparse_attention_config if attention_config is not None else None
@@ -221,9 +219,4 @@ def create_attention(
         max_seq_len=max_seq_len,
     )
     attention = attn_cls(**kwargs)
-    if recipe is not None and recipe.ignore_steps:
-        from .quant_dispatcher import AttentionQuantDispatcher
-
-        unquantized = attn_cls(**{**kwargs, "quant_attention_config": None})
-        return AttentionQuantDispatcher(attention, unquantized, attention_metadata_state)
     return attention

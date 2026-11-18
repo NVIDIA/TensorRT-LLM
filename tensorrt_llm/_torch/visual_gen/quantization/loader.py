@@ -254,7 +254,7 @@ class DynamicLinearWeightLoader:
     def _should_dynamic_quantize(
         self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
     ) -> bool:
-        """Decide whether to quantize a weight, validating configured step exclusions."""
+        """Decide whether a checkpoint weight needs load-time quantization."""
         if not self.dynamic_weight_quant or quant_algo is None:
             return False
 
@@ -278,14 +278,30 @@ class DynamicLinearWeightLoader:
                 return False  # Already quantized
             return weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
 
-        if getattr(self.quant_config, "ignore_steps", []):
+        return False
+
+    def validate_step_quant_weights(
+        self, weight_dict: Dict[str, torch.Tensor], quant_algo: QuantAlgo, name: str
+    ) -> None:
+        """Require original weights and an implemented load-time quantizer."""
+        weight = weight_dict.get("weight")
+        if (
+            not self.dynamic_weight_quant
+            or weight is None
+            or weight.dtype not in _HIGH_PRECISION_DTYPES
+        ):
+            raise ValueError(
+                f"quant_config.ignore_steps requires original BF16/FP16 weights and "
+                f"load-time weight quantization (dynamic: true) for module '{name}'; "
+                "a pre-quantized checkpoint cannot restore the original BF16 precision."
+            )
+        if not self._should_dynamic_quantize(weight_dict, quant_algo, name):
             raise ValueError(
                 "`ignore_steps` requires load-time weight quantization (`dynamic: true`). "
                 f"Load-time weight quantization ({quant_algo.name}) is not supported for "
                 f"module '{name}'. The checkpoint provides a {weight.dtype} weight, "
                 "but the VisualGen loader has no load-time quantizer for this algorithm."
             )
-        return False
 
     def _maybe_dynamic_quantize(
         self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
@@ -390,6 +406,11 @@ class DynamicLinearWeightLoader:
         self, module: Linear, name: str, weight_dicts: List[Dict[str, torch.Tensor]]
     ) -> None:
         """Load weights into Linear module with optional quantization."""
+        from .transformer_quant_dispatcher import current_weight_reuse
+
+        reuse = current_weight_reuse(self.model_config.component_name)
+        if reuse is not None and id(module) in reuse.reused_modules:
+            return
         module_quant_config = getattr(module, "quant_config", None)
         if module_quant_config is not None:
             quant_algo = module_quant_config.quant_algo
@@ -407,11 +428,12 @@ class DynamicLinearWeightLoader:
             self._check_static_quant_scales(weight_dict, quant_algo, name, module)
             self._check_static_nvfp4_input_scale(module, weight_dict, quant_algo, name)
 
-        if getattr(self.quant_config, "ignore_steps", []) and quant_algo is not None:
-            # Reject unsupported quantization before retaining any BF16 weights.
+        if quant_algo is not None and (
+            (reuse is not None and reuse.require_dynamic_weights)
+            or getattr(self.quant_config, "ignore_steps", [])
+        ):
             for weight_dict in weight_dicts:
-                self._should_dynamic_quantize(weight_dict, quant_algo, name)
-            self._retain_unquantized_weight(module, name, weight_dicts)
+                self.validate_step_quant_weights(weight_dict, quant_algo, name)
 
         # Special handling for fused NVFP4 dynamic quantization
         # Fused weights (Q,K,V or gate,up) must be quantized TOGETHER
@@ -424,36 +446,3 @@ class DynamicLinearWeightLoader:
             ]
 
         module.load_weights(quantized_weight_dicts)
-
-    def _retain_unquantized_weight(self, module, name, weight_dicts) -> None:
-        """Load an unquantized local shard with the same fused/TP weight mapping."""
-        import copy
-
-        from tensorrt_llm._torch.modules.linear import UnquantizedLinearMethod
-        from tensorrt_llm.models.modeling_utils import QuantConfig
-
-        if not self.dynamic_weight_quant or any(
-            wd.get("weight") is None
-            or wd["weight"].dtype not in (torch.bfloat16, torch.float16, torch.float32)
-            for wd in weight_dicts
-        ):
-            raise ValueError(
-                f"quant_config.ignore_steps requires original BF16/FP16 weights for {name}; "
-                "a pre-quantized checkpoint cannot restore the original BF16 precision."
-            )
-        # Reuse the original module's TP sharding and fused-weight descriptors,
-        # but give the temporary loader its own parameter/module dictionaries.
-        shadow = copy.copy(module)
-        shadow._parameters = {}
-        shadow._buffers = {}
-        shadow._modules = {}
-        shadow.quant_config = QuantConfig()
-        shadow.quant_method = UnquantizedLinearMethod()
-        with torch.device(module.weight.device):
-            shadow.quant_method.create_weights(
-                shadow, module.in_features, module.out_features, module.has_bias, module.dtype
-            )
-        shadow.quant_method.load_weights(
-            shadow, weight_dicts, module.weights_loading_config.weight_mode
-        )
-        module.register_buffer("_unquantized_weight", shadow.weight.detach(), persistent=False)

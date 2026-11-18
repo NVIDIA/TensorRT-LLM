@@ -158,7 +158,6 @@ class Attention(nn.Module):
         self.layer_idx = layer_idx if layer_idx is not None else 0
         self.module_name = self._qualified_module_name(config.component_name, module_name)
         recipe = config.attention.quant_attention_config
-        self._quant_attention_config = recipe
         self._quantization_excluded = recipe is not None and is_quant_excluded(
             recipe, self.module_name
         )
@@ -192,7 +191,6 @@ class Attention(nn.Module):
         )
 
         attention_metadata_state = getattr(config, "attention_metadata_state", None)
-        self._quant_ignore_state = attention_metadata_state
 
         if self.qk_norm:
             # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
@@ -309,18 +307,6 @@ class Attention(nn.Module):
             enable_sequence_parallel=enable_sequence_parallel,
             use_ulysses=use_ulysses,
             async_ulysses=use_ulysses and async_ulysses,
-        )
-
-    @property
-    def attention_quantization_enabled(self) -> bool:
-        """Whether Q/K/V should follow the attention recipe on the current step."""
-        return (
-            self._quant_attention_config is not None
-            and not self._quantization_excluded
-            and (
-                self._quant_ignore_state is None
-                or not self._quant_ignore_state.get("attention_quant_ignored", False)
-            )
         )
 
     @staticmethod
