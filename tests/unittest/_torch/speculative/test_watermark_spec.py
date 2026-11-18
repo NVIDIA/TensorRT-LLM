@@ -210,8 +210,11 @@ def test_dual_key_routing_diversifies_repeated_prompts():
     if torch.cuda.get_device_properties(0).total_memory / 1e9 < 35:
         pytest.skip("Not enough memory to load the target model")
     # The same prompt twice: with the first key only the two requests repeat each other; routing
-    # tokens to the second key at random makes them diverge.
-    config = WatermarkConfig(key=0x5EED5EED, algorithm="gumbel_dual_key", alpha=0.25)
+    # tokens to the second key at random makes them diverge. Without deduplication, no repeated
+    # context falls back to ordinary sampling, so the divergence comes from the routing alone.
+    config = WatermarkConfig(
+        key=0x5EED5EED, algorithm="gumbel_dual_key", alpha=0.25, deduplicate_contexts="none"
+    )
     prompts = PROMPTS * 2
     params = dict(max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True)
     unseeded = _generate(config, False, False, SamplingParams(**params), prompts)
