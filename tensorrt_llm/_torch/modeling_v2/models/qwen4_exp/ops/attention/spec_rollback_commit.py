@@ -86,7 +86,8 @@ def _stage_kernel(
         tl.store(stream + i * (CTX + P) + w, tl.where(w < CTX, hist, row), mask=w < CTX + P)
 
 
-@triton.jit
+# The index rows (requests x verify rows) follow the batch: a runtime value, one variant a geometry.
+@triton.jit(do_not_specialize=["rows"])
 def _commit_kernel(
     accepted,
     slots,
