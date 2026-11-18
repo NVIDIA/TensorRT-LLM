@@ -82,7 +82,9 @@ from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslGroupedGemmNvfp4Impl,
     TrtllmCutedslGroupedGemmNvfp4PlusImpl,
 )
-from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import CuteDslFc12FusedMoENvfp4Runner
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12.nvfp4 import (
+    CuteDslFc12FusedMoENvfp4Runner,
+)
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoENvfp4Runner
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     CUTLASS_LEAVES,
@@ -91,6 +93,7 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmCutlassUnquantizedImpl,
     TrtllmCutlassW4a16Mxfp4Impl,
     TrtllmCutlassW4a16Nvfp4Impl,
+    TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl,
     TrtllmTritonFp8BlockScalesImpl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
@@ -152,6 +155,7 @@ from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
+    FusedMoEQuantScalesDeepSeekFP8BlockScales,
     MXFP4WeightTRTLLMGenFusedMoEMethod,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
@@ -4632,17 +4636,19 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024, sm_version=sm_version)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384, sm_version=sm_version)
     assert (len(decode), len(prefill)) == (decode_count, prefill_count)
-    assert all(len(t) == 11 for t in decode + prefill)
-    assert {t[-2] for t in decode} == {(1, 1)}
-    assert {t[-2] for t in prefill} == {(2, 4)}
-    assert {t[-1] for t in decode + prefill} == {"expert"}
+    assert all(len(t) == 12 for t in decode + prefill)
+    assert {t[-3] for t in decode} == {(1, 1)}
+    assert {t[-3] for t in prefill} == {(2, 4)}
+    assert {t[-2] for t in decode + prefill} == {"expert"}
+    assert {t[-1] for t in decode + prefill} == {False}
     for tactic in decode + prefill:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     default_tactics = [
         megamoe_op.default_megamoe_tactic(num_tokens) for num_tokens in (64, 4096, 16384)
     ]
-    assert all(len(tactic) == 11 for tactic in default_tactics)
-    assert {tactic[-1] for tactic in default_tactics} == {"expert"}
+    assert all(len(tactic) == 12 for tactic in default_tactics)
+    assert {tactic[-2] for tactic in default_tactics} == {"expert"}
+    assert {tactic[-1] for tactic in default_tactics} == {False}
     for tactic in default_tactics:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     if sm_version == 107:
@@ -4656,7 +4662,7 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
                 in_kernel_fc2_reduce=False,
                 combine_format="bf16",
             )
-            assert len(selected) == 11
+            assert len(selected) == 12
             assert selected == megamoe_op._unpack_tactic(tactic)
     invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
     invalid_tactic[3] = ("grouped", 0)
@@ -4665,9 +4671,10 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
     megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
     assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
-    v4 = megamoe_op.default_megamoe_tactic(64)[:-1]
-    megamoe_op.validate_megamoe_tactic(v4, sm_version=sm_version)
-    assert megamoe_op._unpack_tactic(v4) == megamoe_op.default_megamoe_tactic(64)
+    for legacy_len in (11, 10):  # v5 (no combine_dedup) and v4 (no READY granularity)
+        legacy = megamoe_op.default_megamoe_tactic(64)[:legacy_len]
+        megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
+        assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
 
 
 @pytest.mark.cpu_only
@@ -5056,6 +5063,7 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
         BlockPhase,
         map_phase_interleaved_fc12_work_id,
         resolve_phase_interleaved_fc1_claim_target,
+        resolve_phase_interleaved_stream_extent,
     )
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_scheduler import (
         PhaseInterleavedFc12Scheduler,
@@ -5129,6 +5137,8 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
             pipeline_init_wait(cluster_shape_mn=(1, 1))
             worker = self.scheduler._work_id_worker
             state = self.scheduler._task_mapping_state
+            # Mirror PhaseInterleavedFc12Scheduler.gen_next_work initialization.
+            state = resolve_phase_interleaved_stream_extent(state)
             _, fc1_valid, state = map_phase_interleaved_fc12_work_id(
                 Int32(0), Int32(BlockPhase.Linear1), (Int32(0), Int32(0), Int32(0)), state
             )
@@ -5379,6 +5389,7 @@ def should_skip_locality_domain_param(
     activation_type: ActivationType,
     swiglu_gptoss_style: bool,
     dtype: torch.dtype,
+    model_config: Optional[MoeModelConfig] = None,
 ) -> Optional[str]:
     """Return a static skip reason for locality domain MoE backend params."""
     if backend_type != MoeBackendType.CUTEDSL:
@@ -5392,6 +5403,12 @@ def should_skip_locality_domain_param(
         return "locality domain MoE backend test only supports SwiGLU"
     if swiglu_gptoss_style:
         return "locality domain MoE backend test does not cover GPT-OSS SwiGLU style"
+    # CuteDslLocalityDomainMixin._adjust_locality_domain_plan runs such shapes
+    # on the full-GPU kernels, so the locality-domain ops would not be tuned.
+    if model_config is not None and (
+        (2 * model_config.intermediate_size) % 256 != 0 or model_config.hidden_size % 256 != 0
+    ):
+        return "locality domain shards must be 128-row multiples"
     return None
 
 
@@ -5504,6 +5521,7 @@ def generate_test_params() -> List:
                 ActivationType.Swiglu,
                 swiglu_gptoss_style,
                 dtype,
+                model_config,
             )
             locality_domain_param_values = (
                 dtype,
@@ -5951,8 +5969,19 @@ def test_moe_backend(
                 assert autotuner.stats.tuned_op_profiled_configs.get(op_name, 0) > 0
                 assert not autotuner.stats.failed_profiling_count.get(op_name, set())
 
+        # The SM90 Triton FP8-activation leaf runs decode-sized BF16 batches
+        # without any autotuned op, so those runs leave nothing to capture.
+        # Every other call (FP16 input, a non-uniform clamp, more rows) runs
+        # the parent's tuned fused op and keeps the tactic replay below.
+        runs_untuned_triton = (
+            isinstance(backend, TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+            and seq_len <= backend.TRITON_FP8_ACT_MAX_TOKENS
+            and dtype_activation == torch.bfloat16
+            and backend._triton_swiglu is not None
+        )
+
         # Check if this backend+quant_algo combination supports autotuner capture/replay
-        if supports_autotuner_capture(backend_type, quant_algo):
+        if supports_autotuner_capture(backend_type, quant_algo) and not runs_untuned_triton:
             # Capture phase: record which tactics are used (requires actual execution)
             with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
                 _ = run_moe()
@@ -7132,6 +7161,7 @@ def _cutlass_leaf_on_cpu(leaf_cls):
     leaf.act_beta = None
     leaf.act_clamp = None
     leaf.act_clamp_after_silu = False
+    leaf.activation = DEFAULT_MOE_ACTIVATION
     leaf.tp_size, leaf.tp_rank, leaf.ep_size, leaf.ep_rank = 1, 0, 1, 0
     leaf.cluster_size, leaf.cluster_rank = 1, 0
     leaf.use_fused_finalize = True
@@ -7520,6 +7550,169 @@ def test_triton_fp8_block_scales_leaf_localizes_global_slot_ids(enable_alltoall,
     # The kernel returns its own tensor, so the scheduler must not hand it the
     # alltoall workspace to fill.
     assert not leaf.supports_moe_output_in_alltoall_workspace()
+
+
+def _sm90_triton_fp8_act_leaf_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl, dict, list]:
+    """The SM90 Triton FP8-activation leaf, opted into its Triton path, with
+    both callees replaced by recorders: what the Triton runner saw, and the
+    fused-op calls."""
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import fp8_block_scales_hopper_triton
+
+    seen = {}
+
+    def run_triton(x, ids, scales, *args, **kwargs):
+        seen.update(ids=ids, scales=scales, args=args, **kwargs)
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(
+        fp8_block_scales_hopper_triton, "run_triton_fp8_block_scale_moe_fp8_act", run_triton
+    )
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+    leaf.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
+        fc_weight_scales="fc31-scale", proj_weight_scales="fc2-scale"
+    )
+    leaf._triton_swiglu = (7.0, True)
+    return leaf, seen, calls
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "change, takes_triton",
+    [
+        pytest.param({}, True, id="at-threshold"),
+        pytest.param({"num_tokens": 33}, False, id="above-threshold"),
+        pytest.param({"x_sf": torch.ones(1)}, False, id="scale-factors"),
+        pytest.param({"x_dtype": torch.float16}, False, id="fp16-input"),
+        pytest.param({"moe_output": torch.zeros(32, 8)}, False, id="moe-output"),
+        pytest.param({"triton_swiglu": None}, False, id="non-uniform-clamp"),
+    ],
+)
+def test_sm90_triton_fp8_act_leaf_dispatch(change, takes_triton, monkeypatch):
+    """Up to ``TRITON_FP8_ACT_MAX_TOKENS`` rows of plain BF16 input without an
+    output buffer run Triton; everything else runs the inherited fused op."""
+    leaf, seen, calls = _sm90_triton_fp8_act_leaf_on_cpu(monkeypatch)
+    assert leaf.TRITON_FP8_ACT_MAX_TOKENS == 32
+    if "triton_swiglu" in change:
+        leaf._triton_swiglu = change["triton_swiglu"]
+    num_tokens = change.get("num_tokens", 32)
+    ctx = _cpu_run_context(num_tokens=num_tokens)
+    ctx = dataclasses.replace(
+        ctx,
+        x=ctx.x.to(change.get("x_dtype", torch.bfloat16)),
+        x_sf=change.get("x_sf"),
+        comm_plan=dataclasses.replace(ctx.comm_plan, moe_output=change.get("moe_output")),
+    )
+
+    leaf.run_moe(ctx)
+
+    assert bool(seen) is takes_triton
+    assert len(calls) == (0 if takes_triton else 1)
+    if takes_triton:
+        assert seen["args"] == (leaf.w3_w1_weight, "fc31-scale", leaf.w2_weight, "fc2-scale")
+        assert seen["swiglu_limit"] == 7.0
+        assert seen["swiglu_clamp_after_silu"] is True
+        assert seen["output_dtype"] is torch.bfloat16
+
+
+@pytest.mark.cpu_only
+def test_sm90_triton_fp8_act_leaf_localizes_slots_and_defaults_the_scales(monkeypatch):
+    """Under EP the Triton kernel indexes this rank's experts, so every slot
+    outside them weighs 0; folded router weights arrive as None and weigh 1."""
+    leaf, seen, _ = _sm90_triton_fp8_act_leaf_on_cpu(monkeypatch)
+    leaf.ep_size = 2
+    leaf.expert_size_per_partition = 4
+    leaf.slot_start = 4  # this rank owns slots 4..7
+    ctx = dataclasses.replace(
+        _cpu_run_context(num_tokens=2),
+        # 1 is below this rank's slots, -1 padding, 8 (num_slots) above them.
+        token_selected_experts=torch.tensor([[5, 1], [-1, 8]], dtype=torch.int32),
+        token_final_scales=None,
+    )
+
+    leaf.run_moe(ctx)
+
+    assert seen["ids"].tolist() == [[1, 0], [0, 3]]
+    assert seen["scales"].tolist() == [[1.0, 0.0], [0.0, 0.0]]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "slots, expected",
+    [
+        pytest.param({}, (None, False), id="no-clamp"),
+        pytest.param({"act_clamp": 5.0, "act_clamp_after_silu": True}, (5.0, True), id="scalar"),
+        pytest.param({"act_clamp": torch.full((4,), 5.0)}, (5.0, False), id="uniform-tensor"),
+        pytest.param({"act_clamp": torch.tensor([5.0, 5.0, 6.0, 5.0])}, None, id="per-expert"),
+        pytest.param({"w2_bias": torch.zeros(1)}, None, id="expert-bias"),
+        pytest.param({"act_alpha": 1.702}, None, id="alpha"),
+    ],
+)
+def test_sm90_triton_fp8_act_leaf_reads_the_clamp_off_its_slots(slots, expected):
+    """The Triton SwiGLU takes the clamp by value, so it serves only a layer
+    whose installed clamp is one value for every expert."""
+    leaf = _cutlass_leaf_on_cpu(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+    for name, value in slots.items():
+        setattr(leaf, name, value)
+
+    assert leaf._uniform_swiglu_clamp() == expected
+
+
+@pytest.mark.cpu_only
+def test_sm90_triton_fp8_act_leaf_prewarms_once_per_layer_shape(monkeypatch):
+    """``cache_derived_state`` compiles the Triton path up to the row threshold
+    once per process for layers that share weight shapes, top-k and clamp, and
+    not at all for a layer whose clamp keeps it on the fused op."""
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import (
+        fp8_block_scales_hopper,
+        fp8_block_scales_hopper_triton,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        fp8_block_scales_hopper_triton,
+        "prewarm_triton_fp8_block_scale_moe_fp8_act",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl, "_prewarmed", set())
+    monkeypatch.setattr(
+        fp8_block_scales_hopper.DeepgemmCudaHopperFp8BlockScalesImpl,
+        "cache_derived_state",
+        lambda self: None,
+    )
+
+    def layer(clamp):
+        leaf = _cutlass_leaf_on_cpu(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+        leaf.w3_w1_weight = torch.zeros((4, 32, 8), dtype=torch.bfloat16)
+        leaf.w2_weight = torch.zeros((4, 8, 16), dtype=torch.bfloat16)
+        leaf.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
+            fc_weight_scales=torch.ones((4, 1, 1)), proj_weight_scales=torch.ones((4, 1, 1))
+        )
+        leaf.routing_method = SimpleNamespace(top_k=2)
+        leaf.act_clamp = clamp
+        leaf.cache_derived_state()
+        return leaf
+
+    first = layer(7.0)
+    layer(7.0)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    expected = (
+        first.w3_w1_weight,
+        first.quant_scales.fc_weight_scales,
+        first.w2_weight,
+        first.quant_scales.proj_weight_scales,
+    )
+    assert all(arg is want for arg, want in zip(args, expected, strict=True))
+    assert kwargs == dict(top_k=2, max_tokens=32, swiglu_limit=7.0, swiglu_clamp_after_silu=False)
+
+    layer(6.0)
+    assert len(calls) == 2
+    per_expert = layer(torch.tensor([5.0, 6.0, 5.0, 5.0]))
+    assert per_expert._triton_swiglu is None
+    assert len(calls) == 2
 
 
 @pytest.mark.cpu_only

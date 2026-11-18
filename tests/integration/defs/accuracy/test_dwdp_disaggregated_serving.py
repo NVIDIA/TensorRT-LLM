@@ -225,7 +225,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
             "dwdp_config": {
                 "dwdp_size": 2,
@@ -256,7 +256,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
         }
 
@@ -338,7 +338,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
             "dwdp_config": {
                 "dwdp_size": 2,
@@ -370,7 +370,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
         }
 
@@ -471,7 +471,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
             "dwdp_config": {
                 "dwdp_size": 2,
@@ -506,7 +506,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "backend": "NIXL",
             },
             "moe_config": {
-                "backend": "CUTEDSL",
+                "tactic": "cutedsl.grouped_gemm",
             },
         }
 

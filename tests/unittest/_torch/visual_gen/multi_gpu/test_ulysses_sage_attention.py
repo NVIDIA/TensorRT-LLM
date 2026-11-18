@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.visual_gen.attention.backends import UlyssesAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ._worker_pool import run_distributed
@@ -52,9 +53,13 @@ def _cuda_cc():
 
 
 def _skip_unsupported_int8(sage_attn_qk_int8: bool) -> None:
-    """Skip INT8 SageAttention on SM103 and SM107."""
-    if sage_attn_qk_int8 and _cuda_cc() in ((10, 3), (10, 7)):
-        pytest.skip("INT8 SageAttention kernels are unavailable on SM103 and SM107.")
+    """Restrict INT8 SageAttention to the shipped SM100 cubins.
+
+    FP8 cases exercise kernels directly, independently of AttentionConfig's
+    public recipe allowlist, including the FP8 kernels shipped for SM107.
+    """
+    if sage_attn_qk_int8 and get_sm_version() != 100:
+        pytest.skip("INT8 SageAttention kernels are only available on SM100.")
 
 
 @pytest.fixture(autouse=True, scope="module")

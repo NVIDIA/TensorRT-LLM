@@ -1290,6 +1290,7 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         draft_step=None,
         mapping_lm_head_tp=None,
         out=None,
+        vocab_sharded=None,
     ):
         """Greedy block drafts straight from ``k3_markov``.
 
@@ -1317,6 +1318,7 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             draft_step=draft_step,
             mapping_lm_head_tp=mapping_lm_head_tp,
             out=out,
+            vocab_sharded=vocab_sharded,
         )
 
     def _prepare_next_new_tokens(

@@ -64,7 +64,7 @@ from .engine.multimodal import (
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import make_scheduled_inputs, resolve_mrope_position_deltas_cache
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
-from .engine.runners.encoder import EncoderConfig, EncoderRunner, resolve_scheduled_encoder_args
+from .engine.runners.encoder import EncoderConfig, resolve_scheduled_encoder_args
 from .engine.runners.encoder_decoder import EncoderDecoderRunner, EncoderDecoderRunnerConfig
 from .engine.runners.interface import ModelRunner, ScheduledInputs, ScheduledModelRunner
 from .engine.runners.mm_encoder import MultimodalEncoderRunner
@@ -147,6 +147,11 @@ class ModelEngine:
             model_weights_restore_mode=model_weights_restore_mode,
         )
         if not self.model.model_config.is_generation:
+            if not self.llm_args.mm_encoder_only:
+                raise ValueError(
+                    "Non-generation models run through ScheduledEncoderExecutor, which does not "
+                    "use ModelEngine."
+                )
             self.llm_args = resolve_scheduled_encoder_args(self.llm_args)
         self._validate_breakable_cuda_graph_compatibility()
         self._init_from_model()
@@ -451,11 +456,10 @@ class ModelEngine:
         self.attn_backend = resolve_attention_backend(self.model, self.llm_args)
 
         runner_cls = resolve_runner_type(self.model, self.llm_args)
-        if self.is_spec_decode and issubclass(runner_cls, (MultimodalEncoderRunner, EncoderRunner)):
+        if self.is_spec_decode and issubclass(runner_cls, MultimodalEncoderRunner):
             raise ValueError(
                 f"{runner_cls.__name__} does not support speculative decoding; "
-                "pooling and multimodal encoder models must not set "
-                "speculative_config."
+                "multimodal encoder models must not set speculative_config."
             )
 
         if self.is_spec_decode:
@@ -487,21 +491,6 @@ class ModelEngine:
 
     def _initialize_runner(self, runner_cls: type[ModelRunner]) -> ModelRunner:
         assert self._model_caller is not None
-        if issubclass(runner_cls, EncoderRunner):
-            return runner_cls.create(
-                self.model,
-                llm_args=self.llm_args,
-                mapping=self.mapping,
-                dist=self.dist,
-                max_batch_size=self.batch_size,
-                max_num_tokens=self.max_num_tokens,
-                max_seq_len=self.max_seq_len,
-                max_beam_width=self.max_beam_width,
-                model_caller=self._model_caller,
-                attention_backend=self.attn_backend,
-                attention_runtime_features=self.attn_runtime_features,
-                moe_load_balancer=self.moe_load_balancer,
-            )
         if issubclass(runner_cls, EncoderDecoderRunner):
             return self._initialize_encoder_decoder_runner(runner_cls)
         if issubclass(runner_cls, MultimodalEncoderRunner):
@@ -545,6 +534,8 @@ class ModelEngine:
     def _decoder_runner_config(
         self, config_cls: type[DecoderRunnerConfig] = DecoderRunnerConfig, **extra_fields: Any
     ) -> DecoderRunnerConfig:
+        from ._util import is_disagg_enabled
+
         return config_cls(
             max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
@@ -594,6 +585,7 @@ class ModelEngine:
             ),
             spec_decode_fast_paths=self.spec_decode_fast_paths,
             watermark_config=self.llm_args.watermark_config,
+            is_disagg=is_disagg_enabled(self.llm_args.cache_transceiver_config),
             **extra_fields,
         )
 

@@ -172,7 +172,7 @@ def _run_routed_expert_multi_lora(
     llm = LLM(
         model=model_dir,
         lora_config=lora_config,
-        moe_config=MoeConfig(backend="CUTLASS"),
+        moe_config=MoeConfig(tactic="cutlass"),
         kv_cache_config=_KV_CACHE_CONFIG,
         cuda_graph_config=cuda_graph_config,
         peft_cache_config=peft_cache_config,
@@ -335,7 +335,7 @@ def _run_paired_adapter_engine(
     llm = LLM(
         model=model_dir,
         lora_config=lora_config,
-        moe_config=MoeConfig(backend="CUTLASS"),
+        moe_config=MoeConfig(tactic="cutlass"),
         kv_cache_config=KvCacheConfig(max_tokens=128, enable_block_reuse=False),
         skip_tokenizer_init=True,
         peft_cache_config=PeftCacheConfig(
