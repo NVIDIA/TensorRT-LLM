@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Dict, List, Optional, Set
@@ -42,8 +41,6 @@ _ITERATION_STATS_SCALAR_FIELDS = (
 _ITERATION_STATS_OPTIONAL_FIELDS = ("static_batching_stats",)
 
 
-# The /metrics JSON key of each InflightBatchingStats field taken from a rank's payload; the other
-# fields of a rank's row come from rank 0's stats.
 _PAYLOAD_IFB_KEYS = {
     "num_context_requests": "numContextRequests",
     "num_ctx_tokens": "numCtxTokens",
@@ -65,7 +62,6 @@ _SCHEDULING_COUNTER_KEYS = {
     "num_ctx_decoder_hold_passes": "numCtxDecoderHoldPasses",
     "num_ctx_decoder_held_requests": "numCtxDecoderHeldRequests",
 }
-_NO_SCHEDULING_COUNTERS = RankSchedulingCounters()
 # The /metrics JSON key of each KvCacheStats field, in the native serializer's (sorted) key order.
 _KV_CACHE_STATS_KEYS = {
     "alloc_new_blocks": "allocNewBlocks",
@@ -83,11 +79,6 @@ _KV_CACHE_STATS_KEYS = {
     "tokens_per_block": "tokensPerBlock",
     "used_num_blocks": "usedNumBlocks",
 }
-# A rank's kvCacheStats text as json.dumps writes it: repr of each value, in key order.
-_KV_CACHE_STATS_FORMAT = (
-    "{" + ", ".join(f'"{key}": %r' for key in _KV_CACHE_STATS_KEYS.values()) + "}"
-)
-# The /metrics JSON key of each SpecDecodingStats field, in the native serializer's (sorted) key order.
 _SPECDEC_STATS_KEYS = {
     "acceptance_length": "acceptanceLength",
     "draft_overhead": "draftOverhead",
@@ -96,27 +87,8 @@ _SPECDEC_STATS_KEYS = {
     "num_draft_tokens": "numDraftTokens",
     "num_requests_with_draft_tokens": "numRequestsWithDraftTokens",
 }
-_SPECDEC_STATS_FORMAT = (
-    "{" + ", ".join(f'"{key}": %r' for key in _SPECDEC_STATS_KEYS.values()) + "}"
-)
-# Marks for the parts of a rank row that differ between ranks other than 0, and their row text.
-_IFB_MARK, _KV_MARK, _SPECDEC_MARK, _RANK_MARK = (
-    "@adp-row-inflight-batching-stats@",
-    "@adp-row-kv-cache-stats@",
-    "@adp-row-specdec-stats@",
-    "@adp-row-attention-dp-rank@",
-)
-_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT = (
-    json.dumps(_IFB_MARK),
-    json.dumps(_KV_MARK),
-    json.dumps(_SPECDEC_MARK),
-    json.dumps(_RANK_MARK),
-)
-_MARK_TEXTS = re.compile(
-    "("
-    + "|".join(re.escape(text) for text in (_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT))
-    + ")"
-)
+
+_NO_SCHEDULING_COUNTERS = RankSchedulingCounters()
 
 
 def _snapshot_kv_cache_stats(stats: KvCacheStats | None) -> RankKvCacheStats | None:
@@ -191,23 +163,6 @@ def _restore_specdec_stats(
     stats.iter_latency_ms = rank0_stats.iter_latency_ms if rank0_stats is not None else 0.0
     stats.draft_overhead = rank0_stats.draft_overhead if rank0_stats is not None else 0.0
     return stats
-
-
-def _kv_cache_stats_text(snapshot: RankKvCacheStats | None) -> str:
-    """A rank's ``kvCacheStats`` row text, as serializing its restored stats would write it."""
-    if snapshot is None:
-        return "null"
-    return _KV_CACHE_STATS_FORMAT % tuple(getattr(snapshot, name) for name in _KV_CACHE_STATS_KEYS)
-
-
-def _specdec_stats_text(
-    snapshot: RankSpecDecodingStats | None, rank0_stats: SpecDecodingStats | None
-) -> str:
-    """A rank's ``specDecodingStats`` row text, as serializing its restored stats would write it."""
-    if snapshot is None:
-        return "null"
-    stats = _restore_specdec_stats(snapshot, rank0_stats)
-    return _SPECDEC_STATS_FORMAT % tuple(getattr(stats, name) for name in _SPECDEC_STATS_KEYS)
 
 
 class ADPIterStatsBuffer:
@@ -525,49 +480,65 @@ class ADPIterStatsBuffer:
         kv_iter_stats: Optional[Dict[int, object]],
         timings: Dict[str, object],
     ) -> List[str]:
-        """Rows of ranks other than 0 differ only in their payload counts, KV cache stats,
-        speculative-decoding stats and rank: the first is built in full and the others are
-        spliced into its text."""
-        rows: List[str] = []
-        template = None
+        """Build structured rank rows and encode each one once."""
+        rows = []
+        peer_template = None
         for state in states:
-            if state.rank == 0:
-                stats = self._make_rank_iter_stats(rank0_stats, state)
-                row = iteration_stats_row(stats, req_stats, kv_iter_stats, 0, **timings)
-                if state.iter_stats.kv_transfer_outcomes is not None:
-                    row["kvTransferOutcomes"] = dict(
-                        zip(("success", "error", "timeout"), state.iter_stats.kv_transfer_outcomes)
-                    )
-                rows.append(json.dumps(row))
-                continue
-            if template is None:
-                stats = self._make_rank_iter_stats(rank0_stats, state)
-                row = iteration_stats_row(stats, attention_dp_rank=state.rank, **timings)
-                ifb = row["inflightBatchingStats"]
-                row["inflightBatchingStats"] = _IFB_MARK
-                row["kvCacheStats"] = _KV_MARK
-                row["specDecodingStats"] = _SPECDEC_MARK
-                row["attentionDpRank"] = _RANK_MARK
-                template = (_MARK_TEXTS.split(json.dumps(row)), ifb)
-            pieces, ifb = template
             payload = state.iter_stats
-            for name, key in _PAYLOAD_IFB_KEYS.items():
-                ifb[key] = getattr(payload, name)
-            counters = payload.scheduling_counters or _NO_SCHEDULING_COUNTERS
-            for name, key in _SCHEDULING_COUNTER_KEYS.items():
-                ifb[key] = getattr(counters, name)
-            ifb["numScheduledRequests"] = payload.num_context_requests + payload.num_gen_requests
-            fills = {
-                _IFB_TEXT: json.dumps(ifb),
-                _KV_TEXT: _kv_cache_stats_text(payload.kv_cache_stats),
-                _SPECDEC_TEXT: _specdec_stats_text(
-                    payload.specdec_stats, rank0_stats.specdec_stats
-                ),
-                _RANK_TEXT: str(state.rank),
-            }
-            row_text = "".join(fills.get(piece, piece) for piece in pieces)
+            if state.rank == 0:
+                row = iteration_stats_row(
+                    self._make_rank_iter_stats(rank0_stats, state),
+                    req_stats,
+                    kv_iter_stats,
+                    0,
+                    **timings,
+                )
+            else:
+                if peer_template is None:
+                    peer_template = iteration_stats_row(
+                        self._make_rank_iter_stats(rank0_stats, state),
+                        attention_dp_rank=state.rank,
+                        **timings,
+                    )
+                row = dict(peer_template)
+                row["attentionDpRank"] = state.rank
+                ifb = dict(peer_template["inflightBatchingStats"])
+                ifb.update((key, getattr(payload, name)) for name, key in _PAYLOAD_IFB_KEYS.items())
+                counters = payload.scheduling_counters or _NO_SCHEDULING_COUNTERS
+                ifb.update(
+                    (key, getattr(counters, name)) for name, key in _SCHEDULING_COUNTER_KEYS.items()
+                )
+                ifb["numScheduledRequests"] = (
+                    payload.num_context_requests + payload.num_gen_requests
+                )
+                row["inflightBatchingStats"] = ifb
+                for key, snapshot in (
+                    ("kvCacheStats", payload.kv_cache_stats),
+                    ("crossKvCacheStats", payload.cross_kv_cache_stats),
+                ):
+                    # Preserve absence when the native JSON schema omits a cache field.
+                    if key in row:
+                        row[key] = (
+                            {
+                                wire: getattr(snapshot, name)
+                                for name, wire in _KV_CACHE_STATS_KEYS.items()
+                            }
+                            if snapshot is not None
+                            else None
+                        )
+                spec = (
+                    _restore_specdec_stats(payload.specdec_stats, rank0_stats.specdec_stats)
+                    if payload.specdec_stats is not None
+                    else None
+                )
+                row["specDecodingStats"] = (
+                    {wire: getattr(spec, name) for name, wire in _SPECDEC_STATS_KEYS.items()}
+                    if spec is not None
+                    else None
+                )
             if payload.kv_transfer_outcomes is not None:
-                outcomes = dict(zip(("success", "error", "timeout"), payload.kv_transfer_outcomes))
-                row_text = row_text[:-1] + ', "kvTransferOutcomes": ' + json.dumps(outcomes) + "}"
-            rows.append(row_text)
+                row["kvTransferOutcomes"] = dict(
+                    zip(("success", "error", "timeout"), payload.kv_transfer_outcomes)
+                )
+            rows.append(json.dumps(row))
         return rows

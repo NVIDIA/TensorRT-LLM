@@ -1828,7 +1828,7 @@ def test_expired_blocking_receive_marks_timeout_and_preserves_retirement(
     session.close.assert_called_once_with()
 
 
-def test_transfer_failure_is_exported_before_idle_wait_without_another_batch() -> None:
+def test_transfer_failure_is_exported_before_idle_wait_without_another_batch(monkeypatch) -> None:
     from prometheus_client import CollectorRegistry
 
     from tensorrt_llm.executor.base_worker import BaseWorker
@@ -1868,7 +1868,7 @@ def test_transfer_failure_is_exported_before_idle_wait_without_another_batch() -
     class IdleWaitReached(Exception):
         pass
 
-    def idle_wait(timeout: object, *, wait_for_batch: bool) -> None:
+    def idle_wait(timeout: object, *, wait_for_batch: bool, **kwargs) -> None:
         assert timeout is None
         assert wait_for_batch is True
         assert len(executor.stats) == 1
@@ -1892,18 +1892,63 @@ def test_transfer_failure_is_exported_before_idle_wait_without_another_batch() -
     executor._publish_transfer_outcomes()
     assert len(executor.stats) == 1
 
+    # Reuse the idle-wait boundary for conversation expiry and source-rank publication.
+    import datetime
 
-def test_outcome_transport_extends_refactor_tuple_without_shifting_loop() -> None:
-    from tensorrt_llm._torch.pyexecutor.iteration_stats import IterationStatsRecord
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankIterStatsPayload, RankState
 
-    native = Mock()
-    native.to_json_str.return_value = '{"iter": 1}'
-    loop = {"kind": "loop", "per_iter": {"iter": 2}}
-    prefix = (native, None, None, None, None, None, None, None, {"gpuTimesMS": [2.5]}, loop)
-    plain = IterationStatsRecord.from_tuple(prefix).to_dict()
-    assert plain["executorLoop"] == loop
-    assert plain["multimodalEncoderStats"] == {"gpuTimesMS": [2.5]}
-    assert "kvTransferOutcomes" not in plain
-    extended = IterationStatsRecord.from_tuple((*prefix, (3, 2, 1))).to_dict()
-    assert extended["executorLoop"] == loop
-    assert extended["kvTransferOutcomes"] == {"success": 3, "error": 2, "timeout": 1}
+    executor.enable_iter_perf_stats = True
+    manager = ConversationManager(0, retention_enabled=False)
+    manager.enable_activity_tracking(now=0.0)
+    manager.observe_admission(
+        SimpleNamespace(
+            is_dummy_request=False,
+            py_conversation_params=SimpleNamespace(conversation_id="session"),
+            lora_task_id=None,
+            cache_salt=None,
+        ),
+        1.0,
+    )
+    executor._conversation_manager = manager
+    executor._conversation_activity_capture_time = float("-inf")
+    executor._conversation_activity_cached = None
+    executor._last_published_conversation_activity = {}
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.time.monotonic", lambda: 601.0)
+    for seconds in (1.0, 0.25):
+        executor._idle_kv_transfer_poll_timeout = Mock(
+            return_value=datetime.timedelta(seconds=seconds)
+        )
+        executor.executor_request_queue.get_from_request_queue = Mock(side_effect=IdleWaitReached)
+        with pytest.raises(IdleWaitReached):
+            executor._fetch_and_enqueue_requests([], 0)
+        call = executor.executor_request_queue.get_from_request_queue.call_args
+        assert call.args[0].total_seconds() == seconds
+        assert call.kwargs == {"wait_for_batch": True, "batch_wait_deadline": 601.0 + seconds}
+    activity = executor.stats[-1][1]["conversationActivity"]
+    assert activity["10m"]["unique"] == 0 and activity["10m"]["complete"] == 1
+    assert activity["1h"]["unique"] == 1
+    states = [
+        RankState(
+            rank=i,
+            iter_stats=RankIterStatsPayload(
+                conversation_activity=ConversationActivityStats(i, 1, 0, 0, i + 1, 0, 0, 0)
+            ),
+        )
+        for i in range(2)
+    ]
+    for capacity, expected in ((0, [1]), (10, [0, 1])):
+        executor.stats.clear()
+        executor._last_published_conversation_activity.clear()
+        executor.max_stats_len = capacity
+        executor._publish_conversation_activity(states)
+        executor._publish_conversation_activity(states)
+        assert [row[1]["attentionDpRank"] for row in executor.stats] == expected
+        assert [
+            row[1]["conversationActivity"]["10m"]["unique"] for row in executor.stats
+        ] == expected
+    executor.dist.rank = 1
+    executor._last_published_conversation_activity.clear()
+    executor._publish_conversation_activity(states)
+    assert len(executor.stats) == 2
