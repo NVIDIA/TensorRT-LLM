@@ -12,7 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A standalone drafter's KV layers in a hybrid (recurrent + MLA) target manager."""
+"""A standalone drafter's KV layers in a hybrid (recurrent + MLA) target manager.
+
+Kimi K3's manager is the hybrid manager that appends a drafter's layers; the
+shared hybrid base describes only the model's own.
+"""
 
 from types import SimpleNamespace
 
@@ -20,6 +24,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaV2CacheLayoutPolicy
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    KimiK3HybridCacheManager,
+    _insert_draft_pool_ratio,
+)
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
@@ -31,9 +39,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import common a
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import mamba_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
-    _insert_draft_pool_ratio,
 )
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -54,12 +62,6 @@ _NUM_TARGET_LAYERS = 6
 _NUM_DRAFT_LAYERS = 2
 
 
-class _K3LikeManager(MambaHybridCacheManagerV2):
-    @classmethod
-    def accepts_appended_draft_layers(cls) -> bool:
-        return True
-
-
 def _mla_config(*, num_layers, kv_quant_algo=None):
     pretrained = SimpleNamespace(
         num_hidden_layers=num_layers,
@@ -77,7 +79,9 @@ def _mla_config(*, num_layers, kv_quant_algo=None):
     )
 
 
-def _creator(*, manager_cls=_K3LikeManager, reads_pages=True, tp_size=16, is_disagg=False):
+def _creator(
+    *, manager_cls=KimiK3HybridCacheManager, reads_pages=True, tp_size=16, is_disagg=False
+):
     """A Kimi K3-like creator: NVFP4 MLA target, FP8 MLA drafter."""
     target = _mla_config(num_layers=_NUM_TARGET_LAYERS, kv_quant_algo=QuantAlgo.NVFP4)
     draft = _mla_config(num_layers=_NUM_DRAFT_LAYERS, kv_quant_algo=QuantAlgo.FP8)
@@ -168,10 +172,10 @@ def test_hybrid_cache_size_per_token_adds_the_draft_layer_bytes(monkeypatch):
     specs = (_draft_spec(_NUM_TARGET_LAYERS), _draft_spec(_NUM_TARGET_LAYERS + 1))
     common = dict(max_batch_size=4, kv_cache_config=KvCacheConfig(), tokens_per_block=32)
 
-    without_draft = MambaHybridCacheManagerV2.get_cache_size_per_token(
+    without_draft = KimiK3HybridCacheManager.get_cache_size_per_token(
         SimpleNamespace(), Mapping(), **common
     )
-    with_draft = MambaHybridCacheManagerV2.get_cache_size_per_token(
+    with_draft = KimiK3HybridCacheManager.get_cache_size_per_token(
         SimpleNamespace(), Mapping(), layer_specs=specs, shared_draft_block_width=16, **common
     )
 
@@ -209,6 +213,11 @@ def test_hybrid_cache_size_reserves_the_draft_scratch_of_every_request(
             1,
         ),
     )
+    # Kimi K3's KDA seed and replay estimates read the model config and do not depend on the drafter.
+    for hook in ("_extra_state_bytes_per_rank", "_estimate_fixed_region_bytes"):
+        monkeypatch.setattr(
+            KimiK3HybridCacheManager, hook, getattr(MambaHybridCacheManagerV2, hook)
+        )
     max_batch_size, max_draft_len = 16, 5
     specs = tuple(_draft_spec(_NUM_TARGET_LAYERS + i) for i in range(5))
     common = dict(
@@ -218,10 +227,8 @@ def test_hybrid_cache_size_reserves_the_draft_scratch_of_every_request(
         spec_config=MTPDecodingConfig(max_draft_len=max_draft_len),
     )
 
-    without_draft = MambaHybridCacheManagerV2.get_cache_size_per_token(
-        object(), Mapping(), **common
-    )
-    with_draft = MambaHybridCacheManagerV2.get_cache_size_per_token(
+    without_draft = KimiK3HybridCacheManager.get_cache_size_per_token(object(), Mapping(), **common)
+    with_draft = KimiK3HybridCacheManager.get_cache_size_per_token(
         object(), Mapping(), layer_specs=specs, shared_draft_block_width=5, **common
     )
 
@@ -337,7 +344,7 @@ def _draft_spec(layer_id, dtype=DataType.FP8):
 def test_append_draft_layers_follows_the_target_layers():
     specs = (_draft_spec(4), _draft_spec(5))
 
-    mamba_mask, attention_mask, heads = MambaHybridCacheManagerV2._append_draft_layers(
+    mamba_mask, attention_mask, heads = KimiK3HybridCacheManager._append_draft_layers(
         specs, [True, False, True, False], [False, True, False, True], 1, k_only=True
     )
 
@@ -367,9 +374,62 @@ def test_append_draft_layers_follows_the_target_layers():
 )
 def test_append_draft_layers_rejects_other_layouts(specs, match):
     with pytest.raises(ValueError, match=match):
-        MambaHybridCacheManagerV2._append_draft_layers(
+        KimiK3HybridCacheManager._append_draft_layers(
             specs, [True, False, True, False], [False, True, False, True], 1, k_only=True
         )
+
+
+def test_shared_hybrid_manager_appends_no_layers():
+    manager = object.__new__(MambaHybridCacheManagerV2)
+
+    masks = manager._append_layers([True, False], [False, True], 1, k_only=True)
+
+    assert masks == ([True, False], [False, True], 1)
+    manager._bind_appended_layers()
+    assert manager._appended_draft_layer_specs == {}
+
+
+def test_shared_hybrid_manager_rejects_layer_specs():
+    with pytest.raises(ValueError, match="describes its layers itself"):
+        MambaHybridCacheManagerV2(
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_num_heads=4,
+            mamba_n_groups=1,
+            mamba_head_dim=8,
+            mamba_num_layers=1,
+            mamba_layer_mask=[True, False],
+            mamba_cache_dtype=torch.float16,
+            mamba_ssm_cache_dtype=torch.float16,
+            kv_cache_config=KvCacheConfig(),
+            kv_cache_type=CacheTypeCpp.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=576,
+            tokens_per_block=32,
+            max_seq_len=128,
+            max_batch_size=1,
+            mapping=Mapping(),
+            layer_mask=[False, True],
+            layer_specs=(_draft_spec(2),),
+        )
+
+
+def test_k3_manager_binds_its_draft_layers_to_local_layer_ids():
+    manager = object.__new__(KimiK3HybridCacheManager)
+    manager._draft_layer_specs = (_draft_spec(4), _draft_spec(5))
+
+    mamba_mask, attention_mask, heads = manager._append_layers(
+        [True, False, True, False], [False, True, False, True], 1, k_only=True
+    )
+    assert mamba_mask == [True, False, True, False, False, False]
+    assert attention_mask == [False, True, False, True, True, True]
+    assert heads == [1] * 6
+
+    # This rank keeps target layers 1 and 3 and draft layer 5.
+    manager.pp_layers = [1, 3, 5]
+    manager._bind_appended_layers()
+    assert manager._appended_draft_layer_specs == {2: _draft_spec(5)}
 
 
 def test_draft_pool_ratio_holds_the_scarcest_target_token_capacity():
@@ -407,7 +467,7 @@ _K3_TARGET_POOL_RATIO = [0.14, 0.635, 0.205, 0.02]
 
 
 def _k3_draft_pool_ratio_config(pool_ratio):
-    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager = object.__new__(KimiK3HybridCacheManager)
     manager._appended_draft_layer_specs = {3: None}
     manager.max_seq_len = _K3_MAX_SEQ_LEN
     config = KVCacheManagerConfig(

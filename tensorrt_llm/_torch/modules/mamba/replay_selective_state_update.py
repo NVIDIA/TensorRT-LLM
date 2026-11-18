@@ -26,7 +26,7 @@ import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version
 
-from .mamba2_metadata import (
+from .replay_metadata import (
     REPLAY_WORK_CACHE_BUF_IDX,
     REPLAY_WORK_CACHE_SLOT,
     REPLAY_WORK_ITEM_WIDTH,

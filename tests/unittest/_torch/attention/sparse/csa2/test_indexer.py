@@ -2047,7 +2047,7 @@ def test_candidate_decode_batched_exact_and_mixed(monkeypatch, mixed):
         # SM100 metadata plans no prefix for decode rows, so they must take the
         # native paged sparse decode.
         with monkeypatch.context() as context:
-            context.setattr(state.metadata, "prepare_sparse_indexer", lambda *a: None)
+            context.setattr(state.metadata, "prepare_sparse_indexer", lambda *a, **k: None)
             with pytest.raises(ValueError, match="native paged sparse decode"):
                 _candidate_decode_run(indexer, state, monkeypatch)
     # An admitted domain wider than the candidate pool changes nothing: only

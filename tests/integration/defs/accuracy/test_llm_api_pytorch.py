@@ -221,7 +221,9 @@ class TestApertus1p5_8B(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Apertus-v1.5-8B"
 
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
+        # The checkpoint's 262144-token context sizes the temporary KV cache
+        # for memory profiling to most of a 48 GB GPU's free memory.
+        with LLM(self.MODEL_PATH, max_seq_len=8192) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -905,6 +907,47 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 kv_cache_config=kv_cache_config,
                 **pytorch_config,
         ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_fp8_block_scales_agg_helix_tp2cp2(self) -> None:
+        """GSM8K on aggregated Helix (TP2 x CP2) with FP8 KV and chunked prefill.
+
+        Aggregated because no cache transceiver is configured: one executor
+        runs both the context and generation phases on the CP ranks.
+        The chunk-aware MLA profile needs a request of 9 x max_num_tokens
+        tokens below max_seq_len, which the model caps at 4096.
+        max_num_tokens=256 gives a 2304-token profile, so the KV estimation
+        measures cached-KV chunk staging instead of subtracting a context-MLA
+        workspace reserve.
+        """
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                tensor_parallel_size=2,
+                context_parallel_size=2,
+                moe_expert_parallel_size=2,
+                cp_config={
+                    "cp_type": "HELIX",
+                    "tokens_per_block": 64
+                },
+                max_batch_size=32,
+                max_num_tokens=256,
+                max_seq_len=4096,
+                enable_chunked_prefill=True,
+                kv_cache_config=KvCacheConfig(
+                    dtype="fp8",
+                    enable_block_reuse=False,
+                    tokens_per_block=64,
+                    use_kv_cache_manager_v2=True,
+                ),
+        ) as llm:
+            transceiver = llm.args.cache_transceiver_config
+            assert transceiver is None or transceiver.backend is None
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -2088,42 +2131,48 @@ DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB = 250000
 class TestDeepSeekV41(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4.1-Flash"
 
-    @pytest.mark.parametrize("tp_size,attention_dp,nvfp4", [
+    # Checkpoint suffix: DeepSeek's MXFP4 experts, NVFP4 experts, and NVFP4 experts with MXFP4 Engram tables.
+    @pytest.mark.parametrize("tp_size,attention_dp,checkpoint", [
         pytest.param(4,
                      False,
-                     False,
+                     "",
                      id="mxfp4-tp4",
                      marks=pytest.mark.skip_less_mpi_world_size(4)),
         pytest.param(4,
                      False,
-                     True,
+                     "-NVFP4",
                      id="nvfp4-tp4",
                      marks=pytest.mark.skip_less_mpi_world_size(4)),
         pytest.param(4,
                      True,
-                     True,
+                     "-NVFP4",
                      id="nvfp4-dp4",
                      marks=pytest.mark.skip_less_mpi_world_size(4)),
         pytest.param(8,
                      False,
-                     True,
+                     "-NVFP4",
                      id="nvfp4-tp8",
                      marks=pytest.mark.skip_less_mpi_world_size(8)),
         pytest.param(8,
                      True,
-                     True,
+                     "-NVFP4",
                      id="nvfp4-dp8",
                      marks=pytest.mark.skip_less_mpi_world_size(8)),
+        pytest.param(4,
+                     True,
+                     "-1017-NVFP4",
+                     id="nvfp4-1017-dp4",
+                     marks=pytest.mark.skip_less_mpi_world_size(4)),
     ])
     def test_gsm8k_dspark(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
                           tp_size: int, attention_dp: bool,
-                          nvfp4: bool) -> None:
+                          checkpoint: str) -> None:
         for name in tuple(os.environ):
             if name.startswith("TRTLLM_V41_"):
                 monkeypatch.delenv(name)
 
         with LLM(
-                self.MODEL_PATH + ("-NVFP4" if nvfp4 else ""),
+                self.MODEL_PATH + checkpoint,
                 tensor_parallel_size=tp_size,
                 moe_expert_parallel_size=tp_size,
                 gpus_per_node=4,
@@ -2160,8 +2209,8 @@ class TestDeepSeekV41(LlmapiAccuracyTestHarness):
                 output.avg_decoded_tokens_per_iter * output.decoding_iter
                 for output in request_outputs) / sum(
                     output.decoding_iter for output in request_outputs)
-            print(f"[AL] DS-V4.1 tp={tp_size} attention_dp={attention_dp} "
-                  f"nvfp4={nvfp4}: {acceptance_length:.3f}")
+            print(f"[AL] DS-V4.1{checkpoint} tp={tp_size} "
+                  f"attention_dp={attention_dp}: {acceptance_length:.3f}")
             assert acceptance_length >= 3.0, (
                 f"DSpark acceptance length {acceptance_length:.3f} < 3.0")
 
@@ -2617,6 +2666,57 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 f"TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp{tp_size}]",
                 acceptance_length)
 
+    @DEEPSEEKV4_PARALLELISM
+    def test_gsm8k_megamoe_deepgemm_draft_len_schedule(self, tp_size,
+                                                       attention_dp):
+        """GSM8K under a schedule that trims, then turns off, verified drafts.
+
+        The evaluation submits every sample up front, so each attention-DP
+        rank first runs full batches without speculation and then passes
+        through the shorter and the full draft length as it drains, out of
+        step with its peers.
+        """
+        _skip_unless_deepseekv4_4gpu_memory(
+            tp_size,
+            min_device_memory_for_4gpus=DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        schedule = {32: 5, 96: 3}
+        spec_config = DSparkDecodingConfig(max_draft_len=5,
+                                           draft_len_schedule=schedule,
+                                           speculative_model=self.MODEL_PATH)
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=tp_size,
+                 enable_attention_dp=attention_dp,
+                 moe_config=MoeConfig(backend="MEGAMOE_DEEPGEMM"),
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=True,
+                 custom_tokenizer="deepseek_v4",
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            # The schedule decides how many steps speculate, so the acceptance
+            # length has no fixed floor; this still requires that some did.
+            acceptance_length = compute_acceptance_length(llm)
+            print(f"[AL] draft_len_schedule[dp{tp_size}] "
+                  f"acceptance_length = {acceptance_length:.3f}")
+
     @pytest.mark.skip_less_device_memory(DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_gsm8k_dep4_megamoe_cutedsl(self):
@@ -2677,10 +2777,13 @@ class TestDeepSeekV41FlashDSpark(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4.1-Flash"
 
     @pytest.mark.skip_less_mpi_world_size(4)
+    # nvfp4_1017: the 1017 NVFP4 export, with NVFP4 routed experts and MXFP4 Engram tables.
+    @parametrize_with_ids("nvfp4_1017", [False, True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("bounded_replay", [False, True])
     def test_gsm8k_tp4(self, bounded_replay: bool, attention_dp: bool,
-                       monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+                       nvfp4_1017: bool, monkeypatch: pytest.MonkeyPatch,
+                       tmp_path: Path) -> None:
         """Full GSM8K with DSpark, block reuse and concurrent requests."""
         env = {
             "TRTLLM_V41_ENCODER_REPLAY": str(int(bounded_replay)),
@@ -2694,7 +2797,9 @@ class TestDeepSeekV41FlashDSpark(LlmapiAccuracyTestHarness):
         # Keep the full accuracy gate instead of the one-sample smoke mode.
         monkeypatch.setenv("INTEGRATION_TEST", "0")
 
-        with LLM(self.MODEL_PATH,
+        model_path = self.MODEL_PATH + ("-1017-NVFP4" if nvfp4_1017 else "")
+        extra_acc_spec = "engram_quant=mxfp4" if nvfp4_1017 else None
+        with LLM(model_path,
                  env_overrides=env,
                  tensor_parallel_size=4,
                  moe_expert_parallel_size=4,
@@ -2718,14 +2823,14 @@ class TestDeepSeekV41FlashDSpark(LlmapiAccuracyTestHarness):
                                                free_gpu_memory_fraction=0.5),
                  sparse_attention_config={"algorithm": "csa2"},
                  speculative_config=DSparkDecodingConfig(
-                     max_draft_len=5,
-                     speculative_model=self.MODEL_PATH)) as llm:
+                     max_draft_len=5, speculative_model=model_path)) as llm:
             task = GSM8K(self.MODEL_NAME)
             acc_params = task.get_hypothesis_testing_params(
                 dtype=llm.args.dtype,
                 quant_algo=llm.args.quant_config.quant_algo,
                 kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
-                spec_dec_algo=llm.args.speculative_config.decoding_type)
+                spec_dec_algo=llm.args.speculative_config.decoding_type,
+                extra_acc_spec=extra_acc_spec)
             assert acc_params.num_samples == 1319
             task.EVALUATE_KWARGS = dict(
                 task.EVALUATE_KWARGS,
@@ -2741,6 +2846,7 @@ class TestDeepSeekV41FlashDSpark(LlmapiAccuracyTestHarness):
                 output_path=str(tmp_path / "results"),
                 output_dir=str(tmp_path / "outputs"))
             score = task.evaluate(llm,
+                                  extra_acc_spec=extra_acc_spec,
                                   extra_evaluator_kwargs=evaluator_kwargs,
                                   sampling_params=SamplingParams(
                                       max_tokens=256,
