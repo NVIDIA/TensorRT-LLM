@@ -1066,6 +1066,31 @@ void StorageManager::_handOffDroppedPages(std::vector<SharedPtr<Page>> const& pa
     }
 }
 
+void StorageManager::_handOffEvictedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level)
+{
+    if (cacheTier(level) == CacheTier::HOST_MEM)
+    {
+        if (hostDropAsync())
+        {
+            std::vector<Page*> rawPages;
+            rawPages.reserve(pages.size());
+            for (auto const& page : pages)
+            {
+                rawPages.push_back(page.get());
+            }
+            _queueHostDrops(rawPages, level, /*mayWait=*/true);
+        }
+        else if (mHostDropHook)
+        {
+            _handOffDroppedPages(pages, level);
+        }
+    }
+    for (auto const& page : pages)
+    {
+        page->hostDropHandled = true;
+    }
+}
+
 HostDropRingInfo StorageManager::setUpHostDropRing(
     size_t ringBytes, bool preferKernel, HostDropLosslessConfig const& lossless)
 {
@@ -2757,27 +2782,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             if (lvlId != kHotLevel && !ev.empty())
             {
                 // Pages the last host level drops go to the host-drop hook (or ring) before their slots are freed.
-                if (cacheTier(lvlId) == CacheTier::HOST_MEM)
-                {
-                    if (hostDropAsync())
-                    {
-                        std::vector<Page*> rawPages;
-                        rawPages.reserve(ev.size());
-                        for (auto const& page : ev)
-                        {
-                            rawPages.push_back(page.get());
-                        }
-                        _queueHostDrops(rawPages, lvlId, /*mayWait=*/true);
-                    }
-                    else if (mHostDropHook)
-                    {
-                        _handOffDroppedPages(ev, lvlId);
-                    }
-                }
-                for (auto const& page : ev)
-                {
-                    page->hostDropHandled = true;
-                }
+                _handOffEvictedPages(ev, lvlId);
             }
             if (dropRecorder && !ev.empty())
             {
@@ -2812,6 +2817,20 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                     accepted.end(), std::make_move_iterator(held.begin()), std::make_move_iterator(held.end()));
                 held.clear();
                 auto& rejected = fallenPages.at(lifeCycle);
+                // Host pages the level below could not take are destroyed with `rejected`. Hand them off here, in the
+                // eviction, so a lossless ring waits for slots for them too.
+                std::map<CacheLevel, std::vector<SharedPtr<Page>>> rejectedHostPages;
+                for (auto const& page : rejected)
+                {
+                    if (page->cacheLevel != kHotLevel && cacheTier(page->cacheLevel) == CacheTier::HOST_MEM)
+                    {
+                        rejectedHostPages[page->cacheLevel].push_back(page);
+                    }
+                }
+                for (auto const& [fromLevel, pages] : rejectedHostPages)
+                {
+                    _handOffEvictedPages(pages, fromLevel);
+                }
                 if (dropRecorder && !rejected.empty() && !isLastLevel(lvlId))
                 {
                     // Above failed trailing levels these droppable pages would have been migrated down: count them

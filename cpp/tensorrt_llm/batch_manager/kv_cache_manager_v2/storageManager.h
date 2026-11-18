@@ -720,6 +720,10 @@ private:
     HostDropHook mHostDropHook;
     HostDropStats mHostDropStats;
     void _handOffDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level);
+    //! Hands off the committed host pages that eviction is about to drop from `level`, waiting for ring slots when the
+    //! ring is lossless, and marks every page handled so its destruction does not hand it off again. The pages must be
+    //! droppable and still hold their slots.
+    void _handOffEvictedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level);
     //! `mayWait` allows the lossless hand-off to wait for released slots; a page destroyed outside eviction passes
     //! false, since its destructor may run anywhere.
     void _queueHostDrops(std::vector<Page*> const& pages, CacheLevel level, bool mayWait);
