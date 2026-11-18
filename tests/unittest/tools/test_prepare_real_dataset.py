@@ -15,6 +15,7 @@
 """LoRA options of ``trtllm-bench prepare-dataset real-dataset`` (no network, no tokenizer download)."""
 
 import json
+import logging
 import os
 from types import SimpleNamespace
 
@@ -33,8 +34,16 @@ class _CharTokenizer:
         return [ord(c) for c in text]
 
 
-def _run(monkeypatch, tmp_path, **root_overrides):
-    monkeypatch.setattr(prepare_real_data, "load_dataset_from_hf", lambda config: iter(_ROWS))
+_MULTI_TURN_ROWS = [{"turns": [f"question {i}", f"follow-up {i}"]} for i in range(3)]
+_MULTIMODAL_ROWS = [{"text": f"describe {i}", "image": f"/images/{i}.jpg"} for i in range(3)]
+
+_INPUT_ARGS = ("--dataset-input-key", "text")
+_MULTI_TURN_ARGS = ("--dataset-input-key", "turns")
+_MULTIMODAL_ARGS = ("--dataset-image-key", "image", "--dataset-prompt-key", "text")
+
+
+def _run(monkeypatch, tmp_path, rows=_ROWS, input_args=_INPUT_ARGS, **root_overrides):
+    monkeypatch.setattr(prepare_real_data, "load_dataset_from_hf", lambda config: iter(rows))
     output = tmp_path / "dataset.jsonl"
     root_args = SimpleNamespace(
         tokenizer=_CharTokenizer(),
@@ -53,8 +62,7 @@ def _run(monkeypatch, tmp_path, **root_overrides):
             "dummy",
             "--dataset-split",
             "train",
-            "--dataset-input-key",
-            "text",
+            *input_args,
             "--output-len-dist",
             "8,0",
         ],
@@ -94,3 +102,63 @@ def test_real_dataset_random_task_ids_follow_random_seed(monkeypatch, tmp_path):
     first = _run(monkeypatch, tmp_path, rand_task_id=(0, 1000), lora_dir="/loras")
     second = _run(monkeypatch, tmp_path, rand_task_id=(0, 1000), lora_dir="/loras")
     assert [row["lora_request"] for row in first] == [row["lora_request"] for row in second]
+
+
+_LORA_OPTIONS = [
+    {"task_id": 1},
+    {"rand_task_id": (0, 2)},
+    {"lora_dir": "/loras"},
+]
+_IGNORED_MESSAGE = "LoRA options (--task-id/--rand-task-id/--lora-dir) are not supported for {} "
+
+
+def _ignored_warnings(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "LoRA options" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("options", _LORA_OPTIONS)
+@pytest.mark.parametrize(
+    "rows, input_args, kind",
+    [
+        (_MULTI_TURN_ROWS, _MULTI_TURN_ARGS, "multi-turn"),
+        (_MULTIMODAL_ROWS, _MULTIMODAL_ARGS, "multimodal"),
+    ],
+)
+def test_real_dataset_warns_when_lora_options_are_ignored(
+    monkeypatch, tmp_path, caplog, rows, input_args, kind, options
+):
+    with caplog.at_level(logging.WARNING):
+        written = _run(monkeypatch, tmp_path, rows=rows, input_args=input_args, **options)
+    assert len(written) == len(rows)
+    assert all("lora_request" not in row for row in written)
+    messages = _ignored_warnings(caplog)
+    assert len(messages) == 1
+    assert messages[0].startswith(_IGNORED_MESSAGE.format(kind))
+    assert messages[0].endswith("and will be ignored.")
+
+
+@pytest.mark.parametrize(
+    "rows, input_args",
+    [
+        (_MULTI_TURN_ROWS, _MULTI_TURN_ARGS),
+        (_MULTIMODAL_ROWS, _MULTIMODAL_ARGS),
+    ],
+)
+def test_real_dataset_does_not_warn_without_lora_options(
+    monkeypatch, tmp_path, caplog, rows, input_args
+):
+    with caplog.at_level(logging.WARNING):
+        written = _run(monkeypatch, tmp_path, rows=rows, input_args=input_args)
+    assert len(written) == len(rows)
+    assert _ignored_warnings(caplog) == []
+
+
+def test_real_dataset_text_rows_do_not_get_the_ignored_lora_warning(monkeypatch, tmp_path, caplog):
+    with caplog.at_level(logging.WARNING):
+        rows = _run(monkeypatch, tmp_path, task_id=1, lora_dir="/loras")
+    assert all("lora_request" in row for row in rows)
+    assert _ignored_warnings(caplog) == []

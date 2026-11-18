@@ -34,6 +34,19 @@ def validate_output_len_dist(ctx, param, value):
         )
 
 
+def _warn_lora_options_ignored(root_args, kind):
+    """Warn that LoRA options given on the command line have no effect on these rows."""
+    if (
+        root_args.task_id != -1
+        or root_args.rand_task_id is not None
+        or root_args.lora_dir is not None
+    ):
+        logging.warning(
+            "LoRA options (--task-id/--rand-task-id/--lora-dir) are not supported for "
+            f"{kind} real-dataset rows and will be ignored."
+        )
+
+
 class DatasetConfig(BaseModel):
     """Dataset configurations."""
 
@@ -333,10 +346,12 @@ def real_dataset(root_args, **kwargs):
         logging.debug(f"Modality: {modality}")
 
     if modality is not None:
+        _warn_lora_options_ignored(root_args, "multimodal")
         dataset_generator = partial(
             generate_multimodal_dataset, multimodal_texts, multimodal_image_paths
         )
     elif multi_turn:
+        _warn_lora_options_ignored(root_args, "multi-turn")
         dataset_generator = partial(generate_multi_turn_dataset, all_turns, input_ids, all_metadata)
     else:
         # LoRA task ids and the --lora-dir apply to the text rows, as for the synthetic datasets.
