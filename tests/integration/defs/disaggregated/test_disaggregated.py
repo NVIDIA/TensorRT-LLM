@@ -40,8 +40,9 @@ from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from defs.deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT
 from defs.trt_test_alternative import check_call, check_output, print_info
-from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
-                               run_disagg_server, run_gen_worker, terminate,
+from disagg_test_utils import (ProcessWrapper, resolve_server_start_timeout,
+                               run_ctx_worker, run_disagg_server,
+                               run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics,
@@ -51,32 +52,6 @@ from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
 MAMBA_BS1_CONCURRENCY2_MODEL = "NVIDIA-Nemotron-Nano-9B-v2"
-
-# Readiness budgets for setup_disagg_cluster when the caller passes none.
-# Pipeline parallelism on SM100/SM103/SM107 enables the CuTe DSL BF16 GEMM/BMM
-# (see TorchLlmArgs.validate_cute_dsl_bf16), whose autotuning JIT-compiles
-# kernels on every rank. With cold caches, readiness of the Qwen3-0.6B PP
-# configurations then takes 350-650s on 4-8 Blackwell or Rubin GPUs.
-DEFAULT_SERVER_START_TIMEOUT = 300
-PP_DISAGG_SERVER_START_TIMEOUT = 900
-
-
-def resolve_server_start_timeout(config: dict[str, Any],
-                                 server_start_timeout: int | None) -> int:
-    """Return the readiness budget for a disagg config.
-
-    An explicit ``server_start_timeout`` wins. Otherwise a config whose context
-    or generation servers use pipeline parallelism gets
-    ``PP_DISAGG_SERVER_START_TIMEOUT`` and any other config gets
-    ``DEFAULT_SERVER_START_TIMEOUT``.
-    """
-    if server_start_timeout is not None:
-        return server_start_timeout
-    uses_pp = any(
-        (config.get(servers) or {}).get("pipeline_parallel_size", 1) > 1
-        for servers in ("context_servers", "generation_servers"))
-    return (PP_DISAGG_SERVER_START_TIMEOUT
-            if uses_pp else DEFAULT_SERVER_START_TIMEOUT)
 
 
 @dataclass

@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from test_disaggregated import (
+from disagg_test_utils import (
     DEFAULT_SERVER_START_TIMEOUT,
     PP_DISAGG_SERVER_START_TIMEOUT,
     resolve_server_start_timeout,
@@ -63,7 +63,7 @@ def test_missing_server_sections_get_default_budget():
     assert resolve_server_start_timeout({}, None) == DEFAULT_SERVER_START_TIMEOUT
 
 
-@pytest.mark.parametrize("config", [_config(1, 1), _config(4, 4)])
+@pytest.mark.parametrize("config", [_config(1, 1), _config(4, 4)], ids=["no_pp", "pp4"])
 def test_explicit_budget_wins(config):
     assert resolve_server_start_timeout(config, 1200) == 1200
 
