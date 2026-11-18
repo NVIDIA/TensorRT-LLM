@@ -100,6 +100,11 @@ class MembershipMnnvlMemory(MnnvlMemory):
     # Communicator indices of the rows mapped on the local scratch allocation.
     _scratch_row_indices: frozenset[int] = frozenset()
 
+    @property
+    def local_device_bytes(self) -> int:
+        """Return the bytes of device memory this rank's row of the allocation takes."""
+        return type(self).allocated_map[self.ptr].aligned_size
+
     def rows_needing_fresh_pages(self, comm: "StoreGroup") -> frozenset[int]:
         """Return every row if a former member may still write into the allocation, else no row.
 

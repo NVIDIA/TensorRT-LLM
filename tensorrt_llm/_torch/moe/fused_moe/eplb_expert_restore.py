@@ -285,6 +285,34 @@ class EplbExpertRestore:
         rank_0_node = node_ranks.pop(nodes[0], [])
         return list(node_ranks.values()) + [[rank] for rank in rank_0_node[1:]]
 
+    def largest_failure_restore_bytes(self) -> int:
+        """Return the most device memory this rank backs to restore any recoverable failure."""
+        ep_rank, ep_size = self.balancer.ep_rank, self.balancer.ep_size
+        current = [np.array(ranks, dtype=np.int32) for _, ranks in self.current_placement()]
+        largest = 0
+        for failure in self._recoverable_failures(self._rank_nodes()):
+            if ep_rank in failure:
+                continue
+            active_ranks = [rank not in failure for rank in range(ep_size)]
+            largest = max(largest, self.plan_expert_restore(active_ranks, current).device_bytes)
+        return largest
+
+    def current_placement(self) -> List[Tuple[int, List[List[int]]]]:
+        """Return each layer's expert count and placement as this rank sees it."""
+        return [
+            (layer.expert_count, self._placement_view(i, layer).tolist())
+            for i, layer in enumerate(self.balancer.single_layer_load_balancers)
+        ]
+
+    def _placement_view(self, layer_idx: int, layer: SingleLayerMoeLoadBalancer) -> np.ndarray:
+        """Return ``layer``'s placement as this rank sees it, with no expert in invalid slots.
+
+        A restore that stopped before it installed its placement may have written part of a slot.
+        """
+        placement = np.array(layer.get_old_rank_expert_ids(), dtype=np.int32)
+        placement[self.balancer.ep_rank, sorted(self._invalid_slots.get(layer_idx, ()))] = -1
+        return placement
+
     def plan_expert_restore(
         self,
         active_ranks: Sequence[bool],

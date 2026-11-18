@@ -24,7 +24,7 @@ cancelled if a peer may have overwritten rows that the forward's combines read.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -50,6 +50,13 @@ def _mask_words(mask: int, ep_rank: int) -> tuple[int, ...]:
     if not (words[ep_rank // _MASK_WORD_BITS] >> (ep_rank % _MASK_WORD_BITS)) & 1:
         raise RuntimeError(f"active_rank_mask must mark the local ep_rank ({ep_rank}) as active")
     return words
+
+
+class BindableCommunication(Protocol):
+    """MoE communication strategy whose collectives can run under a :class:`MoeExecutionState`."""
+
+    def bind_execution_state(self, state: MoeExecutionState) -> None:
+        """Run every later collective with ``state``'s rank mask and abort state."""
 
 
 class MoeExecutionState:
@@ -109,6 +116,16 @@ class MoeExecutionState:
         check of this rank's incomplete-round word in it (:meth:`check_incomplete_rounds`).
         """
         self._workspaces.setdefault(workspace, (reset_workspace, check_incomplete_round))
+
+    def workspace_bytes(self) -> int:
+        """Return the device memory :meth:`remap_workspaces` allocates on this rank."""
+        return sum(workspace.local_device_bytes for workspace in self._workspaces)
+
+    def workspace_rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
+        """Return every row if a former member may still write into any bound workspace."""
+        return frozenset().union(
+            *(workspace.rows_needing_fresh_pages(comm) for workspace in self._workspaces)
+        )
 
     def remap_workspaces(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
         """Map every bound workspace at the same addresses among the active members of ``comm``.

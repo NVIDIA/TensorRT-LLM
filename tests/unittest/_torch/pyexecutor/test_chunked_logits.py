@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Unit tests for chunked logits functionality in TensorRT-LLM.
 
@@ -414,6 +428,75 @@ class TestChunkedLogitsComplicated:
         final_logits = request.py_result.generation_logits
         assert final_logits is not None
         assert final_logits.shape == (1, 50, 1000)
+
+
+class TestRewindOutputs:
+    """A discarded step's outputs are dropped back to the mark taken before it."""
+
+    @staticmethod
+    def _rows(value, num_rows=1, width=4):
+        return torch.full((num_rows, width), float(value))
+
+    @pytest.mark.parametrize("chunked, chunk_size", [(False, 8), (True, 1),
+                                                     (True, 8)])
+    def test_rewind_generation_logits(self, chunked, chunk_size):
+        result = PyResult(prompt_len=4,
+                          max_new_tokens=8,
+                          use_device_memory=False,
+                          return_generation_logits=True,
+                          use_chunked_generation_logits=chunked,
+                          chunk_size=chunk_size)
+        for value in (0, 1):
+            result.append_generation_logits(self._rows(value).unsqueeze(1))
+        mark = result.mark_outputs()
+        result.append_generation_logits(self._rows(9).unsqueeze(1))
+        result.rewind_outputs(mark)
+        result.append_generation_logits(self._rows(2).unsqueeze(1))
+        result.transfer_remaining_device_logits()
+        assert result.generation_logits[0, :, 0].tolist() == [0, 1, 2]
+
+    @pytest.mark.parametrize("kind", ["context", "generation"])
+    def test_rewind_additional_outputs(self, kind):
+        result = PyResult(prompt_len=4,
+                          max_new_tokens=8,
+                          use_device_memory=False,
+                          additional_outputs=["hidden"])
+        append = getattr(result, f"append_additional_{kind}_outputs")
+        append("hidden", self._rows(0))
+        mark = result.mark_outputs()
+        append("hidden", self._rows(9))
+        result.rewind_outputs(mark)
+        append("hidden", self._rows(1))
+        outputs = getattr(result, f"additional_{kind}_outputs")
+        assert outputs["hidden"][:, 0].tolist() == [0, 1]
+
+    def test_rewind_context_logits(self):
+        result = PyResult(prompt_len=4,
+                          max_new_tokens=8,
+                          use_device_memory=False,
+                          return_context_logits=True)
+        result.append_context_logits(self._rows(0, num_rows=2))
+        result.context_rows_end = 2
+        mark = result.mark_outputs()
+        result.append_context_logits(self._rows(9, num_rows=2))
+        result.context_rows_end = 4
+        result.rewind_outputs(mark)
+        assert result.context_rows_end == 2
+        result.append_context_logits(self._rows(1, num_rows=2))
+        assert result.context_logits[:, 0].tolist() == [0, 0, 1, 1]
+
+    def test_rewind_prompt_logprobs(self):
+        result = PyResult(prompt_len=4, max_new_tokens=8)
+        result.append_prompt_logprobs(self._rows(0, num_rows=2).double())
+        result.context_rows_end = 2
+        mark = result.mark_outputs()
+        result.append_prompt_logprobs(self._rows(9, num_rows=1).double())
+        result.set_prompt_last_logprobs(self._rows(9).float())
+        result.context_rows_end = 4
+        result.rewind_outputs(mark)
+        (rows, ) = result.context_prompt_logprob_rows
+        assert rows[:, 0].tolist() == [0, 0]
+        assert result.context_prompt_last_logprobs is None
 
 
 if __name__ == "__main__":

@@ -1455,10 +1455,18 @@ class DecoderWarmup:
             return ran_forward
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+        # A replacement rank launches every cached tactic before it serves.
+        startup_record = Distributed.startup_record
+        replacement = startup_record is not None and startup_record.replacement
         if tune_alone:
             Distributed.pause_startup_record()
         ran_native_forward = run_autotuner_pass(
-            autotune(cache_path=cache_path), synchronize_trtllm_cache=True
+            autotune(
+                cache_path=cache_path,
+                prime_all_runners=replacement,
+                report_progress=startup_record.report_progress if replacement else None,
+            ),
+            synchronize_trtllm_cache=True,
         )
         if tune_alone:
             Distributed.resume_startup_record()

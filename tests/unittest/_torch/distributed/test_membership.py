@@ -977,6 +977,41 @@ def test_node_report_keeps_paused_rank():
         _until(lambda: _committed(clients[0], 0b01))
 
 
+def test_stale_node_report_logged_once(monkeypatch):
+    """Log once when a node supervisor's reports go stale, and once when they resume."""
+    logged = []  # (level, message) of the lines about the hang rule
+
+    def record(level, message):
+        if "hang rule" in message:
+            logged.append((level, message))
+
+    for level in ("warning", "info"):
+        monkeypatch.setattr(
+            authority_process.logger, level, lambda message, level=level: record(level, message)
+        )
+    with _deployment(2, hang_timeout_s=1.0) as (store, clients):
+        node = _NodeSupervisor(store, 0, [0, 1])
+        node.until(lambda view: True)
+        node.report()
+        _until(lambda: logged)
+        # Several more decisions while the reports stay stale.
+        time.sleep(1.0)
+        node.report()
+        _until(lambda: len(logged) > 1)
+    assert logged[:2] == [
+        (
+            "warning",
+            "The supervisor of node 0 has not reported for 0.5 s, so its paused ranks are no "
+            "longer exempt from the hang rule",
+        ),
+        (
+            "info",
+            "The supervisor of node 0 reports again, so its paused ranks are exempt from the hang "
+            "rule again",
+        ),
+    ]
+
+
 def test_rendezvous_store_signs_with_shared_secret(monkeypatch):
     """Open the store named in the environment with a client that signs with the shared secret."""
     server = TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False)

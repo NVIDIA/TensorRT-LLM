@@ -346,6 +346,36 @@ def test_restore_reads_no_placement_while_an_update_may_swap_it(monkeypatch):
     old_rank_expert_ids.assert_not_called()
 
 
+@pytest.mark.parametrize("ep_rank, largest", [(0, 8 << 20), (2, 4 << 20)])
+def test_largest_failure_restore_bytes_skips_failures_that_lose_this_rank(
+    monkeypatch, ep_rank, largest
+):
+    """Size the restore of each recoverable failure that this rank survives, at its placement."""
+    load_balancer, _ = _online_balancer(monkeypatch, _ONLINE, ep_rank=ep_rank)
+    restore = load_balancer.expert_restore
+    # The recoverable failures of nodes [0, 1] and [2, 3] lose node 1 or rank 1.
+    device_bytes = {(2, 3): 8 << 20, (1,): 4 << 20}
+
+    def plan_expert_restore(active_ranks, current):
+        np.testing.assert_array_equal(current[0], _ONLINE)
+        lost = tuple(rank for rank, active in enumerate(active_ranks) if not active)
+        return SimpleNamespace(device_bytes=device_bytes[lost])
+
+    monkeypatch.setattr(restore, "plan_expert_restore", plan_expert_restore)
+    assert restore.largest_failure_restore_bytes() == largest
+
+
+def test_current_placement_hides_invalid_slots(monkeypatch):
+    """Show no expert in a slot of this rank that a stopped restore may have written in part."""
+    load_balancer, _ = _online_balancer(monkeypatch, _ONLINE, ep_rank=2)
+    restore = load_balancer.expert_restore
+    assert restore.current_placement() == [(EXPERTS, _ONLINE.tolist())]
+    restore._invalid_slots[0] = {1}
+    expected = _ONLINE.copy()
+    expected[2, 1] = -1
+    assert restore.current_placement() == [(EXPERTS, expected.tolist())]
+
+
 class _SpareSlotOwner(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin):
     """A MoE layer's weight owner with the quantization method of the MoE backend ``leaf``."""
 

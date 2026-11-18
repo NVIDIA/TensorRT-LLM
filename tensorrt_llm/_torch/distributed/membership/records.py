@@ -227,10 +227,18 @@ class MembershipRecord(_Message):
         """Return whether ``rank`` is a replacement that this change adds."""
         return has_rank(self.joining_mask, rank)
 
+    def is_given_up(self, rank: int) -> bool:
+        """Return whether no replacement of ``rank`` is started."""
+        return has_rank(self.given_up_mask, rank)
+
     def is_member(self, rank: int, incarnation: int) -> bool:
         """Return whether ``rank`` is active with ``incarnation`` as its current process."""
         current = self.incarnations[rank] if rank < len(self.incarnations) else 0
         return self.is_active(rank) and current == incarnation
+
+    def admits(self, rank: int, incarnation: int) -> bool:
+        """Return whether the process ``incarnation`` of ``rank`` is in a committed membership."""
+        return self.state == MembershipState.COMMITTED and self.is_member(rank, incarnation)
 
 
 class NodeView(_Message):

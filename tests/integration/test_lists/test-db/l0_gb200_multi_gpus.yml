@@ -168,3 +168,5 @@ l0_gb200_multi_gpus:
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary
   # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM).
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
+  # WideEP fault tolerance: under load a rank crashes and its replacement rejoins.
+  - test_wide_ep_rank_failure.py::TestRankFailures::test_rank_failure_sequence[crash] TIMEOUT (90)

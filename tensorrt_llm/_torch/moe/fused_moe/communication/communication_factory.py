@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.logger import logger
 
 from ..moe_comm_timeout_guard import get_moe_comm_timeout_budgets
@@ -242,7 +243,8 @@ class CommunicationFactory:
             if model_config.enable_wide_ep_fault_tolerance:
                 raise ValueError(
                     "enable_wide_ep_fault_tolerance requires the NVLinkOneSided all-to-all, "
-                    f"which is unavailable: {e}"
+                    f"which is unavailable: {e}; change the configuration or "
+                    f"{TURN_FAULT_TOLERANCE_OFF}"
                 ) from e
             logger.info(f"NVLinkOneSided not available: {e}")
 

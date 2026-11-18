@@ -647,7 +647,9 @@ class _DecoderEngine(SimpleNamespace):
 
     A token count without a tactic is profiled at ``measured_ms``, and the tuning group merges the
     result (PARALLEL). ``tuned_forwards`` lists the token counts of the forwards in tuning mode,
-    where a cached tactic is compiled.
+    where a cached tactic is compiled. ``prime_all_runners`` lists that option of each tuning pass.
+    Each of the forwards reports one step of progress to the ``report_progress`` that the tuning
+    pass got.
     """
 
     def __init__(self, dist, measured_ms, tuner=None):
@@ -662,6 +664,8 @@ class _DecoderEngine(SimpleNamespace):
             if _gemm(batch.num_tokens) not in profiling_cache.cache:
                 profiling_cache.cache[_gemm(batch.num_tokens)] = (0, 3, measured_ms)
                 tuner._maybe_sync_cache_data(DistributedTuningStrategy.PARALLEL, "gemm")
+            if self.tuning and self.report_progress is not None:
+                self.report_progress()
 
         super().__init__(
             _config=SimpleNamespace(
@@ -695,7 +699,9 @@ class _DecoderEngine(SimpleNamespace):
             profiling_cache=profiling_cache,
             tuner=tuner,
             tuning=False,
+            report_progress=None,
             tuned_forwards=[],
+            prime_all_runners=[],
         )
 
     def _warmup_scheduled(self, resource_manager, kv_cache_manager):
@@ -704,16 +710,17 @@ class _DecoderEngine(SimpleNamespace):
         DecoderWarmup._run_autotuner_warmup(self, resource_manager)
 
     @contextlib.contextmanager
-    def _autotune(self, cache_path=None, **kwargs):
+    def _autotune(self, cache_path=None, prime_all_runners=False, report_progress=None, **kwargs):
         """Run the forwards in the block in tuning mode, as ``autotune`` does, with its cache file."""
         rank = self.dist.mapping.rank
         if cache_path is not None and os.path.exists(cache_path):
             self.profiling_cache.load_cache(cache_path, rank)
-        self.tuning = True
+        self.prime_all_runners.append(prime_all_runners)
+        self.tuning, self.report_progress = True, report_progress
         try:
             yield
         finally:
-            self.tuning = False
+            self.tuning, self.report_progress = False, None
             if cache_path is not None:
                 self.profiling_cache.save_cache(cache_path, rank)
 
@@ -776,16 +783,19 @@ def _replacement_engine(published, tuned_tactics):
 def test_replacement_runs_warmup_originals_skip():
     """Check the final autotuner warmup, which the original ranks skip, on a replacement.
 
-    The replacement runs it alone in tuning mode, from its predecessor's tactics. Every shape hits
-    them, so it profiles nothing and makes no host collective.
+    The replacement runs it alone in tuning mode, so the cached tactics of every runner, its
+    predecessor's, run once before it serves. Every shape hits them, so it profiles nothing and
+    makes no host collective.
     """
     rank_0, published, tuned_tactics = _original_rank_0(16, 16)
     # Only the estimation's warmup ran.
     assert rank_0.tuned_forwards == [16, 1]
+    assert rank_0.prime_all_runners == [False]
     assert tuned_tactics == rank_0.profiling_cache.cache
     replacement = _replacement_engine(published, tuned_tactics)
     replacement.autotuner_warmup(16)
     assert replacement.tuned_forwards == [16, 1]
+    assert replacement.prime_all_runners == [True]
     assert replacement.profiling_cache.cache == tuned_tactics
     # Its general warmup forwards and CUDA graph captures already run its predecessor's tactics.
     assert replacement.tactics_at_general_warmup == tuned_tactics
@@ -808,6 +818,26 @@ def test_replacement_tunes_a_missing_shape_alone():
     _record().close()
 
 
+def test_replacement_warmup_reports_startup_progress():
+    """Check that each step of the warmup a replacement runs alone counts as startup progress.
+
+    The steps go through the progress report of its replayed collectives, so a long warmup that
+    keeps making progress is not taken for a hung startup. An original rank reports none.
+    """
+    rank_0_progress = _record().report_progress = Mock()
+    _, published, tuned_tactics = _original_rank_0(16, 16)
+    rank_0_progress.assert_not_called()
+    replacement = _replacement_engine(published, tuned_tactics)
+    in_tuning_pass = []
+    _record().report_progress = lambda: in_tuning_pass.append(replacement.tuning)
+    replacement.autotuner_warmup(16)
+    assert replacement.tuned_forwards == [16, 1]
+    # The replayed skip vote reports outside the pass, and each shape of the pass inside it.
+    assert False in in_tuning_pass
+    assert in_tuning_pass.count(True) == len(replacement.tuned_forwards)
+    _record().close()
+
+
 def test_original_rank_reports_startup_progress(monkeypatch):
     """Report each startup step of an original rank to the authority."""
     client = Mock()
@@ -822,8 +852,9 @@ def test_replacement_replays_originals_final_warmup(monkeypatch, tmp_path, cache
     """Check a final autotuner warmup that the original ranks run, for a larger token count.
 
     The replacement starts from the tactics its predecessor had before that warmup, so it tunes the
-    same shapes and replays the original ranks' merges of them. The autotuner cache file that the
-    original ranks save holds the shapes of that warmup, so the replacement starts without it.
+    same shapes and replays the original ranks' merges of them. Unlike them, it runs the cached
+    tactics of every runner once. The autotuner cache file that the original ranks save holds the
+    shapes of that warmup, so the replacement starts without it.
     """
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "0")
     cache_path = tmp_path / "autotuner.json"
@@ -841,6 +872,8 @@ def test_replacement_replays_originals_final_warmup(monkeypatch, tmp_path, cache
     replacement = _replacement_engine(published, tuned_tactics)
     replacement.autotuner_warmup(16)
     assert replacement.tuned_forwards == [16, 1]
+    assert rank_0.prime_all_runners == [False, False]
+    assert replacement.prime_all_runners == [True]
     # The merges give it the original ranks' tactic.
     assert replacement.profiling_cache.cache == rank_0.profiling_cache.cache
     assert replacement.dist.host_exchange.calls == 0

@@ -204,6 +204,7 @@ def _executor(monkeypatch, pp_size: int) -> PyExecutor:
     executor._shutdown_sleep_wakeup_listeners = Mock()
     executor.model_engine = None
     executor.draft_model_engine = None
+    executor.llm_args = SimpleNamespace(enable_wide_ep_fault_tolerance=False)
     executor.resource_manager = SimpleNamespace(resource_managers={})
     executor.virtual_memory_pools = None
     executor.dwdp_manager = None

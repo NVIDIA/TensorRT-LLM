@@ -8942,7 +8942,7 @@
     },
     "enable_wide_ep_fault_tolerance": {
       "default": false,
-      "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires the NVLink one-sided all-to-all.",
+      "description": "Keep a wide expert-parallel deployment serving at reduced capacity when one of its ranks fails, until a replacement rejoins. Requires attention DP, EPLB and KV cache manager V2. Unsupported configurations are rejected at startup with the reason.",
       "status": "prototype",
       "title": "Enable Wide Ep Fault Tolerance",
       "type": "boolean"

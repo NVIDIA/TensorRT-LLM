@@ -55,6 +55,7 @@ def _admission_executor(
         canceled_req_ids=[],
         request_broadcaster=SimpleNamespace(deliver_prompts=lambda requests: None),
         track_unique_tokens=False,
+        rank_failure_recovery=None,
         _should_exclude_last_generation_logits=lambda: False,
         observed_live_counts=[],
     )

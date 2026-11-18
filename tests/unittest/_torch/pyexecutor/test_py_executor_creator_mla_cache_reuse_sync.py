@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tensorrt_llm._torch.distributed.startup_record import StartupRecord
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
@@ -254,6 +255,7 @@ def _make_llm_args():
         speculative_config=None,
         disable_overlap_scheduler=True,
         sleep_config=None,
+        enable_wide_ep_fault_tolerance=False,
         cache_transceiver_config=None,
         dwdp_config=None,
         layer_wise_benchmarks_config=SimpleNamespace(
@@ -924,3 +926,28 @@ def test_failed_resource_transition_closes_executor(monkeypatch, failure_stage):
     assert len(executors) == 1
     assert executors[0].closed
     assert not executors[0].started
+
+
+def test_estimation_is_not_recorded(monkeypatch):
+    """Check that the startup record pauses for the KV cache estimation, which replacements skip."""
+    record = StartupRecord()
+    record.record()
+    monkeypatch.setattr(py_executor_creator.Distributed, "startup_record", record)
+    recorded_while_estimating = []
+
+    class FailingCacheCreator(_DummyKvCacheCreator):
+        def try_prepare_estimation(self):
+            return True
+
+        def build_managers(self, resources, estimating_kv_cache):
+            recorded_while_estimating.append(record.active)
+            raise RuntimeError("startup failure")
+
+    with pytest.raises(RuntimeError, match="startup failure"):
+        _run_create_py_executor(
+            monkeypatch,
+            sm_version=100,
+            kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+            kv_cache_creator_cls=FailingCacheCreator,
+        )
+    assert recorded_while_estimating == [False]

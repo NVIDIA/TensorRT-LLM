@@ -1335,6 +1335,10 @@ class TestWarmupCleanup(unittest.TestCase):
         @contextlib.contextmanager
         def trtllm_autotune(**kwargs: object) -> Iterator[None]:
             self.assertIsNone(kwargs["cache_path"])
+            # Without fault tolerance, priming keeps to the JIT runners and
+            # the pass reports no startup progress.
+            self.assertFalse(kwargs["prime_all_runners"])
+            self.assertIsNone(kwargs["report_progress"])
             calls.append("trtllm_autotune_enter")
             yield
             calls.append("trtllm_autotune_exit")
