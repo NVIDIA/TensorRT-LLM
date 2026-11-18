@@ -833,9 +833,10 @@ def test_phase_support_check_preserves_whole_request_semantics(phase: FmhaPhase)
     "selection,sm,is_mla,input_type,kernel_supported,expected",
     [
         (None, 107, True, AttentionInputType.generation_only, True, True),
-        (None, 107, True, AttentionInputType.generation_only, False, False),
-        (None, 100, True, AttentionInputType.generation_only, True, False),
-        (None, 103, True, AttentionInputType.generation_only, True, False),
+        (None, 100, True, AttentionInputType.generation_only, False, False),
+        (None, 100, True, AttentionInputType.generation_only, True, True),
+        (None, 103, True, AttentionInputType.generation_only, True, True),
+        (None, 90, True, AttentionInputType.generation_only, True, False),
         (None, 107, True, AttentionInputType.context_only, True, False),
         (None, 107, True, AttentionInputType.mixed, True, False),
         (None, 107, False, AttentionInputType.generation_only, True, False),

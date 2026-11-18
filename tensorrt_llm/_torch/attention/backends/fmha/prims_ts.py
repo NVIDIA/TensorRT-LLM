@@ -382,8 +382,11 @@ class PrimsTSFmha(PhasedFmha):
             return False, "standard attention is not enabled by the performance policy."
         if forward_args.attention_input_type != AttentionInputType.generation_only:
             return False, "only MLA generation is enabled by the performance policy."
-        if get_sm_version() != 107:
-            return False, "MLA generation is enabled by the performance policy only on SM107."
+        if get_sm_version() not in (100, 103, 107):
+            return (
+                False,
+                "MLA generation is enabled by the performance policy only on SM100/SM103/SM107.",
+            )
         return True, ""
 
     def _is_supported_with_reason(
