@@ -117,7 +117,9 @@ class BasePipeline(nn.Module):
     supports_image_edit: bool = False
 
     @classmethod
-    def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
+    def resolve_variant(
+        cls, config: "DiffusionPipelineConfig", checkpoint_dir: str | None = None
+    ) -> Type["BasePipeline"]:
         """Return *cls* or a more specialized subclass based on *config*.
 
         Override in subclasses to select a variant pipeline at creation

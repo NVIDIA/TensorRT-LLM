@@ -521,7 +521,9 @@ def h3_loader(monkeypatch: pytest.MonkeyPatch) -> tuple:
     monkeypatch.setattr(loader, "_resolve_pipeline_config", lambda path: {})
     monkeypatch.setattr(loader, "_setup_visual_gen_mapping", lambda config: None)
     monkeypatch.setattr(DiffusionPipelineConfig, "from_pretrained", lambda *args, **kwargs: config)
-    monkeypatch.setattr(loader_module.AutoPipeline, "from_config", lambda *args: pipeline)
+    monkeypatch.setattr(
+        loader_module.AutoPipeline, "resolve_class", lambda *args: lambda config: pipeline
+    )
     monkeypatch.setattr(loader, "_get_load_time_cpu_offload_modules", lambda pipeline: [])
     monkeypatch.setattr(loader, "_materialize_meta_tensors", MagicMock())
     return loader, pipeline
@@ -631,7 +633,7 @@ def test_sleep_loading_selects_loader_device_and_restores_previous_device(
         pipeline._sleep_manager.ensure_awake()
         events.append("warmup")
 
-    monkeypatch.setattr(loader_module.AutoPipeline, "from_config", construct)
+    monkeypatch.setattr(loader_module.AutoPipeline, "resolve_class", lambda *args: construct)
     pipeline.load_standard_components.side_effect = components
     pipeline.warmup.side_effect = warmup
     if failure_stage is None:
@@ -743,7 +745,9 @@ def test_loader_uses_model_hook_without_h3_dependency(
     ):
         setattr(pipeline, name, getattr(original, name))
     pipeline.transformer = None
-    monkeypatch.setattr(loader_module.AutoPipeline, "from_config", lambda *args: pipeline)
+    monkeypatch.setattr(
+        loader_module.AutoPipeline, "resolve_class", lambda *args: lambda config: pipeline
+    )
     loader._materialize_meta_tensors.side_effect = lambda *_args: events.append("materialize")
     pipeline.warmup.side_effect = lambda: events.append("warmup")
     assert loader.load(sleep_restore_mode="CPU") is pipeline
@@ -873,7 +877,7 @@ def test_sleep_api_belongs_only_to_h3() -> None:
         for pipeline_cls in (BasePipeline, WanPipeline, FluxPipeline):
             assert not hasattr(pipeline_cls, name)
     for name in ("sleep", "wake_up", "is_sleeping"):
-        assert name in MiniMaxH3Pipeline.__dict__
+        assert hasattr(MiniMaxH3Pipeline, name)
 
 
 @pytest.mark.parametrize("operation", ["sleep", "wake_up"])

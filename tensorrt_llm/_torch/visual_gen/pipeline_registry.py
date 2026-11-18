@@ -48,6 +48,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
 
+import torch.distributed as dist
+
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -156,31 +158,61 @@ class AutoPipeline:
         config: "DiffusionPipelineConfig",
         checkpoint_dir: str,
     ) -> "BasePipeline":
-        """
-        Create pipeline instance from DiffusionPipelineConfig.
-        """
-        # Detect pipeline type from model_index.json or from model safetensors
-        class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
+        return AutoPipeline.resolve_class(config, checkpoint_dir)(config)
 
+    @staticmethod
+    def resolve_class(
+        config: "DiffusionPipelineConfig", checkpoint_dir: str
+    ) -> Type["BasePipeline"]:
+        """Select an implementation on every worker before any constructor enters collectives."""
+        mapping = getattr(config, "mapping", None)
+        distributed = getattr(mapping, "world_size", 1) > 1 and dist.is_initialized()
+        if distributed:
+            error = None
+            pipeline_class = None
+            try:
+                pipeline_class = AutoPipeline._resolve_local_class(config, checkpoint_dir)
+            except Exception as exc:
+                # Every worker must enter the same collective, including a worker with a bad manifest.
+                error = exc
+            identity = (
+                f"{pipeline_class.__module__}.{pipeline_class.__qualname__}"
+                if pipeline_class is not None
+                else None
+            )
+            decisions = [None] * dist.get_world_size()
+            dist.all_gather_object(decisions, (identity, str(error) if error is not None else None))
+            if error is not None:
+                raise error
+            for rank, (selected, failure) in enumerate(decisions):
+                if failure is not None:
+                    raise RuntimeError(f"VisualGen routing failed on rank {rank}: {failure}")
+            if any(selected != identity for selected, _ in decisions):
+                raise RuntimeError(
+                    f"VisualGen pipeline selection differs across ranks: {decisions}"
+                )
+            assert pipeline_class is not None
+        else:
+            pipeline_class = AutoPipeline._resolve_local_class(config, checkpoint_dir)
+
+        target = f"{pipeline_class.__module__}.{pipeline_class.__qualname__}"
+        logger.info(f"AutoPipeline: Creating {target} from {checkpoint_dir}")
+        return pipeline_class
+
+    @staticmethod
+    def _resolve_local_class(
+        config: "DiffusionPipelineConfig", checkpoint_dir: str
+    ) -> Type["BasePipeline"]:
+        class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
         if class_name not in PIPELINE_REGISTRY:
             raise ValueError(
                 f"Unknown pipeline: '{class_name}'. "
                 f"Available: {list(PIPELINE_REGISTRY.keys())}\n"
                 f"Checkpoint: {checkpoint_dir}"
             )
-
         entry = PIPELINE_REGISTRY[class_name]
         AutoPipeline._validate_vae_quantization(config, class_name, entry)
-        pipeline_class = entry.pipeline_cls
-
-        # Let the pipeline class upgrade itself to a specialised variant
-        # (e.g. LTX2Pipeline → LTX2TwoStagesPipeline) based on config.
-        pipeline_class = pipeline_class.resolve_variant(config)
-
-        logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
-
-        # Instantiate pipeline with DiffusionPipelineConfig
-        return pipeline_class(config)
+        return entry.pipeline_cls.resolve_variant(config, checkpoint_dir)
 
     @staticmethod
     def _validate_vae_quantization(

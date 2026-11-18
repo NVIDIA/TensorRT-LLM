@@ -657,7 +657,7 @@ class LTX2Pipeline(BasePipeline):
         super().__init__(model_config)
 
     @classmethod
-    def resolve_variant(cls, config):
+    def resolve_variant(cls, config, checkpoint_dir=None):
         if getattr(config, "cache_backend", None) == "cache_dit":
             logger.info("Cache-DiT is enabled; forcing one-stage LTX2 pipeline.")
             return cls
