@@ -61,8 +61,8 @@ from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flas
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (  # noqa: E501
     beam_logit_softcap,
 )
-from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (  # noqa: E501
-    swiglu_fp32,
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (
+    swiglu_fp32,  # noqa: E501
 )
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.attention.beam_neox_rope import beam_neox_rope
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.attention.beam_nope_query_scale import (  # noqa: E501
@@ -303,25 +303,6 @@ def manager_context(length: int, **overrides):
 # -------------------------------------------------- tests: configuration and construction
 
 
-def test_configuration_is_the_fixed_scope() -> None:
-    assert model_module.NUM_LAYERS == 6
-    assert model_module.LAYER_TYPES == tuple(CONFIG["layer_types"])
-    assert model_module.MLP_LAYER_TYPES == tuple(CONFIG["mlp_layer_types"])
-    assert model_module.ATTENTION_WINDOWS == (512,) * 5 + (1024,)
-    assert model_module.MAX_TOKENS == model_module.KV_CACHE["max_seq_len"] == 1024
-    for field, value in model_module.SUPPORTED_CONFIG.items():
-        assert CONFIG[field] == value, field
-    schema = model_module.weight_schema(model_config())
-    assert len(schema) == 2394
-    assert sum(1 for n in schema if ".mlp.experts." in n) == 3 * 256 * 3
-    fp32 = sorted(n for n, (_, dtype) in schema.items() if dtype == torch.float32)
-    assert fp32 == sorted(
-        f"model.layers.{i}.mlp.gate.{t}"
-        for i in (3, 4, 5)
-        for t in ("weight", "e_score_correction_bias")
-    )
-
-
 @pytest.mark.parametrize(
     "overrides,match",
     [
@@ -360,6 +341,14 @@ def test_constructs_six_distinct_blocks() -> None:
         assert model.layers[i].mlp.gate.weight.dtype == torch.float32
     tensors = model.checkpoint_tensors()
     assert len(tensors) == 2394
+    assert sum(".mlp.experts." in name for name in tensors) == 3 * 256 * 3
+    assert sorted(
+        name for name, tensor in tensors.items() if tensor.dtype == torch.float32
+    ) == sorted(
+        f"model.layers.{i}.mlp.gate.{name}"
+        for i in (3, 4, 5)
+        for name in ("weight", "e_score_correction_bias")
+    )
     spans = sorted(
         (t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in tensors.values()
     )

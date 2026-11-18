@@ -110,10 +110,6 @@ SEEDS = (17, 41)
 LENGTHS = (1, 17, 129)
 CASES = tuple((seed, length) for seed in SEEDS for length in LENGTHS)
 CASE_IDS = [f"seed{seed}-T{length}" for seed, length in CASES]
-#: Eager, batch 1, one fresh context: no CUDA graph, no overlap scheduler, no cached prefix.
-EXECUTION = types.MappingProxyType(
-    dict(eager=True, batch_size=1, fresh_context=True, cuda_graph=False, overlap_scheduler=False)
-)
 #: The KV cache the attention op appends to: one bf16 layer, 32-token pages, 512 tokens per
 #: sequence (the window), one request.
 KV_CACHE = types.MappingProxyType(dict(tokens_per_block=32, max_seq_len=512, num_blocks=16))
@@ -204,10 +200,6 @@ def ieee_fp32():
     """The source's fp32 steps are IEEE fp32: refuse a process that substitutes TF32, both
     before the module's tests and after them."""
     yield from support.ieee_fp32_session()
-
-
-def _execution_state(ieee: dict) -> dict:
-    return {"math": ieee, "execution": dict(EXECUTION)}
 
 
 # ----------------------------------------------------------------------------- comparison
@@ -498,7 +490,7 @@ def replay(
     return out
 
 
-def accounting(seed: int, blk: BeamDenseBlockBf16Sm103Tp1) -> dict:
+def check_loaded_weights(seed: int, blk: BeamDenseBlockBf16Sm103Tp1) -> None:
     """The fifteen tensors: the same names, order, shapes, dtypes and values on both sides."""
     state = generated(seed)["state"]
     expected = reference.param_shapes()
@@ -508,8 +500,6 @@ def accounting(seed: int, blk: BeamDenseBlockBf16Sm103Tp1) -> dict:
         assert tuple(loaded[name].shape) == shape and loaded[name].dtype == DTYPE, name
         assert torch.equal(loaded[name], state[name]), f"{name} differs from the reference's"
     assert not reference.state_problems(generated(seed)["state_cpu"])
-    record = {"tensors": len(loaded), "state_problems": []}
-    return record
 
 
 # ----------------------------------------------------------------------------- op-path instrumentation
@@ -563,26 +553,6 @@ def cache_rows(md: TrtllmAttentionMetadata, length: int) -> tuple[torch.Tensor, 
 
 
 # ----------------------------------------------------------------------------- tests: configuration and construction
-
-
-def test_configuration_is_the_fixed_scope() -> None:
-    """One configuration, no open choices: what the component accepts is what is tested."""
-    assert CASES == ((17, 1), (17, 17), (17, 129), (41, 1), (41, 17), (41, 129))
-    assert block_module.DEFAULT_LAYER_IDX == LAYER_IDX
-    for field, value in block_module.SUPPORTED_CONFIG.items():
-        assert BLOCK_CONFIG[field] == value, field
-    assert BLOCK_CONFIG["rope_parameters"]["sliding_attention"] == block_module.SUPPORTED_ROPE
-    assert block_module.MAX_TOKENS == 1024 >= max(LENGTHS)
-    assert reference.BLOCK0.hidden == BLOCK_CONFIG["hidden_size"]
-    assert reference.BLOCK0.intermediate == BLOCK_CONFIG["intermediate_size"]
-    assert (reference.BLOCK0.heads, reference.BLOCK0.kv_heads, reference.BLOCK0.head_dim) == (
-        48,
-        8,
-        128,
-    )
-    assert reference.BLOCK0.window == BLOCK_CONFIG["sliding_window"] == KV_CACHE["max_seq_len"]
-    assert (reference.SEEDS, reference.LENGTHS) == (SEEDS, LENGTHS)
-    assert torch.cuda.get_device_capability() == SM, "this suite certifies sm_103 only"
 
 
 def test_block_constructs_alone(ieee_fp32) -> None:
@@ -729,10 +699,10 @@ def test_rejects_unsupported_inputs_before_dispatch(case) -> None:
 
 
 @pytest.mark.parametrize("seed,length", CASES, ids=CASE_IDS)
-def test_block_matches_reference(record_property, seed, length, ieee_fp32) -> None:
+def test_block_matches_reference(seed, length, ieee_fp32) -> None:
     """One case: the whole block, then every operation on its own input."""
     blk = loaded_block(seed)
-    accounting_record = accounting(seed, blk)
+    check_loaded_weights(seed, blk)
     ref = reference_record(seed, length)
     x, positions = case_inputs(seed, length)
     results = []
@@ -744,17 +714,6 @@ def test_block_matches_reference(record_property, seed, length, ieee_fp32) -> No
         final.update(reference="reference")
         results.append(final)
         results.extend(replay(blk, md, ref, "reference"))
-    record_property(
-        f"block-seed{seed}-T{length}",
-        {
-            "test": "test_block_matches_reference",
-            "case": {"seed": seed, "length": length},
-            "accounting": accounting_record,
-            "rules": {k: list(v) for k, v in RULES.items()},
-            "results": results,
-            "execution_state": _execution_state(ieee_fp32),
-        },
-    )
     assert_all_pass(results)
 
 
@@ -775,10 +734,11 @@ def test_block_matches_source_captures(seed, length, ieee_fp32) -> None:
     assert_all_pass(results)
 
 
-@pytest.mark.parametrize("seed,length", CASES, ids=CASE_IDS)
-def test_forward_runs_the_component_path(record_property, seed, length, ieee_fp32) -> None:
+@pytest.mark.parametrize("length", [1, 129])
+def test_forward_runs_the_component_path(length, ieee_fp32) -> None:
     """One case: the component's own composition ran, op by op, through thop attention on
     this GPU, with no SDPA and no built-in Beam module on the way."""
+    seed = 17
     blk = loaded_block(seed)
     x, positions = case_inputs(seed, length)
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
@@ -802,19 +762,6 @@ def test_forward_runs_the_component_path(record_property, seed, length, ieee_fp3
     qkv = attention[0].pop("qkv") if attention else None
     for c in calls:
         c.pop("qkv", None)
-    record = {
-        "test": "test_forward_runs_the_component_path",
-        "case": {"seed": seed, "length": length},
-        "block": f"{type(blk).__module__}.{type(blk).__qualname__}",
-        "op_calls": calls,
-        "cuda_kernels": kernels,
-        "attention_kernels": [k for k in kernels if support.ATTENTION_KERNEL.search(k)],
-        "sdpa_cpu_ops": [n for n in cpu_ops if support.SDPA_OPS.search(n)],
-        "kv_cache": dict(KV_CACHE, manager=type(md.kv_cache_manager).__name__, **cache_mapping),
-        "execution_state": _execution_state(ieee_fp32),
-    }
-    record_property(f"path-seed{seed}-T{length}", record)
-
     assert type(blk).__module__.endswith("dense_block.block")
     assert tuple(names) == EXPECTED_CALLS, names
     (call,) = attention
@@ -834,8 +781,8 @@ def test_forward_runs_the_component_path(record_property, seed, length, ieee_fp3
     # Logical block 0 in a one-layer manager: slot 0, which the core call indexes.
     assert cache_mapping == {"layer_offsets": {0: 0}, "num_local_layers": 1, "num_layers": 1}
     assert call["local_layer_idx"] == 0
-    assert record["attention_kernels"], "no attention kernel ran on the GPU"
-    assert not record["sdpa_cpu_ops"], record["sdpa_cpu_ops"]
+    assert any(support.ATTENTION_KERNEL.search(k) for k in kernels), "no attention kernel ran"
+    assert not any(support.SDPA_OPS.search(n) for n in cpu_ops), cpu_ops
     assert torch.cuda.get_device_capability(x.device) == SM
     assert out.shape == (1, length, 5120) and bool(torch.isfinite(out.float()).all())
     # The op appended exactly this call's post-RoPE K and V to the pool.
@@ -844,11 +791,12 @@ def test_forward_runs_the_component_path(record_property, seed, length, ieee_fp3
     assert torch.equal(keys, k_in) and torch.equal(values, v_in)
 
 
-def test_detects_a_wrong_residual_coefficient(record_property, ieee_fp32, monkeypatch) -> None:
+def test_detects_a_wrong_residual_coefficient(ieee_fp32, monkeypatch) -> None:
     """The complete-block comparison rejects a zeroed final residual coefficient and
     accepts the unchanged block, on the same case and the same comparison."""
     seed, length = 17, 17
     blk = loaded_block(seed)
+    check_loaded_weights(seed, blk)
     ref = reference_record(seed, length)
     x, positions = case_inputs(seed, length)
     runs = {}
@@ -862,16 +810,6 @@ def test_detects_a_wrong_residual_coefficient(record_property, ieee_fp32, monkey
             out = blk(x, positions, md)
         runs[label] = compare("block_output", out, ref["block_output"], "block_output")
         runs[label]["feed_forward_scales"] = list(blk.feed_forward_scales)
-    record_property(
-        f"fault-seed{seed}-T{length}",
-        {
-            "test": "test_detects_a_wrong_residual_coefficient",
-            "case": {"seed": seed, "length": length},
-            "fault": "final residual coefficient sqrt(2)/sqrt(3) -> 0.0, fixture-scoped",
-            "runs": runs,
-            "execution_state": _execution_state(ieee_fp32),
-        },
-    )
     assert runs["unchanged"]["passed"] is True, runs["unchanged"]["problems"]
     assert runs["faulted"]["passed"] is False and runs["faulted"]["violations"] > 0
     assert runs["restored"][

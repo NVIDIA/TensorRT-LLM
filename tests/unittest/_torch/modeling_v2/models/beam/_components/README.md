@@ -19,7 +19,7 @@ declared contract, not against the TP4 model as a bitwise reference.
 
 ## Manual QA reports
 
-Tests expose comparison metrics with pytest's `record_property` fixture. Ordinary
+Some tests expose additional comparison metrics with pytest's `record_property` fixture. Ordinary
 pytest runs do not write custom evidence files or collect Git/Slurm metadata.
 For a manual report, run the opt-in QA script from the repository root:
 

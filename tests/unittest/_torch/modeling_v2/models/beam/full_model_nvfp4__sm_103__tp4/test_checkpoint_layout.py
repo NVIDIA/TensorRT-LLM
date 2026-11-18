@@ -498,37 +498,12 @@ def test_wrong_destination_and_short_read_raise(checkpoint) -> None:
 # ------------------------------------------------------------------ component guards
 
 
-def _tensor_state(tensor: torch.Tensor) -> tuple:
-    return (
-        id(tensor),
-        tensor._version,
-        tensor.data_ptr(),
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
-        tensor.dtype,
-        tensor.device,
-    )
-
-
-def _weight_state(model) -> tuple:
-    """Snapshot parameter identity, version and storage metadata for the test."""
-    return tuple((name, _tensor_state(p)) for name, p in model.named_parameters())
-
-
-def _check_weight_state(model, state: tuple) -> None:
-    """Check that a loaded model still matches the test snapshot."""
-    if not model.usable:
-        raise RuntimeError("the component is not usable: no complete load")
-    if _weight_state(model) != state:
-        raise RuntimeError("the weights changed after the test snapshot")
-
-
 def _sm103() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 3)
 
 
 @pytest.mark.skipif(not _sm103(), reason="the component is built for sm_103")
-def test_mapping_rejections_and_weight_state_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mapping_rejections_and_unloaded_model(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm._torch.modeling_v2.models.beam._tp4.component_bf16 import (  # noqa: E501
         BeamCheckpointLayoutBf16Sm103Tp4,
     )
@@ -552,25 +527,8 @@ def test_mapping_rejections_and_weight_state_guard(monkeypatch: pytest.MonkeyPat
     model = BeamCheckpointLayoutBf16Sm103Tp4(cfg, mapping, layers=(0,))
     assert model.vocab_interval == (37984, 75968)
     assert tuple(model.tensor("model.layers.0.self_attn.k_proj.weight").shape) == (256, 5120)
-    state = _weight_state(model)
-    with pytest.raises(RuntimeError):  # no complete load: unusable
-        _check_weight_state(model, state)
     with pytest.raises(RuntimeError):
         model.embed(torch.zeros(1, dtype=torch.int64, device="cuda"))
-    # White-box: mark usable to exercise the guard without a four-rank load.
-    model.usable = True
-    _check_weight_state(model, state)
-    model.tensor("model.layers.0.input_layernorm.weight").add_(0)  # in place: version changes
-    with pytest.raises(RuntimeError):
-        _check_weight_state(model, state)
-    state = _weight_state(model)
-    name = "model__layers__0__self_attn__q_norm__weight"
-    old = getattr(model, name)
-    setattr(
-        model, name, torch.nn.Parameter(old.detach().clone(), requires_grad=False)
-    )  # same-shape replacement
-    with pytest.raises(RuntimeError):
-        _check_weight_state(model, state)
 
 
 @pytest.mark.cpu_only

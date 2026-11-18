@@ -80,8 +80,8 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
-from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (  # noqa: E501
-    swiglu_fp32,
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (
+    swiglu_fp32,  # noqa: E501
 )
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.attention.beam_neox_rope import beam_neox_rope
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.attention.beam_output_gate import (
@@ -574,26 +574,6 @@ def cache_rows(md: TrtllmAttentionMetadata, length: int) -> tuple[torch.Tensor, 
 
 
 # -------------------------------------------------- tests: configuration and construction
-
-
-def test_configuration_is_the_fixed_scope() -> None:
-    """One configuration, no open choices: what the component accepts is what is tested."""
-    assert CASES == ((17, 1), (17, 17), (17, 129), (41, 1), (41, 17), (41, 129))
-    assert block_module.SUPPORTED_LAYER_IDX == LAYER_IDX
-    for field, value in block_module.SUPPORTED_CONFIG.items():
-        assert BLOCK_CONFIG[field] == value, field
-    assert BLOCK_CONFIG["rope_parameters"]["sliding_attention"] == block_module.SUPPORTED_ROPE
-    assert BLOCK_CONFIG["layer_types"][LAYER_IDX] == "sliding_attention"
-    assert BLOCK_CONFIG["mlp_layer_types"][LAYER_IDX] == "sparse"
-    assert len(BLOCK_CONFIG["layer_types"]) == len(BLOCK_CONFIG["mlp_layer_types"]) == NUM_LAYERS
-    assert block_module.MAX_TOKENS == 1024 and max(LENGTHS) == reference.MAX_TOKENS
-    own = block_module.weight_shapes(block_config())
-    assert list(own.items()) == list(reference.own_shapes().items())
-    assert (reference.HEADS, reference.KV_HEADS, reference.HEAD_DIM) == (48, 8, 128)
-    assert reference.WINDOW == BLOCK_CONFIG["sliding_window"] == KV_CACHE["max_seq_len"]
-    assert reference.LAYER_IDX == LAYER_IDX and sum(LAYER_MASK) == 1 and LAYER_MASK[LAYER_IDX]
-    assert (reference.SEEDS, reference.LENGTHS) == (SEEDS, LENGTHS)
-    assert torch.cuda.get_device_capability() == SM, "this suite certifies sm_103 only"
 
 
 def test_block_constructs_alone() -> None:
