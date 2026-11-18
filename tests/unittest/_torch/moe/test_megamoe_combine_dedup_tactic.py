@@ -312,7 +312,10 @@ def test_default_turns_dedup_on_only_in_the_measured_ranges(op: types.ModuleType
             assert tactic[1:5] == base[1:5] and tactic[9:11] == base[9:11]
     assert all(world <= 32 and tokens > 1024 for world, _, tokens in on)
     # Pinned independently of the table: EP16 stays off for its +1.17 GB shared workspace.
-    assert op._SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS == {(4, 96): (8192, 32768), (8, 48): (4096, 16384)}
+    assert op._SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS == {
+        (4, 96): (8192, 32768),
+        (8, 48): (4096, 16384),
+    }
 
 
 @pytest.mark.parametrize(

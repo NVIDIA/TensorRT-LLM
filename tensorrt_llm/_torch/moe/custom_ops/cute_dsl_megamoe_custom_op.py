@@ -2470,6 +2470,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
         sm_version = get_sm_version()
         use_default_tactic = tactic is None
+        problem_key = None
         if use_default_tactic:
             problem_key = _megamoe_problem_key(
                 sm_version=sm_version,
@@ -2586,7 +2587,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # otherwise the provider carves an undersized shared region and the
         # combine staging writes OOB (single-rank IMA; EP>1 looks like a hang).
         _, shared_bytes = probe.get_workspace_sizes()
-        if use_default_tactic and _unpack_tactic(resolved)[11]:
+        if problem_key is not None and _unpack_tactic(resolved)[11]:
             # A dedup default's combine region holds world_size rows per token, the
             # non-dedup one top-k rows; autotuned tactics never dedup, so fit both.
             plain, _ = _resolve_megamoe_kernel_tactic(
