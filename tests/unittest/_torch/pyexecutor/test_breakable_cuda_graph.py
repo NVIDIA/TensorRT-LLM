@@ -821,9 +821,11 @@ class _PreparedBody(nn.Module):
         return (output + kwargs.get("extra", 0)) * scale
 
 
-def _prepared_runner():
+def _prepared_runner(agree_replay=None):
     body = _PreparedBody().cuda()
-    runner = BreakableCUDAGraphRunner(body, prepare_inputs=lambda inputs: inputs)
+    runner = BreakableCUDAGraphRunner(
+        body, prepare_inputs=lambda inputs: inputs, agree_replay=agree_replay
+    )
     inputs = {
         "value": torch.zeros((4, 4), device="cuda"),
         "config": {
@@ -965,6 +967,107 @@ def test_runner_prepared_inputs_incompatible_values_fall_back_eager(monkeypatch,
     assert body.forward_calls == eager_calls + 1
     assert body.forward == original_forward
     assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+
+
+@pytest.mark.parametrize("matches", [(True, True), (True, False), (False, True)])
+def test_runner_prepared_inputs_attention_dp_ranks_agree_before_copying(monkeypatch, matches):
+    """Two attention DP ranks share their staged-input checks: both replay or both run eagerly.
+
+    Rank 1's mismatch is on a late input (``extra``), so a rank that copied while it
+    checked would already have written ``value`` into the graph's inputs.
+    """
+    ranks = []
+    for rank, rank_matches in enumerate(matches):
+        local_answers = []
+
+        def agree_replay(replayable, rank=rank, local_answers=local_answers):
+            local_answers.append(replayable)
+            # Stand-in for the all-gather: the other rank's answer is its scripted check.
+            return all(
+                replayable if peer == rank else peer_matches
+                for peer, peer_matches in enumerate(matches)
+            )
+
+        body, runner, inputs, engine_forward = _prepared_runner(agree_replay)
+        runner.capture(4, engine_forward)
+        ranks.append((body, runner, inputs, engine_forward, local_answers, rank_matches))
+
+    for body, runner, inputs, engine_forward, local_answers, rank_matches in ranks:
+        captured = runner._inputs[4]
+        inputs["value"] = torch.full((4, 4), 5.0, device="cuda")
+        if not rank_matches:
+            inputs["extra"] = torch.full((1, 4), 3.0, device="cuda")
+        expected = body(**inputs)
+        eager_calls = body.forward_calls
+        replay_calls = []
+        original_replay = runner.replay
+
+        def replay(num_tokens, original_replay=original_replay, replay_calls=replay_calls):
+            replay_calls.append(num_tokens)
+            return original_replay(num_tokens)
+
+        monkeypatch.setattr(runner, "replay", replay)
+        actual = runner.execute(4, engine_forward)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert local_answers == [rank_matches]
+        if all(matches):
+            assert replay_calls == [4]
+            assert body.forward_calls == eager_calls
+            torch.testing.assert_close(captured["value"], inputs["value"], rtol=0, atol=0)
+        else:
+            assert replay_calls == []
+            assert body.forward_calls == eager_calls + 1
+            # Nothing was copied into the graph's inputs before the ranks agreed.
+            torch.testing.assert_close(
+                captured["value"], torch.zeros_like(captured["value"]), rtol=0, atol=0
+            )
+        assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+
+
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+@pytest.mark.parametrize("peer_replayable", [True, False])
+def test_decoder_runner_agrees_staged_replay_only_under_attention_dp(
+    enable_attention_dp, peer_replayable
+):
+    """Under attention DP the runner shares each rank's staged-input check with the
+    same TP all-gather as the prefill graph vote; without it, ranks decide alone."""
+    import numpy as np
+
+    from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+    decoder = object.__new__(Gemma4ForCausalLM)
+    nn.Module.__init__(decoder)
+    decoder.model = _PreparedBody()
+    owner = object.__new__(Gemma4ForConditionalGeneration)
+    nn.Module.__init__(owner)
+    owner.llm = decoder
+    owner.model_config = SimpleNamespace(disable_mm_encoder=False)
+    sent = []
+
+    def tp_allgather_int64(values):
+        # Rank 0 is this rank; rank 1 answers peer_replayable.
+        sent.append(list(values))
+        return np.asarray([list(values), [int(peer_replayable)]], dtype=np.int64)
+
+    decoder_runner = object.__new__(DecoderRunner)
+    decoder_runner._model = owner
+    decoder_runner._dist = SimpleNamespace(tp_allgather_int64=tp_allgather_int64)
+    decoder_runner._config = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        prefill_cuda_graph_num_tokens=[4],
+        enable_attention_dp=enable_attention_dp,
+    )
+    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
+    assert runner.stages_inputs
+    if not enable_attention_dp:
+        assert runner._agree_replay is None
+        return
+    assert runner._agree_replay(True) is peer_replayable
+    assert runner._agree_replay(False) is False
+    assert sent == [[1], [0]]
 
 
 @pytest.mark.parametrize("source_kind", ["mutable_owner", "cpu_tensor"])
@@ -1124,6 +1227,7 @@ def test_gemma4_opted_in_decoder_captures_and_refreshes_ple_ids():
     decoder_runner._config = SimpleNamespace(
         prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
         prefill_cuda_graph_num_tokens=[4],
+        enable_attention_dp=False,
     )
     runner = decoder_runner._initialize_breakable_cuda_graph_runner()
     assert runner.stages_inputs

@@ -607,7 +607,18 @@ class DecoderRunner(ScheduledModelRunner):
             decoder_model.model,
             getattr(decoder_model, "prepare_breakable_cuda_graph_replay", None),
             prepare_inputs,
+            self._all_ranks_replay
+            if prepare_inputs is not None and self._config.enable_attention_dp
+            else None,
         )
+
+    def _all_ranks_replay(self, replayable: bool) -> bool:
+        """Agree on a staged-input check across attention DP ranks, as the prefill graph vote does.
+
+        Each rank checks its staged inputs during the forward, after that vote
+        (DecoderInputPreparer), so every rank replays or every rank runs eagerly.
+        """
+        return bool(self._dist.tp_allgather_int64([int(replayable)])[:, 0].all())
 
     @property
     def _use_beam_search(self) -> bool:

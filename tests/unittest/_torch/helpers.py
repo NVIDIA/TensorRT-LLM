@@ -297,7 +297,8 @@ def check_breakable_prefill_replay(model: torch.nn.Module, extra_attrs: dict,
     decoder_runner._model = model
     decoder_runner._config = SimpleNamespace(
         prefill_cuda_graph_backend=backend,
-        prefill_cuda_graph_num_tokens=[num_tokens])
+        prefill_cuda_graph_num_tokens=[num_tokens],
+        enable_attention_dp=False)
     runner = decoder_runner._initialize_breakable_cuda_graph_runner()
     assert runner.stages_inputs
     replay_calls = []

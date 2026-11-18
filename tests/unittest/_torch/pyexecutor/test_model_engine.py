@@ -775,12 +775,14 @@ def test_breakable_multimodal_gate_and_runner_agree(
     runner._config = SimpleNamespace(
         prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
         prefill_cuda_graph_num_tokens=[4],
+        enable_attention_dp=False,
     )
-    layer_model, prepare_replay, prepare_inputs = (
+    layer_model, prepare_replay, prepare_inputs, agree_replay = (
         runner._initialize_breakable_cuda_graph_runner().args
     )
     assert layer_model is decoder.model
     assert prepare_replay == decoder.prepare_breakable_cuda_graph_replay
+    assert agree_replay is None
     if expected == "staged":
         assert prepare_inputs == owner.prepare_breakable_cuda_graph_inputs
     else:

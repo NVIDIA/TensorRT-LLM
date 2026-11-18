@@ -529,6 +529,7 @@ def test_qwenvl_opted_in_decoder_captures_and_refreshes(family, num_levels):
     decoder_runner._config = SimpleNamespace(
         prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
         prefill_cuda_graph_num_tokens=[4],
+        enable_attention_dp=False,
     )
     runner = decoder_runner._initialize_breakable_cuda_graph_runner()
     assert runner.stages_inputs
