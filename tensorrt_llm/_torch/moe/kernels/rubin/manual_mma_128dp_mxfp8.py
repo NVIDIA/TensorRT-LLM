@@ -127,7 +127,10 @@ def build_static_idesc_base(
     encoding for ``mxf4nvf4`` and to E4M3/UE8M0 for ``mxf8f6f4``.
     """
     assert kind in _KINDS, f"Unsupported kind={kind}"
-    assert umma_m in (64, 128, 256), f"Unsupported UMMA_M={umma_m}"
+    # 64 is not encodable here: ``umma_m >> 4`` at bit 24 matches the real
+    # m_dim field (bits [27,29), M >> 7) only for 128 and 256. For 64 it sets
+    # bit 26, _BIT_SFA_LAYOUT, and would silently select the 128dp SFA layout.
+    assert umma_m in (128, 256), f"Unsupported UMMA_M={umma_m}"
     if umma_k is None:
         umma_k = _UMMA_K_NVFP4 if kind == KIND_MXF4NVF4 else 64
     assert umma_k in _K_SIZE_FIELD[kind], f"Unsupported UMMA_K={umma_k} for {kind}"

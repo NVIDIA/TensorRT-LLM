@@ -70,6 +70,10 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     # expert count.
     _supports_non_divisible_ep: bool = True
 
+    # (per-expert alpha, FC1 norm const), built on first use per device. A
+    # class-level default, so a leaf built without ``__init__`` reads None.
+    _fused_fc12_consts: tuple[torch.Tensor, torch.Tensor] | None = None
+
     descriptor = MoEImplDescriptor(
         identity=MoEImplId(PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL, KERNEL_FUSED_FC12, "mxfp8"),
         scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
@@ -168,13 +172,18 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
             )
 
         # Older Rubin CuTe DSL builds miscompile the kernel's MXFP8 path.
-        for dep in (MoEDep.CUTEDSL_RUBIN, MoEDep.CUTEDSL_MXFP8_FUSED_FC12_RUBIN):
+        for dep, needs in (
+            (MoEDep.CUTEDSL_RUBIN, "the Rubin helpers"),
+            (
+                MoEDep.CUTEDSL_MXFP8_FUSED_FC12_RUBIN,
+                "the cutlass.memory / cutlass.tensor_utils submodules",
+            ),
+        ):
             if not d.env.has_dep(dep):
                 return _reject(
                     MoERejectReason.DEP_MISSING,
-                    f"{cls.__name__} requires a CuTe DSL build with the "
-                    "cutlass.memory / cutlass.tensor_utils submodules (e.g. internal "
-                    "0.3.0+20260803 or newer)",
+                    f"{cls.__name__} requires a CuTe DSL build with {needs}; install "
+                    "the nvidia-cutlass-dsl version pinned in requirements.txt",
                 )
 
         return MoEEligibility.ok()
@@ -240,7 +249,9 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     def _check_configs(self) -> None:
         assert self._weights_created
         if self.apply_router_weight_on_input:
-            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+            assert self.routing_method.top_k == 1, (
+                "apply_router_weight_on_input requires top_k == 1"
+            )
 
     def _supports_load_balancer(self) -> bool:
         # The fused op takes precomputed routing (token_selected_experts and
@@ -301,12 +312,12 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
 
         MXFP8 carries all scaling in the UE8M0 block scales, so both the
         per-expert dequantization alphas and the FC1 output normalization
-        constant are exactly 1. They are kernel inputs nonetheless (the kernel
-        also serves NVFP4), so keep one cached copy per module rather than
-        allocating on every forward.
+        constant are exactly 1. The op ABI still takes them, for the kernel's
+        NVFP4 mode, so keep one cached copy per module rather than allocating
+        on every forward.
         """
         num_local_experts = self.expert_size_per_partition
-        cached = getattr(self, "_fused_fc12_consts", None)
+        cached = self._fused_fc12_consts
         if cached is None or cached[0].device != device or cached[0].numel() != num_local_experts:
             cached = (
                 torch.ones(num_local_experts, dtype=torch.float32, device=device),
