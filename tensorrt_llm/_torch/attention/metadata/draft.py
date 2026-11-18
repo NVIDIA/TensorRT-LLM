@@ -30,21 +30,67 @@ if TYPE_CHECKING:
 
 
 class DraftMetadata(Metadata):
-    """The draft steps' metadata, over the draft KV cache.
+    """Base of the draft modes of one-model speculative decoding.
 
-    draft is the core of a second set of metadata, built over the draft KV
-    cache. The draft layers receive it as attn_metadata; the target's
-    metadata are never modified by the loop.
+    A subclass is one draft mode. It
+    holds what the draft forwards read from the attention metadata; the
+    target's metadata are never modified by the loop. The spec worker calls
+    the four hooks around the loop.
 
-    The spec worker calls the four hooks around the loop. Each draft step is
-    prepared on the device only, so the loop can run inside a captured CUDA
-    graph. A subclass is one draft mode: it implements begin_draft_step and
-    may extend the other hooks.
+    draft is the core of the metadata the draft layers receive as
+    attn_metadata, for a mode whose draft layers run the attention backend;
+    such a mode builds it over the draft KV cache and prepares it in
+    begin_draft_step. It stays None for a mode that drafts outside the
+    attention backend.
     """
 
     requires = (TrtllmCoreMetadata,)
-    # Constructed after the other metadata, whose types the draft set copies.
+    # Constructed after the other metadata, whose types a draft set copies.
     builds_metadata = True
+
+    def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
+        super().__init__(registry, config)
+        self.draft: Optional[TrtllmCoreMetadata] = None
+        self._target_inputs: Optional["BatchInputs"] = None
+        self._num_accepted: Optional[torch.Tensor] = None
+
+    def prepare(self, inputs: "BatchInputs") -> None:
+        # The target's latest layout, also after a device-only prepare.
+        self._target_inputs = inputs
+
+    def begin_draft_loop(self, num_accepted: torch.Tensor) -> None:
+        """Before the first draft forward, once the acceptance result is known.
+
+        num_accepted holds, on the device, the tokens each request
+        accepted in the target step, [num_seqs].
+        """
+        self._num_accepted = num_accepted
+
+    def begin_draft_step(self, step: int) -> None:
+        """Before draft forward step: prepare the draft metadata for it.
+
+        A mode with a draft set implements this. It describes the step as a
+        BatchInputs derived from the target step, with stage_host=False, and
+        must then call self.draft.prepare_all(inputs): nothing else prepares
+        the draft set for the step.
+        """
+
+    def end_draft_step(self, step: int) -> None:
+        """After draft forward step and its sampling."""
+
+    def end_draft_loop(self) -> None:
+        """After the last draft forward."""
+
+
+class LinearDraftMetadata(DraftMetadata):
+    """A linear draft chain over the paged draft KV cache (Eagle3 / MTP-Eagle).
+
+    The draft layers run the attention backend on a second set of metadata:
+    the target's types, built over the draft KV cache. Step 0 runs the target
+    step's rows. Each later step runs one token per sequence, every row as a
+    generation row. Each step is prepared on the device only, so the loop can
+    run inside a captured CUDA graph.
+    """
 
     def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
         super().__init__(registry, config)
@@ -60,7 +106,7 @@ class DraftMetadata(Metadata):
         draft_types.sort(
             key=lambda metadata_type: not issubclass(metadata_type, TrtllmCoreMetadata)
         )
-        self.draft: TrtllmCoreMetadata = build_metadata(
+        self.draft = build_metadata(
             draft_types,
             dataclasses.replace(
                 config,
@@ -69,51 +115,6 @@ class DraftMetadata(Metadata):
                 buffer_name_prefix="draft_",
             ),
         )
-        self._target_inputs: Optional["BatchInputs"] = None
-        self._num_accepted: Optional[torch.Tensor] = None
-
-    def prepare(self, inputs: "BatchInputs") -> None:
-        # The target's latest layout, also after a device-only prepare.
-        self._target_inputs = inputs
-        if not inputs.stage_host:
-            return
-        if inputs.spec is not None and inputs.spec.runtime_draft_len > 0:
-            self.draft.prepare_all(inputs)
-
-    def begin_draft_loop(self, num_accepted: torch.Tensor) -> None:
-        """Before the first draft forward, once the acceptance result is known.
-
-        num_accepted holds, on the device, the tokens each request
-        accepted in the target step, [num_seqs].
-        """
-        self._num_accepted = num_accepted
-
-    def begin_draft_step(self, step: int) -> None:
-        """Before draft forward step: prepare the draft metadata for it.
-
-        Every draft mode implements this. It describes the step as a
-        BatchInputs derived from the target step, with stage_host=False, and
-        must then call self.draft.prepare_all(inputs): nothing else prepares
-        the draft set for the step.
-        """
-        raise NotImplementedError
-
-    def end_draft_step(self, step: int) -> None:
-        """After draft forward step and its sampling."""
-
-    def end_draft_loop(self) -> None:
-        """After the last draft forward."""
-
-
-class LinearDraftMetadata(DraftMetadata):
-    """A linear draft chain (Eagle3 / MTP-Eagle).
-
-    Step 0 runs the target step's rows. Each later step runs one token per
-    sequence, every row as a generation row.
-    """
-
-    def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
-        super().__init__(registry, config)
         num_rows = config.max_num_sequences
         # KV-length offsets of the steps after the first: the target step's
         # own offsets plus the rewind to the accepted tokens.
@@ -121,6 +122,13 @@ class LinearDraftMetadata(DraftMetadata):
             (num_rows,), torch.int, "rewind_kv_lens_offsets"
         )
         self._one_token_per_seq = torch.ones((num_rows,), dtype=torch.int)
+
+    def prepare(self, inputs: "BatchInputs") -> None:
+        super().prepare(inputs)
+        if not inputs.stage_host:
+            return
+        if inputs.spec is not None and inputs.spec.runtime_draft_len > 0:
+            self.draft.prepare_all(inputs)
 
     def begin_draft_loop(self, num_accepted: torch.Tensor) -> None:
         super().begin_draft_loop(num_accepted)
@@ -158,3 +166,13 @@ class LinearDraftMetadata(DraftMetadata):
                 stage_host=False,
             )
         self.draft.prepare_all(inputs)
+
+
+class EmbeddedDSparkDraftMetadata(DraftMetadata):
+    """The DSpark drafter embedded in its target model.
+
+    The drafter runs once per target step, on the generation rows, with its
+    own attention over a rolling window the spec worker keeps. It reads no
+    attention metadata and has no draft KV cache, so this mode holds nothing
+    and its hooks do nothing.
+    """

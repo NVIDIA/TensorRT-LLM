@@ -151,7 +151,10 @@ def build_feature_attention_metadata(
     from tensorrt_llm._torch.attention.metadata.chunked_prefill import ChunkedPrefillMetadata
     from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
     from tensorrt_llm._torch.attention.metadata.deepseek_v4 import DeepseekV4Metadata
-    from tensorrt_llm._torch.attention.metadata.draft import LinearDraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft import (
+        EmbeddedDSparkDraftMetadata,
+        LinearDraftMetadata,
+    )
     from tensorrt_llm._torch.attention.metadata.mla_context import MlaContextMetadata
     from tensorrt_llm._torch.attention.metadata.sparse import SparseMetadata
     from tensorrt_llm._torch.attention.metadata.spec_decoding import SpecDecodingMetadata
@@ -189,15 +192,18 @@ def build_feature_attention_metadata(
     max_draft_tokens = 0
     if spec_config is not None:
         spec_dec_mode = spec_config.spec_dec_mode
-        if not spec_dec_mode.is_mtp_eagle_one_model() or not spec_config.is_linear_tree:
-            raise UnsupportedMetadataConfiguration(
-                f"the speculative decoding mode {spec_dec_mode.name} (only linear MTP-Eagle "
-                "one-model is covered)"
-            )
         if getattr(spec_config, "enable_confidence_scheduling", False):
             raise UnsupportedMetadataConfiguration("ragged verification")
+        if spec_dec_mode.is_mtp_eagle_one_model() and spec_config.is_linear_tree:
+            metadata_types.append(LinearDraftMetadata)
+        elif spec_dec_mode.is_dspark() and spec_config.draft_is_embedded_in_target:
+            metadata_types.append(EmbeddedDSparkDraftMetadata)
+        else:
+            raise UnsupportedMetadataConfiguration(
+                f"the speculative decoding mode {spec_dec_mode.name} (linear MTP-Eagle "
+                "one-model and DSpark embedded in the target are covered)"
+            )
         max_draft_tokens = spec_config.max_draft_len
-        metadata_types.append(LinearDraftMetadata)
 
     sparse_attention_config = model_config.sparse_attention_config
     engine_inputs = BatchInputs(

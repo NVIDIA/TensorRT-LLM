@@ -2877,11 +2877,18 @@ class DecoderInputPreparer:
                 # Verify rows that run as the step's trailing context rows.
                 num_extend_ctx_requests = len(host.lists.extend_requests)
                 num_contexts += num_extend_ctx_requests
+            # A parallel-draft mode states its width as a total of draft tokens.
+            if spec_dec_mode.is_parallel_draft():
+                max_draft_len = self._config.original_max_total_draft_tokens
+                max_total_draft_tokens = self._config.original_max_total_draft_tokens
+            else:
+                max_draft_len = self._config.original_max_draft_len
+                max_total_draft_tokens = self._config.spec_dec_max_total_draft_tokens
             spec = SpecStepInputs(
                 spec_dec_mode=spec_dec_mode,
                 runtime_draft_len=host.runtime_draft_len,
-                max_draft_len=self._config.original_max_draft_len,
-                max_total_draft_tokens=self._config.spec_dec_max_total_draft_tokens,
+                max_draft_len=max_draft_len,
+                max_total_draft_tokens=max_total_draft_tokens,
                 attention_spec_dec_mode=spec_dec_mode.attention_need_spec_dec_mode(
                     self._config.attention_backend
                 ),
