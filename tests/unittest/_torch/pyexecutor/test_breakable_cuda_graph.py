@@ -1006,12 +1006,16 @@ def test_runner_prepared_inputs_incompatible_values_fall_back_eager(monkeypatch,
     assert f"{mismatch} differs from the capture" in logged[0][0]
 
 
+@pytest.mark.parametrize("late_input", ["extra", "optional"])
 @pytest.mark.parametrize("matches", [(True, True), (True, False), (False, True)])
-def test_runner_prepared_inputs_attention_dp_ranks_agree_before_copying(monkeypatch, matches):
+def test_runner_prepared_inputs_attention_dp_ranks_agree_before_copying(
+    monkeypatch, matches, late_input
+):
     """Two attention DP ranks share their staged-input checks: both replay or both run eagerly.
 
-    Rank 1's mismatch is on a late input (``extra``), so a rank that copied while it
-    checked would already have written ``value`` into the graph's inputs.
+    The mismatching rank changes a late input, ``extra``'s shape or ``optional``, which
+    was None at capture, so a rank that copied while it checked would already have
+    written ``value`` into the graph's inputs.
     """
     ranks = []
     for rank, rank_matches in enumerate(matches):
@@ -1032,8 +1036,10 @@ def test_runner_prepared_inputs_attention_dp_ranks_agree_before_copying(monkeypa
     for body, runner, inputs, engine_forward, local_answers, rank_matches in ranks:
         captured = runner._inputs[4]
         inputs["value"] = torch.full((4, 4), 5.0, device="cuda")
-        if not rank_matches:
+        if not rank_matches and late_input == "extra":
             inputs["extra"] = torch.full((1, 4), 3.0, device="cuda")
+        elif not rank_matches:
+            inputs["optional"] = torch.ones((4, 4), device="cuda")
         expected = body(**inputs)
         eager_calls = body.forward_calls
         replay_calls = []
@@ -1065,7 +1071,7 @@ def test_runner_prepared_inputs_attention_dp_ranks_agree_before_copying(monkeypa
             reason = (
                 "another attention DP rank's inputs differ"
                 if rank_matches
-                else "inputs['extra'] differs"
+                else f"inputs['{late_input}'] differs"
             )
             assert len(logged) == 1 and reason in logged[0]
             # Nothing was copied into the graph's inputs before the ranks agreed.
@@ -1075,13 +1081,15 @@ def test_runner_prepared_inputs_attention_dp_ranks_agree_before_copying(monkeypa
         assert runner.state == BreakableCUDAGraphRunnerState.IDLE
 
 
-@pytest.mark.parametrize("enable_attention_dp", [False, True])
+@pytest.mark.parametrize("stages_inputs", [False, True])
+@pytest.mark.parametrize("enable_attention_dp, tp_size", [(False, 2), (True, 1), (True, 2)])
 @pytest.mark.parametrize("peer_replayable", [True, False])
 def test_decoder_runner_agrees_staged_replay_only_under_attention_dp(
-    enable_attention_dp, peer_replayable
+    stages_inputs, enable_attention_dp, tp_size, peer_replayable
 ):
-    """Under attention DP the runner shares each rank's staged-input check with the
-    same TP all-gather as the prefill graph vote; without it, ranks decide alone."""
+    """Under attention DP with more than one TP rank, a runner that stages inputs shares
+    each rank's check with the same TP all-gather as the prefill graph vote. Otherwise
+    there is no added all-gather, as in the decode graph agreement."""
     import numpy as np
 
     from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
@@ -1102,16 +1110,18 @@ def test_decoder_runner_agrees_staged_replay_only_under_attention_dp(
         return np.asarray([list(values), [int(peer_replayable)]], dtype=np.int64)
 
     decoder_runner = object.__new__(DecoderRunner)
-    decoder_runner._model = owner
+    # The text decoder alone keeps the unstaged text body.
+    decoder_runner._model = owner if stages_inputs else decoder
     decoder_runner._dist = SimpleNamespace(tp_allgather_int64=tp_allgather_int64)
+    decoder_runner._mapping = SimpleNamespace(tp_size=tp_size)
     decoder_runner._config = SimpleNamespace(
         prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
         prefill_cuda_graph_num_tokens=[4],
         enable_attention_dp=enable_attention_dp,
     )
     runner = decoder_runner._initialize_breakable_cuda_graph_runner()
-    assert runner.stages_inputs
-    if not enable_attention_dp:
+    assert runner.stages_inputs is stages_inputs
+    if not (stages_inputs and enable_attention_dp and tp_size > 1):
         assert runner._agree_replay is None
         return
     assert runner._agree_replay(True) is peer_replayable

@@ -608,7 +608,9 @@ class DecoderRunner(ScheduledModelRunner):
             getattr(decoder_model, "prepare_breakable_cuda_graph_replay", None),
             prepare_inputs,
             self._all_ranks_replay
-            if prepare_inputs is not None and self._config.enable_attention_dp
+            if prepare_inputs is not None
+            and self._config.enable_attention_dp
+            and self._mapping.tp_size > 1
             else None,
         )
 
@@ -617,6 +619,8 @@ class DecoderRunner(ScheduledModelRunner):
 
         Each rank checks its staged inputs during the forward, after that vote
         (DecoderInputPreparer), so every rank replays or every rank runs eagerly.
+        With one TP rank there is nothing to agree on, as in the decode graph
+        agreement (CUDAGraphRunner._agree_graph_shape).
         """
         return bool(self._dist.tp_allgather_int64([int(replayable)])[:, 0].all())
 
