@@ -11,9 +11,12 @@ embedding module (after any scaling the module applies).
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple, Union
 
 import torch
+
+if TYPE_CHECKING:
+    from .multimodal import MultimodalInput
 
 # Bump when the bytes hashed by ``_digest`` change; the version is part of every
 # digest so old and new identities never compare equal.
@@ -289,11 +292,11 @@ def remap_prompt_embeds(
     )
 
 
-def multimodal_row_mask(multimodal_input: Any, num_tokens: int) -> torch.Tensor:
+def multimodal_row_mask(multimodal_input: "MultimodalInput", num_tokens: int) -> torch.Tensor:
     """Return a ``[num_tokens]`` bool mask of a request's multimodal rows.
 
     Args:
-        multimodal_input: ``tensorrt_llm.inputs.multimodal.MultimodalInput``.
+        multimodal_input: Multimodal layout of the request.
         num_tokens: Prompt length.
     """
     mask = torch.zeros(num_tokens, dtype=torch.bool)

@@ -962,6 +962,11 @@ class DecoderRunner(ScheduledModelRunner):
         Runs after ``preprocess_inputs`` so the overlap scheduler's generation
         tokens are already in ``input_ids``; the model then gets embeddings
         instead of ids.
+
+        Args:
+            inputs: Model inputs with ``[N]`` CUDA ``input_ids``.
+            dst_rows: ``[K]`` int64 CUDA indices into ``input_ids``.
+            src_rows: ``[K, H]`` CUDA rows (float16, bfloat16 or float32).
         """
         if getattr(self._model, "fuses_prompt_embeds", False):
             # Multimodal wrappers write the rows after fusing image rows.

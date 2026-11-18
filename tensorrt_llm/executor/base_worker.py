@@ -426,26 +426,30 @@ class BaseWorker(GenerationExecutor):
         KVCacheManagerV2 does; KV cache connectors (external stores) key blocks
         by token ids and the cache salt.
         """
-        from .._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
-            KVCacheManagerV2
         if self.llm_args is not None and getattr(
                 self.llm_args, "kv_connector_config", None) is not None:
             return False
+        return self._uses_kv_cache_manager_v2()
+
+    def _uses_kv_cache_manager_v2(self) -> bool:
+        """Return whether the engine's KV cache manager is KVCacheManagerV2."""
+        from .._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+            KVCacheManagerV2
         return isinstance(getattr(self.engine, "kv_cache_manager", None),
                           KVCacheManagerV2)
 
     def _check_prompt_embeds(self, request: GenerationRequest) -> None:
-        """Reject prompt embeddings this engine cannot place correctly."""
+        """Reject prompt embeddings this engine cannot place correctly.
+
+        Generation-only requests carry only the identity (the prompt's KV is
+        transferred) but pass the same deployment checks as context requests.
+        """
         prompt_embeds = request.prompt_embeds
         if prompt_embeds is None:
             return
-        is_gen_only = (request.disaggregated_params is not None
-                       and request.disaggregated_params.request_type
-                       == "generation_only")
-        if is_gen_only:
-            # Only the salt matters here; the prompt's KV is transferred.
-            return
-        if prompt_embeds.embeds is None:
+        request_type = (request.disaggregated_params.request_type
+                        if request.disaggregated_params is not None else None)
+        if prompt_embeds.embeds is None and request_type != "generation_only":
             raise RequestError("prompt_embeds carries no rows.")
         if self.llm_args is None:
             raise RequestError("prompt_embeds requires the PyTorch backend.")
@@ -480,14 +484,13 @@ class BaseWorker(GenerationExecutor):
         if int(prompt_embeds.positions[-1]) >= request.prompt_len:
             raise RequestError(
                 "prompt_embeds positions exceed the prompt length.")
-        if request.disaggregated_params is not None and (
-                request.disaggregated_params.request_type == "context_only"):
+        if (request_type in ("context_only", "generation_only")
+                and not self._uses_kv_cache_manager_v2()):
             # The V1 transceiver looks up transferred blocks without the
             # request salt that carries the embedding identity.
-            if not self._kv_cache_keys_prompt_embeds():
-                raise RequestError(
-                    "prompt_embeds with disaggregated serving requires "
-                    "kv_cache_config.use_kv_cache_manager_v2=True.")
+            raise RequestError(
+                "prompt_embeds with disaggregated serving requires "
+                "kv_cache_config.use_kv_cache_manager_v2=True.")
 
     def _enqueue_request(self,
                          request: GenerationRequest,

@@ -6,6 +6,7 @@ Rows taken from the checkpoint's own input embedding must reproduce the greedy
 output of the equivalent token prompt exactly, whichever positions carry them.
 """
 
+import asyncio
 import os
 import pickle
 import uuid
@@ -400,3 +401,59 @@ def test_preemption_with_graphs_and_compile(model_dir: str, table: torch.Tensor)
             )
         got = [list(o.outputs[0].token_ids) for o in pressured.generate(requests, params)]
         assert got == expected
+
+
+def test_generation_only_passes_deployment_checks() -> None:
+    # Generation workers reject what context workers reject, from the identity alone.
+    from tensorrt_llm.disaggregated_params import DisaggregatedParams
+
+    _, pe = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
+    request = GenerationRequest(
+        [1, 2, 3],
+        SamplingParams(max_tokens=1),
+        prompt_embeds=pe.identity_only(),
+        disaggregated_params=DisaggregatedParams(request_type="generation_only"),
+    )
+    worker = SimpleNamespace(
+        llm_args=SimpleNamespace(
+            speculative_config=object(),
+            parallel_config=SimpleNamespace(enable_attention_dp=False, cp_size=1),
+        )
+    )
+    with pytest.raises(RequestError, match="speculative decoding"):
+        BaseWorker._check_prompt_embeds(worker, request)
+
+
+def test_cancel_releases_rows(llm: LLM, table: torch.Tensor) -> None:
+    ids = _token_ids(llm, PROMPTS[:1])[0]
+    params = SamplingParams(max_tokens=200, temperature=0.0, end_id=-1)
+
+    async def run() -> None:
+        result = llm.generate_async(
+            {"prompt_embeds": table[torch.tensor(ids)]}, sampling_params=params, streaming=True
+        )
+        result.abort()
+        outputs = [output async for output in result]
+        assert outputs[-1].outputs[0].finish_reason == "cancelled"
+        # The client keeps only the identity once the request is done.
+        assert result._generation_request.prompt_embeds.embeds is None
+
+    asyncio.run(run())
+    assert _run(llm, [ids]) == _run(llm, [{"prompt_embeds": table[torch.tensor(ids)]}])
+
+
+@pytest.mark.parametrize("backend", ["piecewise", "breakable"])
+def test_prefill_cuda_graph(model_dir: str, table: torch.Tensor, backend: str) -> None:
+    # Passes with embedding rows run eagerly; plain prefills keep replaying graphs.
+    with LLM(
+        model=model_dir,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.3, enable_block_reuse=False),
+        prefill_cuda_graph_backend=backend,
+        torch_compile_config=TorchCompileConfig() if backend == "piecewise" else None,
+        max_batch_size=4,
+    ) as graphs:
+        ids = _token_ids(graphs, PROMPTS)
+        expected = _run(graphs, ids)
+        mixed = [ids[0], {"prompt_embeds": table[torch.tensor(ids[1])]}, ids[2]]
+        assert _run(graphs, mixed) == expected
+        assert _run(graphs, ids) == expected

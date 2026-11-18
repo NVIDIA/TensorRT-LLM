@@ -700,14 +700,17 @@ def apply_prompt_embeds_overlay(
     Args:
         embedding_layer: Text embedding layer, used when no multimodal rows
             were fused into ``inputs_embeds``.
-        input_ids: Token ids of the pass; prompt-embedding rows hold in-vocab
-            placeholder ids.
-        inputs_embeds: Fused embeddings, or None for a text-only pass.
-        prompt_embeds_overlay: ``(dst_rows, src_rows)`` from the engine;
-            prompt-embedding rows never overlap multimodal rows.
+        input_ids: ``[N]`` integer CUDA token ids of the packed pass;
+            prompt-embedding rows hold in-vocab placeholder ids.
+        inputs_embeds: ``[N, H]`` fused embeddings on the same device, or None
+            for a text-only pass; written in place.
+        prompt_embeds_overlay: ``(dst_rows, src_rows)`` from the engine:
+            ``[K]`` int64 CUDA indices into the pass and ``[K, H]`` CUDA rows
+            (float16, bfloat16 or float32, cast to the embedding dtype).
+            Prompt-embedding rows never overlap multimodal rows.
 
     Returns:
-        Embeddings for every token of the pass.
+        ``[N, H]`` embeddings for every token of the pass.
     """
     dst_rows, src_rows = prompt_embeds_overlay
     if inputs_embeds is None:
