@@ -1,5 +1,5 @@
 ---
-name: modeling-task-yaml
+name: modeling-v2-onboard-task
 description: Use when a user wants to write, generate, or fill in a task.yaml (task brief) for an agent-flow modeling workflow (modeling-bringup or modeling-v2-onboard), or asks how to onboard / bring up a new model with agent-flow.
 license: Apache-2.0
 metadata:
@@ -32,7 +32,7 @@ only: `modeling-v2-onboard` when the user's agent-flow has
   instead; do not substitute another workflow.
 - Everything the run needs is decided by the run itself: it holds its GPU
   nodes and measures the reference scores. Nothing has to be prepared
-  before launch beyond what the workflow's check reports. If you find
+  before launch beyond a task.yaml that passes the schema check. If you find
   yourself listing other preconditions (sessions to start, scores to
   record first), you are on the wrong workflow.
 - Run options (backend, model) are command-line flags, never task.yaml
@@ -66,8 +66,9 @@ only: `modeling-v2-onboard` when the user's agent-flow has
   (PATH, PYTHONPATH, HOME, HF offline, MPI/UCX) or build-artifact symlinks.
   If the user volunteers such details, copy them verbatim into
   `implements_tips`.
-- Check paths and settings once, at Finish, with the workflow's own check;
-  do not re-implement its checks in the conversation. A problem it reports
+- Do not check paths, the image or the mounts by hand during the
+  conversation: the run's environment task checks them once the planner
+  has started. At Finish, run only the schema check; a problem it reports
   goes back to the user.
 
 ## Questions with fixed choices
@@ -138,7 +139,7 @@ Items and checks:
 Inspect the checkpoint with:
 
 ```bash
-python3 .agents/skills/modeling-task-yaml/scripts/inspect_checkpoint.py <checkpoint_path>
+python3 .agents/skills/modeling-v2-onboard-task/scripts/inspect_checkpoint.py <checkpoint_path>
 ```
 
 Show what it found (architecture, dtype, multimodal, MTP layers,
@@ -288,27 +289,13 @@ Ask with one multi-select question:
    directory and write `<workspace>/task.yaml`. If the user gives an
    existing directory that already holds a task.yaml, ask before
    overwriting.
-3. Check it with the workflow's own check, take each problem back to the
-   user, fix, and re-run until it passes:
-   - when the user's agent-flow has `agent_flow/workflows/modeling_v2_onboard/`:
-     `modeling-v2-onboard --task <workspace>/task.yaml --workspace <workspace> --check`.
-     It checks the schema, the checkout, the workspace, the checkpoint, the
-     image, the mounts and the GPU pool. It does not create the workspace's
-     run state.
-   - otherwise: `python3 .agents/skills/modeling-task-yaml/scripts/validate_task_yaml.py <workspace>/task.yaml`
-     (the schema only).
-
-   If the command is not on PATH, do not install anything or create an
-   environment on your own: tell the user it is missing and ask where to
-   install it (`pip install -e <agent-flow>` into the environment they run
-   it from). Without it, run only the schema check above.
-4. **Slurm with modeling-v2-onboard only:** ask whether to run the runtime
-   check now. It submits one short Slurm job that starts the container and
-   shows the GPUs, the mounted paths and CUDA PyTorch, but it waits for a
-   node. Skipping it starts the run sooner: the run's environment task makes
-   the same checks once the planner has started. If the user wants it, add
-   `--smoke` to the check command and report its result.
-5. Run command.
+3. Check it against agent-flow's task schema, which both workflows load,
+   take each problem back to the user, fix, and re-run until it passes:
+   `python3 .agents/skills/modeling-v2-onboard-task/scripts/validate_task_yaml.py <workspace>/task.yaml`.
+   It checks the fields and that the three paths exist; the image, the
+   mounts and the GPU pool are checked by the run once the planner has
+   started.
+4. Run command.
    - **modeling-v2-onboard** (when the user's agent-flow has
      `agent_flow/workflows/modeling_v2_onboard/`): ask which backend the
      run's planner and workers use, Claude Code (the default) or Codex,
@@ -321,6 +308,11 @@ Ask with one multi-select question:
      `modeling-bringup --task <workspace>/task.yaml --workspace <workspace>`;
      its roles' backends are set by the workflow, so there is nothing to
      choose.
+
+   If the command is not on PATH, do not install anything or create an
+   environment on your own: tell the user it is missing and ask where to
+   install it (`pip install -e <agent-flow>` into the environment they run
+   it from).
 
    Then ask whether to start the run now from this session. If yes, start
    it detached, so it outlives this conversation:
@@ -402,8 +394,7 @@ implements_tips:
 | Account / qos / mounts both under `slurm-environment` and under `gpu_pool` | Under `gpu_pool` with a pool, directly under `slurm-environment` without |
 | A form of blank fields ("slurm_partition: to fill in") | Pre-fill every field a source answers; leave blank only what none does, and say what you looked at |
 | Asking the user for pool fields Slurm or the environment can answer | Ask only `nodes` and `max_nodes`; infer the rest and confirm it |
-| Checking paths, image or mounts by hand during the conversation | Run the workflow's check at Finish |
-| Running `--smoke` without asking | It waits for a Slurm node; ask first |
+| Checking paths, image or mounts by hand during the conversation | Run the schema check at Finish; the run checks the rest |
 | Rewriting the task for `trtllm-modeling-v2` or running its intake | Write the `task_schema.py` format for modeling-v2-onboard or modeling-bringup only |
 | Telling the user to start GPU sessions or record a reference score before launch | The run holds its nodes and measures the reference itself |
 | Creating a venv or installing agent-flow unasked | Say the command is missing and ask where to install it |

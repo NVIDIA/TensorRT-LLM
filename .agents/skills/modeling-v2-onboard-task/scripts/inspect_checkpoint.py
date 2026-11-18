@@ -32,7 +32,15 @@ from pathlib import Path
 
 MULTIMODAL_CONFIG_KEYS = ("vision_config", "audio_config", "visual", "vision_tower")
 PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
-MTP_KEYS = ("num_nextn_predict_layers", "num_mtp_layers", "mtp_num_layers")
+# Where a config states its MTP layer count; the first three are
+# DRAFT_LAYER_KEYS in trtllm_modeling_v2's spec/derive.py.
+MTP_KEYS = (
+    "num_nextn_predict_layers",
+    "num_mtp_modules",
+    "mtp_num_hidden_layers",
+    "num_mtp_layers",
+    "mtp_num_layers",
+)
 WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt")
 
 
