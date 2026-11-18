@@ -726,3 +726,23 @@ export LD_LIBRARY_PATH=$(python3 -c "import importlib.util, pathlib; print(pathl
 ```
 
 Because a node can be broken in isolation, a NIXL failure that appears on only one of several otherwise identical nodes is worth checking here first, before spending a full weight load on an environment change.
+
+
+### Opt-in native NIXL agent recovery
+
+`TRTLLM_ENABLE_NIXL_AGENT_RECOVERY=1` enables recovery for the Python transceiver
+with C++ NIXL, bounce buffers disabled, and ownership enforcement disabled.
+Recovery is disabled by default. Released peer failures remain request scoped;
+only an unretirable native handle fences and rebuilds the local agent.
+
+This opt-in mode requires an MPI executor communicator with `MPI_THREAD_MULTIPLE`.
+It captures and validates that communicator before starting recovery threads and
+warns about launcher-wide termination scope. If recovery exceeds the configured
+KV transfer timeout, the existing retirement fatal handler logs the request,
+agent and generation, then terminates through MPI/the launcher while retaining
+unresolved memory roots. A launcher job can contain other executors.
+
+Scheduler admission failure consensus is batched every 64 scheduling passes for
+model-parallel replicas, adding at most 63 passes after local stall detection.
+Rank-local attention-DP requests do not add a TP vote. Requests whose transfers
+still hold memory remain visible to the scheduler's capacity-stall hold probe.

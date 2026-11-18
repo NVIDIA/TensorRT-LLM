@@ -422,6 +422,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._fp4_mla_bridge_enabled = enforce_physical_ownership
         self._context_first_ownership_logged = False
         ownership_capable = enforce_physical_ownership or self._context_first_ownership
+        recovery_enabled = (
+            os.environ.get("TRTLLM_ENABLE_NIXL_AGENT_RECOVERY", "0") == "1"
+            and not ownership_capable
+            and cache_transceiver_config.kv_cache_bounce_size_mb == 0
+            and not use_pure_python_transfer_agent()
+        )
+        if recovery_enabled:
+            self._retirement_mpi_comm = _retirement_executor_comm(mapping)
+            if mapping.rank == 0:
+                logger.warning(
+                    "Opt-in NIXL recovery uses executor-scoped MPI retirement fail-stop; "
+                    "MPI/launcher termination may include other executors in the same job."
+                )
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
         self._device_id = torch.cuda.current_device()
@@ -460,6 +473,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 agent_buffer_size_mb=cache_transceiver_config.kv_cache_bounce_size_mb,
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
                 rank_info_auth_key=cache_transceiver_config._rank_info_auth_key,
+                recovery_fatal_callback=(
+                    self._fail_unproven_transfer if recovery_enabled else None
+                ),
             )
         )
         if enforce_physical_ownership:

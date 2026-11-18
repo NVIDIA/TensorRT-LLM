@@ -102,7 +102,6 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_physical_pool,
     get_unique_pool_memory_descs,
 )
-from tensorrt_llm._torch.pyexecutor import hang_detector
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import CUASSERT, nvtx_range
@@ -778,6 +777,8 @@ class Sender(SenderBase):
         self._agent_operation_gate = _AgentOperationGate()
         self._agent_generation = 0
         self._agent_failed = False
+        self._admission_lock = threading.Lock()
+        self._recovery_fatal_callback: Optional[Callable[[QuiescenceFatalEvent], None]] = None
         self._retirement_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
         self._recover_agent: Optional[Callable[[int], None]] = None
         self._remote_agent_descriptors: dict[str, bytes] = {}
@@ -1127,11 +1128,18 @@ class Sender(SenderBase):
                         raise _TransferNotSubmittedError(
                             "NIXL transfer session is closed or terminal"
                         )
-                    with task.lock:
-                        task._native_inflight += 1
+                    with self._admission_lock:
+                        if self._agent_failed:
+                            return False, "NIXL agent recovery is pending"
+                        with task.lock:
+                            task._native_inflight += 1
                 try:
                     completed, detail = True, None
                     for index, member in enumerate(requests):
+                        with self._admission_lock:
+                            if self._agent_failed:
+                                completed, detail = False, "NIXL agent recovery is pending"
+                                break
                         status = None
                         retired = True
                         try:
@@ -1156,23 +1164,40 @@ class Sender(SenderBase):
                             if not retired:
                                 retirement_event = threading.Event()
                                 self._unreleased_statuses.append((status, task, retirement_event))
+                                with self._admission_lock:
+                                    self._agent_failed = True
                                 completed, detail = False, "NIXL request awaits agent teardown"
                             del status
                         if not completed:
-                            self._agent_failed = True
                             break
                 finally:
                     if retirement_event is None:
                         with task.lock:
                             task._native_inflight -= 1
-        if not completed:
+        if self._agent_failed:
             recover(generation)
+        started_at = time.monotonic()
         if retirement_event is not None and not retirement_event.wait(self._retirement_timeout_s):
             # Keep the handle and its memory rooted. Ordinary error cleanup
             # cannot safely recycle these buffers after retirement times out.
-            hang_detector.propagate_hard_kill(diagnostics=False)
+            self._fail_agent_recovery(generation, getattr(task, "_unique_rid", -1), started_at)
             raise SystemExit("NIXL agent retirement timed out")
         return completed, detail
+
+    def _fail_agent_recovery(self, generation: int, request_id: int, started_at: float) -> None:
+        """Retain native roots and report fatal expiry through the captured executor handler."""
+        callback = self._recovery_fatal_callback
+        assert callback is not None
+        callback(
+            QuiescenceFatalEvent(
+                request_id=request_id,
+                direction="send",
+                reason=f"NIXL agent {self._agent.name}, generation={generation}: recovery timed out",
+                started_at=started_at,
+                deadline=started_at + self._retirement_timeout_s,
+                expired_at=time.monotonic(),
+            )
+        )
 
     def _submit_transfer(
         self,
@@ -2157,13 +2182,14 @@ class Sender(SenderBase):
             if getattr(self, "_recover_agent", None) is None:
                 self._agent.load_remote_agent(agent_name, ri.transfer_engine_info)
             else:
-                with self._agent_operation_gate.metadata():
-                    if self._agent_failed:
-                        self._remote_agent_descriptors[agent_name] = ri.transfer_engine_info
-                        self._loaded_remote_agents.add(agent_name)
-                        return
-                    previous = self._remote_agent_descriptors.get(agent_name)
-                    if previous is not None and previous != ri.transfer_engine_info:
+                previous = self._remote_agent_descriptors.get(agent_name)
+                if self._agent_failed:
+                    self._remote_agent_descriptors[agent_name] = ri.transfer_engine_info
+                    self._loaded_remote_agents.add(agent_name)
+                    return
+                replacing = previous is not None and previous != ri.transfer_engine_info
+                with self._agent_operation_gate.metadata() if replacing else nullcontext():
+                    if replacing:
                         self._agent.invalidate_remote_agent(agent_name)
                     self._agent.load_remote_agent(agent_name, ri.transfer_engine_info)
                     self._remote_agent_descriptors[agent_name] = ri.transfer_engine_info
@@ -5047,6 +5073,7 @@ class TransferWorkerConfig:
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
     rank_info_auth_key: Optional[bytes] = field(default=None, repr=False)
+    recovery_fatal_callback: Optional[Callable[[QuiescenceFatalEvent], None]] = None
 
 
 class TransferWorker:
@@ -5232,12 +5259,16 @@ class TransferWorker:
             self._agent_recovery_stop = threading.Event()
             self._agent_recovery_thread: Optional[threading.Thread] = None
             if (
-                not self._config.enforce_physical_ownership
+                os.environ.get("TRTLLM_ENABLE_NIXL_AGENT_RECOVERY", "0") == "1"
+                and not self._config.enforce_physical_ownership
                 and not self._config.context_first_ownership
                 and self._config.agent_buffer_size_mb == 0
                 and not use_pure_python_transfer_agent()
             ):
                 if getattr(self._agent, "supports_handle_retirement", False):
+                    if self._config.recovery_fatal_callback is None:
+                        raise ValueError("NIXL recovery requires a captured executor fatal handler")
+                    self._sender._recovery_fatal_callback = self._config.recovery_fatal_callback
                     timeout_s = self._config.tx_overall_timeout_s
                     self._sender._retirement_timeout_s = (
                         timeout_s
@@ -5269,17 +5300,27 @@ class TransferWorker:
                 return
 
             def recover() -> None:
-                torch.cuda.set_device(self._config.device_id)
-                CUASSERT(cudart.cudaSetDevice(self._config.device_id))
+                started_at = time.monotonic()
                 while not self._agent_recovery_stop.is_set():
-                    self._recover_transfer_agent(self._sender._agent_generation)
+                    try:
+                        torch.cuda.set_device(self._config.device_id)
+                        CUASSERT(cudart.cudaSetDevice(self._config.device_id))
+                        self._recover_transfer_agent(self._sender._agent_generation)
+                    except Exception as error:
+                        logger.error(f"NIXL recovery setup failed: {error}")
                     with self._agent_recovery_lock:
                         if not self._sender._agent_failed or (
                             self._sender._shutdown_requested and self._agent is None
                         ):
                             self._agent_recovery_thread = None
                             return
-                    self._agent_recovery_stop.wait(1.0)
+                    remaining = self._sender._retirement_timeout_s - (time.monotonic() - started_at)
+                    if remaining <= 0:
+                        self._sender._fail_agent_recovery(
+                            self._sender._agent_generation, -1, started_at
+                        )
+                        return
+                    self._agent_recovery_stop.wait(min(1.0, remaining))
 
             self._agent_recovery_thread = threading.Thread(
                 target=recover, name="nixl-agent-recovery", daemon=True
@@ -5326,8 +5367,13 @@ class TransferWorker:
                     try:
                         for desc in self._registered_mem:
                             agent.register_memory(desc)
-                        for name, descriptor in sender._remote_agent_descriptors.items():
-                            agent.load_remote_agent(name, descriptor)
+                        for name, descriptor in list(sender._remote_agent_descriptors.items()):
+                            try:
+                                agent.load_remote_agent(name, descriptor)
+                            except RuntimeError as error:
+                                logger.warning(f"Dropping unavailable NIXL peer {name}: {error}")
+                                del sender._remote_agent_descriptors[name]
+                                sender._loaded_remote_agents.discard(name)
                         descriptor = bytes(agent.get_local_agent_desc())
                     except Exception:
                         agent.shutdown()

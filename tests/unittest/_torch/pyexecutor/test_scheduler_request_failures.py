@@ -26,12 +26,17 @@ def test_asymmetric_admission_failure_uses_request_error_path(parallelism):
         barrier.wait()
         return result
 
-    failed = [SimpleNamespace(py_request_id=7), SimpleNamespace(py_request_id=9)]
+    failed = [
+        SimpleNamespace(py_request_id=7, is_last_context_chunk=True),
+        SimpleNamespace(py_request_id=9),
+    ]
     healthy = SimpleNamespace(py_request_id=8, is_last_context_chunk=True)
     executors, batches = [], []
     for rank in range(2):
         executor = object.__new__(PyExecutor)
         executor._is_kv_manager_v2 = True
+        executor.enable_attention_dp = False
+        executor._scheduler_failure_sync_tick = 63
         executor.dist = SimpleNamespace(
             cp_size=2 if parallelism == "cp" else 1,
             tp_size=2 if parallelism == "tp" else 1,
@@ -45,8 +50,16 @@ def test_asymmetric_admission_failure_uses_request_error_path(parallelism):
         executor._handle_errors = Mock()
         batch = ScheduledRequests()
         batch.failed_requests = failed.copy() if rank == 1 else []
-        batch.generation_requests = failed.copy()
-        batch.reset_context_requests([healthy] if rank == 0 else [])
+        batch.generation_requests = (
+            failed[1:] if parallelism == "pp" and rank == 0 else failed.copy()
+        )
+        batch.reset_context_requests(
+            [failed[0], healthy]
+            if parallelism == "pp" and rank == 0
+            else [healthy]
+            if rank == 0
+            else []
+        )
         executors.append(executor)
         batches.append(batch)
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -126,3 +139,40 @@ def test_admission_failure_delivers_one_error_and_cleans_up_once():
     assert batch.context_requests == [healthy]
     assert blocked.py_kv_reuse_poisoned
     assert not executor.is_shutdown
+
+
+def test_model_parallel_failure_votes_are_batched_and_adp_is_rank_local():
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2, executor.enable_attention_dp = True, False
+    failed = SimpleNamespace(py_request_id=7)
+    executor.active_requests = [failed]
+    executor.dist = SimpleNamespace(
+        tp_size=1, cp_size=1, pp_size=3, allgather=Mock(return_value=[[7], [], []])
+    )
+    executor._handle_errors = Mock()
+    batch = ScheduledRequests()
+    batch.failed_requests = [failed]
+    for _ in range(63):
+        executor._fail_scheduler_requests(batch)
+    executor.dist.allgather.assert_not_called()
+    executor._handle_errors.assert_not_called()
+    executor._fail_scheduler_requests(batch)
+    executor.dist.allgather.assert_called_once_with([7])
+    executor._handle_errors.assert_called_once()
+
+    executor.enable_attention_dp = True
+    executor.dist.pp_size, executor.dist.tp_size = 1, 3
+    executor.dist.allgather.reset_mock()
+    batch.failed_requests = [failed]
+    executor._fail_scheduler_requests(batch)
+    executor.dist.allgather.assert_not_called()
+    assert executor._handle_errors.call_count == 2
+
+
+def test_held_transfer_remains_visible_to_the_scheduler_hold_probe():
+    executor = object.__new__(PyExecutor)
+    executor._disagg_coordinator = SimpleNamespace(has_local_retiring_gen_receives=False)
+    executor._transfer_held_failures = {7: (object(), "parked receive")}
+    assert executor._has_scheduler_transfer_holds()
+    executor._transfer_held_failures.clear()
+    assert not executor._has_scheduler_transfer_holds()

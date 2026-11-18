@@ -1364,7 +1364,7 @@ class PyExecutor:
                 self.async_transfer_manager)
         if hasattr(self.scheduler, "set_retiring_gen_receives_probe"):
             self.scheduler.set_retiring_gen_receives_probe(
-                lambda: self.disagg.has_local_retiring_gen_receives)
+                self._has_scheduler_transfer_holds)
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
@@ -10334,6 +10334,10 @@ class PyExecutor:
             self._handle_multimodal_encoder_request_error(
                 scheduled_requests, error_msg, failed_request_ids)
 
+    def _has_scheduler_transfer_holds(self) -> bool:
+        return bool(self._held_transfer_failures()
+                    ) or self.disagg.has_local_retiring_gen_receives
+
     def _fail_scheduler_requests(self,
                                  scheduled_batch: ScheduledRequests) -> None:
         """Agree on admission failures before freeing any rank's request state."""
@@ -10342,16 +10346,36 @@ class PyExecutor:
         local_ids = [
             req.py_request_id for req in scheduled_batch.failed_requests
         ]
-        # Include every pipeline stage before any rank frees request state.
-        if self.dist.pp_size > 1:
-            votes = self.dist.allgather(local_ids)
-        elif self.dist.cp_size > 1:
-            votes = self.dist.tp_cp_allgather(local_ids)
-        elif self.dist.tp_size > 1:
-            votes = self.dist.tp_allgather(local_ids)
+        rank_local = self.enable_attention_dp and self.dist.cp_size == 1 and self.dist.pp_size == 1
+        if rank_local or (self.dist.tp_size == self.dist.cp_size ==
+                          self.dist.pp_size == 1):
+            failed_ids = set(local_ids)
         else:
-            votes = [local_ids]
-        failed_ids = {rid for vote in votes for rid in vote}
+            pending = self.__dict__.setdefault("_pending_scheduler_failures",
+                                               set())
+            pending.difference_update(req.py_request_id
+                                      for req in scheduled_batch.all_requests())
+            pending.update(local_ids)
+            tick = self.__dict__.get("_scheduler_failure_sync_tick", 0) + 1
+            self._scheduler_failure_sync_tick = tick
+            scheduled_batch.failed_requests = []
+            # All participants advance this counter once per scheduling pass.
+            # Batching avoids a world barrier on every PP microbatch.
+            if tick % 64:
+                return
+            active_ids = {req.py_request_id for req in self.active_requests}
+            local_ids = list(pending & active_ids)
+            if self.enable_attention_dp:
+                votes = (self.dist.pp_allgather(local_ids) if self.dist.pp_size
+                         > 1 else self.dist.cp_allgather(local_ids))
+            elif self.dist.pp_size > 1:
+                votes = self.dist.allgather(local_ids)
+            elif self.dist.cp_size > 1:
+                votes = self.dist.tp_cp_allgather(local_ids)
+            else:
+                votes = self.dist.tp_allgather(local_ids)
+            pending.clear()
+            failed_ids = {rid for vote in votes for rid in vote}
         scheduled_batch.failed_requests = []
         if not failed_ids:
             return
