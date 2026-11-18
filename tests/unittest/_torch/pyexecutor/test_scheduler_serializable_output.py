@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pickle
 
 import pytest
@@ -34,6 +37,7 @@ def test_serializable_scheduler_output_round_trip():
     scheduled_requests.paused_requests = [request_pool[4]]
     scheduled_requests.scheduled_mm_encoder_items = {1: [0, 2], 7: [1]}
     scheduled_requests.recompute_paused_requests = [request_pool[7]]
+    scheduled_requests.failed_requests = [request_pool[4]]
     fitting_disagg_gen_init_requests = [request_pool[5], request_pool[6]]
     num_fitting_requests = 3
 
@@ -80,4 +84,11 @@ def test_serializable_scheduler_output_round_trip():
     assert _request_ids(restored_schedule.recompute_paused_requests) == _request_ids(
         scheduled_requests.recompute_paused_requests
     )
+    assert _request_ids(restored_schedule.failed_requests) == [4]
     assert _request_ids(restored_fitting) == _request_ids(fitting_disagg_gen_init_requests)
+
+
+def test_failed_request_lists_are_not_shared():
+    first, second = ScheduledRequests(), ScheduledRequests()
+    first.failed_requests.append(_make_request(42))
+    assert second.failed_requests == []

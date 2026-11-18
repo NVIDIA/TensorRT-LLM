@@ -919,8 +919,8 @@ class TestInflightPrefixWait:
         reqs = [owner, self.make_request(1)]
         for _ in range(2):
             sched.schedule_request(reqs, {owner.request_id})
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-            sched.schedule_request(reqs, {owner.request_id})
+        out = sched.schedule_request(reqs, {owner.request_id})
+        assert ids(out.failed_requests) == [1]
 
     def test_pipeline_ranks_agree_on_each_wait_through_its_expiry(self):
         """Under attention DP with pipeline parallelism, the first PP rank of
@@ -2010,8 +2010,8 @@ class TestKVCacheFailuresCtxChunked:
         managers = (mgr, draft_mgr, cross_mgr)
         for manager in managers:
             manager.kv_cache_map[0] = Mock(is_active=False)
-            manager.free_resources.side_effect = (
-                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
+            manager.free_resources.side_effect = lambda req, manager=manager: (
+                manager.kv_cache_map.pop(req.py_request_id)
             )
         sched = make_scheduler(
             mgr,
@@ -2750,7 +2750,7 @@ class TestDeadlockDetection:
     burns a job's whole wall clock.
     """
 
-    def test_raises_after_repeated_stalls_with_context_candidates(self):
+    def test_fails_requests_after_repeated_stalls_with_context_candidates(self):
         """A prefill-only worker has no generation requests to count."""
         mgr = make_kv_cache_manager(
             resize_context_fn=lambda req, n: False,
@@ -2762,10 +2762,10 @@ class TestDeadlockDetection:
 
         for _ in range(2):
             sched.schedule_request(reqs, set())
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-            sched.schedule_request(reqs, set())
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.failed_requests) == [req.py_request_id for req in reqs]
 
-    def test_raises_after_repeated_stalls_with_generation_candidates(self):
+    def test_fails_requests_after_repeated_stalls_with_generation_candidates(self):
         mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)
         sched._DEADLOCK_STALL_ITERS = 3
@@ -2775,8 +2775,23 @@ class TestDeadlockDetection:
 
         for _ in range(3):
             sched.schedule_request(reqs, set())
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-            sched.schedule_request(reqs, set())
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.failed_requests) == [req.py_request_id for req in reqs]
+
+    def test_two_context_init_failures_do_not_poison_the_next_request(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: req.py_request_id == 2,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 2
+        blocked = [make_ctx_request(0, 100), make_ctx_request(1, 100)]
+        assert sched.schedule_request(blocked, set()).failed_requests == []
+        assert ids(sched.schedule_request(blocked, set()).failed_requests) == [0, 1]
+        healthy = make_ctx_request(2, 100)
+        out = sched.schedule_request([healthy], set())
+        assert ids(out.context_requests) == [2]
+        assert out.failed_requests == []
 
     def test_transient_stall_does_not_raise(self):
         """One bad iteration is normal; the counter has to reset."""
@@ -2858,8 +2873,8 @@ class TestDeadlockDetection:
         # full, so the stall is now the scheduler's to report.
         for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
             sched.schedule_request([blocked], set())
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-            sched.schedule_request([blocked], set())
+        out = sched.schedule_request([blocked], set())
+        assert ids(out.failed_requests) == [blocked.py_request_id]
 
     def test_inflight_send_that_left_active_list_is_not_a_deadlock(self):
         """A sender off the active list but still in flight is not a deadlock.
@@ -2929,8 +2944,8 @@ class TestDeadlockDetection:
 
         for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
             sched.schedule_request([blocked], set())
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-            sched.schedule_request([blocked], set())
+        out = sched.schedule_request([blocked], set())
+        assert ids(out.failed_requests) == [blocked.py_request_id]
 
     @pytest.mark.parametrize("pages_available_after_retirement", [False, True])
     def test_cancelled_receive_holds_pages_only_until_retirement(
@@ -2968,8 +2983,8 @@ class TestDeadlockDetection:
             with patch(
                 "tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger.warning"
             ) as warning:
-                with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-                    sched.schedule_request([blocked], set())
+                out = sched.schedule_request([blocked], set())
+                assert ids(out.failed_requests) == [blocked.py_request_id]
             warning.assert_called_once()
             assert "local_retiring_gen_receives=False" in warning.call_args.args[0]
 
@@ -3398,8 +3413,8 @@ class TestCrossKVAllocationFailures:
         failed_cache = Mock(capacity=0)
         failed_cache.resize.return_value = failure != "resize"
         cross_mgr.kv_cache_map[0] = failed_cache
-        cross_mgr._resume_and_restore.side_effect = lambda req_id, cache: not (
-            failure == "resume" and cache is failed_cache
+        cross_mgr._resume_and_restore.side_effect = lambda req_id, cache: (
+            not (failure == "resume" and cache is failed_cache)
         )
 
         def prepare_context(req: Mock, reuse_limit: int | None = None) -> bool:
@@ -3408,8 +3423,8 @@ class TestCrossKVAllocationFailures:
 
         self_mgr.prepare_context.side_effect = prepare_context
         for manager in (self_mgr, cross_mgr):
-            manager.free_resources.side_effect = (
-                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
+            manager.free_resources.side_effect = lambda req, manager=manager: (
+                manager.kv_cache_map.pop(req.py_request_id)
             )
         sched = make_encoder_scheduler(
             self_mgr,

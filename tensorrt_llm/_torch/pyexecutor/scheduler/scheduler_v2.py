@@ -603,6 +603,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # A level that failed since the last pass (e.g. in an eviction WRITE during prepare_resources) has already
         # dropped pages from this rank's reuse tree only.
         self._raise_if_lockstep_remote_level_failed()
+        self._failed_requests: RequestList = []
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Main scheduling loop
         (
@@ -627,6 +628,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             generation_requests=scheduled_gen,
             paused_requests=evicted,
             recompute_paused_requests=recompute_paused,
+            failed_requests=self._failed_requests,
             fitting_disagg_gen_init_requests=disagg_candidates,
             num_fitting_requests=(len(scheduled_encoder) + len(scheduled_ctx) + len(scheduled_gen)),
         )
@@ -1002,9 +1004,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             pending_ctx, starved_ctx = (
                 sorted(
                     reqs,
-                    key=lambda r: not (
-                        r.state_value == self._context_init_state_value
-                        and self._pregrown_context_tokens(r) > 0
+                    key=lambda r: (
+                        not (
+                            r.state_value == self._context_init_state_value
+                            and self._pregrown_context_tokens(r) > 0
+                        )
                     ),
                 )
                 for reqs in (pending_ctx, starved_ctx)
@@ -2741,7 +2745,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         preempted_ids: set[int],
         made_progress: bool,
     ) -> None:
-        """Fail loudly when no request can be scheduled or reclaimed.
+        """Return stalled requests for request-scoped executor cleanup.
 
         Unchecked, the executor spins at full speed while scheduling nothing,
         which looks healthy to the hang detector and to `/health`. Context
@@ -2872,20 +2876,30 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "Configure kv_cache_config.host_cache_size, increase "
                 "kv_cache_config.max_tokens, or lower max_batch_size."
             )
-        # Logged before the raise so the diagnostic survives even if the
-        # exception is caught or truncated upstream.
+        # Keep the capacity diagnostic separate from request error responses.
         logger.warning(
-            f"[V2Scheduler] Declaring deadlock after {self._stalled_schedules} passes: "
+            f"[V2Scheduler] Failing stalled admissions after {self._stalled_schedules} passes: "
             f"{self._summarize_stall(active_requests, pending_ctx, inflight_request_ids, preempted_ids)} "
             f"{remedy}"
         )
-        raise RuntimeError(
-            f"V2 scheduler deadlock: {num_gen_candidates} generation and "
-            f"{num_ctx_candidates} context request(s) active but none could "
-            f"be scheduled, suspended or preempted in "
-            f"{self._stalled_schedules} consecutive attempts. The KV cache "
-            f"pool is likely exhausted. {remedy}"
-        )
+        self._failed_requests = [
+            req
+            for req in active_requests
+            if req.is_generation_in_progress_state
+            and not req.is_generation_to_complete_state
+            and req.request_id not in inflight_request_ids
+            and not self._has_pending_connector_load(req)
+        ]
+        failed_ids = {req.py_request_id for req in self._failed_requests}
+        for req in pending_ctx:
+            if (
+                req.py_request_id not in failed_ids
+                and req.py_request_id not in preempted_ids
+                and req.request_id not in inflight_request_ids
+            ):
+                self._failed_requests.append(req)
+                failed_ids.add(req.py_request_id)
+        self._stalled_schedules = 0
 
     def _summarize_stall(
         self,

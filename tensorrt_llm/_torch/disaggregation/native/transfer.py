@@ -50,6 +50,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferOp,
     TransferRequest,
     TransferStatus,
+    use_pure_python_transfer_agent,
 )
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     ReceiverBase,
@@ -166,6 +167,46 @@ class OlderReleaseRequestError(ValueError):
             "generation servers must run the same release."
         )
         self.req_info = req_info
+
+
+class _AgentOperationGate:
+    """Serialize agent replacement with complete transfer-handle lifetimes."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._active_transfers = 0
+        self._metadata_active = False
+        self._metadata_waiters = 0
+
+    @contextmanager
+    def transfer(self):
+        with self._condition:
+            while self._metadata_active or self._metadata_waiters:
+                self._condition.wait()
+            self._active_transfers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active_transfers -= 1
+                self._condition.notify_all()
+
+    @contextmanager
+    def metadata(self):
+        with self._condition:
+            self._metadata_waiters += 1
+            try:
+                while self._metadata_active or self._active_transfers:
+                    self._condition.wait()
+                self._metadata_active = True
+            finally:
+                self._metadata_waiters -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._metadata_active = False
+                self._condition.notify_all()
 
 
 @dataclass
@@ -294,6 +335,7 @@ class WriteMeta:
     receiver_slice_id: int = 0
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
+    agent_generation: Optional[int] = None
     transfer_groups: tuple[_TransferGroup, ...] = ()
     kv_result_report_token: bytes = b""
     # Snapshot for this descriptor; a task's per-peer timer may be reused by a later dispatch.
@@ -558,6 +600,7 @@ class SendTaskBase(_LogicalTask):
         self._unique_rid: Optional[int] = params.disagg_request_id
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
         self._physical_owner = SendOperationOwner()
+        self._native_inflight = 0
         # Preserve the task's diagnostic view of its owner's exact roots.
         self._physical_operations = self._physical_owner._physical_operations
 
@@ -731,6 +774,12 @@ class Sender(SenderBase):
         # Guards concurrent add() from the listener thread.
         self._loaded_remote_agents: set[str] = set()
         self._loaded_remote_agents_lock = threading.Lock()
+        self._agent_operation_gate = _AgentOperationGate()
+        self._agent_generation = 0
+        self._agent_failed = False
+        self._recover_agent: Optional[Callable[[int], None]] = None
+        self._remote_agent_descriptors: dict[str, bytes] = {}
+        self._unreleased_statuses: list[tuple[TransferStatus, SendTaskBase, threading.Event]] = []
         self._ownership_poisoned: Optional[Exception] = None
         self._ownership_poison_lock = (
             threading.Lock() if retirement_watchdog is None else retirement_watchdog.lock
@@ -1003,6 +1052,9 @@ class Sender(SenderBase):
             )
 
     def _enqueue(self, write_meta: WriteMeta):
+        session = self._get_session(write_meta.unique_rid)
+        if session is not None:
+            write_meta.agent_generation = getattr(session, "_agent_generation", 0)
         thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
             self._emit_kv_transfer_event(
@@ -1035,15 +1087,82 @@ class Sender(SenderBase):
             return self._get_or_connect_dealer(endpoint)
         return self._get_or_connect_thread_dealer(endpoint)
 
+    def _submit_direct_transfer(
+        self,
+        task: SendTaskBase,
+        requests: tuple[TransferRequest, ...],
+        on_submitted: Optional[Callable[[], None]],
+        agent_generation: Optional[int],
+    ) -> tuple[bool, Optional[str]]:
+        recover = self._recover_agent
+        retirement_event = None
+        gate = self._agent_operation_gate.transfer() if recover is not None else nullcontext()
+        with gate:
+            generation = self._agent_generation
+            if agent_generation is not None and agent_generation != generation:
+                return False, "transfer belongs to a retired NIXL agent generation"
+            completed, detail = False, "NIXL agent recovery is pending"
+            if not self._agent_failed:
+                completed, detail = True, None
+                for index, member in enumerate(requests):
+                    status = None
+                    retired = True
+                    if recover is not None:
+                        with task.lock:
+                            task._native_inflight += 1
+                    try:
+                        if member.op == TransferOp.WRITE and not self._agent.check_remote_descs(
+                            member.remote_name, member.dst_descs
+                        ):
+                            raise RuntimeError("NIXL WRITE remote descriptors unavailable")
+                        status = self._agent.submit_transfer_requests(member)
+                        if index == 0 and on_submitted is not None:
+                            with disagg_diagnostics.suppress_diagnostic_errors():
+                                on_submitted()
+                        completed = status.wait()
+                        if not completed:
+                            detail = getattr(status, "last_status_str", lambda: None)()
+                    except RuntimeError as error:
+                        completed, detail = False, str(error)
+                    finally:
+                        if recover is not None and status is not None:
+                            try:
+                                retired = status.release()
+                            except RuntimeError:
+                                retired = False
+                        if not retired:
+                            retirement_event = threading.Event()
+                            self._unreleased_statuses.append((status, task, retirement_event))
+                            completed, detail = False, "NIXL request handle retirement failed"
+                        if recover is not None and retired:
+                            with task.lock:
+                                task._native_inflight -= 1
+                        # Group members retire before the next member can submit.
+                        del status
+                    if not completed:
+                        if recover is not None:
+                            self._agent_failed = True
+                        break
+        if not completed and recover is not None:
+            recover(generation)
+        if retirement_event is not None:
+            # FAILED permits destination reuse, so backend teardown must precede it.
+            retirement_event.wait()
+        return completed, detail
+
     def _submit_transfer(
         self,
         task: SendTaskBase,
         peer_rank: int,
         request: TransferRequest | _TransferRequestGroup,
         on_submitted: Optional[Callable[[], None]] = None,
+        *,
+        agent_generation: Optional[int] = None,
     ) -> tuple[bool, Optional[str]]:
         requests = request.requests if isinstance(request, _TransferRequestGroup) else (request,)
         owned = self._owns_task(task)
+        if not owned and getattr(self, "_recover_agent", None) is not None:
+            return self._submit_direct_transfer(task, requests, on_submitted, agent_generation)
         try:
             # This query cannot submit a transfer. Reject before acquiring backend ownership.
             for member in requests:
@@ -1418,6 +1537,7 @@ class Sender(SenderBase):
                     write_meta.peer_rank,
                     request,
                     on_submitted=submission_callback,
+                    agent_generation=write_meta.agent_generation,
                 )
                 if transfer_finished:
                     submitted_and_completed = True
@@ -1564,7 +1684,10 @@ class Sender(SenderBase):
                 timer.record_transfer_start(write_meta.peer_rank)
             try:
                 transfer_finished, last_status = self._submit_transfer(
-                    aux_task, write_meta.peer_rank, request
+                    aux_task,
+                    write_meta.peer_rank,
+                    request,
+                    agent_generation=write_meta.agent_generation,
                 )
                 if transfer_finished:
                     del request
@@ -1996,16 +2119,30 @@ class Sender(SenderBase):
         agent_name = ri.instance_name + str(ri.instance_rank)
         logger.debug(f"Loading remote transfer agent descriptor for peer '{agent_name}'")
         # NIXL serializes descriptor load against submit internally. This lock
-        # only closes the local load-vs-shutdown window; active transfers do
-        # not need to drain before a new peer is registered.
+        # closes the load-vs-shutdown window. Recovery-enabled senders also
+        # drain request handles before replacing metadata.
         with self._loaded_remote_agents_lock:
             if self._shutdown_requested:
                 return
             self._registrar.register(ri.instance_name, ri.instance_rank, ri)
-            self._agent.load_remote_agent(
-                agent_name,
-                ri.transfer_engine_info,
-            )
+            if getattr(self, "_recover_agent", None) is None:
+                self._agent.load_remote_agent(agent_name, ri.transfer_engine_info)
+            else:
+                gate = (
+                    self._agent_operation_gate.metadata()
+                    if self._recover_agent is not None
+                    else nullcontext()
+                )
+                with gate:
+                    if self._agent_failed:
+                        self._remote_agent_descriptors[agent_name] = ri.transfer_engine_info
+                        self._loaded_remote_agents.add(agent_name)
+                        return
+                    previous = self._remote_agent_descriptors.get(agent_name)
+                    if previous is not None and previous != ri.transfer_engine_info:
+                        self._agent.invalidate_remote_agent(agent_name)
+                    self._agent.load_remote_agent(agent_name, ri.transfer_engine_info)
+                    self._remote_agent_descriptors[agent_name] = ri.transfer_engine_info
             self._loaded_remote_agents.add(agent_name)
         logger.debug(
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
@@ -2459,6 +2596,7 @@ class TxSession(TxSessionBase):
             sender, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
         )
         self._sender: Sender  # narrow base class type for Pylance
+        self._agent_generation = getattr(sender, "_agent_generation", 0)
         self.request_id = request_id
         self._retirement = None
         if retirement_watchdog is not None and self._enforce_physical_ownership:
@@ -2750,7 +2888,11 @@ class TxSession(TxSessionBase):
 
     def resources_drained(self) -> bool:
         if not getattr(self, "_enforce_physical_ownership", False):
-            return not any(task.status == TaskStatus.TRANSFERRING for task in self.kv_tasks)
+            tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
+            return not any(
+                task.status == TaskStatus.TRANSFERRING or getattr(task, "_native_inflight", 0) > 0
+                for task in tasks
+            )
         retirement = getattr(self, "_retirement", None)
         if retirement is not None and not retirement.can_retire():
             return False
@@ -2758,11 +2900,7 @@ class TxSession(TxSessionBase):
         return all(task.resources_drained for task in tasks)
 
     def _failed_wait_result(self) -> Optional[WaitResult]:
-        return (
-            None
-            if getattr(self, "_enforce_physical_ownership", False) and not self.resources_drained()
-            else WaitResult.FAILED
-        )
+        return None if not self.resources_drained() else WaitResult.FAILED
 
     def _completed_wait_result(self) -> Optional[WaitResult]:
         if getattr(self, "_retirement", None) is not None and not self.is_completed():
@@ -2966,7 +3104,7 @@ class TxSession(TxSessionBase):
         with self.lock:
             if self._closed:
                 return True
-            if getattr(self, "_enforce_physical_ownership", False) and not self.resources_drained():
+            if not self.resources_drained():
                 return False
             retirement = getattr(self, "_retirement", None)
             if retirement is not None and not retirement.close():
@@ -4939,6 +5077,9 @@ class TransferWorker:
 
     def request_shutdown(self) -> None:
         """Close admission and start drain before any potentially blocking teardown."""
+        sender = getattr(self, "_sender", None)
+        if sender is not None:
+            sender._shutdown_requested = True
         watchdog = getattr(self, "_retirement_watchdog", None)
         if watchdog is not None:
             watchdog.request_shutdown()
@@ -5061,6 +5202,20 @@ class TransferWorker:
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
+            self._agent_recovery_retry_at = 0.0
+            self._agent_recovery_lock = threading.Lock()
+            self._agent_recovery_stop = threading.Event()
+            self._agent_recovery_thread: Optional[threading.Thread] = None
+            if (
+                not self._config.enforce_physical_ownership
+                and not self._config.context_first_ownership
+                and self._config.agent_buffer_size_mb == 0
+                and not use_pure_python_transfer_agent()
+            ):
+                if getattr(self._agent, "supports_handle_retirement", False):
+                    self._sender._recover_agent = self._request_agent_recovery
+                else:
+                    logger.warning("NIXL agent recovery requires rebuilt request-release bindings")
         except Exception:
             # shutdown()'s getattr guards handle whichever attrs got set before the failure.
             try:
@@ -5068,6 +5223,96 @@ class TransferWorker:
             except Exception as e:
                 logger.warning(f"TransferWorker init-failure cleanup: {e}")
             raise
+
+    def _request_agent_recovery(self, failed_generation: int) -> None:
+        """Coalesce worker failures into one background recovery attempt."""
+        with self._agent_recovery_lock:
+            if self._agent_recovery_stop.is_set():
+                return
+            if (
+                failed_generation != self._sender._agent_generation
+                or not self._sender._agent_failed
+            ):
+                return
+            if self._agent_recovery_thread is not None and self._agent_recovery_thread.is_alive():
+                return
+
+            def recover() -> None:
+                torch.cuda.set_device(self._config.device_id)
+                CUASSERT(cudart.cudaSetDevice(self._config.device_id))
+                while not self._agent_recovery_stop.is_set():
+                    self._recover_transfer_agent(self._sender._agent_generation)
+                    with self._agent_recovery_lock:
+                        if not self._sender._agent_failed:
+                            self._agent_recovery_thread = None
+                            return
+                    self._agent_recovery_stop.wait(1.0)
+
+            self._agent_recovery_thread = threading.Thread(
+                target=recover, name="nixl-agent-recovery", daemon=True
+            )
+            self._agent_recovery_thread.start()
+
+    def _recover_transfer_agent(self, failed_generation: int) -> bool:
+        """Rebuild a drained send agent without replacing the model or sockets.
+
+        All send handles are inside the sender's reader gate. Its writer gate
+        and the receiver session lock exclude both local sends and new receive
+        publications during reset. An active receive defers reset until its
+        published destinations are no longer in use.
+        """
+        sender, receiver = self._sender, self._receiver
+        # Match registration's lock order: descriptor lock, then writer gate.
+        with sender._loaded_remote_agents_lock, sender._agent_operation_gate.metadata():
+            if failed_generation != sender._agent_generation or not sender._agent_failed:
+                return True
+            if sender._shutdown_requested or time.monotonic() < self._agent_recovery_retry_at:
+                return False
+            with receiver._sessions_lock:
+                if receiver._sessions:
+                    return False
+                old_agent = self._agent
+                try:
+                    if old_agent is not None:
+                        old_agent.shutdown()
+                        self._agent = None
+                    # shutdown drains the native backend, including any handle
+                    # whose explicit release failed. Keep roots until it returns.
+                    for _status, task, retired in sender._unreleased_statuses:
+                        with task.lock:
+                            task._native_inflight -= 1
+                        retired.set()
+                    sender._unreleased_statuses.clear()
+                    mapping = self._config.kv_cache_manager.mapping
+                    agent = _create_nixl_agent(
+                        self._rank_info.instance_name + str(self._rank_info.instance_rank),
+                        rank=mapping.rank,
+                        world_size=mapping.world_size,
+                    )
+                    try:
+                        for desc in self._registered_mem:
+                            agent.register_memory(desc)
+                        for name, descriptor in sender._remote_agent_descriptors.items():
+                            agent.load_remote_agent(name, descriptor)
+                        descriptor = bytes(agent.get_local_agent_desc())
+                    except Exception:
+                        agent.shutdown()
+                        raise
+                except Exception as error:
+                    self._agent_recovery_retry_at = time.monotonic() + 1.0
+                    logger.error(f"NIXL agent recovery failed; new sends remain fenced: {error}")
+                    return False
+                self._agent = sender._agent = receiver._agent = agent
+                self._rank_info.transfer_engine_info = descriptor
+                # The next receive must publish the replacement's descriptor
+                # before requesting any writes into its registered regions.
+                receiver._sender_ep_instance_map.clear()
+                sender._agent_generation += 1
+                sender._agent_failed = False
+                logger.warning(
+                    f"Recovered NIXL agent {agent.name}, generation={sender._agent_generation}"
+                )
+                return True
 
     def _register_kv_cache(self):
         assert self._rank_info.page_table is not None
@@ -5115,6 +5360,24 @@ class TransferWorker:
         if getattr(self, "_shutdown_prepared", False):
             return
         self.request_shutdown()
+        recovery_stop = getattr(self, "_agent_recovery_stop", None)
+        if recovery_stop is not None:
+            recovery_stop.set()
+            recovery_thread = self._agent_recovery_thread
+            if recovery_thread is not None:
+                recovery_thread.join()
+        sender = getattr(self, "_sender", None)
+        if sender is not None and getattr(sender, "_unreleased_statuses", ()):
+            with sender._loaded_remote_agents_lock, sender._agent_operation_gate.metadata():
+                if self._agent is not None:
+                    self._agent.shutdown()
+                    self._agent = None
+                for _status, task, retired in sender._unreleased_statuses:
+                    with task.lock:
+                        task._native_inflight -= 1
+                    retired.set()
+                sender._unreleased_statuses.clear()
+                self._registered_mem.clear()
         watchdog = getattr(self, "_retirement_watchdog", None)
         if watchdog is not None:
             watchdog.require_retired()

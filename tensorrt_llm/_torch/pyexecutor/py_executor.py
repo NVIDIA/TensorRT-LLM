@@ -4358,12 +4358,16 @@ class PyExecutor:
                             self.active_requests)
                     local_scheduler_output = self.scheduler.schedule_request(
                         self.active_requests, self.inflight_req_ids)
+                    scheduled_batch.failed_requests.extend(
+                        local_scheduler_output.failed_requests)
                     local_disagg_candidates = getattr(
                         local_scheduler_output,
                         "fitting_disagg_gen_init_requests", [])
                     self.disagg.revert_deferred_gen_init(
                         local_disagg_candidates,
                         fitting_disagg_gen_init_requests)
+
+                self._fail_scheduler_requests(scheduled_batch)
 
                 if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
@@ -6054,6 +6058,7 @@ class PyExecutor:
         )
         if getattr(self, "_check_helix_schedule", False):
             self._check_helix_schedule_consistency(scheduled_batch)
+        self._fail_scheduler_requests(scheduled_batch)
 
         # Must run after _schedule(): the empty scheduled batch it repairs does
         # not exist until the capacity scheduler has returned its verdict.
@@ -10178,6 +10183,9 @@ class PyExecutor:
                 self.active_requests)
 
         cancelled_model_ids = self._cancelled_disagg_model_request_ids()
+        cancelled_model_ids.update(
+            req.py_request_id
+            for req, _ in self._held_transfer_failures().values())
         scheduling_requests = [
             request for request in self.active_requests
             if request.py_request_id not in cancelled_model_ids
@@ -10303,6 +10311,7 @@ class PyExecutor:
                     retained_ids.add(req.py_request_id)
                     num_displaced -= 1
             scheduled_requests.paused_in_place_ids = frozenset(retained_ids)
+        scheduled_requests.failed_requests = scheduler_output.failed_requests
 
         self._maybe_record_hang_diagnostic_phase("scheduled",
                                                  scheduled_requests)
@@ -10324,6 +10333,51 @@ class PyExecutor:
             failed_request_ids = set(e.request_ids or scheduled_items)
             self._handle_multimodal_encoder_request_error(
                 scheduled_requests, error_msg, failed_request_ids)
+
+    def _fail_scheduler_requests(self,
+                                 scheduled_batch: ScheduledRequests) -> None:
+        """Agree on admission failures before freeing any rank's request state."""
+        if not self._is_kv_manager_v2:
+            return
+        local_ids = [
+            req.py_request_id for req in scheduled_batch.failed_requests
+        ]
+        # Every scheduling rank votes, including ranks with no local failure.
+        # A failed request must not run on another replica after its pages free.
+        if self.dist.cp_size > 1:
+            votes = self.dist.tp_cp_allgather(local_ids)
+        elif self.dist.tp_size > 1:
+            votes = self.dist.tp_allgather(local_ids)
+        else:
+            votes = [local_ids]
+        failed_ids = {rid for vote in votes for rid in vote}
+        scheduled_batch.failed_requests = []
+        if not failed_ids:
+            return
+        failed = [
+            req for req in self.active_requests
+            if req.py_request_id in failed_ids
+        ]
+        scheduled_batch.encoder_requests = [
+            req for req in scheduled_batch.encoder_requests
+            if req.py_request_id not in failed_ids
+        ]
+        scheduled_batch.reset_context_requests([
+            req for req in scheduled_batch.context_requests
+            if req.py_request_id not in failed_ids
+        ])
+        scheduled_batch.generation_requests = [
+            req for req in scheduled_batch.generation_requests
+            if req.py_request_id not in failed_ids
+        ]
+        scheduled_batch.recompute_paused_requests = [
+            req for req in scheduled_batch.recompute_paused_requests
+            if req.py_request_id not in failed_ids
+        ]
+        self._handle_errors(
+            "KV cache admission made no progress within the scheduler limit",
+            requests=failed,
+            charge_budget=False)
 
     def _handle_multimodal_encoder_request_error(
             self, scheduled_requests: ScheduledRequests, error_msg: str,

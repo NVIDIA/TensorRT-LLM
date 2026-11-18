@@ -197,7 +197,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         // Failure detail for the last terminal state (empty if unavailable). Named to match the
         // lookup in BindingsNixlTransferStatus.last_status_str (nixl/_agent_cpp.py), which is what
         // the Python transceiver's error log reads.
-        .def("get_last_status_str", &kvc::TransferStatus::getLastStatusStr);
+        .def("get_last_status_str", &kvc::TransferStatus::getLastStatusStr)
+        .def("release", &kvc::TransferStatus::release, nb::call_guard<nb::gil_scoped_release>());
 
     // BaseAgentConfig struct
     nb::class_<kvc::BaseAgentConfig>(m, "BaseAgentConfig")

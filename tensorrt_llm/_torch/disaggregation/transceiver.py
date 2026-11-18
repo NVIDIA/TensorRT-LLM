@@ -1233,7 +1233,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @staticmethod
     def _ownership_blocks_retirement(session: object) -> bool:
-        """Whether an ownership-enabled session still holds physical resources."""
+        """Whether a session still holds physical transfer resources."""
+        if isinstance(session, TxSession) and not session.resources_drained():
+            return True
         if not getattr(session, "_enforce_physical_ownership", False):
             return False
         resources_drained = getattr(session, "resources_drained", None)

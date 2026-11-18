@@ -28,6 +28,7 @@ from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (  # noqa: E402
 from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
     NixlTransferAgent as CppNixlTransferAgent,
 )
+from tensorrt_llm.tensorrt_llm_transfer_agent_binding import TransferStatus as CppTransferStatus
 
 from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
 
@@ -95,6 +96,8 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
     The nixl_bindings module is independent from the main trtllm bindings,
     so trtllm can function normally even without NIXL.
     """
+
+    supports_handle_retirement = hasattr(CppTransferStatus, "release")
 
     def __init__(
         self,
@@ -245,6 +248,8 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         request should be a C++ TransferRequest (from tensorrt_llm_transfer_agent_binding).
         """
         cpp_status = self._cpp_agent.submit_transfer_requests(request)
+        if cpp_status is None:
+            raise RuntimeError("NIXL could not create a transfer request")
         return BindingsNixlTransferStatus(cpp_status, agent_name=self.name)
 
     def _convert_reg_memory_descs(self, descs: RegMemoryDescs) -> "MemoryDescs":
