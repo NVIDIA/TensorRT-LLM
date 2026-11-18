@@ -58,3 +58,6 @@ def test_certified_cells(cell) -> None:
         differ = got != want
         assert not bool((differ & ~near_tie(scaled)).any()), "e2m1 codes differ away from a tie"
         assert bool((((got & 7).int() - (want & 7).int()).abs()[differ] <= 1).all())
+        # A code that moves across a tie keeps its sign; only a zero magnitude may carry either sign.
+        same_sign = ((got >> 3) == (want >> 3)) | (((got & 7) == 0) & ((want & 7) == 0))
+        assert bool(same_sign[differ].all()), "a tie resolved to the opposite sign"

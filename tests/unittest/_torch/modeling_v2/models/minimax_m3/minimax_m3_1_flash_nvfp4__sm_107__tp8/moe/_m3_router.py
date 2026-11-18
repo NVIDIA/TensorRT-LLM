@@ -77,3 +77,6 @@ def _compare_fp4(
     )
     magnitude = ((got & 7).int() - (want & 7).int()).abs()
     assert bool((magnitude[differ] <= 1).all()), "a tie resolved more than one code away"
+    # A code that moves across a tie keeps its sign; only a zero magnitude may carry either sign.
+    same_sign = ((got >> 3) == (want >> 3)) | (((got & 7) == 0) & ((want & 7) == 0))
+    assert bool(same_sign[differ].all()), "a tie resolved to the opposite sign"
