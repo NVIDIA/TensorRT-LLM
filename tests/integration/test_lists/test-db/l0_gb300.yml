@@ -69,6 +69,7 @@ l0_gb300:
   - unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::TestSparseResolve::test_colliding_selections_preserve_slots_and_eviction
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
+  - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
   # Kimi K3 KDA unit tests (single GPU, random weights, no checkpoint).
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py
   - unittest/_torch/modules/kimi_kda/test_kda_fused_prefill_conv.py
@@ -164,8 +165,16 @@ l0_gb300:
   - unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
   - unittest/_torch/multi_gpu/test_ll_exchange.py
+  # qwen4_exp FP8 target, pre-merge: its 2- and 4-rank collective matrices (l0_b300 skips them),
+  # tep4 MTP3 over an FP8 KV pool, and tep4 MTP3 with IndexShare over 3k-6k-token pass keys (the
+  # sparse attention path) with their acceptance-length floor. dep4 and dep2 disaggregated run
+  # post-merge.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/comm
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_gsm8k[tep4_fp8_kv_breakable] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_long_context TIMEOUT (60)
 
-# K3 collectives and decode-path exchanges, four ranks in one NVLink domain.
+# K3 collectives, decode-path exchanges and the dep16 MegaMoE at EP4, four ranks in one
+# NVLink domain.
 - condition:
     ranges:
       system_gpu_count:
@@ -181,6 +190,7 @@ l0_gb300:
       stage: pre_merge
       backend: pytorch
   tests:
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16/test_k3_megamoe.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_latent_reduce.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_markov/test_k3_markov.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_k3_mnnvl_comm.py

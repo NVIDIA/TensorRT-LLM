@@ -57,11 +57,13 @@ from .config import (
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
 )
+from .config import FP4_MLA_CUTEDSL_4X_ENV as FP4_MLA_CUTEDSL_4X_ENV
 from .config import _ceil_div as _ceil_div
 from .config import _cutedsl_backend_available as _cutedsl_backend_available
 from .config import _env_enabled_default as _env_enabled_default
 from .config import _env_int as _env_int
 from .config import _fp4_mla_attention_backend as _fp4_mla_attention_backend
+from .config import _fp4_mla_cutedsl_4x_enabled as _fp4_mla_cutedsl_4x_enabled
 from .config import (
     _fp4_mla_cutedsl_fused_v_transpose_enabled as _fp4_mla_cutedsl_fused_v_transpose_enabled,
 )
@@ -72,7 +74,11 @@ from .config import _HPUpdatePhase as _HPUpdatePhase
 from .decode import _cutedsl_pad_q_and_sf_kernel as _cutedsl_pad_q_and_sf_kernel
 from .decode import _cutedsl_swizzled_sf_offset as _cutedsl_swizzled_sf_offset
 from .decode import _run_triton_attention_decode as _run_triton_attention_decode
+from .decode import _select_triton_block_v as _select_triton_block_v
 from .decode import run_fp4_mla_attention_decode
+from .decode_4x import _fp4_mla_4x_split_buffers as _fp4_mla_4x_split_buffers
+from .decode_4x import _fp4_mla_cutedsl_4x_reason as _fp4_mla_cutedsl_4x_reason
+from .decode_4x import _run_cutedsl_4x_decode as _run_cutedsl_4x_decode
 from .layout import _ensure_workspace_tensor as _ensure_workspace_tensor
 from .layout import _get_fp4_mla_global_scale as _get_fp4_mla_global_scale
 from .layout import _get_fp4_mla_hp_pool_layout as _get_fp4_mla_hp_pool_layout
@@ -91,7 +97,6 @@ from .layout import (
 from .metadata import _fp4_mla_append_metadata_kernel as _fp4_mla_append_metadata_kernel
 from .metadata import _fp4_mla_generation_hp_page_ids as _fp4_mla_generation_hp_page_ids
 from .metadata import _fp4_mla_generation_lengths_kernel as _fp4_mla_generation_lengths_kernel
-from .metadata import _fp4_mla_generation_num_blocks_device as _fp4_mla_generation_num_blocks_device
 from .metadata import _fp4_mla_generation_page_ids as _fp4_mla_generation_page_ids
 from .metadata import (
     _fp4_mla_materialize_page_table_kernel as _fp4_mla_materialize_page_table_kernel,
@@ -104,7 +109,6 @@ from .metadata import _fp4_mla_uniform_generation_lengths as _fp4_mla_uniform_ge
 from .metadata import _get_linear_mtp_query_len_per_seq as _get_linear_mtp_query_len_per_seq
 from .metadata import _host_int_list as _host_int_list
 from .metadata import _host_int_list_during_forward as _host_int_list_during_forward
-from .metadata import _infer_assume_full_pages as _infer_assume_full_pages
 from .metadata import (
     _materialize_fp4_mla_device_page_table_for_forward as _materialize_fp4_mla_device_page_table_for_forward,
 )
@@ -124,21 +128,7 @@ from .v_cache import (
 from .v_cache import _get_fp4_mla_v_packed_pool as _get_fp4_mla_v_packed_pool
 from .v_cache import _get_fp4_mla_v_packed_pool_base as _get_fp4_mla_v_packed_pool_base
 from .v_cache import _get_fp4_mla_v_scale_pool_base as _get_fp4_mla_v_scale_pool_base
-from .v_cache import _get_triton_v_packed_cache as _get_triton_v_packed_cache
-from .v_cache import _is_triton_v_packed_cache_valid as _is_triton_v_packed_cache_valid
-from .v_cache import _maybe_update_triton_v_packed_cache as _maybe_update_triton_v_packed_cache
 from .v_cache import _repack_cutedsl_v_packed_cache as _repack_cutedsl_v_packed_cache
-from .v_cache import _select_triton_block_v as _select_triton_block_v
-from .v_cache import _set_triton_v_packed_cache_valid as _set_triton_v_packed_cache_valid
-from .v_cache import _shared_v_pack_storage_enabled as _shared_v_pack_storage_enabled
-from .v_cache import _triton_can_prepack_v as _triton_can_prepack_v
-from .v_cache import _triton_prepack_v_enabled as _triton_prepack_v_enabled
-from .v_cache import _triton_shared_v_packed_valid_attr as _triton_shared_v_packed_valid_attr
-from .v_cache import _triton_v_packed_attr as _triton_v_packed_attr
-from .v_cache import _triton_v_packed_cache_tag as _triton_v_packed_cache_tag
-from .v_cache import _triton_v_packed_valid_attr as _triton_v_packed_valid_attr
-from .v_cache import _update_triton_v_packed_cache as _update_triton_v_packed_cache
-from .v_cache import _v_packed_cache_tag as _v_packed_cache_tag
 from .v_cache import _v_packed_shape as _v_packed_shape
 from .v_cache import rebuild_fp4_mla_disagg_imported_cache
 
@@ -152,6 +142,7 @@ __all__ = [
     "FP4_MLA_KV_GLOBAL_SCALE",
     "FP4_MLA_KV_STATIC_AMAX",
     "FP4_MLA_K_RESIDUAL_DIM",
+    "FP4_MLA_CUTEDSL_4X_ENV",
     "FP4_MLA_PACKED_Q_ENV",
     "FP4_MLA_P_GLOBAL_SCALE",
     "FP4_MLA_Q1_PREFIX_BLOCK_DIM",

@@ -2108,6 +2108,20 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         weight_loader = DeepseekV3WeightLoader(self)
         weight_loader.load_weights(weights)
 
+    def setup_post_transform_receiver_aliases(self) -> None:
+        """Bind each MLA `v_b_proj` as a view of the V rows of `kv_b_proj.weight`.
+
+        `DeepseekV3WeightLoader` makes that binding while it loads. A staged MX
+        receiver gets its weights without the loader, so MX receiver
+        preparation (`model_hooks.prepare_post_transform_receiver`) calls this
+        before the weights arrive, and only for a root that qualified for
+        post-transform weights. No other load path calls it, so GMS read-only
+        peers and ordinary loads keep the binding their own path made.
+        """
+        for module in self.modules():
+            if isinstance(module, MLA):
+                module.alias_v_b_proj_to_kv_b_proj()
+
     def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):

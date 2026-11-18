@@ -18,8 +18,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def native_ops() -> torch._ops._OpNamespace:
     target = import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
-        "glm_5_2_nvfp4__sm_107__high_throughput"
+        "tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__high_throughput"
     )
     return target.native_ops
 

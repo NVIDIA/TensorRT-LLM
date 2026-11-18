@@ -301,6 +301,18 @@ The core contract is:
 - `runtime_workspace_is_chunked_prefill_bounded(model_config)` — whether
   chunked prefill limits that workspace to the current KV chunk (default
   `True`)
+- `runtime_workspace_min_tokens(model_config, mapping, *, max_num_tokens,
+  runtime_features)` — backend staging floor in per-token workspace units
+  (default `0`); the estimator credits staging covered by its profiling peak.
+  Dense chunked FP8 context MLA declares its complete partition/query buffer here;
+  sparse gather implementations retain their own layouts and default to zero.
+- `runtime_workspace_profiled_tokens(model_config, *, profiled_prompt_len,
+  max_num_tokens, max_batch_size)` — staging tokens actually exercised by the
+  fresh-prefill profiling route (default `0`). A zero prompt length means no
+  profiling forward ran. The backend owns this declaration alongside the floor:
+  FP8 DSA above its short-MHA threshold uses sparse absorption, so that profile
+  receives no dense K/V staging credit. The estimator does not duplicate backend
+  routing rules when subtracting credit from the staging floor.
 - `runtime_workspace_fixed_bytes(model_config, mapping, **capacities)` — retained
   workspace sized by serving capacity rather than admitted attended-KV length
   (default `0`)
@@ -365,8 +377,21 @@ metadata and cache behavior.
 All backend metadata types inherit from `AttentionMetadata`. The base contract
 includes sequence-length and request-level state, KV-cache manager and
 parameters, runtime feature flags, and optional CUDA-graph buffer management.
+A CUDA graph runner that keys its decode graphs by KV regime hands the
+regime ceiling to the graph's metadata through `set_decode_kv_regime`; only a
+backend whose decode path depends on the KV length keeps it (the FP4 MLA
+2x | 4x | two-stream dispatcher), the default ignores it.
 Sparse metadata subtypes consume only `SparseMetadataParams`, not
 backend-owned `SparseParams`.
+
+Runner-created graph metadata can carry `forward_scratch_buffers`. These buffers
+are valid within one forward and shared by one runner's CUDA graphs, not across
+runners or concurrent forwards. Warmup must register enough capacity; capture
+probes capacity without growing the pool. `CUDAGraphRunner.clear()` releases it.
+Unlike `cuda_graph_buffers`, which may use a process-wide pool, this storage must
+not hold persistent plans or caches. Triton FP4 MLA and the opt-in 4x decoder
+share per-forward partials through this pool; the 2x CuTe DSL partials and all
+persistent decode plans remain metadata-local.
 
 **`TrtllmAttentionMetadata`** is the main metadata family. It adds paged-KV
 block information, TRTLLM runtime state, chunked-prefill/speculative-decode/Helix
@@ -621,13 +646,19 @@ The FMHA package is split by role:
   attends every partition through `Fp4MlaFmha.forward_context_partition`;
   non-final chunks must cover whole 16-token FP4 tiles, which the scheduler
   keeps by rounding them to the 128-token chunk unit. A prefix reused from
-  the block cache is attended the same way, so FP4 MLA block reuse requires
-  chunked prefill; the cached-KV path (`forward_context_with_cached_kv`)
-  rejects FP4 MLA layers. Reuse must also resume on a full FP4 tile, which
-  holds for hybrid linear-attention models (reuse ends on a recurrent-state
-  snapshot that the hybrid manager aligns to a cache block) but not for dense
-  FP4 MLA, whose reuse match can back off into a tile by the one-model
-  draft's prompt lookahead; dense FP4 MLA therefore keeps block reuse off.
+  the block cache is attended the same way, with or without chunked prefill;
+  without it, each partition holds up to `max_num_tokens` cached tokens, the
+  size of the FP8 context scratch. The cached-KV path
+  (`forward_context_with_cached_kv`) rejects FP4 MLA layers. Reuse must also
+  resume on a full FP4 tile. Hybrid linear-attention models resume on a
+  recurrent-state snapshot that the FP4 MLA layout aligns to a cache block,
+  and keep block reuse tied to chunked prefill. The dense manager claims
+  whole cache blocks only, without the reuse-match backoff of one-model
+  drafts, and keeps its HP ring request-private
+  (`ReusePolicy.PRIVATE`), so the ring never cuts a match short. With reuse
+  on, a context step repacks the packed V of every page it reads, reused
+  pages included, and a dense manager's generation steps write packed V
+  directly, since they append to pages their request allocated.
   Disaggregated serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache
@@ -636,12 +667,19 @@ The FMHA package is split by role:
   and the disaggregated launcher publish) keeps a single-copy cache without
   those sidecars (`fp4_mla_context_only_cache`), so it sizes and allocates
   only K, K scales, and the HP ring, runs context attention only, and skips
-  generation warmup shapes. Hybrid
-  linear-attention models (Kimi K3)
-  keep their MLA latent cache in `MambaHybridCacheManagerV2`, which composes
-  `Fp4MlaV2CacheLayoutPolicy` with the recurrent-state lifecycle: the policy
-  owns the MLA layers' roles and HP-ring virtual layers, and the hybrid
-  manager keeps the SSM, convolution, and KDA replay state. For disaggregated
+  generation warmup shapes. A one-model MTP drafter on such a worker must
+  draft a single token (`max_draft_len: 1`), because its later draft steps
+  are generation steps; the generation worker fills in the drafts it lacks. The hybrid
+  linear-attention model Kimi K3
+  keeps its MLA latent cache in `KimiK3HybridCacheManager`, which selects
+  `Fp4MlaV2CacheLayoutPolicy` through the hybrid manager's
+  `_configure_attention_cache_layout` hook; `MambaHybridCacheManagerV2`
+  composes the policy with the recurrent-state lifecycle and forwards the
+  attention-layout operations to it: the policy owns the MLA layers' roles,
+  HP-ring virtual layers and snapshot-point alignment, and the hybrid
+  manager keeps the SSM, convolution, and KDA replay state. No other hybrid
+  linear-attention family has an FP4 MLA layout, so `get_kv_cache_manager_cls`
+  rejects one with an NVFP4 MLA cache. For disaggregated
   serving the hybrid manager owns the transfer declarations and merges the
   policy's MLA roles into them: K and K scales map to `NHD` and the HP ring to
   `REPLICATED` per role, so SSM state keeps the `INDEXED` `Role.ALL` fallback

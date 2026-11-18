@@ -325,7 +325,7 @@ def _run_create_py_executor(
     monkeypatch.setattr(
         py_executor_creator,
         "_load_config_and_create_checkpoint_loader",
-        lambda llm_args, checkpoint_dir: (llm_args, None),
+        lambda llm_args, checkpoint_dir: (llm_args, None, True),
     )
     monkeypatch.setattr(py_executor_creator, "_get_mapping", lambda _: fake_mapping)
     monkeypatch.setattr(
@@ -339,7 +339,9 @@ def _run_create_py_executor(
         py_executor_creator, "get_spec_resource_manager", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(py_executor_creator, "get_spec_drafter", lambda *args, **kwargs: None)
-    monkeypatch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", lambda: None)
+    monkeypatch.setattr(
+        py_executor_creator, "_adjust_torch_mem_fraction", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(py_executor_creator, "log_memory_usage", lambda *args, **kwargs: None)
     monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: is_mla_model)
     monkeypatch.setattr(
@@ -555,7 +557,7 @@ def test_fp4_mla_rejects_unaligned_chunk_unit() -> None:
 
 @pytest.mark.parametrize(
     ("is_hybrid", "enable_chunked_prefill", "supported"),
-    [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
+    [(True, True, True), (True, False, False), (False, True, True), (False, False, True)],
 )
 def test_fp4_mla_block_reuse_blocker(
     monkeypatch: pytest.MonkeyPatch,
@@ -570,9 +572,7 @@ def test_fp4_mla_block_reuse_blocker(
     )
 
     assert (blocker is None) == supported
-    if not is_hybrid:
-        assert "hybrid linear-attention" in blocker
-    elif not enable_chunked_prefill:
+    if not supported:
         assert "enable_chunked_prefill" in blocker
 
 
@@ -598,8 +598,8 @@ def test_hybrid_fp4_mla_keeps_block_reuse_with_chunked_prefill(monkeypatch, sm_v
 
 @pytest.mark.parametrize(
     ("is_hybrid", "enable_chunked_prefill"),
-    [(True, False), (False, True), (False, False)],
-    ids=["hybrid_without_chunked_prefill", "dense", "dense_without_chunked_prefill"],
+    [(True, False)],
+    ids=["hybrid_without_chunked_prefill"],
 )
 def test_fp4_mla_disables_unsupported_block_reuse(
     monkeypatch, is_hybrid: bool, enable_chunked_prefill: bool

@@ -181,9 +181,18 @@ outcome IS NULL OR outcome != 'passed' OR tainted != 0
 The two terms cover two ways a record can fall short:
 
 - **`outcome`** — a test that did not pass may not have reached the code it normally covers.
+  For the same test and stage, at least one `passed` observation is required, and any
+  failure or error makes the result incomplete. `skipped` observations do not invalidate
+  a pass: a stage retry may skip a test whose passing result it reuses. Skipped-only
+  records remain incomplete, and missing outcomes remain unknown. This reduction is
+  independent of process identity and merge order.
 - **`tainted`** — the context channel could not vouch for the attribution of some rows, or for their
   completeness. `README.md` documents the kinds, the reasons and their scopes; `taint_rows` gives the
   detail per `(process, test)`.
+
+Existing schema-5 artifacts can contain the older view that treats every skip as incomplete.
+The selector reduces their raw `test_result` observations with the same policy, while retaining
+their taint flags; the artifact does not need to be rewritten.
 
 Together they are the only way to detect lost or misattributed data. None of it is visible in the
 rows themselves: the footprint stays large and the usual `py_executor` symbols are still there
