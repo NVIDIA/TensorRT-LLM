@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Tests for ExecutorRequestQueue class.
 
 This module tests the ExecutorRequestQueue class functionality including:
@@ -388,3 +390,38 @@ def test_queue_size_methods(executor_queue):
     # Add some data and test
     executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
     assert executor_queue.get_request_queue_size() == 1
+
+
+@pytest.mark.parametrize("arrives", [False, True])
+def test_conversation_activity_poll_preserves_batch_fill_within_deadline(
+        executor_queue, monkeypatch, arrives):
+    import datetime
+    import queue
+
+    now = [0.0]
+    first, second = object(), object()
+    requests = executor_queue
+    requests.request_queue = Mock()
+    requests.request_queue.empty.return_value = True
+    requests.batch_wait_timeout_ms = 5.0
+    requests.max_batch_size = 2
+
+    def get(*, timeout):
+        if not arrives:
+            now[0] = 1.0
+            raise queue.Empty
+        return first if requests.request_queue.get.call_count == 1 else second
+
+    requests.request_queue.get.side_effect = get
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.executor_request_queue.time.monotonic",
+        lambda: now[0])
+    result = requests.get_from_request_queue(datetime.timedelta(seconds=1),
+                                             batch_wait_deadline=1.0)
+    if arrives:
+        assert result == [first, second]
+        assert requests.request_queue.get.call_args_list[1].kwargs[
+            "timeout"] == pytest.approx(0.005)
+    else:
+        assert result == []
+        requests.request_queue.get.assert_called_once_with(timeout=1.0)

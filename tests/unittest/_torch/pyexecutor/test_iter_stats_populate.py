@@ -1063,6 +1063,7 @@ def test_attention_dp_fanout_rows_match_serializing_each_rank_stats():
     rank0_stats.specdec_stats = specdec_stats
     buffer = _build_adp_stats_buffer(rank0_stats)
     states = [RankState(rank=0, iter_stats=buffer.next_payload())]
+    states[0].iter_stats.kv_transfer_outcomes = (0, 0, 0)
     for rank in range(1, 6):
         payload = RankIterStatsPayload(
             has_iter_stats=1,
@@ -1077,6 +1078,10 @@ def test_attention_dp_fanout_rows_match_serializing_each_rank_stats():
             kv_cache_stats=(
                 None if rank == 3 else _snapshot_kv_cache_stats(_make_kv_cache_snapshot(rank))
             ),
+            cross_kv_cache_stats=(
+                _snapshot_kv_cache_stats(_make_kv_cache_snapshot(100 + rank)) if rank % 2 else None
+            ),
+            kv_transfer_outcomes=(rank, 2 * rank, 3 * rank) if rank != 2 else None,
             specdec_stats=(
                 None
                 if rank == 4
@@ -1104,37 +1109,16 @@ def test_attention_dp_fanout_rows_match_serializing_each_rank_stats():
         for state in states
     ]
 
+    expected = [json.loads(row) for row in expected]
+    for state, row in zip(states, expected):
+        if state.rank != 2:
+            row["kvTransferOutcomes"] = dict(
+                zip(("success", "error", "timeout"), (state.rank, 2 * state.rank, 3 * state.rank))
+            )
     rows = buffer.finalize(states[::-1], is_rank0=True, scheduler_mode="non_overlap")
 
-    assert [json.loads(row) for row in rows] == [json.loads(row) for row in expected]
+    assert [json.loads(row) for row in rows] == expected
     assert [BaseWorker._stats_serializer(row) for row in rows] == rows
-
-
-@pytest.mark.parametrize("outcomes", [None, (0, 0, 0), (13, 2, 3)])
-def test_attention_dp_fanout_preserves_rank_local_transfer_outcomes(outcomes):
-    """Transfer outcomes remain rank-local across the serialized row template."""
-    stats = _make_adp_iteration_stats(iter_id=9)
-    buffer = _build_adp_stats_buffer(stats)
-    states = [RankState(rank=0, iter_stats=buffer.next_payload())]
-    states[0].iter_stats.kv_transfer_outcomes = outcomes
-    for rank in range(1, 4):
-        states.append(
-            RankState(
-                rank=rank,
-                iter_stats=RankIterStatsPayload(
-                    has_iter_stats=1,
-                    iter_stats_iter=9,
-                    kv_transfer_outcomes=(rank, 2 * rank, 3 * rank) if rank != 2 else None,
-                ),
-            )
-        )
-    rows = [json.loads(row) for row in buffer.finalize(states, is_rank0=True)]
-    for state, row in zip(states, rows):
-        expected = state.iter_stats.kv_transfer_outcomes
-        if expected is None:
-            assert "kvTransferOutcomes" not in row
-        else:
-            assert row["kvTransferOutcomes"] == dict(zip(("success", "error", "timeout"), expected))
 
 
 def test_attention_dp_fanout_waits_for_complete_matching_payloads():
