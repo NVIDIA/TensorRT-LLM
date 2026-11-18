@@ -28,17 +28,31 @@ import pytest
 import torch
 from numpy.lib.stride_tricks import as_strided
 
-from tensorrt_llm._torch.distributed import host_exchange, mnnvl_host_exchange, mnnvl_memory
-from tensorrt_llm._torch.distributed.host_exchange import HostExchange, MnnvlDist
+from tensorrt_llm import _utils
+from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.distributed import (
+    Distributed,
+    host_exchange,
+    mnnvl_host_exchange,
+    mnnvl_memory,
+)
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
+from tensorrt_llm._torch.distributed.host_exchange import HostExchange, MnnvlDist, MnnvlDistFactory
 from tensorrt_llm._torch.distributed.membership import (
     Authority,
     RankReport,
     Reply,
     ResumeState,
+    StoreGroup,
     rank_mask,
 )
 from tensorrt_llm._torch.distributed.mnnvl_host_exchange import MnnvlHostExchangeGroup
-from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
+from tensorrt_llm._torch.distributed.startup_record import StartupRecord
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    FAULT_TOLERANCE_RANK_ENV,
+    TURN_FAULT_TOLERANCE_OFF,
+    RankIdentity,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -647,6 +661,135 @@ def test_requirements_name_what_is_missing(monkeypatch, lacks, requirement):
     with pytest.raises(ValueError, match=re.escape(requirement)) as error:
         MnnvlDist.check_requirements(mapping)
     assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+
+
+@pytest.fixture
+def fresh_distributed(monkeypatch):
+    """Let a test choose the Distributed implementation, with no communicator cached."""
+    monkeypatch.setattr(Distributed, "_create", None)
+    monkeypatch.setattr(Distributed, "startup_record", None)
+    Distributed.get.cache_clear()
+    yield
+    Distributed.get.cache_clear()
+
+
+def test_fault_tolerance_needs_host_collectives(fresh_distributed):
+    """Refuse a mapping that the host collectives do not support, instead of falling back to MPI."""
+    Distributed.set_implementation(MnnvlDistFactory(), StartupRecord())
+    with pytest.raises(ValueError, match=r"requires attention DP \(enable_attention_dp=True\)"):
+        Distributed.get(Mapping(world_size=2, rank=0, gpus_per_node=2, tp_size=2))
+
+
+def test_rank_identity_alone_keeps_mpi(fresh_distributed, monkeypatch):
+    """Only the startup group of a fault-tolerant deployment selects ``MnnvlDist``, before any get."""
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, RankIdentity(0, 2, 2, False).env_value())
+    assert not isinstance(Distributed.get(Mapping(world_size=2, rank=0, tp_size=2)), MnnvlDist)
+    with pytest.raises(RuntimeError, match="before any communicator is created"):
+        Distributed.set_implementation(MnnvlDistFactory(), StartupRecord())
+
+
+_TP2 = Mapping(world_size=2, rank=1, tp_size=2, enable_attention_dp=True)
+
+
+@pytest.fixture
+def created_exchanges(fresh_distributed, monkeypatch):
+    """Make ``HostExchange.create`` record each mapping and return a fake exchange."""
+    created = []
+
+    def create(cls, mapping, group_type):
+        created.append(mapping)
+        return SimpleNamespace(
+            rank=mapping.tp_rank, nranks=mapping.tp_size, waited_epochs=((1, 7),)
+        )
+
+    monkeypatch.setattr(HostExchange, "create", classmethod(create))
+    monkeypatch.setattr(MnnvlDist, "check_requirements", staticmethod(lambda mapping: None))
+    return created
+
+
+def test_communicators_share_host_exchange(created_exchanges):
+    """Check that every ``MnnvlDist`` of a factory uses the host exchange of the first one."""
+    Distributed.set_implementation(MnnvlDistFactory(), StartupRecord())
+    first = Distributed.get(_TP2)
+    second = Distributed.get(
+        Mapping(world_size=2, rank=1, tp_size=2, moe_ep_size=2, enable_attention_dp=True)
+    )
+    other_tp_group = Distributed.get(
+        Mapping(world_size=4, rank=1, tp_size=4, enable_attention_dp=True)
+    )
+    assert second is not first
+    assert second.host_exchange is first.host_exchange
+    assert len(created_exchanges) == 1
+    with pytest.raises(RuntimeError, match="cannot serve TP rank 1/4"):
+        other_tp_group.host_exchange
+
+
+def test_factory_reports_host_collective_waits(created_exchanges):
+    """Report the waits of the factory's host exchange, and none before it exists."""
+    factory = MnnvlDistFactory()
+    Distributed.set_implementation(factory, StartupRecord())
+    dist = Distributed.get(_TP2)
+    assert factory.waited_epochs == ()
+    dist.host_exchange
+    assert factory.waited_epochs == ((1, 7),)
+
+
+def test_each_factory_has_own_host_exchange(created_exchanges):
+    """Give the communicators of another factory, as of a new start, their own host exchange."""
+    first, other = MnnvlDistFactory()(_TP2), MnnvlDistFactory()(_TP2)
+    assert other.host_exchange is not first.host_exchange
+    assert len(created_exchanges) == 2
+
+
+def _start_alone(monkeypatch, record):
+    """Start rank 0 of a one-rank deployment as a new process does, and return its ``MnnvlDist``."""
+    Distributed.get.cache_clear()
+    monkeypatch.setattr(Distributed, "_create", None)
+    monkeypatch.setattr(mnnvl_memory.TpMnnvlMemory, "comm", None)
+    monkeypatch.setattr(mnnvl_memory.TpMnnvlMemory, "comm_signature", None)
+    startup_group = StoreGroup(None, "startup", 0, [0], startup=record.replacement)
+    monkeypatch.setattr(_utils, "comm", startup_group)
+    Distributed.set_implementation(MnnvlDistFactory(), record)
+    return Distributed.get(Mapping(world_size=1, rank=0, tp_size=1, enable_attention_dp=True))
+
+
+def _final_kv_cache_allocation(dist):
+    """Make the startup collectives of the final KV cache allocation and return their results."""
+    max_tokens = dist.allreduce(256, op=ReduceOp.MIN)
+    quota = Distributed.agree_rank_capacity(
+        "kv_cache_device_quota", 0, 100, lambda: dist.allgather(100)
+    )
+    return max_tokens, quota, dist.tp_allgather_int64([8, 1]).tolist()
+
+
+def test_replacement_replays_paused_first_collective(fresh_distributed, monkeypatch):
+    """Replay a startup whose first host collective ran in the KV cache estimation of rank 0.
+
+    That collective creates the host exchange and splits its communicator. A replacement skips the
+    estimation, so it does both outside a pause.
+    """
+    _use_host_copies(monkeypatch)
+    monkeypatch.setattr(MnnvlHostExchangeGroup, "requirements", classmethod(lambda cls: []))
+    monkeypatch.setattr(
+        mnnvl_host_exchange,
+        "HostExchangeMnnvlMemory",
+        lambda comm, nbytes: _HostRows(np.zeros(nbytes, dtype=np.uint8), nbytes, 0),
+    )
+    original = StartupRecord()
+    original.record()
+    rank_0 = _start_alone(monkeypatch, original)
+    Distributed.pause_startup_record()
+    assert rank_0.allreduce(512, op=ReduceOp.MIN) == 512
+    # The resume keeps the tactics that the autotuner tuned during the pause, here none.
+    tuner = SimpleNamespace(profiling_cache=SimpleNamespace(cache={}))
+    monkeypatch.setattr(AutoTuner, "get", lambda: tuner)
+    Distributed.resume_startup_record()
+    results = _final_kv_cache_allocation(rank_0)
+    original.close()
+    replacement = StartupRecord()
+    replacement.replay(original.published())
+    assert _final_kv_cache_allocation(_start_alone(monkeypatch, replacement)) == results
+    replacement.close()
 
 
 def test_cp_collectives_unavailable():

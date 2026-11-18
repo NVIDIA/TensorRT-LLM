@@ -2733,7 +2733,8 @@ class AutoTuner:
 
     def _hit_on_all_ranks(self, is_cache_hit: bool) -> bool:
         """Whether ``is_cache_hit`` holds on every rank (host all-gather)."""
-        return all(self._dist.tp_cp_allgather(obj=bool(is_cache_hit)))
+        with Distributed.rank_varying("autotuner cache hits"):
+            return all(self._dist.tp_cp_allgather(obj=bool(is_cache_hit)))
 
     def _profile_hits_on_all_ranks(self, profiles: List[OptimizationProfile],
                                    hits: List[bool]) -> List[bool]:
@@ -2742,9 +2743,11 @@ class AutoTuner:
         Ranks build their profiles from their own input shapes (attention DP), so the lists may differ.
         """
         keys = [p.get_opt_shapes() for p in profiles]
+        with Distributed.rank_varying("autotuner cache hits"):
+            gathered = self._dist.tp_cp_allgather(
+                obj=(keys, [bool(hit) for hit in hits]))
         missed = set()
-        for rank_keys, rank_hits in self._dist.tp_cp_allgather(
-                obj=(keys, [bool(hit) for hit in hits])):
+        for rank_keys, rank_hits in gathered:
             missed.update(key for key, hit in zip(rank_keys, rank_hits)
                           if not hit)
         return [key not in missed for key in keys]
@@ -2805,8 +2808,9 @@ class AutoTuner:
 
     def _merge_cache_data(self, custom_op: str):
         cache_data = self.profiling_cache.get_specific_custom_op(custom_op)
-        self.profiling_cache.merge_cache_data(
-            _fastest_entries(self._dist.tp_cp_allgather(obj=cache_data)))
+        with Distributed.rank_varying("measured tactics"):
+            all_cache_data = self._dist.tp_cp_allgather(obj=cache_data)
+        self.profiling_cache.merge_cache_data(_fastest_entries(all_cache_data))
 
     def post_tune_merge_tactics(self,
                                 custom_ops: Optional[Set[str]] = None,
@@ -2821,7 +2825,8 @@ class AutoTuner:
             for key, value in self.profiling_cache.cache.items()
             if custom_ops is None or key[0] in custom_ops
         }
-        per_rank = self._dist.tp_cp_allgather(obj=mine)
+        with Distributed.rank_varying("measured tactics"):
+            per_rank = self._dist.tp_cp_allgather(obj=mine)
         merged = (_majority_entries(per_rank)
                   if majority else _fastest_entries(per_rank))
         changed = sum(1 for key, value in merged.items()

@@ -164,6 +164,30 @@ def test_wide_ep_fault_tolerance_defaults_off(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("enable", [False, True])
+def test_fault_tolerance_mode_env_is_deprecated(monkeypatch: pytest.MonkeyPatch,
+                                                enable: bool) -> None:
+    """TLLM_FAULT_TOLERANCE_MODE=1 alone does not turn on fault tolerance."""
+    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
+    fault_tolerance = dict(
+        enable_wide_ep_fault_tolerance=True) if enable else {}
+    with patch.object(llm_args_mod.logger, "warning") as warning:
+        args = TorchLlmArgs(model=llama_model_path,
+                            cuda_graph_config=None,
+                            **fault_tolerance)
+    deprecations = [
+        call.args[0] for call in warning.call_args_list
+        if "TLLM_FAULT_TOLERANCE_MODE" in str(call.args[0])
+    ]
+    assert args.enable_wide_ep_fault_tolerance is enable
+    if enable:
+        assert deprecations == []
+    else:
+        assert len(deprecations) == 1
+        assert "set enable_wide_ep_fault_tolerance=True" in deprecations[0]
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("model_kwargs", "expected"),
     [

@@ -12,10 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Configuration checks and environment variables of Wide-EP fault tolerance."""
+"""Configuration checks for Wide-EP fault tolerance, and the rank identity from its launcher."""
 
-from typing import Sequence, Tuple
+import os
+from typing import NamedTuple, Optional, Sequence, Tuple
 
+# Set for every rank under Wide-EP fault tolerance to
+# "<rank>,<world size>,<GPUs per node>,<replacement>".
+FAULT_TOLERANCE_RANK_ENV = "TLLM_FAULT_TOLERANCE_RANK"
 # The rendezvous store's host:port. The authority hosts the store.
 RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
 # The hex secret that every deployment process holds. It derives the hello token.
@@ -33,3 +37,25 @@ def check_fault_tolerance_requirements(checks: Sequence[Tuple[bool, str]]) -> No
             + "; ".join(missing)
             + f"; change the configuration or {TURN_FAULT_TOLERANCE_OFF}"
         )
+
+
+class RankIdentity(NamedTuple):
+    """A rank under Wide-EP fault tolerance, where each rank is its own MPI world."""
+
+    rank: int
+    world_size: int
+    gpus_per_node: int
+    replacement: bool
+
+    def env_value(self) -> str:
+        """Return the ``FAULT_TOLERANCE_RANK_ENV`` value that gives a process this identity."""
+        return ",".join(str(int(field)) for field in self)
+
+
+def wide_ep_fault_tolerance_rank() -> Optional[RankIdentity]:
+    """Return the rank identity the node supervisor gave this process, if one started it."""
+    value = os.environ.get(FAULT_TOLERANCE_RANK_ENV)
+    if value is None:
+        return None
+    rank, world_size, gpus_per_node, replacement = (int(field) for field in value.split(","))
+    return RankIdentity(rank, world_size, gpus_per_node, bool(replacement))

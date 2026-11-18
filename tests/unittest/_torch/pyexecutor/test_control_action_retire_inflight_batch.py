@@ -204,6 +204,23 @@ class TestHandleControlRequest:
         assert len(ex.control_requests) == 1
         assert ex._control_drain_transfer_deadline is None
 
+    def test_drain_vote_counts_only_active_ranks(self, cuda_sync):
+        """Fire once every active TP rank drained, without a vote from a rank that left.
+
+        A host collective gives a rank outside the membership the value None unless it gathers the
+        active ranks only.
+        """
+        ex = _ControlExecutor(drain=True)
+
+        def tp_allgather(value, active_only=False):
+            return [value, value] if active_only else [value, None, value]
+
+        ex.dist = SimpleNamespace(world_size=3, pp_size=1, tp_size=3, tp_allgather=tp_allgather)
+
+        ex._handle_control_request()
+
+        assert ex.control_requests == []
+
     def test_drain_transfer_deadline_arms_once_then_fires(self):
         ex = _ControlExecutor(drain=True, transfers=1)
 

@@ -451,11 +451,18 @@ def get_free_ports(num=1) -> List[int]:
 OMPI_COMM_TYPE_HOST = 9
 
 comm = pkl5.Intracomm(MPI.COMM_WORLD)
+world_comm = MPI.COMM_WORLD
 
 
 def set_mpi_comm(new_comm):
     global comm
     comm = new_comm
+
+
+def set_mpi_world_comm(new_comm):
+    """Make ``new_comm`` this process's MPI world and ``mpi_comm()``."""
+    global comm, world_comm
+    comm = world_comm = new_comm
 
 
 thread_local_comm = threading.local()
@@ -528,11 +535,11 @@ def global_mpi_rank():
         # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
         return 0
 
-    return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
+    return world_comm.Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
 def global_mpi_size():
-    return MPI.COMM_WORLD.Get_size() if ENABLE_MULTI_DEVICE else 1
+    return world_comm.Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def mpi_world_size():

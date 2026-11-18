@@ -21,7 +21,7 @@ whose bit ``r`` is set when it holds rank ``r``.
 
 import enum
 import os
-from typing import Dict, Iterable, List, Literal, Optional, Tuple
+from typing import Dict, Iterable, List, Literal, Mapping, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict
 
@@ -58,6 +58,27 @@ RENDEZVOUS_TIMEOUT_S = 600.0
 # missing after this is a launch mistake.
 NODE_SUPERVISOR_TIMEOUT_S = 60.0
 
+# A process started outside the launcher's job must not inherit these.
+_LAUNCHER_ENV_PREFIXES = ("OMPI_", "PMIX_", "PMI_", "PRTE_", "SLURM_")
+# The deployment's opt-in to running Open MPI as root, which a rank keeps.
+_RUN_AS_ROOT_VARS = (
+    "OMPI_ALLOW_RUN_AS_ROOT",
+    "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM",
+    "PRTE_ALLOW_RUN_AS_ROOT",
+    "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM",
+)
+# Open MPI's shared-memory transport, named vader before Open MPI 5, which still accepts that name.
+_SHARED_MEMORY_BTLS = ("sm", "vader")
+
+
+def launcher_free_env(environ: Mapping[str, str]) -> Dict[str, str]:
+    """Return ``environ`` without the launcher's variables, for a process that runs no MPI."""
+    return {
+        name: value
+        for name, value in environ.items()
+        if not name.startswith(_LAUNCHER_ENV_PREFIXES)
+    }
+
 
 def remove_cpu_affinity_constraints() -> None:
     """Let this process run on every CPU unless ``TLLM_NUMA_AWARE_WORKER_AFFINITY`` opts out.
@@ -69,6 +90,24 @@ def remove_cpu_affinity_constraints() -> None:
     """
     if os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY") in (None, "1"):
         _set_affinity_all_threads(list(range(os.cpu_count())))
+
+
+def rank_env(environ: Mapping[str, str]) -> Dict[str, str]:
+    """Return ``environ`` for a rank, a one-process MPI world started outside the launcher's job.
+
+    Keep the opt-in to running as root, and drop the shared-memory ``btl``, which has no peer in a
+    one-process world and leaves a /dev/shm segment behind after a kill.
+    """
+    env = launcher_free_env(environ)
+    env.update((name, environ[name]) for name in _RUN_AS_ROOT_VARS if name in environ)
+    btl = environ.get("OMPI_MCA_btl", "")
+    if btl.startswith("^"):
+        excluded = btl[1:].split(",")
+        env["OMPI_MCA_btl"] = btl if "sm" in excluded else f"{btl},sm"
+    else:
+        included = [name for name in btl.split(",") if name and name not in _SHARED_MEMORY_BTLS]
+        env["OMPI_MCA_btl"] = ",".join(included) or "^sm"
+    return env
 
 
 def all_ranks(nranks: int) -> int:

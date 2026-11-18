@@ -27,6 +27,7 @@ from _torch.distributed.store_group_test_utils import InMemoryStore, Unpickled
 from mpi4py import MPI
 from torch.distributed import TCPStore
 
+from tensorrt_llm._torch.distributed import communicator
 from tensorrt_llm._torch.distributed.membership import (
     SHARED_SECRET_ENV,
     SignedStore,
@@ -34,6 +35,8 @@ from tensorrt_llm._torch.distributed.membership import (
     UnsignedValueError,
     rendezvous,
 )
+from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart, StartupRecord
+from tensorrt_llm._torch.pyexecutor import hang_detector
 
 pytestmark = pytest.mark.cpu_only
 
@@ -76,6 +79,40 @@ def test_split_orders_members_by_key():
     results = _run_ranks({r: lambda r=r: split(r) for r in groups})
     assert results[0] == results[2] == ((2, 0), [2, 0])
     assert results[1] == results[3] == ((3, 1), [3, 1])
+
+
+def _replacement_of_rank_2(monkeypatch):
+    """Return the startup group and record of a replacement of rank 2, whose split rank 0 recorded.
+
+    Rank ``r`` split with color ``r % 2`` and key ``r``, and rank 0 while paused.
+    """
+    store = InMemoryStore()
+    for rank in range(1, 4):
+        store.set(f"group/0/{rank}", pickle.dumps((rank % 2, rank)))
+    original = StartupRecord()
+    monkeypatch.setattr(communicator.Distributed, "startup_record", original)
+    original.record()
+    original.pause()
+    assert _group(store, 0, range(4)).Split(color=0, key=0).membership == (0, 2)
+    original.close()
+    replacement = StartupRecord()
+    replacement.replay(original.published())
+    monkeypatch.setattr(communicator.Distributed, "startup_record", replacement)
+    return _group(InMemoryStore(), 2, range(4), active=[2], startup=True), replacement
+
+
+def test_replacement_replays_split_made_in_pause(monkeypatch):
+    """Replay a split that rank 0 made while paused, which a replacement makes outside a pause."""
+    group, replacement = _replacement_of_rank_2(monkeypatch)
+    assert group.Split(color=0, key=2).membership == (0, 2)
+    replacement.close()
+
+
+def test_replacement_with_another_split_key_cannot_start(monkeypatch):
+    """Refuse a replacement's split whose key differs from its predecessor's."""
+    group, _ = _replacement_of_rank_2(monkeypatch)
+    with pytest.raises(ReplacementCannotStart, match=r"is \(0, 0\), its predecessor's \(0, 2\)"):
+        group.Split(color=0, key=0)
 
 
 def test_split_type_groups_ranks_by_node():
@@ -149,6 +186,48 @@ def test_exchange_keeps_only_latest_call_keys():
     assert sorted(store.values) == ["group/2/0", "group/2/1", "group/2/arrived/0"]
 
 
+def test_closed_groups_leave_no_keys(monkeypatch):
+    """Leave no keys once the survivors close a group whose lowest member failed between calls."""
+    monkeypatch.setattr(rendezvous, "REPORT_INTERVAL_S", 0.01)
+    store = InMemoryStore()
+    changed = threading.Event()
+
+    def on_wait(waiting):
+        if waiting and changed.is_set():
+            raise RuntimeError("the membership changed")
+
+    groups = {r: StoreGroup(store, "change", r, range(3), on_wait) for r in range(3)}
+    _run_ranks({r: lambda r=r: [groups[r].allgather(call) for call in range(3)] for r in groups})
+    # Rank 0 fails, and the new membership stops ranks 1 and 2 in their next call.
+    changed.set()
+    results = _run_ranks({r: lambda r=r: groups[r].allgather(3) for r in (1, 2)})
+    assert all(isinstance(result, RuntimeError) for result in results.values())
+    for r in (1, 2):
+        groups[r].close([1, 2])
+    assert store.values == {}
+
+
+def test_close_after_members_stop_at_different_calls(monkeypatch):
+    """Leave no keys once the lowest member stops between calls while another enters the next."""
+    monkeypatch.setattr(rendezvous, "REPORT_INTERVAL_S", 0.01)
+    store = InMemoryStore()
+    changed = threading.Event()
+
+    def on_wait(waiting):
+        if waiting and changed.is_set():
+            raise RuntimeError("the membership changed")
+
+    groups = {r: StoreGroup(store, "change", r, range(3), on_wait) for r in range(3)}
+    _run_ranks({r: lambda r=r: [groups[r].allgather(call) for call in range(3)] for r in groups})
+    # Rank 2 fails. Rank 0 sees the new membership between calls, rank 1 only in its next call.
+    changed.set()
+    with pytest.raises(RuntimeError, match="the membership changed"):
+        groups[1].allgather(3)
+    for r in (0, 1):
+        groups[r].close([0, 1])
+    assert store.values == {}
+
+
 def test_waiting_mask_beyond_first_counter(monkeypatch):
     """Report a missing rank 64, whose arrival bit is in the second counter."""
     monkeypatch.setattr(rendezvous, "REPORT_INTERVAL_S", 0.01)
@@ -175,6 +254,22 @@ def test_waiting_mask_beyond_first_counter(monkeypatch):
     )
     assert all(isinstance(result, TimeoutError) for result in results.values())
     assert waiting[0] == [1 << 64, 0]
+
+
+def test_hard_kill_ends_only_this_rank(monkeypatch):
+    """Check that the hang detector's hard kill through the group exits only this process."""
+    exits, kills = [], []
+    monkeypatch.setattr(os, "_exit", exits.append)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: kills.append(sig))
+    monkeypatch.setattr(hang_detector, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(hang_detector, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(hang_detector, "mpi_comm", lambda: _group(InMemoryStore(), 1, (0, 1)))
+    monkeypatch.setattr(MPI, "Is_initialized", lambda: True)
+    monkeypatch.setattr(MPI, "Is_finalized", lambda: False)
+    monkeypatch.setattr(MPI, "Query_thread", lambda: MPI.THREAD_MULTIPLE)
+    hang_detector.propagate_hard_kill(3, diagnostics=False)
+    assert exits == [3]
+    assert kills == []
 
 
 @pytest.mark.parametrize("secret", ["ab" * 31, "zz" * 32], ids=["short", "not_hex"])

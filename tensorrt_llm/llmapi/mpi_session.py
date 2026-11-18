@@ -720,10 +720,15 @@ class MpiPoolSession(MpiSession):
         elif explicit_workspace_override:
             # The override is user-owned, including in any further nested pool.
             env.pop(_FLASHINFER_WORKSPACE_MANAGED_ENV, None)
-        self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
-                                        path=sys.path,
-                                        env=env,
-                                        python_args=python_args)
+        self.mpi_pool = self._create_pool(env, python_args)
+
+    def _create_pool(self, env: Dict[str, str],
+                     python_args: List[str]) -> "MPIPoolExecutor":
+        """Spawn the workers with the environment ``env``."""
+        return MPIPoolExecutor(max_workers=self.n_workers,
+                               path=sys.path,
+                               env=env,
+                               python_args=python_args)
 
     def __del__(self):
         self.shutdown_abort()

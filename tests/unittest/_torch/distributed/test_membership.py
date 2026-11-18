@@ -886,7 +886,7 @@ def test_authority_process_runs_until_rank_0_ends(end):
     on every CPU though started bound to one, ignores SIGINT and SIGTERM, and exits with 0 after a
     shutdown, else with 1.
     """
-    # Reserved with SO_REUSEADDR until the process ends, so that the authority can still bind it.
+    # Reserved as ensure_rendezvous reserves it, until the process ends.
     reserved = socket.socket()
     reserved.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     reserved.bind(("127.0.0.1", 0))

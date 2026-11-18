@@ -411,6 +411,7 @@ l0_cpu:
   - unittest/llmapi/test_mpi_lifecycle.py -k "all_failure-2 or worker_system_exit-2 or mixed_collective-4 or all_hang-2 or reuse-2 or sync_recovery-2 or async_drain-2" ISOLATION
   - unittest/llmapi/test_mpi_stop.py
   - unittest/llmapi/test_mpi_stop_launcher.py
+  - unittest/llmapi/test_node_supervisor.py
   - unittest/llmapi/test_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_rl_control_auth.py
@@ -434,6 +435,7 @@ l0_cpu:
   - unittest/llmapi/test_trtllm_serve_config_schemas.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_visual_gen_startup_shutdown.py
+  - unittest/llmapi/test_wide_ep_fault_tolerance_args.py
   - unittest/metrics/test_grafana_dashboard.py
   - unittest/metrics/test_collector.py
   - unittest/metrics/test_perf.py

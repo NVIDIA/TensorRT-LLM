@@ -18,9 +18,11 @@ import os
 import pickle  # nosec B403
 import threading
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import IntEnum
 from functools import lru_cache, wraps
-from typing import Any, Callable, List, Optional, Tuple
+from typing import (TYPE_CHECKING, Any, Callable, ContextManager, List,
+                    Optional, Tuple)
 
 import numpy as np
 import torch
@@ -44,6 +46,9 @@ from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+if TYPE_CHECKING:
+    from .startup_record import StartupRecord
 
 try:
     import ray
@@ -103,13 +108,36 @@ def reduce_op_to_mpi(op: ReduceOp) -> MPI.Op:
 
 
 class Distributed(ABC):
+    # The factory get() uses instead of MPIDist or TorchDist.
+    _create: Optional[Callable[[Mapping], "Distributed"]] = None
+    # The startup record that rank 0 records and a replacement rank replays.
+    startup_record: Optional["StartupRecord"] = None
 
     def __init__(self, mapping: Mapping):
         self.mapping = mapping
 
     @staticmethod
+    def set_implementation(create: Callable[[Mapping], "Distributed"],
+                           startup_record: "StartupRecord") -> None:
+        """Make :meth:`get` create communicators with ``create``.
+
+        ``startup_record`` records or replays their startup collectives.
+
+        Raises:
+            RuntimeError: :meth:`get` already created a communicator.
+        """
+        if Distributed.get.cache_info().currsize:
+            raise RuntimeError(
+                "Set the Distributed implementation before any communicator "
+                "is created")
+        Distributed._create = create
+        Distributed.startup_record = startup_record
+
+    @staticmethod
     @lru_cache(maxsize=None)
     def get(mapping: Mapping) -> "Distributed":
+        if Distributed._create is not None:
+            return Distributed._create(mapping)
         if mpi_disabled():
             return TorchDist(mapping)
         else:
@@ -280,7 +308,11 @@ class Distributed(ABC):
         return obj
 
     @abstractmethod
-    def tp_allgather(self, obj, *, small_payload: bool = False):
+    def tp_allgather(self,
+                     obj,
+                     *,
+                     small_payload: bool = False,
+                     active_only: bool = False):
         pass
 
     def allgather_ints(self, values: List[int]) -> List[List[int]]:
@@ -330,14 +362,21 @@ class Distributed(ABC):
     # (no pickle); the defaults below reuse the object paths, sending plain
     # int lists so the pickled payload stays small on every backend.
 
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+    def tp_allgather_int64(self,
+                           values: ArrayLike,
+                           *,
+                           active_only: bool = False) -> np.ndarray:
         """All-gather a fixed-size int64 vector across the TP group.
 
         Returns an int64 array of shape ``[tp_size, len(values)]`` whose row
         *i* is rank *i*'s vector. Every rank must pass the same length.
+        With ``active_only`` it holds only the active ranks' rows, for a vote
+        over them. Only ``MnnvlDist`` has inactive ranks.
         """
         vec = np.asarray(values, dtype=np.int64).reshape(-1)
-        gathered = self.tp_allgather(vec.tolist(), small_payload=True)
+        gathered = self.tp_allgather(vec.tolist(),
+                                     small_payload=True,
+                                     active_only=active_only)
         return np.asarray(gathered, dtype=np.int64).reshape(len(gathered), -1)
 
     def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
@@ -357,6 +396,62 @@ class Distributed(ABC):
         if self.tp_size > 1:
             vec = self.tp_allgather_int64(vec).reshape(-1)
         return vec.reshape(-1, n)
+
+    # These hooks change nothing unless startup_record is set.
+
+    @staticmethod
+    def rank_varying(name: str) -> ContextManager[None]:
+        """Mark the host collectives in the block as gathering values, such as
+        measurements or process identities, that differ between a rank and its
+        replacement."""
+        record = Distributed.startup_record
+        return nullcontext() if record is None else record.rank_varying(name)
+
+    @staticmethod
+    def agree_per_process(name: str,
+                          gather: Callable[[], Any],
+                          own: Optional[Tuple[int, Any]] = None) -> Any:
+        """Return ``gather()``, a startup value that each process gathers once,
+        whichever executor it starts first. A replacement rank gets the original
+        ranks' result, also inside :meth:`pause_startup_record`.
+
+        ``own`` is ``(index, value)`` when ``gather`` returns every member's
+        input by index and this process's input is ``value``. A replacement's
+        ``value`` must then equal its predecessor's."""
+        record = Distributed.startup_record
+        return gather() if record is None else record.agree(
+            name, gather, per_process=True, own=own)
+
+    @staticmethod
+    def agree_rank_capacity(name: str, rank: int, capacity: int,
+                            gather: Callable[[], List[int]]) -> int:
+        """Return ``rank``'s startup ``capacity``, which its replacement keeps.
+        ``gather`` returns all ranks' capacities."""
+        record = Distributed.startup_record
+        return capacity if record is None else record.agree_rank_capacity(
+            name, rank, capacity, gather)
+
+    @staticmethod
+    def pause_startup_record() -> None:
+        """Run the host collectives without recording or replaying them until
+        :meth:`resume_startup_record`. The KV cache estimation, which a
+        replacement rank skips, runs in between, and so does the autotuner
+        pass that only a replacement runs."""
+        if Distributed.startup_record is not None:
+            Distributed.startup_record.pause()
+
+    @staticmethod
+    def resume_startup_record() -> None:
+        """End :meth:`pause_startup_record`."""
+        if Distributed.startup_record is not None:
+            Distributed.startup_record.resume()
+
+    @staticmethod
+    def report_startup_progress() -> None:
+        """Report a step of this rank's startup, such as a loaded checkpoint
+        file."""
+        if Distributed.startup_record is not None:
+            Distributed.startup_record.report_progress()
 
     def broadcast_int64(self,
                         values: ArrayLike,
@@ -903,7 +998,8 @@ class MPIDist(Distributed):
                      obj,
                      chunk_size: int = 4 * 1024 * 1024,
                      *,
-                     small_payload: bool = False):
+                     small_payload: bool = False,
+                     active_only: bool = False):
         comm = self.tp_comm
         if small_payload:
             return comm.allgather(obj)
@@ -956,7 +1052,10 @@ class MPIDist(Distributed):
         comm.Bcast([buf, MPI.INT64_T], root=root)
         return buf
 
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+    def tp_allgather_int64(self,
+                           values: ArrayLike,
+                           *,
+                           active_only: bool = False) -> np.ndarray:
         return self._allgather_int64_comm(self.tp_comm, values)
 
     def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
@@ -1692,7 +1791,11 @@ class TorchDist(Distributed):
         return obj
 
     @log_op
-    def tp_allgather(self, obj, *, small_payload: bool = False):
+    def tp_allgather(self,
+                     obj,
+                     *,
+                     small_payload: bool = False,
+                     active_only: bool = False):
         vote_pg = self._cuda_obj_pg("tp")
         if isinstance(obj, torch.Tensor):
             if not obj.is_cuda and vote_pg is not None:
@@ -1712,7 +1815,10 @@ class TorchDist(Distributed):
                                    group=self.mapping.tp_group_pg)
             return output_list
 
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+    def tp_allgather_int64(self,
+                           values: ArrayLike,
+                           *,
+                           active_only: bool = False) -> np.ndarray:
         """Fixed-size int64 TP all-gather on the CUDA-staged CPU-tensor path.
 
         The base implementation ships the vector as a pickled object, which on

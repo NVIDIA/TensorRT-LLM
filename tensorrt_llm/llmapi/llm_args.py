@@ -9903,6 +9903,22 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def warn_deprecated_fault_tolerance_mode_env(self) -> 'TorchLlmArgs':
+        """Warn that TLLM_FAULT_TOLERANCE_MODE=1 is deprecated.
+
+        It no longer turns on the fault-tolerant MoE all-to-all, which
+        enable_wide_ep_fault_tolerance does.
+        """
+        if (not self.enable_wide_ep_fault_tolerance
+                and os.environ.get("TLLM_FAULT_TOLERANCE_MODE") == "1"):
+            logger.warning(
+                "TLLM_FAULT_TOLERANCE_MODE=1 is deprecated and will be removed "
+                "in a future release. It no longer turns on Wide-EP fault "
+                "tolerance for the MoE layers; set "
+                "enable_wide_ep_fault_tolerance=True instead.")
+        return self
+
+    @model_validator(mode="after")
     def validate_per_layer_dynamic_eplb_cuda_graph(self) -> 'TorchLlmArgs':
         """Per-layer dynamic EPLB plans cannot be captured in CUDA graphs."""
         if getattr(self.moe_config.load_balancer, "mode",

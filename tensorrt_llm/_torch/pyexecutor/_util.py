@@ -909,10 +909,17 @@ def get_mla_context_workspace_reserve(
 
 
 def _any_rank_failed(failed: bool, mapping: Mapping) -> bool:
-    """Whether ``failed`` holds on any rank; every rank gets the same answer."""
+    """Whether ``failed`` holds on any rank; every rank gets the same answer.
+
+    The original ranks vote in the KV cache estimation, which a replacement
+    rank skips, so a replacement takes their answer and adds its own ``failed``.
+    """
     if mapping.world_size > 1:
-        return bool(
-            Distributed.get(mapping).allreduce(int(failed), op=ReduceOp.MAX))
+        any_failed = Distributed.agree_per_process(
+            "kv_cache_budget_failed",
+            lambda: Distributed.get(mapping).allreduce(int(failed),
+                                                       op=ReduceOp.MAX))
+        return failed or bool(any_failed)
     return failed
 
 

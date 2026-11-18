@@ -30,6 +30,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.distributed.membership_mnnvl_memory import MembershipMnnvlMemory
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlCheckpointCommunicator, MnnvlMemory
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
@@ -802,8 +803,16 @@ class NVLinkOneSided(Communication):
             if reason is None
             else None
         )
-        votes = MnnvlMemory.get_comm(self.mapping).allgather(
-            (reason is None, num_sms, _sentinel_env())
+        # Every rank gets the same votes, so a replacement rank, which builds its layers without the
+        # other ranks, takes the votes that the original ranks recorded at startup, once its own vote
+        # matches its predecessor's. The communicator is taken first: its first use splits the
+        # startup group, a startup value of its own.
+        comm = MnnvlMemory.get_comm(self.mapping)
+        own_vote = (reason is None, num_sms, _sentinel_env())
+        votes = Distributed.agree_per_process(
+            "nvlink_one_sided_sentinel_vote",
+            lambda: comm.allgather(own_vote),
+            own=(comm.Get_rank(), own_vote),
         )
         if len({vote[2] for vote in votes}) > 1:
             raise NVLinkOneSidedConfigError(

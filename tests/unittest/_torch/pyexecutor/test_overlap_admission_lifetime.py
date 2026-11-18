@@ -78,7 +78,9 @@ def _fetch_all_ranks(
     # Produce peer payloads through the real router before simulating transport.
     payloads = []
     for executor, active in zip(executors, residents, strict=True):
-        executor.dist.tp_allgather_int64 = lambda payload: np.asarray([payload], dtype=np.int64)
+        executor.dist.tp_allgather_int64 = lambda payload, active_only: np.asarray(
+            [payload], dtype=np.int64
+        )
         state = executor.adp_router.gather_all_rank_states(active)[0]
         payloads.append(state.serialize())
 
@@ -86,7 +88,7 @@ def _fetch_all_ranks(
     for rank, (executor, queue, active) in enumerate(
         zip(executors, queues, residents, strict=True)
     ):
-        executor.dist.tp_allgather_int64 = lambda payload, rank=rank: np.asarray(
+        executor.dist.tp_allgather_int64 = lambda payload, active_only, rank=rank: np.asarray(
             [
                 payload if peer == rank else peer_payload
                 for peer, peer_payload in enumerate(payloads)

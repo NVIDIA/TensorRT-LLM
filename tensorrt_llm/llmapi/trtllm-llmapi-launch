@@ -7,6 +7,11 @@ set -Eeo pipefail
 task_with_command=("$@")
 native_mpi_rank=$OMPI_COMM_WORLD_RANK
 mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
+# "<rank>,<world size>,<GPUs per node>,<replacement>" (RankIdentity.env_value)
+fault_tolerance_world_size=
+if [ -n "$TLLM_FAULT_TOLERANCE_RANK" ]; then
+    IFS=, read -r mpi_rank fault_tolerance_world_size _ <<< "$TLLM_FAULT_TOLERANCE_RANK"
+fi
 
 flashinfer_workspace_lock_held=0
 flashinfer_temporary_workspace=
@@ -36,7 +41,9 @@ fi
 export TLLM_SPAWN_PROXY_PROCESS=1
 
 function mpi_world_size {
-    if [ -n "$SLURM_NTASKS" ]; then
+    if [ -n "$fault_tolerance_world_size" ]; then
+        echo "$fault_tolerance_world_size"
+    elif [ -n "$SLURM_NTASKS" ]; then
         echo "$SLURM_NTASKS"
     elif [ -n "$OMPI_COMM_WORLD_SIZE" ]; then
         echo "$OMPI_COMM_WORLD_SIZE"
@@ -143,7 +150,16 @@ function use_unique_flashinfer_workspace {
     local temporary_root=${TMPDIR:-/tmp}
     local workspace
 
-    if ! workspace=$(mktemp -d "$temporary_root/trtllm-flashinfer-rank-${mpi_rank}.XXXXXXXX"); then
+    if [ -n "$TLLM_FAULT_TOLERANCE_RANK" ]; then
+        # The rank's worker replaces this shell, so the EXIT trap never removes the workspace.
+        # Every process that the node supervisor (the parent) starts for the rank reuses one.
+        workspace="$temporary_root/trtllm-flashinfer-rank-${mpi_rank}.supervisor-${PPID}"
+        if ! mkdir -m 700 -- "$workspace" 2>/dev/null && \
+            { [ -L "$workspace" ] || [ ! -d "$workspace" ] || [ ! -O "$workspace" ]; }; then
+            log_stderr "Failed to create a temporary FlashInfer JIT workspace; aborting launch"
+            exit 1
+        fi
+    elif ! workspace=$(mktemp -d "$temporary_root/trtllm-flashinfer-rank-${mpi_rank}.XXXXXXXX"); then
         log_stderr "Failed to create a temporary FlashInfer JIT workspace; aborting launch"
         exit 1
     fi
@@ -500,6 +516,10 @@ else
     set +e
 
     log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
+    if [ -n "$TLLM_FAULT_TOLERANCE_RANK" ]; then
+        # The worker must be a direct child of the node supervisor to exit with it.
+        exec python3 -c "from tensorrt_llm._torch.distributed.membership.startup import worker_node_main; worker_node_main()"
+    fi
     run_child_command python3 -m tensorrt_llm.llmapi.mgmn_worker_node
     mgmn_worker_node_exit_code=$?
     log_stderr "Rank${mpi_rank} MGMN worker node exit code: $mgmn_worker_node_exit_code"
