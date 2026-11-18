@@ -689,7 +689,7 @@ if (nccl_extensions_root / "nccl").is_dir():
     )
     package_dirs["nccl"] = str(nccl_extensions_root / "nccl")
     nccl_extensions_package_data = {
-        "nccl.ep": ["lib/*.so", "include/**/*"],
+        "nccl.ep": ["lib/cu*/libnccl_ep.so.0", "include/**/*"],
         "nccl._extensions.bindings": ["*.so", "_internal/*.so"],
         "nccl._extensions.bindings._internal": ["*.so"],
     }

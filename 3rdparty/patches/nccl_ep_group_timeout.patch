@@ -1,8 +1,10 @@
+diff --git a/nccl_ep/include/nccl_ep.h b/nccl_ep/include/nccl_ep.h
+index 1349983..e634ee7 100644
 --- a/nccl_ep/include/nccl_ep.h
 +++ b/nccl_ep/include/nccl_ep.h
-@@ -1068,6 +1068,32 @@ ncclResult_t ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out);
- 
- ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group);
+@@ -1307,6 +1307,32 @@ ncclResult_t ncclEpAfReturn(
+     const ncclEpCombineConfig_t* config,
+     cudaStream_t stream);
  
 +// Set the timeout of the GPU-side wait loops for subsequent launches on this group.
 +//   Host-side only: each launch copies the timeout into its kernel arguments, so a
@@ -11,8 +13,8 @@
 +//
 +// Arguments:
 +//   ep_group   - [IN] EP group
-+//   timeout_ns - [IN] Timeout in nanoseconds, at millisecond resolution like
-+//                     config.timeout_ns. 0 restores the timeout resolved by
++//   timeout_ns - [IN] Timeout in nanoseconds, at millisecond resolution.
++//                     0 restores the timeout resolved by
 +//                     ncclEpCreateGroup (NCCL_EP_TIMEOUT_MS > config.timeout_ns > default).
 +//
 +// Returns: ncclResult_t error code; ncclInvalidArgument for a nonzero timeout below
@@ -33,9 +35,11 @@
  #ifdef __cplusplus
  }
  #endif
+diff --git a/nccl_ep/nccl_ep.cc b/nccl_ep/nccl_ep.cc
+index f7f4a8f..1a3c1ec 100644
 --- a/nccl_ep/nccl_ep.cc
 +++ b/nccl_ep/nccl_ep.cc
-@@ -788,6 +788,8 @@ struct ncclEpGroup {
+@@ -871,6 +871,8 @@ struct ncclEpGroup {
      int* mask_buffer = nullptr; // Device: int[nRanks], null if !enable_mask
      int* async_error_flag = nullptr; // Host-pinned: 0 = ok, 1 = timeout occurred
      uint64_t timeout_cycles = NUM_TIMEOUT_CYCLES; // GPU clock cycles for wait-loop timeout
@@ -44,20 +48,19 @@
  
    // Physical node properties (CUDA device assignment, IPC between co-located GPUs)
      int gpus_per_node; // Physical GPUs per node (nRanks / nNodes)
-@@ -1923,6 +1925,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
+@@ -2700,6 +2702,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
          }
  
          ep_group->timeout_cycles = resolved;
 +        ep_group->creation_timeout_cycles = resolved;
 +        ep_group->clock_khz = clock_khz;
          if (ep_group->rank == 0) {
-             uint64_t timeout_ms = resolved / (clock_khz * 1000ULL / 1000ULL);
-             char env_str[32];
-@@ -5488,6 +5492,30 @@ ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) {
-     __atomic_store_n(ep_group->async_error_flag, 0, __ATOMIC_RELEASE);
+             // Reported in MICROSECONDS: a sub-millisecond budget is legal and
+             // would print as 0 ms.
+@@ -8155,6 +8159,30 @@ ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) {
      return ncclSuccess;
  }
-+
+ 
 +ncclResult_t ncclEpGroupSetTimeout(ncclEpGroup_t ep_group, uint64_t timeout_ns) {
 +    EP_HOST_ASSERT(ep_group != nullptr);
 +    EP_HOST_ASSERT(ep_group->clock_khz > 0);
@@ -65,9 +68,9 @@
 +        ep_group->timeout_cycles = ep_group->creation_timeout_cycles;
 +        return ncclSuccess;
 +    }
-+    // Same millisecond resolution and conversion as config.timeout_ns in ncclEpCreateGroup
++    // The setter accepts millisecond-resolution timeouts.
 +    const uint64_t timeout_ms = timeout_ns / 1000000ULL;
-+    if (timeout_ms == 0 || timeout_ms > UINT64_MAX / ep_group->clock_khz) {
++    if (timeout_ms == 0 || timeout_ms > (UINT64_MAX / 2) / ep_group->clock_khz) {
 +        return ncclInvalidArgument;
 +    }
 +    ep_group->timeout_cycles = ep_group->clock_khz * timeout_ms;
@@ -81,9 +84,12 @@
 +    *timeout_ns = ep_group->timeout_cycles / ep_group->clock_khz * 1000000ULL;
 +    return ncclSuccess;
 +}
- // ── Test-only internal helpers (declared in nccl_ep_test_internal.h) ─────────
- // Exposed via a separate test header so library consumers cannot accidentally
- // depend on these implementation details.
++
+ static ncclResult_t ncclEpAfValidateRole(ncclEpHandle_t handle, bool expect_attn, const char* api_name) {
+     if (handle == nullptr || handle->group == nullptr) {
+         fprintf(stderr, "%s: handle and group must be valid\n", api_name);
+diff --git a/python/nccl/_extensions/bindings/_internal/nccl_ep.pxd b/python/nccl/_extensions/bindings/_internal/nccl_ep.pxd
+index bd80ed2..bfcc368 100644
 --- a/python/nccl/_extensions/bindings/_internal/nccl_ep.pxd
 +++ b/python/nccl/_extensions/bindings/_internal/nccl_ep.pxd
 @@ -5,6 +5,7 @@
@@ -94,12 +100,14 @@
  
  
  ###############################################################################
-@@ -29,3 +30,5 @@ cdef ncclResult_t _ncclEpMaskUpdate(ncclEpGroup_t ep_group, const int* mask, cud
- cdef ncclResult_t _ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
- cdef ncclResult_t _ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
- cdef ncclResult_t _ncclEpErrorClear(ncclEpGroup_t ep_group) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+@@ -34,3 +35,5 @@ cdef ncclResult_t _ncclEpAfDispatch(ncclEpHandle_t handle, const ncclEpDispatchI
+ cdef ncclResult_t _ncclEpAfCombine(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+ cdef ncclResult_t _ncclEpAfRecv(ncclEpHandle_t handle, const ncclEpDispatchInputs_t* inputs, const ncclEpDispatchOutputs_t* outputs, const ncclEpLayoutInfo_t* layout_info, const ncclEpDispatchConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+ cdef ncclResult_t _ncclEpAfReturn(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 +cdef ncclResult_t _ncclEpGroupSetTimeout(ncclEpGroup_t ep_group, uint64_t timeout_ns) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 +cdef ncclResult_t _ncclEpGroupGetTimeout(ncclEpGroup_t ep_group, uint64_t* timeout_ns) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+diff --git a/python/nccl/_extensions/bindings/_internal/nccl_ep_linux.pyx b/python/nccl/_extensions/bindings/_internal/nccl_ep_linux.pyx
+index 8458d60..51cbd99 100644
 --- a/python/nccl/_extensions/bindings/_internal/nccl_ep_linux.pyx
 +++ b/python/nccl/_extensions/bindings/_internal/nccl_ep_linux.pyx
 @@ -43,7 +43,7 @@ cdef extern from "<dlfcn.h>":
@@ -111,18 +119,18 @@
  
  import threading as _cyb_threading
  
-@@ -143,6 +143,8 @@ cdef void* __ncclEpMaskUpdate = NULL
+@@ -135,6 +135,8 @@ cdef void* __ncclEpMaskUpdate = NULL
  cdef void* __ncclEpMaskClean = NULL
  cdef void* __ncclEpGetAsyncError = NULL
  cdef void* __ncclEpErrorClear = NULL
 +cdef void* __ncclEpGroupSetTimeout = NULL
 +cdef void* __ncclEpGroupGetTimeout = NULL
- 
- cdef int _init_nccl_ep() except -1 nogil:
-     global _cyb___py_nccl_ep_init
-@@ -276,6 +278,20 @@ cdef int _init_nccl_ep() except -1 nogil:
+ cdef void* __ncclEpAfDispatch = NULL
+ cdef void* __ncclEpAfCombine = NULL
+ cdef void* __ncclEpAfRecv = NULL
+@@ -307,6 +309,20 @@ cdef int _init_nccl_ep() except -1 nogil:
                  handle = load_library()
-             __ncclEpErrorClear = _cyb_dlsym(handle, 'ncclEpErrorClear')
+             __ncclEpAfReturn = _cyb_dlsym(handle, 'ncclEpAfReturn')
  
 +        global __ncclEpGroupSetTimeout
 +        __ncclEpGroupSetTimeout = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpGroupSetTimeout')
@@ -141,10 +149,10 @@
          _cyb_atomic_int_store(<int *>&_cyb___py_nccl_ep_init, 1)
          return 0
  
-@@ -346,6 +362,12 @@ cpdef dict _inspect_function_pointers():
+@@ -392,6 +408,12 @@ cpdef dict _inspect_function_pointers():
  
-     global __ncclEpErrorClear
-     data["__ncclEpErrorClear"] = <intptr_t>__ncclEpErrorClear
+     global __ncclEpAfReturn
+     data["__ncclEpAfReturn"] = <intptr_t>__ncclEpAfReturn
 +
 +    global __ncclEpGroupSetTimeout
 +    data["__ncclEpGroupSetTimeout"] = <intptr_t>__ncclEpGroupSetTimeout
@@ -154,10 +162,10 @@
      _cyb_func_ptrs = data
      return data
  
-@@ -587,3 +609,23 @@ cdef ncclResult_t _ncclEpErrorClear(ncclEpGroup_t ep_group) except?_NCCLRESULT_T
-             raise FunctionNotFoundError("function ncclEpErrorClear is not found")
-     return (<ncclResult_t (*)(ncclEpGroup_t) noexcept nogil>__ncclEpErrorClear)(
-         ep_group)
+@@ -683,3 +705,23 @@ cdef ncclResult_t _ncclEpAfReturn(ncclEpHandle_t handle, const ncclEpCombineInpu
+             raise FunctionNotFoundError("function ncclEpAfReturn is not found")
+     return (<ncclResult_t (*)(ncclEpHandle_t, const ncclEpCombineInputs_t*, const ncclEpCombineOutputs_t*, const ncclEpCombineConfig_t*, cudaStream_t) noexcept nogil>__ncclEpAfReturn)(
+         handle, inputs, outputs, config, stream)
 +
 +
 +cdef ncclResult_t _ncclEpGroupSetTimeout(ncclEpGroup_t ep_group, uint64_t timeout_ns) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
@@ -178,20 +186,24 @@
 +            raise FunctionNotFoundError("function ncclEpGroupGetTimeout is not found")
 +    return (<ncclResult_t (*)(ncclEpGroup_t, uint64_t*) noexcept nogil>__ncclEpGroupGetTimeout)(
 +        ep_group, timeout_ns)
+diff --git a/python/nccl/_extensions/bindings/cynccl_ep.pxd b/python/nccl/_extensions/bindings/cynccl_ep.pxd
+index 0809338..989305b 100644
 --- a/python/nccl/_extensions/bindings/cynccl_ep.pxd
 +++ b/python/nccl/_extensions/bindings/cynccl_ep.pxd
-@@ -215,3 +215,5 @@ cdef ncclResult_t ncclEpMaskUpdate(ncclEpGroup_t ep_group, const int* mask, cuda
- cdef ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
- cdef ncclResult_t ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
- cdef ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+@@ -244,3 +244,5 @@ cdef ncclResult_t ncclEpAfDispatch(ncclEpHandle_t handle, const ncclEpDispatchIn
+ cdef ncclResult_t ncclEpAfCombine(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+ cdef ncclResult_t ncclEpAfRecv(ncclEpHandle_t handle, const ncclEpDispatchInputs_t* inputs, const ncclEpDispatchOutputs_t* outputs, const ncclEpLayoutInfo_t* layout_info, const ncclEpDispatchConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+ cdef ncclResult_t ncclEpAfReturn(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 +cdef ncclResult_t ncclEpGroupSetTimeout(ncclEpGroup_t ep_group, uint64_t timeout_ns) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 +cdef ncclResult_t ncclEpGroupGetTimeout(ncclEpGroup_t ep_group, uint64_t* timeout_ns) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+diff --git a/python/nccl/_extensions/bindings/cynccl_ep.pyx b/python/nccl/_extensions/bindings/cynccl_ep.pyx
+index 208103a..5248b49 100644
 --- a/python/nccl/_extensions/bindings/cynccl_ep.pyx
 +++ b/python/nccl/_extensions/bindings/cynccl_ep.pyx
-@@ -81,3 +81,11 @@ cdef ncclResult_t ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out) ex
+@@ -101,3 +101,11 @@ cdef ncclResult_t ncclEpAfRecv(ncclEpHandle_t handle, const ncclEpDispatchInputs
  
- cdef ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
-     return _nccl_ep._ncclEpErrorClear(ep_group)
+ cdef ncclResult_t ncclEpAfReturn(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+     return _nccl_ep._ncclEpAfReturn(handle, inputs, outputs, config, stream)
 +
 +
 +cdef ncclResult_t ncclEpGroupSetTimeout(ncclEpGroup_t ep_group, uint64_t timeout_ns) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
@@ -200,6 +212,8 @@
 +
 +cdef ncclResult_t ncclEpGroupGetTimeout(ncclEpGroup_t ep_group, uint64_t* timeout_ns) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
 +    return _nccl_ep._ncclEpGroupGetTimeout(ep_group, timeout_ns)
+diff --git a/python/nccl/_extensions/bindings/nccl_ep.pxd b/python/nccl/_extensions/bindings/nccl_ep.pxd
+index fbb8b70..f1a91c5 100644
 --- a/python/nccl/_extensions/bindings/nccl_ep.pxd
 +++ b/python/nccl/_extensions/bindings/nccl_ep.pxd
 @@ -8,7 +8,7 @@
@@ -211,13 +225,17 @@
  
  
  # <<<< END OF PREAMBLE CONTENT >>>>
-@@ -66,4 +66,6 @@ cpdef mask_update(intptr_t ep_group, intptr_t mask, intptr_t stream)
+@@ -69,6 +69,8 @@ cpdef mask_update(intptr_t ep_group, intptr_t mask, intptr_t stream)
  cpdef mask_clean(intptr_t ep_group, intptr_t stream)
  cpdef int get_async_error(intptr_t ep_group) except? -1
  cpdef error_clear(intptr_t ep_group)
 +cpdef group_set_timeout(intptr_t ep_group, uint64_t timeout_ns)
 +cpdef uint64_t group_get_timeout(intptr_t ep_group) except? 0
- cpdef object get_library_path()
+ cpdef af_dispatch(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t layout_info, intptr_t config, intptr_t stream)
+ cpdef af_combine(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t config, intptr_t stream)
+ cpdef af_recv(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t layout_info, intptr_t config, intptr_t stream)
+diff --git a/python/nccl/_extensions/bindings/nccl_ep.pyx b/python/nccl/_extensions/bindings/nccl_ep.pyx
+index 1206aea..f5db35f 100644
 --- a/python/nccl/_extensions/bindings/nccl_ep.pyx
 +++ b/python/nccl/_extensions/bindings/nccl_ep.pyx
 @@ -10,7 +10,7 @@
@@ -229,7 +247,7 @@
  from libc.stdlib cimport (
      calloc as _cyb_calloc,
      free as _cyb_free,
-@@ -2810,6 +2810,20 @@ cpdef error_clear(intptr_t ep_group):
+@@ -3119,6 +3119,20 @@ cpdef af_return(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t con
      check_status(__status__)
  
  
@@ -250,11 +268,13 @@
  # Hand-written: reports the .so the symbols resolved to; not a C entry point.
  cpdef object get_library_path():
      from ._internal.nccl_ep import _inspect_loaded_library_path
+diff --git a/python/nccl/ep/group.py b/python/nccl/ep/group.py
+index 9c778cb..ed9e595 100644
 --- a/python/nccl/ep/group.py
 +++ b/python/nccl/ep/group.py
-@@ -193,6 +193,25 @@ class Group:
-         )
-         return Handle(ptr)
+@@ -381,6 +381,25 @@ class Group:
+         self._check_mask_enabled("clear async error")
+         _ep_bindings.error_clear(self._ptr)
  
 +    def set_timeout_ns(self, timeout_ns: int) -> None:
 +        """Set the timeout of the GPU-side wait loops for subsequent launches.

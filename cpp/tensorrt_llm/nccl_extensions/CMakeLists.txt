@@ -76,6 +76,9 @@ set(NCCL_EXTENSIONS_WHEEL_STAGING_DIR "${CMAKE_CURRENT_BINARY_DIR}/python")
 set(NCCL_EXTENSIONS_WHEEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/dist")
 set(NCCL_EXTENSIONS_WHEEL_STAMP
     "${NCCL_EXTENSIONS_WHEEL_DIR}/.nccl_extensions_wheel_built")
+set(NCCL_EXTENSIONS_EP_LIB_DIR
+    "${NCCL_EXTENSIONS_WHEEL_STAGING_DIR}/nccl/ep/lib/cu${CUDAToolkit_VERSION_MAJOR}"
+)
 file(GLOB_RECURSE NCCL_EXTENSIONS_PYTHON_SOURCES CONFIGURE_DEPENDS
      "${NCCL_EXTENSIONS_SOURCE_DIR}/python/*")
 
@@ -88,10 +91,10 @@ add_custom_command(
   COMMAND
     ${CMAKE_COMMAND} -E copy_directory "${NCCL_EXTENSIONS_SOURCE_DIR}/python"
     "${NCCL_EXTENSIONS_WHEEL_STAGING_DIR}"
-  COMMAND ${CMAKE_COMMAND} -E make_directory
-          "${NCCL_EXTENSIONS_WHEEL_STAGING_DIR}/nccl/ep/lib"
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:nccl_ep_shared>"
-          "${NCCL_EXTENSIONS_WHEEL_STAGING_DIR}/nccl/ep/lib/libnccl_ep.so"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${NCCL_EXTENSIONS_EP_LIB_DIR}"
+  COMMAND
+    ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:nccl_ep_shared>"
+    "${NCCL_EXTENSIONS_EP_LIB_DIR}/$<TARGET_SONAME_FILE_NAME:nccl_ep_shared>"
   COMMAND
     ${CMAKE_COMMAND} -E copy_if_different
     "${NCCL_EP_BUILDDIR}/include/nccl_ep.h"
