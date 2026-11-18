@@ -14,7 +14,6 @@ import pytest
 from tensorrt_llm._torch.disaggregation.native.messenger import FrameSigner, ZMQMessenger
 from tensorrt_llm._torch.disaggregation.native.rank_info import NATIVE_TRANSFER_PROTOCOL_VERSION
 from tensorrt_llm._torch.disaggregation.native.transfer import (
-    MessageType,
     RankInfoAuthenticationError,
     RankInfoServer,
     Receiver,
@@ -106,24 +105,25 @@ def test_rank_info_exchange_over_real_sockets(master_key: Optional[bytes]) -> No
 
 
 @pytest.mark.parametrize(
-    "receiver_key, server_key, match",
+    "receiver_key, server_key, match, server_drops",
     [
         # The signed server drops the frames; the receiver times out.
-        (_OTHER_MASTER_KEY, _MASTER_KEY, "RankInfo exchange timed out"),
-        (None, _MASTER_KEY, "RankInfo exchange timed out"),
+        (_OTHER_MASTER_KEY, _MASTER_KEY, "RankInfo exchange timed out", 1),
+        (None, _MASTER_KEY, "RankInfo exchange timed out", 1),
         # The unsigned reply fails verification on the signed receiver.
-        (_MASTER_KEY, None, "failed control-plane authentication"),
+        (_MASTER_KEY, None, "failed control-plane authentication", 0),
     ],
     ids=["wrong_key", "receiver_unsigned", "server_unsigned"],
 )
 def test_rank_info_exchange_rejects_key_mismatch(
-    receiver_key: Optional[bytes], server_key: Optional[bytes], match: str
+    receiver_key: Optional[bytes], server_key: Optional[bytes], match: str, server_drops: int
 ) -> None:
     receiver = _make_receiver(receiver_key, timeout_s=0.5)
     with _rank_info_server(server_key) as server:
         receiver._extract_info_endpoint = Mock(return_value=server.endpoint)
         with pytest.raises(RankInfoAuthenticationError, match=match):
             receiver._get_sender_info(Mock())
+        assert _wait_for_auth_failures(server, server_drops) == server_drops
     assert not receiver._incompatible_peers
 
 
@@ -132,17 +132,6 @@ def _wait_for_auth_failures(server: RankInfoServer, count: int, timeout_s: float
     while server._messenger.auth_failures < count and time.monotonic() < deadline:
         time.sleep(0.01)
     return server._messenger.auth_failures
-
-
-def test_signed_server_drops_unsigned_rank_info_request() -> None:
-    with _rank_info_server(_MASTER_KEY) as server:
-        with ZMQMessenger("DEALER", server.endpoint, signer=None) as unsigned:
-            unsigned.send([MessageType.REQUEST_INSTANCE_INFO])
-            auth_failures = _wait_for_auth_failures(server, 1)
-            with pytest.raises(TimeoutError):
-                unsigned.receive(timeout_ms=300)
-    assert auth_failures == 1
-    server._rank_info.to_bytes.assert_not_called()
 
 
 def test_signed_server_drops_message_without_payload_and_keeps_serving() -> None:

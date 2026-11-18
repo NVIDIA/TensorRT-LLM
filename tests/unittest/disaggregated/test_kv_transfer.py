@@ -1254,15 +1254,18 @@ WINDOW_SIZE_TEST_CONFIGS = [
 ]
 
 
+NATIVE_AUTH_TEST_CONFIGS = [
+    c
+    for c in PARALLEL_TEST_CONFIGS
+    if c[7] in ("tp1_pp1_to_tp1_pp1", "tp2_pp1_to_tp1_pp2", "tp2_pp1_dp_to_tp2_pp1_dp")
+]
+
+
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize(
     "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla",
-    [
-        (c[0], c[1], c[2], c[3], c[4], c[5], c[6])
-        for c in PARALLEL_TEST_CONFIGS
-        if c[7] in ("tp1_pp1_to_tp1_pp1", "tp2_pp1_to_tp1_pp2", "tp2_pp1_dp_to_tp2_pp1_dp")
-    ],
-    ids=["tp1_pp1_to_tp1_pp1", "tp2_pp1_to_tp1_pp2", "tp2_pp1_dp_to_tp2_pp1_dp"],
+    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in NATIVE_AUTH_TEST_CONFIGS],
+    ids=[c[7] for c in NATIVE_AUTH_TEST_CONFIGS],
 )
 def test_transfer_worker_v2_with_native_auth(
     ctx_tp: int,

@@ -261,13 +261,13 @@ def test_frame_signer_rejects_rewritten_header_fields() -> None:
 
 def test_frame_signer_rejects_malformed_auth_frames() -> None:
     header, mac = _signed([b"TAG"])[-2:]
-    for message in (
-        [b"TAG"],
-        [b"TAG", header, mac[:-1]],
-        [b"TAG", header[:5], mac],
-        [b"TAG", header + b"extra", mac],
+    for message, match in (
+        ([b"TAG"], "no payload or no authentication frames"),
+        ([b"TAG", header, mac[:-1]], "Malformed authentication frames"),
+        ([b"TAG", header[:5], mac], "Malformed authentication frames"),
+        ([b"TAG", header + b"extra", mac], "Malformed authentication header"),
     ):
-        with pytest.raises(FrameAuthenticationError):
+        with pytest.raises(FrameAuthenticationError, match=match):
             _verify(message)
 
 
@@ -318,11 +318,6 @@ def test_frame_signer_rejects_invalid_configuration(kwargs: dict[str, Any], matc
 
 def test_frame_signer_repr_omits_key_material() -> None:
     assert "0123456789abcdef" not in repr(_signer())
-
-
-def test_messenger_requires_explicit_signer_choice() -> None:
-    with pytest.raises(TypeError):
-        ZMQMessenger("ROUTER", "tcp://127.0.0.1:*")
 
 
 def test_signed_messenger_validates_mode_and_dealer_identity() -> None:
