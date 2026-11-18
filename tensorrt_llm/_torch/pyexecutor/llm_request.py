@@ -752,6 +752,17 @@ def release_exported_handles(result: "PyResult | LlmResult") -> None:
             SharedTensorContainer.release_dict(handle)
 
 
+def release_undelivered_response(response: Any) -> None:
+    """Consume the exported handles of a response that no client will receive.
+
+    Takes the executor's responses, also when the worker has wrapped them; error
+    responses and other records carry no ``LlmResult`` and export nothing.
+    """
+    result = getattr(response, "result", None)
+    if isinstance(result, LlmResult):
+        release_exported_handles(result)
+
+
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
