@@ -1172,6 +1172,9 @@ class ModelLoader:
     This class isolates model loading logic from the main execution engine.
     """
 
+    # Loaders built without __init__ keep the process's torch thread count.
+    _weight_load_num_threads: Optional[int] = None
+
     def __init__(self,
                  llm_args: TorchLlmArgs,
                  mapping: Mapping,
