@@ -91,6 +91,7 @@ def _stage_inputs(inputs: Any, larger: Any) -> Any:
     larger bucket's staged inputs, when the rest of its shape matches, as bucket
     outputs share the largest output. Only one bucket graph replays at a time and
     each replay copies all of its inputs first, so buckets can share this storage.
+    Both must be contiguous, so the view keeps the layout a clone would have.
     Other tensors get a clone.
     """
     values, spec = tree_flatten(inputs)
@@ -106,6 +107,9 @@ def _stage_inputs(inputs: Any, larger: Any) -> Any:
                 isinstance(larger_value, torch.Tensor)
                 and value.device.type != "cpu"
                 and value.dim() > 0
+                and larger_value.dim() == value.dim()
+                and value.is_contiguous()
+                and larger_value.is_contiguous()
                 and larger_value.device == value.device
                 and larger_value.dtype == value.dtype
                 and larger_value.shape[1:] == value.shape[1:]
