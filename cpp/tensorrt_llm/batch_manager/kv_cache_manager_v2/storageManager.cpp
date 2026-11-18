@@ -27,6 +27,7 @@
 #include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
+#include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 #include "kv_cache_manager_v2/utils/math.h"
 #include "kv_cache_manager_v2/utils/staticHostMem.h"
 #include "tensorrt_llm/common/logger.h"
@@ -36,7 +37,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <dlfcn.h>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -1028,17 +1028,6 @@ int64_t steadyNowNs()
         .count();
 }
 
-//! Whether the calling thread holds the Python GIL. The lossless hand-off must not wait for released ring slots
-//! with it held: the consumer that releases them may be a Python thread. Resolved at run time, since this library
-//! does not link Python; false outside a Python process.
-bool callerHoldsPythonGil()
-{
-    using IntFn = int (*)();
-    static auto const isInitialized = reinterpret_cast<IntFn>(dlsym(RTLD_DEFAULT, "Py_IsInitialized"));
-    static auto const gilCheck = reinterpret_cast<IntFn>(dlsym(RTLD_DEFAULT, "PyGILState_Check"));
-    return isInitialized != nullptr && gilCheck != nullptr && isInitialized() != 0 && gilCheck() != 0;
-}
-
 } // namespace
 
 void StorageManager::_handOffDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level)
@@ -1144,7 +1133,7 @@ std::vector<HostDropRingRecord> StorageManager::drainHostDrops(size_t maxRecords
         {
             break;
         }
-        if (!batch.done.queryComplete())
+        if (!batch.consumerDone.queryComplete())
         {
             break;
         }
@@ -1173,7 +1162,34 @@ void StorageManager::_releaseHostDropResources() noexcept
         mHostDropAsync.store(false, std::memory_order_release);
         // A lossless hand-off waiting for slots sees the ring going away and stops staging.
         mHostDropSlotsFreed.notify_all();
-        std::lock_guard<std::mutex> lock(mHostDropMutex);
+        // The consumer that releases slots may be a Python thread, so the GIL is not held while waiting for it.
+        OptionalGilRelease const gilRelease;
+        std::unique_lock<std::mutex> lock(mHostDropMutex);
+        if (mHostDropRing)
+        {
+            // Slots the consumer drained and has not released may still be read. Wait for them, bounded; if a
+            // consumer still holds some, leak the ring (as destroy() leaks unquiesced remote transfers) rather than
+            // free memory it may read.
+            size_t const totalSlots = mHostDropRing->size() / mHostDropSlotBytes;
+            auto const heldByConsumer = [&]
+            {
+                size_t queued = 0;
+                for (auto const& batch : mHostDropQueue)
+                {
+                    queued += batch.records.size();
+                }
+                return totalSlots - mHostDropFree.size() - queued;
+            };
+            auto const maxWait = std::min(
+                std::chrono::nanoseconds(mHostDropMaxWaitNs), std::chrono::nanoseconds(std::chrono::seconds(5)));
+            if (!mHostDropSlotsFreed.wait_for(lock, maxWait, [&] { return heldByConsumer() == 0; }))
+            {
+                TLLM_LOG_WARNING(
+                    "KV cache host-drop ring: %zu slots still held by the consumer at shutdown; leaking the ring",
+                    heldByConsumer());
+                (void) mHostDropRing.release();
+            }
+        }
         if (mHostDropStream != nullptr)
         {
             cuStreamSynchronize(mHostDropStream);
@@ -1195,7 +1211,7 @@ void StorageManager::_releaseHostDropResources() noexcept
     }
 }
 
-void StorageManager::_queueHostDrops(std::vector<SharedPtr<Page>> const& pages, CacheLevel level)
+void StorageManager::_queueHostDrops(std::vector<Page*> const& pages, CacheLevel level, bool mayWait)
 {
     // The pages are DROPPABLE (no live reader) and their slots are released right after this returns. Instead of
     // waiting for anything here, the copy into the ring is queued on the ring's stream behind each page's ready event,
@@ -1296,7 +1312,7 @@ void StorageManager::_queueHostDrops(std::vector<SharedPtr<Page>> const& pages, 
             }
         }
         CachedCudaEvent const done(reinterpret_cast<CudaStream>(stream));
-        HostDropBatch batch{done, {}};
+        HostDropBatch batch{CachedCudaEvent(reinterpret_cast<CudaStream>(stream)), {}};
         batch.records.reserve(items.size());
         for (auto const& item : items)
         {
@@ -1320,13 +1336,13 @@ void StorageManager::_queueHostDrops(std::vector<SharedPtr<Page>> const& pages, 
     {
         items.reserve(pages.size());
         int64_t ringFull = 0;
-        if (!mHostDropLossless)
+        if (!mHostDropLossless || !mayWait)
         {
             {
                 std::lock_guard<std::mutex> lock(mHostDropMutex);
-                for (auto const& page : pages)
+                for (auto* page : pages)
                 {
-                    auto const* committed = dynamic_cast<CommittedPage const*>(page.get());
+                    auto const* committed = dynamic_cast<CommittedPage const*>(page);
                     if (committed == nullptr || committed->block == nullptr || !page->hasValidSlot())
                     {
                         continue;
@@ -1340,7 +1356,7 @@ void StorageManager::_queueHostDrops(std::vector<SharedPtr<Page>> const& pages, 
                     }
                     int32_t const slot = mHostDropFree.back();
                     mHostDropFree.pop_back();
-                    items.push_back(Item{page.get(), committed, pgIdx, bytes, slot});
+                    items.push_back(Item{page, committed, pgIdx, bytes, slot});
                 }
             }
             mHostDropStats.ringFull += ringFull;
@@ -1358,9 +1374,9 @@ void StorageManager::_queueHostDrops(std::vector<SharedPtr<Page>> const& pages, 
 
         std::vector<Pending> todo;
         todo.reserve(pages.size());
-        for (auto const& page : pages)
+        for (auto* page : pages)
         {
-            auto const* committed = dynamic_cast<CommittedPage const*>(page.get());
+            auto const* committed = dynamic_cast<CommittedPage const*>(page);
             if (committed == nullptr || committed->block == nullptr || !page->hasValidSlot())
             {
                 continue;
@@ -1372,45 +1388,43 @@ void StorageManager::_queueHostDrops(std::vector<SharedPtr<Page>> const& pages, 
                 ++ringFull; // no ring slot can ever hold it
                 continue;
             }
-            todo.push_back(Pending{page.get(), committed, pgIdx, bytes});
+            todo.push_back(Pending{page, committed, pgIdx, bytes});
         }
         size_t next = 0;
         while (next < todo.size())
         {
             size_t const left = todo.size() - next;
-            bool gilHeld = false;
+            size_t const want = std::min(left, mHostDropMinChunk);
+            bool mustWait = false;
             {
+                std::lock_guard<std::mutex> lock(mHostDropMutex);
+                mustWait = mHostDropAsync.load(std::memory_order_acquire) && mHostDropFree.size() < want
+                    && steadyNowNs() >= mHostDropPausedUntilNs;
+            }
+            if (mustWait)
+            {
+                // The consumer that releases slots may be a Python thread, so the wait does not hold the GIL. The
+                // lock is declared after the release: it is dropped before the GIL is taken back.
+                OptionalGilRelease const gilRelease;
                 std::unique_lock<std::mutex> lock(mHostDropMutex);
-                size_t const want = std::min(left, mHostDropMinChunk);
-                bool const async = mHostDropAsync.load(std::memory_order_acquire);
-                if (async && mHostDropFree.size() < want && steadyNowNs() >= mHostDropPausedUntilNs)
+                auto const t0 = std::chrono::steady_clock::now();
+                mHostDropStats.waits += 1;
+                bool const ready = mHostDropSlotsFreed.wait_for(lock, std::chrono::nanoseconds(mHostDropMaxWaitNs),
+                    [&] { return mHostDropFree.size() >= want || !mHostDropAsync.load(std::memory_order_acquire); });
+                mHostDropStats.waitNs
+                    += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+                           .count();
+                if (!ready)
                 {
-                    if (callerHoldsPythonGil())
-                    {
-                        gilHeld = true;
-                    }
-                    else
-                    {
-                        auto const t0 = std::chrono::steady_clock::now();
-                        bool const ready = mHostDropSlotsFreed.wait_for(lock,
-                            std::chrono::nanoseconds(mHostDropMaxWaitNs),
-                            [&] {
-                                return mHostDropFree.size() >= want || !mHostDropAsync.load(std::memory_order_acquire);
-                            });
-                        mHostDropStats.waits += 1;
-                        mHostDropStats.waitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - t0)
-                                                     .count();
-                        if (!ready)
-                        {
-                            // The consumer did not release a chunk in time: take what is free, then drop without a
-                            // hand-off until the pause ends.
-                            mHostDropStats.timeouts += 1;
-                            mHostDropPausedUntilNs = steadyNowNs() + mHostDropMaxWaitNs;
-                        }
-                    }
+                    // The consumer did not release a chunk in time: take what is free, then drop without a
+                    // hand-off until the pause ends.
+                    mHostDropStats.timeouts += 1;
+                    mHostDropPausedUntilNs = steadyNowNs() + mHostDropMaxWaitNs;
                 }
-                // Free slots are taken even while paused or under the GIL, never once the ring is going away.
+            }
+            {
+                // Free slots are taken even while paused, never once the ring is going away.
+                std::lock_guard<std::mutex> lock(mHostDropMutex);
                 if (mHostDropAsync.load(std::memory_order_acquire))
                 {
                     size_t const n = std::min(left, mHostDropFree.size());
@@ -1425,12 +1439,8 @@ void StorageManager::_queueHostDrops(std::vector<SharedPtr<Page>> const& pages, 
             }
             if (items.empty())
             {
-                // Paused after a timeout, the GIL is held, or the ring is going away: drop the rest without a hand-off.
+                // Paused after a timeout, or the ring is going away: drop the rest without a hand-off.
                 ringFull += static_cast<int64_t>(left);
-                if (gilHeld)
-                {
-                    mHostDropStats.gilSkips += static_cast<int64_t>(left);
-                }
                 break;
             }
             next += items.size();
@@ -1466,6 +1476,17 @@ void StorageManager::handOffDestroyedPage(Page& page)
         CacheLevel const level = page.cacheLevel;
         if (committed == nullptr || committed->block == nullptr || !page.hasValidSlot()
             || cacheTier(level) != CacheTier::HOST_MEM)
+        {
+            return;
+        }
+        if (hostDropAsync())
+        {
+            // Staged behind the page's ready event, so nothing is awaited here; the destructor may run on any thread,
+            // so it never waits for ring slots (a full ring drops the page).
+            _queueHostDrops({&page}, level, /*mayWait=*/false);
+            return;
+        }
+        if (!mHostDropHook)
         {
             return;
         }
@@ -2740,7 +2761,13 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 {
                     if (hostDropAsync())
                     {
-                        _queueHostDrops(ev, lvlId);
+                        std::vector<Page*> rawPages;
+                        rawPages.reserve(ev.size());
+                        for (auto const& page : ev)
+                        {
+                            rawPages.push_back(page.get());
+                        }
+                        _queueHostDrops(rawPages, lvlId, /*mayWait=*/true);
                     }
                     else if (mHostDropHook)
                     {

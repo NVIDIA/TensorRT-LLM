@@ -157,9 +157,10 @@ CommittedPage::CommittedPage(
 
 CommittedPage::~CommittedPage()
 {
-    // A committed host page that leaves outside last-level eviction (e.g. a request releasing it) is handed to the
-    // host-drop hook while its block link and slot still hold the data.
-    if (cacheLevel != kHotLevel && block != nullptr && hasValidSlot() && !hostDropHandled && manager->hasHostDropHook())
+    // A committed host page that leaves outside last-level eviction (e.g. a request releasing it) is handed off while
+    // its block link and slot still hold the data: staged into the ring in async mode, else passed to the hook.
+    if (cacheLevel != kHotLevel && block != nullptr && hasValidSlot() && !hostDropHandled
+        && (manager->hostDropAsync() || manager->hasHostDropHook()))
     {
         manager->handOffDestroyedPage(*this);
     }

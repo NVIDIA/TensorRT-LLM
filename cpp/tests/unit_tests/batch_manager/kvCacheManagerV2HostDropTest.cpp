@@ -178,7 +178,7 @@ TEST_F(HostDropTest, HookReceivesEachDroppedPageWithItsHostBytes)
     std::vector<HostDropRecord> seen;
     std::vector<bool> contentMatches;
     size_t hostBytes = 0;
-    storage.setHostDropHook(
+    (void) storage.setHostDropHook(
         [&](std::vector<HostDropRecord> const& records)
         {
             for (auto const& record : records)
@@ -221,7 +221,7 @@ TEST_F(HostDropTest, HookReceivesEachDroppedPageWithItsHostBytes)
     EXPECT_EQ(storage.hostDropStats().errors.load(), 0);
 
     // Removing the hook stops the hand-off.
-    storage.setHostDropHook({});
+    (void) storage.setHostDropHook({});
     EXPECT_FALSE(storage.hasHostDropHook());
     commitRound();
     EXPECT_EQ(seen.size(), 4U);
@@ -234,7 +234,7 @@ TEST_F(HostDropTest, HookExceptionIsCountedAndEvictionContinues)
 {
     auto& storage = mManager->storage();
     int calls = 0;
-    storage.setHostDropHook(
+    (void) storage.setHostDropHook(
         [&](std::vector<HostDropRecord> const&)
         {
             ++calls;
@@ -266,6 +266,10 @@ TEST_P(HostDropRingTest, RingCopiesDroppedPagesAndRecyclesSlots)
     bool const preferKernel = GetParam();
     auto& storage = mManager->storage();
     auto const info = storage.setUpHostDropRing(/*ringBytes=*/0, preferKernel);
+    if (preferKernel && !info.kernelCopy)
+    {
+        GTEST_SKIP() << "the batched page-copy kernel is not available on this device";
+    }
     EXPECT_TRUE(storage.hostDropAsync());
     EXPECT_NE(info.address, 0U);
     EXPECT_EQ(info.numSlots, 16) << "the ring has at least 16 slots";
@@ -282,7 +286,8 @@ TEST_P(HostDropRingTest, RingCopiesDroppedPagesAndRecyclesSlots)
 
     // The synchronous hook is not called once the ring is up.
     int hookCalls = 0;
-    storage.setHostDropHook([&](std::vector<HostDropRecord> const&) { ++hookCalls; });
+    (void) storage.setHostDropHook(
+        [&](std::vector<HostDropRecord> const&) { ++hookCalls; });
 
     auto const first = commitRound();
     commitRound();
@@ -348,10 +353,15 @@ TEST_P(HostDropRingTest, LosslessRingWaitsForReleasedSlotsInsteadOfDropping)
     auto& storage = mManager->storage();
     auto const info = storage.setUpHostDropRing(
         /*ringBytes=*/0, preferKernel, HostDropLosslessConfig{/*enabled=*/true, /*maxWaitS=*/10.0, /*minChunk=*/2});
+    if (preferKernel && !info.kernelCopy)
+    {
+        GTEST_SKIP() << "the batched page-copy kernel is not available on this device";
+    }
     ASSERT_EQ(info.numSlots, 16);
 
-    // A consumer that gives slots back only after a while, like the pool's put threads in a burst. It records each
-    // slot's fill byte before releasing the slot (-1: not one pattern); the patterns are checked after it stops.
+    // A consumer that gives slots back only once eviction is waiting for them, like the pool's put threads in a burst,
+    // so the wait is certain. It records each slot's fill byte before releasing the slot (-1: not one pattern); the
+    // patterns are checked after it stops.
     std::atomic<bool> stop{false};
     std::mutex recordsMutex;
     std::vector<std::pair<std::string, int>> seen;
@@ -366,7 +376,10 @@ TEST_P(HostDropRingTest, LosslessRingWaitsForReleasedSlotsInsteadOfDropping)
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     continue;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                while (!stop.load() && storage.hostDropStats().waits.load() == 0)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
                 std::vector<int32_t> slots;
                 {
                     std::lock_guard<std::mutex> lock(recordsMutex);
@@ -411,7 +424,6 @@ TEST_P(HostDropRingTest, LosslessRingWaitsForReleasedSlotsInsteadOfDropping)
     EXPECT_EQ(static_cast<int64_t>(seen.size()), drops);
     EXPECT_GT(stats.waits.load(), 0) << "the ring filled and eviction waited for released slots";
     EXPECT_EQ(stats.timeouts.load(), 0);
-    EXPECT_EQ(stats.gilSkips.load(), 0);
     EXPECT_EQ(stats.errors.load(), 0);
 }
 
@@ -419,8 +431,12 @@ TEST_P(HostDropRingTest, LosslessWaitIsBoundedWhenSlotsNeverComeBack)
 {
     bool const preferKernel = GetParam();
     auto& storage = mManager->storage();
-    storage.setUpHostDropRing(
+    auto const info = storage.setUpHostDropRing(
         /*ringBytes=*/0, preferKernel, HostDropLosslessConfig{/*enabled=*/true, /*maxWaitS=*/0.2, /*minChunk=*/2});
+    if (preferKernel && !info.kernelCopy)
+    {
+        GTEST_SKIP() << "the batched page-copy kernel is not available on this device";
+    }
     auto const t0 = std::chrono::steady_clock::now();
     for (int round = 0; round < 14; ++round)
     {

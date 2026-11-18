@@ -36,6 +36,7 @@
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/streamingEventSink.h"
 #include "kv_cache_manager_v2/utils/copyUtils.h"
+#include "kv_cache_manager_v2/utils/cudaContextScope.h"
 #include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 #include "tensorrt_llm/common/logger.h"
 
@@ -669,6 +670,39 @@ public:
     {
         nb::gil_scoped_acquire acquire;
         return nb::cast<std::vector<std::vector<kv::KVCacheEvent>>>(nb::borrow<nb::object>(mCallback)(events));
+    }
+
+private:
+    PyObject* mCallback;
+};
+
+//! Owns a reference to the host-drop hook's Python callable and drops it under the GIL, wherever the last copy of the
+//! hook is destroyed (removal, replacement or manager teardown).
+class PythonHostDropCallback
+{
+public:
+    explicit PythonHostDropCallback(nb::handle callback)
+        : mCallback(callback.ptr())
+    {
+        Py_INCREF(mCallback);
+    }
+
+    ~PythonHostDropCallback()
+    {
+        if (Py_IsInitialized())
+        {
+            nb::gil_scoped_acquire acquire;
+            Py_DECREF(mCallback);
+        }
+    }
+
+    PythonHostDropCallback(PythonHostDropCallback const&) = delete;
+    PythonHostDropCallback& operator=(PythonHostDropCallback const&) = delete;
+
+    //! The caller must hold the GIL.
+    [[nodiscard]] nb::handle get() const noexcept
+    {
+        return nb::handle(mCallback);
     }
 
 private:
@@ -3844,17 +3878,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 // one per committed page the last host level drops, from inside eviction and before the slots are
                 // freed. `address` is valid only during the call. None removes the hook.
                 kv::HostDropHook hook;
+                std::shared_ptr<PythonHostDropCallback> holder;
                 if (!callback.is_none())
                 {
                     if (!PyCallable_Check(callback.ptr()))
                     {
                         throw nb::type_error("set_host_drop_hook: callback must be callable or None");
                     }
-                    // Held for the life of the process: releasing it would need the GIL at a time C++ chooses.
-                    PyObject* const fn = callback.release().ptr();
+                    holder = std::make_shared<PythonHostDropCallback>(callback);
                     // The storage manager owns the hook, so its stats outlive it.
                     auto* const stats = &self.storage().hostDropStats();
-                    hook = [fn, stats](std::vector<kv::HostDropRecord> const& records)
+                    hook = [holder, stats](std::vector<kv::HostDropRecord> const& records)
                     {
                         nb::gil_scoped_acquire gil;
                         // ~CommittedPage can get here from tp_dealloc while an exception is in flight: park it, so
@@ -3868,8 +3902,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                                 items.append(nb::make_tuple(nb::bytes(r.key.data(), r.key.size()), r.lifeCycle,
                                     r.numTokens, r.address, r.bytes));
                             }
-                            nb::handle const callable(fn);
-                            callable(items);
+                            holder->get()(items);
                         }
                         catch (std::exception const& error) // nb::python_error included
                         {
@@ -3883,10 +3916,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     };
                 }
                 // Never wait for the API lock with the GIL held: an evicting thread holds that lock while it waits
-                // for the GIL inside the hook. The replaced hook only holds a raw pointer, so dropping it needs no GIL.
+                // for the GIL inside the hook. The replaced hook is destroyed after the lock is released (its
+                // callable takes the GIL to drop its reference), but before the GIL is taken back.
                 nb::gil_scoped_release release;
-                auto const apiLock = self.lockExclusive();
-                self.storage().setHostDropHook(std::move(hook));
+                kv::HostDropHook previous;
+                {
+                    auto const apiLock = self.lockExclusive();
+                    previous = self.storage().setHostDropHook(std::move(hook));
+                }
             },
             nb::arg("callback").none())
         .def(
@@ -3900,14 +3937,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 // without a hand-off (see StorageManager::setUpHostDropRing).
                 kv::HostDropRingInfo info{};
                 {
+                    // Setup shares the storage with eviction and shutdown, so it takes the exclusive API lock (after
+                    // the GIL is released, as in set_host_drop_hook) and runs in the manager's CUDA context.
                     nb::gil_scoped_release release;
+                    kv::CudaContextScope const context(self.cudaContext());
+                    TLLM_CHECK_WITH_INFO(context.usable(), "host_drop_ring: the manager's CUDA context is unusable");
+                    auto const apiLock = self.lockExclusive();
                     info = self.storage().setUpHostDropRing(
                         ringBytes, preferKernel, kv::HostDropLosslessConfig{lossless, losslessMaxWaitS, losslessChunk});
                 }
                 return nb::make_tuple(info.address, info.slotBytes, info.numSlots, info.kernelCopy);
             },
             nb::arg("ring_bytes"), nb::arg("prefer_kernel") = true, nb::arg("lossless") = false,
-            nb::arg("lossless_max_wait_s") = 10.0, nb::arg("lossless_chunk") = 64)
+            nb::arg("lossless_max_wait_s") = 2.0, nb::arg("lossless_chunk") = 64)
         .def(
             "drain_host_drops",
             [](kv::KvCacheManager& self, size_t maxRecords)
@@ -3947,7 +3989,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 out["waits"] = c.waits.load();
                 out["wait_ns"] = c.waitNs.load();
                 out["timeouts"] = c.timeouts.load();
-                out["gil_skips"] = c.gilSkips.load();
                 return out;
             })
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),

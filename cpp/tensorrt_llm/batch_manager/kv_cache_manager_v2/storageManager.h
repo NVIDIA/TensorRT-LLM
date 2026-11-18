@@ -98,7 +98,9 @@ struct HostDropLosslessConfig
     bool enabled = false;
     //! Longest single wait. After a wait times out, waiting pauses for as long and pages are dropped without a
     //! hand-off again (counted in ringFull), so a consumer that stops releasing slots costs one wait, not a hang.
-    double maxWaitS = 10.0;
+    //! The wait holds the exclusive API lock (every call into the manager stalls) and bounds teardown, so keep it
+    //! short; a stuck consumer stalls the evicting thread for up to this long in every 2 x maxWaitS.
+    double maxWaitS = 2.0;
     //! A wait ends once this many slots (or every page still to stage) are free; capped at half the ring.
     size_t minChunk = 64;
 };
@@ -113,7 +115,6 @@ struct HostDropStats
     std::atomic<int64_t> waits{0};    // waits of the evicting thread for released ring slots
     std::atomic<int64_t> waitNs{0};   // their total duration
     std::atomic<int64_t> timeouts{0}; // waits that ended without enough slots
-    std::atomic<int64_t> gilSkips{0}; // pages dropped without a hand-off because the evicting thread held the GIL
 };
 
 // Immutable bidirectional mapping between lifecycles and pool groups.
@@ -429,10 +430,13 @@ public:
     //! The hot level's second medium: host pages the GPU reads through a device mapping.
     [[nodiscard]] std::optional<CacheTier> sparseBackingMedium() const;
 
-    //! Installs (or, with an empty hook, removes) the host-drop hook. Inert until set.
-    void setHostDropHook(HostDropHook hook)
+    //! Installs (or, with an empty hook, removes) the host-drop hook and returns the previous one, so the caller can
+    //! destroy it outside the manager's API lock. Inert until set. The hook runs on the evicting thread under the
+    //! exclusive API lock: it must not call back into the manager.
+    [[nodiscard]] HostDropHook setHostDropHook(HostDropHook hook)
     {
-        mHostDropHook = std::move(hook);
+        std::swap(mHostDropHook, hook);
+        return hook;
     }
 
     [[nodiscard]] bool hasHostDropHook() const noexcept
@@ -445,13 +449,15 @@ public:
     //! first call (at most `ringBytes`, at least 16 slots); later calls return the same ring. `preferKernel=false`
     //! forces the host-callback copy. With `lossless.enabled`, a dropped page that finds the ring full is not dropped
     //! without a hand-off: the evicting call stages the pages in chunks and waits for releaseHostDropSlots() between
-    //! them (back-pressure on eviction). The wait is bounded and is never taken while the calling thread holds the
-    //! Python GIL, which the consumer that releases the slots may need.
+    //! them (back-pressure on eviction). The wait is bounded and releases the Python GIL (OptionalGilRelease), which
+    //! the consumer that releases the slots may need. Teardown waits, bounded, for slots a consumer has drained and not
+    //! released, and leaks the ring if some are still held.
     HostDropRingInfo setUpHostDropRing(
         size_t ringBytes, bool preferKernel, HostDropLosslessConfig const& lossless = HostDropLosslessConfig{});
     //! Ring records whose copies have completed, oldest first; a batch is never split.
     std::vector<HostDropRingRecord> drainHostDrops(size_t maxRecords);
-    //! Returns ring slots to the free list once their contents have been consumed.
+    //! Returns ring slots to the free list once their contents have been consumed. The lossless wait holds the
+    //! exclusive API lock, so a consumer must not take the manager's lock between drainHostDrops() and this call.
     void releaseHostDropSlots(std::vector<int32_t> const& slots);
 
     [[nodiscard]] bool hostDropAsync() const noexcept
@@ -714,12 +720,16 @@ private:
     HostDropHook mHostDropHook;
     HostDropStats mHostDropStats;
     void _handOffDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level);
-    void _queueHostDrops(std::vector<SharedPtr<Page>> const& pages, CacheLevel level);
+    //! `mayWait` allows the lossless hand-off to wait for released slots; a page destroyed outside eviction passes
+    //! false, since its destructor may run anywhere.
+    void _queueHostDrops(std::vector<Page*> const& pages, CacheLevel level, bool mayWait);
     void _releaseHostDropResources() noexcept;
 
     struct HostDropBatch
     {
-        CachedCudaEvent done;
+        //! Recorded for the consumer alone: the pages' ready events are shared with migration, which may hold their
+        //! raw handles, and a query here could retire them.
+        CachedCudaEvent consumerDone;
         std::vector<HostDropRingRecord> records;
     };
 
