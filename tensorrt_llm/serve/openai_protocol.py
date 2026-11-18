@@ -54,6 +54,7 @@ from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
+from tensorrt_llm.inputs.multimodal import MultimodalInput
 from tensorrt_llm.kv_hints import KvHintsEnvelope
 from tensorrt_llm.kv_hints.protocol import admit_kv_hints
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
@@ -311,6 +312,37 @@ class ResponseFormat(OpenAIBaseModel):
     format: Optional[xgrammar.structural_tag.Format] = None
 
 
+class TensorBytesHandle(OpenAIBaseModel):
+    """A tensor copied by value (``SharedTensorContainer.from_tensor_bytes``).
+
+    The only tensor form the protocol carries: CUDA IPC and shared-memory
+    handles do not work on another host.
+    """
+    method_key: int
+    tensor_size: List[NonNegativeInt]
+    dtype: str
+    data: str = Field(description="Base64 of the tensor bytes.")
+
+    @model_validator(mode="after")
+    def validate_bytes_handle(self) -> "TensorBytesHandle":
+        from tensorrt_llm._torch.shared_tensor.shared_tensor import (
+            _SharedTensorRebuildMethodRegistry, str_to_torch_dtype)
+
+        if self.method_key != _SharedTensorRebuildMethodRegistry.REBUILD_BYTES:
+            raise ValueError(
+                "Tensor handles must be copied by value (REBUILD_BYTES)")
+        str_to_torch_dtype(self.dtype)
+        return self
+
+
+# Context worker -> generation worker only. to_disaggregated_params() sets them
+# only for context-only results (a generation response would echo the request's
+# copies), and to_llm_disaggregated_params() passes them only to generation-only
+# requests.
+_MULTIMODAL_HANDOFF_FIELDS = ("multimodal_input", "mrope_position_ids_handle",
+                              "mrope_position_deltas_handle")
+
+
 class DisaggregatedParams(OpenAIBaseModel):
     request_type: str
     first_gen_tokens: Optional[List[int]] = None
@@ -333,10 +365,18 @@ class DisaggregatedParams(OpenAIBaseModel):
         description="Prompt-token offset of each multimodal item.")
     multimodal_lengths: Optional[List[PositiveInt]] = Field(
         default=None, description="Prompt-token count of each multimodal item.")
-    # TODO(TRTLLM-12407): Multimodal E/PD over trtllm-serve needs these protocol fields too:
-    # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
-    # Add them here and in to_disaggregated_params()/to_llm_disaggregated_params()
-    # before routing MM encoder -> context -> generation through OpenAI protocol.
+    multimodal_input: Optional[MultimodalInput] = Field(
+        default=None,
+        description="Multimodal KV cache identity of the context request.")
+    mrope_position_ids_handle: Optional[TensorBytesHandle] = Field(
+        default=None, description="mRoPE position IDs of the context request.")
+    mrope_position_deltas_handle: Optional[TensorBytesHandle] = Field(
+        default=None,
+        description="mRoPE position deltas of the context request.")
+    # TODO(TRTLLM-12407): Multimodal E/PD over trtllm-serve also needs the
+    # encoder -> context handoff: encoder embedding handles, with their hashes
+    # and prompt layout. Add them here and in to_disaggregated_params() /
+    # to_llm_disaggregated_params().
     # Orchestrator -> context-worker instruction: return prompt_token_ids as a
     # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
     return_prompt_token_ids_b64: bool = False
@@ -360,6 +400,17 @@ class DisaggregatedParams(OpenAIBaseModel):
                 "multimodal_positions and multimodal_lengths must have the same length"
             )
         return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_multimodal_handoff(self, handler: Any) -> Any:
+        # Left out rather than serialized as null, so a router or worker that
+        # predates these fields still accepts a reply without them.
+        data = handler(self)
+        if isinstance(data, dict):
+            for key in _MULTIMODAL_HANDOFF_FIELDS:
+                if data.get(key, ...) is None:
+                    data.pop(key)
+        return data
 
 
 class ConversationParams(OpenAIBaseModel):
@@ -2304,6 +2355,12 @@ def to_disaggregated_params(
     ctx_usage = tllm_disagg_params.ctx_usage
     if ctx_usage is not None and not isinstance(ctx_usage, UsageInfo):
         ctx_usage = UsageInfo.model_validate(ctx_usage)
+    handoff = {}
+    if tllm_disagg_params.request_type == "context_only":
+        handoff = {
+            name: getattr(tllm_disagg_params, name)
+            for name in _MULTIMODAL_HANDOFF_FIELDS
+        }
     return DisaggregatedParams(
         request_type=tllm_disagg_params.request_type,
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
@@ -2323,6 +2380,7 @@ def to_disaggregated_params(
         remote_tail_start=tllm_disagg_params.remote_tail_start,
         multimodal_positions=tllm_disagg_params.multimodal_positions,
         multimodal_lengths=tllm_disagg_params.multimodal_lengths,
+        **handoff,
     )
 
 
@@ -2331,6 +2389,10 @@ def to_llm_disaggregated_params(
     if disaggregated_params is None:
         return None
     ctx_usage = disaggregated_params.ctx_usage
+    handoff = {}
+    if disaggregated_params.request_type == "generation_only":
+        handoff = disaggregated_params.model_dump(
+            include=set(_MULTIMODAL_HANDOFF_FIELDS))
     return LlmDisaggregatedParams(
         request_type=disaggregated_params.request_type,
         first_gen_tokens=disaggregated_params.first_gen_tokens,
@@ -2351,6 +2413,7 @@ def to_llm_disaggregated_params(
         multimodal_positions=disaggregated_params.multimodal_positions,
         multimodal_lengths=disaggregated_params.multimodal_lengths,
         orig_elapsed_s=disaggregated_params.orig_elapsed_s,
+        **handoff,
     )
 
 

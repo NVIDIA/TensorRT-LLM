@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import hmac
 from types import SimpleNamespace
 
 import pytest
@@ -78,6 +80,9 @@ def test_protected_fields_come_from_protocol_metadata():
     assert set(get_internal_disagg_auth_fields()) == {
         "ctx_info_endpoint",
         "encoded_opaque_state",
+        "multimodal_input",
+        "mrope_position_ids_handle",
+        "mrope_position_deltas_handle",
     }
 
 
@@ -169,6 +174,48 @@ def test_opaque_state_rejects_tampered_payload():
 
     with pytest.raises(ValueError, match="Invalid internal"):
         validate_internal_disagg_request("secret", request, headers)
+
+
+def test_multimodal_handoff_is_signed():
+    request = _make_request()
+    request.disaggregated_params = DisaggregatedParams.model_validate(
+        {
+            **request.disaggregated_params.model_dump(exclude_unset=True),
+            "multimodal_input": {
+                "multimodal_hashes": [[1] * 8],
+                "multimodal_positions": [1],
+                "multimodal_lengths": [2],
+            },
+            "mrope_position_deltas_handle": {
+                "method_key": 4,
+                "tensor_size": [1, 1],
+                "dtype": "torch.int32",
+                "data": "/v///w==",
+            },
+        }
+    )
+    assert request_requires_internal_disagg_auth(request)
+    headers = build_internal_disagg_auth_headers("secret", request)
+    wire_request = CompletionRequest.model_validate_json(
+        request.model_dump_json(exclude_unset=True)
+    )
+    validate_internal_disagg_request("secret", wire_request, headers)
+
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_request("secret", wire_request, {})
+    wire_request.disaggregated_params.multimodal_input.multimodal_hashes[0][0] = 2
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_request("secret", wire_request, headers)
+
+
+def test_requests_without_multimodal_handoff_keep_their_signature():
+    request = _make_request(encoded_opaque_state="b3BhcXVl")
+    legacy_payload = b'{"ctx_info_endpoint":null,"encoded_opaque_state":"b3BhcXVl"}'
+    signature = hmac.new(b"secret", legacy_payload, hashlib.sha256).hexdigest()
+
+    assert build_internal_disagg_auth_headers("secret", request) == {
+        INTERNAL_DISAGG_AUTH_HEADER: f"sha256={signature}"
+    }
 
 
 def test_ctx_info_endpoint_rejects_tampered_payload():

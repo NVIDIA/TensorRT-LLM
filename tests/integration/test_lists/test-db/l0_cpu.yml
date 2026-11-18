@@ -353,6 +353,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_musespark_serve_extensions.py
   - unittest/llmapi/apps/test_musespark_tool_parser.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
+  - unittest/llmapi/apps/test_openai_disagg_multimodal_handoff.py
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
   - unittest/llmapi/apps/test_openai_input_metrics.py
   - unittest/llmapi/apps/test_openai_protocol_chat_agent_fields.py
