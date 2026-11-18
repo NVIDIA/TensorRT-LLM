@@ -4,11 +4,12 @@
 
 These TP1 components are checkout-only test helpers, not supported serving APIs or a
 reference for TP4 bitwise results. Their names describe the isolated component; device and geometry contracts are
-documented in each helper. They do not register ModelingV2 targets. The six-layer prefill helper also
-supports the local cached-generation tests. Use `LLM()` or `trtllm-serve` for serving.
+documented in each helper. They do not register ModelingV2 targets. Use `LLM()` or `trtllm-serve` for serving.
 
 Run tests through pytest with the repository's test import plugin. Existing L0 selectors
-retain the small single-GPU tests; the large component suites remain manual-only.
+retain the small single-GPU tests. The large MoE, sparse-block, six-layer and
+four-rank qualification suites live in
+[the manual integration tree](../../../../../../integration/defs/beam/README.md).
 
 The dense and sparse helpers call the serving family's shared attention function,
 input normalization (`beam_rmsnorm_fp32`), and activation (`swiglu_fp32`); the other

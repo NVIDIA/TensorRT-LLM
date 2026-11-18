@@ -163,7 +163,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/test_modeling_v2_no_stale_claims.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/activation TIMEOUT (30)
   # Beam: lightweight single-GPU entries. High-memory MoE, sparse-block and six-layer
-  # suites belong to manual_b300_beam_components.yml, not L0 or nightly/LR.
+  # suites live in tests/integration/defs/beam and run manually, outside L0/nightly/LR.
   # Startup-inclusive measurements on one GB300 (ARM64, retained cache): operators
   # 58s, GEMM/FP4 entries <=23s, expert 35s and router 26s. The B300 x86 operator
   # entry measured 83s in CI. Each keeps an independent 30-minute ceiling.

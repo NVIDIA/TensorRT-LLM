@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Manual four-GPU load-error qualification with one 32-byte generated tensor.
+r"""Manual four-GPU load-error qualification with one 32-byte generated tensor.
 
 Run in a matching installed/native TRT-LLM environment on one node::
 
     env -u TLLM_DISABLE_MPI timeout 120s mpirun -n 4 python -m pytest -q \\
-        tests/unittest/_torch/modeling_v2/models/beam/test_distributed_loading.py
+        tests/integration/defs/beam/test_distributed_loading.py
 
 This uses real MPI error exchange, catalog diagnostic agreement and CUDA copies.
 Only model geometry/quantization metadata are reduced; no checkpoint, inference,

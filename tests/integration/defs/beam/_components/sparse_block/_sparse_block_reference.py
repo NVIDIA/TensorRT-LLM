@@ -25,7 +25,10 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 
-__extra_import_path__ = ["../moe", "../dense_block"]
+__extra_import_path__ = [
+    "../moe",
+    "~/tests/unittest/_torch/modeling_v2/models/beam/_components/dense_block",
+]
 import _dense_block_reference as block_reference  # noqa: E402
 import _moe_reference as moe_reference  # noqa: E402
 

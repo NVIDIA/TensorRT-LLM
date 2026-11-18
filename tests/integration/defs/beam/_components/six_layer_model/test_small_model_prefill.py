@@ -22,7 +22,7 @@ established separately; these tests generate everything at runtime and need no m
 Invocation (fp32 steps need the TF32 overrides removed before torch is imported)::
 
     env -u TORCH_ALLOW_TF32_CUBLAS_OVERRIDE -u NVIDIA_TF32_OVERRIDE python -m pytest \\
-        tests/unittest/_torch/modeling_v2/models/beam/_components/six_layer_model
+        tests/integration/defs/beam/_components/six_layer_model
 
 Dependencies: a TensorRT-LLM build for sm_103 with flashinfer importable and about 200 GiB
 of free device memory: the generated state and the loaded model hold 62 GiB each, and one
@@ -42,16 +42,19 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
 
-__extra_import_path__ = ["../.."]
+__extra_import_path__ = [
+    "~/tests/integration/defs",
+    "~/tests/unittest/_torch/modeling_v2/models/beam",
+]
 
 import _beam_component_support as support  # noqa: E402
 from _beam_component_support import bitwise_equal  # noqa: E402
-
-from _components.six_layer_model import model as model_module  # noqa: E501
-from _components.six_layer_model.model import (  # noqa: E501
+from beam._components.six_layer_model import model as model_module  # noqa: E501
+from beam._components.six_layer_model.model import (  # noqa: E501
     BeamSixLayerBf16Sm103Tp1,
     prefill_context,
 )
+
 from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm

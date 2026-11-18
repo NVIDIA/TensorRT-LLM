@@ -24,7 +24,7 @@ rule in `RULES`.
 Invocation (fp32 steps need the TF32 overrides removed before torch is imported)::
 
     env -u TORCH_ALLOW_TF32_CUBLAS_OVERRIDE -u NVIDIA_TF32_OVERRIDE python -m pytest \\
-        tests/unittest/_torch/modeling_v2/models/beam/_components/sparse_block
+        tests/integration/defs/beam/_components/sparse_block
 
 QA reports: use ``tests/scripts/beam_component_qa.py`` (see the component README).
 
@@ -52,7 +52,13 @@ except ModuleNotFoundError as exc:
     if exc.name != "tensorrt_llm._torch.models.modeling_beam":
         raise
     builtin_beam = None  # The standard-serving implementation is a separate PR.
-__extra_import_path__ = [".", "../..", "../moe", "../../../.."]
+__extra_import_path__ = [
+    ".",
+    "~/tests/integration/defs",
+    "../moe",
+    "~/tests/unittest/_torch/modeling_v2/models/beam",
+    "~/tests/unittest/_torch/modeling_v2",
+]
 
 import _beam_component_support as support  # noqa: E402
 import _moe_reference as moe_reference  # noqa: E402
@@ -66,10 +72,10 @@ from _beam_component_support import (  # noqa: E402
     unchanged,
 )
 from _validating import validating  # noqa: E402
+from beam._components.moe.moe import BeamMoeBf16Sm103Tp1
+from beam._components.sparse_block import block as block_module  # noqa: E501
+from beam._components.sparse_block.block import BeamSparseBlockBf16Sm103Tp1  # noqa: E501
 
-from _components.moe.moe import BeamMoeBf16Sm103Tp1
-from _components.sparse_block import block as block_module  # noqa: E501
-from _components.sparse_block.block import BeamSparseBlockBf16Sm103Tp1  # noqa: E501
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm

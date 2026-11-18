@@ -39,10 +39,12 @@ from torch import nn
 from tensorrt_llm._torch.modeling_v2.models.beam import dispatch_combine
 from tensorrt_llm._torch.modeling_v2.models.beam._constants import SM as _SM
 
-from ..moe_expert.expert import WEIGHT_SHAPES as EXPERT_WEIGHT_SHAPES
-from ..moe_expert.expert import BeamMoeExpertBf16Sm103Tp1
-from ..moe_router.router import BeamMoeRouterBf16Sm103Tp1
-from ..moe_router.router import check_config as check_router_config
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2/models/beam"]
+
+from _components.moe_expert.expert import WEIGHT_SHAPES as EXPERT_WEIGHT_SHAPES
+from _components.moe_expert.expert import BeamMoeExpertBf16Sm103Tp1
+from _components.moe_router.router import BeamMoeRouterBf16Sm103Tp1
+from _components.moe_router.router import check_config as check_router_config
 
 #: Fields of the checkpoint's configuration this component reads beyond the router's.
 SUPPORTED_CONFIG = {

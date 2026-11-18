@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Test support shared by the Beam GPU tests under ``models/beam/``.
+"""Test support shared by the Beam GPU unit and integration tests.
 
 Only harness code lives here: the IEEE fp32 session guard, result bookkeeping that
 judges with the rules each test file passes in, op-path
@@ -31,7 +31,8 @@ import torch
 from torch.overrides import TorchFunctionMode, resolve_name
 
 if TYPE_CHECKING:
-    from _components.moe.moe import BeamMoeBf16Sm103Tp1
+    __extra_import_path__ = ["~/tests/integration/defs"]
+    from beam._components.moe.moe import BeamMoeBf16Sm103Tp1
 
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 

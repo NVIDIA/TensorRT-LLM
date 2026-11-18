@@ -18,7 +18,7 @@ reaches its own experts and that expert ``e`` is the one loaded under ``experts.
 Invocation (fp32 steps need the TF32 overrides removed before torch is imported)::
 
     env -u TORCH_ALLOW_TF32_CUBLAS_OVERRIDE -u NVIDIA_TF32_OVERRIDE \\
-        python -m pytest tests/unittest/_torch/modeling_v2/models/beam/_components/moe
+        python -m pytest tests/integration/defs/beam/_components/moe
 
 QA reports: use ``tests/scripts/beam_component_qa.py`` (see the component README).
 
@@ -45,7 +45,12 @@ except ModuleNotFoundError as exc:
     if exc.name != "tensorrt_llm._torch.models.modeling_beam":
         raise
     builtin_beam = None  # The standard-serving implementation is a separate PR.
-__extra_import_path__ = [".", "../..", "../../../.."]
+__extra_import_path__ = [
+    ".",
+    "~/tests/integration/defs",
+    "~/tests/unittest/_torch/modeling_v2/models/beam",
+    "~/tests/unittest/_torch/modeling_v2",
+]
 
 import _beam_component_support as support  # noqa: E402
 import _moe_reference as reference  # noqa: E402
@@ -57,11 +62,11 @@ from _beam_component_support import (  # noqa: E402
     tensor_versions,
     unchanged,
 )
-from _validating import validating  # noqa: E402
-
-from _components.moe.moe import BeamMoeBf16Sm103Tp1
 from _components.moe_expert.expert import BeamMoeExpertBf16Sm103Tp1  # noqa: E501
 from _components.moe_router.router import BeamMoeRouterBf16Sm103Tp1  # noqa: E501
+from _validating import validating  # noqa: E402
+from beam._components.moe.moe import BeamMoeBf16Sm103Tp1
+
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.models.beam import dispatch_combine  # noqa: E501
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (  # noqa: E501

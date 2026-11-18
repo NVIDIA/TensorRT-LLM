@@ -37,7 +37,7 @@ generation-phase attention kernels compile on first use and need the installatio
 on ``PATH``)::
 
     env -u TORCH_ALLOW_TF32_CUBLAS_OVERRIDE -u NVIDIA_TF32_OVERRIDE python -m pytest \\
-        tests/unittest/_torch/modeling_v2/models/beam/_components/six_layer_model
+        tests/integration/defs/beam/_components/six_layer_model
 
 Dependencies: a TensorRT-LLM build for sm_103 with flashinfer importable and about 130 GiB of
 free device memory (generated state and loaded model). No model files.
@@ -59,14 +59,20 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
 
-__extra_import_path__ = ["../.."]
+__extra_import_path__ = [
+    "~/tests/integration/defs",
+    "~/tests/unittest/_torch/modeling_v2/models/beam",
+]
 
 import _beam_component_support as support  # noqa: E402
 from _beam_component_support import bitwise_equal  # noqa: E402
+from beam._components.six_layer_model import generation  # noqa: E501
+from beam._components.six_layer_model import model as model_module  # noqa: E501
+from beam._components.six_layer_model.generation import (  # noqa: E501
+    BeamSmallModelGenerator,
+    Lifecycle,
+)
 
-from _components.six_layer_model import generation  # noqa: E501
-from _components.six_layer_model import model as model_module  # noqa: E501
-from _components.six_layer_model.generation import BeamSmallModelGenerator, Lifecycle  # noqa: E501
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
