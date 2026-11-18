@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shape-based FP32, FP16 and BF16 GVR tuning for Rubin."""
+"""Shape-based FP32, FP16 and BF16 GVR tuning for Rubin, K=512/1024/2048.
+
+Reuse shared Blackwell GVR kernels; host options preserve the actual device target.
+"""
 
 import math
 from collections.abc import Callable
