@@ -4284,9 +4284,7 @@ class PyExecutor:
                         local_disagg_candidates,
                         fitting_disagg_gen_init_requests)
 
-                if (self._mm_encoder_item_scheduling_enabled
-                        and (scheduled_batch.scheduled_mm_encoder_items
-                             or self.enable_attention_dp)):
+                if self._mm_encoder_item_scheduling_enabled:
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
@@ -6981,9 +6979,7 @@ class PyExecutor:
                     self._flush_pending_transfer_responses()
                     continue
 
-                if (self._mm_encoder_item_scheduling_enabled
-                        and (scheduled_batch.scheduled_mm_encoder_items
-                             or self.enable_attention_dp)):
+                if self._mm_encoder_item_scheduling_enabled:
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
@@ -8126,9 +8122,7 @@ class PyExecutor:
                         self.kv_cache_manager.flush_deferred_closes()
                     continue
 
-                if (self._mm_encoder_item_scheduling_enabled
-                        and (scheduled_batch.scheduled_mm_encoder_items
-                             or self.enable_attention_dp)):
+                if self._mm_encoder_item_scheduling_enabled:
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
@@ -10244,8 +10238,15 @@ class PyExecutor:
 
     def _forward_multimodal_encoder_step(
             self, scheduled_requests: ScheduledRequests) -> None:
-        """Update the MM cache and encode selected items before LLM prefill."""
+        """Update the MM cache and encode selected items before LLM prefill.
+
+        A rank with no items still enters when attention-DP ranks share one
+        encoder TP pass.
+        """
         scheduled_items = scheduled_requests.scheduled_mm_encoder_items or {}
+        if (not scheduled_items
+                and not self.model_engine.mm_encoder_collective_required):
+            return
         try:
             self.model_engine.forward_multimodal_encoder_items(
                 self.active_requests, scheduled_items)

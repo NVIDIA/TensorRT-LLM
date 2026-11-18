@@ -361,6 +361,10 @@ class ModelEngine:
         self._mm_item_scheduler = mm_item_scheduler
         # Read by py_executor.py and _util.py.
         self.mm_encoder_item_scheduling_enabled = mm_item_scheduler is not None
+        # Read by py_executor.py: ranks with no MM items still enter the encoder step.
+        self.mm_encoder_collective_required = (
+            mm_item_scheduler is not None and mm_item_scheduler.collective
+        )
         self.mm_encoder_output_budget_bytes: int | None = None
         self.bytes_per_mm_encoder_embedding: int | None = None
         if mm_item_scheduler is not None:
@@ -922,11 +926,7 @@ class ModelEngine:
         scheduled_items: dict[int, list[int]],
     ) -> None:
         """Forward selected MM encoder items into the unified output cache."""
-        if not scheduled_items and not (
-            isinstance(self.model, MultimodalModelMixin)
-            and self.model.encoder_parallel_layout.collective
-        ):
-            return
+        # The scheduler holds the eager model; self.model may be a torch.compile wrapper.
         if self._mm_item_scheduler is None:
             raise TypeError("Item-level MM scheduling requires MultimodalModelMixin")
         self._mm_item_scheduler.forward_items(requests, scheduled_items)

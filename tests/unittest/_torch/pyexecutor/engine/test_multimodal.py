@@ -312,6 +312,7 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
             output_budget_bytes=1024,
             bytes_per_embedding=4,
             attention_metadata_capacity=None,
+            collective=False,
         )
         if item_scheduling
         else None

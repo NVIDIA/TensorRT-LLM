@@ -894,6 +894,30 @@ def test_forward_multimodal_encoder_step_propagates_system_errors():
     assert scheduled_requests.scheduled_mm_encoder_items == {failed.request_id: [0]}
 
 
+@pytest.mark.parametrize("collective", [False, True])
+def test_idle_rank_with_compiled_model_enters_shared_encoder_step(collective):
+    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
+
+    # Whole-model torch.compile hides MultimodalModelMixin behind a wrapper.
+    # The gate must not depend on the wrapped model, or an idle rank skips
+    # the shared encoder pass while its peers wait for it.
+    scheduler = Mock(collective=collective)
+    engine = object.__new__(ModelEngine)
+    engine.model = torch.compile(torch.nn.Linear(1, 1))
+    engine._mm_item_scheduler = scheduler
+    engine.mm_encoder_collective_required = scheduler.collective
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = []
+    executor.model_engine = engine
+
+    executor._forward_multimodal_encoder_step(ScheduledRequests())
+
+    assert not isinstance(engine.model, MultimodalModelMixin)
+    assert scheduler.forward_items.call_count == int(collective)
+    if collective:
+        scheduler.forward_items.assert_called_once_with([], {})
+
+
 def _executor_for_mm_admission(active_requests, *, max_batch_size=8, max_num_tokens=8):
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = False
