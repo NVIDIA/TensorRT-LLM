@@ -340,6 +340,7 @@ def _run_qwen_vision_parallel_rank(config):
     scheduler = MultimodalItemScheduler(
         model=model,
         bytes_per_embedding=model.embedding_dim * model.embedding_dtype.itemsize,
+        collective=model.encoder_parallel_layout.collective,
     )
     request = LlmRequest(
         request_id=rank + 1,

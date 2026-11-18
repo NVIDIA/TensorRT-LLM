@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     EncoderGroup,
     MultimodalEncoderContractError,
@@ -352,6 +353,7 @@ class _GroupedEncoderModel(MultimodalModelMixin):
         return Qwen3VLModelBase.get_multimodal_item_partitions(self, param, modality)
 
     def __init__(self):
+        self.model_config = ModelConfig()
         self.encoder_calls: list[int] = []
         self.mm_encoder_groups = (
             EncoderGroup(
