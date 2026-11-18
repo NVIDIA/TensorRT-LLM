@@ -37,10 +37,9 @@ the committed prefix and the output matches what non-speculative decoding would 
 
 With ``algorithm="gumbel_dual_key"`` and ``alpha > 0`` an ordinary decoding position is drawn under
 the second key with probability ``alpha`` (and under the first key otherwise). The choice is the
-Philox stream of a per-slot routing seed at the position's index in the request's output (counted
-from where the slot's state starts, so not from 0 for a request that arrives with tokens already
-generated). It does not depend on the batch, the speculation depth or the TP rank, and a request
-with a seed reproduces it.
+Philox stream of a per-slot routing seed at the position's index in the request's output, also for a
+request that arrives with tokens already generated. It does not depend on the batch, the speculation
+depth or the TP rank, and a request with a seed reproduces it.
 
 :meth:`WatermarkHandler.plan` and :meth:`WatermarkHandler.commit` use static shapes and no
 host synchronization, so they can be captured in a CUDA graph.
@@ -181,9 +180,10 @@ class WatermarkHandler:
             route_alpha = config.alpha if self._dual else 0.0
         self._alpha = float(route_alpha) if self._dual else 0.0
         self._route = self._alpha > 0.0
-        # Seed of each slot's routing stream, set when the slot gets a new occupant.
-        self._route_seeds = (
-            torch.zeros(num_rows, dtype=torch.int64, device=device) if self._route else None
+        # Per slot, set when it gets a new occupant: the seed of the routing stream and the offset
+        # from the committed count to the index of the next token in the request's output.
+        self._route_state = (
+            torch.zeros((num_rows, 2), dtype=torch.int64, device=device) if self._route else None
         )
         # Streams handed out to requests without a seed. Every rank sees the same requests in the
         # same order, so the numbering agrees across ranks.
@@ -249,7 +249,7 @@ class WatermarkHandler:
         width = self.config.context_width
         new_slots: list[int] = []
         new_tails: list[list[int]] = []
-        new_routes: list[int] = []
+        new_routes: list[tuple[int, int]] = []
         prefills: list[tuple[int, torch.Tensor, int]] = []
         for request in requests:
             slot = request.py_seq_slot
@@ -277,28 +277,34 @@ class WatermarkHandler:
             tokens = all_tokens[-width:]
             new_slots.append(slot)
             new_tails.append([PAD_TOKEN] * (width - len(tokens)) + list(tokens))
-            if self._route:
-                seed = request_random_seed(request)
-                new_routes.append(route_seed(seed, self._unseeded_streams))
-                if seed is None:
-                    self._unseeded_streams += 1
+            # `orig_prompt_len` is the length of the prompt as submitted; after a recompute
+            # preemption the request's prompt grows to include its output so far.
+            prompt_len = getattr(request, "orig_prompt_len", None)
+            if prompt_len is None:
+                prompt_len = len(all_tokens)
+            generated = len(all_tokens) - prompt_len
+            num_contexts = 0
             if self._dedupe:
                 # Seed the repeat ring with the contexts that already exist when the request
                 # reaches the sampler: the generated positions (a request can arrive with tokens
                 # generated elsewhere, or be resumed after a preemption) and, with "all", the
                 # positions of the prompt too. Only the most recent `ring_size` count; the context
                 # of the next position is recorded when it commits.
-                # `orig_prompt_len` is the length of the prompt as submitted; after a recompute
-                # preemption the request's prompt grows to include its output so far.
-                prompt_len = getattr(request, "orig_prompt_len", None)
-                if prompt_len is None:
-                    prompt_len = len(all_tokens)
                 start = 0 if self._all else max(prompt_len - width, 0)
                 recent = all_tokens[start:][-(self._ring_size + width) :]
-                generated = len(all_tokens) - prompt_len
+                num_contexts = max(len(recent) - width, 0)
                 prefills.append(
                     (slot, torch.tensor(recent, dtype=torch.int64), max(width - generated, 0))
                 )
+            if self._route:
+                seed = request_random_seed(request)
+                # The committed count starts at `num_contexts`, so this offset makes the routing
+                # index the token's index in the output, also for a resumed request.
+                new_routes.append(
+                    (route_seed(seed, self._unseeded_streams), generated - num_contexts)
+                )
+                if seed is None:
+                    self._unseeded_streams += 1
         if not new_slots:
             return
         pin = prefer_pinned()
@@ -314,7 +320,7 @@ class WatermarkHandler:
             routes = torch.tensor(new_routes, dtype=torch.int64, pin_memory=pin).to(
                 self._device, non_blocking=True
             )
-            self._route_seeds.index_copy_(0, slots, routes)
+            self._route_state.index_copy_(0, slots, routes)
         for slot, recent, skip in prefills:
             recent = recent.to(self._device, non_blocking=True)
             num_contexts = max(recent.shape[0] - width, 0)
@@ -354,7 +360,7 @@ class WatermarkHandler:
             self._dual,
             drafts,
             self._skip,
-            self._route_seeds,
+            self._route_state,
             self._alpha,
         )
         return WatermarkRows(
@@ -421,8 +427,11 @@ class WatermarkHandler:
             ).reshape(batch, num_positions)
         draw_seeds = None
         if self._route:
-            index = count.unsqueeze(1) + torch.arange(num_positions, device=count.device)
-            uniform = philox_uniform_torch(self._route_seeds.index_select(0, slots), index)
+            route = self._route_state.index_select(0, slots)
+            index = (count + route[:, 1]).unsqueeze(1) + torch.arange(
+                num_positions, device=count.device
+            )
+            uniform = philox_uniform_torch(route[:, 0], index)
             draw_seeds = torch.where(uniform < self._alpha, seeds_secondary, seeds)
         return WatermarkRows(
             slots=slots,
@@ -629,7 +638,7 @@ class WatermarkHandler:
             self._step_scratch,
             from_probs=from_probs,
             skip=self._skip,
-            route_seeds=self._route_seeds,
+            route_state=self._route_state,
             alpha=self._alpha,
         )
 

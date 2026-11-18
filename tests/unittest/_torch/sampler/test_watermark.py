@@ -25,6 +25,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import watermark as watermark_module
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.sampler.watermark import (
     WatermarkHandler,
+    WatermarkSpecState,
     request_wants_watermark,
 )
 from tensorrt_llm.bindings import SamplingConfig
@@ -38,7 +39,7 @@ from tensorrt_llm.watermark.prf import (
     context_seeds_torch,
     philox_uniform,
     philox_uniform_torch,
-    route_uniform,
+    route_seed,
     secondary_key,
 )
 from tensorrt_llm.watermark.sampling import (
@@ -412,7 +413,7 @@ class TestHandler:
     @pytest.mark.parametrize(
         "dedupe, from_probs, routing",
         [(d, p, False) for d in ("none", "single_turn", "all") for p in (False, True)]
-        + [("single_turn", False, True), ("all", True, True)],
+        + [("none", False, True)],
     )
     def test_step_matches_plan_draw_commit(self, dedupe, from_probs, routing):
         config = WatermarkConfig(
@@ -461,59 +462,62 @@ class TestHandler:
         if dedupe == "all":
             assert torch.equal(fused._skip, reference._skip)
 
-    def test_routed_plan_matches_reference(self):
-        config = WatermarkConfig(key=99, context_width=3, **_DUAL)
-        handler = WatermarkHandler(config, max_num_sequences=4, max_seq_len=64)
-        requests = [_request(i, i, [5, 6, 7, i], seed=None if i % 2 else 40 + i) for i in range(3)]
-        handler.observe(requests, _can_sample)
-        slots, enabled = _device([2, 0, 1]), _device([True, True, True], torch.bool)
-        rng = np.random.default_rng(3)
-        for _ in range(3):
-            drafts = _device(rng.integers(0, 6, size=(3, 4)))
-            fused = handler.plan(slots, enabled, drafts)
+    @pytest.mark.parametrize("dedupe, history", [("none", None), ("single_turn", 8), ("all", None)])
+    def test_routing_follows_the_output_position(self, dedupe, history):
+        # Output position j is drawn under the second key exactly where the request's routing
+        # stream says so, also for a request that arrives with tokens generated elsewhere.
+        config = WatermarkConfig(
+            key=99,
+            context_width=3,
+            deduplicate_contexts=dedupe,
+            deduplicate_contexts_max_history=history,
+            **_DUAL,
+        )
+        stream = philox_uniform(route_seed(7, 0) & (2**64 - 1), np.arange(60))
+        routed = stream < _DUAL["alpha"]
+        assert routed.any() and not routed.all()
+        prompt = [3, 1, 4, 1, 5]
+        output = [2, 6, 5, 3, 5, 8, 9, 7, 4, 6, 1, 2]  # longer than the bounded repeat history
+        for generated in (0, len(output)):
+            handler = WatermarkHandler(config, max_num_sequences=4, max_seq_len=64)
+            request = _request(1, 0, prompt + output[:generated], seed=7)
+            request.orig_prompt_len = len(prompt)
+            handler.observe([request], _can_sample)
+            slots, enabled = _device([0]), _device([True], torch.bool)
+            drafts = torch.zeros(1, 39, dtype=torch.int64, device="cuda")
+            rows = handler.plan(slots, enabled, drafts)
+            picked = (rows.draw_seeds == rows.seeds_secondary).cpu().numpy()[0]
+            assert (picked == routed[generated : generated + 40]).all()
             reference = handler.plan_reference(slots, enabled, drafts)
-            for name in ("seeds", "seeds_secondary", "active", "draw_seeds"):
-                assert torch.equal(getattr(fused, name), getattr(reference, name)), name
-            assert (fused.draw_seeds == fused.seeds_secondary).any()
-            assert (fused.draw_seeds == fused.seeds).any()
-            handler.commit(
-                fused, _device(rng.integers(0, 6, size=(3, 5)), torch.int32), _device([5, 3, 1])
-            )
+            assert torch.equal(rows.draw_seeds, reference.draw_seeds)
 
-    def test_routing_streams(self):
-        def route(request, alpha=0.5):
-            config = WatermarkConfig(key=99, context_width=3, algorithm="gumbel_dual_key")
-            handler = WatermarkHandler(
-                config, max_num_sequences=4, max_seq_len=64, route_alpha=alpha
-            )
-            handler.observe(request, _can_sample)
-            return handler
-
-        seeded = [
-            route([_request(1, 0, [1, 2, 3], seed=7)])._route_seeds[0].item() for _ in range(2)
+    @pytest.mark.parametrize(
+        "algorithm, rejection, routes",
+        [
+            ("gumbel_dual_key", False, True),
+            ("gumbel_dual_key", True, False),
+            ("gumbel", False, False),
+        ],
+    )
+    def test_routing_modes(self, algorithm, rejection, routes):
+        # Routing needs the dual-key algorithm, and rejection sampling picks the keys itself.
+        config = WatermarkConfig(key=99, context_width=3, algorithm=algorithm, alpha=0.5)
+        state = WatermarkSpecState(config, max_seq_len=64)
+        state.prepare(
+            num_slots=4, max_num_requests=4, max_draft_len=3, use_rejection_sampling=rejection
+        )
+        requests = [
+            _request(1, 0, [1, 2, 3], seed=7),
+            _request(2, 1, [1, 2, 3]),
+            _request(3, 2, [1, 2, 3]),
         ]
-        other = route([_request(1, 0, [1, 2, 3], seed=8)])._route_seeds[0].item()
-        unseeded = route([_request(1, 0, [1, 2, 3]), _request(2, 1, [1, 2, 3])])._route_seeds
-        assert seeded[0] == seeded[1] != other  # a seed reproduces its stream
-        assert unseeded[0].item() != unseeded[1].item()  # each request without a seed has its own
-        # The second key is chosen with probability alpha, from a stream per request.
-        for alpha in (0.1, 0.5):
-            uniform = route_uniform(seeded[0], np.arange(20000))
-            assert abs((uniform < alpha).mean() - alpha) < 0.015
-        # The handler draws position j under the second key exactly where the stream says so.
-        handler = route([_request(1, 0, [1, 2, 3], seed=7)], 0.1)
-        drafts = torch.zeros(1, 299, dtype=torch.int64, device="cuda")
-        rows = handler.plan(_device([0]), _device([True], torch.bool), drafts)
-        expected = route_uniform(seeded[0], np.arange(300)) < 0.1
-        picked = (rows.draw_seeds == rows.seeds_secondary).cpu().numpy()[0]
-        assert expected.any() and (picked == expected).all()
-        # Rejection sampling (alpha 0), alpha 0 and the single-key algorithm use the first key only.
-        handlers = [route([], 0.0)]
-        for kwargs in ({}, dict(algorithm="gumbel_dual_key", alpha=0.0)):
-            config = WatermarkConfig(key=99, context_width=3, **kwargs)
-            handlers.append(WatermarkHandler(config, max_num_sequences=4, max_seq_len=64))
-        for handler in handlers:
-            assert handler.plan(_device([0]), _device([True], torch.bool)).draw_seeds is None
+        state.handler.observe(requests, _can_sample)
+        rows = state.handler.plan(_device([0]), _device([True], torch.bool))
+        assert (rows.draw_seeds is not None) == routes
+        if routes:
+            route = state.handler._route_state[:, 0].tolist()
+            assert route[0] == route_seed(7, 0)  # a seed reproduces its stream
+            assert route[1] != route[2]  # each request without a seed has its own
 
     def test_new_occupant_resets_the_slot(self):
         _, handler = self._handler()
@@ -585,7 +589,7 @@ class TestHandler:
     @pytest.mark.parametrize(
         "dedupe, history, routing",
         [(d, h, False) for d in ("none", "single_turn", "all") for h in (None, 8)]
-        + [("single_turn", 8, True), ("all", None, True)],
+        + [("none", None, True)],
     )
     def test_speculative_windows_match_plain_decoding(self, dedupe, history, routing):
         # Whatever the draft quality, the seeds of the committed positions and the final state

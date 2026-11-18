@@ -106,7 +106,7 @@ def _step_kernel(
     draw_seed = seed_signed
     if ROUTE:
         second = _context_seed(tail_row, tail_row, 0, tl.load(keys_ptr + 1).to(tl.uint64), WIDTH, 0)
-        use_second = _uses_second_key(tl.load(route_ptr + slot), tl.load(count_ptr + slot), alpha)
+        use_second = _uses_second_key(route_ptr, slot, tl.load(count_ptr + slot), alpha)
         draw_seed = tl.where(use_second, second.to(tl.int64, bitcast=True), seed_signed)
 
     # Scan this program's slice of the row (a row without a watermark scans nothing).
@@ -212,7 +212,7 @@ def watermark_step(
     *,
     from_probs: bool,
     skip: Optional[torch.Tensor] = None,
-    route_seeds: Optional[torch.Tensor] = None,
+    route_state: Optional[torch.Tensor] = None,
     alpha: float = 0.0,
 ) -> torch.Tensor:
     """One decode step for ``R`` rows. Device-only; safe to capture in a CUDA graph.
@@ -231,8 +231,9 @@ def watermark_step(
             :class:`~tensorrt_llm._torch.pyexecutor.sampler.watermark.WatermarkHandler`.
         scratch: partial-result buffers with at least ``R`` rows.
         skip: optional ``[rows]`` int64, generated tokens each slot still leaves unwatermarked.
-        route_seeds: optional ``[rows]`` int64 routing-stream seeds of the dual-key algorithm. With
-            them a row is drawn under the second key (``keys[1]``) with probability ``alpha``.
+        route_state: optional ``[rows, 2]`` int64 routing ``(seed, offset)`` per slot of the dual-key
+            algorithm. With it a row is drawn under the second key (``keys[1]``) with probability
+            ``alpha``.
         alpha: the probability of the second key.
 
     Returns:
@@ -261,7 +262,7 @@ def watermark_step(
         scratch.index,
         scratch.counter,
         skip if skip is not None else count,
-        route_seeds if route_seeds is not None else count,
+        route_state if route_state is not None else count,
         values.stride(0),
         tail.stride(0),
         ring.stride(0) if ring is not None else 0,
@@ -275,7 +276,7 @@ def watermark_step(
         BLOCK_WIDTH=triton.next_power_of_2(width),
         FROM_PROBS=from_probs,
         DEDUPE=ring is not None,
-        ROUTE=route_seeds is not None,
+        ROUTE=route_state is not None,
         SKIP=skip is not None,
         HAS_FALLBACK=fallback is not None,
         BLOCK=_BLOCK,

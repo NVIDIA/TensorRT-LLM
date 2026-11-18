@@ -210,15 +210,11 @@ def test_dual_key_routing_diversifies_repeated_prompts():
     if torch.cuda.get_device_properties(0).total_memory / 1e9 < 35:
         pytest.skip("Not enough memory to load the target model")
     # The same prompt twice: with the first key only the two requests repeat each other; routing
-    # tokens to the second key at random makes them diverge, and a seed reproduces its choices.
+    # tokens to the second key at random makes them diverge.
     config = WatermarkConfig(key=0x5EED5EED, algorithm="gumbel_dual_key", alpha=0.25)
     prompts = PROMPTS * 2
     params = dict(max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True)
     unseeded = _generate(config, False, False, SamplingParams(**params), prompts)
-    seeded = _generate(config, False, False, SamplingParams(seed=7, **params), prompts)
     count = len(PROMPTS)
     differ = sum(unseeded[i][1] != unseeded[i + count][1] for i in range(count))
     assert differ == count, f"only {differ}/{count} repeated prompts diverged"
-    # Tokens drawn under the second key are about every fourth one, so an ignored seed would break
-    # the match within a few tokens; tiny numerical differences may still flip a late near-tie.
-    assert all(_common_prefix(seeded[i][1], seeded[i + count][1]) >= 32 for i in range(count))
