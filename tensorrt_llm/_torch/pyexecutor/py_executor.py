@@ -347,7 +347,7 @@ class _KvConnectorTransferDeadline:
 
 # Environment variable to control the benchmark disagg fill target.
 BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME = "TLLM_BENCHMARK_REQ_QUEUES_SIZE"
-# Idle seconds before a benchmark stage short of its budget is reported.
+# Idle seconds before a benchmark stage below its budget is reported.
 _BENCHMARK_STAGE_STALL_WARN_SECONDS = 120
 
 # How long the benchmark-disagg fill gate may retry without making ANY
@@ -717,6 +717,10 @@ class PyExecutor:
     _defer_generation_only_release = False
     # Whether the model forward runs under torch.compile; read once at construction.
     _uses_torch_compile = False
+    # TLLM_BENCHMARK_REQ_QUEUES_SIZE schedule state; see _configure_benchmark_req_queues_size.
+    _benchmark_sweep = False
+    _benchmark_stage_base_fetch = 0
+    _benchmark_gate_rearm_pending = False
     # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
     _is_kv_manager_v2 = False
     # Context chunks given back since the last stats record, by cause, and their tokens.
@@ -9199,16 +9203,15 @@ class PyExecutor:
         else:
             timeout = datetime.timedelta(0)
 
-        # Let the overlap loop retire its previous batch before arming the
-        # next stage, even when no further client request has arrived yet.
-        if (self.is_benchmark_disagg and self._benchmark_sweep
+        # Don't block while a benchmark stage drains; wake up periodically
+        # to report a stage that never reaches its budget.
+        if (self._benchmark_sweep and self.is_benchmark_disagg
                 and not self.is_warmup):
             if self._benchmark_stage_draining:
                 timeout = datetime.timedelta(0)
             elif (self._benchmark_stage_started
                   and self._benchmark_stage_index < len(self._benchmark_stages)
                   and timeout is None):
-                # Wake up to report a stage that never reaches its budget.
                 timeout = datetime.timedelta(
                     seconds=_BENCHMARK_STAGE_STALL_WARN_SECONDS / 2)
 
@@ -9568,11 +9571,10 @@ class PyExecutor:
 
     def _maybe_advance_benchmark_stage(self,
                                        total_num_live_requests: int) -> None:
-        """Advance at a model-parallel drain boundary, before a blocking fetch.
+        """Advance to the next stage once all ranks have drained this one.
 
-        Admission counts are replicated before attention-DP routing. Use only
-        those counts to decide whether to enter the vote; local batch and
-        transceiver state can differ between ranks.
+        Only replicated admission counts decide whether to vote, so all ranks
+        enter the allgather together.
         """
         if not self._benchmark_sweep or self.is_warmup or not self.is_benchmark_disagg:
             return
@@ -9604,17 +9606,12 @@ class PyExecutor:
                 or total_num_live_requests != 0):
             return
 
-        # The replicated live count also selects the idle fetch transport.
-        # Only vote at that boundary, never on a steady-state decode step.
-        # A future stage may already be queued, but cannot have been admitted:
-        # _pop_from_waiting_queue caps each stage at its original request budget.
         local_drained = (
             total_num_live_requests == 0 and self.previous_batch is None
             and self.kv_cache_transceiver.check_gen_transfer_complete())
         status = self._allgather_model_parallel_status((int(local_drained), 0))
         if not all(item[0] for item in status):
-            # The draining fetch does not block; avoid a hot spin.
-            time.sleep(0.001)
+            time.sleep(0.001)  # the draining fetch does not block
             return
         self._log_benchmark_stage("drained")
         self._benchmark_stage_index += 1
@@ -9637,7 +9634,7 @@ class PyExecutor:
         self._log_benchmark_stage("armed")
 
     def _log_benchmark_stage(self, event: str) -> None:
-        """Emit stage boundaries for matching client results to executor logs."""
+        """Log a stage boundary on rank 0."""
         if self.dist.rank == 0:
             logger.info(f"[BENCH-STAGE] index={self._benchmark_stage_index} "
                         f"event={event} fill={self.benchmark_req_queues_size} "
@@ -9964,7 +9961,7 @@ class PyExecutor:
             all_rank_states = None
             new_requests_hint = None
 
-        if self.kv_cache_transceiver is not None and self.is_benchmark_disagg:
+        if self.kv_cache_transceiver is not None:
             self._maybe_advance_benchmark_stage(total_num_live_requests)
 
         # 2. Fetch and enqueue to waiting queue

@@ -1,6 +1,4 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 
 # Add error handling
 set -e
@@ -152,19 +150,12 @@ fi
 
 echo "Hostname: ${hostname}, Port: ${port}"
 echo "Starting benchmark..."
-declare -A concurrency_occurrences=()
 for concurrency in ${concurrency_list}; do
     concurrency=$((concurrency * num_gen_servers))
     num_prompts=$((concurrency * multi_round))
     echo "Benchmarking with concurrency ${concurrency} ... ${num_prompts} prompts"
-    occurrence=$((${concurrency_occurrences[$concurrency]:-0} + 1))
-    concurrency_occurrences[$concurrency]=$occurrence
-    concurrency_log_path=${log_path}/concurrency_${concurrency}
-    if [ "$occurrence" -gt 1 ]; then
-        concurrency_log_path=${concurrency_log_path}_repeat_${occurrence}
-    fi
-    mkdir -p "${concurrency_log_path}"
-    do_process_all_logs ${log_path}/ "${concurrency_log_path}" "line"
+    mkdir -p ${log_path}/concurrency_${concurrency}
+    do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "line"
     python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --model ${model_name} \
         --backend openai \
@@ -178,11 +169,11 @@ for concurrency in ${concurrency_list}; do
         --ignore-eos \
         --no-test-input \
         --save-result \
-        --result-dir "${concurrency_log_path}" \
+        --result-dir "${log_path}/concurrency_${concurrency}" \
         --result-filename "result.json" \
         --percentile-metrics "ttft,tpot,itl,e2el" \
         $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
     echo "Benchmark with concurrency ${concurrency} done"
-    do_process_all_logs ${log_path}/ "${concurrency_log_path}" "log"
+    do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "log"
 done
 # do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "clean"
