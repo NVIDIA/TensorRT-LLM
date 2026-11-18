@@ -3881,6 +3881,9 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
+  // Capture the outer node before entering a nested SLURM compute agent.
+  String dispatcherNodeName = env.NODE_NAME
+
   // Per-stage override of the SLURM infra-retry budget (from opts.infraRetryMax,
   // threaded via the dispatcher's retryContext). Lets resource-scarce pools cap
   // or disable stage-level retries (0 = no retry). Null falls back to the global.
@@ -3950,15 +3953,6 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
       // User abort / pipeline timeout -- never retry
       throw e
     } catch (Exception e) {
-      // If the K8s dispatcher pod this stage runs inside died mid-run, every
-      // retry attempt would execute on that same dead pod and fail immediately,
-      // and the in-pod cleanup can no longer reach the SLURM controller. Stop
-      // retrying in place and propagate so the pod-level wrapper reconciles the
-      // orphaned SLURM job / Jenkins node off-pod (fail closed).
-      if (isDispatcherPodFailure(e)) {
-        echo "[INFRA-RETRY] ${stageName}: dispatcher pod died mid-run; not retrying on the dead pod (${e.toString()}). Failing closed for off-pod reconciliation."
-        throw e
-      }
       // classifyFailure() handles FlowInterruptedException + exit-code-143 +
       // typed throws + originating-step evidence and cause-chain fallback, returning one of
       // PipelineInterruption / InfraFailure / UserFailure. Scope=SLURM
@@ -3970,6 +3964,13 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
         // exception matches no catalog pattern lands here and would
         // otherwise decline the retry with no log output at all.
         echo "[INFRA-RETRY] ${stageName}: SLURM attempt failed with no infra pattern matched (classified as user failure); not retrying. Exception: ${e.toString()}"
+        throw e
+      }
+
+      // A compute-agent failure does not imply the outer dispatcher died.
+      // Only retry in place when that dispatcher is still online.
+      if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+        echo "[INFRA-RETRY] ${stageName}: dispatcher is offline or unknown; not retrying in place. Failing closed for off-pod reconciliation."
         throw e
       }
 
