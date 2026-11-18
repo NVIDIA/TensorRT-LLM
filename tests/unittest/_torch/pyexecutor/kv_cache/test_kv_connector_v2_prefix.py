@@ -550,7 +550,7 @@ class TestRetainContextAllocation:
         req.py_ctx_pre_resize_cap = 64
         req.py_draft_ctx_pre_resize_cap = 64
 
-        manager.retain_context_allocation(req)
+        manager.keep_context_allocation(req)
 
         assert kv_cache.resize_calls == []
         assert kv_cache.capacity == PROMPT_LEN

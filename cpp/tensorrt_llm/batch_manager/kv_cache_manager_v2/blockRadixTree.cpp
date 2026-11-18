@@ -1086,7 +1086,8 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
 BlockRadixTree::ReuseMatch BlockRadixTree::match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest,
     bool enablePartialMatch, int backoff, bool collectOptionalMatches, int alignment) const
 {
-    TLLM_CHECK_DEBUG(alignment > 0 && mTokensPerBlock % alignment == 0);
+    TLLM_CHECK_WITH_INFO(alignment > 0 && mTokensPerBlock % alignment == 0,
+        "match: alignment %d must be positive and divide tokens_per_block %d", alignment, mTokensPerBlock);
     ReuseMatch result{};
     TypedVec<LifeCycleId, std::vector<HalfOpenRange<int>>> optionalEndpointRanges;
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch,
