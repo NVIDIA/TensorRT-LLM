@@ -151,7 +151,7 @@ def test_kda_verify_keeps_builtin_fallback_dense(
     monkeypatch.setattr(target.KimiKDALinearAttention, "forward_verify_fused", verify_fused)
     monkeypatch.setattr(
         target.KimiKDALinearAttention,
-        "forward_verify_sequential",
+        "forward_verify_fla",
         lambda self, *args, output=None, prequantized_input=None: (
             seen_inputs.append(prequantized_input) or self._store_core(core, output)
         ),
