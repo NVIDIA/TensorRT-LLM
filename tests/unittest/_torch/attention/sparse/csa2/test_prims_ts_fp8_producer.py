@@ -1230,7 +1230,8 @@ def test_prims_ts_nvfp4_main_plan_reads_padded_pools_with_producer(
 def test_prims_ts_nvfp4_main_admission() -> None:
     """64-head plans with MAIN rows decode MAIN records in the kernel on the native one-CTA
     Keep-AB schedule of a single split and V owner, which also fuses the MXFP8 output;
-    grids below half a wave take the half-wave schedule instead of a divided one."""
+    grids below half a wave take the half-wave schedule instead of a divided one, and
+    persistent grids the static scheduler."""
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
 
     device = torch.device("cuda", 0)
@@ -1241,6 +1242,7 @@ def test_prims_ts_nvfp4_main_admission() -> None:
         assert packed.decodes_nvfp4_main(device, rows, 64, 128, 512, quantized_output=True), rows
         profile = packed._select_nvfp4_profile(rows, 64, 640, sm_count, capability)
         assert (profile.family, profile.split_kv, profile.head_dim_ctas) == ("keep", 1, 1), rows
+        assert profile.scheduler in ("static", "nonpersistent"), rows
     assert not packed.decodes_nvfp4_main(device, 1252, 16, 128, 512)
     assert not packed.decodes_nvfp4_main(device, 1252, 64, 128, 0)
 

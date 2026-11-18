@@ -473,6 +473,12 @@ def _select_nvfp4_profile(
     with four issuers), which is slower here than one CTA per row: those grids take
     the schedule the policy picks for half a wave (GB300, 64 rows: 44.4 us divided,
     native fused decode 24.7 us; 76 rows on the one-CTA schedule 22.4 us).
+
+    A persistent grid runs on the static scheduler rather than the policy's CLC one, as
+    fast or faster at every measured size, bit for bit (GB300, SWA 128 + 512 MAIN records
+    selected over a 4M-row pool, MXFP8 output; full lists: 1252 rows 128.9 -> 118.1 us,
+    32K rows 2592 -> 2455 us; random live lengths: 152 rows equal, 1252 rows 160.8 -> 141.6
+    us, 32K rows 3753 -> 3255 us).
     """
     if heads != _QUERY_TILE:
         return None
@@ -487,7 +493,9 @@ def _select_nvfp4_profile(
         kv_cache_format="fp8",
         compute_capability=compute_capability,
     )
-    return profile if profile.family == "keep" else None
+    if profile.family != "keep":
+        return None
+    return replace(profile, scheduler="static") if profile.scheduler == "clc" else profile
 
 
 def _compute_capability(device: torch.device) -> tuple[int, int] | None:
