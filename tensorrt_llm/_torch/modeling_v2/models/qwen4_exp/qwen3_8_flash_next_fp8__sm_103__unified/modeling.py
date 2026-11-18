@@ -268,6 +268,7 @@ from . import vision as _vision
 from . import weights as _weights
 from .ops.attention.draft_continue_rows__decode import draft_continue_select, draft_rows_gather
 from .ops.attention.qsa_fp8_pages_to_bf16__prefill import qsa_fp8_pages_to_bf16
+from .ops.attention.qsa_index_compact_plane import qsa_index_compact_plane
 from .ops.attention.qsa_index_scores_cute__prefill import qsa_index_scores_prefill
 from .ops.attention.qsa_index_scores_cute__prefill import supports as _index_scores_cute_supports
 from .ops.attention.qsa_index_scores_groups_cute__decode import (
@@ -2310,6 +2311,13 @@ def _mtp_index_branch(core, M: _MtpWeights, proj, index_scratch, draft: _DraftBo
         [core.index_heads, core.index_kv_heads, 1],
         1,
     )[1]
+    if draft.index_cache.shape[1] != tokens_per_block:
+        qsa_index_compact_plane(
+            token_k, coords, draft.index_cache, draft.position_cache, req_idx, logical,
+            block_table, tokens_per_block, core.compress_ratio, M.idx_kn, core._mtp_cos_sin,
+            core.eps, _QSA_MROPE_SECTION,
+        )  # fmt: skip
+        return _index_query(core, index_scratch)
     qsa_paged_index_store(
         token_k,
         coords,
@@ -3222,6 +3230,13 @@ def _index_plane(core, proj, i, L: _LayerWeights, qsa) -> None:
     )[1]
     pools = core._bound.pools
     index_cache = pools.index_cache[i]
+    if index_cache.shape[1] != tokens_per_block:
+        qsa_index_compact_plane(
+            token_k, coords, index_cache, pools.position_cache, req_idx, logical, block_table,
+            tokens_per_block, core.compress_ratio, L.idx_kn, core._cos_sin, core.eps,
+            _QSA_MROPE_SECTION,
+        )  # fmt: skip
+        return
     qsa_paged_index_store(
         token_k,
         coords,
