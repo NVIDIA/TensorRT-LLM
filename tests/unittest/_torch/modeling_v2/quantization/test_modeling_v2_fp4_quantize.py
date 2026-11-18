@@ -8,8 +8,8 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E501
     fp4_quantize as op,
 )
 
@@ -50,7 +50,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(16, 256), dtype=torch.bfloat16, vec=16, swizzled=True),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
         Cell(
             why="qwen3.8 decode: 1 token, hidden 2560, linear -- its routed-expert input",
             spec=dict(shape=(1, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),

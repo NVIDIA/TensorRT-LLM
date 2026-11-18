@@ -1691,10 +1691,7 @@ void launchClusterKernelForPolicy(Data const& data, void* stream)
             launchClusterKernelForTier<ClusterBlockDim, PreProc, PostProc, decltype(eTag)::value,
                 decltype(kTag)::value>(data, stream);
         });
-    if (!dispatched)
-    {
-        TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
-    }
+    checkTierDispatched(dispatched, data);
 }
 
 template <int ClusterBlockDim>
@@ -1924,10 +1921,7 @@ void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32
                         effectiveThreads,
                         /*smemSize=*/0, stream, PreProc, PostProc, decltype(eTag)::value, decltype(kTag)::value);
                 });
-            if (!dispatched)
-            {
-                TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
-            }
+            checkTierDispatched(dispatched, data);
         });
 }
 #endif // defined(TRTLLM_ROUTING_CUSTOM_ENTRY)

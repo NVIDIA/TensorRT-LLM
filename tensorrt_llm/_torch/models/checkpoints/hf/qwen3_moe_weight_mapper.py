@@ -1,12 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "Qwen3MoeForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Qwen3MoeForCausalLM")
 class Qwen3MoeHfWeightMapper(Qwen2MoeHfWeightMapper):
 
     def init_model_and_config(self, model: nn.Module, config: ModelConfig):

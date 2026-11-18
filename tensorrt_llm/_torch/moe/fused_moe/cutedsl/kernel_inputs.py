@@ -44,6 +44,17 @@ class NvFp4WeightView:
     slot_start: int
 
 
+def prequantized_nvfp4_input_scale(backend: MoEImplBase) -> torch.Tensor | None:
+    """``quantize_input_nvfp4`` passes an unswizzled ``Fp4QuantizedTensor`` through, except on
+    a layer with a pre-quant activation scale (NVFP4_AWQ / NVFP4_ARC).
+
+    Shared by the CuteDSL NVFP4 leaves through a direct binding, so the passthrough
+    rule has one owner next to :func:`quantize_input_nvfp4`."""
+    if getattr(backend, "fc31_act_scale", None) is not None:
+        return None
+    return backend.fc31_input_scale
+
+
 def finalize_routing_scales(backend: MoEImplBase, ctx: MoERunContext) -> torch.Tensor:
     """Per-token expert weights for a CuteDSL finalize epilogue.
 

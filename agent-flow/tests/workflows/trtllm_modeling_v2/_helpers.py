@@ -27,11 +27,11 @@ TARGET_REL = f"{catalog_paths.MODELING_V2_PACKAGE}/models/gpt_oss/gpt_oss_120b__
 _MODELING = '''\
 """A synthetic target, just enough for the static checks."""
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_mul import (
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch.modeling_v2.catalog.activation.silu_and_mul import (
     SiluAndMul,
 )
 
@@ -71,7 +71,7 @@ MODEL_WEIGHTS = SyntheticWeights()
 
 
 _ENTRY = """\
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 
 class Entry(OpWrapper):
@@ -126,9 +126,6 @@ def _build_repo(tmp_path: Path, *, modeling: str = _MODELING) -> Path:
     _write_entry(
         target / catalog_paths.MODEL_OPS_DIRNAME / "moe" / "router.py",
         root / catalog_paths.model_ops_tests_dir(TARGET_REL) / "moe" / "test_modeling_v2_router.py",
-    )
-    (root / catalog_paths.CATALOG_TESTS_DIR / "test_modeling_v2_claims.py").write_text(
-        "def test(): ...\n", encoding="utf-8"
     )
     routing = root / catalog_paths.MODELING_V2_PACKAGE / "models" / "gpt_oss" / "routing.py"
     routing.write_text(

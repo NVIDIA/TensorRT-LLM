@@ -90,7 +90,7 @@ def _make_mock_harmony_message(recipient=None, content_text="", content_type=Non
     try:
         from openai_harmony import TextContent
 
-        content_obj = TextContent(content_text)
+        content_obj = TextContent(text=content_text)
     except (ImportError, TypeError):
         content_obj = MockObj()
         content_obj.text = content_text

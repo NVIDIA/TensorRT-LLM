@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from typing import Optional
 
@@ -9,6 +21,8 @@ import torch.nn as nn
 from tensorrt_llm._utils import nvtx_range
 
 from ..attention.backends import AttentionMetadata
+from .context_logits import project_context_logits
+from .embedding import LMHead
 from .linear import Linear
 
 
@@ -31,15 +45,26 @@ def scale_and_soft_cap_logits(logits: torch.Tensor, multiplier: float,
 
 class LogitsProcessor(nn.Module):
 
-    def __init__(self):
+    def __init__(self, *, allow_context_logits_plan: bool = True):
         super().__init__()
+        self.allow_context_logits_plan = allow_context_logits_plan
 
     @nvtx_range("LogitsProcessor")
     def forward(self,
                 hidden_states: torch.Tensor,
                 lm_head: Linear,
                 attn_metadata: AttentionMetadata,
-                return_context_logits: bool = False) -> torch.Tensor:
+                return_context_logits: bool = False,
+                *,
+                keep_lm_head_dtype: bool = False) -> torch.Tensor:
+        """Logits as fp32, or in the LM head's dtype with ``keep_lm_head_dtype``."""
+
+        if (self.allow_context_logits_plan and return_context_logits
+                and isinstance(lm_head, LMHead)
+                and lm_head.context_logits_workspace is not None):
+            planned_logits = project_context_logits(hidden_states, lm_head)
+            if planned_logits is not None:
+                return planned_logits
 
         if not return_context_logits:
             if attn_metadata is not None:
@@ -53,5 +78,4 @@ class LogitsProcessor(nn.Module):
                 hidden_states = hidden_states[-1]
 
         logits = lm_head(hidden_states)
-        logits = logits.float()
-        return logits
+        return logits if keep_lm_head_dtype else logits.float()

@@ -25,6 +25,7 @@ from ..attention.backends.interface import AttentionRuntimeFeatures
 from .engine.cuda_graph import plan_cuda_graphs
 from .engine.model_setup import (
     compile_model,
+    configure_autotuner_nvmmh,
     create_model_loader,
     init_process_setup,
     prepare_loaded_model,
@@ -103,6 +104,7 @@ class EncoderExecutor:
                 "tensor, pipeline or context parallelism."
             )
         init_process_setup(mapping, dist)
+        configure_autotuner_nvmmh(llm_args)
         max_beam_width, max_num_tokens, max_seq_len, max_batch_size = llm_args.get_runtime_sizes()
         model_loader = create_model_loader(
             llm_args,
@@ -189,7 +191,7 @@ class EncoderExecutor:
             model_inputs=model_inputs,
             gather_context_logits=gather_context_logits,
         )
-        return self._runner.forward(packed_inputs)
+        return self._runner.forward_packed(packed_inputs)
 
     def shutdown(self) -> None:
         """No background thread to stop — release the loader, the graphs, then the model."""
