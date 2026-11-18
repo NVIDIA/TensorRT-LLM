@@ -390,10 +390,14 @@ launch modes, while setting `TRTLLM_CACHE_DIR` does not. An explicitly configure
 `FLASHINFER_CUBIN_DIR` is propagated unchanged to every rank and is the way to
 share downloaded artifacts between ranks.
 
-For offline use on one GPU or multiple GPUs, populate an explicit
-`FLASHINFER_CUBIN_DIR` before starting the processes, either by installing the
-`flashinfer-cubin` package matching `flashinfer-python` or with an online warm-up
-run using the same explicit directory. Then set `FLASHINFER_NO_DOWNLOAD=1` so a
+For offline use on one GPU or multiple GPUs, install the `flashinfer-cubin`
+package matching `flashinfer-python` and set `FLASHINFER_CUBIN_DIR` to the
+directory returned by `flashinfer_cubin.get_cubin_dir()`. To use another explicit
+directory, copy the contents of the package's artifact directory into it first;
+installing the package alone does not populate that directory.
+
+Alternatively, populate the explicit directory with an online warm-up run using
+the same directory. Then set `FLASHINFER_NO_DOWNLOAD=1` so a
 missing artifact fails instead of being downloaded concurrently into the shared
 directory. This also makes the pre-populated artifacts available to new replica
 slots. Alternatively, set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` to retain
