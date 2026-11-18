@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -94,8 +95,38 @@ def _raise_walk_error(error: OSError) -> None:
     raise error
 
 
-def check_licenses(root: Path, config: Path, directories: list[str]) -> tuple[int, int, int]:
+def _source_paths(root: Path, directories: list[str], files: list[Path] | None) -> Iterator[Path]:
+    if files is not None:
+        scan_roots = [root / directory for directory in directories]
+        for path in sorted({Path(os.path.abspath(filename)) for filename in files}):
+            if not any(path.is_relative_to(scan_root) for scan_root in scan_roots):
+                continue
+            for parent in path.parents:
+                if parent.is_symlink():
+                    raise ValueError(f"scan directory is a symlink: {parent}")
+                if parent == root:
+                    break
+            yield path
+        return
+
+    for directory in directories:
+        scan_root = root / directory
+        if not scan_root.is_dir() or scan_root.is_symlink():
+            raise ValueError(f"scan directory is missing or is a symlink: {scan_root}")
+        for current, dirnames, filenames in os.walk(scan_root, onerror=_raise_walk_error):
+            for dirname in sorted(dirnames):
+                path = Path(current) / dirname
+                if path.is_symlink():
+                    raise ValueError(f"scan directory is a symlink: {path}")
+            for filename in sorted(filenames):
+                yield Path(current) / filename
+
+
+def check_licenses(
+    root: Path, config: Path, directories: list[str], *, files: list[Path] | None = None
+) -> tuple[int, int, int]:
     """Return checked, exempted and failed file counts; reject invalid scan paths."""
+    root = Path(os.path.abspath(root))
     policy = json.loads(config.read_text())
     if not isinstance(policy, dict) or policy.keys() - {"filters", "skip"}:
         raise ValueError("unknown license policy fields")
@@ -113,46 +144,34 @@ def check_licenses(root: Path, config: Path, directories: list[str]) -> tuple[in
             raise ValueError("unknown license filter fields")
         re.compile(rule["include_re"])
     checked = warnings = failed = 0
-    for directory in directories:
-        scan_root = root / directory
-        if not scan_root.is_dir() or scan_root.is_symlink():
-            raise ValueError(f"scan directory is missing or is a symlink: {scan_root}")
-        for current, dirnames, files in os.walk(scan_root, onerror=_raise_walk_error):
-            for dirname in sorted(dirnames):
-                path = Path(current) / dirname
-                if path.is_symlink():
-                    raise ValueError(f"scan directory is a symlink: {path}")
-            for filename in sorted(files):
-                path = Path(current) / filename
-                if path.suffix not in _EXTENSIONS:
-                    continue
-                checked += 1
-                relative = path.relative_to(root).as_posix()
-                try:
-                    if path.is_symlink():
-                        raise ValueError("source file is a symlink")
-                    matches = [
-                        rule
-                        for rule in filters
-                        if re.search(rule["include_re"], relative)
-                        and relative not in rule.get("exclude", {})
-                        and not any(
-                            re.search(pattern, relative) for pattern in rule.get("exclude_re", [])
-                        )
-                    ]
-                    if len(matches) > 1:
-                        raise ValueError("file matches multiple license policies")
-                    if matches and matches[0]["license_name"] != "apache":
-                        raise ValueError("unsupported license policy; expected Apache-2.0")
-                    _check_header(path)
-                except (OSError, ValueError) as error:
-                    if relative in skip:
-                        warnings += 1
-                        print(f"warning {relative}: {error}")
-                    else:
-                        failed += 1
-                        print(f"error {relative}: {error}")
-    if not checked:
+    for path in _source_paths(root, directories, files):
+        if path.suffix not in _EXTENSIONS:
+            continue
+        checked += 1
+        relative = path.relative_to(root).as_posix()
+        try:
+            if path.is_symlink():
+                raise ValueError("source file is a symlink")
+            matches = [
+                rule
+                for rule in filters
+                if re.search(rule["include_re"], relative)
+                and relative not in rule.get("exclude", {})
+                and not any(re.search(pattern, relative) for pattern in rule.get("exclude_re", []))
+            ]
+            if len(matches) > 1:
+                raise ValueError("file matches multiple license policies")
+            if matches and matches[0]["license_name"] != "apache":
+                raise ValueError("unsupported license policy; expected Apache-2.0")
+            _check_header(path)
+        except (OSError, ValueError) as error:
+            if relative in skip:
+                warnings += 1
+                print(f"warning {relative}: {error}")
+            else:
+                failed += 1
+                print(f"error {relative}: {error}")
+    if not checked and files is None:
         raise ValueError("no supported source files were checked")
     print(f"filecount: {checked}\nwarncount: {warnings}\nerrcount: {failed}")
     return checked, warnings, failed
@@ -163,9 +182,15 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=_REPO_ROOT / "cpp")
     parser.add_argument("--config", type=Path, default=_REPO_ROOT / "jenkins/license_cpp.json")
     parser.add_argument("directories", nargs="*", default=["include", "tensorrt_llm"])
+    parser.add_argument(
+        "--files",
+        type=Path,
+        nargs="+",
+        help="Check only these files, relative to the current directory",
+    )
     args = parser.parse_args()
     try:
-        _, _, failed = check_licenses(args.root, args.config, args.directories)
+        _, _, failed = check_licenses(args.root, args.config, args.directories, files=args.files)
     except (OSError, ValueError, KeyError, TypeError, re.error) as error:
         parser.exit(1, f"License check failed: {error}\n")
     return int(failed > 0)

@@ -46,11 +46,13 @@ def scan(tmp_path: Path) -> tuple[Path, Path, dict]:
     return root, config, policy
 
 
-def run_scan(scan: tuple[Path, Path, dict]) -> tuple[tuple[int, int, int], str]:
+def run_scan(
+    scan: tuple[Path, Path, dict], *, files: list[Path] | None = None
+) -> tuple[tuple[int, int, int], str]:
     root, config, policy = scan
     config.write_text(json.dumps(policy))
     with contextlib.redirect_stdout(io.StringIO()) as output:
-        counts = checker.check_licenses(root, config, ["include", "tensorrt_llm"])
+        counts = checker.check_licenses(root, config, ["include", "tensorrt_llm"], files=files)
     return counts, output.getvalue()
 
 
@@ -158,13 +160,18 @@ def test_unknown_policy_fields_fail(scan: tuple[Path, Path, dict]) -> None:
         checker.check_licenses(root, config, ["include"])
 
 
-def test_symlink_is_not_read(scan: tuple[Path, Path, dict]) -> None:
+@pytest.mark.parametrize("selected_files", [False, True])
+def test_symlink_is_not_read(scan: tuple[Path, Path, dict], selected_files: bool) -> None:
     root, _, _ = scan
-    (root / "include/example.h").symlink_to(root / "nonexistent")
-    assert run_scan(scan)[0] == (1, 0, 1)
+    path = root / "include/example.h"
+    path.symlink_to(root / "nonexistent")
+    assert run_scan(scan, files=[path] if selected_files else None)[0] == (1, 0, 1)
 
 
-def test_nested_directory_symlink_is_rejected(scan: tuple[Path, Path, dict]) -> None:
+@pytest.mark.parametrize("selected_files", [False, True])
+def test_nested_directory_symlink_is_rejected(
+    scan: tuple[Path, Path, dict], selected_files: bool
+) -> None:
     root, config, _ = scan
     (root / "include/ok.h").write_text(HEADER)
     target = root.parent / "external"
@@ -172,7 +179,12 @@ def test_nested_directory_symlink_is_rejected(scan: tuple[Path, Path, dict]) -> 
     (target / "bad.h").write_text("int value;\n")
     (root / "include/linked").symlink_to(target, target_is_directory=True)
     with pytest.raises(ValueError, match="scan directory is a symlink: .*include/linked"):
-        checker.check_licenses(root, config, ["include", "tensorrt_llm"])
+        checker.check_licenses(
+            root,
+            config,
+            ["include", "tensorrt_llm"],
+            files=[root / "include/linked/bad.h"] if selected_files else None,
+        )
 
 
 def test_missing_or_empty_scan_fails(scan: tuple[Path, Path, dict]) -> None:
@@ -182,14 +194,40 @@ def test_missing_or_empty_scan_fails(scan: tuple[Path, Path, dict]) -> None:
             checker.check_licenses(root, config, [directory])
 
 
+@pytest.mark.parametrize("selected_files", [False, True])
 def test_cli_exit_status_and_paths_outside_cwd(
-    scan: tuple[Path, Path, dict], tmp_path: Path
+    scan: tuple[Path, Path, dict], tmp_path: Path, selected_files: bool
 ) -> None:
     root, config, _ = scan
     path = root / "include/example.h"
     command = [sys.executable, str(SCRIPT), f"--root={root}", f"--config={config}"]
+    if selected_files:
+        command += ["--files", str(path.relative_to(tmp_path))]
     for content, expected in ((HEADER, 0), ("int value;\n", 1)):
         path.write_text(content)
         result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True)
         assert result.returncode == expected, result.stdout + result.stderr
         assert "filecount: 1" in result.stdout
+
+
+def test_selected_files_do_not_scan_siblings_or_other_trees(scan: tuple[Path, Path, dict]) -> None:
+    root, _, _ = scan
+    selected = root / "include/selected file.h"
+    selected.write_text(HEADER)
+    sibling = root / "include/bad.h"
+    sibling.write_text("int value;\n")
+    outside = root.parent / "outside.h"
+    outside.write_text("int value;\n")
+    unsupported = root / "include/ignored.txt"
+    unsupported.write_text("no license\n")
+    assert run_scan(scan, files=[selected, selected, outside, unsupported])[0] == (1, 0, 0)
+    assert run_scan(scan, files=[sibling])[0] == (1, 0, 1)
+    assert run_scan(scan)[0] == (2, 0, 1)
+
+
+def test_empty_selection_does_not_fall_back_to_full_scan(scan: tuple[Path, Path, dict]) -> None:
+    root, _, _ = scan
+    (root / "include/bad.h").write_text("int value;\n")
+    assert run_scan(scan, files=[])[0] == (0, 0, 0)
+    assert run_scan(scan, files=[root.parent / "unrelated.py"])[0] == (0, 0, 0)
+    assert run_scan(scan, files=[root / "include/missing.h"])[0] == (1, 0, 1)

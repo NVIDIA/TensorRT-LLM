@@ -37,18 +37,24 @@ Pull requests do not start testing by themselves. Developers trigger the CI by c
 
 ### C++ license checks
 
-The **Release Checks** GitHub Actions workflow checks C++ license headers after
-the pre-commit checks, within the **Pre-commit Check** job. It scans `cpp/include`
-and `cpp/tensorrt_llm`, including the Python helpers in those directories. It
-checks full Apache license headers and uses the filters and exceptions in
+The **Release Checks** GitHub Actions workflow checks C++ license headers through
+the `check-cpp-licenses` pre-commit hook, within the **Pre-commit Check** job. The
+hook checks changed source files under `cpp/include` and `cpp/tensorrt_llm`,
+including Python helpers, subject to pre-commit's global exclusions. It checks
+full Apache license headers using the filters and exceptions in
 `jenkins/license_cpp.json`. Jenkins Release-Check retains its Go license checker;
-the GHA checker shares its policy configuration. The workflow fetches Git LFS
-source files in the scanned directories before checking their headers, without
-fetching binary assets. Run the GHA checker locally without installing dependencies
-after materializing any LFS source files:
+the hook shares its policy configuration. All currently tracked LFS sources in
+these directories are excluded by pre-commit, so the workflow does not fetch LFS
+objects. Manual workflow runs and PRs with at least 2500 reported changed files
+retain the existing pre-commit fallback to all files.
+
+Run the checker locally without installing dependencies after materializing any
+LFS source files. With no arguments, it scans both source trees in full, including
+files excluded by pre-commit. Use `--files` to check specific files instead:
 
 ```bash
 python3 scripts/check_cpp_licenses.py
+python3 scripts/check_cpp_licenses.py --files cpp/include/tensorrt_llm/executor/types.h
 ```
 
 The workflow runs on pull requests and supports manual runs against a specified
