@@ -24,12 +24,23 @@ batch is laid out one layer group at a time, each group's pages packed at that
 group's encoded size from an aligned base. The store sees one buffer per page.
 """
 
+import ctypes
+import mmap
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterator, List, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 
+try:
+    from cuda.bindings import driver as cuda_driver
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cuda as cuda_driver
+    from cuda import cudart
+
 from tensorrt_llm.logger import logger
+
+from ...kv_cache.host_memory import bind_to_numa_node, host_numa_node_of, populate
 
 __all__ = [
     "ENCODED_GROUP_ALIGNMENT",
@@ -146,6 +157,78 @@ def _lay_out(
     return batch
 
 
+#: Mapping granularity of the NUMA-placed buffer, so huge pages can back it.
+_HUGE_PAGE_BYTES = 2 << 20
+
+
+class PinnedHostBuffer:
+    """Page-locked host memory on the NUMA node of the current GPU.
+
+    Torch's pinned allocator places pages wherever the allocating thread runs,
+    which on a two-socket Grace node is often the socket away from the GPU, so
+    every encode and decode through it crosses the socket link (about 1.6x
+    slower on GB300). The buffer is mapped, bound to the GPU's node before it is
+    touched, faulted in, then registered with CUDA. Where that cannot be done it
+    falls back to torch's pinned memory, and without a GPU to plain memory.
+    """
+
+    def __init__(self, nbytes: int):
+        if nbytes <= 0:
+            raise ValueError(f"nbytes must be > 0, got {nbytes}")
+        self.nbytes = int(nbytes)
+        #: NUMA node the buffer is bound to, or None when it is not placed.
+        self.numa_node: Optional[int] = None
+        self._map: Optional[mmap.mmap] = None
+        self._registered = 0
+        self._tensor: Optional[torch.Tensor] = None
+        if torch.cuda.is_available():
+            try:
+                self._map_on_gpu_node()
+                return
+            except (OSError, RuntimeError) as error:
+                logger.warning(
+                    f"mooncake-store: staging falls back to torch pinned memory, which may sit "
+                    f"on the socket away from the GPU: {error}"
+                )
+                self._release_map()
+        self._tensor = torch.empty(
+            self.nbytes, dtype=torch.uint8, pin_memory=torch.cuda.is_available()
+        )
+        self.address = int(self._tensor.data_ptr())
+
+    def _map_on_gpu_node(self) -> None:
+        size = -(-self.nbytes // _HUGE_PAGE_BYTES) * _HUGE_PAGE_BYTES
+        node = host_numa_node_of(cuda_driver, torch.cuda.current_device())
+        self._map = mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+        self.address = ctypes.addressof(ctypes.c_char.from_buffer(self._map))
+        bound = bind_to_numa_node(self.address, size, node)
+        populate(self._map, self.address, size)
+        status = cudart.cudaHostRegister(
+            self.address, size, cudart.cudaHostRegisterPortable | cudart.cudaHostRegisterMapped
+        )[0]
+        if status != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaHostRegister of {size} B failed with {status}")
+        self._registered = size
+        self.numa_node = node if bound else None
+
+    def _release_map(self) -> None:
+        if self._registered:
+            cudart.cudaHostUnregister(self.address)
+            self._registered = 0
+        if self._map is not None:
+            try:
+                self._map.close()
+            except BufferError:
+                # A ctypes view still exports it; the mapping goes with the object.
+                pass
+            self._map = None
+
+    def close(self) -> None:
+        """Unpin and free the memory. Idempotent."""
+        self._release_map()
+        self._tensor = None
+
+
 class EncodedStagingArena:
     """A registered pinned buffer encoded pages pass through, one per direction.
 
@@ -160,20 +243,22 @@ class EncodedStagingArena:
         self._label = label
         # Pinned so the store can register it and the codec reach it from the
         # GPU; both read and write it while no Python object refers to it.
-        pin = torch.cuda.is_available()
-        self._buffer = torch.empty(int(capacity_bytes), dtype=torch.uint8, pin_memory=pin)
-        self._base = int(self._buffer.data_ptr())
-        status = store.register_buffer(self._base, self._buffer.numel())
+        self._buffer: Optional[PinnedHostBuffer] = PinnedHostBuffer(int(capacity_bytes))
+        self._capacity = int(capacity_bytes)
+        self._base = self._buffer.address
+        status = store.register_buffer(self._base, self._capacity)
         if status != 0:
+            self._buffer.close()
+            self._buffer = None
             raise RuntimeError(
                 f"MooncakeDistributedStore.register_buffer failed with status {status} "
                 f"for the {label} encoded-page staging arena at "
-                f"[{self._base:#x}, {self._base + self._buffer.numel():#x}). Host memory "
+                f"[{self._base:#x}, {self._base + self._capacity:#x}). Host memory "
                 "registration failing points at the pool or the fabric."
             )
         logger.info(
-            f"mooncake-store {label} encoded staging: {self._buffer.numel() / 1024**2:.1f} MiB "
-            f"pinned={pin}"
+            f"mooncake-store {label} encoded staging: {self._capacity / 1024**2:.1f} MiB "
+            f"on NUMA node {self._buffer.numa_node}"
         )
 
     @property
@@ -184,10 +269,15 @@ class EncodedStagingArena:
     @property
     def capacity(self) -> int:
         """Arena size in bytes."""
-        return 0 if self._buffer is None else int(self._buffer.numel())
+        return 0 if self._buffer is None else self._capacity
+
+    @property
+    def numa_node(self) -> Optional[int]:
+        """NUMA node the arena is bound to, or None when it is not placed."""
+        return None if self._buffer is None else self._buffer.numa_node
 
     def close(self) -> None:
-        """Hand the registration back before the buffer is freed. Idempotent."""
+        """Hand the registration back, then free the buffer. Idempotent."""
         if self._buffer is None:
             return
         status = self._store.unregister_buffer(self._base)
@@ -197,4 +287,16 @@ class EncodedStagingArena:
                 f"for the {self._label} encoded-page staging arena at {self._base:#x}. "
                 "The buffer is kept alive rather than freed."
             )
+        self._buffer.close()
         self._buffer = None
+
+    def free_after_store_closed(self) -> None:
+        """Free the buffer once the store that registered it is closed. Idempotent.
+
+        Closing the store drops its registrations, so there is nothing to hand
+        back; freeing before that would leave the store able to reach memory
+        handed out again.
+        """
+        if self._buffer is not None:
+            self._buffer.close()
+            self._buffer = None

@@ -187,9 +187,10 @@ class KvCachePageCodec:
             dst_slots: Destination slot of each page.
             hot_pages: GPU page slot of each page, as the cache's page-index
                 lists name it.
-            stream: Raw CUDA stream handle the work is enqueued on. The pages
-                must be complete on it, and the slots are written by the time
-                it reaches the end of the enqueued work.
+            stream: Raw handle of a created CUDA stream (not the legacy
+                default stream) the work is enqueued on. The pages must be
+                complete on it, and the slots are written by the time it
+                reaches the end of the enqueued work.
         """
         self._run(True, layer_group_id, dst_base, dst_slots, hot_pages, stream)
 
@@ -208,7 +209,7 @@ class KvCachePageCodec:
             src_base: GPU-accessible address of slot 0, `page_bytes` per slot.
             hot_pages: GPU page slot each decoded page is written to.
             src_slots: Source slot of each page.
-            stream: Raw CUDA stream handle the work is enqueued on.
+            stream: Raw handle of a created CUDA stream the work is enqueued on.
         """
         self._run(False, layer_group_id, src_base, hot_pages, src_slots, stream)
 
@@ -225,6 +226,10 @@ class KvCachePageCodec:
             raise ValueError(f"{len(dst)} destination slots for {len(src)} source pages")
         if not dst:
             return
+        if not stream:
+            # The default codec copies with cuMemcpyBatchAsync, which refuses the
+            # legacy default stream, so a codec may reject it.
+            raise ValueError("pass a created CUDA stream, not the legacy default stream (0)")
         # (dst, src) int32 pairs: the PageIndexPair layout the codec reads.
         pairs = np.empty((len(dst), 2), dtype=np.int32)
         pairs[:, 0] = dst

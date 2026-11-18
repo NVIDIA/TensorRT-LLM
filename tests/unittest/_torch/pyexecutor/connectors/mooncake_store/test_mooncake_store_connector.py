@@ -1743,10 +1743,79 @@ def test_codec_arena_covers_a_full_batch_of_the_largest_page(store_config, fake_
 
 
 def test_codec_arena_stays_under_the_pinned_ceiling(store_config, fake_store, monkeypatch):
+    monkeypatch.setattr(worker_module, "MAX_STAGING_BUFFER_BYTES", 4096)
+    codec = FakeCodec({0: 600})
+    with make_worker(fake_store, layout=codec_layout(codec)) as worker:
+        assert worker._save_arena.capacity == 4096
+
+
+def test_codec_arena_holds_at_least_one_page_per_half(store_config, fake_store, monkeypatch):
+    """A ceiling below two pages is raised to two rather than refused."""
     monkeypatch.setattr(worker_module, "MAX_STAGING_BUFFER_BYTES", 1024)
     codec = FakeCodec({0: 600})
     with make_worker(fake_store, layout=codec_layout(codec)) as worker:
-        assert worker._save_arena.capacity == 1024
+        assert worker._save_arena.capacity == 2 * 768
+
+
+def test_codec_save_alternates_arena_halves(store_config, fake_store):
+    """The next batch is encoded into one half while the previous one is written from the other."""
+    set_pool_setting(store_config, transfer_batch_size=1)
+    codec = FakeCodec({0: 24})
+    with make_worker(fake_store, layout=codec_layout(codec)) as worker:
+        hashes = [bytes([index + 1]) * 16 for index in range(3)]
+        worker._put(
+            [RequestTransfers(1, [PageTransfer(h, 0, page) for h, page in zip(hashes, [4, 5, 6])])]
+        )
+        arena, half = worker._save_arena.base, worker._save_arena.capacity // 2
+        expected_keys = [[worker._namespaces[0].key(h)] for h in hashes]
+
+    assert [call[2] for call in codec.calls] == [arena, arena + half, arena]
+    assert [call[4] for call in codec.calls] == [[4], [5], [6]]
+    assert [keys for keys, _, _ in fake_store.put_calls] == expected_keys
+    assert [addresses for _, addresses, _ in fake_store.put_calls] == [
+        [[arena]],
+        [[arena + half]],
+        [[arena]],
+    ]
+
+
+def test_codec_load_waits_for_the_allocation_then_alternates_halves(store_config, fake_store):
+    """With the cache's fence, the load orders itself by it rather than by the forward stream."""
+    set_pool_setting(store_config, transfer_batch_size=1)
+    codec = FakeCodec({0: 24})
+    with make_worker(fake_store, layout=codec_layout(codec)) as worker:
+        hashes = [bytes([index + 9]) * 16 for index in range(3)]
+        for block_hash in hashes:
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        fence = AllocationFence(fake_store)
+        worker.bind_allocation_fence(fence)
+        worker.bind_connector_meta(
+            SimpleNamespace(
+                loads=[
+                    RequestTransfers(
+                        7, [PageTransfer(h, 0, page) for h, page in zip(hashes, [1, 2, 3])]
+                    )
+                ],
+                saves=[],
+            )
+        )
+        worker.start_load_kv(None)
+        arena, half = worker._load_arena.base, worker._load_arena.capacity // 2
+
+    if worker._load_stream is not None:
+        # The fence came before the first read into the arena.
+        assert fence.reads_before_wait == [0]
+        assert fence.waited_for == [{7}]
+    assert [addresses for _, addresses, _ in fake_store.get_calls] == [
+        [[arena]],
+        [[arena + half]],
+        [[arena]],
+    ]
+    assert [(call[2], call[3]) for call in codec.calls] == [
+        (arena, [1]),
+        (arena + half, [2]),
+        (arena, [3]),
+    ]
 
 
 # ---- encoded batch planning ----

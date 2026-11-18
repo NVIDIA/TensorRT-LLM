@@ -183,6 +183,21 @@ def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
     return int(stream.cuda_stream)
 
 
+def _record_event(stream: Optional[torch.cuda.Stream]) -> Optional[torch.cuda.Event]:
+    """An event marking the work enqueued on `stream` so far; None without a GPU."""
+    if not torch.cuda.is_available():
+        return None
+    event = torch.cuda.Event()
+    event.record(stream if stream is not None else torch.cuda.default_stream())
+    return event
+
+
+def _wait_event(event: Optional[torch.cuda.Event]) -> None:
+    """Block the calling thread until `event` has completed."""
+    if event is not None:
+        event.synchronize()
+
+
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
@@ -240,6 +255,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._codec: Optional[KvCachePageCodec] = None
         self._load_arena: Optional[EncodedStagingArena] = None
         self._save_arena: Optional[EncodedStagingArena] = None
+        # Decodes run here when the cache offers an allocation fence, so a
+        # load never waits for the forward pass already queued before it.
+        self._load_stream: Optional[torch.cuda.Stream] = None
+        # Per half of the load arena: the event after the last decode that
+        # read it, which the next get into that half must wait for.
+        self._load_half_ready: List[Optional[torch.cuda.Event]] = [None, None]
         self._save_stream: Optional[torch.cuda.Stream] = None
         # This rank's device, captured on the executor thread; see _drain_saves.
         self._device_index: Optional[int] = None
@@ -482,32 +503,36 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def _open_encoded_staging(self, addressing: PageAddressing) -> None:
         """Allocate and register the pinned arenas encoded pages pass through.
 
-        Sized for a full transfer batch of the largest encoded page, within the
-        same pinned-memory ceiling as raw staging. Only the directions this
-        role drives get an arena.
+        Each arena is two halves, each sized for a full transfer batch of the
+        largest encoded page, so one batch is coded on the GPU while the store
+        moves the other; both within the same pinned-memory ceiling as raw
+        staging. Only the directions this role drives get an arena.
         """
         codec = self._codec
         layer_group_ids = addressing.layer_group_ids
         largest = max(codec.page_bytes(layer_group_id) for layer_group_id in layer_group_ids)
         aligned = -(-largest // ENCODED_GROUP_ALIGNMENT) * ENCODED_GROUP_ALIGNMENT
-        wanted = self._config.transfer_batch_size * largest + ENCODED_GROUP_ALIGNMENT * len(
+        wanted_half = self._config.transfer_batch_size * largest + ENCODED_GROUP_ALIGNMENT * len(
             layer_group_ids
         )
-        capacity = max(aligned, min(wanted, MAX_STAGING_BUFFER_BYTES))
-        if capacity < wanted:
+        half = max(aligned, min(wanted_half, MAX_STAGING_BUFFER_BYTES // 2))
+        half = -(-half // ENCODED_GROUP_ALIGNMENT) * ENCODED_GROUP_ALIGNMENT
+        if half < wanted_half:
             logger.warning(
                 f"mooncake-store rank {self._rank} stages fewer than "
                 f"{self._config.transfer_batch_size} pages per store call: a batch of "
-                f"{largest} B encoded pages does not fit the {MAX_STAGING_BUFFER_BYTES} B "
+                f"{largest} B encoded pages does not fit half the {MAX_STAGING_BUFFER_BYTES} B "
                 "pinned-memory ceiling. Lower transfer_batch_size to make it explicit."
             )
         if self._config.role.loads:
             self._load_arena = EncodedStagingArena(
-                capacity_bytes=capacity, store=self._store, label="load"
+                capacity_bytes=2 * half, store=self._store, label="load"
             )
+            if torch.cuda.is_available():
+                self._load_stream = torch.cuda.Stream()
         if self._config.role.saves:
             self._save_arena = EncodedStagingArena(
-                capacity_bytes=capacity, store=self._store, label="save"
+                capacity_bytes=2 * half, store=self._store, label="save"
             )
 
     def _namespace(
@@ -660,21 +685,39 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def _load_encoded(self, transfers: Sequence[RequestTransfers], stream) -> None:
         """Read encoded pages into the arena, then decode them into their GPU slots.
 
-        Decoding runs on the forward pass's stream, so it lands after whatever
-        earlier work still writes a recycled target page and before the pass
-        reads it; no allocation fence is needed, unlike a zero-copy load.
+        With the cache's allocation fence, decoding runs on this worker's load
+        stream once the target pages are free of earlier GPU work, and the
+        forward stream waits for it on the device: the executor thread never
+        blocks on the pass queued before this one. Without the fence, decoding
+        runs on the forward stream, which orders it the same way.
+
+        The arena's two halves alternate, so the store reads a batch into one
+        while the GPU decodes the previous batch out of the other. A half is
+        reused only after the decode that read it has finished.
         """
         items = self._resolve_pages(transfers)
         if not items:
             return
+        fence = self.get_allocation_fence()
+        if fence is not None and self._load_stream is not None:
+            fence({entry.request_id for entry in transfers})
+            decode_stream = self._load_stream
+        else:
+            # The codec needs a created stream, which the executor always passes.
+            decode_stream = stream if stream is not None else self._load_stream
+        handle = _stream_handle(decode_stream)
         arena = self._load_arena
-        handle = _stream_handle(stream)
-        for batch in plan_encoded_batches(
-            items, self._codec.page_bytes, arena.base, arena.capacity, self._batch_size
+        half = arena.capacity // 2
+        last = None
+        for index, batch in enumerate(
+            plan_encoded_batches(items, self._codec.page_bytes, 0, half, self._batch_size)
         ):
+            which = index % 2
+            base = arena.base + which * half
+            _wait_event(self._load_half_ready[which])
             results = self._store.batch_get_into_multi_buffers(
                 batch.keys,
-                [[address] for address in batch.addresses],
+                [[base + address] for address in batch.addresses],
                 [[size] for size in batch.sizes],
             )
             failed = [
@@ -691,10 +734,13 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 )
             for group in batch.groups:
                 self._codec.decode(
-                    group.layer_group_id, group.base, group.pages, group.slots, handle
+                    group.layer_group_id, base + group.base, group.pages, group.slots, handle
                 )
-            # The next batch reuses the arena, so its decode has to finish first.
-            _sync_stream(handle)
+            last = _record_event(decode_stream)
+            self._load_half_ready[which] = last
+        if decode_stream is not stream and last is not None:
+            # The pass reads these pages: order it after the last decode, on the device.
+            (stream if stream is not None else torch.cuda.default_stream()).wait_event(last)
         logger.debug(f"mooncake-store rank {self._rank} loaded {len(items)} encoded pages")
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
@@ -864,40 +910,59 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 )
 
     def _put_encoded(self, transfers: Sequence[RequestTransfers]) -> None:
-        """Encode the pages the pool lacks into the arena, then write them."""
+        """Encode the pages the pool lacks into the arena, then write them.
+
+        The arena's two halves alternate: the GPU encodes the next batch into
+        one while the store writes the previous batch out of the other.
+        """
         items = self._resolve_pages(transfers)
         if not items:
             return
-        arena = self._save_arena
-        handle = _stream_handle(self._save_stream)
+        # Filtered first, so a page already in the pool costs no encode.
+        pending: List[Tuple[str, int, int]] = []
         for chunk in _batched(items, self._batch_size):
-            # Filtered first, so a page already in the pool costs no encode.
             present = self._store.batch_is_exist([key for key, _, _ in chunk])
-            pending = [
+            pending.extend(
                 item
                 for item, status in zip(chunk, present)
                 if status != 1  # absent, or a failed probe we retry as a write
-            ]
-            for batch in plan_encoded_batches(
-                pending, self._codec.page_bytes, arena.base, arena.capacity, self._batch_size
-            ):
-                for group in batch.groups:
-                    self._codec.encode(
-                        group.layer_group_id, group.base, group.slots, group.pages, handle
-                    )
-                # The store reads the arena on this thread, so fill it first.
-                _sync_stream(handle)
-                results = self._store.batch_put_from_multi_buffers(
-                    batch.keys,
-                    [[address] for address in batch.addresses],
-                    [[size] for size in batch.sizes],
+            )
+        if not pending:
+            return
+        arena = self._save_arena
+        half = arena.capacity // 2
+        handle = _stream_handle(self._save_stream)
+        written = None
+        for index, batch in enumerate(
+            plan_encoded_batches(pending, self._codec.page_bytes, 0, half, self._batch_size)
+        ):
+            base = arena.base + (index % 2) * half
+            for group in batch.groups:
+                self._codec.encode(
+                    group.layer_group_id, base + group.base, group.slots, group.pages, handle
                 )
-                failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
-                if failures:
-                    logger.warning(
-                        f"mooncake-store rank {self._rank} failed to save {failures} of "
-                        f"{len(batch.keys)} encoded pages"
-                    )
+            encoded = _record_event(self._save_stream)
+            if written is not None:
+                # Overlaps the encode above, which fills the other half.
+                self._put_staged(*written)
+            # The store reads the arena on this thread, so the encode must be done.
+            _wait_event(encoded)
+            written = (batch, base)
+        self._put_staged(*written)
+
+    def _put_staged(self, batch, base: int) -> None:
+        """Write one encoded batch from the arena; a failed write is only a future miss."""
+        results = self._store.batch_put_from_multi_buffers(
+            batch.keys,
+            [[base + address] for address in batch.addresses],
+            [[size] for size in batch.sizes],
+        )
+        failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
+        if failures:
+            logger.warning(
+                f"mooncake-store rank {self._rank} failed to save {failures} of "
+                f"{len(batch.keys)} encoded pages"
+            )
 
     # ---- shared ----
 
@@ -989,6 +1054,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # against this memory.
         self._load_staging = None
         self._save_staging = None
+        for arena in (self._load_arena, self._save_arena):
+            if arena is not None:
+                arena.free_after_store_closed()
         self._load_arena = None
         self._save_arena = None
         self._save_stream = None

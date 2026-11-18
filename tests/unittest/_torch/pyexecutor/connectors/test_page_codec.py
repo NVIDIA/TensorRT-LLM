@@ -89,24 +89,32 @@ def test_an_empty_batch_reaches_no_codec():
     assert cache.calls == []
 
 
+def test_the_legacy_default_stream_is_refused():
+    """The default codec's batched copy rejects it, so no codec is handed it."""
+    cache = FakeCache({0: 96})
+    with pytest.raises(ValueError, match="legacy default stream"):
+        make_codec(cache).encode(0, 0x1000, [0], [4], stream=0)
+    assert cache.calls == []
+
+
 def test_a_negative_index_is_refused_before_the_codec_sees_it():
     """The codec addresses memory with these unchecked: BAD_PAGE_INDEX is a wild write."""
     cache = FakeCache({0: 96})
     with pytest.raises(ValueError, match="non-negative"):
-        make_codec(cache).encode(0, 0x1000, [0], [-1], stream=0)
+        make_codec(cache).encode(0, 0x1000, [0], [-1], stream=1)
     assert cache.calls == []
 
 
 def test_mismatched_lists_are_refused():
     cache = FakeCache({0: 96})
     with pytest.raises(ValueError, match="destination slots"):
-        make_codec(cache).decode(0, 0x1000, [1, 2], [0], stream=0)
+        make_codec(cache).decode(0, 0x1000, [1, 2], [0], stream=1)
 
 
 def test_a_rejected_batch_raises():
     cache = FakeCache({0: 96}, result=False)
     with pytest.raises(RuntimeError, match="rejected encoding 1 pages of layer group 0"):
-        make_codec(cache).encode(0, 0x1000, [0], [4], stream=0)
+        make_codec(cache).encode(0, 0x1000, [0], [4], stream=1)
 
 
 def test_bindings_from_an_older_build_are_named_as_the_problem():

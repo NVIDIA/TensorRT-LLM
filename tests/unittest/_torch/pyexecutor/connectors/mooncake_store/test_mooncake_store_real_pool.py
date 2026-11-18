@@ -593,7 +593,9 @@ def _compressed_cache(dtype) -> Iterator[KVCacheManagerV2]:
         cuda_graph_batch_sizes=[],
         cuda_graph_padding_enabled=False,
         spec_config=None,
-        model=_Engine(model_config=_Engine(pretrained_config=None, quant_config=None)),
+        model=_Engine(
+            model_config=_Engine(pretrained_config=_Engine(model_type="llama"), quant_config=None)
+        ),
     )
     provider = create_kv_cache_compression_manager(
         ColdPageQuantizationCompressionConfig(),
@@ -656,11 +658,13 @@ def test_an_encoded_page_written_by_one_cache_decodes_in_another(mooncake_pool, 
         _fill_runtime_values(writer_layout, writer_page, dtype)
 
         codec = writer_layout.page_codec
-        stream = torch.cuda.current_stream().cuda_stream
-        for group_id in group_ids:
-            scratch = torch.empty(codec.page_bytes(group_id), dtype=torch.uint8, device="cuda")
-            codec.encode(group_id, scratch.data_ptr(), [0], [writer_page], stream)
-            codec.decode(group_id, scratch.data_ptr(), [reference_page], [0], stream)
+        # Codecs may refuse the legacy default stream.
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            for group_id in group_ids:
+                scratch = torch.empty(codec.page_bytes(group_id), dtype=torch.uint8, device="cuda")
+                codec.encode(group_id, scratch.data_ptr(), [0], [writer_page], side.cuda_stream)
+                codec.decode(group_id, scratch.data_ptr(), [reference_page], [0], side.cuda_stream)
         torch.cuda.synchronize()
 
         with open_worker(

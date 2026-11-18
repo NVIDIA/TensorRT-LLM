@@ -26,6 +26,7 @@ import ctypes
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -108,6 +109,15 @@ class MemoryStore:
         pass
 
 
+@pytest.fixture(autouse=True)
+def on_a_created_stream():
+    """Codecs may refuse the legacy default stream, so each test runs on one of its own."""
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        yield
+    stream.synchronize()
+
+
 @pytest.fixture
 def memory_store(tmp_path, monkeypatch):
     path = tmp_path / "mooncake.json"
@@ -156,16 +166,27 @@ def model_engine():
         cuda_graph_padding_enabled=False,
         spec_config=None,
         model=SimpleNamespace(
-            model_config=SimpleNamespace(pretrained_config=None, quant_config=None)
+            # The codec reads the model type to pick a K/V layout; a plain decoder is the default one.
+            model_config=SimpleNamespace(
+                pretrained_config=SimpleNamespace(model_type="llama"), quant_config=None
+            )
         ),
     )
 
 
 @contextlib.contextmanager
-def make_cache(dtype: DataType, *, compression=True):
-    """A V2 cache as the connector runs it: GPU tier only, with or without NVFP4."""
+def make_cache(dtype: DataType, *, compression=True, windows=None):
+    """A V2 cache as the connector runs it: GPU tier only, with or without NVFP4.
+
+    `windows` gives layers sliding windows, which puts them in layer groups of
+    their own.
+    """
     kv_cache_config = KvCacheConfig(
-        max_tokens=4096, enable_block_reuse=True, host_cache_size=0, disk_cache_size=0
+        max_tokens=4096,
+        enable_block_reuse=True,
+        host_cache_size=0,
+        disk_cache_size=0,
+        max_attention_window=windows,
     )
     provider = None
     if compression:
@@ -314,6 +335,34 @@ def test_decoded_pages_stay_close_to_the_originals(memory_store):
 
 
 @needs_nvfp4
+def test_every_layer_group_of_a_windowed_cache_round_trips():
+    """The page codec covers each layer group a cache has, at its own encoded size.
+
+    `mooncake-store` refuses sliding windows, but the codec handle is the
+    connectors' common one, so a cache with several layer groups is checked
+    through it directly.
+    """
+    sources, targets = [0, 1], [4, 5]
+    with make_cache(DataType.BF16, windows=[64, 1024]) as manager:
+        layout = build_kv_cache_layout_v2(manager)
+        assert len(layout.groups) > 1, "sliding windows give the cache several layer groups"
+        assert layout.page_codec.layer_group_ids == tuple(
+            group.layer_group_id for group in layout.groups
+        )
+        fill_pages(layout, sources, DataType.BF16, seed=11)
+        reference_round_trip(layout, sources, targets)
+        for group in layout.groups:
+            assert layout.page_codec.page_bytes(group.layer_group_id) < group.bytes_per_page
+            for source, target in zip(sources, targets):
+                original = page_bytes(layout, group, source).view(torch.bfloat16).float()
+                decoded = page_bytes(layout, group, target).view(torch.bfloat16).float()
+                cosine = torch.nn.functional.cosine_similarity(original, decoded, dim=0)
+                assert cosine > 0.98, (
+                    f"layer group {group.layer_group_id}: cosine {cosine.item():.4f}"
+                )
+
+
+@needs_nvfp4
 def test_the_codec_identity_reaches_the_keys(memory_store):
     with make_cache(DataType.BF16) as manager:
         layout = build_kv_cache_layout_v2(manager)
@@ -362,3 +411,52 @@ def test_the_lossless_default_codec_round_trips_bit_exactly():
         assert impl.cold_page_bytes(99) == 0
         assert impl.cold_page_index_location(99) == -1
         assert not impl.encode_cold_pages(99, 0, 0, 0, stream)
+
+
+def _page_nodes(address: int, nbytes: int, step: int = 1 << 20):
+    """The NUMA node each sampled page of a range lives on, as the kernel reports it."""
+    try:
+        libnuma = ctypes.CDLL("libnuma.so.1")
+    except OSError:
+        return None
+    count = max(1, nbytes // step)
+    pages = (ctypes.c_void_p * count)(*[address + index * step for index in range(count)])
+    status = (ctypes.c_int * count)()
+    # With no target nodes, numa_move_pages only reports where each page is.
+    if libnuma.numa_move_pages(0, count, pages, None, status, 0) != 0:
+        return None
+    return set(status)
+
+
+def test_staging_memory_sits_on_the_gpus_numa_node():
+    """Staging through the far socket costs every encode and decode the socket link."""
+    from cuda.bindings import driver
+
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.codec_staging import (
+        PinnedHostBuffer,
+    )
+    from tensorrt_llm._torch.pyexecutor.kv_cache.host_memory import host_numa_node_of
+
+    buffer = PinnedHostBuffer(8 << 20)
+    try:
+        if buffer.numa_node is None:
+            pytest.skip("libnuma is unavailable, so the buffer was not placed")
+        assert buffer.numa_node == host_numa_node_of(driver, torch.cuda.current_device())
+        nodes = _page_nodes(buffer.address, buffer.nbytes)
+        if nodes is not None:
+            assert nodes == {buffer.numa_node}, f"pages landed on nodes {nodes}"
+        # The GPU reaches it at its host address, as the codec does.
+        values = torch.arange(1024, dtype=torch.int32, device="cuda")
+        host = torch.from_numpy(
+            np.ctypeslib.as_array((ctypes.c_int32 * 1024).from_address(buffer.address))
+        )
+        host.zero_()
+        torch.cuda.synchronize()
+        from cuda.bindings import runtime as cudart
+
+        cudart.cudaMemcpy(
+            buffer.address, values.data_ptr(), 4096, cudart.cudaMemcpyKind.cudaMemcpyDefault
+        )
+        assert torch.equal(host, values.cpu())
+    finally:
+        buffer.close()
