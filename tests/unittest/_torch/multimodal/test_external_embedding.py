@@ -185,6 +185,12 @@ def test_qwen3_vl_attached_embedding_uuid_joins_its_hash():
         "prompt": "Describe.",
         "multi_modal_uuids": uuids
     }, [embedding])[1]["multimodal_input"]
+    other_uuid = _attach(processor, {
+        "prompt": "Describe.",
+        "multi_modal_uuids": {
+            "image": ["user-b"]
+        }
+    }, [embedding])[1]["multimodal_input"]
     # Token IDs are decoded back to text before the hook runs.
     from_token_ids = _attach(
         processor, {
@@ -195,6 +201,7 @@ def test_qwen3_vl_attached_embedding_uuid_joins_its_hash():
     assert plain.multimodal_uuids is None
     assert with_uuid.multimodal_uuids == ["user-a"]
     assert with_uuid.multimodal_hashes != plain.multimodal_hashes
+    assert other_uuid.multimodal_hashes != with_uuid.multimodal_hashes
     assert from_token_ids.multimodal_uuids == ["user-a"]
     assert from_token_ids.multimodal_hashes == with_uuid.multimodal_hashes
 
@@ -263,6 +270,11 @@ def test_llava_next_attached_embeddings_are_keyed_per_image():
             multimodal_input.multimodal_hashes[0])
     assert (changed["multimodal_input"].multimodal_hashes[1]
             != multimodal_input.multimodal_hashes[1])
+    # Images of different sizes keep their own row counts.
+    uneven = _attach(processor, inputs,
+                     [first[:2], second])[1]["multimodal_input"]
+    assert uneven.multimodal_positions == [1, 4]
+    assert uneven.multimodal_lengths == [2, 3]
 
 
 def test_llama4_attached_embeddings_are_keyed_per_image():

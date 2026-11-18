@@ -323,6 +323,8 @@ def test_attached_embeddings_reuse_only_identical_embeddings(
     with open(_QWEN_3_VL_DIR / "config.json") as f:
         image_token_id = json.load(f)["image_token_id"]
     prompt_token_ids = list(first_again.prompt_token_ids)
+    # Both test images have the same size, so only the embeddings differ.
+    assert list(second_after_first.prompt_token_ids) == prompt_token_ids
     first_image_token = prompt_token_ids.index(image_token_id)
     assert second_after_first.cached_tokens <= first_image_token
     reusable_tokens = (len(prompt_token_ids) -
