@@ -585,5 +585,24 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
     assert get_moe_load_balancer() is None
 
 
+@pytest.mark.cpu_only
+def test_shutdown_stops_cpp_before_closing_host_weights(
+        mock_runtime: MagicMock) -> None:
+    """The C++ load balancer shuts down before the host weights its updates read are closed."""
+    balancer = MoeLoadBalancer(ep_rank=0, ep_size=4, layer_updates_per_iter=2)
+    # Every rank reports that it is safe to shut down.
+    balancer.shared_mpi_comm.allgather.return_value = [True]
+    layer = MagicMock(spec=SingleLayerMoeLoadBalancer)
+    balancer.single_layer_load_balancers.append(layer)
+    order = []
+    mock_runtime.return_value.shutdown.side_effect = lambda: order.append(
+        "C++ shutdown")
+    layer.py_pre_shutdown_cleanup.side_effect = lambda: order.append(
+        "host weights closed")
+
+    assert balancer.shutdown()
+    assert order == ["C++ shutdown", "host weights closed"]
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -531,8 +531,7 @@ bool MHA::convertMMHAParamsToXQAParams(
         // Inputs to MLA is FP8 instead of BF16/FP16 when using FP8 KV cache.
         xqaParams.data_type = DATA_TYPE_E4M3;
     }
-    if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
+    if (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90)
     {
         xqaParams.multi_block_mode = false;
     }
@@ -3254,8 +3253,7 @@ bool MLA::fillXqaParams(XQAParams& xqaParams, FmhaParams const& p, bool forConfi
             // Inputs to MLA is FP8 instead of BF16/FP16 when using FP8 KV cache.
             xqaParams.data_type = DATA_TYPE_E4M3;
         }
-        if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-            || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
+        if (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90)
         {
             xqaParams.multi_block_mode = false;
         }
@@ -3778,6 +3776,12 @@ int MLA::enqueueGeneration(FmhaParams const& p, cudaStream_t stream)
         if (useSparseMLA())
         {
             auto const& sparseParams = feature<torch_ext::SparseMlaFeature>().params();
+            if (auto const maxCtas = p.fwd.sparse_runtime_params.max_num_ctas_per_seq_kv; maxCtas.has_value())
+            {
+                TLLM_CHECK_WITH_INFO(*maxCtas > 0 && *maxCtas <= std::numeric_limits<int32_t>::max(),
+                    "Sparse MLA max_num_ctas_per_seq_kv must be a positive int32, got %ld", *maxCtas);
+                tllmRunnerParams.mMaxNumCtasPerSeqKv = static_cast<int32_t>(*maxCtas);
+            }
             bool const useDynamicSparseMLA = sparseParams.sparse_attn_kv_lens != nullptr;
             tllmRunnerParams.mSparseAttention
                 = useDynamicSparseMLA ? SparseType::DynamicTokenSparse : SparseType::StaticTokenSparse;

@@ -63,6 +63,8 @@ public:
     CacheLevel cacheLevel;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
+    //! Dedupes the pages of one batched call: the StorageManager::nextVisitStamp() of the last call that took it.
+    uint64_t visitStamp = 0;
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 
@@ -175,8 +177,10 @@ public:
     //
     // `numTokensInBlock` records the page's token count. See
     // CommittedPage::numTokensInBlock for its attention and SSM interpretations.
-    SharedPtr<CommittedPage> convertToCommitted(
-        SharedPtr<Block> block, CachedCudaEvent readyEvent, int numTokensInBlock);
+    // An attention page takes the retention of `retentionSource` if given (the block's page it supersedes), else its
+    // own.
+    SharedPtr<CommittedPage> convertToCommitted(SharedPtr<Block> block, CachedCudaEvent readyEvent,
+        int numTokensInBlock, Page const* retentionSource = nullptr);
 };
 
 // ---------------------------------------------------------------------------

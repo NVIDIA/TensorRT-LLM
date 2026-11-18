@@ -706,6 +706,9 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
     class that serves the vanilla Qwen3NextForCausalLM architecture.
     """
 
+    prefill_kernels = True
+    decode_kernels = True
+
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         return _get_qwen35_moe_model_defaults(llm_args)
@@ -726,6 +729,8 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
     normalizer (Qwen35ConfigCompat) sets num_experts=0 so that
     Qwen3NextModel selects GatedMLP for the feed-forward layers.
     """
+
+    decode_kernels = True
 
     def __init__(self, model_config):
         keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)
@@ -762,6 +767,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     shared here. The concrete subclasses below carry only the registration
     decorators (outer arch string + input-processor `model_type`).
     """
+
+    supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
 
     supports_encoder_cache = True
     # The inner Qwen3.5 decoder implements them (see Qwen3NextForCausalLM).
@@ -859,6 +866,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
 class Qwen3_5MoeVLModel(_Qwen3_5VLModel):
     """VLM wrapper composing Qwen3 vision encoder with Qwen3.5 MoE text decoder."""
 
+    supported_encoder_attention_backends = _Qwen3_5VLModel.supported_encoder_attention_backends
+
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         return _get_qwen35_moe_model_defaults(llm_args)
@@ -881,3 +890,5 @@ class Qwen3_5VLModel(_Qwen3_5VLModel):
     instead of `SparseMoeBlock` (the dense text config has a native `intermediate_size`
     and no `num_experts`).
     """
+
+    supported_encoder_attention_backends = _Qwen3_5VLModel.supported_encoder_attention_backends

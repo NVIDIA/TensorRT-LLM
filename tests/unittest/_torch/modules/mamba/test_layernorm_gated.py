@@ -307,6 +307,66 @@ class TestRMSNormBasic:
 
         assert torch.equal(outputs[True], outputs[False])
 
+    @pytest.mark.parametrize("gate_activation", ["silu", "sigmoid"])
+    @pytest.mark.parametrize("with_fp8", [False, True])
+    def test_token_major_groups_launch_is_bitwise_invariant(
+        self, gate_activation: str, with_fp8: bool
+    ) -> None:
+        """From _MULTIROW_GROUPS_MIN_ROWS rows a program runs _MULTIROW_GROUPS
+        tiles; every output bit must equal the one-tile-per-program launch,
+        including a partial last group."""
+        from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        heads, N = 24, 128
+        rows_per_program = layernorm_gated._MULTIROW_ROWS * layernorm_gated._MULTIROW_GROUPS
+        num_tokens = (
+            triton.cdiv(layernorm_gated._MULTIROW_GROUPS_MIN_ROWS, heads * rows_per_program)
+            * rows_per_program
+            + 3
+        )
+        num_rows = num_tokens * heads
+        assert layernorm_gated._MULTIROW_GROUPS > 1
+        assert num_rows >= layernorm_gated._MULTIROW_GROUPS_MIN_ROWS
+        assert num_rows % rows_per_program != 0
+        torch.manual_seed(5)
+        x = torch.randn(num_rows, N, device=device, dtype=dtype)
+        weight = torch.randn(N, device=device, dtype=dtype) * 0.1 + 1.0
+        wide = torch.randn(num_tokens, heads * N + 128, device=device, dtype=dtype)
+        z = wide[:, 128:].view(num_tokens, heads, N)
+        fp8_scale = torch.tensor(0.13, device=device, dtype=torch.float32) if with_fp8 else None
+
+        actual = rms_norm_gated_token_major(
+            x, z, weight, 1e-6, fp8_scale=fp8_scale, gate_activation=gate_activation
+        )
+        expected = torch.empty_like(actual)
+        layernorm_gated._rms_norm_gated_fwd_multirow_kernel[
+            (triton.cdiv(num_rows, layernorm_gated._MULTIROW_ROWS),)
+        ](
+            x,
+            expected,
+            weight,
+            z,
+            None,
+            fp8_scale,
+            x.stride(0),
+            expected.stride(0),
+            z.stride(0),
+            num_rows,
+            1e-6,
+            N=N,
+            ROWS=layernorm_gated._MULTIROW_ROWS,
+            HEADS_PER_TOK=heads,
+            GATE_SIGMOID=gate_activation == "sigmoid",
+            WEIGHT_IS_DELTA=False,
+            LAUNCH_WITH_PDL=False,
+            GROUPS=1,
+            num_warps=layernorm_gated._MULTIROW_NUM_WARPS,
+        )
+
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
 
 @skip_no_cuda
 class TestRMSNormNVFP4:

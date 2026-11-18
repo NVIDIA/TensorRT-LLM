@@ -137,8 +137,8 @@ def run_fp4_mla_splitkv(
     TRTLLM swizzle for the same rows. Output is [queries, 1-128, 512], FP16/BF16.
     KV lengths include the final query of each uniform linear-MTP request.
     Workspace is owned by metadata and must be warmed before graph capture.
-    Each graph bucket reserves only its fixed query count; eager metadata
-    reserves the configured query capacity for reuse across batch sizes.
+    The workspaces retain metadata ownership and reserve the configured query
+    capacity before capture.
     All input replication and partition planning execute on the current stream
     on every invocation; graph replay therefore consumes the current inputs.
     """
@@ -154,7 +154,8 @@ def run_fp4_mla_splitkv(
     if q_batch_capacity < queries:
         raise ValueError("Q capacity must cover the active query count")
     tasks = splits * queries
-    workspace_queries = queries if getattr(metadata, "is_cuda_graph", False) else q_batch_capacity
+    # Reserve per-forward scratch for the Q capacity before capture.
+    workspace_queries = q_batch_capacity
     task_capacity = splits * workspace_queries
     if splits < 2 or tasks > 65535:
         raise ValueError(f"split-KV requires splits >= 2 and <= 65535 tasks, got {tasks}")
@@ -182,15 +183,15 @@ def run_fp4_mla_splitkv(
         raise ValueError("split-KV inputs must be contiguous on the output device")
 
     def workspace(name: str, count: int, capacity: int, dtype: torch.dtype) -> torch.Tensor:
-        # Graph buckets own separate metadata and have fixed query counts.
-        # Avoid reserving the full engine capacity independently in each bucket.
-        # Eager metadata still reserves capacity to reuse storage across batches.
+        # Views of the shared, capacity-sized scratch (layout._ensure_workspace_tensor).
         return _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_splitkv_" + name,
             (capacity,),
             dtype=dtype,
             device=output.device,
+            shared=True,
+            capacity_numel=capacity,
         )[:count]
 
     repeated_q = workspace("q", tasks * heads * 320, task_capacity * heads * 320, torch.uint8)

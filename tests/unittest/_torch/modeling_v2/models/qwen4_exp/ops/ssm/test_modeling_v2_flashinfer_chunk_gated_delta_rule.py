@@ -26,11 +26,11 @@ import torch
 from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import should_use_cp_host
 from flashinfer.utils import get_compute_capability, get_device_name, get_device_sm_count
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
     INPLACE_MAX_TOKENS,
     RANK4_GEOMETRY,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
     flashinfer_chunk_gated_delta_rule as op,
 )
 

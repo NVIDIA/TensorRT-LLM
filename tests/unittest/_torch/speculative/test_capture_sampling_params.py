@@ -124,6 +124,8 @@ def _fake_meta():
         group_all_temperature_only=None,
         samples_from_vocab_shards=False,
         temperature_only_graphs=False,
+        greedy_graphs=True,
+        shard_temperature_only_graphs=True,
         _sampling_scan_cache=None,
     )
 
@@ -260,6 +262,8 @@ def _populate_meta(mode, draft_len=1):
         group_all_temperature_only=None,
         samples_from_vocab_shards=False,
         temperature_only_graphs=False,
+        greedy_graphs=True,
+        shard_temperature_only_graphs=True,
         _sampling_scan_cache=None,
         max_num_requests=4,
         max_draft_len=draft_len,
@@ -285,7 +289,7 @@ def _populate_meta(mode, draft_len=1):
         prepare_penalty_buffers=lambda: None,
         prepare_watermark_buffers=lambda: None,
         watermark_ready=False,
-        _populate_request_rng_state=lambda requests, normalized: None,
+        _populate_request_rng_state=lambda requests, normalized, defer_rows=None: None,
         _populate_penalty_params=lambda requests: None,
         _populate_watermark_params=lambda requests: None,
     )

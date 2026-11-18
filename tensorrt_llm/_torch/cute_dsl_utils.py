@@ -13,13 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 import platform
 import sys
 import types
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 from ..logger import logger
+from .cute_dsl_file_cache import install_cute_dsl_file_cache
+
+if TYPE_CHECKING:
+    import torch
 
 
 def _skip_legacy_cutlass_mlir_helpers() -> None:
@@ -47,7 +52,7 @@ if platform.system() != "Windows":
     try:
         from cutlass import cute  # noqa
         _skip_legacy_cutlass_mlir_helpers()
-        logger.info(f"cutlass dsl is available")
+        logger.info("cutlass dsl is available")
         IS_CUTLASS_DSL_AVAILABLE = True
 
         try:
@@ -59,6 +64,9 @@ if platform.system() != "Windows":
             IS_CUTLASS_DSL_RUBIN_AVAILABLE = True
     except ImportError:
         pass
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    install_cute_dsl_file_cache()
 
 
 class _GraphSafeDlpack:
@@ -100,6 +108,26 @@ def gmem_ptr(tensor, dtype, assumed_align: int):
                                  assumed_align=assumed_align)
 
 
+@functools.lru_cache(maxsize=None)
+def _smem_optin_bytes(device_index: int) -> int:
+    import torch
+
+    return torch.cuda.get_device_properties(
+        device_index).shared_memory_per_block_optin
+
+
+def smem_optin_bytes(
+        device: Optional[Union[int, "torch.device"]] = None) -> int:
+    """A CTA's opt-in shared memory limit on ``device`` (default: the current CUDA device)."""
+    import torch
+
+    if isinstance(device, torch.device):
+        device = device.index
+    if device is None:
+        device = torch.cuda.current_device()
+    return _smem_optin_bytes(device)
+
+
 def install_cutlass_dsl_compatibility() -> None:
     """Restore CuTe aliases required by pinned third-party FA4 and QuACK."""
     if not IS_CUTLASS_DSL_AVAILABLE:
@@ -112,6 +140,18 @@ def install_cutlass_dsl_compatibility() -> None:
             setattr(cute.core, name, getattr(cute, name))
     if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
         cute.make_fragment = cute.make_rmem_tensor
+
+
+def load_flash_attn_cute_forward():
+    """FlashAttention-4's forward (``flash_attn.cute``) with the CuTe aliases it needs.
+
+    Raises ``ImportError``, ``OSError`` or ``AttributeError`` when the CuTe DSL interface
+    cannot be imported; callers decide whether that is fatal.
+    """
+    install_cutlass_dsl_compatibility()
+    from flash_attn.cute.interface import _flash_attn_fwd
+
+    return _flash_attn_fwd
 
 
 # SMs that a kernel resident for the whole step holds (the DWDP fabric gather;

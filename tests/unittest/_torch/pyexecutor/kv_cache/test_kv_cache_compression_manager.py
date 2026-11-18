@@ -37,6 +37,7 @@ class _RecordingMixin:
     translation without real algorithm side-effects."""
 
     def __init__(self, kv_cache_manager, record_list, name="m"):
+        # pyrefly: ignore [bad-argument-count]
         super().__init__(_compression_config())
         self.bind_kv_cache_managers(kv_cache_manager)
         self._record_list = record_list
@@ -385,7 +386,9 @@ class TestKvCacheCreatorLifecycle:
         creator = object.__new__(util_mod.KvCacheCreator)
         creator._skip_est = False
         creator._max_seq_len = 1024
-        creator._kv_cache_config = SimpleNamespace(host_cache_size=None, disk_cache_size=None)
+        creator._kv_cache_config = SimpleNamespace(
+            host_cache_size=None, disk_cache_size=None, remote_cache_config=None
+        )
         creator._llm_args = SimpleNamespace(kv_cache_compression_config=config)
         creator._model_engine = _factory_model_engine(pretrained_config=pretrained_config)
         creator._is_encoder_decoder = MagicMock(return_value=False)

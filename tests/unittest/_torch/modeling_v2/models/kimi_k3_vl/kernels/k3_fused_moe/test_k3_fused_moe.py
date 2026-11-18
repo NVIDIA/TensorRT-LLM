@@ -54,10 +54,10 @@ M_ALL = list(range(1, 9))
 
 def _ops():
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
         op,  # noqa: F401
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
         op as _rq,  # noqa: F401
     )
 
@@ -204,9 +204,7 @@ def _stock(proc, bias, x, logits):
 @functools.lru_cache(maxsize=None)
 def _layer():
     """One K3MoeState on this GPU and the layer of _experts()' buffers on it."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
 
     _ops()
     proc, _, _ = _experts()
@@ -275,9 +273,7 @@ def test_k3_fused_moe(case, m):
     """Each M's rows against the 8-token call: the slice FC2 adds a token's expert terms in slices whose bounds
     follow the step's group count, so a row may round differently with other tokens present (at most 1 bf16 ulp);
     bit-identity is reported."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
 
     _ops()
     proc, raw, bias = _experts()
@@ -335,9 +331,7 @@ def test_k3_fused_moe_partial_rows_past_m():
     """The combine loads the FC2 partial rows of all 8 token slots, and a call writes only its M tokens' rows: a
     fresh state's partials start zeroed, and each M's output is the same with the rows past M poisoned (NaN) as with
     them zeroed, so no output reads a row its call did not write."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
 
     _ops()
     proc, _, bias = _experts()
@@ -367,9 +361,7 @@ def test_collective_workspaces_refuse_graph_capture():
     """The head all-gather's buffers (the front's) are created collectively (an MNNVL multicast allocation over the TP
     group): under CUDA-graph capture create() raises (the group's ranks agree first that each can allocate; a group of
     one here) instead of allocating. The per-rank state and a layer's counters refuse capture too (they allocate)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
     from tensorrt_llm.mapping import Mapping
 
     _ops()
@@ -385,3 +377,36 @@ def test_collective_workspaces_refuse_graph_capture():
             op.K3MoeState(device, I_TP, E_LOCAL)
         with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
             state.layer(proc["w31"], proc["w31s"], proc["w2"], proc["w2s"])
+
+
+@pytest.mark.parametrize("num_tokens", [1, 5, 8])
+def test_k3_fused_moe_zero_weights_reused_output(num_tokens):
+    """Zero routing weights overwrite active output rows without touching padding or poisoning reuse."""
+    ops = _ops()
+    _, raw, bias = _experts()
+    logits8, x8 = _tokens("16_local")
+    logits = logits8[:num_tokens].contiguous()
+    latent = x8[:num_tokens].contiguous()
+    ids, weights, x_fp8, x_sf = ops.k3_route_quant(logits, bias, latent, RSF)
+    assert bool(((ids >= OFFSET) & (ids < OFFSET + E_LOCAL)).all())
+    layer = _layer()
+    reference = _reference(raw, _deq_x(x_fp8, x_sf), ids, weights).bfloat16()
+    expected = layer(x_fp8, x_sf, ids, weights, OFFSET)
+    assert _compare(expected, reference)["ok"]
+    assert bool((expected != 0).any())
+    assert _scratch_rearmed()
+
+    output = torch.full((num_tokens + 1, H), 17.0, dtype=torch.bfloat16, device="cuda")
+    for routing_weights in (weights, torch.zeros_like(weights), weights):
+        output[:num_tokens].fill_(float("nan"))
+        actual = layer(x_fp8, x_sf, ids, routing_weights, OFFSET, out=output)
+        assert actual.shape == (num_tokens, H)
+        assert actual.dtype == torch.bfloat16
+        assert actual.data_ptr() == output.data_ptr()
+        assert bool(torch.isfinite(actual).all())
+        if routing_weights is weights:
+            assert torch.equal(_bits(actual), _bits(expected))
+        else:
+            assert torch.equal(actual, torch.zeros_like(actual))
+        assert bool((output[num_tokens:] == 17.0).all())
+        assert _scratch_rearmed()
