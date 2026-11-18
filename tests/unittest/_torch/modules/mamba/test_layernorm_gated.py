@@ -444,6 +444,38 @@ class TestRMSNormBasic:
         )
         torch.testing.assert_close(actual, expected.to(dtype), rtol=1e-2, atol=1e-2)
 
+    @pytest.mark.parametrize("num_tokens", [256, 257])
+    @pytest.mark.parametrize("N", [64, 128, 256])
+    def test_strided_rows_match_contiguous(self, N: int, num_tokens: int) -> None:
+        """x and output rows with padded strides, with and without a partial last tile,
+        give the contiguous launch's bits on both entry points and leave the padding
+        untouched."""
+        from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        heads, pad = 3, 32
+        num_rows = num_tokens * heads
+        tile = layernorm_gated._multirow_rows(N, dtype.itemsize)
+        torch.manual_seed(13)
+        x = torch.randn(num_rows, N + pad, device=device, dtype=dtype)[:, pad:]
+        weight = torch.rand(N, device=device, dtype=dtype) + 0.5
+        wide = torch.randn(num_tokens, heads * N + pad, device=device, dtype=dtype)
+        z = wide[:, pad:].view(num_tokens, heads, N)
+        z_rows = z.reshape(-1, N)
+        expected, _, _ = layernorm_gated._layer_norm_fwd(
+            x.contiguous(), weight, None, 1e-6, z=z_rows, is_rms_norm=True
+        )
+
+        guarded = torch.full((num_rows + tile, N + pad), 7.0, device=device, dtype=dtype)
+        out, _, _ = layernorm_gated._layer_norm_fwd(
+            x, weight, None, 1e-6, z=z_rows, out=guarded[:num_rows, :N], is_rms_norm=True
+        )
+        assert torch.equal(out, expected)
+        guarded[:num_rows, :N] = 7.0
+        assert torch.all(guarded == 7.0)
+        assert torch.equal(rms_norm_gated_token_major(x, z, weight, 1e-6), expected)
+
     @pytest.mark.parametrize("N,extra_rows", [(128, 3), (128, 4), (64, 8)])
     def test_dense_launch_writes_no_row_past_the_end(self, N: int, extra_rows: int) -> None:
         """Row counts that are not a multiple of the tile height must not write past the output."""
