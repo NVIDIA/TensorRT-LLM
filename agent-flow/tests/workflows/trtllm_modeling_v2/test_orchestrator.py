@@ -239,6 +239,33 @@ def test_a_delivery_check_runs_again_only_when_a_task_that_claims_it_lands(
     assert status.latest()[serve.key].marker == served_on
 
 
+def test_a_claim_that_lands_while_its_check_runs_stays_owed(tmp_path):
+    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    runs = []
+
+    def check(chk):
+        runs.append(chk.key)
+        if len(runs) == 1:
+            orchestrator._claim([chk.key])  # a task lands and claims it while this run measures
+        return SimpleNamespace(name=chk.gate, member=chk.member, detail="", tree_state="",
+                               passed=True)  # fmt: skip
+
+    services = Services(
+        plan=lambda turn: PlannerAnswer("DONE", ""),
+        work=lambda task: "UNIT_READY",
+        check=check,
+        free_gpus=lambda: 4,
+        marker=lambda: f"m{len(runs)}",
+    )
+    status = c.ContractStatus.load(tmp_path)
+    orchestrator = GraphOrchestrator(services, c.Contract(checks=(serve,)), status, tmp_path)
+    orchestrator._claim([serve.key])
+    orchestrator._run_check_once(serve)
+    assert serve.key in orchestrator._owed
+    orchestrator._run_check_once(serve)
+    assert serve.key not in orchestrator._owed and runs == [serve.key, serve.key]
+
+
 def test_a_failure_on_the_final_tree_reaches_the_planner(tmp_path):
     turns = []
 
@@ -499,6 +526,9 @@ def test_a_boot_is_owed_only_where_no_stronger_check_loads_the_same_engine():
     # A later unit on the smoke profile does not take the confirmation from a benchmark.
     mixed = {**spec, "features": ["multimodal"], "profile": {"multimodal": "smoke"}}
     assert c.compile_contract(mixed, world_size=4).confirm == "core:accuracy[gsm8k]@tp1"
+    # Where no unit owes a benchmark, a variant's confirms it, not the core's boot.
+    variant = {**spec, "features": [], "profile": {"core": "smoke"}, "variants": {"kv_fp8": fp8}}
+    assert c.compile_contract(variant, world_size=4).confirm == "kv_fp8:accuracy[gsm8k]@tp4"
 
 
 def test_a_failed_check_runs_again_with_its_repair_and_nothing_else_does(tmp_path):

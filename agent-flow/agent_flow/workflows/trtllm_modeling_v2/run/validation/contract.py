@@ -106,8 +106,8 @@ class Contract:
     notes: tuple[str, ...] = ()
     #: The key of the check that confirms the final tree when none of its kind
     #: has passed on it (:func:`confirmed`): the benchmark of the last unit that
-    #: owes one, at its cheapest member; the last boot where the run owes no
-    #: benchmark at all.
+    #: owes one, at its cheapest member, else the last variant's that does; the
+    #: last boot where the run owes no benchmark at all.
     confirm: str = ""
 
     def required(self) -> tuple[Check, ...]:
@@ -330,8 +330,9 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
     lean = profile_of(task_data) in (PROFILE_SMOKE, PROFILE_BRINGUP)
     checks: list[Check] = []
     notes: list[str] = []
-    # What confirms the final tree: the last benchmark owed, else (boots alone) the last boot.
-    confirm = boot_alone = ""
+    # What confirms the final tree: the last unit's benchmark, else the last variant's, else
+    # (boots alone) the last boot.
+    confirm = variant_confirm = boot_alone = ""
     reuses = {kv.name for kv in check_config.launch_kv_caches(task_data) if kv.reuse}
     for index, unit in enumerate(units):
         level = profile_of(task_data, unit)
@@ -431,6 +432,8 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
                 at = [m for m in at if m not in loaded]
             elif gate == "accuracy":
                 at = scored
+                if scored:
+                    variant_confirm = Check(name, gate_names[gate], scored[0], TIER_PROOF).key
             owned = {c.key for c in checks}
             checks.extend(
                 Check(
@@ -455,7 +458,9 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         if single is not None:
             inputs = check_inputs(task_data, last, serve.GATE_NAME, single, last_features)
             checks.append(Check(last, serve.GATE_NAME, single, TIER_DELIVERY, inputs=inputs))
-    return Contract(checks=tuple(checks), notes=tuple(notes), confirm=confirm or boot_alone)
+    return Contract(
+        checks=tuple(checks), notes=tuple(notes), confirm=confirm or variant_confirm or boot_alone
+    )
 
 
 def _boot_observes(reuses: bool, drafts: bool, multimodal: bool) -> bool:

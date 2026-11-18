@@ -341,6 +341,9 @@ class GraphOrchestrator:
         #: Checks that were asked for and whose run recorded no verdict (its session
         #: was lost): each runs again, though an earlier pass of it stands.
         self._owed: set[str] = {str(k) for k in saved.get("owed") or ()}
+        #: Per owed check, how many times a landing claimed it: a run clears the claims
+        #: made before it started, not one that came while it ran on an earlier tree.
+        self._claims: dict[str, int] = {}
         #: An event that needs the planner's judgement waits: it wakes the planner
         #: at once. What a dead process left unread is read first.
         self._urgent = bool(self.events) or self.unread_reports
@@ -518,22 +521,30 @@ class GraphOrchestrator:
                 self._owed.add(check.key)
             raise
 
+    def _claim(self, keys: Iterable[str]) -> None:
+        """Owe ``keys`` from a landing on: a run that started before it does not clear them."""
+        with self._status_lock:
+            for key in keys:
+                self._owed.add(key)
+                self._claims[key] = self._claims.get(key, 0) + 1
+
     def _run_check_once(self, check: contract_mod.Check) -> bool:
         marker = self.s.marker()
-        if marker:
-            with self._status_lock:
-                here = contract_mod.passed_here(
-                    self.contract, self.status, check, marker, self.s.holds
-                )
-                if here:
-                    self._owed.discard(check.key)
+        with self._status_lock:
+            claims = self._claims.get(check.key, 0)
+            here = bool(marker) and contract_mod.passed_here(
+                self.contract, self.status, check, marker, self.s.holds
+            )
             if here:
-                return True
+                self._owed.discard(check.key)
+        if here:
+            return True
         result = self.s.check(check)
         reads = self.s.narrow(result) if self.s.narrow is not None else ("", "")
         with self._status_lock:
             self.status.record(check.unit, result, marker=marker, inputs=check.inputs, reads=reads)
-            self._owed.discard(check.key)
+            if self._claims.get(check.key, 0) == claims:
+                self._owed.discard(check.key)
         return bool(result.passed)
 
     def _submit_checks(
@@ -576,8 +587,7 @@ class GraphOrchestrator:
         if decision.partition("\n")[0] not in FINISHED:
             return decision, []
         delivery = self._delivery_keys()
-        with self._status_lock:
-            self._owed.update(k for k in task.satisfies if k in delivery)
+        self._claim(k for k in task.satisfies if k in delivery)
         self._agentless.add(task.id)
         try:
             return decision, self._run_checks(k for k in task.satisfies if k not in delivery)
