@@ -73,8 +73,7 @@ _BATCHED_CANDIDATE_KEYS = 4 << 20  # 4M
 _CANDIDATE_CLUSTER_TOPK_MAX_ROWS = 64
 # CTAs per row of the attention-TP chain's self-sampling GVR: one 4-CTA cluster.
 _GVR_ROW_CTAS = 4
-# The self-sampling GVR decode engine runs one CTA per row. On the candidate source, whose rows
-# are twice as long, larger decode batches select with the exact radix Top-K.
+# Existing CSA2 candidate-source decode cutoff: larger batches keep exact radix Top-K.
 _DECODE_GVR_SOURCE_MAX_ROWS = 256
 # Candidate consumers' decode batches above this many rows rank 8-column groups first.
 _CONSUMER_BLOCK_TOPK_MIN_ROWS = 64

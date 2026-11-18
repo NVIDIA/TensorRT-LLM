@@ -143,8 +143,8 @@ BLKC = 1024  # CTA size of the clustered register path
 # thread-block clusters, distributed shared memory and st.async, and the device module
 # compiles for either. The dispatch reads the device as (num_sms, sm_version):
 #   - ``num_sms`` sizes the register-resident waves on every target;
-#   - ``wave_sms`` sizes the streaming and clustered-register waves: Blackwell keeps the
-#     148-SM budget on Blackwell/Rubin, Hopper uses its SM count;
+#   - ``wave_sms`` sizes decode streaming and clustered-register waves: Blackwell/Rubin use
+#     148 SMs, Hopper uses its SM count; prefill uses physical counts on Hopper/Rubin;
 #   - ``cluster_fits`` keeps clustered plans to the clusters a Hopper GPU co-schedules.
 SUPPORTED_SM_VERSIONS = (90, 100, 103, 107)
 _BLACKWELL_SM_VERSIONS = (100, 103, 107)
@@ -155,8 +155,13 @@ _TUNED_SM_VERSIONS = (90, 100, 103)
 
 
 def wave_sms(num_sms: int, sm_version: int) -> int:
-    """SM budget of the streaming and clustered-register wave arithmetic."""
+    """SM budget of the decode streaming and clustered-register wave arithmetic."""
     return _BLACKWELL_WAVE_SMS if sm_version in _BLACKWELL_SM_VERSIONS else num_sms
+
+
+def _prefill_wave_sms(num_sms: int, sm_version: int) -> int:
+    """Prefill keeps Blackwell's fixed budget and uses physical SM counts on Hopper/Rubin."""
+    return _BLACKWELL_WAVE_SMS if sm_version in (100, 103) else num_sms
 
 
 # Co-resident clusters per cluster size at one CTA per SM (cudaOccupancyMaxActiveClusters), by
@@ -894,6 +899,8 @@ def route_streaming(
     sm_version: int = 100,
     regsel: bool = False,
     fp16: bool = False,
+    *,
+    wave_budget: int | None = None,
 ) -> dict[str, object]:
     """route() restricted to its STREAMING half (main / clus) — the varlen
     capture policy: per-row kernels must be picked from the families that are
@@ -906,7 +913,7 @@ def route_streaming(
     logits (their K = 2048 rows take Hopper's 512-thread slab, see ``_wide_slab``)."""
     if b < 1:
         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
-    wave = wave_sms(num_sms, sm_version)
+    wave = wave_sms(num_sms, sm_version) if wave_budget is None else wave_budget
     R = 1
     if b <= 32:
         r1 = max(wave // b, 1)
@@ -1911,6 +1918,8 @@ def _route_streaming_16bit(
     dtype: torch.dtype = torch.bfloat16,
     num_sms: int = 148,
     sm_version: int = 100,
+    *,
+    wave_budget: int | None = None,
 ) -> dict[str, object]:
     """16-bit form of ``route_streaming``.
 
@@ -1921,10 +1930,19 @@ def _route_streaming_16bit(
     whose chunk fills less than 3/4 of that tile takes the 8-byte-vector engine (``vec4``: FP32
     tile geometry, all threads active).
     """
-    wave = wave_sms(num_sms, sm_version)
+    wave = wave_sms(num_sms, sm_version) if wave_budget is None else wave_budget
     regsel = _regsel_rows(dtype, b, num_sms)
     plan = route_streaming(
-        b, n, npad, k, force_main, num_sms, sm_version, regsel, dtype is torch.float16
+        b,
+        n,
+        npad,
+        k,
+        force_main,
+        num_sms,
+        sm_version,
+        regsel,
+        dtype is torch.float16,
+        wave_budget=wave,
     )
     if plan["kernel"] in ("main", "clus"):
         tpl = plan["tpl"]
@@ -2157,7 +2175,7 @@ def _prefill_launcher(
     low = dtype in _DTYPES_16BIT
     if low and det:
         raise RuntimeError("deterministic mode requires float32 logits")
-    wave = wave_sms(num_sms, sm_version)
+    wave = _prefill_wave_sms(num_sms, sm_version)
     key = _prefill_cache_key(tier, k, n_bucket, _DTYPE_TAG[dtype], det, v16, wave)
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
@@ -2166,10 +2184,20 @@ def _prefill_launcher(
     n_route = max(n_bucket, k + 1)
     if low:
         plan = _route_streaming_16bit(
-            b_route, n_route, n_route, k, True, dtype, num_sms, sm_version
+            b_route,
+            n_route,
+            n_route,
+            k,
+            True,
+            dtype,
+            num_sms,
+            sm_version,
+            wave_budget=wave,
         )
     else:
-        plan = route_streaming(b_route, n_route, n_route, k, True, num_sms, sm_version)
+        plan = route_streaming(
+            b_route, n_route, n_route, k, True, num_sms, sm_version, wave_budget=wave
+        )
     if plan["kernel"] != "main":
         raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
     rt = plan["rt"]
@@ -3914,9 +3942,9 @@ def _device_num_sms(dev_index: int) -> int:
     return _unpack_device_profile(_device_profile_key(dev_index))[0]
 
 
-def _device_wave_sms(dev_index: int) -> int:
-    """Return the streaming / clustered wave budget of a CUDA device."""
-    return wave_sms(*_unpack_device_profile(_device_profile_key(dev_index)))
+def _device_prefill_wave_sms(dev_index: int) -> int:
+    """Return the prefill tier budget of a CUDA device."""
+    return _prefill_wave_sms(*_unpack_device_profile(_device_profile_key(dev_index)))
 
 
 # ---------------------------------------------------------------------------
@@ -4686,7 +4714,7 @@ def run_prefill(
     n_env = min(max(n_env, 1), npad)
     n_bucket = _prefill_bucket(n_env)
     num_sms, sm_version = _unpack_device_profile(_device_profile_key(d))
-    wave = wave_sms(num_sms, sm_version)
+    wave = _prefill_wave_sms(num_sms, sm_version)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
         tier = _prefill_tier(r1 - r0, n_env, k, wave)
@@ -4731,7 +4759,7 @@ def prefill_ready(
     n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
     n_env = min(max(n_env, 1), max(npad, 1))
     n_bucket = _prefill_bucket(n_env)
-    wave = _device_wave_sms(logits.get_device())
+    wave = _device_prefill_wave_sms(logits.get_device())
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k, wave)
         v16 = _prefill_v16(tier, logits.dtype, npad)
@@ -5041,7 +5069,7 @@ def warmup_prefill(
     dtype: torch.dtype = torch.float32,
 ) -> None:
     """Compile every prefill engine ``run_prefill`` can request before serving:
-    the tier-0 arm per pow2 envelope bucket where a launch of at most ``wave_sms`` rows
+    the tier-0 arm per pow2 envelope bucket where a launch of at most the prefill wave's rows
     keeps it (``_prefill_tier`` is evaluated at both edges of every bucket), tiers 1/2
     one launch each. ``num_rows_list`` defaults to one row count per tier.
     ``max_cols`` is the compressed max column count;
@@ -5054,7 +5082,7 @@ def warmup_prefill(
     if dtype in _DTYPES_16BIT and deterministic:
         raise RuntimeError("deterministic mode requires float32 logits")
     dev = torch.cuda.current_device()
-    wave = _device_wave_sms(dev)
+    wave = _device_prefill_wave_sms(dev)
     if num_rows_list is None:
         num_rows_list = (1, wave + 1, 2 * wave + 1)
     k = int(top_k)
