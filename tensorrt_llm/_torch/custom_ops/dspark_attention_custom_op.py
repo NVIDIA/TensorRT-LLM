@@ -51,7 +51,7 @@ def _gen_dspark_context_wkv_m_profiles(max_m: int) -> Tuple[int, ...]:
 
 # Attention-only limits; the shared DSpark shape contract (head and RoPE dims, window,
 # draft block sizes and storage) comes from dspark_rmsnorm_rope_custom_op.
-_DSV4_DSPARK_SUPPORTED_NUM_HEADS = (64, 128)
+_DSV4_DSPARK_SUPPORTED_NUM_HEADS = (8, 16, 32, 64, 128)
 _DSV4_DSPARK_PAGE_SIZES = (16, 32, 64, 128, 256)
 
 
@@ -405,8 +405,10 @@ def is_fused_dsv4_dspark_attention_supported(
         return _log_unsupported(
             f"expected q/kv_cache ranks 4/3, got {q.ndim}/{kv_cache.ndim}", "tensor_ranks"
         )
+    if q.shape[0] == 0:
+        return _log_unsupported("batch must be nonempty", "batch_size")
     if q.shape[1] not in _DSV4_DSPARK_BLOCK_SIZES:
-        return _log_unsupported(f"draft block size must be 5 or 6, got {q.shape[1]}", "block_size")
+        return _log_unsupported(f"draft block size must be 1 to 8, got {q.shape[1]}", "block_size")
     if q.shape[2] not in _DSV4_DSPARK_SUPPORTED_NUM_HEADS or q.shape[3] != _DSV4_DSPARK_HEAD_DIM:
         return _log_unsupported(
             f"q must have {_DSV4_DSPARK_SUPPORTED_NUM_HEADS} heads and head_dim 512; "
@@ -459,7 +461,11 @@ def is_fused_dsv4_dspark_attention_supported(
 
 def warmup_fused_dsv4_dspark_attention(block_size: int, eps: float, num_heads: int) -> None:
     """Best-effort prewarm of the production DSV4 DSpark fused-op path."""
-    if _get_dspark_arch_str() is None or block_size not in _DSV4_DSPARK_BLOCK_SIZES:
+    if (
+        _get_dspark_arch_str() is None
+        or block_size not in _DSV4_DSPARK_BLOCK_SIZES
+        or num_heads not in _DSV4_DSPARK_SUPPORTED_NUM_HEADS
+    ):
         return
 
     batch = 1

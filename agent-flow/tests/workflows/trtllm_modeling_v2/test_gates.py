@@ -546,7 +546,7 @@ def test_indirect_entries_must_have_contracts_and_collected_tests(tmp_path, loca
         _write_entry(entry, test)
     else:
         nested.write_text(
-            "from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm import exported as run\n",
+            "from tensorrt_llm._torch.modeling_v2.catalog.norm import exported as run\n",
             encoding="utf-8",
         )
         entry = root / catalog_paths.CATALOG_DIR / "norm/flashinfer_rmsnorm.py"
@@ -581,7 +581,7 @@ def test_family_helper_cannot_hide_sibling_import(tmp_path, absolute):
     sibling.mkdir()
     (sibling / "modeling.py").write_text("class Other: pass\n", encoding="utf-8")
     module = (
-        "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.sibling.modeling"
+        "tensorrt_llm._torch.modeling_v2.models.gpt_oss.sibling.modeling"
         if absolute
         else ".sibling.modeling"
     )

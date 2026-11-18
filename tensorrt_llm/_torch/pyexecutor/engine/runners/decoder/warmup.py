@@ -10,11 +10,12 @@ import gc
 import os
 import time
 from collections.abc import Callable
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
@@ -60,6 +61,19 @@ if TYPE_CHECKING:
     from .graphs import DecoderCudaGraphs, ForwardWarmup
     from .inputs import DecoderInputPreparer
     from .metadata import DecoderMetadata
+
+
+class AutotunerWarmupMode(Enum):
+    """Batches the autotuner warmup tunes on."""
+
+    # A context batch, then a single generation request.
+    CONTEXT_AND_SINGLE_GENERATION = auto()
+    # A context batch, then a max_batch_size generation batch: aggregated
+    # helix ranks both prefill and decode full batches.
+    CONTEXT_AND_FULL_GENERATION = auto()
+    # Only a max_batch_size generation batch: helix ranks on a disaggregated
+    # generation server never prefill.
+    GENERATION_ONLY = auto()
 
 
 class WarmupAgreement:
@@ -205,6 +219,28 @@ class WarmupAgreement:
             f"cache capacity across ranks. Consider increasing "
             f"--kv_cache_free_gpu_mem_fraction."
         )
+
+    def agree_capture_batch(
+        self, batch: ScheduledRequests | None, label: str, batch_size: int, draft_len: int
+    ) -> bool:
+        """Whether every rank of the forward group captures this generation graph: free KV
+        differs per rank under attention DP, so a graph any rank cannot fit is skipped on all."""
+        allgather = self.allgather()
+        flags = [int(batch is not None)]
+        if allgather is not None:
+            flags = list(allgather(flags[0]))
+        if all(flags):
+            return True
+        # During KV cache estimation a skip makes the profiling peak unrepresentative (the
+        # final executor still captures this graph), so it is never silent.
+        where = ""
+        if len(flags) > 1:
+            where = f" on rank(s) {[rank for rank, flag in enumerate(flags) if not flag]}"
+        logger.warning(
+            f"Skipping CUDA graph warmup ({label}) for batch size={batch_size}, "
+            f"draft_len={draft_len}: not enough KV cache space{where}."
+        )
+        return False
 
     def assert_all_tp_ranks_have_warmup_batch(self, batch, num_tokens: int) -> None:
         """Assert every TP rank has a valid warmup batch, or raise with diagnostics.
@@ -432,12 +468,12 @@ class DecoderWarmup:
             and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager)
         )
-        # Helix CP and decode-only workers never run a context batch, so every
-        # phase below warms up pure-generation shapes only. Both follow from the
-        # configuration, so every rank takes the same branch.
-        generation_only = self.mapping.has_cp_helix() or is_decode_only(
-            self.sparse_attention_config
-        )
+        # Helix ranks on a disaggregated generation server and decode-only
+        # workers never run a context batch, so every phase below warms up
+        # pure-generation shapes only. Aggregated Helix ranks prefill too. All
+        # follow from the configuration, so every rank takes the same branch.
+        disagg_helix = self.mapping.has_cp_helix() and self._config.is_disagg
+        generation_only = disagg_helix or is_decode_only(self.sparse_attention_config)
         # A capturable guided decoder rules out the general warmup's generation
         # requests only: the autotuner below runs its context step with the
         # decoder installed. Run the context requests anyway, so that the
@@ -447,10 +483,14 @@ class DecoderWarmup:
         can_run_context_warmup = can_run_general_warmup or self._agreement.agree_flag(
             self._context_warmups_supported
             and not generation_only
+            # Aggregated Helix warms prefill in the autotuner warmup instead.
+            and not self.mapping.has_cp_helix()
             and not isinstance(kv_cache_manager, MambaHybridCacheManager)
         )
 
         log_mem_snapshot("warmup/before_warmup")
+        with self._warmup_timer.phase("fmha_module_prewarm"):
+            self._prewarm_fmha_libraries(kv_cache_manager)
         # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
         # collective-bearing forward, so their JIT cost is not charged against the
         # MoE all-to-all completion-flag deadline.
@@ -511,7 +551,13 @@ class DecoderWarmup:
                 ),
                 self._torch_compile_bypass(),
             ):
-                self._run_autotuner_warmup(resource_manager, generation_only=generation_only)
+                if generation_only:
+                    mode = AutotunerWarmupMode.GENERATION_ONLY
+                elif self.mapping.has_cp_helix():
+                    mode = AutotunerWarmupMode.CONTEXT_AND_FULL_GENERATION
+                else:
+                    mode = AutotunerWarmupMode.CONTEXT_AND_SINGLE_GENERATION
+                self._run_autotuner_warmup(resource_manager, mode=mode)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
             # for Mamba hybrid models. Runs regardless of enable_autotuner,
@@ -537,7 +583,11 @@ class DecoderWarmup:
             gc.collect()
             torch.cuda.empty_cache()
         with self._warmup_timer.phase("cuda_graph_capture"):
-            self._graphs.warmup_and_capture(resource_manager)
+            # KV-cache estimation always uses both passes, so the KV-cache size ignores the switch.
+            self._graphs.warmup_and_capture(
+                resource_manager,
+                allow_single_pass=not getattr(kv_cache_manager, "is_estimating_kv_cache", False),
+            )
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
@@ -726,6 +776,50 @@ class DecoderWarmup:
                     f"skipping bucket. {type(e).__name__}: {e}"
                 )
         torch.cuda.synchronize()
+
+    def _prewarm_fmha_libraries(self, kv_cache_manager: KVCacheManager | KVCacheManagerV2) -> None:
+        """Build eligible FMHA modules before the first warmup forward.
+
+        flashinfer builds the module on first use, and MPI workers keep a
+        flashinfer workspace per process by default, so every rank builds its
+        own copy. Under pipeline parallelism the first warmup forward reaches
+        the ranks one after another, so builds left to that forward run in turn
+        and startup grows with the pipeline depth. Building here lets the ranks
+        build at the same time. Without pipeline parallelism there is nothing
+        to overlap. Library-specific hooks decide static layer eligibility.
+        """
+        if self.mapping.pp_size == 1:
+            return
+        from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPrewarmConfig
+
+        config = FmhaPrewarmConfig(
+            dtype=self._config.dtype,
+            kv_cache_dtype=kv_cache_manager.dtype,
+            tokens_per_block=kv_cache_manager.tokens_per_block,
+            extra_tokens_per_block=frozenset(
+                getattr(kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ())
+            ),
+            context=not self.mapping.has_cp_helix()
+            and not is_decode_only(self.sparse_attention_config),
+            generation=not is_context_only_kv_cache(kv_cache_manager),
+            helix=self.mapping.has_cp_helix(),
+        )
+        attempted: set[type[Fmha]] = set()
+        for module in self.model.modules():
+            # Locality follows retained projection weights, including models
+            # that do not set _weights_removed. Attention backends are plain
+            # attributes, so inspect them without assuming a wrapper or name
+            # (Attention.attn, MLA.mqa/mha, cross or custom attention).
+            if not any(True for _ in module.parameters()):
+                continue
+            for backend in vars(module).values():
+                if isinstance(backend, TrtllmAttention):
+                    backend.prewarm_fmha(config, attempted)
+
+        # Eligibility and build success may differ across TP peers. Every peer
+        # meets here before a forward can start a collective's timeout clock.
+        if self.mapping.tp_size > 1 and self.dist is not None:
+            self.dist.tp_allgather(1)
 
     def _prewarm_cute_dsl_indexer_q(self) -> None:
         """Pre-compile the DSv4 indexer-Q CuTe DSL kernels, then barrier.
@@ -966,7 +1060,8 @@ class DecoderWarmup:
         self, resource_manager: ResourceManager, warmup_requests_configs: list[tuple[int, int]]
     ) -> None:
         for num_tokens, num_gen_tokens in warmup_requests_configs:
-            # Helix CP does not support warmup with context requests.
+            # General warmup builds no Helix context dummies; aggregated Helix
+            # warms prefill in the autotuner warmup instead.
             if self.mapping.has_cp_helix() and num_tokens != num_gen_tokens:
                 continue
             try:
@@ -1132,13 +1227,13 @@ class DecoderWarmup:
             release_megamoe_scratch()
 
     def _run_autotuner_warmup(
-        self, resource_manager: ResourceManager, generation_only: bool = False
+        self,
+        resource_manager: ResourceManager,
+        mode: AutotunerWarmupMode = AutotunerWarmupMode.CONTEXT_AND_SINGLE_GENERATION,
     ) -> None:
         """Runs forward passes to populate the autotuner cache.
 
-        ``generation_only`` tunes on one batch of ``max_batch_size`` generation
-        requests instead of a context batch, for workers that never run one
-        (Helix CP and decode-only workers).
+        ``mode`` selects the batches to tune on; see ``AutotunerWarmupMode``.
         """
         from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
             IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
@@ -1187,15 +1282,18 @@ class DecoderWarmup:
             )
         )
         if use_mxfp8_flashinfer_graph_default:
-            # CuTeDSL is the alternative backend; PP has no graph-pass handoff.
-            tune_with_cute_dsl = (
-                IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE and not self.mapping.has_pp()
-            )
             for quant_method in mxfp8_methods:
                 quant_method.enable_flashinfer_auto()
-                quant_method.tune_decode_graph_backends = (
-                    tune_with_cute_dsl and quant_method.uses_flashinfer
-                )
+        # PP has no handoff for the per-operator cache in the FlashInfer pass.
+        tune_mxfp8_backends = (
+            not compile_all_batches
+            and not self.mapping.has_pp()
+            and IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE
+        )
+        for quant_method in mxfp8_methods:
+            quant_method.tune_mxfp8_backends = (
+                tune_mxfp8_backends and quant_method.backend == "auto"
+            )
         # An explicit auto setting stays intact, but compiled auto dispatch
         # uses native GEMM. Do not run or mark an unused FlashInfer tuning pass.
         flashinfer_mxfp8_methods = [
@@ -1239,13 +1337,14 @@ class DecoderWarmup:
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        if generation_only:
-            tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
-            num_gen_requests = min(
-                self._config.max_batch_size,
-                self._config.max_num_tokens // tokens_per_gen_request,
-            )
-            curr_max_num_tokens = num_gen_requests * tokens_per_gen_request
+        tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
+        num_gen_requests = min(
+            self._config.max_batch_size,
+            self._config.max_num_tokens // tokens_per_gen_request,
+        )
+        max_gen_batch_tokens = num_gen_requests * tokens_per_gen_request
+        if mode is AutotunerWarmupMode.GENERATION_ONLY:
+            curr_max_num_tokens = max_gen_batch_tokens
         else:
             token_num_upper_bound = min(
                 self._config.max_num_tokens,
@@ -1284,7 +1383,7 @@ class DecoderWarmup:
             f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})..."
         )
 
-        if generation_only:
+        if mode is AutotunerWarmupMode.GENERATION_ONLY:
             warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
         else:
             warmup_configs = [(curr_max_num_tokens, 0)]
@@ -1293,16 +1392,19 @@ class DecoderWarmup:
                 and not self.mapping.has_pp()
                 and not is_context_only_kv_cache(kv_cache_manager)
             ):
-                # Add generation request to warmup the autotuner cache.
-                warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
+                # Add generation requests to warmup the autotuner cache.
+                if mode is AutotunerWarmupMode.CONTEXT_AND_FULL_GENERATION:
+                    warmup_configs.append((max_gen_batch_tokens, num_gen_requests))
+                else:
+                    warmup_configs.append((tokens_per_gen_request, 1))
 
         def run_autotuner_pass(autotune_context: Any, synchronize_trtllm_cache: bool) -> bool:
             """Run one isolated tuning pass with fresh synthetic batches."""
             ran_forward = False
             with self._graphs.no_cuda_graph(), autotune_context:
-                for num_tokens, num_gen_requests in warmup_configs:
+                for num_tokens, batch_gen_requests in warmup_configs:
                     warmup_request = self._dummy_requests.create_warmup_request(
-                        resource_manager, num_tokens, num_gen_requests
+                        resource_manager, num_tokens, batch_gen_requests
                     )
                     with self._dummy_requests.release_batch_context(
                         warmup_request, resource_manager
@@ -1311,12 +1413,12 @@ class DecoderWarmup:
                             batch,
                             num_tokens,
                             f"autotuner, num_tokens={num_tokens}, "
-                            f"num_gen_requests={num_gen_requests}",
+                            f"num_gen_requests={batch_gen_requests}",
                         ):
                             continue
                         with self._warmup_timer.phase(
                             f"autotuner shape num_tokens={num_tokens}, "
-                            f"num_gen_requests={num_gen_requests}",
+                            f"num_gen_requests={batch_gen_requests}",
                             record=False,
                             log_start=True,
                         ):
@@ -1395,6 +1497,13 @@ class DecoderWarmup:
                     "Native MXFP8 autotuning had no runnable warmup batch; "
                     "using the default native GEMM tactic."
                 )
+
+        if (
+            cache_path
+            and ran_flashinfer_forward
+            and any(method.tune_mxfp8_backends for method in flashinfer_mxfp8_methods)
+        ):
+            AutoTuner.get().profiling_cache.save_cache(cache_path, self.mapping.rank)
 
         logger.info(
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
@@ -1724,14 +1833,18 @@ class DecoderWarmup:
             return
 
         from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import (
+            CSA2Indexer,
+            prewarm_prefill_topk,
             prewarm_sparse_candidate_kernels,
         )
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Mode, CSA2Params
 
         config = self.model.model_config.pretrained_config
+        layout = kv_cache_manager.layout
         with torch.inference_mode():
             try:
                 compiled = prewarm_sparse_candidate_kernels(
-                    kv_cache_manager.layout,
+                    layout,
                     config.index_n_heads,
                     config.index_head_dim,
                     torch.device("cuda"),
@@ -1739,6 +1852,32 @@ class DecoderWarmup:
             except RuntimeError as e:
                 logger.warning(f"CSA2 sparse indexer prewarm skipped. {type(e).__name__}: {e}")
                 compiled = False
+            # The backends build their indexers at their first forward: build the same Top-K
+            # configuration to compile every prefill engine a context pass can request.
+            options = next(
+                (
+                    module.backend.sparse_params
+                    for module in self.model.modules()
+                    if isinstance(
+                        getattr(getattr(module, "backend", None), "sparse_params", None),
+                        CSA2Params,
+                    )
+                ),
+                None,
+            )
+            try:
+                widths = prewarm_prefill_topk(
+                    CSA2Indexer(
+                        layout, index, config.index_n_heads, config.index_head_dim, options=options
+                    ).top_k
+                    for index in range(len(layout.compress_ratios))
+                    if layout.layer(index).mode in (CSA2Mode.FULL, CSA2Mode.REINDEX)
+                )
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                logger.warning(f"CSA2 prefill Top-K prewarm skipped. {type(e).__name__}: {e}")
+                widths = []
+            if widths:
+                logger.info(f"CSA2 prefill Top-K prewarm compiled widths {widths}")
         torch.cuda.synchronize()
         if self.mapping.tp_size > 1 and self.dist is not None:
             self.dist.tp_allgather(1)

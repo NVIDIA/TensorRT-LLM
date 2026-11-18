@@ -31,8 +31,8 @@ import uuid
 from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
-from typing import (TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional,
-                    Sequence, Set, Tuple)
+from typing import (TYPE_CHECKING, Any, Dict, Iterator, Literal, NoReturn,
+                    Optional, Sequence, Set, Tuple)
 
 import click
 import pydantic
@@ -58,10 +58,10 @@ from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi.disagg_utils import (
-    DisaggClusterConfig, DisaggServerConfig, MetadataServerConfig, ServerRole,
-    extract_disagg_cluster_config, parse_disagg_config_file,
-    parse_metadata_server_config_file, validate_config_bool,
-    validate_internal_request_auth_key)
+    CtxGenServerConfig, DisaggClusterConfig, DisaggServerConfig,
+    MetadataServerConfig, ServerRole, extract_disagg_cluster_config,
+    parse_disagg_config_file, parse_metadata_server_config_file,
+    validate_config_bool, validate_internal_request_auth_key)
 from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
                                           CacheTransceiverConfig,
                                           KvCacheConnectorConfig, SleepConfig,
@@ -84,6 +84,7 @@ from tensorrt_llm.serve.multi_frontend import (LAUNCHER_UDS_ENV,
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
+from tensorrt_llm.serve.visual_gen_utils import check_path_response_policy
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import TerminalOutcome, apply_usage_session_config
 from tensorrt_llm.usage import config as _telemetry_config
@@ -438,9 +439,8 @@ def _publish_bound_address(report_addr: Optional[str], host: str,
         host = resolved
     report_addr = os.path.abspath(report_addr)
     parent = os.path.dirname(report_addr)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=parent or None,
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=parent,
                                     prefix=os.path.basename(report_addr) + ".",
                                     suffix=".tmp")
     try:
@@ -801,8 +801,16 @@ def launch_server(
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
     if server_role is not None:
-        os.environ[
-            DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = server_role.name.lower()
+        role = server_role.name.lower()
+        os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role
+        # MPI workers can predate this process (trtllm-llmapi-launch) and then
+        # never see the variable above; forward it through worker_main's
+        # explicit environment overrides as well.
+        llm_args["env_overrides"] = {
+            **(llm_args.get("env_overrides") or {}),
+            DisaggLauncherEnvs.TLLM_DISAGG_ROLE.value:
+            role,
+        }
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -1000,6 +1008,12 @@ _EMBEDDING_ARCH_MAP = {
     "Qwen3ForCausalLM": "Qwen3ForTextEmbedding",
 }
 
+# Qwen3-Reranker checkpoints declare their causal-LM architecture because they
+# are trained to answer yes or no. The rerank command supplies the serving
+# intent needed to select the scalar text-reranking wrapper.
+_RERANK_ARCHITECTURE = "Qwen3ForTextReranking"
+_RERANK_ARCH_MAP = {"Qwen3ForCausalLM": _RERANK_ARCHITECTURE}
+
 
 def _is_pplx_decider_checkpoint(model: str,
                                 revision: Optional[str] = None) -> bool:
@@ -1091,11 +1105,14 @@ def _resolve_embedding_architecture_override(
     return {"architectures": [target]}
 
 
-def _reject_embedding_extra_model_inputs(cuda_graph_config: Any) -> None:
-    """Reject encoder CUDA graph extra model inputs for the embeddings server.
+def _reject_encode_only_extra_model_inputs(
+        cuda_graph_config: Any, server_name: Literal["embeddings",
+                                                     "rerank"]) -> None:
+    """Reject encoder CUDA graph extra model inputs for HTTP encode servers.
 
-    /v1/embeddings has no field for extra model inputs, so the server calls
-    llm.encode() without them and every request would miss the declared inputs.
+    The embeddings and rerank request schemas have no field for extra model
+    inputs, so the servers call llm.encode() without them and every request
+    would miss the declared inputs.
     `cuda_graph_config` is the raw --config mapping or a parsed config object.
     """
     if isinstance(cuda_graph_config, dict):
@@ -1105,10 +1122,54 @@ def _reject_embedding_extra_model_inputs(cuda_graph_config: Any) -> None:
     if specs:
         raise click.BadParameter(
             "cuda_graph_config.extra_model_inputs is not supported by "
-            "trtllm-serve embeddings: /v1/embeddings has no field for extra "
-            "model inputs. Pass them through the Python llm.encode() API "
-            "instead.",
+            f"trtllm-serve {server_name}: its request schema has no field for "
+            "extra model inputs. Pass them through the Python llm.encode() "
+            "API instead.",
             param_hint="config")
+
+
+def _resolve_rerank_architecture_override(
+        model: str,
+        trust_remote_code: bool,
+        revision: Optional[str] = None) -> Optional[dict]:
+    """Route a published Qwen3-Reranker checkpoint to its scoring model."""
+    try:
+        from transformers import AutoConfig
+        hf_config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision)
+        architectures = getattr(hf_config, "architectures", None) or []
+    except Exception as e:  # noqa: BLE001 - custom config errors
+        raise click.BadParameter(
+            f"Could not read model config for rerank routing ({model}): {e}",
+            param_hint="model") from e
+
+    if not architectures:
+        raise click.BadParameter(
+            f"Model {model!r} does not declare an architecture; rerank "
+            f"requires {_RERANK_ARCHITECTURE}.",
+            param_hint="model")
+
+    source = architectures[0]
+    if source == _RERANK_ARCHITECTURE:
+        return None
+
+    target = _RERANK_ARCH_MAP.get(source)
+    if target is None:
+        raise click.BadParameter(
+            f"Unsupported rerank architecture {source!r}; expected "
+            f"Qwen3ForCausalLM or {_RERANK_ARCHITECTURE}.",
+            param_hint="model")
+
+    if os.path.isdir(model):
+        score_config = os.path.join(model, "1_LogitScore", "config.json")
+        if not os.path.isfile(score_config):
+            logger.warning(
+                f"{model} maps to {target} but has no "
+                "1_LogitScore/config.json; proceeding with the standard "
+                "Qwen3-Reranker yes/no token IDs.")
+
+    logger.info(f"Rerank routing: overriding architecture {source} -> {target}")
+    return {"architectures": [target]}
 
 
 def launch_embedding_server(
@@ -1160,6 +1221,50 @@ def launch_embedding_server(
     asyncio.run(server(host, port))
 
 
+def launch_rerank_server(
+    host: str,
+    port: int,
+    llm_args: dict,
+    max_queue_delay: float,
+    max_queue_size: int,
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+) -> None:
+    model = llm_args["model"]
+    llm_args.pop("build_config", None)
+    llm_args.pop("encode_only", None)
+
+    model_kwargs = dict(llm_args.get("model_kwargs") or {})
+    configured_architectures = model_kwargs.get("architectures")
+    if configured_architectures is not None:
+        if configured_architectures != [_RERANK_ARCHITECTURE]:
+            raise click.BadParameter(
+                "Unsupported rerank architecture override "
+                f"{configured_architectures!r}; expected "
+                f"[{_RERANK_ARCHITECTURE!r}].",
+                param_hint="config")
+    else:
+        override = _resolve_rerank_architecture_override(
+            model, llm_args.get("trust_remote_code", False),
+            llm_args.get("revision"))
+        if override is not None:
+            model_kwargs["architectures"] = override["architectures"]
+
+    if model_kwargs:
+        llm_args["model_kwargs"] = model_kwargs
+
+    llm = PyTorchLLM(encode_only=True, **llm_args)
+    server = OpenAIServer(
+        generator=llm,
+        model=model,
+        server_role=ServerRole.RERANK,
+        metadata_server_cfg=metadata_server_cfg,
+        tool_parser=None,
+        embedding_max_queue_delay=max_queue_delay,
+        embedding_max_queue_size=max_queue_size,
+        graceful_shutdown_timeout=llm.args.serve_graceful_shutdown_timeout_s)
+    asyncio.run(server(host, port))
+
+
 def launch_visual_gen_server(
         host: str,
         port: int,
@@ -1167,6 +1272,7 @@ def launch_visual_gen_server(
         visual_gen_args: Optional["VisualGenArgs"] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         middleware: Sequence[str] = (),
+        media_load_workers: int = 8,
 ):
     """Launch a VISUAL_GEN model server for image/video generation.
 
@@ -1176,7 +1282,12 @@ def launch_visual_gen_server(
         model: Model path or HuggingFace Hub model ID.
         visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
+        media_load_workers: Size of the pool that reads uploads and
+            ``format='path'`` references.
     """
+    # Refuse a misconfigured path-response switch before the model loads.
+    check_path_response_policy()
+
     # Only global rank 0 serves HTTP; in external multi-rank launch ranks > 0
     # must become workers before binding, else every rank on a multi-GPU node
     # races the same port and all but one die EADDRINUSE. VisualGen() on a
@@ -1222,7 +1333,8 @@ def launch_visual_gen_server(
                                   model=model,
                                   server_role=ServerRole.VISUAL_GEN,
                                   metadata_server_cfg=metadata_server_cfg,
-                                  tool_parser=None)
+                                  tool_parser=None,
+                                  media_load_workers=media_load_workers)
             _apply_fastapi_middlewares(server.app, middleware)
             uvloop.run(server(host, port, sockets=[s]))
         except _VisualGenStartupTermination as e:
@@ -1410,7 +1522,8 @@ def launch_visual_gen_server(
                   default=8,
                   help="Size of the dedicated thread pool that decodes media "
                   "payloads (image / video / audio) for multimodal "
-                  "requests.",
+                  "requests. A VisualGen server reads uploads and "
+                  "format='path' references on it.",
                   status="prototype")
 @stability_option("--trust_remote_code",
                   is_flag=True,
@@ -2034,8 +2147,13 @@ def serve(
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
 
-        launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
-                                 metadata_server_cfg, middleware)
+        launch_visual_gen_server(host,
+                                 port,
+                                 model,
+                                 parsed_visual_gen_args,
+                                 metadata_server_cfg,
+                                 middleware,
+                                 media_load_workers=num_media_load_workers)
 
     # Only the OpenAI HTTP path publishes the bound address. Fail loudly rather
     # than leaving a launcher waiting forever on a file nobody writes.
@@ -2216,6 +2334,67 @@ def serve_encoder(
         allow_request_chat_template=allow_request_chat_template)
 
 
+def _prepare_encode_only_llm_args(
+    *,
+    model: str,
+    max_batch_size: int,
+    max_num_tokens: int,
+    trust_remote_code: bool,
+    revision: Optional[str],
+    extra_llm_api_options: Optional[str],
+    telemetry: bool,
+    server_name: Literal["embeddings", "rerank"],
+) -> dict:
+    """Resolve shared LLM arguments for single-GPU encode-only servers."""
+    explicit_cli_keys = collect_explicit_cli_keys(exclude=("config", ))
+    llm_args, _ = get_llm_args(
+        model=model,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        tensor_parallel_size=1,
+        telemetry=telemetry,
+        explicit_cli_keys=explicit_cli_keys,
+    )
+
+    extra_dict = {}
+    if extra_llm_api_options is not None:
+        with open(extra_llm_api_options, "r", encoding="utf-8") as config_file:
+            extra_dict = yaml.safe_load(config_file)
+        if extra_dict is None:
+            extra_dict = {}
+        elif not isinstance(extra_dict, dict):
+            raise ConfigInputError("Configuration file root must be a mapping.")
+
+    _command_telemetry.apply_raw_config_telemetry_opt_out(
+        extra_dict,
+        usage_context=_telemetry_config.UsageContext.CLI_SERVE,
+        component="server",
+        explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+    )
+    llm_args = update_llm_args_with_extra_dict(
+        llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
+    _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+
+    effective_tp = llm_args.get("tensor_parallel_size") or 1
+    effective_pp = llm_args.get("pipeline_parallel_size") or 1
+    effective_cp = llm_args.get("context_parallel_size") or 1
+    if effective_tp > 1 or effective_pp > 1 or effective_cp > 1:
+        raise click.BadParameter(
+            f"The {server_name} server is single-GPU only; multi-GPU "
+            "(TP/PP/CP) is not supported yet. Got "
+            f"tensor_parallel_size={effective_tp}, "
+            f"pipeline_parallel_size={effective_pp}, "
+            f"context_parallel_size={effective_cp} from --config.",
+            param_hint="config")
+
+    _reject_encode_only_extra_model_inputs(llm_args.get("cuda_graph_config"),
+                                           server_name)
+
+    return llm_args
+
+
 @click.command("embeddings")
 @click.argument("model", type=str)
 @click.option("--host",
@@ -2300,59 +2479,117 @@ def serve_embedding(
     """
     logger.set_level(log_level)
 
-    explicit_cli_keys = collect_explicit_cli_keys(exclude=("config", ))
-
-    # Single-GPU, encode-only: tensor_parallel_size is fixed to 1 and not exposed as a
-    # flag (the in-process encode path has no multi-GPU worker proxy). gpus_per_node is
-    # auto-detected by get_llm_args; free_gpu_memory_fraction is omitted because the
-    # encode path allocates no KV cache. All remain settable via --config if needed.
-    llm_args, _ = get_llm_args(model=model,
-                               max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               trust_remote_code=trust_remote_code,
-                               revision=revision,
-                               tensor_parallel_size=1,
-                               telemetry=telemetry,
-                               explicit_cli_keys=explicit_cli_keys)
-
-    extra_dict = {}
-    if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
-            extra_dict = yaml.safe_load(f)
-        if extra_dict is None:
-            extra_dict = {}
-        elif not isinstance(extra_dict, dict):
-            raise ConfigInputError("Configuration file root must be a mapping.")
-    _command_telemetry.apply_raw_config_telemetry_opt_out(
-        extra_dict,
-        usage_context=_telemetry_config.UsageContext.CLI_SERVE,
-        component="server",
-        explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+    llm_args = _prepare_encode_only_llm_args(
+        model=model,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        extra_llm_api_options=extra_llm_api_options,
+        telemetry=telemetry,
+        server_name="embeddings",
     )
-    llm_args = update_llm_args_with_extra_dict(
-        llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
-
-    _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
-
-    # The CLI does not expose TP/PP/CP, but a --config YAML could still set them. Reject
-    # that explicitly rather than hang: the in-process encode-only path cannot shard.
-    effective_tp = llm_args.get("tensor_parallel_size") or 1
-    effective_pp = llm_args.get("pipeline_parallel_size") or 1
-    effective_cp = llm_args.get("context_parallel_size") or 1
-    if effective_tp > 1 or effective_pp > 1 or effective_cp > 1:
-        raise click.BadParameter(
-            "The embeddings server is single-GPU only; multi-GPU (TP/PP/CP) is not "
-            f"supported yet. Got tensor_parallel_size={effective_tp}, "
-            f"pipeline_parallel_size={effective_pp}, "
-            f"context_parallel_size={effective_cp} from --config.",
-            param_hint="config")
-    _reject_embedding_extra_model_inputs(llm_args.get("cuda_graph_config"))
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
     launch_embedding_server(host, port, llm_args, max_queue_delay,
                             max_queue_size, metadata_server_cfg)
+
+
+@click.command("rerank")
+@click.argument("model", type=str)
+@click.option("--host",
+              type=str,
+              default="localhost",
+              help="Hostname of the server.")
+@click.option("--port", type=int, default=8000, help="Port of the server.")
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+@click.option("--max_batch_size",
+              type=int,
+              default=_LLM_ARGS_FIELDS["max_batch_size"].default,
+              help="Maximum batch size coalesced into a single encode() call.")
+@click.option(
+    "--max_num_tokens",
+    type=int,
+    default=8192,
+    help="Maximum number of batched input tokens in each encode() call.")
+@click.option(
+    "--max_queue_delay",
+    type=click.FloatRange(min=0.0),
+    default=0.005,
+    help="Dynamic-batching hold window in seconds: how long an incoming request "
+    "waits for others to join its batch before being dispatched.")
+@click.option(
+    "--max_queue_size",
+    type=click.IntRange(min=1),
+    default=2048,
+    help="Maximum number of in-flight queued requests; further requests are "
+    "rejected with HTTP 429.")
+@click.option("--trust_remote_code",
+              is_flag=True,
+              default=False,
+              help="Flag for HF transformers.")
+@click.option(
+    "--config",
+    "--extra_llm_api_options",
+    "extra_llm_api_options",
+    type=str,
+    default=None,
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file.")
+@click.option("--hf_revision",
+              "--revision",
+              "revision",
+              type=str,
+              default=None,
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
+@click.option("--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
+@click.option("--telemetry/--no-telemetry",
+              default=True,
+              help="Enable or disable anonymous usage telemetry collection.")
+def serve_rerank(
+    model: str,
+    host: str,
+    port: int,
+    log_level: str,
+    max_batch_size: int,
+    max_num_tokens: int,
+    max_queue_delay: float,
+    max_queue_size: int,
+    trust_remote_code: bool,
+    extra_llm_api_options: Optional[str],
+    revision: Optional[str],
+    metadata_server_config_file: Optional[str],
+    telemetry: bool,
+) -> None:
+    """Run a /rerank, /v1/rerank, and /v2/rerank server.
+
+    MODEL: model name | HF checkpoint path
+    """
+    logger.set_level(log_level)
+    llm_args = _prepare_encode_only_llm_args(
+        model=model,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        extra_llm_api_options=extra_llm_api_options,
+        telemetry=telemetry,
+        server_name="rerank",
+    )
+
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+    launch_rerank_server(host, port, llm_args, max_queue_delay, max_queue_size,
+                         metadata_server_cfg)
 
 
 @click.command("disaggregated")
@@ -2931,6 +3168,12 @@ def set_cuda_device():
     torch.cuda.set_device(device_id)
 
 
+_ATTENTION_TP_MISMATCH = (
+    "the same attention tensor parallelism (tensor_parallel_size, "
+    "or 1 with enable_attention_dp) in context_servers and "
+    "generation_servers")
+
+
 def _drafter_reads_helix_sharded_context(
         decoding_type: Optional[str], attention_backend: Optional[str]) -> bool:
     """Whether a speculative_config's drafter reads a helix-sharded context.
@@ -2940,7 +3183,9 @@ def _drafter_reads_helix_sharded_context(
     return decoding_type == "DSpark" and attention_backend == "CUTEDSL"
 
 
-def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
+def _shared_draft_kv_blocker(server_configs: list[CtxGenServerConfig],
+                             *,
+                             check_attention_tp: bool = True) -> Optional[str]:
     """What keeps the context and generation servers from sharing draft KV, or None.
 
     A config may list only one side: a DWDP context MPI world launches its
@@ -2954,14 +3199,12 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
                 "generation_servers")
     # Ranks hold the same KV heads when their attention TP matches: attention
     # DP keeps every head on each rank.
-    if len({
+    if check_attention_tp and len({
             1 if cfg.other_args.get("enable_attention_dp", False) else
             cfg.other_args.get("tensor_parallel_size", 1)
             for cfg in server_configs
     }) != 1:
-        return ("the same attention tensor parallelism (tensor_parallel_size, "
-                "or 1 with enable_attention_dp) in context_servers and "
-                "generation_servers")
+        return _ATTENTION_TP_MISMATCH
     if any(
             cfg.other_args.get("context_parallel_size", 1) != 1
             for cfg in server_configs
@@ -2994,14 +3237,35 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
         if str(kv_cache.get("dtype", "auto")).lower().startswith("mixed_"):
             return "a uniform KV cache dtype in both sections"
         tokens_per_block = kv_cache.get("tokens_per_block", 32)
-        if spec.get("decoding_type") == "DSpark" and backend == "CUTEDSL":
+        if (spec.get("decoding_type") == "DSpark" and backend == "CUTEDSL"
+                and (tokens_per_block <= 1 or 128 % tokens_per_block)):
             # The CuTe DSL MLA block decode pages by any divisor of 128 above 1.
-            if tokens_per_block <= 1 or 128 % tokens_per_block:
-                return (
-                    "kv_cache_config.tokens_per_block to divide 128 for "
+            return ("kv_cache_config.tokens_per_block to divide 128 for "
                     "DSpark with attention_backend CUTEDSL in both sections")
-        elif tokens_per_block not in (16, 32, 64):
-            return "kv_cache_config.tokens_per_block to be 16, 32, or 64 in both sections"
+    # Each worker's gate reads its drafter's backend, so sections naming
+    # different backends could decide differently (unset is AUTO).
+    if len({(cfg.other_args["speculative_config"].get("decoding_type"),
+             cfg.other_args["speculative_config"].get("attention_backend")
+             or "AUTO")
+            for cfg in server_configs}) != 1:
+        return ("the same speculative_config decoding_type and "
+                "attention_backend in both sections")
+    # Each worker's gate decides which page sizes its drafter reads (a manager
+    # hosting draft layers also reads 128-token pages); equal pages, or pages
+    # every gate admits, keep both workers' decisions the same.
+    page_sizes = {(cfg.other_args.get("kv_cache_config")
+                   or {}).get("tokens_per_block", 32)
+                  for cfg in server_configs}
+    all_cutedsl = all(
+        _drafter_reads_helix_sharded_context(
+            cfg.other_args["speculative_config"].get("decoding_type"),
+            cfg.other_args["speculative_config"].get("attention_backend"))
+        for cfg in server_configs)
+    if len(page_sizes) > 1 and not all_cutedsl and not page_sizes <= {
+            16, 32, 64
+    }:
+        return ("kv_cache_config.tokens_per_block to be equal in both "
+                "sections, or 16, 32, or 64 in both")
     return None
 
 
@@ -3073,7 +3337,22 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
             "TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1":
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
-    if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in (None, "auto"):
+    shared_draft_kv = os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
+    # Left unset, each worker decides: a manager hosting draft layers shares
+    # (its gate compares global KV heads and the peers reshard its views), and
+    # other managers keep a separate draft KV cache. That holds when the sides
+    # differ only in attention TP, and for a one-sided config, whose other side
+    # is launched separately and decides the same way.
+    sides = {cfg.type for cfg in disagg_cfg.server_configs}
+    attention_tp_only = (blocker == _ATTENTION_TP_MISMATCH
+                         and sides == {"ctx", "gen"}
+                         and _shared_draft_kv_blocker(
+                             disagg_cfg.server_configs,
+                             check_attention_tp=False) is None)
+    one_sided = blocker is None and sides != {"ctx", "gen"}
+    if shared_draft_kv == "auto" or (shared_draft_kv is None
+                                     and not attention_tp_only
+                                     and not one_sided):
         resolved = _shared_draft_kv_default(disagg_cfg.server_configs, blocker)
         os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = resolved
         if blocker is not None:
@@ -3089,6 +3368,15 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         logger.info(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV unset or 'auto' resolved to "
             f"'{resolved}': {reason}.")
+    elif shared_draft_kv is None:
+        why = ("the sections differ only in attention tensor parallelism"
+               if attention_tp_only else
+               "the configuration lists only context or only generation "
+               "servers")
+        logger.info(
+            f"TRTLLM_DISAGG_SHARED_DRAFT_KV left unset: {why}, so a manager "
+            "hosting draft layers shares draft KV and other managers keep a "
+            "separate draft KV cache.")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.
@@ -3365,6 +3653,7 @@ main = DefaultGroup(
         # server, and the report of what they collectively contributed to it.
         "mooncake_master": mooncake_master,
         "mooncake_pool_report": mooncake_pool_report,
+        "rerank": serve_rerank,
     })
 
 if __name__ == "__main__":

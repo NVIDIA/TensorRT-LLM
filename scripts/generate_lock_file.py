@@ -222,7 +222,7 @@ if __name__ == "__main__":
         name = project_info["name"]
         author = '"TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"'
         version = project_info["version"]
-        py_version = '">=3.10,<3.13"'
+        py_version = '">=3.12,<3.13"'
         poetry_init_cmd = f'poetry init --no-interaction --name {name} --author {author} --python {py_version}'
         if name == "tensorrt-llm":
             poetry_init_cmd += " -l Apache-2.0"

@@ -69,20 +69,6 @@ def server_devices(count: int) -> str:
     return ",".join(visible.split(",")[: max(count, 1)])
 
 
-def device_memory_used_mib(count: int = 1) -> int | None:
-    """The most memory in use on any of the first ``count`` visible devices (a server's)."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "-i", server_devices(count), "--query-gpu=memory.used",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=30,
-        ).stdout  # fmt: skip
-    except subprocess.TimeoutExpired:
-        return None
-    used = [int(line) for line in out.split() if line.isdigit()]
-    return max(used) if used else None
-
-
 def device_holders(count: int = 1) -> set[int]:
     """Pids that hold memory on the first ``count`` devices this job was given."""
     try:
@@ -186,7 +172,7 @@ def stop_server(
         server.wait()
     stray = holders(world) - before - {os.getpid()}
     if stray and log is not None:
-        log(f"[perf] server left device holders {sorted(stray)}; reaping")
+        log(f"[server] server left device holders {sorted(stray)}; reaping")
     reaped = sorted(set(reap(stray))) if stray else []
     deadline = time.monotonic() + DEVICE_RELEASE_TIMEOUT_S
     while stray and holders(world) & stray and time.monotonic() < deadline:

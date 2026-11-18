@@ -15,9 +15,11 @@
 # the License.
 #
 
-# MoE domain directory. The backend sub-directories own their build targets;
-# everything else here (communication/, loadBalance/, routing/, utils/) compiles
-# into kernels_src, exactly as it did before the move.
+# MoE backend sub-directories own their build targets, except sources built as
+# tllm::kernel_moe_* components in ../kernelComponents.cmake:
+# trtllmGen/DevKernel.cu, communication/fusedMoeCommKernels.cu, and
+# loadBalance/moeLoadBalanceKernels.cu. The remaining sources compile into
+# kernels_src.
 add_subdirectory(cuteDsl) # cute_dsl_src
 add_subdirectory(trtllmGen) # trtllm_gen_fp8_block_scale_moe{,_routing}
 add_subdirectory(loadBalance/dynamicEplb) # moe_dynamic_eplb_src
