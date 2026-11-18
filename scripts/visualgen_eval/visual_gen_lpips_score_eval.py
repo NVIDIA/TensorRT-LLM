@@ -543,24 +543,27 @@ def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
         output_dir.mkdir(parents=True, exist_ok=True)
 
     needs_generation = any(sample["generated_path"] is None for sample in samples)
+    if any(sample["media_type"] == "video" for sample in samples):
+        import cv2  # noqa: F401
+
     visual_gen = None
     default_params = None
-    if needs_generation:
-        if args.model is None:
-            raise ValueError("--model is required when any sample needs generation.")
-        if args.config is None:
-            raise ValueError("--config is required when any sample needs generation.")
-        from tensorrt_llm import VisualGen, VisualGenArgs
-
-        extra_args = VisualGenArgs.from_yaml(args.config)
-        visual_gen = VisualGen(model=resolved_model, args=extra_args)
-        default_params = visual_gen.default_params
-
     lpips_model = _make_lpips_model(lpips_net, lpips_device)
     dataset_dir = args.dataset.resolve().parent
     sample_results = []
     temp_video_dir = tempfile.TemporaryDirectory(prefix="visual_gen_lpips_video_")
     try:
+        if needs_generation:
+            if args.model is None:
+                raise ValueError("--model is required when any sample needs generation.")
+            if args.config is None:
+                raise ValueError("--config is required when any sample needs generation.")
+            from tensorrt_llm import VisualGen, VisualGenArgs
+
+            extra_args = VisualGenArgs.from_yaml(args.config)
+            visual_gen = VisualGen(model=resolved_model, args=extra_args)
+            default_params = visual_gen.default_params
+
         for index, sample in enumerate(samples):
             start_time = time.time()
             media_type = sample["media_type"]

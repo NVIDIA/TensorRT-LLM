@@ -32,6 +32,7 @@ from ..llmapi.llm_utils import update_llm_args_with_extra_dict
 from ..logger import logger, severity_map
 from ..usage import apply_usage_session_config
 from ..usage import config as _telemetry_config
+from ..usage.usage_lib import _mark_visual_gen
 from ._telemetry import TelemetryGroup, apply_raw_config_telemetry_opt_out
 from .utils import collect_explicit_cli_keys
 
@@ -171,20 +172,14 @@ def main(ctx, model: str, tokenizer: Optional[str],
 
     if ctx.invoked_subcommand in (_IMAGE_GENERATION_EVAL_COMMAND,
                                   "video_generation_eval"):
-        if extra_llm_api_options is not None:
-            with open(extra_llm_api_options, 'r') as f:
-                apply_raw_config_telemetry_opt_out(
-                    yaml.safe_load(f),
-                    usage_context=_telemetry_config.UsageContext.CLI_EVAL,
-                    component="llm",
-                    explicit_cli_telemetry="telemetry"
-                    in collect_explicit_cli_keys(),
-                )
+        _mark_visual_gen()
         ctx.obj = {
             "model": model,
             "extra_llm_api_options": extra_llm_api_options,
             "log_level": log_level,
             "telemetry": telemetry,
+            "explicit_cli_telemetry": "telemetry"
+            in collect_explicit_cli_keys(),
         }
         return
 

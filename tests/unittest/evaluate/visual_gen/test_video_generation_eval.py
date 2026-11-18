@@ -29,21 +29,27 @@ def test_reference_paths_resolve_relative_to_yaml(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "config,ids",
+    "config,ids,message",
     [
-        ({"reference_dir": []}, ["fox"]),
-        ({"reference_dir": "missing"}, ["fox"]),
-        ({"reference_dir": "."}, ["fox"]),
-        ({"reference_dir": "."}, ["fox", "fox"]),
-        ({"unknown": 1}, ["fox"]),
+        ({"reference_dir": []}, ["fox"], "reference_dir must be a non-empty"),
+        ({"reference_dir": "missing"}, ["fox"], "reference_dir is not an existing"),
+        ({"reference_dir": "."}, ["fox"], "Missing videos"),
+        ({"reference_dir": "."}, ["fox", "fox"], "Prompt IDs must be unique"),
+        ({"reference_dir": ".", "unknown": 1}, ["fox"], "Unknown LPIPS options"),
     ],
 )
-def test_invalid_reference_config_fails_before_loading_model(tmp_path, config, ids, monkeypatch):
+def test_invalid_reference_config_fails_before_loading_model(
+    tmp_path, config, ids, message, monkeypatch
+):
+    if message != "Missing videos":
+        (tmp_path / "0000.mp4").touch()
+        (tmp_path / "0001.mp4").touch()
+
     def fail(*args):
         raise AssertionError("Must validate before loading LPIPS")
 
     monkeypatch.setattr(evaluators, "LPIPSVideoEvaluator", fail)
-    with pytest.raises(click.BadParameter):
+    with pytest.raises(click.BadParameter, match=message):
         evaluators.build_video_evaluator("lpips", config, tmp_path, ids)
 
 
@@ -60,7 +66,7 @@ def test_cli_generates_scores_and_closes_runtimes(tmp_path, monkeypatch):
     generator = SimpleNamespace(
         generate=lambda **kwargs: [item], close=lambda: closed.append("generator")
     )
-    monkeypatch.setattr(cli, "build_video_evaluator", lambda *args: metric)
+    monkeypatch.setattr(cli, "build_video_evaluator", lambda *args, **kwargs: metric)
     monkeypatch.setattr(cli, "build_visual_generator", lambda *args: (generator, None))
     result = CliRunner().invoke(
         cli.VideoGenerationEval.command,
@@ -217,7 +223,7 @@ def test_script_scoring_preserves_shorter_video_pairing(tmp_path, monkeypatch):
     import torch
 
     script = (
-        Path(__file__).resolve().parents[3]
+        Path(__file__).resolve().parents[4]
         / "scripts/visualgen_eval/visual_gen_lpips_score_eval.py"
     )
     spec = importlib.util.spec_from_file_location("lpips_script", script)
@@ -258,7 +264,7 @@ def test_script_scores_without_importing_trtllm(tmp_path):
     from pathlib import Path
 
     script = (
-        Path(__file__).resolve().parents[3]
+        Path(__file__).resolve().parents[4]
         / "scripts/visualgen_eval/visual_gen_lpips_score_eval.py"
     )
     code = textwrap.dedent("""\
@@ -382,7 +388,7 @@ def test_missing_existing_videos_fail_before_loading_models(tmp_path, monkeypatc
             "--output-dir",
             str(tmp_path / "out"),
         ],
-        obj={},
+        obj={"model": "unused-model"},
     )
     assert result.exit_code == 2, result.output
     assert "generated_dir" in result.output or "Missing videos" in result.output
@@ -421,3 +427,225 @@ def test_other_evaluators_still_require_model():
     result = CliRunner().invoke(root.main, ["image_generation_eval"])
     assert result.exit_code == 2
     assert "--model" in result.output
+
+
+@pytest.mark.parametrize("alias", ["direct", "symlink", "hardlink", "cross_index"])
+def test_generation_cannot_overwrite_references(tmp_path, monkeypatch, alias):
+    references = tmp_path / "reference"
+    references.mkdir()
+    baseline = references / "0000.mp4"
+    baseline.write_bytes(b"baseline")
+    output = tmp_path / "generated"
+    output.mkdir()
+    target = output / "0000.mp4"
+    if alias == "direct":
+        target = baseline
+    elif alias == "symlink":
+        target.symlink_to(baseline)
+    elif alias == "hardlink":
+        target.hardlink_to(baseline)
+    else:
+        target = references / "0001.mp4"
+        target.write_bytes(b"second baseline")
+
+    def fail(*args):
+        raise AssertionError("Must reject overlap before loading LPIPS")
+
+    monkeypatch.setattr(evaluators, "LPIPSVideoEvaluator", fail)
+    ids = ["first", "second"] if alias == "cross_index" else ["first"]
+    with pytest.raises(click.BadParameter, match="would overwrite a reference video"):
+        evaluators.build_video_evaluator(
+            "lpips", {"reference_dir": "reference"}, tmp_path, ids, output_paths=[target]
+        )
+    assert baseline.read_bytes() == b"baseline"
+
+
+def test_existing_video_self_comparison_is_allowed(tmp_path, monkeypatch):
+    path = tmp_path / "0000.mp4"
+    path.touch()
+    monkeypatch.setattr(evaluators, "LPIPSVideoEvaluator", lambda refs, net, device: refs)
+    assert evaluators.build_video_evaluator("lpips", {"reference_dir": "."}, tmp_path, ["0"]) == {
+        "0": path
+    }
+
+
+@pytest.mark.parametrize("value", [0, 1, 2, 128, 255])
+@pytest.mark.parametrize("kind", ["numpy", "pil", "torch"])
+def test_integer_image_normalization(value, kind):
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    from tensorrt_llm.evaluate.visual_gen.lpips import _to_lpips_tensor
+
+    image = np.full((8, 8, 3), value, dtype=np.uint8)
+    if kind == "pil":
+        image = Image.fromarray(image)
+    elif kind == "torch":
+        image = torch.from_numpy(image)
+    result = _to_lpips_tensor(image, "cpu")
+    assert torch.allclose(result, torch.full_like(result, value / 255 * 2 - 1), atol=1e-7)
+
+
+def test_partial_scores_survive_later_failure(tmp_path, monkeypatch):
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("first\nsecond\n")
+    options = tmp_path / "options.yaml"
+    options.write_text("reference_dir: .\ngenerated_dir: .\n")
+    for index in range(2):
+        (tmp_path / f"{index:04d}.mp4").touch()
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "results.json").write_text('{"stale": true}')
+    closed = []
+
+    def evaluate(prompt_id, prompt, path):
+        if prompt_id == "1":
+            raise ValueError("second video failed")
+        return {"lpips": 0.1}
+
+    monkeypatch.setattr(
+        cli,
+        "build_video_evaluator",
+        lambda *args, **kwargs: SimpleNamespace(
+            evaluate=evaluate, close=lambda: closed.append(True)
+        ),
+    )
+    result = CliRunner().invoke(
+        cli.VideoGenerationEval.command,
+        [
+            "--prompts",
+            str(prompts),
+            "--evaluator-options",
+            str(options),
+            "--output-dir",
+            str(output),
+        ],
+        obj={"model": "unused"},
+    )
+    assert result.exit_code != 0
+    assert str(result.exception) == "second video failed"
+    rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["scores"] == {"lpips": 0.1}
+    assert not (output / "results.json").exists()
+    assert closed == [True]
+
+
+@pytest.mark.parametrize("position", ["root", "subcommand"])
+def test_generator_config_is_read_once_and_telemetry_is_consumed(tmp_path, monkeypatch, position):
+    import builtins
+
+    import tensorrt_llm.commands.eval as root
+    import tensorrt_llm.evaluate.visual_gen.generators as generators
+
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("fox\n")
+    options = tmp_path / "options.yaml"
+    options.write_text("reference_dir: .\n")
+    config = tmp_path / "generator.yaml"
+    config.write_text("telemetry_config:\n  disabled: true\ngeneration_params:\n  seed: 123\n")
+    original_open = builtins.open
+    reads = []
+
+    def open_once(path, *args, **kwargs):
+        if str(path) == str(config):
+            reads.append(path)
+            assert len(reads) == 1, "Generator configuration was read twice"
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", open_once)
+    saved = []
+    item = SimpleNamespace(error=None, video=True, save=lambda path: saved.append(path))
+    params = type("Params", (), {"model_fields": {"seed": object()}})()
+    generator = SimpleNamespace(
+        default_params=params, generate=lambda **kwargs: [item], close=lambda: None
+    )
+    monkeypatch.setattr(generators, "VisualGenGeneratorBackend", lambda **kwargs: generator)
+    monkeypatch.setattr(
+        cli,
+        "build_video_evaluator",
+        lambda *args, **kwargs: SimpleNamespace(
+            evaluate=lambda *args: {"lpips": 0.0}, close=lambda: None
+        ),
+    )
+    config_args = ["--config", str(config)]
+    result = CliRunner().invoke(
+        root.main,
+        [
+            "--model",
+            "unused",
+            *(config_args if position == "root" else []),
+            "video_generation_eval",
+            *(config_args if position == "subcommand" else []),
+            "--prompts",
+            str(prompts),
+            "--evaluator-options",
+            str(options),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(reads) == 1 and len(saved) == 1
+    assert params.seed == 123
+
+
+def test_root_config_does_not_break_subcommand_help(tmp_path):
+    import tensorrt_llm.commands.eval as root
+
+    result = CliRunner().invoke(
+        root.main,
+        [
+            "--model",
+            "unused",
+            "--config",
+            str(tmp_path / "missing.yaml"),
+            "video_generation_eval",
+            "--help",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_script_lpips_failure_precedes_generator_initialization(tmp_path, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    import tensorrt_llm
+
+    script = (
+        Path(__file__).resolve().parents[4]
+        / "scripts/visualgen_eval/visual_gen_lpips_score_eval.py"
+    )
+    spec = importlib.util.spec_from_file_location("lpips_script", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module.torch, "use_deterministic_algorithms", lambda *args: None)
+    monkeypatch.setattr(module, "_load_yaml", lambda *args: {})
+    monkeypatch.setattr(module, "_load_json", lambda *args: {})
+    monkeypatch.setattr(
+        module,
+        "_normalize_dataset",
+        lambda *args: ([{"generated_path": None, "media_type": "image"}], None, None, "alex"),
+    )
+    monkeypatch.setattr(module, "_resolve_model", lambda *args: "unused")
+
+    def fail_lpips(*args):
+        raise ImportError("missing LPIPS")
+
+    def fail_generator(*args, **kwargs):
+        pytest.fail("Must load LPIPS before allocating generator")
+
+    monkeypatch.setattr(module, "_make_lpips_model", fail_lpips)
+    monkeypatch.setattr(tensorrt_llm, "VisualGen", fail_generator)
+    args = SimpleNamespace(
+        config=tmp_path / "config.yaml",
+        dataset=tmp_path / "dataset.json",
+        threshold=None,
+        lpips_net=None,
+        model="unused",
+        model_root=None,
+        output_dir=None,
+    )
+    with pytest.raises(ImportError, match="missing LPIPS"):
+        module._evaluate(args)

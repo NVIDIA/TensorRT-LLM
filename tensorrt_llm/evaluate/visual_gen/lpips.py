@@ -34,8 +34,9 @@ def _to_lpips_tensor(image: Any, device: str) -> torch.Tensor:
     if tensor.shape[-1] != 3:
         raise ValueError(f"Expected RGB image with 3 channels, got shape {tuple(tensor.shape)}")
 
+    integer_pixels = not tensor.is_floating_point()
     tensor = tensor.to(device=device, dtype=torch.float32)
-    if tensor.max() > 2.0:
+    if integer_pixels or tensor.max() > 2.0:
         tensor = tensor / 255.0
     tensor = tensor.permute(2, 0, 1).unsqueeze(0)
     return tensor * 2.0 - 1.0

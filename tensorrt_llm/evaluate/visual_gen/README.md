@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Visual generation evaluation
 
 **Table of contents**
@@ -15,7 +18,7 @@
   Its accepted keys depend on the selected evaluator; unknown keys are rejected.
 
 Both commands require `--prompts` and `--output-dir`. The prompt file accepts
-one prompt per line, a JSON list, or JSONL records such as:
+one prompt per line, a JSON list in a file ending in `.json`, or JSONL records such as:
 
 ```json
 {"id": 1, "prompt": "A red fox walking through snow"}
@@ -145,6 +148,9 @@ trtllm-eval --model /path/to/video-model video_generation_eval \
 New videos are saved as `results/generated_videos/0000.mp4`, etc. A supplied
 `generated_dir` is an input directory, not a destination for new generation.
 Both modes write `results.json` and `results.jsonl` under `--output-dir`.
+Completed scores are flushed to `results.jsonl` after each video, so they survive
+a later failure; `results.json` is written only when the entire run succeeds.
+Generation rejects output paths that overlap reference videos.
 
 LPIPS requires the `lpips` and OpenCV packages, plus cached or downloadable
 backbone weights. Generating MP4s also requires an encoder such as FFmpeg.

@@ -510,8 +510,15 @@ class TestSerializedTerminationKinds:
             (False, [], True),
         ],
     )
+    @pytest.mark.parametrize("config_position", ["root", "subcommand"])
     def test_video_eval_yaml_opt_out_before_missing_video(
-        self, tmp_path, captured_exit_payloads, yaml_disabled, cli_flags, expect_report
+        self,
+        tmp_path,
+        captured_exit_payloads,
+        yaml_disabled,
+        cli_flags,
+        expect_report,
+        config_position,
     ):
         from tensorrt_llm.commands.eval import main as eval_main
 
@@ -527,10 +534,10 @@ class TestSerializedTerminationKinds:
                 args=[
                     "--model",
                     "unused",
-                    "--config",
-                    str(config),
+                    *(["--config", str(config)] if config_position == "root" else []),
                     *cli_flags,
                     "video_generation_eval",
+                    *(["--config", str(config)] if config_position == "subcommand" else []),
                     "--prompts",
                     str(prompts),
                     "--evaluator-options",
@@ -542,7 +549,10 @@ class TestSerializedTerminationKinds:
             )
         assert raised.value.code == 2
         if expect_report:
-            assert _captured_terminal_parameters(captured_exit_payloads)["exitCode"] == 2
+            params = _captured_terminal_parameters(captured_exit_payloads)
+            assert params["exitCode"] == 2
+            assert params["errorCategory"] == ""
+            assert (params["priorStartupFailures"], params["startupStateStatus"]) == (0, "")
         else:
             assert captured_exit_payloads == []
 

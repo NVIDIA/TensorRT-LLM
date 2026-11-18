@@ -102,7 +102,12 @@ def ordered_video_paths(directory: Path, count: int) -> list[Path]:
 
 
 def build_video_evaluator(
-    name: str, config: dict, base_dir: Path, prompt_ids: list[str]
+    name: str,
+    config: dict,
+    base_dir: Path,
+    prompt_ids: list[str],
+    *,
+    output_paths: list[Path] | None = None,
 ) -> VideoEvaluator:
     if name != "lpips":
         raise click.BadParameter("Supported video evaluator: lpips", param_hint="--evaluator")
@@ -113,6 +118,19 @@ def build_video_evaluator(
         raise click.BadParameter("Prompt IDs must be unique", param_hint="--prompts")
     directory = resolve_video_directory(config.get("reference_dir"), base_dir, "reference_dir")
     paths = ordered_video_paths(directory, len(prompt_ids))
+    if output_paths is not None:
+        resolved_references = {path.resolve() for path in paths}
+        reference_files = {(path.stat().st_dev, path.stat().st_ino) for path in paths}
+        for path in output_paths:
+            aliases_reference = path.resolve() in resolved_references
+            if path.exists():
+                stat = path.stat()
+                aliases_reference |= (stat.st_dev, stat.st_ino) in reference_files
+            if aliases_reference:
+                raise click.BadParameter(
+                    f"Generated output would overwrite a reference video: {path}",
+                    param_hint="--output-dir",
+                )
     net = config.get("net", "alex")
     device = config.get("device", "cpu")
     if net not in ("alex", "vgg", "squeeze"):
