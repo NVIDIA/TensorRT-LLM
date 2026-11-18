@@ -5,8 +5,9 @@
 ``ops/attention/_k3_fp4_mla_{cache,kernels}`` copy definitions of the FP4 MLA backend modules outside the
 KV-cache-manager contract; ``_k3_fp4_mla_{v_repack,cute_dsl_utils}`` copy whole modules. Copied
 definitions must be AST-identical to their source definitions (imports aside), apart from the explicitly
-listed target-specific divergences. Every name the copies import from the contract modules must exist
-there. Parsing only: no GPU, no imports of the modules.
+listed target-specific divergences and the definitions the family owns (no backend definition matches
+them). Every name the copies import from the contract modules must exist there. Parsing only: no GPU,
+no imports of the modules.
 """
 
 import ast
@@ -52,10 +53,26 @@ INTENTIONAL_DIVERGENCES = {
         "K3 keeps its served context/generation fusion and owns the caller rather "
         "than adopting the backend's new shared-plan workflow wholesale."
     ),
-    "_update_triton_v_packed_cache": (
-        "K3 keeps its served V-cache update and metadata sidecars after the same "
-        "FP4 MLA backend refactor."
-    ),
+}
+# Definitions the K3 targets serve with that no backend source module defines as the family does: the
+# Triton V-packed cache and its repack kernels, the device-side generation page count the repack reads
+# under CUDA graphs, the SM107-only Q-quant fusion gate, and the FP8 context SM check. The family owns
+# them; they are not compared.
+FAMILY_OWNED = {
+    "_fp4_mla_generation_num_blocks_device",
+    "can_fuse_fp4_mla_q_quant",
+    "_v_packed_cache_tag",
+    "_triton_can_prepack_v",
+    "_triton_shared_v_packed_valid_attr",
+    "_triton_v_packed_cache_tag",
+    "_update_triton_v_packed_cache",
+    "_maybe_update_triton_v_packed_cache",
+    "_FP8_CONTEXT_SUPPORTED_SMS",
+    "require_fp4_mla_fp8_context_support",
+    "_fp4_mla_attention_v_repack_kernel",
+    "_fp4_mla_attention_v_repack_pages_kernel",
+    "_fp4_mla_attention_v_repack_pages_dyn_kernel",
+    "fp4_mla_repack_v_cache",
 }
 WHOLE_COPIES = {
     "_k3_fp4_mla_v_repack": "fp4_mla_cutedsl_v_repack",
@@ -110,7 +127,6 @@ def test_copied_definitions_match_their_sources(copy):
     copied = _definitions(_parse(FAMILY / f"{copy}.py"))
     assert copied
     for name, node in copied.items():
-        assert name in sources, f"{copy}.{name} has no source definition"
         if name in ENV_FREE_DEFINITIONS:
             text = ast.unparse(node)
             assert "environ" not in text and "getenv" not in text and "_env_" not in text, (
@@ -119,9 +135,13 @@ def test_copied_definitions_match_their_sources(copy):
             continue
         matches = [
             src
-            for src, src_node in sources[name]
+            for src, src_node in sources.get(name, ())
             if _strip_imports(src_node) == _strip_imports(node)
         ]
+        if name in FAMILY_OWNED:
+            assert not matches, f"{copy}.{name} matches its source in {matches}; compare it again"
+            continue
+        assert name in sources, f"{copy}.{name} has no source definition"
         if name in INTENTIONAL_DIVERGENCES:
             assert not matches, (
                 f"{copy}.{name} now matches the backend's shared-plan signature; remove the explicit exception"

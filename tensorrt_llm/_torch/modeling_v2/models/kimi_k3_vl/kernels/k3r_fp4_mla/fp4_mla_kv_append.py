@@ -43,7 +43,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.metadata import (
     _fp4_mla_generation_hp_page_ids,
-    _fp4_mla_generation_num_blocks_device,
     _fp4_mla_generation_page_ids,
     _fp4_mla_uniform_generation_lengths,
     _materialize_fp4_mla_device_page_table_for_forward,
@@ -55,6 +54,7 @@ from ...ops.attention._fp4_mla_decode import backend_plan_geometry
 
 # The family copies of the FP4 MLA cache-update code outside the KV-cache-manager contract.
 from ...ops.attention._k3_fp4_mla_cache import (
+    _fp4_mla_generation_num_blocks_device,
     _get_cutedsl_persistent_v_packed_cache,
     _get_fp4_mla_v_packed_pool_base,
     _maybe_update_triton_v_packed_cache,

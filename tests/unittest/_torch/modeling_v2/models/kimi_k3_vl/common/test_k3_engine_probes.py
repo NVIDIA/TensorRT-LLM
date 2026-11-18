@@ -141,7 +141,9 @@ def test_routed_experts_tune_the_routing_tile_like_mains_runners():
     the routing tile through the family's copies of main's two CuteDSL outer runners
     (``ops/moe/k3r_experts``). The copies keep main's AutoTuner keys, ``unique_id``, routing tiles
     and tuning config, so a tactic cache written by either serves the other."""
-    from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import CuteDslFc12FusedMoENvfp4Runner
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12.nvfp4 import (
+        CuteDslFc12FusedMoENvfp4Runner,
+    )
     from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoENvfp4Runner
     from tensorrt_llm._torch.utils import ActivationType
 

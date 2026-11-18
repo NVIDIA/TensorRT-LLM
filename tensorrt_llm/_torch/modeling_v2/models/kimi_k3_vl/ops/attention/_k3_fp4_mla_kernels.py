@@ -7,7 +7,8 @@ and V-packed cache repack.
 
 Copied verbatim from ``tensorrt_llm/_torch/attention/backends/fp4_mla/`` (only the imports differ):
 the KV-cache-manager contract modules (config, layout, metadata, packed_plan, state) stay imported.
-``test_modeling_v2_k3_fp4_mla_copies.py`` checks each definition against its source.
+``test_modeling_v2_k3_fp4_mla_copies.py`` checks each definition against its source, except the
+definitions the family owns (listed there).
 """
 
 from typing import Any, Optional

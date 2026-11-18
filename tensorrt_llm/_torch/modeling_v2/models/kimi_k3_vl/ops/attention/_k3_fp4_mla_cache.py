@@ -7,7 +7,8 @@ packed-V cache and FP8 context scratch.
 
 Copied verbatim from ``tensorrt_llm/_torch/attention/backends/fp4_mla/`` (only the imports differ):
 the KV-cache-manager contract modules (config, layout, metadata, packed_plan, state) stay imported.
-``test_modeling_v2_k3_fp4_mla_copies.py`` checks each definition against its source.
+``test_modeling_v2_k3_fp4_mla_copies.py`` checks each definition against its source, except the
+definitions the family owns (listed there).
 """
 
 import copy
@@ -57,7 +58,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.metadata import (
     _fp4_mla_generation_hp_page_ids,
-    _fp4_mla_generation_num_blocks_device,
     _fp4_mla_generation_page_ids,
     _fp4_mla_uniform_generation_lengths,
     _materialize_fp4_mla_device_page_table_for_forward,
@@ -78,6 +78,17 @@ from ._k3_fp4_mla_kernels import (
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+
+def _fp4_mla_generation_num_blocks_device(metadata: Any) -> torch.Tensor:
+    """Device-side scalar view holding the generation page-table capacity.
+
+    ``paged_kv_indptr_decode[num_gen]`` is the fixed-stride generation-table
+    endpoint. Device kernels combine it with the live KV lengths, so inactive
+    slots are never consumed.
+    """
+    num_gen = metadata.num_seqs - metadata.num_contexts
+    return metadata.fp4_mla_state.paged_kv_indptr_decode[num_gen : num_gen + 1]
 
 
 def _validate_fp4_mla_context_rope(
@@ -1522,6 +1533,7 @@ def _update_triton_v_packed_cache(
         _v_packed_shape(kv_cache, v_head_dim, page_size, block_v),
         dtype=torch.uint8,
         device=kv_cache.device,
+        shared=False,
     )
     fp4_mla_repack_v_cache(
         v_packed,
