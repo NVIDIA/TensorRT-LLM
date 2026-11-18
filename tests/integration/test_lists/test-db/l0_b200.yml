@@ -145,10 +145,13 @@ l0_b200:
   - unittest/_torch/kv_cache_compression
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
   - unittest/disaggregated/test_fp4_mla_kv_transfer.py
+  # Locality domains via mock localization: per-domain KV pools on one GPU.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_locality_domains
   - unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py TIMEOUT (60)
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
   - unittest/_torch/modeling/test_glm5_next_contracts.py
   - unittest/_torch/modules/test_mhc.py
+  - unittest/_torch/modules/test_mega_mhc_pipeline.py::test_mega_mhc_pipeline_changed_input_graph[bf16-shifted-many-task-waves]
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
@@ -223,6 +226,9 @@ l0_b200:
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_rmsnorm.py
   - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
+  # GLM-5.3-Flash FP8 modeling_v2 target (sm_100): its operations. The 4-rank boundary matrix runs in
+  # l0_dgx_b200.
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4 --ignore=unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/comm/test_modeling_v2_mhc_ar_boundary.py
   # KDA runtime state-pool and mixed-batch core coverage.
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py

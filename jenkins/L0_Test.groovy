@@ -583,6 +583,8 @@ def timeoutEvidenceFile(String stageName) {
 def clearTimeoutEvidence(String stageName) {
     try {
         sh "rm -f '${timeoutEvidenceFile(stageName)}' || true"
+        // Created by the agent so it stays the owner; the pytest plugin only appends to it.
+        writeFile(file: timeoutEvidenceFile(stageName), text: "")
     } catch (InterruptedException interruptedError) {
         throw interruptedError
     } catch (Exception cleanupError) {
@@ -598,13 +600,23 @@ def retainUnfinishedTimeoutEvidence(String stageName, String llmSrc) {
 
     String unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
     String helper = "${llmSrc}/jenkins/scripts/pytest_timeout_evidence.py"
-    int status = sh(
-        script: "python3 '${helper}' --evidence-file '${evidenceFile}' " +
-            "--unfinished-test-file '${unfinishedTestFile}'",
-        returnStatus: true,
-    )
-    if (status != 0) {
-        echo "Ignorable warning: could not scope timeout evidence before rerunning ${stageName}"
+    try {
+        sh(
+            script: "python3 '${helper}' --evidence-file '${evidenceFile}' " +
+                "--unfinished-test-file '${unfinishedTestFile}'",
+        )
+    } catch (InterruptedException interruptedError) {
+        throw interruptedError
+    } catch (hudson.AbortException scopeError) {
+        boolean ignorable =
+            (scopeError.message ==~ /script returned exit code -?\d+/) &&
+            FailureClassifier.flattenThrowable(scopeError).size() == 1 &&
+            (FailureClassifier.classify(scopeError, InfraFailure.K8S) instanceof UserFailure)
+        if (!ignorable) {
+            throw scopeError
+        }
+        echo "Ignorable warning: could not scope timeout evidence before rerunning ${stageName}: ${scopeError.message}"
+        return
     }
 }
 
@@ -3550,6 +3562,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
                 def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
                 def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
+                def timeoutLogCmd = Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(
+                    "grep -aF -e 'TRTLLM_PYTEST_TIMEOUT ' -e 'TRTLLM_PYTEST_ATTEMPT ' -- '${slurmJobLogPath}' || true"))
                 def watcher = prepareCheckpointWatcher(pipeline, stageName, postTag)
                 try {
                     withEnv(watcher.env + [
@@ -3617,6 +3631,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                                 done
                                 [ "\$_perf_ok" -eq 0 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp perf \$perf_folder failed after 3 attempts"
                             done < <(eval '${sshListPerfCmd}' 2>/dev/null || true)
+                            # Give the final snapshot this job's timeout markers.
+                            [ -f "\$TIMEOUT_EVIDENCE_FILE" ] && ${timeoutLogCmd} >> "\$TIMEOUT_EVIDENCE_FILE"
                             touch "\$PROGRESS_DONE_FILE"
                             wait \$WATCHER_PID
                             exit \$rc
@@ -4309,7 +4325,10 @@ boolean hasBudgetForInfraRetry(def pipeline, String stageName, String scope, Inf
 
 def classifyFailure(def pipeline, Throwable error, String scope, Map retryContext=null)
 {
-    if (error instanceof TrtllmCiException) return FailureClassifier.classify(error, scope)
+    // Interruptions carry their own reasons; do not collect step logs while cancelling.
+    if (error instanceof TrtllmCiException || FailureClassifier.hasInterruption(error)) {
+        return FailureClassifier.classify(error, scope)
+    }
 
     // Reuse evidence only when it was collected for this exact error and classification scope.
     boolean cachedForFailure = retryContext?.failureEvidence != null &&
@@ -4333,11 +4352,12 @@ def preservePrimaryFailure(Throwable primaryError, Closure actions)
 {
     try {
         actions()
-    } catch (InterruptedException e) {
-        throw e
     } catch (Exception e) {
         // Post-processing failures must not replace the failure that triggered them.
-        if (primaryError == null || FailureClassifier.classify(e, InfraFailure.BOTH) instanceof PipelineInterruption) throw e
+        // K8s node removal is secondary; control and unknown interruptions still win.
+        if (primaryError == null || FailureClassifier.classify(e, InfraFailure.K8S) instanceof PipelineInterruption) throw e
+        // Keep agent loss on the primary so outer handlers do not retry on a dead dispatcher.
+        FailureClassifier.attachAgentLoss(primaryError, e)
         echo "[INFRA-RETRY] Secondary failure while handling ${primaryError}:\n${Utils.getStackTrace(e)}"
     }
 }
@@ -5660,6 +5680,8 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
             def watcher = prepareCheckpointWatcher(pipeline, stageName, postTag)
             try {
                 withEnv(watcher.env + [
+                    "TIMEOUT_XML_SCRIPT=${llmSrc}/jenkins/scripts/generate_timeout_xml.py",
+                    "TIMEOUT_INPUT_FINAL=1",
                     "PROGRESS_DONE_FILE=${WORKSPACE}/.rerun${times}-done-${stageName}",
                     "LABEL_PREFIX=rerun${times} checkpoint",
                     "FINAL_LABEL=rerun${times} final snapshot",
@@ -6026,6 +6048,7 @@ def prepareCheckpointWatcher(pipeline, String stageName, String postTag)
         "POST_TAG=${postTag}",
         "PROGRESS_TAR=${progressTar}",
         "PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC}",
+        "TIMEOUT_EVIDENCE_FILE=${timeoutEvidenceFile(stageName)}",
     ]
     for (location in locations) {
         String path = testResultsDirTarget(location, "test-results") + progressTar
@@ -7324,9 +7347,9 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                     runner("", true, null)
                 })
                 return
-            } catch (InterruptedException e) {
-                throw e
             } catch (Exception e) {
+                def c = classifyFailure(pipeline, e, InfraFailure.K8S)
+                if (c instanceof PipelineInterruption) throw e
                 // Once the runner has started, this is an execution failure the
                 // inner retry owns -- honor singleAttempt and do not re-run. But if
                 // the dispatcher pod itself died mid-run, its in-pod cleanup could not
@@ -7334,16 +7357,14 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                 // back on the parent context here, so reconcile them from a fresh
                 // cleanup pod before failing closed.
                 if (attemptPlacementContext.runnerStarted) {
-                    if (slurmDispatcher && isDispatcherPodFailure(e)) {
+                    if (slurmDispatcher && isDispatcherPodFailure(c)) {
                         // Pass this attempt's pod spec explicitly so the finalizer
                         // never depends on the registry entry's podSpec surviving a
                         // prior attempt's deregister.
                         finalizeOrphanedSlurmResource(pipeline, stageName, attemptPodSpec)
                     }
-                    throw e
+                    throw (c instanceof InfraFailure ? c : e)
                 }
-                def c = classifyFailure(pipeline, e, InfraFailure.K8S)
-                if (c instanceof PipelineInterruption) throw e
                 if (!(c instanceof InfraFailure)) {
                     // UserFailure -> don't retry, but leave a trace: a pod/agent
                     // launch exception missing from PATTERN_CATALOG (e.g. a
@@ -7424,9 +7445,6 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                 echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
             }
             return
-        } catch (InterruptedException e) {
-            // User abort / pipeline timeout -- never retry
-            throw e
         } catch (Exception e) {
             // classifyFailure() handles FlowInterruptedException + exit-code-143 +
             // typed throws + originating-step evidence and cause-chain fallback, returning one of

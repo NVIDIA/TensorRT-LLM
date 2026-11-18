@@ -168,7 +168,7 @@ def main():
             timeoutTests = list(dict.fromkeys(line.strip() for line in f if line.strip()))
     except IOError as e:
         print(f"Error reading {full_path}: {e}")
-        return
+        sys.exit(1)
 
     if not timeoutTests:
         print(f"No timeout tests found in {full_path}, skipping timeout XML generation")
