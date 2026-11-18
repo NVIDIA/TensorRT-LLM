@@ -25,6 +25,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBufferMeta,
     build_aux_transfer_layout,
 )
+from tensorrt_llm._torch.disaggregation.native.messenger import FrameSigner
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     AttentionPolicy,
     HNDHeadMismatchMapper,
@@ -635,7 +636,11 @@ def _make_receiver_for_view_validation(
     messengers = {}
 
     def make_messenger(
-        *, mode: str, endpoint: str | None = None, signer=None, identity=None
+        *,
+        mode: str,
+        endpoint: str | None = None,
+        signer: FrameSigner | None = None,
+        identity: str | None = None,
     ) -> Mock:
         messenger = Mock()
         messenger.endpoint = endpoint or "tcp://receiver"

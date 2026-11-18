@@ -4,7 +4,9 @@
 
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Optional
 from unittest.mock import Mock, patch
 
 import pytest
@@ -28,14 +30,14 @@ _TRANSFER_MODULE = "tensorrt_llm._torch.disaggregation.native.transfer"
 _RECEIVER_ENDPOINT = "tcp://127.0.0.1:40100"
 
 
-def test_derived_keys_are_distinct_per_use():
+def test_derived_keys_are_distinct_per_use() -> None:
     rank_info = _derive_native_auth_key(_MASTER_KEY, b"rank-info")
     control = _derive_native_auth_key(_MASTER_KEY, b"control-plane")
     assert len({_MASTER_KEY, rank_info, control}) == 3
     assert rank_info != _derive_native_auth_key(_OTHER_MASTER_KEY, b"rank-info")
 
 
-def test_frame_signer_only_when_key_configured():
+def test_frame_signer_only_when_key_configured() -> None:
     assert _make_native_frame_signer(None) is None
     signer = _make_native_frame_signer(_MASTER_KEY)
     message = [b"KV_AGENT_RESULT"] + signer.sign(
@@ -48,7 +50,7 @@ def test_frame_signer_only_when_key_configured():
         )
 
 
-def _make_receiver(master_key, timeout_s=5.0) -> Receiver:
+def _make_receiver(master_key: Optional[bytes], timeout_s: float = 5.0) -> Receiver:
     receiver = Receiver.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
     receiver._shutdown = True
@@ -66,7 +68,7 @@ def _make_receiver(master_key, timeout_s=5.0) -> Receiver:
 
 
 @contextmanager
-def _rank_info_server(master_key):
+def _rank_info_server(master_key: Optional[bytes]) -> Iterator[RankInfoServer]:
     # Shut down inside the test body: thread-leak checks run before fixture teardown.
     rank_info = Mock(to_bytes=Mock(return_value=b"rank-info"))
     with patch(f"{_TRANSFER_MODULE}.get_local_ip", return_value="127.0.0.1"):
@@ -83,7 +85,7 @@ def _rank_info_server(master_key):
         server.shutdown()
 
 
-def _fetch(receiver, server):
+def _fetch(receiver: Receiver, server: RankInfoServer) -> None:
     receiver._extract_info_endpoint = Mock(return_value=server.endpoint)
     sender_info = Mock(sender_endpoints=[], protocol_version=NATIVE_TRANSFER_PROTOCOL_VERSION)
     with (
@@ -96,7 +98,7 @@ def _fetch(receiver, server):
 
 
 @pytest.mark.parametrize("master_key", [None, _MASTER_KEY])
-def test_rank_info_exchange_over_real_sockets(master_key):
+def test_rank_info_exchange_over_real_sockets(master_key: Optional[bytes]) -> None:
     with _rank_info_server(master_key) as server:
         _fetch(_make_receiver(master_key), server)
 
@@ -112,7 +114,9 @@ def test_rank_info_exchange_over_real_sockets(master_key):
     ],
     ids=["wrong_key", "receiver_unsigned", "server_unsigned"],
 )
-def test_rank_info_exchange_rejects_key_mismatch(receiver_key, server_key, match):
+def test_rank_info_exchange_rejects_key_mismatch(
+    receiver_key: Optional[bytes], server_key: Optional[bytes], match: str
+) -> None:
     receiver = _make_receiver(receiver_key, timeout_s=0.5)
     with _rank_info_server(server_key) as server:
         receiver._extract_info_endpoint = Mock(return_value=server.endpoint)
@@ -121,14 +125,14 @@ def test_rank_info_exchange_rejects_key_mismatch(receiver_key, server_key, match
     assert not receiver._incompatible_peers
 
 
-def _wait_for_auth_failures(server, count, timeout_s=5.0):
+def _wait_for_auth_failures(server: RankInfoServer, count: int, timeout_s: float = 5.0) -> int:
     deadline = time.monotonic() + timeout_s
     while server._messenger.auth_failures < count and time.monotonic() < deadline:
         time.sleep(0.01)
     return server._messenger.auth_failures
 
 
-def test_signed_server_drops_unsigned_rank_info_request():
+def test_signed_server_drops_unsigned_rank_info_request() -> None:
     with _rank_info_server(_MASTER_KEY) as server:
         with ZMQMessenger("DEALER", server.endpoint, signer=None) as unsigned:
             unsigned.send([MessageType.REQUEST_INSTANCE_INFO])
@@ -139,7 +143,7 @@ def test_signed_server_drops_unsigned_rank_info_request():
     server._rank_info.to_bytes.assert_not_called()
 
 
-def test_signed_server_drops_message_without_payload_and_keeps_serving():
+def test_signed_server_drops_message_without_payload_and_keeps_serving() -> None:
     with _rank_info_server(_MASTER_KEY) as server:
         auth_frames = _make_native_frame_signer(_MASTER_KEY).sign(
             [],

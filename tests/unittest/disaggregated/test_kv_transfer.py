@@ -1265,8 +1265,14 @@ WINDOW_SIZE_TEST_CONFIGS = [
     ids=["tp1_pp1_to_tp1_pp1", "tp2_pp1_to_tp1_pp2", "tp2_pp1_dp_to_tp2_pp1_dp"],
 )
 def test_transfer_worker_v2_with_native_auth(
-    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla
-):
+    ctx_tp: int,
+    ctx_pp: int,
+    ctx_enable_dp: bool,
+    gen_tp: int,
+    gen_pp: int,
+    gen_enable_dp: bool,
+    is_mla: bool,
+) -> None:
     """Transfers succeed end to end with signed control messages on every worker."""
     setup = create_transfer_worker_setup(
         ctx_tp=ctx_tp,

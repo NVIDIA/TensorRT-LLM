@@ -6,6 +6,8 @@ import socket
 import threading
 import time
 import unittest
+from collections.abc import Iterator, Mapping, Sequence
+from typing import Any, Optional
 
 import pytest
 from parameterized import parameterized
@@ -13,6 +15,7 @@ from parameterized import parameterized
 from tensorrt_llm._torch.disaggregation.native.messenger import (
     FrameAuthenticationError,
     FrameSigner,
+    SignedHeader,
     ZMQMessenger,
     decode_message,
 )
@@ -158,27 +161,36 @@ def test_zmq_messenger_double_start_listener(dynamic_endpoint):
 _KEY = b"0123456789abcdef0123456789abcdef"
 _OTHER_KEY = b"fedcba9876543210fedcba9876543210"
 _CONTEXT = b"trtllm-test-ctl-v1\0"
+_MessengerPair = tuple[ZMQMessenger, ZMQMessenger]
 
 
-def _signer(keys=None, active_key_id=1, context=_CONTEXT):
+def _signer(
+    keys: Optional[Mapping[int, bytes]] = None,
+    active_key_id: int = 1,
+    context: bytes = _CONTEXT,
+) -> FrameSigner:
     return FrameSigner(keys or {1: _KEY}, active_key_id, context)
 
 
-def _signed(frames, signer=None, **kwargs):
-    params = {
-        "sender_id": b"sender",
-        "recipient_id": b"recipient",
-        "flow": FrameSigner.FLOW_TO_ROUTER,
-        **kwargs,
-    }
-    return list(frames) + (signer or _signer()).sign(list(frames), **params)
+def _signed(frames: list[bytes], signer: Optional[FrameSigner] = None) -> list[bytes]:
+    return list(frames) + (signer or _signer()).sign(
+        list(frames),
+        sender_id=b"sender",
+        recipient_id=b"recipient",
+        flow=FrameSigner.FLOW_TO_ROUTER,
+    )
 
 
-def _verify(message, signer=None, recipient_id=b"recipient", flow=FrameSigner.FLOW_TO_ROUTER):
+def _verify(
+    message: list[bytes],
+    signer: Optional[FrameSigner] = None,
+    recipient_id: bytes = b"recipient",
+    flow: int = FrameSigner.FLOW_TO_ROUTER,
+) -> tuple[list[bytes], SignedHeader]:
     return (signer or _signer()).verify(message, recipient_id=recipient_id, flow=flow)
 
 
-def test_frame_signer_round_trip():
+def test_frame_signer_round_trip() -> None:
     payload, header = _verify(_signed([b"KV_AGENT_RESULT", b"prefix", b""]))
     assert payload == [b"KV_AGENT_RESULT", b"prefix", b""]
     assert header.sender_id == b"sender"
@@ -187,14 +199,14 @@ def test_frame_signer_round_trip():
 
 
 @pytest.mark.parametrize("index", [0, 1, 2])
-def test_frame_signer_rejects_modified_payload(index):
+def test_frame_signer_rejects_modified_payload(index: int) -> None:
     message = _signed([b"AUX_AGENT_RESULT", b"1", b"23"])
     message[index] += b"x"
     with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
         _verify(message)
 
 
-def test_frame_signer_rejects_shifted_frame_boundary():
+def test_frame_signer_rejects_shifted_frame_boundary() -> None:
     # Plain concatenation of both payloads is b"AUX123OK"; the length prefixes
     # are what keep rank 1 / rid 23 from being re-cut into rank 12 / rid 3.
     message = _signed([b"AUX", b"1", b"23", b"OK"])
@@ -203,7 +215,7 @@ def test_frame_signer_rejects_shifted_frame_boundary():
         _verify(shifted)
 
 
-def test_frame_signer_rejects_dropped_or_appended_frames():
+def test_frame_signer_rejects_dropped_or_appended_frames() -> None:
     message = _signed([b"KV_AGENT_RESULT", b"prefix", b"dst", b"sizes"])
     with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
         _verify(message[:2] + message[-2:])
@@ -221,19 +233,21 @@ def test_frame_signer_rejects_dropped_or_appended_frames():
     ],
     ids=["wrong_key", "wrong_context", "wrong_recipient", "other_flow"],
 )
-def test_frame_signer_rejects_mismatched_verifier(verifier_kwargs, match):
+def test_frame_signer_rejects_mismatched_verifier(
+    verifier_kwargs: dict[str, Any], match: str
+) -> None:
     with pytest.raises(FrameAuthenticationError, match=match):
         _verify(_signed([b"REQUEST_DATA", b"info", b"token"]), **verifier_kwargs)
 
 
-def test_frame_signer_rejects_rewritten_header_fields():
+def test_frame_signer_rejects_rewritten_header_fields() -> None:
     message = _signed([b"CANCEL_SESSION", b"1234"])
     message[-2] = message[-2][: -len(b"sender")] + b"SENDER"
     with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
         _verify(message)
 
 
-def test_frame_signer_rejects_malformed_auth_frames():
+def test_frame_signer_rejects_malformed_auth_frames() -> None:
     header, mac = _signed([b"TAG"])[-2:]
     for message in (
         [b"TAG"],
@@ -245,7 +259,7 @@ def test_frame_signer_rejects_malformed_auth_frames():
             _verify(message)
 
 
-def test_frame_signer_rejects_message_without_payload():
+def test_frame_signer_rejects_message_without_payload() -> None:
     with pytest.raises(FrameAuthenticationError, match="no payload"):
         _verify(_signed([]))
 
@@ -264,7 +278,7 @@ def test_frame_signer_rejects_frame_of_4_gib() -> None:
         _verify(message)
 
 
-def test_frame_signer_rotation_accepts_every_configured_key():
+def test_frame_signer_rotation_accepts_every_configured_key() -> None:
     old = _signer({1: _KEY}, 1)
     rolling = _signer({1: _KEY, 2: _OTHER_KEY}, 2)
     new = _signer({2: _OTHER_KEY}, 2)
@@ -285,21 +299,21 @@ def test_frame_signer_rotation_accepts_every_configured_key():
         ({"keys": {1: _KEY}, "active_key_id": 1, "context": b""}, "non-empty context"),
     ],
 )
-def test_frame_signer_rejects_invalid_configuration(kwargs, match):
+def test_frame_signer_rejects_invalid_configuration(kwargs: dict[str, Any], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         FrameSigner(**{"context": _CONTEXT, **kwargs})
 
 
-def test_frame_signer_repr_omits_key_material():
+def test_frame_signer_repr_omits_key_material() -> None:
     assert "0123456789abcdef" not in repr(_signer())
 
 
-def test_messenger_requires_explicit_signer_choice():
+def test_messenger_requires_explicit_signer_choice() -> None:
     with pytest.raises(TypeError):
         ZMQMessenger("ROUTER", "tcp://127.0.0.1:*")
 
 
-def test_signed_messenger_validates_mode_and_dealer_identity():
+def test_signed_messenger_validates_mode_and_dealer_identity() -> None:
     with pytest.raises(ValueError, match="only ROUTER and DEALER"):
         ZMQMessenger("REP", "tcp://127.0.0.1:*", signer=_signer())
     with pytest.raises(ValueError, match="identity"):
@@ -307,7 +321,7 @@ def test_signed_messenger_validates_mode_and_dealer_identity():
 
 
 @pytest.fixture
-def signed_pair():
+def signed_pair() -> Iterator[_MessengerPair]:
     signer = _signer()
     router = ZMQMessenger("ROUTER", "tcp://127.0.0.1:*", signer=signer)
     dealer = ZMQMessenger(
@@ -318,7 +332,7 @@ def signed_pair():
     router.stop()
 
 
-def test_signed_router_dealer_round_trip(signed_pair):
+def test_signed_router_dealer_round_trip(signed_pair: _MessengerPair) -> None:
     router, dealer = signed_pair
     dealer.send([b"REQUEST_INSTANCE_INFO"])
     routing_id, request = router.receive(timeout_ms=1000)
@@ -329,15 +343,15 @@ def test_signed_router_dealer_round_trip(signed_pair):
     assert dealer.receive(timeout_ms=1000) == [b"second"]
 
 
-def test_signed_router_refuses_reply_to_unauthenticated_peer(signed_pair):
+def test_signed_router_refuses_reply_to_unauthenticated_peer(signed_pair: _MessengerPair) -> None:
     router, _ = signed_pair
     with pytest.raises(FrameAuthenticationError, match="No authenticated peer"):
         router.send([b"unknown-routing-id", b"reply"])
 
 
 def test_signed_router_bounds_reply_targets_and_adds_them_after_verification(
-    signed_pair, monkeypatch
-):
+    signed_pair: _MessengerPair, monkeypatch: pytest.MonkeyPatch
+) -> None:
     router, dealer = signed_pair
     monkeypatch.setattr(ZMQMessenger, "_MAX_PEER_IDS", 2)
     with ZMQMessenger("DEALER", router.endpoint, signer=None) as unsigned:
@@ -346,7 +360,7 @@ def test_signed_router_bounds_reply_targets_and_adds_them_after_verification(
             router.receive(timeout_ms=1000)
     assert not router._peer_ids
 
-    def request_from(sender):
+    def request_from(sender: ZMQMessenger) -> bytes:
         sender.send([b"REQUEST_INSTANCE_INFO"])
         return router.receive(timeout_ms=1000)[0]
 
@@ -372,7 +386,9 @@ def test_signed_router_bounds_reply_targets_and_adds_them_after_verification(
         assert third.receive(timeout_ms=1000) == [b"reply"]
 
 
-def test_signed_listener_drops_messages_failing_verification_and_keeps_running(signed_pair):
+def test_signed_listener_drops_messages_failing_verification_and_keeps_running(
+    signed_pair: _MessengerPair,
+) -> None:
     router, dealer = signed_pair
     received = []
     router.start_listener(received.append)
@@ -402,7 +418,9 @@ def test_signed_listener_drops_messages_failing_verification_and_keeps_running(s
     assert listener_alive
 
 
-def test_signed_dealer_rejects_reply_for_other_recipient_or_from_other_peer(signed_pair):
+def test_signed_dealer_rejects_reply_for_other_recipient_or_from_other_peer(
+    signed_pair: _MessengerPair,
+) -> None:
     router, dealer = signed_pair
     signer = _signer()
     router_id = router.endpoint.encode()
@@ -424,7 +442,7 @@ def test_signed_dealer_rejects_reply_for_other_recipient_or_from_other_peer(sign
         dealer._verify(from_other)
 
 
-def test_signed_dealer_rejects_repeated_reply(signed_pair):
+def test_signed_dealer_rejects_repeated_reply(signed_pair: _MessengerPair) -> None:
     router, dealer = signed_pair
     reply = [b"reply"] + _signer().sign(
         [b"reply"],
@@ -440,7 +458,13 @@ def test_signed_dealer_rejects_repeated_reply(signed_pair):
     assert dealer.replays_rejected == 1
 
 
-def _raw_signed(router, seq, stream_id, payload=(b"TAG",), sender_id=b"tcp://127.0.0.1:40009"):
+def _raw_signed(
+    router: ZMQMessenger,
+    seq: int,
+    stream_id: bytes,
+    payload: Sequence[bytes] = (b"TAG",),
+    sender_id: bytes = b"tcp://127.0.0.1:40009",
+) -> list[bytes]:
     payload = list(payload)
     return payload + _signer().sign(
         payload,
@@ -453,7 +477,7 @@ def _raw_signed(router, seq, stream_id, payload=(b"TAG",), sender_id=b"tcp://127
 
 
 @pytest.fixture
-def replay_router():
+def replay_router() -> Iterator[_MessengerPair]:
     router = ZMQMessenger("ROUTER", "tcp://127.0.0.1:*", signer=_signer())
     raw = ZMQMessenger("DEALER", router.endpoint, signer=None)
     yield router, raw
@@ -461,7 +485,7 @@ def replay_router():
     router.stop()
 
 
-def test_replay_rejects_repeated_and_older_seq(replay_router):
+def test_replay_rejects_repeated_and_older_seq(replay_router: _MessengerPair) -> None:
     router, raw = replay_router
     stream_id = os.urandom(16)
     message = _raw_signed(router, seq=5, stream_id=stream_id)
@@ -475,7 +499,7 @@ def test_replay_rejects_repeated_and_older_seq(replay_router):
     assert router.replays_rejected == 2
 
 
-def test_replay_accepts_gaps_and_new_stream_ids(replay_router):
+def test_replay_accepts_gaps_and_new_stream_ids(replay_router: _MessengerPair) -> None:
     router, raw = replay_router
     first, restarted = os.urandom(16), os.urandom(16)
     for seq, stream_id in ((5, first), (9, first), (1, restarted)):
@@ -484,7 +508,9 @@ def test_replay_accepts_gaps_and_new_stream_ids(replay_router):
     assert router.replays_rejected == 0
 
 
-def test_replay_state_is_bounded_and_keeps_recently_used_streams(replay_router, monkeypatch):
+def test_replay_state_is_bounded_and_keeps_recently_used_streams(
+    replay_router: _MessengerPair, monkeypatch: pytest.MonkeyPatch
+) -> None:
     router, raw = replay_router
     monkeypatch.setattr(ZMQMessenger, "_MAX_REPLAY_STATE", 2)
     first, second, third = (os.urandom(16) for _ in range(3))
@@ -501,7 +527,7 @@ def test_replay_state_is_bounded_and_keeps_recently_used_streams(replay_router, 
     assert router.receive(timeout_ms=1000)[1:] == [b"TAG"]
 
 
-def test_replay_state_survives_a_rewritten_sender_id(replay_router):
+def test_replay_state_survives_a_rewritten_sender_id(replay_router: _MessengerPair) -> None:
     # A message whose sender_id was changed after signing fails the MAC check.
     router, raw = replay_router
     message = _raw_signed(router, seq=5, stream_id=os.urandom(16))
@@ -514,12 +540,12 @@ def test_replay_state_survives_a_rewritten_sender_id(replay_router):
         router.receive(timeout_ms=1000)
 
 
-def test_listener_drops_replayed_message_and_keeps_running(replay_router):
+def test_listener_drops_replayed_message_and_keeps_running(replay_router: _MessengerPair) -> None:
     router, raw = replay_router
     received = []
     arrived = threading.Event()
 
-    def on_message(frames):
+    def on_message(frames: list[bytes]) -> None:
         received.append(frames[1:])
         if len(received) == 2:
             arrived.set()
@@ -541,7 +567,7 @@ def test_listener_drops_replayed_message_and_keeps_running(replay_router):
     assert router.auth_failures == 1
 
 
-def test_shared_signed_dealer_keeps_seq_order_across_threads():
+def test_shared_signed_dealer_keeps_seq_order_across_threads() -> None:
     signer = _signer()
     with ZMQMessenger("ROUTER", "tcp://127.0.0.1:*", signer=signer) as router:
         with ZMQMessenger(
@@ -551,7 +577,7 @@ def test_shared_signed_dealer_keeps_seq_order_across_threads():
             # send lock threads interleave seq assignment and socket writes.
             threads, per_thread, blob = 8, 50, bytes(64 * 1024)
 
-            def worker(index):
+            def worker(index: int) -> None:
                 for i in range(per_thread):
                     dealer.send([b"T", f"{index}-{i}".encode(), blob])
 

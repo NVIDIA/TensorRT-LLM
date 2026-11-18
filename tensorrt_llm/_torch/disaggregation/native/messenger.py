@@ -176,7 +176,23 @@ class FrameSigner:
         seq: int = 0,
         stream_id: bytes = bytes(STREAM_ID_SIZE),
     ) -> list[bytes]:
-        """Return the ``[header, mac]`` frames to append to ``frames``."""
+        """Return the ``[header, mac]`` frames to append to ``frames``.
+
+        Args:
+            frames: Payload frames of the message, in the order they are sent.
+            sender_id: Id of the sending component. It is sent in the header,
+                which the MAC covers.
+            recipient_id: Id of the component the message is for. It is covered
+                by the MAC and not sent; the verifier supplies its own id.
+            flow: ``FLOW_TO_ROUTER`` or ``FLOW_TO_DEALER``.
+            seq: Number of the message within ``stream_id``. ``ZMQMessenger``
+                passes a per-socket counter that starts at 1. With the default
+                of 0 on every message, a ``ZMQMessenger`` accepts only the
+                first message of a (sender id, stream id) pair.
+            stream_id: ``STREAM_ID_SIZE`` bytes that identify the sending
+                socket. ``ZMQMessenger`` passes a random value drawn once per
+                socket. The default is all zero bytes.
+        """
         if len(stream_id) != self.STREAM_ID_SIZE:
             raise ValueError(f"stream_id must be {self.STREAM_ID_SIZE} bytes")
         header = (
@@ -192,6 +208,13 @@ class FrameSigner:
         self, frames: list[bytes], *, recipient_id: bytes, flow: int
     ) -> tuple[list[bytes], SignedHeader]:
         """Verify ``[*payload, header, mac]`` and return the payload and header.
+
+        Args:
+            frames: The received message without any ROUTER routing id frame.
+            recipient_id: Id of the verifying component. The MAC matches only
+                when the signer passed the same value.
+            flow: The flow this socket receives on, ``FLOW_TO_ROUTER`` or
+                ``FLOW_TO_DEALER``.
 
         Raises:
             FrameAuthenticationError: The message is malformed, has no payload

@@ -3214,7 +3214,7 @@ class Receiver(ReceiverBase):
         rank_info_auth_key: Optional[bytes] = None,
         rank_info_timeout_s: float = _FALLBACK_TX_OVERALL_TIMEOUT_S,
         frame_signer: Optional[FrameSigner] = None,
-    ):
+    ) -> None:
         self._registrar = peer_registrar
         self._agent = agent
         self._enforce_physical_ownership = enforce_physical_ownership
@@ -4781,7 +4781,7 @@ class RankInfoServer:
         port: Optional[int] = None,
         rank_info_auth_key: Optional[bytes] = None,
         frame_signer: Optional[FrameSigner] = None,
-    ):
+    ) -> None:
         self._rank_info = rank_info
         self._rank_info_auth_key = _validate_native_auth_key(rank_info_auth_key)
         self._rank_info_auth_challenges: OrderedDict[bytes, tuple[bytes, float]] = OrderedDict()
