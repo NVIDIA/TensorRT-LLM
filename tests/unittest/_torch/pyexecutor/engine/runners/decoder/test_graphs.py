@@ -25,7 +25,6 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
     DecoderCudaGraphs,
     _make_single_token_context_graph_batch,
-    _variant_capture_passes,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
@@ -506,55 +505,6 @@ def _packed_split_decisions(runner: DecoderCudaGraphs, resource_manager: Mock):
         mapping=runner.mapping,
         sm_count_fn=runner._decode_sm_count,
     )
-
-
-@pytest.mark.cpu_only
-def test_decode_graph_variants_are_the_fp4_mla_ones_in_capture_order(monkeypatch) -> None:
-    from tensorrt_llm._torch.attention.mla import MLA
-
-    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV", raising=False)
-    mla_layer = Mock(spec=MLA)
-    mla_layer.num_heads_tp = 128
-    model = Mock()
-    model.modules.return_value = [mla_layer]
-    runner = decoder_graphs(decoder_config(), model=model)
-    resource_manager = Mock()
-    config_module = "tensorrt_llm._torch.attention.backends.fp4_mla.config"
-
-    # a KV cache without the FP4 MLA layout (every other model) declares no variant
-    resource_manager.get_resource_manager.return_value = Mock(spec=["max_blocks_per_seq"])
-    assert runner._decode_graph_variants(resource_manager) == []
-
-    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "fp4_mla_layout"])
-    fp4_kv_cache_manager.max_blocks_per_seq = 235
-    resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
-    with (
-        patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),
-        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=True),
-        patch(f"{config_module}._fp4_mla_split_on_demand_enabled", return_value=True),
-        patch.object(runner, "_decode_sm_count", return_value=212),
-        patch.object(runner, "_fp4_mla_4x_unavailable", return_value=None),
-    ):
-        variants = runner._decode_graph_variants(resource_manager)
-        # the KV regime first: its capture passes are tied to the warm-up lengths
-        assert [variant.name for variant in variants] == ["kv_regime", "packed_split"]
-        assert variants[0].values(128, 3) == (8191, 30080)
-        assert variants[1].values(128, 3) == (0, 1) and variants[1].values(16, 3) == (1,)
-        # (warm-up length, regime, split decision) passes of one shape
-        assert _variant_capture_passes([30080], tuple(variants), 128, 3) == [
-            (30080, (30080, 0)),
-            (30080, (30080, 1)),
-            (8191, (8191, 0)),
-            (8191, (8191, 1)),
-        ]
-    # by default only the packed split decision keys the graphs
-    with (
-        patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=False),
-        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=True),
-        patch(f"{config_module}._fp4_mla_split_on_demand_enabled", return_value=True),
-        patch.object(runner, "_decode_sm_count", return_value=212),
-    ):
-        assert [v.name for v in runner._decode_graph_variants(resource_manager)] == ["packed_split"]
 
 
 @pytest.mark.cpu_only

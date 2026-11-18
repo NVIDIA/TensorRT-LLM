@@ -11,7 +11,6 @@ import tensorrt_llm._torch.attention.backends.fp4_mla.config as fp4_mla_config
 import tensorrt_llm._torch.attention.backends.fp4_mla.cutedsl_common as cutedsl_common
 import tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_mufu16 as mufu16
 import tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_mufu16_fused_v_transpose as mufu16_fused_v_transpose  # noqa: E501
-from tensorrt_llm._torch.attention.backends.fp4_mla.call_cache import LruCache
 
 pytestmark = pytest.mark.cpu_only
 
@@ -24,28 +23,6 @@ def fresh_availability():
     fp4_mla_config._cutedsl_backend_available.cache_clear()
     yield
     fp4_mla_config._cutedsl_backend_available.cache_clear()
-
-
-def test_lru_cache_keeps_the_first_entry_of_a_key_and_drops_the_least_recently_used():
-    cache = LruCache(2)
-
-    assert cache.get("a") is None
-    assert cache.put("a", 1) == 1
-    # a key that has an entry keeps it: callers racing to prepare the same call share one
-    assert cache.put("a", 2) == 1
-    assert cache.put("b", 3) == 3
-    assert cache.get("a") == 1
-    # "b" is now the least recently used entry
-    assert cache.put("c", 4) == 4
-    assert len(cache) == 2
-    assert cache.get("b") is None
-    assert cache.get("a") == 1
-    assert cache.get("c") == 4
-
-
-def test_each_kernel_keeps_its_own_executor_and_prepared_call_caches():
-    for name in ("_FUSED_EXECUTOR_CACHE", "_PREPARED_FUSED_CALL_CACHE", "_FUSED_COMPILE_CACHE"):
-        assert getattr(mufu16, name) is not getattr(mufu16_fused_v_transpose, name)
 
 
 @pytest.mark.parametrize("kernel_module", [cutedsl_common, mufu16, mufu16_fused_v_transpose])

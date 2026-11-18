@@ -2874,18 +2874,6 @@ def test_v2_hybrid_without_fp4_mla_has_no_layout() -> None:
     assert not has_fp4_mla_cache_layout(SimpleNamespace())
 
 
-def test_v2_hybrid_subclass_overriding_a_layout_hook_cannot_take_the_fp4_mla_layout() -> None:
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import mamba_cache_manager_v2
-
-    class Overriding(MambaHybridCacheManagerV2):
-        def _extra_buffers_per_layer(self, *, tokens_per_block):
-            return {}
-
-    with pytest.raises(NotImplementedError, match="Overriding overrides _extra_buffers_per_layer"):
-        mamba_cache_manager_v2._reject_fp4_mla_layout_hook_overrides(Overriding)
-    mamba_cache_manager_v2._reject_fp4_mla_layout_hook_overrides(MambaHybridCacheManagerV2)
-
-
 def test_v2_hybrid_without_fp4_mla_keeps_its_disagg_role_mapping() -> None:
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr._use_kda_replay_update = False

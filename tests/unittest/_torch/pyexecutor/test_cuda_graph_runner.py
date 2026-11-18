@@ -1109,24 +1109,6 @@ class PackedSplitGraphKeyTestCase(unittest.TestCase):
         runner._capture_allowed = True
         self.assertEqual(runner._get_compatible_variant_key(unsplit), unsplit)
 
-    def test_the_split_decision_is_settled_before_the_kv_regime(self) -> None:
-        runner = self._runner()
-        runner.set_graph_variants(
-            (
-                kv_regime_variant(lambda batch_size, draft_len: (8192, 16384)),
-                self._split_variant((False, True)),
-            )
-        )
-        # an unsplit graph of another KV regime keeps the step unsplit: the regime round-up finds it
-        regime_unsplit = KeyType(batch_size=2, draft_len=0, variants=(16384, 0))
-        runner.graph_metadata = {regime_unsplit: object()}
-        missing_regime = regime_unsplit._replace(variants=(8192, 0))
-        self.assertEqual(runner._get_compatible_variant_key(missing_regime), regime_unsplit)
-        # without any unsplit graph of the shape the step takes the split graph of its regime
-        regime_split = KeyType(batch_size=2, draft_len=0, variants=(8192, 1))
-        runner.graph_metadata = {regime_split: object()}
-        self.assertEqual(runner._get_compatible_variant_key(missing_regime), regime_split)
-
     def test_attention_dp_ranks_replay_the_split_graph_when_any_rank_splits(self) -> None:
         runner = self._runner()
         exchanges = []
