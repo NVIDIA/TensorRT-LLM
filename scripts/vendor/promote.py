@@ -962,12 +962,8 @@ def _local_lock_document(worktree: Path, lock: str, revision: str | None = None)
 
 
 def _diff_paths(worktree: Path, *args: str) -> set[str]:
-    paths = _run(
-        ["git", "diff", "--name-only", "--no-renames", "-z", *args, "--"],
-        cwd=worktree,
-        binary_output=True,
-        strip=False,
-    )
+    # NUL-separated output keeps Git from quoting non-ASCII paths (core.quotePath).
+    paths = _git(worktree, "diff", "--name-only", "--no-renames", "-z", *args, "--")
     return {path for path in paths.split("\0") if path}
 
 

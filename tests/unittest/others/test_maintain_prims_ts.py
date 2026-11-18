@@ -36,6 +36,7 @@ b = importlib.import_module(f"{_SPEC.name}.bot")
 _VENDOR = "example-vendor"
 _CONSUMER = "NVIDIA/TensorRT-LLM"
 _UPSTREAM = "flashinfer-ai/flashinfer"
+# A non-ASCII scope: Git quotes such paths unless its output is NUL-separated.
 _SCOPED_LOCK = "models/démo/3rdparty/vendor_sources.lock.yaml"
 
 pytestmark = pytest.mark.cpu_only
