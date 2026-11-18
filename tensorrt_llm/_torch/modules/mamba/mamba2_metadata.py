@@ -14,8 +14,9 @@
 # limitations under the License.
 
 import contextlib
+import itertools
 import math
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 import triton
@@ -23,26 +24,40 @@ import triton.language as tl
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.modules.fla.flashinfer_chunk import \
+    invalidate_int32_cu_seqlens_cache
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
+
+if TYPE_CHECKING:
+    from .gdn_mixer import GdnIterationContext
 
 REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
 REPLAY_WORK_CACHE_SLOT = 1
 REPLAY_WORK_PNAT = 2
 REPLAY_WORK_CACHE_BUF_IDX = 3
-REPLAY_WORK_ITEM_WIDTH = 4
+REPLAY_WORK_REPLAY_SLOT = 4
+REPLAY_WORK_ITEM_WIDTH = 5
 _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE = 256
 
 
-@triton.jit
+# Neither the decode count nor the alignment of the decode slices of the state
+# and replay slots (they start after the step's context requests) is
+# specialized: a mixed step would otherwise reach a new variant, and compile
+# it, while serving.
+@triton.jit(do_not_specialize=["num_decodes"],
+            do_not_specialize_on_alignment=["state_indices", "replay_indices"])
 def _prepare_gdn_replay_work_items_kernel(
     state_indices,
+    replay_indices,
     prev_num_accepted_tokens,
     cache_buf_idx,
     work_items,
     n_writes_output,
     num_decodes,
+    stride_pnat,
+    stride_cache_buf_idx,
     replay_step_width: tl.constexpr,
     replay_history_size: tl.constexpr,
     work_item_width: tl.constexpr,
@@ -50,14 +65,20 @@ def _prepare_gdn_replay_work_items_kernel(
     cache_slot_field: tl.constexpr,
     pnat_field: tl.constexpr,
     cache_buf_idx_field: tl.constexpr,
+    replay_slot_field: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Build the write-first GDN replay partition in one launch."""
     offsets = tl.arange(0, BLOCK_SIZE)
     active = offsets < num_decodes
     slots = tl.load(state_indices + offsets, mask=active, other=0)
-    pnat = tl.load(prev_num_accepted_tokens + slots, mask=active, other=0)
-    active_buffer = tl.load(cache_buf_idx + slots, mask=active, other=0)
+    replay_slots = tl.load(replay_indices + offsets, mask=active, other=0)
+    pnat = tl.load(prev_num_accepted_tokens + replay_slots * stride_pnat,
+                   mask=active,
+                   other=0)
+    active_buffer = tl.load(cache_buf_idx + replay_slots * stride_cache_buf_idx,
+                            mask=active,
+                            other=0)
     writes = active & (pnat + replay_step_width > replay_history_size)
     writes_i32 = writes.to(tl.int32)
     inclusive_write_offsets = tl.cumsum(writes_i32, axis=0)
@@ -71,26 +92,43 @@ def _prepare_gdn_replay_work_items_kernel(
     tl.store(output_base + cache_slot_field, slots, mask=active)
     tl.store(output_base + pnat_field, pnat, mask=active)
     tl.store(output_base + cache_buf_idx_field, active_buffer, mask=active)
+    tl.store(output_base + replay_slot_field, replay_slots, mask=active)
     tl.store(n_writes_output, n_writes)
 
 
-def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
-                                    cache_buf_idx, work_items, n_writes,
-                                    replay_step_width, replay_history_size):
+def _build_replay_work_items_triton(state_indices,
+                                    prev_num_accepted_tokens,
+                                    cache_buf_idx,
+                                    work_items,
+                                    n_writes,
+                                    replay_step_width,
+                                    replay_history_size,
+                                    replay_indices=None):
     """Single-launch build of the write-first replay partition.
 
-    Interchangeable with :func:`_build_replay_work_items_torch`; the caller
-    picks between them. Kept to one CTA because the write-first offsets come
-    from an in-block ``tl.cumsum``.
+    Interchangeable with :func:`_build_replay_work_items_torch` for up to
+    ``_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE`` decodes; the caller picks
+    between them. Kept to one CTA because the write-first offsets come from an
+    in-block ``tl.cumsum``. The block always spans the largest batch and the
+    kernel specializes neither on the decode count nor on the alignment of
+    ``state_indices``, so one compiled kernel serves every batch and offset.
+    PNAT and the active buffer are read at ``replay_indices``, which default
+    to ``state_indices``.
     """
+    if replay_indices is None:
+        replay_indices = state_indices
     num_decodes = state_indices.shape[0]
+    assert num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE
     _prepare_gdn_replay_work_items_kernel[(1, )](
         state_indices,
+        replay_indices,
         prev_num_accepted_tokens,
         cache_buf_idx,
         work_items,
         n_writes,
         num_decodes,
+        prev_num_accepted_tokens.stride(0),
+        cache_buf_idx.stride(0),
         replay_step_width=replay_step_width,
         replay_history_size=replay_history_size,
         work_item_width=REPLAY_WORK_ITEM_WIDTH,
@@ -98,23 +136,31 @@ def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
         cache_slot_field=REPLAY_WORK_CACHE_SLOT,
         pnat_field=REPLAY_WORK_PNAT,
         cache_buf_idx_field=REPLAY_WORK_CACHE_BUF_IDX,
-        BLOCK_SIZE=triton.next_power_of_2(num_decodes),
+        replay_slot_field=REPLAY_WORK_REPLAY_SLOT,
+        BLOCK_SIZE=_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE,
         num_warps=4,
     )
 
 
 @torch.compile(dynamic=True, fullgraph=True)
-def _build_replay_work_items_torch(state_indices, prev_num_accepted_tokens,
-                                   cache_buf_idx, work_items, n_writes,
-                                   replay_step_width, replay_history_size):
+def _build_replay_work_items_torch(state_indices,
+                                   prev_num_accepted_tokens,
+                                   cache_buf_idx,
+                                   work_items,
+                                   n_writes,
+                                   replay_step_width,
+                                   replay_history_size,
+                                   replay_indices=None):
     """Same partition as :func:`_build_replay_work_items_triton`, in ATen ops."""
+    if replay_indices is None:
+        replay_indices = state_indices
     num_decodes = state_indices.shape[0]
     position_in_decode_batch = torch.arange(num_decodes,
                                             dtype=torch.int32,
                                             device=state_indices.device)
-    cache_slot_idx = state_indices.to(torch.long)
-    pnat = prev_num_accepted_tokens[cache_slot_idx].to(torch.int32)
-    active_cache_buf_idx = cache_buf_idx[cache_slot_idx].to(torch.int32)
+    replay_slot_idx = replay_indices.to(torch.long)
+    pnat = prev_num_accepted_tokens[replay_slot_idx].to(torch.int32)
+    active_cache_buf_idx = cache_buf_idx[replay_slot_idx].to(torch.int32)
 
     writes = (pnat + replay_step_width > replay_history_size)
     writes_i32 = writes.to(torch.int32)
@@ -134,10 +180,14 @@ def _build_replay_work_items_torch(state_indices, prev_num_accepted_tokens,
     decode_work_items[:, REPLAY_WORK_PNAT].scatter_(0, output_offsets, pnat)
     decode_work_items[:, REPLAY_WORK_CACHE_BUF_IDX].scatter_(
         0, output_offsets, active_cache_buf_idx)
+    decode_work_items[:, REPLAY_WORK_REPLAY_SLOT].scatter_(
+        0, output_offsets, replay_indices.to(torch.int32))
     n_writes.copy_(batch_n_writes)
 
 
-@triton.jit
+# num_seqs and N follow the batch; specializing them (on == 1 or % 16) would
+# compile kernel variants mid-serving.
+@triton.jit(do_not_specialize=["num_seqs", "N"])
 def _cu_seqlens_triton_kernel(
     cu_seqlens_ptr,  # [num_seqs + 1]
     chunk_indices_ptr,  # [N] output
@@ -317,6 +367,32 @@ def cu_seqlens_to_chunk_indices_offsets(
     return chunk_indices, chunk_offsets
 
 
+class InforwardSnapshotSplit(NamedTuple):
+    """Index tensors of one step's in-forward Mamba snapshot split.
+
+    See ``Mamba2Metadata._prepare_inforward_split``. ``k`` requests are split;
+    ``num_tail_tokens`` tokens lie in their tails.
+    """
+    k: int
+    num_tail_tokens: int
+    cu: torch.Tensor
+    gather: torch.Tensor
+    live: torch.Tensor
+    main_rows: torch.Tensor
+    split_rows: torch.Tensor
+    stage_rows: torch.Tensor
+    tail_tok: torch.Tensor
+    cu_tail: torch.Tensor
+    tail_slots: torch.Tensor
+    conv_win: torch.Tensor
+
+
+# Fields of InforwardSnapshotSplit, in upload order.
+_INFORWARD_SPLIT_FIELDS = ("cu", "gather", "live", "main_rows", "split_rows",
+                           "stage_rows", "tail_tok", "cu_tail", "tail_slots",
+                           "conv_win")
+
+
 class Mamba2Metadata:
 
     # Warmup-only knob: when set via ``force_initial_states_for_warmup``,
@@ -325,6 +401,11 @@ class Mamba2Metadata:
     # during warmup. Class-scoped (not env-var) so it cannot leak into real
     # inference from a stray shell export or a forked worker.
     _warmup_force_initial_states: bool = False
+
+    # Warmup-only knob, set via ``inforward_split_for_warmup``: ``prepare()``
+    # plans an in-forward snapshot split for the context requests, so warmup
+    # captures the CUDA graphs of the split GDN prefill core.
+    _warmup_inforward_split: bool = False
 
     # Set by a subclass whose prefill kernel compiles a separate variant
     # depending on whether every context length is a multiple of this value.
@@ -340,6 +421,16 @@ class Mamba2Metadata:
             yield
         finally:
             cls._warmup_force_initial_states = prev
+
+    @classmethod
+    @contextlib.contextmanager
+    def inforward_split_for_warmup(cls):
+        prev = cls._warmup_inforward_split
+        cls._warmup_inforward_split = True
+        try:
+            yield
+        finally:
+            cls._warmup_inforward_split = prev
 
     def __init__(
         self,
@@ -367,6 +458,12 @@ class Mamba2Metadata:
                                               dtype=torch.bool,
                                               device="cuda")
         self.use_initial_states = False
+        # Host gate for the GDN state reset (see gdn_mixer._reset_prefill_states):
+        # True when a context request of this iteration starts without a
+        # recurrent state; state_reset_done flips once the first GDN layer has
+        # cleared those slots for every layer.
+        self.prefill_needs_state_reset = True
+        self.state_reset_done = False
         self.chunk_indices: torch.Tensor = None
         self.chunk_offsets: torch.Tensor = None
 
@@ -378,10 +475,34 @@ class Mamba2Metadata:
                                          device="cuda")
         self._state_indices_buffer = DeviceCopyBuffer(
             self.state_indices, pin_memory=prefer_pinned())
+        # The decode requests' slots of a mixed iteration in their own buffer:
+        # the FlashInfer decode kernel wants an aligned base pointer, which the
+        # tail slice ``state_indices[num_contexts:]`` only has when the number
+        # of context requests is a multiple of 4 (see _mixed_decode_recurrent).
+        self.state_indices_decode = torch.zeros(max_batch_size,
+                                                dtype=torch.int32,
+                                                device="cuda")
         # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
         self._state_indices_aliased_ptr = None
+        # Per-iteration GdnIterationContext (Qwen3NextGatedDeltaNet.forward_core):
+        # the first GDN layer of an iteration builds it once and the other
+        # layers reuse it. Cleared by prepare() and prepare_steady_gen_step().
+        self.gdn_iteration_context: Optional["GdnIterationContext"] = None
+
+        # Replay-history slot of each request. Managers that keep replay
+        # history in its own slot lifecycle fill this static buffer; otherwise
+        # it aliases ``state_indices``.
+        self.replay_state_indices = self.state_indices
+        self._replay_state_indices = torch.zeros(max_batch_size,
+                                                 dtype=torch.int32,
+                                                 device="cuda")
+        self._replay_state_indices_cpu = torch.zeros(max_batch_size,
+                                                     dtype=torch.int32,
+                                                     pin_memory=prefer_pinned())
+        self._replay_state_indices_buffer = DeviceCopyBuffer(
+            self._replay_state_indices, pin_memory=prefer_pinned())
 
         self.replay_work_items = torch.zeros(max_batch_size,
                                              REPLAY_WORK_ITEM_WIDTH,
@@ -395,9 +516,42 @@ class Mamba2Metadata:
                                            dtype=torch.int,
                                            device="cuda")
         self._arange_buffer_long = self._arange_buffer.to(torch.long)
+
+        # In-forward Mamba snapshot split of this step (None: no split), and
+        # the buffer its index tensors live in at fixed field offsets, so they
+        # keep their addresses across steps (sized on the first split from the
+        # cache manager's staging capacity).
+        self.inforward_split: Optional[InforwardSnapshotSplit] = None
+        self._inforward_split_buf: Optional[torch.Tensor] = None
+        self._inforward_split_offsets: list[int] = []
         self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
                                             dtype=torch.long,
                                             device="cuda")
+
+    def arange_long(self, n: int) -> torch.Tensor:
+        """``[0, 1, ..., n]`` as int64 on the device: the cu_seqlens of ``n`` one-token sequences."""
+        return self._arange_buffer_long[:n + 1]
+
+    def prepare_steady_gen_step(self, attn_metadata: AttentionMetadata):
+        """``prepare()`` for a decode-only batch whose request layout (ids,
+        order, state slots, padding rows) is unchanged since the last
+        ``prepare()``: the state indices and the dummy-request mask are still
+        in place, so their host walk and H2D copies are skipped; only the
+        per-step bookkeeping is refreshed."""
+        self.prefill_needs_state_reset = False
+        self.state_reset_done = False
+        self.gdn_iteration_context = None
+        batch_size = attn_metadata.seq_lens.shape[0]
+        kv_cache_manager = attn_metadata.kv_cache_manager
+
+        self._prepare_replay_work_items(kv_cache_manager, batch_size, 0)
+
+        self.query_start_loc = None
+        self.query_start_loc_long = self._arange_buffer_long[:batch_size + 1]
+
+        flush = getattr(kv_cache_manager, "flush_state_transfers", None)
+        if flush is not None:
+            flush()
 
     def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int,
                                    num_contexts: int):
@@ -417,23 +571,22 @@ class Mamba2Metadata:
             return
         use_gdn_all_layer_commit = getattr(
             kv_cache_manager, "use_gdn_cached_replay_all_layer_commit", False)
-        if use_gdn_all_layer_commit:
-            from tensorrt_llm._torch.modules.fla.cached_replay import \
-                CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
-
-            # The fused small-batch GDN kernel commits its checkpoint in-layer
-            # and indexes cache metadata directly. Work items are only consumed
-            # by the partitioned replay + all-layer commit path.
-            if num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
-                return
+        # The fused small-batch GDN kernel commits its checkpoint in-layer
+        # and indexes cache metadata directly. Work items are only consumed
+        # by the partitioned replay + all-layer commit path.
+        if (use_gdn_all_layer_commit
+                and not kv_cache_manager.gdn_replay_partitioned(num_decodes)):
+            return
 
         prev_num_accepted_tokens = replay_metadata.prev_num_accepted_tokens
         cache_buf_idx = replay_metadata.cache_buf_idx
         replay_step_width = replay_metadata.replay_step_width
         replay_history_size = replay_metadata.replay_history_size
 
-        if (use_gdn_all_layer_commit
-                and num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE):
+        # The kernel reads the accepted counts and active buffers through their
+        # strides: a manager that keeps them in its KV cache pool hands out
+        # strided views of the per-slot replay metadata rows.
+        if num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE:
             build_work_items = _build_replay_work_items_triton
         else:
             build_work_items = _build_replay_work_items_torch
@@ -445,9 +598,143 @@ class Mamba2Metadata:
             self.replay_n_writes,
             replay_step_width,
             replay_history_size,
+            self.replay_state_indices[num_contexts:batch_size],
         )
 
+    def _prepare_inforward_split(self, attn_metadata: AttentionMetadata,
+                                 kv_cache_manager, plan, num_contexts: int,
+                                 batch_size: int) -> None:
+        """Index tensors of the in-forward Mamba snapshot split.
+
+        A planned request's chunk [start, start + len) becomes two chunked
+        prefill sequences, [start, start + before) and the tail [start + before,
+        start + len); both gather the request's live state. The GDN layer
+        writes the first one's final state (the state at P) to the live slot,
+        recomputes the tail from it with the outputs written back at
+        ``tail_tok``, and stages the tail's final state (the state at the
+        prompt end) in the request's row. ``conv_win`` holds the token
+        positions of the convolution window that ends at P.
+        """
+        request_ids = attn_metadata.request_ids[:num_contexts]
+        entries = [plan.get(rid) for rid in request_ids]
+        k = sum(entry is not None for entry in entries)
+        if k == 0:
+            return
+        if batch_size != num_contexts:
+            raise RuntimeError("In-forward Mamba snapshot planned for a batch "
+                               "with generation requests")
+        width = kv_cache_manager.conv_state_shape[-1]
+        rows_cap = kv_cache_manager.inforward_snapshot_rows
+        tail_cap = rows_cap * kv_cache_manager.inforward_snapshot_max_tail
+        lens = attn_metadata.seq_lens[:num_contexts].tolist()
+        vals = {name: [] for name in _INFORWARD_SPLIT_FIELDS}
+        vals["cu"].append(0)
+        vals["cu_tail"].append(0)
+        start = 0
+        for rid, length, entry in zip(request_ids, lens, entries):
+            slot = kv_cache_manager.state_index(rid)
+            vals["live"].append(slot)
+            vals["main_rows"].append(len(vals["gather"]))
+            vals["gather"].append(slot)
+            if entry is None:
+                vals["cu"].append(start + length)
+            else:
+                before, after = entry.num_before, entry.num_after
+                if before + after != length or before < width:
+                    raise RuntimeError(
+                        f"In-forward Mamba snapshot: request {rid} chunk of "
+                        f"{length} tokens does not match the plan ({before} + "
+                        f"{after}, window {width})")
+                vals["split_rows"].append(len(vals["gather"]) - 1)
+                vals["stage_rows"].append(entry.row)
+                vals["cu"].append(start + before)
+                # The tail as a sequence of its own: its outputs are recomputed
+                # from the state at P, its final state is dropped.
+                vals["gather"].append(slot)
+                vals["cu"].append(start + length)
+                vals["tail_tok"].extend(range(start + before, start + length))
+                vals["cu_tail"].append(vals["cu_tail"][-1] + after)
+                vals["tail_slots"].append(slot)
+                vals["conv_win"].extend(
+                    range(start + before - width, start + before))
+            start += length
+        num_tail_tokens = len(vals["tail_tok"])
+        if k > rows_cap or num_tail_tokens > tail_cap:
+            raise RuntimeError(
+                f"In-forward Mamba snapshot: {k} requests / {num_tail_tokens} "
+                "tail tokens exceed the staging capacity")
+        if self._inforward_split_buf is None:
+            batch_cap = self.max_batch_size
+            capacity = (batch_cap + rows_cap + 1, batch_cap + rows_cap,
+                        batch_cap, batch_cap, rows_cap, rows_cap, tail_cap,
+                        rows_cap + 1, rows_cap, width * rows_cap)
+            self._inforward_split_offsets = [0, *itertools.accumulate(capacity)]
+            self._inforward_split_buf = torch.zeros(
+                self._inforward_split_offsets[-1],
+                dtype=torch.long,
+                device="cuda")
+        offsets = self._inforward_split_offsets
+        flat = [0] * offsets[-1]
+        for name, start in zip(_INFORWARD_SPLIT_FIELDS, offsets):
+            flat[start:start + len(vals[name])] = vals[name]
+        # One upload through a fresh pinned tensor: no later host write can
+        # race the copy.
+        self._inforward_split_buf.copy_(torch.tensor(
+            flat, dtype=torch.long, pin_memory=prefer_pinned()),
+                                        non_blocking=True)
+        views = {
+            name: self._inforward_split_buf[start:start + len(vals[name])]
+            for name, start in zip(_INFORWARD_SPLIT_FIELDS, offsets)
+        }
+        self.inforward_split = InforwardSnapshotSplit(
+            k=k, num_tail_tokens=num_tail_tokens, **views)
+
+    @staticmethod
+    def _warmup_inforward_split_plan(attn_metadata: AttentionMetadata,
+                                     kv_cache_manager,
+                                     num_contexts: int) -> dict:
+        """Split each context request with room for the longest tail, up to the
+        staging rows (``inforward_split_for_warmup``)."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import \
+            InforwardSnapshotEntry
+        tail = kv_cache_manager.inforward_snapshot_max_tail
+        plan = {}
+        for rid, length in zip(attn_metadata.request_ids[:num_contexts],
+                               attn_metadata.seq_lens[:num_contexts].tolist()):
+            if (len(plan) < kv_cache_manager.inforward_snapshot_rows
+                    and length - tail
+                    >= kv_cache_manager.inforward_snapshot_min_main):
+                plan[rid] = InforwardSnapshotEntry(len(plan), length - tail,
+                                                   length - tail, tail)
+        return plan
+
+    def _prepare_replay_state_indices(self, kv_cache_manager,
+                                      batch_request_ids) -> None:
+        """Fill the static replay-slot buffer, or alias the state slots."""
+        if getattr(kv_cache_manager, "replay_layer_group_id", None) is None:
+            self.replay_state_indices = self.state_indices
+            return
+        batch_size = len(batch_request_ids)
+        indices = kv_cache_manager.get_replay_state_indices(batch_request_ids)
+        assert len(indices) == batch_size, (
+            f"get_replay_state_indices() returned {len(indices)} entries for "
+            f"a batch of {batch_size} requests.")
+        self._replay_state_indices_cpu[:batch_size].copy_(
+            torch.as_tensor(indices,
+                            dtype=self._replay_state_indices_cpu.dtype))
+        self._replay_state_indices_buffer.update(
+            self._replay_state_indices_cpu[:batch_size])
+        self.replay_state_indices = self._replay_state_indices
+
     def prepare(self, attn_metadata: AttentionMetadata):
+        # The cu_seqlens buffers below are rewritten in place: drop the GDN
+        # launch path's per-iteration int32 casts of them first.
+        invalidate_int32_cu_seqlens_cache()
+        # Every iteration starts with the reset undone; the context branch below
+        # decides whether any request needs it at all.
+        self.prefill_needs_state_reset = False
+        self.state_reset_done = False
+        self.gdn_iteration_context = None
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
         context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
@@ -508,6 +795,15 @@ class Mamba2Metadata:
                                     dtype=self.state_indices_cpu.dtype))
                 self._state_indices_buffer.update(
                     self.state_indices_cpu[:batch_size])
+            self._prepare_replay_state_indices(kv_cache_manager,
+                                               batch_request_ids)
+        else:
+            self.replay_state_indices = self.state_indices
+
+        num_decodes = batch_size - num_contexts
+        if num_contexts > 0 and num_decodes > 0:
+            self.state_indices_decode[:num_decodes].copy_(
+                self.state_indices[num_contexts:batch_size], non_blocking=True)
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)
@@ -563,6 +859,13 @@ class Mamba2Metadata:
             # Keep a host boolean gate for chunk metadata construction.
             self.use_initial_states = bool(
                 self.has_initial_states_cpu[:num_contexts].any())
+            # Only context requests without a state need their slots zeroed;
+            # continuation chunks (the common case under prefix reuse) skip the
+            # reset launches in every GDN layer. Warmup forces the flag on so the
+            # reset kernel is compiled before the first real iteration.
+            self.prefill_needs_state_reset = bool(
+                Mamba2Metadata._warmup_force_initial_states
+                or not self.has_initial_states_cpu[:num_contexts].all())
 
             if self.use_initial_states:
                 _extra = compute_extra_chunks_cpu(attn_metadata.seq_lens,
@@ -580,6 +883,18 @@ class Mamba2Metadata:
             self.query_start_loc = None
             self.query_start_loc_long = self._arange_buffer_long[:batch_size +
                                                                  1]
+
+        self.inforward_split = None
+        plan = getattr(kv_cache_manager, "inforward_snapshot_plan", None)
+        if (Mamba2Metadata._warmup_inforward_split and num_contexts > 0
+                and request_ids is not None):
+            plan = self._warmup_inforward_split_plan(attn_metadata,
+                                                     kv_cache_manager,
+                                                     num_contexts)
+        if (isinstance(plan, dict) and plan and num_contexts > 0
+                and request_ids is not None):
+            self._prepare_inforward_split(attn_metadata, kv_cache_manager, plan,
+                                          num_contexts, batch_size)
 
         # Complete any deferred recurrent-state block onboards scheduled by
         # CppMambaHybridCacheManager.prepare_resources(). prepare_resources

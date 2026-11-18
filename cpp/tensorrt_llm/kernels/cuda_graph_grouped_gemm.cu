@@ -201,7 +201,7 @@ void cudaGraphGroupedGemmType(cutlass::gemm::GemmCoord* problemSizesPtr, int pro
 // dimensions already on the GPU and reuses their compatible storage directly.
 // ====================================================================
 
-template <typename Config>
+template <typename Config, typename ElementD>
 void fp8CudaGraphGroupedGemmImpl(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,
     void** ptrBGpu, void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu,
     cudaStream_t stream)
@@ -218,8 +218,7 @@ void fp8CudaGraphGroupedGemmImpl(cutlass::gemm::GemmCoord* problemSizesPtr, int 
 
     using ElementA = cutlass::float_e4m3_t;
     using ElementB = cutlass::float_e4m3_t;
-    using ElementC = cutlass::float_e4m3_t;
-    using ElementD = cutlass::float_e4m3_t;
+    using ElementC = ElementD;
     using ElementAccumulator = float;
 
     using LayoutA = cutlass::layout::RowMajor;
@@ -327,6 +326,7 @@ void fp8CudaGraphGroupedGemmImpl(cutlass::gemm::GemmCoord* problemSizesPtr, int 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+template <typename ElementD>
 void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,
     void** ptrBGpu, void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu,
     cudaStream_t stream)
@@ -335,7 +335,7 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
     if (smVersion == fp8GroupedGemmConfig::kSm90)
     {
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) && !defined(EXCLUDE_SM_90)
-        fp8CudaGraphGroupedGemmImpl<fp8GroupedGemmConfig::Sm90Config>(
+        fp8CudaGraphGroupedGemmImpl<fp8GroupedGemmConfig::Sm90Config, ElementD>(
             problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
         return;
 #endif
@@ -343,7 +343,7 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
     else if (smVersion == fp8GroupedGemmConfig::kSm100)
     {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) && !defined(EXCLUDE_SM_100F)
-        fp8CudaGraphGroupedGemmImpl<fp8GroupedGemmConfig::Sm100Config>(
+        fp8CudaGraphGroupedGemmImpl<fp8GroupedGemmConfig::Sm100Config, ElementD>(
             problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
         return;
 #endif
@@ -356,15 +356,35 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
 
 void cudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu, void** ptrBGpu,
     void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu, bool isLoraIn,
-    tensorrt_llm::DataType dataType, int minKN, cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, cudaStream_t stream)
+    tensorrt_llm::DataType dataType, int minKN, cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, cudaStream_t stream,
+    std::optional<tensorrt_llm::DataType> outputDataType)
 {
+    auto const outputType = outputDataType.value_or(dataType);
+    TLLM_CHECK_WITH_INFO(dataType == tensorrt_llm::DataType::kFP8 || outputType == dataType,
+        "Mixed output dtype is supported only for FP8 grouped GEMM inputs.");
 #ifdef ENABLE_FP8
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     if (dataType == tensorrt_llm::DataType::kFP8)
     {
         checkFp8CudaGraphAlignment(hostMaxProblemSizesPtr, problemCount, minKN, "FP8 CUDA graph grouped GEMM");
-        fp8CudaGraphGroupedGemm(
-            problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
+        switch (outputType)
+        {
+        case tensorrt_llm::DataType::kFP8:
+            fp8CudaGraphGroupedGemm<cutlass::float_e4m3_t>(problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu,
+                ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
+            break;
+        case tensorrt_llm::DataType::kHALF:
+            fp8CudaGraphGroupedGemm<cutlass::half_t>(problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu,
+                ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
+            break;
+#ifdef ENABLE_BF16
+        case tensorrt_llm::DataType::kBF16:
+            fp8CudaGraphGroupedGemm<cutlass::bfloat16_t>(problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu,
+                ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
+            break;
+#endif
+        default: TLLM_THROW("FP8 grouped GEMM output must be fp8, fp16, or bf16.");
+        }
         return;
     }
 #else
@@ -551,7 +571,7 @@ void cudaGraphSplitKGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int p
     {
         // Reuse the non-split-K fp8 path; CUTLASS 3.x cooperative schedule handles large-K efficiently.
         checkFp8CudaGraphAlignment(hostMaxProblemSizesPtr, problemCount, minKN, "FP8 CUDA graph split-K grouped GEMM");
-        fp8CudaGraphGroupedGemm(
+        fp8CudaGraphGroupedGemm<cutlass::float_e4m3_t>(
             problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
         return;
     }

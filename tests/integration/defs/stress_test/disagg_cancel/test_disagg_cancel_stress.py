@@ -28,6 +28,8 @@ from __future__ import annotations
 import textwrap
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +89,13 @@ def test_disagg_cancellation_marathon(
         monkeypatch.delenv(name, raising=False)
 
     harness = DisaggCancellationStressHarness(config_path)
+    if harness.config.external_cluster is not None:
+        missing = harness.config.external_cluster.missing_env_vars()
+        if missing:
+            pytest.skip(
+                "attach-mode marathon needs an externally-launched cluster; "
+                f"unset environment variables: {missing}"
+            )
     try:
         harness.setup()
         harness.start()
@@ -185,6 +194,222 @@ def test_stress_config_rejects_unknown_mode(tmp_path: Path) -> None:
                 """,
             )
         )
+
+
+def _write_attach_yaml(tmp_path: Path, *, mode: str = "log_only") -> Path:
+    """Write a minimal attach-mode marathon YAML for external_cluster tests."""
+    return _write_mode_yaml(
+        tmp_path,
+        f"""\
+        mode: {mode}
+        duration_min: 1
+        kv_cache_manager: v2
+        transceiver: python
+        external_cluster:
+          server_url: ${{TEST_ATTACH_URL}}
+          server_log: ${{TEST_ATTACH_LOG_DIR}}/orch/server.log
+          worker_logs:
+            - role: ctx
+              path: ${{TEST_ATTACH_LOG_DIR}}/ctx/server.log
+            - role: gen
+              path: ${{TEST_ATTACH_LOG_DIR}}/gen1/server.log
+        log_only_probe:
+          interval_s: 0.01
+          max_tokens: 8
+          request_timeout_s: 1
+        log_scan:
+          hard_zero_patterns:
+            - "Broken promise"
+        """,
+    )
+
+
+def test_external_cluster_config_parses_without_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Attach YAMLs must parse/validate even when the ${VAR} refs are unset."""
+    monkeypatch.delenv("TEST_ATTACH_URL", raising=False)
+    monkeypatch.delenv("TEST_ATTACH_LOG_DIR", raising=False)
+
+    cfg = StressConfig.from_yaml_path(_write_attach_yaml(tmp_path))
+
+    ext = cfg.external_cluster
+    assert ext is not None
+    assert ext.server_url == "${TEST_ATTACH_URL}"
+    assert [role for role, _ in ext.worker_logs] == ["ctx", "gen"]
+    assert sorted(ext.missing_env_vars()) == ["TEST_ATTACH_LOG_DIR", "TEST_ATTACH_URL"]
+
+
+def test_external_cluster_rejects_full_cancel_poison(tmp_path: Path) -> None:
+    """Injection needs local worker PIDs, so attach mode only supports log_only."""
+    with pytest.raises(ValueError, match="full_cancel_poison is unsupported"):
+        StressConfig.from_yaml_path(_write_attach_yaml(tmp_path, mode="full_cancel_poison"))
+
+
+def test_external_cluster_rejects_bad_worker_role(tmp_path: Path) -> None:
+    """Structural validation catches roles other than ctx/gen at parse time."""
+    with pytest.raises(ValueError, match="role must be 'ctx' or 'gen'"):
+        StressConfig.from_yaml_path(
+            _write_mode_yaml(
+                tmp_path,
+                """\
+                mode: log_only
+                external_cluster:
+                  server_url: http://localhost:8000
+                  worker_logs:
+                    - role: orchestrator
+                      path: /tmp/x.log
+                """,
+            )
+        )
+
+
+def _write_attached_logs(serve: Path, subdirs=("ctx", "gen1", "orch")) -> None:
+    """Create the logs an attached cluster has already written."""
+    for sub in subdirs:
+        (serve / sub).mkdir(parents=True, exist_ok=True)
+        (serve / sub / "server.log").write_text("startup ok\n")
+
+
+def test_setup_external_cluster_binds_endpoint_and_log_specs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """setup() in attach mode expands env refs and skips the local launcher."""
+    monkeypatch.setenv("TEST_ATTACH_URL", "http://127.0.0.1:8340")
+    monkeypatch.setenv("TEST_ATTACH_LOG_DIR", str(tmp_path / "serve"))
+    _write_attached_logs(tmp_path / "serve")
+
+    h = DisaggCancellationStressHarness(_write_attach_yaml(tmp_path))
+    checked_urls: list[str] = []
+    monkeypatch.setattr(h, "_check_external_endpoint", lambda url, **kw: checked_urls.append(url))
+
+    h.setup()
+
+    assert h._server_url == "http://127.0.0.1:8340"
+    assert h._model_name == "dummy"  # top-level model from _write_mode_yaml
+    assert h._cluster is None
+    assert h._tracked_workers == []
+    assert checked_urls == ["http://127.0.0.1:8340/health"]
+    assert [(s.role, s.index) for s in h._worker_specs] == [("ctx", 0), ("gen", 0)]
+    assert h._worker_specs[0].log_path == str(tmp_path / "serve" / "ctx" / "server.log")
+    assert h._server_log_path == str(tmp_path / "serve" / "orch" / "server.log")
+
+
+def test_setup_external_cluster_fails_on_unset_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unset ${VAR} at setup() time is an error, never a literal passthrough."""
+    monkeypatch.delenv("TEST_ATTACH_URL", raising=False)
+    monkeypatch.delenv("TEST_ATTACH_LOG_DIR", raising=False)
+
+    h = DisaggCancellationStressHarness(_write_attach_yaml(tmp_path))
+    with pytest.raises(ValueError, match="unset environment variable 'TEST_ATTACH_URL'"):
+        h.setup()
+
+
+@pytest.mark.parametrize(
+    ("missing", "label"),
+    [
+        ("ctx", r"worker_logs\[ctx_0\]"),
+        ("gen1", r"worker_logs\[gen_0\]"),
+        ("orch", "server_log"),
+    ],
+    ids=["ctx", "gen", "server"],
+)
+def test_setup_external_cluster_requires_readable_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str, label: str
+) -> None:
+    """A log the scanner could never open fails setup instead of going unchecked."""
+    serve = tmp_path / "serve"
+    monkeypatch.setenv("TEST_ATTACH_URL", "http://127.0.0.1:8340")
+    monkeypatch.setenv("TEST_ATTACH_LOG_DIR", str(serve))
+    _write_attached_logs(serve, [sub for sub in ("ctx", "gen1", "orch") if sub != missing])
+
+    h = DisaggCancellationStressHarness(_write_attach_yaml(tmp_path))
+    monkeypatch.setattr(h, "_check_external_endpoint", lambda url, **kw: None)
+    with pytest.raises(RuntimeError, match=f"external_cluster.{label}.*not a readable file"):
+        h.setup()
+
+
+class _Response:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+    def __enter__(self) -> "_Response":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> bool:
+        return False
+
+
+@pytest.mark.parametrize(
+    ("answer", "message"),
+    [
+        (_Response(500), "returned HTTP 500"),
+        (urllib.error.URLError("connection refused"), "unreachable"),
+        (TimeoutError("timed out"), "unreachable"),
+    ],
+    ids=["http_500", "refused", "timeout"],
+)
+def test_setup_external_cluster_rejects_an_unhealthy_orchestrator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: Any, message: str
+) -> None:
+    """The health check itself, not a stub of it: only HTTP 200 passes setup."""
+    monkeypatch.setenv("TEST_ATTACH_URL", "http://127.0.0.1:8340")
+    monkeypatch.setenv("TEST_ATTACH_LOG_DIR", str(tmp_path / "serve"))
+    _write_attached_logs(tmp_path / "serve")
+    requested: list[str] = []
+
+    def urlopen(url: str, timeout: float) -> _Response:
+        requested.append(url)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    h = DisaggCancellationStressHarness(_write_attach_yaml(tmp_path))
+    with pytest.raises(RuntimeError, match=message):
+        h.setup()
+    assert requested == ["http://127.0.0.1:8340/health"]
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout: _Response(200))
+    healthy = DisaggCancellationStressHarness(_write_attach_yaml(tmp_path))
+    healthy.setup()
+    assert healthy._server_url == "http://127.0.0.1:8340"
+
+
+def test_external_cluster_log_scanner_trips_on_pattern(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log scanner tails externally-provided logs and fail-fasts on hits."""
+    serve = tmp_path / "serve"
+    for sub in ("ctx", "gen1", "orch"):
+        (serve / sub).mkdir(parents=True)
+        (serve / sub / "server.log").write_text("startup ok\n")
+    monkeypatch.setenv("TEST_ATTACH_URL", "http://127.0.0.1:8340")
+    monkeypatch.setenv("TEST_ATTACH_LOG_DIR", str(serve))
+
+    h = DisaggCancellationStressHarness(
+        _write_attach_yaml(tmp_path), log_scanner_poll_interval_s=0.02
+    )
+    monkeypatch.setattr(h, "_check_external_endpoint", lambda url, **kw: None)
+    h.setup()
+
+    scanner = threading.Thread(target=h._log_scanner_thread_body, daemon=True)
+    scanner.start()
+    time.sleep(0.1)
+    with (serve / "gen1" / "server.log").open("a") as f:
+        f.write("terminate called: Broken promise\n")
+
+    deadline = time.monotonic() + 2.0
+    while not h.failed_event.is_set() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    h.stop_event.set()
+    scanner.join(timeout=2.0)
+
+    assert h.failed_event.is_set()
+    assert "Broken promise" in (h.failure_reason or "")
+    assert "gen_0" in (h.failure_reason or "")
 
 
 def test_log_only_thread_sends_probe_and_stops(

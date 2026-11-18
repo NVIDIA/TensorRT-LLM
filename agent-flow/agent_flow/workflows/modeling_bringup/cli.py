@@ -5,6 +5,7 @@ from pathlib import Path
 
 from agent_flow.workflows.agent_team.cli import _parse_args
 from agent_flow.workflows.agent_team.cli import main as _team_main
+from agent_flow.workflows.agent_team.state import STATE_FILENAME
 
 from .node_policy import policy_for_type
 from .prompts import build_modeling_bringup_prompts
@@ -15,8 +16,20 @@ MODELING_BRINGUP_PROMPTS = build_modeling_bringup_prompts()
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+    # On resume, agent_team keeps the checkpointed `<workspace>/task.yaml` and
+    # ignores a different `--task`, so read that same file here. Otherwise the
+    # prompt switches and the trtllm repo path would follow a task the agents
+    # never see.
+    task_path = args.task
+    checkpointed_task = args.workspace / "task.yaml"
+    if (
+        not args.clean
+        and (args.workspace / STATE_FILENAME).is_file()
+        and checkpointed_task.is_file()
+    ):
+        task_path = checkpointed_task
     try:
-        task_data = load_and_validate_task_yaml(args.task)
+        task_data = load_and_validate_task_yaml(task_path)
         prompts = build_modeling_bringup_prompts(
             include_slurm_environment=has_slurm_environment(task_data),
             replan_on_qa=args.replan_on_qa,

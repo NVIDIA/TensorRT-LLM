@@ -675,6 +675,8 @@ def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
     ) as llm:
         encoder_replay_keys = []
         decoder_replay_keys = []
+        encoder_runner = None
+        captured_mixed_keys = set()
         if tensor_parallel_size == 1:
             model_engine = llm._executor.engine.model_engine
             assert isinstance(model_engine._runner, EncoderDecoderRunner)

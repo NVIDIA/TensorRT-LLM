@@ -3,7 +3,8 @@
 
 """Resolved settings for scheduled decoder execution."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -15,6 +16,9 @@ from tensorrt_llm.llmapi.llm_args import (
 
 from ..interface import RunnerConfig
 
+if TYPE_CHECKING:
+    from tensorrt_llm.watermark.config import WatermarkConfig
+
 
 @dataclass(frozen=True)
 class DecoderRunnerConfig(RunnerConfig):
@@ -23,7 +27,6 @@ class DecoderRunnerConfig(RunnerConfig):
     dtype: torch.dtype
     enable_attention_dp: bool
     disable_overlap_scheduler: bool
-    is_encode_only: bool
     is_spec_decode: bool
     spec_config: DecodingBaseConfig | None
     max_draft_len: int
@@ -49,3 +52,12 @@ class DecoderRunnerConfig(RunnerConfig):
     mm_encoder_cache_enabled: bool
     enable_autotuner: bool
     cuda_graph_specialize_lora: bool
+    # The one-engine worker samples greedy and temperature-only target rows from vocabulary shards.
+    samples_from_vocab_shards: bool
+    # The model takes the one-engine speculative fast paths
+    # (SpecDecOneEngineForCausalLM.spec_decode_fast_paths); False for a config
+    # built without it. Keyword-only, so subclasses may still add required fields.
+    spec_decode_fast_paths: bool = field(default=False, kw_only=True)
+    watermark_config: "WatermarkConfig | None" = field(default=None, kw_only=True)
+    # The executor serves disaggregated (a cache transceiver is configured).
+    is_disagg: bool = field(kw_only=True)

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared split-KV reduction-mode policy for FMHA and MLA decode."""
+"""Shared split-KV reduction-mode policy for FMHA and MLA."""
 
 from collections.abc import Iterable
 

@@ -12,9 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fail-fast behavior for HTTP endpoint wait helpers without GPUs."""
+"""Fail-fast endpoint and multi-node coordination helpers (no GPU, no server)."""
 
+import ast
 import errno
+import os
 import socket
 import subprocess
 from collections.abc import Iterator
@@ -33,6 +35,12 @@ from test_common.http_utils import (
 # The CPU-Generic CI stages select tests with `-m cpu_only`; without this
 # marker every test here is deselected and pytest exits with code 5.
 pytestmark = pytest.mark.cpu_only
+
+UNITTEST_ROOT = Path(__file__).resolve().parents[1]
+MULTINODE_TEST_PATHS = (
+    UNITTEST_ROOT / "llmapi/apps/_test_disagg_serving_multi_nodes.py",
+    UNITTEST_ROOT / "llmapi/apps/_test_disagg_serving_multi_nodes_service_discovery.py",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +67,49 @@ def _server_log(tmp_path, content):
     return str(p)
 
 
+def _load_slurm_topology_fixture(path: Path):
+    tree = ast.parse(path.read_text())
+    selected_nodes = []
+    required_assignments = {"RANK", "NODE_RANK", "NODE_LIST", "LOCAL_RANK"}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in required_assignments
+            for target in node.targets
+        ):
+            selected_nodes.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name == "require_supported_slurm_topology":
+            node.decorator_list = []
+            selected_nodes.append(node)
+
+    namespace = {
+        "os": os,
+        "pytest": pytest,
+        "expand_slurm_nodelist": lambda value: {
+            "node[01-02]": ["node01", "node02"],
+            "node[01-04]": ["node01", "node02", "node03", "node04"],
+        }[value],
+    }
+    module = ast.Module(body=selected_nodes, type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), path, "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("module_path", MULTINODE_TEST_PATHS)
+def test_slurm_topology_uses_step_nodelist(monkeypatch, module_path: Path) -> None:
+    monkeypatch.setenv("SLURM_PROCID", "0")
+    monkeypatch.setenv("SLURM_NODEID", "0")
+    monkeypatch.setenv("SLURM_LOCALID", "0")
+    monkeypatch.setenv("SLURM_NODELIST", "node[01-04]")
+    monkeypatch.setenv("SLURM_STEP_NODELIST", "node[01-02]")
+    monkeypatch.setenv("SLURM_STEP_NUM_NODES", "2")
+    monkeypatch.setenv("SLURM_STEP_NUM_TASKS", "2")
+
+    namespace = _load_slurm_topology_fixture(module_path)
+
+    assert namespace["NODE_LIST"] == ["node01", "node02"]
+    namespace["require_supported_slurm_topology"]()
+
+
 def test_dead_server_proc_fails_fast_and_dumps_log(tmp_path, dead_url: str):
     log = _server_log(tmp_path, "loading weights...\nlast server words\n")
     proc = subprocess.Popen(["true"])
@@ -78,6 +129,19 @@ def test_error_keyword_in_server_log_fails_fast(tmp_path, dead_url: str):
     msg = str(e.value)
     assert "Found error in server file" in msg
     assert "engine exploded" in msg
+
+
+def test_additional_server_proc_fails_readiness_wait_fast(tmp_path, dead_url: str) -> None:
+    log = _server_log(tmp_path, "context worker failed\n")
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    with pytest.raises(RuntimeError, match="Context worker.*exited unexpectedly"):
+        wait_for_endpoint_ready(
+            dead_url,
+            timeout=30,
+            check_files=[log],
+            additional_server_procs=[(proc, "Context worker")],
+        )
 
 
 def test_ready_timeout_dumps_log_tail(tmp_path, dead_url: str):
@@ -117,11 +181,11 @@ def test_endpoint_down_wait_retries_a_read_timeout(
         "test_common.http_utils.time",
         SimpleNamespace(monotonic=monotonic, sleep=sleep),
     )
-    with pytest.raises(RuntimeError, match="did not become down"):
-        wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=timeout)
+    with pytest.raises(RuntimeError, match="did not refuse"):
+        wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=timeout, required_failures=1)
 
     assert len(calls) >= minimum_polls
-    assert clock.now >= timeout
+    assert clock.now == timeout
     assert all(0 < poll_timeout <= timeout for poll_timeout in calls)
 
 
@@ -146,10 +210,9 @@ def test_endpoint_down_wait_makes_one_request_per_poll(monkeypatch: pytest.Monke
         "test_common.http_utils.time",
         SimpleNamespace(monotonic=monotonic, sleep=sleep),
     )
-    wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=2)
+    wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=2, required_failures=1)
 
-    assert len(calls) == 2
-    assert all(0 < timeout <= 2 for timeout in calls)
+    assert calls == [2, 1]
 
 
 def test_endpoint_down_wait_retries_a_reset_before_refusal(
@@ -177,14 +240,14 @@ def test_endpoint_down_wait_retries_a_reset_before_refusal(
         "test_common.http_utils.time",
         SimpleNamespace(monotonic=monotonic, sleep=sleep),
     )
-    wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=2)
+    wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=2, required_failures=1)
 
     assert len(calls) == 2
     assert all(0 < timeout <= 2 for timeout in calls)
 
 
 def test_endpoint_down_wait_recognizes_real_connection_refused(dead_url: str) -> None:
-    wait_for_endpoint_down(dead_url, timeout=2)
+    wait_for_endpoint_down(dead_url, timeout=2, required_failures=1)
 
 
 def test_missing_check_file_does_not_crash_the_wait(tmp_path, dead_url: str):
@@ -218,6 +281,52 @@ def test_fail_if_proc_died_noop_when_alive_or_none(tmp_path):
     finally:
         proc.kill()
         proc.wait()
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [
+        SimpleNamespace(status_code=200),
+        SimpleNamespace(status_code=503),
+        requests.ReadTimeout("slow probe"),
+        requests.ConnectionError(OSError(errno.ECONNRESET, "Connection reset")),
+    ],
+    ids=["ok", "unavailable", "read-timeout", "reset"],
+)
+def test_endpoint_down_requires_default_consecutive_refusals(
+    monkeypatch, interruption: SimpleNamespace | requests.RequestException, dead_url: str
+) -> None:
+    refused = requests.ConnectionError(OSError(errno.ECONNREFUSED, "Connection refused"))
+    probes = iter([refused, interruption] + [refused] * 10)
+    probe_count = 0
+
+    def get(*args, **kwargs):
+        nonlocal probe_count
+        probe_count += 1
+        result = next(probes)
+        if isinstance(result, requests.RequestException):
+            raise result
+        return result
+
+    monkeypatch.setattr("test_common.http_utils.requests.get", get)
+    monkeypatch.setattr("test_common.http_utils.time.sleep", lambda _: None)
+
+    wait_for_endpoint_down(dead_url, timeout=30)
+
+    assert probe_count == 12
+
+
+def test_endpoint_down_times_out_while_endpoint_responds(monkeypatch, dead_url: str) -> None:
+    monotonic_values = iter([0.0, 0.0, 2.0, 2.0])
+    monkeypatch.setattr(
+        "test_common.http_utils.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(status_code=503),
+    )
+    monkeypatch.setattr("test_common.http_utils.time.monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr("test_common.http_utils.time.sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="did not refuse 10 consecutive probes within 2 seconds"):
+        wait_for_endpoint_down(dead_url, timeout=2)
 
 
 def test_report_error_keyword_scan_fires(tmp_path):

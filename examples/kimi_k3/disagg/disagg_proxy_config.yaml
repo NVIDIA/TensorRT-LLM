@@ -4,8 +4,8 @@
 # Modeled on examples/disaggregated/disagg_config.yaml. The proxy routes
 # each request to a context server for prefill, then to a generation
 # server for decode; the KV + KDA state moves ctx -> gen through the
-# cache transceiver configured in the worker configs (NIXL, Python V2
-# runtime - see ctx_config.yaml / gen_config_no_sa.yaml).
+# cache transceiver configured in the worker configs (NIXL, Python
+# transceiver - see ctx_config.yaml / gen_config_no_sa.yaml).
 #
 # Replace hostnames/ports with the actual worker endpoints (each K3
 # worker spans 16 GPUs = 4 NVL72 nodes; the URL is rank 0's node).

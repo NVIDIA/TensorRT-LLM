@@ -389,9 +389,10 @@ def test_trtllm_serve_example(llm_root, llm_venv):
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
     ])
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_trtllm_serve_example.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_trtllm_serve_example.py")
+    ])
 
 
 def test_trtllm_serve_multimodal_example(llm_root, llm_venv):
@@ -402,7 +403,7 @@ def test_trtllm_serve_multimodal_example(llm_root, llm_venv):
         os.path.join(example_root, "requirements.txt")
     ])
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_trtllm_serve_multimodal_example.py")
     ])
 
@@ -414,9 +415,10 @@ def test_trtllm_serve_lora_example(llm_root, llm_venv):
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
     ])
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_trtllm_serve_lora.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_trtllm_serve_lora.py")
+    ])
 
 
 @pytest.mark.parametrize("backend", ["pytorch"])
@@ -428,7 +430,7 @@ def test_trtllm_serve_top_logprobs(llm_root, llm_venv, backend: str):
         os.path.join(example_root, "requirements.txt")
     ])
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_trtllm_serve_top_logprobs.py"), "-k", backend
     ])
 
@@ -437,11 +439,12 @@ def test_trtllm_serve_top_logprobs(llm_root, llm_venv, backend: str):
 def test_openai_misc_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_openai_misc.py"), "-k", backend
     ])
 
 
+@pytest.mark.skip_less_device(4)
 def test_openai_kv_cache_contamination(llm_root, llm_venv):
     """NVBug 6025177 regression: cross-request KV-cache contamination on cancel-during-chunked-prefill.
 
@@ -450,7 +453,7 @@ def test_openai_kv_cache_contamination(llm_root, llm_venv):
     """
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
-        "-m", "pytest", "-v",
+        "-m", "pytest", "-s", "--tb=long", "-ra", "-v",
         str(test_root / "_test_openai_kv_cache_contamination.py")
     ])
 
@@ -469,9 +472,10 @@ def test_trtllm_serve_profile_example(llm_root, llm_venv):
     YAML.
     """
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_trtllm_serve_profile.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_trtllm_serve_profile.py")
+    ])
 
 
 @pytest.mark.parametrize("backend", ["pytorch"])
@@ -479,7 +483,7 @@ def test_openai_completions_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     filter_expr = f"{backend} and not sampler"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_openai_completions.py"), "-k", filter_expr
     ])
 
@@ -489,7 +493,7 @@ def test_openai_chat_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     filter_expr = f"{backend} and not sampler"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_openai_chat.py"), "-k", filter_expr
     ])
 
@@ -498,29 +502,31 @@ def test_openai_chat_example(llm_root, llm_venv, backend: str):
 def test_openai_reasoning(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_openai_reasoning.py"), "-k", backend
     ])
 
 
 def test_openai_tool_call(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_tool_call.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_openai_tool_call.py")
+    ])
 
 
 def test_openai_post_processor(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_post_processor.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_openai_post_processor.py")
+    ])
 
 
 def test_openai_completions_with_logit_bias(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_openai_completions.py"), "-k",
         "logit_bias_effect"
     ])
@@ -529,53 +535,57 @@ def test_openai_completions_with_logit_bias(llm_root, llm_venv):
 def test_openai_chat_with_logit_bias(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_openai_chat.py"), "-k", "logit_bias_effect"
     ])
 
 
 def test_openai_perf_metrics(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_perf_metrics.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_openai_perf_metrics.py")
+    ])
 
 
 @skip_pre_hopper
 def test_openai_chat_harmony(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_chat_harmony.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_openai_chat_harmony.py")
+    ])
 
 
 @skip_pre_hopper
 def test_openai_chat_harmony_perf_metrics(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_openai_chat_harmony_perf_metrics.py")
     ])
 
 
 def test_anthropic_messages(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_anthropic_messages.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_anthropic_messages.py")
+    ])
 
 
 def test_openai_responses(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_responses.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_openai_responses.py")
+    ])
 
 
 def test_openai_responses_entrypoint(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_openai_responses_entrypoint.py")
     ])
 
@@ -583,21 +593,33 @@ def test_openai_responses_entrypoint(llm_root, llm_venv):
 def test_openai_health(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_openai_metrics.py"), "-k", "test_health"
     ])
 
 
 def test_openai_prometheus(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_prometheus.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_openai_prometheus.py")
+    ])
+
+
+def test_openai_multi_frontend(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_openai_multi_frontend.py")
+    ])
 
 
 def test_openai_lora(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_lora.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_openai_lora.py")
+    ])
 
 
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
@@ -605,6 +627,10 @@ def test_openai_chat_multimodal_example(llm_root, llm_venv):
     llm_venv.run_cmd([
         "-m",
         "pytest",
+        "-s",
+        "-v",
+        "--tb=long",
+        "-ra",
         str(test_root / "_test_openai_chat_multimodal.py"),
         "-m",
         "not needs_l40s",
@@ -613,9 +639,10 @@ def test_openai_chat_multimodal_example(llm_root, llm_venv):
 
 def test_openai_mmencoder_example(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_mmencoder.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_openai_mmencoder.py")
+    ])
 
 
 @pytest.mark.parametrize(
@@ -624,7 +651,7 @@ def test_openai_mmencoder_example(llm_root, llm_venv):
 def test_openai_chat_guided_decoding(llm_root, llm_venv, model_name: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_openai_chat_guided_decoding.py"), "-k",
         model_name
     ])
@@ -636,7 +663,7 @@ def test_openai_chat_guided_decoding(llm_root, llm_venv, model_name: str):
 def test_trtllm_benchmark_serving(llm_venv, model_name):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root /
             f"_test_trtllm_serve_benchmark.py::test_trtllm_serve_benchmark[{model_name}]"
             )
@@ -647,7 +674,7 @@ def test_trtllm_benchmark_serving(llm_venv, model_name):
 def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
-        "-m", "pytest",
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
         str(test_root / "_test_trtllm_serve_multimodal_benchmark.py")
     ])
 
@@ -662,6 +689,10 @@ def test_openai_disagg_multi_nodes_completion_service_discovery(
     llm_venv.run_cmd([
         "-m",
         "pytest",
+        "-s",
+        "-v",
+        "--tb=long",
+        "-ra",
         str(test_root /
             f"_test_disagg_serving_multi_nodes_service_discovery.py::test_completion[{service_discovery}]"
             ),
@@ -681,6 +712,10 @@ def test_openai_disagg_multi_nodes_completion(llm_root, llm_venv, ctx_config,
     llm_venv.run_cmd([
         "-m",
         "pytest",
+        "-s",
+        "-v",
+        "--tb=long",
+        "-ra",
         str(test_root /
             f"_test_disagg_serving_multi_nodes.py::test_completion[{ctx_config}-{gen_config}]"
             ),
@@ -1327,7 +1362,7 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
 
 @pytest.mark.timeout(5400)
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_mpi_world_size(16)
 @pytest.mark.parametrize("eval_task", ["mmlu"])
 @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 16), (8, 2, 8)],
                          ids=["tp16", "tp8pp2"])

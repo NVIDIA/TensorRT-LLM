@@ -51,6 +51,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     RouterConfig,
     ServerRole,
 )
+from tensorrt_llm.serve import disagg_coordinator as coordinator_module
 from tensorrt_llm.serve.coordinator_server import CoordinatorServer
 from tensorrt_llm.serve.disagg_coordinator import (
     COORDINATOR_RESERVATION_TIMEOUT_ENV,
@@ -67,11 +68,14 @@ from tensorrt_llm.serve.openai_protocol import (
 from tensorrt_llm.serve.router import (
     KV_CACHE_HASH_ALGO_V1,
     KV_CACHE_HASH_ALGO_V2,
+    ROUTING_CONTENT_REQUIRED,
     CoordinatorDelegatingRouter,
     KvCacheAwareRouter,
     LoadBalancingRouter,
 )
 from tensorrt_llm.serve.router_utils import BlockHashMixin as SharedBlockHashMixin
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(autouse=True)
@@ -223,6 +227,15 @@ def test_coordinator_rejects_unknown_role():
         coordinator._router_for_role("typo")
 
 
+def test_coordinator_rejects_non_loopback_http_cluster_storage():
+    config = _make_config([], [], "round_robin", "round_robin")
+    config.hostname = "0.0.0.0"
+    config.disagg_cluster_config = DisaggClusterConfig(cluster_uri="http://127.0.0.1:18000")
+
+    with pytest.raises(ValueError, match="loopback-only"):
+        DisaggCoordinatorService(config, _client_factory)
+
+
 def test_kv_router_rejects_mixed_prepared_hash_algorithms():
     router = KvCacheAwareRouter(server_role=ServerRole.CONTEXT, servers=["server-a", "server-b"])
     router._prepared_ready_servers.update(router.servers)
@@ -294,7 +307,13 @@ async def test_coordinator_publishes_worker_render_fingerprints_to_the_frontend(
 
 @pytest.mark.asyncio
 async def test_coordinator_expires_stale_reservation():
-    config = _make_config([], ["gen:8000"], "round_robin", "conversation")
+    config = _make_config(
+        [],
+        ["gen:8000"],
+        "round_robin",
+        "conversation",
+        gen_router_args={"new_conversation_min_match_blocks": 0},
+    )
     coordinator = DisaggCoordinatorService(
         config,
         _client_factory,
@@ -460,17 +479,52 @@ def test_coordinator_client_configures_empty_delegating_kv_router():
 
 @pytest.mark.asyncio
 async def test_coordinator_client_readiness_is_cached():
+    """Reuse ready state and keep a shared refresh alive across caller deadlines."""
     config = _make_config([], [], "round_robin", "round_robin")
     client = CoordinatorClient("http://coordinator", config)
-    client._is_ready = True
+    client.cluster_info = AsyncMock(side_effect=[{"is_ready": False}, {"is_ready": True}])
+
+    assert await client.is_ready() is False
+    assert await client.is_ready() is True
+    assert client.cluster_info.await_count == 2
+    client.cluster_info.reset_mock()
 
     assert await client.is_ready() is True
+    client.cluster_info.assert_not_awaited()
     assert client._session is None
-    await client.stop()
+
+    client._is_ready = False
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch_when_released() -> dict:
+        started.set()
+        await release.wait()
+        return {"is_ready": True}
+
+    client.cluster_info.side_effect = fetch_when_released
+    refresh = client._get_refresh_task()
+    try:
+        await asyncio.wait_for(started.wait(), timeout=30)
+        # The event stays blocked until after both deadlines, regardless of runner speed.
+        with patch.object(coordinator_module, "COORDINATOR_READINESS_TIMEOUT_S", 0.01):
+            assert await client.is_ready() is False
+            assert await client.is_ready() is False
+        assert client._refresh_task is refresh
+        assert not refresh.done()
+        client.cluster_info.assert_awaited_once()
+        release.set()
+        assert await asyncio.wait_for(asyncio.shield(refresh), timeout=30) is True
+        assert await client.is_ready() is True
+        client.cluster_info.assert_awaited_once()
+    finally:
+        release.set()
+        await client.stop()
 
 
 @pytest.mark.asyncio
 async def test_coordinator_state_sync_starts_in_background():
+    """Recover from refresh failures and drain owned work before closing routers."""
     config = _make_config([], [], "round_robin", "round_robin")
     client = CoordinatorClient("http://coordinator", config)
     client._state_sync_interval_s = 10
@@ -480,13 +534,59 @@ async def test_coordinator_state_sync_starts_in_background():
             "server_lists": {"context": [], "generation": []},
         }
     )
-    client._sync_coordinator_state = AsyncMock()
+    client.cluster_info = AsyncMock(
+        side_effect=[
+            RuntimeError("coordinator unavailable"),
+            {"is_ready": False},
+            {"is_ready": True},
+            {"is_ready": True},
+        ]
+    )
+    client._sync_router_server_lists = AsyncMock(
+        side_effect=[None, None, RuntimeError("router preparation failed"), None]
+    )
+    readiness = []
 
-    await client.start()
+    async def tick(interval_s: float) -> None:
+        """Observe each completed iteration and stop after the recovery sequence."""
+        assert interval_s == client._state_sync_interval_s
+        readiness.append(client._is_ready)
+        if len(readiness) == 5:
+            raise asyncio.CancelledError
 
-    assert client._is_ready is True
-    client._sync_coordinator_state.assert_called_once_with(10)
-    await client.stop()
+    # Control loop iterations without patching other tasks' asyncio.sleep.
+    controlled_asyncio = SimpleNamespace(**{**vars(asyncio), "sleep": tick})
+    with patch.object(coordinator_module, "asyncio", controlled_asyncio):
+        try:
+            await client.start()
+            assert client._is_ready is True
+            assert client._sync_task is not None
+            with pytest.raises(asyncio.CancelledError):
+                await client._sync_task
+            assert readiness == [True, False, False, False, True]
+
+            started = asyncio.Event()
+
+            async def unfinished_fetch() -> dict:
+                started.set()
+                await asyncio.Event().wait()
+                return {"is_ready": True}
+
+            client.cluster_info.side_effect = unfinished_fetch
+            refresh = client._get_refresh_task()
+            await asyncio.wait_for(started.wait(), timeout=30)
+            close_router = client.ctx_router.close
+
+            async def close_after_refresh() -> None:
+                assert refresh.cancelled()
+                await close_router()
+
+            client.ctx_router.close = close_after_refresh
+        finally:
+            await client.stop()
+    assert refresh.cancelled()
+    assert client._refresh_task is None
+    assert await client.is_ready() is False
 
 
 def test_service_discovery_sets_coordinator_state_sync_interval():
@@ -508,7 +608,13 @@ async def test_cluster_info_updates_readiness_and_local_servers():
     client.ctx_router.remove_server = AsyncMock(wraps=client.ctx_router.remove_server)
     client.ctx_router.add_server = AsyncMock(wraps=client.ctx_router.add_server)
     client.ctx_router.prepare_servers = AsyncMock()
-    client.ctx_router._fetch_server_info = AsyncMock(return_value={})
+
+    async def fetch_server_info(server: str, timeout: float) -> dict:
+        assert client._is_ready is False
+        return {}
+
+    client.ctx_router._fetch_server_info = AsyncMock(side_effect=fetch_server_info)
+    client._is_ready = True
 
     await client._apply_cluster_info(
         {
@@ -552,6 +658,26 @@ def test_prefix_token_cache_retokenizes_extended_text():
     assert block_hashing._encode_with_prefix_cache("abc", 1, tokenizer) == [2]
     assert block_hashing._encode_with_prefix_cache("abc", 1, tokenizer) == [2]
     assert tokenizer.calls == ["ab", "abc"]
+
+
+def test_router_tokenization_cache_reuses_cached_prompt_prefix():
+    class CharTokenizer:
+        is_fast = True
+
+        def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+            return {
+                "input_ids": [ord(c) for c in text],
+                "offset_mapping": [(i, i + 1) for i in range(len(text))],
+            }
+
+    tokenizer = CharTokenizer()
+    block_hashing = SharedBlockHashMixin()
+    block_hashing._init_block_hashing(enable_tokenization_cache=True)
+    previous = "system prompt and tools. " * 400
+    for prompt in (previous, previous + "<|im_start|>user\nmore"):
+        ids = block_hashing._encode_with_prefix_cache(prompt, 1, tokenizer)
+        assert ids == [ord(c) for c in prompt]
+    assert block_hashing._prefix_token_cache(tokenizer).hits == 1
 
 
 def test_stateless_router_places_locally_in_worker():
@@ -803,6 +929,99 @@ def test_conversation_coordinator_sticky_by_conv_id():
             )
 
 
+_NEW_CONV_ROUTER_ARGS = {"tokens_per_block": 16, "new_conversation_min_match_blocks": 16}
+_SHARED_PREFIX = list(range(1000, 1256))  # 16 blocks of 16 tokens
+
+
+def _ctx_conv_request(conv_id, tokens, request_id):
+    return CompletionRequest(
+        model="m",
+        prompt=list(tokens),
+        conversation_params=ConversationParams(conversation_id=conv_id),
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only", disagg_request_id=request_id
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_select_without_placement_reserves_nothing():
+    config = _make_config(
+        ["ctx0:8000", "ctx1:8000"],
+        ["gen:8000"],
+        "conversation",
+        "round_robin",
+        ctx_router_args=dict(_NEW_CONV_ROUTER_ARGS),
+    )
+    coordinator = DisaggCoordinatorService(config, _client_factory)
+    router = coordinator.ctx_router
+
+    server, info, req_id = await coordinator.select("context", "t::sa:a", 7, None)
+    assert server is None and req_id == 7
+    assert info == {ROUTING_CONTENT_REQUIRED: True}
+    assert coordinator._reservation_tasks == {}
+    assert sum(router._server_content_load.values()) == 0
+
+    request = _ctx_conv_request("t::sa:a", _SHARED_PREFIX + [1] * 40, 7)
+    server, _, _ = await coordinator.select("context", router.content_routing_key(request), 7, None)
+    assert server in ("ctx0:8000", "ctx1:8000")
+    assert ("context", 7) in coordinator._reservation_tasks
+    await coordinator.finish("context", 7)
+    assert coordinator._reservation_tasks == {}
+
+
+def test_conversation_coordinator_places_new_conversation_by_content():
+    """Delegated routing places a new sibling conversation by content.
+
+    The sibling follows the earlier conversation, and only requests of new
+    conversation_ids are hashed on the worker.
+    """
+    with _FakeWorker() as ctx0, _FakeWorker() as ctx1, _FakeWorker() as gen0:
+        config = _make_config(
+            [ctx0.url, ctx1.url],
+            [gen0.url],
+            "conversation",
+            "round_robin",
+            ctx_router_args=dict(_NEW_CONV_ROUTER_ARGS),
+        )
+        with _CoordinatorThread(config) as coord:
+            assert asyncio.run(_wait_coord_ready(coord.url))
+
+            async def drive():
+                remote = CoordinatorClient(coord.url, config)
+                await remote.start()
+                router = remote.ctx_router
+                assert isinstance(router, CoordinatorDelegatingRouter)
+                hashed = []
+                original = router._local.content_routing_key
+
+                def counting(request):
+                    hashed.append(request.conversation_params.conversation_id)
+                    return original(request)
+
+                router._local.content_routing_key = counting
+                sibling_a = _ctx_conv_request("t::sa:a", _SHARED_PREFIX + [1] * 40, 1)
+                other = _ctx_conv_request("t2", list(range(5000, 5300)), 2)
+                sibling_b = _ctx_conv_request("t::sa:b", _SHARED_PREFIX + [2] * 40, 3)
+                turn_2 = _ctx_conv_request("t::sa:a", _SHARED_PREFIX + [1] * 80, 4)
+                servers = {}
+                for request in (sibling_a, other, sibling_b, turn_2):
+                    # All stay in flight, so least-loaded avoids busy servers.
+                    servers[request.disaggregated_params.disagg_request_id] = (
+                        await router.get_next_server(request)
+                    )[0]
+                for request in (sibling_a, other, sibling_b, turn_2):
+                    await router.finish_request(request)
+                await remote.stop()
+                return servers, hashed
+
+            servers, hashed = asyncio.run(drive())
+            assert servers[2] != servers[1]
+            assert servers[3] == servers[1]
+            assert servers[4] == servers[1]
+            assert hashed == ["t::sa:a", "t2", "t::sa:b"]
+
+
 def test_worker_generates_disagg_request_id_before_generation_routing():
     """Generation routing uses the ID generated by the coordinator client."""
     from tensorrt_llm.serve.router import CoordinatorDelegatingRouter
@@ -861,6 +1080,28 @@ def test_coordinator_session_gives_up_idle_connections_before_the_server():
             dc.make_coordinator_session(url)
         assert connector.call_args.kwargs["limit"] == 0
         assert connector.call_args.kwargs["keepalive_timeout"] == dc.COORDINATOR_KEEPALIVE_TIMEOUT_S
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("somaxconn", "expected"), [("4096\n", 4096), ("65535\n", 16384), (None, 16384)]
+)
+def test_coordinator_uds_backlog_is_capped_by_somaxconn(monkeypatch, somaxconn, expected):
+    import io
+
+    from tensorrt_llm.serve import coordinator_server
+
+    real_open = open
+
+    def fake_open(path, *args, **kwargs):
+        if path != "/proc/sys/net/core/somaxconn":
+            return real_open(path, *args, **kwargs)
+        if somaxconn is None:
+            raise FileNotFoundError(path)
+        return io.StringIO(somaxconn)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    assert coordinator_server._effective_uds_backlog() == expected
 
 
 @pytest.mark.asyncio

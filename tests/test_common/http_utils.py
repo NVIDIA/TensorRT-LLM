@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import errno
 import os
@@ -66,13 +54,14 @@ def wait_for_endpoint_ready(
     check_files: list[str] | None = None,
     server_proc: subprocess.Popen | None = None,
     check_interval: float = 30.0,
+    additional_server_procs: list[tuple[subprocess.Popen | None, str]] | None = None,
 ):
     """Poll ``url`` until it returns 200, failing fast and loudly otherwise.
 
     Fail-fast paths (all of which dump the tails of ``check_files`` so the
     server-side story lands in the CI log):
-      - ``server_proc`` exited -> no point polling a dead server for the
-        remaining timeout;
+      - ``server_proc`` or an ``additional_server_procs`` entry exited ->
+        no point polling when a required server is dead;
       - an error keyword appears in a ``check_files`` log (scanned every
         ``check_interval`` seconds; time-based rather than iteration-based);
       - ``timeout`` elapses without the endpoint becoming ready.
@@ -81,8 +70,9 @@ def wait_for_endpoint_ready(
     next_file_check = start + check_interval
     missing_warned: set[str] = set()
     while time.monotonic() - start < timeout:
-        # Check server_proc if provided (singular)
         fail_if_proc_died(server_proc, "Server process (before becoming ready)", check_files)
+        for additional_proc, what in additional_server_procs or []:
+            fail_if_proc_died(additional_proc, what, check_files)
 
         if check_files and time.monotonic() >= next_file_check:
             next_file_check = time.monotonic() + check_interval
@@ -116,25 +106,34 @@ def wait_for_endpoint_ready(
     )
 
 
-def wait_for_endpoint_down(url: str, timeout: int = 300) -> None:
-    """Wait until a request fails with connection refused or the deadline passes."""
+def wait_for_endpoint_down(url: str, timeout: float = 300, required_failures: int = 10) -> None:
+    """Wait for ``required_failures`` consecutive connection refusals.
+
+    An HTTP response or any other request error resets the count. Probes run
+    one second apart, so the timeout must allow enough time for the full streak.
+    """
     deadline = time.monotonic() + timeout
+    consecutive_refusals = 0
     while (remaining := deadline - time.monotonic()) > 0:
         try:
             response = requests.get(url, timeout=min(5, remaining))
-        except requests.ConnectionError as err:
-            if _is_connection_refused(err):
-                print(f"endpoint {url} refused the connection and is down")
-                return
-            print(f"Shutdown probe for {url} will retry after a connection error: {err}")
-        except requests.Timeout as err:
-            print(
-                f"Shutdown probe for {url} timed out while waiting for the endpoint to stop: {err}"
-            )
+        except requests.RequestException as err:
+            if isinstance(err, requests.ConnectionError) and _is_connection_refused(err):
+                consecutive_refusals += 1
+                if consecutive_refusals >= required_failures:
+                    print(f"endpoint {url} refused the connection and is down")
+                    return
+            else:
+                consecutive_refusals = 0
+                print(f"Shutdown probe for {url} will retry after a request error: {err}")
         else:
-            print(f"endpoint {url} is still up and returned status code {response.status_code}")
+            consecutive_refusals = 0
+            print(f"endpoint {url} returned status code {response.status_code}")
         time.sleep(min(1, max(0, deadline - time.monotonic())))
-    raise RuntimeError(f"Endpoint {url} did not become down within {timeout} seconds")
+    raise RuntimeError(
+        f"Endpoint {url} did not refuse {required_failures} consecutive probes "
+        f"within {timeout} seconds"
+    )
 
 
 def _is_connection_refused(error: BaseException) -> bool:

@@ -46,10 +46,6 @@ namespace tensorrt_llm::nanobind::executor
 
 void initConfigBindings(nb::module_& m)
 {
-    nb::enum_<tle::BatchingType>(m, "BatchingType")
-        .value("STATIC", tle::BatchingType::kSTATIC)
-        .value("INFLIGHT", tle::BatchingType::kINFLIGHT);
-
     auto dynamicBatchConfigGetstate = [](tle::DynamicBatchConfig const& self)
     {
         return nb::make_tuple(self.getEnableBatchSizeTuning(), self.getEnableMaxNumTokensTuning(),
@@ -234,34 +230,6 @@ void initConfigBindings(nb::module_& m)
             &tle::DecodingConfig::setLookaheadDecodingConfig)
         .def("__getstate__", decodingConfigGetstate)
         .def("__setstate__", decodingConfigSetstate);
-
-    auto extendedRuntimePerfKnobConfigSetstate = [](tle::ExtendedRuntimePerfKnobConfig& self, nb::tuple const& state)
-    {
-        if (state.size() != 4)
-        {
-            throw std::runtime_error("Invalid extendedRuntimePerfKnobConfig state!");
-        }
-        new (&self) tle::ExtendedRuntimePerfKnobConfig(nb::cast<bool>(state[0]), nb::cast<bool>(state[1]),
-            nb::cast<bool>(state[2]), nb::cast<SizeType32>(state[3]));
-    };
-    auto extendedRuntimePerfKnobConfigGetstate = [](tle::ExtendedRuntimePerfKnobConfig const& self)
-    {
-        return nb::make_tuple(self.getMultiBlockMode(), self.getEnableContextFMHAFP32Acc(), self.getCudaGraphMode(),
-            self.getCudaGraphCacheSize());
-    };
-    nb::class_<tle::ExtendedRuntimePerfKnobConfig>(m, "ExtendedRuntimePerfKnobConfig")
-        .def(
-            nb::init<bool, bool>(), nb::arg("multi_block_mode") = true, nb::arg("enable_context_fmha_fp32_acc") = false)
-        .def_prop_rw("multi_block_mode", &tle::ExtendedRuntimePerfKnobConfig::getMultiBlockMode,
-            &tle::ExtendedRuntimePerfKnobConfig::setMultiBlockMode)
-        .def_prop_rw("enable_context_fmha_fp32_acc", &tle::ExtendedRuntimePerfKnobConfig::getEnableContextFMHAFP32Acc,
-            &tle::ExtendedRuntimePerfKnobConfig::setEnableContextFMHAFP32Acc)
-        .def_prop_rw("cuda_graph_mode", &tle::ExtendedRuntimePerfKnobConfig::getCudaGraphMode,
-            &tle::ExtendedRuntimePerfKnobConfig::setCudaGraphMode)
-        .def_prop_rw("cuda_graph_cache_size", &tle::ExtendedRuntimePerfKnobConfig::getCudaGraphCacheSize,
-            &tle::ExtendedRuntimePerfKnobConfig::setCudaGraphCacheSize)
-        .def("__getstate__", extendedRuntimePerfKnobConfigGetstate)
-        .def("__setstate__", extendedRuntimePerfKnobConfigSetstate);
 
     // Guided decoding config
     auto pyGuidedDecodingConfig = nb::class_<tle::GuidedDecodingConfig>(m, "GuidedDecodingConfig");
