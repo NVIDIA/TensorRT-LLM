@@ -32,6 +32,7 @@
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaMaskSelection.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
+#include "tensorrt_llm/runtime/locality_domain/locality_domain_utils.h"
 #include "tensorrt_llm/thop/attentionVariant.h"
 
 #include <algorithm>
@@ -377,16 +378,6 @@ constexpr inline T roundUp(T a, T b)
     return divUp(a, b) * b;
 }
 
-// Persistent is the default for performance. TRTLLM_GEN_FMHA_CONTEXT_STATIC_TILE_SCHEDULER=1 selects the static
-// variant instead: the sm107 persistent context kernel can hang in a tcgen05 TMEM-dealloc guardrail trap
-// (observed with the MLA HQk192/HV128 SeparateQkv kernel on Kimi-K3 prefill). Kernel support check and launch
-// must agree on the scheduler, so both go through this helper.
-TileScheduler contextTileScheduler()
-{
-    return tensorrt_llm::common::getEnvUseStaticTileSchedulerForTrtllmGenContextFmha() ? TileScheduler::Static
-                                                                                       : TileScheduler::Persistent;
-}
-
 QkvLayout AttentionInputLayoutToQkvLayout(AttentionInputLayout layout)
 {
     if (layout == AttentionInputLayout::PACKED_QKV)
@@ -470,7 +461,7 @@ bool isTrtllmGenContextSupported(TllmGenFmhaRunner const& runner, MHARunnerFixed
         tensorrt_llm::kernels::detail::selectTrtllmGenMask(
             fixedParams.attentionMaskType, probeSlidingWindowSize, 0, kWindowProbeKvSeqLen));
     tllmRunnerParams.mKernelType = FmhaKernelType::Context;
-    tllmRunnerParams.mTileScheduler = contextTileScheduler();
+    tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
     tllmRunnerParams.mMultiCtasKvMode = false;
     tllmRunnerParams.mNumHeadsQ = fixedParams.numQHeads;
     tllmRunnerParams.mNumHeadsKv = fixedParams.numKvHeads;
@@ -930,8 +921,8 @@ void TrtllmGenFmha<AttentionVariant>::launchContext(MHARunnerParams const& runne
     // Parameters to select kernels.
     tllmRunnerParams.mQkvLayout = qkvLayout;
     tllmRunnerParams.mKernelType = FmhaKernelType::Context;
-    // Persistent scheduler by default for better performance; see contextTileScheduler().
-    tllmRunnerParams.mTileScheduler = contextTileScheduler();
+    // Always use persistent scheduler for better performance.
+    tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
     tllmRunnerParams.mMultiCtasKvMode = false;
 
     tllmRunnerParams.qPtr = runnerParams.qPtr;
@@ -1473,7 +1464,11 @@ void TrtllmGenFmha<MLA>::runGenerationImpl(MLA const& op, FmhaParams const& p, c
 
     // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
     tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
-    tllmRunnerParams.mMultiProcessorCount = op.mMultiProcessorCount;
+    // A locality-domain stream runs only on its Green Context's SMs, so size the KV split for those.
+    // GQA decode stays on the device count: at small batch its kernels run faster over-split.
+    auto const streamSmCount = static_cast<int>(tensorrt_llm::locality_domain::getLocalizedStreamSmCount(stream));
+    tllmRunnerParams.mMultiProcessorCount
+        = streamSmCount > 0 ? std::min(streamSmCount, op.mMultiProcessorCount) : op.mMultiProcessorCount;
     tllmRunnerParams.stream = stream;
     tllmRunnerParams.mSfStartTokenIdx = p.token_offset;
 
@@ -1804,8 +1799,7 @@ bool XqaFmha<AttentionVariant>::fillParams(
             // Inputs to MLA is FP8 instead of BF16/FP16 when using FP8 KV cache.
             xqaParams.data_type = DATA_TYPE_E4M3;
         }
-        if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-            || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && op.mSM < kSM_90))
+        if (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && op.mSM < kSM_90)
         {
             xqaParams.multi_block_mode = false;
         }

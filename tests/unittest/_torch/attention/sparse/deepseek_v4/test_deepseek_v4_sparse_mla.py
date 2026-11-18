@@ -25,8 +25,8 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import PrimsTSSparseMlaFmha
+from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen import TrtllmGenFmha
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     MLAParams,
@@ -863,7 +863,7 @@ def test_deepseek_v4_sparse_mla_split_kv_reduction(
     """
     monkeypatch.setenv("TLLM_FMHA_LIBS", "-prims_ts_sparse_mla")
     generation_fmhas: list[type] = []
-    for fmha_cls in (PrimsTSSparseMlaFmha, FallbackFmha):
+    for fmha_cls in (PrimsTSSparseMlaFmha, TrtllmGenFmha):
 
         def spy_forward(self, q, k, v, metadata, forward_args, _forward=fmha_cls.forward):
             if forward_args.attention_input_type == AttentionInputType.generation_only:
@@ -872,7 +872,7 @@ def test_deepseek_v4_sparse_mla_split_kv_reduction(
 
         monkeypatch.setattr(fmha_cls, "forward", spy_forward)
     _run_deepseek_v4_sparse_mla([14, 508, 3947], 2, sinks, exports_softmax_stats)
-    assert generation_fmhas and set(generation_fmhas) == {FallbackFmha}, generation_fmhas
+    assert generation_fmhas and set(generation_fmhas) == {TrtllmGenFmha}, generation_fmhas
 
 
 def _run_deepseek_v4_sparse_mla(

@@ -14,10 +14,7 @@
 # limitations under the License.
 
 from contextlib import nullcontext
-<<<<<<< HEAD
-=======
-from types import MethodType, SimpleNamespace
->>>>>>> origin/main
+from types import MethodType
 from typing import cast
 from unittest.mock import Mock, patch
 

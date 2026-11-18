@@ -4242,34 +4242,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                             "The per-tensor FP8 attention recipe needs the PrimTS "
                             "FMHA library (TLLM_FMHA_LIBS=+prims_ts), which is not "
                             "enabled or does not support this request.")
+                    if (metadata.num_contexts > 0
+                            and metadata.use_paged_context_fmha
+                            and metadata.uses_trtllm_gen_only_page_size):
+                        raise RuntimeError(
+                            "No TRT-LLM attention FMHA library serves paged prefill "
+                            f"with {metadata.tokens_per_block}-token KV pages. Enable "
+                            "flashinfer_trtllm_gen in TLLM_FMHA_LIBS, use a supported "
+                            "TRTLLM-Gen configuration or disable chunked prefill, KV "
+                            "reuse and speculative decoding.")
                     raise RuntimeError(
-<<<<<<< HEAD
-                        "The per-tensor FP8 attention recipe needs the PrimTS "
-                        "FMHA library (TLLM_FMHA_LIBS=+prims_ts), which is not "
-                        "enabled or does not support this request.")
-                if (metadata.num_contexts > 0
-                        and metadata.use_paged_context_fmha
-                        and metadata.uses_trtllm_gen_only_page_size):
-                    raise RuntimeError(
-                        "No TRT-LLM attention FMHA library serves paged prefill "
-                        f"with {metadata.tokens_per_block}-token KV pages. Enable "
-                        "flashinfer_trtllm_gen in TLLM_FMHA_LIBS, use a supported "
-                        "TRTLLM-Gen configuration or disable chunked prefill, KV "
-                        "reuse and speculative decoding.")
-                raise RuntimeError(
-                    "No TRT-LLM attention FMHA library supports this request.")
-            if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
-                # Conservatively disable reclamation for metadata used by graphs
-                # or backends that can retain staged workspace state.
-                metadata.workspace_reclaimable = False
-            try:
-                fmha.forward(q, k, v, metadata, forward_args)
-            except RuntimeError as exc:
-                log_attention_failure_context(
-                    type(self).__name__, self.layer_idx, metadata,
-                    forward_args.attention_window_size, exc)
-                raise
-=======
                         "No TRT-LLM attention FMHA library supports this request."
                     )
                 if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
@@ -4283,7 +4265,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                         type(self).__name__, self.layer_idx, metadata,
                         part_args.attention_window_size, exc)
                     raise
->>>>>>> origin/main
 
         if self.print_skip_softmax_stat:
             total_blocks, skipped_blocks = self.skip_softmax_stat

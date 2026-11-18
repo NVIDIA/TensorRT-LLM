@@ -16,7 +16,6 @@
 import os
 from typing import TypeAlias
 
-from .beam_shared_prefix import BeamSharedPrefixFmha
 from .cute_dsl_mla import CuteDslMlaFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
@@ -34,6 +33,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     scope, so backends can import trtllm attention classes at module scope
     without an import cycle.
     """
+    from .beam_shared_prefix import BeamSharedPrefixFmha
     from .flash_mla import FlashMlaFmha
     from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
     from .fmha_v2 import FmhaV2Fmha
@@ -78,7 +78,9 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "gqa_segmented": GqaSegmentedFmha,
         "gqa_decode": GqaDecodeFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
-<<<<<<< HEAD
+        # Opt-in wide-beam generation path (TLLM_FMHA_LIBS=+beam_shared_prefix);
+        # takes generation-only beam-search batches ahead of the native libraries.
+        "beam_shared_prefix": BeamSharedPrefixFmha,
         # The native attention op's libraries. One order serves MHA and MLA:
         # fmha_v2 serves no MHA generation and XQA no context phase.
         "trtllm_gen": TrtllmGenFmha,
@@ -87,12 +89,6 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "fmha_v2": FmhaV2Fmha,
         "mmha": MmhaFmha,
         "unfused": UnfusedFmha,
-=======
-        # Opt-in wide-beam generation path (TLLM_FMHA_LIBS=+beam_shared_prefix);
-        # takes generation-only beam-search batches ahead of the fallback.
-        "beam_shared_prefix": BeamSharedPrefixFmha,
-        "fallback": FallbackFmha,
->>>>>>> origin/main
     }
 
 
