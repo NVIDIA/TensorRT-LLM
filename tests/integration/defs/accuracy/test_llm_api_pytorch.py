@@ -221,7 +221,9 @@ class TestApertus1p5_8B(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Apertus-v1.5-8B"
 
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
+        # The checkpoint's 262144-token context sizes the temporary KV cache
+        # for memory profiling to most of a 48 GB GPU's free memory.
+        with LLM(self.MODEL_PATH, max_seq_len=8192) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 

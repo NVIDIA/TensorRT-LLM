@@ -109,7 +109,6 @@ full:H20/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_sc
 full:H20/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-torch_compile=False-sampler_async_worker=False] SKIP (https://nvbugs/6692005)
 full:H20/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding_4gpus[attention_dp=True-mtp_nextn=0] SKIP (https://nvbugs/6692005)
 full:H20/accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16] SKIP (https://nvbugs/6618649)
-full:L40S/accuracy/test_llm_api_pytorch.py::TestApertus1p5_8B::test_auto_dtype SKIP (https://nvbugs/7091647)
 full:L40S/accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_cuda_graph_matches_eager_logits[bert-yelp] SKIP (https://nvbugs/6802114)
 full:RTXPro6000D/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=True] SKIP (https://nvbugs/5929339)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=False] SKIP (https://nvbugs/6616033)
