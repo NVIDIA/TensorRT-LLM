@@ -155,7 +155,7 @@ def test_unpack_rejects_short_frame():
 
 
 @pytest.mark.parametrize("opaque_state", [None, b""])
-def test_params_to_wire_encodes_empty_state(opaque_state):
+def test_params_to_wire_encodes_empty_state(opaque_state: bytes | None) -> None:
     p = types.SimpleNamespace(
         first_gen_tokens=[1],
         req_id=42,

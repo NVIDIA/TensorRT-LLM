@@ -1023,7 +1023,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.context_phase_params = ContextPhaseParams(
                 first_gen_tokens=first_gen_tokens,
                 req_id=req.py_request_id,
-                opaque_state=b"",
+                opaque_state=None,
                 draft_tokens=draft_tokens,
                 ctx_dp_rank=0,
                 disagg_info_endpoint="",

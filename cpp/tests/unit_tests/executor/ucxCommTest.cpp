@@ -56,7 +56,7 @@
 #include <random>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
-#ifdef TEST_UCX_ZMQ_AVAILABLE
+#if defined(TEST_UCX_ZMQ_AVAILABLE)
 #include <zmq.hpp>
 #endif
 
@@ -206,7 +206,7 @@ TEST_F(UcxCommTest, Basic)
     }
 }
 
-#ifdef TEST_UCX_ZMQ_AVAILABLE
+#if defined(TEST_UCX_ZMQ_AVAILABLE)
 TEST_F(UcxCommTest, malformedMultipartRequestDoesNotStopListener)
 {
     try

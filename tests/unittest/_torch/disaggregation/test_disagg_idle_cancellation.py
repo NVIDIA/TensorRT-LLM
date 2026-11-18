@@ -82,6 +82,21 @@ def _request(request_id: int, *, context: bool = False) -> LlmRequest:
     return request
 
 
+def test_apply_aux_uses_absent_opaque_state() -> None:
+    request = SimpleNamespace(
+        py_first_gen_tokens=[1],
+        py_draft_tokens=None,
+        context_phase_params=None,
+        py_request_id=123,
+    )
+    session = Mock()
+
+    KvCacheTransceiverV2._apply_aux(None, session, request)
+
+    session.unpack_aux.assert_called_once_with(request)
+    assert request.context_phase_params.opaque_state is None
+
+
 @pytest.fixture
 def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     """Build the real cancellation path with controlled external boundaries.

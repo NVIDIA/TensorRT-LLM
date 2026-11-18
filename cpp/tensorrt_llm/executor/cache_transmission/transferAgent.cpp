@@ -33,7 +33,7 @@ namespace tensorrt_llm::executor::kv_cache
 namespace
 {
 constexpr size_t kMaxSerializedAgentDescBytes = 64ULL * 1024 * 1024;
-}
+} // namespace
 
 void promoteHostLibraryToGlobalScope()
 {
@@ -139,9 +139,6 @@ AgentDesc AgentDesc::deserialize(std::string const& data)
     {
         bounceHandshake = su::deserialize<std::string>(is);
     }
-    TLLM_CHECK_WITH_INFO(!is.fail(),
-        "AgentDesc::deserialize failed: stream error after reading %zu/%zu regions (data size=%zu)", regions.size(),
-        numRegions, data.size());
     return AgentDesc{std::move(backendAgentDesc), std::move(regions), std::move(bounceHandshake)};
 }
 

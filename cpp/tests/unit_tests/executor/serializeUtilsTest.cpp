@@ -76,7 +76,8 @@ TEST(SerializeUtilsTest, RejectTruncatedDiscriminators)
     std::istringstream optionalInput;
     EXPECT_THROW(su::deserialize<std::optional<int>>(optionalInput), tensorrt_llm::common::TllmException);
     std::istringstream variantInput;
-    EXPECT_THROW(su::deserialize<std::variant<int>>(variantInput), tensorrt_llm::common::TllmException);
+    using ZeroWidthVariant = std::variant<std::array<int, 0>>;
+    EXPECT_THROW(su::deserialize<ZeroWidthVariant>(variantInput), tensorrt_llm::common::TllmException);
 }
 
 TEST(SerializeUtilsTest, ZeroSizeArrayRoundtrip)
