@@ -573,11 +573,11 @@ class PrimsTSSparseMlaFmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         device: torch.device,
         plan_kwargs: dict,
-        *,
-        use_workers: bool,
     ) -> list[tuple[int, bool]]:
-        """Return one row count per specialization and whether a worker should build it."""
+        """Return one row count per specialization and whether it needs parallel precompilation."""
         from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+
+        from . import prims_ts_precompile
 
         requests = int(metadata.max_num_requests or 0)
         draft = int(metadata.max_total_draft_tokens or 0)
@@ -594,6 +594,9 @@ class PrimsTSSparseMlaFmha(Fmha):
         }
         workspace = torch.empty(max(sizes.values()), device=device, dtype=torch.uint8)
         wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper(workspace_buffer=workspace)
+        local_ranks = prims_ts_precompile.local_rank_count(metadata.mapping)
+        # A disk lookup is useful only if at least two misses could start a pool.
+        check_cache = prims_ts_precompile.worker_count(2, local_ranks=local_ranks) > 1
         variants = []
         seen = set()
         # A spec can cover several row counts. Keep the one with the largest
@@ -603,7 +606,7 @@ class PrimsTSSparseMlaFmha(Fmha):
             spec = wrapper._state["compile_spec"]
             if spec not in seen:
                 seen.add(spec)
-                variants.append((rows, use_workers and not wrapper.is_kernel_cached()))
+                variants.append((rows, check_cache and not wrapper.is_kernel_cached()))
         return variants
 
     @staticmethod
@@ -818,17 +821,12 @@ class _WarmupProfile:
         )
 
 
-def _warmup_profiles(
-    profiles: list[_WarmupProfile], metadata: "TrtllmAttentionMetadata", *, use_workers: bool = True
-) -> bool:
-    """Prepare the local plans and report whether any profiles were warmed."""
+def _warmup_profiles(profiles: list[_WarmupProfile], metadata: "TrtllmAttentionMetadata") -> None:
+    """Precompile missing kernels in parallel and prepare all plans locally."""
     if not profiles:
-        return False
+        return
     from . import prims_ts_precompile
 
-    local_ranks = prims_ts_precompile.local_rank_count(metadata.mapping)
-    # Two missing variants is the smallest batch that can use a worker pool.
-    use_workers = use_workers and prims_ts_precompile.worker_count(2, local_ranks=local_ranks) > 1
     payloads = []
     plans = []
     seen = set()
@@ -840,7 +838,7 @@ def _warmup_profiles(
             continue
         seen.add(key)
         for rows, needs_worker in profile.library._kernel_variants(
-            metadata, profile.device, kwargs, use_workers=use_workers
+            metadata, profile.device, kwargs
         ):
             if needs_worker:
                 device_index = profile.device.index
@@ -852,10 +850,12 @@ def _warmup_profiles(
             workspace_bytes = _workspace_size(profile.device, rows, heads, **kwargs)
             plans.append((workspace_bytes, profile, rows))
     if not plans:
-        return False
+        return
     start = time.perf_counter()
     if payloads:
-        prims_ts_precompile.precompile_payloads(payloads, local_ranks=local_ranks)
+        prims_ts_precompile.precompile_payloads(
+            payloads, local_ranks=prims_ts_precompile.local_rank_count(metadata.mapping)
+        )
     # Allocate the largest workspace first so all profiles can share it. The
     # serving process must load every artifact even when the disk cache is warm.
     for _, profile, rows in sorted(plans, key=lambda plan: plan[0], reverse=True):
@@ -864,15 +864,11 @@ def _warmup_profiles(
         f"PrimTS sparse MLA warmup loaded {len(plans)} variants across {len(seen)} profiles "
         f"in {time.perf_counter() - start:.1f} s"
     )
-    return True
 
 
 def warmup_prims_ts_sparse_mla(
-    model: torch.nn.Module,
-    metadata: "DeepseekV4TrtllmAttentionMetadata",
-    *,
-    use_workers: bool = True,
-) -> bool:
+    model: torch.nn.Module, metadata: "DeepseekV4TrtllmAttentionMetadata"
+) -> None:
     """Warm enabled DeepSeek-V4 generation profiles before the first model forward."""
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
         DeepseekV4TrtllmAttention,
@@ -912,7 +908,7 @@ def warmup_prims_ts_sparse_mla(
                         fused_groups=layer.n_local_groups if fused else None,
                     )
                 )
-    return _warmup_profiles(profiles, metadata, use_workers=use_workers)
+    _warmup_profiles(profiles, metadata)
 
 
 __all__ = [

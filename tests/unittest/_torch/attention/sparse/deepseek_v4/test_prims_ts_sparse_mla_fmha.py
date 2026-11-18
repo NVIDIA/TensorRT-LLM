@@ -1097,9 +1097,7 @@ def test_warmup_collects_only_enabled_layer_profiles(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(mod.PrimsTSSparseMlaFmha, "_is_fp8_cache", staticmethod(lambda _: True))
     monkeypatch.setattr(module, "supports_dsv4_epilogue_fusion", lambda layer: layer.fused)
-    monkeypatch.setattr(
-        mod, "_warmup_profiles", lambda profiles, meta, **kw: captured.extend(profiles)
-    )
+    monkeypatch.setattr(mod, "_warmup_profiles", lambda profiles, meta: captured.extend(profiles))
     mod.warmup_prims_ts_sparse_mla(SimpleNamespace(modules=lambda: iter(layers)), metadata)
     assert [(p.extra, p.q_dtype, p.has_sinks, p.fused_groups) for p in captured] == [
         (512, torch.float8_e4m3fn, True, 8),
@@ -1303,15 +1301,16 @@ def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> No
     lib = PrimsTSSparseMlaFmha(attn)
     mod._warmup_profiles([mod._WarmupProfile(lib, extra=32, **profile)], eager)
     assert planned == [(20, 32), (15, 32), (7, 32)]
-    # Final metadata needs local plans, including profiles absent in the first pass.
+    # A later pass can also dispatch newly encountered variants before preparing its local plans.
     planned.clear()
     fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
-    mod._warmup_profiles([mod._WarmupProfile(lib, extra=64, **profile)], fresh, use_workers=False)
+    mod._warmup_profiles([mod._WarmupProfile(lib, extra=64, **profile)], fresh)
     assert planned == [(20, 64), (15, 64), (7, 64)]
     assert (
         mla_decode.BatchSparseMLADecodePagedTSWrapper.discovery_rows == list(range(20, 0, -1)) * 2
     )
-    assert len(fanned) == 1
+    assert len(fanned) == 2
+    assert [p["plan_kwargs"]["max_extra_topk"] for p in fanned[1][0]] == [64, 64, 64]
     payloads, workers = fanned[0]
     assert workers == 2
     assert [p["rows"] for p in payloads] == [20, 15, 7]
