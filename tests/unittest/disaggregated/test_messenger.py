@@ -538,6 +538,9 @@ def test_replay_state_survives_a_rewritten_sender_id(replay_router: _MessengerPa
     raw.send(rewritten)
     with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
         router.receive(timeout_ms=1000)
+    raw.send(message)
+    with pytest.raises(FrameAuthenticationError, match="Repeated or out-of-order message"):
+        router.receive(timeout_ms=1000)
 
 
 def test_listener_drops_replayed_message_and_keeps_running(replay_router: _MessengerPair) -> None:
