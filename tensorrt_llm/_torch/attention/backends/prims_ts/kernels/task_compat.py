@@ -115,10 +115,27 @@ if TS_TREE_WALKING_TASK:
             super().__init__(*args, **kwargs)
             # Classified here, outside any runtime control flow: ``_create_stage_info``
             # is traced inside it, where generators and new attributes are not allowed.
-            self._domain_loop_bounds = None
+            # Only Python values are kept: a runtime loop bound stored on the task
+            # would be threaded through the walker's staged loops as task state.
+            self._has_domain_loop = False
             self._step_follows_domain_loop = {}
             if self.restore_loop_state_outside_loop:
                 self._classify_steps_around_domain_loop()
+
+        def _first_domain_loop(self):
+            """The schedule's first ``DomainLoop``, or ``None``."""
+
+            def walk(nodes):
+                for node in nodes:
+                    if isinstance(node, DomainLoop):
+                        return node
+                    if isinstance(node, (ConditionalBlock, WorkTileLoop)):
+                        found = walk(node.body)
+                        if found is not None:
+                            return found
+                return None
+
+            return walk(self.schedule.body)
 
         def _classify_steps_around_domain_loop(self):
             """Record each step's position relative to the first ``DomainLoop``."""
@@ -127,8 +144,7 @@ if TS_TREE_WALKING_TASK:
             def walk(nodes):
                 for node in nodes:
                     if isinstance(node, DomainLoop):
-                        if self._domain_loop_bounds is None:
-                            self._domain_loop_bounds = (node.start, node.end, node.step)
+                        self._has_domain_loop = True
                         seen_loop[0] = True
                     elif isinstance(node, Step):
                         self._step_follows_domain_loop[id(node)] = seen_loop[0]
@@ -170,8 +186,9 @@ if TS_TREE_WALKING_TASK:
 
         def _create_stage_info(self, step, ctx):
             values = dict(super()._create_stage_info(step, ctx).__dict__)
-            if self._domain_loop_bounds is not None and ctx.loop is None:
-                start_bound, end_bound, step_bound = self._domain_loop_bounds
+            if self._has_domain_loop and ctx.loop is None:
+                loop = self._first_domain_loop()
+                start_bound, end_bound, step_bound = loop.start, loop.end, loop.step
                 start = self._resolve_bound(start_bound, ctx.work_tile)
                 end = self._resolve_bound(end_bound, ctx.work_tile)
                 stride = self._resolve_bound(step_bound, ctx.work_tile)

@@ -301,7 +301,7 @@ class MlaInterleavedTask(MlaTask):
 
             super().__init__(*args, **kwargs)
             # The lane is the schedule's fixed ``domain_loop`` start.
-            self._lane = int(self._domain_loop_bounds[0])
+            self._lane = int(self._first_domain_loop().start)
             self._cumulative_k_parity = cutlass.Int32(0)
             self._mapped_domain_start = cutlass.Int32(self._lane)
             self._actual_domain = cutlass.Int32(0)
