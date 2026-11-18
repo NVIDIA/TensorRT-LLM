@@ -20,6 +20,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     Receiver,
     _derive_native_auth_key,
     _make_native_frame_signer,
+    _make_rank_info_auth_key,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -60,9 +61,7 @@ def _make_receiver(master_key: Optional[bytes], timeout_s: float = 5.0) -> Recei
     receiver._sessions_lock = threading.Lock()
     receiver._shutdown = True
     receiver._rank_info_timeout_s = timeout_s
-    receiver._rank_info_auth_key = (
-        _derive_native_auth_key(master_key, b"rank-info") if master_key else None
-    )
+    receiver._rank_info_auth_key = _make_rank_info_auth_key(master_key)
     receiver._frame_signer = _make_native_frame_signer(master_key)
     receiver._messenger = Mock(endpoint=_RECEIVER_ENDPOINT)
     receiver._incompatible_peers = {}
@@ -79,9 +78,7 @@ def _rank_info_server(master_key: Optional[bytes]) -> Iterator[RankInfoServer]:
     with patch(f"{_TRANSFER_MODULE}.get_local_ip", return_value="127.0.0.1"):
         server = RankInfoServer(
             rank_info,
-            rank_info_auth_key=(
-                _derive_native_auth_key(master_key, b"rank-info") if master_key else None
-            ),
+            rank_info_auth_key=_make_rank_info_auth_key(master_key),
             frame_signer=_make_native_frame_signer(master_key),
         )
     try:

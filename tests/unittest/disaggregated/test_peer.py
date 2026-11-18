@@ -655,6 +655,7 @@ def _make_receiver_for_view_validation(
         registrar,
         Mock(),
         enforce_physical_ownership=enforce_physical_ownership,
+        frame_signer=None,
     )
     receiver._build_recv_req_info = Mock()
     receiver._request_sender_data = Mock()

@@ -136,13 +136,12 @@ _RANK_INFO_CHALLENGE_TTL_S = 10.0
 _NATIVE_CTL_AUTH_CONTEXT = b"trtllm-native-disagg-ctl-v1\0"
 _NATIVE_SUBKEY_CONTEXT = b"trtllm-native-auth-subkey-v1\0"
 _NATIVE_CTL_KEY_ID = 0
-_MIN_NATIVE_AUTH_KEY_BYTES = 16
 
 
 def _validate_native_auth_key(key: Optional[bytes]) -> Optional[bytes]:
-    if key is not None and (not isinstance(key, bytes) or len(key) < _MIN_NATIVE_AUTH_KEY_BYTES):
+    if key is not None and (not isinstance(key, bytes) or len(key) < FrameSigner.MIN_KEY_SIZE):
         raise ValueError(
-            f"Native transfer authentication keys must be at least {_MIN_NATIVE_AUTH_KEY_BYTES} "
+            f"Native transfer authentication keys must be at least {FrameSigner.MIN_KEY_SIZE} "
             "bytes when configured (32 random bytes recommended, e.g. `openssl rand -hex 32`); "
             "use the same internal_request_auth_key on communicating peers"
         )
@@ -167,6 +166,12 @@ def _make_native_frame_signer(master_key: Optional[bytes]) -> Optional[FrameSign
         _NATIVE_CTL_KEY_ID,
         _NATIVE_CTL_AUTH_CONTEXT,
     )
+
+
+def _make_rank_info_auth_key(master_key: Optional[bytes]) -> Optional[bytes]:
+    if master_key is None:
+        return None
+    return _derive_native_auth_key(master_key, b"rank-info")
 
 
 class RankInfoAuthenticationError(PermissionError):
@@ -712,9 +717,6 @@ class _SessionQuiescence:
 
 
 class Sender(SenderBase):
-    # Class-level default keeps objects built with __new__ (tests) unsigned.
-    _frame_signer: Optional[FrameSigner] = None
-
     # Time-to-live for orphaned RecvReqInfo entries (seconds).
     # In gen-first ADP broadcast, non-assigned DP ranks accumulate
     # RecvReqInfo that never gets consumed.  Entries older than this
@@ -732,7 +734,8 @@ class Sender(SenderBase):
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
         context_first_ownership: bool = False,
-        frame_signer: Optional[FrameSigner] = None,
+        *,
+        frame_signer: Optional[FrameSigner],
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
@@ -3201,9 +3204,6 @@ class KVRecvTask(_LogicalTask):
 
 
 class Receiver(ReceiverBase):
-    # Class-level default keeps objects built with __new__ (tests) unsigned.
-    _frame_signer: Optional[FrameSigner] = None
-
     def __init__(
         self,
         peer_registrar: PeerRegistrar,
@@ -3213,14 +3213,15 @@ class Receiver(ReceiverBase):
         context_first_ownership: bool = False,
         rank_info_auth_key: Optional[bytes] = None,
         rank_info_timeout_s: float = _FALLBACK_TX_OVERALL_TIMEOUT_S,
-        frame_signer: Optional[FrameSigner] = None,
+        *,
+        frame_signer: Optional[FrameSigner],
     ) -> None:
         self._registrar = peer_registrar
         self._agent = agent
         self._enforce_physical_ownership = enforce_physical_ownership
         self._context_first_ownership = context_first_ownership
         self._retirement_watchdog = retirement_watchdog
-        self._rank_info_auth_key = _validate_native_auth_key(rank_info_auth_key)
+        self._rank_info_auth_key = rank_info_auth_key
         self._rank_info_timeout_s = rank_info_timeout_s
         self._frame_signer = frame_signer
         self._dealers = {}
@@ -4780,10 +4781,11 @@ class RankInfoServer:
         addr: Optional[str] = None,
         port: Optional[int] = None,
         rank_info_auth_key: Optional[bytes] = None,
-        frame_signer: Optional[FrameSigner] = None,
+        *,
+        frame_signer: Optional[FrameSigner],
     ) -> None:
         self._rank_info = rank_info
-        self._rank_info_auth_key = _validate_native_auth_key(rank_info_auth_key)
+        self._rank_info_auth_key = rank_info_auth_key
         self._rank_info_auth_challenges: OrderedDict[bytes, tuple[bytes, float]] = OrderedDict()
         self._shutdown = False  # must be set before _start_listener() so __del__ is safe
         if addr is None and port is None:
@@ -4972,9 +4974,7 @@ class TransferWorker:
                     )
             self._retirement_watchdog = RetirementWatchdog(self._on_quiescence_fatal)
         master_key = _validate_native_auth_key(config.native_auth_key)
-        self._rank_info_auth_key = (
-            _derive_native_auth_key(master_key, b"rank-info") if master_key is not None else None
-        )
+        self._rank_info_auth_key = _make_rank_info_auth_key(master_key)
         self._frame_signer = _make_native_frame_signer(master_key)
         kvm = config.kv_cache_manager
         self._aux_buffer = _make_aux_buffer(

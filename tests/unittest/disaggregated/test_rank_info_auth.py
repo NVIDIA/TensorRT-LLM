@@ -42,6 +42,7 @@ def _make_receiver() -> Receiver:
     # receiver shut down so its destructor can safely run during any later test.
     receiver._sessions_lock = threading.Lock()
     receiver._shutdown = True
+    receiver._frame_signer = None
     return receiver
 
 
@@ -288,7 +289,9 @@ def test_server_warns_only_when_authentication_is_disabled(key):
         patch(f"{_TRANSFER_MODULE}.ZMQMessenger"),
         patch(f"{_TRANSFER_MODULE}.logger.warning") as warning,
     ):
-        server = RankInfoServer(Mock(), addr="127.0.0.1", port=1234, rank_info_auth_key=key)
+        server = RankInfoServer(
+            Mock(), addr="127.0.0.1", port=1234, rank_info_auth_key=key, frame_signer=None
+        )
         if key is None:
             warning.assert_called_once()
             assert "without authentication" in warning.call_args.args[0]
