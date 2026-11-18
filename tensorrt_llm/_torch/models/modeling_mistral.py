@@ -27,7 +27,7 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    EncoderParallelMode, MultimodalModelMixin, PreparedLlmInputs,
+    MultimodalModelMixin, PreparedLlmInputs,
     make_multimodal_encoder_model_config)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     _MULTIMODAL_ENV_NAME, _is_mm_disagg)
@@ -860,12 +860,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
 
     supports_encoder_cache = True
     supports_mm_encoder_item_scheduling = True
-
-    @classmethod
-    def get_multimodal_encoder_parallel_modes(
-            cls, model_config: ModelConfig
-    ) -> dict[str, frozenset[EncoderParallelMode]]:
-        return {"vision": frozenset({"tp", "dp"})}
+    supported_encoder_parallel_modes = frozenset({"tp", "dp"})
 
     def __init__(
         self,

@@ -131,20 +131,16 @@ rejects explicit encoder TP even though its vision encoder supports TP.
 Encoder DP currently excludes encoder-only execution, encoder CUDA graphs, and
 side-stream prefetch. Encoder TP with LLM attention DP requires item scheduling
 and also excludes encoder CUDA graphs and side-stream prefetch. Models without
-item scheduling, including Gemma4, reject shared encoder TP with attention DP
-at startup.
+item scheduling reject shared encoder TP with attention DP at startup.
 
-Model integrations declare these capabilities through
-`MultimodalModelMixin.get_multimodal_encoder_parallel_modes(model_config)`.
-The method returns supported modes for each encoder enabled by that config,
-including its projector. Image and video can share a `vision` entry:
+Model integrations declare these capabilities in
+`MultimodalModelMixin.supported_encoder_parallel_modes`, for example
+`frozenset({"tp", "dp"})`. A model whose enabled encoders change the answer,
+such as Gemma4 with a DP-only audio encoder, overrides
+`get_supported_encoder_parallel_modes(model_config)`.
 
-```python
-{"vision": frozenset({"tp", "dp"}), "audio": frozenset({"dp"})}
-```
-
-The model loader validates each encoder before constructing weights. A hybrid
-encoder TP/DP configuration requires both modes. An empty mapping means explicit
+The model loader checks the declaration before constructing weights. A hybrid
+encoder TP/DP configuration requires both modes. An empty set means explicit
 encoder parallelism has not been integrated; omitting the setting continues to
 use the existing model path. These declarations describe implemented capabilities;
 model-specific accuracy and performance validation are separate requirements.

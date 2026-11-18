@@ -29,7 +29,6 @@ from typing import (
     Iterable,
     Iterator,
     List,
-    Literal,
     Optional,
     Sequence,
     Tuple,
@@ -72,9 +71,6 @@ from .multimodal_encoder_data_parallel import (
 
 class MultimodalEncoderContractError(ValueError):
     """A request-local MM encoder input or output contract violation."""
-
-
-EncoderParallelMode = Literal["tp", "dp"]
 
 
 def _assemble_multimodal_encoder_embeddings(
@@ -468,8 +464,8 @@ class MultimodalModelMixin:
     language-model delegation.
 
     Models provide encoder computation and layout-specific input slicing. They declare optional
-    encoder TP/DP support through `get_multimodal_encoder_parallel_modes`; the shared execution
-    path handles DP work placement, communication, and output ordering.
+    encoder TP/DP support in `supported_encoder_parallel_modes`; the shared execution path
+    handles DP work placement, communication, and output ordering.
 
     Current limitations:
 
@@ -494,6 +490,12 @@ class MultimodalModelMixin:
     `BaseMultimodalInputProcessor.get_mm_item_metadata`. This is the executor-layer gate for
     item scheduling."""
 
+    supported_encoder_parallel_modes: ClassVar[frozenset[str]] = frozenset()
+    """Explicit encoder parallel modes the model supports: "tp" when its encoder layers and
+    weight loader shard weights with the encoder mapping, "dp" when replicas run through the
+    shared input slicing and encode interfaces. Empty means not integrated. Omitting
+    `encoder_data_parallel_size` keeps the existing model path."""
+
     # TODO: Move capability declarations into the planned single
     # SupportsMultimodal Protocol; keep shared execution in this mixin
     # and encoder attention-metadata setup in MultimodalEncoderMixin.
@@ -505,59 +507,17 @@ class MultimodalModelMixin:
     _encoder_forward_context: Callable[[], contextlib.AbstractContextManager[None]] | None = None
 
     @classmethod
-    def get_multimodal_encoder_parallel_modes(
-        cls, model_config: ModelConfig
-    ) -> dict[str, frozenset[EncoderParallelMode]]:
-        """Return supported parallel modes for each enabled encoder front end.
-
-        The model loader queries this before constructing weights when
-        ``encoder_data_parallel_size`` is set. Overrides inspect the config
-        without constructing modules. Encoder construction uses
-        ``make_multimodal_encoder_model_config`` to apply the selected mapping.
-
-        Keys identify logical encoders, including their projectors. Image and
-        video may share ``vision``; audio may have different capabilities.
-        ``tp`` requires encoder layers and the weight loader to shard weights
-        with the encoder mapping. ``dp`` requires independent replicas using
-        the shared input-slicing and encode interfaces; the framework handles
-        DP placement, communication, and output ordering.
-
-        Every enabled encoder must support the selected mode; hybrid TP/DP
-        requires both. The default empty mapping means explicit encoder
-        parallelism is not integrated. Omitting the encoder setting preserves
-        the existing model path. These declarations describe implementation
-        capabilities; accuracy and performance validation are separate.
-
-        Args:
-            model_config: Resolved model config identifying the enabled encoders.
-
-        Returns:
-            Mapping from enabled logical encoder names to supported modes.
-
-        Example:
-            A model with a TP/DP vision encoder and a DP-only audio encoder returns::
-
-                {"vision": frozenset({"tp", "dp"}), "audio": frozenset({"dp"})}
-        """
-        return {}
+    def get_supported_encoder_parallel_modes(cls, model_config: ModelConfig) -> frozenset[str]:
+        """Return the modes that every encoder enabled by `model_config` supports."""
+        return cls.supported_encoder_parallel_modes
 
     @classmethod
     @final
     def validate_multimodal_encoder_parallelism(cls, model_config: ModelConfig) -> None:
-        """Validate declared capabilities before model construction.
+        """Check an explicit encoder parallel setting before weights are built.
 
-        Called by the model loader for an explicit encoder parallel setting.
-        All enabled encoders must support the selected modes. Shared encoder
-        TP with LLM attention DP also requires the item scheduling contract.
-        Models customize ``get_multimodal_encoder_parallel_modes`` rather
-        than overriding this shared validation.
-
-        Args:
-            model_config: Resolved model config with the requested encoder parallelism.
-
-        Raises:
-            NotImplementedError: An enabled encoder lacks a requested mode.
-            ValueError: Shared encoder TP requires unavailable item scheduling.
+        Called by the model loader. Models declare their modes rather than
+        overriding this shared check.
         """
         mm_config = model_config.multimodal_config
         if (
@@ -566,23 +526,17 @@ class MultimodalModelMixin:
             or model_config.disable_mm_encoder
         ):
             return
-        encoder_modes = cls.get_multimodal_encoder_parallel_modes(model_config)
-        if not encoder_modes:
+        supported = cls.get_supported_encoder_parallel_modes(model_config)
+        if not supported:
             raise NotImplementedError(
                 f"{cls.__name__} does not support explicit multimodal encoder parallelism."
             )
         layout = EncoderParallelLayout.from_config(model_config)
-        required_modes: set[EncoderParallelMode] = set()
-        if layout.dp_size > 1:
-            required_modes.add("dp")
-        if layout.tp_size > 1:
-            required_modes.add("tp")
-        for encoder_name, modes in encoder_modes.items():
-            for mode in sorted(required_modes - modes):
-                parallelism = "tensor" if mode == "tp" else "data"
+        for mode, size, name in (("dp", layout.dp_size, "data"), ("tp", layout.tp_size, "tensor")):
+            if size > 1 and mode not in supported:
                 raise NotImplementedError(
-                    f"{cls.__name__} encoder '{encoder_name}' does not support "
-                    f"multimodal encoder {parallelism} parallelism."
+                    f"{cls.__name__} does not support multimodal encoder {name} parallelism "
+                    "with this config."
                 )
         if layout.collective and not cls.supports_mm_encoder_item_scheduling:
             raise ValueError("Encoder TP with attention DP requires MM encoder item scheduling.")

@@ -58,7 +58,6 @@ from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
 from .modeling_multimodal_mixin import (
     EncoderCachePartition,
-    EncoderParallelMode,
     MultimodalModelMixin,
     PreparedLlmInputs,
     make_multimodal_encoder_model_config,
@@ -1002,17 +1001,14 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     supports_vision_gpu_normalize: ClassVar[bool] = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
 
+    supported_encoder_parallel_modes = frozenset({"tp", "dp"})
+
     @classmethod
-    def get_multimodal_encoder_parallel_modes(
-        cls, model_config: ModelConfig
-    ) -> dict[str, frozenset[EncoderParallelMode]]:
-        config = model_config.pretrained_config
-        modes: dict[str, frozenset[EncoderParallelMode]] = {}
-        if config.vision_config is not None:
-            modes["vision"] = frozenset({"tp", "dp"})
-        if config.audio_config is not None:
-            modes["audio"] = frozenset({"dp"})
-        return modes
+    def get_supported_encoder_parallel_modes(cls, model_config: ModelConfig) -> frozenset[str]:
+        # The audio encoder does not shard its weights, so it supports DP only.
+        if model_config.pretrained_config.audio_config is not None:
+            return cls.supported_encoder_parallel_modes & {"dp"}
+        return cls.supported_encoder_parallel_modes
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:

@@ -24,7 +24,6 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    EncoderParallelMode,
     MultimodalEncoderContractError,
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
@@ -141,11 +140,7 @@ class CountingEncoderMultimodalModel(DummyMultimodalModel):
 
 
 class DataParallelEncoderMultimodalModel(DummyMultimodalModel):
-    @classmethod
-    def get_multimodal_encoder_parallel_modes(
-        cls, model_config: ModelConfig
-    ) -> dict[str, frozenset[EncoderParallelMode]]:
-        return {"vision": frozenset({"dp"})}
+    supported_encoder_parallel_modes = frozenset({"dp"})
 
     def __init__(self, rank: int, *, enable_attention_dp: bool = False):
         embedding = make_embedding(num_embeddings=8, hidden_size=2)
@@ -585,7 +580,7 @@ def test_encoder_tp_checks_model_opt_in_before_construction():
         patch.object(AutoModelForCausalLM, "from_config") as constructor,
     ):
         with pytest.raises(
-            NotImplementedError, match="encoder 'vision' does not support.*tensor parallelism"
+            NotImplementedError, match="does not support multimodal encoder tensor parallelism"
         ):
             object.__new__(ModelLoader).load("unused", None)
         constructor.assert_not_called()
@@ -595,21 +590,20 @@ def test_encoder_tp_checks_model_opt_in_before_construction():
 @pytest.mark.parametrize(
     "modes,dp_size,unsupported",
     [
-        ({"vision": frozenset({"tp"})}, 1, None),
-        ({"vision": frozenset({"tp"})}, 2, "vision.*data"),
-        ({"vision": frozenset({"tp", "dp"}), "audio": frozenset({"dp"})}, 1, "audio.*tensor"),
-        ({"vision": frozenset({"tp", "dp"}), "audio": frozenset({"dp"})}, 2, "audio.*tensor"),
-        ({"vision": frozenset({"tp", "dp"}), "audio": frozenset({"dp"})}, 4, None),
+        (frozenset({"tp"}), 1, None),
+        (frozenset({"tp"}), 2, "data"),
+        (frozenset({"dp"}), 1, "tensor"),
+        (frozenset({"dp"}), 2, "tensor"),
+        (frozenset({"dp"}), 4, None),
+        (frozenset({"tp", "dp"}), 2, None),
     ],
 )
-def test_encoder_parallelism_checks_each_encoder(modes, dp_size, unsupported):
+def test_encoder_parallelism_checks_declared_modes(modes, dp_size, unsupported):
     config = ModelConfig(
         mapping=Mapping(world_size=4, tp_size=4),
         multimodal_config=MultimodalConfig(encoder_data_parallel_size=dp_size),
     )
-    with patch.object(
-        DummyMultimodalModel, "get_multimodal_encoder_parallel_modes", return_value=modes
-    ):
+    with patch.object(DummyMultimodalModel, "supported_encoder_parallel_modes", modes):
         if unsupported:
             with pytest.raises(NotImplementedError, match=unsupported):
                 DummyMultimodalModel.validate_multimodal_encoder_parallelism(config)
@@ -625,7 +619,7 @@ def test_default_or_disabled_encoder_does_not_require_parallel_integration(disab
         multimodal_config=MultimodalConfig(encoder_data_parallel_size=1 if disabled else None),
     )
     with patch.object(
-        DummyMultimodalModel, "get_multimodal_encoder_parallel_modes"
+        DummyMultimodalModel, "get_supported_encoder_parallel_modes"
     ) as capabilities:
         DummyMultimodalModel.validate_multimodal_encoder_parallelism(config)
     capabilities.assert_not_called()
@@ -639,11 +633,7 @@ def test_shared_encoder_tp_checks_item_scheduling_before_construction():
     )
     with (
         patch.object(AutoModelForCausalLM, "_resolve_class", return_value=DummyMultimodalModel),
-        patch.object(
-            DummyMultimodalModel,
-            "get_multimodal_encoder_parallel_modes",
-            return_value={"vision": frozenset({"tp", "dp"})},
-        ),
+        patch.object(DummyMultimodalModel, "supported_encoder_parallel_modes", frozenset({"tp", "dp"})),
         patch.object(ModelLoader, "_load_and_validate_config", return_value=config),
         patch.object(AutoModelForCausalLM, "from_config") as constructor,
     ):
@@ -676,10 +666,7 @@ def test_gemma_encoder_parallelism_respects_enabled_front_ends(unified, vision, 
     if not unified and vision and not audio:
         model_cls.validate_multimodal_encoder_parallelism(config)
     else:
-        unsupported_encoder = "vision" if unified and vision else "audio"
-        with pytest.raises(
-            NotImplementedError, match=f"'{unsupported_encoder}'.*tensor parallelism"
-        ):
+        with pytest.raises(NotImplementedError, match="tensor parallelism"):
             model_cls.validate_multimodal_encoder_parallelism(config)
 
 

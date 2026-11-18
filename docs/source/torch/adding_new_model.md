@@ -136,14 +136,14 @@ item metadata, input slicing, and encoder execution contract. Construct encoder
 front ends with `make_multimodal_encoder_model_config(model_config)` so their
 mapping is independent of the language model's attention parallelism.
 
-Implement `get_multimodal_encoder_parallel_modes(model_config)` to declare
-supported modes for each enabled logical encoder, including its projector.
-Declare `tp` when the implementation and weight loader shard weights with the
-encoder mapping, and `dp` when it supports independent replicas through the
-shared execution path. Return only encoders enabled by the config; audio and
-vision can have different capabilities. The loader checks these declarations
-before constructing weights. See [multimodal encoder parallelism](../features/parallel-strategy.md#multimodal-encoders)
-for the configuration and an example declaration.
+Set `supported_encoder_parallel_modes` to declare the supported modes. Declare
+`tp` when the encoders, projectors and weight loader shard weights with the
+encoder mapping, and `dp` when the model supports independent replicas through
+the shared execution path. If the enabled encoders change the answer (for
+example, an audio encoder that supports only `dp`), override
+`get_supported_encoder_parallel_modes(model_config)`. The loader checks the
+declaration before constructing weights. See [multimodal encoder parallelism](../features/parallel-strategy.md#multimodal-encoders)
+for the configuration.
 
 `supports_mm_encoder_item_scheduling` describes the separate item scheduling
 contract. Shared encoder TP across attention-DP ranks requires it. Validate

@@ -75,8 +75,7 @@ from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_encoder import \
     prepare_encoder_attn_metadata as _prepare_qwen_vl_vision_attn_metadata
 from .modeling_multimodal_mixin import (
-    EncoderParallelMode, MultimodalModelMixin,
-    make_multimodal_encoder_model_config,
+    MultimodalModelMixin, make_multimodal_encoder_model_config,
     reorder_multimodal_embeddings_by_modality)
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
@@ -2332,12 +2331,8 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     }
 
     supports_mm_encoder_item_scheduling = True
-
-    @classmethod
-    def get_multimodal_encoder_parallel_modes(
-            cls, model_config: ModelConfig
-    ) -> dict[str, frozenset[EncoderParallelMode]]:
-        return {"vision": frozenset({"dp"})}
+    # The Hugging Face Qwen2-VL vision tower does not shard weights.
+    supported_encoder_parallel_modes = frozenset({"dp"})
 
     def get_multimodal_item_partitions(
         self,
@@ -2781,12 +2776,7 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     supported_encoder_attention_backends = Qwen2VLModelBase.supported_encoder_attention_backends
-
-    @classmethod
-    def get_multimodal_encoder_parallel_modes(
-            cls, model_config: ModelConfig
-    ) -> dict[str, frozenset[EncoderParallelMode]]:
-        return {"vision": frozenset({"tp", "dp"})}
+    supported_encoder_parallel_modes = frozenset({"tp", "dp"})
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
