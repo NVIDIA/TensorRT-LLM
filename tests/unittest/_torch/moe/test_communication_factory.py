@@ -59,6 +59,7 @@ def _make_model_config(
         use_cuda_graph=False,
         use_low_precision_moe_combine=False,
         moe_load_balancer=None,
+        enable_wide_ep_fault_tolerance=False,
     )
 
 
@@ -572,6 +573,62 @@ def test_auto_selection_skips_nccl_ep_when_preconditions_fail(
     )
 
     assert isinstance(strategy, AllGatherReduceScatter)
+
+
+def _create_one_sided(model_config, forced: bool):
+    if forced:
+        return communication_factory.CommunicationFactory._create_forced_method(
+            "NVLINK_ONE_SIDED",
+            model_config,
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+            payload_in_workspace=False,
+            alltoall_result_do_sum=True,
+            hidden_size=4096,
+        )
+    return communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+    )
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+@pytest.mark.parametrize("forced", [False, True])
+def test_one_sided_runs_rank_mask_kernels_only_with_fault_tolerance(
+    monkeypatch: pytest.MonkeyPatch, forced: bool, fault_tolerance: bool
+):
+    """NVLinkOneSided runs the rank-mask kernels exactly when the model is fault tolerant."""
+    model_config = _make_model_config()
+    model_config.enable_wide_ep_fault_tolerance = fault_tolerance
+    one_sided = Mock()
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", one_sided)
+
+    assert _create_one_sided(model_config, forced) is one_sided.return_value
+    assert one_sided.call_args.kwargs["enable_wide_ep_fault_tolerance"] is fault_tolerance
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_fault_tolerance_reports_one_sided_error(
+    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
+):
+    """Fault tolerance runs only on NVLinkOneSided, so its construction error is not swallowed."""
+    model_config = _make_model_config(torch.float16)
+    model_config.enable_wide_ep_fault_tolerance = fault_tolerance
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+
+    if fault_tolerance:
+        with pytest.raises(ValueError, match="requires the NVLinkOneSided.*strategy unavailable"):
+            _create_one_sided(model_config, forced=False)
+    else:
+        assert isinstance(_create_one_sided(model_config, forced=False), AllGatherReduceScatter)
 
 
 _NCCL_EP_QUANT_ALGOS = [

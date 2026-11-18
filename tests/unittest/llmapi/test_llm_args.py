@@ -156,6 +156,14 @@ def test_checkpoint_io_policy_rejects_unknown_value() -> None:
 
 
 @pytest.mark.cpu_only
+def test_wide_ep_fault_tolerance_defaults_off(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
+    assert not TorchLlmArgs(
+        model=llama_model_path).enable_wide_ep_fault_tolerance
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("model_kwargs", "expected"),
     [

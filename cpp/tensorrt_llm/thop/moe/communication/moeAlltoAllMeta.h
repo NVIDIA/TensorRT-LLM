@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllSentinel.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -101,8 +102,11 @@ enum MoeA2AMetaInfoIndex : int64_t
     // Reserved receive capacity, including payload alignment padding.
     SENTINEL_RECV_SIZE_INDEX = 25,
 
+    // Offset of the incomplete-round word (see moeAlltoAllKernels.h), 0 in layouts without a rank mask.
+    INCOMPLETE_ROUND_OFFSET_INDEX = 26,
+
     // Number of int64_t entries in the metadata tensor; not a stored layout field.
-    NUM_METAINFO_FIELDS = 26
+    NUM_METAINFO_FIELDS = 27
 };
 
 using MoeA2AWorkspaceLayout = std::array<int64_t, NUM_METAINFO_FIELDS>;
@@ -138,6 +142,7 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_SENTINEL_COMBINE_LANDING_OFFSET_INDEX", SENTINEL_COMBINE_LANDING_OFFSET_INDEX},
         {"MOE_A2A_SENTINEL_RECV_OFFSET_INDEX", SENTINEL_RECV_OFFSET_INDEX},
         {"MOE_A2A_SENTINEL_RECV_SIZE_INDEX", SENTINEL_RECV_SIZE_INDEX},
+        {"MOE_A2A_INCOMPLETE_ROUND_OFFSET_INDEX", INCOMPLETE_ROUND_OFFSET_INDEX},
         {"MOE_A2A_NUM_METAINFO_FIELDS", NUM_METAINFO_FIELDS},
         {"MOE_A2A_MAX_RANKS", kMaxRanks},
         {"MOE_A2A_MAX_TOP_K", kMaxTopK},
@@ -151,6 +156,8 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_SENTINEL_FORMAT_MXFP8", static_cast<int>(sentinel::PayloadFormat::kMxfp8)},
         {"MOE_A2A_SENTINEL_FORMAT_FP8_BLOCK128", static_cast<int>(sentinel::PayloadFormat::kFp8Block128)},
         {"MOE_A2A_SENTINEL_FORMAT_NVFP4", static_cast<int>(sentinel::PayloadFormat::kNvfp4)},
+        {"MOE_A2A_ABORT_STATE_WORDS", sizeof(MoeA2AAbortState) / sizeof(int32_t)},
+        {"MOE_A2A_ABORT_WAITED_FLAG_INDEX", offsetof(MoeA2AAbortState, waited_flag) / sizeof(int32_t)},
     };
 }
 

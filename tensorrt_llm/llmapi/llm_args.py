@@ -8727,6 +8727,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    enable_wide_ep_fault_tolerance: bool = Field(
+        default=False,
+        description="Run the MoE all-to-all of wide expert parallelism in its "
+        "fault-tolerant mode, in which the NVLink one-sided all-to-all "
+        "exchanges only with the EP ranks marked active. Requires the NVLink "
+        "one-sided all-to-all.",
+        status="prototype")
+
     reorder_policy_config: Optional[ReorderRequestPolicyConfig] = Field(
         default=None,
         description="The request reordering policy to use.",
