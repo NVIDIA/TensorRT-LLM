@@ -179,6 +179,7 @@ def _serve_never_finishing_handler(directory: str) -> None:
     server = object.__new__(OpenAIServer)
     server.app = app
     server.disagg_cluster_worker = None
+    server._launcher_watchdog = None
     server.graceful_shutdown_timeout = _BOUND_S
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(workdir / "http.sock"))
