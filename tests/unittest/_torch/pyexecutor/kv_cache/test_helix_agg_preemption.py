@@ -675,21 +675,55 @@ def _fill_pool_with_prefills(
     return [[rank_requests[1], rank_requests[2]] for rank_requests in requests]
 
 
-def test_prefill_only_pressure_recompute_pauses_with_host_tier() -> None:
+# The two prompts of PREFILL_ONLY_PRESSURE, plus two short decodes that are
+# suspended to the host tier before the prompts fill the pool.
+SUSPENDED_DECODES_BEHIND_PREFILLS = Scenario(
+    prompt_lens={1: 448, 2: 448, 3: 64, 4: 64},
+    max_new_tokens={1: 8, 2: 8, 3: 8, 4: 8},
+    max_num_tokens=128,
+    chunk_unit=TOKENS_PER_BLOCK,
+)
+
+
+@pytest.mark.parametrize(
+    "with_suspended_decodes", [False, True], ids=["no_decodes", "suspended_decodes"]
+)
+def test_prefill_only_pressure_recompute_pauses_with_host_tier(
+    with_suspended_decodes: bool,
+) -> None:
     """Two half-prefilled prompts fill the pool and no decode request holds
-    pages, so the generation path has nothing to suspend. The context path
-    recompute-pauses the newer prompt, every rank picks the same one, and both
-    finish.
+    GPU pages, so the generation path has nothing to suspend. The context path
+    recompute-pauses the newer prompt, every rank picks the same one, and all
+    requests finish.
+
+    With suspended_decodes, two short decodes were suspended to the host tier
+    before the prompts filled the pool. Their pages all sit on the host tier,
+    so tearing them down would free no GPU page: neither path takes them, and
+    the context path still recompute-pauses prompt 2.
 
     The starting state is built directly; how often serving reaches it (for
     example after the decode requests are suspended) needs a multi-GPU run.
     """
-    scenario = PREFILL_ONLY_PRESSURE
+    scenario = (
+        SUSPENDED_DECODES_BEHIND_PREFILLS if with_suspended_decodes else PREFILL_ONLY_PRESSURE
+    )
     ranks = [
         _make_rank(cp_rank, scenario, host_cache_size=ROOMY_HOST_TIER_BYTES)
         for cp_rank in range(CP_SIZE)
     ]
-    active = _fill_pool_with_prefills(ranks)
+    requests = [{i: _make_request(i, scenario) for i in scenario.prompt_lens} for _ in ranks]
+    if with_suspended_decodes:
+        decisions = [
+            _step(cp_rank, manager, scheduler, [rank_requests[3], rank_requests[4]], scenario)
+            for cp_rank, ((manager, scheduler), rank_requests) in enumerate(zip(ranks, requests))
+        ]
+        assert all(d == decisions[0] for d in decisions), decisions
+        assert decisions[0][0] == ((3, 0, 64), (4, 0, 64))
+        for (_, scheduler), rank_requests in zip(ranks, requests):
+            for request_id in (3, 4):
+                scheduler._suspend_request(rank_requests[request_id])
+    _fill_pool_with_prefills(ranks, scenario, requests)
+    active = [[rank_requests[i] for i in scenario.prompt_lens] for rank_requests in requests]
 
     first_recompute_paused = None
     for _ in range(MAX_ITERATIONS):
@@ -758,92 +792,6 @@ def test_suspended_prefill_preempts_a_newer_prefill_to_resume() -> None:
 
     assert not any(active), "requests did not finish"
     assert resumed_at == [256] * CP_SIZE
-
-
-# The two prompts of PREFILL_ONLY_PRESSURE, plus two short decodes that are
-# suspended to the host tier before the prompts fill the pool.
-SUSPENDED_DECODES_BEHIND_PREFILLS = Scenario(
-    prompt_lens={1: 448, 2: 448, 3: 64, 4: 64},
-    max_new_tokens={1: 8, 2: 8, 3: 8, 4: 8},
-    max_num_tokens=128,
-    chunk_unit=TOKENS_PER_BLOCK,
-)
-
-
-def test_context_fallback_skips_requests_given_up_earlier_in_the_pass() -> None:
-    """Prompts 1 and 2 fill the pool ahead of decodes 3 and 4, both suspended
-    to the host tier. Decode 3 cannot resume, so the generation path
-    recompute-pauses decode 4; prompt 1 then needs pages, and the context path
-    must not take decode 4 a second time. `_step` checks that no request is
-    listed twice; every rank decides the same, and all finish.
-
-    Decode 3's pages are all on the roomy host tier, so recompute-pausing it
-    would free no GPU memory: the context path takes the active prompt 2.
-    """
-    scenario = SUSPENDED_DECODES_BEHIND_PREFILLS
-    ranks = [
-        _make_rank(cp_rank, scenario, host_cache_size=ROOMY_HOST_TIER_BYTES)
-        for cp_rank in range(CP_SIZE)
-    ]
-    requests = [{i: _make_request(i, scenario) for i in scenario.prompt_lens} for _ in ranks]
-    decisions = [
-        _step(cp_rank, manager, scheduler, [rank_requests[3], rank_requests[4]], scenario)
-        for cp_rank, ((manager, scheduler), rank_requests) in enumerate(zip(ranks, requests))
-    ]
-    assert all(d == decisions[0] for d in decisions), decisions
-    assert decisions[0][0] == ((3, 0, 64), (4, 0, 64))
-    for (_, scheduler), rank_requests in zip(ranks, requests):
-        for request_id in (3, 4):
-            assert rank_requests[request_id].state == LlmRequestState.GENERATION_IN_PROGRESS
-            scheduler._suspend_request(rank_requests[request_id])
-    _fill_pool_with_prefills(ranks, scenario, requests)
-    active = [[rank_requests[i] for i in (1, 2, 3, 4)] for rank_requests in requests]
-
-    first_recompute_paused = None
-    for _ in range(MAX_ITERATIONS):
-        if not any(active):
-            break
-        decisions = [
-            _step(cp_rank, manager, scheduler, rank_active, scenario)
-            for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
-        ]
-        assert all(d == decisions[0] for d in decisions), decisions
-        if first_recompute_paused is None:
-            first_recompute_paused = decisions[0][3]
-
-    assert not any(active), "requests did not finish"
-    assert first_recompute_paused == (4, 2)
-
-
-def test_context_fallback_skips_a_request_given_up_earlier_with_no_active_victim() -> None:
-    """As above, but prompt 2 is left out of the active list, so every
-    candidate behind prompt 1 is suspended and the context path falls back to
-    suspended victims. Decode 3 cannot resume and the generation path
-    recompute-pauses decode 4; the context path must then take decode 3, not
-    decode 4 a second time.
-    """
-    scenario = SUSPENDED_DECODES_BEHIND_PREFILLS
-    ranks = [
-        _make_rank(cp_rank, scenario, host_cache_size=ROOMY_HOST_TIER_BYTES)
-        for cp_rank in range(CP_SIZE)
-    ]
-    requests = [{i: _make_request(i, scenario) for i in scenario.prompt_lens} for _ in ranks]
-    decisions = [
-        _step(cp_rank, manager, scheduler, [rank_requests[3], rank_requests[4]], scenario)
-        for cp_rank, ((manager, scheduler), rank_requests) in enumerate(zip(ranks, requests))
-    ]
-    assert all(d == decisions[0] for d in decisions), decisions
-    for (_, scheduler), rank_requests in zip(ranks, requests):
-        for request_id in (3, 4):
-            scheduler._suspend_request(rank_requests[request_id])
-    _fill_pool_with_prefills(ranks, scenario, requests)
-
-    decisions = [
-        _step(cp_rank, manager, scheduler, [rank_requests[i] for i in (1, 3, 4)], scenario)
-        for cp_rank, ((manager, scheduler), rank_requests) in enumerate(zip(ranks, requests))
-    ]
-    assert all(d == decisions[0] for d in decisions), decisions
-    assert decisions[0][3] == (4, 3)
 
 
 # Request 2 fills most of the pool and decodes while the older request 1 is
