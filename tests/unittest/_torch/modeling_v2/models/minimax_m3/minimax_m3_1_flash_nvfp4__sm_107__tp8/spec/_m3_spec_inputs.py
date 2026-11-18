@@ -9,7 +9,7 @@ import zlib
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_shard_accept import (  # noqa: E501
     SHARD_ROWS,
     make_keys,
 )

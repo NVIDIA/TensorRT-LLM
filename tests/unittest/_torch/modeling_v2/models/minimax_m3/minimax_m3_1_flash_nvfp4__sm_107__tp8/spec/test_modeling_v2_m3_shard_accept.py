@@ -5,13 +5,13 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_shard_accept import (  # noqa: E501
     SHARD_ROWS,
     exchange_tokens,
     local_argmax,
     make_keys,
 )
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_shard_accept import (  # noqa: E501
     m3_shard_accept as op,
 )
 
@@ -68,7 +68,7 @@ def _case(spec, seed, edit_logits=None):
             force_total, next_new, num_sms(), force_vec)  # fmt: skip
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS_BY_TP[8], ids=[c.why[:44] for c in op.CELLS_BY_TP[8]])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     """Bit-exact: the op reduces BF16 logits without arithmetic, ties (within the shard and across ranks) go to
     the lowest global index on both sides."""
@@ -85,7 +85,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
 
 def test_guard_refuses_nan_logits() -> None:
-    args = list(_case(op.CELLS[0].spec, 1))
+    args = list(_case(op.CELLS_BY_TP[8][0].spec, 1))
     args[0][1, 7] = float("nan")
     with pytest.raises(AssertionError, match="NaN"):
         with validating(op):
@@ -102,7 +102,7 @@ def _signed_zero_maxima(logits: torch.Tensor) -> None:
 @pytest.mark.parametrize("ties", [False, True], ids=["peer_rows", "peer_ties"])
 def test_signed_zero_maxima_take_the_lower_index(ties) -> None:
     """-0.0 and +0.0 compare equal, so the lower index wins as with torch.argmax (also across ranks)."""
-    spec = dict(op.CELLS[1].spec, ties=ties)
+    spec = dict(op.CELLS_BY_TP[8][1].spec, ties=ties)
     args = _case(spec, seed_of(f"signed-zero-{ties}"), edit_logits=_signed_zero_maxima)
     ref = op.reference(*args)
     op(*args)

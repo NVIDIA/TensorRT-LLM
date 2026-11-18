@@ -12,12 +12,12 @@ import types
 import pytest
 import torch
 
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels import m3_spec_tail
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8 import (
     modeling,
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
     m3_fold_tail,
-    m3_spec_tail,
 )
 
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):

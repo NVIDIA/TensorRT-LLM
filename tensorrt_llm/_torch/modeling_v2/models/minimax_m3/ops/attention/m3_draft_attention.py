@@ -25,11 +25,31 @@ class M3DraftAttention(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_107})
 
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="first draft pass of a 4-request verify (4 x 4 rows)", spec=dict(reqs=4, qlen=4)),
-        Cell(why="a later draft pass, one row per request", spec=dict(reqs=8, qlen=1)),
-        Cell(why="a context chunk's draft rows", spec=dict(reqs=1, context=512)),
-    )
+    # The cells each Rubin target runs, by tensor-parallel size; ``CELLS`` is their union.
+    CELLS_BY_TP: dict[int, tuple[Cell, ...]] = {
+        2: (
+            Cell(
+                why="first draft pass of a 4-request verify (4 x 4 rows)", spec=dict(reqs=4, qlen=4)
+            ),
+            Cell(why="a later draft pass, one row per request", spec=dict(reqs=8, qlen=1)),
+            Cell(why="a context chunk's draft rows", spec=dict(reqs=1, context=512)),
+        ),
+        4: (
+            Cell(
+                why="first draft pass of a 4-request verify (4 x 4 rows)", spec=dict(reqs=4, qlen=4)
+            ),
+            Cell(why="a later draft pass, one row per request", spec=dict(reqs=8, qlen=1)),
+            Cell(why="a context chunk's draft rows", spec=dict(reqs=1, context=512)),
+        ),
+        8: (
+            Cell(
+                why="first draft pass of a 2-request verify (2 x 4 rows)", spec=dict(reqs=2, qlen=4)
+            ),
+            Cell(why="a later draft pass, one row per request", spec=dict(reqs=2, qlen=1)),
+            Cell(why="a context chunk's draft rows", spec=dict(reqs=1, context=512)),
+        ),
+    }
+    CELLS: tuple[Cell, ...] = tuple(cell for cells in CELLS_BY_TP.values() for cell in cells)
 
     note = """
     `reference` is exact (float64) causal softmax attention: Q rotated by the backend's NeoX RoPE at each token's
@@ -56,12 +76,15 @@ class M3DraftAttention(OpWrapper):
         attends positions up to it. Its Q is rotated here; every K / V row, the step's own included, is read from
         the drafter layer's paged cache at the slots the metadata's KV cache manager holds, so this is evaluated
         after the call (whose roped, quantized append it then reads back; the test checks that append itself).
-        Mirrors one KV head per rank and un-scaled NeoX RoPE, the drafter's configuration.
+        Mirrors un-scaled NeoX RoPE, the drafter's configuration, over one KV head per rank or grouped KV heads
+        (query head h reads KV head h // (heads / kv heads)).
         """
         manager = metadata.kv_cache_manager
         layer = backend.layer_idx
         heads, dim = backend.num_heads, backend.head_dim
-        assert backend.num_kv_heads == 1, "mirrors the one-KV-head-per-rank layout only"
+        kv_heads = int(backend.num_kv_heads)
+        assert heads % kv_heads == 0
+        group = heads // kv_heads
         rope = backend.rope_params
         assert backend.position_embedding_type == int(PositionEmbeddingType.rope_gpt_neox)
         assert rope.scale_type == RotaryScalingType.none and rope.alpha == 1.0
@@ -92,8 +115,27 @@ class M3DraftAttention(OpWrapper):
                 dtype=torch.int64,
                 device=device,
             )
-            keys = pool[pages, 0, 0].to(torch.float64).reshape(-1, dim)[:length] * kv_scale
-            values = pool[pages, 1, 0].to(torch.float64).reshape(-1, dim)[:length] * kv_scale
+            if kv_heads == 1:
+                keys = pool[pages, 0, 0].to(torch.float64).reshape(-1, dim)[:length] * kv_scale
+                values = pool[pages, 1, 0].to(torch.float64).reshape(-1, dim)[:length] * kv_scale
+            else:
+                # [kv heads, tokens, dim]: each KV head's rows in token order across the pages.
+                keys = (
+                    pool[pages, 0]
+                    .to(torch.float64)
+                    .transpose(0, 1)
+                    .reshape(kv_heads, -1, dim)[:, :length]
+                    * kv_scale
+                )
+                values = (
+                    pool[pages, 1]
+                    .to(torch.float64)
+                    .transpose(0, 1)
+                    .reshape(kv_heads, -1, dim)[:, :length]
+                    * kv_scale
+                )
+                keys = keys.repeat_interleave(group, dim=0)  # [heads, tokens, dim]
+                values = values.repeat_interleave(group, dim=0)
             qpos = cached[row] + torch.arange(n, device=device)
             angles = qpos.to(torch.float64)[:, None] * inv_freq[None, :]
             cos, sin = angles.cos()[:, None, :], angles.sin()[:, None, :]
@@ -101,9 +143,16 @@ class M3DraftAttention(OpWrapper):
             x1, x2 = rows[..., : rot // 2], rows[..., rot // 2 : rot]
             rows = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin, rows[..., rot:]], dim=-1)
             allowed = torch.arange(length, device=device)[None, :] <= qpos[:, None]
-            logits = torch.einsum("thd,kd->thk", rows, keys) * sm_scale
-            logits = logits.masked_fill(~allowed[:, None, :], float("-inf"))
-            out[first : first + n] = torch.softmax(logits, dim=-1) @ values
+            if kv_heads == 1:
+                logits = torch.einsum("thd,kd->thk", rows, keys) * sm_scale
+                logits = logits.masked_fill(~allowed[:, None, :], float("-inf"))
+                out[first : first + n] = torch.softmax(logits, dim=-1) @ values
+            else:
+                logits = torch.einsum("thd,hkd->thk", rows, keys) * sm_scale
+                logits = logits.masked_fill(~allowed[:, None, :], float("-inf"))
+                out[first : first + n] = torch.einsum(
+                    "thk,hkd->thd", torch.softmax(logits, dim=-1), values
+                )
             first += n
         return out.reshape(total, heads * dim).to(qkv.dtype)
 

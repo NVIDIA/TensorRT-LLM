@@ -160,10 +160,13 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .. import cute_aot, m31_capture_fork, runtime_hooks_compat
+from ..kernels import m3_spec_tail
 from ..msa import engine as _msa_engine
+from ..ops import gqamix_sparse_decode as _gqamix_kernel
 from ..ops import m3_fsel_topk as _fsel
 from ..ops.activation.m3_shared_swiglu_mxfp8 import m3_shared_swiglu_mxfp8
 from ..ops.activation.m31_silu_and_mul import m31_silu_and_mul as m3_silu_and_mul
+from ..ops.attention.m3_draft_attention import m3_draft_attention
 from ..ops.attention.m3_select_blocks import m3_select_blocks
 from ..ops.attention.m31_fp8_indexer_qk_norm_rope import m3_fp8_indexer_qk_norm_rope
 from ..ops.attention.m31_qk_norm_rope_fp8 import m3_qk_norm_rope_fp8
@@ -177,6 +180,7 @@ from ..ops.gemm.m31_mxfp8_linear import m3_mxfp8_linear
 from ..ops.moe.m3_moe_engine import M3MoeEngine
 from ..ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
 from ..ops.spec.m3_draft_input import m3_draft_input
+from ..ops.spec.m3_shard_accept import m3_shard_accept
 from ..ops.spec.m31_capture_norm import m3_capture_norm
 from ..ops.spec.m31_chunk_norm import m3_chunk_norm
 from . import dspark as _dspark
@@ -189,7 +193,6 @@ from .kernels import (
     m3_mc_allreduce,
     m3_prequant,
     m3_report,
-    m3_spec_tail,
 )
 from .kernels import m3_fullctx_decode as m3_fullctx_decode_kernel
 from .kernels import m3_index_score as _index_score_kernel
@@ -201,8 +204,6 @@ from .kernels.long_select import long_select_blocks
 from .kernels.m3_moe.op import M3MoeState, ar_push_desc, shared_ctas_for
 from .kernels.mx_gemv import op as mx_gemv
 from .m31_switches import m31_disabled, m31_enabled
-from .ops import gqamix_sparse_decode as _gqamix_kernel
-from .ops.attention.m3_draft_attention import m3_draft_attention
 from .ops.attention.m3_fullctx_decode import m3_fullctx_decode
 from .ops.attention.m3_index_score import m3_index_score
 from .ops.attention.m3_msa_attention import m3_msa_attention
@@ -241,7 +242,6 @@ from .ops.spec.m3_draft_silu import m3_draft_silu
 from .ops.spec.m3_draft_step import m3_draft_step
 from .ops.spec.m3_force_vec import m3_force_vec, m3_force_vec_req
 from .ops.spec.m3_sampled_accept import m3_sampled_accept
-from .ops.spec.m3_shard_accept import m3_shard_accept
 from .ops.spec.m3_spec_offsets import m3_spec_offsets
 from .ops.spec.m3_step_prologue import m3_step_prologue
 

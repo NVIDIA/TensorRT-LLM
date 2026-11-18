@@ -6,7 +6,7 @@
 """MiniMax-M3 index decode block scorer (CuTe DSL, Blackwell) with its pre-wait schedule.
 
 The kernel of ``tensorrt_llm/_torch/attention/kernels/blackwell/minimax_m3_index_decode_score.py`` (the same scores, bit
-for bit) with two schedule options this target compiles in:
+for bit) with four schedule options a target compiles in:
 
 * ``prefetch_old``: before the grid-dependency wait, the TMA warp L2-prefetches this CTA's index-K pages that hold only
   tokens older than this step (the producer ahead writes only this step's tokens), up to ``prefetch_depth`` blocks per
@@ -15,9 +15,17 @@ for bit) with two schedule options this target compiles in:
   and the first K tile right after it. The tiles are read after the wait, so their contents are final; the block table
   is only written between graph replays, so the early page id is the right one whenever the block is valid. A CTA
   whose early tiles lie past the request's true length drains them before it exits.
+* ``prestage_old`` (with ``early_issue``; ``IndexScoreRunner.PRESTAGE_OLD``): when the CTA's first block holds only
+  tokens older than this step (block < (seq_lens hint - decode query length) / 128), its K tile is TMA-loaded into its
+  stage before the wait; Q (and a first block that is not all old) is still loaded after it.
+* ``early_trigger`` (``IndexScoreRunner.EARLY_TRIGGER``): every CTA releases the dependent block selector right after
+  its setup, so the selector launches and makes its pre-wait reads while this grid scores; the selector still waits
+  for this whole grid before it reads a score, so the scores and the selection are unchanged.
+
+``IndexScoreRunner`` compiles neither of the last two; a target that does subclasses it with its own ``kernel_cache``.
 
 Every kernel is compiled before the executor's warmup (``layers.prebuild_index_scorer``) through ``IndexScoreRunner``
-and called through this target's ``m3_index_score`` entry.
+and called through the target's ``m3_index_score`` entry.
 """
 
 from pathlib import Path
@@ -37,7 +45,11 @@ from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import (
     mma_sync,
     simple_tma_copy,
 )
-from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL, griddepcontrol_wait
+from tensorrt_llm._torch.kernels.blackwell.utils import (
+    TRTLLM_ENABLE_PDL,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+)
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
 __all__ = ["IndexDecodeScoreKernel", "IndexScoreRunner"]
@@ -105,6 +117,8 @@ class IndexDecodeScoreKernel:
         prefetch_old: bool = False,
         early_issue: bool = False,
         prefetch_depth: int = 0,
+        prestage_old: bool = False,
+        early_trigger: bool = False,
     ):
         # prefetch_old: before the grid dependency wait, the TMA warp L2-prefetches this CTA's index-K pages that
         # hold only tokens older than this step (the predecessor writes only this step's tokens).
@@ -118,6 +132,12 @@ class IndexDecodeScoreKernel:
         # prefetch_depth: blocks per CTA that prefetch_old covers (0 = all of them). Prefetching every older page at
         # large batches floods L2; the first few per CTA are the ones whose latency the pipeline cannot hide.
         self.prefetch_depth = prefetch_depth
+        # prestage_old (with early_issue): when this CTA's first block holds only tokens older than this step, its K
+        # tile is TMA-loaded into its stage BEFORE the grid dependency wait (the predecessor writes only this step's
+        # tokens; the block table and the seq_lens hint are final before the grid starts). Q stays after the wait.
+        self.prestage_old = prestage_old and early_issue
+        # early_trigger: release the dependent block selector right after this CTA's setup (see the module docstring).
+        self.early_trigger = early_trigger
         self.dtype = dtype
         self.num_heads = num_heads
         self.max_decode_query_len = max_decode_query_len
@@ -267,6 +287,8 @@ class IndexDecodeScoreKernel:
             cpasync.prefetch_descriptor(q_tma_atom)
             cpasync.prefetch_descriptor(k_tma_atom)
         cute.arch.sync_threads()
+        if cutlass.const_expr(self.early_trigger):
+            griddepcontrol_launch_dependents()
 
         if cutlass.const_expr(self.prefetch_old):
             if warp_id == 4:
@@ -286,13 +308,39 @@ class IndexDecodeScoreKernel:
                             Int32(BLOCK_K * head_dim * (dtype.width // 8)),
                         )
 
-        # No explicit launch_dependents: the only consumer is the block selector,
-        # which reduces over every block this grid writes, so triggering it early
-        # would leave it resident and spinning in its own wait. The implicit
-        # trigger as the CTAs exit still gives it the launch overlap.
+        # Without early_trigger there is no explicit launch_dependents: the only consumer is the block selector,
+        # which reduces over every block this grid writes, so triggering it early leaves it resident and spinning in
+        # its own wait. The implicit trigger as the CTAs exit still gives it the launch overlap.
         early_q = False
+        if cutlass.const_expr(self.prestage_old):
+            early_k = False
         early_page = Int32(0)
-        if cutlass.const_expr(self.early_issue):
+        if cutlass.const_expr(self.prestage_old):
+            if warp_id == 4:
+                seqlen_hint = seq_lens[batch_id]
+                hint_blocks = cute.ceil_div(seqlen_hint, BLOCK_K)
+                if hint_blocks > block_table.shape[1]:
+                    hint_blocks = block_table.shape[1]
+                if split_id < hint_blocks:
+                    early_q = True
+                    early_page = block_table[batch_id, split_id]
+                    # Stage the first K tile now when every token of the block predates this step.
+                    if split_id < (seqlen_hint - decode_query_len) // BLOCK_K:
+                        early_k = True
+                        cute.arch.mbarrier_wait(tma_empty_mbar + 1 % num_stages, 1)
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                tma_full_mbar + 1 % num_stages,
+                                BLOCK_K * head_dim * (dtype.width // 8),
+                            )
+                        simple_tma_copy(
+                            k_tma_atom,
+                            k_tma_tensor[early_page, None, None],
+                            sK[None, None, 1 % num_stages],
+                            tma_full_mbar + 1 % num_stages,
+                            cache_policy=EVICT_FIRST,
+                        )
+        elif cutlass.const_expr(self.early_issue):
             if warp_id == 4:
                 hint_blocks = cute.ceil_div(seq_lens[batch_id], BLOCK_K)
                 if hint_blocks > block_table.shape[1]:
@@ -303,7 +351,35 @@ class IndexDecodeScoreKernel:
 
         griddepcontrol_wait()
 
-        if cutlass.const_expr(self.early_issue):
+        if cutlass.const_expr(self.prestage_old):
+            if warp_id == 4:
+                if early_q:
+                    gQ_early = cute.local_tile(
+                        cute.domain_offset((batch_id * decode_query_len, 0, 0), q_tma_tensor),
+                        tiler=(MAX_DQL, NUM_HEADS, head_dim),
+                        coord=(0, 0, 0),
+                    )
+                    cute.arch.mbarrier_wait(tma_empty_mbar, 1)
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            tma_full_mbar, BLOCK_Q * head_dim * (dtype.width // 8)
+                        )
+                    simple_tma_copy(q_tma_atom, gQ_early, sQ_tma, tma_full_mbar)
+                    if not early_k:
+                        cute.arch.mbarrier_wait(tma_empty_mbar + 1 % num_stages, 1)
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                tma_full_mbar + 1 % num_stages,
+                                BLOCK_K * head_dim * (dtype.width // 8),
+                            )
+                        simple_tma_copy(
+                            k_tma_atom,
+                            k_tma_tensor[early_page, None, None],
+                            sK[None, None, 1 % num_stages],
+                            tma_full_mbar + 1 % num_stages,
+                            cache_policy=EVICT_FIRST,
+                        )
+        elif cutlass.const_expr(self.early_issue):
             if warp_id == 4:
                 if early_q:
                     gQ_early = cute.local_tile(
@@ -540,9 +616,13 @@ class IndexScoreRunner:
     """Compiled ``IndexDecodeScoreKernel`` variants, keyed by (index dtype, index heads, decode query length, head dim,
     split_k, early issue). Batch, query-token count, page count and block-table width stay symbolic, so one compile
     serves every decode step of its key. ``prefetch_old`` is always on; ``early`` also caps the prefetch at one block
-    per CTA."""
+    per CTA. ``PRESTAGE_OLD`` (with ``early``) and ``EARLY_TRIGGER`` hold for every key of a runner, so a runner that
+    sets them carries its own ``kernel_cache``."""
 
     kernel_cache: dict = {}
+    #: Compile ``prestage_old`` into the ``early`` kernels and ``early_trigger`` into every kernel.
+    PRESTAGE_OLD = False
+    EARLY_TRIGGER = False
     SUPPORTED_HEAD_DIM = 128  # capacity: fixed: the checkpoint's index head dim
     SUPPORTED_PAGE_SIZE = IndexDecodeScoreKernel.BLOCK_K
     # BLOCK_Q must fit one warp's worth of epilogue lanes.
@@ -628,9 +708,20 @@ class IndexScoreRunner:
             prefetch_old=True,
             early_issue=early,
             prefetch_depth=cls.EARLY_PREFETCH_DEPTH if early else 0,
+            prestage_old=early and cls.PRESTAGE_OLD,
+            early_trigger=cls.EARLY_TRIGGER,
+        )
+        # The two runner-wide options name the shipped object only when on (the base runner's names are unchanged).
+        schedule = "".join(
+            f" {name}"
+            for name, on in (
+                ("prestage_old", cls.PRESTAGE_OLD),
+                ("early_trigger", cls.EARLY_TRIGGER),
+            )
+            if on
         )
         cls.kernel_cache[key] = cute_aot.compile_or_load(
-            f"m3_index_score {key}",
+            f"m3_index_score {key}{schedule}",
             lambda: cute.compile(
                 kernel,
                 q_fake,

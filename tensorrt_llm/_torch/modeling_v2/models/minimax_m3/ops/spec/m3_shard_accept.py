@@ -118,54 +118,169 @@ class M3ShardAccept(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_107})
 
-    # Every greedy verify step of the target (modeling.SHARD_ACCEPT): draft_len 3 at 1..12 requests (4..48 rows), the
-    # target lm_head's BF16 shard logits (50016 columns per rank at TP4). The logits come from the head GEMM, so the
-    # op only reduces.
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="cap 1: 4 verify rows (1 request x T = 4), rank 0 of 4, next_new staged",
-            spec=dict(nreq=1, draft_len=3, vs=50016, world=4, rank=0, force="none", strided=False),
-        ),
-        Cell(
-            why="cap 2: 8 verify rows, rank 2, global ids offset by 2 x 50016",
-            spec=dict(nreq=2, draft_len=3, vs=50016, world=4, rank=2, force="none", strided=False),
-        ),
-        Cell(
-            why="cap 4: 16 verify rows (4 requests x T = 4), rank 1 of 4, next_new staged",
-            spec=dict(nreq=4, draft_len=3, vs=50016, world=4, rank=1, force="none", strided=False),
-        ),
-        Cell(
-            why="cap 8: 32 verify rows, rank 3, global ids offset by 3 x 50016",
-            spec=dict(nreq=8, draft_len=3, vs=50016, world=4, rank=3, force="none", strided=False),
-        ),
-        Cell(
-            why="12 rows (3 requests) read from a row-strided view of a wider logits buffer, forced counts",
-            spec=dict(nreq=3, draft_len=3, vs=50016, world=4, rank=0, force="vec", strided=True),
-        ),
-        Cell(
-            why="the 48-row maximum (12 requests at draft 3), force_total, rows with exact cross-rank ties",
-            spec=dict(
-                nreq=12,
-                draft_len=3,
-                vs=50016,
-                world=4,
-                rank=2,
-                force="total",
-                strided=False,
-                ties=True,
+    # Every greedy verify step of the target (the target modeling's SHARD_ACCEPT) at draft_len 3, on the target
+    # lm_head's BF16 shard logits; the logits come from the head GEMM, so the op only reduces. The tp2 and tp4 targets
+    # certify the TP4 shards: 1..12 requests (4..48 rows), 50016 columns per rank of 4. The tp8 target: 1..2 requests
+    # (4..8 rows) plus the 48-row maximum, 25008 columns per rank of 8 (8 exchange slots per row).
+    # The cells each Rubin target runs, by tensor-parallel size; ``CELLS`` is their union.
+    CELLS_BY_TP: dict[int, tuple[Cell, ...]] = {
+        2: (
+            Cell(
+                why="cap 1: 4 verify rows (1 request x T = 4), rank 0 of 4, next_new staged",
+                spec=dict(
+                    nreq=1, draft_len=3, vs=50016, world=4, rank=0, force="none", strided=False
+                ),
+            ),
+            Cell(
+                why="cap 2: 8 verify rows, rank 2, global ids offset by 2 x 50016",
+                spec=dict(
+                    nreq=2, draft_len=3, vs=50016, world=4, rank=2, force="none", strided=False
+                ),
+            ),
+            Cell(
+                why="cap 4: 16 verify rows (4 requests x T = 4), rank 1 of 4, next_new staged",
+                spec=dict(
+                    nreq=4, draft_len=3, vs=50016, world=4, rank=1, force="none", strided=False
+                ),
+            ),
+            Cell(
+                why="cap 8: 32 verify rows, rank 3, global ids offset by 3 x 50016",
+                spec=dict(
+                    nreq=8, draft_len=3, vs=50016, world=4, rank=3, force="none", strided=False
+                ),
+            ),
+            Cell(
+                why="12 rows (3 requests) read from a row-strided view of a wider logits buffer, forced counts",
+                spec=dict(
+                    nreq=3, draft_len=3, vs=50016, world=4, rank=0, force="vec", strided=True
+                ),
+            ),
+            Cell(
+                why="the 48-row maximum (12 requests at draft 3), force_total, rows with exact cross-rank ties",
+                spec=dict(
+                    nreq=12,
+                    draft_len=3,
+                    vs=50016,
+                    world=4,
+                    rank=2,
+                    force="total",
+                    strided=False,
+                    ties=True,
+                ),
+            ),
+            # Every other request count of the verify range, on the 4-rank 50016-column shards.
+            *(
+                Cell(
+                    why=f"{n} requests ({4 * n} verify rows): a request count between the ones above",
+                    spec=dict(
+                        nreq=n,
+                        draft_len=3,
+                        vs=50016,
+                        world=4,
+                        rank=n % 4,
+                        force="none",
+                        strided=False,
+                    ),
+                )
+                for n in (5, 6, 7, 9, 10, 11)
             ),
         ),
-        # Every other request count of the verify range, on the 4-rank 50016-column shards.
-        *(
+        4: (
             Cell(
-                why=f"{n} requests ({4 * n} verify rows): a request count between the ones above",
+                why="cap 1: 4 verify rows (1 request x T = 4), rank 0 of 4, next_new staged",
                 spec=dict(
-                    nreq=n, draft_len=3, vs=50016, world=4, rank=n % 4, force="none", strided=False
+                    nreq=1, draft_len=3, vs=50016, world=4, rank=0, force="none", strided=False
                 ),
-            )
-            for n in (5, 6, 7, 9, 10, 11)
+            ),
+            Cell(
+                why="cap 2: 8 verify rows, rank 2, global ids offset by 2 x 50016",
+                spec=dict(
+                    nreq=2, draft_len=3, vs=50016, world=4, rank=2, force="none", strided=False
+                ),
+            ),
+            Cell(
+                why="cap 4: 16 verify rows (4 requests x T = 4), rank 1 of 4, next_new staged",
+                spec=dict(
+                    nreq=4, draft_len=3, vs=50016, world=4, rank=1, force="none", strided=False
+                ),
+            ),
+            Cell(
+                why="cap 8: 32 verify rows, rank 3, global ids offset by 3 x 50016",
+                spec=dict(
+                    nreq=8, draft_len=3, vs=50016, world=4, rank=3, force="none", strided=False
+                ),
+            ),
+            Cell(
+                why="12 rows (3 requests) read from a row-strided view of a wider logits buffer, forced counts",
+                spec=dict(
+                    nreq=3, draft_len=3, vs=50016, world=4, rank=0, force="vec", strided=True
+                ),
+            ),
+            Cell(
+                why="the 48-row maximum (12 requests at draft 3), force_total, rows with exact cross-rank ties",
+                spec=dict(
+                    nreq=12,
+                    draft_len=3,
+                    vs=50016,
+                    world=4,
+                    rank=2,
+                    force="total",
+                    strided=False,
+                    ties=True,
+                ),
+            ),
+            # Every other request count of the verify range, on the 4-rank 50016-column shards.
+            *(
+                Cell(
+                    why=f"{n} requests ({4 * n} verify rows): a request count between the ones above",
+                    spec=dict(
+                        nreq=n,
+                        draft_len=3,
+                        vs=50016,
+                        world=4,
+                        rank=n % 4,
+                        force="none",
+                        strided=False,
+                    ),
+                )
+                for n in (5, 6, 7, 9, 10, 11)
+            ),
         ),
-    )
+        8: (
+            Cell(
+                why="b1: 4 verify rows (1 request x T = 4), rank 0 of 8, next_new staged",
+                spec=dict(
+                    nreq=1, draft_len=3, vs=25008, world=8, rank=0, force="none", strided=False
+                ),
+            ),
+            Cell(
+                why="b2: 8 verify rows, rank 7, global ids offset by 7 x 25008",
+                spec=dict(
+                    nreq=2, draft_len=3, vs=25008, world=8, rank=7, force="none", strided=False
+                ),
+            ),
+            Cell(
+                why="8 rows (2 requests) read from a row-strided view of a wider logits buffer, forced counts",
+                spec=dict(
+                    nreq=2, draft_len=3, vs=25008, world=8, rank=3, force="vec", strided=True
+                ),
+            ),
+            Cell(
+                why="the 48-row maximum (12 requests at draft 3), force_total, rows with exact cross-rank ties",
+                spec=dict(
+                    nreq=12,
+                    draft_len=3,
+                    vs=25008,
+                    world=8,
+                    rank=5,
+                    force="total",
+                    strided=False,
+                    ties=True,
+                ),
+            ),
+        ),
+    }
+    CELLS: tuple[Cell, ...] = tuple(cell for cells in CELLS_BY_TP.values() for cell in cells)
 
     note = """
     The op reduces BF16 logits exactly, so the reference is bit-exact, including cross-rank ties (lowest global

@@ -10,11 +10,29 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from ...kernels.embedding_firstnorm.op import DecodeEmbedding, m3_embed_norm
+from ....kernels.embedding_firstnorm import op as _embed_op
+from ....kernels.embedding_firstnorm.op import GATHER_MAX_ROWS, m3_embed_norm
 
 __all__ = ["DecodeEmbedding", "m3_embedding_firstnorm"]
 
 VOCAB = 200064  # MiniMax-M3's vocabulary; the decode table is the full (replicated) embedding
+
+
+class DecodeEmbedding(_embed_op.DecodeEmbedding):
+    """The family owner at this target's rows (1..16: the 9..16-row gather included) with the 16-byte alignment
+    check."""
+
+    def __init__(self, table, weight, eps, rows, id_dtype, use_pdl=True):
+        super().__init__(
+            table,
+            weight,
+            eps,
+            rows,
+            id_dtype,
+            use_pdl,
+            max_rows=GATHER_MAX_ROWS,
+            check_align=True,
+        )
 
 
 class M3EmbeddingFirstnorm(OpWrapper):
@@ -79,7 +97,9 @@ class M3EmbeddingFirstnorm(OpWrapper):
         out: torch.Tensor,
         use_pdl: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return m3_embed_norm(ids, table, weight, eps, raw, out, use_pdl)
+        return m3_embed_norm(
+            ids, table, weight, eps, raw, out, use_pdl, max_rows=GATHER_MAX_ROWS, check_align=True
+        )
 
     def reference(
         self,

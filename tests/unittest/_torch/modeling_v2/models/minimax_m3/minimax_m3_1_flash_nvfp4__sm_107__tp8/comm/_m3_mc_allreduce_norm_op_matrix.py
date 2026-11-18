@@ -358,9 +358,7 @@ def _capture_reference(
     updated: torch.Tensor, weight: torch.Tensor, eps: float, out: torch.Tensor
 ) -> None:
     """The capture the boundary replaces: m3_spec_tail.capture_norm of the updated residual (no second addend)."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
-        m3_spec_tail,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels import m3_spec_tail
 
     m3_spec_tail.capture_norm(updated, None, weight, eps, out)
 

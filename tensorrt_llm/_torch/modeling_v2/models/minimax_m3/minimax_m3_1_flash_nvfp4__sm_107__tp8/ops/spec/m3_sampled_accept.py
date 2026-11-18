@@ -12,7 +12,7 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from .m3_shard_accept import strict_accept
+from ....ops.spec.m3_shard_accept import strict_accept
 
 #: Verify rows per call.
 MAX_ROWS = 48

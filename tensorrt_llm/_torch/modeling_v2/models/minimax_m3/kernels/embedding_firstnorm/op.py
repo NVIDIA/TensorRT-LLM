@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Host side of the MiniMax-M3 decode embedding + first-layer RMSNorm (m3_embedding_firstnorm_kernel.py): H 6144,
-1..8 rows, into caller-owned buffers.
+1..8 rows (up to ``GATHER_MAX_ROWS`` for a caller that passes ``max_rows``), into caller-owned buffers. The kernel is
+one CTA per row, so a row count changes only the grid.
 
 Compiled on the first call per (rows, id dtype, table shape, PDL), which must happen outside CUDA-graph capture
 (:class:`DecodeEmbedding` compiles at construction).
@@ -22,6 +23,7 @@ from .m3_embedding_firstnorm_kernel import m3_embed_norm as _m3_embed_norm_jit
 
 HIDDEN = 6144  # capacity: fixed: the checkpoint's hidden size
 MAX_ROWS = 8  # capacity: fixed: the kernel's built rows (decode steps)
+GATHER_MAX_ROWS = 16  # capacity: fixed: the rows a target that also gathers 9..16 rows builds
 
 _lock = threading.Lock()
 _compiled: Dict[tuple, object] = {}
@@ -36,10 +38,10 @@ def arg(tensor):
     )
 
 
-def _check(ids, table, weight, raw, out) -> None:
+def _check(ids, table, weight, raw, out, max_rows: int, check_align: bool) -> None:
     rows = ids.shape[0] if ids.dim() == 1 else 0
     if not (
-        1 <= rows <= MAX_ROWS
+        1 <= rows <= max_rows
         and ids.dtype in (torch.int32, torch.int64)
         and ids.is_contiguous()
         and table.dtype == torch.bfloat16
@@ -52,10 +54,13 @@ def _check(ids, table, weight, raw, out) -> None:
             t.dtype == torch.bfloat16 and tuple(t.shape) == (rows, HIDDEN) and t.is_contiguous()
             for t in (raw, out)
         )
+        # check_align: arg() declares 16-byte alignment for these operands (the kernel's 128-bit copies).
+        and (not check_align or all(t.data_ptr() % 16 == 0 for t in (table, weight, raw, out)))
     ):
         raise ValueError(
-            "m3_embed_norm: expects ids int32/int64 [1..8], a contiguous bf16 table [V, 6144], bf16 weight [6144] "
-            "and contiguous bf16 raw / out [rows, 6144]"
+            f"m3_embed_norm: expects ids int32/int64 [1..{max_rows}], a contiguous bf16 table [V, 6144], bf16 weight "
+            "[6144] and contiguous bf16 raw / out [rows, 6144]"
+            + (", with table / weight / raw / out 16-byte aligned" if check_align else "")
         )
 
 
@@ -100,10 +105,14 @@ def m3_embed_norm(
     raw: torch.Tensor,
     out: torch.Tensor,
     use_pdl: bool = True,
+    *,
+    max_rows: int = MAX_ROWS,
+    check_align: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Write ``table[ids]`` into ``raw`` (a zero row for an id outside ``[0, V)``) and its RMSNorm with ``weight`` /
-    ``eps`` into ``out``; returns ``(out, raw)``."""
-    _check(ids, table, weight, raw, out)
+    ``eps`` into ``out``; returns ``(out, raw)``. ``max_rows`` bounds the accepted row count (``MAX_ROWS`` or
+    ``GATHER_MAX_ROWS``); ``check_align`` also rejects operands that are not 16-byte aligned."""
+    _check(ids, table, weight, raw, out, max_rows, check_align)
     fn = _compile(ids, table, weight, eps, raw, out, use_pdl)
     stream = cuda_driver.CUstream(torch.cuda.current_stream(ids.device).cuda_stream)
     fn(
@@ -122,13 +131,26 @@ def m3_embed_norm(
 class DecodeEmbedding:
     """Caller-owned buffers of one (rows, id dtype) decode embedding: ``raw`` (the gathered rows, the first residual)
     and ``output`` (their RMSNorm), over ``table`` and the first layer's plain (non-Gemma) input norm ``weight`` /
-    ``eps``. Built (and compiled) before CUDA-graph capture."""
+    ``eps``. Built (and compiled) before CUDA-graph capture. ``max_rows`` / ``check_align``: as in
+    ``m3_embed_norm``, for every call of the owner."""
 
-    def __init__(self, table, weight, eps, rows, id_dtype, use_pdl=True):
+    def __init__(
+        self,
+        table,
+        weight,
+        eps,
+        rows,
+        id_dtype,
+        use_pdl=True,
+        *,
+        max_rows: int = MAX_ROWS,
+        check_align: bool = False,
+    ):
         assert not torch.cuda.is_current_stream_capturing()
         assert table.dtype == torch.bfloat16 and table.is_contiguous() and table.shape[1] == HIDDEN
         assert weight.dtype == torch.bfloat16 and weight.shape == (HIDDEN,)
-        assert 1 <= rows <= MAX_ROWS and id_dtype in (torch.int32, torch.int64)
+        assert 1 <= rows <= max_rows and id_dtype in (torch.int32, torch.int64)
+        self.max_rows, self.check_align = max_rows, check_align
         self.table, self.weight, self.rows, self.id_dtype, self.use_pdl = (
             table,
             weight,
@@ -145,7 +167,15 @@ class DecodeEmbedding:
     def __call__(self, ids):
         assert ids.shape == (self.rows,) and ids.dtype == self.id_dtype and ids.is_contiguous()
         return m3_embed_norm(
-            ids, self.table, self.weight, self.eps, self.raw, self.output, self.use_pdl
+            ids,
+            self.table,
+            self.weight,
+            self.eps,
+            self.raw,
+            self.output,
+            self.use_pdl,
+            max_rows=self.max_rows,
+            check_align=self.check_align,
         )
 
 

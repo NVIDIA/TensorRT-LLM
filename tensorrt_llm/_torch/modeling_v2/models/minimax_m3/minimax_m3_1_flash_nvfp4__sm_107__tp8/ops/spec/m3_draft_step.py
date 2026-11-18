@@ -14,8 +14,8 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
+from ....ops.spec.m3_shard_accept import exchange_tokens, local_argmax, make_keys
 from ..gemm.m3_target_head import decode as decode_coded
-from .m3_shard_accept import exchange_tokens, local_argmax, make_keys
 
 #: Requests (head rows) per pass, and exchange rows per call half of the workspace.
 MAX_TOKENS = 8
