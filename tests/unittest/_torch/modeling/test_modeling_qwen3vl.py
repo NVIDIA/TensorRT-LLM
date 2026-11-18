@@ -548,9 +548,10 @@ def test_qwenvl_opted_in_decoder_captures_and_refreshes(family, num_levels):
         assert runner.has_graph(4)
         calls_after_capture = body.forward_calls
         inputs["inputs_embeds"] = torch.full((4, 4), 3.0, device="cuda")
-        inputs["deepstack_embeds"] = [
-            torch.full((4, 4), 5.0, device="cuda") for _ in range(num_levels)
-        ]
+        # As in `_fuse_multimodal_embeddings`, image rows are views of the wrapper's DeepStack
+        # buffer, and the text batch below reuses that buffer.
+        owner.deepstack_input_embeds.fill_(5.0)
+        inputs["deepstack_embeds"] = list(owner.deepstack_input_embeds.unbind(0))
         actual = runner.execute(4, engine)
         torch.cuda.synchronize()
 

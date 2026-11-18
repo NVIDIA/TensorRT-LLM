@@ -2005,6 +2005,9 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         )
         if self.deepstack_num_level > 0 and not prepared_inputs.get("deepstack_embeds"):
             # Text batches replay the same body as image batches, with zero DeepStack rows.
+            # Image batches scatter their rows into this same scratch buffer (see
+            # `_fuse_multimodal_embeddings`), so clear the last image batch's rows. Replay
+            # copies these views into the graph's own inputs.
             num_tokens = prepared_inputs["inputs_embeds"].shape[0]
             deepstack_buffer = self.deepstack_input_embeds[:, :num_tokens, :]
             deepstack_buffer.zero_()
