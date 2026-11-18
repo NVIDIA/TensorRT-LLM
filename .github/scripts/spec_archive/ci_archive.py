@@ -18,6 +18,7 @@
 No source branch is checked out and no downloaded file is executed. Keep this
 script and git-spec on the protected default branch. See ci/README.md.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -25,13 +26,13 @@ import base64
 import datetime as dt
 import json
 import os
-from pathlib import Path, PurePosixPath
 import re
 import runpy
 import sys
 import tempfile
 from collections.abc import Iterator
 from http.client import HTTPMessage
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Protocol
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urlsplit
@@ -53,7 +54,9 @@ class ArtifactClient(Protocol):
 
 
 def core_api() -> dict:
-    path = Path(os.environ.get("SPEC_ARCHIVE_CORE", Path(__file__).resolve().parents[1] / "git-spec"))
+    path = Path(
+        os.environ.get("SPEC_ARCHIVE_CORE", Path(__file__).resolve().parents[1] / "git-spec")
+    )
     return runpy.run_path(str(path))
 
 
@@ -68,8 +71,13 @@ def checked_sha(value: str) -> str:
 
 
 def checked_repo(value: str) -> str:
-    if not isinstance(value, str) or len(value.split("/")) < 2 or any(
-        not re.fullmatch(r"[A-Za-z0-9_.-]+", part) or part in (".", "..") for part in value.split("/")
+    if (
+        not isinstance(value, str)
+        or len(value.split("/")) < 2
+        or any(
+            not re.fullmatch(r"[A-Za-z0-9_.-]+", part) or part in (".", "..")
+            for part in value.split("/")
+        )
     ):
         raise ValueError("Expected namespace/repository (nested GitLab namespaces are supported)")
     return value
@@ -87,8 +95,11 @@ def safe_path(path: str) -> str:
 
 
 def design_links(description: str | None, files: dict[str, bytes]) -> list[str]:
-    texts = [description or ""] + [data.decode("utf-8", errors="replace") for name, data in files.items()
-                                      if name.lower().endswith(".md")]
+    texts = [description or ""] + [
+        data.decode("utf-8", errors="replace")
+        for name, data in files.items()
+        if name.lower().endswith(".md")
+    ]
     links = set()
     for text in texts:
         for match in re.finditer(r"(?im)^\s*design-doc:\s*(https://[^\s<>]+)", text):
@@ -100,8 +111,9 @@ def design_links(description: str | None, files: dict[str, bytes]) -> list[str]:
 
 
 class NoRedirects(HTTPRedirectHandler):
-    def redirect_request(self, req: Request, fp: BinaryIO, code: int, msg: str,
-                         headers: HTTPMessage, newurl: str) -> None:
+    def redirect_request(
+        self, req: Request, fp: BinaryIO, code: int, msg: str, headers: HTTPMessage, newurl: str
+    ) -> None:
         # Do not send a CI credential to a Location supplied by remote content.
         return None
 
@@ -109,7 +121,14 @@ class NoRedirects(HTTPRedirectHandler):
 class API:
     def __init__(self, base_url: str, token: str | None, provider: str) -> None:
         parsed = urlsplit(base_url)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
             raise ValueError("Provider API URL must be a credential-free HTTPS URL")
         if not token:
             raise ValueError(f"Configure a personal/project read API token for {provider}")
@@ -120,8 +139,9 @@ class API:
         )
         self.opener = build_opener(NoRedirects())
 
-    def get(self, path: str, *, params: dict | None = None,
-            raw: bool = False) -> dict | list | bytes:
+    def get(
+        self, path: str, *, params: dict | None = None, raw: bool = False
+    ) -> dict | list | bytes:
         url = self.base_url + "/" + path.lstrip("/")
         if params:
             url += "?" + urlencode(params, doseq=True)
@@ -147,7 +167,14 @@ class Provider:
     def __init__(self, api: API, repo: str, host: str) -> None:
         self.api, self.repo, self.host = api, checked_repo(repo), host
         parsed = urlsplit("https://" + host)
-        if not parsed.hostname or parsed.netloc != host or parsed.path or parsed.query or parsed.fragment or parsed.username:
+        if (
+            not parsed.hostname
+            or parsed.netloc != host
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or parsed.username
+        ):
             raise ValueError("Invalid forge host")
 
     def identity(self, number: int) -> dict:
@@ -155,20 +182,39 @@ class Provider:
             raise ValueError("PR/MR number must be a positive integer")
         return {"provider": self.name, "host": self.host, "repo": self.repo, "pr": number}
 
-    def manifest(self, number: int, record: dict, head: str, base: str,
-                 files: dict[str, bytes], now: str | None = None) -> dict:
+    def manifest(
+        self,
+        number: int,
+        record: dict,
+        head: str,
+        base: str,
+        files: dict[str, bytes],
+        now: str | None = None,
+    ) -> dict:
         paths = [root for root in ROOTS if any(path.startswith(root) for path in files)]
         tool = "mixed" if len(paths) == 2 else "openspec" if paths == [ROOTS[1]] else "speckit"
         status, merge = self.lifecycle(record)
-        return {"schema_version": 1, **self.identity(number),
-                "repo_url": f"https://{self.host}/{self.repo}",
-                "head_sha": checked_sha(head), "base_sha": checked_sha(base),
-                "merge_sha": merge, "status": status, "title": record["title"],
-                "author": record["user"]["login"] if self.name == "github" else record["author"]["username"],
-                "created": record["created_at"], "archived_at": now or utc_now(),
-                "tool": tool, "paths": paths,
-                "design_docs": design_links(record.get("body") if self.name == "github" else record.get("description"), files),
-                "sha256": None}
+        return {
+            "schema_version": 1,
+            **self.identity(number),
+            "repo_url": f"https://{self.host}/{self.repo}",
+            "head_sha": checked_sha(head),
+            "base_sha": checked_sha(base),
+            "merge_sha": merge,
+            "status": status,
+            "title": record["title"],
+            "author": record["user"]["login"]
+            if self.name == "github"
+            else record["author"]["username"],
+            "created": record["created_at"],
+            "archived_at": now or utc_now(),
+            "tool": tool,
+            "paths": paths,
+            "design_docs": design_links(
+                record.get("body") if self.name == "github" else record.get("description"), files
+            ),
+            "sha256": None,
+        }
 
     @staticmethod
     def check_files(files: dict[str, bytes]) -> None:
@@ -196,12 +242,23 @@ class GitHub(Provider):
 
     @staticmethod
     def lifecycle(record: dict) -> tuple[str, str | None]:
-        status = "merged" if record.get("merged") or record.get("merged_at") else "open" if record["state"] == "open" else "abandoned"
+        status = (
+            "merged"
+            if record.get("merged") or record.get("merged_at")
+            else "open"
+            if record["state"] == "open"
+            else "abandoned"
+        )
         # GitHub's open PR merge_commit_sha can identify a synthetic test merge.
-        return status, checked_sha(record["merge_commit_sha"]) if status == "merged" and record.get("merge_commit_sha") else None
+        return status, checked_sha(record["merge_commit_sha"]) if status == "merged" and record.get(
+            "merge_commit_sha"
+        ) else None
 
     def tree(self, repo: str, treeish: str, recursive: bool = False) -> list[dict]:
-        result = self.api.get(self.path("git/trees/" + checked_sha(treeish), repo), params={"recursive": "1"} if recursive else None)
+        result = self.api.get(
+            self.path("git/trees/" + checked_sha(treeish), repo),
+            params={"recursive": "1"} if recursive else None,
+        )
         if result.get("truncated"):
             raise ValueError("GitHub spec tree was truncated; refusing incomplete archival")
         return result["tree"]
@@ -234,8 +291,9 @@ class GitHub(Provider):
                     raise ValueError("Spec tree exceeds file-count limit")
         return entries
 
-    def snapshot(self, number: int, head: str | None = None,
-                 now: str | None = None) -> tuple[dict, dict[str, bytes]]:
+    def snapshot(
+        self, number: int, head: str | None = None, now: str | None = None
+    ) -> tuple[dict, dict[str, bytes]]:
         record = self.record(number)
         if self.lifecycle(record)[0] != "open":
             raise ValueError("Pull request is no longer open; refusing removal-bound archival")
@@ -243,7 +301,9 @@ class GitHub(Provider):
             raise ValueError("GitHub source head moved; retry archival with the current PR head")
         head = checked_sha(head or record["head"]["sha"])
         source = checked_repo(record["head"]["repo"]["full_name"])
-        comparison = self.api.get(self.path("compare/" + checked_sha(record["base"]["sha"]) + "..." + head))
+        comparison = self.api.get(
+            self.path("compare/" + checked_sha(record["base"]["sha"]) + "..." + head)
+        )
         merge_base = checked_sha(comparison["merge_base_commit"]["sha"])
         head_entries = self.entries(source, head)
         base_entries = self.entries(self.repo, merge_base)
@@ -275,7 +335,9 @@ class GitLab(Provider):
 
     @staticmethod
     def lifecycle(record: dict) -> tuple[str, str | None]:
-        status = {"opened": "open", "locked": "open", "merged": "merged", "closed": "abandoned"}[record["state"]]
+        status = {"opened": "open", "locked": "open", "merged": "merged", "closed": "abandoned"}[
+            record["state"]
+        ]
         merge = record.get("merge_commit_sha") or record.get("squash_commit_sha")
         return status, checked_sha(merge) if status == "merged" and merge else None
 
@@ -283,8 +345,12 @@ class GitLab(Provider):
         blobs = {}
         for root in ROOTS:
             try:
-                entries = list(self.api.pages(self.path("repository/tree", project),
-                                              {"path": root.rstrip("/"), "ref": checked_sha(commit), "recursive": "true"}))
+                entries = list(
+                    self.api.pages(
+                        self.path("repository/tree", project),
+                        {"path": root.rstrip("/"), "ref": checked_sha(commit), "recursive": "true"},
+                    )
+                )
             except HTTPError as error:
                 # Missing roots are legitimate; this handler cannot swallow a
                 # failed blob download because downloads happen below it.
@@ -306,15 +372,18 @@ class GitLab(Provider):
                     raise ValueError("Spec tree exceeds file-count limit")
         return blobs
 
-    def snapshot(self, number: int, head: str | None = None,
-                 now: str | None = None) -> tuple[dict, dict[str, bytes]]:
+    def snapshot(
+        self, number: int, head: str | None = None, now: str | None = None
+    ) -> tuple[dict, dict[str, bytes]]:
         record = self.record(number)
         if self.lifecycle(record)[0] != "open":
             raise ValueError("Merge request is no longer open; refusing removal-bound archival")
         diff = record.get("diff_refs") or {}
         current_head = checked_sha(diff.get("head_sha") or record.get("sha"))
         if record.get("sha") and record["sha"] != current_head:
-            raise ValueError("GitLab MR diff refs are not ready for the current source head; retry later")
+            raise ValueError(
+                "GitLab MR diff refs are not ready for the current source head; retry later"
+            )
         if head is not None and head != current_head:
             raise ValueError("GitLab source head moved; retry archival with the current MR head")
         source = record.get("source_project_id")
@@ -326,7 +395,9 @@ class GitLab(Provider):
         files = {}
         if head_entries != base_entries:
             for path, (blob_sha, _) in head_entries.items():
-                files[path] = self.api.get(self.path("repository/blobs/" + blob_sha + "/raw", source), raw=True)
+                files[path] = self.api.get(
+                    self.path("repository/blobs/" + blob_sha + "/raw", source), raw=True
+                )
                 self.check_files(files)
         return self.manifest(number, record, current_head, merge_base, files, now), files
 
@@ -347,8 +418,13 @@ def provider_from_env(name: str, repo: str | None = None) -> GitHub | GitLab:
     return GitLab(API(api_url, token, name), repo or os.environ.get("CI_PROJECT_PATH"), host)
 
 
-def archive(provider: GitHub | GitLab, number: int, client: ArtifactClient,
-            api: dict, head: str | None = None) -> dict | None:
+def archive(
+    provider: GitHub | GitLab,
+    number: int,
+    client: ArtifactClient,
+    api: dict,
+    head: str | None = None,
+) -> dict | None:
     manifest, files = provider.snapshot(number, head=head)
     if not files:
         return None
@@ -377,7 +453,9 @@ def main(argv: list[str] | None = None) -> int:
     number = args.pr
     if args.command == "event":
         if args.provider != "github":
-            parser.error("GitLab events must trigger a protected default-branch pipeline with --pr IID")
+            parser.error(
+                "GitLab events must trigger a protected default-branch pipeline with --pr IID"
+            )
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         number = number or event.get("number")
         # Identity comes from the trusted runner repository, never a PR URL.
