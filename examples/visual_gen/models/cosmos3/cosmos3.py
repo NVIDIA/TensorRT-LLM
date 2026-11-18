@@ -488,7 +488,14 @@ def main():
     parser.add_argument(
         "--disable_guardrails", action="store_true", help="NOT RECOMMENDED: Disable guardrails"
     )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        help="Override the checkpoint's default denoising step count",
+    )
     args = parser.parse_args()
+    if args.num_inference_steps is not None and args.num_inference_steps < 1:
+        parser.error("--num_inference_steps must be positive")
 
     prompt, image_path, enable_audio, output_type = resolve_prompt_and_options(
         prompt=args.prompt,
@@ -509,6 +516,8 @@ def main():
     # --- Model-specific: T2V / TI2V request construction ---
     # Query per-model defaults (resolution, steps, guidance, seed, etc.).
     params = visual_gen.default_params
+    if args.num_inference_steps is not None:
+        params.num_inference_steps = args.num_inference_steps
     if image_path is not None:
         params.image_reference = [MediaRef(content=image_path, format="path")]
 

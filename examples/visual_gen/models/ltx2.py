@@ -78,6 +78,11 @@ def main():
         default="ltx2_t2v_output.mp4",
         help="Path to save the output video",
     )
+    parser.add_argument(
+        "--skip_warmup",
+        action="store_true",
+        help="Skip synthetic warmup requests before generating the video",
+    )
     args = parser.parse_args()
 
     # LTX-2 requires pipeline_config.text_encoder_path for the Gemma3 text
@@ -86,6 +91,8 @@ def main():
     extra_args = (
         VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else VisualGenArgs()
     )
+    if args.skip_warmup:
+        extra_args.compilation_config.skip_warmup = True
     text_encoder_path = args.text_encoder_path
     if text_encoder_path is None and not args.visual_gen_args:
         text_encoder_path = "google/gemma-3-12b-it"

@@ -452,7 +452,7 @@ def ltx2_two_stage_bf16_video_path(_visual_gen_deps, llm_venv):
     return output_path
 
 
-def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
+def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv, tmp_path):
     """Run examples/visual_gen/models/ltx2.py with NVFP4 config end-to-end.
 
     Validates that the LTX-2 example script and ``configs/ltx2-fp4-1gpu.yaml``
@@ -460,12 +460,12 @@ def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
     ``--text_encoder_path`` because the shared YAML intentionally omits it to keep
     the config model-path-agnostic.
     """
+    import av
+
     model_path = get_checkpoint("LTX-2/ltx-2-19b-dev.safetensors")
     text_encoder_path = _ltx2_lpips_text_encoder_path()
 
-    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "ltx2_example")
-    os.makedirs(out_dir, exist_ok=True)
-    output_path = os.path.join(out_dir, "ltx2_output.mp4")
+    output_path = tmp_path / "ltx2_output.mp4"
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "ltx2.py")
     config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", "ltx2-fp4-1gpu.yaml")
@@ -482,8 +482,12 @@ def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
             config_path,
             "--text_encoder_path",
             text_encoder_path,
+            "--skip_warmup",
             "--output_path",
-            output_path,
+            str(output_path),
         ],
     )
-    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    with av.open(str(output_path)) as media:
+        assert sum(1 for _ in media.decode(video=0)) == LTX2_T2V_NUM_FRAMES
+    with av.open(str(output_path)) as media:
+        assert next(media.decode(audio=0)).samples > 0

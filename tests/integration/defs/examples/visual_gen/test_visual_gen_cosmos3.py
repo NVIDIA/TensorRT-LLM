@@ -468,7 +468,7 @@ def _cosmos3_example_deps(request, model_subpath):
         pytest.param("Cosmos3-Super", id="super-1gpu"),
     ],
 )
-def test_cosmos3_example(_cosmos3_example_deps, model_subpath, llm_root, llm_venv):
+def test_cosmos3_example(_cosmos3_example_deps, model_subpath, llm_root, llm_venv, tmp_path):
     """Run the Nano or Super example with the shared single-GPU config.
 
     Uses VANILLA attention and the checkpoint's quantization settings through
@@ -477,11 +477,7 @@ def test_cosmos3_example(_cosmos3_example_deps, model_subpath, llm_root, llm_ven
     model_path = _lpips_model_path(model_subpath)
     _require_exists(model_path, f"{model_subpath} checkpoint", is_dir=True)
 
-    out_dir = os.path.join(
-        llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_example", model_subpath
-    )
-    os.makedirs(out_dir, exist_ok=True)
-    output_path = os.path.join(out_dir, "cosmos3_output.mp4")
+    output_path = tmp_path / "cosmos3_output.mp4"
 
     script_path = os.path.join(
         llm_root, "examples", "visual_gen", "models", "cosmos3", "cosmos3.py"
@@ -502,12 +498,20 @@ def test_cosmos3_example(_cosmos3_example_deps, model_subpath, llm_root, llm_ven
             config_path,
             "--prompt",
             "A serene mountain landscape with snow-capped peaks and a flowing river",
+            "--num_inference_steps",
+            "4",
             "--output_path",
-            output_path,
+            str(output_path),
         ],
         env={"TRTLLM_DISABLE_COSMOS3_GUARDRAILS": "1"},
     )
-    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    import av
+
+    with av.open(str(output_path)) as video:
+        frames = video.decode(video=0)
+        assert next(frames, None) is not None and next(frames, None) is not None, (
+            f"{model_subpath} example did not produce a decodable video"
+        )
 
 
 def test_cosmos3_t2i_4step_example(_visual_gen_deps, llm_root, llm_venv):
