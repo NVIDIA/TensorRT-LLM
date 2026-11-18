@@ -33,7 +33,7 @@ from diffusers.modular_pipelines.minimax_h3.references import (
 )
 from PIL import Image, ImageOps
 
-from .packing import (
+from ..packing import (
     MINIMAX_H3_CANVAS_MULTIPLE,
     MINIMAX_H3_FPS,
     MINIMAX_H3_FRAMES_PER_CHUNK,
@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
     from tensorrt_llm.visual_gen.params import VisualGenParams
 
-    from .pipeline_minimax_h3 import MiniMaxH3Pipeline
+    from .pipeline import MiniMaxH3Pipeline
 
 
 def validate_reference_order(value: object) -> list[str] | None:
