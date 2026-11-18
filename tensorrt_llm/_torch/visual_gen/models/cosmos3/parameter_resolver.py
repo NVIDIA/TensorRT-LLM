@@ -53,7 +53,7 @@ from .defaults import (
     resolve_checkpoint_policy_defaults,
     resolve_raw_action_dim,
 )
-from .overrides import COSMOS3_OVERRIDES, TRANSFER, VIDEO_TO_VIDEO, ParameterOverride
+from .overrides import COSMOS3_OVERRIDES, ParameterOverride
 from .sampling import DISTILLED_GUIDANCE_SCALE
 
 REQUEST = "request"
@@ -472,7 +472,7 @@ class Candidates(NamedTuple):
     """What one field may take, by origin. ``recommended`` and ``fallback`` are both
     defaults; a caller's value that differs from ``recommended`` (the domain preset,
     the embodiment width) is worth a warning, one that differs from ``fallback`` (the
-    generation tables) is not."""
+    family tables) is not."""
 
     request: Any = None
     checkpoint: Any = None
@@ -556,23 +556,19 @@ class ParameterResolver:
         is_v2v: bool = False,
         is_transfer: bool = False,
     ) -> tuple[Optional[ParameterOverride], str]:
-        """The override of ``name`` for this kind of request, else for this family and
-        ``mode`` (``"video"``, ``"image"`` or ``"action"``), with the table row it came
-        from; ``(None, "")`` when there is none. One that names
+        """The override of ``name`` for this family and the request's workflow (transfer,
+        video-to-video, else ``mode``: ``"video"``, ``"image"`` or ``"action"``), else
+        the family's default one, with the table row it came from; ``(None, "")`` when
+        there is none. One that names
         another checkpoint value than ``checkpoint_value`` does not apply; that is
         logged once, since the checkpoint has moved off the value the override corrects."""
-        workflow = TRANSFER if is_transfer else (VIDEO_TO_VIDEO if is_v2v else None)
-        rows = (
-            (workflow, COSMOS3_OVERRIDES["workflow"].get(workflow, {})),
-            (
-                f"{self.family}.{mode}",
-                COSMOS3_OVERRIDES["generation"].get(self.family, {}).get(mode, {}),
-            ),
-        )
-        for key, row in rows:
-            found = row.get(name)
+        workflow = "transfer" if is_transfer else ("video_to_video" if is_v2v else mode)
+        family = COSMOS3_OVERRIDES.get(self.family, {})
+        for row in (workflow, "default"):
+            found = family.get(row, {}).get(name)
             if found is None:
                 continue
+            key = f"{self.family}.{row}"
             if (
                 self._log
                 and checkpoint_value is not None
@@ -641,9 +637,9 @@ class ParameterResolver:
         policy: Mapping[str, Any] = self.policy_defaults if policy_active else {}
 
         mode = "action" if in_action else p.mode
-        generation = COSMOS3_DEFAULTS["generation"].get(self.family, {})
-        table = generation.get(mode, {})
-        video_table = generation.get("video", {})
+        family = COSMOS3_DEFAULTS.get(self.family, {})
+        table = family.get("action", {}).get("common", {}) if in_action else family.get(mode, {})
+        video_table = family.get("video", {})
 
         def tables(key: str) -> Any:
             # An explicit ``None`` in the mode's table switches the field off for that
@@ -652,7 +648,7 @@ class ParameterResolver:
 
         preset_key = canonical_domain_preset_key(p.domain_name, p.domain_id) if in_action else None
         preset: Mapping[str, Any] = (
-            COSMOS3_DEFAULTS["action"].get(preset_key, {}) if preset_key else {}
+            family.get("action", {}).get(preset_key, {}) if preset_key else {}
         )
         label = (
             repr(preset_key)

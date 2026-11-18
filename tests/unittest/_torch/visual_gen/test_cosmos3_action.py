@@ -48,8 +48,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
 
 pytestmark = pytest.mark.cosmos3
 
-ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["action"]
-DROID_POLICY_DEFAULTS = COSMOS3_DEFAULTS["policy"]["droid_lerobot"]
+ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["action"]["common"]
+DROID_POLICY_DEFAULTS = COSMOS3_DEFAULTS["nemotron_dense"]["policy"]["droid_lerobot"]
 
 
 def resolve_domain_action_config(checkpoint_policy=None, **given) -> dict:
@@ -167,7 +167,7 @@ class TestDomainActionPresets:
 
     def test_presets_carry_sampling_settings_only(self):
         """Width is per-embodiment; aliases share presets, so it must not live there."""
-        for preset in COSMOS3_DEFAULTS["action"].values():
+        for preset in COSMOS3_DEFAULTS["qwen3"]["action"].values():
             assert "raw_action_dim" not in preset
 
     @pytest.mark.parametrize(

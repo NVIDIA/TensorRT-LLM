@@ -69,8 +69,8 @@ from tensorrt_llm.visual_gen.args import CompilationConfig, TorchCompileConfig, 
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
-QWEN3_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["image"]
-ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["action"]
+QWEN3_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["image"]
+ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["action"]["common"]
 
 
 @pytest.fixture(autouse=True, scope="module")

@@ -37,8 +37,8 @@ from tensorrt_llm.visual_gen.params import VisualGenParams
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
-QWEN3_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["video"]
-QWEN3_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["image"]
+QWEN3_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["video"]
+QWEN3_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["image"]
 
 # The relevant subset of the 4-Step checkpoint's scheduler config
 # (values verbatim; keys unrelated to distilled detection omitted).

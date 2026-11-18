@@ -49,7 +49,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
 )
 
 # Cosmos3-Nano (text-to-video + text-to-image) — default-setting LPIPS golden.
-# Params are the Nano/Super video defaults (cosmos3/defaults.py: COSMOS3_DEFAULTS, generation.qwen3.video).
+# Params are the Nano/Super video defaults (cosmos3/defaults.py: COSMOS3_DEFAULTS, qwen3.video).
 # Cosmos3 requires VANILLA attention and guardrails disabled in CI.
 COSMOS3_NANO_MODEL_SUBPATH = "Cosmos3-Nano"
 COSMOS3_LPIPS_PROMPT = "A serene mountain landscape with snow-capped peaks and a flowing river"

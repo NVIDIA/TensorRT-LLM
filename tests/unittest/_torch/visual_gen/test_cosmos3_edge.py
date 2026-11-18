@@ -60,12 +60,12 @@ from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
-QWEN3_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["video"]
-QWEN3_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["image"]
-EDGE_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["generation"]["nemotron_dense"]["video"]
-EDGE_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["generation"]["nemotron_dense"]["image"]
-ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["action"]
-DROID_POLICY_DEFAULTS = COSMOS3_DEFAULTS["policy"]["droid_lerobot"]
+QWEN3_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["video"]
+QWEN3_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["image"]
+EDGE_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["nemotron_dense"]["video"]
+EDGE_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["nemotron_dense"]["image"]
+ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["action"]["common"]
+DROID_POLICY_DEFAULTS = COSMOS3_DEFAULTS["nemotron_dense"]["policy"]["droid_lerobot"]
 
 DEVICE = "cuda"
 
@@ -864,7 +864,7 @@ class TestEdgePolicyReferenceInput:
 
 class TestEdgeDefaults:
     def test_generation_defaults_matrix(self):
-        edge_video = COSMOS3_DEFAULTS["generation"][NEMOTRON_DENSE_RECIPE.name]["video"]
+        edge_video = COSMOS3_DEFAULTS[NEMOTRON_DENSE_RECIPE.name]["video"]
         assert edge_video is EDGE_VIDEO_DEFAULTS
         assert (edge_video["height"], edge_video["width"]) == (480, 832)
         assert edge_video["num_frames"] == 121
@@ -872,13 +872,13 @@ class TestEdgeDefaults:
         assert edge_video["guidance_scale"] == 5.0
         assert "flow_shift" not in edge_video  # the checkpoint scheduler's shift applies
 
-        edge_t2i = COSMOS3_DEFAULTS["generation"][NEMOTRON_DENSE_RECIPE.name]["image"]
+        edge_t2i = COSMOS3_DEFAULTS[NEMOTRON_DENSE_RECIPE.name]["image"]
         assert edge_t2i is EDGE_IMAGE_DEFAULTS
         assert (edge_t2i["height"], edge_t2i["width"]) == (640, 640)
         assert edge_t2i["guidance_scale"] == 4.0
         assert edge_t2i["guidance_interval"] is None
 
-        assert COSMOS3_DEFAULTS["generation"][QWEN3_RECIPE.name]["video"] is QWEN3_VIDEO_DEFAULTS
+        assert COSMOS3_DEFAULTS[QWEN3_RECIPE.name]["video"] is QWEN3_VIDEO_DEFAULTS
 
     def test_executor_defaults_are_edge_shaped(self):
         params = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name).default_generation_params
@@ -914,17 +914,14 @@ class TestEdgeDefaults:
         assert (policy.num_inference_steps, policy.guidance_scale) == (4, 3.0)
         assert policy.guidance_interval == DROID_POLICY_DEFAULTS["guidance_interval"]
         assert (
-            COSMOS3_DEFAULTS["generation"][NEMOTRON_DENSE_RECIPE.name]["action"]
+            COSMOS3_DEFAULTS[NEMOTRON_DENSE_RECIPE.name]["action"]["common"]
             is ACTION_GENERATION_DEFAULTS
         )
         for action_mode in (ACTION_MODE_FORWARD_DYNAMICS, ACTION_MODE_INVERSE_DYNAMICS):
             resolved = pipeline.resolver.request(RequestParameters(action_mode=action_mode))
             assert (resolved.num_inference_steps, resolved.guidance_scale) == (30, 1.0)
             assert resolved.guidance_interval is None
-        assert (
-            COSMOS3_DEFAULTS["generation"][NEMOTRON_DENSE_RECIPE.name]["video"]
-            is EDGE_VIDEO_DEFAULTS
-        )
+        assert COSMOS3_DEFAULTS[NEMOTRON_DENSE_RECIPE.name]["video"] is EDGE_VIDEO_DEFAULTS
 
     @pytest.mark.parametrize(
         "action_mode",
@@ -1175,7 +1172,7 @@ class TestSchedulerCacheBounds:
         """The checkpoint's shift and every transfer hint preset; nothing else."""
         hint_shifts = {
             float(defaults["flow_shift"])
-            for defaults in COSMOS3_DEFAULTS["transfer"].values()
+            for defaults in COSMOS3_DEFAULTS["qwen3"]["transfer"].values()
             if "flow_shift" in defaults
         }
         pipeline = self._pipeline(checkpoint_shift=2.75)

@@ -56,7 +56,7 @@ from tensorrt_llm.visual_gen.params import MediaRef, VisualGenParams
 
 pytestmark = pytest.mark.cosmos3
 
-QWEN3_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["generation"]["qwen3"]["video"]
+QWEN3_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["video"]
 
 # What a plain Cosmos3 video request advertises, and so what the executor
 # merges into every request before infer() sees it.
@@ -302,7 +302,7 @@ class TestTransferConfig:
     def test_two_or_more_controls_use_the_mixed_row(self, hints):
         """A mixed request does not combine the controls' rows and does not fall
         back to the generic video values: it has its own row."""
-        mixed = COSMOS3_DEFAULTS["transfer"]["mixed"]
+        mixed = COSMOS3_DEFAULTS["qwen3"]["transfer"]["mixed"]
         extra = {key: {"control": b"clip"} for key in hints}
         cfg = resolve_transfer_config(extra, _req())
         assert cfg.guidance_scale == mixed["guidance_scale"]
@@ -1228,9 +1228,9 @@ class TestTransferSamplingAndSafety:
         pipeline.scheduler = StubScheduler()
         baseline = pipeline.scheduler
         self._run(pipeline, monkeypatch)
-        assert sampling.flow_shift_calls == [COSMOS3_DEFAULTS["transfer"]["edge"]["flow_shift"]], (
-            "transfer did not program the hint's flow shift"
-        )
+        assert sampling.flow_shift_calls == [
+            COSMOS3_DEFAULTS["qwen3"]["transfer"]["edge"]["flow_shift"]
+        ], "transfer did not program the hint's flow shift"
         # Installed, not merely built: a bare call that drops the returned
         # scheduler leaves the previous request's schedule in place.
         assert pipeline.scheduler is not baseline, (
@@ -1240,9 +1240,12 @@ class TestTransferSamplingAndSafety:
     TWO_CONTROLS = {"blur": {"control": b"clip"}}
 
     @pytest.mark.parametrize("extra", [None, TWO_CONTROLS], ids=["one-control", "two-controls"])
-    def test_flow_shift_is_request_then_checkpoint_then_default(self, monkeypatch, extra):
+    def test_flow_shift_is_request_then_override_then_checkpoint_then_default(
+        self, monkeypatch, extra
+    ):
         """The same order for one control and for several: the caller's shift, else
-        the checkpoint scheduler's, else the request's default row."""
+        the transfer override in place of a scheduler shift of 1.0, else the
+        checkpoint scheduler's, else the request's default row."""
         row = "mixed" if extra else "edge"
 
         def shift(*, checkpoint=None, request=None):
@@ -1255,8 +1258,9 @@ class TestTransferSamplingAndSafety:
             self._run(pipeline, monkeypatch, cfg_extra=cfg_extra)
             return sampling.flow_shift_calls
 
-        assert shift() == [COSMOS3_DEFAULTS["transfer"][row]["flow_shift"]]
-        assert shift(checkpoint=1.0) == [1.0]
+        assert shift() == [COSMOS3_DEFAULTS["qwen3"]["transfer"][row]["flow_shift"]]
+        assert shift(checkpoint=1.0) == [10.0]
+        assert shift(checkpoint=7.0) == [7.0]
         assert shift(checkpoint=1.0, request=4.0) == [4.0]
 
     def test_schedule_is_programmed_through_the_sampling_policy(self, monkeypatch):

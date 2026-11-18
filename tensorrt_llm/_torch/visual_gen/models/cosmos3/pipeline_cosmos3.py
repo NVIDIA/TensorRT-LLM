@@ -701,7 +701,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         these fields supported during request validation.
         """
         params = self.resolver.request(RequestParameters(mode="video"))
-        return {k: getattr(params, k) for k in COSMOS3_DEFAULTS["generation"][self.family]["video"]}
+        return {k: getattr(params, k) for k in COSMOS3_DEFAULTS[self.family]["video"]}
 
     def classify_request_failure(self, exc: BaseException) -> Optional[str]:
         """Cosmos3 rejects unusable request content with ``ValueError`` and
@@ -869,9 +869,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         checkpoint_shift = getattr(self.sampling, "checkpoint_flow_shift", None)
         if checkpoint_shift is not None:
             shifts.add(float(checkpoint_shift))
-        rows = [*COSMOS3_DEFAULTS["transfer"].values()]
-        for scope in COSMOS3_OVERRIDES.values():
-            rows += [{k: v.value for k, v in row.items()} for row in scope.values()]
+        rows = [*COSMOS3_DEFAULTS.get(self.resolver.family, {}).get("transfer", {}).values()]
+        for row in COSMOS3_OVERRIDES.get(self.resolver.family, {}).values():
+            rows.append({name: override.value for name, override in row.items()})
         for row in rows:
             if row.get("flow_shift") is not None:
                 shifts.add(float(row["flow_shift"]))

@@ -44,42 +44,41 @@ class ParameterOverride:
         return self.replaces is None or checkpoint_value == self.replaces
 
 
-VIDEO_TO_VIDEO = "video_to_video"
-TRANSFER = "transfer"
+# Video-to-video conditions on clean reference latents: it always prepends the
+# system prompt and samples a shifted-linear grid. The scheduler configs that ship
+# a Karras grid carry flow_shift 1.0, which the Karras grid never reads, so it is
+# not a shift for the linear grid.
+_VIDEO_TO_VIDEO = {
+    "use_system_prompt": ParameterOverride(True),
+    "use_karras_sigmas": ParameterOverride(False),
+    "flow_shift": ParameterOverride(10.0, replaces=1.0),
+}
 
+# Transfer prompts arrive complete, so the system prompt is never prepended; the
+# grid and the shift follow video-to-video.
+_TRANSFER = {
+    "use_system_prompt": ParameterOverride(False),
+    "use_karras_sigmas": ParameterOverride(False),
+    "flow_shift": ParameterOverride(10.0, replaces=1.0),
+}
+
+# By model family (the architecture recipe name from the transformer config), then
+# by workflow: "transfer", "video_to_video", or the mode ("video", "image",
+# "action") of any other request. A setting the workflow's row does not name is
+# taken from the family's "default" row, if it has one.
 COSMOS3_OVERRIDES: dict[str, dict[str, dict[str, ParameterOverride]]] = {
-    # By the kind of request. These are looked up before the generation rows.
-    "workflow": {
-        # Video-to-video conditions on clean reference latents: it always prepends
-        # the system prompt and samples a shifted-linear grid. The scheduler configs
-        # that ship a Karras grid carry flow_shift 1.0, which the Karras grid never
-        # reads, so it is not a shift for the linear grid.
-        VIDEO_TO_VIDEO: {
-            "use_system_prompt": ParameterOverride(True),
-            "use_karras_sigmas": ParameterOverride(False),
-            "flow_shift": ParameterOverride(10.0, replaces=1.0),
-        },
-        # Transfer prompts arrive complete, so the system prompt is never
-        # prepended; the grid and the shift follow video-to-video.
-        TRANSFER: {
-            "use_system_prompt": ParameterOverride(False),
-            "use_karras_sigmas": ParameterOverride(False),
-            "flow_shift": ParameterOverride(10.0, replaces=1.0),
-        },
+    # Nano and Super. Images sample the Karras grid unless the request selects a
+    # linear one; this is the shift that grid then runs at.
+    "qwen3": {
+        "video_to_video": _VIDEO_TO_VIDEO,
+        "transfer": _TRANSFER,
+        "image": {"flow_shift": ParameterOverride(3.0, replaces=1.0)},
     },
-    # By model family (the architecture recipe name from the transformer config)
-    # and then by mode, like ``COSMOS3_DEFAULTS["generation"]``.
-    "generation": {
-        # Nano and Super. Images sample the Karras grid unless the request selects a
-        # linear one; this is the shift that grid then runs at.
-        "qwen3": {
-            "image": {"flow_shift": ParameterOverride(3.0, replaces=1.0)},
-        },
-        # Edge samples its checkpoint-declared linear flow grid, whose scheduler
-        # config carries the same unread flow_shift 1.0.
-        "nemotron_dense": {
-            "video": {"flow_shift": ParameterOverride(3.0, replaces=1.0)},
-            "image": {"flow_shift": ParameterOverride(3.0, replaces=1.0)},
-        },
+    # Edge samples its checkpoint-declared linear flow grid, whose scheduler config
+    # carries the same unread flow_shift 1.0.
+    "nemotron_dense": {
+        "default": {"flow_shift": ParameterOverride(3.0, replaces=1.0)},
+        "video_to_video": _VIDEO_TO_VIDEO,
+        "transfer": _TRANSFER,
     },
 }

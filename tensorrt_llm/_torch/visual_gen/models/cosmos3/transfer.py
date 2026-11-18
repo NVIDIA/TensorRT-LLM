@@ -22,7 +22,7 @@ from tensorrt_llm._torch.visual_gen.triton_kernels import (
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.media.decoding import decode_video_reference_window
 
-from .defaults import COSMOS3_DEFAULTS
+from .defaults import _TRANSFER_DEFAULTS
 
 # ---------------------------------------------------------------------------
 # Transfer sampling + per-control-hint defaults, ported from vllm-omni's
@@ -49,7 +49,7 @@ CONTROL_DIRECTIVE_TEMPLATE = (
 def transfer_defaults(hints: Mapping[str, Any]) -> dict[str, Any]:
     """The default row of a transfer request: the control's own row for a single
     control, the ``"mixed"`` row for two or more."""
-    return COSMOS3_DEFAULTS["transfer"][next(iter(hints)) if len(hints) == 1 else "mixed"]
+    return _TRANSFER_DEFAULTS[next(iter(hints)) if len(hints) == 1 else "mixed"]
 
 
 # Canny (lower, upper) hysteresis thresholds per edge-strength preset;
@@ -247,38 +247,38 @@ def resolve_transfer_config(
         num_video_frames_per_chunk=_extra_or_default(
             extra_params,
             "num_video_frames_per_chunk",
-            COSMOS3_DEFAULTS["transfer"]["common"]["num_video_frames_per_chunk"],
+            _TRANSFER_DEFAULTS["common"]["num_video_frames_per_chunk"],
         ),
         num_conditional_frames=_extra_or_default(
             extra_params,
             "num_conditional_frames",
-            COSMOS3_DEFAULTS["transfer"]["common"]["num_conditional_frames"],
+            _TRANSFER_DEFAULTS["common"]["num_conditional_frames"],
         ),
         max_frames=_extra_or_default(
-            extra_params, "max_frames", COSMOS3_DEFAULTS["transfer"]["common"]["max_frames"]
+            extra_params, "max_frames", _TRANSFER_DEFAULTS["common"]["max_frames"]
         ),
         show_control_condition=_extra_or_default(
             extra_params,
             "show_control_condition",
-            COSMOS3_DEFAULTS["transfer"]["common"]["show_control_condition"],
+            _TRANSFER_DEFAULTS["common"]["show_control_condition"],
         ),
         show_input=_extra_or_default(
-            extra_params, "show_input", COSMOS3_DEFAULTS["transfer"]["common"]["show_input"]
+            extra_params, "show_input", _TRANSFER_DEFAULTS["common"]["show_input"]
         ),
         num_first_chunk_conditional_frames=_extra_or_default(
             extra_params,
             "num_first_chunk_conditional_frames",
-            COSMOS3_DEFAULTS["transfer"]["common"]["num_first_chunk_conditional_frames"],
+            _TRANSFER_DEFAULTS["common"]["num_first_chunk_conditional_frames"],
         ),
         share_vision_temporal_positions=_extra_or_default(
             extra_params,
             "share_vision_temporal_positions",
-            COSMOS3_DEFAULTS["transfer"]["common"]["share_vision_temporal_positions"],
+            _TRANSFER_DEFAULTS["common"]["share_vision_temporal_positions"],
         ),
         emphasize_control_in_prompt=_extra_or_default(
             extra_params,
             "emphasize_control_in_prompt",
-            COSMOS3_DEFAULTS["transfer"]["common"]["emphasize_control_in_prompt"],
+            _TRANSFER_DEFAULTS["common"]["emphasize_control_in_prompt"],
         ),
         # `num_frames` and `frame_rate` are request fields, not extra params, so
         # they are read from `req_params` alone: `extra_params` spellings of them
