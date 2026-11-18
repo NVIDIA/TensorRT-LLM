@@ -144,10 +144,25 @@ from .. import cute_aot, runtime_hooks_compat
 from ..msa import engine as _msa_engine
 from ..ops import swiglu_rows_plan
 from ..ops.moe.megamoe_local.local_impl import MegaMoEDeferredTopkReduce, _route_quant_key
+from ..tile_select import TileSelect, TileSelectSettings
 from . import ctx_boundary_plan as _cbplan
 from . import idx_scorer as _idx_scorer
-from . import tile_select as _tsel
 from .m31_switches import large_prefill_graphs_disabled, m31_disabled
+
+# DEP2CTX_TSEL: the prefill tile select (tile_select) and its row-major select for the prefill scorer's scores
+# (idx_scorer). Kill switches TRTLLM_M31_DISABLE_DEP2CTX_TSEL=1 (the built-in select),
+# TRTLLM_M31_DISABLE_DEP2CTX_TSEL_ROWS=1 (no row-major select, so the scorer stays off too) and
+# TRTLLM_M31_DISABLE_TSEL_NARROW=1 (the op's tile kernel for every tile).
+_TSEL_ON = not m31_disabled("DEP2CTX_TSEL")
+_tsel = TileSelect(
+    TileSelectSettings(
+        target="dep2ctx",
+        switch="DEP2CTX_TSEL",
+        enabled=_TSEL_ON,
+        rows_enabled=_TSEL_ON and not m31_disabled("DEP2CTX_TSEL_ROWS"),
+        narrow=not m31_disabled("TSEL_NARROW"),
+    )
+)
 
 # This module's torch namespace (namespace_of): its Python custom ops register there.
 _NS = namespace_of(__name__)
@@ -876,6 +891,8 @@ def _bcg_note(item: str, x: Any) -> None:
 # handle compiles on A1's first eager take (the bucket's warm-up), never inside a capture. Kill switch
 # TRTLLM_M31_DISABLE_DEP2CTX_A1_IN_BCG=1.
 _A1_IN_BCG = not m31_disabled("DEP2CTX_A1_IN_BCG")
+# This target's name for the fused QKV kernel's AOT objects (kernels/qkv_fusion).
+_QKV_FUSION_AOT_NAME = "m31_dep2ctx_qkv_fusion"
 _A1_BCG_GEMMS: Dict[int, Any] = {}
 
 
@@ -885,11 +902,9 @@ def _a1_bcg_warm(
     """Compile and load A1's GEMM-only handle once per N, eagerly (on A1's first eager take)."""
     if not (_ITEMS_IN_BCG and _A1_IN_BCG) or n_total in _A1_BCG_GEMMS:
         return
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep2ctx.kernels.qkv_fusion.plain_gemm import (  # noqa: E501
-        get_gemm,
-    )
+    from ..kernels.qkv_fusion.plain_gemm import get_gemm
 
-    gemm = get_gemm(n_total, 4, num_heads_kv, num_heads_index)
+    gemm = get_gemm(n_total, 4, num_heads_kv, num_heads_index, aot_name=_QKV_FUSION_AOT_NAME)
     gemm(act.view(rows, -1), act_sf, proj.weight, proj.weight_scale, proj._mxfp8_alpha)
     _A1_BCG_GEMMS[n_total] = gemm
     logger.info(f"[M3.1 dep2ctx] DEP2CTX_A1_IN_BCG GEMM-only handle ready (N={n_total})")
@@ -1816,14 +1831,14 @@ def _ctx_qkv_fused_runner(num_heads_q: int, num_heads_kv: int, num_heads_index: 
     key = geometry + (tuple(sorted(cfg.items())),)
     runner = _CTX_QKV_FUSED_RUNNERS.get(key)
     if runner is None:
-        from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep2ctx.kernels.qkv_fusion.kernel import (  # noqa: E501
-            M3QkvFusedRunner,
-        )
+        from ..kernels.qkv_fusion.kernel import M3QkvFusedRunner
 
         for each in _CTX_QKV_FUSED_CFGS:
             each_key = geometry + (tuple(sorted(each.items())),)
             if each_key not in _CTX_QKV_FUSED_RUNNERS:
                 _CTX_QKV_FUSED_RUNNERS[each_key] = M3QkvFusedRunner(
+                    aot_name=_QKV_FUSION_AOT_NAME,
+                    check_page_counts=False,
                     num_heads_q=num_heads_q,
                     num_heads_kv=num_heads_kv,
                     num_heads_index=num_heads_index,
@@ -5490,7 +5505,7 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep2ctx(MiniMaxM3ForCausalLM):
         # DEP2CTX_TSEL (#20629 TILE_SELECT): the prefill top-16 select as the tile select, on every layer's MSA indexer.
         _tsel.register(self)
         # DEP2CTX_IDX_SCORER (CTX, exact): the prefill indexer scores from the exact K=32 Q8KV8 scorer, not the proxy.
-        _idx_scorer.register(self)
+        _idx_scorer.register(self, _tsel)
         # DEP2CTX_BCG_PAD_MASK: the step's pad-row mask, sized for the largest prefill step.
         self._pad_rows = _ppr.PrefillPadRows(
             int(getattr(model_config, "max_num_tokens", 0) or 0),

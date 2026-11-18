@@ -26,9 +26,6 @@ import torch
 
 from .kernel import HEAD_DIM, M3QkvFusedRunner
 
-# The attention-DP rank's head geometry (all heads): 4 KV heads and 4 index heads.
-NUM_HEADS_KV = 4
-NUM_HEADS_INDEX = 4
 SF_VEC_SIZE = 32
 # Weight-side DLPack arguments kept per runner; the cache holds the tensors, so a key's pointer cannot be reused.
 _MAX_CACHED_WEIGHTS = 1024
@@ -39,9 +36,7 @@ def num_fixed_slots(num_heads_kv: int, num_heads_index: int) -> int:
     return 2 * num_heads_kv + num_heads_index + 1
 
 
-def num_heads_q_for(
-    n: int, num_heads_kv: int = NUM_HEADS_KV, num_heads_index: int = NUM_HEADS_INDEX
-) -> int:
+def num_heads_q_for(n: int, num_heads_kv: int, num_heads_index: int) -> int:
     """The head-slot count that makes the fused kernel's packed N equal ``n``."""
     if n % HEAD_DIM:
         raise ValueError(f"N={n} is not a multiple of {HEAD_DIM}")
@@ -106,19 +101,28 @@ _TAIL_ARGS = (0,) * 9 + (0, 0.0)
 
 
 class M3ClcMxfp8Gemm:
-    """One compiled GEMM-only handle for a fixed N (any M, any K that is a multiple of 128)."""
+    """One compiled GEMM-only handle for a fixed N (any M, any K that is a multiple of 128).
+
+    ``num_heads_kv`` / ``num_heads_index`` are the calling target's per-rank head geometry and ``aot_name`` its name
+    for the fused kernel's AOT objects.
+    """
 
     def __init__(
         self,
         n: int,
-        heads_per_tile: int = 4,
-        num_heads_kv: int = NUM_HEADS_KV,
-        num_heads_index: int = NUM_HEADS_INDEX,
+        heads_per_tile: int,
+        num_heads_kv: int,
+        num_heads_index: int,
+        *,
+        aot_name: str,
         **cfg,
     ):
         self.n = int(n)
         self.heads_per_tile = int(heads_per_tile)
         self.runner = M3QkvFusedRunner(
+            aot_name=aot_name,
+            # This handle builds its own arguments (make_args below), never the runner's.
+            check_page_counts=False,
             num_heads_q=num_heads_q_for(self.n, num_heads_kv, num_heads_index),
             num_heads_kv=num_heads_kv,
             num_heads_index=num_heads_index,
@@ -225,17 +229,14 @@ class M3ClcMxfp8Gemm:
         return out
 
 
-_GEMMS: Dict[Tuple[int, int, int, int], M3ClcMxfp8Gemm] = {}
+_GEMMS: Dict[Tuple[str, int, int, int, int], M3ClcMxfp8Gemm] = {}
 
 
 def get_gemm(
-    n: int,
-    heads_per_tile: int,
-    num_heads_kv: int = NUM_HEADS_KV,
-    num_heads_index: int = NUM_HEADS_INDEX,
+    n: int, heads_per_tile: int, num_heads_kv: int, num_heads_index: int, *, aot_name: str
 ) -> M3ClcMxfp8Gemm:
-    """The cached handle for (N, heads per tile, KV heads, index heads); compiles on first use."""
-    key = (int(n), int(heads_per_tile), int(num_heads_kv), int(num_heads_index))
+    """The cached handle for (AOT name, N, heads per tile, KV heads, index heads); compiles on first use."""
+    key = (aot_name, int(n), int(heads_per_tile), int(num_heads_kv), int(num_heads_index))
     gemm = _GEMMS.get(key)
     if gemm is None:
         gemm = M3ClcMxfp8Gemm(
@@ -243,11 +244,27 @@ def get_gemm(
             heads_per_tile=heads_per_tile,
             num_heads_kv=num_heads_kv,
             num_heads_index=num_heads_index,
+            aot_name=aot_name,
         )
         _GEMMS[key] = gemm
     return gemm
 
 
-def m3_clc_mxfp8_gemm(act, act_sf, weight, weight_sf, alpha, out=None, heads_per_tile: int = 4):
+def m3_clc_mxfp8_gemm(
+    act,
+    act_sf,
+    weight,
+    weight_sf,
+    alpha,
+    out=None,
+    heads_per_tile: int = 4,
+    *,
+    num_heads_kv: int,
+    num_heads_index: int,
+    aot_name: str,
+):
     """``bf16_rn(alpha * act @ weight.T)`` for MXFP8 operands with swizzled UE8M0 K32 scales."""
-    return get_gemm(weight.shape[0], heads_per_tile)(act, act_sf, weight, weight_sf, alpha, out)
+    gemm = get_gemm(
+        weight.shape[0], heads_per_tile, num_heads_kv, num_heads_index, aot_name=aot_name
+    )
+    return gemm(act, act_sf, weight, weight_sf, alpha, out)

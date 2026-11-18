@@ -65048,10 +65048,8 @@ License: `Apache License 2.0`
 CuTe DSL source files licensed under the CUTLASS BSD-3-Clause license, in
 `tensorrt_llm/_torch/modeling_v2/models/minimax_m3/`:
 
-  - `minimax_m3_1_flash_nvfp4__sm_107__tp2ctx/kernels/qkv_fusion/clc_tile_scheduler.py`
-  - `minimax_m3_1_flash_nvfp4__sm_107__tp2ctx/kernels/qkv_fusion/kernel.py`
-  - `minimax_m3_1_flash_nvfp4__sm_107__dep2ctx/kernels/qkv_fusion/clc_tile_scheduler.py`
-  - `minimax_m3_1_flash_nvfp4__sm_107__dep2ctx/kernels/qkv_fusion/kernel.py`
+  - `kernels/qkv_fusion/clc_tile_scheduler.py`
+  - `kernels/qkv_fusion/kernel.py`
 
 ### Licenses
 License: `BSD 3-Clause License`

@@ -4039,10 +4039,14 @@ def _a1_runner(num_heads_q: int, num_heads_kv: int, num_heads_index: int):
     key = (num_heads_q, num_heads_kv, num_heads_index)
     runner = _A1_RUNNERS.get(key)
     if runner is None:
-        from .kernels.qkv_fusion.kernel import M3QkvFusedRunner
+        from ..kernels.qkv_fusion.kernel import M3QkvFusedRunner
 
         runner = _A1_RUNNERS[key] = M3QkvFusedRunner(
-            num_heads_q=num_heads_q, num_heads_kv=num_heads_kv, num_heads_index=num_heads_index
+            aot_name="m31_tp2_qkv_fusion",
+            check_page_counts=True,
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            num_heads_index=num_heads_index,
         )
         logger.info(f"[M3.1 agg] TP2_PREFILL_QKV_FUSED runner compiled for heads {key}")
     return runner

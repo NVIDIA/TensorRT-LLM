@@ -91,6 +91,7 @@ registers and runs slower.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import NamedTuple, Tuple
 
 import cuda.bindings.driver as cuda_driver
@@ -112,19 +113,9 @@ from cutlass.utils.gemm import sm100 as gemm_sm100
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
-from ....kernels.qkv_fusion.clc_tile_scheduler import (
+from .clc_tile_scheduler import (
     ClcDynamicPersistentTileScheduler,
     ClcDynamicPersistentTileSchedulerParams,
-)
-
-# The family's qkv_fusion package, which holds the tile scheduler this kernel traces.
-_FAMILY_QKV_FUSION_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    os.pardir,
-    os.pardir,
-    os.pardir,
-    "kernels",
-    "qkv_fusion",
 )
 
 HEAD_DIM = 128
@@ -1752,11 +1743,22 @@ class M3QkvGemmNormRopeKvInsert:
 # Host side
 # ---------------------------------------------------------------------------
 
+# (aot_name, compile key) -> (op, compiled handle).
 _COMPILE_CACHE: dict = {}
+
+
+def _aot_sources():
+    """The ``sources`` of this module's AOT objects: the Python files of the model family package (its targets and
+    the family code they import, this kernel and its tile scheduler included) and of the shared Blackwell kernel
+    helpers."""
+    family = Path(__file__).resolve().parents[2]
+    shared = cute_aot.BLACKWELL_DIR
+    return cute_aot.py_files(str(family), str(shared))
 
 
 def compile(
     *,
+    aot_name: str,
     num_heads_q: int = 32,
     num_heads_kv: int = 2,
     num_heads_index: int = 2,
@@ -1771,7 +1773,10 @@ def compile(
     enable_pdl: bool = True,
     epi_wgs: int = 1,
 ):
-    """Compile one handle serving every M (and any cache geometry)."""
+    """Compile one handle serving every M (and any cache geometry).
+
+    ``aot_name`` is the calling target's name for its AOT objects (the first word of their cache key).
+    """
     arch = os.environ.get("CUTE_DSL_ARCH")
     if arch is not None and arch != "sm_107a":
         raise RuntimeError("requires CUTE_DSL_ARCH=sm_107a")
@@ -1790,8 +1795,9 @@ def compile(
         enable_pdl,
         epi_wgs,
     )
-    if key in _COMPILE_CACHE:
-        return _COMPILE_CACHE[key]
+    cache_key = (aot_name, key)
+    if cache_key in _COMPILE_CACHE:
+        return _COMPILE_CACHE[cache_key]
     op = M3QkvGemmNormRopeKvInsert(
         num_heads_q=num_heads_q,
         num_heads_kv=num_heads_kv,
@@ -1862,15 +1868,13 @@ def compile(
 
     # Loaded from an exported object when the family cute_aot finds one; compiled here otherwise.
     compiled = cute_aot.compile_or_load(
-        f"m31_tp2_qkv_fusion {key!r} --enable-tvm-ffi",
+        f"{aot_name} {key!r} --enable-tvm-ffi",
         compile_fn,
-        sources=cute_aot.py_files(
-            os.path.dirname(os.path.abspath(__file__)), _FAMILY_QKV_FUSION_DIR
-        ),
+        sources=_aot_sources(),
         tvm_ffi=True,
     )
-    _COMPILE_CACHE[key] = (op, compiled)
-    return _COMPILE_CACHE[key]
+    _COMPILE_CACHE[cache_key] = (op, compiled)
+    return _COMPILE_CACHE[cache_key]
 
 
 def _cache_strides(kv_data_cache, kv_scale_cache, index_k_cache):
@@ -1903,11 +1907,16 @@ class M3QkvFusedRunner:
       each (or one pre-concatenated [4 * 128] q|K|index-q|index-K tensor).
     ``debug_gemm_out=True`` handles write only the bf16 GEMM output to
     ``gemm_out`` [M, N] and leave every producer output untouched.
+
+    ``aot_name`` names the calling target's AOT objects (``compile``). ``check_page_counts`` asserts that the scale
+    and index-K caches have the data cache's page count (the kernel bounds a slot's page by the data cache's count
+    only); a target that passes False does not check it.
     """
 
-    def __init__(self, **cfg):
-        self.op, self.compiled = compile(**cfg)
+    def __init__(self, *, aot_name: str, check_page_counts: bool, **cfg):
+        self.op, self.compiled = compile(aot_name=aot_name, **cfg)
         self.debug = bool(cfg.get("debug_gemm_out", False))
+        self.check_page_counts = bool(check_page_counts)
 
     def make_args(
         self,
@@ -1951,8 +1960,9 @@ class M3QkvFusedRunner:
             HEAD_DIM // 16,
         )
         assert index_k_cache.dim() == 4 and index_k_cache.shape[1:] == (1, PAGE_SIZE, HEAD_DIM)
-        # The kernel bounds a slot's page by the data cache's page count only.
-        assert kv_scale_cache.shape[0] == kv_data_cache.shape[0] == index_k_cache.shape[0]
+        if self.check_page_counts:
+            # The kernel bounds a slot's page by the data cache's page count only.
+            assert kv_scale_cache.shape[0] == kv_data_cache.shape[0] == index_k_cache.shape[0]
         assert kv_data_cache.stride(4) == 1 and kv_data_cache.stride(3) == HEAD_DIM // 2
         assert kv_scale_cache.stride(4) == 1 and kv_scale_cache.stride(3) == HEAD_DIM // 16
         assert index_k_cache.stride(3) == 1 and index_k_cache.stride(2) == HEAD_DIM

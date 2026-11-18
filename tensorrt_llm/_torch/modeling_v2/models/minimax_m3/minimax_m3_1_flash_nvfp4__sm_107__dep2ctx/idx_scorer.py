@@ -49,7 +49,6 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.msa.kernels.msa_utils imp
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.logger import logger
 
-from . import tile_select
 from .m31_switches import m31_disabled, m31_enabled
 
 IDX_SCORER = not m31_disabled("DEP2CTX_IDX_SCORER")
@@ -326,11 +325,11 @@ def prewarm(num_heads: int, device: Optional[torch.device] = None) -> None:
     )
 
 
-def _off_reason(model) -> Optional[str]:
+def _off_reason(model, tile_select) -> Optional[str]:
     """Why the scorer must not register on this model, or None."""
     if not IDX_SCORER:
         return "TRTLLM_M31_DISABLE_DEP2CTX_IDX_SCORER=1"
-    if not tile_select.TSEL or tile_select._rows_op() is None:
+    if not tile_select.settings.enabled or tile_select.rows_op() is None:
         # Without the row-major tile select the zero-copy view would go to the one-CTA-per-row built-in select.
         return "the row-major tile select is off or not built (DEP2CTX_TSEL / DEP2CTX_TSEL_ROWS)"
     for layer in model.model.layers:
@@ -343,11 +342,12 @@ def _off_reason(model) -> Optional[str]:
     return None
 
 
-def register(model) -> int:
+def register(model, tile_select) -> int:
     """Register ``score`` (bound to the indexer's per-rank KV head count) on every layer's MSA indexer that has an
-    unset scorer hook, with ``tile_select.select_rows`` as its ``prefill_scorer_selector`` when that is unset, and arm
-    the family's lazy proxy plan (with ``accepts`` and ``prewarm``); the number registered."""
-    reason = _off_reason(model)
+    unset scorer hook, with ``tile_select.select_rows`` (the target's ``TileSelect``) as its
+    ``prefill_scorer_selector`` when that is unset, and arm the family's lazy proxy plan (with ``accepts`` and
+    ``prewarm``); the number registered."""
+    reason = _off_reason(model, tile_select)
     if reason is not None:
         logger.info(f"[M3.1 dep2ctx] IDX_SCORER_OFF: {reason}; the proxy scores")
         return 0

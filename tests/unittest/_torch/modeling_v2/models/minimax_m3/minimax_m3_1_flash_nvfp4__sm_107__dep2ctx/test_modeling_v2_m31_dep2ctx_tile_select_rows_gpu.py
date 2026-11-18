@@ -14,11 +14,27 @@ strict xfail), so that comparison leaves negative NaN out there. Skipped off sm_
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep2ctx import (  # noqa: E501
-    tile_select,
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep2ctx.m31_switches import (  # noqa: E501
+    m31_disabled,
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.tile_select import (
+    TileSelect,
+    TileSelectSettings,
+)
 from tensorrt_llm._utils import get_sm_version
+
+# The dep2ctx target's tile select (its modeling module builds the same one).
+_TSEL_ON = not m31_disabled("DEP2CTX_TSEL")
+tile_select = TileSelect(
+    TileSelectSettings(
+        target="dep2ctx",
+        switch="DEP2CTX_TSEL",
+        enabled=_TSEL_ON,
+        rows_enabled=_TSEL_ON and not m31_disabled("DEP2CTX_TSEL_ROWS"),
+        narrow=not m31_disabled("TSEL_NARROW"),
+    )
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or get_sm_version() != 107, reason="SM107 (Rubin) only"

@@ -17,8 +17,23 @@ contract above; test_negative_nan_above_128_blocks pins that as a strict xfail.
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2ctx import (
-    tile_select,
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2ctx.m31_switches import (  # noqa: E501
+    m31_disabled,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.tile_select import (
+    TileSelect,
+    TileSelectSettings,
+)
+
+# The tp2ctx target's tile select (its modeling module builds the same one).
+tile_select = TileSelect(
+    TileSelectSettings(
+        target="tp2ctx",
+        switch="TP2CTX_TSEL",
+        enabled=not m31_disabled("TP2CTX_TSEL"),
+        rows_enabled=False,
+        narrow=not m31_disabled("TSEL_NARROW"),
+    )
 )
 
 BLOCK = 128
