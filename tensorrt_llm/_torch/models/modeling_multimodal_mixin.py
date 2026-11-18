@@ -764,7 +764,7 @@ class MultimodalModelMixin:
         self,
         group: Sequence[tuple[int, Sequence[tuple[MultimodalParams, Sequence[int], str]]]],
     ) -> Optional[list[torch.Tensor]]:
-        """Encode a group of owners' batches in one encoder call on every rank.
+        """Encode a group of owners' batches on every rank, one encoder call per modality run.
 
         Returns this rank's outputs, or ``None`` when it owns no batch in the
         group. A request error fails only the owner's requests: every rank
@@ -773,11 +773,20 @@ class MultimodalModelMixin:
         encodes each owner alone.
         """
         tp_rank = self.model_config.mapping.tp_rank
+        encoder_inputs = [encoder_input for _, inputs in group for encoder_input in inputs]
+        # Each modality is its own encoder TP forward. Share failures after each
+        # one, so no rank starts the next forward while a peer has failed. The DP
+        # path runs every modality in one placement and checks between its runs.
+        runs = (
+            [encoder_inputs]
+            if self.encoder_parallel_layout.distributes_items
+            else [list(run) for _, run in itertools.groupby(encoder_inputs, key=lambda e: e[2])]
+        )
+        shared_outputs: list[torch.Tensor] = []
         try:
-            with encoder_dp_error_guard(self.exchange_encoder_status):
-                shared_outputs = self._forward_multimodal_encoder_items_local(
-                    [encoder_input for _, inputs in group for encoder_input in inputs]
-                )
+            for run in runs:
+                with encoder_dp_error_guard(self.exchange_encoder_status):
+                    shared_outputs.extend(self._forward_multimodal_encoder_items_local(run))
         except MultimodalEncoderContractError:
             if len(group) == 1:
                 if group[0][0] == tp_rank:

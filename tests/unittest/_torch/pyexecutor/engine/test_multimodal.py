@@ -1352,3 +1352,97 @@ def test_shared_encoder_tp_fails_only_the_requests_that_failed(failure: str) -> 
     assert [model.encoded_values for model in models] == [expected_values] * 2
     assert not is_multimodal_encoder_ready(requests[0])
     assert is_multimodal_encoder_ready(requests[1])
+
+
+class _MismatchedCollective(BaseException):
+    """The ranks entered different collectives: a real run would hang."""
+
+
+class _ModalityTpModel(MultimodalModelMixin):
+    """Shared encoder TP over two thread ranks; each encoder call is one TP forward.
+
+    The forward starts with a TP collective. ``fail_after_image`` is raised on
+    this rank after its image forward, as a rank-local failure would be.
+    """
+
+    embedding_dtype = torch.float32
+
+    def __init__(self, rank: int, group: _ThreadTpGroup, fail_after_image=None) -> None:
+        self.model_config = ModelConfig(
+            mapping=Mapping(world_size=2, rank=rank, tp_size=2, enable_attention_dp=True),
+            multimodal_config=MultimodalConfig(
+                encoder_data_parallel_size=1, encoder_cache_max_bytes=0
+            ),
+        )
+        self.group = group
+        self.fail_after_image = fail_after_image
+        self.forwards: list[str] = []
+
+    def exchange_encoder_status(self, values: Sequence[int]) -> list[object]:
+        rows = self.group.allgather(self.model_config.mapping.tp_rank, list(values))
+        if not all(isinstance(row, list) for row in rows):
+            raise _MismatchedCollective
+        return rows
+
+    def encode_multimodal_inputs(self, multimodal_params, **_) -> torch.Tensor:
+        (modality,) = {
+            key for key in multimodal_params[0].multimodal_data if key in ("image", "video")
+        }
+        peers = self.group.allgather(self.model_config.mapping.tp_rank, ("encoder TP", modality))
+        if any(peer != peers[0] for peer in peers):
+            raise _MismatchedCollective
+        self.forwards.append(modality)
+        if modality == "image" and self.fail_after_image is not None:
+            raise self.fail_after_image
+        return torch.cat(
+            [param.multimodal_data[modality]["pixel_values"] for param in multimodal_params]
+        )
+
+
+def _modality_input(modality: str, value: float) -> list[tuple[MultimodalParams, list[int], str]]:
+    data = {
+        modality: {"pixel_values": torch.full((1, 2), value)},
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [(modality, 0)], encoder_token_lengths=[4], output_embedding_lengths=[1]
+        ),
+    }
+    return [(MultimodalParams(multimodal_data=data), [1], modality)]
+
+
+@pytest.mark.parametrize("failure", ["system_error", "request_error"])
+def test_shared_encoder_tp_shares_failures_before_the_next_modality(failure: str) -> None:
+    """Rank 0 owns an image, rank 1 a video. Both fit one group, so both ranks
+    run the image forward and then the video forward. Rank 0 fails after the
+    image forward. Rank 1 must not start the video forward alone."""
+    group = _ThreadTpGroup(2)
+    error = {
+        "system_error": RuntimeError("CUDA out of memory on rank 0"),
+        "request_error": MultimodalEncoderContractError("bad image on rank 0"),
+    }[failure]
+    models = [_ModalityTpModel(0, group, fail_after_image=error), _ModalityTpModel(1, group)]
+    inputs = [_modality_input("image", 100.0), _modality_input("video", 200.0)]
+    outcomes: list[object] = [None, None]
+
+    def run(rank: int) -> None:
+        try:
+            outcomes[rank] = models[rank].forward_multimodal_encoder_items(
+                inputs[rank], max_tokens=8, max_items=2
+            )
+        except BaseException as caught:  # noqa: BLE001 - record every outcome
+            outcomes[rank] = caught
+
+    with patch.object(dp_module, "Distributed", group), ThreadPoolExecutor(2) as ranks:
+        list(ranks.map(run, range(2)))
+
+    assert not any(isinstance(outcome, _MismatchedCollective) for outcome in outcomes)
+    if failure == "system_error":
+        # Every rank raises the same error before the video forward.
+        assert all(isinstance(outcome, EncoderDpError) for outcome in outcomes)
+        assert str(outcomes[0]) == str(outcomes[1])
+        assert [model.forwards for model in models] == [["image"]] * 2
+        return
+    # Only rank 0's request fails. The group is encoded again one owner at a
+    # time, and rank 1 gets its video rows.
+    assert outcomes[0] is error
+    torch.testing.assert_close(outcomes[1], [torch.full((1, 2), 200.0)])
+    assert [model.forwards for model in models] == [["image", "image", "video"]] * 2
