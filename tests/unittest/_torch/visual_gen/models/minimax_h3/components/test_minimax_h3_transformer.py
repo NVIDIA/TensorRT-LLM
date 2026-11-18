@@ -1502,6 +1502,7 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
 def test_refiner_rejects_padding_without_mask_support() -> None:
     refiner = h3.MiniMaxH3TokenRefiner.__new__(h3.MiniMaxH3TokenRefiner)
     nn.Module.__init__(refiner)
+    refiner._attn_backend = "CUTEDSL"
     refiner._supports_key_padding_mask = False
     refiner.sharder = SimpleNamespace(size=2)
     with pytest.raises(NotImplementedError, match="key_padding_mask"):
