@@ -107,7 +107,7 @@ git clone https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash /models/MiniMax-M3
 
 ## Serving MiniMax-M3.1-Flash
 
-MiniMax-M3.1-Flash is served with the same `MiniMaxM3SparseForConditionalGeneration` architecture, CLI flags, and YAML options as MiniMax-M3. On SM107 (Rubin), and with tensor parallelism 4 or 8 on SM103 (GB300), it runs on the MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3` family. All 60 of its attention layers are sparse (its `sparse_attention_freq` has no dense entries), so there are no dense target layers. The examples use a local copy of the checkpoint at `/models/MiniMax-M3.1-Flash`.
+MiniMax-M3.1-Flash is served with the same `MiniMaxM3SparseForConditionalGeneration` architecture, CLI flags, and YAML options as MiniMax-M3. On SM107 (Rubin) it runs on the MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3` family. All 60 of its attention layers are sparse (its `sparse_attention_freq` has no dense entries), so there are no dense target layers. The examples use a local copy of the checkpoint at `/models/MiniMax-M3.1-Flash`.
 
 ### Checkpoint
 

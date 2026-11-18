@@ -202,10 +202,6 @@ l0_cpu:
   # MiniMax-M3.1-Flash sm_107 tp2 target: its device-free (cpu_only) tests; the stage's -m cpu_only collects
   # only them. The comm tests run 2 ranks.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/*
-  # MiniMax-M3.1-Flash GB300 (sm_103) tp4 and tp8 targets: their device-free (cpu_only) tests; the stage's -m cpu_only collects
-  # only them.
-  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4 --import-mode=importlib
-  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp8 --import-mode=importlib
   - unittest/_torch/models/test_qwen3_next_eager_fusion.py::test_sparse_moe_keeps_shared_expert_tokens_unpadded
   # MiniMax-M3 VL input processor and wrapper forward; the CPU stage's -m cpu_only
   # leaves the checkpoint-backed tests out.

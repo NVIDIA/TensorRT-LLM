@@ -1922,11 +1922,6 @@ _M31_TARGETS = {
     ),
     "dep": ("minimax_m3_1_flash_nvfp4__sm_107__dep", "ModelingV2MiniMaxM31FlashNvfp4Sm107Dep"),
 }
-# The GB300 (sm103) M3.1 targets, by topology.
-_M31_SM103_TARGETS = {
-    "tp4": ("minimax_m3_1_flash_nvfp4__sm_103__tp4", "ModelingV2MiniMaxM31FlashNvfp4Sm103Tp4"),
-    "tp8": ("minimax_m3_1_flash_nvfp4__sm_103__tp8", "ModelingV2MiniMaxM31FlashNvfp4Sm103Tp8"),
-}
 _M31_LAYOUTS = {
     "tp2": _M3_TP2,
     "tp4": _M3_TP4,
@@ -1961,7 +1956,7 @@ def _m31_route(monkeypatch):
 
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
 
-    for directory, name in [*_M31_TARGETS.values(), *_M31_SM103_TARGETS.values()]:
+    for directory, name in _M31_TARGETS.values():
         stub = types.ModuleType(f"{_M3_TARGETS}.{directory}.modeling")
         setattr(stub, name, type(name, (), {"__module__": stub.__name__}))
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
@@ -2024,8 +2019,9 @@ def test_minimax_m3_1_route_takes_an_fp8_or_nvfp4_kv_cache(_m31_route, kv_dtype)
 @pytest.mark.parametrize(
     "capability, topology, kv_dtype, reason",
     [
-        ((10, 3), "tp2", "nvfp4", r"tp2 on sm103 \(GB300\), where only tp4 and tp8 run"),
-        ((10, 0), "tp8", "nvfp4", r"neither sm103 \(GB300\) nor sm107 \(Rubin\)"),
+        ((10, 3), "tp4", "nvfp4", r"not sm107 \(Rubin\)"),
+        ((10, 3), "tp8", "nvfp4", r"not sm107 \(Rubin\)"),
+        ((10, 0), "tp8", "nvfp4", r"not sm107 \(Rubin\)"),
         ((10, 7), "tp2", "auto", "a KV cache other than FP8 or NVFP4"),
         (
             (10, 7),
@@ -2040,7 +2036,7 @@ def test_minimax_m3_1_route_takes_an_fp8_or_nvfp4_kv_cache(_m31_route, kv_dtype)
             "a parallel layout no target runs",
         ),
     ],
-    ids=["sm103", "sm100", "bf16_kv_cache", "tp4_ep4", "dep8_tp_experts"],
+    ids=["sm103_tp4", "sm103_tp8", "sm100", "bf16_kv_cache", "tp4_ep4", "dep8_tp_experts"],
 )
 def test_minimax_m3_1_route_declines_with_the_reason(
     _m31_route, capability, topology, kv_dtype, reason
@@ -2177,29 +2173,7 @@ def test_minimax_m3_checkpoint_keeps_its_message_on_an_m3_1_topology(
 
 def test_minimax_m3_1_checkpoint_is_not_taken_by_the_m3_targets(_m31_route):
     """The M3.1 checkpoint has the M3 shape, so the M3 layout check is what keeps it off the M3 tp4 / tp8 targets:
-    on sm103 it lands on the M3.1 GB300 target, on sm107 on the M3.1 Rubin tp4 target."""
+    on sm107 it lands on the M3.1 Rubin tp4 target."""
     assert _m31_route._layout_mismatch(_m3_text_config(**_M31_LAYOUT)) is not None
-    resolved = _m31_route.route(_m31_model_config(_M3_TP4), _m3_llm_args("auto", "nvfp4"), (10, 3))
-    assert resolved.__name__ == _M31_SM103_TARGETS["tp4"][1]
     resolved = _m31_route.route(_m31_model_config(_M3_TP4), _m3_llm_args("auto", "nvfp4"), (10, 7))
     assert resolved.__name__ == _M31_TARGETS["tp4"][1]
-
-
-@pytest.mark.parametrize(
-    "topology, speculation",
-    [*((topology, "none") for topology in sorted(_M31_SM103_TARGETS)), ("tp4", "dspark")],
-)
-def test_minimax_m3_1_route_picks_the_gb300_target_by_topology(
-    _m31_route, tmp_path, topology, speculation
-):
-    """On sm103 (GB300) the M3.1 tp4 and tp8 topologies have their own target directories, with no speculation or a
-    standalone DSpark drafter; tp4 and tp8 on sm107 keep the Rubin targets."""
-    spec_config = _m31_dspark(tmp_path) if speculation == "dspark" else None
-    resolved = _m31_route.route(
-        _m31_model_config(topology, spec_config), _m3_llm_args("auto", "nvfp4"), (10, 3)
-    )
-    directory, name = _M31_SM103_TARGETS[topology]
-    assert resolved.__module__ == f"{_M3_TARGETS}.{directory}.modeling"
-    assert resolved.__name__ == name
-    rubin = _m31_route.route(_m31_model_config(topology), _m3_llm_args("auto", "nvfp4"), (10, 7))
-    assert rubin.__name__ == _M31_TARGETS[topology][1]
