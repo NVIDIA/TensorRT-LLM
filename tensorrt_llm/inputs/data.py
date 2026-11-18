@@ -2,6 +2,7 @@
 # https://github.com/vllm-project/vllm/blob/2e33fe419186c65a18da6668972d61d7bbc31564/vllm/inputs/data.py
 from typing import Any, Dict, List, Union
 
+import torch
 from typing_extensions import NotRequired, TypedDict
 
 
@@ -89,11 +90,45 @@ class TokensPrompt(TypedDict):
     The length should not include the delimiter tokens.
     """
 
+    prompt_embeds: NotRequired[torch.Tensor]
+    """Precomputed ``[K, hidden_size]`` input embeddings for ``K`` prompt positions.
 
-PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt]
+    The dtype must be float16, bfloat16 or float32; the engine converts rows to
+    the model dtype. ``generate`` takes an owned CPU snapshot at submission, so
+    later writes to the caller's tensor have no effect. Each row replaces the
+    token embedding of one prompt position and must equal what the model's
+    input embedding module would produce there, including any scaling it
+    applies. The ids at those positions are placeholders: they still feed
+    repetition penalties, prompt logprobs and KV cache events. KV blocks are
+    shared only between requests with identical ids and rows. Supported only on
+    decoder models that declare ``supports_prompt_embeds``, on the PyTorch
+    backend, without speculative decoding, attention data parallelism, pipeline
+    parallelism or context parallelism. With disaggregated serving the
+    generation-only request must carry the same ``prompt_embeds`` as the
+    context request (only its identity is used there) and the KV cache manager
+    must be V2.
+    """
+
+    prompt_embeds_mask: NotRequired[Union[List[bool], torch.Tensor]]
+    """Length-``len(prompt_token_ids)`` bools, True where a ``prompt_embeds`` row
+    replaces the token embedding; rows are consumed in position order. May be
+    omitted when ``prompt_embeds`` has one row per prompt token.
+    """
 
 
-def prompt_inputs(inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt]:
+class EmbedsPrompt(TypedDict):
+    """Schema for a prompt given entirely as precomputed input embeddings."""
+
+    prompt_embeds: torch.Tensor
+    """``[L, hidden_size]`` input embeddings, one row per prompt position. See
+    ``TokensPrompt.prompt_embeds`` for the contract."""
+
+
+PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt, EmbedsPrompt]
+
+
+def prompt_inputs(
+    inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt, EmbedsPrompt]:
     if isinstance(inputs, str):
         prompt_inputs = TextPrompt(prompt=inputs)
     elif isinstance(inputs, list):
@@ -101,7 +136,8 @@ def prompt_inputs(inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt]:
         prompt_inputs = TokensPrompt(prompt_token_ids=inputs)
     elif isinstance(inputs, dict):
         assert inputs.get("prompt") is not None \
-            or inputs.get("prompt_token_ids") is not None
+            or inputs.get("prompt_token_ids") is not None \
+            or inputs.get("prompt_embeds") is not None
         return inputs
     else:
         raise TypeError(

@@ -1253,6 +1253,19 @@ class GenerationResult(GenerationResultBase):
             self._done = True
             raise response
         self._handle_response(response)
+        self._release_prompt_embeds()
+
+    def _release_prompt_embeds(self) -> None:
+        """Drop the client copy of prompt-embedding rows once the request is done.
+
+        The rows were sent before any response arrived; the result keeps only
+        their identity so a retained output does not pin the tensor.
+        """
+        prompt_embeds = getattr(self._generation_request, "prompt_embeds", None)
+        if (self._done and prompt_embeds is not None
+                and prompt_embeds.embeds is not None):
+            self._generation_request.prompt_embeds = (
+                prompt_embeds.identity_only())
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
@@ -1263,6 +1276,7 @@ class GenerationResult(GenerationResultBase):
             self._done = True
             raise response
         self._handle_response(response)
+        self._release_prompt_embeds()
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         """Wait for the completion of the request, and return the result.

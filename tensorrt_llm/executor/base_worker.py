@@ -405,6 +405,58 @@ class BaseWorker(GenerationExecutor):
                     self._lora_adapter_identities.setdefault(
                         adapter_id, identity)
 
+    def _check_prompt_embeds(self, request: GenerationRequest) -> None:
+        """Reject prompt embeddings this engine cannot place correctly."""
+        prompt_embeds = request.prompt_embeds
+        if prompt_embeds is None:
+            return
+        is_gen_only = (request.disaggregated_params is not None
+                       and request.disaggregated_params.request_type
+                       == "generation_only")
+        if is_gen_only:
+            # Only the salt matters here; the prompt's KV is transferred.
+            return
+        if prompt_embeds.embeds is None:
+            raise RequestError("prompt_embeds carries no rows.")
+        if self.llm_args is None:
+            raise RequestError("prompt_embeds requires the PyTorch backend.")
+        unsupported = []
+        if self.llm_args.speculative_config is not None:
+            unsupported.append("speculative decoding")
+        parallel_config = self.llm_args.parallel_config
+        if parallel_config.enable_attention_dp:
+            unsupported.append("attention data parallelism")
+        if parallel_config.pp_size > 1:
+            unsupported.append("pipeline parallelism")
+        if parallel_config.cp_size > 1:
+            unsupported.append("context parallelism")
+        if unsupported:
+            raise RequestError("prompt_embeds is not supported with " +
+                               ", ".join(unsupported) + ".")
+        model = self.engine.model_engine.model
+        if not getattr(model, "supports_prompt_embeds", False):
+            raise RequestError(
+                f"prompt_embeds is not supported by {type(model).__name__}.")
+        hidden_size = model.config.hidden_size
+        if prompt_embeds.hidden_size != hidden_size:
+            raise RequestError(
+                f"prompt_embeds hidden size ({prompt_embeds.hidden_size}) "
+                f"does not match the model hidden size ({hidden_size}).")
+        if int(prompt_embeds.positions[-1]) >= request.prompt_len:
+            raise RequestError(
+                "prompt_embeds positions exceed the prompt length.")
+        if request.disaggregated_params is not None and (
+                request.disaggregated_params.request_type == "context_only"):
+            from .._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+                KVCacheManagerV2
+
+            # The V1 transceiver looks up transferred blocks without the
+            # request salt that carries the embedding identity.
+            if not isinstance(self.engine.kv_cache_manager, KVCacheManagerV2):
+                raise RequestError(
+                    "prompt_embeds with disaggregated serving requires "
+                    "kv_cache_config.use_kv_cache_manager_v2=True.")
+
     def _enqueue_request(self,
                          request: GenerationRequest,
                          result_wait_queue=None) -> int:
@@ -412,6 +464,7 @@ class BaseWorker(GenerationExecutor):
         if request.prompt_adapter_request is not None:
             raise RequestError(
                 "Prompt adapters are not supported by the PyTorch executor.")
+        self._check_prompt_embeds(request)
         py_lora_path = None
         py_lora_ckpt_source = None
         if self._lora_manager is not None and request.lora_request is not None:
@@ -598,6 +651,10 @@ class BaseWorker(GenerationExecutor):
                     arrival_time=request.arrival_time,
                     watermarking=request.sampling_params.watermarking,
                     prompt_trimmed_prefix=trimmed_prefix,
+                    prompt_embeds=(request.prompt_embeds
+                                   if request.prompt_embeds is not None
+                                   and request.prompt_embeds.embeds is not None
+                                   else None),
                 ),
             )
 

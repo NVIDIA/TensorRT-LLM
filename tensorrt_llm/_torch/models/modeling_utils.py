@@ -663,6 +663,18 @@ class DecoderModelForCausalLM(nn.Module,
     # The model-specific TorchLlmArgs fields this model implements; the loader
     # rejects a set one that is not listed.
     model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
+    # True when the input embedding is the only reader of a context token id,
+    # so precomputed rows (tensorrt_llm.inputs.prompt_embeds) can replace it.
+    # Each model opts in after its forward has been audited for other readers.
+    supports_prompt_embeds: ClassVar[bool] = False
+
+    def embed_prompt_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Return the input embeddings ``forward`` computes from ``input_ids``.
+
+        The engine overwrites the rows of prompt-embedding positions and passes
+        the result as ``inputs_embeds``.
+        """
+        return self.model.embed_tokens(input_ids)
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(

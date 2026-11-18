@@ -953,6 +953,20 @@ class DecoderRunner(ScheduledModelRunner):
         with reclaim_scope, moe_scope:
             return self._model_caller(**kwargs)
 
+    @nvtx_range("_apply_prompt_embeds_overlay")
+    def _apply_prompt_embeds_overlay(
+        self, inputs: dict[str, Any], dst_rows: torch.Tensor, src_rows: torch.Tensor
+    ) -> dict[str, Any]:
+        """Replace the token embedding of prompt-embedding rows with the supplied rows.
+
+        Runs after ``preprocess_inputs`` so the overlap scheduler's generation
+        tokens are already in ``input_ids``; the model then gets embeddings
+        instead of ids.
+        """
+        embeds = self._model.embed_prompt_tokens(inputs["input_ids"])
+        embeds.index_copy_(0, dst_rows, src_rows.to(embeds.dtype))
+        return {**inputs, "input_ids": None, "inputs_embeds": embeds}
+
     @nvtx_range("_forward_step")
     def _forward_step(
         self,
@@ -966,6 +980,9 @@ class DecoderRunner(ScheduledModelRunner):
         inputs = self._inputs.preprocess_inputs(
             inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
         )
+        prompt_embeds_overlay = inputs.pop("prompt_embeds_overlay", None)
+        if prompt_embeds_overlay is not None:
+            inputs = self._apply_prompt_embeds_overlay(inputs, *prompt_embeds_overlay)
         spec_metadata = inputs.get("spec_metadata")
         gather_ids = spec_metadata.gather_ids if spec_metadata is not None else None
 

@@ -136,6 +136,7 @@ l0_a10:
   - unittest/llmapi/test_llm_args.py
   - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
+  - unittest/llmapi/test_llm_prompt_embeds.py
   # executor
   - unittest/executor/test_spec_dec_stats_pairing.py
   - unittest/executor/test_spec_decode_stats_payload.py

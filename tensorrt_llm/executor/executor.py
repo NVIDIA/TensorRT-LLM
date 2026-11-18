@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.logger import logger, set_level
 
@@ -135,6 +136,7 @@ class GenerationExecutor(ABC):
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
         kv_hints: Optional[KvHintsInput] = None,
+        prompt_embeds: Optional[PromptEmbeds] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -168,7 +170,8 @@ class GenerationExecutor(ABC):
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,
-            kv_hints=kv_hints)
+            kv_hints=kv_hints,
+            prompt_embeds=prompt_embeds)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):

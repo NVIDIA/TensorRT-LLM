@@ -57,6 +57,7 @@ from ..executor.utils import (RequestError, create_mpi_comm_session,
 from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
                       create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
+from ..inputs.prompt_embeds import PromptEmbeds, build_prompt_embeds
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -885,6 +886,15 @@ class BaseLLM:
             sampling_params.max_tokens = 1
             self._configure_bart_decoder_prefix(sampling_params)
 
+        prompt_embeds = None
+        if isinstance(inputs, dict) and ("prompt_embeds" in inputs
+                                         or "prompt_embeds_mask" in inputs):
+            inputs, prompt_embeds = self._split_prompt_embeds(inputs)
+            if is_gen_only:
+                # The prompt's KV arrives from the context worker; only the
+                # identity that salts its blocks travels.
+                prompt_embeds = prompt_embeds.identity_only()
+
         if isinstance(inputs, PreprocessedInputs):
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
@@ -950,6 +960,7 @@ class BaseLLM:
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,
             kv_hints=kv_hints,
+            prompt_embeds=prompt_embeds,
         )
 
         if sampling_params.return_perf_metrics:
@@ -961,6 +972,41 @@ class BaseLLM:
             prompt,
             self.tokenizer,
             post_processor_hook=self._post_processor_hook)
+
+    _PROMPT_EMBEDS_ALLOWED_KEYS = frozenset(
+        ("prompt_token_ids", "prompt_embeds", "prompt_embeds_mask"))
+
+    def _split_prompt_embeds(
+            self, inputs: Dict[str, Any]) -> Tuple[TokensPrompt, PromptEmbeds]:
+        """Validate a prompt-embedding request and split off its rows.
+
+        Positions are taken as given, so only finalized token ids are
+        accepted: nothing may expand, render or truncate the prompt afterwards.
+        Execution-mode restrictions are enforced by the worker at admission.
+        """
+        if inputs.get("prompt_embeds") is None:
+            raise ValueError("prompt_embeds_mask requires prompt_embeds.")
+        extra_keys = sorted(set(inputs) - self._PROMPT_EMBEDS_ALLOWED_KEYS)
+        if extra_keys:
+            raise ValueError(
+                f"prompt_embeds cannot be combined with {extra_keys}; pass "
+                "finalized prompt_token_ids (with prompt_embeds_mask) instead.")
+        if self.args.backend != "pytorch":
+            raise ValueError(
+                f"prompt_embeds is not supported with the {self.args.backend} "
+                "backend.")
+        if (self._is_encoder_decoder_model() or self.args.mm_encoder_only
+                or self._encode_only):
+            raise ValueError(
+                "prompt_embeds requires a decoder-only generation model.")
+        prompt_token_ids = inputs.get("prompt_token_ids")
+        if prompt_token_ids is not None:
+            prompt_token_ids = self._normalize_token_ids(
+                prompt_token_ids, "prompt_token_ids")
+        prompt_token_ids, prompt_embeds = build_prompt_embeds(
+            prompt_token_ids, inputs["prompt_embeds"],
+            inputs.get("prompt_embeds_mask"))
+        return TokensPrompt(prompt_token_ids=prompt_token_ids), prompt_embeds
 
     def _preprocess(
         self,
@@ -1000,6 +1046,11 @@ class BaseLLM:
             )
 
         inputs = prompt_inputs(inputs)
+
+        if "prompt_embeds" in inputs or "prompt_embeds_mask" in inputs:
+            raise ValueError(
+                "prompt_embeds is only accepted by generate() and "
+                "generate_async(); it cannot be preprocessed separately.")
 
         if "multi_item_part_lens" in inputs:
             raise ValueError(

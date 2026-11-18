@@ -3,6 +3,7 @@
 """Decoder input preparation state."""
 
 import contextlib
+import functools
 import itertools
 import math
 import os
@@ -297,6 +298,10 @@ class HostLists:
     # draft_probs rows are one-hot'd after spec_metadata.prepare().
     padding_gen_slots: list[int] = field(default_factory=list)
     multimodal_params_list: list[MultimodalParams] = field(default_factory=list)
+    # Flattened input rows and CPU source rows of this pass's prompt-embedding
+    # positions, one entry per context request that has any in its chunk.
+    prompt_embeds_dst_rows: list[torch.Tensor] = field(default_factory=list)
+    prompt_embeds_src_rows: list[torch.Tensor] = field(default_factory=list)
     # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
     mrope_position_ids: list[tuple[int, int, torch.Tensor]] = field(default_factory=list)
     mrope_delta_write_seq_slots: list[int] = field(default_factory=list)
@@ -1442,6 +1447,10 @@ class DecoderInputPreparer:
             # rather than assuming a contiguous multimodal prefix.
             context_start_idx = len(input_ids)
             input_ids.extend(prompt_tokens)
+            if request.py_prompt_embeds is not None:
+                self._pack_context_prompt_embeds(
+                    host, request, begin_compute, len(prompt_tokens), context_start_idx
+                )
 
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(prompt_tokens))
@@ -1482,6 +1491,28 @@ class DecoderInputPreparer:
         host.num_ctx_tokens = num_ctx_tokens
         host.text_token_indices_ctx = text_token_indices_ctx
         host.mm_token_indices = mm_token_indices
+
+    @staticmethod
+    def _pack_context_prompt_embeds(
+        host: HostInputs,
+        request: LlmRequest,
+        begin: int,
+        num_tokens: int,
+        context_start_idx: int,
+    ) -> None:
+        """Record the prompt-embedding rows that fall in this chunk.
+
+        Rows are staged per chunk from the request's CPU copy, which lives
+        until the request finishes, so recomputed or replayed prefills
+        (including CED replay rows before the scheduled chunk) read them again.
+        """
+        prompt_embeds = request.py_prompt_embeds
+        lo, hi = prompt_embeds.chunk_rows(begin, begin + num_tokens)
+        if hi == lo:
+            return
+        positions = prompt_embeds.positions[lo:hi]
+        host.lists.prompt_embeds_dst_rows.append(positions + (context_start_idx - begin))
+        host.lists.prompt_embeds_src_rows.append(prompt_embeds.embeds[lo:hi])
 
     def _pack_context_multimodal(
         self,
@@ -2919,6 +2950,7 @@ class DecoderInputPreparer:
             breakable_eligible = (
                 replay_plan is None
                 and not host.lists.multimodal_params_list
+                and not host.lists.prompt_embeds_src_rows
                 and (
                     not host.remote_tail_modes
                     or (supports_mixed_breakable and host.remote_tail_modes == {"destination"})
@@ -2940,7 +2972,9 @@ class DecoderInputPreparer:
             total_num_tokens,
             host.num_ctx_requests,
             attn_all_rank_num_tokens,
-            allow_prefill_cuda_graph=(
+            # Prefill graphs replay the embedding lookup from input ids.
+            allow_prefill_cuda_graph=not host.lists.prompt_embeds_src_rows
+            and (
                 breakable_prefill
                 or (
                     not host.remote_tail_modes
@@ -3050,6 +3084,9 @@ class DecoderInputPreparer:
             if self._config.enable_attention_dp:
                 set_spec_metadata_all_rank_num_tokens(spec_metadata, *host.spec_all_rank_counts)
 
+        if host.lists.prompt_embeds_src_rows:
+            inputs["prompt_embeds_overlay"] = self._ship_prompt_embeds(host)
+
         if host.mm_token_indices is not None:
             ship_multimodal_indices(
                 inputs,
@@ -3059,6 +3096,23 @@ class DecoderInputPreparer:
                 total_num_tokens=host.total_num_tokens,
             )
         return inputs
+
+    @staticmethod
+    def _ship_prompt_embeds(host: HostInputs) -> tuple[torch.Tensor, torch.Tensor]:
+        """Copy this pass's prompt-embedding rows and their input rows to the GPU."""
+        dst_rows = host.lists.prompt_embeds_dst_rows
+        src_rows = host.lists.prompt_embeds_src_rows
+        num_rows = sum(rows.shape[0] for rows in src_rows)
+        dtype = functools.reduce(torch.promote_types, (rows.dtype for rows in src_rows))
+        pin = prefer_pinned()
+        rows_host = torch.empty((num_rows, src_rows[0].shape[1]), dtype=dtype, pin_memory=pin)
+        torch.cat(src_rows, out=rows_host)
+        dst_host = torch.empty((num_rows,), dtype=torch.long, pin_memory=pin)
+        torch.cat(dst_rows, out=dst_host)
+        return (
+            dst_host.to("cuda", non_blocking=True),
+            rows_host.to("cuda", non_blocking=True),
+        )
 
     def _record_iter_states(self, host: HostInputs, scheduled_requests: ScheduledRequests) -> None:
         num_generation_tokens = (

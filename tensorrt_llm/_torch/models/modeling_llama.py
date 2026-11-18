@@ -1152,6 +1152,9 @@ class LlamaModel(DecoderModel):
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
 
+    # The embedding is the only reader of context token ids.
+    supports_prompt_embeds = True
+
     @classmethod
     def get_preferred_kv_cache_manager_version(
         cls,

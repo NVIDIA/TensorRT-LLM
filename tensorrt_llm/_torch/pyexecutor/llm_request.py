@@ -18,6 +18,7 @@ from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
                                             MultimodalParams,
                                             get_multimodal_item_metadata)
+from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
 from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import LogprobMode
@@ -1004,6 +1005,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_bad_words = None
         self.py_no_repeat_ngram_size = None
         self.py_kv_hints: Optional[KvHintsSnapshot] = None
+        # Precomputed rows for some prompt positions; read-only and shared
+        # with child requests.
+        self.py_prompt_embeds: Optional[PromptEmbeds] = None
         # The largest id of a prompt the prompt-tail transport restored
         # (executor/prompt_tail.py) when recorded; None: admission scans it.
         self.py_prompt_token_bound: Optional[int] = None
@@ -1421,6 +1425,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child.py_disaggregated_params = deepcopy(self.py_disaggregated_params)
         child.py_conversation_params = deepcopy(self.py_conversation_params)
         child.py_kv_hints = self.py_kv_hints
+        child.py_prompt_embeds = self.py_prompt_embeds
         child.py_uncached_prefill_tokens = self.py_uncached_prefill_tokens
         child.py_disable_speculative_decoding = self.py_disable_speculative_decoding
         child.is_attention_dp_dummy = self.is_attention_dp_dummy
@@ -1943,6 +1948,7 @@ def executor_request_to_llm_request(
     # Published by the attention-DP router before this conversion, if at all.
     llm_request.py_uncached_prefill_tokens = inputs.uncached_prefill_tokens
     llm_request.py_kv_hints = inputs.kv_hints
+    llm_request.py_prompt_embeds = inputs.prompt_embeds
     llm_request.py_prompt_token_bound = prompt_token_bound
     if child_req_ids:
         for child_id in child_req_ids:

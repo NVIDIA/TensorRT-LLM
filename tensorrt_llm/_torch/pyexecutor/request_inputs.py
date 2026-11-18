@@ -9,6 +9,7 @@ from typing import Any
 from tensorrt_llm.bindings.executor import Request
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
 from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
 from tensorrt_llm.sampling_params import LogitsProcessor, LogprobMode
 from tensorrt_llm.scheduling_params import SchedulingParams
@@ -43,6 +44,7 @@ class PythonRequestInputs:
     kv_hints: KvHintsSnapshot | None = None
     watermarking: bool | None = None
     prompt_trimmed_prefix: int = 0
+    prompt_embeds: PromptEmbeds | None = None
 
     @classmethod
     def from_native_request(cls, request: Request) -> "PythonRequestInputs":
@@ -74,6 +76,7 @@ class PythonRequestInputs:
             kv_hints=getattr(request, "py_kv_hints", None),
             watermarking=getattr(request, "py_watermarking", None),
             prompt_trimmed_prefix=getattr(request, "py_prompt_trimmed_prefix", 0),
+            prompt_embeds=getattr(request, "py_prompt_embeds", None),
         )
 
 

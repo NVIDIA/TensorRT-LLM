@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .content_format import ContentFormat, detect_content_format
-from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
+from .data import (EmbedsPrompt, PromptInputs, TextPrompt, TokensPrompt,
+                   prompt_inputs)
 from .evs import (compute_retained_tokens_count,
                   compute_retained_tokens_from_tubelet_budget,
                   compute_retention_mask)
 from .multimodal import (MultimodalInput, MultimodalItemMetadata,
                          MultimodalItemPartition)
 from .multimodal_data import AudioData, BaseModalityData, VideoData
+from .prompt_embeds import PromptEmbeds
 # yapf and isort conflict on the following import blocks
 # yapf: disable
 from .registry import (BaseMultimodalDummyInputsBuilder,
@@ -44,6 +46,8 @@ __all__ = [
     "prompt_inputs",
     "TextPrompt",
     "TokensPrompt",
+    "EmbedsPrompt",
+    "PromptEmbeds",
     "InputProcessor",
     "create_input_processor",
     "create_input_processor_with_hash",

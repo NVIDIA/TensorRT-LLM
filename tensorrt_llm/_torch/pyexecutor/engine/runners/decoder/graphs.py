@@ -111,6 +111,11 @@ def _make_single_token_context_graph_batch(
             or request.is_generation_only_request
             or request.py_disaggregated_params is not None
             or request.py_mm_encoder_event is not None
+            # A decode row embeds the placeholder id, not the supplied row.
+            or (
+                request.py_prompt_embeds is not None
+                and request.py_prompt_embeds.covers(request.context_current_position)
+            )
             or (
                 request.py_multimodal_data is not None
                 and (

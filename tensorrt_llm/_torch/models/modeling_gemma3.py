@@ -377,6 +377,9 @@ class Gemma3TextModel(DecoderModel):
 class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                                                 Gemma3TextConfig]):
 
+    # The embedding is the only reader of context token ids.
+    supports_prompt_embeds = True
+
     @classmethod
     def get_preferred_transceiver_runtime(
         cls,
