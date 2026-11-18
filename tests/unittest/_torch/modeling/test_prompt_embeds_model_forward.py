@@ -11,17 +11,14 @@ from copy import deepcopy
 from typing import Optional
 
 import torch
-
-from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
-from tensorrt_llm._torch.metadata import KVCacheParams
-
-# isort: off
-from .test_modeling_gemma4 import (
+from test_modeling_gemma4 import (
     GEMMA4_PLE_CONFIG,
     TestGemma4HFComparison,
     _build_gemma4_kv_cache_manager,
 )
-# isort: on
+
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+from tensorrt_llm._torch.metadata import KVCacheParams
 
 
 def _gemma4_context_logits(
