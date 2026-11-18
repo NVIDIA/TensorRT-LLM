@@ -3663,16 +3663,16 @@ class Receiver(ReceiverBase):
                             "retry the request and verify matching internal_request_auth_key values"
                         )
             except TimeoutError as error:
-                # A peer that signs control messages drops unsigned ones (and
-                # the reverse), so a key mismatch can also surface as a timeout.
+                # A context peer with a key drops a request that is unsigned or
+                # signed with another key, so a key mismatch also ends here.
                 raise RankInfoAuthenticationError(
                     "RankInfo exchange timed out; retry the request and verify peer availability "
                     "and that communicating peers use the same internal_request_auth_key"
                 ) from error
             except FrameAuthenticationError as error:
                 raise RankInfoAuthenticationError(
-                    f"RankInfo reply failed control-plane authentication ({error}): configure "
-                    "the same internal_request_auth_key on communicating peers"
+                    f"RankInfo reply failed control-plane authentication ({error}): use the same "
+                    "internal_request_auth_key and TensorRT-LLM version on communicating peers"
                 ) from error
             finally:
                 messenger.stop()
@@ -4793,8 +4793,9 @@ class RankInfoServer:
         self._messenger = ZMQMessenger(mode="ROUTER", endpoint=endpoint, signer=frame_signer)
         if self._rank_info_auth_key is None:
             logger.warning(
-                "Native RankInfo authentication is disabled: internal_request_auth_key is not "
-                "configured, so REQUEST_INSTANCE_INFO returns transfer metadata without authentication"
+                "Native transfer authentication is disabled: internal_request_auth_key is not "
+                "configured, so RankInfo and all native control messages between context and "
+                "generation workers are sent and accepted without authentication"
             )
         self._start_listener()
 
