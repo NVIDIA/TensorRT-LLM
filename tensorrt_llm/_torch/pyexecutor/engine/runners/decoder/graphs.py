@@ -447,7 +447,7 @@ class DecoderCudaGraphs:
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        # Room for the longest tail after the shortest main part (Mamba2Metadata._warmup_inforward_split_plan).
+        # Room for the longest tail after the shortest main part (GDNMambaMetadata._warmup_inforward_split_plan).
         num_tokens = (
             kv_cache_manager.inforward_snapshot_min_main
             + kv_cache_manager.inforward_snapshot_max_tail
@@ -457,7 +457,7 @@ class DecoderCudaGraphs:
         logger.info(f"Running in-forward Mamba snapshot split warmup ({num_tokens} tokens)")
         with (
             self.no_cuda_graph(),
-            resolve_mamba_metadata_cls(self.model).inforward_split_for_warmup(),
+            resolve_mamba_metadata_cls(self.model, kv_cache_manager).inforward_split_for_warmup(),
         ):
             warmup_request = self._dummy_requests.create_warmup_request(
                 resource_manager, num_tokens, 0, num_context_requests=1
@@ -1488,7 +1488,12 @@ class DecoderCudaGraphs:
         variants = [contextlib.nullcontext]
         split_variant = None
         if self._plans_inforward_splits(resource_manager):
-            split_variant = resolve_mamba_metadata_cls(self.model).inforward_split_for_warmup
+            kv_cache_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER
+            )
+            split_variant = resolve_mamba_metadata_cls(
+                self.model, kv_cache_manager
+            ).inforward_split_for_warmup
             variants.append(split_variant)
         for num_contexts in _BREAK_GRAPH_NUM_CONTEXTS:
             for variant in variants:

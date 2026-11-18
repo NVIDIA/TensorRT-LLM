@@ -2285,7 +2285,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
     # Staging rows per batch for recurrent-state snapshots taken inside the
-    # forward (MambaHybridCacheManagerV2); 0 = none.
+    # forward (the GDN cache manager's in-forward snapshots); 0 = none.
     inforward_snapshot_rows: int = 0
     # Block width of a drafter whose layers share this manager, else 0.
     _shared_draft_block_width: int = 0
@@ -2294,7 +2294,7 @@ class KVCacheManagerV2(BaseResourceManager):
     _defer_close_enabled: bool = False
     _deferred_closes: "deque[tuple[int, _KVCache]] | tuple[()]" = ()
     # Local layer id -> storage of the draft-owned layers a subclass appends
-    # after the layers it describes itself (MambaHybridCacheManagerV2).
+    # after the layers it describes itself (KimiK3HybridCacheManager).
     # Empty when ``layer_specs`` describes every layer.
     _appended_draft_layer_specs: dict[int, KVCacheLayerSpec] = {}
 

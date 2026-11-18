@@ -37,7 +37,8 @@ from defs.common import (get_ucx_tls, parse_gsm8k_output,
                          resolve_llm_model_path, wait_for_reported_addr,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
-                           skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
+                           skip_no_hopper, skip_no_sm100f, skip_pre_blackwell,
+                           skip_pre_hopper)
 from defs.deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT
 from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
@@ -3153,7 +3154,8 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_pre_blackwell
+# Its config pins moe_config.tactic trtllm_gen (SM100 family only).
+@skip_no_sm100f
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("model_path", ['gpt_oss/gpt-oss-120b'])
 def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
@@ -3493,6 +3495,8 @@ def _check_deepseek_v41_gsm8k(server_url: str, model_dir: str, tokenizer,
     return seen_ids
 
 
+# The configs these Blackwell cases load pin moe_config.tactic trtllm_gen, whose
+# implementations run on the SM100 family only.
 @pytest.mark.timeout(12600)
 @pytest.mark.parametrize("test_config", [
     pytest.param(TestConfig(model_path='DeepSeek-R1/DeepSeek-R1-0528-FP4-v2',
@@ -3501,21 +3505,21 @@ def _check_deepseek_v41_gsm8k(server_url: str, model_dir: str, tokenizer,
                             accuracy_threshold=0.92,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
-                 marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
+                 marks=(pytest.mark.skip_less_device(8), skip_no_sm100f)),
     pytest.param(TestConfig(model_path='DeepSeek-R1/DeepSeek-R1-0528-FP4-v2',
                             test_desc='deepseek_r1_v2_fp4_mtp_stress',
                             request_count=35000,
                             accuracy_threshold=0.90,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
-                 marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
+                 marks=(pytest.mark.skip_less_device(8), skip_no_sm100f)),
     pytest.param(TestConfig(model_path='gpt_oss/gpt-oss-120b',
                             test_desc='gpt_oss_120b_trtllm_stress',
                             request_count=60000,
                             accuracy_threshold=0.42,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
-                 marks=(pytest.mark.skip_less_device(4), skip_pre_blackwell)),
+                 marks=(pytest.mark.skip_less_device(4), skip_no_sm100f)),
     pytest.param(
         TestConfig(
             model_path='gpt_oss/gpt-oss-120b',
@@ -3538,7 +3542,7 @@ def _check_deepseek_v41_gsm8k(server_url: str, model_dir: str, tokenizer,
             cancellation_rate=10,
             cancellation_delay=0.5,
         ),
-        marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell),
+        marks=(pytest.mark.skip_less_device(8), skip_no_sm100f),
     ),
     pytest.param(TestConfig(model_path='gpt_oss/gpt-oss-120b',
                             test_desc='gpt_oss_120b_triton_stress',
@@ -3560,7 +3564,7 @@ def _check_deepseek_v41_gsm8k(server_url: str, model_dir: str, tokenizer,
                             accuracy_threshold=0.90,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
-                 marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
+                 marks=(pytest.mark.skip_less_device(8), skip_no_sm100f)),
     pytest.param(TestConfig(
         model_path='Qwen3/Qwen3-32B-FP8',
         test_desc='qwen3_32b_fp8_stress',

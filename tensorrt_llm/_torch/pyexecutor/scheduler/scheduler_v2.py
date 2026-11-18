@@ -416,7 +416,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._sched_iter = 0
         # Reuse probe results of this scheduling pass, by request id (_uncached_tokens).
         self._reuse_probes: dict[int, Optional[int]] = {}
-        # In-forward Mamba snapshots (MambaHybridCacheManagerV2): staging rows
+        # In-forward Mamba snapshots (the GDN cache manager's): staging rows
         # per batch, and those left in the batch being scheduled.
         self._inforward_snapshot_rows = kv_cache_manager.inforward_snapshot_rows
         self._inforward_snapshot_rows_left = 0
@@ -2016,7 +2016,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         """The snapshot point P a forced chunk ends at, if the chunk can run through the prompt end instead.
 
         The GDN layers then record the state at P inside the forward
-        (MambaHybridCacheManagerV2 in-forward snapshots), which saves the extra
+        (the GDN cache manager's in-forward snapshots), which saves the extra
         context iteration of the short tail [P, prompt end).
         """
         manager = self.kv_cache_manager
