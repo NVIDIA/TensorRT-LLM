@@ -31,7 +31,10 @@ from _torch.helpers import dspark_markov_chain_logits_reference
 
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM, dspark_layer_window_size
 from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
-from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_step_bias
+from tensorrt_llm._torch.models.modeling_speculative import (
+    DSparkConfidenceHead,
+    dspark_markov_step_bias,
+)
 from tensorrt_llm._torch.speculative.dflash import dflash_draft_slot_ids
 
 needs_cuda = pytest.mark.skipif(
@@ -700,6 +703,28 @@ def test_confidence_head_of_an_unknown_width_fails_only_under_confidence_schedul
             build(drafter, weight, None)
     else:
         assert build(drafter, weight, None) is None
+
+
+def test_confidence_logits_pair_each_position_with_its_previous_token():
+    """A head trained with the Markov feature reads the anchor's row for the first drafted
+    position and the previous draft's row for every later one."""
+    hidden_size = TINY["hidden_size"]
+    generator = torch.Generator().manual_seed(11)
+    head = DSparkConfidenceHead(
+        hidden_size=hidden_size, markov_rank=RANK, with_markov=True, bias=True
+    )
+    markov_w1 = torch.randn(VOCAB, RANK, generator=generator)
+    drafter = SimpleNamespace(confidence_head=head, markov_w1=markov_w1)
+    block_hidden = torch.randn(2, 3, hidden_size, generator=generator)
+    anchors = torch.tensor([3, 5])
+    drafts = torch.tensor([[1, 2, 4], [6, 7, 8]])
+
+    logits = GQADSparkForCausalLM.draft_confidence_logits(drafter, block_hidden, anchors, drafts)
+
+    previous_tokens = torch.tensor([[3, 1, 2], [5, 6, 7]])
+    features = torch.cat([block_hidden, markov_w1[previous_tokens]], dim=-1)
+    expected = F.linear(features, head.proj.weight, head.proj.bias).squeeze(-1)
+    torch.testing.assert_close(logits, expected)
 
 
 @needs_gpu
