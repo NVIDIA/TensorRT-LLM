@@ -109,8 +109,8 @@ PooledPhysMemAllocator::PooledPhysMemAllocator(size_t physMemSize, int numLocali
     {
         for (size_t size = mPhysMemSize << 1; size > mPhysMemSize && size <= maxChunkSize; size <<= 1)
         {
-            mLargerPools.push_back(std::make_unique<SimplePool<PhysMemWrapper>>(
-                [this, size]() -> PhysMemWrapper* { return new PhysMemWrapper(size, mProp); },
+            mLargerPools.push_back(std::make_unique<SimplePool<PhysMemWrapper>>([this, size]() -> PhysMemWrapper*
+                { return new PhysMemWrapper(size, mProp); },
                 [](PhysMemWrapper* chunk) { delete chunk; }));
         }
     }

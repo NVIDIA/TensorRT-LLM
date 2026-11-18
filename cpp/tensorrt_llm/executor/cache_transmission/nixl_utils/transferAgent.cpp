@@ -996,7 +996,10 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
     // Store remote VMM region info for chunk boundary calculations in
     // VmmDescSplitter::splitAndCoalesceTransferDescs. Per-agent map because different remote agents may have
     // overlapping virtual addresses.
+    // The descriptor carries all of the peer's regions, so it replaces what an earlier load stored:
+    // a stale entry could report an old chunk size for addresses the peer has since re-registered.
     auto const& regions = agentDesc.getVramRegions();
+    mRemoteVramRegionInfo.erase(name);
     if (!regions.empty())
     {
         auto& remoteMap = mRemoteVramRegionInfo[name];

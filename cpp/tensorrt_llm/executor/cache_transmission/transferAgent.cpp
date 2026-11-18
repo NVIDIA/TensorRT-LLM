@@ -187,8 +187,12 @@ MemoryDescs VmmDescSplitter::splitDescsWithRegionMap(MemoryDescs const& descs, V
             size_t pieceSize = remaining;
             if (pieceChunkSize > 0)
             {
+                // Stop at the chunk end and at the region end: a region can end inside a chunk
+                // (a registration that ends there), and what follows belongs to another region.
                 size_t offsetInChunk = static_cast<size_t>((addr - pieceBase) % pieceChunkSize);
-                pieceSize = std::min(remaining, pieceChunkSize - offsetInChunk);
+                size_t const regionLeft
+                    = static_cast<size_t>(pieceBase + regionMap.find(pieceBase)->second.totalLen - addr);
+                pieceSize = std::min({remaining, pieceChunkSize - offsetInChunk, regionLeft});
             }
             result.emplace_back(addr, pieceSize, deviceId);
             addr += pieceSize;
@@ -279,15 +283,15 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
         bool valid = false;
     };
 
-    // Returns {chunkSize, regionBase, found}. A miss means the address is not covered by any
-    // region metadata (e.g. the peer did not send its region info). Two misses both look like
+    // Returns {chunkSize, regionBase, regionLen, found}. A miss means the address is not covered by
+    // any region metadata (e.g. the peer did not send its region info). Two misses both look like
     // {0, 0} yet may belong to two distinct regions, so pieces with a missed lookup on either
     // side are never merged — a merge could silently cross a chunk or registration boundary.
     auto cachedLookup = [](uintptr_t addr, VramRegionMap const& regionMap, RegionCache& cache)
     {
         if (cache.valid && addr >= cache.base && addr - cache.base < cache.totalLen)
         {
-            return std::tuple<size_t, uintptr_t, bool>{cache.chunkSize, cache.base, true};
+            return std::tuple<size_t, uintptr_t, size_t, bool>{cache.chunkSize, cache.base, cache.totalLen, true};
         }
         auto it = regionMap.upper_bound(addr);
         if (it != regionMap.begin())
@@ -296,10 +300,10 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
             if (addr >= it->first && addr - it->first < it->second.totalLen)
             {
                 cache = {it->first, it->second.totalLen, it->second.chunkSize, true};
-                return std::tuple<size_t, uintptr_t, bool>{cache.chunkSize, cache.base, true};
+                return std::tuple<size_t, uintptr_t, size_t, bool>{cache.chunkSize, cache.base, cache.totalLen, true};
             }
         }
-        return std::tuple<size_t, uintptr_t, bool>{0, 0, false};
+        return std::tuple<size_t, uintptr_t, size_t, bool>{0, 0, 0, false};
     };
 
     RegionCache srcCache, dstCache;
@@ -317,18 +321,21 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
         {
             // Looked up per piece: a pool mapped from chunks of several sizes is several adjacent
             // regions, and a pair can cross from one into the next.
-            auto [srcChunkSize, srcBase, srcFound] = cachedLookup(srcAddr, localRegionMap, srcCache);
-            auto [dstChunkSize, dstBase, dstFound] = cachedLookup(dstAddr, remoteRegionMap, dstCache);
+            auto [srcChunkSize, srcBase, srcLen, srcFound] = cachedLookup(srcAddr, localRegionMap, srcCache);
+            auto [dstChunkSize, dstBase, dstLen, dstFound] = cachedLookup(dstAddr, remoteRegionMap, dstCache);
+            // Each side stops at its chunk end and at its region end (a region can end inside a chunk).
             size_t srcPieceSize = remaining;
             if (srcChunkSize > 0)
             {
-                srcPieceSize = srcChunkSize - static_cast<size_t>((srcAddr - srcBase) % srcChunkSize);
+                srcPieceSize = std::min(srcChunkSize - static_cast<size_t>((srcAddr - srcBase) % srcChunkSize),
+                    static_cast<size_t>(srcBase + srcLen - srcAddr));
             }
 
             size_t dstPieceSize = remaining;
             if (dstChunkSize > 0)
             {
-                dstPieceSize = dstChunkSize - static_cast<size_t>((dstAddr - dstBase) % dstChunkSize);
+                dstPieceSize = std::min(dstChunkSize - static_cast<size_t>((dstAddr - dstBase) % dstChunkSize),
+                    static_cast<size_t>(dstBase + dstLen - dstAddr));
             }
 
             size_t pieceSize = std::min({remaining, srcPieceSize, dstPieceSize});

@@ -52,6 +52,12 @@ def _chunk_sizes(address: int, size: int) -> list[int]:
     return sizes
 
 
+def _require_free_gpu_memory(nbytes: int) -> None:
+    free, _ = torch.cuda.mem_get_info()
+    if free < nbytes:
+        pytest.skip(f"needs {nbytes // MiB} MiB of free GPU memory, {free // MiB} MiB free")
+
+
 def _make_manager(quota: int, slot_bytes: int):
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
         AttentionLayerConfig,
@@ -80,6 +86,8 @@ def test_pool_sizes_do_not_depend_on_the_chunk_size(monkeypatch):
 
     # Not a multiple of 512 MiB, so the pool ends in smaller chunks.
     quota = 4 * GiB + 100 * MiB
+    # The pool is the quota plus 4 MiB.
+    _require_free_gpu_memory(quota + 4 * MiB)
     unit = _gpu_alloc_granularity(quota)
     assert unit == 8 * MiB
     results = {}
@@ -103,10 +111,49 @@ def test_pool_sizes_do_not_depend_on_the_chunk_size(monkeypatch):
     assert raised_chunks == [512 * MiB] * 8 + [64 * MiB, 32 * MiB, 8 * MiB]
 
 
+def test_shrink_inside_a_chunk_keeps_the_slot_count(monkeypatch):
+    """A shrink that ends inside a larger chunk keeps that chunk mapped but not usable."""
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
+
+    quota = 4 * GiB + 100 * MiB
+    _require_free_gpu_memory(quota + 4 * MiB)
+    # Ends inside the fifth 512 MiB chunk.
+    smaller = 2 * GiB + 300 * MiB
+    results = {}
+    for value in (None, "512"):
+        if value is None:
+            monkeypatch.delenv(ENV, raising=False)
+        else:
+            monkeypatch.setenv(ENV, value)
+        manager, base = _make_manager(quota, 256 << 10)
+        try:
+            assert manager.resize(GPU_LEVEL, smaller)
+            stats = manager.get_storage_statistics(GPU_LEVEL)
+            capacity = [(list(s.slot_sizes), s.total) for s in stats]
+            usable = stats[0].total * stats[0].slot_sizes[0]
+            results[value] = (
+                manager.get_quota(GPU_LEVEL),
+                capacity,
+                usable,
+                _chunk_sizes(base, usable),
+            )
+        finally:
+            manager.shutdown()
+    default_quota, default_capacity, default_usable, default_chunks = results[None]
+    raised_quota, raised_capacity, raised_usable, raised_chunks = results["512"]
+    assert raised_quota == default_quota
+    assert raised_capacity == default_capacity
+    assert raised_usable == default_usable < quota
+    assert sum(default_chunks) == default_usable
+    # The chunk the new end falls in stays mapped, past the usable bytes.
+    assert sum(raised_chunks) > raised_usable
+    assert raised_chunks[-1] == 512 * MiB
+
+
 @pytest.mark.parametrize("value", ["1g", "-512", "abc"])
 def test_malformed_value_is_rejected(monkeypatch, value):
     monkeypatch.setenv(ENV, value)
-    with pytest.raises(Exception, match=ENV):
+    with pytest.raises(ValueError, match=ENV):
         _make_manager(1 * GiB, 256 << 10)
 
 

@@ -237,8 +237,8 @@ private:
         PooledPhysMemAllocator::PooledPhysMem handle;
     };
 
-    void push(PooledPhysMemAllocator::PooledPhysMem handle, size_t offset, size_t size,
-        LocalityDomainId localityDomainId);
+    void push(
+        PooledPhysMemAllocator::PooledPhysMem handle, size_t offset, size_t size, LocalityDomainId localityDomainId);
     void pop(LocalityDomainId localityDomainId);
     // One domain: map or unmap chunks at the end so the usable range becomes `target` bytes.
     void resizeAtEnd(size_t target);

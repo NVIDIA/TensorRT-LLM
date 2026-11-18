@@ -758,6 +758,52 @@ TEST(VmmDescSplitterTest, SplitDescsAcrossRuns)
     EXPECT_EQ(out[3].getLen(), 0x80000);
 }
 
+TEST(VmmDescSplitterTest, SplitDescsStopAtRegionEndInsideChunk)
+{
+    // 4MB and 2MB chunks; one registration ends 1MB into the 2MB chunk and another covers the rest.
+    VramRegionMap regionMap;
+    regionMap[0x000000] = {0x400000, 0x400000};
+    regionMap[0x400000] = {0x100000, 0x200000};
+    regionMap[0x500000] = {0x100000, 0x100000};
+
+    std::vector<MemoryDesc> descs{{0x400000, 0x200000, 0}};
+    MemoryDescs input{MemoryType::kVRAM, descs};
+
+    auto result = VmmDescSplitter::splitDescsWithRegionMap(input, regionMap);
+    auto const& out = result.getDescs();
+
+    ASSERT_EQ(out.size(), 2);
+    EXPECT_EQ(out[0].getAddr(), 0x400000);
+    EXPECT_EQ(out[0].getLen(), 0x100000);
+    EXPECT_EQ(out[1].getAddr(), 0x500000);
+    EXPECT_EQ(out[1].getLen(), 0x100000);
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsStopAtRegionEndInsideChunk)
+{
+    // Same remote layout as above; the local side is one large chunk, so only the remote regions split.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x10000000] = {0x800000, 0x800000};
+    remoteMap[0x000000] = {0x400000, 0x400000};
+    remoteMap[0x400000] = {0x100000, 0x200000};
+    remoteMap[0x500000] = {0x100000, 0x100000};
+
+    std::vector<MemoryDesc> srcDescs{{0x10000000, 0x200000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x400000, 0x200000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitAndCoalesceTransferDescs(srcInput, dstInput, localMap, remoteMap);
+
+    ASSERT_EQ(splitDst.getDescs().size(), 2);
+    ASSERT_EQ(splitSrc.getDescs().size(), 2);
+    EXPECT_EQ(splitDst.getDescs()[0].getAddr(), 0x400000);
+    EXPECT_EQ(splitDst.getDescs()[0].getLen(), 0x100000);
+    EXPECT_EQ(splitDst.getDescs()[1].getAddr(), 0x500000);
+    EXPECT_EQ(splitDst.getDescs()[1].getLen(), 0x100000);
+    EXPECT_EQ(splitSrc.getDescs()[1].getAddr(), 0x10100000);
+}
+
 TEST(VmmDescSplitterTest, SplitDescsNonVmm)
 {
     VramRegionMap regionMap;
