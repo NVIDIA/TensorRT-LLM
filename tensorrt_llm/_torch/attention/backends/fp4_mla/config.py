@@ -6,6 +6,7 @@ import functools
 import importlib.util
 import inspect
 import os
+import threading
 from typing import Any, Literal, Optional
 
 from tensorrt_llm._errors import UnsupportedError
@@ -173,6 +174,12 @@ def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
 def _cutedsl_verbose_compile_enabled() -> bool:
     """Whether a CuTe DSL compilation leaves the PyIR status lines on stdout."""
     return _env_enabled_default(CUTEDSL_VERBOSE_COMPILE_ENV, False)
+
+
+# Held by a CuTe DSL compilation of the FP4 MLA kernels: it switches the DSL's
+# process-wide PyIR frontend and may filter sys.stdout while it runs, and both
+# are restored correctly only when compilations do not overlap.
+_CUTEDSL_COMPILE_LOCK = threading.RLock()
 
 
 FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"

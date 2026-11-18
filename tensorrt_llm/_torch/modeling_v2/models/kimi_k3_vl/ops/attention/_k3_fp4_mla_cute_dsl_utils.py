@@ -12,7 +12,10 @@ import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.dsl import BaseDSL
 
-from tensorrt_llm._torch.attention.backends.fp4_mla.config import _cutedsl_verbose_compile_enabled
+from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+    _CUTEDSL_COMPILE_LOCK,
+    _cutedsl_verbose_compile_enabled,
+)
 
 _PYIR_STDOUT_LINES = frozenset(
     {
@@ -51,16 +54,17 @@ class _PyIRStdoutFilter:
 
 
 def _compile_cutedsl(*args: object, **kwargs: object) -> Callable[..., object]:
-    """Compile the FP4 MLA kernels with their required PyIR frontend."""
-    if _cutedsl_verbose_compile_enabled():
-        with BaseDSL.enable_pyir():
-            return cute.compile(*args, **kwargs)
-    stdout_filter = _PyIRStdoutFilter(sys.stdout)
-    try:
-        with contextlib.redirect_stdout(stdout_filter), BaseDSL.enable_pyir():
-            return cute.compile(*args, **kwargs)
-    finally:
-        stdout_filter.finish()
+    """Compile the FP4 MLA kernels with their required PyIR frontend, one compilation at a time."""
+    with _CUTEDSL_COMPILE_LOCK:
+        if _cutedsl_verbose_compile_enabled():
+            with BaseDSL.enable_pyir():
+                return cute.compile(*args, **kwargs)
+        stdout_filter = _PyIRStdoutFilter(sys.stdout)
+        try:
+            with contextlib.redirect_stdout(stdout_filter), BaseDSL.enable_pyir():
+                return cute.compile(*args, **kwargs)
+        finally:
+            stdout_filter.finish()
 
 
 def _current_cu_stream() -> cuda.CUstream:

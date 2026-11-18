@@ -11,6 +11,7 @@ configuration and creates it.
 from __future__ import annotations
 
 import math
+import weakref
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, List, Optional
 
@@ -92,7 +93,9 @@ class Fp4MlaCacheLayout:
     DISAGG_IGNORED_ROLES: frozenset[DataRole] = frozenset((Role.MLA_V_SCALE, Role.MLA_V_PACKED))
 
     def __init__(self, manager: "KVCacheManagerV2") -> None:
-        self._manager = manager
+        # Weak: the manager owns its layout, so the pair is not a reference
+        # cycle and the layout's device buffers go with the manager.
+        self._manager_ref = weakref.ref(manager)
         # Set by configure_manager.
         self.mla_v_scale_head_dim: int = 0
         # None when decode reads V from the KV cache or the worker keeps no packed V.
@@ -116,6 +119,16 @@ class Fp4MlaCacheLayout:
         self._fp4_mla_view_cache: dict[Any, Any] = {}
         self._fp8_context_scratch: Optional[Any] = None
         self._fp4_mla_q_buffers: Optional[dict[str, torch.Tensor]] = None
+
+    @property
+    def _manager(self) -> "KVCacheManagerV2":
+        """The KV cache manager that owns this layout."""
+        manager = self._manager_ref()
+        if manager is None:
+            raise ReferenceError(
+                "The KV cache manager of this FP4 MLA cache layout no longer exists."
+            )
+        return manager
 
     @property
     def blocks_in_primary_pool(self) -> int:

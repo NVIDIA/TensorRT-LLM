@@ -662,12 +662,32 @@ _CUTEDSL_LAUNCHER_TENSOR_NAMES = (
 )
 
 
+def _launcher_call_operands(
+    args: tuple[object, ...], kwargs: dict[str, object]
+) -> tuple[tuple[object, ...], dict[str, object]]:
+    """Split a launcher call into its tensor operands, in launch order, and its other arguments.
+
+    The decode passes the operands by keyword; a positional call is accepted as well.
+    """
+    names = _CUTEDSL_LAUNCHER_TENSOR_NAMES
+    if len(args) > len(names):
+        raise RuntimeError(
+            f"CuTeDSL launcher takes {len(names)} tensor arguments, got {len(args)} positional ones"
+        )
+    options = dict(kwargs)
+    by_keyword = names[len(args) :]
+    missing = [name for name in by_keyword if name not in options]
+    if missing:
+        raise RuntimeError(f"CuTeDSL launcher call lacks the tensor arguments {missing}")
+    return tuple(args) + tuple(options.pop(name) for name in by_keyword), options
+
+
 def _launcher_tensor_pointers(tensors: tuple[object, ...]) -> dict[str, int | None]:
     """Record stable launch addresses, including fused-V's absent sidecar."""
     if len(tensors) != len(_CUTEDSL_LAUNCHER_TENSOR_NAMES):
         raise RuntimeError(
             f"CuTeDSL launcher requires {len(_CUTEDSL_LAUNCHER_TENSOR_NAMES)} "
-            f"positional tensor arguments, got {len(tensors)}"
+            f"tensor arguments, got {len(tensors)}"
         )
     pointers = {}
     for name, tensor in zip(_CUTEDSL_LAUNCHER_TENSOR_NAMES, tensors):
@@ -1386,12 +1406,12 @@ def run_one(
 
             def record_launcher(*args: object, **kwargs: object) -> object:
                 nonlocal launcher_kwargs, launcher_tensors, launcher_tensor_ptrs
-                current_tensors = tuple(args)
+                current_tensors, current_kwargs = _launcher_call_operands(args, kwargs)
                 current_ptrs = _launcher_tensor_pointers(current_tensors)
                 if launcher_tensor_ptrs is None:
                     launcher_tensors = current_tensors
                     launcher_tensor_ptrs = current_ptrs
-                    launcher_kwargs = dict(kwargs)
+                    launcher_kwargs = current_kwargs
                 elif current_ptrs != launcher_tensor_ptrs:
                     raise RuntimeError(
                         "CuTeDSL launcher tensor pointers changed within one benchmark run"
