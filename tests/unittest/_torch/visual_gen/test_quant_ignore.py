@@ -153,10 +153,54 @@ def test_linear_step_quant_algo_support_is_validated_by_loader(algo: str, typed:
     config = {"quant_algo": algo, "ignore_steps": [0]}
     quant = LinearQuantConfig(**config) if typed else config
     VisualGenArgs(quant_config=quant)
-    parsed, _, dynamic, _ = DiffusionPipelineConfig.load_diffusion_quant_config(config)
+    parsed, _, dynamic, _ = DiffusionPipelineConfig._resolve_quant_config(quant, None)
     assert parsed.quant_algo == algo
     assert parsed.ignore_steps == [0]
     assert dynamic
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "algorithm,activation_dynamic",
+    [
+        ("FP8", False),
+        ("FP8_BLOCK_SCALES", False),
+        ("FP8_PER_CHANNEL_PER_TOKEN", True),
+        ("NVFP4", True),
+    ],
+)
+def test_typed_step_quantization_uses_shared_parser_defaults(
+    algorithm: str, activation_dynamic: bool
+) -> None:
+    typed = LinearQuantConfig(quant_algo=algorithm, ignore_steps=[0, 2])
+    parsed, *modes = DiffusionPipelineConfig._resolve_quant_config(typed, None)
+    _, *dict_modes = DiffusionPipelineConfig._resolve_quant_config(
+        {"quant_algo": algorithm, "dynamic": True, "ignore_steps": [0, 2]}, None
+    )
+    assert parsed.model_dump() == typed.model_dump()
+    assert modes == dict_modes == [None, True, activation_dynamic]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("algorithm", ["NVFP4", "INT8"])
+@pytest.mark.parametrize("ignore_steps", [[], [0]])
+def test_typed_quantization_preserves_explicit_fields_and_loading_mode(
+    algorithm: str, ignore_steps: list[int]
+) -> None:
+    typed = LinearQuantConfig(
+        quant_algo=algorithm,
+        group_size=64,
+        exclude_modules=["blocks.0.*"] if not ignore_steps else None,
+        ignore_steps=ignore_steps,
+    )
+    original = typed.model_dump()
+    parsed, layer_config, dynamic_weights, dynamic_activations = (
+        DiffusionPipelineConfig._resolve_quant_config(typed, None)
+    )
+    assert parsed.model_dump() == original == typed.model_dump()
+    assert layer_config is None
+    assert dynamic_weights is bool(ignore_steps)
+    assert dynamic_activations is (algorithm == "NVFP4" and bool(ignore_steps))
 
 
 @pytest.mark.cpu_only

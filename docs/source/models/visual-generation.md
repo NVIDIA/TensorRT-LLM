@@ -254,8 +254,14 @@ quant_config:
 ```
 
 Nonempty layer and step exclusion lists cannot be combined. Step 0 is the first
-step of each denoising loop; LTX-2 Stage 2 starts at 0 again. Step exclusions
-require a BF16/FP16 checkpoint and load-time quantization (`dynamic: true`).
+denoising step. In two-stage generation, numbering continues across stages:
+with 8 steps in Stage 1, `ignore_steps: [9]` selects Stage 2's second step.
+Each new generation starts at 0; indices outside the actual total step count
+raise an error.
+
+Step exclusions require a BF16/FP16 checkpoint and load-time quantization (`dynamic: true`).
+With Python `LinearQuantConfig`, a nonempty `ignore_steps` list enables load-time
+quantization automatically; without it, typed configurations retain static loading.
 They retain both BF16 and quantized Linear weights: roughly 1.5 times the BF16
 weight storage for FP8, or 1.3 times for NVFP4 including scales, before auxiliary
 buffers and loading peaks. These ratios describe weights, not total pipeline memory.
@@ -264,7 +270,8 @@ weights are shared between execution paths.
 LTX-2 refinement follows its native LoRA precision policy: NVFP4 LoRA targets
 can use merged BF16 weights.
 
-Attention kernels have separate [layer and step exclusions](../features/visualgen-quantized-attention.md#layer-and-step-exclusions).
+Attention kernels use the same numbering with their own `ignore_steps` list;
+see the [combined Linear/attention example](../features/visualgen-quantized-attention.md#layer-and-step-exclusions).
 
 #### Wan VAE NVFP4
 

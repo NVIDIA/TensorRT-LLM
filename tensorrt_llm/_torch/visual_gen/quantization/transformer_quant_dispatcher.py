@@ -42,6 +42,15 @@ class TransformerQuantSchedule:
     def key(self, step: int | None) -> QuantIgnoreKey:
         return step in self.linear, step in self.attention
 
+    def for_stage(self, step_offset: int) -> "TransformerQuantSchedule":
+        """Translate configured exclusions into a stage's local step indices."""
+        if not step_offset:
+            return self
+        return TransformerQuantSchedule(
+            frozenset(step - step_offset for step in self.linear if step >= step_offset),
+            frozenset(step - step_offset for step in self.attention if step >= step_offset),
+        )
+
 
 def fixed_quant_config(config: DiffusionModelConfig, key: QuantIgnoreKey) -> DiffusionModelConfig:
     """Derive a fixed path from an already resolved component configuration."""

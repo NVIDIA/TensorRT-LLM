@@ -1288,6 +1288,14 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     # Inference entry point
     # ------------------------------------------------------------------
 
+    def _validate_quant_ignore_steps(self, num_steps: int) -> None:
+        if any(
+            dispatcher.stage == "base"
+            for dispatcher in self._transformer_quant_dispatchers.values()
+        ):
+            num_steps += len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1
+        super()._validate_quant_ignore_steps(num_steps)
+
     def infer(self, req):
         extra = req.params.extra_params or {}
         refs = req.params.image_reference
@@ -1438,7 +1446,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # state, so no per-request clone, merge, or unmerge math is needed.
         self._assert_cuda_graph_safe_lora_bindings()
         fixed_paths = getattr(self, "_distilled_lora_fixed_paths", False)
-        stage_context = self.transformer_quant_stage("refinement") if fixed_paths else nullcontext()
+        stage_context = (
+            self.transformer_quant_stage(
+                "refinement", ignore_steps_offset=len(self.scheduler.timesteps)
+            )
+            if fixed_paths
+            else nullcontext()
+        )
         with stage_context:
             lora_cache = self._distilled_lora_weight_cache
             using_persistent_lora = lora_cache is not None

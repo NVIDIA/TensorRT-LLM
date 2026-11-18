@@ -15,6 +15,7 @@ from utils.llm_data import get_checkpoint
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.visual_gen.args import LinearQuantConfig
 
 # Skip heavy components (text_encoder ~44GB, vae ~300MB) to speed up tests
 # These components are loaded via diffusers and don't need quantization testing
@@ -182,6 +183,18 @@ def test_attention_only_steps_create_component_metadata(tmp_path, backend):
             QuantConfig(quant_algo=QuantAlgo.FP8, exclude_modules=["runtime.*"]),
             ((QuantAlgo.FP8, ["runtime.*"], False, False),) * 2,
             id="quant_config_override",
+        ),
+        pytest.param(
+            ("FP8", "FP8"),
+            LinearQuantConfig(quant_algo=QuantAlgo.NVFP4),
+            ((QuantAlgo.NVFP4, None, False, False),) * 2,
+            id="typed_static_nvfp4",
+        ),
+        pytest.param(
+            ("FP8", "FP8"),
+            LinearQuantConfig(quant_algo=QuantAlgo.NVFP4, ignore_steps=[0]),
+            ((QuantAlgo.NVFP4, None, True, True),) * 2,
+            id="typed_step_nvfp4",
         ),
     ],
 )

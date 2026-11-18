@@ -50,6 +50,16 @@ class _TinyPipeline(BasePipeline):
                 block.linear.weight.copy_(weights)
 
 
+class _MultiTinyPipeline(_TinyPipeline):
+    @property
+    def transformer_components(self):
+        return list(self.pipeline_config.model_configs)
+
+    def _init_transformer(self):
+        for name, config in self.pipeline_config.model_configs.items():
+            setattr(self, name, _TinyModel(config))
+
+
 def _config(linear=(0, 1), attention=(0, 2)):
     return DiffusionPipelineConfig(
         cuda_graph={"enable": False},
@@ -139,18 +149,9 @@ def test_pipeline_selects_real_models_and_resets_on_loop_exit():
 
 @pytest.mark.cpu_only
 def test_multiple_components_keep_unquantized_component_single_instance():
-    class MultiPipeline(_TinyPipeline):
-        @property
-        def transformer_components(self):
-            return list(self.pipeline_config.model_configs)
-
-        def _init_transformer(self):
-            for name, config in self.pipeline_config.model_configs.items():
-                setattr(self, name, _TinyModel(config))
-
     config = _config()
     config.model_configs["transformer_2"] = DiffusionModelConfig(component_name="transformer_2")
-    pipeline = MultiPipeline(config)
+    pipeline = _MultiTinyPipeline(config)
     secondary = pipeline.transformer_2
     assert len(pipeline._transformer_quant_dispatchers["transformer"].variants) == 4
     assert len(pipeline._transformer_quant_dispatchers["transformer_2"].variants) == 1
@@ -183,6 +184,129 @@ def test_warmup_visits_every_path_even_when_first_steps_have_the_same_state():
     dispatcher = pipeline._transformer_quant_dispatchers["transformer"]
     assert visited == {id(model) for _, model in dispatcher.models()}
     assert dispatcher.forced_key is None
+    pipeline._is_warmup = False
+    with pytest.raises(ValueError, match="out-of-range"):
+        list(pipeline._profile_denoise_steps(range(2)))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("component", ["transformer", "transformer_2"])
+@pytest.mark.parametrize("kind", ["linear", "attention"])
+def test_quant_ignore_steps_reject_out_of_range_indices_and_reset(component, kind):
+    config = _config(
+        linear=(4,) if kind == "linear" else (), attention=(4,) if kind == "attention" else ()
+    )
+    if component == "transformer_2":
+        config.model_configs[component] = config.model_configs["transformer"].model_copy(
+            update={"component_name": component}
+        )
+        config.model_configs["transformer"] = DiffusionModelConfig(component_name="transformer")
+    pipeline = _MultiTinyPipeline(config)
+    dispatcher = pipeline._transformer_quant_dispatchers[component]
+    pipeline._publish_denoise_step((4, 5))
+    field = "quant_config" if kind == "linear" else "attention_config.quant_attention_config"
+    with pytest.raises(ValueError, match="out-of-range") as error:
+        next(pipeline._profile_denoise_steps(range(4)))
+    assert f"{field}.ignore_steps" in str(error.value)
+    assert component in str(error.value)
+    assert "[4]" in str(error.value) and "4 steps" in str(error.value)
+    assert dispatcher.step is None
+    assert all(
+        model.model_config.attention_metadata_state["denoise_step"] is None
+        for _, model in dispatcher.models()
+    )
+    assert list(pipeline._profile_denoise_steps(range(5))) == list(enumerate(range(5)))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("as_iterator", [False, True])
+def test_quant_ignore_steps_accept_last_step_for_repeated_requests(as_iterator):
+    pipeline = _TinyPipeline(_config(linear=(3,), attention=(0, 3)))
+    for _ in range(2):
+        timesteps = iter(range(4)) if as_iterator else range(4)
+        for step, _ in pipeline._profile_denoise_steps(timesteps):
+            dispatcher = pipeline._transformer_quant_dispatchers["transformer"]
+            assert pipeline.transformer is dispatcher.select(step)
+            assert pipeline.transformer.model_config.attention_metadata_state["denoise_step"] == (
+                step,
+                4,
+            )
+        assert dispatcher.step is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("as_iterator", [False, True])
+def test_multistage_exclusions_preserve_local_steps(as_iterator):
+    linear, attention = (7, 9), (8, 10)
+    pipeline = _TinyPipeline(_config(linear=linear, attention=attention))
+    dispatcher = pipeline._transformer_quant_dispatchers["transformer"]
+    original_schedule = dispatcher.schedule
+    for key in dispatcher.schedule.keys:
+        model = _TinyModel(
+            fixed_quant_config(pipeline.pipeline_config.model_configs["transformer"], key)
+        )
+        dispatcher.add(key, model, stage="refinement")
+    inputs = torch.randn(1, 8, 128, dtype=torch.bfloat16)
+    with observe_quantization_paths(dispatcher) as trace:
+        for _ in range(2):
+            for stage, offset, count in (("base", 0, 8), ("refinement", 8, 3)):
+                timesteps = iter(range(count)) if as_iterator else range(count)
+                with pipeline.transformer_quant_stage(stage, ignore_steps_offset=offset):
+                    for local_step, timestep in enumerate(timesteps):
+                        pipeline._publish_denoise_step((local_step, count))
+                        step = offset + local_step
+                        assert timestep == local_step
+                        assert dispatcher.step == local_step
+                        assert pipeline.transformer.model_config.attention_metadata_state[
+                            "denoise_step"
+                        ] == (local_step, count)
+                        trace.step = step
+                        pipeline.transformer(inputs)
+                    pipeline._publish_denoise_step(None)
+                assert dispatcher.stage == "base" and dispatcher.step is None
+                assert dispatcher.schedule is original_schedule
+                assert all(
+                    model.model_config.attention_metadata_state["denoise_step"] is None
+                    for _, model in dispatcher.models()
+                )
+    assert_quantization_routes(
+        trace,
+        {
+            (step, f"blocks.0.{name}", kind): "bf16" if step in ignored else "quantized"
+            for step in range(11)
+            for name, kind, ignored in (
+                ("linear", "linear", linear),
+                ("attention", "attention", attention),
+            )
+        },
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("kind", ["linear", "attention"])
+def test_refinement_exclusions_validate_local_range_and_restore(kind):
+    pipeline = _TinyPipeline(
+        _config(
+            linear=(11,) if kind == "linear" else (), attention=(11,) if kind == "attention" else ()
+        )
+    )
+    dispatcher = pipeline._transformer_quant_dispatchers["transformer"]
+    original_schedule = dispatcher.schedule
+    for key in dispatcher.schedule.keys:
+        dispatcher.add(
+            key,
+            _TinyModel(
+                fixed_quant_config(pipeline.pipeline_config.model_configs["transformer"], key)
+            ),
+            stage="refinement",
+        )
+    with (
+        pipeline.transformer_quant_stage("refinement", ignore_steps_offset=8),
+        pytest.raises(ValueError, match="3 steps"),
+    ):
+        next(pipeline._profile_denoise_steps(range(3)))
+    assert dispatcher.stage == "base" and dispatcher.step is None
+    assert dispatcher.schedule is original_schedule
 
 
 @pytest.mark.cpu_only
@@ -283,10 +407,15 @@ def test_final_linear_layout_and_scales_are_shared_without_requantization(algori
             loader.load_linear_weights(self.transformer.mlp.down_proj, "down", weights[2:])
 
     config = _config()
-    config.model_configs["transformer"].quant_config = LinearQuantConfig(
-        quant_algo=algorithm, ignore_steps=[0, 1]
+    model_config = config.model_configs["transformer"]
+    (
+        model_config.quant_config,
+        model_config.quant_config_dict,
+        model_config.dynamic_weight_quant,
+        model_config.force_dynamic_quantization,
+    ) = DiffusionPipelineConfig._resolve_quant_config(
+        LinearQuantConfig(quant_algo=algorithm, ignore_steps=[0, 1]), None
     )
-    config.model_configs["transformer"].force_dynamic_quantization = True
     with torch.device("cuda"):
         pipeline = Pipeline(config)
         weights = [{"weight": torch.randn(128, 128, dtype=torch.bfloat16)} for _ in range(3)]
