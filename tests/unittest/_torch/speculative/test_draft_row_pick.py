@@ -408,6 +408,7 @@ def _mtp_worker(mapping=None):
     w.guided_decoder = None
     w.sa_enhancer = None
     w.fused_draft_head = None
+    w._d2t = None
     w.mapping = mapping
     w._auxiliary_state_handlers = []
     w._row_pick = DraftRowPick("test MTP layers")
