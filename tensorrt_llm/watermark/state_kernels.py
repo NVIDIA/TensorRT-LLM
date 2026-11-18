@@ -45,13 +45,16 @@ def _mix64(x):
 
 
 @triton.jit
-def _uses_second_key(route_seed, position, alpha):
-    """Whether the token at generation ``position`` is drawn under the second key.
+def _uses_second_key(route_ptr, slot, index, alpha):
+    """Whether the token ``index`` positions after the slot's committed count uses the second key.
 
-    The routing stream is Philox under ``route_seed`` at counter ``position``: a function of the
-    request and the token's place in its output only, so plain and exact-match speculative
-    decoding make the same choices.
+    ``route_ptr`` holds ``(seed, offset)`` per slot; the offset turns the committed count into the
+    token's index in the request's output. The routing stream is Philox under the seed at that
+    index: a function of the request and the token's place in its output only, so plain and
+    exact-match speculative decoding make the same choices.
     """
+    route_seed = tl.load(route_ptr + 2 * slot)
+    position = index + tl.load(route_ptr + 2 * slot + 1)
     key0 = (route_seed & 0xFFFFFFFF).to(tl.uint32)
     key1 = ((route_seed >> 32) & 0xFFFFFFFF).to(tl.uint32)
     return _philox_uniform(position.to(tl.uint32), key0, key1) < alpha
@@ -125,7 +128,7 @@ def _plan_kernel(
             # The seed this position is drawn with; `seeds` stays the context's identity, which
             # the repeat check and the repeat ring compare.
             index = tl.load(count_ptr + slot) + position
-            use_second = _uses_second_key(tl.load(route_ptr + slot), index, alpha)
+            use_second = _uses_second_key(route_ptr, slot, index, alpha)
             tl.store(draw_ptr + out, tl.where(use_second, seed2_signed, seed_signed))
     active = tl.load(enabled_ptr + request) != 0
     if SKIP:
@@ -164,7 +167,7 @@ def plan_windows(
     dual: bool,
     drafts: torch.Tensor | None,
     skip: torch.Tensor | None = None,
-    route_seeds: torch.Tensor | None = None,
+    route_state: torch.Tensor | None = None,
     alpha: float = 0.0,
 ):
     """Seeds and activity of ``B`` windows of ``K + 1`` positions.
@@ -180,9 +183,9 @@ def plan_windows(
         dual: whether to also return the seeds of the second key.
         drafts: optional ``[B, K]`` draft tokens the window verifies.
         skip: optional ``[rows]`` int64, generated tokens each slot still leaves unwatermarked.
-        route_seeds: optional ``[rows]`` int64 routing-stream seeds (requires ``dual``). With
-            them, each position is drawn under the first key or, with probability ``alpha``, the
-            second one, see :func:`_uses_second_key`.
+        route_state: optional ``[rows, 2]`` int64 routing ``(seed, offset)`` per slot (requires
+            ``dual``). With it, each position is drawn under the first key or, with probability
+            ``alpha``, the second one, see :func:`_uses_second_key`.
         alpha: the probability of the second key.
 
     Returns:
@@ -195,7 +198,7 @@ def plan_windows(
     width = tail.shape[1]
     seeds = torch.empty((batch, num_drafts + 1), dtype=torch.int64, device=slots.device)
     seeds2 = torch.empty_like(seeds) if dual else seeds
-    route = route_seeds is not None
+    route = route_state is not None
     assert not route or dual, "routing needs the second key"
     draw = torch.empty_like(seeds) if route else seeds
     active = torch.empty((batch, num_drafts + 1), dtype=torch.int8, device=slots.device)
@@ -213,7 +216,7 @@ def plan_windows(
         seeds2,
         active,
         keys,
-        route_seeds if route else count,
+        route_state if route else count,
         draw,
         tail.stride(0),
         drafts.stride(0) if drafts is not None else 0,

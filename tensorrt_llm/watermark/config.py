@@ -47,13 +47,11 @@ class WatermarkConfig(StrictBaseModel):
         default=0.1,
         ge=0.0,
         le=1.0,
-        description="Only used by 'gumbel_dual_key' (ignored otherwise). Probability that a token of ordinary "
-        "(including exact-match speculative) decoding is drawn under the second key instead "
-        "of the first. The choice is made per token from the request's own random stream, so "
-        "requests with the same prompt and key diverge instead of repeating each other; a "
-        "request with a seed reproduces its choices. 0 uses the first key for every such token. "
-        "Speculative decoding with rejection sampling ignores it: the speculative protocol "
-        "selects the key of each token.",
+        description="Only used by 'gumbel_dual_key'. Probability that a token of ordinary or "
+        "exact-match speculative decoding is drawn under the second key instead of the first, "
+        "chosen from a random stream of the request: requests with the same prompt diverge, and "
+        "a request seed reproduces the choice. 0 uses the first key only. Speculative decoding "
+        "with rejection sampling ignores it.",
     )
     key: int = Field(
         description="Secret key, an integer in [0, 2**64). Detection needs the same value.",

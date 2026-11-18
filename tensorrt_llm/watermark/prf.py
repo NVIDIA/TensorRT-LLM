@@ -35,7 +35,6 @@ __all__ = [
     "PAD_TOKEN",
     "secondary_key",
     "route_seed",
-    "route_uniform",
     "context_seed",
     "context_seeds",
     "context_seeds_torch",
@@ -91,11 +90,6 @@ def route_seed(request_seed: "int | None", stream: int) -> int:
         else:
             value = (((stream + 1) * _GOLDEN) & _MASK64) ^ _ROUTE_UNSEEDED_SALT
         return _signed64(int(_mix64(np.array([value], dtype=np.uint64))[0]))
-
-
-def route_uniform(seed: int, positions: np.ndarray) -> np.ndarray:
-    """Uniform numbers in (0, 1) of the routing stream ``seed`` at generation ``positions``."""
-    return philox_uniform(seed & _MASK64, positions)
 
 
 def _signed64(value: int) -> int:
