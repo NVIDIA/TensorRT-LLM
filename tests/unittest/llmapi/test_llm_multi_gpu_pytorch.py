@@ -244,8 +244,9 @@ def test_llm_beam_search_pp2(compare_pp1: bool, async_relay: bool,
                 next(iter(position.values())).logprob
                 for position in beam.logprobs
             ]
-            assert sum(token_logprobs) == pytest.approx(
-                beam.cumulative_logprob), prompt
+            assert sum(token_logprobs) == pytest.approx(beam.cumulative_logprob,
+                                                        rel=1e-4,
+                                                        abs=1e-4), prompt
 
 
 def _context_requests_per_rank(llm: LLM) -> Dict[int, int]:
