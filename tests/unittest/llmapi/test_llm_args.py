@@ -6979,6 +6979,7 @@ class TestDSparkConfidenceScheduling:
             guided_decoding_backend=None,
             enable_lora=False,
             lora_config=None,
+            enable_locality_domains=False,
             sparse_attention_config=None,
             pipeline_parallel_size=1,
             context_parallel_size=1,
@@ -7010,6 +7011,9 @@ class TestDSparkConfidenceScheduling:
             ({
                 "enable_lora": True
             }, "does not yet support LoRA"),
+            ({
+                "enable_locality_domains": True
+            }, "does not yet support locality domains"),
             ({
                 "pipeline_parallel_size": 2
             }, "does not yet support pipeline parallelism"),
