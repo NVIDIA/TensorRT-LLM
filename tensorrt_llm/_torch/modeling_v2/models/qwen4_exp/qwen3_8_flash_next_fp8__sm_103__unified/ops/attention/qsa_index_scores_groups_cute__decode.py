@@ -94,9 +94,13 @@ def _shfl_xor_f(x, m, *, loc=None, ip=None):
 
 
 class _IdxGroupsKernel:
-    def __init__(self, *, rpr, tpb, cr, tiles, stages, bt_width, num_requests, pdl, bn=BN):
+    def __init__(
+        self, *, rpr, tpb, cr, tiles, stages, bt_width, num_requests, pdl, bn=BN, compact=False
+    ):
         assert 2 <= rpr <= 3 and tpb % cr == 0 and bn in (64, 128)
         self.T, self.tpb, self.cr = rpr, tpb, cr
+        # Compact index pages (`index_plane_layout`): a page's compressed keys are its first rows.
+        self.compact = compact
         self.bn = bn
         self.tiles, self.stages = tiles, max(2, min(stages, tiles))
         self.bt_width, self.num_requests, self.pdl = bt_width, num_requests, pdl
@@ -162,7 +166,10 @@ class _IdxGroupsKernel:
             page = _lds1(s_pg + (j * bn + k) * 4)
             ok = page >= 0
             n = cutlass.Int32(cutlass.select_(ok, cutlass.Int32(16), cutlass.Int32(0)))
-            tok = (k * cr + cr - 1) % tpb
+            if const_expr(self.compact):
+                tok = k % (tpb // cr)
+            else:
+                tok = (k * cr + cr - 1) % tpb
             src = (
                 cache_base
                 + (
@@ -386,9 +393,17 @@ def _index_scores_groups(
     if rows == 0:
         return out
     groups = rows // rows_per_request
+    compact = index_cache.shape[1] != tokens_per_block
     col_progs = -(-max_blocks // (BN * TILES))
     pdl = bool(use_pdl and get_env_enable_pdl())
-    key = (rows_per_request, tokens_per_block, compress_ratio, tuple(block_table.shape), pdl)
+    key = (
+        rows_per_request,
+        tokens_per_block,
+        compress_ratio,
+        tuple(block_table.shape),
+        pdl,
+        compact,
+    )
     args = (
         _ptr(q, cutlass.BFloat16),
         _ptr(index_cache, cutlass.BFloat16),
@@ -416,6 +431,7 @@ def _index_scores_groups(
             bt_width=block_table.shape[1],
             num_requests=block_table.shape[0],
             pdl=pdl,
+            compact=compact,
         )
         fn = _COMPILED[key] = cute.compile(kern, *args, options="--opt-level 2 --enable-tvm-ffi")
     fn(

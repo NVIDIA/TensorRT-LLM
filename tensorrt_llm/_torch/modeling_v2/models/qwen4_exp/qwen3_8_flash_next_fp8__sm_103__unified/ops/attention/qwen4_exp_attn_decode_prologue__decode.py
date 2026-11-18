@@ -23,6 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa.index_plane_layout import index_plane_row
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
@@ -175,6 +176,7 @@ def _attn_decode_prologue_kernel(
     MAIN_PROGRAMS: tl.constexpr,
     TPB: tl.constexpr,
     CR: tl.constexpr,
+    IDX_ROWS: tl.constexpr,
     ROTARY_PAIRS: tl.constexpr,
     IN_LAUNCH_GROUPS: tl.constexpr,
     IQ_ROW_MAP: tl.constexpr,
@@ -279,7 +281,7 @@ def _attn_decode_prologue_kernel(
         group = tl.load(
             index_cache
             + member_pages[:, None] * s_ic_page
-            + (tl.maximum(members, 0) % TPB)[:, None] * s_ic_slot
+            + index_plane_row(tl.maximum(members, 0), TPB, CR, IDX_ROWS)[:, None] * s_ic_slot
             + dims[None, :],
             mask=(earlier & ~in_launch)[:, None],
             other=0.0,
@@ -338,7 +340,8 @@ def _attn_decode_prologue_kernel(
                     ),
                     (ID,),
                 )
-            tl.store(index_cache + page * s_ic_page + slot * s_ic_slot + dims, stored_k)
+            index_row = index_plane_row(logical, TPB, CR, IDX_ROWS)
+            tl.store(index_cache + page * s_ic_page + index_row * s_ic_slot + dims, stored_k)
 
 
 def _launch(num_tokens: int) -> Tuple[int, int]:
@@ -546,6 +549,7 @@ class Qwen4ExpAttnDecodePrologue(OpWrapper):
             MAIN_PROGRAMS=main_programs,
             TPB=tokens_per_block,
             CR=compress_ratio,
+            IDX_ROWS=index_cache.shape[1],
             ROTARY_PAIRS=cos_sin.shape[1] // 2,
             IN_LAUNCH_GROUPS=rows_per_request > 1,
             IQ_ROW_MAP=index_q_rows is not None,
