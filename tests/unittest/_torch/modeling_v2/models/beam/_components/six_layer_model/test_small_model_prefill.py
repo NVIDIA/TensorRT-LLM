@@ -39,6 +39,9 @@ from collections import OrderedDict
 import pytest
 import torch
 
+if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+    pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
+
 __extra_import_path__ = ["../.."]
 
 import _beam_component_support as support  # noqa: E402
@@ -79,8 +82,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-
-assert torch.cuda.is_available(), "the Beam six-block model requires a CUDA device"
 
 pytestmark = pytest.mark.high_cuda_memory
 

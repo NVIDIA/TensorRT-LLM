@@ -41,6 +41,8 @@ on ``PATH``)::
 
 Dependencies: a TensorRT-LLM build for sm_103 with flashinfer importable and about 130 GiB of
 free device memory (generated state and loaded model). No model files.
+This is a manual QA suite, not scheduled CI; ensure that memory is available before running.
+The high_cuda_memory marker is a label, not a free-memory check.
 """
 
 from __future__ import annotations
@@ -53,6 +55,9 @@ from collections import OrderedDict
 import numpy as np
 import pytest
 import torch
+
+if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+    pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
 
 __extra_import_path__ = ["../.."]
 
@@ -72,8 +77,6 @@ from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm.bindings.executor import FinishReason
-
-assert torch.cuda.is_available(), "the Beam six-block model requires a CUDA device"
 
 pytestmark = pytest.mark.high_cuda_memory
 

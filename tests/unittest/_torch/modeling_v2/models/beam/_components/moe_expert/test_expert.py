@@ -29,6 +29,9 @@ from collections.abc import Iterator
 import pytest
 import torch
 
+if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+    pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
+
 __extra_import_path__ = [".", "../..", "../../../.."]
 
 import _expert_cases as cases  # noqa: E402
@@ -41,8 +44,6 @@ from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 impo
     SwigluFp32,
     swiglu_fp32,
 )
-
-assert torch.cuda.is_available(), "the Beam MoE expert tests require a CUDA device"
 
 BF16 = torch.bfloat16
 _WEIGHT_BYTES = sum(2 * rows * cols for rows, cols in WEIGHT_SHAPES.values())

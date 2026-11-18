@@ -43,6 +43,9 @@ from collections import OrderedDict
 import pytest
 import torch
 
+if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+    pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
+
 try:
     import tensorrt_llm._torch.models.modeling_beam as builtin_beam
 except ModuleNotFoundError as exc:
@@ -91,8 +94,6 @@ from tensorrt_llm._torch.modeling_v2.models.beam.ops.residual.beam_depth_residua
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm.mapping import Mapping
-
-assert torch.cuda.is_available(), "the Beam sparse block requires a CUDA device"
 
 pytestmark = pytest.mark.high_cuda_memory
 

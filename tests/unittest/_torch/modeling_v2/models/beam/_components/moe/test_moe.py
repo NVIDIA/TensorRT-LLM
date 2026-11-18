@@ -36,6 +36,9 @@ from collections import OrderedDict
 import pytest
 import torch
 
+if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+    pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
+
 try:
     import tensorrt_llm._torch.models.modeling_beam as builtin_beam
 except ModuleNotFoundError as exc:
@@ -70,8 +73,6 @@ from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_dispatch_combine i
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
     beam_grouped_topk_router,
 )
-
-assert torch.cuda.is_available(), "the Beam MoE tests require a CUDA device"
 
 pytestmark = pytest.mark.high_cuda_memory
 

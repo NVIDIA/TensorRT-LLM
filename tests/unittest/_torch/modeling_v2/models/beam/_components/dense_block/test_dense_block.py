@@ -44,6 +44,9 @@ from pathlib import Path
 import pytest
 import torch
 
+if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+    pytest.skip("Beam component tests require a CUDA device with sm_103", allow_module_level=True)
+
 try:
     import tensorrt_llm._torch.models.modeling_beam as builtin_beam
 except ModuleNotFoundError as exc:
@@ -180,8 +183,6 @@ OPS = (
     beam_depth_residual,
     swiglu_fp32,
 )
-
-assert torch.cuda.is_available(), "the Beam dense block requires a CUDA device"
 
 
 def block_config(**overrides) -> types.SimpleNamespace:
