@@ -14,6 +14,7 @@ from torch import nn
 import tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph as bcg
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor import breakable_cuda_graph_runner as runner_module
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
@@ -933,11 +934,24 @@ def test_runner_prepared_inputs_keep_one_staged_copy_per_bucket(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "change", ["shape", "dtype", "optional", "list_length", "list_type", "scalar", "owner"]
+    "change, mismatch",
+    [
+        ("shape", "inputs['config']['features'][0]"),
+        ("dtype", "inputs['value']"),
+        ("optional", "inputs['optional']"),
+        ("list_length", "inputs['config']['features']"),
+        ("list_type", "inputs['config']['features']"),
+        ("scalar", "inputs['scale']"),
+        ("owner", "inputs['owner']"),
+    ],
 )
-def test_runner_prepared_inputs_incompatible_values_fall_back_eager(monkeypatch, change):
+def test_runner_prepared_inputs_incompatible_values_fall_back_eager(monkeypatch, change, mismatch):
     body, runner, inputs, engine_forward = _prepared_runner()
     runner.capture(4, engine_forward)
+    logged = []
+    monkeypatch.setattr(
+        runner_module.logger, "info_once", lambda message, key: logged.append((message, key))
+    )
     original_forward = body.forward
     if change == "shape":
         inputs["config"]["features"][0] = torch.full((1, 4), 5.0, device="cuda")
@@ -960,13 +974,18 @@ def test_runner_prepared_inputs_incompatible_values_fall_back_eager(monkeypatch,
         pytest.fail("incompatible prepared inputs must not replay")
 
     monkeypatch.setattr(runner, "replay", unexpected_replay)
-    actual = runner.execute(4, engine_forward)
-    torch.cuda.synchronize()
+    for step in (1, 2):
+        actual = runner.execute(4, engine_forward)
+        torch.cuda.synchronize()
 
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert body.forward_calls == eager_calls + 1
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert body.forward_calls == eager_calls + step
+        assert runner.num_eager_fallbacks == step
     assert body.forward == original_forward
     assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+    # One info-level key per bucket (the logger prints a key once), naming the input.
+    assert [key for _, key in logged] == ["breakable_prefill_eager_fallback_4"] * 2
+    assert f"{mismatch} differs from the capture" in logged[0][0]
 
 
 @pytest.mark.parametrize("matches", [(True, True), (True, False), (False, True)])
@@ -1007,6 +1026,10 @@ def test_runner_prepared_inputs_attention_dp_ranks_agree_before_copying(monkeypa
             return original_replay(num_tokens)
 
         monkeypatch.setattr(runner, "replay", replay)
+        logged = []
+        monkeypatch.setattr(
+            runner_module.logger, "info_once", lambda message, key: logged.append(message)
+        )
         actual = runner.execute(4, engine_forward)
         torch.cuda.synchronize()
 
@@ -1015,10 +1038,18 @@ def test_runner_prepared_inputs_attention_dp_ranks_agree_before_copying(monkeypa
         if all(matches):
             assert replay_calls == [4]
             assert body.forward_calls == eager_calls
+            assert runner.num_eager_fallbacks == 0 and logged == []
             torch.testing.assert_close(captured["value"], inputs["value"], rtol=0, atol=0)
         else:
             assert replay_calls == []
             assert body.forward_calls == eager_calls + 1
+            assert runner.num_eager_fallbacks == 1
+            reason = (
+                "another attention DP rank's inputs differ"
+                if rank_matches
+                else "inputs['extra'] differs"
+            )
+            assert len(logged) == 1 and reason in logged[0]
             # Nothing was copied into the graph's inputs before the ranks agreed.
             torch.testing.assert_close(
                 captured["value"], torch.zeros_like(captured["value"]), rtol=0, atol=0

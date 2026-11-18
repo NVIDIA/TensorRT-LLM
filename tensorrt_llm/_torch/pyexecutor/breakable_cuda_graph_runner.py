@@ -139,6 +139,9 @@ class BreakableCUDAGraphRunner:
         self._active_graph: Optional[BreakableCUDAGraph] = None
         self._active_num_tokens: Optional[int] = None
         self._metrics: dict[str, float] = {}
+        # Executions whose staged inputs did not match the capture, so the body ran
+        # eagerly. The bucket graphs alone cannot tell a replay from this fallback.
+        self.num_eager_fallbacks = 0
 
     def _prepare_body_inputs(self, args: tuple, kwargs: dict) -> dict[str, Any]:
         assert self._input_signature is not None and self._prepare_inputs is not None
@@ -424,7 +427,17 @@ class BreakableCUDAGraphRunner:
                 if self._agree_replay is not None:
                     replayable = self._agree_replay(replayable)
                 if not replayable:
-                    logger.debug("BCG input layout changed; running the decoder body eagerly")
+                    self.num_eager_fallbacks += 1
+                    reason = (
+                        f"{mismatch} differs from the capture"
+                        if mismatch is not None
+                        else "another attention DP rank's inputs differ from the capture"
+                    )
+                    logger.info_once(
+                        f"Breakable prefill CUDA graph: the {num_tokens}-token body runs "
+                        f"eagerly because {reason} (logged once per token bucket)",
+                        key=f"breakable_prefill_eager_fallback_{num_tokens}",
+                    )
                     return original_forward(**inputs)
                 _copy_inputs(static_inputs, inputs)
                 kwargs = static_inputs
