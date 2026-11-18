@@ -18,7 +18,11 @@ from tensorrt_llm._torch.modules.linear import Linear
 
 # Importing models applies the pipeline registration decorators.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
-from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.attention.attention import (
+    Attention,
+    QKVMode,
+    _needs_cudnn_fp8_fallback,
+)
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
 from tensorrt_llm._torch.visual_gen.attention.backends.vanilla import VanillaAttention
@@ -57,10 +61,12 @@ _SM107_ONLY = pytest.mark.skipif(
 
 
 def _cosine(a, b):
+    """Cosine similarity of two tensors in fp32."""
     return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
 
 
 def _config(backend, quant_attention, fp8=True):
+    """Model config for a small Wan block."""
     config = DiffusionModelConfig(
         pretrained_config=SimpleNamespace(
             num_attention_heads=HEADS,
@@ -82,6 +88,7 @@ def _block(config):
     g = torch.Generator(device="cuda").manual_seed(0)
 
     def randn(shape, scale):
+        """Seeded normal tensor on the GPU."""
         return torch.randn(shape, device="cuda", generator=g) * scale
 
     with torch.no_grad():
@@ -110,6 +117,7 @@ def _block(config):
 
 
 def _inputs(batch, seq, text_len=64):
+    """Seeded hidden states, text, timestep embedding and RoPE tables."""
     g = torch.Generator(device="cuda").manual_seed(1)
     x = torch.randn(batch, seq, HIDDEN, device="cuda", generator=g).bfloat16()
     text = torch.randn(batch, text_len, HIDDEN, device="cuda", generator=g).bfloat16()
@@ -135,6 +143,7 @@ def _inputs(batch, seq, text_len=64):
     ],
 )
 def test_fused_block_matches_unfused(backend, quant_attention):
+    """The fused FP8 block matches the unfused block."""
     block = _block(_config(backend, quant_attention))
     unfused = _block(_config(backend, quant_attention))
     assert block.plan_fp8_fusions()
@@ -167,6 +176,7 @@ def test_fused_block_matches_unfused(backend, quant_attention):
     ],
 )
 def test_fused_block_compiles(backend, quant_attention, fullgraph):
+    """The fused FP8 block under torch.compile matches eager."""
     block = _block(_config(backend, quant_attention))
     assert block.plan_fp8_fusions()
     x, text, temb, cos, sin = _inputs(1, 1560)
@@ -179,6 +189,7 @@ def test_fused_block_compiles(backend, quant_attention, fullgraph):
 
 @_FP8_GPU
 def test_per_token_temb_takes_the_unfused_path():
+    """A per-token timestep embedding falls back to the unfused path."""
     block = _block(_config("VANILLA", None))
     unfused = _block(_config("VANILLA", None))
     assert block.plan_fp8_fusions()
@@ -192,6 +203,7 @@ def test_per_token_temb_takes_the_unfused_path():
 
 @_FP8_GPU
 def test_bf16_block_is_not_planned():
+    """A BF16 block plans no FP8 fusions."""
     block = _block(_config("VANILLA", None, fp8=False))
     assert not block.plan_fp8_fusions(log=True)
     assert not block._fp8_block
@@ -209,6 +221,7 @@ def _sdpa(q, k, v):
 
 
 def _qkv(batch, seq, heads, seed=0):
+    """Seeded BF16 [B, S, H, D] Q, K and V."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     return [
         torch.randn(batch, seq, heads, HEAD_DIM, device="cuda", generator=g).bfloat16()
@@ -217,6 +230,7 @@ def _qkv(batch, seq, heads, seed=0):
 
 
 def _backend(backend, heads, quant=_TRTLLM_FP8):
+    """Attention backend with the given FP8 recipe."""
     return create_attention(
         backend=backend,
         layer_idx=0,
@@ -229,6 +243,7 @@ def _backend(backend, heads, quant=_TRTLLM_FP8):
 
 
 def _model_config(backend, quant=_TRTLLM_FP8, heads=12):
+    """Model config for a Wan attention layer."""
     config = DiffusionModelConfig(
         pretrained_config=SimpleNamespace(
             hidden_size=heads * HEAD_DIM,
@@ -243,6 +258,7 @@ def _model_config(backend, quant=_TRTLLM_FP8, heads=12):
 
 
 def _wan_self_attention(backend, quant=_TRTLLM_FP8, heads=12, **kwargs):
+    """Wan self-attention with fused QKV, QK norm and RoPE and seeded weights."""
     attn = Attention(
         hidden_size=heads * HEAD_DIM,
         num_attention_heads=heads,
@@ -277,6 +293,7 @@ def _wan_rope(seq):
 @_SM107_ONLY
 @pytest.mark.parametrize("batch,seq,heads", [(1, 1560, 10), (2, 1560, 40)])
 def test_bf16_input_matches_sdpa_and_cudnn(batch, seq, heads):
+    """BF16 inputs on the dense FP8 library match SDPA and cuDNN FP8."""
     trtllm = _backend("TRTLLM", heads)
     assert any(isinstance(f, TrtllmGenDenseFp8Fmha) for f in trtllm._fmha_manager.fmha_libs)
     q, k, v = _qkv(batch, seq, heads)
@@ -293,6 +310,7 @@ def test_bf16_input_matches_sdpa_and_cudnn(batch, seq, heads):
 @_SM107_ONLY
 @pytest.mark.parametrize("out_fp8", [False, True])
 def test_prequantized_matches_sdpa(out_fp8):
+    """Prequantized Q/K/V match SDPA with BF16 and e4m3 output."""
     batch, seq, heads = 2, 1560, 40
     trtllm = _backend("TRTLLM", heads)
     assert trtllm.accepts_fp8_qkv()
@@ -313,6 +331,7 @@ def test_prequantized_matches_sdpa(out_fp8):
 
 @_SM107_ONLY
 def test_attention_module_uses_fp8_producer():
+    """The FP8 QKV producer matches the backend's own quantization and BF16."""
     batch, seq, heads = 2, 1560, 12
     attn = _wan_self_attention("TRTLLM", heads=heads)
     assert attn._fp8_qkv_producer
@@ -333,6 +352,7 @@ def test_attention_module_uses_fp8_producer():
 
 @_SM107_ONLY
 def test_attention_module_fp8_producer_under_compile():
+    """The FP8 QKV producer under torch.compile matches eager."""
     batch, seq, heads = 1, 1560, 12
     attn = _wan_self_attention("TRTLLM", heads=heads)
     hidden = torch.randn(batch, seq, heads * HEAD_DIM, device="cuda").bfloat16()
@@ -354,6 +374,7 @@ def test_attention_module_fp8_producer_under_compile():
     ],
 )
 def test_fp8_producer_off(backend, kwargs):
+    """Per-head QK norm, unfused QK norm and cuDNN do not use the FP8 producer."""
     defaults = dict(
         qkv_mode=QKVMode.FUSE_QKV, qk_norm=True, qk_norm_mode="full", fuse_qk_norm_rope=True
     )
@@ -370,7 +391,10 @@ def test_fp8_producer_off(backend, kwargs):
 
 @_SM107_ONLY
 def test_cross_attention_runs_on_cudnn_fp8(monkeypatch):
+    """Cross-attention with the FP8 recipe runs on cuDNN FP8."""
+
     def cross_attention():
+        """Wan cross-attention layer on the TRTLLM backend."""
         return Attention(
             hidden_size=12 * HEAD_DIM,
             num_attention_heads=12,
@@ -384,16 +408,62 @@ def test_cross_attention_runs_on_cudnn_fp8(monkeypatch):
     assert isinstance(attn.attn, CuDNNAttention)
     # cuDNN FP8 does not take key_padding_mask; masked calls go to VANILLA.
     assert isinstance(attn._masked_attn, VanillaAttention)
-    # PrimTS has no SM107 kernels, so enabling it does not change the routing.
+    # Enabled PrimTS serves the recipe on SM107 and keeps precedence; cross-attention then
+    # takes the VANILLA fallback as on Blackwell.
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
-    assert isinstance(cross_attention().attn, CuDNNAttention)
+    assert isinstance(cross_attention().attn, VanillaAttention)
 
 
 @_SM107_ONLY
 def test_dense_fp8_library_needs_the_recipe():
+    """Without the FP8 recipe the dense FP8 library is not registered."""
     trtllm = _backend("TRTLLM", 10, quant=None)
     assert not any(isinstance(f, TrtllmGenDenseFp8Fmha) for f in trtllm._fmha_manager.fmha_libs)
     assert not trtllm.accepts_fp8_qkv()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm,sparse", [(100, False), (103, False), (107, True)])
+def test_dense_fp8_library_unavailable_off_sm107_or_on_sparse_layers(monkeypatch, sm, sparse):
+    """The dense FP8 library serves only SM107 and never a sparse (e.g. SkipSoftmax) layer."""
+    from tensorrt_llm._torch.attention.backends.fmha import trtllm_gen_dense_fp8
+
+    monkeypatch.setattr(trtllm_gen_dense_fp8, "get_sm_version", lambda: sm)
+    attn = SimpleNamespace(
+        quant_attention_config=_TRTLLM_FP8,
+        sparse_params=object() if sparse else None,
+        is_mla_enable=False,
+        num_heads=12,
+        num_kv_heads=12,
+        head_dim=HEAD_DIM,
+    )
+    assert not TrtllmGenDenseFp8Fmha._is_available(attn)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm,fmha_libs,sparse,expected",
+    [
+        (107, None, False, True),
+        (100, None, False, False),
+        (103, None, False, False),
+        (107, "-trtllm_gen_dense_fp8", False, False),
+        (107, "+prims_ts", False, False),
+        (107, None, True, False),
+    ],
+)
+def test_dense_fp8_routing_follows_the_fmha_library(monkeypatch, sm, fmha_libs, sparse, expected):
+    """Cross-attention and context-parallel routing agree with the FMHA library selection."""
+    monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: sm)
+    if fmha_libs is None:
+        monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_FMHA_LIBS", fmha_libs)
+    config = SimpleNamespace(
+        quant_attention_config=_TRTLLM_FP8,
+        sparse_attention_config=object() if sparse else None,
+    )
+    assert _needs_cudnn_fp8_fallback(config) is expected
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +496,7 @@ def wan_checkpoint(tmp_path: Path) -> str:
 def test_block_fusions_default_off_and_override_reaches_the_model_config(
     wan_checkpoint: str,
 ) -> None:
+    """enable_fp8_block_fusions defaults off and an override reaches the model config."""
     default_args = VisualGenArgs(model=wan_checkpoint)
     loader = PipelineLoader(default_args, device="cpu")
     assert loader._resolve_pipeline_config(wan_checkpoint) == {"enable_fp8_block_fusions": False}
@@ -442,6 +513,7 @@ def test_block_fusions_default_off_and_override_reaches_the_model_config(
 
 @pytest.mark.cpu_only
 def test_unknown_pipeline_config_key_is_rejected(wan_checkpoint: str) -> None:
+    """A misspelled pipeline_config key raises."""
     args = VisualGenArgs(model=wan_checkpoint, pipeline_config={"enable_fp8_block_fusion": True})
     with pytest.raises(ValueError, match="Unknown pipeline_config keys for WanPipeline"):
         PipelineLoader(args, device="cpu")._resolve_pipeline_config(wan_checkpoint)
@@ -450,6 +522,7 @@ def test_unknown_pipeline_config_key_is_rejected(wan_checkpoint: str) -> None:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("enabled", [False, True])
 def test_post_load_weights_plans_block_fusions_only_when_enabled(monkeypatch, enabled) -> None:
+    """post_load_weights plans block fusions only when enabled."""
     planned = []
     monkeypatch.setattr(
         WanBlock, "plan_fp8_fusions", lambda self, log=False: planned.append(self) or False

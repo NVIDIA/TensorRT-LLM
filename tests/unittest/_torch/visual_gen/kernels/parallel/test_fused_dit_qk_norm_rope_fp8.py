@@ -157,6 +157,7 @@ def test_fake_under_compile():
     qkv, q_w, k_w, cos, sin = _inputs(tokens, num_heads, tokens, seed=4)
 
     def fn(x):
+        """AdaLN mode with residual, gate and bias."""
         amax = torch.ops.trtllm.dit_v_amax(x, num_heads, HEAD_DIM)
         return _run(x, num_heads, q_w, k_w, cos, sin, False, amax)
 
@@ -172,9 +173,11 @@ def test_fake_under_compile():
 
 
 def _rnq_inputs(batch, seq, hidden, seed=0):
+    """Seeded inputs for every residual / norm mode."""
     g = torch.Generator(device="cuda").manual_seed(seed)
 
     def randn(*shape, scale=1.0):
+        """Seeded normal tensor on the GPU."""
         return torch.randn(*shape, device="cuda", generator=g) * scale
 
     return dict(
@@ -210,6 +213,7 @@ def _rnq_reference(x, y, y_bias, gate, mode, weight, bias, inv_scale):
 
 
 def _rnq_run(x, y, y_bias, gate, mode, weight, bias, inv_scale, seq):
+    """Run the op on [B, S, hidden] inputs and restore their shape."""
     hidden = x.shape[-1]
     x_out, normed = torch.ops.trtllm.fused_residual_norm_quant(
         x.reshape(-1, hidden),
@@ -243,6 +247,7 @@ def _rnq_run(x, y, y_bias, gate, mode, weight, bias, inv_scale, seq):
     ],
 )
 def test_residual_norm_quant_matches_reference(hidden, batch, mode, has_y, has_gate, has_bias):
+    """Each mode, with and without optional inputs, matches the reference."""
     seq = 333
     t = _rnq_inputs(batch, seq, hidden, seed=hidden + batch + mode)
     y = t["y"] if has_y else None
@@ -270,12 +275,14 @@ def test_residual_norm_quant_matches_reference(hidden, batch, mode, has_y, has_g
 
 
 def test_residual_norm_quant_supported_hidden_sizes():
+    """Multiples of 1024 up to 8192 are supported; other widths are not."""
     supported = torch.ops.trtllm.fused_residual_norm_quant_supported
     assert all(supported(h) for h in (1024, 3072, 5120, 8192))
     assert not any(supported(h) for h in (0, 1000, 3000, 9216))
 
 
 def test_residual_norm_quant_rejects_cpu_inv_out_scale():
+    """A host inv_out_scale is rejected."""
     t = _rnq_inputs(1, 64, 3072)
     inv_scale = torch.tensor([E4M3_MAX / 6.0])
     with pytest.raises(RuntimeError, match="inv_out_scale must be a CUDA tensor"):
@@ -283,6 +290,7 @@ def test_residual_norm_quant_rejects_cpu_inv_out_scale():
 
 
 def test_residual_norm_quant_fake_under_compile():
+    """The fake op traces with fullgraph and compiled output equals eager."""
     t = _rnq_inputs(1, 64, 3072, seed=7)
     inv_scale = torch.tensor([E4M3_MAX / 6.0], device="cuda")
 

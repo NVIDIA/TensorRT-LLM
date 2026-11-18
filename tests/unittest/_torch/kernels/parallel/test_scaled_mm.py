@@ -133,6 +133,7 @@ _SM89_PLUS = pytest.mark.skipif(getSMVersion() < 89,
 
 
 def _epilogue_operands(m, n, k, seed=0):
+    """e4m3 operands, per-tensor scales, a BF16 bias and the fp32 reference GEMM."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     a = torch.randn(m, k, device="cuda", generator=g)
     w = torch.randn(n, k, device="cuda", generator=g) * 0.05
@@ -182,6 +183,7 @@ def test_fp8_scaled_mm_epilogue(m, n, k, gelu, out_fp8):
 
 @_SM89_PLUS
 def test_fp8_scaled_mm_epilogue_rejects_bad_arguments():
+    """An unknown epilogue and a missing d_scale for e4m3 output raise."""
     a8, w8, scale_a, scale_w, bias, _ = _epilogue_operands(64, 256, 128, seed=4)
     with pytest.raises(RuntimeError, match="epilogue"):
         torch.ops.trtllm.cublas_scaled_mm(a8,

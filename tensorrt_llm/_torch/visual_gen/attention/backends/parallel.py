@@ -902,14 +902,17 @@ class UlyssesAttention(AttentionBackend):
         return self.inner_backend.support_kv_cache_page_size(tokens_per_page, dtype)
 
     def accepts_fp8_qkv(self) -> bool:
+        """FP8 Q/K/V pass through when the inner backend takes them and no side stream is used."""
         return self._async_side_stream is None and self.inner_backend.accepts_fp8_qkv()
 
     def fp8_v_amax(self, qkv: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+        """|V| maximum over the Ulysses group, so every rank quantizes V with one scale."""
         local_amax = torch.ops.trtllm.dit_v_amax(qkv, num_heads, head_dim)
         return funcol.all_reduce(local_amax, "max", self.process_group)
 
     def _fp8_all_to_all(self, t: torch.Tensor, scatter_dim: int, gather_dim: int) -> torch.Tensor:
         # FP8 payloads move as int64 words (or bytes when the head dim is not a multiple of 8).
+        """All-to-all of an e4m3 tensor across the Ulysses group."""
         word = torch.int64 if t.shape[-1] % 8 == 0 else torch.uint8
         out = all_to_all_4d(
             t.contiguous().view(word),

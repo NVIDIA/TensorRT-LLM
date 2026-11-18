@@ -949,6 +949,7 @@ FP8_RECIPE = QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8")
 
 
 def _run_fp8(world_size, fn, **kwargs):
+    """Run ``fn`` on ``world_size`` ranks; skips without SM107 or enough GPUs."""
     if not torch.cuda.is_available() or get_sm_version() != 107:
         pytest.skip("trtllm-gen dense FP8 attention serves the per-tensor FP8 recipe on SM107")
     if torch.cuda.device_count() < world_size:
@@ -957,10 +958,12 @@ def _run_fp8(world_size, fn, **kwargs):
 
 
 def _fp8_cosine(a, b):
+    """Cosine similarity of two tensors in fp32."""
     return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
 
 
 def _fp8_config(backend, vgm=None, quant_attention_config=FP8_RECIPE):
+    """Model config for a Wan-sized attention layer with the FP8 recipe."""
     config = DiffusionModelConfig(
         pretrained_config=SimpleNamespace(
             hidden_size=FP8_HEADS * FP8_HEAD_DIM,
@@ -978,6 +981,7 @@ def _fp8_config(backend, vgm=None, quant_attention_config=FP8_RECIPE):
 
 
 def _fp8_wan_self_attention(config, enable_sequence_parallel, norm_gain=1.0):
+    """Wan self-attention with fused QKV, QK norm and RoPE and seeded weights."""
     attn = Attention(
         hidden_size=FP8_HEADS * FP8_HEAD_DIM,
         num_attention_heads=FP8_HEADS,
@@ -999,6 +1003,7 @@ def _fp8_wan_self_attention(config, enable_sequence_parallel, norm_gain=1.0):
 
 
 def _fp8_inputs(batch, seq):
+    """Seeded hidden states and Wan RoPE tables for ``seq`` tokens."""
     g = torch.Generator(device="cuda").manual_seed(11)
     hidden = torch.randn(
         batch, seq, FP8_HEADS * FP8_HEAD_DIM, device="cuda", generator=g
@@ -1012,6 +1017,7 @@ def _fp8_inputs(batch, seq):
 
 
 def _logic_ulysses_matches_single_gpu(rank, world_size, *, batch):
+    """Ulysses FP8 output and V scale match the single-GPU layer."""
     seq = 1560 * world_size
     shard = seq // world_size
     rows = slice(rank * shard, (rank + 1) * shard)
@@ -1045,6 +1051,7 @@ def _logic_ulysses_matches_single_gpu(rank, world_size, *, batch):
 
 
 def _logic_ulysses_cuda_graph(rank, world_size):
+    """Ulysses FP8 graph replays equal eager."""
     batch, seq = 1, 1560 * world_size
     shard = seq // world_size
     rows = slice(rank * shard, (rank + 1) * shard)
@@ -1070,6 +1077,7 @@ def _logic_ulysses_cuda_graph(rank, world_size):
 
 
 def _logic_attn2d_runs_on_cudnn_fp8(rank, world_size):
+    """Attention2D keeps cuDNN FP8 and matches the BF16 single-GPU layer."""
     batch, seq = 1, 1560 * world_size
     shard = seq // world_size
     rows = slice(rank * shard, (rank + 1) * shard)
@@ -1098,15 +1106,18 @@ def _logic_attn2d_runs_on_cudnn_fp8(rank, world_size):
 
 @pytest.mark.parametrize("world_size,batch", [(2, 1), (4, 2)])
 def test_ulysses_fp8_matches_single_gpu(world_size, batch):
+    """Ulysses FP8 attention matches one GPU."""
     _run_fp8(world_size, _logic_ulysses_matches_single_gpu, batch=batch)
 
 
 def test_ulysses_fp8_cuda_graph_replay():
+    """Ulysses FP8 attention under CUDA graph replay."""
     _run_fp8(2, _logic_ulysses_cuda_graph)
 
 
 @pytest.mark.skipif(flash_attn_combine is None, reason="Attention2D needs flash_attn_combine.")
 def test_attn2d_fp8_runs_on_cudnn():
+    """Attention2D with the FP8 recipe on cuDNN FP8."""
     _run_fp8(4, _logic_attn2d_runs_on_cudnn_fp8)
 
 

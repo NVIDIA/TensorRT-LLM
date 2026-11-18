@@ -1986,6 +1986,7 @@ def _register_fake():
         eps: float,
         inv_out_scale: Optional[torch.Tensor],
     ):
+        """Fake: x_out like x (empty without y) and e4m3 rows (empty in mode 0)."""
         x_out = torch.empty_like(x) if y is not None else x.new_empty(0)
         normed = (x.new_empty(x.shape, dtype=torch.float8_e4m3fn)
                   if mode != 0 else x.new_empty(0, dtype=torch.float8_e4m3fn))

@@ -881,6 +881,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         return full
 
     def accepts_fp8_qkv(self) -> bool:
+        """Whether the dense FP8 library takes prequantized Q/K/V for this layer."""
         return self._prequantized_fp8_lib is not None
 
     def forward_fp8(
@@ -893,6 +894,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len: int,
         out_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """[B, S, H, D] e4m3 Q/K/V to [B, S, H, D] BF16, or e4m3 when ``out_scale`` is given."""
         tokens = batch_size * seq_len
         flat = (tokens, self.num_heads, self.head_dim)
         out = self._prequantized_fp8_lib.run_prequantized(

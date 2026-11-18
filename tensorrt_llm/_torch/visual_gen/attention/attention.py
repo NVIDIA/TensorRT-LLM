@@ -15,7 +15,7 @@
 
 import math
 from enum import Enum
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,17 +28,22 @@ from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoa
 from ...utils import Fp4QuantizedTensor
 from ..config import DiffusionModelConfig
 from ..modules.rms_norm import RMSNormTPAware
-from .backends.interface import AttentionTensorLayout
+from .backends.interface import AttentionBackend, AttentionTensorLayout
 from .backends.parallel import wrap_parallel_attention
 from .backends.utils import create_attention
 
+if TYPE_CHECKING:
+    from tensorrt_llm.visual_gen.args import AttentionConfig
 
-def _dense_fp8_serves_recipe(attention_config) -> bool:
-    """Whether TRTLLM self-attention runs the per-tensor FP8 recipe on trtllm-gen dense FP8.
 
-    PrimTS serves the same recipe and keeps precedence when it is enabled and runs on this
-    device. Enabled alone is not enough: on SM107 (Rubin) PrimTS is enabled but unavailable,
-    and the FMHA manager still picks trtllm-gen dense FP8.
+def _needs_cudnn_fp8_fallback(attention_config: Optional["AttentionConfig"]) -> bool:
+    """Whether TRTLLM per-tensor FP8 runs on a library without cross-attention or LSE.
+
+    The trtllm-gen dense FP8 library serves TRTLLM self-attention for this recipe, so
+    cross-attention and context-parallel (Attention2D/Ring) layers run on cuDNN FP8 instead.
+    Mirrors the FMHA manager's choice for this recipe: PrimTS keeps precedence when it is
+    enabled and runs on this device; otherwise the dense FP8 library serves the recipe when it
+    is enabled and runs on this device. The library itself also rejects sparse layers.
     """
     if attention_config is None or attention_config.sparse_attention_config is not None:
         return False
@@ -48,11 +53,13 @@ def _dense_fp8_serves_recipe(attention_config) -> bool:
 
     from ...attention.backends.fmha.registry import FMHA_LIBS, get_enabled_fmha_lib_classes
 
+    sm = get_sm_version()
+    enabled = get_enabled_fmha_lib_classes()
     prims_ts = FMHA_LIBS["prims_ts"]
-    prims_ts_serves = (
-        prims_ts in get_enabled_fmha_lib_classes() and get_sm_version() in prims_ts.SUPPORTED_SMS
-    )
-    return not prims_ts_serves
+    if prims_ts in enabled and sm in prims_ts.SUPPORTED_SMS:
+        return False
+    dense_fp8 = FMHA_LIBS["trtllm_gen_dense_fp8"]
+    return dense_fp8 in enabled and sm in dense_fp8.SUPPORTED_SMS
 
 
 class QKVMode(str, Enum):
@@ -144,7 +151,9 @@ class Attention(nn.Module):
         is_separate_qkv_cross_attention = (
             self.qkv_mode == QKVMode.SEPARATE_QKV and not separate_qkv_is_self_attention
         )
-        dense_fp8_trtllm = base_backend == "TRTLLM" and _dense_fp8_serves_recipe(config.attention)
+        cudnn_fp8_fallback = base_backend == "TRTLLM" and _needs_cudnn_fp8_fallback(
+            config.attention
+        )
 
         # Cross-attention fallback: every TRTLLM backend and every VSA backend are
         # self-attention only. The CuTeDSL SOL backend delegates cross-attention per
@@ -153,7 +162,7 @@ class Attention(nn.Module):
         # cuDNN takes no key_padding_mask, so cross-attention routed to cuDNN FP8 keeps a
         # VANILLA backend for calls that pass one.
         masked_fallback_backend = None
-        if is_separate_qkv_cross_attention and dense_fp8_trtllm:
+        if is_separate_qkv_cross_attention and cudnn_fp8_fallback:
             backend_name = "CUDNN"
             masked_fallback_backend = "VANILLA"
             logger.info_once(
@@ -177,7 +186,7 @@ class Attention(nn.Module):
                 f"support qkv_mode=SEPARATE_QKV; falling back to {backend_name}.",
                 key=(type(self).__name__, requested, backend_name),
             )
-        elif dense_fp8_trtllm and cp_size > 1 and enable_sequence_parallel:
+        elif cudnn_fp8_fallback and cp_size > 1 and enable_sequence_parallel:
             # Attention2D and Ring merge partial results by LSE, which the trtllm-gen dense
             # FP8 path does not return; cuDNN FP8 runs the same recipe with LSE.
             backend_name = "CUDNN"
@@ -321,7 +330,7 @@ class Attention(nn.Module):
         self.sparse_params = sparse_params
 
         # Create compute backend
-        def _create_backend(name: str):
+        def _create_backend(name: str) -> AttentionBackend:
             return create_attention(
                 backend=name,
                 layer_idx=self.layer_idx,
@@ -345,7 +354,7 @@ class Attention(nn.Module):
                     "parallelism; use enable_sequence_parallel=False or Ulysses/Attention2D."
                 )
 
-        def _wrap(attn):
+        def _wrap(attn: AttentionBackend) -> AttentionBackend:
             return wrap_parallel_attention(
                 attn,
                 visual_gen_mapping=vgm,

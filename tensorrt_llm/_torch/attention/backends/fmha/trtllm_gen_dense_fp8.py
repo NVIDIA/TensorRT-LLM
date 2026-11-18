@@ -25,6 +25,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
@@ -35,15 +36,16 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 LOG2E = math.log2(math.e)
 
 
-def is_per_tensor_fp8(cfg) -> bool:
+def is_per_tensor_fp8(cfg: Optional["QuantAttentionConfig"]) -> bool:
     """Whether a ``QuantAttentionConfig`` is the per-tensor FP8 recipe (e4m3 Q/K/V, one scale each)."""
     return (
         cfg is not None
-        and not getattr(cfg, "vc_attention", False)
+        and not cfg.vc_attention
         and cfg.qk_dtype == "fp8"
         and cfg.v_dtype == "fp8"
         and (cfg.q_block_size, cfg.k_block_size, cfg.v_block_size) == (0, 0, 0)
@@ -60,6 +62,7 @@ def dense_fp8_supported(
 
 
 def _cu_seqlens(batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
+    """Cumulative sequence offsets [B + 1] for B sequences of ``seq_len`` tokens."""
     return torch.arange(batch_size + 1, dtype=torch.int32, device=device) * seq_len
 
 
@@ -79,10 +82,20 @@ class TrtllmGenDenseFp8Fmha(Fmha):
     """
 
     supports_per_tensor_fp8 = True
+    # Devices the dense FP8 recipe is validated on; ``AttentionConfig`` accepts the recipe for
+    # TRTLLM on the same SMs.
+    SUPPORTED_SMS = frozenset({107})
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        """Whether the layer carries the per-tensor FP8 recipe and a kernel serves its heads."""
         if not is_per_tensor_fp8(getattr(attn, "quant_attention_config", None)):
+            return False
+        if get_sm_version() not in cls.SUPPORTED_SMS:
+            logger.debug("TrtllmGenDenseFp8Fmha is unavailable: SM107 is required.")
+            return False
+        if attn.sparse_params is not None:
+            logger.debug("TrtllmGenDenseFp8Fmha is unavailable: sparse attention is not supported.")
             return False
         if attn.is_mla_enable or attn.num_heads != attn.num_kv_heads:
             logger.debug("TrtllmGenDenseFp8Fmha is unavailable: MHA without MLA is required.")
@@ -105,6 +118,7 @@ class TrtllmGenDenseFp8Fmha(Fmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
+        """Whether this request runs here; logs the reason at debug level when it does not."""
         supported, reason = self._is_supported_with_reason(q, k, v, metadata, forward_args)
         if not supported:
             logger.debug(f"TrtllmGenDenseFp8Fmha does not support request: {reason}")
@@ -118,6 +132,7 @@ class TrtllmGenDenseFp8Fmha(Fmha):
         meta: "TrtllmAttentionMetadata",
         fwd: AttentionForwardArgs,
     ) -> tuple[bool, str]:
+        """(supported, reason) for cache-free, uniform-length per-tensor FP8 context attention."""
         attn = self.attn
         if meta.kv_cache_manager is not None:
             return False, "only cache-free attention is supported."
@@ -178,6 +193,7 @@ class TrtllmGenDenseFp8Fmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
     ) -> None:
+        """Quantize BF16 Q/K/V per tensor and run the dense FP8 kernel into ``forward_args.output``."""
         attn = self.attn
         batch_size = int(metadata.num_contexts)
         seq_len = int(metadata.max_seq_len)
@@ -202,6 +218,7 @@ class TrtllmGenDenseFp8Fmha(Fmha):
         forward_args.output.view(tokens, num_heads, head_dim).copy_(out)
 
     def supports_prequantized_fp8(self) -> bool:
+        """Whether a kernel takes e4m3 Q/K/V with the softmax scale folded into Q and K."""
         attn = self.attn
         return dense_fp8_supported(attn.head_dim, attn.num_heads, torch.bfloat16, True)
 
@@ -215,6 +232,7 @@ class TrtllmGenDenseFp8Fmha(Fmha):
         seq_len: int,
         out_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Attention on e4m3 [T, H, D] Q/K/V; BF16 output, or e4m3 when ``out_scale`` is given."""
         out_dtype = torch.bfloat16 if out_scale is None else torch.float8_e4m3fn
         scale_out = v_descale.float().reshape(1)
         if out_scale is not None:
