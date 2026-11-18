@@ -130,8 +130,8 @@ class FcShard:
         return self._op(x.contiguous(), self.w_shard, self._cfg)
 
     def set_fast_gather(self, fn) -> None:
-        """FOLD_F7: ``fn(y)`` gathers ``partial``'s output in one launch, or returns None (the NCCL all-gather runs);
-        None uninstalls it."""
+        """The tp8 target's FOLD_F7: ``fn(y)`` gathers ``partial``'s output in one launch, or returns None (the NCCL
+        all-gather runs); None uninstalls it. Without one (the tp4 target), ``gather`` is the NCCL all-gather."""
         self._fast_gather = fn
 
     def gather(self, y: torch.Tensor) -> torch.Tensor:

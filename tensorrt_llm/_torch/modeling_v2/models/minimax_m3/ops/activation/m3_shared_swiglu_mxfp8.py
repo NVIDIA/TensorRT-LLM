@@ -86,24 +86,37 @@ def _swq_kernel(
 class M3Swq(OpWrapper):
     """``silu_and_mul`` (SwiGLU-OAI) over ``x = [g | u]`` (bf16 [M, 2I]) rounded to bf16, then MXFP8-quantized as
     ``trtllm::mxfp8_quantize(h, True)``: (E4M3 [M, I], UE8M0 scales in the 128x4-swizzled layout), bit for bit, in one
-    launch. The TP8 shared expert's down projection (intermediate 384, no GEMV row table) reads it at ``SWQ_ROWS``."""
+    launch. The TP8 shared expert's down projection (intermediate 384, no GEMV row table) reads it at ``SWQ_ROWS``;
+    the TP2 target's past its down GEMV's rows."""
 
     ARCHS = frozenset({Arch.SM_107})
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="shared expert, the smallest row count it serves", spec=dict(m=9, inter=384)),
-        Cell(
-            why="shared expert, a 32-row decode verify (8 requests; the widest TP8 decode step)",
-            spec=dict(m=32, inter=384),
+
+    # The cells each Rubin target runs, by tensor-parallel size; ``CELLS`` is their union.
+    CELLS_BY_TP: dict[int, tuple[Cell, ...]] = {
+        2: (
+            Cell(why="shared expert, the smallest row count it serves", spec=dict(m=9, inter=384)),
+            Cell(
+                why="shared expert, a 32-row decode verify (8 requests; the widest TP8 decode step)",
+                spec=dict(m=32, inter=384),
+            ),
+            Cell(
+                why="TP2 shared expert (width 1536), the first row past its down GEMV (17)",
+                spec=dict(m=17, inter=1536),
+            ),
+            Cell(
+                why="TP2 shared expert (width 1536), draft length 7 at 4 requests (32 rows)",
+                spec=dict(m=32, inter=1536),
+            ),
         ),
-        Cell(
-            why="TP2 shared expert (width 1536), the first row past its down GEMV (17)",
-            spec=dict(m=17, inter=1536),
+        8: (
+            Cell(why="shared expert, the smallest row count it serves", spec=dict(m=9, inter=384)),
+            Cell(
+                why="shared expert, a 32-row decode verify (c8; the widest TP8 32-row step)",
+                spec=dict(m=32, inter=384),
+            ),
         ),
-        Cell(
-            why="TP2 shared expert (width 1536), draft length 7 at 4 requests (32 rows)",
-            spec=dict(m=32, inter=1536),
-        ),
-    )
+    }
+    CELLS: tuple[Cell, ...] = tuple(cell for cells in CELLS_BY_TP.values() for cell in cells)
 
     note = """
     Bitwise to the two-kernel path (silu_and_mul's fp32 arithmetic and bf16 rounding, then mxfp8_quantize's

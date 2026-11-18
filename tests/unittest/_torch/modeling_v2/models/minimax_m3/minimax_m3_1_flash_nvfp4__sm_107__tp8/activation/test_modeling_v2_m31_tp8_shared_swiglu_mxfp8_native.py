@@ -11,10 +11,10 @@ CUDA-graph replay of refreshed inputs."""
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.activation.m3_shared_swiglu_mxfp8 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.activation.m3_shared_swiglu_mxfp8 import (
     m3_shared_swiglu_mxfp8,
 )
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
     pytest.skip("the sm_107 TP8 target runs on SM107 only", allow_module_level=True)

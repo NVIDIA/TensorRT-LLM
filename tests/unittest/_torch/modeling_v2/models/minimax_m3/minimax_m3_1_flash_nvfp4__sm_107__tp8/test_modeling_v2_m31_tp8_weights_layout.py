@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modeling_v2._native import NoTarget
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import m31_weights as F
 
 try:
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8 import (
@@ -50,17 +51,17 @@ def _core(sparse_freq, moe_freq, fused=True):
 def test_layer_kinds_come_from_the_config_independently():
     """Sparse attention on every layer while layers 0-1 keep the dense MLP."""
     d = W.MODEL_WEIGHTS.dims(_core([1] * 6, [0, 0, 1, 1, 1, 1]))
-    assert list(W._sparse_attn_layers(d)) == [0, 1, 2, 3, 4, 5]
-    assert list(W._dense_mlp_layers(d)) == [0, 1]
-    assert list(W._moe_layers(d)) == [2, 3, 4, 5]
-    assert list(W._five_way_qkv_layers(d)) == [0, 1, 2, 3, 4, 5]
-    assert list(W._three_way_qkv_layers(d)) == []
+    assert list(F._sparse_attn_layers(d)) == [0, 1, 2, 3, 4, 5]
+    assert list(F._dense_mlp_layers(d)) == [0, 1]
+    assert list(F._moe_layers(d)) == [2, 3, 4, 5]
+    assert list(F._five_way_qkv_layers(d)) == [0, 1, 2, 3, 4, 5]
+    assert list(F._three_way_qkv_layers(d)) == []
 
 
 def test_expert_scalars_are_the_fp32_reciprocal_of_the_stored_multiplier():
     stored = torch.tensor(12345.678, dtype=torch.float32)
-    out = W._divisor(stored, None)
+    out = F._divisor(stored, None)
     assert out.dtype == torch.float32
     assert out.view(torch.int32).item() == torch.reciprocal(stored).view(torch.int32).item()
     with pytest.raises(ValueError):
-        W._divisor(torch.tensor(0.0), None)
+        F._divisor(torch.tensor(0.0), None)

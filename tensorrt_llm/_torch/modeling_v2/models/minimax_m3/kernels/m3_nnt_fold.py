@@ -17,12 +17,11 @@
 A decode-only DSpark step ends with two launches: the catalog's ``next_new_tokens`` (N3 A2,
 ``ops/dspark/strict_accept_kernel.py``) builds ``out[i] = [accepted[batch_idx[i], num_accepted[i] - 1],
 *next_draft[i]]``, then, after the wait on the sampler's store copies, ``m3_fold_tail`` (the C++ op
-``minimaxM3Sm107Tp4/foldTail.cu`` this TP2 target shares with the TP4 one, or its Triton twin) stores the step's
-outputs into the spec sampler's per-slot
-store and stages the next step's inputs for the armed rows. This kernel does both: CTA ``i`` (lane ``c`` = column)
-computes row ``i`` of ``out`` as ``next_new_tokens_kernel`` does and, when ``i < min(ctrl[0], fold_rows)``, writes with
-``s = slots[i]`` exactly what ``foldTailKernel`` writes for row ``i`` from (``accepted``, ``out``, ``next_draft``,
-``num_accepted``):
+``minimaxM3Sm107Tp4/foldTail.cu`` the tp2 and tp4 targets run, or its Triton twin) stores the step's outputs into
+the spec sampler's per-slot store and stages the next step's inputs for the armed rows. This kernel does both: CTA
+``i`` (lane ``c`` = column) computes row ``i`` of ``out`` as ``next_new_tokens_kernel`` does and, when
+``i < min(ctrl[0], fold_rows)``, writes with ``s = slots[i]`` exactly what ``foldTailKernel`` writes for row ``i``
+from (``accepted``, ``out``, ``next_draft``, ``num_accepted``):
 
 * ``dst_new[s, c] = accepted[i, c]`` (0 past ``accepted``'s width) for ``c <`` the store width; the same for
   ``dst_next`` from ``out`` and ``dst_draft`` from ``next_draft``; ``dst_lens[s] = num_accepted[i]``;

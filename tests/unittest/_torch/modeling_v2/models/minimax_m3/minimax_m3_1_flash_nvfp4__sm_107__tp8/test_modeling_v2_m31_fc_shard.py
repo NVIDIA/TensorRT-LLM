@@ -15,9 +15,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.gemm import (  # noqa: E501
-    m31_fc_shard,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm import m31_fc_shard
 
 K, N, TP = 30720, 6144, 8
 COLS = N // TP

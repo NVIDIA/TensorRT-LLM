@@ -76,17 +76,17 @@ from tensorrt_llm._torch.speculative.interface import (
 )
 from tensorrt_llm.logger import logger
 
+from ..kernels import m3_nnt_fold
 from ..m31_tail_bookkeep import tail_bookkeep_draft_len, tail_bookkeep_log_once
 from ..ops.embedding.m31_embedding import m3_embedding
+from ..ops.gemm.m31_fc_shard import FcShard
 from ..ops.spec.m31_force_vec import m3_force_vec
 from . import dspark_tailfold as _tfold
 from .drafter_mxfp8 import route_his_layout, route_mx_linears
 from .dspark_markov_worker import MAX_FAST_BATCH, S4WorkerMixin
 from .dspark_t6 import routes_line
 from .dspark_tailfork import copy_captures, ctx_store_launch, ctx_store_prep, view_key
-from .kernels import m3_nnt_fold
 from .m31_switches import m31_disabled, m31_enabled
-from .ops.gemm.m31_fc_shard import FcShard
 
 # S9BVR: the drafter's row-parallel all-reduces (each layer's o_proj and MLP down projection) of up to this many
 # rows run the one-shot all-reduce instead of AUTO. On this target AUTO resolves to NCCL at every row count: the AR

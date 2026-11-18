@@ -12,10 +12,8 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.norm.m3_embedding_firstnorm import (  # noqa: E501
-    VOCAB,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.norm.m3_embedding_firstnorm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.norm.m3_embedding_firstnorm import VOCAB
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.norm.m3_embedding_firstnorm import (
     m3_embedding_firstnorm as op,
 )
 
@@ -23,7 +21,7 @@ __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
-    pytest.skip("the sm_107 TP8 target runs on SM107 only", allow_module_level=True)
+    pytest.skip("the sm_107 targets run on SM107 only", allow_module_level=True)
 
 H = 6144
 EPS = 1e-6

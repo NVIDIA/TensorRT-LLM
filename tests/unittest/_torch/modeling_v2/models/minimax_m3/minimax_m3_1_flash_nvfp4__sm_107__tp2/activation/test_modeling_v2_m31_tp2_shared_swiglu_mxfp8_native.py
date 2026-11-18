@@ -13,7 +13,7 @@ import torch
 from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 try:
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2.ops.activation.m3_shared_swiglu_mxfp8 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.activation.m3_shared_swiglu_mxfp8 import (
         m3_shared_swiglu_mxfp8,
     )
 except NoTarget as exc:

@@ -18,10 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels import m3_fold_tail
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels import (
-    m3_nnt_fold,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels import m3_fold_tail, m3_nnt_fold
 
 VOCAB = 200064
 NUM_SLOTS = 12

@@ -9,7 +9,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.activation.m3_shared_swiglu_mxfp8 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.activation.m3_shared_swiglu_mxfp8 import (
     m3_shared_swiglu_mxfp8 as op,
 )
 
@@ -30,7 +30,7 @@ def _assert_bitwise(x):
     assert sf.numel() <= rsf.numel() and torch.equal(sf, rsf.view(-1)[: sf.numel()])
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:48] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS_BY_TP[8], ids=[c.why[:48] for c in op.CELLS_BY_TP[8]])
 def test_certified_cells(cell) -> None:
     g = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     x = (torch.randn(cell.spec["m"], 2 * cell.spec["inter"], generator=g, device="cuda") * 4.0).to(

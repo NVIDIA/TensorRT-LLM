@@ -175,7 +175,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .. import cute_aot, m31_capture_fork, m31_decode_fsel, runtime_hooks_compat
 from ..kernels import m3_index_score as _index_score_kernel
-from ..kernels import m3_spec_tail
+from ..kernels import m3_nnt_fold, m3_spec_tail
 from ..kernels import msa_kv_update as _msa_kv_update_kernel
 from ..kernels.m3ll import die_local as _die_local
 from ..kernels.m3ll import tp4_moe_engine as _wc_moe_engine
@@ -183,6 +183,8 @@ from ..msa import engine as _msa_engine
 from ..ops import gqamix_sparse_decode as _gqamix_kernel
 from ..ops import gumbel_draft as _gumbel
 from ..ops import m3_fsel_topk as _fsel
+from ..ops.activation.m3_shared_swiglu_mxfp8 import m3_shared_swiglu_mxfp8
+from ..ops.activation.m31_silu_and_mul import m31_silu_and_mul as m3_silu_and_mul
 from ..ops.attention.m3_dense_qk_norm_rope_fp8 import m3_dense_qk_norm_rope_fp8
 from ..ops.attention.m3_draft_attention import m3_draft_attention
 from ..ops.attention.m3_select_blocks import m3_select_blocks
@@ -222,7 +224,7 @@ from . import weights as _weights
 from .gen_glue import glue_disabled
 from .gen_glue import log_engagement as _gen_glue_log
 from .kernels import lc2_mixed as _lc2_mixed
-from .kernels import m3_attn_lc, m3_mc_allreduce, m3_nnt_fold, m3_prequant, m3_report
+from .kernels import m3_attn_lc, m3_mc_allreduce, m3_prequant, m3_report
 from .kernels import m3_draft_lowm as _draft_lowm_kernel
 from .kernels import m3_draft_step as m3_draft_step_kernel
 from .kernels import m3_drafter_attn as _drafter_attn_kernel
@@ -244,8 +246,6 @@ from .kernels.m3_nvfp4_index_decode import Nvfp4IndexDecodeScorer
 from .kernels.mx_gemv import op as mx_gemv
 from .kernels.triton_sparse_decode import MERGE_MXFP8, MERGE_MXFP8_MIN_TOKENS
 from .m31_switches import m31_disabled, m31_enabled
-from .ops.activation.m3_shared_swiglu_mxfp8 import m3_shared_swiglu_mxfp8
-from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
 from .ops.attention.m3_fullctx_decode import m3_fullctx_decode
 from .ops.attention.m3_index_score_t2sc import m3_index_score_t2sc
 from .ops.attention.m3_msa_attention import m3_msa_attention
@@ -2544,7 +2544,9 @@ def _dense_swiglu(core, gu: torch.Tensor) -> torch.Tensor:
                 taken(path, rows)
                 return act
             uncovered(path, "the gate_up layout")
-    return m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
+    return m3_silu_and_mul(
+        gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta, native_vec=False
+    )
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -5610,7 +5612,9 @@ class PrefillTarget:
         else:
             act = _native_swiglu(core, gu, False)
             if act is None:
-                act = m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
+                act = m3_silu_and_mul(
+                    gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta, native_vec=False
+                )
         out, _ = _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm)
         return out
 
@@ -6744,7 +6748,9 @@ class DecodeTarget:
         else:
             act = _native_swiglu(core, gu, False)
             if act is None:
-                act = m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
+                act = m3_silu_and_mul(
+                    gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta, native_vec=False
+                )
         return _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm, push)
 
     def _routed_chunks(self, i: int, x, router_logits, topk=None):
@@ -7713,7 +7719,7 @@ class M3Eagle3Draft(nn.Module):
             else:
                 taken(DRAFT_SILU_PATH, int(gu.shape[0]), "drafter MLP SwiGLU, one C++ launch")
         if act is None:
-            act = m3_silu_and_mul(gu, None, None, None)
+            act = m3_silu_and_mul(gu, None, None, None, native_vec=False)
         out = self._linear(act, "dn")
         return m3_allreduce(out, self.allreduce, None) if reduce else out
 

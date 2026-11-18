@@ -10,7 +10,7 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from ....kernels.embedding_firstnorm.op import DecodeEmbedding, m3_embed_norm
+from ...kernels.embedding_firstnorm.op import DecodeEmbedding, m3_embed_norm
 
 __all__ = ["DecodeEmbedding", "m3_embedding_firstnorm"]
 
@@ -35,7 +35,7 @@ class M3EmbeddingFirstnorm(OpWrapper):
             why="six rows (one request verifying a draft), int64 ids",
             spec=dict(rows=6, id_dtype=torch.int64),
         ),
-        # Every other row count the decode dispatch takes (modeling.EMBED_FIRSTNORM), both id dtypes.
+        # Every other row count the decode dispatch takes (the target modeling's EMBED_FIRSTNORM), both id dtypes.
         *(
             Cell(
                 why=f"{rows} rows: a decode row count between the ones above",
@@ -48,6 +48,9 @@ class M3EmbeddingFirstnorm(OpWrapper):
     note = """
     The gathered rows are exact. The norm is flashinfer's RMSNorm arithmetic in its reduction order with a fast
     rsqrt, where `reference` sums in fp64 and takes torch's rsqrt: within the band the test derives, not bit for bit.
+    SM107 against the stock embedding + RMSNorm module (flashinfer's kernel, 768 threads): the gathered rows are
+    bitwise equal; the normed rows differ in one bf16 ulp on ~5e-6 of the elements (~1.6% of rows, 1-2 elements each:
+    the fp32 sum-of-squares tree differs, so the rsqrt input can differ in its last bits).
     An id outside [0, V) gives a zero row and a zero norm (torch's embedding would raise). No accepted input is known
     to compute wrongly: the host side rejects any other dtype, shape or a strided buffer.
     """

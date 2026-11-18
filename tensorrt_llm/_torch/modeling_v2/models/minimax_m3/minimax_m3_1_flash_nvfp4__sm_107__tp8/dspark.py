@@ -78,14 +78,14 @@ from ..m31_tail_bookkeep import tail_bookkeep_draft_len, tail_bookkeep_log_once
 # set-up. Bitwise the stock gathers. Default ON; kill switch TRTLLM_M31_DISABLE_TP8_FLAGFREE_GATHER=1, read at import.
 from ..ops import flagfree_gather as _ffg  # noqa: E402
 from ..ops.embedding.m31_embedding import m3_embedding
+from ..ops.gemm.m31_fc_shard import MAX_ROWS as FC_SHARD_MAX_ROWS
+from ..ops.gemm.m31_fc_shard import FcShard
 from . import dspark_ctxlen
 from .drafter_down_splitk import route_down_splitk, route_oproj_splitk
 from .drafter_mxfp8 import route_gu_swiglu, route_his_layout, route_mx_linears
 from .dspark_markov_worker import MAX_FAST_BATCH, TAILBK_SPEC, S4WorkerMixin
 from .kernels import m3_mc_allreduce
 from .m31_switches import m31_disabled, m31_enabled
-from .ops.gemm.m31_fc_shard import MAX_ROWS as FC_SHARD_MAX_ROWS
-from .ops.gemm.m31_fc_shard import FcShard
 from .ops.sampling import m31_chain_spec_mc as _chain_spec_mc
 
 # DRAFT_AR_NORM_CLUSTER (opt-in, TRTLLM_M31_ENABLE_DRAFT_AR_NORM_CLUSTER=1): the drafter's fused all-reduces + norms

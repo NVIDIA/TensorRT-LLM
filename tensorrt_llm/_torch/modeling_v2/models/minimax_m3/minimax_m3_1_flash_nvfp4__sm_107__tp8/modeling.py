@@ -162,6 +162,8 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from .. import cute_aot, m31_capture_fork, runtime_hooks_compat
 from ..msa import engine as _msa_engine
 from ..ops import m3_fsel_topk as _fsel
+from ..ops.activation.m3_shared_swiglu_mxfp8 import m3_shared_swiglu_mxfp8
+from ..ops.activation.m31_silu_and_mul import m31_silu_and_mul as m3_silu_and_mul
 from ..ops.attention.m3_select_blocks import m3_select_blocks
 from ..ops.attention.m31_fp8_indexer_qk_norm_rope import m3_fp8_indexer_qk_norm_rope
 from ..ops.attention.m31_qk_norm_rope_fp8 import m3_qk_norm_rope_fp8
@@ -173,6 +175,7 @@ from ..ops.gemm.m31_bf16_linear import m3_bf16_linear
 from ..ops.gemm.m31_mxfp8_gemm import m3_mxfp8_gemm
 from ..ops.gemm.m31_mxfp8_linear import m3_mxfp8_linear
 from ..ops.moe.m3_moe_engine import M3MoeEngine
+from ..ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
 from ..ops.spec.m3_draft_input import m3_draft_input
 from ..ops.spec.m31_capture_norm import m3_capture_norm
 from ..ops.spec.m31_chunk_norm import m3_chunk_norm
@@ -199,8 +202,6 @@ from .kernels.m3_moe.op import M3MoeState, ar_push_desc, shared_ctas_for
 from .kernels.mx_gemv import op as mx_gemv
 from .m31_switches import m31_disabled, m31_enabled
 from .ops import gqamix_sparse_decode as _gqamix_kernel
-from .ops.activation.m3_shared_swiglu_mxfp8 import m3_shared_swiglu_mxfp8
-from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
 from .ops.attention.m3_draft_attention import m3_draft_attention
 from .ops.attention.m3_fullctx_decode import m3_fullctx_decode
 from .ops.attention.m3_index_score import m3_index_score
@@ -233,7 +234,6 @@ from .ops.gemm.m3_mx_gemv import (
 from .ops.gemm.m3_mx_gemv_bf16 import m3_mx_gemv_bf16
 from .ops.gemm.m3_mxfp8_cublaslt import m3_mxfp8_cublaslt
 from .ops.moe.m3_router_tc import m3_router_tc
-from .ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
 from .ops.sampling import m31_chain_spec_mc as _chain_spec_mc
 from .ops.sampling import m31_softmax_mc as _softmax_mc
 from .ops.sampling import m31_topp_det as _topp_det
@@ -270,6 +270,11 @@ class _EngagedM3MoeEngine(M3MoeEngine):
 
 
 m3_moe_engine = _EngagedM3MoeEngine()
+
+
+# SILU_VEC: the SwiGLU-OAI activation on the family native op (m31_silu_and_mul's native_vec) instead of the
+# stock Triton silu_and_mul. TRTLLM_M31_DISABLE_SILU_VEC=1: the stock Triton op everywhere. Read at import.
+SILU_VEC = not m31_disabled("SILU_VEC")
 
 # The sampler and rejection-sampler override registries the target installs its sampling kernels through; None on a
 # runtime without them, where the stock sampling ops run.
@@ -2409,7 +2414,9 @@ def _dense_swiglu(core, gu: torch.Tensor) -> torch.Tensor:
         else:
             taken(path, rows, "dense swigluoai")
     if act is None:
-        act = m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
+        act = m3_silu_and_mul(
+            gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta, native_vec=SILU_VEC
+        )
     return act
 
 
@@ -3377,7 +3384,9 @@ class PrefillTarget:
         if dense:
             act = _dense_swiglu(core, gu)
         else:
-            act = m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
+            act = m3_silu_and_mul(
+                gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta, native_vec=SILU_VEC
+            )
         out, _ = _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm)
         return out
 
@@ -4041,7 +4050,9 @@ class DecodeTarget:
         if dense:
             act = _dense_swiglu(core, gu)
         else:
-            act = m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
+            act = m3_silu_and_mul(
+                gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta, native_vec=SILU_VEC
+            )
         return _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm, push)
 
     def _routed_chunks(self, i: int, x, router_logits):
@@ -5199,7 +5210,7 @@ class M3Eagle3Draft(nn.Module):
             else:
                 taken(DRAFT_SILU_PATH, int(gu.shape[0]), "drafter MLP SwiGLU, one C++ launch")
         if act is None:
-            act = m3_silu_and_mul(gu, None, None, None)
+            act = m3_silu_and_mul(gu, None, None, None, native_vec=SILU_VEC)
         out = self.linear(act, "dn")
         return m3_allreduce(out, self.allreduce, None) if reduce else out
 

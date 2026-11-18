@@ -73,6 +73,7 @@ from tensorrt_llm._torch.speculative.interface import (
 from tensorrt_llm.logger import logger
 
 from .. import m31_capture_fork
+from ..kernels import m3_nnt_fold
 from ..m31_tail_bookkeep import TailBookkeepMixin
 from ..ops.embedding.m31_embedding import m3_embedding
 from ..ops.spec.m31_force_vec import m3_force_vec
@@ -83,7 +84,7 @@ from .dspark_markov_worker import MAX_FAST_BATCH, TAILBK_SPEC, S4WorkerMixin
 from .dspark_t6 import route_lowm_linears, routes_line
 from .dspark_tailfork import copy_captures, ctx_store_launch, ctx_store_prep, view_key
 from .gen_glue import glue_disabled
-from .kernels import m3_mc_allreduce, m3_nnt_fold, m3_report
+from .kernels import m3_mc_allreduce, m3_report
 from .m31_switches import m31_disabled, m31_enabled
 from .ops.gemm.m31_fc_shard import FcShard
 
