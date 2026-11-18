@@ -83,10 +83,9 @@ Rules:
 
 ### Who declares, and how it is found
 
-`get_recurrent_state_spec(pretrained_config, *, quant_config=None, spec_config=None)` is a
-classmethod of the model class; `DecoderModelForCausalLM` returns `None`. The five family classes
-implement it by converting the result of their geometry function
-(`recurrent_state_spec_from_mamba_params`).
+`get_recurrent_state_spec(pretrained_config, *, quant_config=None)` is a classmethod of the model
+class; `DecoderModelForCausalLM` returns `None`. The five family classes implement it by converting
+the result of their geometry function (`recurrent_state_spec_from_mamba_params`).
 
 A VLM wrapper forwards to the class of its language model and passes on the config that its
 `__init__` builds that language model from. The declaration read from the composite config before
@@ -145,14 +144,15 @@ it a state object, a `MambaState`, which the manager then calls at these points:
 | Hook | When | Use |
 |---|---|---|
 | `_initialize_spec_state()` | `MambaHybridCacheManagerV2.__init__`, before the pool is built | The family manager returns its `MambaState`. The shared manager returns `None`, and raises when speculative decoding is configured |
-| `MambaReplayState.replay_layout()`, `replay_shares_state_slot` | Same point | The per-slot dtype and shape of each replay buffer of a layer, and whether those buffers live in the recurrent-state slot; see `../REGIONS_DEVELOPER_GUIDE.md` |
-| `bind_replay_pool()`, then `bind()` | `_setup_model_state()`, once the layout, the pools and the slot capacity are final | Take the views of the replay buffers, then of the SSM and convolution state. The pool keeps owning them |
+| `bind()` | `_setup_model_state()`, once the layout, the pools and the slot capacity are final | Take the views of the SSM and convolution state. The pool keeps owning them |
 | `reset_slots()` | `prepare_resources()` and `add_dummy_requests()`, for the context requests of a batch | Reset the state those requests start from |
-| `reset_replay_slots()` | `prepare_resources()` and `add_dummy_requests()`, for a generation request that gets a replay slot for the first time | Reset the replay history of that slot |
 | `make_layer_cache()` | `mamba_layer_cache(layer_idx)`, when speculative decoding is configured | Build the `MambaLayerCache` a mixer reads for one layer. Without a state the manager returns the convolution and SSM views alone |
 | `update(MambaAcceptanceBatch)` | `update_mamba_states()`, which a speculative worker calls after it accepts tokens | Apply the accepted tokens to the state |
 | `intermediate_indices`, `intermediate_ssm`, `intermediate_conv` | Read through the manager's `intermediate_state_indices`, `intermediate_ssm_states` and `intermediate_conv_states` | The intermediate views that mixers pass to their kernels; `None` when the state keeps none |
 | `shutdown()` | The manager's `shutdown()` | Release what the state holds |
+
+A state that keeps replay buffers has further hooks. `../REGIONS_DEVELOPER_GUIDE.md` describes how
+those buffers are laid out, bound and reset.
 
 The manager itself answers the rest:
 
