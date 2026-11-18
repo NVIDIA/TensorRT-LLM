@@ -452,7 +452,9 @@ def _run_mtp_worker(layer_cls, mapping=None, num_contexts=2, num_gens=3, k=3, se
         draft_inputs["hidden_states"],
         torch.zeros(b, VOCAB, device="cuda"),
         md,
-        SimpleNamespace(runtime_draft_len=k, batch_indices_cuda=None),
+        SimpleNamespace(
+            runtime_draft_len=k, batch_indices_cuda=None, wants_advanced_draft_sampling=False
+        ),
         SimpleNamespace(mtp_layers=layers, embed_tokens=None, lm_head=None),
     )
     torch.cuda.synchronize()
