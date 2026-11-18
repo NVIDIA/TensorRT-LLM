@@ -187,14 +187,7 @@ def glm5_next_attention_mapping(mapping: Mapping | None) -> Mapping | None:
     same remap :class:`~tensorrt_llm._torch.attention.mla.MLA` applies."""
     if mapping is None or not mapping.enable_attention_dp:
         return mapping
-    return Mapping(
-        world_size=mapping.pp_size * mapping.tp_size,
-        tp_size=1,
-        pp_size=mapping.pp_size * mapping.tp_size,
-        rank=mapping.rank,
-        gpus_per_node=mapping.gpus_per_node,
-        enable_attention_dp=True,
-    )
+    return mapping.split_tp(mapping.tp_size, enable_attention_dp=True)
 
 
 class Glm5NextAllReduce(nn.Module):

@@ -326,7 +326,8 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
         model_config, {id(model_config.extra_attrs): model_config.extra_attrs}
     )
     # TorchLlmArgs.validate_encoder_data_parallel rejects bad sizes at startup;
-    # Mapping.split_tp checks them again for callers that build ModelConfig directly.
+    # EncoderParallelLayout.from_config checks them again for callers that build
+    # ModelConfig directly.
     encoder_mapping = EncoderParallelLayout.from_config(model_config).mapping
     if encoder_mapping is model_config.mapping:
         return encoder_config

@@ -30,7 +30,6 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     vision_normalization_from_processor,
 )
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.mapping import Mapping
 
 from ..._utils import async_tensor_h2d
 from ...inputs import (
@@ -810,19 +809,9 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
         )
 
         self.mapping = model_config.mapping
-        overridden_tp_size = 1 if model_config.mapping.enable_attention_dp else None
-        if overridden_tp_size is not None:
-            assert self.mapping.tp_size % overridden_tp_size == 0
-            tp_size = overridden_tp_size
-            # "Misuse" pp_size here to perform all-reduce within smaller groups
-            pp_size = self.mapping.pp_size * self.mapping.tp_size // overridden_tp_size
-            mapping = Mapping(
-                world_size=tp_size * pp_size,
-                rank=self.mapping.rank,
-                gpus_per_node=self.mapping.gpus_per_node,
-                tp_size=tp_size,
-                pp_size=pp_size,
-            )
+        if self.mapping.enable_attention_dp:
+            # Each rank runs the merger alone.
+            mapping = self.mapping.split_tp(self.mapping.tp_size)
         else:
             mapping = self.mapping
 

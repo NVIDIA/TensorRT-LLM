@@ -384,19 +384,9 @@ def _get_vision_tp_mapping(model_config: ModelConfig, num_heads: int) -> Mapping
     if not _vision_requires_replication(model_config, num_heads):
         return model_config.mapping
 
-    # Fold every parallel dimension (incl. helix cp) into pp so each rank
-    # runs the tower replicated; without cp the world size collapses below
-    # the rank range under helix.
-    attn_ranks = (
-        model_config.mapping.pp_size * model_config.mapping.tp_size * model_config.mapping.cp_size
-    )
-    return Mapping(
-        world_size=attn_ranks,
-        rank=model_config.mapping.rank,
-        gpus_per_node=model_config.mapping.gpus_per_node,
-        tp_size=1,
-        pp_size=attn_ranks,
-    )
+    # One rank per group, so each rank runs the tower replicated. Helix CP
+    # ranks become groups too.
+    return model_config.mapping.split_tp(model_config.mapping.tp_size)
 
 
 def _tpool_patch_merger(

@@ -657,27 +657,35 @@ class Mapping(MappingBase):
             dwdp_rank=self._dwdp_rank,
             helix_repurposed_cp_size=self.cp_size)
 
-    def split_tp(self, dp_size: int) -> "Mapping":
-        """Split the TP group into ``dp_size`` groups of contiguous ranks.
+    def split_tp(self,
+                 dp_size: int,
+                 *,
+                 enable_attention_dp: bool = False) -> "Mapping":
+        """Split each TP group into ``dp_size`` groups of contiguous ranks.
 
         The returned mapping has TP size ``tp_size // dp_size``. Its PP
-        dimension only counts the groups (``pp_rank`` is the group index), so
-        collectives on its TP group stay inside one group. Attention DP, CP
-        and MoE settings are not copied.
+        dimension only counts the groups (``pp_size * dp_size`` of them), so
+        collectives on its TP group stay inside one group. With CP, only a
+        split into single ranks is allowed, and each CP rank is then its own
+        group. CP config, PP partition and MoE settings are not copied.
+        ``enable_attention_dp`` sets that flag on the returned mapping.
         """
-        if self.pp_size != 1 or self.cp_size != 1:
-            raise NotImplementedError(
-                "Splitting the TP group requires pipeline parallel size 1 and "
-                "context parallel size 1.")
         if dp_size <= 0 or self.tp_size % dp_size:
             raise ValueError(
                 f"The split size must divide the tensor parallel size "
                 f"({self.tp_size}), got {dp_size}.")
+        tp_size = self.tp_size // dp_size
+        if self.cp_size != 1 and tp_size != 1:
+            # CP ranks sit between TP ranks, so a TP group is not contiguous.
+            raise NotImplementedError(
+                "Splitting the TP group with context parallel size > 1 "
+                "requires one rank per group.")
         return Mapping(world_size=self.world_size,
                        rank=self.rank,
                        gpus_per_node=self.gpus_per_node,
-                       tp_size=self.tp_size // dp_size,
-                       pp_size=dp_size)
+                       tp_size=tp_size,
+                       pp_size=self.world_size // tp_size,
+                       enable_attention_dp=enable_attention_dp)
 
     # DeviceMesh specific methods
     @property

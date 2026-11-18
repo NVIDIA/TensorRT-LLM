@@ -10,7 +10,6 @@ from torch import nn
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduceParams
@@ -88,23 +87,14 @@ class GatedMLP(nn.Module):
         self.mapping = config.mapping
         if overridden_tp_size is not None:
             assert config.mapping.tp_size % overridden_tp_size == 0
-            tp_size = overridden_tp_size
-            # "Misuse" pp_size here to perform all-reduce within smaller groups
-            pp_size = config.mapping.pp_size * config.mapping.tp_size // overridden_tp_size
-            mapping = Mapping(
-                world_size=tp_size * pp_size,
-                rank=self.mapping.rank,
-                gpus_per_node=self.mapping.gpus_per_node,
-                tp_size=tp_size,
-                pp_size=pp_size,
-                enable_attention_dp=self.mapping.enable_attention_dp,
-            )
+            # All-reduce within smaller groups of ranks.
+            mapping = config.mapping.split_tp(
+                config.mapping.tp_size // overridden_tp_size,
+                enable_attention_dp=self.mapping.enable_attention_dp)
         else:
             mapping = config.mapping
 
         # Calculate local intermediate size after tensor parallel sharding
-        tp_size = mapping.tp_size
-
         local_intermediate_start = Linear._calc_shard(self.intermediate_size,
                                                       mapping.tp_size,
                                                       mapping.tp_rank)

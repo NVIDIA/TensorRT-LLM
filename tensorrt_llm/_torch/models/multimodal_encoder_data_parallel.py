@@ -68,6 +68,11 @@ class EncoderParallelLayout:
         dp_size = None if mm_config is None else mm_config.encoder_data_parallel_size
         if dp_size is None:
             return cls(mapping)
+        if mapping.pp_size != 1 or mapping.cp_size != 1:
+            raise NotImplementedError(
+                "Explicit encoder parallelism requires pipeline parallel size 1 "
+                "and context parallel size 1."
+            )
         encoder_mapping = mapping.split_tp(dp_size)
         shared_tp = mapping.enable_attention_dp and dp_size < mapping.tp_size
         return cls(
