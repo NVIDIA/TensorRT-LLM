@@ -133,7 +133,7 @@ def _run_encoder_dp_rank(enable_attention_dp: bool, lengths: list[int] | None = 
         lengths = [4, 1, 3] if lengths is None else lengths
         param = _make_param([10, 20, 30][: len(lengths)], lengths)
 
-    output = model._run_multimodal_encoder([param])
+    model._run_multimodal_encoder([param])
     model.encoded_item_ids.clear()
     previous_sync_debug_mode = torch.cuda.get_sync_debug_mode()
     try:
@@ -141,6 +141,12 @@ def _run_encoder_dp_rank(enable_attention_dp: bool, lengths: list[int] | None = 
         output = model._run_multimodal_encoder([param])
     finally:
         torch.cuda.set_sync_debug_mode(previous_sync_debug_mode)
+    if enable_attention_dp:
+        assert isinstance(output, torch.Tensor)
+    else:
+        assert isinstance(output, tuple)
+        assert len({item.untyped_storage().data_ptr() for item in output}) == 1
+        output = torch.cat(output)
     torch.cuda.synchronize()
     return rank, model.encoded_item_ids, output.cpu()
 
@@ -162,7 +168,8 @@ def _run_encoder_dp_failure_rank(request_error: bool):
     raised = type(error.value).__name__, str(error.value), type(error.value.__cause__).__name__
 
     output = model._run_multimodal_encoder([param])
-    return rank, raised, output.cpu()
+    assert isinstance(output, tuple)
+    return rank, raised, torch.cat(output).cpu()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")

@@ -423,7 +423,7 @@ def test_encoder_data_parallel_partitions_items_and_restores_order():
 
     assert rank_zero_model.encoded_item_ids == [10]
     expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
-    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(torch.cat(output), expected)
 
 
 @pytest.mark.cpu_only
@@ -472,7 +472,7 @@ def test_encoder_dp_uses_the_model_item_slicer() -> None:
 
     assert model.encoded_item_ids == [20]
     expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
-    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(torch.cat(output), expected)
 
 
 def make_interleaved_encoder_dp_param() -> MultimodalParams:
@@ -506,7 +506,7 @@ def test_encoder_dp_uses_modality_local_indices_in_prompt_order() -> None:
     assert model.encoded_item_ids == [20]
     assert param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] is metadata
     expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
-    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(torch.cat(output), expected)
 
 
 @pytest.mark.cpu_only
@@ -610,7 +610,7 @@ def test_encoder_dp_keeps_requests_atomic_without_encoder_token_lengths() -> Non
 
     assert model.encoded_item_ids == [10, 20, 30]
     expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
-    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(torch.cat(output), expected)
 
 
 @pytest.mark.cpu_only
@@ -637,7 +637,7 @@ def test_encoder_data_parallel_uses_physical_input_token_costs():
 
     assert model.encoded_item_ids == [20]
     expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
-    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(torch.cat(output), expected)
 
 
 @pytest.mark.cpu_only
@@ -1547,6 +1547,52 @@ def test_encoder_cache_partial_hit_batches_encoder_across_partial_params():
     # Both new miss items (`[3]*8` and `[4]*8`) written to cache alongside the two
     # already-cached seed items.
     assert len(model._multimodal_encoder_cache) == 4
+
+
+@pytest.mark.cpu_only
+def test_encoder_dp_partial_cache_keeps_gathered_miss_views():
+    model = DataParallelEncoderMultimodalModel(rank=0)
+    cache = model._initialize_multimodal_encoder_cache(4096)
+    assert cache is not None
+    param = make_keyed_multimodal_param(
+        item_hashes=[[1] * 8, [2] * 8, [3] * 8],
+        embedding_lengths=[2, 2, 2],
+    )
+    keys = model._encoder_cache_keys(param)
+    assert keys is not None
+    assert cache.put(keys[1], torch.full((2, 2), 100.0))
+    # Both misses stay atomic for placement because costs are unavailable.
+    gathered = torch.tensor([0.0, 0.0, 24.0, 24.0]).unsqueeze(1).repeat(1, 2)
+    with (
+        patch.object(model, "_allgather_encoder_dp_output", return_value=gathered),
+        patch.object(
+            mixin_module,
+            "_assemble_multimodal_encoder_embeddings",
+            wraps=_assemble_multimodal_encoder_embeddings,
+        ) as assemble,
+        patch("torch.cat", wraps=torch.cat) as concatenate,
+    ):
+        embeddings = model._get_or_encode_multimodal_embeddings([param])
+
+    torch.testing.assert_close(
+        embeddings,
+        torch.tensor([0.0, 0.0, 100.0, 100.0, 24.0, 24.0]).unsqueeze(1).repeat(1, 2),
+    )
+    assemble.assert_called_once()
+    pieces = assemble.call_args.args[0]
+    first, hit, last = (pieces[i] for i in range(3))
+    gathered_ptr = gathered.untyped_storage().data_ptr()
+    assert first.untyped_storage().data_ptr() == last.untyped_storage().data_ptr() == gathered_ptr
+    assert last.storage_offset() - first.storage_offset() == 4
+    assert embeddings.untyped_storage().data_ptr() != gathered_ptr
+    assert embeddings.untyped_storage().nbytes() == 6 * 2 * embeddings.element_size()
+    # The other cat is this model's local encode. There is no DP reorder copy.
+    assert concatenate.call_count == 2
+    for key, view in zip(keys, [first, hit, last], strict=True):
+        cached = cache.get(key)
+        assert cached is not None
+        assert cached.untyped_storage().data_ptr() != gathered_ptr
+        assert cached.untyped_storage().nbytes() == 2 * 2 * view.element_size()
 
 
 def test_encoder_cache_logs_rejected_oversized_write():

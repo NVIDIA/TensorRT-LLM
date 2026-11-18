@@ -1,5 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import List
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -7,10 +10,10 @@ import torch
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     find_input_mm_embeds, get_attached_multimodal_embeddings,
     get_multimodal_embeddings)
-from tensorrt_llm.inputs.multimodal import (MultimodalParams,
-                                            MultimodalRuntimeData,
-                                            _as_cpu_tensor, _compute_mm_masks,
-                                            _find_mm_token_start_pos_from_masks)
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
+    MultimodalParams, MultimodalRuntimeData, _as_cpu_tensor, _compute_mm_masks,
+    _find_mm_token_start_pos_from_masks)
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           maybe_compute_mm_embed_cumsum)
 
@@ -618,6 +621,70 @@ class TestGetMultimodalEmbeddings:
             assert (embedding.untyped_storage().data_ptr()
                     != encoder_output.untyped_storage().data_ptr())
         torch.testing.assert_close(torch.cat(cached, dim=0), encoder_output)
+
+    @pytest.mark.parametrize("current_chunk_only", [False, True],
+                             ids=["full-request", "active-chunk"])
+    def test_dp_prefill_attaches_views_and_concatenates_once(
+            self, current_chunk_only):
+        first = _make_mm_params_with_data(total_mm_tokens=5)
+        second = _make_mm_params_with_data(total_mm_tokens=3)
+        cached_output = torch.full((2, _EMBED_DIM), -1.0)
+        cached = _make_mm_params_with_data(has_cached_embedding=True,
+                                           total_mm_tokens=2,
+                                           cached_embedding=cached_output)
+        cached.multimodal_data[
+            "multimodal_embedding_is_chunk"] = current_chunk_only
+        cached.multimodal_runtime = _make_runtime(0, 2, [2])
+        first.multimodal_runtime = _make_runtime(1, 3, [2, 3])
+        second.multimodal_runtime = _make_runtime(0, 3, [3])
+        for param, lengths in ((first, [2, 3]), (second, [3])):
+            param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = (
+                MultimodalItemMetadata(item_refs=[("image", i)
+                                                  for i in range(len(lengths))],
+                                       output_embedding_lengths=lengths))
+
+        gathered = torch.arange(8 * _EMBED_DIM,
+                                dtype=torch.float32).reshape(8, _EMBED_DIM)
+        items = (gathered[3:5], gathered[:3], gathered[5:])
+        first_rows = (items[0][1:],
+                      items[1][:2]) if current_chunk_only else items[:2]
+        expected = torch.cat((*first_rows, cached_output, items[2]), dim=0)
+        encode = Mock(return_value=items)
+
+        with (patch.object(torch, "cat", wraps=torch.cat) as concatenate,
+              patch.object(torch.Tensor,
+                           "clone",
+                           side_effect=AssertionError("DP output was cloned"))):
+            output, = get_multimodal_embeddings(encode, [first, cached, second])
+
+        encode.assert_called_once_with([first, second])
+        concatenate.assert_called_once()
+        torch.testing.assert_close(output, expected)
+        first_items = first.multimodal_data["multimodal_embedding"]
+        second_item = second.multimodal_data["multimodal_embedding"]
+        assert len(first_items) == 2
+        gathered_ptr = gathered.untyped_storage().data_ptr()
+        for attached, item in zip([*first_items, second_item],
+                                  items,
+                                  strict=True):
+            assert attached.untyped_storage().data_ptr() == gathered_ptr
+            assert attached.storage_offset() == item.storage_offset()
+
+    def test_dp_prefill_reuses_dense_single_request_on_later_chunks(self):
+        param = _make_mm_params_with_data(total_mm_tokens=5)
+        param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = (
+            MultimodalItemMetadata(item_refs=[("image", 0), ("image", 1)],
+                                   output_embedding_lengths=[2, 3]))
+        gathered = torch.ones((5, _EMBED_DIM))
+        encode = Mock(return_value=(gathered[3:], gathered[:3]))
+
+        with patch.object(torch, "cat", wraps=torch.cat) as concatenate:
+            first, = get_multimodal_embeddings(encode, [param])
+            second, = get_multimodal_embeddings(encode, [param])
+
+        encode.assert_called_once_with([param])
+        concatenate.assert_called_once()
+        assert second is first
 
     def test_special_tokens_basic_caching(self):
         """Test caching behavior with special tokens present."""

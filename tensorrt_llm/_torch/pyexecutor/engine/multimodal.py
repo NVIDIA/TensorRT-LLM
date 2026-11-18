@@ -21,7 +21,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _concat_embeddings
 from tensorrt_llm._torch.models.multimodal_encoder_data_parallel import (
     EncoderDpStatus,
     raise_shared_system_error,
@@ -810,7 +810,7 @@ class MultimodalItemScheduler:
             # cached output for every small LLM chunk. One segment stays a view.
             # TODO: Remove the remaining current-chunk join at the common LLM
             # fusion boundary in the separate embedding-materialization follow-up.
-            embedding = _join_embeddings(segments, start=start, end=end)
+            embedding = _concat_embeddings(segments, start=start, end=end)
         else:
             # A chunk without MM rows still attaches an empty embedding so the
             # model does not encode this request inline.

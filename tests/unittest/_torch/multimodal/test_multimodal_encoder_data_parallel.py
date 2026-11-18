@@ -92,7 +92,7 @@ def test_plan_encoder_dp_items_uses_input_cost():
 
 def test_execute_encoder_dp_items_reconstructs_global_output():
     costs, row_counts = [3, 4, 2], [2, 1, 2]
-    peer_output = torch.tensor([[10.0], [10.0], [30.0], [30.0]])
+    gathered = torch.tensor([[20.0], [10.0], [10.0], [30.0], [30.0]])
     encoded_indices: list[int] = []
 
     def prepare_local(indices):
@@ -103,8 +103,8 @@ def test_execute_encoder_dp_items_reconstructs_global_output():
 
     def allgather(tensor, rank_row_counts):
         assert rank_row_counts == [1, 4]
-        assert tensor.shape == (1, 1)
-        return torch.cat([tensor, peer_output])
+        torch.testing.assert_close(tensor, gathered[:1])
+        return gathered
 
     output = execute_encoder_dp_items(
         costs,
@@ -117,8 +117,13 @@ def test_execute_encoder_dp_items_reconstructs_global_output():
     )
 
     assert encoded_indices == [1]
+    assert [item.storage_offset() for item in output] == [1, 0, 3]
+    assert all(
+        item.untyped_storage().data_ptr() == gathered.untyped_storage().data_ptr()
+        for item in output
+    )
     torch.testing.assert_close(
-        output,
+        torch.cat(output),
         torch.tensor([[10.0], [10.0], [20.0], [30.0], [30.0]]),
     )
 
@@ -169,7 +174,7 @@ def test_execute_encoder_dp_items_keeps_empty_rank_in_collectives():
         empty_output=torch.empty((0, 1)),
     )
 
-    torch.testing.assert_close(output, peer_contribution)
+    torch.testing.assert_close(output, (peer_contribution,))
     assert statuses == [EncoderDpStatus.OK]
     assert collective_dtypes == [torch.float32]
 

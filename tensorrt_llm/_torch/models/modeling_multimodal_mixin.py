@@ -588,7 +588,7 @@ class MultimodalModelMixin:
         self,
         multimodal_params: Sequence[MultimodalParams],
         **encoder_kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run encoder work with optional runtime instrumentation after H2D."""
         if self._encoder_forward_context is None:
             return self._encode_multimodal_inputs_dp(multimodal_params, **encoder_kwargs)
@@ -814,6 +814,8 @@ class MultimodalModelMixin:
             embeddings = self._encode_multimodal_input_runs_dp(
                 param_runs, prepared_runs=True, transfer_local_inputs=transfer_local_inputs
             )
+            if isinstance(embeddings, tuple):
+                return list(embeddings)
             lengths = [rows for _, item_rows, _ in encoder_inputs for rows in item_rows]
             return list(torch.split(embeddings, lengths, dim=0))
 
@@ -833,14 +835,17 @@ class MultimodalModelMixin:
                 )
             else:
                 embeddings = self._run_multimodal_encoder(group_params)
-            expected_length = sum(group_lengths)
-            if embeddings.shape[0] != expected_length:
-                raise MultimodalEncoderContractError(
-                    f"MM encoder output length {embeddings.shape[0]} does not "
-                    f"match the {expected_length} rows declared by the "
-                    "selected items"
-                )
-            outputs.extend(torch.split(embeddings, group_lengths, dim=0))
+            if isinstance(embeddings, tuple):
+                outputs.extend(embeddings)
+            else:
+                expected_length = sum(group_lengths)
+                if embeddings.shape[0] != expected_length:
+                    raise MultimodalEncoderContractError(
+                        f"MM encoder output length {embeddings.shape[0]} does not "
+                        f"match the {expected_length} rows declared by the "
+                        "selected items"
+                    )
+                outputs.extend(torch.split(embeddings, group_lengths, dim=0))
             group_params.clear()
             group_lengths.clear()
 
@@ -973,7 +978,7 @@ class MultimodalModelMixin:
         self,
         multimodal_params: Sequence[MultimodalParams],
         **encoder_kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run the model encoder, splitting items between encoder DP replicas."""
         params = list(multimodal_params)
         if not self.encoder_parallel_layout.distributes_items:
@@ -987,7 +992,7 @@ class MultimodalModelMixin:
         prepared_runs: bool = False,
         transfer_local_inputs: Callable[[Iterable[MultimodalParams]], None] | None = None,
         **encoder_kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Place every run in one step and gather their combined output once."""
         items: list[tuple[MultimodalParams, int | None]] = []
         costs: list[int] = []
@@ -1068,7 +1073,7 @@ class MultimodalModelMixin:
                 if encoder_context is not None:
                     encoder_scope.enter_context(encoder_context())
 
-            return execute_encoder_dp_items(
+            outputs = execute_encoder_dp_items(
                 costs,
                 row_counts,
                 layout=layout,
@@ -1078,6 +1083,17 @@ class MultimodalModelMixin:
                 empty_output=empty_output,
                 on_prepared=start_encoder_timer if encoder_context is not None else None,
             )
+
+        # An unsplittable request occupies one DP slot. The cache and
+        # scheduler still consume one view per logical item.
+        item_outputs: list[torch.Tensor] = []
+        for (param, index), output in zip(items, outputs, strict=True):
+            if index is None:
+                _, lengths = param.get_item_layout()
+                item_outputs.extend(output.split(lengths, dim=0))
+            else:
+                item_outputs.append(output)
+        return tuple(item_outputs) if item_outputs else empty_output
 
     @property
     def encoder_cache_active(self) -> bool:
@@ -1853,10 +1869,8 @@ class MultimodalModelMixin:
         """Encode only the miss items of each partial-hit param and stitch results.
 
         Miss residuals from all partial-hit params in the batch are encoded in a
-        single call and the concatenated output is split back per param, mirroring
-        how `get_multimodal_embeddings` batches full-miss params. After this returns,
-        each param's `multimodal_embedding` has the same shape as a full encoder run
-        so downstream `get_multimodal_embeddings` treats it as fully cached.
+        single call, mirroring how `get_multimodal_embeddings` batches full misses.
+        Attach each request's hit and miss rows in prompt order.
         """
         if not partials:
             return
@@ -1876,8 +1890,11 @@ class MultimodalModelMixin:
         # Keep one call across requests and modalities so EncoderGroup can
         # batch modalities that share an encoder.
         batched_output = self._run_multimodal_encoder([param for param, _, _ in encoder_inputs])
-        output_lengths = [length for _, lengths, _ in encoder_inputs for length in lengths]
-        encoded_items = iter(torch.split(batched_output, output_lengths, dim=0))
+        if isinstance(batched_output, tuple):
+            encoded_items = iter(batched_output)
+        else:
+            output_lengths = [length for _, lengths, _ in encoder_inputs for length in lengths]
+            encoded_items = iter(torch.split(batched_output, output_lengths, dim=0))
 
         for param, partition in partials:
             miss_tensors = [next(encoded_items) for _ in partition.miss_indices]
@@ -1885,6 +1902,8 @@ class MultimodalModelMixin:
             by_item: Dict[int, torch.Tensor] = dict(partition.hits)
             for miss_idx, tensor in zip(partition.miss_indices, miss_tensors, strict=True):
                 by_item[miss_idx] = tensor
+            # Keep only this request's rows alive across chunks, regardless of
+            # the lifetime of the other requests that shared the miss gather.
             param.multimodal_data["multimodal_embedding"] = _assemble_multimodal_encoder_embeddings(
                 by_item, len(partition.keys)
             )
@@ -1916,23 +1935,28 @@ class MultimodalModelMixin:
             return
 
         embedding = param.multimodal_data.get("multimodal_embedding")
+        _, embedding_lengths = param.get_item_layout()
         if isinstance(embedding, list):
-            embedding = torch.cat(embedding, dim=0)
-            param.multimodal_data["multimodal_embedding"] = embedding
-        if not isinstance(embedding, torch.Tensor):
+            if [piece.shape[0] for piece in embedding] != list(embedding_lengths):
+                embedding = torch.cat(embedding, dim=0)
+                param.multimodal_data["multimodal_embedding"] = embedding
+        if isinstance(embedding, list):
+            item_embeddings = embedding
+        elif not isinstance(embedding, torch.Tensor):
             logger.debug(
                 f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping write because no tensor embedding was "
                 "attached after encoder execution."
             )
             return
 
-        _, embedding_lengths = param.get_item_layout()
-        if sum(embedding_lengths) != embedding.shape[0]:
+        elif sum(embedding_lengths) != embedding.shape[0]:
             logger.debug(
                 f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping write because embedding row count "
                 "does not match multimodal_embedding_lengths."
             )
             return
+        else:
+            item_embeddings = torch.split(embedding, embedding_lengths, dim=0)
 
         # Encoder outputs are concatenated per params object. Splitting by item length lets future
         # requests reuse matching items independently, even when their request-level item order
@@ -1941,7 +1965,7 @@ class MultimodalModelMixin:
         rejected_entries = 0
         for key, item_embedding in zip(
             keys,
-            torch.split(embedding, embedding_lengths, dim=0),
+            item_embeddings,
             strict=True,
         ):
             if encoder_cache.put(key, item_embedding):
@@ -1950,7 +1974,7 @@ class MultimodalModelMixin:
                 rejected_entries += 1
         logger.debug(
             f"{_MM_ENCODER_CACHE_LOG_NAME}: wrote {inserted_entries} item entries, "
-            f"rejected={rejected_entries}, rows={embedding.shape[0]}."
+            f"rejected={rejected_entries}, rows={sum(embedding_lengths)}."
         )
         encoder_cache.log_stats("multimodal encoder cache write.")
 
@@ -1995,7 +2019,7 @@ class MultimodalModelMixin:
 
     @staticmethod
     def _validate_embeddings(
-        embeddings: list[torch.Tensor],
+        embeddings: list[torch.Tensor] | tuple[torch.Tensor, ...],
         multimodal_params: Sequence[MultimodalParams],
         *,
         current_chunk_only: bool = False,
@@ -2007,13 +2031,12 @@ class MultimodalModelMixin:
         Skipped if any param lacks `multimodal_runtime.total_embeds_in_request`, since the contract
         cannot be evaluated without complete metadata.
         """
-        if len(embeddings) != 1:
+        if isinstance(embeddings, list) and len(embeddings) != 1:
             raise ValueError(
                 f"MultimodalModelMixin requires a single embedding tensor, got {len(embeddings)} "
                 "tensors."
             )
 
-        embeddings_tensor = embeddings[0]
         expected_rows = 0
         has_runtime_metadata = []
         for param in multimodal_params:
@@ -2038,7 +2061,7 @@ class MultimodalModelMixin:
             )
             return
 
-        actual_rows = embeddings_tensor.shape[0]
+        actual_rows = sum(embedding.shape[0] for embedding in embeddings)
         if actual_rows != expected_rows:
             raise ValueError(
                 f"Multimodal embedding row count mismatch: expected {expected_rows}, got {actual_rows}."
@@ -2174,8 +2197,13 @@ def _dispatch_cross_iter_prefetch(
                 if partial_hits and encoder_cache is not None:
                     model._encode_with_partial_cache(partial_hits, encoder_cache)
                 if cache_misses:
-                    encoder_output = model._run_multimodal_encoder(cache_misses).clone()
-                    _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
+                    encoder_output = model._run_multimodal_encoder(cache_misses)
+                    _store_chunked_prefill_embeddings(
+                        cache_misses,
+                        [encoder_output.clone()]
+                        if isinstance(encoder_output, torch.Tensor)
+                        else encoder_output,
+                    )
                     if encoder_cache is not None:
                         for param in cache_misses:
                             model._write_encoder_cache_entries(param, encoder_cache)
@@ -2184,9 +2212,12 @@ def _dispatch_cross_iter_prefetch(
             # independently instead of gathering the unused batch output with `torch.cat`.
             for param in params_list:
                 embedding = param.multimodal_data.get("multimodal_embedding")
-                if not isinstance(embedding, torch.Tensor):
+                if isinstance(embedding, list):
+                    model._validate_embeddings(tuple(embedding), [param])
+                elif isinstance(embedding, torch.Tensor):
+                    model._validate_embeddings([embedding], [param])
+                else:
                     raise ValueError("Multimodal encoder prefetch did not produce an embedding.")
-                model._validate_embeddings([embedding], [param])
     finally:
         # Stash the event on every candidate's durable LlmRequest (not the
         # per-iter `MultimodalParams`), since `_prepare_inputs` rebuilds the

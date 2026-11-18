@@ -2505,7 +2505,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         """The encoder entry of ``forward``.
 
         With encoder DP, the shared entry splits the items between replicas
-        and returns one prompt-ordered tensor. Otherwise the legacy encoder
+        and returns prompt-ordered item views. Otherwise the legacy encoder
         returns one tensor per modality. ``get_multimodal_embeddings`` takes
         both.
         """

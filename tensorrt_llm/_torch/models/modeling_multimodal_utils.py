@@ -316,7 +316,7 @@ def needs_multimodal_encoder(
 
 def _store_chunked_prefill_embeddings(
     multimodal_params: List[MultimodalParams],
-    embeddings: List[torch.Tensor],
+    embeddings: List[torch.Tensor] | tuple[torch.Tensor, ...],
 ) -> None:
     """
     Store computed multimodal embeddings back to multimodal_data to avoid recomputation.
@@ -324,6 +324,32 @@ def _store_chunked_prefill_embeddings(
     NOTE: this function only stores multimodal embeddings within the current request context,
     mostly for chunked prefill. It does not persist embeddings across different requests or sessions.
     """
+    if isinstance(embeddings, tuple):
+        # DP returns prompt-ordered item views of an owned allgather buffer.
+        request_embeddings: list[torch.Tensor | list[torch.Tensor]] = []
+        offset = 0
+        for param in multimodal_params:
+            metadata = param.item_metadata
+            assert metadata is not None
+            count = len(metadata.item_refs)
+            pieces = list(embeddings[offset:offset + count])
+            runtime = param.multimodal_runtime
+            assert runtime is not None
+            assert sum(piece.shape[0]
+                       for piece in pieces) == runtime.total_embeds_in_request
+            if len(pieces) <= 1:
+                request_embeddings.append(
+                    pieces[0] if pieces else embeddings[0][:0])
+            else:
+                request_embeddings.append(pieces)
+            offset += count
+        assert offset == len(embeddings)
+        for param, embedding in zip(multimodal_params,
+                                    request_embeddings,
+                                    strict=True):
+            param.multimodal_data["multimodal_embedding"] = embedding
+        return
+
     # TODO: support multiple multimodal modalities per request
     if len(embeddings) > 1:
         raise ValueError("Multiple modalities caching is not supported yet.")
@@ -375,10 +401,26 @@ def _normalize_encoder_embeddings(
     return encoder_embeddings
 
 
-def _join_embeddings(embeddings: List[torch.Tensor],
-                     *,
-                     start: int = 0,
-                     end: Optional[int] = None) -> torch.Tensor:
+def _slice_embeddings(embeddings: List[torch.Tensor], start: int,
+                      end: int | None) -> List[torch.Tensor]:
+    """Select a row range across pieces without copying rows."""
+    slices = []
+    offset = 0
+    for embedding in embeddings:
+        segment_end = offset + embedding.shape[0]
+        slice_end = segment_end if end is None else min(end, segment_end)
+        if max(start, offset) < slice_end:
+            slices.append(embedding[max(start - offset, 0):slice_end - offset])
+        offset = segment_end
+        if end is not None and offset >= end:
+            break
+    return slices or [embeddings[0][:0]]
+
+
+def _concat_embeddings(embeddings: List[torch.Tensor],
+                       *,
+                       start: int = 0,
+                       end: Optional[int] = None) -> torch.Tensor:
     """Join per-item/per-request embeddings along dim 0 without a needless copy.
 
     ``torch.cat`` always allocates, so calling it on a one-element list
@@ -388,25 +430,10 @@ def _join_embeddings(embeddings: List[torch.Tensor],
     full extra allocation live at the prefill peak. Multimodal embeddings are
     read-only downstream -- they are sliced and scattered into the input
     embedding buffer, never written in place -- so returning the sole tensor
-    is equivalent to concatenating it. If a row range is given, slice each
-    segment first so rows outside the current prefill chunk are never copied.
+    is equivalent to concatenating it.
     """
-    if start != 0 or end is not None:
-        slices = []
-        offset = 0
-        for embedding in embeddings:
-            segment_end = offset + embedding.shape[0]
-            slice_end = segment_end if end is None else min(end, segment_end)
-            if max(start, offset) < slice_end:
-                slices.append(embedding[max(start - offset, 0):slice_end -
-                                        offset])
-            offset = segment_end
-            if end is not None and offset >= end:
-                break
-        if not slices:
-            return embeddings[0][:0]
-        embeddings = slices
-
+    if start or end is not None:
+        embeddings = _slice_embeddings(embeddings, start, end)
     return embeddings[0] if len(embeddings) == 1 else torch.cat(embeddings,
                                                                 dim=0)
 
@@ -414,7 +441,7 @@ def _join_embeddings(embeddings: List[torch.Tensor],
 def get_multimodal_embeddings(
     encoder_forward_fn: Callable[
         ...,
-        torch.Tensor | List[torch.Tensor],
+        torch.Tensor | List[torch.Tensor] | tuple[torch.Tensor, ...],
     ],
     multimodal_params: List[MultimodalParams],
     encoder_kwargs: Optional[Dict[str, Any]] = None,
@@ -431,7 +458,8 @@ def get_multimodal_embeddings(
     Args:
         encoder_forward_fn: Callable that performs encoder forward pass.
                            Should accept List[MultimodalParams] and return either
-                           a single torch.Tensor or List[torch.Tensor].
+                           a tensor, a list of modality tensors, or a tuple of
+                           encoder DP item views in prompt order.
         multimodal_params: All multimodal parameters in the batch.
         encoder_kwargs: Optional kwargs to pass to encoder_forward_fn.
     Returns:
@@ -465,12 +493,14 @@ def get_multimodal_embeddings(
     # Step 2: Run encoder forward only on uncached parameters
     if uncached_multimodal_params:
         kwargs = encoder_kwargs or {}
-        encoder_embeddings = encoder_forward_fn(uncached_multimodal_params,
-                                                **kwargs)
-        encoder_embeddings = _normalize_encoder_embeddings(encoder_embeddings)
+        output = encoder_forward_fn(uncached_multimodal_params, **kwargs)
+        if isinstance(output, tuple) and not output:
+            raise ValueError("Encoder DP item views must be nonempty.")
+        encoder_embeddings = (output if isinstance(output, tuple) else
+                              _normalize_encoder_embeddings(output))
 
         # TODO: support multiple multimodal modalities per request
-        if len(encoder_embeddings) > 1:
+        if isinstance(encoder_embeddings, list) and len(encoder_embeddings) > 1:
             logger.warning(
                 f"Multiple modalities caching is not supported yet. "
                 f"encoder returned {len(encoder_embeddings)} embeddings "
@@ -488,6 +518,11 @@ def get_multimodal_embeddings(
             logger.warning(
                 "Multimodal runtime data missing or incomplete, will not cache embeddings."
             )
+            if isinstance(encoder_embeddings, tuple):
+                return [
+                    encoder_embeddings[0] if len(encoder_embeddings) == 1 else
+                    torch.cat(encoder_embeddings, dim=0)
+                ]
             return encoder_embeddings
 
         # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"].
@@ -495,7 +530,8 @@ def get_multimodal_embeddings(
         # with the enclosing ModelCaller scope, while chunked prefill reads the
         # cached rows in later iterations, so cache an owned copy instead of
         # views of the encoder output.
-        encoder_embeddings = [encoder_embeddings[0].clone()]
+        if isinstance(encoder_embeddings, list):
+            encoder_embeddings = [encoder_embeddings[0].clone()]
         _store_chunked_prefill_embeddings(uncached_multimodal_params,
                                           encoder_embeddings)
 
@@ -534,21 +570,25 @@ def get_attached_multimodal_embeddings(
             start = runtime.num_cached_mm_tokens
             end = start + runtime.num_mm_tokens_in_chunk
             if isinstance(embeds, list):
-                embeds = _join_embeddings(embeds, start=start, end=end)
+                embeds = _slice_embeddings(embeds, start, end)
             else:
                 embeds = embeds[start:end]
-        elif isinstance(embeds, list):
-            # Legacy paths can attach a list of full-request output pieces.
-            embeds = _join_embeddings(embeds)
-            param.multimodal_data["multimodal_embedding"] = embeds
-        if not isinstance(embeds, torch.Tensor):
+        if isinstance(embeds, list):
+            if not all(isinstance(piece, torch.Tensor) for piece in embeds):
+                raise TypeError("multimodal_embedding must contain tensors")
+            attached_embeddings.extend(embeds)
+        elif isinstance(embeds, torch.Tensor):
+            attached_embeddings.append(embeds)
+        else:
             raise TypeError("multimodal_embedding must be a torch.Tensor")
-        attached_embeddings.append(embeds)
 
     if not attached_embeddings:
         return []
-    # Match get_multimodal_embeddings output: one concatenated tensor.
-    return [_join_embeddings(attached_embeddings)]
+    embedding = _concat_embeddings(attached_embeddings)
+    if len(multimodal_params) == 1 and not current_chunk_only:
+        # Reuse the dense result on later prefill chunks of this request.
+        multimodal_params[0].multimodal_data["multimodal_embedding"] = embedding
+    return [embedding]
 
 
 def find_input_mm_embeds(
@@ -635,7 +675,7 @@ def find_input_mm_embeds(
 
     if len(mm_embeds) == 1:
         sliced = [mm_embeds[0][start:end] for start, end in slices]
-        return [_join_embeddings(sliced)]
+        return [_concat_embeddings(sliced)]
     return [mm_embeds[i][start:end] for i, (start, end) in enumerate(slices)]
 
 
@@ -744,7 +784,7 @@ def fuse_input_embeds(
             return input_ids, None, extra_embeds
         return input_ids, None
 
-    mm_embed = _join_embeddings(mm_embeds)
+    mm_embed = _concat_embeddings(mm_embeds)
 
     # TODO: support the case where only one index tensor is provided, the other is derived as the complement (try to avoid implicit host-device synchronization)
     if text_token_indices is None or mm_token_indices is None:

@@ -26,7 +26,7 @@ for reconstruction.
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
-from itertools import accumulate, pairwise
+from itertools import accumulate
 from typing import TYPE_CHECKING, Callable, Iterator, Sequence
 
 import torch
@@ -181,7 +181,7 @@ def execute_encoder_dp_items(
     allgather: Callable[[torch.Tensor, list[int]], torch.Tensor],
     empty_output: torch.Tensor,
     on_prepared: Callable[[], None] | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, ...]:
     """Place, run, and reorder atomic multimodal encoder items.
 
     Every rank derives the same plan from ``costs`` (physical encoder input
@@ -198,7 +198,7 @@ def execute_encoder_dp_items(
     including zero rows. When supplied, ``on_prepared`` runs on every rank
     after local input preparation and before encoding.
 
-    Returns one dense tensor with each item's ``row_counts`` rows, in item order.
+    Returns an output view for each item, in item order.
     """
 
     def prepare() -> tuple[tuple[int, ...], list[int], Callable[[], torch.Tensor] | None]:
@@ -233,19 +233,13 @@ def execute_encoder_dp_items(
     rank_row_counts = [0] * layout.dp_size
     for rank, rows in zip(ranks, row_counts, strict=True):
         rank_row_counts[rank] += rows
-    if not sum(rank_row_counts):
-        return local_output
-
-    gathered = allgather(local_output, rank_row_counts)
-    if all(left <= right for left, right in pairwise(ranks)):
-        # Rank order already matches item order; avoid another full-size copy.
-        return gathered
+    gathered = allgather(local_output, rank_row_counts) if sum(rank_row_counts) else empty_output
     rank_row_starts = list(accumulate(rank_row_counts, initial=0))
     ordered_outputs = []
     for rank, rows in zip(ranks, row_counts, strict=True):
         ordered_outputs.append(gathered[rank_row_starts[rank] : rank_row_starts[rank] + rows])
         rank_row_starts[rank] += rows
-    return torch.cat(ordered_outputs, dim=0)
+    return tuple(ordered_outputs)
 
 
 _PAYLOAD_ALIGNMENT = 256
