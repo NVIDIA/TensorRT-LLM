@@ -1173,8 +1173,9 @@ class S4WorkerMixin:
         draft_step=None,
         mapping_lm_head_tp=None,
         out=None,
+        vocab_sharded=None,
     ):
-        # The chain's tokens answer the block form only; ``out`` belongs to the step form.
+        # The chain's tokens answer the block form only; ``out`` and ``vocab_sharded`` belong to the step form.
         tokens = self._s4_tokens
         if tokens is not None and logits.dim() == 3 and tokens.shape == logits.shape[:2]:
             self._s4_tokens = None
@@ -1187,4 +1188,5 @@ class S4WorkerMixin:
             draft_step=draft_step,
             mapping_lm_head_tp=mapping_lm_head_tp,
             out=out,
+            vocab_sharded=vocab_sharded,
         )
