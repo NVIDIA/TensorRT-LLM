@@ -18,7 +18,7 @@ A MoE layer on the generic path (a step the target's decode path, its ``decode_m
    over this rank's experts and intermediate slice; above ``moe_max_num_tokens`` tokens in even chunks;
 5. the latent all-reduce over the TP group, the latent RMSNorm and the latent up projection (3584 -> 7168);
 6. beside 2-5, on the auxiliary stream while a CUDA graph is captured: the shared experts (gate_up GEMM,
-   ``activation/situ_and_mul``, down GEMM and its all-reduce);
+   ``activation/k3_situ_and_mul``, down GEMM and its all-reduce);
 7. the sum of the two.
 
 These are the kernels and the order of the built-in ``ConfigurableMoE`` + ``TRTLLMGenFusedMoE`` + ``GatedMLP`` block
@@ -48,8 +48,8 @@ from tensorrt_llm._torch.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.mxfp8_quantize import mxfp8_quantize
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import engine_settings as _engine_settings
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl import environment as _environment
-from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.activation.situ_and_mul import (
-    situ_and_mul,
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.activation.k3_situ_and_mul import (
+    k3_situ_and_mul,
 )
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import K3AllReduce
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.dsv3_fused_a_gemm import (
@@ -791,7 +791,7 @@ class KimiK3GatedMLP(nn.Module):
 
     def _apply_activation(self, x: torch.Tensor) -> torch.Tensor:
         """SiTU on the ``[gate | up]`` halves of the last dimension."""
-        out = situ_and_mul(x.reshape(-1, x.shape[-1]), *self.situ_betas)
+        out = k3_situ_and_mul(x.reshape(-1, x.shape[-1]), *self.situ_betas)
         return out.reshape(*x.shape[:-1], x.shape[-1] // 2)
 
     def forward(self, x: torch.Tensor, final_all_reduce_params=None) -> torch.Tensor:

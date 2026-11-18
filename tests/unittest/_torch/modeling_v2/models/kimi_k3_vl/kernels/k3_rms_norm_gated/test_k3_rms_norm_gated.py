@@ -14,8 +14,8 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.modules.mamba.layernorm_gated  # noqa: F401  (registers the comparison op)
-from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.rms_norm_gated_token_major import (
-    rms_norm_gated_token_major,
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.k3_rms_norm_gated_token_major import (
+    k3_rms_norm_gated_token_major,
 )
 
 assert torch.cuda.is_available(), "k3_rms_norm_gated_token_major requires a CUDA device"
@@ -45,8 +45,8 @@ def _inputs(cell):
 
 @pytest.mark.parametrize(
     "cell",
-    rms_norm_gated_token_major.CELLS,
-    ids=[c.why[:40] for c in rms_norm_gated_token_major.CELLS],
+    k3_rms_norm_gated_token_major.CELLS,
+    ids=[c.why[:40] for c in k3_rms_norm_gated_token_major.CELLS],
 )
 def test_bitwise_equal_to_builtin_op(cell) -> None:
     args = _inputs(cell)

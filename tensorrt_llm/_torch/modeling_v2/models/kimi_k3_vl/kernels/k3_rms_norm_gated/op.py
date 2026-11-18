@@ -23,11 +23,10 @@ process. Only what that op runs is copied: the token-major multi-row path and it
 """
 
 import functools
+import os
 
 import torch
 import triton
-
-from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 from .k3_rms_norm_gated_kernel import (
     _layer_norm_fwd_1pass_kernel,
@@ -51,7 +50,7 @@ def _pdl_device_policy(device_index: int) -> tuple[bool, int]:
     """Whether PDL is allowed on this device, and its SM count."""
     props = torch.cuda.get_device_properties(device_index)
     sm_version = props.major * 10 + props.minor
-    allowed = sm_version >= 90 and get_env_enable_pdl()
+    allowed = sm_version >= 90 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     return allowed, props.multi_processor_count
 
 

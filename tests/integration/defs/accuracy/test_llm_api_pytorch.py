@@ -318,9 +318,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                     acceptance_length,
                 )
 
-    @skip_no_rubin
     @pytest.mark.skip_less_device_memory(60000)
-    def test_nvfp4_mla(self, monkeypatch):
+    @pytest.mark.parametrize("enable_chunked_prefill", [False, True],
+                             ids=["unchunked", "chunked"])
+    def test_nvfp4_mla(self, monkeypatch: pytest.MonkeyPatch,
+                       enable_chunked_prefill: bool) -> None:
+        from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+            _fp4_mla_attention_backend, fp4_mla_generation_backend_supported)
+        if not fp4_mla_generation_backend_supported(
+                get_sm_version(), _fp4_mla_attention_backend()):
+            pytest.skip("requires a supported FP4 MLA generation backend")
         from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import \
             Fp4MlaFmha
         from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import \
@@ -339,7 +346,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
                 attn_backend="TRTLLM",
                 kv_cache_config=kv_cache_config,
-                enable_chunked_prefill=False,
+                enable_chunked_prefill=enable_chunked_prefill,
+                cuda_graph_config=CudaGraphConfig(),
                 max_num_tokens=8192,
                 max_batch_size=1350,
         ) as llm:
@@ -2608,6 +2616,57 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             assert_acceptance_length(
                 f"TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp{tp_size}]",
                 acceptance_length)
+
+    @DEEPSEEKV4_PARALLELISM
+    def test_gsm8k_megamoe_deepgemm_draft_len_schedule(self, tp_size,
+                                                       attention_dp):
+        """GSM8K under a schedule that trims, then turns off, verified drafts.
+
+        The evaluation submits every sample up front, so each attention-DP
+        rank first runs full batches without speculation and then passes
+        through the shorter and the full draft length as it drains, out of
+        step with its peers.
+        """
+        _skip_unless_deepseekv4_4gpu_memory(
+            tp_size,
+            min_device_memory_for_4gpus=DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        schedule = {32: 5, 96: 3}
+        spec_config = DSparkDecodingConfig(max_draft_len=5,
+                                           draft_len_schedule=schedule,
+                                           speculative_model=self.MODEL_PATH)
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=tp_size,
+                 enable_attention_dp=attention_dp,
+                 moe_config=MoeConfig(backend="MEGAMOE_DEEPGEMM"),
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=True,
+                 custom_tokenizer="deepseek_v4",
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            # The schedule decides how many steps speculate, so the acceptance
+            # length has no fixed floor; this still requires that some did.
+            acceptance_length = compute_acceptance_length(llm)
+            print(f"[AL] draft_len_schedule[dp{tp_size}] "
+                  f"acceptance_length = {acceptance_length:.3f}")
 
     @pytest.mark.skip_less_device_memory(DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
     @pytest.mark.skip_less_mpi_world_size(4)

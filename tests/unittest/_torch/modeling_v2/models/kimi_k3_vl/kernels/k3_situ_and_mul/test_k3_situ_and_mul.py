@@ -12,8 +12,8 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.modules.situ  # noqa: F401  (registers trtllm::situ_and_mul, the comparison)
-from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.activation.situ_and_mul import (
-    situ_and_mul,
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.activation.k3_situ_and_mul import (
+    k3_situ_and_mul,
 )
 
 assert torch.cuda.is_available(), "k3_situ_and_mul requires a CUDA device"
@@ -41,7 +41,9 @@ def _input(cell) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("pdl", ("1", "0"))
-@pytest.mark.parametrize("cell", situ_and_mul.CELLS, ids=[c.why[:40] for c in situ_and_mul.CELLS])
+@pytest.mark.parametrize(
+    "cell", k3_situ_and_mul.CELLS, ids=[c.why[:40] for c in k3_situ_and_mul.CELLS]
+)
 def test_bitwise_equal_to_builtin_op(cell, pdl, monkeypatch) -> None:
     monkeypatch.setenv("TRTLLM_ENABLE_PDL", pdl)
     x = _input(cell)

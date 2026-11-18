@@ -554,6 +554,12 @@ class KimiK3DSparkWorker(DSparkWorker):
         ):
             # New buffers clear request slots; seed them before generation.
             spec_metadata.prepare()
+        if (
+            self._ctx_unified_cache
+            and spec_metadata.is_cuda_graph
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            self._reseed_warmup_generation_slots(spec_metadata)
         # A decode step of the supported mode runs the acceptance and the drafter's inputs as one kernel
         # (trtllm::k3_spec_accept), which also decodes the block table below.
         if shard is None:
@@ -1271,6 +1277,7 @@ class KimiK3DSparkWorker(DSparkWorker):
         draft_step=None,
         mapping_lm_head_tp=None,
         out=None,
+        vocab_sharded=None,
     ):
         """Greedy block drafts straight from ``k3_markov``.
 
@@ -1298,6 +1305,7 @@ class KimiK3DSparkWorker(DSparkWorker):
             draft_step=draft_step,
             mapping_lm_head_tp=mapping_lm_head_tp,
             out=out,
+            vocab_sharded=vocab_sharded,
         )
 
     def _prepare_next_new_tokens(

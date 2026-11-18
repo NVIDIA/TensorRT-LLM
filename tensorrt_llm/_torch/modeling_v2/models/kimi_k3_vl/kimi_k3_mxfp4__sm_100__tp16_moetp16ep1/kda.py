@@ -5,7 +5,7 @@
 Every step runs operations of this family and target:
 
 * prefill: the fused ``[q | k | v | g]`` projection, ``ssm/kda_prefill_conv`` (conv + SiLU), ``ssm/kda_prefill`` on
-  the indexed fp32 state pool, the gated output norm (``norm/rms_norm_gated_token_major``);
+  the indexed fp32 state pool, the gated output norm (``norm/k3_rms_norm_gated_token_major``);
 * decode of one token per request: ``ssm/k3_kda_decode_attn`` (projection fused in) on the decode branch, else
   ``ssm/kda_decode`` after the fused projection;
 * inside a breakable CUDA graph, the same core as one eager break (``graph/eager_on_graph``).
@@ -30,8 +30,8 @@ from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import sm_reserve
 from tensorrt_llm._torch.modeling_v2.catalog.graph.eager_on_graph import eager_on_graph
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_allreduce import K3AllReduce
-from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
-    rms_norm_gated_token_major,
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.k3_rms_norm_gated_token_major import (  # noqa: E501
+    k3_rms_norm_gated_token_major,
 )
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import K3KdaBuffers
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_decode_attn import (
@@ -84,7 +84,8 @@ class _ConvTaps(nn.Module):
 
 
 class _GatedNormWeight(nn.Module):
-    """The gated output norm's ``weight`` [head_dim] and ``eps`` (the norm is ``norm/rms_norm_gated_token_major``)."""
+    """The gated output norm's ``weight`` [head_dim] and ``eps`` (the norm is
+    ``norm/k3_rms_norm_gated_token_major``)."""
 
     def __init__(self, dim: int, eps: float) -> None:
         super().__init__()
@@ -595,8 +596,8 @@ class K3DecodeKDA(nn.Module):
         return bfa[..., hd : hd + self.num_heads], F.linear(bfa[..., :hd], self.f_b_proj.weight)
 
     def _output_gate(self, o: torch.Tensor, onorm_g: torch.Tensor) -> torch.Tensor:
-        """``rmsnorm(o) * weight * sigmoid(onorm_g)`` per head row (``norm/rms_norm_gated_token_major``)."""
-        return rms_norm_gated_token_major(
+        """``rmsnorm(o) * weight * sigmoid(onorm_g)`` per head row (``norm/k3_rms_norm_gated_token_major``)."""
+        return k3_rms_norm_gated_token_major(
             o.reshape(-1, self.head_dim),
             onorm_g.reshape(-1, self.num_heads, self.head_dim),
             self.o_norm.weight,

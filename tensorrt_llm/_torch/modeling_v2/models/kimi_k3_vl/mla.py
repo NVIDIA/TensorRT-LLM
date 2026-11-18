@@ -97,6 +97,8 @@ _POSITION_EMBEDDING_ROPE_GPT_NEOX = 2
 _MASK_PADDING, _MASK_CAUSAL = 0, 1
 _CONTEXT, _GENERATION = 1, 2
 _QUANT_MODE_BF16_KV = 0
+# Rows of a KV expansion from which kv_b runs per head into the strided K buffer (the built-in MLA's threshold).
+_MIN_STRIDED_KV_EXPAND_TOKENS = 4096
 # tensorrt_llm.runtime.kv_cache_manager_v2.BAD_PAGE_INDEX: an unassigned page-table entry.
 _BAD_PAGE_INDEX = -1
 
@@ -724,23 +726,10 @@ class K3DecodeMLA(nn.Module):
     ) -> None:
         """K / V of the prompt from its latent rows: kv_b per head with the K rows written straight into the
         strided K buffer (its rope half is left for the attention op, which takes k_pe from ``latent_cache``) and
-        the V rows into the V half of a [k_nope | v] buffer, whose row stride the context kernel assumes."""
-        heads, nope, v_dim, kv = (
-            self.num_heads_tp,
-            self.qk_nope_head_dim,
-            self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        t = compressed_kv.shape[0]
+        the V rows into a V buffer of their own."""
+        heads = self.num_heads_tp
         k = torch.empty_like(q).view(-1, heads, self.qk_head_dim)
-        w = self.kv_b_proj.weight
-        w_k = w[: heads * nope].view(heads, nope, kv)
-        w_v = w[heads * nope :].view(heads, v_dim, kv)
-        ckv = compressed_kv.unsqueeze(0).expand(heads, t, kv)
-        kv_buf = torch.empty(t, heads * (nope + v_dim), dtype=q.dtype, device=q.device)
-        v = kv_buf[:, heads * nope :]
-        bmm_out(ckv, w_k.transpose(1, 2), k[..., :nope].transpose(0, 1))
-        bmm_out(ckv, w_v.transpose(1, 2), v.unflatten(-1, (heads, v_dim)).transpose(0, 1))
+        v = self._expand_kv_strided(compressed_kv, k)
         self._thop(
             md,
             rope,
@@ -783,10 +772,41 @@ class K3DecodeMLA(nn.Module):
             quant_mode=_QUANT_MODE_BF16_KV,
         )
 
+    def _expand_kv_strided(self, compressed_kv: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        """kv_b per head: K's non-rope columns written into ``k`` [n, heads, 192] in place, and V [n, heads * 128]
+        returned in a buffer of its own."""
+        heads, nope, v_dim, kv = (
+            self.num_heads_tp,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        t = compressed_kv.shape[0]
+        w = self.kv_b_proj.weight
+        w_k = w[: heads * nope].view(heads, nope, kv)
+        w_v = w[heads * nope :].view(heads, v_dim, kv)
+        ckv = compressed_kv.unsqueeze(0).expand(heads, t, kv)
+        v = torch.empty(t, heads * v_dim, dtype=k.dtype, device=k.device)
+        bmm_out(ckv, w_k.transpose(1, 2), k[..., :nope].transpose(0, 1))
+        bmm_out(ckv, w_v.transpose(1, 2), v.unflatten(-1, (heads, v_dim)).transpose(0, 1))
+        return v
+
     def _expand_kv(self, compressed_kv: torch.Tensor, k_pe: torch.Tensor):
-        """``(K [n, heads * 192], V [n, heads * 128] view)`` of latent rows: kv_b, then k_pe broadcast to every
-        head."""
+        """``(K [n, heads * 192], V [n, heads * 128])`` of latent rows: kv_b, then k_pe broadcast to every head.
+        From ``_MIN_STRIDED_KV_EXPAND_TOKENS`` rows on, kv_b runs per head into the K buffer; below it one wide
+        GEMM is faster than two launches per head."""
         heads, nope, v_dim = self.num_heads_tp, self.qk_nope_head_dim, self.v_head_dim
+        if compressed_kv.shape[0] >= _MIN_STRIDED_KV_EXPAND_TOKENS:
+            k = torch.empty(
+                compressed_kv.shape[0],
+                heads,
+                self.qk_head_dim,
+                dtype=compressed_kv.dtype,
+                device=compressed_kv.device,
+            )
+            v = self._expand_kv_strided(compressed_kv, k)
+            k[..., nope:] = k_pe.view(-1, 1, self.qk_rope_head_dim)
+            return k.view(-1, heads * self.qk_head_dim), v
         kv = F.linear(compressed_kv, self.kv_b_proj.weight)
         k_nope, v = kv.split([heads * nope, heads * v_dim], -1)
         k = maybe_compiled_cat(

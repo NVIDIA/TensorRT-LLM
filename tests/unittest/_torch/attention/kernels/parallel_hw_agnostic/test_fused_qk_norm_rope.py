@@ -554,3 +554,118 @@ def test_fused_qk_norm_rope_to_fp8(
         rtol=0.07,
         atol=0.1,
     )
+
+
+# The launcher lets one warp process several heads of a token and reuse the
+# token's RoPE cos/sin for all of them. It picks heads_per_warp as the largest
+# divisor of the head count, at most half of it, that keeps
+# num_tokens * num_heads / heads_per_warp >= 16 * SM count. If no divisor fits,
+# it splits the heads as evenly as possible and the last warp of a token gets
+# fewer heads. So, on any GPU with 11 to 512 SMs:
+# - a call with 4096 tokens gives each warp half of the heads, rounded up
+#   (4096 * 2 >= 16 * 512);
+# - calls with 4 tokens keep one head per warp for up to 80 heads (4 * 80 / 2 < 16 * 11).
+_MANY_HEADS_PER_WARP_TOKENS = 4096
+_ONE_HEAD_PER_WARP_TOKENS = 4
+_YARN = dict(factor=4.0, low=20.0, high=46.0, attention_factor=1.1386)
+_LARGE_CALL_CASES = {
+    # Qwen3-VL-8B decoder: 32 Q + 8 KV heads, interleaved mRoPE with sections (24, 20, 20).
+    "qwen3_vl_mrope": dict(base=5e6, eps=1e-6, use_mrope=True),
+    "neox": dict(),
+    "interleave": dict(is_neox=False),
+    "yarn": dict(**_YARN),
+    "partial_rotary": dict(rotary_dim=64),
+    "head_dim_64": dict(head_dim=64, rotary_dim=64),
+    # 64 Q + 8 KV heads, head_dim 64, YaRN, no QK norm (gpt-oss).
+    "head_dim_64_no_qk_norm_yarn": dict(
+        num_heads_q=64, head_dim=64, rotary_dim=64, is_qk_norm=False, **_YARN
+    ),
+    "head_dim_256_gemma": dict(num_heads_q=16, head_dim=256, rotary_dim=256, use_gemma=True),
+    # 64 Q + 4 KV heads (Qwen3-235B-A22B): 68 heads, so each warp gets 34 heads.
+    "68_heads": dict(num_heads_q=64, num_heads_k=4),
+    # Qwen3-VL-235B-A22B at TP4: 16 Q + 1 KV heads with mRoPE. In place there are
+    # 17 heads, so a token's two warps get 9 and 8 heads.
+    "17_heads_mrope": dict(num_heads_q=16, num_heads_k=1, base=5e6, eps=1e-6, use_mrope=True),
+}
+
+
+@pytest.mark.parametrize("out_fp8", [False, True], ids=["bf16_in_place", "fp8_out_of_place"])
+@pytest.mark.parametrize("case", list(_LARGE_CALL_CASES))
+@torch.inference_mode()
+def test_fused_qk_norm_rope_large_call_matches_small_calls(case, out_fp8):
+    """A large call, where a warp processes several heads of a token, gives the
+    same bits as small calls on the same tokens, where a warp processes one head.
+    """
+    p = dict(
+        num_heads_q=32,
+        num_heads_k=8,
+        head_dim=128,
+        rotary_dim=128,
+        eps=1e-5,
+        base=1e6,
+        is_neox=True,
+        factor=1.0,
+        low=0.0,
+        high=0.0,
+        attention_factor=1.0,
+        is_qk_norm=True,
+        use_gemma=False,
+        use_mrope=False,
+    )
+    p.update(_LARGE_CALL_CASES[case])
+    num_tokens = _MANY_HEADS_PER_WARP_TOKENS
+    head_dim = p["head_dim"]
+    hidden_size = (p["num_heads_q"] + 2 * p["num_heads_k"]) * head_dim
+
+    torch.random.manual_seed(0)
+    qkv = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda") * 3.0
+    q_weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda")
+    k_weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda")
+    tokens = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+    if p["use_mrope"]:
+        # Distinct temporal / height / width rows, as for image tokens.
+        position_ids = torch.stack([tokens // 256, tokens // 16 % 16, tokens % 16]) + 100
+        mrope_section = [24, 20, 20]
+    else:
+        position_ids = tokens * 7 + 100
+        mrope_section = [0, 0, 0]
+
+    def run(qkv, position_ids):
+        args = (
+            qkv,
+            p["num_heads_q"],
+            p["num_heads_k"],
+            p["num_heads_k"],
+            head_dim,
+            p["rotary_dim"],
+            p["eps"],
+            q_weight,
+            k_weight,
+            p["base"],
+            p["is_neox"],
+            position_ids.contiguous(),
+            p["factor"],
+            p["low"],
+            p["high"],
+            p["attention_factor"],
+            p["is_qk_norm"],
+            p["use_gemma"],
+            p["use_mrope"],
+            mrope_section[1],
+            mrope_section[2],
+        )
+        if out_fp8:
+            return torch.ops.trtllm.fused_qk_norm_rope_to_fp8(*args)
+        torch.ops.trtllm.fused_qk_norm_rope(*args)
+        return qkv
+
+    large_call = run(qkv.clone(), position_ids)
+    step = _ONE_HEAD_PER_WARP_TOKENS
+    small_calls = torch.cat(
+        [
+            run(qkv[start : start + step].clone(), position_ids[..., start : start + step])
+            for start in range(0, num_tokens, step)
+        ]
+    )
+    bits = torch.uint8 if out_fp8 else torch.int16
+    assert torch.equal(large_call.view(bits), small_calls.view(bits))

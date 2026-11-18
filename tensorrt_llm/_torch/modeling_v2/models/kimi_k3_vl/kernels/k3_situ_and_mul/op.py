@@ -21,12 +21,12 @@ PDL is used when ``TRTLLM_ENABLE_PDL`` is unset or 1 and the GPU is SM 9.0 or ne
 
 from __future__ import annotations
 
+import os
 from typing import Mapping, Optional
 
 import torch
 import triton  # type: ignore[import]
 
-from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._utils import get_sm_version
 
 from .k3_situ_and_mul_kernel import k3_situ_and_mul_kernel
@@ -48,7 +48,7 @@ def k3_situ_and_mul(
     def grid(meta: Mapping[str, int]) -> tuple[int, int]:
         return (b, triton.cdiv(d, meta["BLOCK_SIZE"]))
 
-    launch_with_pdl = get_env_enable_pdl() and get_sm_version() >= 90
+    launch_with_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1" and get_sm_version() >= 90
     k3_situ_and_mul_kernel[grid](
         o_ptr=output,
         o_stride=output.stride(0),

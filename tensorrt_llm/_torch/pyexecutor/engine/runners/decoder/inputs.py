@@ -69,7 +69,11 @@ from tensorrt_llm.inputs.multimodal import (
     check_mm_embed_cumsum_if_needed,
     strip_mm_data_for_generation,
 )
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    DSparkDecodingConfig,
+    PrefillCudaGraphBackend,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -104,6 +108,13 @@ def resolve_runtime_draft_len(
     if spec_config is not None and not spec_config.is_linear_tree:
         return get_static_draft_len(spec_config)
     return runtime_draft_len
+
+
+def dspark_schedules_draft_len(spec_config: DecodingBaseConfig | None) -> bool:
+    """Whether a DSpark draft length schedule can shorten a step's uniform verify window."""
+    return (
+        isinstance(spec_config, DSparkDecodingConfig) and spec_config.draft_len_schedule is not None
+    )
 
 
 def uses_full_generation_page_table(
@@ -595,6 +606,10 @@ class DecoderInputPreparer:
         ``spec_metadata.num_tokens``, ``num_generations`` and ``seq_lens`` for
         this batch before calling this. ``num_generations`` counts every
         generation request, CUDA-graph dummies included.
+
+        The step's draft length rides along: each rank picks it from its own
+        batch, and a drafter that crosses a cross-rank barrier has to know
+        whether any peer drafts this step.
         """
         if not self._config.enable_attention_dp:
             return None, None
@@ -602,6 +617,7 @@ class DecoderInputPreparer:
             spec_metadata.dp_num_tokens(),
             len(spec_metadata.seq_lens),
             spec_metadata.num_generations,
+            spec_metadata.runtime_draft_len,
         )
         if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
             # attn counts span TP only while spec counts span TP*CP; keep the
@@ -2699,7 +2715,10 @@ class DecoderInputPreparer:
                 ),
             )
 
-        if self._dspark_trims_submitted_tokens:
+        # Attention sizes its generation rows by the static draft ceiling
+        # unless told the step's window, which both the confidence scheduler
+        # and a draft length schedule can shorten.
+        if self._dspark_trims_submitted_tokens or dspark_schedules_draft_len(spec_config):
             self._publish_gen_token_layout(
                 attn_metadata,
                 scheduled_requests.generation_requests,

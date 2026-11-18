@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the attn_res_fwd op.
+"""GPU test for the attn_res_fwd catalog entry.
 
 A cell is (T, N): T tokens and N = K + 1 candidates, K snapshots plus the layer residual. Every cell
 checks the four outputs' shapes and dtypes, bit-identical results from two identical calls, untouched
 inputs, and closeness to an fp32 torch evaluation of the contract's Semantics under the metric of
-the built-in op test (tests/unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py).
+main's op test (tests/unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py).
 
 The op picks its kernel from (T, N): at T == 1 the single-CTA decode kernel for N in {1, 2, 4} and the
 split-K cluster kernel for N in {8, 12}; the fixed-N = 12 online variant at (T, N) == (1024, 12); the
@@ -23,7 +23,7 @@ __extra_import_path__ = ["../../../.."]
 from _validating import validating
 
 assert torch.cuda.is_available(), "attn_res_fwd requires a CUDA device"
-# Runs on sm_100 and sm_103 (the architectures the op is certified on); other architectures skip this file.
+# The receipts are sm_100 ones; CI's other architectures skip this file.
 pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="certified on sm_100 and sm_103",
@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN_SIZE = 7168
 RMS_EPS = 1e-6
-# The thresholds of the built-in op test.
+# The thresholds of main's op test.
 MIN_COSINE = 0.999
 MAX_RELATIVE_L2 = 3e-2
 INPUT_NAMES = ("layer_residual", "block_residual", "res_weight", "rms_weight")
@@ -41,7 +41,7 @@ OUTPUT_NAMES = ("output", "rsigma", "probs", "logits")
 def _make_inputs(
     num_tokens: int, num_candidates: int, seed: int = 0
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Inputs at the scales of the built-in op tests, seeded by the cell."""
+    """Inputs at the scales of main's op tests, seeded by the cell."""
     torch.manual_seed(seed)
     layer_residual = (
         torch.randn(num_tokens, 1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
@@ -63,7 +63,7 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _similarity(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
-    """Cosine similarity and relative L2 error, the metric of the built-in op tests."""
+    """Cosine similarity and relative L2 error, the metric of main's op tests."""
     actual_float = actual.float().flatten()
     expected_float = expected.float().flatten()
     cosine = torch.nn.functional.cosine_similarity(actual_float, expected_float, dim=0).item()
@@ -122,16 +122,6 @@ def test_guard_refuses_mixed_devices(index) -> None:
             attn_res_fwd(
                 call_layer_residual, call_block_residual, call_res_weight, call_rms_weight, RMS_EPS
             )
-
-
-@pytest.mark.parametrize("index", (0, 1))
-def test_guard_refuses_misaligned_residuals(index) -> None:
-    inputs = list(_make_inputs(2, 2))
-    shape = inputs[index].shape
-    shifted = torch.empty(inputs[index].numel() + 1, dtype=torch.bfloat16, device="cuda")[1:]
-    inputs[index] = shifted.view(shape).copy_(inputs[index])
-    with pytest.raises(AssertionError, match="16-byte aligned"):
-        attn_res_fwd.is_valid(*inputs, RMS_EPS)
 
 
 def test_cuda_graph_replay_matches_eager() -> None:

@@ -215,11 +215,29 @@ def test_k3_family_paths_select_kernel_collective_and_host_tests(rule, relative)
 def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
     repo = Path(__file__).resolve().parents[4]
     prefix = "unittest/_torch/modeling_v2/models/kimi_k3_vl/"
+    root = repo / "tests" / prefix
+
+    def files(name: str) -> set:
+        """The test files a list entry runs: the file, or every test file under the directory."""
+        if (root / name).is_dir():
+            return {p.relative_to(root).as_posix() for p in (root / name).rglob("test_*.py")}
+        return {name}
+
+    index = YAMLIndex.load(repo / "tests/integration/test_lists/test-db")
+    listed = {}
+    for block in index.blocks:
+        for entry in block.tests:
+            target = entry.split()[0].split("::")[0]
+            if target.startswith(prefix):
+                listed.setdefault(block.yaml_stem, set()).update(files(target.removeprefix(prefix)))
+    gr100 = listed.get("l0_gr100", set())
+    other_gpu = set().union(
+        *(v for stem, v in listed.items() if stem not in ("l0_gr100", "l0_cpu"))
+    )
     # The unit tests mirror the family's source tree (and its targets), so they sit in subdirectories.
-    expected = {
-        p.relative_to(repo / "tests" / prefix).as_posix()
-        for p in (repo / "tests" / prefix).rglob("test_*.py")
-    }
+    # Tests whose GPU stage is the single-GPU GR100 stage (SM107) are not part of this check; their
+    # cpu_only cases may also run in l0_cpu.
+    expected = files("") - (gr100 - other_gpu)
     # The 4-GPU MNNVL tests, by path under the family's unit directory: they run on GB300. Every other GPU test runs on
     # B300, except the two sets below.
     collective_tests = {
@@ -246,9 +264,13 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
         "ops/comm/test_modeling_v2_mnnvl_fusion_allreduce_op_matrix.py",
         "ops/moe/test_modeling_v2_k3_moe_front_op_matrix.py",
         "test_modeling_v2_mnnvl_mcast_workspace_op_matrix.py",
+        "kimi_k3_nvfp4__sm_107__dep16/test_k3_megamoe.py",
+        "ops/comm/test_core_allreduce.py",
+        "ops/gemm/test_k3_fp8w_gemm_push_cells.py",
+        *files("kernels/k3r_comm"),
     }
     assert collective_tests <= expected, collective_tests - expected
-    # The tests that run on the targets' SM (sm_100; B300 is sm_103): one B200. Their kernels are certified on
+    # The tests that run on the MXFP4 targets' SM (sm_100; B300 is sm_103): one B200. Their kernels are certified on
     # sm_100 only, except the parity test of the family's attention-residual CUDA against the built-in ops.
     sm100_tests = {
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_dspark_mla_ops.py",
@@ -265,7 +287,6 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
         "ops/comm/test_modeling_v2_k3_allreduce_fallback_op_matrix.py",
     }
     assert sm100_tests | non_mnnvl_tests <= expected, (sm100_tests | non_mnnvl_tests) - expected
-    index = YAMLIndex.load(repo / "tests/integration/test_lists/test-db")
     stages = parse_stages_from_groovy(repo / "jenkins/L0_Test.groovy")
     seen = set()
     for block in index.blocks:
@@ -281,28 +302,37 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
                         if arg.startswith("--ignore=")
                     ), (block.yaml_stem, entry)
                 continue
-            name = target.removeprefix(prefix)
-            assert name not in seen, (block.yaml_stem, name)
-            seen.add(name)
-            if block.yaml_stem == "l0_cpu":
-                assert name not in collective_tests | sm100_tests | non_mnnvl_tests, (
-                    block.yaml_stem,
-                    name,
-                )
+            if block.yaml_stem == "l0_gr100":
                 continue
-            if name in sm100_tests:
-                yaml_stem, count = "l0_b200", 1
-            elif name in non_mnnvl_tests:
-                yaml_stem, count = "l0_dgx_b200", 4
-            elif name in collective_tests:
-                yaml_stem, count = "l0_gb300", 4
-            else:
-                yaml_stem, count = "l0_b300", 1
-            assert block.yaml_stem == yaml_stem, name
-            assert block.condition["ranges"]["system_gpu_count"] == {"gte": count, "lte": count}
-            assert block.condition["terms"]["stage"] == "pre_merge"
-            assert any(
-                stage.yaml_stem == block.yaml_stem and block_matches_stage(block, stage)
-                for stage in stages.values()
-            ), (block.yaml_stem, name)
+            for name in sorted(files(target.removeprefix(prefix))):
+                if block.yaml_stem == "l0_cpu" and name in gr100:
+                    continue
+                assert name not in seen, (block.yaml_stem, name)
+                seen.add(name)
+                if block.yaml_stem == "l0_cpu":
+                    assert name not in collective_tests | sm100_tests | non_mnnvl_tests, (
+                        block.yaml_stem,
+                        name,
+                    )
+                    continue
+                multi = name in collective_tests
+                post_merge = multi and block.yaml_stem == "l0_gb300_multi_gpus"
+                if name in sm100_tests:
+                    yaml_stem, count = "l0_b200", 1
+                elif name in non_mnnvl_tests:
+                    yaml_stem, count = "l0_dgx_b200", 4
+                elif multi:
+                    yaml_stem, count = "l0_gb300", 4
+                else:
+                    yaml_stem, count = "l0_b300", 1
+                assert post_merge or block.yaml_stem == yaml_stem, name
+                assert block.condition["ranges"]["system_gpu_count"] == {"gte": count, "lte": count}
+                assert block.condition["terms"]["stage"] == (
+                    "post_merge" if post_merge else "pre_merge"
+                )
+                # The parsed stages are the pre-merge L0 stages.
+                assert post_merge or any(
+                    stage.yaml_stem == block.yaml_stem and block_matches_stage(block, stage)
+                    for stage in stages.values()
+                ), (block.yaml_stem, name)
     assert seen == expected

@@ -16,9 +16,11 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_add_rms
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_add_rmsnorm_persistent_fwd import (  # noqa: E501
     attn_res_add_rmsnorm_persistent_fwd,
 )
-from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_fwd import attn_res_fwd
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_rmsnorm_fwd import (
     attn_res_rmsnorm_fwd,
+)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.k3_attn_res_fwd import (
+    k3_attn_res_fwd,
 )
 from tensorrt_llm.logger import logger
 
@@ -89,7 +91,7 @@ def _use_persistent_attn_res(M: int, H: int, N: int, max_fused_tokens: int) -> b
 def _apply_attn_res_fused(
     prefix_sum: torch.Tensor, block_residual: torch.Tensor, proj: nn.Linear, norm: KimiK3RMSNorm
 ) -> Optional[torch.Tensor]:
-    """Fused attn_res via the family's ``attn_res_fwd`` op.
+    """Fused attn_res via the family's ``k3_attn_res_fwd`` op.
 
     Returns ``None`` when the call falls outside the fused kernel's
     contract (dtype/shape) so the caller can use the exact fp32 reference
@@ -109,7 +111,7 @@ def _apply_attn_res_fused(
         return None
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    output, _rsigma, _probs, _logits = attn_res_fwd(
+    output, _rsigma, _probs, _logits = k3_attn_res_fwd(
         layer_kernel,
         block_kernel,
         proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
@@ -272,7 +274,7 @@ def _apply_attn_res(
     block_residual: ``[num_snapshots, num_tokens, hidden_size]``
 
     Unless ``KIMI_K3_FUSED_ATTN_RES=0``, inputs fitting the fused kernel's
-    contract dispatch to the family's ``attn_res_fwd`` op.
+    contract dispatch to the family's ``k3_attn_res_fwd`` op.
     Only the fallback boundary restores the HF ``[M, K, H]`` layout.
     """
     if _FUSED_ATTN_RES_ENABLED:

@@ -5,7 +5,7 @@
 The shared ops (torch.ops.trtllm.attn_res_*, cpp/tensorrt_llm/thop/attnResOp.cpp) stay in the wheel for the built-in
 Kimi K3 model, so each OpWrapper's cells run through both and every output must match bit for bit:
 
-- attn_res_fwd (k3_attn_res_fwd) against trtllm::attn_res_fwd: output, rsigma, probs and logits;
+- k3_attn_res_fwd against trtllm::attn_res_fwd: output, rsigma, probs and logits;
 - attn_res_rmsnorm_fwd (k3_attn_res_rmsnorm_fwd, early trigger) against trtllm::attn_res_rmsnorm_fwd;
 - attn_res_add_rmsnorm_fwd (k3_attn_res_add_rmsnorm_fwd, early trigger) against trtllm::attn_res_add_rmsnorm_fwd;
 - attn_res_add_rmsnorm_persistent_fwd against trtllm::attn_res_add_rmsnorm_persistent_fwd, with and without the
@@ -24,9 +24,11 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_add_rms
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_add_rmsnorm_persistent_fwd import (  # noqa: E501
     attn_res_add_rmsnorm_persistent_fwd,
 )
-from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_fwd import attn_res_fwd
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_rmsnorm_fwd import (
     attn_res_rmsnorm_fwd,
+)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.k3_attn_res_fwd import (
+    k3_attn_res_fwd,
 )
 
 __extra_import_path__ = ["."]
@@ -50,7 +52,7 @@ def _ids(op):
     return [c.why[:48] for c in op.CELLS]
 
 
-@pytest.mark.parametrize("cell", attn_res_fwd.CELLS, ids=_ids(attn_res_fwd))
+@pytest.mark.parametrize("cell", k3_attn_res_fwd.CELLS, ids=_ids(k3_attn_res_fwd))
 def test_attn_res_fwd(cell) -> None:
     x = make_inputs(cell)
     args = (
@@ -60,7 +62,7 @@ def test_attn_res_fwd(cell) -> None:
         x["rms_weight"],
         cell.spec["eps"],
     )
-    _assert_same_bits(attn_res_fwd(*args), torch.ops.trtllm.attn_res_fwd(*args), cell)
+    _assert_same_bits(k3_attn_res_fwd(*args), torch.ops.trtllm.attn_res_fwd(*args), cell)
 
 
 @pytest.mark.parametrize("cell", attn_res_rmsnorm_fwd.CELLS, ids=_ids(attn_res_rmsnorm_fwd))
