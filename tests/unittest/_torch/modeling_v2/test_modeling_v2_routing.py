@@ -1231,7 +1231,7 @@ def test_minimax_m3_honors_a_draft_moe_tactic_only(monkeypatch, tp):
 
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------
 
-_QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.modeling."
+_QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default.modeling."
 
 
 @pytest.fixture

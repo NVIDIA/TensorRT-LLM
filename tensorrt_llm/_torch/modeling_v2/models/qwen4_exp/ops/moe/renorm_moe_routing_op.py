@@ -3,7 +3,7 @@
 """Renormalized MoE routing: top-k over the raw router logits, then a softmax
 over just those k, in one trtllm call.
 
-Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`) at
+Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_10x__default`) at
 every layout."""
 
 from __future__ import annotations
@@ -88,17 +88,17 @@ class RenormMoeRoutingOp(OpWrapper):
             why="coarse logits (3 values): ties decide most of the ranking",
             spec=dict(_ckpt(64), output_dtype=torch.float32, dist="coarse"),
         ),
-        # The FP8 unified target's routed experts in its captured decode graph (1..128 rows).
+        # The FP8 target's routed experts in its captured decode graph (1..128 rows).
         Cell(
-            why="FP8 unified captured attention-DP decode: 8 rows (dep2 2 x 4, dep4 4 x 2)",
+            why="FP8 target captured attention-DP decode: 8 rows (dep2 2 x 4, dep4 4 x 2)",
             spec=_ckpt(8, capture=True),
         ),
         Cell(
-            why="FP8 unified captured decode: 72 rows (batch 72)",
+            why="FP8 target captured decode: 72 rows (batch 72)",
             spec=_ckpt(72, capture=True),
         ),
         Cell(
-            why="FP8 unified captured decode: 128 rows, the largest (batch 128; dep2 2 x 64, "
+            why="FP8 target captured decode: 128 rows, the largest (batch 128; dep2 2 x 64, "
             "dep4 4 x 32 gathered)",
             spec=_ckpt(128, capture=True),
         ),

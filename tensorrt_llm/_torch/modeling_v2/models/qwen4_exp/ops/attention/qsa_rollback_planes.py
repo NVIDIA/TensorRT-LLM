@@ -4,7 +4,7 @@
 gather the verify rows' slots of all planes before the trunk writes them, and after the
 draft loop write the gathered values back into the slots of the rows the sampler rejected.
 
-Tier 5 (Triton, called by the qwen4_exp target, `qwen3_8_flash_next_nvfp4__sm_103__default`,
+Tier 5 (Triton, called by the qwen4_exp target, `qwen3_8_flash_next_nvfp4__sm_10x__default`,
 at every layout). The planes are separate buffers of the cache manager (one per
 attention layer, each `[pages, tokens_per_block, heads, dim]` with a free page stride and a
 contiguous tail); the kernels reach them through a table of their base addresses and page

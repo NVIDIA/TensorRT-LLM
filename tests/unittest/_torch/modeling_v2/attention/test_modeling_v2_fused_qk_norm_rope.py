@@ -183,7 +183,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default": (
         Cell(
             why="qwen4_exp main rope, decode: one token, Gemma norm and interleaved mRoPE "
             "with three distinct position rows",
@@ -264,7 +264,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
         ),
     ),
     # Its tp1 / dep2 / dep4 calls are the NVFP4 target's shapes above.
-    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default": (
         Cell(
             why="qwen4_exp tp2 fused-row main rope, 1 token: 12 q / 1 k, 16 tail heads",
             spec=dict(tokens=1, **_QWEN_TP2_ROW),

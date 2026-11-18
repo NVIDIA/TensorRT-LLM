@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """QSA block compression of the paged index-key side cache: completed groups to anchors.
 
-Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`) at every
+Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_10x__default`) at every
 layout.
 """
 

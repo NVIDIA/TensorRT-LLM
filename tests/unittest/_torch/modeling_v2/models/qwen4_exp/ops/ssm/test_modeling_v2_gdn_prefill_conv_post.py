@@ -170,7 +170,7 @@ def _rank2_cell(lengths, initial, slots) -> dict:
 
 #: The shapes each target calls this entry with beyond its own cells, by target directory.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default": (
         Cell(
             why="fp8 tp2/tep2 rank: 37+1+128 tokens carry/fresh/carry at slots 8191, 0, 4096",
             spec=_rank2_cell((37, 1, 128), (True, False, True), (8191, 0, 4096)),

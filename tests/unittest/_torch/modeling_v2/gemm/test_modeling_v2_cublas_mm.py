@@ -119,7 +119,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(m=16, k=2880, n=5120, dtype=torch.bfloat16, bias=True, out_dtype=None),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default": (
         Cell(
             why="qwen fp8 attn in-proj tp2 7424 wide, the largest captured decode batch 128",
             spec=dict(m=128, k=2560, n=7424, dtype=torch.bfloat16, bias=False, out_dtype=None),

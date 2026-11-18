@@ -4,7 +4,7 @@
 the rank-`R` bottleneck and the block-injection weights, from the first
 projection's fp32 logits, in one Triton row kernel.
 
-Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`) at every
+Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_10x__default`) at every
 layout.
 """
 
@@ -94,19 +94,19 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
             why="default stack-final mixer (no inject): one decode token",
             spec=dict(rows=1, inject=False, logits_width=352),
         ),
-        # The FP8 unified target's HC mixers in its captured graphs at 641..3071 rows (e.g. the
+        # The FP8 target's HC mixers in its captured graphs at 641..3071 rows (e.g. the
         # breakable prefill buckets): fewer rows run `qwen4_exp_hc_decode_tc_first`, more the
         # rstd form.
         Cell(
-            why="FP8 unified captured prefill HC mixer, 641 rows: 352-wide logits",
+            why="FP8 target captured prefill HC mixer, 641 rows: 352-wide logits",
             spec=dict(rows=641, logits_width=352, capture=True),
         ),
         Cell(
-            why="FP8 unified captured prefill HC mixer, 1024 rows: 352-wide logits",
+            why="FP8 target captured prefill HC mixer, 1024 rows: 352-wide logits",
             spec=dict(rows=1024, logits_width=352, capture=True),
         ),
         Cell(
-            why="FP8 unified captured prefill HC mixer, 3071 rows (the largest): 352-wide",
+            why="FP8 target captured prefill HC mixer, 3071 rows (the largest): 352-wide",
             spec=dict(rows=3071, logits_width=352, capture=True),
         ),
     )
