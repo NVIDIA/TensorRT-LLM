@@ -34,8 +34,11 @@ _EPS = 1e-6
 
 
 def _require_sm100() -> torch.device:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("The fused per-token AdaLN kernel requires an SM100 GPU.")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("The fused per-token AdaLN kernel requires an SM100 or SM103 GPU.")
     return torch.device("cuda", torch.cuda.current_device())
 
 

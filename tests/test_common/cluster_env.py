@@ -16,9 +16,9 @@ There are two consumers:
   with get_ucx_tls_cmd(). L0_Test.groovy passes the resolved cluster via
   --cluster-name.
 * Multi-node tests call apply_ucx_env() on the environment they hand to the
-  servers they spawn, with the cluster taken from SLURM_CLUSTER_NAME. Only
-  cluster-specific rules are applied there; the catch-all rule's clear-only
-  behavior is limited to PerfSanity.
+  servers they spawn, with the cluster taken from SLURM_CLUSTER_NAME. Local
+  device detection fills in missing devices by default. The catch-all rule's
+  clear-only behavior is limited to PerfSanity.
 
 Cluster names follow SlurmPartition.clusterName in the bloom Jenkins shared
 library (src/com/nvidia/bloom/SlurmConfig.groovy), e.g. "gcp-nrt", "aws-cmh",
@@ -30,8 +30,11 @@ wildcards to match both forms.
 
 import functools
 import os
+import socket
 import subprocess
 from fnmatch import fnmatch
+from ipaddress import IPv4Address
+from pathlib import Path
 
 # Cleared on every cluster before any cluster-specific setting: these may leak
 # in from the outer environment and break UCX transport auto-selection.
@@ -227,37 +230,94 @@ def detect_gpu_type():
     return gpu_type_from_stage_name(out)
 
 
-def apply_ucx_env(environ=None, cluster_name=None, gpu_type=None):
-    """Apply the cluster's UCX rule to an environment mapping in place.
+def _local_net_device() -> str:
+    """Select an active IPv4 interface using the local default route."""
+    import psutil
 
-    When a cluster-specific rule matches, clears BASE_UCX_UNSET_VARS and sets
-    the rule's vars. When the cluster is unset or only the catch-all rule
-    matches, the mapping is left unchanged.
+    stats = psutil.net_if_stats()
+    candidates = {
+        name
+        for name, addresses in psutil.net_if_addrs().items()
+        if name in stats
+        and stats[name].isup
+        and any(
+            address.family == socket.AF_INET
+            and not IPv4Address(address.address).is_loopback
+            and not IPv4Address(address.address).is_unspecified
+            and not IPv4Address(address.address).is_link_local
+            for address in addresses
+        )
+    }
+    try:
+        routes = Path("/proc/net/route").read_text().splitlines()[1:]
+    except (FileNotFoundError, PermissionError):
+        routes = []
+    defaults = []
+    for line in routes:
+        fields = line.split()
+        if len(fields) < 8 or fields[0] not in candidates:
+            continue
+        if fields[1] != "00000000" or fields[7] != "00000000":
+            continue
+        flags = int(fields[3], 16)
+        if flags & 0x1 and not flags & 0x200:  # Route is up and does not reject traffic.
+            defaults.append((int(fields[6]), fields[0]))
+    if defaults:
+        lowest_metric = min(metric for metric, _ in defaults)
+        candidates = {name for metric, name in defaults if metric == lowest_metric}
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    raise RuntimeError(
+        f"Cannot select a unique local IPv4 network interface from {sorted(candidates)}; "
+        "set UCX_NET_DEVICES explicitly."
+    )
+
+
+def apply_ucx_env(environ=None, cluster_name=None, gpu_type=None, *, detect_devices=True):
+    """Apply cluster UCX settings, optionally detecting a local network device.
+
+    A cluster-specific rule clears BASE_UCX_UNSET_VARS and sets its vars.
+    With detect_devices enabled, an explicit UCX_NET_DEVICES takes priority
+    over cluster defaults. If neither supplies a device, select an active
+    local IPv4 interface using the default route, or the sole active IPv4
+    interface when no default route is available. Unlisted clusters use
+    TCP/CUDA/shm transports in this mode.
 
     Args:
         environ: Mapping to update; defaults to os.environ.
         cluster_name: Cluster name; defaults to SLURM_CLUSTER_NAME.
         gpu_type: GPU type token; defaults to detect_gpu_type().
+        detect_devices: Detect missing local devices and preserve an explicit
+            UCX_NET_DEVICES override. Defaults to True; False applies only
+            cluster rules.
 
     Returns:
-        The vars that were set, or None when no cluster-specific rule applies.
+        The vars that were set, or None when no rule or detection applies.
     """
     if environ is None:
         environ = os.environ
     if cluster_name is None:
         cluster_name = environ.get("SLURM_CLUSTER_NAME", "")
-    if not cluster_name:
+    if not cluster_name and not detect_devices:
         return None
-    if gpu_type is None:
+    if gpu_type is None and cluster_name:
         gpu_type = detect_gpu_type()
     env = get_ucx_env(cluster_name, gpu_type)
+    clear_vars = BASE_UCX_UNSET_VARS if env else ()
+    explicit_devices = environ.get("UCX_NET_DEVICES") if detect_devices else None
     if not env:
-        return None
-    for key in BASE_UCX_UNSET_VARS:
+        if not detect_devices:
+            return None
+        env = {"UCX_TLS": "tcp,self,sm,cuda_copy,cuda_ipc"}
+    if explicit_devices is not None:
+        env["UCX_NET_DEVICES"] = explicit_devices
+    elif detect_devices and "UCX_NET_DEVICES" not in env:
+        env["UCX_NET_DEVICES"] = _local_net_device()
+    for key in clear_vars:
         environ.pop(key, None)
     environ.update(env)
     print(
         f"UCX env for cluster={cluster_name!r} gpu={gpu_type!r}: "
-        f"cleared {list(BASE_UCX_UNSET_VARS)}, set {env}"
+        f"cleared {list(clear_vars)}, set {env}"
     )
     return env

@@ -47,10 +47,11 @@ def merge_to_sqlite(pattern: str, out_path: str) -> tuple[sqlite3.Connection, in
 
 
 def _collect_defs(node: ast.AST, prefix: str, rel: str, funcs: set[tuple[str, str]]) -> None:
-    """Record functions/methods reachable through class and control-flow nesting (matches PY_START co_qualname)."""
+    """Record functions/methods reachable through class, closure and control flow (matches PY_START co_qualname)."""
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             funcs.add((rel, prefix + child.name))
+            _collect_defs(child, f"{prefix}{child.name}.<locals>.", rel, funcs)
         elif isinstance(child, ast.ClassDef):
             _collect_defs(child, f"{prefix}{child.name}.", rel, funcs)
         else:

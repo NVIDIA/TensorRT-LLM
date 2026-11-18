@@ -45,15 +45,31 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _Req:
-    def __init__(self, req_id):
+    def __init__(self, req_id: int) -> None:
         self.py_request_id = req_id
         self.lora_task_id = None
         self.cache_salt = None
         self.is_dummy = False
-        self.is_last_context_chunk = True
-        self.context_current_position = 0
-        self.context_chunk_size = 8
+        self.use_draft_model = False
+        self.prompt_len = 8
+        self.target_position = 0
+        self.target_chunk_size = 8
+        self.draft_position = 0
+        self.draft_chunk_size = 8
         self.py_draft_tokens = None
+        self.is_disagg_generation_init_state = False
+
+    @property
+    def context_current_position(self):
+        return self.draft_position if self.use_draft_model else self.target_position
+
+    @property
+    def context_chunk_size(self):
+        return self.draft_chunk_size if self.use_draft_model else self.target_chunk_size
+
+    @property
+    def is_last_context_chunk(self):
+        return self.context_current_position + self.context_chunk_size == self.prompt_len
 
 
 class _Batch:
@@ -67,7 +83,7 @@ class _Batch:
         return self.context_requests + self.generation_requests
 
 
-def _manager(resume_ok):
+def _manager(resume_ok: bool) -> tuple[KVCacheManagerV2, MagicMock]:
     """A draft manager whose resume answers ``resume_ok``, with nothing else real.
 
     Built without ``__init__``: the method under test needs only the mirror
@@ -78,10 +94,12 @@ def _manager(resume_ok):
     manager.is_draft = True
     manager.enable_joint_kv_cache_reuse = False
     manager.num_extra_kv_tokens = 0
+    manager._mirror_uses_draft_view = False  # one-engine external drafter: target view
     manager._allocated_draft_lens = set()
     cache = MagicMock(name="kv_cache")
     cache.resize.return_value = True
     cache.capacity = 0
+    cache.history_length = 0
     manager._mirror_draft_kv_cache = MagicMock(return_value=cache)
     manager._resume_and_restore = MagicMock(return_value=resume_ok)
     manager._required_gen_capacity = MagicMock(return_value=1)
@@ -187,3 +205,42 @@ def test_admit_mirror_reports_a_resumed_mirror_as_admissible():
     manager = _mirror_manager(resume_ok=True, cache=MagicMock(name="kv_cache"))
 
     assert manager.admit_mirror(_Req(341)) is True
+
+
+@pytest.mark.parametrize("extra_tokens", [0, 3])
+def test_separate_draft_chunked_prefill_fits_the_pool(extra_tokens):
+    """Without reuse, reserve the target chunk instead of the full draft prompt."""
+    manager, cache = _manager(resume_ok=True)
+    manager._mirror_uses_draft_view = True
+    manager.num_extra_kv_tokens = extra_tokens
+    manager.kv_cache_map = {7: cache}
+    manager._gpu_max_tokens = 1024 + extra_tokens
+    cache.resize.side_effect = lambda capacity, history: capacity <= manager._gpu_max_tokens
+    req = _Req(7)
+    req.prompt_len = 4096
+    req.target_chunk_size = 512
+    req.draft_position = 0
+    req.draft_chunk_size = req.prompt_len
+    manager.max_attention_window_vec = [req.prompt_len]
+
+    for position in (0, 512):
+        req.target_position = position
+        manager._prepare_draft_resources(_Batch(context_requests=[req]))
+        cache.resize.assert_called_with(position + 512 + extra_tokens, None)
+
+
+def test_separate_draft_does_not_add_draft_tokens_before_last_chunk():
+    manager, cache = _manager(resume_ok=True)
+    manager._mirror_uses_draft_view = True
+    manager.num_extra_kv_tokens = 2
+    req = _Req(7)
+    req.prompt_len = 4096
+    req.target_position = 3584
+    req.target_chunk_size = 256
+    req.draft_position = 0
+    req.draft_chunk_size = req.prompt_len
+    req.py_draft_tokens = [10, 11, 12]
+
+    manager._prepare_draft_resources(_Batch(context_requests=[req]))
+
+    cache.resize.assert_called_once_with(3842, None)

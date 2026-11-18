@@ -83,6 +83,7 @@ def _make_bare_absorption_mla(
     )
     mla.num_heads_tp = 2
     mla.num_heads_tp_cp = 2
+    mla.num_context_heads = mla.num_heads_tp
     mla.qk_nope_head_dim = qk_nope_head_dim
     mla.kv_lora_rank = 512
     mla.v_head_dim = 128

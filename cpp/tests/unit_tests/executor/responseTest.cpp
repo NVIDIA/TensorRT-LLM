@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,17 +58,13 @@ TEST(ResponseTest, ctorInvalidErrorMsg)
 TEST(ResponseTest, responseWithResult)
 {
     IdType requestId = 1;
-    auto cumLogProbs = VecLogProbs{1.};
-    auto logProbs = std::vector<VecLogProbs>{{1.}};
     auto finishReasons = std::vector<FinishReason>{FinishReason::kEND_ID};
-    auto result = Result{true, {{1}}, cumLogProbs, logProbs, finishReasons};
+    auto result = Result{true, {{1}}, finishReasons};
     auto response = Response(requestId, result);
     EXPECT_EQ(response.getRequestId(), requestId);
     auto resp_result = response.getResult();
     EXPECT_EQ(resp_result.isFinal, result.isFinal);
     EXPECT_EQ(resp_result.outputTokenIds, result.outputTokenIds);
-    EXPECT_EQ(resp_result.logProbs, result.logProbs);
-    EXPECT_EQ(resp_result.cumLogProbs, result.cumLogProbs);
     EXPECT_EQ(resp_result.finishReasons, result.finishReasons);
     EXPECT_EQ(response.hasError(), false);
 

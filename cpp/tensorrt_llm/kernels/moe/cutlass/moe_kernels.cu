@@ -1862,7 +1862,16 @@ __global__ void expandInputRowsFp8BlockScaleKernel(InputActivationsType const* u
     int64_t const num_elems_in_col = hidden_size / ELEM_PER_THREAD;
     auto* const permuted_output = fp8_block_scale_out.fp8_out;
 
-    for (int64_t permuted_row = blockIdx.x; permuted_row < num_valid_tokens; permuted_row += gridDim.x)
+    // Each block takes a contiguous run of permuted rows: they are sorted by expert, so one search finds the
+    // first row's expert and the rest advance linearly instead of searching per row.
+    int64_t const rows_per_block = ceilDiv(num_valid_tokens, static_cast<int64_t>(gridDim.x));
+    int64_t const row_begin = blockIdx.x * rows_per_block;
+    int64_t const row_end = std::min(row_begin + rows_per_block, num_valid_tokens);
+    int64_t expert = row_begin < row_end
+        ? findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, row_begin + 1) - 1
+        : 0;
+
+    for (int64_t permuted_row = row_begin; permuted_row < row_end; ++permuted_row)
     {
         int64_t const unpermuted_row = permuted_row_to_unpermuted_row[permuted_row];
         int64_t const source_k_rank = unpermuted_row / num_tokens;
@@ -1871,8 +1880,10 @@ __global__ void expandInputRowsFp8BlockScaleKernel(InputActivationsType const* u
         auto const* source_row_ptr = reinterpret_cast<DataElem const*>(unpermuted_input + source_row * hidden_size);
         auto* dest_row_ptr = permuted_output + permuted_row * hidden_size;
 
-        int64_t const expert
-            = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, permuted_row + 1) - 1;
+        while (expert + 1 < num_experts_per_node && expert_first_token_offset[expert + 1] <= permuted_row)
+        {
+            ++expert;
+        }
         int64_t const scale_row = permuted_row + fp8BlockScaleExpertPad(expert_first_token_offset[expert], expert);
 
         for (int64_t elem_index = threadIdx.x; elem_index < num_elems_in_col; elem_index += EXPAND_THREADS_PER_BLOCK)
@@ -2873,8 +2884,12 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
         }();
 
         static int32_t const sm_count = tensorrt_llm::common::getMultiProcessorCount();
-        int32_t const max_blocks_per_sm
-            = tensorrt_llm::common::getMaxActiveBlocksPerSM(fn, ACTIVATION_THREADS_PER_BLOCK, 0);
+        TLLM_CHECK_WITH_INFO(num_elems_in_col > 0, "MoE activation requires a positive inter_size.");
+        // A row narrower than the block (e.g. a tensor-parallel slice of the intermediate size) would leave the
+        // remaining threads idle, so shrink the block to the row width, in whole warps.
+        int32_t const threads = static_cast<int32_t>(
+            std::min<int64_t>(ACTIVATION_THREADS_PER_BLOCK, ceilDiv(num_elems_in_col, int64_t{32}) * 32));
+        int32_t const max_blocks_per_sm = tensorrt_llm::common::getMaxActiveBlocksPerSM(fn, threads, 0);
         // X dimension for tokens in groups of num_rows_per_cta_v
         // Y dimension for columns
         // Each CTA processes num_rows_per_cta_v * threads_x tokens
@@ -2882,9 +2897,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
         // Divide by rows_per_cta to get the number of token blocks needed
         int64_t const max_token_blocks = (max_tokens + num_rows_per_cta_v - 1) / num_rows_per_cta_v;
         int32_t const grid_x = std::min(sm_count * max_blocks_per_sm, static_cast<int32_t>(max_token_blocks));
-        int32_t const grid_y = static_cast<int32_t>(
-            (num_elems_in_col + ACTIVATION_THREADS_PER_BLOCK - 1) / ACTIVATION_THREADS_PER_BLOCK);
-        int32_t const threads = ACTIVATION_THREADS_PER_BLOCK;
+        int32_t const grid_y = static_cast<int32_t>((num_elems_in_col + threads - 1) / threads);
 
         cudaLaunchConfig_t config;
         config.gridDim = dim3(grid_x, grid_y, 1);
@@ -2902,12 +2915,12 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
             (GemmOutputType*) nullptr, fp8_block_scale_out);
     }; // end lambda doActivationKernelLauncher
 
-    // 256 threads per block * 256 blocks / 1 rows per block can be handled by 1-2 waves depending on SM arch
+    // Rows per CTA follow the total number of column vectors (num_elems_in_col * expanded_num_tokens), not the block
+    // width the launcher picks from the row width: one row per CTA below 64K vectors, two below 128K, four above.
     if (num_elems_in_col * expanded_num_tokens < 256 * 256)
     {
         doActivationKernelLauncher(std::integral_constant<int, 1>());
     }
-    // 256 threads per block * 512 blocks / 2 rows per block can be handled by 1-2 waves depending on SM arch
     else if (num_elems_in_col * expanded_num_tokens < 256 * 512)
     {
         doActivationKernelLauncher(std::integral_constant<int, 2>());
@@ -3026,6 +3039,37 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
 
 // ============================== Lora Add Bias =================================
 constexpr static int LORA_KERNELS_THREADS_PER_BLOCK = 256;
+
+#if defined(ENABLE_FP8)
+template <class T>
+__global__ void convertMoeLoraInputToFp8Kernel(
+    __nv_fp8_e4m3* output, T const* input, int64_t const* numValidTokens, int64_t hiddenSize, int64_t numElements)
+{
+    int64_t const index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t const validElements = numValidTokens ? *numValidTokens * hiddenSize : numElements;
+    if (index < numElements)
+    {
+        // Padded rows can contain uninitialized values and must never be read.
+        output[index] = __nv_fp8_e4m3(index < validElements ? static_cast<float>(input[index]) : 0.0f);
+    }
+}
+
+template <class T>
+void convertMoeLoraInputToFp8(__nv_fp8_e4m3* output, T const* input, int64_t const* numValidTokens, int64_t hiddenSize,
+    int64_t numRows, cudaStream_t stream)
+{
+    int64_t const numElements = numRows * hiddenSize;
+    if (numElements == 0)
+    {
+        return;
+    }
+    int const blocks
+        = static_cast<int>((numElements + LORA_KERNELS_THREADS_PER_BLOCK - 1) / LORA_KERNELS_THREADS_PER_BLOCK);
+    convertMoeLoraInputToFp8Kernel<<<blocks, LORA_KERNELS_THREADS_PER_BLOCK, 0, stream>>>(
+        output, input, numValidTokens, hiddenSize, numElements);
+    sync_check_cuda_error(stream);
+}
+#endif
 
 template <class ScaleBiasType, class LoraType, bool IsGated>
 __global__ void loraAddBiasKernel(ScaleBiasType* output, LoraType const* lora_result, ScaleBiasType const* bias,
@@ -3534,6 +3578,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     lora_fc1_result_ = {};
     lora_add_bias_ = {};
     lora_fc2_result_ = {};
+    mLoraFc1ResultBytes = workspaces.at("lora_fc1_result").first;
+    mLoraFc2ResultBytes = workspaces.at("lora_fc2_result").first;
 
     if (use_lora)
     {
@@ -4029,7 +4075,7 @@ inline void runMoeLoraGroupedGemmModule(::tensorrt_llm::kernels::cutlass_kernels
     int64_t num_permuted_tokens, int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes,
     int64_t splitk_slices, void const* input_base, void* output_base,
     ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGroupedGemmRunFn run, tensorrt_llm::DataType data_type,
-    cudaStream_t stream)
+    tensorrt_llm::DataType output_data_type, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(mod.permuted_ranks_dev != nullptr,
         "Grouped-GEMM LoRA module is missing permuted ranks buffer (forgot to populate grouped_gemm?).");
@@ -4037,7 +4083,7 @@ inline void runMoeLoraGroupedGemmModule(::tensorrt_llm::kernels::cutlass_kernels
         "Grouped-GEMM LoRA GEMM dispatch is unavailable: grouped_gemm.run was not populated (this consumer of "
         "libmoe_gemm_src.a does not link libtorch).");
     run(mod, num_permuted_tokens, in_hidden_size, max_lora_rank, dtype_bytes, splitk_slices, input_base, output_base,
-        data_type, stream);
+        data_type, output_data_type, stream);
 }
 
 // Map the activation/back-bone type to the DataType enum the
@@ -4267,8 +4313,30 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     if (lora_params.grouped_gemm.enabled)
     {
         auto const& grouped_gemm = lora_params.grouped_gemm;
-        tensorrt_llm::DataType const data_type = moeLoraDataType<ScaleBiasType>();
+        tensorrt_llm::DataType const data_type = grouped_gemm.data_type;
+        tensorrt_llm::DataType const compute_data_type = moeLoraDataType<ScaleBiasType>();
 
+        void const* grouped_input = input;
+        if (data_type == tensorrt_llm::DataType::kFP8)
+        {
+#if defined(ENABLE_FP8)
+            // FC2's result storage must remain unused until FC1's grouped GEMMs finish on this stream.
+            // It must stay separate from overlapped_gemm1_gemm2_{inputs,outputs} and FC1's LoRA output.
+            size_t const fp8InputBytes = static_cast<size_t>(expanded_num_rows) * hidden_size * sizeof(__nv_fp8_e4m3);
+            TLLM_CHECK_WITH_INFO(
+                fp8InputBytes <= mLoraFc2ResultBytes, "FC2 LoRA result buffer is too small for the FP8 FC1 input.");
+            auto* fp8_input = reinterpret_cast<__nv_fp8_e4m3*>(lora_fc2_result_);
+            convertMoeLoraInputToFp8(fp8_input, input, num_valid_tokens_ptr, hidden_size, expanded_num_rows, stream);
+            grouped_input = fp8_input;
+#else
+            TLLM_THROW("FP8 MoE LoRA requires an ENABLE_FP8 build.");
+#endif
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(data_type == compute_data_type,
+                "MoE LoRA cache dtype must match the activation compute dtype unless the cache is FP8.");
+        }
         // The grouped-GEMM GEMM skips rank-0 rows, but the bias/reorder paths
         // read lora_fc1_result_ for every valid row. Zero the buffer first so
         // skipped rows are a deterministic no-op. It is contiguous and holds
@@ -4276,18 +4344,19 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         size_t const fc1_result_bytes = static_cast<size_t>(expanded_num_rows) * static_cast<size_t>(inter_size)
             * (is_gated_activation ? 2u : 1u) * sizeof(ScaleBiasType);
         TLLM_CUDA_CHECK(cudaMemsetAsync(lora_fc1_result_, 0, fc1_result_bytes, stream));
-
         runMoeLoraGroupedGemmModule(grouped_gemm.fc1, expanded_num_rows, /*in_hidden_size=*/hidden_size,
             grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices,
-            /*input_base=*/static_cast<void const*>(input),
-            /*output_base=*/static_cast<void*>(lora_fc1_result), grouped_gemm.run, data_type, stream);
+            /*input_base=*/grouped_input,
+            /*output_base=*/static_cast<void*>(lora_fc1_result), grouped_gemm.run, data_type, compute_data_type,
+            stream);
 
         if (is_gated_activation)
         {
             runMoeLoraGroupedGemmModule(grouped_gemm.gated, expanded_num_rows, /*in_hidden_size=*/hidden_size,
                 grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices,
-                /*input_base=*/static_cast<void const*>(input),
-                /*output_base=*/static_cast<void*>(lora_gated_out), grouped_gemm.run, data_type, stream);
+                /*input_base=*/grouped_input,
+                /*output_base=*/static_cast<void*>(lora_gated_out), grouped_gemm.run, data_type, compute_data_type,
+                stream);
         }
     }
     else
@@ -4362,18 +4431,41 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     if (lora_params.grouped_gemm.enabled)
     {
         auto const& grouped_gemm = lora_params.grouped_gemm;
-        tensorrt_llm::DataType const data_type = moeLoraDataType<ScaleBiasType>();
+        tensorrt_llm::DataType const data_type = grouped_gemm.data_type;
+        tensorrt_llm::DataType const compute_data_type = moeLoraDataType<ScaleBiasType>();
 
+        void const* grouped_input = input;
+        if (data_type == tensorrt_llm::DataType::kFP8)
+        {
+#if defined(ENABLE_FP8)
+            // GEMM1 and its activation must finish consuming FC1's LoRA delta on this stream before this cast.
+            // Its storage must stay separate from overlapped_gemm1_gemm2_{inputs,outputs} and FC2's LoRA output,
+            // and must not be reused again until FC2's grouped GEMMs finish.
+            size_t const fp8InputBytes = static_cast<size_t>(num_tokens) * inter_size * sizeof(__nv_fp8_e4m3);
+            TLLM_CHECK_WITH_INFO(
+                fp8InputBytes <= mLoraFc1ResultBytes, "FC1 LoRA result buffer is too small for the FP8 FC2 input.");
+            auto* fp8_input = reinterpret_cast<__nv_fp8_e4m3*>(lora_fc1_result_);
+            convertMoeLoraInputToFp8(fp8_input, input, num_valid_tokens_ptr, inter_size, num_tokens, stream);
+            grouped_input = fp8_input;
+#else
+            TLLM_THROW("FP8 MoE LoRA requires an ENABLE_FP8 build.");
+#endif
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(data_type == compute_data_type,
+                "MoE LoRA cache dtype must match the activation compute dtype unless the cache is FP8.");
+        }
         // As in loraFC1, zero the output so rank-0 rows the GEMM skips do not
         // feed stale data into the downstream add.
         size_t const fc2_result_bytes
             = static_cast<size_t>(num_tokens) * static_cast<size_t>(hidden_size) * sizeof(ScaleBiasType);
         TLLM_CUDA_CHECK(cudaMemsetAsync(lora_fc2_result_, 0, fc2_result_bytes, stream));
-
         runMoeLoraGroupedGemmModule(grouped_gemm.fc2, num_tokens, /*in_hidden_size=*/inter_size,
             grouped_gemm.max_lora_rank, grouped_gemm.dtype_bytes, grouped_gemm.splitk_slices,
-            /*input_base=*/static_cast<void const*>(input),
-            /*output_base=*/static_cast<void*>(lora_fc2_result_), grouped_gemm.run, data_type, stream);
+            /*input_base=*/grouped_input,
+            /*output_base=*/static_cast<void*>(lora_fc2_result_), grouped_gemm.run, data_type, compute_data_type,
+            stream);
         sync_check_cuda_error(stream);
         return;
     }

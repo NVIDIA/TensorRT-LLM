@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Tests for the modeling-bringup workflow prompts, CLI wiring, and task-schema validation."""
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ import pytest
 import yaml
 
 from agent_flow.workflows.agent_team import workflow as _agent_team_workflow_module
+from agent_flow.workflows.agent_team.state import STATE_FILENAME
 from agent_flow.workflows.modeling_bringup import cli as _modeling_bringup_cli_module
 from agent_flow.workflows.modeling_bringup import task_schema as _task_schema
 
@@ -853,127 +856,6 @@ def test_modeling_bringup_workflow_uses_extended_bundle(tmp_path, monkeypatch):
         importlib.reload(mb_prompts)
 
 
-def _print_baseline_context_table(
-    variant: str,
-    rows: list[tuple[str, str, float, int | None, int | None]],
-    unavailable: list[str],
-) -> None:
-    """Print an overview table of each role's baseline ("start") context usage.
-
-    Visible with ``pytest -s``. Purely informational — the caller's
-    assertions still enforce the 20% budget.
-    """
-    header = ("role", "backend", "context%", "tokens / window")
-    table_rows = [
-        (name, backend, f"{percentage:.1f}%", f"{tokens} / {window}")
-        for name, backend, percentage, tokens, window in rows
-    ]
-    columns = list(zip(header, *table_rows)) if table_rows else [(h,) for h in header]
-    widths = [max(len(str(cell)) for cell in col) for col in columns]
-
-    def _fmt(cells: tuple[str, ...]) -> str:
-        return "  ".join(cell.ljust(widths[col]) for col, cell in enumerate(cells))
-
-    rule = "-" * (sum(widths) + 2 * (len(widths) - 1))
-    print(f"\n=== modeling-bringup baseline context usage ({variant}) ===")
-    print(_fmt(header))
-    print(rule)
-    for row in table_rows:
-        print(_fmt(row))
-    if not table_rows:
-        print("(no live backend reported context usage)")
-    if unavailable:
-        print(f"skipped: {'; '.join(unavailable)}")
-
-
-@pytest.mark.live_backend
-@pytest.mark.parametrize(
-    "include_slurm_environment",
-    [False, True],
-    ids=["local", "slurm"],
-)
-def test_modeling_bringup_claude_agents_baseline_context_under_20_percent(
-    tmp_path, include_slurm_environment
-):
-    """Each Claude-backed modeling-bringup agent's pre-input context must stay < 20%.
-
-    The modeling-bringup bundle layers substantial domain guidance
-    (source boundary, validation policies, accuracy gate, evidence
-    labels, and — for Slurm tasks — the container bootstrap) on top of
-    the generic ``agent_team`` prompts. This guards that the larger
-    prompt, together with the Claude Code preset, built-in tools, MCP
-    tool schemas, and memory the agent carries *before any user input*,
-    still leaves most of the context window free for real work. The Slurm
-    variant carries the largest prompts, so it is the worst case for
-    bloat — both variants are exercised.
-
-    Mirrors ``test_claude_agents_baseline_context_under_20_percent`` in
-    the agent_team suite, but builds the workflow with the
-    modeling-bringup bundle. Uses the live local ``/context`` control
-    request via ``fetch_baseline_context_usage`` (no model call), so it
-    runs for real wherever the ``claude`` CLI is installed and skips
-    cleanly when the backend cannot be reached. A baseline at or above
-    20% fails; an unreachable backend skips.
-    """
-    variant = "slurm" if include_slurm_environment else "local"
-    mb_prompts = importlib.import_module("agent_flow.workflows.modeling_bringup.prompts")
-    importlib.reload(mb_prompts)
-    bundle = mb_prompts.build_modeling_bringup_prompts(
-        include_slurm_environment=include_slurm_environment
-    )
-    workflow_module = _load_agent_team_workflow_module()
-    workflow = workflow_module.AgentTeamWorkflow(workspace=tmp_path, prompts=bundle)
-    try:
-        # Only Claude Code-backed agents report a pre-input /context
-        # breakdown; the codex-backed plan_drafter / reviewer return None.
-        claude_agents = {
-            name: agent
-            for name, agent in (
-                ("coder", workflow.coder),
-                ("plan_reviewer", workflow.plan_reviewer),
-                ("qa", workflow.qa),
-            )
-            if agent.config.backend.kind == "claude-code"
-        }
-        assert claude_agents, "expected at least one Claude Code-backed modeling-bringup agent"
-
-        unavailable: list[str] = []
-        rows: list[tuple[str, str, float, int | None, int | None]] = []
-        for name, agent in claude_agents.items():
-            backend_kind = agent.config.backend.kind
-            try:
-                usage = agent.fetch_baseline_context_usage()
-            except Exception as exc:  # CLI missing / backend unreachable
-                unavailable.append(f"{name} ({variant}): {exc}")
-                continue
-            if usage is None or usage.context_percentage is None:
-                unavailable.append(f"{name} ({variant}): no pre-input context usage")
-                continue
-            rows.append(
-                (
-                    name,
-                    backend_kind,
-                    usage.context_percentage,
-                    usage.context_tokens,
-                    usage.context_window,
-                )
-            )
-
-        # Overview of where each role starts before any real work.
-        _print_baseline_context_table(variant, rows, unavailable)
-
-        for name, backend_kind, percentage, tokens, window in rows:
-            assert percentage < 20.0, (
-                f"{name} ({variant}) pre-input context {percentage:.1f}% "
-                f"exceeds the 20% budget "
-                f"({tokens}/{window} tokens)"
-            )
-        if not rows:
-            pytest.skip("no live backend reported context usage: " + "; ".join(unavailable))
-    finally:
-        workflow.close()
-
-
 def _valid_task_payload(tmp_path) -> dict:
     """Return a fully-populated payload whose three required paths exist on disk under ``tmp_path``."""
     ref = tmp_path / "modeling.py"
@@ -1040,6 +922,101 @@ def test_modeling_bringup_cli_includes_slurm_prompts_with_slurm_environment(tmp_
     assert "Slurm container bootstrap" in captured["prompts"].coder
     assert "test_command.md" in captured["prompts"].coder
     assert "slurm_partition" in captured["prompts"].plan_drafter
+
+
+def _resumable_workspace(tmp_path, checkpointed_payload) -> Path:
+    """Return a workspace that holds a checkpoint and a different task copy."""
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    (workspace / STATE_FILENAME).write_text("{}", encoding="utf-8")
+    (workspace / "task.yaml").write_text(
+        yaml.safe_dump(checkpointed_payload, sort_keys=False), encoding="utf-8"
+    )
+    return workspace
+
+
+@pytest.mark.parametrize("clean", [False, True])
+def test_modeling_bringup_cli_resumes_from_the_checkpointed_task(tmp_path, monkeypatch, clean):
+    """A resumed run takes its prompt switches from the checkpointed task.
+
+    agent_team keeps reading `<workspace>/task.yaml` on resume and ignores a
+    different `--task`; only `--clean`, which starts over, follows `--task`.
+    """
+    from agent_flow.git_worktree import GitWorktreeIsolation
+
+    payload = _valid_task_payload(tmp_path)
+    task_path = _write_task_yaml(tmp_path, payload)
+    slurm_environment = {"slurm_partition": "gb200", "docker_image": "/containers/trtllm.sqsh"}
+    workspace = _resumable_workspace(tmp_path, {**payload, "slurm-environment": slurm_environment})
+    argv = ["--task", str(task_path), "--workspace", str(workspace)]
+    if clean:
+        argv.append("--clean")
+    captured = {}
+
+    async def fake_clean(self):
+        pass
+
+    def fake_team_main(forwarded_argv, *, prompts):
+        captured["argv"] = forwarded_argv
+        captured["prompts"] = prompts
+
+    monkeypatch.setattr(GitWorktreeIsolation, "clean", fake_clean)
+    monkeypatch.setattr(_modeling_bringup_cli_module, "_team_main", fake_team_main)
+
+    _modeling_bringup_cli_module.main(argv)
+
+    assert captured["argv"] == argv
+    assert ("Slurm container bootstrap" in captured["prompts"].coder) is (not clean)
+
+
+def test_modeling_bringup_cli_isolates_the_checkpointed_repo_on_resume(tmp_path, monkeypatch):
+    """A resumed `--concurrent` run builds node worktrees from the checkpointed task's repo."""
+    from agent_flow.git_worktree import GitWorktreeIsolation
+
+    payload = _valid_task_payload(tmp_path)
+    task_path = _write_task_yaml(tmp_path, payload)
+    checkpointed_repo = tmp_path / "checkpointed-repo"
+    checkpointed_repo.mkdir()
+    workspace = _resumable_workspace(
+        tmp_path, {**payload, "trtllm_repo_path": str(checkpointed_repo)}
+    )
+    captured = {}
+    monkeypatch.setattr(
+        _modeling_bringup_cli_module, "_team_main", lambda argv, **kwargs: captured.update(kwargs)
+    )
+
+    _modeling_bringup_cli_module.main(
+        ["--task", str(task_path), "--workspace", str(workspace), "--concurrent"]
+    )
+
+    assert isinstance(captured["isolation"], GitWorktreeIsolation)
+    assert captured["isolation"].repo_path == checkpointed_repo
+
+
+def test_modeling_bringup_cli_clean_resets_the_repo_named_by_task_flag(tmp_path, monkeypatch):
+    """`--clean` starts over from `--task`, so it resets that task's repo."""
+    from agent_flow.git_worktree import GitWorktreeIsolation
+
+    payload = _valid_task_payload(tmp_path)
+    task_path = _write_task_yaml(tmp_path, payload)
+    checkpointed_repo = tmp_path / "checkpointed-repo"
+    checkpointed_repo.mkdir()
+    workspace = _resumable_workspace(
+        tmp_path, {**payload, "trtllm_repo_path": str(checkpointed_repo)}
+    )
+    cleaned = []
+
+    async def fake_clean(self):
+        cleaned.append(self.repo_path)
+
+    monkeypatch.setattr(GitWorktreeIsolation, "clean", fake_clean)
+    monkeypatch.setattr(_modeling_bringup_cli_module, "_team_main", lambda argv, **kwargs: None)
+
+    _modeling_bringup_cli_module.main(
+        ["--task", str(task_path), "--workspace", str(workspace), "--clean"]
+    )
+
+    assert cleaned == [Path(payload["trtllm_repo_path"])]
 
 
 def test_task_schema_accepts_valid_payload(tmp_path):

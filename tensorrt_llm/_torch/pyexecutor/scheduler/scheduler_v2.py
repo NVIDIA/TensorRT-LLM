@@ -18,15 +18,22 @@ import os
 from collections import Counter
 from typing import Callable, Optional
 
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
+from tensorrt_llm.llmapi.llm_args import (
+    CapacitySchedulerPolicy,
+    ContextChunkingPolicy,
+    ContextSchedulingPolicy,
+)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.kv_cache_manager_v2 import RemoteMemError
 
+from ...disaggregation import diagnostics as disagg_diagnostics
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
     get_draft_token_length,
     rewind_context_after_cache_drop,
 )
+from . import ctx_decoder_batch
 from .prefix_wait_planner import PrefixWaitPlanner
 from .scheduler import (
     RemoteTailPhase,
@@ -46,6 +53,7 @@ class ScheduleAction(enum.Enum):
     SCHEDULED = "scheduled"  # success — payload contains tokens etc.
     SKIP = "skip"  # skip this request, continue the loop
     STOP = "stop"  # stop the scheduling loop
+    DEFER = "defer"  # retry this request after the rest of this iteration's context order
 
 
 class _RecomputePauseState:
@@ -111,6 +119,16 @@ class BudgetTracker:
         if peft_pages > 0:
             self.commit_peft(req, peft_pages)
 
+    def hold(self, num_tokens: int, num_requests: int) -> None:
+        """Set tokens and request slots aside for requests scheduled later in the iteration."""
+        self.num_tokens += num_tokens
+        self.num_requests += num_requests
+
+    def release(self, num_tokens: int, num_requests: int) -> None:
+        """Return what ``hold`` set aside."""
+        self.num_tokens -= num_tokens
+        self.num_requests -= num_requests
+
     def commit_peft(self, req: LlmRequest, peft_pages: int) -> None:
         """Record only PEFT consumption without affecting token/request budgets.
 
@@ -156,6 +174,22 @@ class KVCacheV2Scheduler(RequestScheduler):
     assignment into one unified loop.
     """
 
+    # The RemoteMemError a resume raised because the request's KV pages were on a remote cache level that failed: set
+    # by _try_allocate_generation and by the context and disagg generation-init admissions, consumed by
+    # _on_lost_kv_cache.
+    _lost_kv_error: Optional[RemoteMemError] = None
+    # (request, error message) of requests that lost KV pages and cannot recompute them; take_lost_kv_requests.
+    _lost_kv_requests: tuple = ()
+    # Managers whose remote cache level failing stops this rank (recover_lost_kv_per_rank=False); empty otherwise.
+    _lockstep_remote_managers: tuple = ()
+
+    _ctx_decoder_held = False
+    # Holds since take_decision_counters (see RequestScheduler.take_decision_counters).
+    _num_gen_init_cap_holds = 0
+    _num_gen_init_transfer_budget_holds = 0
+    _num_ctx_decoder_hold_passes = 0
+    _num_ctx_decoder_held_requests = 0
+
     def __init__(
         self,
         max_batch_size: int,
@@ -171,7 +205,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
         enable_prefix_aware_scheduling: bool = True,
         enable_recompute_pause: bool = True,
+        context_scheduling_policy: ContextSchedulingPolicy = ContextSchedulingPolicy.FCFS,
+        context_starvation_iterations: Optional[int] = None,
+        recover_lost_kv_per_rank: bool = True,
+        max_gen_init_admissions_per_pass: Optional[int] = None,
+        context_demote_uncached_tokens: Optional[int] = None,
+        context_demote_max_iters: Optional[int] = None,
+        exact_context_demotion: bool = False,
     ) -> None:
+        """``recover_lost_kv_per_rank`` False is for ranks that schedule in lock step (TP without attention DP, CP,
+        PP): a failed remote cache level then raises RemoteMemError out of ``schedule_request`` instead of re-matching,
+        recomputing or failing the affected requests on this rank alone, which would desynchronize the group."""
         self.remote_tail_phase: RemoteTailPhase | None = None
         self._remote_tail_context_ids: frozenset[int] = frozenset()
         self._remote_tail_generation_ids: frozenset[int] = frozenset()
@@ -196,6 +240,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.cross_kv_cache_manager = cross_kv_cache_manager
         self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
         self.enable_recompute_pause = enable_recompute_pause
+        self.recover_lost_kv_per_rank = recover_lost_kv_per_rank
+        if not recover_lost_kv_per_rank:
+            self._lockstep_remote_managers = tuple(
+                manager
+                for manager in (kv_cache_manager, draft_kv_cache_manager, cross_kv_cache_manager)
+                if manager is not None and manager.has_remote_cache_level
+            )
+        # Disaggregated generation-init requests admitted per pass (None: all that fit).
+        self.max_gen_init_admissions_per_pass = max_gen_init_admissions_per_pass
         # Every input to the prefix-aware skip is fixed for this scheduler's
         # lifetime: the knob is a constructor argument, and both manager
         # attributes are assigned once in ``KVCacheManagerV2.__init__``. Resolve
@@ -240,7 +293,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}, "
             f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}, "
             f"prefix_skip_enabled={self._prefix_skip_enabled}, "
-            f"enable_recompute_pause={enable_recompute_pause}"
+            f"enable_recompute_pause={enable_recompute_pause}, "
+            f"max_gen_init_admissions_per_pass={max_gen_init_admissions_per_pass}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -257,6 +311,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._no_schedule_until_state_value = no_schedule_until_state.value
         self._no_schedule_after_state_value = no_schedule_after_state.value
         self._context_init_state_value = LlmRequestState.CONTEXT_INIT.value
+        # Prefix-aware skip bookkeeping: first-chunk contributors of the previous schedule
+        # (block key -> request id), and keys whose deferral did not pay (see
+        # ``_deferral_paid``).
+        self._prev_first_chunk_contributors: dict = {}
+        self._unpaid_prefix_keys: dict = {}
         self._encoder_init_state_value = LlmRequestState.ENCODER_INIT.value
         self._disagg_gen_init_state_value = LlmRequestState.DISAGG_GENERATION_INIT.value
         self._gen_to_complete_state_value = LlmRequestState.GENERATION_TO_COMPLETE.value
@@ -280,28 +339,105 @@ class KVCacheV2Scheduler(RequestScheduler):
         # the exact remainder releases it once no more than the threshold is
         # left. Gating at the door (not from the second chunk on) keeps long
         # requests from parking mid-prefill with their KV blocks held.
-        demote_uncached = int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0"))
-        self._ctx_demote_uncached_tokens = max(0, demote_uncached) if self.chunking_enabled else 0
+        # The constructor arguments win; unset, the environment variables
+        # (TLLM_V2_CTX_DEMOTE_*) apply.
+        if context_demote_uncached_tokens is None:
+            context_demote_uncached_tokens = int(
+                os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0")
+            )
+        demote_uncached = max(0, context_demote_uncached_tokens)
+        self._ctx_demote_uncached_tokens = demote_uncached if self.chunking_enabled else 0
         # A request demoted this many iterations is let through for good: it
         # runs in arrival order to the end of its prefill (0 = no bound).
-        self._ctx_demote_max_iters = max(
-            0, int(os.environ.get("TLLM_V2_CTX_DEMOTE_MAX_ITERS", "0"))
-        )
+        if context_demote_max_iters is None:
+            context_demote_max_iters = int(os.environ.get("TLLM_V2_CTX_DEMOTE_MAX_ITERS", "0"))
+        self._ctx_demote_max_iters = max(0, context_demote_max_iters)
         self._ctx_demote_skips: dict[int, int] = {}
+        # Requests let through; they keep their estimate for plan_context_pass
+        # and the router's least_prefill load.
+        self._ctx_demote_released: set[int] = set()
+        # Exact classification (RuntimeHooks.exact_context_demotion): by the
+        # prefix cache, not by the router's estimate alone. The router only
+        # knows the conversation's previous prompt length on this rank, so it
+        # calls a forked sub-agent or a new conversation over a cached shared
+        # prefix long, and a continuing turn whose prefix was evicted short
+        # (which then takes the whole budget for every chunk). An estimate
+        # above the threshold is checked once against the radix tree
+        # (read-only probe, one walk per request), a request whose cache this
+        # pool already holds is judged by its exact remainder, and a request
+        # ordered as short whose first prepare shows a long remainder goes
+        # behind the rest of the iteration.
+        self._ctx_demote_exact = self._ctx_demote_uncached_tokens > 0 and exact_context_demotion
+        # First-chunk requests ordered as short on the estimate alone this iteration.
+        self._ctx_unverified_short: set[int] = set()
         if self._ctx_demote_uncached_tokens:
             logger.info(
                 f"KVCacheV2Scheduler: demoting context requests with more than "
                 f"{self._ctx_demote_uncached_tokens} uncached tokens left "
-                f"(max iterations demoted: {self._ctx_demote_max_iters or 'unbounded'})"
+                f"(max iterations demoted: {self._ctx_demote_max_iters or 'unbounded'}, "
+                f"exact: {self._ctx_demote_exact})"
             )
+        elif demote_uncached:
+            logger.warning(
+                "TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS needs chunked prefill; context demotion is off"
+            )
+
+        # Shortest-uncached-first: context requests with the fewest uncached prompt
+        # tokens go first. With a starvation limit, a request pending for more
+        # scheduler iterations than that first takes up to a quarter of
+        # max_num_tokens in whole chunks, oldest first (see _starved_ctx_shares).
+        self._ctx_shortest_first = (
+            context_scheduling_policy == ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST
+        )
+        self._ctx_starvation_iterations = context_starvation_iterations
+        if context_starvation_iterations is not None and not (
+            self._ctx_shortest_first and self.chunking_enabled and max_num_tokens is not None
+        ):
+            logger.warning(
+                "scheduler_config.context_starvation_iterations is ignored: it needs "
+                "context_scheduling_policy='shortest_uncached_first', chunked context and a "
+                "max_num_tokens budget"
+            )
+            self._ctx_starvation_iterations = None
+        self._starved_ctx_tokens = (
+            max_num_tokens // 4 if self._ctx_starvation_iterations is not None else 0
+        )
+        self._sched_iter = 0
+        # Reuse probe results of this scheduling pass, by request id (_uncached_tokens).
+        self._reuse_probes: dict[int, Optional[int]] = {}
+        # In-forward Mamba snapshots (MambaHybridCacheManagerV2): staging rows
+        # per batch, and those left in the batch being scheduled.
+        self._inforward_snapshot_rows = kv_cache_manager.inforward_snapshot_rows
+        self._inforward_snapshot_rows_left = 0
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
+        self._retiring_gen_receives_probe: Callable[[], bool] = lambda: False
+        # Registered by PyExecutor; see set_disagg_transfer_admission_controller.
+        self._disagg_transfer_controller = None
+
+        # Generation requests paused in place (GEN slot preemption).
+        self._gen_paused_ids: frozenset[int] = frozenset()
+        self._gen_resumed_ids: frozenset[int] = frozenset()
+        self._gen_preemption_enabled = False
 
         # `is True`: a manager without the flag reads as off.
         self._swa_scratch_reuse = (
             getattr(kv_cache_manager, "enable_swa_scratch_reuse", False) is True
         )
+
+        # Decoder window whose final-window chunks this pass holds (ctx_decoder_batch.py); 0: none.
+        self._ctx_decoder_hold_window = 0
+        self._ctx_decoder_held = False
+
+    def set_disagg_transfer_admission_controller(self, controller) -> None:
+        """Register the executor's KV-transfer window (DisaggTransferAdmissionController).
+
+        Each pass opens a DisaggTransferAdmissionGate on it. Once the gate closes, generation-init
+        requests are skipped without KV allocation: the executor's FCFS transfer admission would
+        defer them and revert the allocation.
+        """
+        self._disagg_transfer_controller = controller
 
     def _pregrown_context_tokens(self, req: LlmRequest) -> int:
         """KV capacity a context request holds past its position, left by a skipped forward.
@@ -323,6 +459,97 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         return max(0, min(grown, req.context_remaining_length))
 
+    def set_ctx_decoder_hold(self, window: int) -> None:
+        """Hold every holdable final window of this pass (``window`` > 0), or nothing (0)."""
+        self._num_ctx_decoder_hold_passes += self._ctx_decoder_held
+        self._ctx_decoder_hold_window = int(window)
+        self._ctx_decoder_held = False
+
+    def _ctx_decoder_hold_chunk(self, req: LlmRequest, chunk_size: int) -> int:
+        """The chunk of a hold pass: unchanged, cut back to the final window, or 0 (held whole)."""
+        window = self._ctx_decoder_hold_window
+        pos = req.context_current_position
+        if ctx_decoder_batch.window_rows(
+            pos, chunk_size, req.prompt_len, window
+        ) == 0 or not ctx_decoder_batch.holdable(req):
+            return chunk_size
+        req.py_ctx_decoder_held = True
+        self._ctx_decoder_held = True
+        self._num_ctx_decoder_held_requests += 1
+        return ctx_decoder_batch.hold_chunk(
+            pos, chunk_size, req.prompt_len, window, self.chunk_unit_size
+        )
+
+    def plan_context_pass(
+        self, active_requests: RequestList, inflight_ids, window: int
+    ) -> ctx_decoder_batch.ContextPassPlan:
+        """An estimate of this rank's context phase, without allocating anything: arrival order
+        with long-prefill demotion, token budget, request cap and chunk unit; requests not started
+        yet count their uncached-prefill estimate. The shortest-uncached-first and starvation
+        orders, SWA scratch pre-growth and the pass's per-request skips are not modeled; a wrong
+        estimate costs at most a deferred pass, since a request is held once. Holdable rows count
+        only while the queue can refill the held tokens, youngest first, the order the scheduler
+        reaches them."""
+        candidates = [
+            req
+            for req in active_requests
+            if not req.is_attention_dp_dummy
+            and req.state_value == self._context_init_state_value
+            and req.request_id not in inflight_ids
+            and req.py_csa2_remote_tail_mode is None
+        ]
+        if self._ctx_demote_uncached_tokens:
+            kept, demoted = [], []
+            for req in candidates:
+                demote = (
+                    req.py_request_id not in self._ctx_demote_released
+                    and self._is_long_context(req)
+                    and not (
+                        self._ctx_demote_max_iters
+                        and self._ctx_demote_skips.get(req.py_request_id, 0)
+                        >= self._ctx_demote_max_iters
+                    )
+                )
+                (demoted if demote else kept).append(req)
+            candidates = kept + demoted
+        budget = self.max_num_tokens if self.max_num_tokens is not None else 1 << 62
+        unit = self.chunk_unit_size
+        plan = ctx_decoder_batch.ContextPassPlan()
+        items = []  # (rows, holdable, held tokens)
+        for req in candidates:
+            remaining = int(req.context_remaining_length)
+            estimate = req.py_uncached_prefill_tokens
+            if req.is_first_context_chunk and isinstance(estimate, int) and estimate > 0:
+                remaining = min(remaining, estimate)
+            remaining = max(1, remaining)
+            if budget < unit or len(items) >= self.max_num_requests:
+                plan.backlog += remaining
+                continue
+            chunk = min(budget, remaining)
+            if chunk < remaining:
+                chunk = chunk // unit * unit
+            if chunk <= 0:
+                plan.backlog += remaining
+                continue
+            prompt_len = int(req.prompt_len)
+            pos = prompt_len - remaining
+            rows = ctx_decoder_batch.window_rows(pos, chunk, prompt_len, window)
+            held_tokens = (
+                chunk - ctx_decoder_batch.hold_chunk(pos, chunk, prompt_len, window, unit)
+                if rows
+                else 0
+            )
+            items.append((rows, ctx_decoder_batch.holdable(req), held_tokens))
+            plan.rows += rows
+            budget -= chunk
+            plan.backlog += remaining - chunk
+        refill = plan.backlog
+        for rows, can_hold, held_tokens in reversed(items):
+            if rows and can_hold and held_tokens <= refill:
+                plan.holdable_rows += rows
+                refill -= held_tokens
+        return plan
+
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
 
@@ -332,6 +559,30 @@ class KVCacheV2Scheduler(RequestScheduler):
         see those pages and reports a false deadlock.
         """
         self._async_transfer_manager = mgr
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        counters = (
+            self._num_gen_init_cap_holds,
+            self._num_gen_init_transfer_budget_holds,
+            self._num_ctx_decoder_hold_passes,
+            self._num_ctx_decoder_held_requests,
+        )
+        self._num_gen_init_cap_holds = 0
+        self._num_gen_init_transfer_budget_holds = 0
+        self._num_ctx_decoder_hold_passes = 0
+        self._num_ctx_decoder_held_requests = 0
+        return counters
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Expose current rank-local receive ownership to the deadlock detector.
+
+        Args:
+            probe: Whether logically cancelled receives still retain local resources.
+                Read current ownership, not the previous iteration's fleet-wide
+                snapshot: remote retention cannot explain this rank's allocation stall.
+                Retirement and its deadline remain the transfer layer's responsibility.
+        """
+        self._retiring_gen_receives_probe = probe
 
     @property
     def ctx_demote_uncached_tokens(self) -> int:
@@ -347,6 +598,11 @@ class KVCacheV2Scheduler(RequestScheduler):
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
+        self._sched_iter += 1
+        self._reuse_probes.clear()
+        # A level that failed since the last pass (e.g. in an eviction WRITE during prepare_resources) has already
+        # dropped pages from this rank's reuse tree only.
+        self._raise_if_lockstep_remote_level_failed()
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Main scheduling loop
         (
@@ -358,6 +614,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         ) = self._schedule_loop(active_requests, inflight_request_ids)
+        # One that failed in this pass, e.g. in an eviction WRITE that the C++ retried past it, before the batch runs.
+        self._raise_if_lockstep_remote_level_failed()
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -388,6 +646,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._remote_tail_context_ids = context_request_ids
         self._remote_tail_generation_ids = generation_request_ids
 
+    def set_gen_paused_ids(
+        self, request_ids: frozenset[int], resumed_ids: frozenset[int] = frozenset()
+    ) -> None:
+        """Leave paused requests resident and give resumes priority this pass."""
+        self._gen_preemption_enabled = True
+        self._gen_paused_ids = request_ids
+        self._gen_resumed_ids = resumed_ids
+
+    def _filter_paused_requests(self, requests: RequestList) -> RequestList:
+        paused = [req for req in requests if req.py_request_id in self._gen_paused_ids]
+        for req in paused:
+            # Resume from the host token, not a stale overlap tensor.
+            self._clear_request_runtime_state(req)
+        return [req for req in requests if req.py_request_id not in self._gen_paused_ids]
+
     def _filter_remote_tail_phase_requests(self, requests: RequestList) -> RequestList:
         phase = self.remote_tail_phase
         if phase is None:
@@ -396,13 +669,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         for req in requests:
             if req.state_value in (self._context_init_state_value, self._encoder_init_state_value):
                 if (
-                    phase is RemoteTailPhase.CONTEXT
+                    phase in (RemoteTailPhase.CONTEXT, RemoteTailPhase.MIXED)
                     and req.request_id in self._remote_tail_context_ids
                 ):
                     eligible.append(req)
             elif self.is_request_in_schedulable_state(req):
                 if (
-                    phase is RemoteTailPhase.DECODE
+                    phase in (RemoteTailPhase.DECODE, RemoteTailPhase.MIXED)
                     and req.request_id in self._remote_tail_generation_ids
                 ):
                     eligible.append(req)
@@ -445,15 +718,19 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = self._filter_remote_tail_phase_requests(list(active_requests))
+        if self._gen_paused_ids:
+            requests_list = self._filter_paused_requests(requests_list)
+        # Only context requests can carry an exclusive mode, so test the state
+        # first: during decode every request fails it, one cheap compare each.
         exclusive_remote_mode = next(
             (
                 getattr(req, "py_csa2_remote_tail_mode", None)
                 for req in requests_list
-                if not defer_remote_tail_context
+                if req.state_value == self._context_init_state_value
+                and not defer_remote_tail_context
                 and self.remote_tail_phase is not RemoteTailPhase.DECODE
                 and req.request_id not in inflight_request_ids
-                and req.state_value == self._context_init_state_value
-                and getattr(req, "py_csa2_remote_tail_mode", None) is not None
+                and getattr(req, "py_csa2_remote_tail_mode", None) == "source"
             ),
             None,
         )
@@ -469,9 +746,18 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
             )
 
+        # Resume deadlines take precedence over the first-token preference.
+        if self._gen_resumed_ids:
+            requests_list.sort(key=lambda req: req.py_request_id not in self._gen_resumed_ids)
+
         req_it_end = len(requests_list)
         recompute_pause_state = _RecomputePauseState(req_it_end)
         req_it = 0
+        disagg_gate = (
+            self._disagg_transfer_controller.begin_gate(active_requests)
+            if self._disagg_transfer_controller is not None
+            else None
+        )
 
         # Context requests are always deferred to a second phase so that
         # generation requests are fully accounted for in the budget before
@@ -480,8 +766,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         # prevents PEFT adapter eviction failures when gen requests hold
         # adapters that can't be evicted mid-iteration.
         pending_ctx: RequestList = []
+        # Index of each pending context request in requests_list.
+        pending_ctx_index: dict[int, int] = {}
 
-        # Pre-claim PEFT pages for GENERATION_TO_COMPLETE requests.
+        # Pre-claim PEFT pages for terminal requests and, with GEN preemption,
+        # every live decode, including requests omitted from this batch.
         # In the overlap executor these requests are no longer scheduled
         # (state outside schedulable range) but their adapters haven't
         # been released yet (mark_request_done runs after prepare_resources
@@ -489,9 +778,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         # empty and context requests with a different adapter could be
         # admitted, causing ensure_batch to crash when it can't evict the
         # still-active adapter.
-        for req in requests_list:
-            if req.state_value == self._gen_to_complete_state_value:
-                budget.pre_claim_peft(req)
+        if self.peft_cache_manager is not None:
+            for req in active_requests:
+                if req.state_value == self._gen_to_complete_state_value or (
+                    self._gen_preemption_enabled
+                    and req.state_value == LlmRequestState.GENERATION_IN_PROGRESS.value
+                ):
+                    # Paused and displaced decode requests still hold their adapters.
+                    budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
@@ -520,9 +814,29 @@ class KVCacheV2Scheduler(RequestScheduler):
             # no free slots remain, so the request is skipped and retried next
             # iteration. PEFT budget is still checked and committed.
             if req_state_value == self._disagg_gen_init_state_value:
+                if (
+                    self.max_gen_init_admissions_per_pass is not None
+                    and len(disagg_candidates) >= self.max_gen_init_admissions_per_pass
+                ):
+                    # Admitted in a later pass, in order.
+                    self._num_gen_init_cap_holds += 1
+                    req_it += 1
+                    continue
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
                     break
+
+                if disagg_gate is not None and disagg_gate.closed:
+                    # The KV-transfer budget of this pass is exhausted: the executor's FCFS admission
+                    # defers every candidate after the one that closed the gate and reverts its KV,
+                    # so do not allocate it. PEFT is charged as for such a deferred candidate, so the
+                    # rest of the pass sees the same budget as without the gate.
+                    disagg_gate.num_skipped += 1
+                    self._num_gen_init_transfer_budget_holds += 1
+                    if peft_pages > 0:
+                        budget.commit_peft(req, peft_pages)
+                    req_it += 1
+                    continue
 
                 action, tokens = self._try_schedule_disagg_gen_init(req, budget)
                 if action is ScheduleAction.STOP:
@@ -531,6 +845,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req_it += 1
                     continue
                 disagg_candidates.append(req)
+                if disagg_gate is not None:
+                    disagg_gate.observe_candidate(req)
                 # Disagg requests only commit PEFT (not num_requests/num_tokens)
                 # because they don't participate in the forward pass. Counting
                 # them toward num_requests would steal batch slots from gen/ctx
@@ -560,12 +876,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 # Defer to phase 2 so gen PEFT budget is settled first.
                 pending_ctx.append(req)
+                pending_ctx_index[req.py_request_id] = req_it
                 req_it += 1
                 continue
 
             else:
                 if exclusive_remote_mode is not None:
-                    # Replay-only batches harvest the preceding decode on CPU
+                    # Source-only batches harvest the preceding decode on CPU
                     # without launching its next step. On resume, use the host
                     # token count rather than the one-step-behind overlap path.
                     self._clear_request_runtime_state(req)
@@ -620,6 +937,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
             protected.add(req.py_request_id)
+            # A request this pass already suspended or recompute-paused has
+            # given up what it can for now; taking it again would list it
+            # twice and report pages that were never released.
+            protected.update(r.py_request_id for r in evicted)
+            protected.update(r.py_request_id for r in recompute_paused)
             # Demotion reorders compute, not page priority: a demoted request
             # that arrived before `req` would have been scheduled, and so
             # protected, ahead of it in FCFS order.
@@ -630,7 +952,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                     if other.py_request_id in demoted_ids:
                         protected.add(other.py_request_id)
             return self._try_preempt_for_pages(
-                requests_list, protected, inflight_request_ids, recompute_paused, preempted_ids
+                requests_list,
+                protected,
+                inflight_request_ids,
+                recompute_paused,
+                preempted_ids,
+                pending_ctx_index[req.py_request_id],
             )
 
         # --- Phase 2: schedule deferred context / encoder requests ---
@@ -651,129 +978,203 @@ class KVCacheV2Scheduler(RequestScheduler):
         # iteration as a stall even though the contributor is running. Deferring
         # is itself the progress in that case.
         deferred_behind_contributor = False
-        # New requests that wait for a prefix another request prefills. Planned
-        # once per schedule_request, so a retry below spends no wait budget.
+        # Only context-only batches take Mamba snapshots inside the forward.
+        self._inforward_snapshot_rows_left = 0 if scheduled_gen else self._inforward_snapshot_rows
+        first_chunk_contributors: dict = {}
+        context_init_ids = (
+            {
+                r.py_request_id
+                for r in requests_list
+                if r.state_value == self._context_init_state_value
+            }
+            if contributed_blocks is not None and self._prev_first_chunk_contributors
+            else frozenset()
+        )
+
+        if self._ctx_shortest_first and len(pending_ctx) > 1:
+            pending_ctx = self._order_ctx_shortest_first(pending_ctx)
+        starved_ctx: RequestList = []
+        if self._ctx_starvation_iterations is not None:
+            pending_ctx, starved_ctx = self._split_starved_ctx(pending_ctx)
+        # After any reordering: pre-grown requests go first in each pass so no
+        # other request takes the budget their replay needs (stable sort).
+        if self._swa_scratch_reuse:
+            pending_ctx, starved_ctx = (
+                sorted(
+                    reqs,
+                    key=lambda r: not (
+                        r.state_value == self._context_init_state_value
+                        and self._pregrown_context_tokens(r) > 0
+                    ),
+                )
+                for reqs in (pending_ctx, starved_ctx)
+            )
+        # New requests that wait for a prefix another request prefills, planned
+        # in scheduling order. Planned once per schedule_request, so a retry
+        # below spends no wait budget.
         if prefix_waits is None:
             prefix_waits = (
-                self._prefix_wait_planner.plan(pending_ctx)
-                if self._prefix_wait_planner is not None and pending_ctx
+                self._prefix_wait_planner.plan(pending_ctx + starved_ctx)
+                if self._prefix_wait_planner is not None and (pending_ctx or starved_ctx)
                 else {}
             )
-
-        # After any reordering: pre-grown requests go first so no other request
-        # takes the budget their replay needs (stable sort).
-        if self._swa_scratch_reuse:
-            pending_ctx = sorted(
-                pending_ctx,
-                key=lambda r: not (
-                    r.state_value == self._context_init_state_value
-                    and self._pregrown_context_tokens(r) > 0
-                ),
-            )
-
-        for req in pending_ctx:
-            if budget.requests_full:
-                break
-            if req.py_request_id in prefix_waits:
-                # A request new in this pass only prefills the prefix if it was
-                # admitted ahead of this one. A prefix wait is not progress; see
-                # the invariant below.
-                owner_id = prefix_waits[req.py_request_id]
-                if owner_id is None or any(r.py_request_id == owner_id for r in scheduled_ctx):
-                    continue
-            # A radix probe cannot affect admission once the chunk token budget
-            # is exhausted. Keep scanning: an encoder request may still fit.
-            if (
-                self.chunking_enabled
-                and req.state_value == self._context_init_state_value
-                and not self._has_context_chunk_budget(budget)
-            ):
-                continue
-            if scheduled_ctx and self._first_chunk_waits_for_budget(req, budget):
-                continue
-            if req.py_request_id in preempted_ids:
-                continue
-            remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
-            if defer_remote_tail_context and remote_mode is not None:
-                continue
-            if exclusive_remote_mode is not None and remote_mode != exclusive_remote_mode:
-                continue
-            # Destination replay is atomic; source prefix processing may be chunked.
-            if remote_mode == "destination" and not budget.can_fit_tokens(
-                req.context_remaining_length
-            ):
-                continue
-            if scheduled_ctx and remote_mode != scheduled_remote_mode:
-                continue
-            # Probe context requests before peft_pages_needed and before
-            # _try_schedule_context so that a deferral costs nothing: KV pages
-            # are allocated inline, so a skip decided after prepare_context
-            # would pay a create/suspend cycle. Chunk continuations are probed
-            # too -- they cannot be deferred, but they do contribute a block, so
-            # they register once scheduled.
-            first_new_block = None
-            if contributed_blocks is not None and (
-                req.state_value == self._context_init_state_value
-            ):
-                first_new_block = self.kv_cache_manager.probe_first_new_block_key(req)
+            if prefix_waits:
+                self.kv_cache_manager.count_prefix_waits(len(prefix_waits))
+        if self._ctx_demote_exact and prefix_waits:
+            # The probe of a waiting request predates the prefix it waits for;
+            # it is probed again once it stops waiting.
+            for req in pending_ctx + starved_ctx:
+                if req.py_request_id in prefix_waits:
+                    req.py_uncached_prefill_probed = False
+        # Starved requests are scheduled after the others, but their first shares
+        # and request slots are held back while the others fill the budget.
+        starved_shares = self._starved_ctx_shares(starved_ctx, budget)
+        budget.hold(sum(starved_shares), len(starved_ctx))
+        held = 0
+        ctx_stopped = False
+        for starved_pass, ctx_requests in ((False, pending_ctx), (True, starved_ctx)):
+            if starved_pass:
+                if not starved_ctx:
+                    break
+                held = sum(starved_shares)
+                budget.release(held, len(starved_ctx))
+                if ctx_stopped:
+                    break
+            # A DEFER re-appends its request to the tail of this pass, so the
+            # pass iterates over its own copy.
+            ctx_requests = list(ctx_requests)
+            for idx, req in enumerate(ctx_requests):
+                token_cap = None
+                if starved_pass:
+                    # Its own share plus what the shortest-first fill left,
+                    # minus the shares still held for the starved requests after it.
+                    held -= starved_shares[idx]
+                    token_cap = budget.remaining_tokens - held
+                if budget.requests_full:
+                    break
+                if req.py_request_id in prefix_waits:
+                    # A request new in this pass only prefills the prefix if it was
+                    # admitted ahead of this one. A prefix wait is not progress; see
+                    # the invariant below.
+                    owner_id = prefix_waits[req.py_request_id]
+                    if owner_id is None or any(r.py_request_id == owner_id for r in scheduled_ctx):
+                        continue
+                # A radix probe cannot affect admission once the chunk token budget
+                # is exhausted. Keep scanning: an encoder request may still fit.
                 if (
-                    req.is_first_context_chunk
-                    and first_new_block is not None
-                    and first_new_block in contributed_blocks
+                    self.chunking_enabled
+                    and req.state_value == self._context_init_state_value
+                    and not self._has_context_chunk_budget(budget)
                 ):
-                    logger.debug(
-                        f"Deferring context request {req.py_request_id}: its first new "
-                        "block is already contributed by a request that runs this iteration"
-                    )
-                    deferred_behind_contributor = True
                     continue
-            peft_pages = budget.peft_pages_needed(req)
-            if peft_pages is None:
-                continue
-            if req.state_value == self._encoder_init_state_value:
-                action, tokens = self._try_schedule_encoder(req, budget)
-                if action is ScheduleAction.STOP:
-                    break
-                scheduled_encoder.append(req)
-                budget.commit(req, tokens, peft_pages)
-            else:
-                action, tokens, chunking_flag = self._try_schedule_context(
-                    req, budget, preempt_for_pages
-                )
-                if action is ScheduleAction.STOP:
-                    break
-                if action is ScheduleAction.SKIP:
+                if scheduled_ctx and self._first_chunk_waits_for_budget(req, budget):
                     continue
-                has_chunking = has_chunking or chunking_flag
-                scheduled_ctx.append(req)
-                if self._prefix_wait_planner is not None:
-                    self._prefix_wait_planner.add_owner(req)
-                if len(scheduled_ctx) == 1:
-                    scheduled_remote_mode = remote_mode
-                budget.commit(req, tokens, peft_pages)
-                # Register the block only once the request has cleared its
-                # budget and is committed. Registering earlier, inside the check
-                # above, would let a request that then fails to schedule defer
-                # its duplicates anyway -- and this loop `continue`s on every
-                # ScheduleAction.SKIP, so failing to schedule is routine.
-                #
-                # Together with the in-flight-only pre-pass this gives the
-                # invariant that keeps the deadlock detector below sound:
-                # a request is only ever deferred behind a contributor that
-                # actually runs this iteration, so a deferral always leaves
-                # either inflight_request_ids or scheduled_ctx non-empty.
-                #
-                # A prefix wait (PrefixWaitPlanner) is deliberately not
-                # progress. Its owner is either scheduled in this pass or a
-                # prefilling request that is itself a context candidate, and
-                # each request waits at most MAX_WAIT_PASSES (128) passes in
-                # total, well below _DEADLOCK_STALL_ITERS. A
-                # pass that only waits therefore counts as a stall but cannot
-                # trip the detector by itself, while counting it as progress
-                # would let a stalled owner plus new sibling arrivals hide a
-                # real deadlock.
-                if first_new_block is not None:
-                    contributed_blocks.add(first_new_block)
+                if req.py_request_id in preempted_ids:
+                    continue
+                remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
+                if defer_remote_tail_context and remote_mode is not None:
+                    continue
+                if exclusive_remote_mode is not None and remote_mode != exclusive_remote_mode:
+                    continue
+                # Destination replay is atomic; source prefix processing may be chunked.
+                if remote_mode == "destination" and not budget.can_fit_tokens(
+                    req.context_remaining_length
+                ):
+                    continue
+                if (
+                    scheduled_ctx
+                    and remote_mode != scheduled_remote_mode
+                    and (remote_mode == "source" or scheduled_remote_mode == "source")
+                ):
+                    continue
+                # Probe context requests before peft_pages_needed and before
+                # _try_schedule_context so that a deferral costs nothing: KV pages
+                # are allocated inline, so a skip decided after prepare_context
+                # would pay a create/suspend cycle. Chunk continuations are probed
+                # too -- they cannot be deferred, but they do contribute a block, so
+                # they register once scheduled.
+                first_new_block = None
+                if contributed_blocks is not None and (
+                    req.state_value == self._context_init_state_value
+                ):
+                    first_new_block = self.kv_cache_manager.probe_first_new_block_key(req)
+                    if (
+                        req.is_first_context_chunk
+                        and first_new_block is not None
+                        and first_new_block in contributed_blocks
+                        and self._deferral_paid(first_new_block, context_init_ids)
+                    ):
+                        logger.debug(
+                            f"Deferring context request {req.py_request_id}: its first new "
+                            "block is already contributed by a request that runs this iteration"
+                        )
+                        deferred_behind_contributor = True
+                        continue
+                peft_pages = budget.peft_pages_needed(req)
+                if peft_pages is None:
+                    continue
+                if req.state_value == self._encoder_init_state_value:
+                    action, tokens = self._try_schedule_encoder(req, budget)
+                    if action is ScheduleAction.STOP:
+                        ctx_stopped = True
+                        break
+                    scheduled_encoder.append(req)
+                    budget.commit(req, tokens, peft_pages)
+                else:
+                    try:
+                        action, tokens, chunking_flag = self._try_schedule_context(
+                            req, budget, preempt_for_pages, token_cap
+                        )
+                    except RemoteMemError as error:
+                        # Raised by its cache's resume, before anything was taken for it.
+                        self._lost_kv_error = error
+                        action = self._on_lost_kv_cache(req, inflight_request_ids, recompute_paused)
+                    if action is ScheduleAction.STOP:
+                        ctx_stopped = True
+                        break
+                    if action is ScheduleAction.SKIP:
+                        continue
+                    if action is ScheduleAction.DEFER:
+                        # Ordered as short, prepared, found long: it goes behind
+                        # the rest of this pass and counts as demoted for aging.
+                        # Starved requests carry a token cap and are never deferred.
+                        demoted_ids.add(req.py_request_id)
+                        ctx_requests.append(req)
+                        continue
+                    has_chunking = has_chunking or chunking_flag
+                    scheduled_ctx.append(req)
+                    if self._prefix_wait_planner is not None:
+                        self._prefix_wait_planner.add_owner(req)
+                    if len(scheduled_ctx) == 1:
+                        scheduled_remote_mode = remote_mode
+                    budget.commit(req, tokens, peft_pages)
+                    # Register the block only once the request has cleared its
+                    # budget and is committed. Registering earlier, inside the check
+                    # above, would let a request that then fails to schedule defer
+                    # its duplicates anyway -- and this loop `continue`s on every
+                    # ScheduleAction.SKIP, so failing to schedule is routine.
+                    #
+                    # Together with the in-flight-only pre-pass this gives the
+                    # invariant that keeps the deadlock detector below sound:
+                    # a request is only ever deferred behind a contributor that
+                    # actually runs this iteration, so a deferral always leaves
+                    # either inflight_request_ids or scheduled_ctx non-empty.
+                    #
+                    # A prefix wait (PrefixWaitPlanner) is deliberately not
+                    # progress. Its owner is either scheduled in this pass or a
+                    # prefilling request that is itself a context candidate, and
+                    # each request waits at most MAX_WAIT_PASSES (128) passes in
+                    # total, well below _DEADLOCK_STALL_ITERS. A
+                    # pass that only waits therefore counts as a stall but cannot
+                    # trip the detector by itself, while counting it as progress
+                    # would let a stalled owner plus new sibling arrivals hide a
+                    # real deadlock.
+                    if first_new_block is not None:
+                        contributed_blocks.add(first_new_block)
+                        if req.is_first_context_chunk:
+                            first_chunk_contributors[first_new_block] = req.py_request_id
+
+        self._prev_first_chunk_contributors = first_chunk_contributors
 
         made_progress = bool(
             scheduled_gen
@@ -783,6 +1184,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             or evicted
             or recompute_paused
             or deferred_behind_contributor
+            # A decoder-batching hold defers a request by one pass on purpose.
+            or self._ctx_decoder_held
         )
         if (
             self.remote_tail_phase is None
@@ -791,8 +1194,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         ):
             # A non-ADP replay that cannot acquire KV must let decode release
             # pages. Retry admission without replay; keep its forward isolated.
+            # Pass every active request so the retry keeps the PEFT claims of
+            # paused decodes, which requests_list has already dropped.
             return self._schedule_loop(
-                requests_list,
+                active_requests,
                 inflight_request_ids,
                 defer_remote_tail_context=True,
                 prefix_waits=prefix_waits,
@@ -804,6 +1209,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._ctx_demote_skips = {
                 rid: self._ctx_demote_skips.get(rid, 0) + 1 for rid in demoted_ids
             }
+            self._ctx_demote_released.intersection_update(
+                req.py_request_id for req in active_requests
+            )
 
         # Phase and frozen-membership deferrals are not KV capacity stalls.
         self._detect_deadlock(
@@ -813,6 +1221,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             preempted_ids,
             made_progress=made_progress,
         )
+        if disagg_gate is not None and disagg_gate.num_skipped:
+            logger.debug(
+                f"Disagg transfer budget exhausted: skipped KV allocation for "
+                f"{disagg_gate.num_skipped} generation-init requests"
+            )
 
         return (
             scheduled_encoder,
@@ -829,47 +1242,199 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _is_long_context(self, req: LlmRequest) -> bool:
         """Whether the router's uncached-prefill estimate exceeds the threshold
         and, once mid-prefill, more than the threshold is actually left. A
-        request without an estimate (none published, or dropped by the aging
-        bound) is never long. No radix probe here: it would walk the whole
-        prompt for every request on every iteration."""
+        request without an estimate is never long. No radix probe here unless
+        exact demotion is on (then at most one per request): it would walk the
+        whole prompt for every request on every iteration."""
         if req.state_value == self._encoder_init_state_value:
             return False
         estimate = req.py_uncached_prefill_tokens
-        if estimate is None or estimate <= self._ctx_demote_uncached_tokens:
+        if estimate is None:
             return False
-        return not (
-            req.context_current_position > 0
-            and req.context_remaining_length <= self._ctx_demote_uncached_tokens
-        )
+        threshold = self._ctx_demote_uncached_tokens
+        if self._ctx_demote_exact:
+            if req.context_current_position > 0 or self._holds_context_cache(req):
+                return req.context_remaining_length > threshold
+            if estimate > threshold and not req.py_uncached_prefill_probed:
+                req.py_uncached_prefill_probed = True
+                reused = self.kv_cache_manager.probe_context_reuse(req)
+                if reused is not None:
+                    estimate = max(req.prompt_len - reused, 0)
+                    req.py_uncached_prefill_tokens = estimate
+            return estimate > threshold
+        if estimate <= threshold:
+            return False
+        return not (req.context_current_position > 0 and req.context_remaining_length <= threshold)
 
     def _defer_long_context(self, pending_ctx: RequestList) -> tuple[RequestList, set[int]]:
-        """Move long requests to the tail of this iteration's context order.
+        """Move long requests to the tail of this iteration's context order,
+        and hold requests without an estimate behind started demoted prefills.
 
-        Returns the new order and the ids demoted.
+        Returns the new order and the ids demoted. With exact demotion also
+        records which requests were kept on the estimate alone (see
+        _try_schedule_context_chunked).
         """
         keep: RequestList = []
         deferred: RequestList = []
+        self._ctx_unverified_short = set()
         for req in pending_ctx:
-            if self._is_long_context(req):
+            rid = req.py_request_id
+            if rid not in self._ctx_demote_released and self._is_long_context(req):
                 aged_out = (
                     self._ctx_demote_max_iters > 0
-                    and self._ctx_demote_skips.get(req.py_request_id, 0)
-                    >= self._ctx_demote_max_iters
+                    and self._ctx_demote_skips.get(rid, 0) >= self._ctx_demote_max_iters
                 )
                 if not aged_out:
                     deferred.append(req)
                     continue
-                # Let through for good: with no estimate the request is never
-                # long again, so it keeps its arrival order to the end of its
-                # prefill. Demoted again, a started prefill would hold its KV
-                # blocks without progress; a chunk that finds no pages is
-                # skipped, not suspended, so enough of them fill the pool and
-                # no context request can allocate.
-                req.py_uncached_prefill_tokens = None
+                # Let through for good: a released request keeps its arrival
+                # order to the end of its prefill. Demoted again, a started
+                # prefill would hold its KV blocks without progress; a chunk
+                # that finds no pages is skipped, not suspended, so enough of
+                # them fill the pool and no context request can allocate.
+                self._ctx_demote_released.add(rid)
+            elif (
+                self._ctx_demote_exact
+                and rid not in self._ctx_demote_released
+                and req.py_uncached_prefill_tokens is not None
+                and req.context_current_position == 0
+                and not self._holds_context_cache(req)
+            ):
+                self._ctx_unverified_short.add(req.py_request_id)
             keep.append(req)
-        return keep + deferred, {req.py_request_id for req in deferred}
+        demoted = {req.py_request_id for req in deferred}
+        # A request without an estimate is of unknown length. Ahead of a
+        # demoted prefill that has started, it could start a prefill of any
+        # size; once the started one aged out and took the budget back, it
+        # would be parked mid-prefill with its pages held, and with a cache
+        # tier below the GPU neither can be preempted. So one that has not
+        # started yet waits behind the started demoted prefills that arrived
+        # before it, at most until they finish; requests known to be short
+        # still go first. The demoted requests keep their arrival order and
+        # the held ones go right after the last started one.
+        started = [i for i, req in enumerate(deferred) if self._started_context(req)]
+        if started:
+            arrival = {req.py_request_id: i for i, req in enumerate(pending_ctx)}
+            first = arrival[deferred[started[0]].py_request_id]
+            last = started[-1]
+            held = [
+                req
+                for req in keep
+                if req.py_uncached_prefill_tokens is None
+                and arrival[req.py_request_id] > first
+                and not self._started_context(req)
+            ]
+            if held:
+                held_ids = {req.py_request_id for req in held}
+                keep = [req for req in keep if req.py_request_id not in held_ids]
+                return keep + deferred[: last + 1] + held + deferred[last + 1 :], demoted
+        return keep + deferred, demoted
+
+    def _started_context(self, req: LlmRequest) -> bool:
+        """Whether *req* has begun its prefill, so that parking it would hold its pages."""
+        return req.context_current_position > 0 or self._holds_context_cache(req)
+
+    # ---- Shortest-uncached-first context order ----
+
+    def _uncached_tokens(self, req: LlmRequest) -> int:
+        """Prompt tokens *req* still has to compute, net of reusable cached blocks.
+
+        A first-chunk request has not claimed its reusable prefix yet, so its
+        remaining length still counts it; the prefix is probed once per
+        scheduling pass, without claiming pages.
+        """
+        remaining = req.context_remaining_length
+        if not req.is_first_context_chunk:
+            return remaining
+        if req.py_request_id not in self._reuse_probes:
+            self._reuse_probes[req.py_request_id] = self.kv_cache_manager.probe_context_reuse(req)
+        reusable = self._reuse_probes[req.py_request_id]
+        if reusable is None:
+            return remaining
+        return remaining - min(max(reusable - req.context_current_position, 0), remaining)
+
+    def _order_ctx_shortest_first(self, pending_ctx: RequestList) -> RequestList:
+        """Order context requests by uncached prompt tokens, fewest first.
+
+        The sort is stable, so requests with equal counts keep their arrival
+        order. A list with encoder requests keeps arrival order.
+        """
+        if any(req.state_value != self._context_init_state_value for req in pending_ctx):
+            return pending_ctx
+        keyed = sorted(
+            ((self._uncached_tokens(req), pos, req) for pos, req in enumerate(pending_ctx)),
+            key=lambda item: item[:2],
+        )
+        return [req for _, _, req in keyed]
+
+    def _split_starved_ctx(self, pending_ctx: RequestList) -> tuple[RequestList, RequestList]:
+        """Split off requests pending beyond the starvation limit: ``(others, starved)``, oldest first.
+
+        Stamps each request with the scheduler iteration it was first seen. Nothing is split off
+        with a single pending request or with encoder requests in the list.
+        """
+        now = self._sched_iter
+        starved = []
+        for req in pending_ctx:
+            if req.py_ctx_sched_since_iter is None:
+                req.py_ctx_sched_since_iter = now
+            elif now - req.py_ctx_sched_since_iter > self._ctx_starvation_iterations:
+                starved.append(req)
+        if (
+            not starved
+            or len(pending_ctx) < 2
+            or any(req.state_value != self._context_init_state_value for req in pending_ctx)
+        ):
+            return pending_ctx, []
+        starved.sort(key=lambda req: req.py_ctx_sched_since_iter)
+        starved_ids = {id(req) for req in starved}
+        return [req for req in pending_ctx if id(req) not in starved_ids], starved
+
+    def _starved_ctx_shares(self, starved_ctx: RequestList, budget: BudgetTracker) -> list[int]:
+        """First share of each starved request, oldest first, within the budget.
+
+        A share is up to a quarter of max_num_tokens but at least one chunk unit, in whole chunk
+        units unless it ends the prompt, so an older request is never left a share too small to
+        run a chunk while a younger one runs.
+        """
+        if not starved_ctx:
+            return []
+        unit = self.chunk_unit_size
+        cap = max(self._starved_ctx_tokens // unit * unit, unit)
+        shares = []
+        left = budget.remaining_tokens
+        for req in starved_ctx:
+            uncached = self._uncached_tokens(req)
+            share = max(0, min(uncached, cap, left))
+            if share < uncached:
+                share = share // unit * unit
+            shares.append(share)
+            left -= share
+        return shares
 
     # ---- Prefix-aware skip ----
+
+    _MAX_UNPAID_PREFIX_KEYS = 4096
+
+    def _deferral_paid(self, key, context_init_ids) -> bool:
+        """Whether deferring behind the contributor of ``key`` can still be repaid by a reuse hit.
+
+        The skip assumes the contributor commits ``key`` while it runs, so the deferred duplicate
+        matches it on the next pass. When a request contributed ``key`` on the previous schedule,
+        has since left the context phase, and ``key`` is still the first new block of a
+        duplicate, the block was not committed by that context step (e.g. the block reaches into
+        the tokens the request recomputes or reads ahead, so it is only filled during generation)
+        and every further deferral is pure delay: with n samples of one prompt this admitted one
+        sample per prompt per iteration. Such keys stop deferring.
+        """
+        if key in self._unpaid_prefix_keys:
+            return False
+        contributor = self._prev_first_chunk_contributors.get(key)
+        if contributor is not None and contributor not in context_init_ids:
+            if len(self._unpaid_prefix_keys) >= self._MAX_UNPAID_PREFIX_KEYS:
+                self._unpaid_prefix_keys.pop(next(iter(self._unpaid_prefix_keys)))
+            self._unpaid_prefix_keys[key] = None
+            return False
+        return True
 
     def _is_prefix_skip_candidate(self, req: LlmRequest) -> bool:
         """Whether *req* may be deferred in favour of a duplicate prefix.
@@ -1018,10 +1583,22 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
         don't participate in the forward pass token budget.
         """
-        # Cache-transceiver mode disables the separate one-model draft manager,
-        # so disagg generation init has no paired-reuse path. Supporting one
-        # would also require draft KV transfer and history_length=prompt_len.
-        if not self.kv_cache_manager.prepare_disagg_gen_init(req):
+        # Only the target manager receives prompt KV. Drafters that need it
+        # under disagg keep their layers in that manager (MTP/Eagle fold them
+        # in; DFlash uses explicit draft layer specs). A separate draft manager
+        # gets no transfer and no paired-reuse path here.
+        try:
+            prepared = self.kv_cache_manager.prepare_disagg_gen_init(req)
+        except RemoteMemError as error:
+            # Its prefix match resumed pages a failed remote cache level took with it: drop the match, and the next
+            # pass matches again without them.
+            self._lost_kv_error = error
+            return self._on_lost_kv_cache(req, set(), []), 0
+        if not prepared:
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                disagg_diagnostics.emit_kv_admission_result(
+                    req, self.kv_cache_manager, admitted=False
+                )
             logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0
@@ -1031,11 +1608,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         req: LlmRequest,
         budget: BudgetTracker,
         preempt_for_pages: Callable[[LlmRequest], bool],
+        token_cap: Optional[int] = None,
     ) -> tuple[ScheduleAction, int, bool]:
         """Try to schedule a context request (chunked or non-chunked).
 
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
+        *token_cap* limits the chunk below the budget left (chunked only).
 
         Source reservations advance the prefix before budget checks. Destination
         pages are allocated here; loads are accepted after the final batch trims.
@@ -1043,7 +1622,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         first_chunk = req.is_first_context_chunk
         if self.chunking_enabled:
-            result = self._try_schedule_context_chunked(req, budget, preempt_for_pages)
+            if (
+                self._ctx_shortest_first
+                and first_chunk
+                and not self._holds_context_cache(req)
+                and not self._first_chunk_fits_budget(req, budget, token_cap)
+            ):
+                # Nothing is claimed yet, so there is nothing to release.
+                return ScheduleAction.SKIP, 0, False
+            result = self._try_schedule_context_chunked(req, budget, preempt_for_pages, token_cap)
         else:
             result = self._try_schedule_context_full(req, budget, preempt_for_pages)
 
@@ -1053,6 +1640,47 @@ class KVCacheV2Scheduler(RequestScheduler):
             self.release_context_admission(req)
 
         return result
+
+    def _holds_context_cache(self, req: LlmRequest) -> bool:
+        """Whether *req* holds a cache in any pool, which a failed first admission must release."""
+        return any(
+            manager is not None and req.py_request_id in manager.kv_cache_map
+            for manager in (
+                self.kv_cache_manager,
+                self.draft_kv_cache_manager,
+                self.cross_kv_cache_manager,
+            )
+        )
+
+    def _first_chunk_fits_budget(
+        self, req: LlmRequest, budget: BudgetTracker, token_cap: Optional[int]
+    ) -> bool:
+        """Whether a first chunk can come out non-empty, decided before preparation claims its prefix.
+
+        No chunk comes out when a starved request's token_cap leaves no budget, or under FORCE_CHUNK
+        when a leftover below chunk_unit_size reaches neither the next snapshot point nor the prompt
+        end; the claim's end is estimated with the reuse probe (_uncached_tokens).
+        """
+        remaining = budget.remaining_tokens
+        if remaining is None:
+            return True
+        if token_cap is not None:
+            remaining = min(remaining, token_cap)
+        if remaining <= 0:
+            return False
+        if (
+            self.chunking_policy != ContextChunkingPolicy.FORCE_CHUNK
+            or remaining >= self.chunk_unit_size
+        ):
+            return True
+        pos = (
+            req.context_current_position + req.context_remaining_length - self._uncached_tokens(req)
+        )
+        next_point = min(
+            (point for point in req.expect_snapshot_points if point > pos),
+            default=req.prompt_len,
+        )
+        return min(next_point, req.prompt_len) - pos <= remaining
 
     def release_context_admission(self, req: LlmRequest) -> None:
         """Free a first-chunk context's caches in every pool and rewind its cursor.
@@ -1095,6 +1723,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # before budget check.
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for context request {req.py_request_id}")
+            self._preempt_for_resume(req, preempt_for_pages)
             return ScheduleAction.STOP, 0, False
 
         context_tokens = req.context_remaining_length
@@ -1148,23 +1777,42 @@ class KVCacheV2Scheduler(RequestScheduler):
         chunk learns its reuse only in prepare_context, which matches its prefix
         and resumes its pages, and a failed first chunk releases both again.
         Once another context chunk runs this iteration, the first chunk waits
-        for a fresh budget unless its whole remaining prompt fits.
+        for a fresh budget unless its whole remaining prompt fits. Under
+        shortest-uncached-first the uncached remainder from the reuse probe
+        (_uncached_tokens) must fit instead, and a first chunk that already
+        holds a cache does not wait here: only preparation releases that claim.
         """
         remaining = budget.remaining_tokens
-        return (
+        if not (
             self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
             and req.state_value == self._context_init_state_value
             and req.is_first_context_chunk
             and remaining is not None
             and remaining < self.chunk_unit_size
-            and req.context_remaining_length > remaining
-        )
+        ):
+            return False
+        if not self._ctx_shortest_first:
+            return req.context_remaining_length > remaining
+        return self._uncached_tokens(req) > remaining and not self._holds_context_cache(req)
+
+    def _preempt_for_resume(
+        self, req: LlmRequest, preempt_for_pages: Callable[[LlmRequest], bool]
+    ) -> bool:
+        """Free GPU pages for a suspended mid-prefill request that could not resume.
+
+        Under helix, bringing a suspended request's pages back can fail once
+        newer requests have taken the GPU pages, for example after its pages
+        moved to a tier below GPU. Like a failed resize, give up a newer
+        started request so the older one is not left waiting behind it.
+        """
+        return self.has_cp_helix and not req.is_first_context_chunk and preempt_for_pages(req)
 
     def _try_schedule_context_chunked(
         self,
         req: LlmRequest,
         budget: BudgetTracker,
         preempt_for_pages: Callable[[LlmRequest], bool],
+        token_cap: Optional[int] = None,
     ) -> tuple[ScheduleAction, int, bool]:
         """FCFS interleaved chunking for a single context request.
 
@@ -1177,6 +1825,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         remaining_budget = budget.remaining_tokens
         pre_prepare_context_remaining = req.context_remaining_length
         force_chunk = self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
+        inforward_point = None
+        if self._inforward_snapshot_rows:
+            # A mark from an earlier pass whose batch did not run this request
+            # must not outlive that pass.
+            req.py_mamba_inforward_snapshot_point = None
 
         if not self._has_context_chunk_budget(budget):
             return ScheduleAction.SKIP, 0, False
@@ -1184,7 +1837,34 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
+            if self._preempt_for_resume(req, preempt_for_pages):
+                return ScheduleAction.STOP, 0, False
             return ScheduleAction.SKIP, 0, False
+
+        if req.py_request_id in self._ctx_unverified_short:
+            # Ordered as short on the router's estimate alone; the reuse claimed
+            # just now makes the remainder exact. Once per request per iteration.
+            # A first chunk that is not scheduled releases its admission, so the
+            # retry matches its prefix again. A starved request (token_cap set)
+            # runs on the share it holds instead: deferring it would not move it,
+            # and the next iteration would order it as short and defer it again.
+            self._ctx_unverified_short.discard(req.py_request_id)
+            if token_cap is None and self._is_long_context(req):
+                if (
+                    self._ctx_demote_max_iters > 0
+                    and self._ctx_demote_skips.get(req.py_request_id, 0)
+                    >= self._ctx_demote_max_iters
+                ):
+                    # Demoted as long as the bound allows: let through for good,
+                    # as at the door (see _defer_long_context).
+                    self._ctx_demote_released.add(req.py_request_id)
+                else:
+                    # The exact remainder replaces the estimate, so the next
+                    # iteration demotes the request at the door, where the
+                    # aging bound applies, without preparing it first.
+                    req.py_uncached_prefill_tokens = req.context_remaining_length
+                    req.py_uncached_prefill_probed = True
+                    return ScheduleAction.DEFER, 0, False
 
         # Calculate chunk size from remaining budget
         #    (context_remaining_length is now correct after block reuse)
@@ -1194,6 +1874,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         has_recovery = recovery_rows is not None
         replay_tokens = recovery_rows or 0
         remaining_budget = budget.remaining_tokens
+        if token_cap is not None:
+            # The chunk is sized as if only token_cap tokens were left.
+            remaining_budget = (
+                token_cap if remaining_budget is None else min(remaining_budget, token_cap)
+            )
         if replay_tokens and self.max_context_length is not None:
             suffix_capacity = self.max_context_length - replay_tokens
             minimum_suffix = min(context_remaining, self.chunk_unit_size)
@@ -1215,6 +1900,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             # With no remaining state to snapshot, avoid artificial boundaries.
             chunk_size = _get_forced_context_chunk_size(req)
             budget_context_remaining = context_remaining
+            if self._inforward_snapshot_rows_left > 0 and not has_recovery:
+                inforward_point = self._inforward_snapshot_point(req, chunk_size, remaining_budget)
+                if inforward_point is not None:
+                    chunk_size = context_remaining
         else:
             budget_context_remaining = (
                 context_remaining
@@ -1267,6 +1956,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         # gets a fresh budget; under steady-state load this resolves quickly.
         if chunk_size <= 0:
             return ScheduleAction.SKIP, 0, False
+        # A pre-grown chunk replays exactly (see above), so it is never cut back.
+        if self._ctx_decoder_hold_window and not force_chunk and pregrown == 0:
+            chunk_size = self._ctx_decoder_hold_chunk(req, chunk_size)
+            if chunk_size <= 0:
+                # Held whole for one pass: it keeps its prepared KV and its place in the queue,
+                # as on an exhausted budget.
+                return ScheduleAction.SKIP, 0, False
         budget_chunk_size = chunk_size
         # Decoder queries are a subset of these physical Encoder rows, including
         # recovery rows, so they fit the same iteration's input-token budget.
@@ -1296,7 +1992,43 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
+        if inforward_point is not None and req.context_chunk_size == context_remaining:
+            req.py_mamba_inforward_snapshot_point = inforward_point
+            self._inforward_snapshot_rows_left -= 1
+
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
+
+    def _inforward_snapshot_point(
+        self, req: LlmRequest, chunk_size: int, remaining_budget: Optional[int]
+    ) -> Optional[int]:
+        """The snapshot point P a forced chunk ends at, if the chunk can run through the prompt end instead.
+
+        The GDN layers then record the state at P inside the forward
+        (MambaHybridCacheManagerV2 in-forward snapshots), which saves the extra
+        context iteration of the short tail [P, prompt end).
+        """
+        manager = self.kv_cache_manager
+        pos = req.context_current_position
+        point = pos + chunk_size
+        end = req.prompt_len
+        points = req.expect_snapshot_points
+        if not points or point != points[-1] or not point < end:
+            return None
+        if pos + req.context_remaining_length != end:
+            return None
+        if (
+            end - point > manager.inforward_snapshot_max_tail
+            or point - pos < manager.inforward_snapshot_min_main
+        ):
+            return None
+        if remaining_budget is not None and end - pos > remaining_budget:
+            return None
+        if self.max_context_length is not None and end - pos > self.max_context_length:
+            return None
+        mm_data = getattr(req, "py_multimodal_data", None)
+        if isinstance(mm_data, dict) and mm_data.get("mm_bidirectional_blocks", False):
+            return None
+        return point
 
     def _reuse_claim_limit(self, req: LlmRequest) -> int | None:
         """Pair the two pools on one depth before either claims.
@@ -1315,6 +2047,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         target_match = self.kv_cache_manager.probe_context_reuse(req)
         if draft_match is None or target_match is None:
             return None
+        # Claiming the minimum stops the target's lookup there, hiding where the
+        # prompt leaves the tree; the attention-only draft match still reaches it.
+        self.kv_cache_manager.note_context_fork(req, draft_match)
         return min(draft_match, target_match)
 
     def _admit_unpaired_draft(self, req: LlmRequest) -> bool:
@@ -1693,26 +2428,49 @@ class KVCacheV2Scheduler(RequestScheduler):
         elif scheduled_beam_width != beam_width:
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
+        self._lost_kv_error = None
         success = self._try_allocate_generation(req)
+        if self._lost_kv_error is not None:
+            lost = self._on_lost_kv_cache(req, inflight_request_ids, recompute_paused)
+            return lost, 0, scheduled_beam_width, req_it_end
 
-        if not success:
-            if self.has_cp_helix:
-                # No-evict stance: every validated helix run used
-                # GUARANTEED_NO_EVICT semantics; eviction stays off under
-                # helix until a KV-pressure e2e validates it.
-                raise RuntimeError(
-                    f"[V2Scheduler] KV allocation failed for helix request "
-                    f"{req.py_request_id}; eviction is disabled under helix "
-                    f"CP pending end-to-end validation. Increase "
-                    f"kv_cache_config.max_gpu_total_bytes (rank-local bytes) "
-                    f"or max_tokens (GLOBAL tokens across CP ranks, not "
-                    f"per-rank), or reduce concurrency."
-                )
-            req_it_end, success = self._try_evict_for_gen(
-                req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
+        if not success and self.kv_cache_manager.flush_deferred_closes():
+            # Finished requests whose close is deferred
+            # (kv_cache_config.defer_generation_only_release) still hold pages.
+            # Closing them now is never earlier than the immediate close they
+            # replace, and costs no running request a suspend or a recompute.
+            success = self._try_allocate_generation(req)
+            if self._lost_kv_error is not None:
+                lost = self._on_lost_kv_cache(req, inflight_request_ids, recompute_paused)
+                return lost, 0, scheduled_beam_width, req_it_end
+
+        if not success and self.has_cp_helix and not self.enable_recompute_pause:
+            # Without recompute pause (e.g. a disaggregated generation server,
+            # which cannot replay a prefill) and with the deferred closes above
+            # flushed, no page is left to free. Suspending to a lower tier is
+            # validated only under aggregated helix, so fail instead of
+            # stalling.
+            raise RuntimeError(
+                f"[V2Scheduler] KV allocation failed for helix request "
+                f"{req.py_request_id}; recompute pause is disabled "
+                f"(e.g. on a disaggregated generation server, which "
+                f"cannot replay the prefill), so the scheduler cannot "
+                f"preempt a request. Increase "
+                f"kv_cache_config.max_gpu_total_bytes (rank-local bytes) "
+                f"or max_tokens (GLOBAL tokens across CP ranks, not "
+                f"per-rank), or reduce concurrency."
             )
 
         if not success:
+            # Under helix without a tier below GPU, a suspended request's pages
+            # have nowhere to go, so recompute-pause is the only way to make
+            # room.
+            if not self.has_cp_helix or self.kv_cache_manager.has_cache_tier_below_gpu:
+                req_it_end, success = self._try_evict_for_gen(
+                    req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
+                )
+
+        if not success and self._lost_kv_error is None:
             req_it_end, success = self._try_recompute_pause_for_gen(
                 req,
                 requests_list,
@@ -1724,6 +2482,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                 inflight_request_ids,
             )
 
+        if self._lost_kv_error is not None:
+            # Lost only once a victim made room for its resume; the ladders stopped there.
+            lost = self._on_lost_kv_cache(req, inflight_request_ids, recompute_paused)
+            return lost, 0, scheduled_beam_width, req_it_end
+
         if success:
             return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
 
@@ -1731,7 +2494,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         # GPU pages so other requests can resume().
         # Skip if already suspended — suspending again is a no-op
         # that frees no pages.
-        if self.kv_cache_manager.is_request_active(
+        if self.has_cp_helix and not self.kv_cache_manager.has_cache_tier_below_gpu:
+            # Suspending frees nothing under helix without a tier below GPU.
+            # The request still sits out this step, so clear its stale batch
+            # index.
+            logger.debug(
+                f"[V2Scheduler] Helix request {req.py_request_id} found no pages or victim; waiting"
+            )
+            self._clear_request_runtime_state(req)
+        elif self.kv_cache_manager.is_request_active(
             req.py_request_id
         ) and not self._has_pending_connector_load(req):
             logger.debug(
@@ -1756,7 +2527,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         here, but its mirror still has to be admitted under this rollback: see
         ``_admit_unpaired_draft``.
         """
-        if not self.kv_cache_manager.try_allocate_generation(req):
+        try:
+            if not self.kv_cache_manager.try_allocate_generation(req):
+                return False
+        except RemoteMemError as error:
+            # Its resume read pages a failed remote cache level took with it: no room brings them back.
+            self._lost_kv_error = error
             return False
 
         draft_manager = self._joint_draft_manager
@@ -1768,6 +2544,67 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         self.kv_cache_manager.revert_allocate_generation(req)
         return False
+
+    def _on_lost_kv_cache(
+        self, req: LlmRequest, inflight_request_ids: set[int], recompute_paused: RequestList
+    ) -> ScheduleAction:
+        """Handle *req* after its cache's resume raised ``_lost_kv_error``: pages it needs were on a remote cache
+        level that failed, which the manager retires and unlinks from the reuse tree.
+
+        A request that computed nothing yet matches its prompt again next pass. A started one re-prefills through
+        recompute pause where this executor can, and is failed (``take_lost_kv_requests``) where it cannot.
+
+        Without ``recover_lost_kv_per_rank`` the error is re-raised: lock-step peers did not see it.
+        """
+        error, self._lost_kv_error = self._lost_kv_error, None
+        if not self.recover_lost_kv_per_rank:
+            raise RemoteMemError(
+                f"Request {req.py_request_id} lost KV pages to a failed remote cache level on this rank, whose "
+                f"TP/CP/PP peers schedule in lock step and did not see the failure; stopping the executor"
+            ) from error
+        if not self._is_started_request(req):
+            logger.warning(
+                f"[V2Scheduler] Request {req.py_request_id} matched KV pages on a failed remote cache level; "
+                f"matching it again: {error}"
+            )
+            self.release_context_admission(req)
+        elif self.enable_recompute_pause and self._is_recompute_pause_candidate(
+            req, inflight_request_ids
+        ):
+            logger.warning(
+                f"[V2Scheduler] Request {req.py_request_id} lost KV pages to a failed remote cache level; "
+                f"recomputing it: {error}"
+            )
+            self._preempt_or_defer(req, recompute_paused)
+        else:
+            logger.error(
+                f"[V2Scheduler] Request {req.py_request_id} lost KV pages to a failed remote cache level and "
+                f"cannot recompute them here; failing it: {error}"
+            )
+            self._clear_request_runtime_state(req)
+            if all(lost is not req for lost, _ in self._lost_kv_requests):
+                message = f"KV cache pages lost with a failed remote cache level: {error}"
+                self._lost_kv_requests = (*self._lost_kv_requests, (req, message))
+        return ScheduleAction.SKIP
+
+    def _raise_if_lockstep_remote_level_failed(self) -> None:
+        """Stop a lock-step rank once any of its remote cache levels failed.
+
+        The failure is rank-local (a donor this rank's chunks sat on, or this rank's transfer timeout), and the level's
+        pages leave only this rank's reuse tree, so the group's matches, admissions and collectives would diverge.
+        """
+        for manager in self._lockstep_remote_managers:
+            if manager.any_remote_level_failed:
+                raise RemoteMemError(
+                    "A remote KV cache level failed on this rank. Its TP/CP/PP peers schedule in lock step and cannot "
+                    "drop the same pages or requests, so the executor stops instead of diverging from them."
+                )
+
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        """Requests the last passes could neither schedule nor recompute after a remote cache level failed, with their
+        error messages; the executor fails them."""
+        lost, self._lost_kv_requests = self._lost_kv_requests, ()
+        return list(lost)
 
     # ---- Eviction ----
 
@@ -1804,12 +2641,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         inflight_request_ids: set[int],
         recompute_paused: RequestList,
         preempted_ids: set[int],
+        requester_idx: int,
     ) -> bool:
         """Release one started request's KV cache so another can allocate.
 
         The fallback for a pool that suspension cannot drain; see
-        `KVCacheManagerV2.preempt_request`. With a cache tier below GPU,
-        suspension is cheaper and keeps the pages, so that path is left alone.
+        `KVCacheManagerV2.preempt_request`. With a cache tier below GPU, this
+        waits while an active decode request holds GPU pages; under helix it
+        falls back to preemption once none does.
 
         The victim leaves on `recompute_paused`, the same channel the
         generation side uses, because a re-prefill needs more teardown than the
@@ -1821,7 +2660,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns True when pages became available in this iteration.
         """
         if self.kv_cache_manager.has_cache_tier_below_gpu:
-            return False
+            # Wait while an active generation request holds GPU pages: they
+            # come back when it finishes, or if a failing generation request
+            # suspends it; a blocked context request never triggers that
+            # suspend. Under helix, once no active generation request is left,
+            # every started request is mid-prefill or suspended, and none gives
+            # its pages back on its own, so fall through to recompute-pause.
+            if not self.has_cp_helix or any(
+                r.is_generation_in_progress_state
+                and self.kv_cache_manager.is_request_active(r.py_request_id)
+                for r in requests_list
+            ):
+                return False
         # A disaggregated generation worker received its context KV rather
         # than computing it, so it cannot replay a prefill at all.
         if not self.enable_recompute_pause:
@@ -1829,15 +2679,31 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Newest first, so the requests closest to completing keep their
         # pages and the pool drains instead of thrashing.
-        for i in range(len(requests_list) - 1, -1, -1):
-            victim = requests_list[i]
-            if victim.py_request_id in protected_ids:
-                continue
-            if not self._is_recompute_pause_candidate(victim, inflight_request_ids):
-                continue
-            if not self.kv_cache_manager.is_request_active(victim.py_request_id):
-                continue
-
+        stop = -1
+        if self.has_cp_helix:
+            # Only requests behind the requester, as the generation ladder
+            # does: an older victim would retake the pages on the next pass
+            # and preempt the requester in turn.
+            stop = requester_idx
+        candidates = [
+            victim
+            for victim in reversed(requests_list[stop + 1 :])
+            if victim.py_request_id not in protected_ids
+            and self._is_recompute_pause_candidate(victim, inflight_request_ids)
+        ]
+        # An active request holds its pages on GPU, so preempting it always
+        # frees GPU memory. A suspended request's pages move to the lower tier
+        # whenever that tier has room, so it is worth preempting only once the
+        # tier is full and its pages are stuck on GPU; take one only when no
+        # active request is left to give.
+        active = [
+            victim
+            for victim in candidates
+            if self.kv_cache_manager.is_request_active(victim.py_request_id)
+        ]
+        if active or not self.kv_cache_manager.has_cache_tier_below_gpu:
+            candidates = active
+        for victim in candidates:
             if not self._preempt_or_defer(victim, recompute_paused):
                 return False
             logger.debug(
@@ -1934,12 +2800,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         # The active_requests scan covers senders still on the list and the
         # generation-side receiver. The transfer manager covers finished
         # senders that have already left active_requests (see
-        # set_async_transfer_manager).
-        transfer_holding = any(
-            req.state_value in self._TRANSFER_HOLDING_STATE_VALUES for req in active_requests
-        ) or (
-            self._async_transfer_manager is not None
-            and self._async_transfer_manager.has_any_inflight_requests()
+        # set_async_transfer_manager). Logically cancelled receivers also leave
+        # that list while the coordinator retains their physical ownership.
+        transfer_holding = (
+            any(req.state_value in self._TRANSFER_HOLDING_STATE_VALUES for req in active_requests)
+            or (
+                self._async_transfer_manager is not None
+                and self._async_transfer_manager.has_any_inflight_requests()
+            )
+            or self._retiring_gen_receives_probe()
         )
         if transfer_holding:
             if self._stalled_schedules:
@@ -1968,10 +2837,29 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
             return
 
-        # A connector rejects every tier below GPU at bring-up
-        # (`PyExecutor._reject_non_gpu_cache_tiers`), so offering host_cache_size
-        # there is advice the user cannot act on.
-        if getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None:
+        if self.has_cp_helix:
+            # Under helix, max_gpu_total_bytes is per rank but max_tokens
+            # counts tokens across all CP ranks.
+            gpu_remedy = (
+                "increase kv_cache_config.max_gpu_total_bytes (rank-local bytes), "
+                "max_tokens (GLOBAL tokens across CP ranks) or "
+                "free_gpu_memory_fraction, or lower max_batch_size."
+            )
+            # Only aggregated helix (the side that can recompute-pause) can
+            # suspend to a host tier.
+            if not self.enable_recompute_pause:
+                remedy = gpu_remedy[0].upper() + gpu_remedy[1:]
+            elif self.kv_cache_manager.has_cache_tier_below_gpu:
+                remedy = (
+                    "The host tier may be full: increase "
+                    f"kv_cache_config.host_cache_size, or {gpu_remedy}"
+                )
+            else:
+                remedy = f"Configure kv_cache_config.host_cache_size, or {gpu_remedy}"
+        elif getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None:
+            # A connector rejects every tier below GPU at bring-up
+            # (`PyExecutor._reject_non_gpu_cache_tiers`), so host_cache_size is
+            # not an option here.
             remedy = (
                 "A KV connector is attached, which requires a GPU-only cache, "
                 "so no secondary tier can be configured. Increase "
@@ -2035,7 +2923,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"states={dict(states)}; sample_ids={sample_ids}; "
             f"kv_connector={has_connector}; "
             f"cache_tier_below_gpu={self.kv_cache_manager.has_cache_tier_below_gpu}; "
-            f"transfers_in_flight={transfers_in_flight}"
+            f"transfers_in_flight={transfers_in_flight}; "
+            f"local_retiring_gen_receives={self._retiring_gen_receives_probe()}"
         )
 
     def _free_kv_caches(self, req: LlmRequest) -> None:
@@ -2146,6 +3035,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             if self._try_allocate_generation(req):
                 return req_it_end, True
+            if self._lost_kv_error is not None:
+                break  # no victim brings its pages back
 
         return req_it_end, False
 
@@ -2225,6 +3116,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             # secondary-tier capacity just released to ordinary-suspend another
             # active victim.
             success = self._try_allocate_generation(req)
+            if self._lost_kv_error is not None:
+                return req_it_end, False
             if not success and self.kv_cache_manager.can_evict:
                 req_it_end, success = self._try_evict_for_gen(
                     req, requests_list, req_it, req_it_end, evicted, inflight_request_ids

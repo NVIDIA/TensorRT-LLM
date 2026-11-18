@@ -88,14 +88,18 @@ def _load_launcher_constants(launcher: Path):
     return module
 
 
-def run(entry: str, world_size: int = WORLD_SIZE) -> None:
+def run(entry: str, world_size: int = WORLD_SIZE, directory: Path | None = None) -> None:
     """Run ``_<entry>_op_matrix``'s launcher over ``world_size`` devices of this node (its local ``mpirun``).
 
     A launcher that takes ``--world-size`` (the stateful entries' ``_lockstep`` launchers) also runs as one of N
     ranks started by an external launcher, ``--launcher srun --world-size N``: that is how a multi-node receipt is
     recorded, outside pytest; the others ignore the argument and size themselves from CUDA_VISIBLE_DEVICES.
+
+    The launcher is looked up in ``directory``, by default this file's own: a target-owned collective keeps its
+    launcher beside its own tests.
     """
-    launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
+    base = Path(__file__).resolve().parent if directory is None else Path(directory).resolve()
+    launcher = base / f"_{entry}_op_matrix.py"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices(world_size))
 
     # The ranks import tensorrt_llm absolutely, and a source checkout is not
