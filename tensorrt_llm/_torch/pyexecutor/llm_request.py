@@ -382,6 +382,10 @@ class PyResult:
         # rows); the worker builds the user-facing values from them.
         self.context_prompt_logprob_rows: list[torch.Tensor] | None = None
         self.context_prompt_last_logprobs: torch.Tensor | None = None
+        # One past the last prompt position whose context row is stored. Only
+        # the rank that calls store_context_logits reads it, so PyResult.Diff
+        # does not sync it to other ranks.
+        self.context_rows_end = 0
         self._context_logits = LogitsStorage(
             seq_length=prompt_len,
             use_device_memory=use_device_memory,
