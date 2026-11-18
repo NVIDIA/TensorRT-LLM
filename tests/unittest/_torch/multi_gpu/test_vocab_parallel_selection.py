@@ -464,6 +464,7 @@ def _fused_draft_head_check(rank, tp):
     try:
         worker = _Worker()
         assert worker.enable_vocab_parallel_argmax(lm_head, key_exchange)
+        worker.mapping = mapping  # the draft head's TP rank
         worker.build_fused_draft_head(SimpleNamespace(lm_head=lm_head))
         head = worker.fused_draft_head
         assert head is not None and head.max_rows == 8
