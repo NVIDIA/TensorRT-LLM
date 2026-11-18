@@ -374,6 +374,14 @@ def _fill_kv_pages(buffer: torch.Tensor, pages: Sequence[int], value: float) -> 
     return True
 
 
+class CompletionCapacityError(ValueError):
+    """A request needs more completion blocks than the KV cache can ever hold.
+
+    Raised on arrival, where the request is refused, and again at admission, where the scheduler fails
+    that request alone (`KVCacheV2Scheduler.take_lost_kv_requests`) instead of raising into the executor loop.
+    """
+
+
 class Role:
     KEY = DataRole("key")
     VALUE = DataRole("value")
@@ -5693,16 +5701,17 @@ class KVCacheManagerV2(BaseResourceManager):
         its offer starts. Disabling partial radix matching is not enough on its own: a
         one-model draft's lookahead backoff trims a match of whole blocks to one or more
         tokens short of a boundary, which would leave the connector nothing to offer for
-        any request with a local hit. Aligning trades the trimmed block for the connector
-        serving it and everything after it. Any other configuration keeps token-granular
-        reuse.
+        any request with a local hit. Without a backoff a match of whole blocks ends on a
+        boundary, but trimming it to the pages an attention layer holds (for example a
+        sliding window's coverage) can still end it mid-block, so the alignment holds
+        whether or not a backoff is in effect. Aligning trades the trimmed block for the
+        connector serving it and everything after it. Any other configuration keeps
+        token-granular reuse.
 
         Returns:
-            The ledger `tokens_per_block` when a backoff is in effect, partial reuse is
-            off and the connector requires block-aligned reuse; otherwise 1.
+            The ledger `tokens_per_block` when the connector requires block-aligned reuse;
+            otherwise 1.
         """
-        if self.reuse_match_backoff <= 0:
-            return 1
         if (
             self.kv_connector_manager is None
             or not self.kv_connector_manager.requires_block_aligned_reuse
@@ -7010,8 +7019,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self._inflight_draft_lens.setdefault(request_id, []).append(draft_slots)
         return True
 
-    def retain_generation_allocation(self, req: LlmRequest) -> None:
+    def keep_generation_allocation(self, req: LlmRequest) -> None:
         """Keep a published allocation for the next attempt of a skipped step.
+
+        This is the connector counterpart of `revert_allocate_generation` and does not go through it. A subclass
+        that overrides the revert to unwind per-step state must handle this method too.
 
         The pages and connector save ownership remain intact. The skipped
         step leaves the in-flight queue until scheduling retries it, so an
@@ -7157,7 +7169,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self._after_shrink(req.py_request_id, kv_cache)
 
-    def retain_context_allocation(self, req: LlmRequest) -> None:
+    def keep_context_allocation(self, req: LlmRequest) -> None:
         """Keep a reported context allocation for the next attempt of a skipped step.
 
         The connector already holds the allocation's page IDs. Shrinking it would free
@@ -7895,7 +7907,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         required = self._completion_blocks_required(req)
         if required > capacity:
-            raise ValueError(
+            raise CompletionCapacityError(
                 f"Request {req.request_id} requires {required} completion blocks, "
                 f"but only {capacity} fit after retained padding allocations; "
                 "reduce the prompt/output length or increase the KV cache capacity"

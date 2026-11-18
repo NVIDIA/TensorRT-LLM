@@ -449,7 +449,7 @@ private:
     // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
     // yields the attention-only prefix (used for numReusableTokensBeforeHybridPruning).
     std::vector<MatchResult> pruneMatch(
-        std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId, int alignment = 1) const;
+        std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId, int alignment) const;
 
     // Erase any pending empty root blocks from mRoots.
     // Const-qualified: deferred cleanup is not a logical mutation.

@@ -1920,7 +1920,7 @@ class PyExecutor:
         A capacity-only connector transfers nothing, so both its hooks and the
         executor work surrounding them are no-ops.
         """
-        connector = self.kv_connector_manager
+        connector = getattr(self, "kv_connector_manager", None)
         return connector is not None and not connector.capacity_only
 
     @staticmethod
@@ -1952,7 +1952,7 @@ class PyExecutor:
     @property
     def _kv_connector_reports_failed_loads(self) -> bool:
         """Whether the connector hands failed prefix loads back for a restart."""
-        connector = self.kv_connector_manager
+        connector = getattr(self, "kv_connector_manager", None)
         return connector is not None and connector.reports_failed_loads
 
     def _maybe_init_kv_connector_manager(self) -> None:
@@ -3394,7 +3394,7 @@ class PyExecutor:
                     for req in transfers.requests_in_transfer().values()))
 
     def _has_pending_connector_transfers(self) -> bool:
-        connector = self.kv_connector_manager
+        connector = getattr(self, "kv_connector_manager", None)
         if connector is None:
             return False
         if self.enable_attention_dp:
@@ -5997,7 +5997,7 @@ class PyExecutor:
                 if self._kv_connector_moves_kv:
                     # Published pages and pending saves keep their ownership.
                     # The next scheduling attempt reuses this allocation.
-                    manager.retain_generation_allocation(req)
+                    manager.keep_generation_allocation(req)
                 else:
                     manager.revert_allocate_generation(req)
         reverted = []
@@ -6006,7 +6006,7 @@ class PyExecutor:
                       and req.py_connector_allocation_reported)
             for manager in managers:
                 if retain:
-                    manager.retain_context_allocation(req)
+                    manager.keep_context_allocation(req)
                 else:
                     manager.revert_unexecuted_context_chunk(req)
             if not retain and not PyExecutor._is_stats_dummy_request(req):
@@ -6446,7 +6446,7 @@ class PyExecutor:
 
     def _release_unused_connector_reservations(
             self, scheduled_batch: Optional[ScheduledRequests] = None) -> None:
-        connector = self.kv_connector_manager
+        connector = getattr(self, "kv_connector_manager", None)
         if connector is None or not connector.prefix_reservations_enabled:
             return
         accepted = ({
@@ -6759,6 +6759,9 @@ class PyExecutor:
                     charge_budget=False)
                 continue
             self.kv_cache_manager.drop_context_allocation(req)
+            if getattr(self, "enable_joint_kv_cache_reuse", False):
+                # The paired draft pool holds the same request's allocation, as in `_revert_ctx_alloc`.
+                self.draft_kv_cache_manager.free_resources(req)
             spec_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_manager is not None:
