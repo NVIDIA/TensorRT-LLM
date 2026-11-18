@@ -196,7 +196,8 @@ class FrameSigner:
         Raises:
             FrameAuthenticationError: The message is malformed, has no payload
                 frame, uses an unknown key id, was sent on the other flow or to
-                another recipient, or its MAC does not match.
+                another recipient, has a frame of 4 GiB or more, or its MAC
+                does not match.
         """
         if len(frames) < 3:
             raise FrameAuthenticationError("Message carries no payload or no authentication frames")
@@ -212,7 +213,12 @@ class FrameSigner:
             raise FrameAuthenticationError("Message was sent on the other flow")
         if key_id not in self._mac_bases:
             raise FrameAuthenticationError(f"Unknown key id {key_id}")
-        if not hmac.compare_digest(mac, self._mac(key_id, header, recipient_id, payload)):
+        try:
+            expected_mac = self._mac(key_id, header, recipient_id, payload)
+        except struct.error as e:
+            # The length of each MAC input is packed into 4 bytes.
+            raise FrameAuthenticationError("Frame is too large to authenticate") from e
+        if not hmac.compare_digest(mac, expected_mac):
             raise FrameAuthenticationError("MAC mismatch")
         sender_id = header[self._HEADER.size :]
         return list(payload), SignedHeader(key_id, msg_flow, seq, stream_id, sender_id)

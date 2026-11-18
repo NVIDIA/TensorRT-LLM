@@ -250,6 +250,20 @@ def test_frame_signer_rejects_message_without_payload():
         _verify(_signed([]))
 
 
+class _FourGiBFrame(bytes):
+    """A frame that reports a length of 4 GiB without holding that much data."""
+
+    def __len__(self) -> int:
+        return 2**32
+
+
+def test_frame_signer_rejects_frame_of_4_gib() -> None:
+    message = _signed([b"TAG", b"data"])
+    message[1] = _FourGiBFrame(message[1])
+    with pytest.raises(FrameAuthenticationError, match="too large"):
+        _verify(message)
+
+
 def test_frame_signer_rotation_accepts_every_configured_key():
     old = _signer({1: _KEY}, 1)
     rolling = _signer({1: _KEY, 2: _OTHER_KEY}, 2)
