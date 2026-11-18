@@ -3,6 +3,9 @@
 """specDSA megakernel (CuTe DSL, SM100): the cooperative launch, the indexer-K stream, the sampled threshold,
 candidate publication and the teams' exact top-512 selection, with the row split descriptors, the selection entry points
 and the host entry points ``SpecDsaMegakernel`` and ``compile_mk`` used by ``megakernel_op.py``.
+
+The kernel is specialized for the ``DS_V4_FLASH`` spec of ``config.py``: its structural constants are defined from
+it and ``SpecDsaMegakernel`` rejects a config with another ``kernel_key``.
 """
 
 from __future__ import annotations
@@ -25,17 +28,19 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from . import megakernel_attention as A
 from . import megakernel_lib as L
+from .config import DS_V4_FLASH as SPEC
+from .config import NUM_SMS, SpecDsaConfig, require_built_for
 
 # ====================================================================================================================
 # Per-row split descriptors (which stream CTA streams which 256-position splits and pages of a row), built on the
 # device by ``build_desc_device``.
 # ====================================================================================================================
 
-K_TOP = 512
+K_TOP = SPEC.topk
 SPLIT_TOK = 256
 TILE = 128
 MAXS = 8
-N_MAX = 1 << 18
+N_MAX = SPEC.max_index_len
 PLAN = dict(aim_base=1024, sfac=16, amin=1792, sd_en=0, r_const=64, scap=8192)
 DESC_WORDS = 32
 MAGIC = 20912
@@ -1140,13 +1145,13 @@ class SpecDsaMegakernel:
 
     def __init__(
         self,
-        num_sms: int = 148,
+        num_sms: int = NUM_SMS,
         policy: int = L.POL_EVICT_FIRST,
         debug: bool = False,
         stamps: bool = False,
         math_regs: int = 232,
         kv_stages: int = 2,
-        phys_block_kv: int = 32,
+        phys_block_kv: int = SPEC.index_page_tokens,
         prewarm: bool = True,
         skew: int = 0,
         coop: bool = True,
@@ -1218,7 +1223,9 @@ class SpecDsaMegakernel:
         b1l_upub: int = 2,
         ring: bool = False,
         ring_w12: bool = False,
+        config: SpecDsaConfig | None = None,
     ):
+        require_built_for(config, SPEC)
         assert coop, (
             "the protocol spins across CTAs: all 148 CTAs must be co-resident (cooperative launch)"
         )

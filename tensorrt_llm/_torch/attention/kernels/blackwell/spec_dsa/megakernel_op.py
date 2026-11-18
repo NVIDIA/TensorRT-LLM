@@ -43,49 +43,34 @@ from dataclasses import dataclass
 
 import torch
 
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from .config import DS_V4_FLASH, INDEX_TILE, NUM_SMS, SpecDsaConfig, check_device, supported_spec
 
 __all__ = [
-    "DEFAULT_SOFTMAX_SCALE",
     "ERR_ABORTED",
     "ERR_MISMATCH",
     "ERR_NLIMIT",
     "ERR_STALE",
     "ERR_TIMEOUT",
-    "MAX_CTX_LEN",
-    "MIN_CTX_LEN",
-    "SUPPORTED_BATCH_SIZES",
     "SpecDsaMegakernelState",
     "error_bits",
     "is_supported",
     "precompile",
     "prepare",
     "run",
+    "supported_batch_sizes",
 ]
-
-SUPPORTED_BATCH_SIZES = tuple(range(1, 49))
-NUM_SMS = 148
-NUM_HEADS = 64
-INDEX_DIM = 128
-LATENT_DIM = 512
-TOPK = 512
-WINDOW = 128
-INDEX_PAGE_BYTES = 32 * (INDEX_DIM + 4)  # 32 positions x (128 FP8 values + one float32 scale)
-MIN_CTX_LEN = TOPK
-MAX_CTX_LEN = 1 << 18
-DEFAULT_SOFTMAX_SCALE = 1.0 / math.sqrt(512.0)
 
 # Per-row error bits recorded by the kernel (``error_bits``).
 ERR_STALE = 1  # the state's lengths differ from run()'s ctx_lens: prepare() was not refreshed
 ERR_TIMEOUT = 2  # a wait for another CTA timed out (10 s); the launch was aborted
-ERR_NLIMIT = 4  # a compressed length outside [0, MAX_CTX_LEN]
+ERR_NLIMIT = 4  # a compressed length outside [0, max_index_len]
 ERR_MISMATCH = 8  # the stream and team CTAs disagreed on the selection path
 ERR_ABORTED = 16  # this row stopped because another row or CTA aborted
 
 _BASE = dict(
     debug=False,
     stamps=False,
-    phys_block_kv=32,
+    phys_block_kv=DS_V4_FLASH.index_page_tokens,
     skew=0,
     prewarm=True,
     coop=True,
@@ -129,8 +114,11 @@ _CONFIGS: dict[int, dict] = {
     **{b: _BS16 for b in range(9, 49)},
 }
 
+# The knob sets of the megakernel per spec (kernel_key) and batch size: the base knobs plus the set of the batch size.
+_KNOBS = {DS_V4_FLASH.kernel_key: {b: {**_BASE, **knobs} for b, knobs in _CONFIGS.items()}}
+
 _lock = threading.Lock()
-_engines: dict[tuple[int, int], dict] = {}
+_engines: dict[tuple, dict] = {}
 
 
 def _kernel_modules() -> tuple:
@@ -139,25 +127,30 @@ def _kernel_modules() -> tuple:
     return megakernel_lib, megakernel
 
 
-def is_supported(device: torch.device | None = None) -> tuple[bool, str]:
-    """Whether ``device`` can run the kernel: CuTe DSL installed, SM100 with all 148 SMs (one CTA per SM)."""
-    if not IS_CUTLASS_DSL_AVAILABLE:
-        return False, "nvidia-cutlass-dsl is not available"
-    if not torch.cuda.is_available():
-        return False, "CUDA is not available"
-    props = torch.cuda.get_device_properties(
-        device if device is not None else torch.cuda.current_device()
-    )
-    if (props.major, props.minor) != (10, 0):
-        return False, f"requires SM100, got SM{props.major}{props.minor}"
-    if props.multi_processor_count != NUM_SMS:
-        return False, f"requires {NUM_SMS} SMs, got {props.multi_processor_count}"
-    return True, ""
+def supported_batch_sizes(config: SpecDsaConfig | None = None) -> range:
+    """Batch sizes the megakernel serves for ``config`` (default: DS-V4-Flash): 1 up to ``megakernel_max_batch``."""
+    return range(1, supported_spec(config).megakernel_max_batch + 1)
 
 
-def _check_batch_size(batch_size: int) -> None:
-    if batch_size not in SUPPORTED_BATCH_SIZES:
-        raise ValueError(f"batch size {batch_size} not in {SUPPORTED_BATCH_SIZES}")
+def is_supported(
+    device: torch.device | None = None, config: SpecDsaConfig | None = None
+) -> tuple[bool, str]:
+    """Whether the megakernel serves ``config`` (default: DS-V4-Flash) on ``device``.
+
+    That takes a supported spec with a megakernel, CuTe DSL installed and SM100 with all 148 SMs (one CTA per SM).
+    """
+    try:
+        if supported_spec(config).megakernel_max_batch < 1:
+            return False, "the spec has no megakernel"
+    except NotImplementedError as e:
+        return False, str(e)
+    return check_device(device)
+
+
+def _check_batch_size(batch_size: int, config: SpecDsaConfig) -> None:
+    sizes = supported_batch_sizes(config)
+    if batch_size not in sizes:
+        raise ValueError(f"batch size {batch_size} not in [{sizes.start}, {sizes.stop - 1}]")
 
 
 def _device_index(device: torch.device) -> int:
@@ -165,9 +158,10 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
-def _engine(device: torch.device, batch_size: int) -> dict:
-    _check_batch_size(batch_size)
-    key = (_device_index(device), batch_size)
+def _engine(device: torch.device, batch_size: int, config: SpecDsaConfig | None = None) -> dict:
+    config = supported_spec(config)
+    _check_batch_size(batch_size, config)
+    key = (_device_index(device), batch_size, config.kernel_key)
     with _lock:
         if key not in _engines:
             lib, mk = _kernel_modules()
@@ -176,8 +170,8 @@ def _engine(device: torch.device, batch_size: int) -> dict:
                 policy=lib.POL_EVICT_FIRST if batch_size > 1 else lib.POL_NONE,
                 full_attention_tiles=True,
                 nrows=batch_size,
-                **_BASE,
-                **_CONFIGS[batch_size],
+                config=config,
+                **_KNOBS[config.kernel_key][batch_size],
             )
             _engines[key] = {"kernel": kernel, "fn": None}
         return _engines[key]
@@ -196,12 +190,12 @@ def _desc_params(kernel, batch_size: int, row: int) -> tuple[int, bool, int]:
     return (row * int(kernel.drot)) % kernel.ns, bool(zlast), int(zc)
 
 
-def precompile(device: torch.device, batch_size: int) -> None:
+def precompile(device: torch.device, batch_size: int, config: SpecDsaConfig | None = None) -> None:
     """Compile the kernels for ``batch_size`` rows on ``device`` (main kernel about 15 s, plus the descriptor kernels).
 
     Must run outside CUDA-graph capture. ``run`` compiles on first use otherwise.
     """
-    e = _engine(device, batch_size)
+    e = _engine(device, batch_size, config)
     _, mk = _kernel_modules()
     with _lock:
         if e["fn"] is None:
@@ -222,7 +216,7 @@ class SpecDsaMegakernelState:
 
     ``ws64`` holds ``WS_WORDS`` int64 words per row (generation counter, error words, selection directives), ``hist``,
     ``board`` and ``region`` the per-row selection scratch. ``gidx``, ``dbg``, ``stamps`` and ``ctl`` are kernel
-    arguments used only by diagnostic builds.
+    arguments used only by diagnostic builds. ``config`` is the spec the state was built for.
     """
 
     batch_size: int
@@ -237,6 +231,7 @@ class SpecDsaMegakernelState:
     dbg: torch.Tensor
     stamps: torch.Tensor
     ctl: torch.Tensor
+    config: SpecDsaConfig
 
 
 def _host_ints(t: torch.Tensor, count: int, name: str) -> list[int]:
@@ -251,33 +246,41 @@ def prepare(
     kv_lens: torch.Tensor,
     idx_block_table: torch.Tensor,
     state: SpecDsaMegakernelState | None = None,
+    *,
+    config: SpecDsaConfig | None = None,
 ) -> SpecDsaMegakernelState:
     """Build (or refresh in place) the per-step state for ``B = ctx_lens.numel()`` rows.
 
     Args:
-        ctx_lens: int32 [B], compressed (indexer) length of each row, in [512, 2**18].
+        ctx_lens: int32 [B], compressed (indexer) length of each row, in [512, 2**18] for DS-V4-Flash.
         kv_lens: int32 [B], uncompressed length of each row (>= 128); the window is its last 128 positions.
         idx_block_table: int32 [B, pages] on the target device, indexer K pages of each row (32 compressed positions
             per page; whole 128-position tiles, so at least ``4 * ceil(n / 128)`` valid entries).
-        state: a state of the same batch size to refresh; keeps its workspace (and generation counter).
+        state: a state of the same batch size to refresh; keeps its workspace (and generation counter) and its spec.
+        config: the spec (default: DS-V4-Flash, the only one the kernels serve).
 
     The lengths are checked on the host: pass host (CPU) tensors to avoid a device-to-host copy; device tensors work
     but synchronize.
     """
+    if state is not None:
+        if config is not None and config.kernel_key != state.config.kernel_key:
+            raise ValueError(f"state is for {state.config.name!r}, got {config.name!r}")
+        config = state.config
+    config = supported_spec(config)
     batch_size = int(ctx_lens.numel())
-    _check_batch_size(batch_size)
+    _check_batch_size(batch_size, config)
     device = idx_block_table.device
     if device.type != "cuda":
         raise ValueError("idx_block_table must be a CUDA tensor")
     ctx_host = _host_ints(ctx_lens, batch_size, "ctx_lens")
     kv_host = _host_ints(kv_lens, batch_size, "kv_lens")
-    if any(not MIN_CTX_LEN <= n <= MAX_CTX_LEN for n in ctx_host):
+    if any(not config.min_index_len <= n <= config.max_index_len for n in ctx_host):
         raise ValueError(
-            f"compressed lengths must lie in [{MIN_CTX_LEN}, {MAX_CTX_LEN}], got {ctx_host}"
+            f"compressed lengths must lie in [{config.min_index_len}, {config.max_index_len}], got {ctx_host}"
         )
-    if any(n < WINDOW for n in kv_host):
-        raise ValueError(f"uncompressed lengths must be at least {WINDOW}, got {kv_host}")
-    need_pages = 4 * math.ceil(max(ctx_host) / 128)
+    if any(n < config.window for n in kv_host):
+        raise ValueError(f"uncompressed lengths must be at least {config.window}, got {kv_host}")
+    need_pages = config.pages_per_tile * math.ceil(max(ctx_host) / INDEX_TILE)
     if idx_block_table.dim() != 2 or idx_block_table.shape[0] < batch_size:
         raise ValueError(f"idx_block_table must be [B, pages] with B >= {batch_size}")
     if idx_block_table.shape[1] < need_pages:
@@ -287,20 +290,22 @@ def prepare(
     if state is not None and state.batch_size != batch_size:
         raise ValueError(f"state is for {state.batch_size} rows, got {batch_size}")
     _, mk = _kernel_modules()
-    kernel = _engine(device, batch_size)["kernel"]
+    kernel = _engine(device, batch_size, config)["kernel"]
     rsz = kernel.row_sizes()
     if state is None:
         state = SpecDsaMegakernelState(
             batch_size=batch_size,
             desc=torch.zeros(batch_size * rsz["desc"], dtype=torch.int32, device=device),
-            swa_local=torch.empty((batch_size, WINDOW), dtype=torch.int32, device=device),
-            swa_lens=torch.full((batch_size,), WINDOW, dtype=torch.int32, device=device),
-            gidx=torch.full((batch_size, TOPK + WINDOW), -7, dtype=torch.int32, device=device),
+            swa_local=torch.empty((batch_size, config.window), dtype=torch.int32, device=device),
+            swa_lens=torch.full((batch_size,), config.window, dtype=torch.int32, device=device),
+            gidx=torch.full(
+                (batch_size, config.selected_rows), -7, dtype=torch.int32, device=device
+            ),
             ws64=torch.zeros(batch_size * rsz["ws"], dtype=torch.int64, device=device),
             hist=torch.zeros(batch_size * rsz["hist"], dtype=torch.int32, device=device),
             board=torch.zeros(batch_size * rsz["board"], dtype=torch.int64, device=device),
             region=torch.zeros(batch_size * rsz["region"], dtype=torch.int64, device=device),
-            dbg=torch.empty(MAX_CTX_LEN + 512, dtype=torch.float32, device=device),
+            dbg=torch.empty(config.max_index_len + 512, dtype=torch.float32, device=device),
             stamps=torch.zeros(
                 NUM_SMS
                 * mk.NSTAMP
@@ -313,10 +318,11 @@ def prepare(
                 device=device,
             ),
             ctl=torch.zeros(batch_size * rsz["ctl"], dtype=torch.int32, device=device),
+            config=config,
         )
     torch.add(
         torch.tensor(kv_host, dtype=torch.int32).to(device, non_blocking=True).unsqueeze(1),
-        torch.arange(-WINDOW, 0, dtype=torch.int32, device=device),
+        torch.arange(-config.window, 0, dtype=torch.int32, device=device),
         out=state.swa_local,
     )
     ctx = torch.tensor(ctx_host, dtype=torch.int32).to(device, non_blocking=True)
@@ -378,7 +384,7 @@ def run(
     sinks: torch.Tensor,
     topk: torch.Tensor,
     out: torch.Tensor,
-    softmax_scale: float = DEFAULT_SOFTMAX_SCALE,
+    softmax_scale: float | None = None,
 ) -> None:
     """Launch the fused kernel on the current stream.
 
@@ -397,45 +403,53 @@ def run(
         sinks: float32 [64], per-head attention sink.
         topk: int32 [B, 512] output, the selected compressed positions (in no particular order).
         out: bfloat16 [B, 64 * 512] output.
-        softmax_scale: attention softmax scale.
+        softmax_scale: attention softmax scale (default: ``1 / sqrt(kv_dim)`` of the spec).
+
+    The shapes are those of the DS-V4-Flash spec; ``state.config`` gives the sizes the checks use.
     """
+    config = state.config
     b = state.batch_size
-    _check_numel("q_idx", q_idx, b * NUM_HEADS * INDEX_DIM)
+    if softmax_scale is None:
+        softmax_scale = config.default_softmax_scale
+    _check_numel("q_idx", q_idx, b * config.index_heads * config.index_head_dim)
     if q_idx.element_size() != 1:
         raise ValueError(f"q_idx must be FP8 (1 byte per value), got {q_idx.dtype}")
-    _check_numel("w_idx", w_idx, b * NUM_HEADS, torch.float32)
-    _check_numel("q_att", q_att, b * NUM_HEADS * LATENT_DIM)
+    _check_numel("w_idx", w_idx, b * config.index_heads, torch.float32)
+    _check_numel("q_att", q_att, b * config.attn_heads * config.kv_dim)
     if q_att.element_size() != 1:
         raise ValueError(f"q_att must be FP8 (1 byte per value), got {q_att.dtype}")
-    _check_numel("sinks", sinks, NUM_HEADS)
-    _check_numel("topk", topk, b * TOPK, torch.int32)
-    _check_numel("out", out, b * NUM_HEADS * LATENT_DIM, torch.bfloat16)
-    _check_rows("swa_pool", swa_pool, LATENT_DIM)
-    _check_rows("c_pool", c_pool, LATENT_DIM)
+    _check_numel("sinks", sinks, config.attn_heads)
+    _check_numel("topk", topk, b * config.topk, torch.int32)
+    _check_numel("out", out, b * config.attn_heads * config.kv_dim, torch.bfloat16)
+    _check_rows("swa_pool", swa_pool, config.kv_dim)
+    _check_rows("c_pool", c_pool, config.kv_dim)
     pages = int(k_cache.shape[0])
-    if k_cache.element_size() != 1 or k_cache.numel() != pages * INDEX_PAGE_BYTES:
+    if k_cache.element_size() != 1 or k_cache.numel() != pages * config.index_page_bytes:
         raise ValueError(
-            f"k_cache must hold {INDEX_PAGE_BYTES} bytes per page, got {tuple(k_cache.shape)}"
+            f"k_cache must hold {config.index_page_bytes} bytes per page, got {tuple(k_cache.shape)}"
         )
     if bt_c.dtype != torch.int32 or bt_c.stride(-1) != 1 or bt_c.data_ptr() % 16 != 0:
         raise ValueError("bt_c must be int32 with unit stride and a 16-byte aligned base")
     if b > 1 and bt_c.stride(0) % 4 != 0:
         raise ValueError(f"bt_c rows must be 16-byte aligned, got a row stride of {bt_c.stride(0)}")
-    e = _engine(q_idx.device, b)
+    e = _engine(q_idx.device, b, config)
     if e["fn"] is None:
-        precompile(q_idx.device, b)
+        precompile(q_idx.device, b, config)
     e["fn"](
         k_cache.view(pages, -1),
         q_idx.reshape(-1)
-        .as_strided((NUM_HEADS, INDEX_DIM, b), (INDEX_DIM, 1, NUM_HEADS * INDEX_DIM))
+        .as_strided(
+            (config.index_heads, config.index_head_dim, b),
+            (config.index_head_dim, 1, config.index_heads * config.index_head_dim),
+        )
         .view(torch.uint8),
-        w_idx.reshape(-1).as_strided((NUM_HEADS, b), (1, NUM_HEADS)),
+        w_idx.reshape(-1).as_strided((config.index_heads, b), (1, config.index_heads)),
         idx_block_table[:b],
         ctx_lens.reshape(-1)[:b],
         state.desc,
-        q_att.view(torch.uint8).view(b, NUM_HEADS, LATENT_DIM),
-        swa_pool.view(torch.uint8).view(-1, LATENT_DIM),
-        c_pool.view(torch.uint8).view(-1, LATENT_DIM),
+        q_att.view(torch.uint8).view(b, config.attn_heads, config.kv_dim),
+        swa_pool.view(torch.uint8).view(-1, config.kv_dim),
+        c_pool.view(torch.uint8).view(-1, config.kv_dim),
         state.swa_local,
         bt_swa[:b],
         bt_c[:b],

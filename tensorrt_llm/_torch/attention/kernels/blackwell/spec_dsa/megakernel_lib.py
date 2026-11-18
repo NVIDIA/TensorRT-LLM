@@ -3,6 +3,8 @@
 """specDSA megakernel, device helpers: PTX wrappers, the selection primitives of the exact top-512 (sortable
 float keys, histograms, crossing-bin search, warp and block reductions, memory helpers) and the L2 cache-policy
 constants.
+
+The constants that follow from the model (top-K) are defined from the ``DS_V4_FLASH`` spec of ``config.py``.
 """
 
 import cutlass
@@ -13,6 +15,8 @@ from cutlass._mlir.dialects import arith as mlir_arith
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import math as mlir_math
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from .config import DS_V4_FLASH as SPEC
 
 # ====================================================================================================================
 # Inline PTX helpers: bulk and TMA gather copies, mbarriers, cluster and DSMEM operations, timers.
@@ -651,7 +655,7 @@ def red_add_gpu_u32(addr, val, *, loc=None, ip=None):
 # helpers for the threshold and the exact top-512.
 # ====================================================================================================================
 
-K_TOP = 512
+K_TOP = SPEC.topk
 NBS = 256
 QUADC = 288
 NB_SEL = 1024

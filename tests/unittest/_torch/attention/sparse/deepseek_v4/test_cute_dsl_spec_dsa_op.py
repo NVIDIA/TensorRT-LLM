@@ -14,11 +14,14 @@
 # limitations under the License.
 """One op for every batch size: ``spec_dsa.op`` from 1 to 1,024 rows (SM100).
 
-The op picks the megakernel up to ``MEGAKERNEL_MAX_BATCH`` rows and the large-batch kernels above it. The case builder
+The op picks the megakernel up to the spec's ``megakernel_max_batch`` rows and the large-batch kernels above it.
+The case builder
 and the fp64 references of the large-batch test check every row's top-512 and attention here too, so both
 implementations are covered through the one interface: batch sizes around the switch and between the powers of two,
 the CUDA-graph and in-place refresh path, and the argument checks of the op.
 """
+
+import dataclasses
 
 import pytest
 import torch
@@ -67,12 +70,12 @@ def _launch(op, state, inp, topk, out):
 
 def test_implementation_for():
     op = _op()
-    last = op.MEGAKERNEL_MAX_BATCH
+    last = H.SPEC.megakernel_max_batch
     assert op.implementation_for(1) == "megakernel"
     assert op.implementation_for(last) == "megakernel"
     assert op.implementation_for(last + 1) == "large_batch"
-    assert op.implementation_for(op.MAX_BATCH_SIZE) == "large_batch"
-    for bad in (-1, 0, op.MAX_BATCH_SIZE + 1):
+    assert op.implementation_for(H.SPEC.max_batch) == "large_batch"
+    for bad in (-1, 0, H.SPEC.max_batch + 1):
         with pytest.raises(ValueError, match="batch size"):
             op.implementation_for(bad)
 
@@ -154,7 +157,19 @@ def test_rejects_bad_arguments():
             sinks,
             state=state,
         )
-    many = op.MEGAKERNEL_MAX_BATCH + 1
+    # a state keeps the spec it was built for
+    other = dataclasses.replace(H.SPEC, name="other", topk=1024)
+    with pytest.raises(ValueError, match="state is for"):
+        op.prepare(
+            torch.tensor([4096], dtype=i32),
+            torch.tensor([16384], dtype=i32),
+            bt[:1],
+            sinks,
+            state=state,
+            config=other,
+        )
+    assert state.config is H.SPEC
+    many = H.SPEC.megakernel_max_batch + 1
     bt_many = torch.zeros((many, 128), dtype=i32, device=dev)
     large_state = op.prepare(
         torch.full((many,), 4096, dtype=i32), torch.full((many,), 16384, dtype=i32), bt_many, sinks

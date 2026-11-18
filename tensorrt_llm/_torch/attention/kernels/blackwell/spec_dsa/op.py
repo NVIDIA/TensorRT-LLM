@@ -12,17 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""specDSA: fused DeepSeek-V4-Flash decode sparse attention on B200 (SM100) for any batch size from 1 to 1,024.
+"""specDSA: fused decode sparse attention of a DeepSeek DSA model on B200 (SM100), any batch size from 1 to 1,024.
 
-One decode step of a CSA layer: FP8 paged-MQA indexer logits over the compressed indexer K cache, exact top-512
+One decode step of a CSA layer: FP8 paged-MQA indexer logits over the compressed indexer K cache, exact top-K
 selection, mapping of the selected positions to compressed-KV rows, and the sparse MLA attention over those rows, the
-128-row sliding window and the attention sink. One call replaces the four kernels of the unfused chain. The top-512
-threshold is guessed from sampled logits as in the GVR V2 top-K and checked by a count certificate (the selection
-stays exact: a row where the guess does not hold takes an exact fallback).
+sliding window and the attention sink. One call replaces the four kernels of the unfused chain. The top-K threshold is
+guessed from sampled logits as in the GVR V2 top-K and checked by a count certificate (the selection stays exact: a row
+where the guess does not hold takes an exact fallback).
+
+The kernels are specialized for a ``SpecDsaConfig`` (``config.py``). The default and, today, only spec is
+``DS_V4_FLASH`` (top-512 over a 64 x 128 FP8 indexer, 64 attention heads over 512-byte E4M3 KV rows, a 128-row window).
+A config without kernels is refused with ``NotImplementedError`` (``is_supported`` and ``config.supported_spec`` tell
+beforehand) and its caller keeps the existing kernels.
 
 Two implementations sit behind one interface; ``implementation_for`` names the one a batch size uses:
 
-- ``megakernel`` (``megakernel.py`` / ``megakernel_op.py``, 1 to ``MEGAKERNEL_MAX_BATCH`` rows): one cooperative launch
+- ``megakernel`` (``megakernel.py`` / ``megakernel_op.py``, 1 to ``megakernel_max_batch`` rows): one cooperative launch
   that streams the indexer K cache once and does the selection and the attention on dedicated CTAs while the others
   keep streaming; compiled per batch size.
 - ``large_batch`` (``large_batch.py`` / ``large_batch_op.py``, more rows): a persistent indexer kernel and an attention
@@ -32,9 +37,9 @@ Per step, ``prepare`` does the host work (descriptors or CTA schedule from the l
 on the current stream; the launch can be captured in a CUDA graph and replayed while ``prepare`` refreshes the state in
 place.
 
-Contract:
-- A state belongs to one batch size and one caller. ``prepare`` calls that refresh it and launches that share it must be
-  stream-ordered.
+Contract (the numbers are those of DS-V4-Flash):
+- A state belongs to one batch size, one spec and one caller. ``prepare`` calls that refresh it and launches that share
+  it must be stream-ordered.
 - ``ctx_lens`` (compressed indexer length of each row, in [512, 2**18]) and ``kv_lens`` (uncompressed length, at least
   128; the window is its last 128 positions) are read on the host by ``prepare``: pass host (CPU) tensors to avoid a
   device-to-host copy; device tensors work but synchronize. ``run`` takes both on the device.
@@ -48,21 +53,15 @@ Contract:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
 
 from . import large_batch_op, megakernel_op
+from .config import SpecDsaConfig, check_device, supported_spec
 
 __all__ = [
-    "DEFAULT_SOFTMAX_SCALE",
     "ERR_STALE",
-    "MAX_BATCH_SIZE",
-    "MAX_CTX_LEN",
-    "MEGAKERNEL_MAX_BATCH",
-    "MIN_BATCH_SIZE",
-    "MIN_CTX_LEN",
     "SpecDsaState",
     "error_bits",
     "implementation_for",
@@ -71,16 +70,6 @@ __all__ = [
     "prepare",
     "run",
 ]
-
-MIN_BATCH_SIZE = 1
-MAX_BATCH_SIZE = 1024
-# Largest batch size of the megakernel; larger batches use the large-batch kernels.
-MEGAKERNEL_MAX_BATCH = 48
-NUM_HEADS = 64
-MIN_CTX_LEN = megakernel_op.MIN_CTX_LEN
-MAX_CTX_LEN = megakernel_op.MAX_CTX_LEN
-DEFAULT_SOFTMAX_SCALE = 1.0 / math.sqrt(512.0)
-WINDOW = megakernel_op.WINDOW
 
 # Error bit shared by both implementations: the state's lengths differ from the launch's ``ctx_lens`` (``prepare`` was
 # not refreshed). The megakernel reports further bits per row (``megakernel_op.ERR_*``).
@@ -94,42 +83,54 @@ _LARGE_BATCH = "large_batch"
 class SpecDsaState:
     """Per-step metadata and workspace of one caller; see ``prepare``.
 
-    ``implementation`` names the kernels the batch size uses, ``state`` is their state and ``sinks`` the float32 [64]
-    attention-sink copy the megakernel launch reads (the large-batch state holds its own per-row copy).
+    ``implementation`` names the kernels the batch size uses, ``state`` is their state, ``sinks`` the float32
+    [attn_heads] attention-sink copy the megakernel launch reads (the large-batch state holds its own per-row copy) and
+    ``config`` the spec the state was built for.
     """
 
     batch_size: int
     implementation: str
     state: object
     sinks: torch.Tensor | None
+    config: SpecDsaConfig
 
 
-def _check_batch_size(batch_size: int) -> None:
-    if not MIN_BATCH_SIZE <= batch_size <= MAX_BATCH_SIZE:
-        raise ValueError(f"batch size {batch_size} not in [{MIN_BATCH_SIZE}, {MAX_BATCH_SIZE}]")
+def implementation_for(batch_size: int, config: SpecDsaConfig | None = None) -> str:
+    """Name of the implementation that serves ``batch_size`` rows of ``config`` (default: DS-V4-Flash).
+
+    ``"megakernel"`` or ``"large_batch"``.
+    """
+    config = supported_spec(config)
+    if not 1 <= batch_size <= config.max_batch:
+        raise ValueError(f"batch size {batch_size} not in [1, {config.max_batch}]")
+    return _MEGAKERNEL if batch_size <= config.megakernel_max_batch else _LARGE_BATCH
 
 
-def implementation_for(batch_size: int) -> str:
-    """Name of the implementation that serves ``batch_size`` rows: ``"megakernel"`` or ``"large_batch"``."""
-    _check_batch_size(batch_size)
-    return _MEGAKERNEL if batch_size <= MEGAKERNEL_MAX_BATCH else _LARGE_BATCH
+def is_supported(
+    device: torch.device | None = None, config: SpecDsaConfig | None = None
+) -> tuple[bool, str]:
+    """Whether the kernels serve ``config`` (default: DS-V4-Flash) on ``device``, and the reason when they do not.
+
+    That takes a spec with kernels, CuTe DSL installed and SM100 with all 148 SMs (one CTA per SM).
+    """
+    try:
+        supported_spec(config)
+    except NotImplementedError as e:
+        return False, str(e)
+    return check_device(device)
 
 
-def is_supported(device: torch.device | None = None) -> tuple[bool, str]:
-    """Whether ``device`` can run the kernels: CuTe DSL installed, SM100 with all 148 SMs (one CTA per SM)."""
-    return megakernel_op.is_supported(device)
-
-
-def precompile(device: torch.device, batch_size: int) -> None:
+def precompile(device: torch.device, batch_size: int, config: SpecDsaConfig | None = None) -> None:
     """Compile what ``batch_size`` rows need on ``device`` (the megakernel per batch size, the large-batch
     kernels once).
 
     Must run outside CUDA-graph capture; ``run`` compiles on first use otherwise.
     """
-    if implementation_for(batch_size) == _MEGAKERNEL:
-        megakernel_op.precompile(device, batch_size)
+    config = supported_spec(config)
+    if implementation_for(batch_size, config) == _MEGAKERNEL:
+        megakernel_op.precompile(device, batch_size, config)
     else:
-        large_batch_op.precompile(device)
+        large_batch_op.precompile(device, config)
 
 
 def prepare(
@@ -138,6 +139,8 @@ def prepare(
     idx_block_table: torch.Tensor,
     sinks: torch.Tensor,
     state: SpecDsaState | None = None,
+    *,
+    config: SpecDsaConfig | None = None,
 ) -> SpecDsaState:
     """Build (or refresh in place) the per-step state for ``B = ctx_lens.numel()`` rows.
 
@@ -147,12 +150,18 @@ def prepare(
         idx_block_table: int32 [B, pages] on the target device, indexer K pages of each row (32 compressed positions
             per page; whole 128-position tiles).
         sinks: float32 [64] on the target device, per-head attention sink.
-        state: a state of the same batch size to refresh; keeps its workspace.
+        state: a state of the same batch size to refresh; keeps its workspace and its spec.
+        config: the spec (default: DS-V4-Flash). A new state is built for it; a refreshed state keeps its own.
     """
+    if state is not None:
+        if config is not None and config.kernel_key != state.config.kernel_key:
+            raise ValueError(f"state is for {state.config.name!r}, got {config.name!r}")
+        config = state.config
+    config = supported_spec(config)
     batch_size = int(ctx_lens.numel())
-    implementation = implementation_for(batch_size)
-    if sinks.numel() != NUM_HEADS:
-        raise ValueError(f"sinks must have {NUM_HEADS} entries, got {tuple(sinks.shape)}")
+    implementation = implementation_for(batch_size, config)
+    if sinks.numel() != config.attn_heads:
+        raise ValueError(f"sinks must have {config.attn_heads} entries, got {tuple(sinks.shape)}")
     if state is not None and (
         state.batch_size != batch_size or state.implementation != implementation
     ):
@@ -161,11 +170,11 @@ def prepare(
         )
     inner = state.state if state is not None else None
     if implementation == _MEGAKERNEL:
-        inner = megakernel_op.prepare(ctx_lens, kv_lens, idx_block_table, inner)
+        inner = megakernel_op.prepare(ctx_lens, kv_lens, idx_block_table, inner, config=config)
         sinks_copy = (
             state.sinks
             if state is not None
-            else torch.empty(NUM_HEADS, dtype=torch.float32, device=sinks.device)
+            else torch.empty(config.attn_heads, dtype=torch.float32, device=sinks.device)
         )
         sinks_copy.copy_(sinks.reshape(-1))
     else:
@@ -173,12 +182,16 @@ def prepare(
             raise ValueError(f"kv_lens must have {batch_size} entries, got {int(kv_lens.numel())}")
         if idx_block_table.dim() != 2 or idx_block_table.shape[0] < batch_size:
             raise ValueError(f"idx_block_table must be [B, pages] with B >= {batch_size}")
-        inner = large_batch_op.prepare(ctx_lens, sinks, inner)
+        inner = large_batch_op.prepare(ctx_lens, sinks, inner, config=config)
         sinks_copy = None
     if state is not None:
         return state
     return SpecDsaState(
-        batch_size=batch_size, implementation=implementation, state=inner, sinks=sinks_copy
+        batch_size=batch_size,
+        implementation=implementation,
+        state=inner,
+        sinks=sinks_copy,
+        config=config,
     )
 
 
@@ -208,7 +221,7 @@ def run(
     bt_c: torch.Tensor,
     topk: torch.Tensor,
     out: torch.Tensor,
-    softmax_scale: float = DEFAULT_SOFTMAX_SCALE,
+    softmax_scale: float | None = None,
 ) -> None:
     """Launch the fused kernels on the current stream.
 
@@ -227,7 +240,9 @@ def run(
             16-byte aligned (row stride a multiple of 4 entries).
         topk: int32 [B, 512] output, the selected compressed positions (in no particular order).
         out: bfloat16 [B, 64 * 512] output.
-        softmax_scale: attention softmax scale.
+        softmax_scale: attention softmax scale (default: ``1 / sqrt(kv_dim)`` of the spec of ``state``).
+
+    The shapes are those of DS-V4-Flash; ``state.config`` gives the sizes the checks use.
     """
     if state.implementation == _MEGAKERNEL:
         megakernel_op.run(

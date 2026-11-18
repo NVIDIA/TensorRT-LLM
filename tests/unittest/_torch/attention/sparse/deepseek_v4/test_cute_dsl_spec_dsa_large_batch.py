@@ -21,23 +21,26 @@ set is well defined), planted exact ties or all-equal logits; an attention mode 
 makes one wrong KV row visible far above the bf16 noise.
 """
 
-import math
-
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa.config import DS_V4_FLASH as SPEC
+from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa.config import NUM_SMS
 from tensorrt_llm._utils import get_sm_version
 
-K_TOP, H_IDX, D_IDX, H_ATT, D_ATT = 512, 64, 128, 64, 512
+# The shapes under test are those of the spec (``config.py``); test_cute_dsl_spec_dsa_config.py pins its values.
+K_TOP, H_IDX, D_IDX = SPEC.topk, SPEC.index_heads, SPEC.index_head_dim
+H_ATT, D_ATT = SPEC.attn_heads, SPEC.kv_dim
+# compressed / SWA rows per page, window, compress ratio
 TPB_C, TPB_SWA, WINDOW, RATIO = (
-    32,
-    128,
-    128,
-    4,
-)  # compressed / SWA rows per page, window, compress ratio
-PAGE_BYTES = TPB_C * (D_IDX + 4)  # 32 x 128 e4m3 values, then 32 fp32 scales
-N_MAX = 1 << 18
-SM_SCALE = 1.0 / math.sqrt(512.0)
+    SPEC.kv_page_rows,
+    SPEC.swa_page_rows,
+    SPEC.window,
+    SPEC.compress_ratio,
+)
+PAGE_BYTES = SPEC.index_page_bytes  # 32 x 128 e4m3 values, then 32 fp32 scales
+N_MAX = SPEC.max_index_len
+SM_SCALE = SPEC.default_softmax_scale
 
 # Lengths around the schedule's granule (256 tokens, 128 units = 32,768 tokens) and the limits.
 LENGTHS = [
@@ -504,11 +507,16 @@ def test_schedule_matches_reference(batch):
         if trial == 0:
             ns = [N_MAX] * batch
         elif trial == 1:
-            ns = [op.MIN_CTX_LEN + int(x) for x in torch.randint(0, 3000, (batch,), generator=gen)]
+            ns = [
+                SPEC.min_index_len + int(x) for x in torch.randint(0, 3000, (batch,), generator=gen)
+            ]
         else:
-            ns = [int(x) for x in torch.randint(op.MIN_CTX_LEN, N_MAX + 1, (batch,), generator=gen)]
-        got = op._schedule(ns, op.NUM_SMS)
-        assert got.tolist() == [list(r) for r in _schedule_reference(ns, op.NUM_SMS)]
+            ns = [
+                int(x)
+                for x in torch.randint(SPEC.min_index_len, N_MAX + 1, (batch,), generator=gen)
+            ]
+        got = op._schedule(ns, NUM_SMS)
+        assert got.tolist() == [list(r) for r in _schedule_reference(ns, NUM_SMS)]
 
 
 def test_rejects_unsupported_arguments():
@@ -517,13 +525,13 @@ def test_rejects_unsupported_arguments():
     sinks = torch.zeros(H_ATT, device=dev)
     ok = torch.full((256,), 4096, dtype=torch.int32)
     with pytest.raises(ValueError):
-        op.prepare(torch.full((256,), op.MAX_CTX_LEN + 1, dtype=torch.int32), sinks)
+        op.prepare(torch.full((256,), N_MAX + 1, dtype=torch.int32), sinks)
     with pytest.raises(ValueError):
-        op.prepare(torch.full((256,), op.MIN_CTX_LEN - 1, dtype=torch.int32), sinks)
+        op.prepare(torch.full((256,), SPEC.min_index_len - 1, dtype=torch.int32), sinks)
     with pytest.raises(ValueError):
         op.prepare(torch.empty(0, dtype=torch.int32), sinks)
     with pytest.raises(ValueError):
-        op.prepare(torch.full((op.MAX_BATCH_SIZE + 1,), 4096, dtype=torch.int32), sinks)
+        op.prepare(torch.full((SPEC.max_batch + 1,), 4096, dtype=torch.int32), sinks)
     with pytest.raises(ValueError):
         op.prepare(ok, torch.zeros(H_ATT - 1, device=dev))
     state = op.prepare(ok, sinks)

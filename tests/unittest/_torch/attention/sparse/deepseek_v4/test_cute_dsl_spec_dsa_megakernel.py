@@ -19,24 +19,27 @@ set is well defined (rows with planted exact ties or all-equal rows are checked 
 mode in which every score is bit-equal so one wrong KV row is visible far above the bf16 noise.
 """
 
-import math
 import zlib
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa.config import DS_V4_FLASH as SPEC
 from tensorrt_llm._utils import get_sm_version
 
-K_TOP, H_IDX, D_IDX, H_ATT, D_ATT = 512, 64, 128, 64, 512
+# The shapes under test are those of the spec (``config.py``); test_cute_dsl_spec_dsa_config.py pins its values.
+K_TOP, H_IDX, D_IDX = SPEC.topk, SPEC.index_heads, SPEC.index_head_dim
+H_ATT, D_ATT = SPEC.attn_heads, SPEC.kv_dim
+# compressed / SWA rows per page, window, compress ratio
 TPB_C, TPB_SWA, WINDOW, RATIO = (
-    32,
-    128,
-    128,
-    4,
-)  # compressed / SWA rows per page, window, compress ratio
-PAGE_BYTES = TPB_C * (D_IDX + 4)  # 32 x 128 e4m3 values, then 32 fp32 scales
-N_MAX = 1 << 18
-SM_SCALE = 1.0 / math.sqrt(512.0)
+    SPEC.kv_page_rows,
+    SPEC.swa_page_rows,
+    SPEC.window,
+    SPEC.compress_ratio,
+)
+PAGE_BYTES = SPEC.index_page_bytes  # 32 x 128 e4m3 values, then 32 fp32 scales
+N_MAX = SPEC.max_index_len
+SM_SCALE = SPEC.default_softmax_scale
 
 
 def _op():
@@ -402,7 +405,7 @@ CASES = [  # (rows' compressed lengths, attention mode, extra case options)
 
 
 @pytest.mark.parametrize("ns,attn,extra", CASES)
-def test_dsv4_sparse_decode_matches_reference(ns, attn, extra):
+def test_matches_reference(ns, attn, extra):
     op, mk = _op(), _mk()
     batch = len(ns)
     extra = dict(extra)
@@ -458,13 +461,14 @@ def test_dsv4_sparse_decode_matches_reference(ns, attn, extra):
     assert bool((ws[:, mk.W_DONE] == launches).all()), "one workspace generation per launch"
 
 
-def test_dsv4_sparse_decode_rejects_unsupported_shapes():
+def test_rejects_unsupported_shapes():
     op = _op()
     dev = torch.device("cuda")
     i32 = torch.int32
-    bt = torch.zeros((49, 8), dtype=i32, device=dev)
+    many = SPEC.megakernel_max_batch + 1
+    bt = torch.zeros((many, 8), dtype=i32, device=dev)
     with pytest.raises(ValueError, match="batch size"):
-        op.prepare(torch.full((49,), 4096, dtype=i32), torch.full((49,), 16384, dtype=i32), bt)
+        op.prepare(torch.full((many,), 4096, dtype=i32), torch.full((many,), 16384, dtype=i32), bt)
     with pytest.raises(ValueError, match="compressed lengths"):
         op.prepare(torch.tensor([300], dtype=i32), torch.tensor([1200], dtype=i32), bt[:1])
     with pytest.raises(ValueError, match="compressed lengths"):

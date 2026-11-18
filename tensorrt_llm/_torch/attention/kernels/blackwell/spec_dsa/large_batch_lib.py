@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """specDSA large-batch kernels, device helpers: PTX helpers, the ready queue and the selection routines shared by
 the two kernels, and the L2 cache-policy constants.
+
+The constants that follow from the model (top-K) are defined from the ``DS_V4_FLASH`` spec of ``config.py``.
 """
 
 import cutlass
@@ -13,11 +15,13 @@ from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import math as mlir_math
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .config import DS_V4_FLASH as SPEC
+
 # ====================================================================================================================
 # PTX helpers, the ready queue and the selection routines shared by the two kernels.
 # ====================================================================================================================
 
-K_TOP = 512
+K_TOP = SPEC.topk
 NBS = 256
 QUADC = 288
 NB_SEL = 1024

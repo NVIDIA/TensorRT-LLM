@@ -12,12 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""specDSA (speculative DSA): fused DeepSeek-V4-Flash decode sparse attention for Blackwell.
+"""specDSA (speculative DSA): fused decode sparse attention of the DeepSeek DSA models for Blackwell.
 
-The indexer logits, the exact top-512 selection, the mapping to compressed-KV rows and the sparse attention over the
-selected rows run in one megakernel (up to 48 rows) or in two kernels (more rows). The top-512 threshold is guessed from
+The indexer logits, the exact top-K selection, the mapping to compressed-KV rows and the sparse attention over the
+selected rows run in one megakernel (few rows) or in two kernels (many rows). The top-K threshold is guessed from
 sampled logits as in the GVR V2 top-K and checked by a count certificate; a row where the guess does not hold takes an
 exact fallback.
 
-Import :mod:`.op` for the host side; nothing is re-exported here.
+The kernels are specialized for a spec (:mod:`.config`); DeepSeek-V4-Flash is the one with kernels today (``README.md``
+lists the specs and how to add one). Import :mod:`.op` for the host side and :mod:`.config` for the specs; nothing is
+re-exported here.
 """

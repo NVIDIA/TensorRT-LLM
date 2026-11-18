@@ -5,6 +5,9 @@ the attention sink (TMA gathers, tcgen05 MMA, softmax and correction warps).
 
 The first half is the stand-alone attention engine, the second the roles that the team CTAs of the megakernel run. Where
 both define a name differently the roles' name is kept and the engine's carries an ``_engine`` (``_ENGINE``) suffix.
+
+The constants that follow from the model (heads, KV row size, window, top-K) are defined from the ``DS_V4_FLASH`` spec
+of ``config.py``.
 """
 
 from __future__ import annotations
@@ -24,15 +27,16 @@ from cutlass.cutlass_dsl import dsl_user_op as _dsl_user_op
 from cutlass.experimental import primitives as prims
 
 from . import megakernel_lib as L
+from .config import DS_V4_FLASH as SPEC
 
 # ====================================================================================================================
 # Sparse MLA building blocks shared by the attention roles: Q / KV tensor maps, tcgen05 MMA and softmax helpers.
 # ====================================================================================================================
 
-HEADS = 64
-LATENT = 512
-WINDOW = 128
-TOPK = 512
+HEADS = SPEC.attn_heads
+LATENT = SPEC.kv_dim
+WINDOW = SPEC.window
+TOPK = SPEC.topk
 NROWS = WINDOW + TOPK
 SLICE = 128
 NSLICE = LATENT // SLICE

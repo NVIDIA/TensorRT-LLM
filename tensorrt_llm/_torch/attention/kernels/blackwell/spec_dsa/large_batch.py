@@ -3,6 +3,9 @@
 """specDSA large-batch kernels (CuTe DSL, SM100): the persistent indexer kernel (one CTA per SM: FP8 logits,
 sampled-threshold top-512, mapping to compressed-KV rows, ready queue) and the attention kernel launched behind it with
 programmatic dependent launch.
+
+The kernels are specialized for the ``DS_V4_FLASH`` spec of ``config.py``: their structural constants are defined from
+it and the kernel classes reject a config with another ``kernel_key``.
 """
 
 from __future__ import annotations
@@ -24,19 +27,21 @@ from cutlass.experimental import primitives as prims
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from . import large_batch_lib as L
+from .config import DS_V4_FLASH as SPEC
+from .config import NUM_SMS, SpecDsaConfig, require_built_for
 
 # ====================================================================================================================
 # Sparse MLA tile loads, MMA and softmax helpers shared by the two kernels.
 # ====================================================================================================================
 
-HEADS = 64
-LATENT = 512
-WINDOW = 128
-NROWS = 640
+HEADS = SPEC.attn_heads
+LATENT = SPEC.kv_dim
+WINDOW = SPEC.window
+NROWS = SPEC.selected_rows
 TILE_N = 128
 NTILES = NROWS // TILE_N
 SLICE = 128
-NSLICE = 4
+NSLICE = LATENT // SLICE
 Q_SLICE_BYTES = HEADS * SLICE
 SLOT_BYTES = TILE_N * SLICE
 LOG2_E = 1.4426950408889634
@@ -1371,7 +1376,8 @@ def _issue_kv_tile(slot_base, mbar_base, tma_swa, tma_cmp, use_swa, gidx_t, wl, 
 
 
 class AttentionTail:
-    def __init__(self):
+    def __init__(self, config: SpecDsaConfig | None = None):
+        require_built_for(config, SPEC)
         self.threads = 288  # warps 0-3 loader, 4-7 softmax/epilogue, 8 MMA issue
 
     @cute.jit
@@ -1622,7 +1628,7 @@ def compile_tail(tail: AttentionTail):
 
 _RND_RN = "rn"
 NEG_INF = -math.inf
-K_TOP = 512
+K_TOP = SPEC.topk
 RING = 256
 RING_CHUNK = 64
 MAIN_CAP = 2048
@@ -2442,11 +2448,11 @@ def _finalize_seg(
 class IndexerKernel:
     def __init__(
         self,
-        num_sms: int = 148,
+        num_sms: int = NUM_SMS,
         block_kv: int = 128,
-        phys_block_kv: int = 32,
-        num_heads: int = 64,
-        head_dim: int = 128,
+        phys_block_kv: int = SPEC.index_page_tokens,
+        num_heads: int = SPEC.index_heads,
+        head_dim: int = SPEC.index_head_dim,
         policy: int = L.POL_NONE,
         debug_dump: bool = False,
         admit: bool = True,
@@ -2491,7 +2497,9 @@ class IndexerKernel:
         dq_cap: int = DQ_CAP,
         validate: bool = True,
         tiebin: bool = True,
+        config: SpecDsaConfig | None = None,
     ):
+        require_built_for(config, SPEC)
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
         self.num_blocks_per_mma = block_kv // phys_block_kv
