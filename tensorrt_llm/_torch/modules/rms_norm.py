@@ -20,6 +20,8 @@ from typing import NamedTuple, Optional, Tuple, TypeAlias, Union, cast
 import torch
 from torch import nn
 
+from tensorrt_llm.logger import logger
+
 from ..._utils import get_sm_version
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
@@ -172,12 +174,18 @@ class RMSNorm(nn.Module):
             return (out, residual) if has_residual else out
 
         if (self.fp8_scale is not None and residual is not None
-                and not is_torch_compiling()
-                and add_rmsnorm_fp8_quant_supported(hidden_states, residual)):
-            fp8 = add_rmsnorm_fp8_quant(hidden_states, residual, self.weight,
-                                        self.fp8_scale, self.variance_epsilon,
-                                        self.use_gemma)
-            return Fp8NormOutput(fp8, hidden_states), residual
+                and not self.return_hp_output and not is_torch_compiling()):
+            if add_rmsnorm_fp8_quant_supported(hidden_states, residual):
+                fp8 = add_rmsnorm_fp8_quant(hidden_states, residual,
+                                            self.weight, self.fp8_scale,
+                                            self.variance_epsilon,
+                                            self.use_gemma)
+                return Fp8NormOutput(fp8, hidden_states), residual
+            logger.debug_once(
+                "RMSNorm has an FP8 scale, but the fused add + RMSNorm + FP8 "
+                "quantize kernel does not support these inputs, so the "
+                "consumer quantizes the plain output instead",
+                key="rms_norm_fp8_copy_fallback")
 
         if self.return_hp_output:
             raise ValueError(

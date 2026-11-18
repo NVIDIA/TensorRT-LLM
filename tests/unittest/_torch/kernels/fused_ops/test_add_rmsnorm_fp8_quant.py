@@ -159,6 +159,19 @@ def test_rms_norm_fp8_scale_falls_back_to_plain_output(monkeypatch, case):
     _assert_same_bits(residual_out, ref_residual)
 
 
+def test_rms_norm_fp8_scale_keeps_hp_output_error():
+    """An FP8 scale does not bypass the error for return_hp_output outside the NVFP4 path."""
+    hidden_size = 1024
+    norm = RMSNorm(
+        hidden_size=hidden_size, eps=_EPS, dtype=torch.bfloat16, return_hp_output=True
+    ).cuda()
+    x, residual, _, scale = _inputs(5, hidden_size)
+
+    norm.fp8_scale = scale
+    with pytest.raises(ValueError, match="Auxiliary high precision output"):
+        norm(x, residual)
+
+
 @pytest.mark.parametrize("num_tokens", (4, 300))
 @torch.no_grad()
 def test_static_fp8_linear_takes_the_norm_fp8_copy(num_tokens):
