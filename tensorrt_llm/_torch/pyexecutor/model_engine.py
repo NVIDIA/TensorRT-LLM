@@ -37,6 +37,7 @@ from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
 from ..tensor_lru_cache import TensorLRUCache
+from ._weight_loading import notify_weight_loading_complete
 from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import CUDAGraphRunner
 from .engine.cuda_graph import plan_cuda_graphs
@@ -278,6 +279,7 @@ class ModelEngine:
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader
             )
+            notify_weight_loading_complete(self.mapping.rank)
             if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                 self.moe_load_balancer = moe_load_balancer
         else:

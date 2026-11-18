@@ -333,3 +333,42 @@ Being selective keeps CI turnaround fast and conserves hardware resources.
 ### Avoiding unnecessary `--disable-fail-fast` usage
 
 Avoid habitually using `--disable-fail-fast` as it wastes scarce hardware resources. The CI system automatically reuses successful test stages when commits remain unchanged, and subsequent `/bot run` commands only retry failed stages. Overusing `--disable-fail-fast` keeps failed pipelines consuming resources (like DGX-H100s), increasing queue backlogs and reducing team efficiency.
+
+## Experimental disaggregated QA timeout budgets
+
+Selected large-model disaggregated QA cases use
+`@pytest.mark.disagg_weight_loading(seconds)` to separate two wall-clock budgets:
+
+1. From pytest setup until every context and generation rank has returned from
+   loading its main model, including checkpoint preparation and weight finalization.
+2. From the last rank's loading completion until the test finishes, including
+   remaining communication initialization, compilation, warmup, registration,
+   inference or accuracy evaluation, and teardown. This budget is the existing
+   `pytest.mark.timeout` value (or `--timeout` for cases without that marker).
+
+The experiment enables a 7200-second loading budget for Kimi K2.5 NVFP4,
+GLM-5.2 NVFP4's NIXL test, DeepSeek V4 Flash Base, and the two DeepSeek V4.1
+Flash GSM8K cases. Nemotron Super 120B's concurrency test uses 1800 seconds for
+loading and retains a 3600-second execution budget. Unmarked tests keep their
+existing timeout behavior. `TRTLLM_TEST_WEIGHT_LOADING_TIMEOUT` can override the
+loading budget with a positive number of seconds.
+
+This version supports one cluster launch per test attempt and single-host
+PyTorch workers with the main/one-model checkpoint. It does not separate the
+loading of an additional external draft model or later worker reloads. Each
+attempt has its own shared state directory; ranks publish atomic completion
+events rather than parsed progress bars. Concurrent rank durations are not
+added. Some initialization precedes or overlaps loading and is consequently
+within the first budget. A fresh runtime wheel built from the same checkout is
+required; changing test sources alone does not install the completion signal.
+
+The supervisor uses the thread timeout mechanism so a blocked CUDA call remains
+bounded, emits `[disagg-timeout] phase=weight_loading` and `phase=post_loading`
+messages, and preserves exact-nodeid timeout evidence and hang tracebacks.
+`timeout func_only=True` is unsupported. Internal server-ready limits become
+safety limits covering both budgets; the supervisor enforces the actual phase
+deadlines. Jenkins/process/group limits must cover both budgets, cleanup, and
+any configured retries, and can still terminate a run earlier if set too low.
+
+CPU regression checks are in `tests/unittest/tools/test_disagg_timeout.py`,
+already covered by the `unittest/tools` parent entry in the CPU test list.
