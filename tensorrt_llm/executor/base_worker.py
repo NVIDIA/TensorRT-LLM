@@ -462,7 +462,10 @@ class BaseWorker(GenerationExecutor):
             raise RequestError(
                 f"prompt_embeds is not supported by {type(model).__name__}: "
                 f"{reason}.")
-        hidden_size = model.config.hidden_size
+        config = model.config
+        hidden_size = getattr(config, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = config.text_config.hidden_size
         if prompt_embeds.hidden_size != hidden_size:
             raise RequestError(
                 f"prompt_embeds hidden size ({prompt_embeds.hidden_size}) "

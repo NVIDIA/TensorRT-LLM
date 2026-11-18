@@ -54,6 +54,7 @@ from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
 from .modeling_multimodal_utils import (
     _store_chunked_prefill_embeddings,
+    apply_prompt_embeds_overlay,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
@@ -427,6 +428,10 @@ class MultimodalModelMixin:
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
 
+    fuses_prompt_embeds: ClassVar[bool] = True
+    """Whether ``forward`` takes ``prompt_embeds_overlay`` and writes those rows after fusing
+    multimodal rows (the engine then keeps ``input_ids`` instead of passing embeddings)."""
+
     supports_mm_encoder_item_scheduling: ClassVar[bool] = False
     """Whether the model supports item-level MM encoder scheduling: it implements the item-encode
     forward and pairs with a processor that overrides
@@ -711,6 +716,14 @@ class MultimodalModelMixin:
         """Return the inner language model that receives prepared inputs."""
         raise NotImplementedError
 
+    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
+        """Return why this model cannot take ``prompt_embeds``, or None if it can.
+
+        Wrappers opt in once the ids they pass to the language model (and any id-derived inputs
+        they build) treat a prompt-embedding row like the language model expects.
+        """
+        return "its multimodal wrapper does not handle prompt_embeds yet"
+
     @property
     def runtime_hooks(self) -> RuntimeHooks:
         """Return the inner language model's step-loop hooks."""
@@ -805,6 +818,7 @@ class MultimodalModelMixin:
     ) -> torch.Tensor:
         """Prepare multimodal inputs and dispatch them to the language model."""
         multimodal_params = kwargs.pop("multimodal_params", [])
+        prompt_embeds_overlay = kwargs.pop("prompt_embeds_overlay", None)
         mm_inputs = self.prepare_multimodal_inputs(
             input_ids=input_ids,
             positions=position_ids,
@@ -823,6 +837,17 @@ class MultimodalModelMixin:
             mm_inputs = PreparedLlmInputs(
                 input_ids=None,
                 inputs_embeds=inputs_embeds,
+                extra_embeds=mm_inputs.extra_embeds,
+            )
+        if prompt_embeds_overlay is not None:
+            mm_inputs = PreparedLlmInputs(
+                input_ids=None,
+                inputs_embeds=apply_prompt_embeds_overlay(
+                    self.text_embedding_layer,
+                    input_ids,
+                    mm_inputs.inputs_embeds,
+                    prompt_embeds_overlay,
+                ),
                 extra_embeds=mm_inputs.extra_embeds,
             )
 

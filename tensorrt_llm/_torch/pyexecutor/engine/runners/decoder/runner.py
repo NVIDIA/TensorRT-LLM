@@ -963,6 +963,9 @@ class DecoderRunner(ScheduledModelRunner):
         tokens are already in ``input_ids``; the model then gets embeddings
         instead of ids.
         """
+        if getattr(self._model, "fuses_prompt_embeds", False):
+            # Multimodal wrappers write the rows after fusing image rows.
+            return {**inputs, "prompt_embeds_overlay": (dst_rows, src_rows)}
         input_ids = inputs["input_ids"]
         embeds = self._model.embed_prompt_tokens(input_ids)
         embeds.index_copy_(0, dst_rows, src_rows.to(embeds.dtype))

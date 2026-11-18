@@ -76,8 +76,8 @@ from .modeling_multimodal_encoder import \
     prepare_encoder_attn_metadata as _prepare_qwen_vl_vision_attn_metadata
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
-    _install_processor_output_validation_filter, find_input_mm_embeds,
-    fuse_input_embeds, get_attached_multimodal_embeddings,
+    _install_processor_output_validation_filter, apply_prompt_embeds_overlay,
+    find_input_mm_embeds, fuse_input_embeds, get_attached_multimodal_embeddings,
     get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
@@ -2324,6 +2324,11 @@ def _qwen_vision_input_partitions(
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
+
+    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
+        """mRoPE positions of prompt-embedding rows are text positions."""
+        return self.llm.prompt_embeds_unsupported_reason()
+
     supported_encoder_attention_backends = {
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
     }
@@ -2560,6 +2565,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
                 mrope_delta_read_seq_slots=kwargs.get(
                     "mrope_delta_read_seq_slots"))
 
+        raw_input_ids = input_ids
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
@@ -2568,6 +2574,12 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
             mm_token_indices=kwargs.get("mm_token_indices"),
             text_token_indices=kwargs.get("text_token_indices"),
         )
+        prompt_embeds_overlay = kwargs.get("prompt_embeds_overlay")
+        if prompt_embeds_overlay is not None:
+            input_embeds = apply_prompt_embeds_overlay(
+                self.llm.model.embed_tokens, raw_input_ids, input_embeds,
+                prompt_embeds_overlay)
+            input_ids = None
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,

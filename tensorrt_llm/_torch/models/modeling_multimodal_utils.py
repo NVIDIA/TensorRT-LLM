@@ -689,6 +689,33 @@ def _as_copy_index(index: torch.Tensor,
                     non_blocking=True)
 
 
+def apply_prompt_embeds_overlay(
+    embedding_layer: Embedding,
+    input_ids: torch.Tensor,
+    inputs_embeds: Optional[torch.Tensor],
+    prompt_embeds_overlay: Tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Write prompt-embedding rows into the fused input embeddings.
+
+    Args:
+        embedding_layer: Text embedding layer, used when no multimodal rows
+            were fused into ``inputs_embeds``.
+        input_ids: Token ids of the pass; prompt-embedding rows hold in-vocab
+            placeholder ids.
+        inputs_embeds: Fused embeddings, or None for a text-only pass.
+        prompt_embeds_overlay: ``(dst_rows, src_rows)`` from the engine;
+            prompt-embedding rows never overlap multimodal rows.
+
+    Returns:
+        Embeddings for every token of the pass.
+    """
+    dst_rows, src_rows = prompt_embeds_overlay
+    if inputs_embeds is None:
+        inputs_embeds = embedding_layer(input_ids)
+    inputs_embeds.index_copy_(0, dst_rows, src_rows.to(inputs_embeds.dtype))
+    return inputs_embeds
+
+
 def fuse_input_embeds(
     embedding_layer: Embedding,
     input_ids: torch.IntTensor,

@@ -1617,6 +1617,11 @@ class Qwen3VisionModelBase(nn.Module):
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
+    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
+        """mRoPE positions of prompt-embedding rows are text positions; the
+        language model gets the raw ids, placeholders included."""
+        return self.llm.prompt_embeds_unsupported_reason()
+
     supported_encoder_attention_backends = {
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
     }
