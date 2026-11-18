@@ -19,6 +19,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
+from ..attention.metadata.core import TrtllmCoreMetadata
 from ..distributed import Distributed
 from ..hostfunc import HOSTFUNC_USER_DATA_HANDLES, record_hostfunc_graph_replay
 from ..memory_buffer_utils import Buffers, get_memory_buffers
@@ -201,6 +202,9 @@ def sampling_variant(spec_metadata: Optional[SpecMetadata]) -> str:
 def _save_spec_decode_capture_state(
         attn_metadata: Any, enable_spec_decode: bool) -> Optional[torch.Tensor]:
     if not enable_spec_decode or not hasattr(attn_metadata, 'kv_lens_cuda'):
+        return None
+    if isinstance(attn_metadata, TrtllmCoreMetadata):
+        # Every forward derives kv_lens_cuda from the staged lengths; nothing accumulates.
         return None
     return attn_metadata.kv_lens_cuda[:attn_metadata.num_seqs].clone()
 

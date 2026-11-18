@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1758,7 +1759,7 @@ class MLA(nn.Module):
                 )
 
         if isinstance(self.mha, TrtllmAttention):
-            assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+            assert isinstance(attn_metadata, (TrtllmAttentionMetadata, TrtllmCoreMetadata))
             if attn_metadata.helix_context_local_slots is not None:
                 if self.mha.uses_fp4_mla_attention:
                     raise NotImplementedError(

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, List, Optional, Set
 
@@ -18,12 +19,15 @@ from tensorrt_llm.mapping import Mapping
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..attention.backends.sparse.params import MTPIndexShareMetadata
+from ..attention.metadata.core import TrtllmCoreMetadata
+from ..attention.metadata.draft import DraftMetadata
 from ..model_config import ModelConfig
 from ..modules.multi_stream_utils import do_multi_stream
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
+from ..utils import get_model_extra_attrs
 from .fused_accept import step0_epilogue
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, DraftRowPick,
                         SpecMetadata, SpecWorkerBase,
@@ -722,8 +726,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             else:
                 # The step-0 sequence lengths, before the draft loop rewrites them.
                 pre_draft_seq_lens = attn_metadata._seq_lens_cuda
+                # The feature-split metadata run the draft loop on metadata of
+                # its own; only the old metadata are rewritten and restored.
+                feature_metadata = isinstance(attn_metadata, TrtllmCoreMetadata)
                 # Save the old attn_metadata and spec_metadata
-                self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+                if not feature_metadata:
+                    self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
                 # Prepare inputs for the 1st draft model forward
                 position_ids = position_ids.squeeze(0)
@@ -751,7 +759,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     num_accepted_tokens, original_all_rank_num_tokens,
                     resource_manager, accepted_tokens, pre_draft_seq_lens)
                 # restore attn_metadata to support cuda graph
-                self._restore_attn_metadata_from_spec_dec(attn_metadata)
+                if not feature_metadata:
+                    self._restore_attn_metadata_from_spec_dec(attn_metadata)
                 # restore all_rank_num_tokens for attention DP
                 if original_all_rank_num_tokens is not None:
                     attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
@@ -767,7 +776,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 spec_metadata.batch_indices_cuda, batch_size,
                 num_accepted_tokens)
 
-        attn_metadata.use_spec_decoding = True
+        if not isinstance(attn_metadata, TrtllmCoreMetadata):
+            attn_metadata.use_spec_decoding = True
 
         # Commit model-owned target state only after draft preparation has
         # succeeded; SpecWorkerBase aborts the still-pending snapshots on any
@@ -935,9 +945,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # MTP Eagle: step 0's gather ids, hidden rows, later positions and
         # step-0 -> 1 metadata update in one launch (the step-0 epilogue). It
         # reads the pre-loop sequence lengths, since it writes the live ones.
+        # The draft steps' metadata of the feature-split path; None on the old
+        # path, which rewrites the target's metadata in place instead.
+        draft_metadata = (attn_metadata.get_metadata(DraftMetadata)
+                          if isinstance(attn_metadata, TrtllmCoreMetadata) else
+                          None)
         use_epilogue = (pre_draft_seq_lens is not None and self.is_mtp_eagle
                         and self.spec_decode_fast_paths
                         and self.guided_decoder is None
+                        and draft_metadata is None
                         and hasattr(attn_metadata, "kv_lens_cuda"))
         step0 = None
         # [k + 1, b] int32 token buffer of an epilogue step: row 0 = each
@@ -974,13 +990,29 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # object: draft_kv_cache_context swaps buffers in place for every
                 # TrtllmAttentionMetadata, and sparse metadata all derive from it.
                 draft_scope.callback(_reset_mtp_index_share, attn_metadata)
-            draft_attn_metadata = draft_scope.enter_context(
-                self.draft_kv_cache_context(attn_metadata,
-                                            draft_kv_cache_manager))
+            if draft_metadata is not None:
+                draft_metadata.begin_draft_loop(num_accepted_tokens)
+                draft_scope.callback(draft_metadata.end_draft_loop)
+                draft_metadata.begin_draft_step(0)
+                draft_attn_metadata = draft_metadata.draft
+                # The attention custom ops resolve the metadata from the
+                # model's extra attributes, not from their arguments.
+                extra_attrs = get_model_extra_attrs()
+                if extra_attrs is not None:
+                    target_metadata_ref = extra_attrs.get("attention_metadata")
+                    extra_attrs["attention_metadata"] = weakref.ref(
+                        draft_attn_metadata)
+                    draft_scope.callback(extra_attrs.__setitem__,
+                                         "attention_metadata",
+                                         target_metadata_ref)
+            else:
+                draft_attn_metadata = draft_scope.enter_context(
+                    self.draft_kv_cache_context(attn_metadata,
+                                                draft_kv_cache_manager))
             attn_metadata = draft_attn_metadata
             inputs["attn_metadata"] = draft_attn_metadata
-            if self.is_mtp_eagle and is_dsa_cache_manager(
-                    draft_kv_cache_manager):
+            if (draft_metadata is None and self.is_mtp_eagle
+                    and is_dsa_cache_manager(draft_kv_cache_manager)):
                 # Overlap scheduling corrects kv_lens_cuda from the runtime
                 # accepted-token counts inside the captured graph. The target
                 # forward refreshes target slot mappings during that correction;
@@ -1262,7 +1294,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     }
 
                 # Update attn_metadata for the next iteration.
-                if i == 0:
+                if draft_metadata is not None:
+                    draft_metadata.end_draft_step(i)
+                    if i + 1 < runtime_draft_len:
+                        draft_metadata.begin_draft_step(i + 1)
+                elif i == 0:
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     if step0 is None:  # else: done by the step-0 epilogue
                         attn_metadata._seq_lens_cuda[:batch_size].fill_(1)

@@ -25,6 +25,8 @@ from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
 import numpy as np
 import torch
 
+from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
+
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
@@ -2908,10 +2910,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.cache_context_plan and not has_variable_window_starts and self._run_context_plan(
                 q, k, v, metadata, forward_args):
             return forward_args.output
-        assert isinstance(
-            metadata,
-            TrtllmAttentionMetadata,
-        )
+        assert isinstance(metadata,
+                          (TrtllmAttentionMetadata, TrtllmCoreMetadata))
         token_major_view = (metadata.token_major_gen_view()
                             if forward_args.attention_input_type
                             == AttentionInputType.generation_only else None)

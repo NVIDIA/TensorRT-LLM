@@ -666,6 +666,7 @@ class DecoderRunner(ScheduledModelRunner):
         attn_metadata = self._metadata.setup_attention(kv_cache_manager, draft_kv_cache_manager)
         if isinstance(attn_metadata, TrtllmAttentionMetadata):
             attn_metadata.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
+        self._inputs.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
         if enable_spec_decode:
             spec_resource_manager, spec_tree_manager = get_spec_managers(resource_manager)
             spec_metadata = self._metadata.setup_speculative(spec_resource_manager)

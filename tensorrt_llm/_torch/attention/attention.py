@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -53,8 +54,10 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
     assert metadata_ref is not None, "Attention metadata is not set"
     metadata = metadata_ref()
     assert isinstance(
-        metadata, (FlashInferAttentionMetadata, TrtllmAttentionMetadata)
-    ), "Metadata must be a subclass of FlashInferAttentionMetadata or TrtllmAttentionMetadata"
+        metadata,
+        (FlashInferAttentionMetadata, TrtllmAttentionMetadata,
+         TrtllmCoreMetadata
+         )), "Metadata must be FlashInfer or TRT-LLM attention metadata"
 
     attn_layers = extra_attrs.get(attn_type + "_layers", None)
     assert attn_layers is not None, "Attention layer is not registered"

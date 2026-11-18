@@ -15,7 +15,11 @@ import torch.nn.functional as F
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention.backends.interface import MLAParams, PositionalEmbeddingParams
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionMetadata,
+    MLAParams,
+    PositionalEmbeddingParams,
+)
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
@@ -2054,7 +2058,7 @@ class Indexer(nn.Module):
                 "indexer_topk_out_buffer_gen" if is_generation else "indexer_topk_out_buffer_ctx"
             )
 
-        topk_indices_buffer = metadata.get_empty(
+        topk_indices_buffer = AttentionMetadata.get_empty(
             metadata.cuda_graph_buffers,
             (hidden_states.shape[0], self.index_topk),
             cache_name=cache_name,
