@@ -2683,8 +2683,9 @@ def test_moe_mxe2m1_weights(num_tokens,
                 gemm2_scales_mxe2m1_shuffled.cuda(),
                 gemm2_bias_shuffled.cuda() if gemm2_bias_shuffled is not None
                 else None, num_experts, top_k, n_groups, top_k_groups,
-                intermediate_size, None, None, 0, num_experts, routed_scaling,
-                routing_method_type, act_type.value, topk_weights, topk_ids)
+                intermediate_size, valid_hidden_size, valid_intermediate_size,
+                0, num_experts, routed_scaling, routing_method_type,
+                act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "bf16":
             output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
@@ -2697,8 +2698,9 @@ def test_moe_mxe2m1_weights(num_tokens,
                 gemm2_scales_mxe2m1_shuffled.cuda(),
                 gemm2_bias_shuffled.cuda() if gemm2_bias_shuffled is not None
                 else None, num_experts, top_k, n_groups, top_k_groups,
-                intermediate_size, None, None, 0, num_experts, routed_scaling,
-                routing_method_type, act_type.value, topk_weights, topk_ids)
+                intermediate_size, valid_hidden_size, valid_intermediate_size,
+                0, num_experts, routed_scaling, routing_method_type,
+                act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "fp8":
             output = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
@@ -2719,9 +2721,13 @@ def test_moe_mxe2m1_weights(num_tokens,
             raise ValueError("Invalid dtype_activation")
     torch.cuda.synchronize()
     output_dequant_actual = output.to(torch.float)
+    assert torch.isfinite(
+        output_dequant_actual).all(), "MoE output contains non-finite values"
     output_dequant_reference = output_dequant_reference[:, :
                                                         unpadded_hidden_size].contiguous(
                                                         )
+    assert torch.isfinite(output_dequant_reference).all(
+    ), "MoE reference contains non-finite values"
     if act_type == ActType.SiTu:
         check_accuracy(output_dequant_reference,
                        output_dequant_actual,
