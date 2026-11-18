@@ -7208,15 +7208,22 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
     bucket by bucket and its finalize walk calls both post-load hooks. A refit
     may also rewrite only one of the two projections of a slot, which the
     parent writes into its half of the plain ``[w3, w1]`` layout; so before
-    FC1 bytes land in a slot already in the kernel layout, that slot is first
-    returned to the parent's layout, and the interleave is reapplied to the
-    whole slot at the next finalize.
+    one projection lands in a slot already in the kernel layout, that slot is
+    first returned to the parent's layout, and the interleave is reapplied to
+    the whole slot at the next finalize. When both projections arrive (always
+    the case for ``FUSED_GATE_UP_PROJ``) they overwrite the whole slot, so it
+    is not returned first, and its scales are interleaved while still raw and
+    then swizzled once, instead of swizzled, unswizzled and swizzled again.
+    Finalize runs every layout pass on contiguous slot runs.
     """
     # The fused kernel gathers per-token FC1 scales in 16-byte chunks, i.e.
     # 16 UE8M0 scales covering 16 * 32 = 512 K elements per row.
     FC1_K_ALIGNMENT = 16 * MXFP8CutlassFusedMoEMethod.BLOCK_SIZE
     # Gate/up interleave granularity expected by the fused SwiGLU epilogue.
     INTERLEAVE_GROUP_SIZE = 64
+    # Largest transient one finalize batch may allocate (each layout pass
+    # materializes its input once); a refit runs next to a live KV cache.
+    FINALIZE_BATCH_BYTES = 256 << 20
 
     def create_weights(self, module: torch.nn.Module) -> None:
         if module.hidden_size % self.FC1_K_ALIGNMENT != 0:
@@ -7258,9 +7265,13 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
         # a down_proj-only bucket cannot re-interleave a finalized slot.
         arrives = (w1_weight is not None
                    or w3_weight is not None) and expert_idx >= 0
+        # Both projections overwrite the whole slot, so its old layout is moot.
+        whole_slot = (w1_weight is not None and w1_weight.shape[0] != 0
+                      and w3_weight is not None and w3_weight.shape[0] != 0)
         interleaved = module._cute_dsl_mxfp8_w3_w1_weight_interleaved
         if arrives and expert_idx in interleaved:
-            self._deinterleave_w3_w1_weight(dst_w3_w1_weight)
+            if not whole_slot:
+                self._deinterleave_w3_w1_weight(dst_w3_w1_weight)
             interleaved.discard(expert_idx)
         super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
                                          dst_w3_w1_weight,
@@ -7268,16 +7279,19 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
         if arrives:
             module._cute_dsl_mxfp8_w3_w1_interleave_pending.add(expert_idx)
 
-    def _carries_w3_w1_scale(self, module: torch.nn.Module, weights: Dict,
-                             expert_id: int) -> bool:
-        """Whether ``weights`` holds an FC1 block scale for ``expert_id``."""
+    def _w3_w1_scale_halves(self, module: torch.nn.Module, weights: Dict,
+                            expert_id: int) -> set[str]:
+        """The FC1 projections whose block scales ``weights`` holds."""
         if module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-            return weights.get("gate_up_proj_weight_scale") is not None
+            if weights.get("gate_up_proj_weight_scale") is None:
+                return set()
+            return {"w1", "w3"}
+        halves = set()
         for leaf in ("w1", "w3"):
             key = self._get_scale_key(weights, expert_id, leaf)
             if key is not None and weights[key] is not None:
-                return True
-        return False
+                halves.add(leaf)
+        return halves
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
         interleaved = module._cute_dsl_mxfp8_w3_w1_scale_interleaved
@@ -7285,27 +7299,55 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
             scale_data = module.w3_w1_weight_scale.data
             for local_slot_id, expert_id in enumerate(
                     module.initial_local_expert_ids):
-                if (local_slot_id in interleaved and self._carries_w3_w1_scale(
-                        module, weights, expert_id)):
+                if local_slot_id not in interleaved:
+                    continue
+                halves = self._w3_w1_scale_halves(module, weights, expert_id)
+                if not halves:
+                    continue
+                # Only a one-projection write keeps the other half's bytes,
+                # which must be back in the parent's layout first.
+                if len(halves) == 1:
                     self._deinterleave_w3_w1_weight_scale(
                         module, scale_data[local_slot_id])
-                    interleaved.discard(local_slot_id)
+                interleaved.discard(local_slot_id)
         super().load_quant_scales(module, weights)
 
     @classmethod
-    def _interleave_w3_w1_rows(cls, x: torch.Tensor) -> torch.Tensor:
-        """``[w3; w1]`` rows -> ``[up 0:64, gate 64:128, ...]``."""
+    def _interleave_w3_w1_rows(cls,
+                               x: torch.Tensor,
+                               dim: int = 0) -> torch.Tensor:
+        """``[w3; w1]`` rows -> ``[up 0:64, gate 64:128, ...]`` on ``dim``."""
         return interleave_linear_and_gate(x,
                                           group_size=cls.INTERLEAVE_GROUP_SIZE,
-                                          dim=0)
+                                          dim=dim)
 
     @classmethod
-    def _deinterleave_w3_w1_rows(cls, x: torch.Tensor) -> torch.Tensor:
+    def _deinterleave_w3_w1_rows(cls,
+                                 x: torch.Tensor,
+                                 dim: int = 0) -> torch.Tensor:
         """The inverse of :meth:`_interleave_w3_w1_rows`."""
         sizes = x.size()
         group = cls.INTERLEAVE_GROUP_SIZE
-        return x.view(sizes[0] // (2 * group), 2, group,
-                      *sizes[1:]).transpose(0, 1).contiguous().view(sizes)
+        grouped = x.view(*sizes[:dim], sizes[dim] // (2 * group), 2, group,
+                         *sizes[dim + 1:])
+        return grouped.transpose(dim, dim + 1).contiguous().view(sizes)
+
+    @classmethod
+    def _slot_batches(cls, slots, slot_data: torch.Tensor):
+        """Contiguous ``[lo, hi)`` runs of ``slots`` within the batch budget."""
+        per_slot_bytes = slot_data[0].numel() * slot_data.element_size()
+        max_slots = max(1, cls.FINALIZE_BATCH_BYTES // max(1, per_slot_bytes))
+        run_start = prev = None
+        for slot in sorted(slots):
+            if run_start is not None and (slot != prev + 1
+                                          or slot - run_start >= max_slots):
+                yield run_start, prev + 1
+                run_start = None
+            if run_start is None:
+                run_start = slot
+            prev = slot
+        if run_start is not None:
+            yield run_start, prev + 1
 
     @classmethod
     def _interleave_w3_w1_weight(cls, dst_w3_w1_weight: torch.Tensor) -> None:
@@ -7320,61 +7362,89 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
         w3_w1_u8.copy_(cls._deinterleave_w3_w1_rows(w3_w1_u8))
 
     def _permute_w3_w1_weight_scale_rows(
-            self, module: torch.nn.Module, dst_w3_w1_weight_scale: torch.Tensor,
-            permute: Callable[[torch.Tensor], torch.Tensor]) -> None:
-        """Reorder the rows of one slot's swizzled [2N, K/32] UE8M0 scales.
+            self, module: torch.nn.Module, block: torch.Tensor,
+            permute: Callable[..., torch.Tensor]) -> None:
+        """Reorder the rows of a slot run's swizzled [2N, K/32] UE8M0 scales.
 
-        The slot is stored int32-packed and swizzled, so unswizzle -> permute
-        rows -> swizzle, then write the same bytes back through the int32
-        view.
+        ``block`` is ``[slots, 2N, K/128]`` int32-packed and swizzled, so
+        unswizzle -> permute rows -> swizzle, then write the same bytes back
+        through the int32 view.
         """
         rows = module.expand_intermediate_size_per_partition
         k = module.hidden_size
-        sf_u8 = dst_w3_w1_weight_scale.view(torch.uint8)
-        unswizzled = unswizzle_sf(sf_u8, rows, k,
-                                  self.BLOCK_SIZE).view(rows,
+        unswizzled = unswizzle_sf(block.view(torch.uint8), rows, k,
+                                  self.BLOCK_SIZE).view(block.shape[0], rows,
                                                         k // self.BLOCK_SIZE)
-        swizzled = swizzle_sf(permute(unswizzled), rows, k, self.BLOCK_SIZE)
-        dst_w3_w1_weight_scale.copy_(
-            swizzled.view(self.BLOCK_SCALES_DTYPE).reshape(
-                dst_w3_w1_weight_scale.shape))
+        swizzled = swizzle_sf(permute(unswizzled, dim=1), rows, k,
+                              self.BLOCK_SIZE)
+        block.copy_(swizzled.view(self.BLOCK_SCALES_DTYPE).reshape(block.shape))
+
+    def _swizzle_raw_w3_w1_weight_scale(self, module: torch.nn.Module,
+                                        block: torch.Tensor) -> None:
+        """Bring a slot run's raw plain-layout FC1 scales to the kernel layout.
+
+        Interleaving the raw rows and then swizzling once replaces the
+        parent's swizzle followed by unswizzle -> interleave -> swizzle.
+        """
+        rows = module.expand_intermediate_size_per_partition
+        k = module.hidden_size
+        interleaved = self._interleave_w3_w1_rows(block.view(torch.uint8),
+                                                  dim=1)
+        swizzled = swizzle_sf(interleaved, rows, k, self.BLOCK_SIZE)
+        block.copy_(swizzled.view(self.BLOCK_SCALES_DTYPE).reshape(block.shape))
 
     def _interleave_w3_w1_weight_scale(
             self, module: torch.nn.Module,
             dst_w3_w1_weight_scale: torch.Tensor) -> None:
-        self._permute_w3_w1_weight_scale_rows(module, dst_w3_w1_weight_scale,
-                                              self._interleave_w3_w1_rows)
+        self._permute_w3_w1_weight_scale_rows(
+            module, dst_w3_w1_weight_scale.unsqueeze(0),
+            self._interleave_w3_w1_rows)
 
     def _deinterleave_w3_w1_weight_scale(
             self, module: torch.nn.Module,
             dst_w3_w1_weight_scale: torch.Tensor) -> None:
-        self._permute_w3_w1_weight_scale_rows(module, dst_w3_w1_weight_scale,
-                                              self._deinterleave_w3_w1_rows)
+        self._permute_w3_w1_weight_scale_rows(
+            module, dst_w3_w1_weight_scale.unsqueeze(0),
+            self._deinterleave_w3_w1_rows)
 
     def process_weights_after_loading(self, module: torch.nn.Module) -> None:
-        # Snapshot the scale slots the parent is about to swizzle: those are
-        # exactly the slots whose FC1 scales were (re)staged and therefore owe
-        # the interleave once the swizzle has been applied.
-        scale_slots = {
-            local_slot_id
-            for local_slot_id, _ in
-            getattr(module, "_mxfp8_w3_w1_sf_pending_slots", ()) or ()
-        }
+        # The slots whose FC1 scales were (re)staged owe the interleave. Every
+        # pass below runs on contiguous slot runs, not one slot per launch.
+        pending = getattr(module, "_mxfp8_w3_w1_sf_pending_slots", None)
+        halves_by_slot: Dict[int, set[str]] = {}
+        for local_slot_id, half in pending or ():
+            halves_by_slot.setdefault(local_slot_id, set()).add(half)
+        # A slot with both halves restaged holds raw bytes in the plain layout
+        # throughout: its rows are interleaved before a single swizzle, done
+        # here, and the parent swizzles the rest. A slot with one half
+        # restaged mixes raw and swizzled bytes; the parent swizzles its new
+        # half and the interleave follows.
+        whole_slots = {s for s, h in halves_by_slot.items() if len(h) == 2}
+        partial_slots = set(halves_by_slot) - whole_slots
+        scale_data = module.w3_w1_weight_scale.data
+        if whole_slots:
+            pending.difference_update(
+                (s, half) for s in whole_slots for half in ("w1", "w3"))
+            for lo, hi in self._slot_batches(whole_slots, scale_data):
+                self._swizzle_raw_w3_w1_weight_scale(module,
+                                                     scale_data[lo:hi])
+            module._cute_dsl_mxfp8_w3_w1_scale_interleaved.update(whole_slots)
         super().process_weights_after_loading(module)
 
         weight_slots = module._cute_dsl_mxfp8_w3_w1_interleave_pending
         if weight_slots:
             weight_data = module.w3_w1_weight.data
-            for local_slot_id in sorted(weight_slots):
-                self._interleave_w3_w1_weight(weight_data[local_slot_id])
+            for lo, hi in self._slot_batches(weight_slots, weight_data):
+                block = weight_data[lo:hi].view(torch.uint8)
+                block.copy_(self._interleave_w3_w1_rows(block, dim=1))
             module._cute_dsl_mxfp8_w3_w1_weight_interleaved.update(weight_slots)
             weight_slots.clear()
-        if scale_slots:
-            scale_data = module.w3_w1_weight_scale.data
-            for local_slot_id in sorted(scale_slots):
-                self._interleave_w3_w1_weight_scale(module,
-                                                    scale_data[local_slot_id])
-            module._cute_dsl_mxfp8_w3_w1_scale_interleaved.update(scale_slots)
+        if partial_slots:
+            for lo, hi in self._slot_batches(partial_slots, scale_data):
+                self._permute_w3_w1_weight_scale_rows(
+                    module, scale_data[lo:hi], self._interleave_w3_w1_rows)
+            module._cute_dsl_mxfp8_w3_w1_scale_interleaved.update(
+                partial_slots)
 
     def pre_reload_weights(self, module: torch.nn.Module) -> None:
         rebuilt = set(module.rebuild_tensor_metadata)
