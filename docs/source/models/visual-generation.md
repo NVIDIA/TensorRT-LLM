@@ -172,6 +172,8 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 
 ## MiniMax-H3 Notes
 
+Base MiniMax-H3 defaults to `num_inference_steps=50`. The video and audio schedulers each use 50 sigma points including the terminal zero, so generation runs 49 joint denoising updates. To reproduce the 27-update schedule, pass `num_inference_steps=28`.
+
 MiniMax-H3 parallel VAE uses independent spatial tiles via
 `parallel_config.parallel_vae_size`, with size from 1 through the world size (`tp_size * ulysses_size`).
 Tile geometry and blending follow the loaded Diffusers VAE.

@@ -978,9 +978,17 @@ def test_ref2va_tensor_parallel_text_encoder_rejects_vision_inputs() -> None:
         pipeline._encode_reference_text_tokens([11], {"pixel_values": torch.zeros(1)})
 
 
-def test_default_generation_steps() -> None:
+def test_default_schedule_runs_49_joint_denoising_updates() -> None:
     pipeline = _SyntheticMiniMaxH3Pipeline()
-    assert pipeline.default_generation_params["num_inference_steps"] == 50
+    params = pipeline.default_generation_params
+    assert params["num_inference_steps"] == 50
+    params.update(height=32, width=32)
+    pipeline.forward(prompt="a synthetic prompt", seed=42, **params)
+
+    assert pipeline.transformer.forward_calls == 49
+    for scheduler in (pipeline.scheduler, pipeline.audio_scheduler):
+        assert len(scheduler.sigmas) == 50
+        assert scheduler.sigmas[-1].item() == 0.0
 
 
 def test_hf_download_is_scoped_to_the_supported_h3_components(
