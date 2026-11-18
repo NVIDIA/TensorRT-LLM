@@ -18,9 +18,14 @@ def iteration_stats_row(
     scheduler_mode: Optional[str] = None,
     gpu_forward_time_ms: Optional[float] = None,
     mm_encoder_stats: Optional[dict] = None,
+    is_queue_snapshot: bool = False,
 ) -> dict:
     """``stats`` as a dict, tagged with its attention-DP rank (0 without attention DP), with its
-    request and KV-cache iteration stats and the profiler's per-loop timings when present."""
+    request and KV-cache iteration stats and the profiler's per-loop timings when present.
+
+    ``is_queue_snapshot`` adds ``"isQueueSnapshot": true``: the record was taken without a
+    forward pass, so it reports the queues and its duration and per-loop timings are not
+    measurements. Measured records do not have the key."""
     row = json.loads(stats.to_json_str())
     row["attentionDpRank"] = 0 if attention_dp_rank is None else attention_dp_rank
     if req_stats:
@@ -39,4 +44,6 @@ def iteration_stats_row(
         row["multimodalEncoderStats"] = mm_encoder_stats
     if scheduler_mode is not None:
         row["schedulerMode"] = scheduler_mode
+    if is_queue_snapshot:
+        row["isQueueSnapshot"] = True
     return row
