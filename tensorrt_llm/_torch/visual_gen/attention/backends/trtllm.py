@@ -43,11 +43,14 @@ from ...denoise_step import get_denoise_step
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
-def vc_smooth_phase(denoise_step: Optional[Tuple[int, int]]) -> Tuple[bool, bool]:
-    """V-Smooth phase of a denoise step as (smooth, refresh), the VCAttentionPreprocessor schedule.
+def vc_smooth_phase(denoise_step: Optional[Tuple[int, int]]) -> str:
+    """V-Smooth phase of a denoise step, the VCAttentionPreprocessor path by name. ``cold`` starts
+    the generation at step 0, ``warm`` regroups from the current centroids, ``keep`` demeans on
+    the current grouping and ``plain`` runs without tile means after the window.
 
-    No step, as in warm-up, counts as a refreshing smooth step. The CUDA graph runner keys the
-    transformer graph on this value so each phase replays its own capture.
+    No step, as in warm-up, starts cold. The CUDA graph runner keys the transformer graph on this
+    value and replays one capture per phase. The captured preprocessor records no step
+    bookkeeping and no random draw.
     """
     from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import (
         VC_PERM_REFRESH_EVERY,
@@ -55,26 +58,19 @@ def vc_smooth_phase(denoise_step: Optional[Tuple[int, int]]) -> Tuple[bool, bool
     )
 
     if denoise_step is None:
-        return (True, True)
+        return "cold"
     step_idx, num_steps = denoise_step
-    smooth = step_idx < math.ceil(VC_SMOOTH_STEP_FRACTION * num_steps)
-    return (smooth, smooth and step_idx % VC_PERM_REFRESH_EVERY == 0)
+    if step_idx >= math.ceil(VC_SMOOTH_STEP_FRACTION * num_steps):
+        return "plain"
+    if step_idx == 0:
+        return "cold"
+    return "warm" if step_idx % VC_PERM_REFRESH_EVERY == 0 else "keep"
 
 
-def vc_denoise_step() -> Optional[Tuple[int, int]]:
-    """The denoise step that puts the VC preprocessor in the phase of the current graph key.
-
-    Under CUDA graph replay the real step is unknown to the captured code, so the phase the
-    runner resolved on the host selects a representative step. Outside the runner the real step
-    is used.
-    """
-    phase = resolved_extra_key("flux3_vc_phase")
-    if phase is None:
-        return get_denoise_step()
-    smooth, refresh = phase
-    if not smooth:
-        return (7, 8)
-    return (0, 8) if refresh else (1, 8)
+def vc_prepare_mode() -> Optional[str]:
+    """The preprocessor path of the current graph key under the CUDA graph runner, else ``None``.
+    Outside the runner the real denoise step drives the schedule."""
+    return resolved_extra_key("flux3_vc_phase")
 
 
 class TrtllmAttentionMetadata:
@@ -420,8 +416,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 generic block-sparse FMHA.
             timestep: Denoising timestep consumed by the sparse prediction hooks.
             grouped_tokens: Under VC-Attention, the ``(start, stop)`` token range the
-                value grouping covers: the image tokens of a joint sequence, whose text
-                tokens follow them in input order. ``None`` groups the whole sequence.
+                value grouping covers. In a joint sequence the range holds the image
+                tokens. The text tokens follow them in input order. ``None`` groups the
+                whole sequence.
             **kwargs: Backend-specific keyword arguments forwarded by the attention
                 module, such as ``key_padding_mask``; ignored here, as by the other
                 backends. The TRTLLM kernels have no key-padding input, so callers
@@ -463,7 +460,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                     "vc_attention": True,
                     "vc_attention_qk_fp8": quant_cfg.qk_dtype == "fp8",
                     "vc_repair_budget": quant_cfg.vc_repair_budget,
-                    "vc_denoise_step": vc_denoise_step(),
+                    "vc_denoise_step": get_denoise_step(),
+                    "vc_mode": vc_prepare_mode(),
                     "vc_grouped_tokens": grouped_tokens,
                 }
             elif quant_cfg is not None:
