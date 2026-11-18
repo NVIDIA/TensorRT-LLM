@@ -890,18 +890,23 @@ def test_runner_prepared_inputs_refresh_owned_nested_storage(monkeypatch):
     assert replay_calls == [4, 4]
 
 
-def test_runner_prepared_inputs_keep_one_staged_copy_per_bucket(monkeypatch):
-    """Two buckets keep their own staged inputs: alternate replays read each bucket's values."""
+def test_runner_prepared_inputs_share_the_largest_bucket_storage(monkeypatch):
+    """A smaller bucket stages its token-major device inputs in the leading rows of the
+    largest bucket's; alternate replays still read only the current step's rows."""
     body = _PreparedBody().cuda()
     runner = BreakableCUDAGraphRunner(body, prepare_inputs=lambda inputs: inputs)
     inputs = {}
 
     def set_inputs(num_tokens, value):
+        rows = torch.arange(num_tokens, device="cuda", dtype=torch.float32)[:, None]
+
         def full(offset):
-            return torch.full((num_tokens, 4), float(value + offset), device="cuda")
+            return torch.full((num_tokens, 4), float(value + offset), device="cuda") + rows
 
         inputs.update(value=full(0), config={"features": [full(1)], "offset": (full(2),)})
-        inputs.update(extra=full(3))
+        # A host tensor and a tensor whose first dimension is not the token count.
+        inputs.update(extra=full(3), host_scale=torch.tensor(1.0))
+        inputs.update(positions=torch.zeros((3, 1, num_tokens), device="cuda"))
 
     def engine_forward():
         if runner.is_capturing:
@@ -911,6 +916,18 @@ def test_runner_prepared_inputs_keep_one_staged_copy_per_bucket(monkeypatch):
     for num_tokens in (8, 4):
         set_inputs(num_tokens, 0)
         runner.capture(num_tokens, engine_forward)
+    largest, smaller = runner._inputs[8], runner._inputs[4]
+    for name in ("value", "extra"):
+        assert smaller[name].data_ptr() == largest[name].data_ptr()
+        assert smaller[name].shape == (4, 4)
+    assert (
+        smaller["config"]["features"][0].data_ptr() == largest["config"]["features"][0].data_ptr()
+    )
+    assert smaller["config"]["offset"][0].data_ptr() == largest["config"]["offset"][0].data_ptr()
+    for name in ("host_scale", "positions"):
+        assert smaller[name].untyped_storage().data_ptr() != (
+            largest[name].untyped_storage().data_ptr()
+        )
     calls_after_capture = body.forward_calls
     replay_calls = []
     original_replay = runner.replay
@@ -926,8 +943,9 @@ def test_runner_prepared_inputs_keep_one_staged_copy_per_bucket(monkeypatch):
         actual = runner.execute(num_tokens, engine_forward)
         torch.cuda.synchronize()
 
-        # value + offset + feature + extra
-        expected = torch.full((num_tokens, 4), 4.0 * value + 6, device="cuda")
+        # value + offset + feature + extra, each with its row index added.
+        rows = torch.arange(num_tokens, device="cuda", dtype=torch.float32)[:, None]
+        expected = torch.full((num_tokens, 4), 4.0 * value + 6, device="cuda") + 4 * rows
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert body.forward_calls == calls_after_capture
     assert replay_calls == [num_tokens for num_tokens, _ in steps]
