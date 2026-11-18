@@ -88,10 +88,13 @@ async def _run(endpoint: str, events_after_token: list):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint", ENDPOINTS)
 async def test_error_event_after_first_token_fails_request(endpoint):
-    output = await _run(endpoint, [ERROR_EVENT])
+    token_event = ENDPOINTS[endpoint][2]
+    output = await _run(endpoint, [ERROR_EVENT, token_event])
 
     assert not output.success
     assert ERROR_MESSAGE in output.error
+    # The client stops reading at the error event.
+    assert output.generated_text == "Hello"
 
 
 @pytest.mark.asyncio
