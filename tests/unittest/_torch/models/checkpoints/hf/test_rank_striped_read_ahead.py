@@ -204,7 +204,10 @@ def test_cgroup_admission_honors_high_ancestors_and_namespaces(monkeypatch, cgro
 
 
 def _fake_files(monkeypatch, files):
-    """Serve `files` (path to text, or to an exception to raise) through `Path`."""
+    """Serve `files` through `Path`: a file's text, or an exception that reading it raises.
+
+    A key ending in `/` holds an exception that listing that directory raises.
+    """
 
     def read_text(path, *args, **kwargs):
         del args, kwargs
@@ -218,6 +221,8 @@ def _fake_files(monkeypatch, files):
 
     def iterdir(path):
         prefix = f"{path}/"
+        if isinstance(files.get(prefix), BaseException):
+            raise files[prefix]
         names = {name[len(prefix) :].split("/", 1)[0] for name in files if name.startswith(prefix)}
         if not names:
             raise FileNotFoundError(path)
@@ -356,6 +361,18 @@ def _fake_files(monkeypatch, files):
             },
             180,
             id="v2-unreadable-protected-cache-gives-no-credit",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                # The children's protection is unknown when they cannot be listed.
+                "/sys/fs/cgroup/jobs/": PermissionError("jobs"),
+                "/sys/fs/cgroup/jobs/memory.current": "1100\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1280\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 700\ninactive_file 300\n",
+            },
+            180,
+            id="v2-unlistable-children-give-no-credit",
         ),
     ],
 )
