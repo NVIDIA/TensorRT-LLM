@@ -218,7 +218,8 @@ def _float_bits(x):
 def _piece_energy_bits(x, row_mask):
     """Energy of every channel over the rows; ``row_mask`` excludes padding and non-finite rows."""
     energy = tl.sum(tl.where(row_mask[:, None], x * x, 0.0), axis=0)
-    # NaN energies (garbage rows of a partial Page) rank lowest, so exactly G channels win.
+    # Non-finite rows do not vote, so the energies are finite; a NaN would rank lowest, so exactly
+    # G channels win whatever the input.
     return tl.where(energy == energy, energy, 0.0).to(tl.int32, bitcast=True)
 
 
@@ -747,8 +748,17 @@ def _tq_encode_kernel(
 
         if MODE == 1:
             G: tl.constexpr = N // 2
-            # Rows holding NaN or Inf (garbage tokens of a partial Page) do not vote on the split.
-            voters = row_mask & (amax < float("inf"))
+            norm_all = tl.sum(x0 * x0, axis=1)
+            if P1 > 0:
+                norm_all += tl.sum(x1 * x1, axis=1)
+            if P2 > 0:
+                norm_all += tl.sum(x2 * x2, axis=1)
+            if P3 > 0:
+                norm_all += tl.sum(x3 * x3, axis=1)
+            # Rows holding any NaN or Inf (garbage tokens of a partial Page) do not vote on the
+            # split. amax alone misses a NaN among finite values (tl.max skips NaN); the energy of
+            # such a row is NaN, and a prescaled finite row's energy is at most 4 * N.
+            voters = row_mask & (norm_all < float("inf"))
             e0 = _piece_energy_bits(x0, voters)
             e1 = e0
             e2 = e0
@@ -764,7 +774,6 @@ def _tq_encode_kernel(
             _store_mask(mask_ptr, o0, 0, P0)
             pos0, before = _outlier_positions(o0, 0, 0, P0, G)
             norm_hi = tl.sum(tl.where(o0[None, :], x0 * x0, 0.0), axis=1)
-            norm_all = tl.sum(x0 * x0, axis=1)
             pos1 = pos0
             pos2 = pos0
             pos3 = pos0
@@ -772,17 +781,14 @@ def _tq_encode_kernel(
                 _store_mask(mask_ptr, o1, P0, P1)
                 pos1, before = _outlier_positions(o1, before, P0, P1, G)
                 norm_hi += tl.sum(tl.where(o1[None, :], x1 * x1, 0.0), axis=1)
-                norm_all += tl.sum(x1 * x1, axis=1)
             if P2 > 0:
                 _store_mask(mask_ptr, o2, P0 + P1, P2)
                 pos2, before = _outlier_positions(o2, before, P0 + P1, P2, G)
                 norm_hi += tl.sum(tl.where(o2[None, :], x2 * x2, 0.0), axis=1)
-                norm_all += tl.sum(x2 * x2, axis=1)
             if P3 > 0:
                 _store_mask(mask_ptr, o3, P0 + P1 + P2, P3)
                 pos3, before = _outlier_positions(o3, before, P0 + P1 + P2, P3, G)
                 norm_hi += tl.sum(tl.where(o3[None, :], x3 * x3, 0.0), axis=1)
-                norm_all += tl.sum(x3 * x3, axis=1)
             norm_lo = tl.maximum(norm_all - norm_hi, 0.0)
             root_g = tl.sqrt(G * 1.0)
             inv_hi = tl.where(norm_hi > 0, root_g * tl.math.rsqrt(norm_hi), 0.0)
