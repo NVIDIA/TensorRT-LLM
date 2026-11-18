@@ -9229,7 +9229,9 @@ class PyExecutor:
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
             fetch_kwargs = {
-                "wait_for_batch": not (pending_retirement or self.is_shutdown)
+                "wait_for_batch":
+                not (pending_retirement or self.is_shutdown or
+                     (self._benchmark_sweep and self._benchmark_stage_draining))
             }
             if idle_tick is not None:
                 fetch_kwargs["idle_tick"] = idle_tick
@@ -9238,7 +9240,8 @@ class PyExecutor:
             try:
                 with self.hang_detector.pause():
                     # Zero queue timeout does not disable waiting to fill a batch.
-                    # Retirement and shutdown must keep progressing without arrivals.
+                    # Retirement, shutdown and a draining benchmark stage must
+                    # keep progressing without arrivals.
                     new_requests.extend(
                         self.executor_request_queue.get_from_request_queue(
                             timeout, **fetch_kwargs))

@@ -537,11 +537,13 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, the generation worker will not overlap KV cache transfer with model inference. The default value is `0`.
 
 * `TLLM_BENCHMARK_REQ_QUEUES_SIZE`: Gen-only benchmark fill gate on the generation worker. `0`
-  (default) disables it; a scalar `C` gates the first decode batch at `C` requests. A schedule
-  `C1,C2,...` runs one stage per entry, and `C/N` sets a fill target `C` with a request budget `N`
-  (`0 < C <= N`, default `N = C`). Fill targets are clamped to the executor's admission capacity.
-  Each stage gates its initial fill once and advances after its budget is admitted and all requests
-  have drained, so the client must send exactly the declared requests in order. A schedule requires
+  (default) disables it; a scalar `C` holds decoding once, until `C` requests are admitted and their
+  KV transfers are complete. The first decode batch can still be partial. A schedule `C1,C2,...`
+  runs one stage per entry, and `C/N` sets a fill target `C` with a request budget `N`
+  (`0 < C <= N`, default `N = C`); unlike scalar `8`, `8/8` is a one-stage schedule with a budget.
+  Fill targets are clamped to the executor's admission capacity. Each stage gates its initial fill
+  once and advances after its budget is admitted and all requests have drained, so the client must
+  send exactly the declared requests in order. A schedule requires
   one generation worker without pipeline parallelism. Stage transitions are logged as
   `[BENCH-STAGE]`. Under Slurm, set it inside the container (`env
   TLLM_BENCHMARK_REQ_QUEUES_SIZE=64,128 ...`); `srun --export` splits comma-separated values.
