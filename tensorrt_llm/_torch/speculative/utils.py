@@ -37,7 +37,7 @@ from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
-from .spec_sampler_base import SpecSampler
+from .spec_sampler_base import SpecSampler, logit_edits_unsupported_reason
 from .suffix_automaton import SuffixAutomatonManager
 
 _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES = (
@@ -723,7 +723,8 @@ def get_spec_decoder(
             penalty_supported=penalty_supported,
             fused_sampling=fused_sampling,
             watermark_unsupported_reason=_watermark_unsupported_reason(
-                spec_config, sampler_args.watermark_config))
+                spec_config, sampler_args.watermark_config),
+            logit_edits_unsupported=logit_edits_unsupported_reason(spec_config))
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 

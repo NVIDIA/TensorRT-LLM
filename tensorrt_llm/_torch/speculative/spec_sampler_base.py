@@ -50,6 +50,7 @@ from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, to
 from ..pyexecutor.sampler.sampler_features import max_token_room, meet_stop_token_criteria
 from ..pyexecutor.sampler.watermark import request_carries_watermark
 from ..pyexecutor.scheduler import ScheduledRequests
+from . import logit_edits
 from .spec_store_scatter import spec_store_scatter
 
 # Rejection messages for the sampling features the one-model speculative path
@@ -61,18 +62,10 @@ UNSUPPORTED_MIN_LENGTH_MSG = (
     "min_length is not supported with one-model speculative decoding. "
     "Drop min_length from the request, or disable speculative decoding."
 )
-UNSUPPORTED_BAD_WORDS_MSG = (
-    "bad_words is not supported with one-model speculative decoding. "
-    "Drop bad_words from the request, or disable speculative decoding."
-)
 UNSUPPORTED_NO_REPEAT_NGRAM_MSG = (
     "no_repeat_ngram_size is not supported with one-model speculative "
     "decoding. Drop no_repeat_ngram_size from the request, or disable "
     "speculative decoding."
-)
-UNSUPPORTED_EMBEDDING_BIAS_MSG = (
-    "embedding_bias is not supported with one-model speculative decoding. "
-    "Drop embedding_bias from the request, or disable speculative decoding."
 )
 UNSUPPORTED_TOP_P_DECAY_MSG = (
     "top_p_decay is not supported with one-model speculative decoding. "
@@ -89,10 +82,55 @@ UNSUPPORTED_MIN_P_MSG = (
     "config when using one-model speculative decoding. Restore that default, "
     "drop min_p from the request, or disable speculative decoding."
 )
+# embedding_bias and bad_words are served only where the deploy opted into rewriting the
+# target logits ahead of acceptance, and by the workers that verify through that pass.
+LOGIT_EDITS_DISABLED_MSG = (
+    "embedding_bias (logit_bias) and bad_words require 'enable_penalty: true' in the "
+    "speculative decoding config when using one-model speculative decoding. Enable that "
+    "flag, drop them from the request, or disable speculative decoding."
+)
+LOGIT_EDITS_TREE_MSG = (
+    "embedding_bias (logit_bias) and bad_words are not supported with tree speculative "
+    "decoding (dynamic tree) yet. Drop them from the request, use a linear speculation "
+    "mode, or disable speculative decoding."
+)
+LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG = (
+    "embedding_bias (logit_bias) and bad_words are not supported with relaxed acceptance "
+    "for thinking. Drop them from the request, disable "
+    "use_relaxed_acceptance_for_thinking, or disable speculative decoding."
+)
+LOGIT_EDITS_MODE_MSG = (
+    "embedding_bias (logit_bias) and bad_words are not supported with this speculative "
+    "decoding mode (vanilla MTP or SA). Drop them from the request, or disable "
+    "speculative decoding."
+)
+
+
+def logit_edits_unsupported_reason(spec_config) -> Optional[str]:
+    """Why this one-model deploy cannot serve embedding_bias and bad_words, or None.
+
+    Both are applied to the target logits a worker verifies against, in the pass
+    ``enable_penalty`` turns on. That pass maps one logits row to each verified position of
+    a linear draft, and strict or rejection acceptance reads its output; tree rows, relaxed
+    acceptance and the workers that verify outside it (vanilla MTP, SA) are not covered.
+    """
+    if not getattr(spec_config, "enable_penalty", False):
+        return LOGIT_EDITS_DISABLED_MSG
+    if getattr(spec_config, "use_dynamic_tree", False):
+        return LOGIT_EDITS_TREE_MSG
+    if getattr(spec_config, "use_relaxed_acceptance_for_thinking", False):
+        return LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG
+    spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
+    if spec_dec_mode is not None and (spec_dec_mode.is_mtp_vanilla() or spec_dec_mode.is_sa()):
+        return LOGIT_EDITS_MODE_MSG
+    return None
 
 
 def one_model_sampling_rejection_reason(
-    sampling_params: Optional[SamplingParams], *, fused_sampling: bool = False
+    sampling_params: Optional[SamplingParams],
+    *,
+    fused_sampling: bool = False,
+    logit_edits_unsupported: Optional[str] = LOGIT_EDITS_DISABLED_MSG,
 ) -> Optional[str]:
     """Why ``sampling_params`` cannot be served by the one-model speculative path.
 
@@ -104,6 +142,9 @@ def one_model_sampling_rejection_reason(
     This mirrors the subset of those rules ``SamplingParams`` alone can decide,
     so the request can be rejected before the stream opens; the executor-side
     check stays as the backstop for submission paths that bypass the LLM API.
+
+    ``logit_edits_unsupported`` is ``logit_edits_unsupported_reason`` of the deploy: why it
+    cannot serve embedding_bias and bad_words, or None when it can.
 
     Returns ``None`` when nothing in ``sampling_params`` is unsupported.
     """
@@ -118,12 +159,19 @@ def one_model_sampling_rejection_reason(
         return UNSUPPORTED_MIN_LENGTH_MSG
     # Either form populates py_bad_words; the string form needs a tokenizer to
     # resolve, so test the raw fields rather than _get_bad_words().
-    if sampling_params.bad or sampling_params.bad_token_ids:
-        return UNSUPPORTED_BAD_WORDS_MSG
+    has_bad_words = bool(sampling_params.bad or sampling_params.bad_token_ids)
+    if has_bad_words or sampling_params.embedding_bias is not None:
+        if logit_edits_unsupported is not None:
+            return logit_edits_unsupported
+        # The string form counts once it is tokenized; the executor-side check sees
+        # every word either way.
+        bad_words = [[token] for token in sampling_params.bad_token_ids or ()]
+        bad_words += sampling_params._bad_word_ids or []
+        reason = logit_edits.rejection_reason(sampling_params.embedding_bias, bad_words)
+        if reason is not None:
+            return reason
     if sampling_params.no_repeat_ngram_size:
         return UNSUPPORTED_NO_REPEAT_NGRAM_MSG
-    if sampling_params.embedding_bias is not None:
-        return UNSUPPORTED_EMBEDDING_BIAS_MSG
     # A per-request callback becomes py_logits_post_processors; the one-model path never
     # calls it (a fused verify may not even materialize the full logits).
     if sampling_params.logits_processor:
@@ -229,7 +277,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         min_p = sampling_config.min_p
         if min_p and min_p > 0.0 and not self._fused_sampling:
             raise ValueError(UNSUPPORTED_MIN_P_MSG)
-        self._validate_unsupported_logits_processors(request)
+        self._validate_unsupported_logits_processors(
+            request,
+            logit_edits_unsupported=getattr(
+                self, "_logit_edits_unsupported", LOGIT_EDITS_DISABLED_MSG
+            ),
+        )
         # The occurrence penalties need a [slots, vocab_size] workspace that is only
         # allocated when the deploy opted in, so a request asking for them while the
         # flag is off cannot be honored. Reject instead of silently decoding from an
@@ -256,12 +309,18 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
 
     @staticmethod
-    def _validate_unsupported_logits_processors(request: LlmRequest) -> None:
+    def _validate_unsupported_logits_processors(
+        request: LlmRequest,
+        *,
+        logit_edits_unsupported: Optional[str] = LOGIT_EDITS_DISABLED_MSG,
+    ) -> None:
         """Reject logits-side sampling features the one-model path cannot apply.
 
         TorchSampler implements min_length, bad_words, no_repeat_ngram_size,
         embedding_bias, top_p_decay and logits post-processor callbacks by editing
-        the target logits before sampling. The one-model path has no logits-editing hook, so each is
+        the target logits before sampling. The one-model path applies embedding_bias and
+        bad_words inside the worker where the deploy supports it (``logit_edits_unsupported``
+        is None) and the request fits the per-slot tables; everything else is
         rejected here instead of being silently dropped.
 
         Each check gates on a non-neutral value rather than on presence, since a
@@ -274,12 +333,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         min_length = getattr(request, "py_min_length", None)
         if min_length and min_length > 0:
             raise ValueError(UNSUPPORTED_MIN_LENGTH_MSG)
-        if getattr(request, "py_bad_words", None):
-            raise ValueError(UNSUPPORTED_BAD_WORDS_MSG)
+        if logit_edits.request_has_logit_edits(request):
+            reason = logit_edits_unsupported or logit_edits.rejection_reason(
+                getattr(request, "py_embedding_bias", None),
+                getattr(request, "py_bad_words", None),
+            )
+            if reason is not None:
+                raise ValueError(reason)
         if getattr(request, "py_no_repeat_ngram_size", None):
             raise ValueError(UNSUPPORTED_NO_REPEAT_NGRAM_MSG)
-        if getattr(request, "py_embedding_bias", None) is not None:
-            raise ValueError(UNSUPPORTED_EMBEDDING_BIAS_MSG)
         # The one-model sampler never calls a request's logits post-processors, and a fused
         # verify (e.g. the MiniMax-M3 shard verify) does not even gather the full logits, so
         # the callback would be skipped silently.
@@ -361,6 +423,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         penalty_supported: bool = True,
         fused_sampling: bool = False,
         watermark_unsupported_reason: Optional[str] = None,
+        logit_edits_unsupported: Optional[str] = LOGIT_EDITS_DISABLED_MSG,
     ):
         """
         Initialize the speculative sampler.
@@ -375,12 +438,16 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             fused_sampling: whether the configured sampler supports min_p.
             watermark_unsupported_reason: why this speculation mode cannot serve watermarked
                 requests (None when it can). Such requests are rejected at admission.
+            logit_edits_unsupported: why this deploy cannot serve embedding_bias and
+                bad_words (None when it can). Such requests are rejected at admission;
+                the edits themselves are applied inside the worker.
         """
         self._enable_penalty = enable_penalty
         self._penalty_supported = penalty_supported
         self._watermark_config = args.watermark_config
         self._watermark_unsupported_reason = watermark_unsupported_reason
         self._fused_sampling = fused_sampling
+        self._logit_edits_unsupported = logit_edits_unsupported
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len

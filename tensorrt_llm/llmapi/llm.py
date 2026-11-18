@@ -1666,7 +1666,9 @@ class BaseLLM:
                        None)
         reason = spec_sampler_base.one_model_sampling_rejection_reason(
             sampling_params,
-            fused_sampling=bool(mode is not None and mode.is_fused))
+            fused_sampling=bool(mode is not None and mode.is_fused),
+            logit_edits_unsupported=spec_sampler_base.
+            logit_edits_unsupported_reason(self.args.speculative_config))
         if reason is not None:
             raise RequestError(reason)
 

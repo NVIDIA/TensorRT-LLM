@@ -57,6 +57,7 @@ from ..pyexecutor.sampler.ops.vanilla import (GREEDY_TEMPERATURE_THRESHOLD,
                                               greedy_search_sampling_batch)
 from ..pyexecutor.sampler.sampler_common import request_random_seed
 from ..pyexecutor.sampler.watermark import WatermarkSpecState
+from . import logit_edits
 from .block_verification import block_verify, counter_uniforms
 from .fused_accept import (MAX_DRAFT_LEN, fused_strict_accept,
                            sample_and_strict_accept)
@@ -876,6 +877,10 @@ class SpecMetadata:
     # See penalty_ops.PenaltyState for what each buffer holds and why the prompt is
     # split from generated tokens.
     penalty_state: Optional["penalty_ops.PenaltyState"] = None
+    # Per-slot embedding-bias and bad-words tables; None until prepare_logit_edit_buffers
+    # runs. Gated by enable_penalty like the occurrence penalties: both rewrite the target
+    # logits ahead of acceptance, which the deploy must opt into.
+    logit_edit_state: Optional["logit_edits.LogitEditState"] = None
     # Whether any request in the current batch has a penalty. Diagnostic only: it
     # must NOT gate the apply pass, because decode steps replay a CUDA graph
     # captured during warmup, when the flag is necessarily False. Whether a row is
@@ -1286,6 +1291,21 @@ class SpecMetadata:
                                               dtype=torch.long,
                                               device='cuda')
 
+    def prepare_logit_edit_buffers(self):
+        """Allocate the embedding-bias and bad-words tables. Idempotent; no-op when disabled.
+
+        Sized and indexed like the penalty buffers (see ``prepare_penalty_buffers``), which
+        also publishes the scratch row and the row -> slot table these tables share.
+        """
+        if (not self.enable_penalty or self.vocab_size <= 0
+                or self.logit_edit_state is not None):
+            return
+        slot_capacity = self.num_seq_slots or self.max_num_requests
+        if slot_capacity <= 0:
+            return
+        self.logit_edit_state = logit_edits.LogitEditState.create(
+            slot_capacity=slot_capacity, vocab_size=self.vocab_size)
+
     def prepare_watermark_buffers(self):
         """Allocate the watermark state. Idempotent; no-op when watermarking is off.
 
@@ -1553,6 +1573,7 @@ class SpecMetadata:
         # here before the shallow copy rather than lazily in each view.
         self.prepare_rejection_sampling_buffers()
         self.prepare_penalty_buffers()
+        self.prepare_logit_edit_buffers()
         self.prepare_watermark_buffers()
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
@@ -1735,6 +1756,8 @@ class SpecMetadata:
         self.prepare_rejection_sampling_buffers()
         # Likewise for the occurrence-penalty workspace. No-op unless enable_penalty.
         self.prepare_penalty_buffers()
+        # And the embedding-bias and bad-words tables, under the same flag.
+        self.prepare_logit_edit_buffers()
         # And the watermark's per-slot context state. No-op unless watermark_config is set.
         self.prepare_watermark_buffers()
 
@@ -1805,6 +1828,9 @@ class SpecMetadata:
         # logits before sampling, so an all-greedy batch is penalized too (its argmax
         # is taken over the penalized logits). Filled before the early return below.
         self._populate_penalty_params(requests)
+        # Likewise the embedding bias and the bad words of requests new to their slot.
+        if self.logit_edit_state is not None:
+            self.logit_edit_state.observe(requests)
         # Likewise the watermark: a greedy request is simply not flagged.
         self._populate_watermark_params(requests)
 
@@ -2413,13 +2439,26 @@ class SpecWorkerBase(nn.Module, ABC):
 
         self._execute_guided_decoder_if_present(logits)
 
+        # The requests' logits edits, as _accept_draft_tokens applies them: one row per
+        # request and no drafts ahead of it. The step's ``logits`` output stays the
+        # model's own scores.
+        edits_logits = getattr(spec_metadata, "enable_penalty", False) is True
+        sampled_logits = logits
+        if edits_logits and isinstance(logits, torch.Tensor):
+            sampled_logits = self._edit_target_logits(
+                logits.unsqueeze(0) if logits.dim() == 1 else logits,
+                torch.empty((batch_size - num_contexts, 0),
+                            dtype=torch.int,
+                            device=logits.device), num_contexts, batch_size,
+                spec_metadata)
+
         if _watermark_active(spec_metadata):
             target_tokens, watermark_plans = self._sample_tokens_and_watermark_plans(
-                logits, spec_metadata, num_contexts, batch_size)
+                sampled_logits, spec_metadata, num_contexts, batch_size)
         else:
             watermark_plans = None
             target_tokens = self._sample_tokens_for_batch(
-                logits, spec_metadata, num_contexts, batch_size)
+                sampled_logits, spec_metadata, num_contexts, batch_size)
 
         accepted_tokens = torch.zeros((batch_size, 1),
                                       dtype=torch.int,
@@ -2429,6 +2468,9 @@ class SpecWorkerBase(nn.Module, ABC):
         num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
+        if edits_logits:
+            self._commit_accepted_tokens((accepted_tokens, num_accepted_tokens),
+                                         batch_size, spec_metadata)
         if watermark_plans is not None:
             self._commit_watermark(spec_metadata,
                                    watermark_plans,
@@ -2815,30 +2857,33 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
         return accepted_tokens, num_accepted_tokens
 
-    def _apply_occurrence_penalties(
-            self, logits: torch.Tensor, draft_tokens: torch.Tensor,
-            num_contexts: int, batch_size: int,
-            spec_metadata: SpecMetadata) -> torch.Tensor:
-        """Return the target logits acceptance should read, penalized.
+    def _edit_target_logits(self, logits: torch.Tensor,
+                            draft_tokens: torch.Tensor, num_contexts: int,
+                            batch_size: int,
+                            spec_metadata: SpecMetadata) -> torch.Tensor:
+        """Return the target logits acceptance should read, with the requests' logits
+        edits applied.
 
-        No-op unless the deploy enabled the penalties and some request in the batch
-        actually uses one. ``logits`` must already be in the normalized
+        The edits are each request's embedding bias, the occurrence penalties and its
+        bad words, in the order ``TorchSampler`` applies them. No-op unless the deploy
+        enabled them (``enable_penalty``). ``logits`` must already be in the normalized
         layout after ``_reshape_logits_for_accept``: one row per context plus
         either ``draft_len + 1`` rows per generation request (uniform) or each
         request's packed ``verify_lens`` rows (ragged). This is also what makes
         PARD's wider raw layout fit the same mapping.
 
-        Returns the logits acceptance should read: a penalized copy when the
-        penalties apply, otherwise the caller's tensor unchanged.
+        Returns the logits acceptance should read: an edited copy when the
+        edits apply, otherwise the caller's tensor unchanged.
         """
         if not getattr(spec_metadata, "enable_penalty", False):
             return logits
         # NB: deliberately NOT gated on batch_uses_penalty. Decode steps replay a
         # captured CUDA graph, so a host-side skip decided at capture time would be
         # baked in permanently -- and capture happens during warmup, when no real
-        # request is resident and the flag is False. The penalty pass must always be
-        # captured; whether it changes anything is decided on device by
-        # ``penalty_active``, which the replayed kernel re-reads every step.
+        # request is resident and the flag is False. The pass must always be
+        # captured; whether it changes anything is decided on device by the per-slot
+        # state (``penalty_active``, the bias and ban tables), which the replayed
+        # kernels re-read every step.
         draft_len = draft_tokens.shape[1] if draft_tokens.dim() > 1 else 0
         mapping = penalty_ops.build_row_mapping(spec_metadata,
                                                 num_contexts,
@@ -2852,16 +2897,25 @@ class SpecWorkerBase(nn.Module, ABC):
         row_slots, intra_tokens, intra_valid = mapping
         if row_slots.numel() != logits.shape[0]:
             # The caller's row layout is not the one this mapping describes (tree
-            # modes); penalizing against it would charge the wrong request.
+            # modes); editing against it would charge the wrong request.
             return logits
-        # Copy first: apply_penalties rewrites in place, and the caller keeps this
-        # tensor as the step's reported logits. Penalizing it directly would feed
-        # the penalized scores back to logprobs and to the next step's consumers.
+        # Copy first: the edits rewrite in place, and the caller keeps this
+        # tensor as the step's reported logits. Editing it directly would feed
+        # the edited scores back to logprobs and to the next step's consumers.
         # fp32 whatever the logits' dtype.
-        penalized = logits.to(torch.float32, copy=True)
-        penalty_ops.apply_penalties(penalized, spec_metadata, row_slots,
+        edited = logits.to(torch.float32, copy=True)
+        edit_state = getattr(spec_metadata, "logit_edit_state", None)
+        if edit_state is not None and edited.size(-1) != edit_state.vocab_size:
+            # A vocab-sharded logits view cannot index the full-vocab token tables.
+            edit_state = None
+        if edit_state is not None:
+            logit_edits.apply_embedding_bias(edited, edit_state, row_slots)
+        penalty_ops.apply_penalties(edited, spec_metadata, row_slots,
                                     intra_tokens, intra_valid)
-        return penalized
+        if edit_state is not None:
+            logit_edits.apply_bad_words(edited, edit_state, row_slots,
+                                        intra_tokens, intra_valid)
+        return edited
 
     def _accept_draft_tokens(self, logits, draft_tokens, num_contexts,
                              batch_size, spec_metadata):
@@ -2873,19 +2927,20 @@ class SpecWorkerBase(nn.Module, ABC):
         runs on the gen subset. Draft probs for the gen subset are gathered
         from the slot-indexed buffer by `py_seq_slot`.
 
-        Occurrence penalties are applied to the target logits first, so both the
-        strict and the rejection branch verify against the penalized distribution.
+        The requests' logits edits (embedding bias, occurrence penalties, bad words)
+        are applied to the target logits first, so both the strict and the rejection
+        branch verify against the edited distribution.
         They are applied to a copy: the caller keeps a reference to this tensor and
         returns it as the step's ``logits`` output (Eagle3's ``raw_logits``), which
         feeds logprobs and other consumers that must see the model's own scores.
-        The draft distribution is deliberately left unpenalized: rejection sampling
+        The draft distribution is deliberately left unedited: rejection sampling
         stays unbiased either way (it only requires draft_probs to match how the
         draft tokens were actually drawn), so this costs acceptance rate rather
-        than correctness.
+        than correctness. A draft token the edits ban has target probability zero
+        and is never accepted.
         """
-        logits = self._apply_occurrence_penalties(logits, draft_tokens,
-                                                  num_contexts, batch_size,
-                                                  spec_metadata)
+        logits = self._edit_target_logits(logits, draft_tokens, num_contexts,
+                                          batch_size, spec_metadata)
         num_gens = batch_size - num_contexts
         if num_gens > 0 and self._can_use_rejection_sampling(spec_metadata):
             draft_len = draft_tokens.shape[1]
@@ -2907,17 +2962,17 @@ class SpecWorkerBase(nn.Module, ABC):
                 accepted = self._sample_and_accept_draft_tokens_rejection(
                     logits, draft_tokens, draft_probs, num_contexts, batch_size,
                     spec_metadata)
-                return self._commit_occurrence_counts(accepted, batch_size,
-                                                      spec_metadata)
+                return self._commit_accepted_tokens(accepted, batch_size,
+                                                    spec_metadata)
         accepted = self._sample_and_accept_draft_tokens_base(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata)
-        return self._commit_occurrence_counts(accepted, batch_size,
-                                              spec_metadata)
+        return self._commit_accepted_tokens(accepted, batch_size, spec_metadata)
 
-    def _commit_occurrence_counts(
+    def _commit_accepted_tokens(
             self, accepted: tuple[torch.Tensor, torch.Tensor], batch_size: int,
             spec_metadata: SpecMetadata) -> tuple[torch.Tensor, torch.Tensor]:
-        """Record the tokens this step accepted, so later steps penalize them.
+        """Record the tokens this step accepted, so later steps penalize them and match
+        bad words against them.
 
         Rejected speculative tokens never entered the sequence and are excluded by
         ``num_accepted_tokens``. Passes ``accepted`` straight through so callers can
@@ -2929,9 +2984,13 @@ class SpecWorkerBase(nn.Module, ABC):
         slot_ids = spec_metadata.batch_slot_ids
         if slot_ids is None:
             return accepted
-        penalty_ops.update_penalty_counts(spec_metadata,
-                                          slot_ids[:batch_size].to(torch.int64),
+        slot_rows = slot_ids[:batch_size].to(torch.int64)
+        penalty_ops.update_penalty_counts(spec_metadata, slot_rows,
                                           accepted_tokens, num_accepted_tokens)
+        edit_state = getattr(spec_metadata, "logit_edit_state", None)
+        if edit_state is not None:
+            logit_edits.advance_tails(edit_state, slot_rows, accepted_tokens,
+                                      num_accepted_tokens)
         return accepted
 
     def _draft_logits_are_sharded(self, logits, spec_metadata):
