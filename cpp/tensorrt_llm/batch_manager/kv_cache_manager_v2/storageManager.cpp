@@ -1132,6 +1132,52 @@ bool StorageManager::decodeColdPages(
         });
 }
 
+size_t StorageManager::coldPageBytes(LayerGroupId layerGroup) const noexcept
+{
+    if (layerGroup.value() < 0 || layerGroup >= mPageIndexLocations.size())
+    {
+        return 0;
+    }
+    return mColdPageCodec->queryColdPageBytes(layerGroup);
+}
+
+PageIndexLocation StorageManager::coldPageIndexLocation(LayerGroupId layerGroup) const noexcept
+{
+    if (layerGroup.value() < 0 || layerGroup >= mPageIndexLocations.size())
+    {
+        return PageIndexLocation::kBadLocation;
+    }
+    return mPageIndexLocations[layerGroup];
+}
+
+bool StorageManager::encodeColdPagesExternal(
+    LayerGroupId layerGroup, void* dstBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+{
+    if (coldPageIndexLocation(layerGroup) == PageIndexLocation::kBadLocation)
+    {
+        return false;
+    }
+    if (numPages == 0)
+    {
+        return true;
+    }
+    return mColdPageCodec->encode(layerGroup, dstBase, pageIndices, numPages, reinterpret_cast<cudaStream_t>(stream));
+}
+
+bool StorageManager::decodeColdPagesExternal(
+    LayerGroupId layerGroup, void const* srcBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+{
+    if (coldPageIndexLocation(layerGroup) == PageIndexLocation::kBadLocation)
+    {
+        return false;
+    }
+    if (numPages == 0)
+    {
+        return true;
+    }
+    return mColdPageCodec->decode(layerGroup, srcBase, pageIndices, numPages, reinterpret_cast<cudaStream_t>(stream));
+}
+
 void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
     PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
 {

@@ -199,6 +199,10 @@ llm = LLM(
 )
 ```
 
+With the `mooncake-store` KV connector, its pool takes the place of the Host and
+Disk tiers, and the connector stores pages in the same cold-page encoding; see
+[Compressed pages](kv-cache-connector.md#compressed-pages).
+
 Cold-page NVFP4 is different from an active NVFP4 KV cache. The former stores
 NVFP4 only in a cold cache tier and restores the runtime type before Attention;
 the latter sets `KvCacheConfig(dtype="nvfp4")` and keeps active GPU KV in

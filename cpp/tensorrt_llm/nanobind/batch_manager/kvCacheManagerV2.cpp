@@ -3895,6 +3895,47 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::gil_scoped_release release;
                 return self.poolGroupDescs().raw();
             })
+        .def(
+            "cold_page_bytes",
+            [](kv::KvCacheManager const& self, int layerGroupId)
+            { return self.coldPageBytes(kv::LayerGroupId{layerGroupId}); },
+            nb::arg("layer_group_id"),
+            "Bytes of one page of the layer group as the cold-page codec encodes it; 0 for an unknown layer group.")
+        .def(
+            "cold_page_index_location",
+            [](kv::KvCacheManager const& self, int layerGroupId)
+            { return static_cast<int>(self.coldPageIndexLocation(kv::LayerGroupId{layerGroupId})); },
+            nb::arg("layer_group_id"),
+            "Where encode_cold_pages and decode_cold_pages read the page-index pairs of the layer group: 0 host "
+            "memory, 1 device memory, -1 an unknown layer group.")
+        .def(
+            "encode_cold_pages",
+            [](kv::KvCacheManager& self, int layerGroupId, std::uintptr_t dstBase, std::uintptr_t pageIndices,
+                std::size_t numPages, std::uintptr_t stream)
+            {
+                return self.encodeColdPages(kv::LayerGroupId{layerGroupId}, reinterpret_cast<void*>(dstBase),
+                    reinterpret_cast<kv::PageIndexPair const*>(pageIndices), numPages,
+                    reinterpret_cast<CUstream>(stream));
+            },
+            nb::arg("layer_group_id"), nb::arg("dst_base"), nb::arg("page_indices"), nb::arg("num_pages"),
+            nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>(),
+            "Encode hot pages of the layer group with this manager's cold-page codec into caller-owned memory.\n\n"
+            "page_indices addresses num_pages (dst, src) int32 pairs in the memory cold_page_index_location names: src "
+            "is a hot page slot, dst a page slot at dst_base, which is GPU-accessible and cold_page_bytes wide per "
+            "slot. Work is enqueued on cuda_stream. Returns False for an unknown layer group or a rejected batch. "
+            "Touches no cache level of the manager, so it serves storage outside it, such as a KV connector's store.")
+        .def(
+            "decode_cold_pages",
+            [](kv::KvCacheManager& self, int layerGroupId, std::uintptr_t srcBase, std::uintptr_t pageIndices,
+                std::size_t numPages, std::uintptr_t stream)
+            {
+                return self.decodeColdPages(kv::LayerGroupId{layerGroupId}, reinterpret_cast<void const*>(srcBase),
+                    reinterpret_cast<kv::PageIndexPair const*>(pageIndices), numPages,
+                    reinterpret_cast<CUstream>(stream));
+            },
+            nb::arg("layer_group_id"), nb::arg("src_base"), nb::arg("page_indices"), nb::arg("num_pages"),
+            nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>(),
+            "The reverse of encode_cold_pages: decode pages at src_base (src slots) into hot page slots (dst).")
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("allow_seq_rebasing", &kv::KvCacheManager::allowSeqRebasing)

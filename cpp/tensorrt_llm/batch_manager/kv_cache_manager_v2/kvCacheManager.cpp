@@ -950,6 +950,30 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> KvCacheManager::poolGroupDescs() const
     return mStorage->poolGroupDescs();
 }
 
+// ---- Cold-page codec for external storage ----------------------------------
+
+size_t KvCacheManager::coldPageBytes(LayerGroupId layerGroup) const noexcept
+{
+    return mStorage->coldPageBytes(layerGroup);
+}
+
+PageIndexLocation KvCacheManager::coldPageIndexLocation(LayerGroupId layerGroup) const noexcept
+{
+    return mStorage->coldPageIndexLocation(layerGroup);
+}
+
+bool KvCacheManager::encodeColdPages(
+    LayerGroupId layerGroup, void* dstBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+{
+    return mStorage->encodeColdPagesExternal(layerGroup, dstBase, pageIndices, numPages, stream);
+}
+
+bool KvCacheManager::decodeColdPages(
+    LayerGroupId layerGroup, void const* srcBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+{
+    return mStorage->decodeColdPagesExternal(layerGroup, srcBase, pageIndices, numPages, stream);
+}
+
 // ---- Query / info ---------------------------------------------------------
 
 int KvCacheManager::tokensPerBlock() const noexcept

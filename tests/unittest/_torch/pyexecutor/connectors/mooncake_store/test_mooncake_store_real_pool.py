@@ -31,6 +31,7 @@ and needs an InfiniBand device and a GPUDirect path.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import os
 import time
@@ -574,3 +575,129 @@ def test_a_real_v2_cache_registers_per_allocation_and_round_trips_over_rdma(rdma
             "Shutdown left KV pool registrations behind over memory the cache "
             "manager is about to free."
         )
+
+
+@contextlib.contextmanager
+def _compressed_cache(dtype) -> Iterator[KVCacheManagerV2]:
+    """A cache whose cold pages are NVFP4, as a connector deployment runs it: no cold tier."""
+    from types import SimpleNamespace as _Engine
+
+    from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
+    from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
+
+    kv_cache_config = KvCacheConfig(
+        max_tokens=2048, enable_block_reuse=True, host_cache_size=0, disk_cache_size=0
+    )
+    engine = _Engine(
+        mapping=_Engine(has_cp_helix=lambda: False),
+        cuda_graph_batch_sizes=[],
+        cuda_graph_padding_enabled=False,
+        spec_config=None,
+        model=_Engine(model_config=_Engine(pretrained_config=None, quant_config=None)),
+    )
+    provider = create_kv_cache_compression_manager(
+        ColdPageQuantizationCompressionConfig(),
+        model_engine=engine,
+        kv_cache_config=kv_cache_config,
+    )
+    manager = KVCacheManagerV2(
+        kv_cache_config=kv_cache_config,
+        kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=4,
+        num_kv_heads=4,
+        head_dim=128,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=256,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=dtype,
+        vocab_size=32000,
+        cold_page_codec_provider=provider,
+    )
+    try:
+        yield manager
+    finally:
+        manager.shutdown()
+
+
+def _fill_runtime_values(layout: KvCacheLayout, page_index: int, dtype) -> None:
+    """KV-like values of the cache's dtype, so the codec has something to quantize."""
+    for group in layout.groups:
+        for region in group.regions:
+            page = region.slot_tensor(page_index)
+            if dtype == tensorrt_llm.bindings.DataType.FP8:
+                values = torch.randn(page.numel(), device="cuda").to(torch.float8_e4m3fn)
+            else:
+                values = torch.randn(page.numel() // 2, device="cuda").to(torch.bfloat16)
+            page.copy_(values.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [tensorrt_llm.bindings.DataType.BF16, tensorrt_llm.bindings.DataType.FP8],
+    ids=["bf16", "fp8"],
+)
+def test_an_encoded_page_written_by_one_cache_decodes_in_another(mooncake_pool, dtype):
+    """Through a live pool, a compressed page replays exactly as the cache's codec decodes it.
+
+    The reference is the writer cache's own codec round trip into a spare page,
+    so the comparison is bit for bit even though NVFP4 is lossy.
+    """
+    from tensorrt_llm._utils import is_sm_100f
+
+    if not is_sm_100f():
+        pytest.skip("NVFP4 cold-page kernels need an SM100-family GPU")
+    writer_page, reference_page, reader_page = 2, 6, 5
+    with _compressed_cache(dtype) as writer_cache, _compressed_cache(dtype) as reader_cache:
+        writer_layout = build_kv_cache_layout_v2(writer_cache)
+        reader_layout = build_kv_cache_layout_v2(reader_cache)
+        assert writer_layout.page_codec is not None
+        group_ids = tuple(group.layer_group_id for group in writer_layout.groups)
+        _fill_runtime_values(writer_layout, writer_page, dtype)
+
+        codec = writer_layout.page_codec
+        stream = torch.cuda.current_stream().cuda_stream
+        for group_id in group_ids:
+            scratch = torch.empty(codec.page_bytes(group_id), dtype=torch.uint8, device="cuda")
+            codec.encode(group_id, scratch.data_ptr(), [0], [writer_page], stream)
+            codec.decode(group_id, scratch.data_ptr(), [reference_page], [0], stream)
+        torch.cuda.synchronize()
+
+        with open_worker(
+            mooncake_pool, layout=writer_layout, stage_through_host=False, model_key="v2-nvfp4"
+        ) as writer:
+            assert not writer._registered_ranges, "encoded pages never touch the KV pools"
+            save_page(writer, request_id=1, page_index=writer_page, group_ids=group_ids)
+        with open_worker(
+            mooncake_pool, layout=reader_layout, stage_through_host=False, model_key="v2-nvfp4"
+        ) as reader:
+            assert reader.count_prefix_hit([BLOCK_HASH]) == 1
+            load_page(reader, request_id=2, page_index=reader_page, group_ids=group_ids)
+
+        for writer_group, reader_group in zip(writer_layout.groups, reader_layout.groups):
+            for writer_region, reader_region in zip(writer_group.regions, reader_group.regions):
+                assert torch.equal(
+                    reader_region.slot_tensor(reader_page),
+                    writer_region.slot_tensor(reference_page),
+                ), "a page replayed through the pool must decode as the cache's codec does"
+
+
+def test_raw_and_encoded_pages_never_share_a_key(mooncake_pool):
+    """A server storing raw pages does not find a compressed server's blocks."""
+    from tensorrt_llm._utils import is_sm_100f
+
+    if not is_sm_100f():
+        pytest.skip("NVFP4 cold-page kernels need an SM100-family GPU")
+    with _compressed_cache(tensorrt_llm.bindings.DataType.BF16) as cache:
+        layout = build_kv_cache_layout_v2(cache)
+        group_ids = tuple(group.layer_group_id for group in layout.groups)
+        _fill_runtime_values(layout, 1, tensorrt_llm.bindings.DataType.BF16)
+        with open_worker(
+            mooncake_pool, layout=layout, stage_through_host=False, model_key="v2-mixed"
+        ) as writer:
+            save_page(writer, request_id=1, page_index=1, group_ids=group_ids)
+        raw_layout = dataclasses.replace(layout, page_codec=None)
+        with open_worker(
+            mooncake_pool, layout=raw_layout, stage_through_host=True, model_key="v2-mixed"
+        ) as reader:
+            assert reader.count_prefix_hit([BLOCK_HASH]) == 0

@@ -35,6 +35,13 @@ nothing will release.
 A capacity-only worker opens its handle and stops there, with no layout, no
 buffer registration and no save thread, so a node can lend host memory to the
 pool without an HCA that can pin GPU pages.
+
+When the cache manager has a cold-page codec (`KvCacheLayout.page_codec`, from
+a `kv_cache_compression_config` method such as `quantization_for_cold_page`),
+the pool is this deployment's cold tier and holds pages in that codec's
+encoding, as the manager's own host and disk tiers would. A page is then encoded
+from its GPU slot into registered pinned staging before a put and decoded back
+after a get, so the store never touches the KV pools themselves.
 """
 
 import threading
@@ -51,7 +58,9 @@ from tensorrt_llm.logger import logger
 
 from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
+from ..page_codec import KvCachePageCodec
 from .addressing import PageAddressing
+from .codec_staging import ENCODED_GROUP_ALIGNMENT, EncodedStagingArena, plan_encoded_batches
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, local_address, pool_config
 from .gpudirect import PEERMEM_ENV, allocation_range, format_diagnosis, select_registration_path
 from .keys import KeyNamespace
@@ -226,6 +235,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Host staging, when the pool cannot register device memory.
         self._load_staging: Optional[HostStagingPool] = None
         self._save_staging: Optional[HostStagingPool] = None
+        # The cache's cold-page codec, when the pool holds encoded pages, and
+        # the pinned arenas those pages pass through.
+        self._codec: Optional[KvCachePageCodec] = None
+        self._load_arena: Optional[EncodedStagingArena] = None
+        self._save_arena: Optional[EncodedStagingArena] = None
         self._save_stream: Optional[torch.cuda.Stream] = None
         # This rank's device, captured on the executor thread; see _drain_saves.
         self._device_index: Optional[int] = None
@@ -308,7 +322,14 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # executor thread; the save thread would otherwise see device 0.
         if torch.cuda.is_available():
             self._device_index = torch.cuda.current_device()
-        if self._config.stage_through_host:
+        codec = layout.page_codec
+        if codec is not None:
+            # Pages pass through the codec and pinned staging, so the store
+            # never reaches the KV pools and they are not registered.
+            addressing = PageAddressing(layout)
+            self._codec = codec
+            self._open_encoded_staging(addressing)
+        elif self._config.stage_through_host:
             addressing = PageAddressing(layout)
             self._open_staging(addressing)
         else:
@@ -317,12 +338,17 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         self._addressing = addressing
         for layer_group_id in addressing.layer_group_ids:
-            bytes_per_page = addressing.bytes_per_page(layer_group_id)
+            if codec is None:
+                bytes_per_page = addressing.bytes_per_page(layer_group_id)
+                encoding = None
+            else:
+                bytes_per_page = codec.page_bytes(layer_group_id)
+                encoding = codec.encoding(layer_group_id)
             self._namespaces[layer_group_id] = self._namespace(
-                self._rank, layer_group_id, bytes_per_page
+                self._rank, layer_group_id, bytes_per_page, encoding
             )
             self._peer_namespaces[layer_group_id] = tuple(
-                self._namespace(rank, layer_group_id, bytes_per_page)
+                self._namespace(rank, layer_group_id, bytes_per_page, encoding)
                 for rank in range(self._world_size)
             )
 
@@ -348,6 +374,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         logger.warning(
             f"mooncake-store worker rank {self._rank} registered layout: {addressing.describe()}"
         )
+        if codec is not None:
+            logger.warning(
+                f"mooncake-store worker rank {self._rank} stores pages through the KV "
+                f"cache's cold-page codec: {codec.describe()}"
+            )
 
     def _register_pools(self, addressing: PageAddressing) -> None:
         """Register the KV pools with Mooncake, one call per allocation.
@@ -448,7 +479,44 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 f"more. Lower transfer_batch_size to make the reduction explicit."
             )
 
-    def _namespace(self, rank: int, layer_group_id: int, bytes_per_page: int) -> KeyNamespace:
+    def _open_encoded_staging(self, addressing: PageAddressing) -> None:
+        """Allocate and register the pinned arenas encoded pages pass through.
+
+        Sized for a full transfer batch of the largest encoded page, within the
+        same pinned-memory ceiling as raw staging. Only the directions this
+        role drives get an arena.
+        """
+        codec = self._codec
+        layer_group_ids = addressing.layer_group_ids
+        largest = max(codec.page_bytes(layer_group_id) for layer_group_id in layer_group_ids)
+        aligned = -(-largest // ENCODED_GROUP_ALIGNMENT) * ENCODED_GROUP_ALIGNMENT
+        wanted = self._config.transfer_batch_size * largest + ENCODED_GROUP_ALIGNMENT * len(
+            layer_group_ids
+        )
+        capacity = max(aligned, min(wanted, MAX_STAGING_BUFFER_BYTES))
+        if capacity < wanted:
+            logger.warning(
+                f"mooncake-store rank {self._rank} stages fewer than "
+                f"{self._config.transfer_batch_size} pages per store call: a batch of "
+                f"{largest} B encoded pages does not fit the {MAX_STAGING_BUFFER_BYTES} B "
+                "pinned-memory ceiling. Lower transfer_batch_size to make it explicit."
+            )
+        if self._config.role.loads:
+            self._load_arena = EncodedStagingArena(
+                capacity_bytes=capacity, store=self._store, label="load"
+            )
+        if self._config.role.saves:
+            self._save_arena = EncodedStagingArena(
+                capacity_bytes=capacity, store=self._store, label="save"
+            )
+
+    def _namespace(
+        self,
+        rank: int,
+        layer_group_id: int,
+        bytes_per_page: int,
+        encoding: Optional[str] = None,
+    ) -> KeyNamespace:
         return KeyNamespace(
             namespace=self._config.namespace,
             model_key=self._model_key,
@@ -457,6 +525,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             layer_group_id=layer_group_id,
             tokens_per_block=self._addressing.tokens_per_block,
             bytes_per_page=bytes_per_page,
+            encoding=encoding,
         )
 
     # ---- leader-facing lookup ----
@@ -526,6 +595,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
         if metadata is None or not metadata.loads:
             return
+        if self._codec is not None:
+            self._load_encoded(metadata.loads, stream)
+            return
 
         keys, addresses, sizes, total_pages = self._resolve(metadata.loads)
         if not keys:
@@ -584,6 +656,46 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 _sync_stream(handle)
 
         logger.debug(f"mooncake-store rank {self._rank} loaded {total_pages} pages")
+
+    def _load_encoded(self, transfers: Sequence[RequestTransfers], stream) -> None:
+        """Read encoded pages into the arena, then decode them into their GPU slots.
+
+        Decoding runs on the forward pass's stream, so it lands after whatever
+        earlier work still writes a recycled target page and before the pass
+        reads it; no allocation fence is needed, unlike a zero-copy load.
+        """
+        items = self._resolve_pages(transfers)
+        if not items:
+            return
+        arena = self._load_arena
+        handle = _stream_handle(stream)
+        for batch in plan_encoded_batches(
+            items, self._codec.page_bytes, arena.base, arena.capacity, self._batch_size
+        ):
+            results = self._store.batch_get_into_multi_buffers(
+                batch.keys,
+                [[address] for address in batch.addresses],
+                [[size] for size in batch.sizes],
+            )
+            failed = [
+                key
+                for key, result in zip(batch.keys, results)
+                if not isinstance(result, int) or result < 0
+            ]
+            if failed or len(results) != len(batch.keys):
+                # As for a raw load: these tokens already count as computed.
+                raise RuntimeError(
+                    f"mooncake-store failed to load {len(failed) or len(batch.keys)} of "
+                    f"{len(batch.keys)} encoded pages; the affected KV slots were already "
+                    f"reported as computed. First failure: {failed[:1]}"
+                )
+            for group in batch.groups:
+                self._codec.decode(
+                    group.layer_group_id, group.base, group.pages, group.slots, handle
+                )
+            # The next batch reuses the arena, so its decode has to finish first.
+            _sync_stream(handle)
+        logger.debug(f"mooncake-store rank {self._rank} loaded {len(items)} encoded pages")
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
         """No-op: loads complete in `start_load_kv`.
@@ -654,9 +766,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             # the copy fails with cudaErrorInvalidValue on every rank but 0.
             if self._device_index is not None:
                 torch.cuda.set_device(self._device_index)
-            if self._save_staging is not None and torch.cuda.is_available():
-                # Owned by this thread so the gather never queues behind the
-                # executor's work.
+            staged = self._save_staging is not None or self._save_arena is not None
+            if staged and torch.cuda.is_available():
+                # Owned by this thread so the gather or encode never queues
+                # behind the executor's work.
                 self._save_stream = torch.cuda.Stream()
         except Exception as exc:
             # Fatal, unlike a failure in the transfer loop below: a thread that
@@ -699,6 +812,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                             self._outstanding_saves[entry.request_id] = remaining
 
     def _put(self, transfers: Sequence[RequestTransfers]) -> None:
+        if self._codec is not None:
+            self._put_encoded(transfers)
+            return
         keys, addresses, sizes, _ = self._resolve(transfers)
         if not keys:
             return
@@ -747,7 +863,67 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                     f"{len(pending)} pages"
                 )
 
+    def _put_encoded(self, transfers: Sequence[RequestTransfers]) -> None:
+        """Encode the pages the pool lacks into the arena, then write them."""
+        items = self._resolve_pages(transfers)
+        if not items:
+            return
+        arena = self._save_arena
+        handle = _stream_handle(self._save_stream)
+        for chunk in _batched(items, self._batch_size):
+            # Filtered first, so a page already in the pool costs no encode.
+            present = self._store.batch_is_exist([key for key, _, _ in chunk])
+            pending = [
+                item
+                for item, status in zip(chunk, present)
+                if status != 1  # absent, or a failed probe we retry as a write
+            ]
+            for batch in plan_encoded_batches(
+                pending, self._codec.page_bytes, arena.base, arena.capacity, self._batch_size
+            ):
+                for group in batch.groups:
+                    self._codec.encode(
+                        group.layer_group_id, group.base, group.slots, group.pages, handle
+                    )
+                # The store reads the arena on this thread, so fill it first.
+                _sync_stream(handle)
+                results = self._store.batch_put_from_multi_buffers(
+                    batch.keys,
+                    [[address] for address in batch.addresses],
+                    [[size] for size in batch.sizes],
+                )
+                failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
+                if failures:
+                    logger.warning(
+                        f"mooncake-store rank {self._rank} failed to save {failures} of "
+                        f"{len(batch.keys)} encoded pages"
+                    )
+
     # ---- shared ----
+
+    def _resolve_pages(self, transfers: Sequence[RequestTransfers]) -> List[Tuple[str, int, int]]:
+        """`(key, layer group, page slot)` per page, in transfer order."""
+        if self._addressing is None:
+            raise RuntimeError("KV cache layout has not been registered")
+        items: List[Tuple[str, int, int]] = []
+        for entry in transfers:
+            for page in entry.pages:
+                namespace = self._namespaces.get(page.layer_group_id)
+                if namespace is None:
+                    raise KeyError(
+                        f"layer group {page.layer_group_id} is not in the registered "
+                        "layout; the scheduler and worker disagree about the model"
+                    )
+                num_slots = self._addressing.num_slots(page.layer_group_id)
+                if not 0 <= page.page_index < num_slots:
+                    # The codec addresses pages unchecked, so an index out of
+                    # range would be a wild access rather than an error.
+                    raise IndexError(
+                        f"page index {page.page_index} out of range [0, {num_slots}) "
+                        f"for layer group {page.layer_group_id}"
+                    )
+                items.append((namespace.key(page.block_hash), page.layer_group_id, page.page_index))
+        return items
 
     def _resolve(
         self, transfers: Sequence[RequestTransfers]
@@ -813,6 +989,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # against this memory.
         self._load_staging = None
         self._save_staging = None
+        self._load_arena = None
+        self._save_arena = None
         self._save_stream = None
         global _LOCAL_WORKER
         if _LOCAL_WORKER is self:

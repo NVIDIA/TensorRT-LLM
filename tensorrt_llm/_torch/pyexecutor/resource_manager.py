@@ -14,6 +14,8 @@
 # limitations under the License.
 import copy
 import enum
+import hashlib
+import json
 import math
 import os
 from abc import ABC, abstractmethod
@@ -3085,6 +3087,23 @@ class KVCacheCompressionManager(BaseResourceManager):
     ) -> None:
         """Decode one complete KVCM migration batch from cold storage."""
         raise NotImplementedError
+
+    def cold_page_codec_identity(self) -> str:
+        """Name the encoded representation this method's cold-page codec writes.
+
+        A store that outlives one server, or is shared by several (the
+        `mooncake-store` connector's pool), keys its pages by this name, so
+        servers whose codecs would decode a page differently never read each
+        other's pages. The default covers the algorithm and every field of its
+        config, which is all a method's settings; a method whose encoding
+        depends on anything else extends it.
+        """
+        payload = json.dumps(self.config.model_dump(mode="json"),
+                             sort_keys=True,
+                             default=str)
+        digest = hashlib.blake2b(payload.encode("utf-8"),
+                                 digest_size=8).hexdigest()
+        return f"{self.config.algorithm}-{digest}"
 
     # ================================================================== #
     # KV-cache lifecycle hooks (5, in temporal order).                   #

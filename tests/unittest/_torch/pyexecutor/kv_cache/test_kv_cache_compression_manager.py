@@ -641,3 +641,28 @@ class TestCompressionCompatibility:
             SimpleNamespace(enable_block_reuse=True),
             None,
         )
+
+
+class TestColdPageCodecIdentity:
+    """The name a store outside the cache keys encoded pages by."""
+
+    @staticmethod
+    def _identity(**fields) -> str:
+        return KVCacheCompressionManager.cold_page_codec_identity(
+            SimpleNamespace(config=ColdPageQuantizationCompressionConfig(**fields))
+        )
+
+    def test_equal_settings_give_equal_identities(self):
+        assert self._identity() == self._identity()
+        assert self._identity().startswith("quantization_for_cold_page-")
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"skip_rope_quantization": True},
+            {"nvfp4_residual_dim": 0},
+            {"mixed_precision_last_n": 64},
+        ],
+    )
+    def test_any_setting_that_changes_the_encoding_changes_the_identity(self, fields):
+        assert self._identity(**fields) != self._identity()

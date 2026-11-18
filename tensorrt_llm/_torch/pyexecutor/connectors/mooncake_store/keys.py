@@ -21,8 +21,10 @@ chain is seeded with a `ReuseScope` covering what the tokens do not record.
 
 A key is `<namespace>/<block hash>`. The namespace pins down everything else
 that decides what the stored bytes mean: the model, the shard that produced
-them, the layer group inside that shard, the tokens each page holds and how many
-bytes a page is. A change to any of those reads as a miss rather than as garbage.
+them, the layer group inside that shard, the tokens each page holds, how many
+bytes a page is and, for a page stored through the cache's cold-page codec, the
+codec's encoding. A change to any of those reads as a miss rather than as
+garbage.
 """
 
 import hashlib
@@ -148,17 +150,25 @@ class KeyNamespace:
     world_size: int
     layer_group_id: int
     tokens_per_block: int
+    #: Bytes of a stored page: the encoded size when `encoding` is set.
     bytes_per_page: int
+    #: The cold-page codec's name for what a stored page holds
+    #: (`KvCachePageCodec.encoding`), or None for the page's raw bytes. Raw
+    #: keys carry no encoding component, so they are spelled as before.
+    encoding: Optional[str] = None
 
     @property
     def prefix(self) -> str:
         """The literal string every key in this namespace starts with."""
-        return (
+        prefix = (
             f"{self.namespace}/{self.model_key}"
             f"/w{self.world_size}r{self.rank}"
             f"/lg{self.layer_group_id}"
             f"/t{self.tokens_per_block}b{self.bytes_per_page}"
         )
+        if self.encoding is not None:
+            prefix += f"/e{self.encoding}"
+        return prefix
 
     def key(self, block_hash: bytes) -> str:
         """The store key holding one page of this namespace."""

@@ -2531,6 +2531,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self._has_lossy_cold_page_codec = (
             getattr(codec_config, "algorithm", None) == "quantization_for_cold_page"
         )
+        # The method whose codec this manager's cold pages go through; see cold_page_codec_identity.
+        self._cold_page_codec_provider = (
+            cold_page_codec_provider
+            if getattr(cold_page_codec_provider, "provides_cold_page_codec", False)
+            else None
+        )
         # Filled on first use; the layer grouping does not change after init.
         self._layer_group_life_cycles: Optional[List[AttnLifeCycle]] = None
 
@@ -10110,6 +10116,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 "kv cache dtype, related checks are skipped"
             )
         return bool(has_invalid_values)
+
+    @property
+    def cold_page_codec_identity(self) -> Optional[str]:
+        """Name of the encoding a `kv_cache_compression_config` codec gives this manager's cold pages.
+
+        None when the manager keeps the lossless default codec, or when it is the estimation build,
+        which builds no codec. A KV connector that stores pages outside the manager encodes them
+        through `impl.encode_cold_pages` when this is set, and keys them by it.
+        """
+        provider = getattr(self, "_cold_page_codec_provider", None)
+        if provider is None or self.is_estimating_kv_cache:
+            return None
+        return provider.cold_page_codec_identity()
 
     def shutdown(self):
         try:

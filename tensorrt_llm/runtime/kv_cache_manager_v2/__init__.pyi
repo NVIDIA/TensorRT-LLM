@@ -2009,6 +2009,37 @@ class KVCacheManager:
     def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]: ...
     @property
     def pool_group_descs(self) -> Sequence[PoolGroupDesc]: ...
+    def cold_page_bytes(self, layer_group_id: int) -> int:
+        """Bytes of one page of the layer group as the cold-page codec encodes it; 0 if unknown."""
+        ...
+    def cold_page_index_location(self, layer_group_id: int) -> int:
+        """Where the codec reads page-index pairs: 0 host memory, 1 device memory, -1 unknown."""
+        ...
+    def encode_cold_pages(
+        self,
+        layer_group_id: int,
+        dst_base: int,
+        page_indices: int,
+        num_pages: int,
+        cuda_stream: int,
+    ) -> bool:
+        """Encode hot pages with the cold-page codec into caller-owned memory.
+
+        ``page_indices`` addresses ``num_pages`` int32 ``(dst, src)`` pairs in the memory
+        ``cold_page_index_location`` names: ``src`` is a hot page slot, ``dst`` a slot at ``dst_base``,
+        ``cold_page_bytes`` wide. Takes no API lock and touches no cache level.
+        """
+        ...
+    def decode_cold_pages(
+        self,
+        layer_group_id: int,
+        src_base: int,
+        page_indices: int,
+        num_pages: int,
+        cuda_stream: int,
+    ) -> bool:
+        """Decode pages at ``src_base`` (``src`` slots) into hot page slots (``dst``)."""
+        ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int: ...
     def adjust(self) -> None: ...
     @property

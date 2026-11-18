@@ -40,10 +40,13 @@ import torch
 
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 
+from .page_codec import KvCachePageCodec
+
 if TYPE_CHECKING:
     from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 __all__ = [
+    "KvCachePageCodec",
     "KvCacheBufferRef",
     "KvCacheLayerGroupLayout",
     "KvCacheLayout",
@@ -180,6 +183,10 @@ class KvCacheLayout:
     groups: Tuple[KvCacheLayerGroupLayout, ...]
     #: Element type of the KV data, for typed views over a region.
     dtype: torch.dtype = torch.uint8
+    #: The cache manager's cold-page codec, when a `kv_cache_compression_config`
+    #: method gives it one. A connector that stores pages outside the cache can
+    #: keep them in that encoding; None means the cache keeps cold pages as-is.
+    page_codec: Optional[KvCachePageCodec] = None
 
     def group(self, layer_group_id: int) -> KvCacheLayerGroupLayout:
         for group in self.groups:
@@ -332,4 +339,7 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
         tokens_per_block=int(manager.tokens_per_block),
         groups=tuple(groups),
         dtype=dtype,
+        page_codec=KvCachePageCodec.from_manager(
+            manager, {group.layer_group_id: group.bytes_per_page for group in groups}
+        ),
     )

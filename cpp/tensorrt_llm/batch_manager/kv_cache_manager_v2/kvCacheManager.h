@@ -251,6 +251,30 @@ public:
 
     TypedVec<PoolGroupIndex, PoolGroupDesc> poolGroupDescs() const;
 
+    // ---- Cold-page codec for external storage --------------------------------
+    //
+    // The codec the cold tiers use, run against caller-owned memory, so a KV connector's store can hold pages in
+    // the same encoded representation as this manager's host, disk and remote levels. These read only the codec and
+    // its per-layer-group properties, which are fixed at construction, and take no API lock: the codec may call into
+    // Python, and holding the lock across that would order it against the GIL. A codec is not required to be
+    // reentrant, so callers serialize their own calls, and use these only while this manager has no cold tier of
+    // its own running the codec.
+
+    //! Bytes of one encoded page of `layerGroup`; zero for an unknown layer group.
+    [[nodiscard]] size_t coldPageBytes(LayerGroupId layerGroup) const noexcept;
+
+    //! Where the PageIndexPair array of `layerGroup` must reside; PageIndexLocation::kBadLocation if unknown.
+    [[nodiscard]] PageIndexLocation coldPageIndexLocation(LayerGroupId layerGroup) const noexcept;
+
+    //! Encode hot pages (PageIndexPair::src) into encoded pages at `dstBase + dst * coldPageBytes(layerGroup)`.
+    //! See StorageManager::encodeColdPagesExternal().
+    bool encodeColdPages(
+        LayerGroupId layerGroup, void* dstBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+
+    //! Decode encoded pages at `srcBase + src * coldPageBytes(layerGroup)` into hot pages (PageIndexPair::dst).
+    bool decodeColdPages(LayerGroupId layerGroup, void const* srcBase, PageIndexPair const* pageIndices,
+        size_t numPages, CUstream stream);
+
     // ---- Query / info ------------------------------------------------------
 
     int tokensPerBlock() const noexcept;

@@ -25,6 +25,7 @@ plain integers, which is all the addressing arithmetic needs.
 """
 
 import contextlib
+import dataclasses
 import json
 import os
 import threading
@@ -53,13 +54,19 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import 
     allocation_spans,
     split_at_cuts,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.codec_staging import (
+    plan_encoded_batches,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
     RangeFacts,
     allocation_range,
     describe_range,
     format_diagnosis,
 )
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import BlockHashChain
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
+    BlockHashChain,
+    KeyNamespace,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     PageTransfer,
     RequestTransfers,
@@ -1551,3 +1558,267 @@ def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config)
     assert metadata.saves == []
     # Nothing was handed to a save thread, so nothing pins its pages either.
     assert scheduler.request_finished(request, [7, 8, 9]) is False
+
+
+# ---- cold-page codec ----
+
+
+class FakeCodec:
+    """Stands in for `KvCachePageCodec`: fixed encoded sizes, calls recorded."""
+
+    def __init__(self, page_bytes, identity="fake-0123"):
+        self._page_bytes = dict(page_bytes)
+        self.identity = identity
+        self.calls = []
+
+    def page_bytes(self, layer_group_id):
+        return self._page_bytes[layer_group_id]
+
+    def encoding(self, layer_group_id):
+        return f"{self.identity}.r{layer_group_id}"
+
+    def describe(self):
+        return self.identity
+
+    def encode(self, layer_group_id, base, slots, pages, stream):
+        self.calls.append(("encode", layer_group_id, base, list(slots), list(pages)))
+
+    def decode(self, layer_group_id, base, pages, slots, stream):
+        self.calls.append(("decode", layer_group_id, base, list(pages), list(slots)))
+
+
+def codec_layout(codec, **kwargs):
+    return dataclasses.replace(make_layout(**kwargs), page_codec=codec)
+
+
+@pytest.fixture
+def no_stream_sync(monkeypatch):
+    """The codec calls are recorded rather than enqueued, so there is nothing to wait for."""
+    monkeypatch.setattr(worker_module, "_sync_stream", lambda _stream: None)
+
+
+def test_codec_worker_registers_its_arenas_and_no_kv_pool(store_config, fake_store):
+    """Encoded pages pass through staging, so the store never reaches the KV pools."""
+    layout = codec_layout(FakeCodec({0: 24, 1: 40}), num_groups=2)
+    with make_worker(fake_store, layout=layout) as worker:
+        arenas = {worker._load_arena.base, worker._save_arena.base}
+        assert {address for address, _ in fake_store.registered} == arenas
+        assert worker._registered_ranges == []
+
+
+def test_codec_keys_name_the_encoding_and_the_encoded_size(store_config, fake_store):
+    with make_worker(fake_store, layout=codec_layout(FakeCodec({0: 24}))) as worker:
+        encoded_key = worker._namespaces[0].key(b"\x01" * 16)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        raw_key = worker._namespaces[0].key(b"\x01" * 16)
+
+    assert f"/t{TOKENS_PER_BLOCK}b24/efake-0123.r0/" in encoded_key
+    # A raw page keeps the key it always had.
+    assert "/e" not in raw_key
+    assert f"/t{TOKENS_PER_BLOCK}b64/" in raw_key
+
+
+def test_codec_save_encodes_only_the_pages_the_pool_lacks(store_config, fake_store, no_stream_sync):
+    codec = FakeCodec({0: 24, 1: 40})
+    with make_worker(fake_store, layout=codec_layout(codec, num_groups=2)) as worker:
+        stored, fresh, later = b"\x01" * 16, b"\x02" * 16, b"\x03" * 16
+        fake_store.objects.add(worker._namespaces[0].key(stored))
+        worker._put(
+            [
+                RequestTransfers(
+                    1,
+                    [
+                        PageTransfer(stored, 0, 1),
+                        PageTransfer(fresh, 0, 3),
+                        PageTransfer(fresh, 1, 5),
+                        PageTransfer(later, 0, 2),
+                    ],
+                )
+            ]
+        )
+        arena = worker._save_arena.base
+        expected_keys = [
+            worker._namespaces[0].key(fresh),
+            worker._namespaces[1].key(fresh),
+            worker._namespaces[0].key(later),
+        ]
+
+    # One codec call per layer group; each group packs its pages from an
+    # aligned base at its own encoded size, which is how the codec addresses them.
+    assert codec.calls == [
+        ("encode", 0, arena, [0, 1], [3, 2]),
+        ("encode", 1, arena + 256, [0], [5]),
+    ]
+    (keys, addresses, sizes) = fake_store.put_calls[0]
+    assert keys == expected_keys
+    assert addresses == [[arena], [arena + 256], [arena + 24]]
+    assert sizes == [[24], [40], [24]]
+
+
+def test_codec_save_of_pages_already_stored_encodes_nothing(
+    store_config, fake_store, no_stream_sync
+):
+    codec = FakeCodec({0: 24})
+    with make_worker(fake_store, layout=codec_layout(codec)) as worker:
+        block_hash = b"\x04" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        worker._put([RequestTransfers(1, [PageTransfer(block_hash, 0, 1)])])
+    assert codec.calls == []
+    assert fake_store.put_calls == []
+
+
+def test_codec_load_reads_into_the_arena_then_decodes(store_config, fake_store, no_stream_sync):
+    codec = FakeCodec({0: 24, 1: 40})
+    with make_worker(fake_store, layout=codec_layout(codec, num_groups=2)) as worker:
+        first, second = b"\x05" * 16, b"\x06" * 16
+        for layer_group_id, block_hash in ((0, first), (1, first), (0, second)):
+            fake_store.objects.add(worker._namespaces[layer_group_id].key(block_hash))
+        worker.bind_connector_meta(
+            SimpleNamespace(
+                loads=[
+                    RequestTransfers(
+                        7,
+                        [
+                            PageTransfer(first, 0, 4),
+                            PageTransfer(first, 1, 6),
+                            PageTransfer(second, 0, 5),
+                        ],
+                    )
+                ],
+                saves=[],
+            )
+        )
+        # Decoding is ordered on the stream, so no allocation fence is bound.
+        worker.start_load_kv(None)
+        arena = worker._load_arena.base
+
+    (_keys, addresses, sizes) = fake_store.get_calls[0]
+    assert addresses == [[arena], [arena + 256], [arena + 24]]
+    assert sizes == [[24], [40], [24]]
+    assert codec.calls == [
+        ("decode", 0, arena, [4, 5], [0, 1]),
+        ("decode", 1, arena + 256, [6], [0]),
+    ]
+
+
+def test_codec_load_decodes_nothing_when_a_page_is_missing(
+    store_config, fake_store, no_stream_sync
+):
+    codec = FakeCodec({0: 24})
+    with make_worker(fake_store, layout=codec_layout(codec)) as worker:
+        worker.bind_connector_meta(
+            SimpleNamespace(
+                loads=[RequestTransfers(7, [PageTransfer(b"\x07" * 16, 0, 1)])], saves=[]
+            )
+        )
+        with pytest.raises(RuntimeError, match="already reported as computed"):
+            worker.start_load_kv(None)
+    assert codec.calls == []
+
+
+def test_codec_refuses_a_page_index_outside_the_layer_group(store_config, fake_store):
+    """The codec addresses pages unchecked, so a bad index must not reach it."""
+    codec = FakeCodec({0: 24})
+    with make_worker(fake_store, layout=codec_layout(codec, num_slots=8)) as worker:
+        with pytest.raises(IndexError, match="out of range"):
+            worker._put([RequestTransfers(1, [PageTransfer(b"\x08" * 16, 0, 8)])])
+    assert codec.calls == []
+    assert fake_store.exist_calls == []
+
+
+def test_codec_prefix_hit_looks_up_the_encoded_keys(store_config, fake_store):
+    with make_worker(fake_store, layout=codec_layout(FakeCodec({0: 24}))) as worker:
+        hashes = [bytes([index]) * 16 for index in range(2)]
+        for block_hash in hashes:
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        assert worker.count_prefix_hit(hashes) == 2
+
+
+def test_codec_arena_covers_a_full_batch_of_the_largest_page(store_config, fake_store):
+    codec = FakeCodec({0: 24, 1: 40})
+    with make_worker(fake_store, layout=codec_layout(codec, num_groups=2)) as worker:
+        batch = worker._config.transfer_batch_size
+        assert worker._save_arena.capacity >= batch * 40
+        assert worker._load_arena.capacity == worker._save_arena.capacity
+
+
+def test_codec_arena_stays_under_the_pinned_ceiling(store_config, fake_store, monkeypatch):
+    monkeypatch.setattr(worker_module, "MAX_STAGING_BUFFER_BYTES", 1024)
+    codec = FakeCodec({0: 600})
+    with make_worker(fake_store, layout=codec_layout(codec)) as worker:
+        assert worker._save_arena.capacity == 1024
+
+
+# ---- encoded batch planning ----
+
+
+def plan(items, page_bytes, *, arena_bytes=4096, max_pages=64, base=0x10000):
+    return list(plan_encoded_batches(items, page_bytes.__getitem__, base, arena_bytes, max_pages))
+
+
+def test_plan_keeps_the_callers_page_order():
+    items = [("a", 1, 10), ("b", 0, 11), ("c", 1, 12)]
+    (batch,) = plan(items, {0: 32, 1: 48})
+    assert batch.keys == ["a", "b", "c"]
+    # Group 1 is laid out first, since its page came first.
+    assert batch.addresses == [0x10000, 0x10000 + 256, 0x10000 + 48]
+    assert [(g.layer_group_id, g.base, g.slots, g.pages) for g in batch.groups] == [
+        (1, 0x10000, [0, 1], [10, 12]),
+        (0, 0x10000 + 256, [0], [11]),
+    ]
+
+
+def test_plan_closes_a_batch_at_the_page_limit():
+    items = [(str(index), 0, index) for index in range(5)]
+    batches = plan(items, {0: 16}, max_pages=2)
+    assert [batch.keys for batch in batches] == [["0", "1"], ["2", "3"], ["4"]]
+    # Every batch starts over at the arena base.
+    assert [batch.addresses[0] for batch in batches] == [0x10000] * 3
+
+
+def test_plan_closes_a_batch_when_the_arena_is_full():
+    items = [(str(index), 0, index) for index in range(3)]
+    # Two 200 B pages fill 512 B once aligned; a third needs 768 B.
+    batches = plan(items, {0: 200}, arena_bytes=512)
+    assert [batch.keys for batch in batches] == [["0", "1"], ["2"]]
+
+
+def test_plan_counts_each_groups_alignment_against_the_arena():
+    # Each group alone fits; together their aligned regions do not.
+    items = [("a", 0, 1), ("b", 1, 2)]
+    batches = plan(items, {0: 200, 1: 200}, arena_bytes=256)
+    assert [batch.keys for batch in batches] == [["a"], ["b"]]
+
+
+def test_plan_refuses_a_page_larger_than_the_arena():
+    with pytest.raises(ValueError, match="more than the 256 B staging arena"):
+        plan([("a", 0, 1)], {0: 300}, arena_bytes=256)
+
+
+def test_raw_key_namespace_is_spelled_as_before():
+    namespace = KeyNamespace(
+        namespace="trtllm",
+        model_key="m",
+        rank=1,
+        world_size=2,
+        layer_group_id=0,
+        tokens_per_block=32,
+        bytes_per_page=4096,
+    )
+    assert namespace.prefix == "trtllm/m/w2r1/lg0/t32b4096"
+
+
+def test_encoded_key_namespace_adds_the_encoding_last():
+    namespace = KeyNamespace(
+        namespace="trtllm",
+        model_key="m",
+        rank=1,
+        world_size=2,
+        layer_group_id=0,
+        tokens_per_block=32,
+        bytes_per_page=1168,
+        encoding="quantization_for_cold_page-0011223344556677.r4096",
+    )
+    assert namespace.prefix == (
+        "trtllm/m/w2r1/lg0/t32b1168/equantization_for_cold_page-0011223344556677.r4096"
+    )
