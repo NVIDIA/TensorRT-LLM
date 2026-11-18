@@ -69,6 +69,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 from tensorrt_llm.metrics.perf_utils import (_record_input_processing,
                                              _start_input_processing,
                                              _time_input_processing)
@@ -120,7 +121,7 @@ from tensorrt_llm.serve.openai_protocol import (
     RerankUsageInfo, RerankV2Request, RerankV2Response, RerankV2Result,
     ResponseFormat, ResponsesRequest, ResponsesResponse,
     RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
-    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
+    TokenizeResponse, UpdateWeightsRequest, UsageInfo, VideoGenerationRequest,
     ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
@@ -163,8 +164,10 @@ from tensorrt_llm.serve.tokenization_owners import (TokenizationOwners,
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
-from tensorrt_llm.serve.visual_gen_utils import (local_media_path_is_disallowed,
-                                                 parse_visual_gen_params)
+from tensorrt_llm.serve.visual_gen_utils import (check_path_response_policy,
+                                                 parse_visual_gen_params,
+                                                 path_response_is_disabled,
+                                                 request_reads_files)
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -176,7 +179,7 @@ from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
-    from tensorrt_llm.visual_gen import VisualGen
+    from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 
 def _preprocess_in_conversation(
@@ -705,6 +708,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     merged.setdefault(modality, {}).update(kw)
                 cfg.media_io_kwargs = merged
                 self.multimodal_server_config = cfg
+        if self._is_visual_gen:
+            check_path_response_policy()
+
         self.allow_request_chat_template = allow_request_chat_template
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self._enable_rl_control_endpoints = enable_rl_control_endpoints
@@ -919,6 +925,8 @@ class OpenAIServer(_VideoRoutesMixin):
             # down; the /metrics handler already treats that as no stats.
             self._metrics_stats_executor.shutdown(wait=False,
                                                   cancel_futures=True)
+            BaseMediaIO.clear_executor(self._media_load_executor)
+            self._media_load_executor.shutdown(wait=False, cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
         self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
@@ -2101,7 +2109,11 @@ class OpenAIServer(_VideoRoutesMixin):
             if record is not None and raw_request is not None:
                 raw_request.state.perf_metrics_records.append(record)
         if self.metrics_collector:
-            if res.candidate_metrics:
+            records = getattr(res, "candidate_metric_records", None)
+            if records:
+                for record in records:
+                    self.metrics_collector.emit(record)
+            elif res.candidate_metrics:
                 for candidate_m in res.candidate_metrics:
                     self.metrics_collector.log_request_metrics_dict(candidate_m)
             elif res.metrics_dict:
@@ -2222,7 +2234,8 @@ class OpenAIServer(_VideoRoutesMixin):
             self, "_spec_decode_num_spec_tokens", None)
 
     def _record_iteration_stat(self, llm_stat: dict) -> None:
-        self.metrics_collector.log_iteration_stats(llm_stat)
+        self.metrics_collector.emit(
+            PerfMetricsCollector.collect_iteration(llm_stat))
         # Tee into the /metrics snapshot buffer so the HTTP handler can serve
         # without competing for the engine queue (nvbug 6102381).
         if self._iteration_stats_buffer is not None:
@@ -4171,7 +4184,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # through to the outer ``except Exception`` → 500 so the
             # client doesn't get blamed for a server-internal failure.
             try:
-                params = parse_visual_gen_params(request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 logger.info(
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
@@ -4328,21 +4341,38 @@ class OpenAIServer(_VideoRoutesMixin):
             self, response_format: Optional[str]) -> Optional[Response]:
         """Return a 400 when ``response_format='path'`` but it is disabled.
 
-        Shares the switch with ``format='path'`` on the request side; see
-        :func:`local_media_path_is_disallowed`. Returns ``None`` when allowed.
+        See :func:`path_response_is_disabled`. Returns ``None`` when allowed.
         """
         if response_format != "path":
             return None
-        if local_media_path_is_disallowed():
+        if path_response_is_disabled():
             return self.create_error_response(
                 "response_format='path' is disabled on this server "
-                "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "
+                "(TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1); it returns "
                 "server-side filesystem paths and is only meaningful for "
                 "co-located clients.",
                 err_type="BadRequestError",
                 status_code=HTTPStatus.BAD_REQUEST,
             )
         return None
+
+    async def _parse_visual_gen_params(
+        self, request: Union[ImageGenerationRequest, ImageEditRequest,
+                             VideoGenerationRequest]
+    ) -> "VisualGenParams":
+        """Translate a VisualGen request with `parse_visual_gen_params`.
+
+        A request that reads files (a ``format='path'`` reference or an
+        upload) is parsed on the media-load pool, which bounds how many
+        requests read at once; a read keeps its worker until it finishes,
+        even after its request is cancelled. Any other request is parsed
+        inline.
+        """
+        if not request_reads_files(request):
+            return parse_visual_gen_params(request, self.generator)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._media_load_executor, parse_visual_gen_params, request,
+            self.generator)
 
     def _image_object(self, request: Union[ImageGenerationRequest,
                                            ImageEditRequest],
@@ -4429,7 +4459,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                params = parse_visual_gen_params(request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 logger.info(
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )

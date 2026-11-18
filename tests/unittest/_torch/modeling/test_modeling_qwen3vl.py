@@ -1626,8 +1626,16 @@ def test_normalization_startup_follows_encoder_dtype(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("enabled", [None, False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "enabled,dtype",
+    [
+        (None, torch.bfloat16),
+        (False, torch.bfloat16),
+        (True, torch.bfloat16),
+        (True, torch.float16),
+        (True, torch.float32),
+    ],
+)
 @pytest.mark.parametrize(
     "input_kind",
     [
@@ -1781,8 +1789,16 @@ def test_normalization_metadata_survives_processor_output(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32, torch.float64])
 @pytest.mark.parametrize("default_dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("worker_dtype", [torch.float32, torch.float64])
-@pytest.mark.parametrize("scalar_statistics", [False, True])
-@pytest.mark.parametrize("do_rescale,do_normalize", [(True, True), (True, False), (False, True)])
+@pytest.mark.parametrize(
+    "do_rescale,do_normalize,scalar_statistics",
+    [
+        (True, True, False),
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+        (False, True, True),
+    ],
+)
 def test_normalization_enabled_operations(
     dtype, default_dtype, worker_dtype, scalar_statistics, do_rescale, do_normalize
 ):

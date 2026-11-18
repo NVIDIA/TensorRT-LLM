@@ -224,6 +224,7 @@ class ReusedBlocksByLevel:
     full: list[int]
     partial: list[int]
 
+@dataclass(slots=True)
 class SsmSnapshotIterationStatsDelta:
     iter_snapshot_lookups: int = 0
     iter_snapshot_hits: int = 0
@@ -436,7 +437,7 @@ class SparseCacheConfig:
     Setting both on one buffer is rejected.
     """
 
-    selection_id: int | None
+    selection_id: int | None = None
     """Layers whose selection is one selection, named so they can say so.
 
     A model running one indexer across several layers hands them all the same units every
@@ -597,6 +598,9 @@ class KVCacheManagerConfig:
     # declaration order. A (layer, role) pair belongs to one layer config or one region.
     regions: list[RegionConfig] = ...
     host_mem_backing: HostMemBackingConfig = ...
+    # Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's
+    # per-layer-group slot-count proportions at cold page sizes.
+    cold_typical_step: BatchDesc | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -894,7 +898,12 @@ class _KVCache:
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
         is_end: bool = False,
+        ssm_from_pending: bool = False,
     ) -> None: ...
+    def acquire_ssm_snapshot_slot(self) -> int | None: ...
+    @property
+    def pending_ssm_snapshot_slot(self) -> int | None: ...
+    def release_ssm_snapshot_slot(self) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...
     @property

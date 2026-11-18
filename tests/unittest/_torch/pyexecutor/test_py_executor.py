@@ -2299,6 +2299,7 @@ def _make_disagg_transfer_request(
     req.py_prompt_len = prompt_len
     req.total_input_len_cp = prompt_len if total_input_len_cp is None else total_input_len_cp
     req.is_disagg_generation_transmission_in_progress = in_progress
+    req.is_disagg_generation_transmission_complete = False
     return req
 
 
@@ -4600,6 +4601,7 @@ class TestPendingTransferResponseFlush:
         executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
         executor.previous_batch = None
+        executor.enable_kv_cache_events = False
         executor._flush_pending_transfer_responses = Mock()
         executor._packed_sync_enabled = False
         executor._stage_timing = False
@@ -4792,6 +4794,7 @@ class TestOneModelMTPDraftTokenScheduling:
         ex._packed_sync_enabled = False
         ex._stage_timing = False
         ex.waiting_queue = []
+        ex.canceled_req_ids = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         ex._pad_attention_dp_dummy_request = Mock()

@@ -238,6 +238,9 @@ def test_mapping_mismatch_coordinates_fallback_before_reader_setup(monkeypatch):
     assert status.selected == "native"
     assert status.effective == "native"
     assert "mapping.world_size" in status.fallback_reason
+    # The fallback load is preparation; without read-ahead there is nothing to finish.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds == 0.0
     reader_start.assert_not_called()
     warning.assert_called_once()
 
@@ -369,6 +372,9 @@ def test_ineligible_request_uses_exact_native_fallback(
     assert not status.activated
     assert status.effective == "native"
     assert status.fallback_reason
+    # The fallback load is preparation; without read-ahead there is nothing to finish.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds == 0.0
     reader_start.assert_not_called()
     if requested_policy == "rank_striped_read_ahead":
         warning.assert_called_once()
@@ -450,7 +456,11 @@ def test_session_overlaps_materialization_and_cancels_tail(tmp_path, monkeypatch
         assert "model.norm.weight" in weights
 
     assert stopped.is_set()
-    assert loader.last_checkpoint_io_status.effective == "rank_striped_read_ahead"
+    status = loader.last_checkpoint_io_status
+    assert status.effective == "rank_striped_read_ahead"
+    # Preparation started the readers; finalization waited for them to stop.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds > 0
 
 
 def test_node_major_page_faults_reads_vmstat(monkeypatch):
@@ -926,6 +936,8 @@ def test_mapping_and_materialization_failures_never_retry(tmp_path, monkeypatch)
     assert status.fallback_reason == (
         "model materialization failed: RuntimeError: materialization failed"
     )
+    # Finishing read-ahead is timed even when the with-block fails.
+    assert status.finalization_seconds > 0
     assert "model materialization failed" in error_log.call_args.args[0]
     assert "cleanup failure" not in error_log.call_args.args[0]
 
@@ -1072,6 +1084,25 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         rank_striped_read_ahead.RankStripedReadAheadSession._run = original_run
     communicator.Barrier()
 
+    # Only one of the two files holds the prefix; a rank that cannot read headers reads both.
+    original_read_header = weight_loader._read_safetensors_header
+    if rank == world_size - 1:
+
+        def fail_header(_path):
+            raise ValueError("rank-local header failure")
+
+        weight_loader._read_safetensors_header = fail_header
+    header_loader = _rank_striped_loader()
+    try:
+        with header_loader.open_weight_session(
+            checkpoint_dir, mapping=mapping, key_prefixes=("model.norm.",)
+        ) as header_weights:
+            pass
+        header_status = header_loader.last_checkpoint_io_status
+    finally:
+        weight_loader._read_safetensors_header = original_read_header
+    communicator.Barrier()
+
     return {
         "rank": rank,
         "success": success,
@@ -1083,6 +1114,10 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         "read_effective": read_status.effective,
         "read_reason": read_status.fallback_reason,
         "read_sum": float(read_weights["model.norm.weight"].sum()),
+        "header_effective": header_status.effective,
+        "header_reason": header_status.fallback_reason,
+        "header_sum": float(header_weights["model.norm.weight"].sum()),
+        "header_read_both_files": "lm_head.weight" in header_weights,
     }
 
 
@@ -1093,6 +1128,9 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_real_mpi_success_and_rank_local_failures(tmp_path, mpi_pool_executor):
     checkpoint_dir, expected = _write_checkpoint(tmp_path)
+    save_file(
+        {"lm_head.weight": torch.ones(6, 4)}, str(checkpoint_dir / "model-lm-head.safetensors")
+    )
     results = list(
         mpi_pool_executor.map(
             _run_real_mpi_scenarios,
@@ -1117,3 +1155,10 @@ def test_real_mpi_success_and_rank_local_failures(tmp_path, mpi_pool_executor):
     assert all(result["read_effective"] == "native" for result in results)
     assert all("rank-local read failure" in result["read_reason"] for result in results)
     assert all(result["read_sum"] == expected_sum for result in results)
+    assert all(result["header_effective"] == "native" for result in results)
+    assert all("rank-local header failure" in result["header_reason"] for result in results)
+    assert all(result["header_sum"] == expected_sum for result in results)
+    assert {result["rank"]: result["header_read_both_files"] for result in results} == {
+        0: False,
+        1: True,
+    }

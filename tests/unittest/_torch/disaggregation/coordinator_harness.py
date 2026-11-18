@@ -45,6 +45,7 @@ class TransferRequest(SimpleNamespace):
             is_disagg_context_transmission_state=False,
             py_kv_transfer_start_time=None,
             py_kv_transfer_timed_out=False,
+            py_multimodal_params=None,
             py_disaggregated_params=None,
             cached_tokens=0,
             response=None,

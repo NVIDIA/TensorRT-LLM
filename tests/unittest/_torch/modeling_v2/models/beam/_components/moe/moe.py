@@ -36,8 +36,8 @@ from typing import Mapping
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import dispatch_combine
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import SM as _SM
+from tensorrt_llm._torch.modeling_v2.models.beam import dispatch_combine
+from tensorrt_llm._torch.modeling_v2.models.beam._constants import SM as _SM
 
 from ..moe_expert.expert import WEIGHT_SHAPES as EXPERT_WEIGHT_SHAPES
 from ..moe_expert.expert import BeamMoeExpertBf16Sm103Tp1
