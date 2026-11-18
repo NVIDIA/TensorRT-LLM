@@ -163,6 +163,10 @@ class Glm5NextVisionAttention(Attention):
                 not model_config.mapping.enable_attention_dp and model_config.mapping.tp_size > 1
             ),
             head_dim=config.hidden_size // config.num_heads,
+            # Vision attention runs from the outer VL wrapper, outside the
+            # compiled LM region. Unregistered, compiled LM attention lookups
+            # never resolve a vision layer (same as Qwen2_5_VLVisionAttention).
+            register_to_config=False,
         )
         # Backend resolution can substitute an implementation; require plain
         # TRTLLM metadata and full-attention semantics after construction too.
@@ -175,13 +179,6 @@ class Glm5NextVisionAttention(Attention):
         # Per-head Q/K RMSNorm over head_dim, weights replicated across TP.
         self.q_norm = RMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.k_norm = RMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
-        # Vision attention runs from the outer VL wrapper, outside the
-        # compiled LM region. Unregister from the shared attn-layer metadata
-        # map so compiled LM attention lookups never resolve a vision layer
-        # (same contract as Qwen2_5_VLVisionAttention).
-        if self.register_to_config:
-            model_config.extra_attrs.get("attn_layers", {}).pop(self.layer_idx_str, None)
-            self.register_to_config = False
 
     def forward(
         self,

@@ -1688,22 +1688,18 @@ class Qwen2_5_VLVisionAttention(Attention):
             # hidden_size; don't inherit head_dim mirrored from the text
             # sub-config onto the top-level pretrained_config.
             head_dim=config.hidden_size // config.num_heads,
+            # Vision attention runs from the outer VL wrapper (outside the
+            # compiled LM region). A registered layer would take
+            # `attn_custom_op_inplace` under torch.compile or a breakable
+            # CUDA graph, which looks `attention_metadata` up in the global
+            # `extra_attrs` -- the LM decoder's metadata, set by
+            # `DecoderRunner._model_forward` -- so vision FMHA would get the
+            # LM's S/num_contexts with vision's head_dim and dispatch fails
+            # (`FMHA kernels are not found ... D: <vision_head_dim>`).
+            # Unregistered, `forward_impl` takes the eager path that uses
+            # vision's own `attn_metadata`.
+            register_to_config=False,
         )
-        # Vision attention runs from the outer VL wrapper (outside the
-        # compiled LM region). When `set_torch_compiling(True)` is set
-        # for the LM, `forward_impl` would otherwise dispatch vision
-        # through `attn_custom_op_inplace`, which looks
-        # `attention_metadata` up in the global `extra_attrs` --
-        # that slot is populated by `DecoderRunner._model_forward` with
-        # the LM decoder's metadata, so vision FMHA receives the LM's
-        # S/num_contexts with vision's head_dim and dispatch fails
-        # (`FMHA kernels are not found ... D: <vision_head_dim>`).
-        # Unregister so `forward_impl` falls back to the eager path
-        # that uses vision's own `attn_metadata`.
-        if self.register_to_config:
-            model_config.extra_attrs.get("attn_layers",
-                                         {}).pop(self.layer_idx_str, None)
-            self.register_to_config = False
 
     def apply_rope(self,
                    q: torch.Tensor,

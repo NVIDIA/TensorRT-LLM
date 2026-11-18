@@ -174,13 +174,11 @@ class MiniCPMV4_6VisionAttention(Attention):
             config=model_config,
             reduce_output=False,
             head_dim=config.hidden_size // config.num_attention_heads,
+            # Vision attention runs eagerly from the VL wrapper (outside the
+            # compiled LM region); unregistered, `forward_impl` uses the eager
+            # path with the vision-local `attn_metadata` instead of the LM's.
+            register_to_config=False,
         )
-        # Vision attention runs eagerly from the VL wrapper (outside the
-        # compiled LM region); unregister so `forward_impl` uses the eager path
-        # with the vision-local `attn_metadata` instead of the LM's.
-        if self.register_to_config:
-            model_config.extra_attrs.get("attn_layers", {}).pop(self.layer_idx_str, None)
-            self.register_to_config = False
 
     def forward(
         self,
