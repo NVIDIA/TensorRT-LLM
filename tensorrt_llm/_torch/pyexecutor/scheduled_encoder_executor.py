@@ -11,7 +11,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -28,6 +28,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import host_profiler_context
 
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
+from .encoder_completion import Completion, PoolingCompletion
 from .engine.model_setup import build_encoder_runner
 from .engine.runners.encoder import EncoderRunner, resolve_scheduled_encoder_args
 from .engine.runners.interface import ScheduledInputs
@@ -61,9 +62,7 @@ if TYPE_CHECKING:
 
 __all__ = ["ScheduledEncoderExecutor", "fit_batch", "prompt_cost"]
 
-_MULTIMODAL_INPUT_ERROR = (
-    "Scheduled requests to a non-generation model cannot carry multimodal inputs."
-)
+_MULTIMODAL_INPUT_ERROR = "Requests to a pooling model cannot carry multimodal inputs."
 
 # One forward runs while the next is launched; a third waits for the first to be published.
 _MAX_IN_FLIGHT = 2
@@ -131,6 +130,7 @@ class ScheduledEncoderExecutor:
         self,
         runner: EncoderRunner,
         *,
+        completion: Completion,
         model_loader: ModelLoader,
         llm_args: TorchLlmArgs,
         mapping: Mapping,
@@ -143,6 +143,7 @@ class ScheduledEncoderExecutor:
 
         Args:
             runner: The model's runner; every forward goes through its scheduled entry point.
+            completion: How a forward's outputs complete its requests; it fits the runner.
             model_loader: The loader that loaded the model, cleaned up at shutdown.
             llm_args: The resolved arguments; the executor reads its timeouts, garbage
                 collection threshold and metrics switches.
@@ -153,6 +154,7 @@ class ScheduledEncoderExecutor:
             max_seq_len: The longest prompt a request may have.
         """
         self._runner = runner
+        self._completion = completion
         self._model_loader = model_loader
         self.dist = dist
         self.max_batch_size = max_batch_size
@@ -242,6 +244,7 @@ class ScheduledEncoderExecutor:
                 )
             return cls(
                 built.runner,
+                completion=PoolingCompletion(),
                 model_loader=built.model_loader,
                 llm_args=llm_args,
                 mapping=mapping,
@@ -538,7 +541,7 @@ class ScheduledEncoderExecutor:
     def _check_admissible(self, item: RequestQueueItem) -> None:
         """Raise ValueError if one forward cannot run this request."""
         request = item.request
-        if (
+        if not self._completion.accepts_multimodal_inputs and (
             getattr(request, "py_multimodal_data", None) is not None
             or request.mrope_config is not None
         ):
@@ -626,6 +629,7 @@ class ScheduledEncoderExecutor:
                 done.record()
         except Exception as error:
             self._slots.release()
+            self._completion.retire(requests)
             self._fail(requests, error)
             return
         self._in_flight.put(
@@ -680,15 +684,14 @@ class ScheduledEncoderExecutor:
 
     @nvtx_range("_complete")
     def _complete(
-        self, requests: list[LlmRequest], outputs: dict[str, torch.Tensor]
+        self, requests: list[LlmRequest], outputs: dict[str, Any]
     ) -> list[tuple[int, LlmResponse]]:
-        """Store each request's pooled row as its context logits and report it finished with reason LENGTH."""
+        """Store the forward's results on its requests and report each finished with reason LENGTH."""
+        self._completion.store(requests, outputs)
         batch_token_time = self._perf_manager.get_timestamp()
         gpu_times_cache = {}
         responses = []
-        for request, row in zip(requests, outputs["logits"]):
-            if request.py_return_context_logits:
-                request.py_result.append_context_logits(row.unsqueeze(0) if row.ndim == 1 else row)
+        for request in requests:
             # The public result reports a finished request with no tokens and reason LENGTH.
             request.state = LlmRequestState.GENERATION_COMPLETE
             request.set_finished_reason(FinishReason.LENGTH, 0)

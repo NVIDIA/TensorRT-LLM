@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor import scheduled_encoder_executor
+from tensorrt_llm._torch.pyexecutor.encoder_completion import PoolingCompletion
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import (
     ScheduledEncoderExecutor,
@@ -126,6 +127,7 @@ class _Harness:
         self.runner = _Runner(max_batch_size)
         self.executor = ScheduledEncoderExecutor(
             self.runner,
+            completion=PoolingCompletion(),
             model_loader=Mock(),
             llm_args=SimpleNamespace(
                 garbage_collection_gen0_threshold=20000,
