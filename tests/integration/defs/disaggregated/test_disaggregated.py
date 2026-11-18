@@ -52,6 +52,12 @@ from tensorrt_llm.logger import logger
 
 MAMBA_BS1_CONCURRENCY2_MODEL = "NVIDIA-Nemotron-Nano-9B-v2"
 
+# Readiness budget for the Qwen3-0.6B pipeline-parallel disaggregated tests.
+# With cold JIT caches every rank spends most of its startup in warmup (kernel
+# JIT and autotuning), so cluster readiness takes 350-650s on 4-8 Blackwell or
+# Rubin GPUs, past the 300s default.
+PP_DISAGG_SERVER_START_TIMEOUT = 900
+
 
 @dataclass
 class TestConfig:
@@ -1621,7 +1627,9 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
         model_path=qwen_model_root,
         cwd=llm_venv.get_working_directory(),
         disagg_schedule_style="generation_first",
-        post_client_test=post_client_test)
+        post_client_test=post_client_test,
+        server_start_timeout=(PP_DISAGG_SERVER_START_TIMEOUT
+                              if ctx_pp > 1 else 300))
 
 
 def test_disaggregated_overlap_transceiver_runtime_python(
@@ -1965,7 +1973,8 @@ def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
                            "ctxpp2_genpp2",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=PP_DISAGG_SERVER_START_TIMEOUT)
 
 
 @pytest.mark.skip_less_device(4)
@@ -2010,7 +2019,8 @@ def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
                            "ctxtp2pp2_gentp2pp2",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=PP_DISAGG_SERVER_START_TIMEOUT)
 
 
 @pytest.mark.skip_less_device(8)
@@ -2021,14 +2031,12 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
         qwen_model_root
     ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
-    # Cold model initialization and JIT across eight Blackwell ranks took
-    # about 640s on B300; allow headroom for CI variability (NVBug 6771023).
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=900)
+                           server_start_timeout=PP_DISAGG_SERVER_START_TIMEOUT)
 
 
 @pytest.mark.skip_less_device(8)
@@ -2043,7 +2051,8 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
                            "ctxpp4_gentp4",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=PP_DISAGG_SERVER_START_TIMEOUT)
 
 
 @skip_no_hopper
