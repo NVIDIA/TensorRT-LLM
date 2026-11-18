@@ -398,6 +398,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_g
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (
     flashinfer_chunk_gated_delta_rule,
+    flashinfer_chunk_gdn_inforward_split,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
     fused_recurrent_gated_delta_rule_cached_replay_update,
@@ -1724,6 +1725,14 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             f"{rank_pools.ple_state[0].shape[0]} PLE slots (bind {self._binds})",
             flush=True,
         )
+        # The tail of an in-forward snapshot split runs FlashInfer's in-place path.
+        max_tail = getattr(cm, "inforward_snapshot_max_tail", 0)
+        if getattr(cm, "inforward_snapshot_rows", 0) > 0 and max_tail > _GDN_INPLACE_MAX_TOKENS:
+            raise NotImplementedError(
+                f"in-forward Mamba snapshots with a tail of up to {max_tail} tokens "
+                "(kv_cache_config.mamba_state_config.additional_snapshot_offsets_from_end): this "
+                f"target splits tails of at most {_GDN_INPLACE_MAX_TOKENS} tokens"
+            )
         bound = _Bound(cm, rank_pools)
         if self.spec_rollback is not None:
             self.spec_rollback.set_index_planes(
@@ -3754,6 +3763,110 @@ class _KvRangeProbe:
 # ------------------------------------------------------------------ prefill ---
 
 
+# TRTLLM_QWEN4_EXP_INFORWARD_VALIDATE=1: every in-forward snapshot step also runs the two
+# context iterations it replaces (the chunk up to P, then the tail) on copies of the pool
+# rows, and prints how far the split's states and outputs are from theirs. Debug only.
+# The split the executor's warmup runs for a dummy request (`_warm_inforward_split`) reports
+# as `[inforward-validate] [warmup] ...`, so a line without `[warmup]` is a served request's.
+_INFORWARD_VALIDATE = os.environ.get("TRTLLM_QWEN4_EXP_INFORWARD_VALIDATE", "0") == "1"
+_inforward_validate_reports = 0
+_inforward_validate_warmup = False
+
+
+def _inforward_report(what: str, got: torch.Tensor, ref: torch.Tensor) -> None:
+    global _inforward_validate_reports
+    if _inforward_validate_reports >= 400:
+        return
+    _inforward_validate_reports += 1
+    g, r = got.float(), ref.float()
+    diff = float((g - r).abs().max()) if g.numel() else 0.0
+    scale = float(r.abs().max()) if r.numel() else 0.0
+    tag = "[warmup] " if _inforward_validate_warmup else ""
+    print(
+        f"[inforward-validate] {tag}{what}: bitwise={bool(torch.equal(got, ref))} "
+        f"max_abs_diff={diff:.3e} ref_max_abs={scale:.3e} shape={tuple(got.shape)}",
+        flush=True,
+    )
+
+
+def _inforward_reference_layout(split, num_tokens: int):
+    """The two iterations' row sets of a split step: the rows before every tail (`main`,
+    with their `cu`), and for each split request its index among the step's requests."""
+    device = split.cu.device
+    keep = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    keep[split.tail_tok] = False
+    main = torch.nonzero(keep).reshape(-1)
+    # Request ends in packed rows: the end of each request's last gather row.
+    num_rows = split.gather.shape[0]
+    is_main = torch.zeros(num_rows, dtype=torch.bool, device=device)
+    is_main[split.main_rows] = True
+    last = torch.ones(num_rows, dtype=torch.bool, device=device)
+    last[:-1] = is_main[1:]
+    ends = split.cu[1:][last]
+    tails = torch.zeros_like(ends)
+    request_of_split = torch.searchsorted(split.main_rows, split.split_rows)
+    tail_len = split.cu_tail[1:] - split.cu_tail[:-1]
+    tails[request_of_split] = tail_len
+    lens = torch.diff(ends, prepend=ends.new_zeros(1)) - tails
+    cu_main = torch.cat([lens.new_zeros(1), torch.cumsum(lens, 0)])
+    return main, cu_main, request_of_split
+
+
+class _InforwardSplit(NamedTuple):
+    """A context-only step's in-forward snapshot split (`Mamba2Metadata.inforward_split`,
+    planned by the cache manager): `k` requests run through their prompt end in this chunk
+    instead of taking one more context iteration for the tail past their snapshot point P.
+    The recurrent layers leave the state at P in the request's slot and stage the state at
+    the prompt end in the manager's staging row (`finish_inforward_snapshots`).
+
+    `split` holds the long index tensors; the rest are this target's views of them: slot
+    vectors in the pool's index dtype, the carry flags of the sequences cut at P (a tail is a
+    sequence of its own that the first pass starts from zeros), and for the PLE layer the
+    rows before each P its conv state (`ple_conv_win`) and id context (`ple_ngram_win`) at P
+    are rebuilt from."""
+
+    split: NamedTuple
+    gather: torch.Tensor
+    carried: torch.Tensor
+    live: torch.Tensor
+    ple_conv_win: torch.Tensor
+    ple_ngram_win: torch.Tensor
+    # The staging rows in the pool's index dtype.
+    stage_idx: torch.Tensor
+
+
+def _inforward_split(md, mm, si_all, hi_all, pools) -> _InforwardSplit | None:
+    """This step's in-forward snapshot split, or None on a step without one."""
+    split = getattr(mm, "inforward_split", None)
+    if split is None:
+        return None
+    if _INFORWARD_VALIDATE:
+        global _inforward_validate_warmup
+        _inforward_validate_warmup = bool(getattr(mm, "_warmup_inforward_split", False))
+    assert md.num_seqs == md.num_contexts, (
+        "an in-forward snapshot split on a step with generation rows"
+    )
+    carried = torch.zeros(split.gather.shape[0], dtype=hi_all.dtype, device=hi_all.device)
+    carried.index_copy_(0, split.main_rows, hi_all[: md.num_contexts])
+    # The first packed row of each planned request's tail: its snapshot point P.
+    points = split.cu.index_select(0, split.split_rows + 1)
+
+    def window(width: int) -> torch.Tensor:
+        back = torch.arange(width, 0, -1, dtype=points.dtype, device=points.device)
+        return torch.reshape(points[:, None] - back[None, :], [-1])
+
+    ple_conv, ple_ngram = pools.ple_state
+    return _InforwardSplit(
+        split=split,
+        gather=split.gather.to(si_all.dtype),
+        carried=carried,
+        live=split.live.to(si_all.dtype),
+        ple_conv_win=window(ple_conv.shape[-1]),
+        ple_ngram_win=window(ple_ngram.shape[-1]),
+        stage_idx=split.stage_rows.to(si_all.dtype),
+    )
+
+
 class _PrefillStep(NamedTuple):
     """One step's host-side state, built by `PrefillTarget.prepare` and read by the forward's
     breaks. `num_tokens` is the batch's row count `n` and `physical_tokens` the `T` the
@@ -3780,6 +3893,8 @@ class _PrefillStep(NamedTuple):
     fp8_pages: int | None = None
     # `_live_score_columns`: a bound on every row's selection window.
     live_cols: int | None = None
+    # A context-only step with in-forward snapshots: `_InforwardSplit`.
+    inforward: _InforwardSplit | None = None
 
 
 class PrefillTarget:
@@ -4095,6 +4210,8 @@ class PrefillTarget:
                 core.head_k_dim,
                 out[0, num_prefill_tokens:num_tokens].view(num_decode_tokens, core.value_dim),
             )
+        elif step.inforward is not None:
+            self._gdn_inforward(mixed_qkv, a, b, L, i, qsl_all, si_all, hi_all, out, num_tokens)
         else:
             q, k, v, g, beta = self._gdn_prefill_prep(
                 mixed_qkv, a, b, L, i, qsl_all, si_all, hi_all
@@ -4120,6 +4237,138 @@ class PrefillTarget:
                 linear_gate=True,
             )
         out[:, num_tokens:].zero_()
+
+    def _gdn_inforward(self, mq, a, b, L, i, qsl, si, hi, out, num_tokens) -> None:
+        """The context-only recurrence of a step with in-forward snapshots (`_InforwardSplit`).
+
+        The conv pass runs over whole chunks, so it leaves each planned slot the window that
+        ends at the prompt end: that goes to the staging row and the window that ends at P,
+        the raw inputs before P, into the slot. The recurrence is cut at P
+        (`flashinfer_chunk_gdn_inforward_split`)."""
+        core = self.core
+        inf = self._step.inforward
+        split = inf.split
+        pools = core._bound.pools
+        conv_states = pools.conv[i]
+        stage_ssm, stage_conv = core._bound.cm.inforward_snapshot_stage_views(i)
+        ref = (
+            self._gdn_inforward_reference(mq, a, b, L, i, qsl, si, hi, num_tokens)
+            if _INFORWARD_VALIDATE
+            else None
+        )
+        window = mq.index_select(0, split.conv_win)
+        q, k, v, g, beta = self._gdn_prefill_prep(mq, a, b, L, i, qsl, si, hi)
+        slots = split.tail_slots
+        stage_conv.index_copy_(0, split.stage_rows, conv_states.index_select(0, slots))
+        conv_states.index_copy_(
+            0,
+            slots,
+            torch.transpose(torch.reshape(window, [split.k, conv_states.shape[-1], -1]), 1, 2).to(
+                conv_states.dtype
+            ),
+        )
+        flashinfer_chunk_gdn_inforward_split(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            pools.ssm[i],
+            cu_seqlens=split.cu,
+            gather=inf.gather,
+            has_initial_state=inf.carried,
+            main_rows=split.main_rows,
+            live=inf.live,
+            tail_tok=split.tail_tok,
+            cu_tail=split.cu_tail,
+            tail_slots=split.tail_slots,
+            stage=stage_ssm,
+            stage_rows=split.stage_rows,
+            stage_idx=inf.stage_idx,
+            tail_lo=split.tail_lo,
+            tail_hi=split.tail_hi,
+            output=out[:, :num_tokens],
+        )
+        if ref is not None:
+            ssm_p, conv_p, ssm_end, conv_end, out_ref, live, of_split = ref
+            _inforward_report(
+                f"gdn L{i} ssm@P (all requests)", pools.ssm[i].index_select(0, live), ssm_p
+            )
+            _inforward_report(
+                f"gdn L{i} conv@P (all requests)", conv_states.index_select(0, live), conv_p
+            )
+            rows = split.stage_rows
+            _inforward_report(
+                f"gdn L{i} ssm@end (split)",
+                stage_ssm.index_select(0, rows),
+                ssm_end.index_select(0, of_split),
+            )
+            _inforward_report(
+                f"gdn L{i} conv@end (split)",
+                stage_conv.index_select(0, rows),
+                conv_end.index_select(0, of_split),
+            )
+            _inforward_report(f"gdn L{i} output", out[0, :num_tokens], out_ref)
+
+    def _gdn_inforward_reference(self, mq, a, b, L, i, qsl, si, hi, num_tokens):
+        """`_INFORWARD_VALIDATE`: the chunk up to P and then the tail, as two context
+        iterations run them, over copies of the step's pool rows (slot `r` = request `r`).
+        Returns the states at P, the states at the prompt end and the output rows."""
+        core = self.core
+        split = self._step.inforward.split
+        pools = core._bound.pools
+        live = split.live
+        main, cu_main, of_split = _inforward_reference_layout(split, num_tokens)
+        ssm = pools.ssm[i].index_select(0, live).contiguous()
+        conv = pools.conv[i].index_select(0, live).contiguous()
+        idx = torch.arange(live.shape[0], dtype=si.dtype, device=si.device)
+        out_ref = torch.zeros(
+            num_tokens, core.num_v_heads, core.head_v_dim, dtype=mq.dtype, device=mq.device
+        )
+
+        def run(rows, cu, slots, carried):
+            qv = gdn_prefill_conv_post(
+                x=mq.index_select(0, rows).contiguous(),
+                weight=L.conv_w,
+                conv_states=conv,
+                query_start_loc=cu.to(qsl.dtype),
+                cache_indices=slots,
+                has_initial_state=carried,
+                a=a.index_select(0, rows).contiguous(),
+                b=b.index_select(0, rows).contiguous(),
+                A_log=L.a_log,
+                dt_bias=L.dt_bias,
+                num_k_heads=core.num_k_heads,
+                head_k_dim=core.head_k_dim,
+                num_v_heads=core.num_v_heads,
+                head_v_dim=core.head_v_dim,
+                pad_slot_id=_PAD_SLOT_ID,
+                l2_norm_eps=_L2_NORM_EPS,
+                softplus_threshold=_SOFTPLUS_THRESHOLD,
+                linear_gate=True,
+            )
+            o, _ = flashinfer_chunk_gated_delta_rule(
+                *qv,
+                scale=None,
+                initial_state=ssm,
+                initial_state_indices=slots,
+                inplace_indexed_state_update=True,
+                output_final_state=False,
+                cu_seqlens=cu,
+                head_first=False,
+                use_qk_l2norm_in_kernel=False,
+                output=None,
+                state_workspace=None,
+                has_initial_state=carried,
+                linear_gate=True,
+            )
+            out_ref.index_copy_(0, rows, o[0].to(out_ref.dtype))
+
+        run(main, cu_main, idx, hi)
+        ssm_p, conv_p = ssm.clone(), conv.clone()
+        tail_slots = of_split.to(si.dtype)
+        run(split.tail_tok, split.cu_tail, tail_slots, torch.ones_like(hi[: split.k]))
+        return ssm_p, conv_p, ssm, conv, out_ref, live, of_split
 
     def _gdn_prefill_prep(self, mq, a, b, L, i, qsl, si, hi):
         """The context rows' recurrence inputs in one pass over `mq`, the token-major q|k|v
@@ -4186,8 +4435,15 @@ class PrefillTarget:
         num_tokens = step.num_tokens
         next_norm = self._layers[core.ple_layer].ahc_norm
         conv_input = None
+        inf = step.inforward
+        ple_ref = None
+        if inf is not None and _INFORWARD_VALIDATE:
+            ple_ref = self._ple_inforward_reference(
+                hc, conv_states, ngram_pool, si_all, carry_all, qsl
+            )
         if step.stage:
             core.spec_rollback.stage_ple_verify(ngram_pool, conv_states, step.input_ids)
+        if step.stage or inf is not None:
             conv_input = torch.empty_like(hc[:num_tokens])
         ngram = ple_ngram_embed(
             step.input_ids,
@@ -4230,8 +4486,118 @@ class PrefillTarget:
         )
         if step.stage:
             core.spec_rollback.stage_ple_conv_input(conv_input)
+        if inf is not None:
+            # In-forward snapshots: both pools hold each planned slot's state at the prompt
+            # end. Stage it and rebuild the state at P from the rows before P: the conv
+            # input tail and the last ids.
+            split = inf.split
+            slots = split.tail_slots
+            stage_conv, stage_ngram = core._bound.cm.inforward_ple_stage_views(core.ple_layer)
+            stage_conv.index_copy_(0, split.stage_rows, conv_states.index_select(0, slots))
+            stage_ngram.index_copy_(0, split.stage_rows, ngram_pool.index_select(0, slots))
+            conv_states.index_copy_(
+                0,
+                slots,
+                torch.transpose(
+                    torch.reshape(
+                        conv_input.index_select(0, inf.ple_conv_win),
+                        [split.k, conv_states.shape[-1], -1],
+                    ),
+                    1,
+                    2,
+                ).to(conv_states.dtype),
+            )
+            ngram_pool.index_copy_(
+                0,
+                slots,
+                torch.reshape(step.input_ids.index_select(0, inf.ple_ngram_win), [split.k, -1]).to(
+                    ngram_pool.dtype
+                ),
+            )
+            if ple_ref is not None:
+                conv_p, ngram_p, conv_end, ngram_end, hc_ref, normed_ref, live, of_split = ple_ref
+                rows = split.stage_rows
+                _inforward_report(
+                    "ple conv@P (all requests)", conv_states.index_select(0, live), conv_p
+                )
+                _inforward_report(
+                    "ple ngram@P (all requests)", ngram_pool.index_select(0, live), ngram_p
+                )
+                _inforward_report(
+                    "ple conv@end (split)",
+                    stage_conv.index_select(0, rows),
+                    conv_end.index_select(0, of_split),
+                )
+                _inforward_report(
+                    "ple ngram@end (split)",
+                    stage_ngram.index_select(0, rows),
+                    ngram_end.index_select(0, of_split),
+                )
+                _inforward_report("ple hc_out", hc_out[:num_tokens], hc_ref)
+                _inforward_report("ple normed", normed_out[:num_tokens], normed_ref)
         hc_out[num_tokens:].zero_()
         normed_out[num_tokens:].zero_()
+
+    def _ple_inforward_reference(self, hc, conv_states, ngram_pool, si_all, carry_all, qsl):
+        """`_INFORWARD_VALIDATE`: the PLE block over the chunk up to P and then over the tail,
+        as two context iterations run it, on copies of the step's pool rows."""
+        core = self.core
+        S = self._stack
+        step = self._step
+        split = step.inforward.split
+        num_tokens = step.num_tokens
+        live = split.live
+        main, cu_main, of_split = _inforward_reference_layout(split, num_tokens)
+        conv = conv_states.index_select(0, live).contiguous()
+        ngram = ngram_pool.index_select(0, live).contiguous()
+        idx = torch.arange(live.shape[0], dtype=si_all.dtype, device=si_all.device)
+        next_norm = self._layers[core.ple_layer].ahc_norm
+        hc_ref = torch.zeros_like(hc[:num_tokens])
+        normed_ref = torch.zeros_like(hc[:num_tokens])
+
+        def run(rows, cu, slots, carried):
+            n = rows.shape[0]
+            ids = step.input_ids.index_select(0, rows).contiguous()
+            cu = cu.to(qsl.dtype)
+            ng = ple_ngram_embed(
+                ids, ngram, slots, carried, cu, core.w["ple_table"], S.ple_tscale, S.ple_mult,
+                S.ple_vocab, S.ple_offs, core.eos_token_id, n,
+                row_window=_ple_window(core),
+            )  # fmt: skip
+            if _ple_needs_sum(core):
+                ng = core.tp_sum(ng)
+            o, nm = ple_gate_conv_inject_norm(
+                hc.index_select(0, rows).contiguous(),
+                cublas_mm(ng, S.ple_key),
+                cublas_mm(ng, S.ple_val),
+                S.ple_nk_w,
+                S.ple_nq_w,
+                S.ple_nc_w,
+                S.ple_conv_w,
+                conv,
+                slots,
+                cu,
+                next_norm,
+                core.eps,
+                core.hc_count,
+                _PLE_CLAMP_MIN,
+                core.ple_dilation,
+                _PAD_SLOT_ID,
+                n,
+                carried,
+            )
+            hc_ref.index_copy_(0, rows, o)
+            normed_ref.index_copy_(0, rows, nm)
+
+        run(main, cu_main, idx, carry_all)
+        conv_p, ngram_p = conv.clone(), ngram.clone()
+        run(
+            split.tail_tok,
+            split.cu_tail,
+            of_split.to(si_all.dtype),
+            torch.ones_like(carry_all[: split.k]),
+        )
+        return conv_p, ngram_p, conv, ngram, hc_ref, normed_ref, live, of_split
 
     def _splice(self, h) -> None:
         """Break: write the step's vision rows over their placeholder rows of the token
@@ -4410,6 +4776,7 @@ class PrefillTarget:
             fp8_pages=fp8_pages,
             nvfp4_context=nvfp4_context,
             live_cols=_live_score_columns(core, md, batch),
+            inforward=_inforward_split(md, mm, si_all, hi_all, pools),
         )
 
     def forward(
@@ -6801,6 +7168,12 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
     # decode-step prepare), validated there; off at every other layout.
     spec_decode_fast_paths: bool = False
     runtime_hooks: RuntimeHooks | None = None
+    # A context chunk that reaches the prompt end takes the Mamba snapshot before it inside
+    # the same forward: the GDN layers and the PLE layer split their state at the snapshot
+    # point (`PrefillTarget._gdn_inforward`, `_ple_block`). A positive value turns the path
+    # on in the cache manager; 1 leaves the fewest chunk tokens before the snapshot point at
+    # the manager's own floor (the GDN conv window and the PLE windows).
+    inforward_snapshot_min_main = 1
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
