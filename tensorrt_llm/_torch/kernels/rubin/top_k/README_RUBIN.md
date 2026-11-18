@@ -1,5 +1,7 @@
 # Rubin GVR dispatch and locality
 
+Rubin-specific dispatch, low-precision tuning and locality policies live in this directory. They reuse the shared GVR host and device kernels in `../../blackwell/top_k`; the shared host imports Rubin tuning lazily when dispatching SM107 inputs.
+
 ## Dispatch
 
 SM107 variable-length dispatch supports FP32, FP16 and BF16 with K=512/1024/2048. Selection depends on dtype, shape and SM resources. FP32 selects existing register, cluster and streaming kernels with capacity checks. FP16/BF16 select native code-radix and PCW options. Host option selection preserves the actual compilation target and device identity in cache keys.
@@ -27,7 +29,7 @@ Prepare and warm before capture. Resource discovery, ownership checks, compilati
 ```python
 import torch
 
-from tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_locality import PreparedRowTopK
+from tensorrt_llm._torch.kernels.rubin.top_k.gvr_topk_locality import PreparedRowTopK
 
 prepared = PreparedRowTopK(
     logits,

@@ -2547,14 +2547,23 @@ def _tallws_launcher(
 
 
 def _route_fp32_varlen(
-    num_rows: int, n: int, npad: int, k: int, num_sms: int, sm_version: int, *, det: bool = False, r_cap: int = 0
+    num_rows: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int,
+    sm_version: int,
+    *,
+    det: bool = False,
+    r_cap: int = 0,
 ) -> dict:
     """Apply Rubin tuning to FP32 variable-length dispatch."""
     if sm_version == 107 and not det and r_cap == 0:
-        try:
-            from .gvr_topk_rubin_dispatch import make_plan, select_tuning
-        except ImportError:
-            from gvr_topk_rubin_dispatch import make_plan, select_tuning
+        from tensorrt_llm._torch.kernels.rubin.top_k.gvr_topk_rubin_dispatch import (
+            make_plan,
+            select_tuning,
+        )
+
         tuning = select_tuning(num_rows, n, k, num_sms, sm_version)
         if tuning is not None:
             return make_plan(
@@ -2621,15 +2630,21 @@ def _varlen_launcher(
     hit = cache.get(key)
     if hit is not None:
         return hit
-    rubin_lowp = low and use_rubin_tuning and sm_version == 107 and k in (512, 1024, 2048)
+    lowp_tuning = None
     cluster_size = 1
-    if rubin_lowp:
-        # Select host options without changing the compilation target or cache identity.
-        sm_version = 100
     # The device envelope never exceeds the physical row stride. The router
     # needs a k+1 floor to select a family even when every row is short.
     n_kernel = min(n_env, npad)
     n_route = max(n_kernel, k + 1)
+    if low and use_rubin_tuning and sm_version == 107:
+        from tensorrt_llm._torch.kernels.rubin.top_k.gvr_topk_rubin_dispatch import (
+            select_lowp_tuning,
+        )
+
+        lowp_tuning = select_lowp_tuning(num_rows, n_kernel, npad, k, num_sms, sm_version)
+        if lowp_tuning is not None:
+            # Keep the actual compilation target and device profile in the cache key.
+            sm_version = lowp_tuning.sm_version
     cr_shift = 0 if cr == 1 else 2
     if _tallws_gate(num_rows, n_kernel, k, num_sms, sm_version, dtype, det):
         lc = _tallws_launcher(num_rows, npad, k, next_n, cr_shift, num_sms, dtype)
@@ -2657,9 +2672,7 @@ def _varlen_launcher(
         plan_free = _route_16bit(num_rows, n_route, npad, k, num_sms, sm_version, dtype=dtype)
     else:
         router = _route_fp32_varlen if use_rubin_tuning else route
-        plan_free = router(
-            num_rows, n_route, npad, k, num_sms, sm_version, det=det, r_cap=r_cap
-        )
+        plan_free = router(num_rows, n_route, npad, k, num_sms, sm_version, det=det, r_cap=r_cap)
         # Select host options without changing the compilation target.
         if plan_free.get("_rubin_blackwell_options", False):
             sm_version = 100
@@ -2746,8 +2759,8 @@ def _varlen_launcher(
     )
     if crc is not None:
         crc_blk, crc_vpt, crc_cs, crc_list = crc
-        if rubin_lowp and crc_blk == 512 and crc_cs == 16 and num_rows * crc_cs * 2 <= num_sms:
-            crc_blk, crc_vpt = 1024, crc_vpt // 2
+        if lowp_tuning is not None:
+            crc_blk, crc_vpt = lowp_tuning.crc_geometry(crc_blk, crc_vpt, crc_cs)
         crc_blk, crc_vpt, _ = _fit_row_window_16bit(crc_blk, crc_vpt, 1, n_kernel, crc_cs)
         fn = dev.get_compiled__reg(
             (crc_blk, crc_vpt, 1, 1, True, False, False, 1024),
@@ -2976,7 +2989,7 @@ def _varlen_launcher(
         if low:
             reg_options["cr2"] = bool(
                 dtype is torch.float16
-                and (not rubin_lowp or k != 2048 or num_rows > num_sms)
+                and (lowp_tuning is None or lowp_tuning.cr2)
                 and reg_options["code_radix"]
                 and sm_version in _TUNED_SM_VERSIONS
                 and (
@@ -3029,9 +3042,7 @@ def _varlen_launcher(
                 dtype is torch.bfloat16
                 and _REG_CODE_RADIX_FORCE is None
                 and plan_free["kernel"] == "reg"
-                and (
-                    npad % 64 == 0 or (rubin_lowp and n_kernel > 2048 and npad % 8 == 0)
-                )
+                and (lowp_tuning.pcw_aligned if lowp_tuning is not None else npad % 64 == 0)
                 and num_rows <= 64
                 and 2 * num_rows <= num_sms
                 and (
