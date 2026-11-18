@@ -18,7 +18,7 @@ context_servers:
     dtype: fp8
   disable_overlap_scheduler: true
   moe_config:
-    backend: TRTLLM
+    tactic: trtllm_gen
   cuda_graph_config: null
   print_iter_log: true
   cache_transceiver_config:
@@ -41,7 +41,7 @@ generation_servers:
     dtype: fp8
   disable_overlap_scheduler: true
   moe_config:
-    backend: TRTLLM
+    tactic: trtllm_gen
   cuda_graph_config:
     enable_padding: true
     batch_sizes:
