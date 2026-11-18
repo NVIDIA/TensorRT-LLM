@@ -347,21 +347,36 @@ async def test_encoder_capability_discovery_is_typed_and_role_specific(role, bac
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("late", [False, True])
-async def test_encode_export_release_failure_withdraws_readiness(tmp_path, monkeypatch, late):
+@pytest.mark.parametrize("cancel_path", ["context", "late", "during_release"])
+async def test_encode_export_release_failure_withdraws_readiness(
+    tmp_path, monkeypatch, cancel_path
+):
     llm, _ = model()
     llm.args = SimpleNamespace(mm_encoder_only=True, guided_decoding_backend=None)
     llm.tokenizer = None
     llm._check_health = lambda: True
-    released = []
+    result, _source_tensors = native_result()
+    params = result.disaggregated_params
+    expected = [
+        *params.multimodal_embedding_handles,
+        params.mrope_position_ids_handle,
+        params.mrope_position_deltas_handle,
+    ]
+    released, completed = [], []
+    entered, release_finished = asyncio.Event(), asyncio.Event()
+    allow_release = threading.Event()
+    if cancel_path != "during_release":
+        allow_release.set()
+    loop = asyncio.get_running_loop()
+    original_release = SharedTensorContainer.release_dict
 
     class Handle:
         error = None
         finished = True
-        disaggregated_params = None
+        disaggregated_params = params
 
         async def __aiter__(self):
-            if late:
+            if cancel_path == "late":
                 raise asyncio.CancelledError
             yield self
 
@@ -380,28 +395,70 @@ async def test_encode_export_release_failure_withdraws_readiness(tmp_path, monke
         lambda *args: SimpleNamespace(media=(), inputs="prompt"),
     )
 
-    def release(result):
-        released.append(result)
-        return False
+    def release(export):
+        released.append(export)
+        if export == expected[0]:
+            loop.call_soon_threadsafe(entered.set)
+            assert allow_release.wait(5)
+            raise RuntimeError("release failed")
+        original_release(export)
+        completed.append(export)
+        if export == expected[-1]:
+            loop.call_soon_threadsafe(release_finished.set)
 
-    monkeypatch.setattr(servicer, "release_encoder_result", release)
+    monkeypatch.setattr(SharedTensorContainer, "release_dict", release)
     inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
     req = request()
     req.encoder.encode_only.SetInParent()
     context = FakeServicerContext()
-    context.is_cancelled = not late
-    if late:
-        with pytest.raises(asyncio.CancelledError):
-            _ = [value async for value in inference.Generate(req, context)]
-    else:
-        _ = [value async for value in inference.Generate(req, context)]
-    assert released and all(result is handle for result in released)
-    assert inference._encoder_cleanup_failed
-    control = OpenEngineControlServicer(llm, "qwen", inference)
-    assert not control._engine_is_healthy()
-    with pytest.raises(AbortError, match="cleanup failed"):
-        _ = [value async for value in inference.Generate(req, FakeServicerContext())]
-    assert not inference.active_request_count() and not inference._encoder_cleanup_tasks
+    context.is_cancelled = cancel_path != "late"
+
+    async def consume():
+        return [value async for value in inference.Generate(req, context)]
+
+    rpc = asyncio.create_task(consume())
+    drain = None
+    try:
+        if cancel_path == "during_release":
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            assert params.multimodal_embedding_handles is None
+            assert params.mrope_position_ids_handle is None
+            assert params.mrope_position_deltas_handle is None
+            rpc.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(rpc, timeout=2)
+            drain = asyncio.create_task(inference.drain_encoder_cleanup())
+            await asyncio.sleep(0)
+            assert not drain.done()
+            assert not completed
+            allow_release.set()
+            await asyncio.wait_for(drain, timeout=5)
+        elif cancel_path == "late":
+            with pytest.raises(asyncio.CancelledError):
+                await rpc
+        else:
+            await rpc
+        assert released == expected
+        assert completed == expected[1:]
+        assert inference._encoder_cleanup_failed
+        control = OpenEngineControlServicer(llm, "qwen", inference)
+        assert not control._engine_is_healthy()
+        with pytest.raises(AbortError, match="cleanup failed"):
+            _ = [value async for value in inference.Generate(req, FakeServicerContext())]
+        assert not inference.active_request_count() and not inference._encoder_cleanup_tasks
+    finally:
+        allow_release.set()
+        if not rpc.done():
+            rpc.cancel()
+        await asyncio.gather(rpc, return_exceptions=True)
+        if drain is not None:
+            await drain
+        await inference.drain_encoder_cleanup()
+        if released:
+            await asyncio.wait_for(release_finished.wait(), timeout=5)
+        for export in expected:
+            if export not in completed:
+                original_release(export)
 
 
 @pytest.mark.asyncio

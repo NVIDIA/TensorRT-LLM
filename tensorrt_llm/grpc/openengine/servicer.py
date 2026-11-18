@@ -746,9 +746,6 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 if prefill_exports is not None and prefill_exports.has_exports(result):
                     await self._run_encoder_cleanup(release_prefill_result(result))
                 if context.cancelled():
-                    if encoder_action == "encode":
-                        if not await asyncio.to_thread(release_encoder_result, result):
-                            self._encoder_cleanup_failed = True
                     abort_request("RPC cancelled")
                     return
                 if encoder_action == "encode" and not result.error:
