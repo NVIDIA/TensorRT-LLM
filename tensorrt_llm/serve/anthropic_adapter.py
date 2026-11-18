@@ -64,6 +64,7 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicUsage,
     anthropic_sse,
 )
+from tensorrt_llm.serve.disagg_request_deadline import DisaggRequestTimeoutError
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -1304,9 +1305,9 @@ async def reframe_openai_stream(
         raise AnthropicResponseError(
             "Upstream stream ended before [DONE]; the response is incomplete"
         )
-    except AnthropicResponseError as e:
+    except (AnthropicResponseError, DisaggRequestTimeoutError) as e:
         # Raised only on upstream framing this module can describe precisely,
-        # so the text originates here and carries no internal detail: pass it
+        # or the serving deadline, so the text carries no internal detail: pass it
         # through rather than flattening it to a generic message.
         logger.error(f"Anthropic stream failed: {e}")
         for frame in reframer.error(str(e)):

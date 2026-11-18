@@ -42,6 +42,7 @@ from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.async_utils import drain_cleanup
 from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
@@ -840,13 +841,36 @@ class OpenAIHttpClient(OpenAIClient):
         success: bool = True,
         req_id: Optional[int] = None,
     ) -> None:
+        """Release routing bookkeeping before propagating waiter cancellation.
+
+        Args:
+            request: Request whose HTTP leg has finished.
+            success: Whether the worker returned successfully.
+            req_id: Original routing reservation ID, when explicitly assigned.
+
+        Raises:
+            asyncio.CancelledError: The waiter was cancelled, after release.
+        """
         self._metrics_collector.completed_requests.inc()
         if req_id is None:
-            await self._router.finish_request(request, self._session, success=success)
+            release = self._router.finish_request(request, self._session, success=success)
         else:
-            await self._router.finish_request(
+            release = self._router.finish_request(
                 request, self._session, success=success, req_id=req_id
             )
+        # The router may wait for a lock even after the HTTP work has ended.
+        # Keep an owner for release when the request deadline cancels this waiter.
+        cleanup = asyncio.gather(release, return_exceptions=True)
+        cancelled = await drain_cleanup(cleanup)
+        error = cleanup.result()[0]
+        if isinstance(error, BaseException):
+            if not cancelled:
+                raise error
+            asyncio.get_running_loop().call_exception_handler(
+                {"message": "Router release failed during request cancellation", "exception": error}
+            )
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def shutdown(self) -> None:
         await self._session.close()
