@@ -9,7 +9,11 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native import transfer
-from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import BindingsNixlTransferAgent
+from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import (
+    BindingsNixlTransferAgent,
+    BindingsNixlTransferStatus,
+    TransferState,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -49,7 +53,6 @@ def make_worker():
         instance_name="prefill", instance_rank=5, transfer_engine_info=b"old-descriptor"
     )
     worker._registered_mem = [object(), object()]
-    worker._agent_recovery_retry_at = 0.0
     worker._agent_recovery_lock = threading.Lock()
     worker._agent_recovery_stop = threading.Event()
     worker._agent_recovery_thread = None
@@ -147,6 +150,71 @@ def test_failed_release_retains_physical_owner_until_agent_shutdown():
         assert pending.result(timeout=2)[0] is False
     assert task._native_inflight == 0
     assert sender._unreleased_statuses == []
+
+
+def test_stalled_sibling_drains_for_recovery():
+    worker = make_worker()
+    sender = worker._sender
+    sender._agent_failed = False
+    entered, failure_reported = threading.Event(), threading.Event()
+
+    def stalled_wait(timeout_ms):
+        assert 0 <= timeout_ms <= 100
+        entered.set()
+        assert failure_reported.wait(2)
+        return TransferState.IN_PROGRESS
+
+    stalled_native, failed_native = Mock(), Mock()
+    stalled_native.wait.side_effect = stalled_wait
+    failed_native.wait.return_value = TransferState.FAILURE
+    for native in (stalled_native, failed_native):
+        native.release.return_value = True
+    sender._agent.submit_transfer_requests.side_effect = [
+        BindingsNixlTransferStatus(stalled_native),
+        BindingsNixlTransferStatus(failed_native),
+    ]
+
+    def recover(generation):
+        failure_reported.set()
+        worker._recover_transfer_agent(generation)
+
+    sender._recover_agent.side_effect = recover
+    old_agent = worker._agent
+    task = make_task()
+
+    def shutdown():
+        assert task._native_inflight == 1
+
+    old_agent.shutdown.side_effect = shutdown
+    replacement = Mock()
+    replacement.get_local_agent_desc.return_value = b"new-descriptor"
+    with patch.object(transfer, "_create_nixl_agent", return_value=replacement):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            stalled = pool.submit(
+                sender._submit_transfer, task, 11, make_request(), agent_generation=0
+            )
+            try:
+                assert entered.wait(2)
+                assert not sender._submit_transfer(
+                    make_task(), 11, make_request(), agent_generation=0
+                )[0]
+                assert not stalled.result(timeout=2)[0]
+            finally:
+                failure_reported.set()
+    old_agent.shutdown.assert_called_once()
+    assert task._native_inflight == 0
+    assert sender._agent_generation == 1
+    assert not sender._agent_failed
+
+
+@pytest.mark.parametrize("terminal", [TransferState.SUCCESS, TransferState.FAILURE])
+def test_interruptible_wait_polls_until_terminal(terminal):
+    native = Mock()
+    native.wait.side_effect = [TransferState.IN_PROGRESS, terminal]
+    status = BindingsNixlTransferStatus(native)
+    assert status.wait(stop_requested=lambda: False) == (terminal == TransferState.SUCCESS)
+    assert native.wait.call_count == 2
+    assert all(call.args == (100,) for call in native.wait.call_args_list)
 
 
 def test_concurrent_errors_rebuild_one_agent_and_restore_registered_regions():

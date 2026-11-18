@@ -10342,9 +10342,10 @@ class PyExecutor:
         local_ids = [
             req.py_request_id for req in scheduled_batch.failed_requests
         ]
-        # Every scheduling rank votes, including ranks with no local failure.
-        # A failed request must not run on another replica after its pages free.
-        if self.dist.cp_size > 1:
+        # Include every pipeline stage before any rank frees request state.
+        if self.dist.pp_size > 1:
+            votes = self.dist.allgather(local_ids)
+        elif self.dist.cp_size > 1:
             votes = self.dist.tp_cp_allgather(local_ids)
         elif self.dist.tp_size > 1:
             votes = self.dist.tp_allgather(local_ids)

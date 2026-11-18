@@ -15,6 +15,7 @@
 
 import os
 import time
+from collections.abc import Callable
 
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
@@ -45,12 +46,25 @@ class BindingsNixlTransferStatus(TransferStatus):
         return self._cpp_status.is_completed()
 
     @nvtx_range("BindingsNixlTransferStatus.wait")
-    def wait(self, timeout_ms=None) -> bool:
+    def wait(self, timeout_ms=None, *, stop_requested: Callable[[], bool] | None = None) -> bool:
         """Wait for transfer to complete (releases GIL)."""
         start_time = time.time()
         if timeout_ms is None:
             timeout_ms = -1
-        result = self._cpp_status.wait(timeout_ms)
+        if stop_requested is None:
+            result = self._cpp_status.wait(timeout_ms)
+        else:
+            deadline = None if timeout_ms < 0 else time.monotonic() + timeout_ms / 1000
+            result = TransferState.IN_PROGRESS
+            while not stop_requested():
+                poll_ms = 100
+                if deadline is not None:
+                    poll_ms = max(0, min(poll_ms, int((deadline - time.monotonic()) * 1000)))
+                result = self._cpp_status.wait(poll_ms)
+                if result != TransferState.IN_PROGRESS or (
+                    deadline is not None and time.monotonic() >= deadline
+                ):
+                    break
         if result != TransferState.SUCCESS:
             logger.error(
                 f"NIXL (cpp binding) wait returned non-SUCCESS state={result} "

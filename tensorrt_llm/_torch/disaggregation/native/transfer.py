@@ -1095,9 +1095,9 @@ class Sender(SenderBase):
         agent_generation: Optional[int],
     ) -> tuple[bool, Optional[str]]:
         recover = self._recover_agent
+        assert recover is not None
         retirement_event = None
-        gate = self._agent_operation_gate.transfer() if recover is not None else nullcontext()
-        with gate:
+        with self._agent_operation_gate.transfer():
             generation = self._agent_generation
             if agent_generation is not None and agent_generation != generation:
                 return False, "transfer belongs to a retired NIXL agent generation"
@@ -1107,9 +1107,8 @@ class Sender(SenderBase):
                 for index, member in enumerate(requests):
                     status = None
                     retired = True
-                    if recover is not None:
-                        with task.lock:
-                            task._native_inflight += 1
+                    with task.lock:
+                        task._native_inflight += 1
                     try:
                         if member.op == TransferOp.WRITE and not self._agent.check_remote_descs(
                             member.remote_name, member.dst_descs
@@ -1119,31 +1118,35 @@ class Sender(SenderBase):
                         if index == 0 and on_submitted is not None:
                             with disagg_diagnostics.suppress_diagnostic_errors():
                                 on_submitted()
-                        completed = status.wait()
+                        # A failed sibling must be able to drain this gate before
+                        # rebuilding the agent, even if this handle stays IN_PROG.
+                        completed = status.wait(stop_requested=lambda: self._agent_failed)
                         if not completed:
                             detail = getattr(status, "last_status_str", lambda: None)()
                     except RuntimeError as error:
                         completed, detail = False, str(error)
                     finally:
-                        if recover is not None and status is not None:
+                        if status is not None:
                             try:
                                 retired = status.release()
                             except RuntimeError:
                                 retired = False
+                            # An interrupted wait is not a terminal backend result.
+                            if not completed and self._agent_failed:
+                                retired = False
                         if not retired:
                             retirement_event = threading.Event()
                             self._unreleased_statuses.append((status, task, retirement_event))
-                            completed, detail = False, "NIXL request handle retirement failed"
-                        if recover is not None and retired:
+                            completed, detail = False, "NIXL request awaits agent teardown"
+                        if retired:
                             with task.lock:
                                 task._native_inflight -= 1
                         # Group members retire before the next member can submit.
                         del status
                     if not completed:
-                        if recover is not None:
-                            self._agent_failed = True
+                        self._agent_failed = True
                         break
-        if not completed and recover is not None:
+        if not completed:
             recover(generation)
         if retirement_event is not None:
             # FAILED permits destination reuse, so backend teardown must precede it.
@@ -2128,12 +2131,7 @@ class Sender(SenderBase):
             if getattr(self, "_recover_agent", None) is None:
                 self._agent.load_remote_agent(agent_name, ri.transfer_engine_info)
             else:
-                gate = (
-                    self._agent_operation_gate.metadata()
-                    if self._recover_agent is not None
-                    else nullcontext()
-                )
-                with gate:
+                with self._agent_operation_gate.metadata():
                     if self._agent_failed:
                         self._remote_agent_descriptors[agent_name] = ri.transfer_engine_info
                         self._loaded_remote_agents.add(agent_name)
@@ -5202,7 +5200,6 @@ class TransferWorker:
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
-            self._agent_recovery_retry_at = 0.0
             self._agent_recovery_lock = threading.Lock()
             self._agent_recovery_stop = threading.Event()
             self._agent_recovery_thread: Optional[threading.Thread] = None
@@ -5266,7 +5263,7 @@ class TransferWorker:
         with sender._loaded_remote_agents_lock, sender._agent_operation_gate.metadata():
             if failed_generation != sender._agent_generation or not sender._agent_failed:
                 return True
-            if sender._shutdown_requested or time.monotonic() < self._agent_recovery_retry_at:
+            if sender._shutdown_requested:
                 return False
             with receiver._sessions_lock:
                 if receiver._sessions:
@@ -5299,7 +5296,6 @@ class TransferWorker:
                         agent.shutdown()
                         raise
                 except Exception as error:
-                    self._agent_recovery_retry_at = time.monotonic() + 1.0
                     logger.error(f"NIXL agent recovery failed; new sends remain fenced: {error}")
                     return False
                 self._agent = sender._agent = receiver._agent = agent
