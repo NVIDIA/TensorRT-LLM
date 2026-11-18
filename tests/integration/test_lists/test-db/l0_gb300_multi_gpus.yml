@@ -164,3 +164,5 @@ l0_gb300_multi_gpus:
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_pass_graph[world2]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_encoder_pass_graph[world2]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_breakable_prefill_cuda_graph TIMEOUT (60)
+  # NVFP4 DSpark attention-DP4 gate with FP8 Engram tables (pre-merge runs the MXFP4-table export).
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)
