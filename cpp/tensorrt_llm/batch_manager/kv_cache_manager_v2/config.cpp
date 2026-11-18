@@ -53,6 +53,8 @@ void BufferConfig::validate() const
         "BufferConfig: tokensPerBlockOverride is not supported on a sparse buffer; use the layer's "
         "sparse_cache.unit_tokens");
     TLLM_CHECK_WITH_INFO(sparseUnitChunks > 0, "BufferConfig: sparseUnitChunks must be positive");
+    TLLM_CHECK_WITH_INFO(sparseWriteBackGranularity >= 0 && (isSparse || sparseWriteBackGranularity == 0),
+        "BufferConfig: sparseWriteBackGranularity must be nonnegative and requires a sparse buffer");
 }
 
 void RegionConfig::validate() const

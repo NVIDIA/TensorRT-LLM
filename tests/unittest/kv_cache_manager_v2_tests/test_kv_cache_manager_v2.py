@@ -807,12 +807,16 @@ class TestSparseBufferConfig(unittest.TestCase):
         plain = BufferConfig("key", 4096)
         self.assertFalse(plain.is_sparse)
         self.assertEqual(plain.sparse_unit_chunks, 1)
+        self.assertEqual(plain.sparse_write_back_granularity, 0)
 
-        buffer = BufferConfig("key", 4096, is_sparse=True, sparse_unit_chunks=4)
+        buffer = BufferConfig(
+            "key", 4096, is_sparse=True, sparse_unit_chunks=4, sparse_write_back_granularity=4
+        )
         copied = deepcopy(buffer)
         buffer.sparse_unit_chunks = 1
         self.assertEqual(copied.sparse_unit_chunks, 4)
         self.assertTrue(copied.is_sparse)
+        self.assertEqual(copied.sparse_write_back_granularity, 4)
 
         cache = SparseCacheConfig(num_selected_blocks=16, max_cached_units=64, unit_tokens=4)
         copied_cache = deepcopy(cache)
@@ -2118,38 +2122,40 @@ class TestSparseUnitCopy(unittest.TestCase):
 
     def test_chunked_layout_follows_the_strides(self):
         # Two heads: a unit is two runs, chunk_stride apart on both sides.
-        chunk, chunks, units = 16, 2, 2
-        chunk_stride = chunk * units
-        page_stride = chunk_stride * chunks
-        host = self._pattern(page_stride)
-        result = _introspection.sparse_unit_copy(
-            host_pool=host,
-            host_page_stride=page_stride,
-            page_table=[0],
-            device_arena=[0] * (page_stride),
-            base_cell=0,
-            num_blocks=1,
-            cells_per_buffer=1,
-            buffer_bytes=page_stride,
-            num_chunks=chunks,
-            chunk_bytes=chunk,
-            chunk_stride=chunk_stride,
-            unit_stride=chunk,
-            expansion=units,
-            miss_ordinal=[1],
-            miss_slot=[1],
-            miss_count=[1],
-            selection_width=1,
-            buffer_layer=list(range(1)),
-        )
-        # Unit 1 of each chunk moves to unit 1 of the same chunk, verbatim.
-        for c in range(chunks):
-            base = c * chunk_stride + chunk
-            self.assertEqual(result[base : base + chunk], host[base : base + chunk])
-        # Unit 0 of each chunk was not selected.
-        for c in range(chunks):
-            base = c * chunk_stride
-            self.assertEqual(result[base : base + chunk], [0] * chunk)
+        chunks, units = 2, 2
+        for chunk in (16, 16384):
+            with self.subTest(chunk_bytes=chunk):
+                chunk_stride = chunk * units
+                page_stride = chunk_stride * chunks
+                host = self._pattern(page_stride)
+                result = _introspection.sparse_unit_copy(
+                    host_pool=host,
+                    host_page_stride=page_stride,
+                    page_table=[0],
+                    device_arena=[0] * (page_stride),
+                    base_cell=0,
+                    num_blocks=1,
+                    cells_per_buffer=1,
+                    buffer_bytes=page_stride,
+                    num_chunks=chunks,
+                    chunk_bytes=chunk,
+                    chunk_stride=chunk_stride,
+                    unit_stride=chunk,
+                    expansion=units,
+                    miss_ordinal=[1],
+                    miss_slot=[1],
+                    miss_count=[1],
+                    selection_width=1,
+                    buffer_layer=list(range(1)),
+                )
+                # Unit 1 of each chunk moves to unit 1 of the same chunk, verbatim.
+                for c in range(chunks):
+                    base = c * chunk_stride + chunk
+                    self.assertEqual(result[base : base + chunk], host[base : base + chunk])
+                # Unit 0 of each chunk was not selected.
+                for c in range(chunks):
+                    base = c * chunk_stride
+                    self.assertEqual(result[base : base + chunk], [0] * chunk)
 
     def test_layers_land_in_their_own_sub_slot(self):
         # A cold page concatenates two layers' buffers; the cache cell is derived.
@@ -4089,7 +4095,14 @@ class TestSparseDataPath(unittest.TestCase):
         init_cuda_once()
 
     @classmethod
-    def _manager(cls) -> KVCacheManager:
+    def _manager(
+        cls,
+        *,
+        include_partial_units: bool = False,
+        chunks: int = 1,
+        buffer_bytes: int | None = None,
+        write_back_granularity: int = 1,
+    ) -> KVCacheManager:
         return KVCacheManager(
             KVCacheManagerConfig(
                 tokens_per_block=cls.TPB,
@@ -4103,8 +4116,12 @@ class TestSparseDataPath(unittest.TestCase):
                         [
                             BufferConfig(
                                 "key",
-                                cls.BUF,
+                                cls.BUF if buffer_bytes is None else buffer_bytes,
                                 is_sparse=True,
+                                sparse_unit_chunks=chunks,
+                                sparse_write_back_granularity=write_back_granularity
+                                if include_partial_units
+                                else 0,
                             ),
                             # A pool group is sized from its device-backed pools, so a sparse layer
                             # carries one. This is also the shape a model uses: an indexer and the
@@ -4115,6 +4132,7 @@ class TestSparseDataPath(unittest.TestCase):
                             num_selected_blocks=cls.SELECTED,
                             max_cached_units=cls.CELLS,
                             unit_tokens=cls.TPB,
+                            include_partial_units=include_partial_units,
                         ),
                     )
                 ],
@@ -4130,6 +4148,77 @@ class TestSparseDataPath(unittest.TestCase):
         except ImportError:  # pragma: no cover - fast mode without torch
             raise unittest.SkipTest("torch and the CUDA bindings are needed to address raw memory")
         return ctypes, cudart, torch
+
+    def test_partial_flush_preserves_unmodified_token_groups(self) -> None:
+        """A flush copies only touched token groups within every head."""
+        ctypes, cudart, torch = self._deps()
+        for chunks, token_bytes, token_offset, grain in itertools.product(
+            (1, 2, 4), (1, 2, 8, 16, 128), (0, 37, self.TPB - 1), (1, 4)
+        ):
+            with self.subTest(
+                chunks=chunks, token_bytes=token_bytes, token_offset=token_offset, grain=grain
+            ):
+                size = chunks * self.TPB * token_bytes
+                manager = self._manager(
+                    include_partial_units=True,
+                    chunks=chunks,
+                    buffer_bytes=size,
+                    write_back_granularity=grain,
+                )
+                cache = None
+                try:
+                    group = manager.get_layer_group_id(0)
+                    pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+                    stride = manager.get_page_stride(LayerId(0), "key")
+                    cache = manager.create_kv_cache()
+                    with TemporaryCudaStream([]) as stream:
+                        handle = cast(CudaStream, stream.handle)
+                        self.assertTrue(cache.resume(handle))
+                        history = self.TPB + token_offset
+                        self.assertTrue(cache.resize(history + 1, history))
+                        pages = [int(x) for x in cache.get_base_page_indices(group)]
+                        address = pool + pages[1] * stride
+                        initial = self._pattern(size, 7)
+                        replacement = self._pattern(size, 11)
+                        ctypes.memmove(address, initial, size)
+                        batch = Batch(
+                            manager,
+                            handle,
+                            max_batch_size=1,
+                            max_blocks_per_seq=8,
+                            index_tables=manager.sparse_index_table_specs(),
+                        )
+                        batch.add_kv_cache(cache)
+                        batch.publish()
+                        out = torch.full((1, 1), BAD_PAGE_INDEX, dtype=torch.int32, device="cuda")
+                        batch.prepare_sparse_write_indices([BufferId(0, "key")], out, handle)
+                        torch.cuda.synchronize()
+                        arena = int(batch.get_sparse_cache_base_address(LayerId(0), "key"))
+                        source = (ctypes.c_ubyte * size).from_buffer_copy(replacement)
+                        (err,) = cudart.cudaMemcpy(
+                            arena + int(out[0, 0]) * size,
+                            ctypes.addressof(source),
+                            size,
+                            cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                        )
+                        self.assertEqual(int(err), 0)
+                        batch.wait_published()
+                        batch.flush_sparse_units([history + 1])
+                        self.assertTrue(cache.resize(history + 1, history + 1))
+                        torch.cuda.synchronize()
+                        expected = bytearray(initial)
+                        for chunk in range(chunks):
+                            start = (chunk * self.TPB + token_offset // grain * grain) * token_bytes
+                            expected[start : start + token_bytes * grain] = replacement[
+                                start : start + token_bytes * grain
+                            ]
+                        actual = ctypes.string_at(address, size)
+                        batch.remove_kv_cache(cache)
+                        self.assertEqual(actual, bytes(expected))
+                finally:
+                    if cache is not None:
+                        cache.close()
+                    manager.shutdown()
 
     @staticmethod
     def _pattern(size: int, seed: int) -> bytes:

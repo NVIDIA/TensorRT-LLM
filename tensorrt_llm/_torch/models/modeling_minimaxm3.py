@@ -1583,6 +1583,7 @@ class MiniMaxM3Attention(Attention):
         caches receive packed E2M1 K/V plus their E4M3 SF16 scale bytes while
         Q, index-Q, and index-K remain FP8.
         """
+        offload_state = getattr(attn_metadata, "sparse_offload_state", None)
         if (
             not self.enable_fused_qkv_index_projection
             or not isinstance(self.attn, MiniMaxM3MsaSparseAttention)
@@ -1590,7 +1591,7 @@ class MiniMaxM3Attention(Attention):
             or self.attn.indexer_kv_dtype != "fp8"
             or packed.dtype != torch.bfloat16
             or position_ids is None
-            or getattr(attn_metadata, "sparse_offload_state", None) is not None
+            or (offload_state is not None and self.main_kv_is_nvfp4)
         ):
             return None
         kv_cache_manager = attn_metadata.kv_cache_manager
@@ -1609,7 +1610,14 @@ class MiniMaxM3Attention(Attention):
             buffers, index_k_cache, scale_buffers, out_cache_loc = cache_tensors
         if out_cache_loc is None:
             return None
-        plan = self._fused_producer_plan(buffers, index_k_cache, scale_buffers, out_cache_loc)
+        offload = (
+            offload_state is not None
+            and kv_cache_manager is not None
+            and kv_cache_manager.offloads_layer(self.layer_idx)
+        )
+        plan = self._fused_producer_plan(
+            buffers, index_k_cache, scale_buffers, out_cache_loc, offload=offload
+        )
         if plan is None:
             return None
         num_tokens = int(packed.shape[0])
@@ -1617,6 +1625,14 @@ class MiniMaxM3Attention(Attention):
             return None
         kv_quant_scale, static_args = plan
         positions = position_ids.reshape(-1).contiguous().to(torch.int32)
+        index_out_cache_loc = None
+        if offload:
+            from ..attention.backends.sparse.minimax_m3.kernels.offload import prepare_write_slots
+
+            index_out_cache_loc = out_cache_loc[:num_tokens]
+            kv_cache_manager.prepare_sparse_write_indices(offload_state, self.layer_idx)
+            prepare_write_slots(offload_state, self.layer_idx, attn_metadata.msa_sparse_write_slots)
+            out_cache_loc = attn_metadata.msa_sparse_write_slots
         if scale_buffers is not None:
             q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
                 packed.contiguous(),
@@ -1636,6 +1652,7 @@ class MiniMaxM3Attention(Attention):
                 out_cache_loc[:num_tokens],
                 *static_args,
                 positions,
+                index_out_cache_loc=index_out_cache_loc,
             )
         return q.flatten(1), index_q.flatten(1)
 
@@ -1645,6 +1662,8 @@ class MiniMaxM3Attention(Attention):
         index_k_cache: torch.Tensor,
         scale_buffers: Optional[torch.Tensor],
         out_cache_loc: torch.Tensor,
+        *,
+        offload: bool = False,
     ) -> Optional[Tuple[Optional[torch.Tensor], tuple]]:
         """Resolve the horizontal producer's per-layer-invariant inputs once.
 
@@ -1653,9 +1672,9 @@ class MiniMaxM3Attention(Attention):
         weights and epsilons) is fixed for a given set of cache views and
         parameters, so the checks run once per distinct set and the resolved
         arguments are reused. The key is the address and layout (shape, strides,
-        dtype, device) of every tensor involved plus the norm epsilons: a
-        reloaded parameter or a new cache manager starts a fresh entry, even
-        when it reuses freed memory.
+        dtype, device) of every tensor involved plus the norm epsilons and
+        whether the main cache is an offload arena: a reloaded parameter or a
+        new cache manager starts a fresh entry, even when it reuses freed memory.
         The plan holds the kernel's static arguments only; the cache views
         themselves are passed per call. Returns ``None`` when the fused producer
         does not apply.
@@ -1672,6 +1691,7 @@ class MiniMaxM3Attention(Attention):
             getattr(self.qkv_proj, "inv_kv_scales", None) if scale_buffers is not None else None
         )
         key = (
+            offload,
             _tensor_view_key(buffers),
             _tensor_view_key(index_k_cache),
             _tensor_view_key(scale_buffers),
@@ -1691,7 +1711,13 @@ class MiniMaxM3Attention(Attention):
         if len(cache) >= _MAX_FUSED_PRODUCER_PLANS:
             cache.clear()
         plan = self._resolve_fused_producer_plan(
-            buffers, index_k_cache, scale_buffers, out_cache_loc, rotary_cos_sin, kv_quant_scale
+            buffers,
+            index_k_cache,
+            scale_buffers,
+            out_cache_loc,
+            rotary_cos_sin,
+            kv_quant_scale,
+            offload=offload,
         )
         cache[key] = plan
         return plan
@@ -1704,6 +1730,8 @@ class MiniMaxM3Attention(Attention):
         out_cache_loc: torch.Tensor,
         rotary_cos_sin: Optional[torch.Tensor],
         kv_quant_scale: Optional[torch.Tensor],
+        *,
+        offload: bool = False,
     ) -> Optional[Tuple[Optional[torch.Tensor], tuple]]:
         """Validate the producer's static inputs; see :meth:`_fused_producer_plan`."""
         rope = self.pos_embd_params.rope if self.pos_embd_params is not None else None
@@ -1762,7 +1790,14 @@ class MiniMaxM3Attention(Attention):
                 and buffers.stride(3) == 128
                 and buffers.stride(2) == 128 * 128
                 and buffers.stride(1) >= self.num_key_value_heads * buffers.stride(2)
-                and buffers.stride(0) >= 2 * buffers.stride(1)
+                and (
+                    buffers.stride(0) >= 2 * buffers.stride(1)
+                    or (
+                        offload
+                        and buffers.stride(0) == self.num_key_value_heads * buffers.stride(2)
+                        and buffers.stride(1) % buffers.stride(0) == 0
+                    )
+                )
                 and buffers.stride(0) % 4 == 0
                 and buffers.stride(1) % 4 == 0
             )
@@ -1778,7 +1813,7 @@ class MiniMaxM3Attention(Attention):
             and index_k_cache.stride(0) % 4 == 0
             and index_k_cache.stride(1) % 4 == 0
             and buffers is not None
-            and index_k_cache.shape[0] == buffers.shape[0]
+            and (offload or index_k_cache.shape[0] == buffers.shape[0])
         )
         supported_rope_cache = (
             rotary_cos_sin.is_cuda

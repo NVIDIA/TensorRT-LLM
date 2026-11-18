@@ -635,18 +635,18 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     }
 }
 
-//! Copy `bytes` from `src` to `dst` with one warp, `sizeof(Vec)` at a time.
+//! Copy `bytes` cooperatively, `sizeof(Vec)` per thread at a time.
 //!
 //! The width is the launcher's choice, made from the layout and the addresses it produces,
 //! so there is no alignment test here and no tail: `bytes` divides by `sizeof(Vec)` and both
 //! pointers are aligned to it.
-template <typename Vec>
-__device__ inline void copyChunkWarp(char* dst, char const* src, uint32_t bytes, uint32_t lane)
+template <typename Vec, uint32_t kCopyThreads>
+__device__ inline void copyChunk(char* dst, char const* src, uint32_t bytes, uint32_t lane)
 {
     auto* out = reinterpret_cast<Vec*>(dst);
     auto const* in = reinterpret_cast<Vec const*>(src);
     uint32_t const count = bytes / static_cast<uint32_t>(sizeof(Vec));
-    for (uint32_t i = lane; i < count; i += kWarpSize)
+    for (uint32_t i = lane; i < count; i += kCopyThreads)
     {
         out[i] = in[i];
     }
@@ -656,11 +656,13 @@ __device__ inline void copyChunkWarp(char* dst, char const* src, uint32_t bytes,
 //!
 //! Split from the kernel so the width is switched on once per block: one launch covers
 //! every pool, so there is no per-pool launch to template.
-template <typename Vec>
-__device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc const& desc, int32_t list, int32_t first)
+template <typename Vec, uint32_t kCopyThreads>
+__device__ void copySparseUnitsImpl(
+    SparseUnitCopyArgs const& args, SparseCopyDesc const& desc, int32_t list, int32_t globalWarp)
 {
-    uint32_t const lane = threadIdx.x % kWarpSize;
-    int32_t const stride = static_cast<int32_t>(gridDim.x) * kWarpsPerCopyCta;
+    int32_t const first = globalWarp / static_cast<int32_t>(kCopyThreads / kWarpSize);
+    uint32_t const lane = threadIdx.x % kCopyThreads;
+    int32_t const stride = static_cast<int32_t>(gridDim.x) * static_cast<int32_t>(kThreads / kCopyThreads);
     auto const listBase = static_cast<ptrdiff_t>(list) * args.work.capacity;
     int32_t const count = args.work.total != nullptr ? args.work.total[list] : args.work.capacity;
 
@@ -709,16 +711,50 @@ __device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc c
         char const* src = fetching ? cold : hot;
         char* dst = fetching ? hot : cold;
 
+        uint32_t firstByte = 0;
+        uint32_t bytes = desc.layout.chunkBytes;
+        if (!fetching && args.fromTokens != nullptr && desc.writeBackGranularity != 0)
+        {
+            int32_t const unitStart = ordinal * args.unitTokens;
+            int32_t const firstToken = max(0, args.fromTokens[row] - unitStart);
+            int32_t const lastToken = min(args.unitTokens, args.toTokens[row] - unitStart);
+            if (firstToken >= lastToken)
+            {
+                continue;
+            }
+            int32_t const grain = desc.writeBackGranularity;
+            int32_t const firstGroup = firstToken / grain;
+            int32_t const lastGroup = (lastToken + grain - 1) / grain;
+            uint32_t const groupBytes = desc.layout.chunkBytes / args.unitTokens * grain;
+            firstByte = static_cast<uint32_t>(firstGroup) * groupBytes;
+            bytes = static_cast<uint32_t>(lastGroup - firstGroup) * groupBytes;
+        }
         for (uint32_t c = 0; c < desc.layout.numChunks; ++c)
         {
-            auto const offset = static_cast<uint64_t>(c) * desc.layout.chunkStride;
-            copyChunkWarp<Vec>(dst + offset, src + offset, desc.layout.chunkBytes, lane);
+            auto const offset = static_cast<uint64_t>(c) * desc.layout.chunkStride + firstByte;
+            copyChunk<Vec, kCopyThreads>(dst + offset, src + offset, bytes, lane);
         }
     }
 }
 
-//! One warp per work item, walking the compacted list with a grid-stride loop. `blockIdx.y`
-//! is the buffer, `blockIdx.x` the work.
+template <typename Vec>
+__device__ void copySparseUnits(
+    SparseUnitCopyArgs const& args, SparseCopyDesc const& desc, int32_t list, int32_t globalWarp)
+{
+    // Large host reads need enough independent loads to cover link latency. Small
+    // units and dirty-token writes keep a warp per item for batch parallelism.
+    if (args.direction == SparseCopyDirection::kFetch && desc.layout.chunkBytes >= 16 * 1024)
+    {
+        copySparseUnitsImpl<Vec, kThreads>(args, desc, list, globalWarp);
+    }
+    else
+    {
+        copySparseUnitsImpl<Vec, kWarpSize>(args, desc, list, globalWarp);
+    }
+}
+
+//! A warp or CTA per work item, walking the compacted list with a grid-stride loop.
+//! `blockIdx.y` is the buffer, `blockIdx.x` the work.
 __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyArgs args)
 {
     // Broadcast from lane zero before anything can diverge: threadIdx.x varies within the
@@ -988,6 +1024,8 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
         "launchSparseUnitCopy: rows, buffers, grid CTAs and units-per-page must be positive");
     TLLM_CHECK_WITH_INFO(args.copyDesc != nullptr && args.leases != nullptr,
         "launchSparseUnitCopy: every device array must be provided");
+    TLLM_CHECK_WITH_INFO(args.unitTokens > 0 && (args.fromTokens == nullptr) == (args.toTokens == nullptr),
+        "launchSparseUnitCopy: partial write-back requires paired token bounds and positive unit size");
     checkWorkList(args.work, "launchSparseUnitCopy", true);
     TLLM_CHECK_WITH_INFO(args.work.numLists <= 1 || args.arena.bufferLayer != nullptr,
         "launchSparseUnitCopy: a per-layer work list needs the buffer-to-layer map");

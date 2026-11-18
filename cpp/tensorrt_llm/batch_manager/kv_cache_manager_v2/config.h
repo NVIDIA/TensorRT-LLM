@@ -280,6 +280,10 @@ struct BufferConfig
     //! place buffers of one attention or SSM layer in different lifecycle groups.
     std::optional<ReusePolicy> reusePolicy;
 
+    //! Smallest contiguous token group within each sparse chunk. Zero keeps whole-unit
+    //! write-back. Token-major buffers use one; a four-token swizzle uses four.
+    int sparseWriteBackGranularity = 0;
+
     [[nodiscard]] ReusePolicy effectiveReusePolicy(ReusePolicy layerPolicy) const noexcept
     {
         return reusePolicy.value_or(layerPolicy);

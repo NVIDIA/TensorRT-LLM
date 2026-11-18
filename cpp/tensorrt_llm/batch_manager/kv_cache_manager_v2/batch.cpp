@@ -40,6 +40,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
+constexpr size_t kFlushRangeFields = 4;
+
 //! Largest batch and longest sequence the declared constraints describe, or zero when none
 //! were declared.
 std::pair<int, int> deriveBounds(KVCacheManagerConfig const& config)
@@ -226,6 +228,35 @@ void Batch::_allocateCopyDesc()
                 desc.cellBytes = run.bufferBytes;
                 desc.layout = run.layout;
                 desc.width = run.width;
+                auto const unitTokens = mManager->config().tokensPerBlock / mManager->sparseCacheUnitsPerPage(lcId);
+                if (mManager->sparseCacheIncludesPartialUnits(lcId))
+                {
+                    for (auto const& layer : mManager->config().layers)
+                    {
+                        if (std::visit([](auto const& cfg) { return cfg.layerId; }, layer) != id.layerId)
+                        {
+                            continue;
+                        }
+                        for (auto const& config : layerBuffers(layer))
+                        {
+                            if (config.role == id.role && config.sparseWriteBackGranularity != 0)
+                            {
+                                auto const grain = config.sparseWriteBackGranularity;
+                                TLLM_CHECK_WITH_INFO(grain <= UINT16_MAX && unitTokens % grain == 0
+                                        && desc.layout.chunkBytes % unitTokens == 0,
+                                    "Sparse write-back granularity must divide the unit's contiguous token layout");
+                                desc.writeBackGranularity = static_cast<uint16_t>(grain);
+                            }
+                        }
+                    }
+                }
+                if (desc.writeBackGranularity != 0)
+                {
+                    auto tokenLayout = desc.layout;
+                    tokenLayout.chunkBytes = desc.layout.chunkBytes / unitTokens * desc.writeBackGranularity;
+                    tokenLayout.unitStride = tokenLayout.chunkBytes;
+                    desc.width = sparseCopyWidth(tokenLayout, run.hostPageStride, run.bufferBytes);
+                }
 
                 auto const width = static_cast<uint64_t>(sparseCopyWidthBytes(desc.width));
                 TLLM_CHECK_WITH_INFO(desc.hostBase % width == 0 && desc.deviceBase % width == 0,
@@ -580,8 +611,8 @@ Batch::LayoutGenerator Batch::_layoutFlushRanges()
         co_return;
     }
 
-    auto const elements
-        = 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mManager->numLifeCycles().value());
+    auto const elements = kFlushRangeFields * static_cast<size_t>(mMaxBatchSize)
+        * static_cast<size_t>(mManager->numLifeCycles().value());
     mFlushRanges = co_yield elements;
     // An empty range asks for nothing, which is what a row that never flushes should read.
     cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(mFlushRanges), 0, elements, cudaStream()));
@@ -591,7 +622,7 @@ Batch::LayoutGenerator Batch::_layoutFlushRanges()
 int32_t const* Batch::flushFromUnits(LifeCycleId lifeCycle) const
 {
     auto* base = mFlushRanges;
-    return base + 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(lifeCycle.value());
+    return base + kFlushRangeFields * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(lifeCycle.value());
 }
 
 int32_t const* Batch::flushToUnits(LifeCycleId lifeCycle) const
@@ -644,7 +675,7 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
             continue;
         }
         int const unitTokens = mManager->config().tokensPerBlock / unitsPerPage;
-        auto const base = static_cast<size_t>(2 * mMaxBatchSize * lcId.value());
+        auto const base = kFlushRangeFields * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(lcId.value());
 
         // Bounded in aggregate rather than per row, which is what the compacted list allows
         // and what in-flight batching needs: one prefilling row may cross the whole step's
@@ -656,12 +687,16 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
             auto const& kvCache = mRows[row];
             int fromUnit = 0;
             int toUnit = 0;
+            int fromToken = 0;
+            int toToken = 0;
             if (kvCache != nullptr)
             {
                 TLLM_CHECK_WITH_INFO(newHistoryLengths[toSizeT(row)] >= kvCache->historyLength(),
                     "Batch::flushSparseUnits: history length cannot be decreased");
                 fromUnit = kvCache->historyLength() / unitTokens;
                 toUnit = newHistoryLengths[toSizeT(row)] / unitTokens;
+                fromToken = kvCache->historyLength();
+                toToken = newHistoryLengths[toSizeT(row)];
                 if (mManager->sparseCacheIncludesPartialUnits(lcId))
                 {
                     toUnit = newHistoryLengths[toSizeT(row)] == kvCache->historyLength()
@@ -674,6 +709,8 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
             }
             mFlushRangeStaging[base + toSizeT(row)] = fromUnit;
             mFlushRangeStaging[base + static_cast<size_t>(mMaxBatchSize) + toSizeT(row)] = toUnit;
+            mFlushRangeStaging[base + 2 * static_cast<size_t>(mMaxBatchSize) + toSizeT(row)] = fromToken;
+            mFlushRangeStaging[base + 3 * static_cast<size_t>(mMaxBatchSize) + toSizeT(row)] = toToken;
         }
 
         TLLM_CHECK_WITH_INFO(crossed <= mScratch[lcId].flushWork.capacity,
@@ -1828,6 +1865,12 @@ void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
     copy.numBuffers = scratch.numBuffers;
     copy.direction = SparseCopyDirection::kWriteBack;
     copy.unitsPerPage = mManager->sparseCacheUnitsPerPage(lifeCycle);
+    if (mManager->sparseCacheIncludesPartialUnits(lifeCycle))
+    {
+        copy.unitTokens = mManager->config().tokensPerBlock / copy.unitsPerPage;
+        copy.fromTokens = flushFromUnits(lifeCycle) + 2 * mMaxBatchSize;
+        copy.toTokens = copy.fromTokens + mMaxBatchSize;
+    }
     // The work list is every layer of this row, which is what a write-back crosses at once,
     // unlike a fetch, which resolves one layer across the whole batch.
     copy.work = scratch.flushWork;

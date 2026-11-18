@@ -389,6 +389,14 @@ class BufferConfig:
     """
     reuse_policy: ReusePolicy | None = None
 
+    sparse_write_back_granularity: int = 0
+    """Contiguous token group copied by partial sparse writeback, or zero for whole units.
+
+    A positive value declares that each chunk stores groups of this many tokens
+    consecutively. Dirty token ranges round outward to group boundaries. Use one
+    for token-major chunks and the swizzle group size for grouped scale buffers.
+    """
+
 @dataclass(slots=True)
 class SparseCacheConfig:
     """One layer's sparse fetch path.

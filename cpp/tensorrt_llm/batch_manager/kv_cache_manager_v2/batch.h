@@ -779,8 +779,8 @@ private:
     //! tables exist, because a descriptor names where in them a buffer's indices sit.
     void _allocateCopyDesc();
 
-    //! Device room for the per-row unit ranges a write-back reads:
-    //! [life cycle][2][maxBatchSize], as [from][to]. Allocated with the fetch scratch,
+    //! Device room for the per-row unit and token ranges a write-back reads:
+    //! [life cycle][4][maxBatchSize], as [fromUnit][toUnit][fromToken][toToken]. Allocated with the fetch scratch,
     //! which has the same lifetime.
     //! Yields the elements the write-back ranges need, then clears the slice.
     LayoutGenerator _layoutFlushRanges();

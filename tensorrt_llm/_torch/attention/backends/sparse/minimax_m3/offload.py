@@ -60,7 +60,8 @@ class MiniMaxM3SparseOffloadMixin(SparseOffloadCacheMixin):
         }
         if len(heads) != 1:
             raise ValueError("MiniMax-M3 offload requires uniform sparse-layer KV head counts")
-        self._sparse_offload_topk = self._m3_topk_blocks * heads.pop()
+        local_heads = heads.pop()
+        self._sparse_offload_topk = self._m3_topk_blocks * local_heads
         layers = []
         roles = {Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
         for layer in config.layers:
@@ -75,6 +76,10 @@ class MiniMaxM3SparseOffloadMixin(SparseOffloadCacheMixin):
                 sparse_buffer = copy(buffer)
                 if buffer.role in roles:
                     sparse_buffer.is_sparse = True
+                    sparse_buffer.sparse_unit_chunks = local_heads
+                    sparse_buffer.sparse_write_back_granularity = (
+                        4 if buffer.role == Role.VALUE_BLOCK_SCALE else 1
+                    )
                 buffers.append(sparse_buffer)
             sparse_layer.buffers = buffers
             sparse_layer.sparse_cache = sparse_cache_config(

@@ -229,7 +229,7 @@ enum class SparseCopyDirection : uint8_t
 //! Sizes rather than addresses, so the width is a property of the layout and can live in a
 //! descriptor built once. The two base pointers are checked against it on the host, where a
 //! misaligned pool is a configuration error worth naming rather than a case to handle.
-enum class SparseCopyWidth : int32_t
+enum class SparseCopyWidth : uint8_t
 {
     kByte = 0,
     kWord = 1,
@@ -299,6 +299,9 @@ struct alignas(16) SparseCopyDesc
     SelectionUnitLayout layout;
 
     SparseCopyWidth width;
+    //! Zero retains whole-unit write-back; otherwise each chunk contains contiguous
+    //! groups of this many tokens. Preserves the descriptor's 64-byte footprint.
+    uint16_t writeBackGranularity = 0;
 };
 
 static_assert(sizeof(SparseCopyDesc) == 64, "A copy descriptor is meant to be four vector loads");
@@ -350,6 +353,12 @@ struct SparseUnitCopyArgs
     //! is fixed before anyone knows how many units a step will miss. The device-side total
     //! is what the loop actually follows.
     int32_t gridCtas;
+
+    //! Optional [numRows] token bounds for partial-unit write-back. Descriptors opt
+    //! into copying this range, rounded out to their contiguous token groups.
+    int32_t const* fromTokens = nullptr;
+    int32_t const* toTokens = nullptr;
+    int32_t unitTokens = 1;
 };
 
 //! Widest vector a pool's layout admits, from its sizes alone. A layout admitting none

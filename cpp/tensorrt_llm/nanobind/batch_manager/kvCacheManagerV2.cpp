@@ -1843,16 +1843,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "may name a layer that named nothing.") DEF_COPY(kv::SparseCacheConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>>(),
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>, int>(),
             nb::arg("role"), nb::arg("size"), nb::arg("tokens_per_block_override") = std::nullopt,
             nb::arg("is_sparse") = false, nb::arg("coalescing_group") = 0, nb::arg("sparse_unit_chunks") = 1,
-            nb::arg("reuse_policy") = std::nullopt)
+            nb::arg("reuse_policy") = std::nullopt, nb::arg("sparse_write_back_granularity") = 0)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
         .def_rw("is_sparse", &kv::BufferConfig::isSparse)
         .def_rw("coalescing_group", &kv::BufferConfig::coalescingGroup)
         .def_rw("sparse_unit_chunks", &kv::BufferConfig::sparseUnitChunks)
+        .def_rw("sparse_write_back_granularity", &kv::BufferConfig::sparseWriteBackGranularity)
         .def_rw("reuse_policy", &kv::BufferConfig::reusePolicy) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")

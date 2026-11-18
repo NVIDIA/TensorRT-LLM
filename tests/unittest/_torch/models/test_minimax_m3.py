@@ -2412,6 +2412,80 @@ def test_horizontal_producer_explicit_caches_match_manager(
     for actual, reference in zip(replay, eager):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
+    offload_slots = torch.empty_like(slots)
+    offload_state = object()
+    offload_metadata = SimpleNamespace(
+        kv_cache_manager=manager,
+        msa_out_cache_loc=slots,
+        msa_sparse_write_slots=offload_slots,
+        msa_idx_k_cache=lambda _: index,
+        sparse_offload_state=offload_state,
+    )
+    manager.offloads_layer.return_value = True
+    if nvfp4:
+        assert (
+            layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(packed, positions, offload_metadata)
+            is None
+        )
+        manager.prepare_sparse_write_indices.assert_not_called()
+        return
+
+    arena = torch.zeros((2, 3, 2, 128, 128), dtype=torch.float8_e4m3fn, device="cuda")
+    arena_view = arena.permute(1, 0, 2, 3, 4)
+    expected_arena = torch.zeros_like(arena)
+    expected_arena[:, 2, :, 1].copy_(main[0, :, :, 0])
+    expected_arena[:, 0, :, 5].copy_(main[1, :, :, 1])
+    expected_index = index.view(torch.uint8).clone()
+    index.zero_()
+    manager.get_buffers.return_value = arena_view
+    prepared_slots = torch.tensor([257, 5, -1, -1], dtype=torch.int32, device="cuda")
+
+    def prepare_slots(state, layer_idx, output):
+        assert state is offload_state and layer_idx == 3
+        output.copy_(prepared_slots)
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.offload.prepare_write_slots",
+        prepare_slots,
+    )
+    resolutions = _count_plan_resolutions(monkeypatch, layer)
+    offload_outputs = layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        packed, positions, offload_metadata
+    )
+    assert offload_outputs is not None
+    manager.prepare_sparse_write_indices.assert_called_once_with(offload_state, 3)
+    for actual, reference in zip(offload_outputs, eager[:2]):
+        torch.testing.assert_close(actual.view(torch.uint8), reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        arena.view(torch.uint8), expected_arena.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(index.view(torch.uint8), expected_index, rtol=0, atol=0)
+    assert resolutions[0] == 1
+
+    # Resident validation must not reuse the plan that accepts the offload arena.
+    assert layer._fused_producer_plan(arena_view, index, None, slots) is None
+    assert resolutions[0] == 2
+
+    # A plan hit still reserves and converts this step's main-KV write slots.
+    arena.zero_()
+    index.zero_()
+    prepared_slots.copy_(torch.tensor([6, 258, -1, -1], dtype=torch.int32, device="cuda"))
+    expected_arena.zero_()
+    expected_arena[:, 0, :, 6].copy_(main[0, :, :, 0])
+    expected_arena[:, 2, :, 2].copy_(main[1, :, :, 1])
+    repeated_outputs = layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        packed, positions, offload_metadata
+    )
+    assert repeated_outputs is not None
+    assert resolutions[0] == 2
+    assert manager.prepare_sparse_write_indices.call_count == 2
+    for actual, reference in zip(repeated_outputs, eager[:2]):
+        torch.testing.assert_close(actual.view(torch.uint8), reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        arena.view(torch.uint8), expected_arena.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(index.view(torch.uint8), expected_index, rtol=0, atol=0)
+
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 offload producer needs CUDA")
@@ -2426,6 +2500,7 @@ def test_piecewise_offload_packed_projection_fallback(monkeypatch, kv_dtype):
     positions = torch.arange(4, dtype=torch.int32, device="cuda")
     metadata = SimpleNamespace(
         num_tokens=2,
+        kv_cache_manager=None,
         sparse_offload_state=object(),
         msa_idx_k_cache=lambda _: index,
         msa_out_cache_loc=torch.tensor([0, 129, -1, -1], dtype=torch.int32, device="cuda"),
