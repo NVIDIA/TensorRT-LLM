@@ -148,7 +148,7 @@ def test_extent_plan_is_complete_disjoint_and_fair(tmp_path, monkeypatch):
     monkeypatch.setattr(read_ahead, "_CHUNK_SIZE", 4)
     monkeypatch.setattr(read_ahead, "_WORKERS_PER_LOAD_GROUP", 3)
     monkeypatch.setattr(read_ahead, "_WORKERS_PER_RANK", 2)
-    files = [(str(tmp_path / "a"), 10), (str(tmp_path / "b"), 7)]
+    files = [(str(tmp_path / "a"), 0, 10), (str(tmp_path / "b"), 0, 7)]
     plans = [read_ahead.build_local_plan(files, rank, 4) for rank in range(4)]
 
     expected = {
@@ -986,6 +986,65 @@ def test_loader_passes_full_checkpoint_bytes_to_reader(
     plan = session_factory.call_args.args[2]
     assert plan.assigned_bytes < checkpoint_bytes
     assert session_factory.call_args.kwargs["checkpoint_bytes"] == checkpoint_bytes
+
+
+@pytest.mark.parametrize("checkpoint_fits", [True, False])
+def test_read_ahead_reads_only_the_node_ranks_stages_and_experts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checkpoint_fits: bool
+) -> None:
+    # PP2 x EP2: this node holds rank 0 (layers 0-1, experts 0-1) and rank 3 (layers 2-3, experts 2-3).
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    tensors = {"model.embed_tokens.weight": torch.ones(64)}
+    for layer in range(4):
+        tensors[f"model.layers.{layer}.input_layernorm.weight"] = torch.ones(64)
+        for expert in range(4):
+            tensors[f"model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"] = torch.ones(64)
+    path = str(checkpoint_dir / "model.safetensors")
+    save_file(tensors, path)
+    file_size, header_bytes, header = weight_loader_module._read_safetensors_header(path)
+    node_bytes = 8 + header_bytes
+    for name, info in header.items():
+        parts = name.split(".")
+        if name != "__metadata__" and (
+            "experts" not in parts or (parts[2] < "2") == (parts[5] < "2")
+        ):
+            node_bytes += info["data_offsets"][1] - info["data_offsets"][0]
+    assert node_bytes < file_size
+
+    config = SimpleNamespace(num_hidden_layers=4)
+    model = SimpleNamespace(
+        model_config=SimpleNamespace(pretrained_config=config, moe_load_balancer=None)
+    )
+
+    def mapping(rank: int) -> Mapping:
+        return Mapping(world_size=4, rank=rank, tp_size=2, pp_size=2, moe_ep_size=2)
+
+    peer = weight_loader_module._rank_read_set(mapping(3), model)
+    node_communicator = mock.Mock()
+    node_communicator.Get_rank.return_value = 0
+    node_communicator.Get_size.return_value = 2
+    node_communicator.allgather.side_effect = lambda value: [value, (*value[:2], peer)]
+    active_communicator = mock.Mock()
+    active_communicator.Get_size.return_value = 4
+    active_communicator.allgather.side_effect = lambda value: [value] * 4
+    active_communicator.Split_type.return_value = node_communicator
+    monkeypatch.setattr(weight_loader_module, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(weight_loader_module, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(weight_loader_module, "mpi_comm", lambda: active_communicator)
+    # Whole files when the checkpoint fits, else only the node's share.
+    read_bytes = file_size if checkpoint_fits else node_bytes
+    available = read_bytes + read_ahead._HOST_MEMORY_HEADROOM_BYTES
+    monkeypatch.setattr(weight_loader_module, "effective_available_host_memory", lambda: available)
+    session_factory = mock.Mock(wraps=read_ahead.RankStripedReadAheadSession)
+    monkeypatch.setattr(weight_loader_module, "RankStripedReadAheadSession", session_factory)
+
+    loader = _rank_striped_loader()
+    with loader.open_weight_session(str(checkpoint_dir), mapping=mapping(0), model=model):
+        pass
+
+    assert loader.last_checkpoint_io_status.activated
+    assert session_factory.call_args.kwargs["checkpoint_bytes"] == read_bytes
 
 
 def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:

@@ -16,6 +16,7 @@ import glob
 import json
 import multiprocessing
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -82,6 +83,71 @@ _PREFETCH_LOG_INTERVAL_SEC = 60.0
 # the lock makes the check-and-set atomic across concurrent prefetch threads.
 _PREFETCH_FALLBACK_LOGGED = threading.Event()
 _PREFETCH_FALLBACK_LOG_LOCK = threading.Lock()
+_LAYER_IN_NAME = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+_EXPERT_IN_NAME = re.compile(r"\.experts\.(\d+)\.")
+
+
+def _rank_read_set(mapping: Mapping, model) -> tuple | None:
+    """The PP layers and EP slice this rank loads; None if it loads all."""
+    config = getattr(model, "model_config", None)
+    if config is None:
+        return None
+    num_layers = getattr(config.pretrained_config, "num_hidden_layers", None)
+    layers = (frozenset(mapping.pp_layers(num_layers))
+              if mapping.has_pp() and num_layers else None)
+    # The MoE load balancer places experts by its own assignment.
+    ep_size = mapping.moe_ep_size if config.moe_load_balancer is None else 1
+    if layers is None and ep_size == 1:
+        return None
+    return (layers, num_layers, mapping.is_last_pp_rank(), ep_size,
+            mapping.moe_ep_rank)
+
+
+def _node_read_extents(stats, read_sets) -> list[tuple[str, int, int]]:
+    """The (path, offset, length) ranges any of a node's ranks reads."""
+    from tensorrt_llm._torch.moe.fused_moe.interface import \
+        _compute_ep_partition
+
+    def indices(name):  # (layer, expert), None where the name has none
+        return tuple(match and int(match.group(1))
+                     for match in (_LAYER_IN_NAME.search(name),
+                                   _EXPERT_IN_NAME.search(name)))
+
+    files = []
+    for path, _ in stats:
+        _, header_bytes, header = _read_safetensors_header(path)
+        files.append(
+            (path, 8 + header_bytes, [(*indices(name), *info["data_offsets"])
+                                      for name, info in header.items()
+                                      if name != "__metadata__"]))
+    num_experts = 1 + max(
+        (expert for *_, tensors in files
+         for _, expert, _, _ in tensors if expert is not None),
+        default=-1)
+
+    def is_read(layer, expert, read_set) -> bool:
+        layers, num_layers, is_last_stage, ep_size, ep_rank = read_set
+        # Layers past the decoder (e.g. MTP) live on the last stage.
+        if layers is not None and layer is not None and (
+            (layer not in layers) if layer < num_layers else not is_last_stage):
+            return False
+        if ep_size > 1 and expert is not None:
+            _, start, end = _compute_ep_partition(num_experts, ep_size, ep_rank)
+            return start <= expert < end
+        return True
+
+    extents = []
+    for path, data_start, tensors in files:
+        start, end = 0, data_start  # coalesce the header and tensors read
+        for begin, stop in sorted(
+            (begin, stop) for layer, expert, begin, stop in tensors if any(
+                is_read(layer, expert, s) for s in read_sets)):
+            if data_start + begin > end:
+                extents.append((path, start, end - start))
+                start = data_start + begin
+            end = max(end, data_start + stop)
+        extents.append((path, start, end - start))
+    return extents
 
 
 class _LazySafetensorsWeights(ConsumableWeightsDict):
@@ -870,6 +936,7 @@ class HfWeightLoader(BaseWeightLoader):
         weight_files = []
         stats = []
         available_memory = 0
+        read_set = None
         eligibility_reason = None
         preflight_error = None
         try:
@@ -890,6 +957,7 @@ class HfWeightLoader(BaseWeightLoader):
             elif (self._partial_model_loading
                   or int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0")) != 0):
                 eligibility_reason = "partial model loading was requested"
+            read_set = _rank_read_set(mapping, kwargs.get("model"))
             available_memory = effective_available_host_memory()
         except Exception as error:
             preflight_error = error
@@ -906,6 +974,8 @@ class HfWeightLoader(BaseWeightLoader):
 
         local_rank = 0
         local_size = 1
+        read_sets = [read_set]
+        extents = []
         node_error = None
         try:
             backing_signature = tuple(
@@ -915,13 +985,21 @@ class HfWeightLoader(BaseWeightLoader):
                 local_rank = node_communicator.Get_rank()
                 local_size = node_communicator.Get_size()
                 observations = node_communicator.allgather(
-                    (backing_signature, available_memory))
+                    (backing_signature, available_memory, read_set))
                 if any(observation[0] != observations[0][0]
                        for observation in observations[1:]):
                     eligibility_reason = (
                         "node-local ranks resolved different backing files")
                 available_memory = min(observation[1]
                                        for observation in observations)
+                read_sets = [observation[2] for observation in observations]
+            extents = [(path, 0, stat.st_size) for path, stat in stats]
+            # Whole files stream fastest; narrow to the node's tensors only
+            # when the checkpoint does not fit.
+            fits, _ = memory_admission(sum(s.st_size for _, s in stats),
+                                       available_memory)
+            if None not in read_sets and not fits:
+                extents = _node_read_extents(stats, read_sets)
         except Exception as error:
             node_error = error
 
@@ -939,11 +1017,11 @@ class HfWeightLoader(BaseWeightLoader):
 
         file_sizes = [(path, stat.st_size) for path, stat in stats]
         checkpoint_bytes = sum(size for _, size in file_sizes)
-        admitted, headroom = memory_admission(checkpoint_bytes,
-                                              available_memory)
+        node_bytes = sum(length for _, _, length in extents)
+        admitted, headroom = memory_admission(node_bytes, available_memory)
         if eligibility_reason is None and not admitted:
             eligibility_reason = (
-                f"checkpoint bytes ({checkpoint_bytes}) exceed available "
+                f"bytes this node reads ({node_bytes}) exceed available "
                 f"host memory ({available_memory}) after startup headroom "
                 f"({headroom})")
 
@@ -977,12 +1055,12 @@ class HfWeightLoader(BaseWeightLoader):
         session = None
         setup_error = None
         try:
-            plan = build_local_plan(file_sizes, local_rank, local_size)
+            plan = build_local_plan(extents, local_rank, local_size)
             session = RankStripedReadAheadSession(
                 active_communicator,
                 node_communicator,
                 plan,
-                checkpoint_bytes=checkpoint_bytes).start()
+                checkpoint_bytes=node_bytes).start()
         except Exception as error:
             setup_error = error
         coordinated_setup_error = coordinate_error(active_communicator,
