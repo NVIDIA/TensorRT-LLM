@@ -4684,12 +4684,15 @@ class PerfSanityTestConfig:
                     text=True,
                 )
                 if PLACEHOLDER_GPU_NAME in output:
-                    compute_cap = subprocess.check_output(
-                        "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1",
-                        shell=True,
-                        stderr=subprocess.DEVNULL,
-                        text=True,
-                    ).strip()
+                    compute_cap = (
+                        subprocess.check_output(
+                            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                        )
+                        .splitlines()[0]
+                        .strip()
+                    )
                     return PLACEHOLDER_GPU_MAPPING.get(
                         (compute_cap, platform.machine()), "unsupported"
                     )
