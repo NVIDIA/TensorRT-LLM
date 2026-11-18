@@ -112,9 +112,11 @@ def _case_counts(
     multi_gpu_scheduled = status == "post_merge" or multi_gpu_scheduled
     try:
         root = Path(repo_root)
-        from cbts.blocks import YAMLIndex, block_matches_stage, parse_stages_from_groovy
+        from cbts.blocks import YAMLIndex, block_matches_stage, parse_stages
 
-        stages = parse_stages_from_groovy(root / "jenkins/L0_Test.groovy", include_post_merge=True)
+        stages = parse_stages(
+            root / "jenkins/scripts/test_stage_configs.json", include_post_merge=True
+        )
         index = YAMLIndex.load(root / "tests/integration/test_lists/test-db")
         by_stem: dict[str, list] = {}
         for b in index.blocks:

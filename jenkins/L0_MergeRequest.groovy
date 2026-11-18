@@ -235,6 +235,11 @@ def CBTS_COVERAGE = "cbts_coverage"
 def DISABLE_CBTS = "disable_cbts"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
+// Dynamic split-count overrides for L0_Test.groovy's sharded stage families,
+// propagated downstream via the `testFilter` job parameter.
+// See computeDynamicSplitCounts.
+@Field
+def DYNAMIC_SPLIT_COUNTS = "dynamic_split_counts"
 // CBTS per-test coverage is limited to the official post-merge pipeline.
 @Field
 def ENABLE_CBTS_COVERAGE = true
@@ -313,6 +318,7 @@ def testFilter = [
     (CBTS_COVERAGE): false,
     (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
     (INFRA_DRY_RUN): (params.InfraDryRun?.toString()?.toBoolean() ?: false),
+    (DYNAMIC_SPLIT_COUNTS): null,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -618,6 +624,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
         // L0_Test applies stage eligibility after the pipeline-level gate.
         testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+        testFilter[(DYNAMIC_SPLIT_COUNTS)] = computeDynamicSplitCounts(pipeline)
     }
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     testFilter[(OSS_COMPLIANCE_FILE_CHANGED)] = getOssComplianceFileChanged(pipeline, globalVars)
@@ -1561,6 +1568,40 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS failed, falling back to full run: ${e}")
+        return null
+    }
+}
+
+// pyyaml is needed by jenkins/scripts/cbts/blocks.py (used by both CBTS's
+// main.py and scripts/test_to_stage_mapping.py) to parse test-db YAMLs.
+def _ensurePython3Yaml(pipeline)
+{
+    sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
+}
+
+// Computes dynamic split counts for L0_Test.groovy's sharded stage families by
+// shelling out to scripts/test_to_stage_mapping.py --emit-splits, which sizes
+// every stage family from its actual (mako-filtered) test set using
+// block_matches_stage()/derive_mako_from_stage() from blocks.py -- the same
+// matching trt-test-db performs at runtime via L0_Test.groovy's
+// getMakoArgsFromStageName(). Delegating keeps that matching logic in exactly
+// one place instead of a second Groovy port that could drift out of sync.
+def computeDynamicSplitCounts(pipeline)
+{
+    try {
+        _ensurePython3Yaml(pipeline)
+        def output = sh(
+            label: "Compute dynamic split counts",
+            script: "cd ${LLM_ROOT} && python3 -B scripts/test_to_stage_mapping.py --emit-splits",
+            returnStdout: true,
+        ).trim()
+        return output ? readJSON(text: output, returnPojo: true) : [:]
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("computeDynamicSplitCounts: failed to size splits via test_to_stage_mapping.py " +
+                      "(${e.class.simpleName}: ${e.message}); L0_Test.groovy will keep hardcoded splits " +
+                      "from test_stage_configs.json")
         return null
     }
 }
