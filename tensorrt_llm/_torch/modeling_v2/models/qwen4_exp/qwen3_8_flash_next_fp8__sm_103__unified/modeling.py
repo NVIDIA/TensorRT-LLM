@@ -99,7 +99,11 @@ from transformers import PretrainedConfig
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
-from tensorrt_llm._torch.attention.backends.sparse.qsa.index_plane_layout import slot_rows
+from tensorrt_llm._torch.attention.backends.sparse.qsa.index_plane_layout import (
+    COMPACT_ENV,
+    compact_enabled,
+    slot_rows,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
@@ -7058,6 +7062,21 @@ class ModelingV2Qwen38FlashNextFp8Sm103Unified(
             raise NoTarget(
                 f"a {kv_cache_quant_algo} KV cache; the target stores K/V as the checkpoint's "
                 "bf16, as FP8 or as NVFP4"
+            )
+        if (
+            spec is not None
+            and kv_cache_quant_algo is not None
+            and compact_enabled()
+            and spec.max_draft_len > text.indexer_compress_ratio
+        ):
+            # A quantized K/V pool packs the QSA side planes, which is where the compact layout
+            # applies (`pool.pool_geometry`); on a bf16 pool the cache manager refuses the switch.
+            raise NoTarget(
+                f"{COMPACT_ENV}=1 with max_draft_len={spec.max_draft_len}: compact index pages "
+                "keep a group's raw keys for at most indexer_compress_ratio + 1 = "
+                f"{text.indexer_compress_ratio + 1} consecutive positions of a request in one "
+                f"step, so the verify step runs at max_draft_len 1..{text.indexer_compress_ratio} "
+                "on them"
             )
         if rowtile_groups and kv_cache_quant_algo != QuantAlgo.FP8:
             stored = "bf16" if kv_cache_quant_algo is None else kv_cache_quant_algo

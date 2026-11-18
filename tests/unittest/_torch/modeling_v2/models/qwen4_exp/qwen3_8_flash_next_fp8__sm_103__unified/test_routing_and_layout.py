@@ -1739,6 +1739,27 @@ def test_compact_index_pages_shrink_the_packed_index_page_only(algo, monkeypatch
     assert g.index_page_bytes == want * g.index_kv_heads * g.index_head_dim * 2
 
 
+@pytest.mark.cpu_only
+def test_compact_index_pages_decline_a_verify_step_wider_than_a_group_plus_one(
+    on_sm103, monkeypatch
+):
+    """Compact pages keep a group's raw keys for `indexer_compress_ratio + 1` consecutive positions
+    of a request in a step: a quantized K/V pool on them runs max_draft_len 1..compress_ratio."""
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import index_plane_layout
+
+    cr = _TEXT["indexer_compress_ratio"]
+    fp8_kv = dict(kv_cache_config=KvCacheConfig(dtype="fp8"))
+    _admitted(_routed_config("tep4", _mtp(cr + 1)), **fp8_kv)
+    monkeypatch.setenv(index_plane_layout.COMPACT_ENV, "1")
+    config = _routed_config("tep4", _mtp(cr + 1))
+    assert modeling_v2_resolve(config, _llm_args("auto", **fp8_kv)) is None
+    with pytest.raises(ValueError, match=f"{index_plane_layout.COMPACT_ENV}=1 with max_draft_len"):
+        modeling_v2_resolve(config, _llm_args("require", **fp8_kv))
+    _admitted(_routed_config("tep4", _mtp(cr)), **fp8_kv)
+    # A bf16 pool has no packed side planes; the cache manager refuses the switch there.
+    _admitted(_routed_config("tep4", _mtp(cr + 1)))
+
+
 # ------------------------------------------------ the stock manager, on GPU ---
 
 
