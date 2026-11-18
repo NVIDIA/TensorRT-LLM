@@ -278,6 +278,15 @@ class RankState:
     num_generation_requests: int = 0
     num_connector_transfers: int = 0
     connector_poll_failed: bool = False
+    num_in_transfer_requests: int = 0
+    """Requests still sending KV to the generation server, which
+    ``num_active_requests`` includes as routing load under
+    ``kv_cache_routing_account_for_in_transfer``. They need no forward step."""
+
+    # Tags the (tag, num_in_transfer_requests) section appended to the
+    # message. The tag is negative where every older layout has a count or a
+    # -1 default, so older layouts decode unchanged without the section.
+    _IN_TRANSFER_TAG: ClassVar[int] = -4
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
         if iter_stats_payload is not None:
@@ -296,12 +305,18 @@ class RankState:
             self.num_generation_requests,
             self.num_connector_transfers,
             int(self.connector_poll_failed),
+            self._IN_TRANSFER_TAG,
+            self.num_in_transfer_requests,
         ]
 
     @classmethod
     def deserialize(cls, data: list[int | float]) -> RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
+        num_in_transfer_requests = 0
+        if len(values) >= 2 and values[-2] == cls._IN_TRANSFER_TAG:
+            num_in_transfer_requests = values[-1]
+            values = values[:-2]
         prefix_field_count = 5
         rank_state_fields = fields(cls)[:prefix_field_count]
         if not values:
@@ -352,4 +367,5 @@ class RankState:
             connector_poll_failed=bool(values[stats_end + 3])
             if len(values) > stats_end + 3
             else False,
+            num_in_transfer_requests=num_in_transfer_requests,
         )
