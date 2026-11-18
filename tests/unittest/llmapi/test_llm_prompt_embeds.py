@@ -354,19 +354,14 @@ def test_multi_gpu(model_dir: str, table: torch.Tensor, tp_size: int, pp_size: i
 
 def test_connector_keeps_salt_scoping() -> None:
     # External KV stores key blocks by ids and salt, even with the V2 manager.
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    def worker(connector: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            llm_args=SimpleNamespace(kv_connector_config=connector),
+            _uses_kv_cache_manager_v2=lambda: True,
+        )
 
-    v2 = object.__new__(KVCacheManagerV2)
-    with_connector = SimpleNamespace(
-        llm_args=SimpleNamespace(kv_connector_config=object()),
-        engine=SimpleNamespace(kv_cache_manager=v2),
-    )
-    without = SimpleNamespace(
-        llm_args=SimpleNamespace(kv_connector_config=None),
-        engine=SimpleNamespace(kv_cache_manager=v2),
-    )
-    assert not BaseWorker._kv_cache_keys_prompt_embeds(with_connector)
-    assert BaseWorker._kv_cache_keys_prompt_embeds(without)
+    assert not BaseWorker._kv_cache_keys_prompt_embeds(worker(object()))
+    assert BaseWorker._kv_cache_keys_prompt_embeds(worker(None))
 
 
 def test_preemption_with_graphs_and_compile(model_dir: str, table: torch.Tensor) -> None:
