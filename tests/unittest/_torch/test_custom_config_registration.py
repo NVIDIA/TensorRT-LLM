@@ -554,3 +554,67 @@ def test_load_hf_model_config_handles_dense_nemotron_h(tmp_path):
 
     assert cfg is not None
     assert cfg.hybrid_override_pattern == _NEMOTRON_H_DENSE_PATTERN
+
+
+@pytest.mark.parametrize("tokenizer_metadata", [False, True])
+def test_beam_standard_config_and_tokenizer_loading(tmp_path, tokenizer_metadata: bool) -> None:
+    import pickle
+
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+    from tensorrt_llm._torch.configs import BeamConfig
+    from tensorrt_llm._torch.pyexecutor.config_utils import _CONFIG_REGISTRY, load_pretrained_config
+    from tensorrt_llm.tokenizer import load_hf_tokenizer
+
+    config = BeamConfig().to_dict()
+    # The full-attention NoPE entry must survive both config-loading paths.
+    assert config["rope_parameters"]["full_attention"] is None
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    words = ["<unk>", "old", "prompt", "latest", "user", "turn"]
+    backend = Tokenizer(models.WordLevel({w: i for i, w in enumerate(words)}, unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    if tokenizer_metadata:
+        PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>").save_pretrained(
+            tmp_path
+        )
+    else:
+        backend.save(str(tmp_path / "tokenizer.json"))
+
+    assert _CONFIG_REGISTRY["beam"] is BeamConfig
+    for loaded in (AutoConfig.from_pretrained(tmp_path), load_pretrained_config(str(tmp_path))):
+        assert isinstance(loaded, BeamConfig)
+        assert loaded.name_or_path == str(tmp_path)
+        assert loaded.rope_parameters == config["rope_parameters"]
+    automatic = AutoTokenizer.from_pretrained(tmp_path, trust_remote_code=False)
+    assert isinstance(automatic, PreTrainedTokenizerFast)
+    # This is also the standard loader called by PostprocWorker.__init__.
+    worker_tokenizer = load_hf_tokenizer(str(tmp_path), trust_remote_code=False)
+    assert worker_tokenizer is not None
+    prompt = "old prompt latest user turn"
+    assert automatic.encode(prompt) == worker_tokenizer.encode(prompt) == [1, 2, 3, 4, 5]
+    assert worker_tokenizer.tokenizer.padding_side == "left"
+    assert worker_tokenizer.tokenizer.truncation_side == "left"
+    assert worker_tokenizer.encode(prompt, truncation=True, max_length=3) == [3, 4, 5]
+    assert worker_tokenizer.decode([3, 4, 5]) == "latest user turn"
+    restored = pickle.loads(pickle.dumps(worker_tokenizer))
+    assert type(restored) is type(worker_tokenizer)
+    assert restored.encode(prompt) == [1, 2, 3, 4, 5]
+
+    # A worker starts in a fresh interpreter and loads the tokenizer without a
+    # Beam-specific class or prior model construction.
+    script = """
+import sys
+from tensorrt_llm.tokenizer import load_hf_tokenizer
+worker = load_hf_tokenizer(sys.argv[1], trust_remote_code=False)
+assert worker.encode("old prompt latest user turn", truncation=True, max_length=3) == [3, 4, 5]
+assert worker.decode([3, 4, 5]) == "latest user turn"
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr

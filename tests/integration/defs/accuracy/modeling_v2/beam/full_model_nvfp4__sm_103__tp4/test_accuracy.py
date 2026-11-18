@@ -37,7 +37,6 @@ def _run_first100(models_root, output_dir, time_budget_s):
     config = {
         "modeling_v2": "require",
         "checkpoint_format": "beam_nvfp4",
-        "custom_tokenizer": "tensorrt_llm._torch.models.checkpoints.beam.tokenizer.BeamFastTokenizer",
         "reasoning_parser": "beam_harmony_text",
         "tensor_parallel_size": 4,
         "max_batch_size": 1,

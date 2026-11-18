@@ -9,7 +9,6 @@ Create `beam-baseline.yaml`:
 ```yaml
 modeling_v2: require
 checkpoint_format: beam_nvfp4
-custom_tokenizer: tensorrt_llm._torch.models.checkpoints.beam.tokenizer.BeamFastTokenizer
 reasoning_parser: beam_harmony_text
 tensor_parallel_size: 4
 max_batch_size: 1
@@ -23,7 +22,7 @@ trtllm-serve /path/to/checkpoint --config beam-baseline.yaml
 ```
 
 The same settings can be passed to `LLM()`; use `checkpoint_format="beam_nvfp4"`
-and `modeling_v2="require"`. Use the concrete `BeamFastTokenizer` for prompts.
+and `modeling_v2="require"`. The standard tokenizer loader recognizes Beam checkpoints automatically.
 The public `examples/llm-api/eval_gsm8k.py` evaluator can score an existing compatible
 endpoint; see its adjacent `gsm8k_eval/README.md` for arguments and resume behavior.
 

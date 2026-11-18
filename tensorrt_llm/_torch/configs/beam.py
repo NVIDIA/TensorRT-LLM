@@ -14,7 +14,8 @@
 # limitations under the License.
 """Architecture configuration for Beam checkpoints."""
 
-from typing import Optional
+from os import PathLike
+from typing import Any, Optional, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -153,6 +154,15 @@ class BeamConfig(PretrainedConfig):
         if self.torch_dtype != dtype:
             raise ValueError(f"BeamConfig dtype {self.torch_dtype!r} != requested {dtype!r}")
         self._validate()
+
+    @classmethod
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: Union[str, PathLike], **kwargs: Any
+    ) -> Union["BeamConfig", tuple["BeamConfig", dict[str, Any]]]:
+        # Direct config-class loading must retain the checkpoint location, just
+        # as AutoConfig does, so the model loader can find the weight shards.
+        kwargs.setdefault("name_or_path", str(pretrained_model_name_or_path))
+        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
 
     def _validate(self) -> None:
         if len(self.layer_types) != self.num_hidden_layers:

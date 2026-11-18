@@ -17,7 +17,6 @@ this checkout on four GB300 GPUs. Create `beam-baseline.yaml`:
 ```yaml
 modeling_v2: require
 checkpoint_format: beam_nvfp4
-custom_tokenizer: tensorrt_llm._torch.models.checkpoints.beam.tokenizer.BeamFastTokenizer
 reasoning_parser: beam_harmony_text
 tensor_parallel_size: 4
 max_batch_size: 1

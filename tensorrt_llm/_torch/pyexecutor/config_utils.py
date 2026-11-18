@@ -850,6 +850,7 @@ class LazyConfigDict(dict):
 
 
 _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDict(
+    beam="BeamConfig",
     cosmos3="Cosmos3Config",
     cosmos3_omni=
     "Cosmos3Config",  # backward-compat alias for pre-rename checkpoints
@@ -1289,11 +1290,6 @@ def load_pretrained_config(model_name_or_path: str,
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
                                                     **kwargs)
-    elif model_type == "beam":
-        # Preserve the checkpoint directory for targets that read stored config.
-        from tensorrt_llm._torch.configs.beam import BeamConfig
-        model_config = BeamConfig.from_dict(config_dict, **kwargs)
-        model_config.name_or_path = model_name_or_path
     elif model_type == "minicpmv4_6" or (
             architectures
             and architectures[0] == "MiniCPMV4_6ForConditionalGeneration"):
