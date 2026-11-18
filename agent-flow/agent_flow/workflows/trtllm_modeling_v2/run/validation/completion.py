@@ -40,7 +40,7 @@ from . import requirements as requirements_mod
 
 @dataclass(frozen=True)
 class Completion:
-    """One assessment for milestones, campaign wrap-up, and final delivery."""
+    """One assessment for milestones and final delivery."""
 
     evaluation: contract_mod.Evaluation
     files: tuple[str, ...] = ()

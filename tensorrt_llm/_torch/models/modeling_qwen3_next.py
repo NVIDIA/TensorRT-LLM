@@ -35,7 +35,6 @@ from transformers import Qwen3NextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.moe.fused_shared_expert import \
     fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.pyexecutor.config_utils import \
@@ -57,6 +56,7 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.expert_l2_prefetch import ExpertL2Prefetch
+from ..modules.fla.gdn_metadata import GDNMambaMetadata, gdn_metadata_for_batch
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (FP8QDQLinearMethod, FP8RowwiseLinearMethod,
                               Linear, TensorParallelMode,
@@ -2206,10 +2206,7 @@ class Qwen3NextModel(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        mamba_metadata = attn_metadata.mamba_metadata
-        if mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            attn_metadata.mamba_metadata = Mamba2Metadata(
-                attn_metadata.max_num_requests, chunk_size=128)
+        mamba_metadata = gdn_metadata_for_batch(attn_metadata)
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -2244,6 +2241,8 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
     load_weights_strips_compile_wrapper = True
     model_specific_llm_args = frozenset(
         {"replicate_embedding", "mnnvl_allreduce_fp8_payload"})
+    # The GDN layers' Mamba metadata, whichever cache manager serves the model.
+    mamba_metadata_cls = GDNMambaMetadata
     # The fast paths' TP key exchange: temperature rows take the four-draws Gumbel kernel; argmax splits rows.
     spec_decode_fast_gumbel = True
     spec_decode_argmax_row_split = True

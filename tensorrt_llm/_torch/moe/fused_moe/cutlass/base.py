@@ -37,7 +37,7 @@ from ..activation import (
 )
 from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
 from ..impl_contract import MoERunContext, require_comm_plan
-from ..impl_environment import collect_moe_environment
+from ..impl_environment import MoEEnvFlag, collect_moe_environment
 from ..quantization import MoEWeightLoadingMode
 from ..routing import BaseMoeRoutingMethod
 from .eligibility import SmSupport
@@ -96,6 +96,7 @@ class CutlassFusedMoEBase(MoEImplBase):
       weight method can load a gpt-oss / MiniMax SwiGLU shape.
     * ``requires_oss_cutlass_build`` / ``uses_dynamic_fc2_scale`` -- whether its
       format, or its dynamic FC2 scale, needs the open-source CUTLASS kernels.
+    * ``opt_in_flag`` -- the environment flag that admits an opt-in leaf.
     * ``can_implement`` and ``_get_quant_method``.
     """
 
@@ -112,6 +113,10 @@ class CutlassFusedMoEBase(MoEImplBase):
     #: Whether ``run_moe`` issues ``torch.ops.trtllm.fused_moe``; only such a
     #: leaf is bound by the open-source CUTLASS build (its gate and all-to-all).
     issues_fused_moe_op: bool = True
+    #: The flag a deployment sets to ``1`` to admit this leaf, or None for a leaf
+    #: that needs none. Its ``can_implement`` checks it, and ``find_cutlass_leaf``
+    #: returns the leaf only when it is set.
+    opt_in_flag: MoEEnvFlag | None = None
 
     FUSED_MOE_OP_FLAGS: FusedMoeOpFlags = FusedMoeOpFlags()
     #: Round ``hidden_size`` and ``intermediate_size_per_partition`` up to a

@@ -203,7 +203,7 @@ def check_shared_sequence() -> None:
     """The three sandwich ops on one workspace, as the model runs them (``_shared_step``, 10 calls): steps at (target
     M, drafter M) = (8, 3), (2, 8), (7, 7), a random rank late at every call, every call against its reference.
     The three wrappers export one workspace type."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         k3_sandwich_plain,
         k3_sandwich_tail,
     )
@@ -271,7 +271,7 @@ CHECKS = [
 def _run_one_rank(args) -> int:
     global R, WORKSPACE, WS_A, WS_B, validating
     R = ls.Rank(args)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_oproj import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_oproj import (
         K3SandwichWorkspace,
     )
 

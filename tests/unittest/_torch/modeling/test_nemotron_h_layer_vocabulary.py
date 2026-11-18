@@ -13,12 +13,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_nemotron_hybrid,
     load_pretrained_config,
     match_nemotron_h_layer_types,
     nemotron_h_legacy_layer_types,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 _NEW = ["linear_attention", "moe", "linear_attention", "full_attention"]
 _LEGACY = ["mamba", "moe", "mamba", "attention"]

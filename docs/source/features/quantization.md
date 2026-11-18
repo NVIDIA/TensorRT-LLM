@@ -123,14 +123,16 @@ cd Model-Optimizer/examples/llm_ptq
 scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --kv_cache_quant nvfp4
 ```
 
-Note that currently TRT-LLM only supports FP8 weight/activation quantization when NVFP4 KV cache is enabled. Therefore, `--quant fp8` is required here.
+The example above uses FP8 weight/activation quantization with an NVFP4 KV cache.
+Dense FP4 MLA also has model-specific checkpoint recipes, including NVFP4 MoE
+weights; its KV-cache precision is configured separately.
 
 ## Model Support Matrix
 
 | Model          |  NVFP4  | MXFP4  | FP8(per tensor)| FP8(block scaling) | FP8(rowwise) | FP8 KV Cache | NVFP4 KV Cache | W4A8 AWQ  | W4A16 AWQ | W4A8 GPTQ  | W4A16 GPTQ |
 | :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: |:---:| :-------: | :-------: | :--------: | :--------: |
 | BERT           |   .     |   .    |   .   |   .   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
-| DeepSeek-R1    |   Y     |   .    |   .   |   Y   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
+| DeepSeek-R1    |   Y     |   .    |   .   |   Y   |   .   |   Y   | Y[^fp4-mla] |     .     |     .     |     .      |     .      |
 | EXAONE         |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |     Y     |     Y     |     .      |     .      |
 | Gemma 3        |   .     |   .    |   Y   |   .   |   .   |   Y   |  .  |     Y     |     Y     |     .      |     .      |
 | GPT-OSS        |   .     |   Y    |   .   |   .   |   .   |   Y   |  .  |     .     |     .     |     .      |     .      |
@@ -156,6 +158,11 @@ The vision component of multi-modal models (BLIP2-OPT/BLIP2-T5/LLaVA/VILA/Nougat
 The language component decides which quantization methods are supported by a given multi-modal model.
 ```
 
+
+[^fp4-mla]: Dense DeepSeek-family MLA generation with an NVFP4 KV cache uses
+    Triton on SM100/SM103, or Triton/CuTe DSL on SM107. Model loading validates
+    the worker and context-parallel configuration. The existing
+    `TestDeepSeekV3Lite::test_nvfp4_mla` accuracy case covers the Triton path on B300.
 
 ## Hardware Support Matrix
 

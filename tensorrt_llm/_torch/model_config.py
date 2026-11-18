@@ -23,7 +23,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Callable, Dict, Generic, Iterator, List,
-                    Optional, Sequence, Set, Tuple, TypeVar)
+                    Optional, Sequence, Set, Tuple, TypeVar, get_args)
 
 import filelock
 import torch
@@ -41,14 +41,17 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
+# yapf: disable
 # Callers import MoeLoadBalancerConfig from this module.
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig  # noqa: F401
 from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
                                           DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
+                                          EncoderAttentionBackend,
                                           KvCacheConfig,
                                           MoeLoadBalancerConfigType,
                                           MultimodalConfig)
+# yapf: enable
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -451,6 +454,7 @@ class ModelConfig(Generic[TConfig]):
     enable_torch_compile_for_embedding = False
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
+    _preserve_kv_cache_quant_algo: bool = field(default=False, repr=False)
 
     # Model-provided per-layer KV geometry. It is stored per config rather than
     # in extra_attrs because one-model drafters share extra_attrs with the
@@ -492,6 +496,59 @@ class ModelConfig(Generic[TConfig]):
     # implementation. Set by the model loader, read by `_resolve_class`.
     modeling_v2_target: Optional[type] = None
 
+    def get_encoder_attention_backend(self, encoder: str, default: str) -> str:
+        """Return the attention backend selected for a logical encoder.
+
+        Args:
+            encoder: Logical encoder name, such as ``"vision"`` or ``"audio"``.
+            default: Backend the model uses for this encoder when
+                ``multimodal_config.encoder_attention_backend`` omits it.
+
+        Returns:
+            The backend from ``multimodal_config.encoder_attention_backend``,
+            or ``default`` when the encoder has no entry.
+
+        Raises:
+            ValueError: If the selected backend is not a public encoder backend.
+        """
+        overrides = (self.multimodal_config.encoder_attention_backend
+                     if self.multimodal_config is not None else None)
+        if not overrides or encoder not in overrides:
+            return default
+        backend = overrides[encoder]
+        backends = get_args(EncoderAttentionBackend)
+        if backend not in backends:
+            raise ValueError(
+                f"Invalid attention backend {backend!r} for the {encoder} encoder; "
+                f"expected one of {', '.join(backends)}")
+        return backend
+
+    def with_encoder_attention_backend(self,
+                                       encoder: str,
+                                       default: str | None = None
+                                       ) -> "ModelConfig":
+        """Return a config whose ``attn_backend`` is the encoder's backend.
+
+        Args:
+            encoder: Logical encoder name, such as ``"vision"`` or ``"audio"``.
+            default: Backend the model uses for this encoder when no override
+                is set. ``None`` means the decoder's ``attn_backend``.
+
+        Returns:
+            ``self`` when the selected backend equals ``attn_backend``;
+            otherwise a shallow copy with only ``attn_backend`` changed, so the
+            decoder config is never modified.
+        """
+        backend = self.get_encoder_attention_backend(
+            encoder, self.attn_backend if default is None else default)
+        if backend == self.attn_backend:
+            return self
+        config = copy.copy(self)
+        # The copy keeps ``_frozen``, so ``setattr`` would raise on a config
+        # from ``from_pretrained``. ``object.__setattr__`` changes only the copy.
+        object.__setattr__(config, "attn_backend", backend)
+        return config
+
     @property
     def kv_cache_layer_specs(self) -> Optional[Tuple[KVCacheLayerSpec, ...]]:
         """Return model-provided per-layer KV-cache geometry, if any."""
@@ -502,20 +559,22 @@ class ModelConfig(Generic[TConfig]):
         """Publish unsharded per-layer KV geometry to generic runtime code."""
         self._kv_cache_layer_specs = tuple(layer_specs)
 
-    def __setattr__(self, key, value):
+    def __setattr__(self, key: str, value: object) -> None:
         """
         Prevent modification of frozen instance attributes.
         However, we allow modification of 'extra_attrs' attributes for torch.compile
         and 'pretrained_config' attributes for mutimodal models.
         'quant_config' is allowed to be modified to set different quantization for VLM.
         '_kv_cache_layer_specs' is set by models that publish per-layer KV geometry.
+        '_preserve_kv_cache_quant_algo' scopes an explicit draft KV precision override.
         All the other attributes are frozen.
         This can be bypassed by manually setting '_frozen' to False. The design is
         to discourage modifying the attributes unintentionally.
         """
         if self._frozen:
             if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
-                           'quant_config', '_kv_cache_layer_specs'):
+                           'quant_config', '_kv_cache_layer_specs',
+                           '_preserve_kv_cache_quant_algo'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
         super().__setattr__(key, value)

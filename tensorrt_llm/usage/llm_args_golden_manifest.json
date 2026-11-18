@@ -291,6 +291,16 @@
       "path": "cuda_graph_config.num_tokens"
     },
     {
+      "allowed_values": [
+        "greedy",
+        "advanced",
+        "temperature_only"
+      ],
+      "capture_policy": "list[literal]|none",
+      "kind": "categorical",
+      "path": "cuda_graph_config.sampling_variants"
+    },
+    {
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "cuda_graph_config.seq_lens"
@@ -953,6 +963,16 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.mixed_precision_last_n"
+    },
+    {
+      "allowed_values": [
+        "default",
+        "strict",
+        "recompute"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_config.mixed_precision_reuse"
     },
     {
       "capture_policy": "list[float]|none",

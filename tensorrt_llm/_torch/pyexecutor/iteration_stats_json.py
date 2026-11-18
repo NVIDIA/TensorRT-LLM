@@ -17,6 +17,7 @@ def iteration_stats_row(
     prev_device_step_time_ms: Optional[float] = None,
     scheduler_mode: Optional[str] = None,
     gpu_forward_time_ms: Optional[float] = None,
+    mm_encoder_stats: Optional[dict] = None,
 ) -> dict:
     """``stats`` as a dict, tagged with its attention-DP rank (0 without attention DP), with its
     request and KV-cache iteration stats and the profiler's per-loop timings when present."""
@@ -34,6 +35,8 @@ def iteration_stats_row(
         row["prevDeviceStepTimeMS"] = prev_device_step_time_ms
     if gpu_forward_time_ms is not None:
         row["gpuForwardTimeMS"] = gpu_forward_time_ms
+    if mm_encoder_stats is not None:
+        row["multimodalEncoderStats"] = mm_encoder_stats
     if scheduler_mode is not None:
         row["schedulerMode"] = scheduler_mode
     return row
