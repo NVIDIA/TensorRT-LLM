@@ -210,6 +210,7 @@ def test_pdl_waits_for_a_delayed_producer():
         mod.mxfp8_head_gemv(xs, values, scales, keys.view(torch.int32).view(1, 2), argmax=True)
 
     def copy_no_wait():
+        # pyrefly: ignore [unexpected-keyword]
         _copy_no_wait[(K // 1024,)](xs, snap, K, BLOCK=1024, launch_pdl=True)
 
     def run(consumer, observe):

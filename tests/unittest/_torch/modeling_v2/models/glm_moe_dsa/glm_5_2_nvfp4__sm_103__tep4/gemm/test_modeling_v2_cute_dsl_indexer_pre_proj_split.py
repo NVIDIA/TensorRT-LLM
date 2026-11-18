@@ -12,7 +12,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
         "cute_dsl_indexer_pre_proj_split runs an sm_103 CuTe DSL kernel", allow_module_level=True
     )
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_indexer_pre_proj_split import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_indexer_pre_proj_split import (  # noqa: E402, E501
     MTP_ROWS,
     PREFILL_MAX_ROWS,
     PrefillSplitHandle,
@@ -20,10 +20,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
     compile_ragged,
     project_unsplit,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_indexer_pre_proj_split import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_indexer_pre_proj_split import (  # noqa: E402, E501
     compile as compile_handle,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_indexer_pre_proj_split import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_indexer_pre_proj_split import (  # noqa: E402, E501
     cute_dsl_indexer_pre_proj_split as op,
 )
 
@@ -54,7 +54,7 @@ def _compare(key, head_weights, ref_key, ref_head_weights) -> None:
     assert_within_ulp(head_weights, ref_head_weights, 512.0, 128.0, ulp=FP32_ULP)
 
 
-def _build(rows: int, seed: int):
+def _build(rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
     weight = torch.randn(KEY + HEADS, HIDDEN, generator=g, device="cuda") * HIDDEN**-0.5

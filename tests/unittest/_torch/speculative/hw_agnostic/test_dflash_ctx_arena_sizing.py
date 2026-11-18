@@ -78,7 +78,7 @@ def _size_arena(metadata):
     worker = _worker()
     draft_model = MagicMock(block_size=8)
     draft_model.config = MagicMock(max_position_embeddings=POSITION_TABLE)
-    spec_metadata = MagicMock(max_num_requests=32)
+    spec_metadata = MagicMock(max_num_requests=32, num_seq_slots=32)
 
     with patch("tensorrt_llm._torch.speculative.dflash.torch.zeros", side_effect=_Stop):
         with pytest.raises(_Stop):

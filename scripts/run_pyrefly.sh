@@ -152,9 +152,11 @@ for argument in "$@"; do
 done
 
 if (( FULL_PROJECT || FILTERED_ARG_COUNT > 0 )); then
+    printf '{"tool":"pyrefly","report_error":"Pyrefly check did not complete"}\n' > "$REPORT_FILE"
     CHECK_DIR="$(mktemp -d)"
     TESTS_CONFIG="$CHECK_DIR/tests.toml"
-    python3 "$WORKFLOW_SCRIPT" write-test-config "$EXCLUSIONS_CONFIG" "$TESTS_CONFIG"
+    python3 "$WORKFLOW_SCRIPT" write-test-config "$EXCLUSIONS_CONFIG" "$TESTS_CONFIG" \
+        --no-extra-import-paths
 fi
 
 if (( ! FULL_PROJECT && FILTERED_ARG_COUNT > 0 )); then
@@ -211,6 +213,9 @@ for scope in tensorrt_llm tests; do
         if (( ${#SCOPE_ARGS[@]} == 0 )); then
             continue
         fi
+    fi
+    if [[ "$scope" == tests ]]; then
+        python3 "$WORKFLOW_SCRIPT" write-test-config "$EXCLUSIONS_CONFIG" "$TESTS_CONFIG"
     fi
     if (( ! PATH_MODULE_FILTER )); then
         python3 "$WORKFLOW_SCRIPT" clear-exclusions-config \

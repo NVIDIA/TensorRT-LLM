@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 from dataclasses import replace
 from types import MappingProxyType
@@ -46,7 +47,10 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLay
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     BlockReusePolicy,
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
     KVCacheManagerV2,
+    PagePriorityCallback,
     Role,
     _compute_index_mapper_capacity,
     _read_guard_page_setting,
@@ -75,6 +79,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    AttnLifeCycle,
     BatchDesc,
     BufferConfig,
     DataRole,
@@ -109,7 +114,7 @@ from .common import (
 )
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
@@ -122,8 +127,61 @@ GB = 1 << 30
 # requests per batch that can take the path, at most max_batch_size and
 # _INFORWARD_SNAPSHOT_MAX_ROWS, within _INFORWARD_SNAPSHOT_STAGING_BYTES) are
 # allocated after the pools, outside the GPU cache quota.
+# TRTLLM_INFORWARD_SNAPSHOT_MAX_ROWS (rows) and TRTLLM_INFORWARD_SNAPSHOT_STAGING_MIB
+# (MiB) override the two caps. Requests beyond the rows run their tails a step later.
+# Every rank schedules on its own and the scheduler budgets split rows from these
+# caps, so both must be set identically on every rank of a server.
 _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
+_INFORWARD_SNAPSHOT_MAX_ROWS_ENV = "TRTLLM_INFORWARD_SNAPSHOT_MAX_ROWS"
+_INFORWARD_SNAPSHOT_STAGING_MIB_ENV = "TRTLLM_INFORWARD_SNAPSHOT_STAGING_MIB"
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """A positive int from the environment, or `default` when unset."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as err:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from err
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    return value
+
+
+def _insert_draft_pool_ratio(
+    target_ratio: Sequence[float],
+    life_cycle_block_bytes: Sequence[int],
+    full_history: Sequence[bool],
+    draft_life_cycle: int,
+) -> list[float]:
+    """Pool ratio per lifecycle with the drafter's share inserted.
+
+    ``target_ratio`` lists the other lifecycles' shares in registration order.
+    The drafter keeps one context entry per target token, so its share is
+    solved for as many blocks as the scarcest full-history target lifecycle
+    holds: ``d / B_draft == (1 - d) * min_i(r_i / B_i)``. The target shares
+    keep their split of ``1 - d``.
+    """
+    target_ids = [i for i in range(len(life_cycle_block_bytes)) if i != draft_life_cycle]
+    if len(target_ratio) != len(target_ids):
+        raise ValueError(
+            f"pool_ratio has {len(target_ratio)} entries for {len(target_ids)} target layer groups"
+        )
+    blocks_per_byte = [
+        ratio / life_cycle_block_bytes[i]
+        for ratio, i in zip(target_ratio, target_ids)
+        if full_history[i]
+    ]
+    if not blocks_per_byte:
+        raise ValueError("the drafter's pool share needs a full-history target layer group")
+    draft_blocks = life_cycle_block_bytes[draft_life_cycle] * min(blocks_per_byte)
+    draft_share = draft_blocks / (1 + draft_blocks)
+    ratio = [share * (1 - draft_share) for share in target_ratio]
+    ratio.insert(draft_life_cycle, draft_share)
+    return ratio
 
 
 class InforwardSnapshotEntry(NamedTuple):
@@ -154,6 +212,23 @@ def _uses_fp4_mla_cache_layout(
     )
 
 
+def _equal_state_slices(capacity: int, num_states: int) -> List[KVCacheDesc]:
+    """One typical request of ``capacity`` tokens holding ``num_states`` recurrent states.
+
+    Each state is modeled as an equal slice of the sequence, so the slices' attention pages
+    add up to the request's and each slice adds one recurrent-state slot.
+    """
+    capacity_per_state, capacity_remainder = divmod(capacity, num_states)
+    capacities = [capacity_per_state + int(i < capacity_remainder) for i in range(num_states)]
+    return [
+        KVCacheDesc(
+            capacity=state_capacity,
+            history_length=max(0, state_capacity - 1),
+        )
+        for state_capacity in capacities
+    ]
+
+
 class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """Hybrid Mamba cache manager backed by KVCacheManagerV2.
 
@@ -182,6 +257,19 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     _inforward_stage_conv: Optional[torch.Tensor] = None
     # Recurrent snapshots use their own commit/history endpoints without draft backoff.
     _supports_reuse_match_backoff = False
+    # get_layer_masks() returns an all-False mamba mask for a draft pool, so
+    # local_num_mamba_layers == 0 and the truncation above cannot apply to it.
+    _supports_draft_reuse_match_backoff = True
+    # It still applies to the paired target, which the scheduler caps at the
+    # draft's claim; the trim can be waived so it cannot leave the snapshot grid.
+    _drop_advisory_draft_lookahead = True
+
+    @classmethod
+    @override
+    def accepts_appended_draft_layers(cls) -> bool:
+        """Hybrid managers lay out their own target layers; subclasses
+        validated with a standalone drafter override this to append its layers."""
+        return False
 
     # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
     # cache manager __init__ coerces a positive spec recompute tail to a full
@@ -245,6 +333,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         Args:
             gdn_fused_verify: Whether the GDN layers verify drafts with the
                 fused kernels (see gdn_replay_partitioned).
+            layer_specs: Draft-owned attention layers a standalone drafter
+                keeps in this manager, appended after the target layers that
+                the mask arguments describe (see ``_append_draft_layers``).
         """
         if conv_state_layout not in ("x_b_c", "q_k_v"):
             raise ValueError(f"Unsupported convolution state layout: {conv_state_layout!r}")
@@ -257,6 +348,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"(got {kwargs['model_type']!r}); pass "
                 "conv_state_layout='x_b_c' or 'q_k_v' instead"
             )
+        draft_layer_specs = tuple(kwargs.pop("layer_specs", None) or ())
+        mamba_layer_mask, layer_mask, num_kv_heads = self._append_draft_layers(
+            draft_layer_specs,
+            mamba_layer_mask,
+            layer_mask,
+            num_kv_heads,
+            k_only=kv_cache_type == CacheTypeCpp.SELFKONLY,
+        )
+        num_layers += len(draft_layer_specs)
         total_layers = len(mamba_layer_mask)
         if layer_mask is None:
             full_attention_layer_mask = [False] * total_layers
@@ -284,6 +384,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # overwrites the per-request list on every scheduler pass, so the point
         # has to be re-merged from here rather than stored only on the request.
         self._branch_snapshot_points: Dict[int, int] = {}
+        # Fork depths a paired draft probe found past this pool's capped claim.
+        self._context_fork_hints: Dict[int, int] = {}
         self._snapshot_pruned_tokens_total = 0
         self._page_pruned_tokens_total = 0
         self._branch_snapshots_taken_total = 0
@@ -310,6 +412,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             layer_idx for layer_idx in self.pp_layers if mamba_layer_mask[layer_idx]
         ]
         self.local_num_mamba_layers = len(self.mamba_pp_layers)
+        local_ids = {layer_idx: offset for offset, layer_idx in enumerate(self.pp_layers)}
+        self._appended_draft_layer_specs = {
+            local_ids[layer.global_layer_id]: layer
+            for layer in draft_layer_specs
+            if layer.global_layer_id in local_ids
+        }
 
         if self.local_num_mamba_layers > 0:
             tp_size = _mamba_effective_tp_size(mapping)
@@ -456,6 +564,53 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._setup_state_pool()
 
+    @staticmethod
+    def _append_draft_layers(
+        draft_layer_specs: Sequence[KVCacheLayerSpec],
+        mamba_layer_mask: list[bool],
+        layer_mask: list[bool] | None,
+        num_kv_heads: int | list[int | None],
+        *,
+        k_only: bool,
+    ) -> tuple[list[bool], list[bool] | None, int | list[int | None]]:
+        """Masks and KV heads with a standalone drafter's layers appended.
+
+        The masks describe this manager's recurrent and target attention
+        layers; the drafter's layers follow them in global layer id order and
+        keep the storage of their specs.
+        """
+        if not draft_layer_specs:
+            return mamba_layer_mask, layer_mask, num_kv_heads
+        num_target_layers = len(mamba_layer_mask)
+        expected_ids = list(range(num_target_layers, num_target_layers + len(draft_layer_specs)))
+        if [layer.global_layer_id for layer in draft_layer_specs] != expected_ids:
+            raise ValueError(
+                "MambaHybridCacheManagerV2 layer_specs must be the drafter's layers "
+                f"{expected_ids} after the target layers"
+            )
+        for layer in draft_layer_specs:
+            if layer.owner is not KVCacheLayerOwner.DRAFT:
+                raise ValueError(
+                    "MambaHybridCacheManagerV2 describes its target layers itself; "
+                    f"layer_specs may add only draft-owned layers (layer {layer.global_layer_id})"
+                )
+            if layer.kv_factor != (1 if k_only else 2):
+                raise ValueError(
+                    f"draft layer {layer.global_layer_id} has kv_factor {layer.kv_factor}, "
+                    "unlike the target cache type"
+                )
+        if layer_mask is None:
+            layer_mask = [False] * num_target_layers
+        if isinstance(num_kv_heads, int):
+            num_kv_heads = [num_kv_heads] * num_target_layers
+        num_draft = len(draft_layer_specs)
+        return (
+            list(mamba_layer_mask) + [False] * num_draft,
+            list(layer_mask) + [True] * num_draft,
+            # Placeholders: the base manager takes the rank-local heads from the specs.
+            list(num_kv_heads) + [layer.num_kv_heads for layer in draft_layer_specs],
+        )
+
     @override
     def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
         # A transferred recurrent state summarizes and overwrites the whole prefix.
@@ -487,6 +642,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         **kwargs,
     ):
         spec_config = kwargs.get("spec_config")
+        # Appended draft layers grow with every token like the target's pages.
+        draft_layer_specs = kwargs.pop("layer_specs", None) or ()
+        kwargs.pop("shared_draft_block_width", None)
+        draft_slope = sum(layer.bytes_per_token() for layer in draft_layer_specs)
+        # Every request also reserves room for the drafter's next block in the
+        # target's attention layers and in the draft layers: max_draft_len + 1
+        # tokens, enough for either DSpark slot convention.
+        draft_scratch_tokens = (
+            spec_config.max_draft_len + 1 if draft_layer_specs and spec_config is not None else 0
+        )
         num_reserved_dummy_slots = _get_num_cuda_graph_padding_dummy_slots(
             spec_config, max_batch_size
         ) + int(mapping.enable_attention_dp)
@@ -546,6 +711,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             cap_partial_attention_snapshots=True,
             attention_slope_override=attention_slope_override,
             attention_page_bytes_override=attention_page_bytes_override,
+            draft_scratch_tokens=draft_scratch_tokens,
             **kwargs,
         )
         fixed_region_bytes = cls._estimate_fixed_region_bytes(
@@ -555,7 +721,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             kv_cache_config=kv_cache_config,
             **kwargs,
         )
-        return slope, intercept + attention_intercept + fixed_region_bytes
+        intercept += max_batch_size * draft_scratch_tokens * draft_slope
+        return slope + draft_slope, intercept + attention_intercept + fixed_region_bytes
+
+    @classmethod
+    @override
+    def _get_per_request_layer_tokens(cls, *args, layer_specs=None, **kwargs):
+        # ``layer_specs`` holds only the appended draft layers here; the
+        # recurrent and target layers keep the base estimate (None for hybrids).
+        return super()._get_per_request_layer_tokens(*args, layer_specs=None, **kwargs)
 
     @classmethod
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
@@ -913,15 +1087,35 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         Each retained state is modeled as an equal slice of the sequence.
         """
         num_states = self._num_ssm_states_per_typical_request(capacity, kv_cache_config)
-        capacity_per_state, capacity_remainder = divmod(capacity, num_states)
-        capacities = [capacity_per_state + int(i < capacity_remainder) for i in range(num_states)]
-        return [
-            KVCacheDesc(
-                capacity=state_capacity,
-                history_length=max(0, state_capacity - 1),
+        return _equal_state_slices(capacity, num_states)
+
+    def _cold_typical_step(
+        self, kv_cache_config: KvCacheConfig, num_cache_tiers: int
+    ) -> Optional[BatchDesc]:
+        """Typical step for the cold tiers' pool split, or None to keep the GPU tier's split.
+
+        One typical request with ``cold_tier_states_per_request`` states, instead of the GPU
+        split's live state plus every retained snapshot: a released conversation mostly comes
+        back through its latest endpoint, so the rest of the cold quota goes to attention pages.
+        An explicit ``pool_ratio`` wins: the cold tiers keep its slot-count ratios.
+        """
+        if num_cache_tiers < 2:
+            return None
+        num_states = kv_cache_config.mamba_state_config.cold_tier_states_per_request
+        if num_states is None or not kv_cache_config.enable_block_reuse:
+            return None
+        if kv_cache_config.pool_ratio is not None:
+            logger.info(
+                "[MambaHybridCacheManagerV2] kv_cache_config.pool_ratio is set, so the cold "
+                "cache tiers keep its slot-count ratios and cold_tier_states_per_request is unused"
             )
-            for state_capacity in capacities
-        ]
+            return None
+        capacity = self._get_typical_request_capacity(kv_cache_config)
+        logger.info(
+            f"[MambaHybridCacheManagerV2] cold cache tiers sized for {num_states} recurrent "
+            f"state(s) per {capacity}-token typical request"
+        )
+        return BatchDesc(_equal_state_slices(capacity, num_states))
 
     def _get_typical_request_capacity(
         self,
@@ -1064,6 +1258,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             config,
             layers=layers,
             typical_step=typical_step,
+            cold_typical_step=self._cold_typical_step(kv_cache_config, len(config.cache_tiers)),
             constraints=constraints,
             # SSM lifecycles require minimum-snapshot commit semantics. The
             # flag is harmless when reuse is disabled because no commits are
@@ -1075,7 +1270,61 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # Adds the FP4 MLA HP-ring virtual layers and the fallback-layer
             # lifecycle; SSM layers are left unchanged.
             result = layout_policy._build_cache_config(self, result)
-        return result
+        return self._with_draft_pool_ratio(result)
+
+    def _with_draft_pool_ratio(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """Give appended draft layers of their own lifecycle a pool share.
+
+        A configured ``pool_ratio`` lists the target's lifecycles; the draft
+        lifecycle's share is inserted for token parity (see
+        ``_insert_draft_pool_ratio``). Native lifecycles are registered in
+        layer and buffer order.
+        """
+        ratio = config.initial_pool_ratio
+        if ratio is None or not self._appended_draft_layer_specs:
+            return config
+        keys: List[tuple] = []
+        block_bytes: List[int] = []
+        draft_keys = set()
+        target_keys = set()
+        for layer in config.layers:
+            # Empty buffers are dropped before the native manager sees them.
+            for buffer in (buffer for buffer in layer.buffers if buffer.size):
+                policy = (
+                    buffer.reuse_policy if buffer.reuse_policy is not None else layer.reuse_policy
+                )
+                if isinstance(layer, SsmLayerConfig):
+                    key = ("ssm", policy)
+                else:
+                    life_cycle = AttnLifeCycle.make(
+                        layer.sliding_window_size,
+                        layer.num_sink_tokens,
+                        config.tokens_per_block,
+                        policy,
+                    )
+                    key = (life_cycle.window_size, life_cycle.num_sink_blocks, policy)
+                if key not in keys:
+                    keys.append(key)
+                    block_bytes.append(0)
+                block_bytes[keys.index(key)] += buffer.size
+                is_draft = int(layer.layer_id) in self._appended_draft_layer_specs
+                (draft_keys if is_draft else target_keys).add(key)
+        if len(ratio) == len(keys):
+            return config
+        if len(draft_keys) != 1 or draft_keys & target_keys or len(ratio) != len(keys) - 1:
+            raise ValueError(
+                f"kv_cache_config.pool_ratio has {len(ratio)} entries; give one per target "
+                f"layer group ({len(keys) - 1}) or one per layer group ({len(keys)})"
+            )
+        full_history = [
+            key[0] != "ssm" and (key[0] is None or key[0] >= self.max_seq_len) for key in keys
+        ]
+        return replace(
+            config,
+            initial_pool_ratio=_insert_draft_pool_ratio(
+                ratio, block_bytes, full_history, keys.index(draft_keys.pop())
+            ),
+        )
 
     def _setup_state_pool(self) -> None:
         """Resolve logical slots, bind base views, then initialize model state."""
@@ -1228,14 +1477,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and row_bytes > 0
         ):
             return 0, row_bytes
-        rows = max(
-            1,
-            min(
-                self.max_batch_size,
-                _INFORWARD_SNAPSHOT_MAX_ROWS,
-                _INFORWARD_SNAPSHOT_STAGING_BYTES // row_bytes,
-            ),
+        max_rows = _env_positive_int(_INFORWARD_SNAPSHOT_MAX_ROWS_ENV, _INFORWARD_SNAPSHOT_MAX_ROWS)
+        staging_mib = _env_positive_int(
+            _INFORWARD_SNAPSHOT_STAGING_MIB_ENV, _INFORWARD_SNAPSHOT_STAGING_BYTES >> 20
         )
+        rows = max(1, min(self.max_batch_size, max_rows, (staging_mib << 20) // row_bytes))
         return rows, row_bytes
 
     def _setup_inforward_snapshot(self) -> None:
@@ -1311,12 +1557,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Commit each planned request up to P from its live state, then copy its staged prompt-end state back.
 
         Called on the execution stream right after the forward, so the copies precede the batch's sampler event.
+        One index_copy_ per staged buffer covers every planned request.
         """
         plan = self.inforward_snapshot_plan
         if not plan:
             return
         self.inforward_snapshot_plan = {}
-        dst, src = [], []
+        slots, rows = [], []
         for request in scheduled_batch.context_requests:
             entry = plan.get(request.py_request_id)
             kv_cache = self.kv_cache_map.get(request.py_request_id)
@@ -1349,13 +1596,30 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 raise RuntimeError(
                     f"In-forward Mamba snapshot: request {request.py_request_id} lost its live SSM slot"
                 )
-            dst += [state[slot] for state in self.all_ssm_states]
-            dst += [state[slot] for state in self.all_conv_states]
-            src += list(self._inforward_stage_ssm[:, entry.row].unbind(0))
-            src += list(self._inforward_stage_conv[:, entry.row].unbind(0))
-        if dst:
-            with torch.cuda.stream(self._stream):
-                torch._foreach_copy_(dst, src, non_blocking=True)
+            slots.append(slot)
+            rows.append(entry.row)
+        if not slots:
+            return
+        # (live pool [slots, ...], staging [rows, ...]) of every buffer the snapshot staged.
+        buffers = list(zip(self.all_ssm_states, self._inforward_stage_ssm.unbind(0)))
+        buffers += list(zip(self.all_conv_states, self._inforward_stage_conv.unbind(0)))
+        buffers += self._inforward_extra_restore_buffers()
+        device = self._inforward_stage_ssm.device
+        with torch.cuda.stream(self._stream):
+            slot_index = _host_slots_to_device(slots, device)
+            # Rows follow batch order, so they are usually 0..n-1 and a slice replaces the gather.
+            leading = rows == list(range(len(rows)))
+            row_index = None if leading else _host_slots_to_device(rows, device)
+            for pool, stage in buffers:
+                src = stage[: len(rows)] if leading else stage.index_select(0, row_index)
+                pool.index_copy_(0, slot_index, src)
+
+    def _inforward_extra_restore_buffers(self) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """(live pool ``[slots, ...]``, staging ``[rows, ...]``) of model state that shares the GDN slot.
+
+        finish_inforward_snapshots restores these with the SSM and conv states; none by default.
+        """
+        return []
 
     def _setup_model_state(self) -> None:
         """Bind views only after layout, pool and slot capacity are final."""
@@ -1487,6 +1751,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         enable_request_stats: bool = False,
         expected_prompt_length: Optional[int] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+        custom_priority_callback: Optional[PagePriorityCallback] = None,
     ) -> Optional[_KVCache]:
         kv_cache = super()._create_kv_cache(
             request_id,
@@ -1497,6 +1762,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
             kv_cache_retention_config=kv_cache_retention_config,
+            custom_priority_callback=custom_priority_callback,
         )
         if (
             self.mapping.rank == 0
@@ -1613,9 +1879,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         )
                     self._host_replay_indices[i] = replay_index
 
-        self._state_indices_buffer.update(self._host_state_indices)
         is_dummy = [req.is_dummy for req in requests]
-        self._refresh_dummy_request_mask(is_dummy)
+        if not self._upload_state_indices_and_dummy_mask(is_dummy):
+            self._state_indices_buffer.update(self._host_state_indices)
+            self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
         for req, value, dummy in zip(requests, state_values, is_dummy):
             self._request_id_to_state_index[req.py_request_id] = value
@@ -1715,13 +1982,27 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             )
 
     def _refresh_dummy_request_mask(self, is_dummy: list[bool]) -> None:
+        self._fill_dummy_request_mask_host(is_dummy)
+        self._dummy_request_mask_buffer.update(self._dummy_request_mask_host)
+
+    def _fill_dummy_request_mask_host(self, is_dummy: list[bool]) -> None:
         count = len(is_dummy)
         if count > self._dummy_request_mask_host.shape[0]:
             raise ValueError("Dummy-request batch exceeds state-index capacity")
         self._dummy_request_mask_host.zero_()
         if count:
             self._dummy_request_mask_host[:count].copy_(torch.tensor(is_dummy, dtype=torch.bool))
-        self._dummy_request_mask_buffer.update(self._dummy_request_mask_host)
+
+    def _upload_state_indices_and_dummy_mask(self, is_dummy: list[bool]) -> bool:
+        """Upload the state indices and the dummy-request mask another way.
+
+        Called by ``_setup_state_indices`` after ``_host_state_indices`` is
+        filled. A subclass that writes ``_state_indices_buffer`` and
+        ``_dummy_request_mask_buffer`` itself (``_fill_dummy_request_mask_host``
+        fills the mask's host side) returns True; False, the default, uploads
+        both with ``DeviceCopyBuffer.update``.
+        """
+        return False
 
     @override
     def get_state_indices(
@@ -1779,6 +2060,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # Preemption also frees: the next cache of this request gets new pages.
         self._initialized_replay_requests.discard(request.py_request_id)
         self._branch_snapshot_points.pop(request.py_request_id, None)
+        self._context_fork_hints.pop(request.py_request_id, None)
         # A freed request ends any steady decode run.
         self._steady_state_index_key = None
         super().free_resources(request, pin_on_release)
@@ -1846,6 +2128,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def try_commit_blocks(self, request: LlmRequest, kv_cache=None) -> None:
+        if self.is_draft:
+            # Attention-only pool: no recurrent state, so the snapshot-boundary
+            # gate below does not apply. expect_snapshot_points is target
+            # geometry. Commit on the base class's block cadence instead.
+            return super().try_commit_blocks(request)
         should_block_reuse = (
             self.enable_block_reuse and not self.is_draft and not request.is_dummy_request
         )
@@ -1873,15 +2160,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 end=commit_end,
             )
             kv_cache.commit(tokens)
-            if (
-                self.local_num_mamba_layers > 0
-                and self._branch_snapshot_points.get(request.py_request_id) == commit_end
-            ):
-                self._branch_snapshots_taken_total += 1
+            if self.local_num_mamba_layers > 0:
+                self._count_snapshot_commit(request, commit_end)
         if request.context_current_position >= commit_limit:
             self._mark_context_position_as_history(request, kv_cache)
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
+
+    def _count_snapshot_commit(self, request: LlmRequest, point: int) -> None:
+        """Count a recurrent-state snapshot committed at ``point`` of ``request``'s prompt."""
+        if self._branch_snapshot_points.get(request.py_request_id) == point:
+            self._branch_snapshots_taken_total += 1
+        waiter_points = (self._waiter_snapshot_points or {}).get(request.py_request_id, ())
+        if point in waiter_points:
+            self._inflight_prefix_points_taken_total += 1
 
     def _mark_context_position_as_history(self, request: LlmRequest, kv_cache) -> None:
         """Advance history without making later recurrent state reusable."""
@@ -1897,6 +2189,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        if self.is_draft:
+            # Attention-only pool; see try_commit_blocks.
+            return super().update_context_resources(scheduled_batch)
         for request in scheduled_batch.context_requests:
             kv_cache = self.kv_cache_map.get(request.py_request_id)
             if kv_cache is None or not kv_cache.is_active:
@@ -2045,6 +2340,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._snapshot_pruned_tokens_total += max(0, hybrid_depth - reused)
             self._page_pruned_tokens_total += max(0, divergence - hybrid_depth)
 
+        fork = self._context_fork_hints.pop(req.py_request_id, None)
+        if fork is not None and fork - reused > self.tokens_per_block:
+            # A paired claim stops the lookup at its depth, hiding a fork past
+            # it. One within a block of the reuse is not worth a snapshot.
+            divergence = max(divergence, fork)
+            num_lookup_tokens = max(num_lookup_tokens, req.prompt_len - 1)
+
         # The whole lookup range matched, so there is no fork here.
         if divergence >= num_lookup_tokens:
             self._skip_branch_snapshot("no_divergence")
@@ -2068,6 +2370,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._branch_snapshot_points[req.py_request_id] = point
         self._apply_branch_snapshot_point(req, context_current_position=reused)
+
+    @override
+    def note_context_fork(self, req: LlmRequest, fork: int) -> None:
+        if self.kv_cache_config.block_reuse_config.enable_branch_snapshot:
+            self._context_fork_hints[req.py_request_id] = fork
 
     def _apply_branch_snapshot_point(
         self,
@@ -2106,7 +2413,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             f"branch_snapshots_taken={self._branch_snapshots_taken_total} "
             f"branch_snapshots_skipped={sum(skipped.values())} "
             f"branch_snapshots_skipped_by_reason="
-            f"{dict(sorted(skipped.items()))}"
+            f"{dict(sorted(skipped.items()))} "
+            f"{self._format_inflight_prefix_counters()}"
         )
 
     @override

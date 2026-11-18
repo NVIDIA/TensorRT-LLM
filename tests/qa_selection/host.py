@@ -27,9 +27,10 @@ import json
 import platform
 import re
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Any, List, Optional, Sequence, cast
 
 from .core.machine import MachineProfile
 from .core.report import ArtifactNames
@@ -107,7 +108,9 @@ class SavedProfile:
             f"profile.ladder must be a list of GPU counts, got {json.dumps(profile.get('ladder'))}",
         )
         try:
-            return MachineProfile(name=LocalProfile.NAME, **profile).checked_ladder()
+            return MachineProfile(
+                name=LocalProfile.NAME, **cast(Mapping[str, Any], profile)
+            ).checked_ladder()
         except ValueError as error:
             raise SavedProfileError(path, f"profile {error}") from error
 

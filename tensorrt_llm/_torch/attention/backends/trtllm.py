@@ -28,11 +28,12 @@ import torch
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
+    from ...host_staging import HostUploader
     from ...model_config import ModelConfig
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from .fmha.gqa_decode import GqaDecodeFmha, GqaDecodeSetup
-    from .fmha.interface import Fmha
+    from .fmha.interface import Fmha, FmhaPrewarmConfig
     from .sparse.dsa.metadata import TokenMajorGenView
 
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
@@ -47,7 +48,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
-from ...pyexecutor import step_inputs
+from ...pyexecutor import h2d_cache, step_inputs
 from ...pyexecutor.config_utils import is_mla
 from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -55,21 +56,28 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
+from .fmha.registry import is_fmha_lib_enabled
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams,
-                        merge_attention_forward_args)
+                        AttentionRuntimeFeatures, KVCacheParams, MLAParams,
+                        PositionalEmbeddingParams, PredefinedAttentionMask,
+                        RopeParams, merge_attention_forward_args)
 from .mixed_precision_rows import store_mixed_precision_low_rows
-from .sparse.hooks import prepare_sparse_runtime_params
+from .sparse.hooks import has_sparse_mla_hooks, prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
+
+
+def _has_fp8_context_mla_fmha(sm_version: int) -> bool:
+    """Whether MLA context attention with an FP8 or NVFP4 KV cache runs the op's
+    FP8 context MLA FMHA on this SM (``mFP8ContextMLA`` in thop/attentionOp.cpp)."""
+    return sm_version == 90 or is_sm_100f(sm_version) or is_sm_120f(sm_version)
 
 
 def _resolve_skip_correction_threshold(threshold: float,
@@ -208,12 +216,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # when beam search is enabled.
     beam_width: int = 1
 
+    # Set by the runner that owns this metadata: per-step uploads go through it.
+    host_uploader: Optional["HostUploader"] = None
+
     # Plan caches of the FMHA libraries, keyed by library. A planned wrapper owns
     # workspaces that CUDA graphs capture, so it lives exactly as long as this
     # metadata; every layer that runs with this metadata reuses it.
-    fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
-                                              init=False,
-                                              repr=False)
+    fmha_plan_caches: Dict[str, Any] = field(default_factory=dict,
+                                             init=False,
+                                             repr=False)
+    # Whether TLLM_FMHA_LIBS enables beam_shared_prefix, read once per metadata so that
+    # prepare() does no per-step work for it when the library is off.
+    beam_shared_prefix_enabled: bool = field(default=False,
+                                             init=False,
+                                             repr=False)
     # Context-only plan shared by the layers of one forward (TrtllmAttention.cache_context_plan).
     context_plan: Optional[_ContextPlan] = field(init=False,
                                                  default=None,
@@ -455,6 +471,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
+        self.beam_shared_prefix_enabled = is_fmha_lib_enabled(
+            "beam_shared_prefix")
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
@@ -769,6 +787,28 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if state is not None:
             state.update_for_spec_dec(self)
 
+    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
+        # The FP4 MLA decode dispatcher chooses 2x | 4x | two-stream on it.
+        state = self.fp4_mla_state
+        if state is not None:
+            state.kv_regime_max_kv = kv_regime
+
+    @property
+    def decode_kv_regime(self) -> Optional[int]:
+        state = self.fp4_mla_state
+        return None if state is None else state.kv_regime_max_kv
+
+    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
+        # The FP4 MLA packed decode launches its split budget only when True.
+        state = self.fp4_mla_state
+        if state is not None:
+            state.packed_split = packed_split
+
+    @property
+    def decode_packed_split(self) -> Optional[bool]:
+        state = self.fp4_mla_state
+        return None if state is None else state.packed_split
+
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
         # buffers below must be rebuilt before the next MLA layer reads them.
@@ -1082,6 +1122,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
              self.host_request_types_runtime, self._num_generations,
              self.max_num_sequences) = saved
 
+    def _upload_to_device(self, key: str, destination: torch.Tensor,
+                          value: torch.Tensor, engine_staging: bool) -> bool:
+        """Copy host ``value`` into ``destination`` through the runner's uploader, unless the
+        engine stages this copy itself (``engine_staging``) or no uploader is set: then False."""
+        if self.host_uploader is None or engine_staging:
+            return False
+        self.host_uploader.upload(key, value, destination)
+        return True
+
     def prepare(self) -> None:
         super().prepare()
         self.context_plan = None
@@ -1113,9 +1162,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
-                             self.prompt_lens_cpu[:self.num_seqs],
-                             pack=True)
+        if not self._upload_to_device(
+                "prompt_lens", self.prompt_lens_cuda[:self.num_seqs],
+                self.prompt_lens_cpu[:self.num_seqs], h2d_cache.enabled()):
+            copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
+                                 self.prompt_lens_cpu[:self.num_seqs],
+                                 pack=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1170,8 +1222,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
-                          maybe_pin_memory(kv_lens[:self.num_seqs]))
+        if not self._upload_to_device(
+                "kv_lens", self.kv_lens_cuda[:self.num_seqs],
+                kv_lens[:self.num_seqs], step_inputs.is_open()):
+            step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
+                              maybe_pin_memory(kv_lens[:self.num_seqs]))
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -1196,17 +1251,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # every block-table access, so the staged/H2D width can be capped
             # at the batch's maximum instead of max_seq_len's worth of
             # columns. Speculative decoding must stage the full width:
-            # draft/tree sub-steps and the overlap scheduler advance
-            # kv_lens_cuda on device past the host snapshot, and their
-            # kernels dereference block columns a host-derived cap would
+            # its kernels dereference block columns a host-derived cap would
             # leave unstaged (uninitialized in this buffer).
-            spec_active = (self.draft_kv_cache_manager is not None
-                           or self.is_spec_decoding_enabled
-                           or bool(self.kv_cache_params.num_extra_kv_tokens) or
-                           (self.runtime_features is not None and
-                            self.runtime_features.has_speculative_draft_tokens))
             max_blocks = None
-            if not spec_active and self.kv_cache_manager.tokens_per_block:
+            if (not self._generation_block_offsets_need_capacity()
+                    and self.kv_cache_manager.tokens_per_block):
                 max_blocks = ceil_div(max_kv_len,
                                       self.kv_cache_manager.tokens_per_block)
             self.kv_cache_manager.copy_batch_block_offsets(
@@ -1251,6 +1300,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             prompt_lens_cpu=prompt_lens_cpu_runtime,
             host_request_types=self.host_request_types[:self.num_seqs],
         )
+
+        # Per-step host planning of the opt-in wide-beam generation library.
+        # It must run here, ahead of every forward of the step, so that under
+        # CUDA graphs it precedes both capture and replay.
+        # Also runs for single-beam steps, where it only drops the previous step's plan.
+        if self.beam_shared_prefix_enabled:
+            from .fmha.beam_shared_prefix import plan_step
+            plan_step(self)
 
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
@@ -1478,6 +1535,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:num_seqs],
         )
 
+    def _generation_block_offsets_need_capacity(self) -> bool:
+        """Whether generation block-offset rows need their configured capacity."""
+        return (self.draft_kv_cache_manager is not None
+                or self.is_spec_decoding_enabled
+                or bool(self.kv_cache_params.num_extra_kv_tokens)
+                or (self.runtime_features is not None
+                    and self.runtime_features.has_speculative_draft_tokens))
+
     @property
     def supports_steady_decode_step(self) -> bool:
         """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
@@ -1552,6 +1617,90 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             prompt_lens_cpu=self.prompt_lens_cpu[:num_seqs],
             host_request_types=self.host_request_types[:num_seqs],
         )
+
+    def support_steady_gen_step(self) -> bool:
+        """Whether ``prepare_steady_gen_step`` may advance this metadata.
+
+        True for the plain decode configuration whose per-step state is fully
+        described by the kv lengths and the KV block table: this class itself
+        (the sparse-attention subclasses keep per-step state in their own
+        ``prepare()``), no FP4-MLA state, no helix / cross attention / locality
+        domains / flash-MLA / MLA cached-kv prefill handling, no mixed-precision
+        KV staging or cold-page window (prepare() redirects its block offsets),
+        and a KV cache manager with a known block size.
+        """
+        return (type(self) is TrtllmAttentionMetadata
+                and self.fp4_mla_state is None
+                and self.kv_cache_manager is not None and getattr(
+                    self.kv_cache_manager, 'tokens_per_block', None) is not None
+                and not self.enable_helix and not self.has_cross_sub_metadata
+                and not getattr(self, 'locality_domain_enabled', False)
+                and not self.enable_flash_mla
+                and not self.enable_context_mla_with_cached_kv
+                and not self._has_mixed_precision_staging()
+                and self.mixed_precision_high_block_table is None
+                and self.kv_cache_params is not None
+                and self.kv_cache_params.use_cache)
+
+    def prepare_steady_gen_step(self, num_real: int, *,
+                                refresh_block_offsets: bool) -> None:
+        """Advance the state of the last ``prepare()`` by one decode step.
+
+        Valid only right after a ``prepare()`` (or a previous call of this
+        method) for a generation-only batch whose first ``num_real`` requests
+        each committed exactly one more token and whose remaining rows are
+        CUDA-graph padding dummies; ``kv_cache_params`` must already hold
+        this step's cached-token counts. Prompt lengths, request types, seq
+        lens and request ids are unchanged, so only the kv lengths move (one
+        in-place add on host and device instead of a rebuilt tensor and an
+        H2D copy). The KV block table is re-staged only when the caller saw a
+        real request start a new block (``refresh_block_offsets``); otherwise
+        the previously staged prefix still covers every block the kernels
+        read. The Mamba metadata, if any, skips its state-index staging the
+        same way.
+        """
+        if self.mamba_metadata:
+            self.mamba_metadata.prepare_steady_gen_step(self)
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
+
+        num_seqs = self.num_seqs
+        self.kv_lens[:num_real].add_(1)
+        self.kv_lens_cuda[:num_real].add_(1)
+        # prepare() binds kv_lens_runtime (host_past_key_value_lengths in
+        # thop.attention, hence max_past_kv_length / mMaxSeqLenKv) to a tensor
+        # of its own without the extra kv tokens, not to self.kv_lens: move it
+        # with the others or eager attention launches keep the stale bound.
+        self.kv_lens_runtime[:num_real].add_(1)
+        self.host_total_kv_lens[1] += num_real
+
+        if refresh_block_offsets:
+            max_kv_len = int(self.kv_lens[:num_seqs].max())
+            spec_active = (self.draft_kv_cache_manager is not None
+                           or self.is_spec_decoding_enabled
+                           or bool(self.kv_cache_params.num_extra_kv_tokens) or
+                           (self.runtime_features is not None and
+                            self.runtime_features.has_speculative_draft_tokens))
+            max_blocks = None
+            if not spec_active and self.kv_cache_manager.tokens_per_block:
+                max_blocks = ceil_div(max_kv_len,
+                                      self.kv_cache_manager.tokens_per_block)
+            self.kv_cache_manager.copy_batch_block_offsets(
+                self.kv_cache_block_offsets,
+                self.request_ids,
+                self.beam_width,
+                self.num_contexts,
+                num_seqs,
+                max_blocks=max_blocks)
+            if self.draft_kv_cache_manager is not None:
+                self.draft_kv_cache_manager.copy_batch_block_offsets(
+                    self.draft_kv_cache_block_offsets,
+                    self.request_ids,
+                    self.beam_width,
+                    self.num_contexts,
+                    num_seqs,
+                    max_blocks=max_blocks)
 
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
@@ -1629,6 +1778,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
             block_ids_per_seq[self.num_contexts:], non_blocking=True)
 
+    def _mla_cached_kv_partition_tokens(self) -> Optional[int]:
+        """Cached tokens attended per MLA context partition, or None if unpartitioned.
+
+        Chunked prefill splits the cached prefix by its buffer size. FP4 MLA
+        also attends a prefix claimed by block reuse in partitions read back
+        from FP4 storage; each partition must fit the FP8 context scratch,
+        which holds ``max_num_tokens`` tokens per chunked-prefill buffer.
+        """
+        features = self.runtime_features
+        if features.chunked_prefill:
+            return features.chunk_size * features.chunked_prefill_buffer_batch_size
+        if self.fp4_mla_state is not None:
+            return int(self.max_num_tokens)
+        return None
+
     def pre_process_for_chunked_prefill(
         self,
         chunked_seq_len: torch.Tensor,
@@ -1638,15 +1802,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         merge_op_tensor: torch.Tensor,
         max_chunk_len_per_loop: list[int],
         chunked_loop_num: int,
+        total_chunk_size: Optional[int] = None,
     ) -> None:
         """
         Pre-process the MLA layer for chunked prefill.
         This method is called before the forward pass to prepare the MLA layer for chunked prefill.
+        Each loop attends at most ``total_chunk_size`` cached tokens summed over the
+        context requests; it defaults to the chunked-prefill buffer size.
         """
         num_contexts = self.num_contexts
-        chunk_size = self.runtime_features.chunk_size
-        chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-        total_chunk_size = chunk_size * chunk_batch_size
+        if total_chunk_size is None:
+            chunk_size = self.runtime_features.chunk_size
+            chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
+            total_chunk_size = chunk_size * chunk_batch_size
         remain_buffer_len = total_chunk_size
         current_batch_idx = 0
         max_chunk_len_per_loop.clear()
@@ -1754,10 +1922,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
             # determine the number of loop
             # currently we assume that the chunk size is the same as the max_num_tokens
-            if self.runtime_features.chunked_prefill:
-                chunk_size = self.runtime_features.chunk_size
-                chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-                total_chunk_size = chunk_size * chunk_batch_size
+            total_chunk_size = self._mla_cached_kv_partition_tokens()
+            if total_chunk_size is not None:
                 self.chunked_loop_num = math.ceil(self.num_ctx_cached_tokens /
                                                   total_chunk_size)
                 self.chunked_seq_len = torch.zeros(
@@ -1809,7 +1975,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     cu_chunked_seq_len=self.host_cu_chunked_seq_len,
                     merge_op_tensor=self.host_merge_op_tensor,
                     max_chunk_len_per_loop=self.max_chunk_len_per_loop,
-                    chunked_loop_num=self.chunked_loop_num)
+                    chunked_loop_num=self.chunked_loop_num,
+                    total_chunk_size=total_chunk_size)
                 self.chunked_seq_len.copy_(self.host_chunked_seq_len,
                                            non_blocking=True)
                 self.cu_chunked_seq_len.copy_(self.host_cu_chunked_seq_len,
@@ -2059,6 +2226,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     cache_context_plan: bool = False
     # FMHA library classes this instance tries before the registry's libraries.
     prepended_fmha_lib_classes: tuple = ()
+    # Head dimension per K/V stage of FlashInferTrtllmGenFmha's FP8 paged causal context attention, run through
+    # trtllm::fmha_paged_context_fp8; 0 keeps FlashInfer's kernel.
+    context_fmha_head_dim_per_stage_kv: int = 0
+    # In a context-only step, FlashInferTrtllmGenFmha computes only each request's last output row (the others are
+    # zero); every row's K / V is still written.
+    context_last_rows_only: bool = False
 
     # Layer state the native attention op reads through FmhaParams.attn. The
     # generator (scripts/generate_fmha_params.py) collects these annotations;
@@ -2103,6 +2276,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_correction_threshold: float = 0.0,
         gqa_decode: Optional["GqaDecodeSetup"] = None,
         cache_context_plan: bool = False,
+        context_fmha_head_dim_per_stage_kv: int = 0,
+        context_last_rows_only: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -2132,6 +2307,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             cache_context_plan (bool): Plan a context-only forward once for the
                 layers that share its metadata and run the trtllm-gen context
                 kernel from that plan (dense, non-sparse layers only).
+            context_fmha_head_dim_per_stage_kv (int): See the class attribute.
+            context_last_rows_only (bool): See the class attribute.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -2205,6 +2382,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.local_layer_idx: Optional[int] = None
         self._fmha_manager: Optional[FmhaManager] = None
         self.gqa_decode = gqa_decode
+        if context_fmha_head_dim_per_stage_kv < 0 or (
+                context_fmha_head_dim_per_stage_kv > 0
+                and head_dim % context_fmha_head_dim_per_stage_kv != 0):
+            raise ValueError(
+                f"context_fmha_head_dim_per_stage_kv="
+                f"{context_fmha_head_dim_per_stage_kv} must be 0 or divide "
+                f"head_dim={head_dim}.")
+        self.context_fmha_head_dim_per_stage_kv = context_fmha_head_dim_per_stage_kv
+        self.context_last_rows_only = context_last_rows_only
         # A GQA decode library of this layer, which plans the module's KV append and deferred prologue (set with
         # the FMHA manager).
         self.gqa_decode_fmha: Optional["GqaDecodeFmha"] = None
@@ -2226,6 +2412,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         """Whether this layer executes dense FP4 MLA, not sparse NVFP4 storage."""
         return (self.is_mla_enable and self.has_fp4_kv_cache
                 and self.sparse_params is None)
+
+    @property
+    def has_fp8_context_mla(self) -> bool:
+        """Whether MLA context attention with an FP8 KV cache runs the op's FP8
+        context MLA FMHA, which reads FP8 Q, K and V."""
+        return (self.is_mla_enable and self.has_fp8_kv_cache
+                and _has_fp8_context_mla_fmha(get_sm_version()))
+
+    def prewarm_fmha(self, config: "FmhaPrewarmConfig",
+                     attempted: set[type["Fmha"]]) -> None:
+        """Prewarm the initialized manager's eligible libraries, once per library."""
+        manager = getattr(self, "_fmha_manager", None)
+        if manager is not None:
+            manager.prewarm(config, attempted)
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
@@ -2334,18 +2534,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if fp8_fallback_layers and fp8_fallback_layers.intersection(
                     mapping.pp_layers(config.num_hidden_layers)):
                 nvfp4_uses_fp8_context = True
-        sm_version = get_sm_version()
         fp8_context_mla = (quant_mode is not None
                            and (quant_mode.has_fp8_kv_cache()
                                 or nvfp4_uses_fp8_context)
-                           and (sm_version == 90 or is_sm_100f(sm_version)
-                                or is_sm_120f(sm_version)))
+                           and _has_fp8_context_mla_fmha(get_sm_version()))
         if not fp8_context_mla:
             return 0
         # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror
         # mNumAttnHeads).
         attn_tp = 1 if mapping.enable_attention_dp else mapping.tp_size
         num_attn_heads = config.num_attention_heads // attn_tp
+        # Helix context attention splits the heads further across CP, except
+        # under a sparse MLA adapter (mirrors MLA.num_context_heads); this
+        # workspace is staged only by context.
+        sparse_mla_adapter = has_sparse_mla_hooks(sparse_algorithm)
+        if mapping.has_cp_helix() and not sparse_mla_adapter:
+            num_attn_heads //= mapping.cp_size
         # The buffer is skipped only where AttentionOp::useSparseMLA() holds, which needs all three of:
         #   * DSA / DeepSeek-V4 -- only these lower to the absorption path that reads K/V from the paged
         #     cache. Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer,
@@ -2357,8 +2561,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # under-reserving OOMs mid-forward.
         sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
                       and is_sm_100f())
-        short_seq_mha_enabled = int(
-            os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
+        from .sparse.dsa.module import _get_short_seq_mha_threshold
+
+        short_seq_mha_enabled = _get_short_seq_mha_threshold() > 0
         stages_no_buffer = sparse_mla and not short_seq_mha_enabled
         return int(
             thop.get_context_mla_workspace_bytes_per_token(
@@ -2371,6 +2576,47 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 separate_q_and_kv_input=True,
                 sparse_mla=stages_no_buffer,
             ))
+
+    @classmethod
+    def runtime_workspace_min_tokens(
+        cls,
+        model_config: "ModelConfig",
+        mapping: "Mapping",
+        *,
+        max_num_tokens: int,
+        runtime_features: AttentionRuntimeFeatures,
+    ) -> int:
+        """Dense FP8 context MLA's complete chunked-prefill K/V staging capacity."""
+        if (not is_mla(model_config.pretrained_config)
+                or not runtime_features.chunked_prefill):
+            return 0
+        if not cls.runtime_workspace_is_chunked_prefill_bounded(model_config):
+            return 0
+        # Mirrors MLA::contextWorkspaceLayout's buffer_batch_size * query_tokens floor
+        # and the cached-partition capacity prepared by this backend's metadata.
+        return runtime_features.chunked_prefill_buffer_batch_size * max_num_tokens
+
+    @classmethod
+    def runtime_workspace_profiled_tokens(
+        cls,
+        model_config: "ModelConfig",
+        *,
+        profiled_prompt_len: int,
+        max_num_tokens: int,
+        max_batch_size: int,
+    ) -> int:
+        """Credit only the dense staging used by the profiling attention route."""
+        sparse_algorithm = getattr(model_config.sparse_attention_config,
+                                   "algorithm", None)
+        if (sparse_algorithm == "dsa"
+                and model_config.quant_config.quant_mode.has_fp8_kv_cache()
+                and is_sm_100f(get_sm_version())):
+            from .sparse.dsa.module import _get_short_seq_mha_threshold
+
+            threshold = _get_short_seq_mha_threshold()
+            if 0 < threshold < profiled_prompt_len:
+                return 0
+        return min(max_num_tokens, max_batch_size * profiled_prompt_len)
 
     @classmethod
     def runtime_workspace_fixed_bytes(cls, model_config: "ModelConfig",

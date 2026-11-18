@@ -271,19 +271,20 @@ PERF_METRIC_LOG_QUERIES = {
     "token_throughput": re.compile(r"Output token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     "total_token_throughput": re.compile(r"Total Token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     "user_throughput": re.compile(r"User throughput \(tok\/s\):\s+(-?[\d\.]+)"),
-    "mean_ttft": re.compile(r"Mean TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "median_ttft": re.compile(r"Median TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "p99_ttft": re.compile(r"P99 TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "mean_itl": re.compile(r"Mean ITL \(ms\):\s+(-?[\d\.]+)"),
-    "median_itl": re.compile(r"Median ITL \(ms\):\s+(-?[\d\.]+)"),
-    "p99_itl": re.compile(r"P99 ITL \(ms\):\s+(-?[\d\.]+)"),
-    "mean_tpot": re.compile(r"Mean TPOT \(ms\):\s+(-?[\d\.]+)"),
-    "median_tpot": re.compile(r"Median TPOT \(ms\):\s+(-?[\d\.]+)"),
-    "p99_tpot": re.compile(r"P99 TPOT \(ms\):\s+(-?[\d\.]+)"),
+    "mean_ttft": re.compile(r"Mean TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_ttft": re.compile(r"Median TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_ttft": re.compile(r"P99 TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "mean_itl": re.compile(r"Mean ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_itl": re.compile(r"Median ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_itl": re.compile(r"P99 ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "mean_tpot": re.compile(r"Mean TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_tpot": re.compile(r"Median TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_tpot": re.compile(r"P99 TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     "mean_e2el": re.compile(r"Mean E2EL \(ms\):\s+(-?[\d\.]+)"),
     "median_e2el": re.compile(r"Median E2EL \(ms\):\s+(-?[\d\.]+)"),
     "p99_e2el": re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
 }
+
 
 # Spec-decoding-only metrics: parsed from benchmark output but only stored
 # (and regression-checked) when the test runs with speculative decoding.
@@ -964,7 +965,8 @@ def add_perf_metric_value(
 ) -> None:
     """Populate `new_data` with per-test perf metrics from `metrics`.
 
-    - Always copies every key in PERF_METRIC_LOG_QUERIES as `d_<name>`.
+    - Copies available values in PERF_METRIC_LOG_QUERIES as `d_<name>`;
+      explicit N/A measurements are omitted from upload and comparison.
     - Adds `d_al` only when spec_decoding=True *and* the value was parsed;
       non-spec rows omit it so OpenSearch baselines don't blend the two
       populations, and spec rows exempted from reporting it (AgentX) omit it
@@ -987,7 +989,9 @@ def add_perf_metric_value(
     whose mean is absent, before results are uploaded.
     """
     for metric_name in PERF_METRIC_LOG_QUERIES:
-        new_data[f"d_{metric_name}"] = metrics[metric_name]
+        value = metrics[metric_name]
+        if value is not None:
+            new_data[f"d_{metric_name}"] = value
     if spec_decoding:
         # 'al' is legitimately absent for AgentX lanes: aiperf does not propagate
         # TRT-LLM's non-standard avg_decoded_tokens_per_iter field. Omit the
@@ -1078,6 +1082,7 @@ STARTUP_METRIC_NAMES = (
     "draft_weight_population_seconds",
     "draft_checkpoint_finalization_seconds",
     "post_load_processing_seconds",
+    "checkpoint_page_cache_release_seconds",
 )
 CHECKPOINT_PIPELINE_PHASES = (
     "checkpoint_preparation_seconds",
@@ -1094,7 +1099,7 @@ CHECKPOINT_IO_POLICY_PATTERN = re.compile(
     r"selected=(?P<selected>[^,]+), activated=(?P<activated>True|False), "
     r"effective=(?P<effective>[^,]+), fallback_reason=(?P<fallback_reason>.*)\."
 )
-CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v4-postmerge-50-auto-50-native"
+CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v5-postmerge-50-auto-50-native"
 CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV = "TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY"
 CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT = 2
 CHECKPOINT_IO_EXPERIMENT_NATIVE_BUCKET = 0
@@ -1683,6 +1688,48 @@ def to_env_dict(env_vars: str) -> Dict[str, str]:
             key, value = env_var.split("=", 1)
             env[key] = value
     return env
+
+
+RELEASE_CHECKPOINT_PAGE_CACHE_ENV = "TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE"
+# GPU types whose servers the release turns on for by default, on a node whose
+# Lustre client drops a file's cached pages once its lock has been idle for at
+# most RELEASE_CHECKPOINT_PAGE_CACHE_MAX_LOCK_AGE_MS: for a server started
+# shortly before, that drop, and the compaction of the freed memory, land in
+# its measurement.
+RELEASE_CHECKPOINT_PAGE_CACHE_GPU_TYPES = ("gb300",)
+RELEASE_CHECKPOINT_PAGE_CACHE_MAX_LOCK_AGE_MS = 10 * 60 * 1000
+
+
+def lustre_lock_max_age_ms() -> Optional[int]:
+    """The shortest lock lifetime (lru_max_age, ms) of this node's Lustre client.
+
+    None without a Lustre client.
+    """
+    ages = []
+    for path in glob.glob("/sys/fs/lustre/ldlm/namespaces/*/lru_max_age"):
+        try:
+            with open(path) as f:
+                ages.append(int(f.read().strip()))
+        except (OSError, ValueError):
+            continue
+    return min(ages) if ages else None
+
+
+def default_release_checkpoint_page_cache(gpu_type: str) -> Optional[str]:
+    """TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE for servers whose YAML does not set it.
+
+    The job's own value when it exports one, else "1" for the GPU types above on
+    a node whose Lustre client ages idle locks out within the limit above.
+    """
+    value = os.environ.get(RELEASE_CHECKPOINT_PAGE_CACHE_ENV)
+    if value is not None:
+        return value
+    if gpu_type not in RELEASE_CHECKPOINT_PAGE_CACHE_GPU_TYPES:
+        return None
+    max_age_ms = lustre_lock_max_age_ms()
+    if max_age_ms is None or max_age_ms > RELEASE_CHECKPOINT_PAGE_CACHE_MAX_LOCK_AGE_MS:
+        return None
+    return "1"
 
 
 # AgentX knobs a ctx_only lane overrides on top of the yaml's client_env_var.
@@ -2284,9 +2331,28 @@ class ServerConfig:
             config_data = {**external_config, **config_data}
         return config_data
 
-    def generate_extra_llm_api_config(self) -> str:
-        """Generate extra-llm-api-config.yml content."""
+    def generate_extra_llm_api_config(
+        self, page_cache_release_default: Optional[str] = None
+    ) -> str:
+        """Generate extra-llm-api-config.yml content.
+
+        ``page_cache_release_default`` is TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE
+        unless this server's env_vars set it.
+        """
         config_data = self.merged_llm_api_config_data()
+
+        # Drop the checkpoint's page cache during startup, so that neither the
+        # file system's delayed drop nor the kernel's compaction of the freed
+        # memory lands in a measurement. Set through env_overrides, which every
+        # rank applies before loading: the MPI ranks of a multi-node server do
+        # not inherit this process's environment.
+        release = to_env_dict(self.env_vars).get(
+            RELEASE_CHECKPOINT_PAGE_CACHE_ENV, page_cache_release_default
+        )
+        if release is not None:
+            env_overrides = dict(config_data.get("env_overrides") or {})
+            env_overrides.setdefault(RELEASE_CHECKPOINT_PAGE_CACHE_ENV, release)
+            config_data["env_overrides"] = env_overrides
 
         # Handle speculative_model path conversion
         if (
@@ -3721,6 +3787,9 @@ class DisaggTestCmds(NamedTuple):
         # Same LLM args a plain ctx server gets from its --config file, with
         # the speculative model / load balancer paths already resolved.
         # model_path is set by to_cmd(), which get_commands() runs first.
+        # Without the page-cache release default: each instance is a server
+        # of its own, so it would drop the checkpoint files that the other
+        # instances on its node are still reading.
         ctx_args = yaml.safe_load(ctx_cfg.generate_extra_llm_api_config()) or {}
         ctx_args["backend"] = ctx_cfg.backend
         worker_config = {
@@ -4615,6 +4684,16 @@ class PerfSanityTestConfig:
             os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
         )
         self.gpu_type = get_gpu_type()
+        self.page_cache_release_default = default_release_checkpoint_page_cache(self.gpu_type)
+        if (
+            self.page_cache_release_default is not None
+            or self.gpu_type in RELEASE_CHECKPOINT_PAGE_CACHE_GPU_TYPES
+        ):
+            print_info(
+                f"{RELEASE_CHECKPOINT_PAGE_CACHE_ENV} for servers whose env_vars do not "
+                f"set it: {self.page_cache_release_default or 'unset'} (gpu {self.gpu_type}, "
+                f"Lustre lock lru_max_age {lustre_lock_max_age_ms()} ms)"
+            )
 
         # Parse test case name to get config_base_name, select_pattern, runtime,
         # benchmark_mode and the time_breakdown modifier
@@ -5106,7 +5185,9 @@ class PerfSanityTestConfig:
             server_cmd = server_config.to_cmd(test_output_dir)
 
             # Generate extra-llm-api-config.yml
-            config_content = server_config.generate_extra_llm_api_config()
+            config_content = server_config.generate_extra_llm_api_config(
+                self.page_cache_release_default
+            )
             config_filename = f"extra-llm-api-config.aggr.{server_config.name}.yml"
             config_path = os.path.join(test_output_dir, config_filename)
             with open(config_path, "w") as f:
@@ -5154,7 +5235,9 @@ class PerfSanityTestConfig:
             # Generate ctx server command
             ctx_cmd = ctx_config.to_cmd(test_output_dir, numa_bind, "CTX")
             if disagg_serving_type == "CTX_0":
-                config_content = ctx_config.generate_extra_llm_api_config()
+                config_content = ctx_config.generate_extra_llm_api_config(
+                    self.page_cache_release_default
+                )
                 config_path = os.path.join(
                     test_output_dir, f"extra-llm-api-config.ctx.{ctx_config.name}.yml"
                 )
@@ -5164,7 +5247,9 @@ class PerfSanityTestConfig:
             # Generate gen server command
             gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
             if disagg_serving_type == "GEN_0":
-                config_content = gen_config.generate_extra_llm_api_config()
+                config_content = gen_config.generate_extra_llm_api_config(
+                    self.page_cache_release_default
+                )
                 config_path = os.path.join(
                     test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
                 )
@@ -5232,7 +5317,9 @@ class PerfSanityTestConfig:
                 )
 
             gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
-            config_content = gen_config.generate_extra_llm_api_config()
+            config_content = gen_config.generate_extra_llm_api_config(
+                self.page_cache_release_default
+            )
             config_path = os.path.join(
                 test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
             )
@@ -5337,7 +5424,7 @@ class PerfSanityTestConfig:
     def get_perf_result(self, outputs: Dict[int, List[str]]):
         """Parse performance results from outputs."""
 
-        def parse_metrics_from_output(output: str) -> Optional[Dict[str, float]]:
+        def parse_metrics_from_output(output: str) -> dict[str, float | None]:
             """Parse all metrics from a single output string."""
             metrics = {}
             all_queries = {
@@ -5367,7 +5454,10 @@ class PerfSanityTestConfig:
                         continue
                     match = regex.search(line)
                     if match:
-                        metrics[metric_type] = float(match.group(1))
+                        # Preserve explicit N/A as a present key so validation
+                        # can distinguish it from missing or malformed output.
+                        value = match.group(1)
+                        metrics[metric_type] = None if value == "N/A" else float(value)
                         break
             return metrics
 

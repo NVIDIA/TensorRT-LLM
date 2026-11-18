@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/storage/core.h"
 
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -57,6 +58,7 @@ size_t tierAllocationGranularity(CacheTier tier, size_t quota)
     // backing raises it to a page should a platform ever ask for more.
     case CacheTier::HOST_MEM: return hostMemSizeGranularity();
     case CacheTier::DISK: return kDiskPoolSizeGranularity;
+    case CacheTier::REMOTE: return kRemotePoolSizeGranularity;
     default: throw std::invalid_argument("Invalid cache tier");
     }
 }
@@ -119,8 +121,18 @@ Slot SlotAllocator::allocate()
     {
         throw OutOfPagesError("SlotAllocator: no free slots");
     }
-    scrubEvents();
+    // Readiness only decides between a fresh id and the front recycled slot, so scan (one
+    // cuEventQuery per call) only while a fresh id is left and no recycled slot is known ready.
+    bool const freshAvailable = mNumActiveSlots < std::min(mCapacity, mTargetCapacity);
+    if (freshAvailable && mNumReadyRecycledSlots == 0)
+    {
+        scrubEvents();
+    }
+    return takeFreeSlot();
+}
 
+Slot SlotAllocator::takeFreeSlot()
+{
     Slot slot;
     if (mNumReadyRecycledSlots > 0)
     {
@@ -157,9 +169,11 @@ std::vector<Slot> SlotAllocator::allocateMultiple(SlotCount numSlots)
     }
     std::vector<Slot> result;
     result.reserve(slotCountToSizeT(numSlots));
+    // Slots released together share one event, so one readiness scan serves the whole batch.
+    scrubEvents();
     for (SlotCount slotCount{0}; slotCount < numSlots; ++slotCount)
     {
-        result.push_back(allocate());
+        result.push_back(takeFreeSlot());
     }
     return result;
 }
@@ -187,7 +201,8 @@ void SlotAllocator::release(Slot slot)
     {
         mOverflowSlots.push_back(std::move(slot));
     }
-    scrubEvents();
+    // Readiness is scanned at the next allocation: a request releases all its slots under one
+    // event, which would otherwise be queried once per slot.
     TLLM_CHECK_DEBUG(check());
 }
 
@@ -207,7 +222,7 @@ void SlotAllocator::prepareForShrink(SlotCount newNumSlots)
     TLLM_CHECK_DEBUG(check());
     TLLM_CHECK_DEBUG(mTargetCapacity == mCapacity);
     TLLM_CHECK_DEBUG(newNumSlots < mCapacity);
-    std::deque<Slot> newRecycled;
+    decltype(mRecycledSlots) newRecycled;
     SlotCount newNumReady = 0;
     SlotCount const oldNumReady = mNumReadyRecycledSlots;
     SlotCount idx = 0;
@@ -387,7 +402,8 @@ HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, H
     , mHostMem(std::max(vmSize, alignedSize(numSlots)), alignedSize(numSlots),
           HostMemBackingOptions{.registerUnit = slotSize,
               .allowRemoteNumaFallback = options.allowRemoteNumaFallback,
-              .useThp = options.useThp},
+              .useThp = options.useThp,
+              .numaNode = options.numaNode},
           /*waitForFill=*/false)
 {
 }
@@ -470,6 +486,10 @@ void DiskSlotPool::destroy()
 {
     if (mFd != kBadFileDescriptor)
     {
+        // This file's transfers are normally done by now: the pool group synchronizes its slots' ready events, which
+        // are recorded after each transfer's completion wait, before destroying them. The wait guards the descriptor
+        // against any piece still in flight. It is process-wide, so it also waits for other managers' disk I/O.
+        waitForDiskIo();
         ::close(mFd);
         mFd = kBadFileDescriptor;
     }
@@ -490,6 +510,47 @@ Address DiskSlotPool::slotAddress(SlotId slot) const
     TLLM_CHECK_DEBUG_WITH_INFO(byteOffset <= static_cast<size_t>(std::numeric_limits<ssize_t>::max()),
         "DiskSlotPool::slotAddress: byte offset out of range");
     return DiskAddress{mFd, static_cast<ssize_t>(byteOffset)};
+}
+
+// ---------------------------------------------------------------------------
+// RemoteSlotPool
+// ---------------------------------------------------------------------------
+
+RemoteSlotPool::RemoteSlotPool(SharedPtr<RemoteMemClient> client, size_t slotSize, SlotCount numSlots)
+    : SlotPoolBase(slotSize)
+    , mRange(std::make_unique<RemoteRange>(std::move(client), slotSize))
+{
+    resize(numSlots);
+}
+
+RemoteSlotPool::~RemoteSlotPool()
+{
+    destroy();
+}
+
+void RemoteSlotPool::destroy()
+{
+    // Returns the chunks to the process's client; the claims stay with it.
+    mRange.reset();
+    mNumSlots = SlotCount{0};
+}
+
+void RemoteSlotPool::resize(SlotCount newNumSlots)
+{
+    TLLM_CHECK_WITH_INFO(mRange != nullptr, "RemoteSlotPool::resize after destroy");
+    mRange->reserve(newNumSlots);
+    mNumSlots = newNumSlots;
+}
+
+Address RemoteSlotPool::slotAddress(SlotId /*slot*/) const
+{
+    throw LogicError("RemoteSlotPool::slotAddress: remote slots have no local address; use remoteRange()");
+}
+
+RemoteRange& RemoteSlotPool::remoteRange() const
+{
+    TLLM_CHECK_WITH_INFO(mRange != nullptr, "RemoteSlotPool::remoteRange after destroy");
+    return *mRange;
 }
 
 // ---------------------------------------------------------------------------
@@ -721,6 +782,25 @@ DiskPoolGroup::DiskPoolGroup(
 }
 
 // ---------------------------------------------------------------------------
+// RemotePoolGroup
+// ---------------------------------------------------------------------------
+
+RemotePoolGroup::RemotePoolGroup(
+    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, SharedPtr<RemoteMemClient> const& client)
+    : PoolGroupBase(numSlots)
+{
+    for (size_t sz : slotSizeList)
+    {
+        mPools.push_back(std::make_unique<RemoteSlotPool>(client, sz, numSlots));
+    }
+}
+
+RemoteRange& RemotePoolGroup::remoteRange(PoolIndex poolIdx) const
+{
+    return static_cast<RemoteSlotPool const&>(*mPools.at(poolIdx)).remoteRange();
+}
+
+// ---------------------------------------------------------------------------
 // CacheLevelStorage
 // ---------------------------------------------------------------------------
 
@@ -812,13 +892,36 @@ DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
 }
 
 // ---------------------------------------------------------------------------
+// RemoteCacheLevelStorage
+// ---------------------------------------------------------------------------
+
+RemoteCacheLevelStorage::RemoteCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, SharedPtr<RemoteMemClient> client)
+    : mClient(std::move(client))
+{
+    TLLM_CHECK(mClient != nullptr);
+    TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
+        "RemoteCacheLevelStorage: slotCountList and slotDescList must have the same length");
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+    {
+        mPoolGroups.push_back(
+            std::make_unique<RemotePoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mClient));
+    }
+}
+
+RemoteRange& RemoteCacheLevelStorage::remoteRange(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
+{
+    return static_cast<RemotePoolGroup const&>(*mPoolGroups.at(pgIdx)).remoteRange(poolIdx);
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
     PooledPhysMemAllocator* gpuPhysMemAllocator, HostMemBackingOptions const& options,
-    std::optional<size_t> sparseReservation)
+    std::optional<size_t> sparseReservation, SharedPtr<RemoteMemClient> remoteClient)
 {
     TLLM_CHECK((cacheTierOf(tierCfg) == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
     return std::visit(
@@ -834,9 +937,16 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             {
                 return std::make_unique<HostCacheLevelStorage>(slotDescList, slotCountList, cfg.maxQuota, options);
             }
-            else
+            else if constexpr (std::is_same_v<T, DiskCacheTierConfig>)
             {
                 return std::make_unique<DiskCacheLevelStorage>(slotDescList, slotCountList, cfg.path);
+            }
+            else
+            {
+                static_assert(std::is_same_v<T, RemoteCacheTierConfig>);
+                TLLM_CHECK_WITH_INFO(remoteClient != nullptr && remoteClient->directory() == cfg.path,
+                    "A remote cache level needs the client of its rendezvous directory");
+                return std::make_unique<RemoteCacheLevelStorage>(slotDescList, slotCountList, std::move(remoteClient));
             }
         },
         tierCfg);

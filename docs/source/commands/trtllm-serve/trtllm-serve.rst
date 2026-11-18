@@ -28,6 +28,8 @@ The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memor
 
 For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the ``trtllm-serve embeddings`` subcommand starts a server that exposes an OpenAI-compatible ``/v1/embeddings`` endpoint with native dynamic batching. See :doc:`Embeddings <../../features/embeddings>` for details.
 
+For reranker models, the ``trtllm-serve rerank`` subcommand exposes ``/rerank``, ``/v1/rerank``, and Cohere-compatible ``/v2/rerank`` endpoints. See :doc:`Reranking <../../features/reranking>` for details.
+
 Starting a Server
 -----------------
 
@@ -255,11 +257,12 @@ TRT-LLM multimodal supports the following modalities and data types (depending o
    Media URLs may be ``http(s)`` URLs or base64 ``data:`` URLs. A ``file://``
    URI or a bare filesystem path is read from the server's own filesystem, so it
    is refused unless the server is started with
-   ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH=<directory>``; then only regular files whose
+   ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR=<directory>``; then only regular files whose
    resolved path is inside that directory are read. This applies to
    ``image_url``, ``video_url`` and ``audio_url`` parts. A deployment whose
    clients send local paths today must set the variable to the directory
-   that holds those files.
+   that holds those files. VisualGen references sent with ``format='path'``
+   follow the same variable.
 
 .. note::
    To convert images to base64-encoded format, use the utility function
@@ -500,7 +503,7 @@ Start a profile window. All fields in the JSON body are optional.
      - Description
    * - ``output_dir``
      - string
-     - Directory where chrome traces are written. Defaults to ``$TLLM_TORCH_PROFILER_DIR`` if set, otherwise ``/tmp``. One trace file per rank is written as ``trtllm-trace-<profile_id>-rank-<N>.json``; ``<profile_id>`` is a timestamp + short uuid so successive cycles don't collide.
+     - Directory where chrome traces are written. Defaults to ``$TLLM_TORCH_PROFILER_DIR`` if set, otherwise a temporary directory. One trace file per rank is written as ``trtllm-trace-<profile_id>-rank-<N>.json``; ``<profile_id>`` is a timestamp + short uuid so successive cycles don't collide.
    * - ``num_steps``
      - int
      - Number of engine iterations to capture. When set, the engine stops the window automatically and you do not need to call ``/stop_profile``. When omitted, profiling runs until ``/stop_profile`` is called.
