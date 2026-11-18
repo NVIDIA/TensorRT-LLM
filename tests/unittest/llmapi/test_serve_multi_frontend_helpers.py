@@ -35,6 +35,13 @@ from fastapi.testclient import TestClient
 from starlette.routing import Match
 
 from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    FAULT_TOLERANCE_RANK_ENV,
+    RENDEZVOUS_ENV,
+    SHARED_SECRET_ENV,
+    RankIdentity,
+)
+from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, ServerRole
 from tensorrt_llm.serve import _frontend_processes, openai_server
 from tensorrt_llm.serve._frontend_processes import _watch_attached_frontends
@@ -106,7 +113,7 @@ def _attached_server(forwarder: LauncherForwarder) -> OpenAIServer:
     server.app = FastAPI(lifespan=lifespan)
     server.generator = SimpleNamespace(
         _executor=SimpleNamespace(resource_governor_queue=None),
-        args=SimpleNamespace(return_perf_metrics=False),
+        args=SimpleNamespace(return_perf_metrics=False, enable_wide_ep_fault_tolerance=False),
     )
     server.use_harmony = False
     server._enable_rl_control_endpoints = False
@@ -654,3 +661,26 @@ def test_only_the_launcher_registers_the_server(monkeypatch, is_launcher: bool) 
         server.metadata_server.put.assert_not_called()
         storage.assert_not_called()
         worker_cls.assert_not_called()
+
+
+def test_attached_frontend_does_not_inherit_the_rank_identity(monkeypatch) -> None:
+    """Check that an attached frontend spawned by a Wide-EP rank 0 holds neither rank nor secret."""
+    monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, RankIdentity(0, 4, 4, False).env_value())
+    monkeypatch.setenv(SHARED_SECRET_ENV, "ab" * 32)
+    monkeypatch.setenv(RENDEZVOUS_ENV, "node-0:29500")
+    llm = SimpleNamespace(_executor=mock.Mock(spec=GenerationExecutorProxy))
+    llm._executor.multi_frontend_attach_info.return_value = {}
+    spawned_envs = []
+
+    def popen(args, env, pass_fds):
+        spawned_envs.append(env)
+        os.write(int(env["TLLM_FRONTEND_READY_FD"]), b"R")
+        return mock.Mock(pid=1, **{"poll.return_value": None})
+
+    monkeypatch.setattr(_frontend_processes.subprocess, "Popen", popen)
+    _frontend_processes._spawn_attached_frontends(llm, 2)
+
+    (spawned_env,) = spawned_envs
+    assert FAULT_TOLERANCE_RANK_ENV not in spawned_env
+    assert SHARED_SECRET_ENV not in spawned_env
+    assert RENDEZVOUS_ENV not in spawned_env

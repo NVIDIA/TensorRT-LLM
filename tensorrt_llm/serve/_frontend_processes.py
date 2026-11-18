@@ -18,6 +18,11 @@ import time
 from collections.abc import Callable, Iterator
 from typing import NamedTuple
 
+from tensorrt_llm._wide_ep_fault_tolerance import (
+    FAULT_TOLERANCE_RANK_ENV,
+    RENDEZVOUS_ENV,
+    SHARED_SECRET_ENV,
+)
 from tensorrt_llm.llmapi.mpi_session import split_mpi_env
 from tensorrt_llm.logger import logger
 
@@ -131,6 +136,10 @@ def _spawn_attached_frontends(
             # make the child's mpi4py try to (re-)join the launcher's job.
             env, _ = split_mpi_env()
             env.update(extra_env or {})
+            # An attached frontend is not a Wide-EP rank, even when the launcher runs as rank 0,
+            # and it reads no rendezvous store.
+            for name in (FAULT_TOLERANCE_RANK_ENV, RENDEZVOUS_ENV, SHARED_SECRET_ENV):
+                env.pop(name, None)
             env["TLLM_EXECUTOR_ATTACH_INFO"] = attach_env
             env["TLLM_EXECUTOR_FRONTEND_ID"] = str(frontend_id)
             env["TLLM_DISABLE_MPI"] = "1"

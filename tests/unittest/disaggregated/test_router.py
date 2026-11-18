@@ -7,6 +7,7 @@ import copy
 import os
 import random
 import threading
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -2664,7 +2665,9 @@ async def test_chat_harmony_preserves_original_tool_conversion_error() -> None:
     assert response == str(original_error)
     assert failing_tool.calls == 1
     server.create_error_response.assert_called_once_with(
-        message=str(original_error), err_type="internal_error")
+        message=str(original_error),
+        err_type="internal_error",
+        status_code=HTTPStatus.BAD_REQUEST)
 
 
 @pytest.mark.parametrize("router_class",

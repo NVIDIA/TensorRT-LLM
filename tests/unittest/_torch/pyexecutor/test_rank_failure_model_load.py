@@ -15,7 +15,9 @@
 """Tests for the model-load checks and the MoE layer binding of Wide-EP fault tolerance."""
 
 import contextlib
+import os
 import re
+import time
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -23,8 +25,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.distributed.membership import HANG_TIMEOUT_S
+from tensorrt_llm._torch.distributed.membership import HANG_TIMEOUT_S, host_weights_prefix
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import SYNC_PROTOCOL_ENV
+from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import DeploymentHostWeights
+from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
 from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import SERVING_TIMEOUT_ENV
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
 from tensorrt_llm._torch.pyexecutor import rank_failure_model_load
@@ -122,3 +126,66 @@ def test_model_load_checks_support_first(monkeypatch):
     loader._load_and_validate_config = Mock(return_value=SimpleNamespace(pretrained_config=None))
     with pytest.raises(ValueError, match=re.escape(f"the fence path ({SYNC_PROTOCOL_ENV} unset")):
         loader.load("/ckpt", Mock())
+
+
+# Host weights. Every node keeps the weights of every expert in /dev/shm.
+
+_EXPERTS = 8
+_LOCAL_RANKS = 2
+
+
+class _MoeWeights(MoEEplbWeightLayoutMixin, torch.nn.Module):
+    """MoE layer weights of 3 local slots of 128 KiB and 4 bytes, plus one weight not per slot."""
+
+    expert_size_per_partition = 3
+
+    def __init__(self, sharer):
+        super().__init__()
+        self.layer_load_balancer = SimpleNamespace(host_tensor_sharer=sharer)
+        self.w3_w1_weight = torch.nn.Parameter(torch.empty(3, 64, 1024, dtype=torch.float16))
+        self.fc31_alpha = torch.nn.Parameter(torch.empty(3, dtype=torch.float32))
+        self.fc31_input_scale = torch.nn.Parameter(torch.empty((), dtype=torch.float32))
+
+
+# Two weights per expert aligned to 256 bytes, plus one fingerprint block per local rank segment.
+_NODE_BYTES = _EXPERTS * (128 * 1024 + 256) + _LOCAL_RANKS * 256
+
+
+@pytest.mark.parametrize("shortfall", [0, 1])
+def test_startup_check_needs_dev_shm_room(monkeypatch, shortfall):
+    """Check the room for host weights in /dev/shm and the leftovers the error names."""
+    sharer = DeploymentHostWeights(
+        0,
+        _EXPERTS,
+        Mock(Get_rank=Mock(return_value=0), Get_size=Mock(return_value=_LOCAL_RANKS)),
+        replacement=False,
+    )
+    sharer.set_shared_memory_base_name(f"wide_ep_ft_test_{os.getpid()}_{time.monotonic_ns()}")
+    model = torch.nn.ModuleList([_MoeWeights(sharer)])
+    free = _NODE_BYTES - shortfall
+    monkeypatch.setattr(os, "statvfs", lambda path: SimpleNamespace(f_bavail=free, f_frsize=1))
+    if not shortfall:
+        rank_failure_model_load._check_host_weights_fit(model)
+        return
+    leftover = f"{host_weights_prefix()}{os.getpid()}_{time.monotonic_ns()}_l0_lr0_all"
+    with open(os.path.join("/dev/shm", leftover), "wb") as segment:
+        segment.write(bytes(1 << 20))
+    try:
+        with pytest.raises(ValueError, match=f"needs {_NODE_BYTES} bytes more") as error:
+            rank_failure_model_load._check_host_weights_fit(model)
+    finally:
+        os.unlink(os.path.join("/dev/shm", leftover))
+    message = str(error.value)
+    assert f"{leftover} (0.0 GiB)" in message
+    assert TURN_FAULT_TOLERANCE_OFF in message
+
+
+def test_leftover_unlinked_during_scan_is_skipped(monkeypatch):
+    """Check that host weights unlinked while /dev/shm is scanned are not named as leftovers."""
+
+    def unlinked():
+        raise FileNotFoundError
+
+    entry = SimpleNamespace(name=f"{host_weights_prefix()}unlinked", stat=unlinked)
+    monkeypatch.setattr(os, "scandir", lambda path: contextlib.nullcontext([entry]))
+    assert rank_failure_model_load._leftover_entries() == ""

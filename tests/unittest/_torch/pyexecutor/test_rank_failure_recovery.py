@@ -55,7 +55,10 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMappingError, Mnnv
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
-from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import EplbExpertRestore
+from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
+    EplbExpertRestore,
+    ExpertRestorePlanMismatchError,
+)
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor import rank_failure_memory as memory_module
 from tensorrt_llm._torch.pyexecutor import rank_failure_recovery as recovery_module
@@ -897,7 +900,7 @@ def test_rearm_synchronizes_before_record_lock(monkeypatch):
     assert steps[remapped + 1 : remapped + 3] == [("sync", True), "rearm"]
 
 
-@pytest.mark.parametrize("failure", ["own mapping", "lost expert"])
+@pytest.mark.parametrize("failure", ["own mapping", "lost expert", "other plan"])
 def test_failed_install_holds_the_steps(monkeypatch, failure):
     """Check that a rank replies FAILED to an install error that no rank removal fixes."""
     r = _resuming()
@@ -906,10 +909,19 @@ def test_failed_install_holds_the_steps(monkeypatch, failure):
     r.client.answers[(Reply.FAILED, 1)] = [next_change]
     if failure == "own mapping":
         r.moe.remap_workspaces.side_effect = MnnvlMappingError([0], "cuMemCreate failed")
-    else:
+    elif failure == "lost expert":
         _eplb(monkeypatch, r)
         r.executor.model_engine.moe_load_balancer.expert_restore.plan_expert_restore = Mock(
             side_effect=ValueError("No node with an active rank keeps host weights for expert 3")
+        )
+    else:
+        _eplb(monkeypatch, r)
+        r.executor.model_engine.moe_load_balancer.expert_restore.restore_lost_experts = Mock(
+            side_effect=ExpertRestorePlanMismatchError(
+                "EP rank 2 planned expert placement 5f1d0c8a9e2b4d67 with workspace rows of "
+                "1048576 bytes, but the lowest active rank planned 0a3c9e7b1f2d4865 with rows of "
+                "1048576 bytes"
+            )
         )
     r.recovery.before_iteration()
     assert _replies(r) == [Reply.FAILED]
@@ -1088,8 +1100,9 @@ def _eplb(monkeypatch, r, restored=6 * MIB, workspace=4 * MIB, device=None, rele
         device.backed += num_bytes
         balancer.expert_restore.backed_spare_slot_bytes = device.backed
 
-    def restore_lost_experts(restore, times, progress):
+    def restore_lost_experts(restore, staging_workspace, allgather, times, progress):
         calls.append(("restore", restore))
+        assert staging_workspace is r.moe.staging_workspace.return_value
         back(restored)
         progress()
         times.update({"back": 1.0, "load": 2.0, "install": 3.0})
@@ -1161,7 +1174,7 @@ def test_newer_change_stops_expert_restore(monkeypatch):
     calls, _, _ = _eplb(monkeypatch, r)
     expert_restore = r.executor.model_engine.moe_load_balancer.expert_restore
 
-    def restore_lost_experts(plan, times, progress):
+    def restore_lost_experts(plan, staging_workspace, allgather, times, progress):
         r.client.deliver(_record(MembershipState.PROPOSE, generation=2, active_mask=0b0011))
         progress()
         calls.append("load after the newer change")

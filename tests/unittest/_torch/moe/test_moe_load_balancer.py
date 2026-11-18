@@ -625,6 +625,17 @@ class _WeightLayout(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin,
         return MagicMock()
 
 
+@pytest.mark.cpu_only
+def test_statistic_routing_layer_has_no_experts_to_load() -> None:
+    """Only a layer with host weights loads experts for its node."""
+    layer = SingleLayerMoeLoadBalancer(MagicMock(),
+                                       MagicMock(),
+                                       expert_count=4,
+                                       updates_enabled=False)
+    with pytest.raises(AssertionError, match="when using statistic routing"):
+        layer.get_load_expert_ids()
+
+
 def _skip_without_gdrcopy_slots():
     """Skip unless online EPLB's slots are GDRCopy mappings."""
     from tensorrt_llm.bindings.internal import runtime
@@ -636,6 +647,13 @@ def _skip_without_gdrcopy_slots():
     del balancer
     if not uses_gdrcopy:
         pytest.skip("host accessible EPLB slots are not GDRCopy mappings here")
+
+
+def _remove_host_weights(base_name: str):
+    """Remove the host weights that a fault-tolerant load balancer leaves in /dev/shm."""
+    for name in os.listdir("/dev/shm"):
+        if name.startswith(f"{base_name}_"):
+            os.unlink(os.path.join("/dev/shm", name))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -664,7 +682,9 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
         2,
         layer_updates_per_iter,
         shared_memory_base_name=f"test_restore_{os.getpid()}",
-        mapping=None)
+        mapping=None,
+        replacement=False,
+        wait_for_host_weights=MagicMock())
     try:
         # Top-1: route() selects one expert per token.
         layer = balancer.add_layer(expert_count, 1, 3)
@@ -754,6 +774,9 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
         # Expert 3 is in rank 1's first slot.
         assert set(route([3] * 8)) == {slot_count}
 
+        workspace = torch.empty((2, 0), dtype=torch.uint8, device="cuda")
+        # Rank 1 restores no plan of its own in this process.
+        allgather = MagicMock(side_effect=lambda value: [value, None])
         if layer_updates_per_iter:
             # A rank failure stopped the forward before its MoE layer, so the
             # EPLB worker still waits for the layer. A restore writes no slot.
@@ -764,7 +787,8 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
             spare = {name: weights[name][3].clone() for name in slot_elements}
             with pytest.raises(RuntimeError,
                                match="abandonIterations|iterations are queued"):
-                balancer.expert_restore.restore_lost_experts(early)
+                balancer.expert_restore.restore_lost_experts(
+                    early, workspace, allgather)
             assert all(
                 torch.equal(weights[name][3], spare[name])
                 for name in slot_elements)
@@ -775,9 +799,12 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
         # chunks holding its bytes, one shared with spare slot 4. Spare slots 4
         # and 5 stay unbacked.
         assert plan.device_bytes == 8 * mib + 4 * mib
+        # Rank 0's node keeps the host weights of rank 1's experts, so it
+        # stages nothing through the all-to-all workspace.
+        assert plan.staged.size == 0
         free = torch.cuda.mem_get_info()[0]
         assert balancer.expert_restore.restore_lost_experts(
-            plan) == plan.device_bytes
+            plan, workspace, allgather) == plan.device_bytes
         assert free - torch.cuda.mem_get_info(
         )[0] >= plan.device_bytes - scratch
         # Only spare slot 3 is backed: backing it again maps nothing, backing slot 4 or 5 would.
@@ -804,7 +831,11 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
             [True, True], [layer.get_old_rank_expert_ids()],
             rejoining=[False, True])
         assert rejoin.device_bytes == 0
-        assert balancer.expert_restore.restore_lost_experts(rejoin) == 0
+        allgather.reset_mock()
+        assert balancer.expert_restore.restore_lost_experts(
+            rejoin, workspace, allgather) == 0
+        # The rejoin stages nothing, so the ranks gather only the plans' digests and row sizes.
+        allgather.assert_called_once_with((rejoin.digest, 0))
         free = torch.cuda.mem_get_info()[0]
         assert balancer.expert_restore.release_empty_spare_slots(
         ) == plan.device_bytes
@@ -834,6 +865,7 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
             assert_loaded([2, 3, 0])
     finally:
         balancer.shutdown()
+        _remove_host_weights(balancer.shared_memory_base_name)
 
 
 _EXPERTS, _HIDDEN, _INTERMEDIATE = 4, 2048, 2048
@@ -935,7 +967,9 @@ def _load_moe_layer(monkeypatch, fault_tolerance: bool,
     balancer_cls = MoeLoadBalancer
     if fault_tolerance:
         balancer_cls = functools.partial(FaultTolerantMoeLoadBalancer,
-                                         mapping=None)
+                                         mapping=None,
+                                         replacement=False,
+                                         wait_for_host_weights=MagicMock())
     balancer = balancer_cls(
         0, 2, 0, shared_memory_base_name=f"test_load_memory_{os.getpid()}")
     try:
@@ -966,6 +1000,7 @@ def _load_moe_layer(monkeypatch, fault_tolerance: bool,
         }
     finally:
         balancer.shutdown()
+        _remove_host_weights(balancer.shared_memory_base_name)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

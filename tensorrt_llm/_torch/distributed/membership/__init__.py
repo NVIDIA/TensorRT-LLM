@@ -24,6 +24,7 @@ from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV, SHARED_SECRET_
 from ..startup_record import REPLACEMENT_CANNOT_START, ReplacementCannotStart
 from .authority import Authority
 from .authority_process import AuthorityProcess
+from .host_weights import host_weights_name, host_weights_prefix
 from .liveness import (
     MembershipClient,
     open_liveness_connection,
@@ -37,6 +38,7 @@ from .records import (
     DEAD_TIMEOUT_S,
     HANG_TIMEOUT_S,
     HELLO_TIMEOUT_S,
+    NODE_SUPERVISOR_LAUNCH,
     RENDEZVOUS_TIMEOUT_S,
     REPORT_INTERVAL_S,
     MembershipRecord,
@@ -77,6 +79,7 @@ __all__ = [
     "MembershipClient",
     "MembershipRecord",
     "MembershipState",
+    "NODE_SUPERVISOR_LAUNCH",
     "NodeReport",
     "NodeView",
     "RECORD_KEY",
@@ -97,6 +100,8 @@ __all__ = [
     "UnsignedValueError",
     "all_ranks",
     "has_rank",
+    "host_weights_name",
+    "host_weights_prefix",
     "latest_epoch",
     "next_epoch",
     "open_liveness_connection",

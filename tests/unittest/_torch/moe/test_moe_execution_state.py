@@ -125,7 +125,7 @@ def test_abort_and_rearm_after_peer_failure() -> None:
         resets.append(1)
         torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, _EP_SIZE, barrier=False)
 
-    state.register_workspace(object(), reset_workspace, Mock())
+    state.register_workspace(object(), reset_workspace, Mock(), workspace)
 
     _collective_round(state, workspace, meta, experts, payload)
     done = _queued_work_done()
@@ -184,7 +184,7 @@ def test_incomplete_round_word_marks_the_state_aborted() -> None:
         key = object()
         # Layers that share a workspace register it again.
         for _ in range(2):
-            state.register_workspace(key, Mock(), check)
+            state.register_workspace(key, Mock(), check, workspace)
 
     state.check_incomplete_rounds()
     torch.cuda.synchronize()
@@ -204,7 +204,12 @@ def test_rearm_resets_bound_layers_and_shared_workspaces() -> None:
     resets = []
     shared = object()
     for name in ("shared", "shared again"):
-        state.register_workspace(shared, lambda name=name: resets.append(name), Mock())
+        state.register_workspace(
+            shared,
+            lambda name=name: resets.append(name),
+            Mock(),
+            torch.empty(2, 1, dtype=torch.uint8),
+        )
     comm = _frontend()
     comm._reset_local_workspace = lambda: resets.append("layer workspace")
     comm.bind_execution_state(state)
@@ -261,17 +266,24 @@ def test_shared_workspace_counted_once() -> None:
     other = _workspace(2 << 20, frozenset({0, 3}))
     resets = []
     checks = []
+    rows = {
+        shared: torch.empty(4, 6, dtype=torch.uint8),
+        other: torch.empty(4, 2, dtype=torch.uint8),
+    }
     for workspace, name in ((shared, "shared"), (shared, "shared again"), (other, "other")):
         state.register_workspace(
             workspace,
             lambda name=name: resets.append(name),
             lambda name=name: checks.append(name),
+            rows[workspace],
         )
     comm = Mock()
 
     state.check_incomplete_rounds()
     assert checks == ["shared", "other"]
 
+    # Restores stage expert weights through the largest workspace.
+    assert state.staging_workspace() is rows[shared]
     assert state.workspace_bytes() == 8 << 20
     assert state.workspace_rows_needing_fresh_pages(comm) == frozenset({0, 3})
     state.remap_workspaces(comm, frozenset({1}))
@@ -371,14 +383,21 @@ def test_bound_layer_passes_the_device_mask(monkeypatch: pytest.MonkeyPatch) -> 
         assert kwargs["abort_state"] is state.abort
     state.register_layer.assert_called_once_with(bound.reset_state)
     state.register_workspace.assert_called_once_with(
-        bound.mnnvl_mem, bound._reset_local_workspace, bound._check_incomplete_round
+        bound.mnnvl_mem,
+        bound._reset_local_workspace,
+        bound._check_incomplete_round,
+        bound.workspace,
     )
 
 
 def _moe_layer(cls: type, **attributes) -> torch.nn.Module:
-    """Build a MoE layer of class ``cls`` without its ``__init__`` and set ``attributes`` on it."""
+    """Build a MoE layer of class ``cls`` without its ``__init__`` and set ``attributes`` on it.
+
+    Like a layer built without EPLB, it has no load balancer.
+    """
     layer = cls.__new__(cls)
     torch.nn.Module.__init__(layer)
+    layer.layer_load_balancer = None
     for name, value in attributes.items():
         setattr(layer, name, value)
     return layer

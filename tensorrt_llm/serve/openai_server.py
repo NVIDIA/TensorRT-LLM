@@ -45,6 +45,8 @@ from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
+from tensorrt_llm.executor.rank_failure_requests import (RANK_FAILURE_CODE,
+                                                         RankFailureError)
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
@@ -79,8 +81,8 @@ from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
-    convert_anthropic_count_tokens_request, convert_anthropic_request,
-    convert_chat_response, reframe_openai_stream)
+    anthropic_error_type, convert_anthropic_count_tokens_request,
+    convert_anthropic_request, convert_chat_response, reframe_openai_stream)
 from tensorrt_llm.serve.anthropic_batches import (AnthropicBatchStore,
                                                   BatchStoreFullError,
                                                   results_to_jsonl)
@@ -179,6 +181,7 @@ from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
+    from tensorrt_llm.serve.fault_tolerance_health import FaultToleranceHealth
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 
@@ -323,14 +326,14 @@ def _stream_error_events(error: Exception) -> List[str]:
 
     The client receives an OpenAI error object with the exception's message,
     then [DONE]. A streaming completion reports a failure the same way once
-    HTTP 200 has been sent.
+    HTTP 200 has been sent. A rank failure carries the rank_failure code.
     """
-    message = str(error)
+    code = RANK_FAILURE_CODE if isinstance(error, RankFailureError) else None
     error_data = json.dumps({
         "error": {
-            "message": message,
+            "message": str(error),
             "type": "server_error",
-            "code": None,
+            "code": code,
             "param": None,
         }
     })
@@ -624,6 +627,9 @@ _InputProcessingResult = TypeVar("_InputProcessingResult")
 
 class OpenAIServer(_VideoRoutesMixin):
 
+    fault_tolerance_health: Optional["FaultToleranceHealth"] = None
+    # The uvicorn server that serves the app, set once __call__ creates it.
+    _uvicorn_server: Optional[uvicorn.Server] = None
     # Class defaults, so a server built without __init__ serves alone.
     _stop_attached_frontends: Optional[Callable[..., Awaitable]] = None
     _attached_frontends_stopped: Optional[asyncio.Task] = None
@@ -781,6 +787,17 @@ class OpenAIServer(_VideoRoutesMixin):
             self.model = model
         self.metrics_collector = None
         args = getattr(self.generator, "args", None)
+        # Attached frontends forward the fault-tolerance routes to the launcher.
+        if (getattr(args, "enable_wide_ep_fault_tolerance", False)
+                and (multi_frontend_serving is None
+                     or multi_frontend_serving.is_launcher)):
+            from tensorrt_llm.serve.fault_tolerance_health import \
+                FaultToleranceHealth
+            self.fault_tolerance_health = FaultToleranceHealth.from_environment(
+                self.generator._fault_tolerance_env,
+                MetricsCollector.serving_labels(args, self.model),
+                self._on_deployment_failed)
+            self.fault_tolerance_health.start()
         perf_metrics_output_dir = (getattr(args, "perf_metrics_output_dir",
                                            None) if args else None)
         perf_metrics = resolve_perf_metrics_config(
@@ -957,6 +974,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self._deregister_server()
                 if self.resource_governor is not None:
                     self.resource_governor.close()
+                if self.fault_tolerance_health is not None:
+                    await asyncio.to_thread(self.fault_tolerance_health.close)
                 self.generator.shutdown()
                 # A stats read still in flight fails fast now that the executor
                 # is down; the /metrics handler already treats that as no stats.
@@ -1257,6 +1276,27 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=error_response.model_dump(),
                             status_code=status_code.value)
 
+    def create_exception_error_response(
+            self,
+            error: Exception,
+            err_type: str = "BadRequestError",
+            status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
+        """Answer a request that failed with ``error``.
+
+        A RankFailureError answers 503 with the rank_failure code, since
+        sending the request again can succeed. Any other error answers
+        ``status_code`` with ``err_type`` and the error's message.
+        """
+        if not isinstance(error, RankFailureError):
+            return self.create_error_response(message=str(error),
+                                              err_type=err_type,
+                                              status_code=status_code)
+        error_response = ErrorResponse(message=str(error),
+                                       type="ServiceUnavailableError",
+                                       code=RANK_FAILURE_CODE)
+        return JSONResponse(content=error_response.model_dump(),
+                            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value)
+
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
             err_type="InvalidRequestError",
@@ -1443,9 +1483,14 @@ class OpenAIServer(_VideoRoutesMixin):
         # The render and generate routes are a separate exposed surface: off
         # unless TRTLLM_ENABLE_RENDER_ENDPOINTS=1.
         mount_render_endpoints(self.app, self)
-        if self.generator.args.return_perf_metrics:
+        if (self.generator.args.return_perf_metrics
+                or self.fault_tolerance_health is not None):
             # register /prometheus/metrics
             self.mount_metrics()
+        if self.fault_tolerance_health is not None:
+            self.app.add_api_route("/fault_tolerance_status",
+                                   self.fault_tolerance_health.status_response,
+                                   methods=["GET"])
 
     def mount_metrics(self):
         # Lazy import for prometheus multiprocessing.
@@ -1456,7 +1501,10 @@ class OpenAIServer(_VideoRoutesMixin):
                                        multiprocess)
         from prometheus_fastapi_instrumentator import Instrumentator
         registry = CollectorRegistry()
-        multiprocess.MultiProcessCollector(registry)
+        if self.generator.args.return_perf_metrics:
+            multiprocess.MultiProcessCollector(registry)
+        if self.fault_tolerance_health is not None:
+            self.fault_tolerance_health.register_metrics(registry)
         Instrumentator(
             should_group_status_codes=False,
             should_respect_env_var=True,
@@ -1789,8 +1837,8 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(content=response.model_dump(exclude_none=True))
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(
-                str(e),
+            return self.create_exception_error_response(
+                e,
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
@@ -1869,7 +1917,11 @@ class OpenAIServer(_VideoRoutesMixin):
         """Attached frontends: forward launcher-owned routes (before register_routes())."""
         if self._launcher_forwarder is None:
             return
-        for method, path in FORWARDED_ROUTES:
+        routes = FORWARDED_ROUTES
+        if self.generator.args.enable_wide_ep_fault_tolerance:
+            from tensorrt_llm.serve import fault_tolerance_health
+            routes += fault_tolerance_health.FORWARDED_ROUTES
+        for method, path in routes:
             self.app.add_api_route(path,
                                    self._launcher_forwarder.forward,
                                    methods=[method],
@@ -1926,6 +1978,24 @@ class OpenAIServer(_VideoRoutesMixin):
         if not executor.doing_shutdown:
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
+
+    def _on_deployment_failed(self) -> None:
+        """Shut the server down once its Wide-EP deployment cannot recover.
+
+        The executor reaches doing_shutdown when it reaps the ended rank 0,
+        so the fatal-error branch of ``health`` sends no signal then. A
+        server that is already shutting down gets no second signal: uvicorn
+        takes a second SIGINT as a forced exit, which cuts the open streams.
+        """
+        server = self._uvicorn_server
+        if server is not None and server.should_exit:
+            logger.error("The Wide-EP deployment failed while the server "
+                         "shuts down")
+            return
+        logger.error("The Wide-EP deployment failed, initiating server "
+                     "shutdown")
+        _record_generator_termination(self.generator)
+        signal.raise_signal(signal.SIGINT)
 
     async def health(self) -> Response:
         if self._check_health():
@@ -2792,7 +2862,7 @@ class OpenAIServer(_VideoRoutesMixin):
             return self.create_error_response(str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_exception_error_response(e)
         finally:
             _record_input_processing("total", input_started)
 
@@ -2836,11 +2906,12 @@ class OpenAIServer(_VideoRoutesMixin):
             try:
                 payload = json.loads(response.body)
                 message = payload.get("message") or json.dumps(payload)
+                code = payload.get("code")
             except (json.JSONDecodeError, AttributeError):
-                message = "Internal server error"
-            err_type = ("invalid_request_error"
-                        if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(message, err_type, status)
+                message, code = "Internal server error", None
+            return anthropic_error_response(message,
+                                            anthropic_error_type(status, code),
+                                            status)
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
@@ -2997,10 +3068,13 @@ class OpenAIServer(_VideoRoutesMixin):
             try:
                 payload = json.loads(response.body)
                 message = payload.get("message") or json.dumps(payload)
+                code = payload.get("code")
             except (json.JSONDecodeError, AttributeError):
-                message = "Internal server error"
-            err_type = "invalid_request_error" if 400 <= status < 500 else "api_error"
-            return "errored", {"type": err_type, "message": message}
+                message, code = "Internal server error", None
+            return "errored", {
+                "type": anthropic_error_type(status, code),
+                "message": message
+            }
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
@@ -3228,7 +3302,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_exception_error_response(e)
         finally:
             _record_input_processing("total", input_started)
 
@@ -3452,7 +3526,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_exception_error_response(e)
         finally:
             _record_input_processing("total", input_started)
 
@@ -3620,8 +3694,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error("Error in harmony chat completion: %s", e)
             logger.debug("Error details: %s", traceback.format_exc())
-            return self.create_error_response(message=str(e),
-                                              err_type="internal_error")
+            return self.create_exception_error_response(
+                e, err_type="internal_error")
         finally:
             _record_input_processing("total", input_started)
 
@@ -3892,7 +3966,7 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_exception_error_response(e)
 
         finally:
             _record_input_processing("total", input_started)
@@ -4600,6 +4674,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
                                 **config_kwargs)
         server = create_uvicorn_server(config)
+        self._uvicorn_server = server
 
         async def _register_after_serving():
             with _StartupTimer("http_server_start"):

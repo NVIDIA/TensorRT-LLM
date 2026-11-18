@@ -257,6 +257,8 @@ Under `enable_wide_ep_fault_tolerance`, `CommunicationFactory` builds `NVLinkOne
 
 A MoE backend runs with the unbacked spare EPLB slots of fault tolerance only if it declares `MoEStaticCapability.supports_spare_slots`: its weight method creates the spare slots and its autotuner profiles only the active slots (`tuner_layout_kwargs`). The Cutlass unquantized and NVFP4 leaves and the CuteDSL NVFP4 grouped-GEMM leaf declare it. While the load balancer adds spare slots (`MoEDeployment.spare_slots_enabled`), selection turns down every other candidate that `can_implement` accepts with `MoERejectReason.SPARE_SLOTS_UNSUPPORTED`, as it does for EPLB, and so does the CuteDSL leaf's `can_implement` on SM107, whose kernels tune every local slot. A backend literal then falls back like any degradation, to a Cutlass leaf with the capability, but the warning, which names Wide-EP fault tolerance and the reason, is logged once per process rather than once per layer; a pinned tactic, or a layer whose format no leaf with the capability serves, fails with that reason.
 
+For the membership changes, recovery and expert restore around these pieces, see the [Wide-EP Fault Tolerance Developer Guide](../../distributed/membership/FAULT_TOLERANCE_DEVELOPER_GUIDE.md).
+
 ### Core Design Principles
 
 1. **Composition over inheritance** — Backend, Communication, EPLB, and Scheduler are independent, composable components

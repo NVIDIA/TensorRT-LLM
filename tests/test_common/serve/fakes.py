@@ -148,6 +148,7 @@ class FakeLlmArgs:
     reasoning_parser: Optional[str] = None  # chat, completions, Responses
     gather_generation_logits: bool = False  # to_sampling_params in chat and completions
     guided_decoding_backend: Optional[str] = None  # the required-tool grammar check
+    enable_wide_ep_fault_tolerance: bool = False  # the fault-tolerance routes and metrics
 
 
 class FakeExecutor:

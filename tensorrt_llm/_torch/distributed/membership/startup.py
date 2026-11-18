@@ -32,9 +32,10 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, NoReturn, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, NoReturn, Optional, Tuple
 
 from tensorrt_llm._utils import global_mpi_size, local_mpi_comm, set_mpi_world_comm
 from tensorrt_llm._wide_ep_fault_tolerance import (
@@ -128,8 +129,8 @@ def ensure_rendezvous(
     )
     if get_spawn_proxy_process_env() and wide_ep_fault_tolerance_rank() is None:
         raise ValueError(
-            "Wide-EP fault tolerance does not support ranks launched by trtllm-llmapi-launch yet, "
-            "so it runs on one node only. Start trtllm-serve or the LLM API without a launcher."
+            f"trtllm-llmapi-launch started the ranks without {SHARED_SECRET_ENV} and "
+            f"{RENDEZVOUS_ENV} exported on every node"
         )
     env = {
         SHARED_SECRET_ENV: os.environ.get(SHARED_SECRET_ENV)
@@ -224,6 +225,59 @@ AGREED_STARTUP_KEY = "agreed_startup"
 WORKER_ARGS_KEY = "worker_args"
 # Each rank's tuned tactics, which a replacement of the rank takes. Format with the rank.
 TUNED_TACTICS_KEY = "tuned_tactics/{}"
+
+_HOST_WEIGHTS_CHECK_S = 1.0
+
+
+def wait_for_node_host_weights(
+    rank: int, ranks_without_host_weights: Callable[[], List[int]]
+) -> None:
+    """Wait until the other ranks on this node hold their EPLB host weights.
+
+    ``ranks_without_host_weights`` returns the other ranks on this node whose host weights in the
+    node's shared memory are missing or broken.
+
+    Raises:
+        ReplacementCannotStart: An active rank's host weights are missing or broken, or a rank
+            without them gets no replacement.
+        RuntimeError: The deployment ended.
+    """
+    waited = _peers_to_wait_for(ranks_without_host_weights)
+    if waited:
+        logger.info(
+            f"Rank {rank} waits for the replacements of ranks {waited} to rebuild their EPLB "
+            "host weights"
+        )
+    while waited:
+        time.sleep(_HOST_WEIGHTS_CHECK_S)
+        # The peers' own startups are watched for stalls, and a stalled peer is replaced or given
+        # up, which ends this wait. So each poll counts as a step of this rank's startup.
+        Distributed.report_startup_progress()
+        waited = _peers_to_wait_for(ranks_without_host_weights)
+
+
+def _peers_to_wait_for(ranks_without_host_weights: Callable[[], List[int]]) -> List[int]:
+    """Return the other ranks on this node whose replacements still build their host weights."""
+    # The store can hold an older record written back, but the connection cannot. A rank builds
+    # its host weights before it joins, so read the record first.
+    record = _state.client.record
+    waited = ranks_without_host_weights()
+    active = [peer for peer in waited if record.is_active(peer)]
+    if active:
+        raise ReplacementCannotStart(
+            f"EPLB host weights of active ranks {active} on this node are missing or broken"
+        )
+    given_up = [peer for peer in waited if record.is_given_up(peer)]
+    if given_up:
+        raise ReplacementCannotStart(
+            f"Ranks {given_up} on this node get no replacement to rebuild their EPLB host weights"
+        )
+    if waited and record.state in (MembershipState.SHUTDOWN, MembershipState.ABORTED):
+        raise RuntimeError(
+            f"The deployment ended ({record.state.name}) before ranks {waited} rebuilt their EPLB "
+            "host weights"
+        )
+    return waited
 
 
 def startup_fingerprint(worker_main_args: dict) -> str:

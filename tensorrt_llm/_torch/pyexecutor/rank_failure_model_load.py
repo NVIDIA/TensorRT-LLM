@@ -15,8 +15,8 @@
 """Check that a model supports Wide-EP fault tolerance and bind its MoE layers as it loads.
 
 The model loader calls ``check_supported`` before it builds the model and ``prepare_model`` before
-any weight loads. ``create_moe_load_balancer`` creates the EPLB load balancer that restores failed
-ranks' experts.
+any weight loads. ``create_moe_load_balancer`` creates the EPLB load balancer whose host weights
+outlive the process.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import os
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
@@ -35,12 +35,19 @@ from tensorrt_llm._wide_ep_fault_tolerance import (
 )
 
 from ..distributed import Distributed
-from ..distributed.membership import HANG_TIMEOUT_S
+from ..distributed.membership import HANG_TIMEOUT_S, host_weights_name, host_weights_prefix
+from ..distributed.membership.startup import wait_for_node_host_weights
 from ..moe.fused_moe.communication.execution_state import BindableCommunication, MoeExecutionState
 from ..moe.fused_moe.communication.nvlink_one_sided import SYNC_PROTOCOL_ENV, get_sync_protocol
 from ..moe.fused_moe.ep_group_health import EPGroupHealth
-from ..moe.fused_moe.eplb_expert_restore import FaultTolerantMoeLoadBalancer
+from ..moe.fused_moe.eplb_expert_restore import (
+    SHARED_MEMORY_DIR,
+    DeploymentHostWeights,
+    FaultTolerantMoeLoadBalancer,
+    slot_parameters,
+)
 from ..moe.fused_moe.fused_moe_vanilla import VanillaMoE
+from ..moe.fused_moe.impl_blocks import MoEEplbWeightLayoutMixin
 from ..moe.fused_moe.interface import MoE
 from ..moe.fused_moe.moe_comm_timeout_guard import (
     SERVING_TIMEOUT_ENV,
@@ -104,8 +111,11 @@ def check_supported(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
 def prepare_model(model: torch.nn.Module) -> None:
     """Check that the built model supports fault tolerance and bind its MoE layers before loading.
 
+    It also checks that /dev/shm has room for the host weights that the node keeps.
+
     Raises:
-        ValueError: The model is not supported with fault tolerance.
+        ValueError: The model is not supported with fault tolerance, or /dev/shm lacks room for
+            the host weights.
     """
     check_model_architectures(model.model_config.pretrained_config.architectures)
     comms = moe_comms(model)
@@ -122,6 +132,7 @@ def prepare_model(model: torch.nn.Module) -> None:
     )
     for comm in comms:
         comm.bind_execution_state(moe_execution_state)
+    _check_host_weights_fit(model)
 
 
 def moe_comms(model: torch.nn.Module) -> List[BindableCommunication]:
@@ -153,9 +164,61 @@ def moe_comms(model: torch.nn.Module) -> List[BindableCommunication]:
 def create_moe_load_balancer(
     model_config: ModelConfig, mapping: Mapping
 ) -> contextlib.AbstractContextManager[Optional[BaseMoeLoadBalancer]]:
-    """Create this rank's EPLB load balancer, which restores failed ranks' experts."""
+    """Create this rank's EPLB load balancer, whose host weights outlive the process."""
     return maybe_create_moe_load_balancer(
         model_config,
         mapping,
-        functools.partial(FaultTolerantMoeLoadBalancer, mapping=model_config.mapping),
+        functools.partial(
+            FaultTolerantMoeLoadBalancer,
+            mapping=model_config.mapping,
+            shared_memory_base_name=host_weights_name(model_config.mapping.node_rank),
+            replacement=Distributed.startup_record.replacement,
+            wait_for_host_weights=wait_for_node_host_weights,
+        ),
+    )
+
+
+def _check_host_weights_fit(model: torch.nn.Module) -> None:
+    """Check that /dev/shm has room for the host weights the node keeps and does not hold yet."""
+    slot_bytes: Dict[DeploymentHostWeights, List[int]] = {}
+    for module in model.modules():
+        if not isinstance(module, MoEEplbWeightLayoutMixin) or module.layer_load_balancer is None:
+            continue
+        sharer = module.layer_load_balancer.host_tensor_sharer
+        if sharer is not None:
+            slot_bytes.setdefault(sharer, []).extend(
+                param.numel() // param.shape[0] * param.element_size()
+                for _, param in slot_parameters(module)
+            )
+    needed = sum(
+        sharer.node_bytes(sizes) - sharer.node_bytes_present()
+        for sharer, sizes in slot_bytes.items()
+    )
+    shm = os.statvfs(SHARED_MEMORY_DIR)
+    free = shm.f_bavail * shm.f_frsize
+    if needed > free:
+        raise ValueError(
+            f"{SHARED_MEMORY_DIR} has {free} bytes free, but Wide-EP fault tolerance needs "
+            f"{needed} bytes more. Enlarge it or {TURN_FAULT_TOLERANCE_OFF}.{_leftover_entries()}"
+        )
+
+
+def _leftover_entries() -> str:
+    """Describe the host weight entries that this user's killed deployments left in /dev/shm."""
+    leftovers = []
+    with os.scandir(SHARED_MEMORY_DIR) as entries:
+        for entry in entries:
+            if not entry.name.startswith(host_weights_prefix()):
+                continue
+            try:
+                stat = entry.stat()
+            except FileNotFoundError:  # Its deployment unlinked it after the scan listed it.
+                continue
+            if stat.st_uid == os.getuid():
+                leftovers.append(f"{entry.name} ({stat.st_blocks * 512 / 2**30:.1f} GiB)")
+    if not leftovers:
+        return ""
+    return (
+        f" {SHARED_MEMORY_DIR} holds host weights that this user's killed deployments may have "
+        f"left. Unlink the ones no running deployment uses: {', '.join(sorted(leftovers))}"
     )

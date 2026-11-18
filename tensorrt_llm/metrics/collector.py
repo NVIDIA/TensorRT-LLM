@@ -172,14 +172,15 @@ class PrometheusExposure:
                          "request_decode_time_buckets",
                          "request_inference_time_buckets")
         }
-        return cls(
-            {
-                "model_name": model,
-                "engine_type": args.backend or "unknown"
-            },
-            **buckets,
-            registry=registry,
-            gauge_multiprocess_mode=gauge_multiprocess_mode)
+        return cls(cls.serving_labels(args, model),
+                   **buckets,
+                   registry=registry,
+                   gauge_multiprocess_mode=gauge_multiprocess_mode)
+
+    @staticmethod
+    def serving_labels(args: "BaseLlmArgs", model: str) -> Dict[str, str]:
+        """Return the labels that every serving metric of ``model`` carries."""
+        return {"model_name": model, "engine_type": args.backend or "unknown"}
 
     def __init__(
         self,

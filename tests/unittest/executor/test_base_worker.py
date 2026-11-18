@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
@@ -28,10 +28,11 @@ from utils.util import skip_single_gpu
 
 from tensorrt_llm.executor import base_worker
 from tensorrt_llm.executor.base_worker import BaseWorker
+from tensorrt_llm.executor.rank_failure_requests import RankFailureError
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
 from tensorrt_llm.executor.result import GenerationResult, LogProbsResult
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
-from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm.executor.utils import ErrorResponse, RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import LogprobParams, SamplingParams
 
@@ -1053,12 +1054,182 @@ def _ipc_worker(monkeypatch, fault_tolerance=True):
     return worker, base_worker.AwaitResponseHelper(worker)
 
 
-def _submit(worker, client_id):
+def _submit(worker, client_id, multimodal_params=None):
     request = SimpleNamespace(id=client_id,
-                              multimodal_params=None,
+                              multimodal_params=multimodal_params,
                               disaggregated_params=None)
     worker.submit(request)
     return request
+
+
+def _sent(worker):
+    """Map each client id to the outputs and error types that reached the client."""
+    sent = {}
+    for postproc_queue in worker.postproc_queues:
+        for (batch, ), _ in postproc_queue.put.call_args_list:
+            for item in batch:
+                sent.setdefault(item.rsp.client_id, []).append(
+                    ("output", item.sampling_params))
+    for (batch, ), _ in worker.result_queue.put.call_args_list:
+        for error in batch:
+            assert isinstance(error, ErrorResponse)
+            sent.setdefault(error.client_id, []).append(
+                ("error", type(error.error_msg)))
+    return sent
+
+
+def _output(client_id, final=False):
+    return LlmResponse(request_id=1,
+                       result=SimpleNamespace(is_final=final),
+                       client_id=client_id)
+
+
+def _ended_by_rank_failure(client_id, resubmit=True):
+    return LlmResponse(request_id=1,
+                       error_msg=RankFailureError(resubmit=resubmit),
+                       client_id=client_id)
+
+
+@pytest.mark.cpu_only
+def test_worker_reenqueues_unanswered_failed_request(monkeypatch):
+    """Check that a request a rank failure ended is resubmitted once if it had no response."""
+    worker, helper = _ipc_worker(monkeypatch)
+    requests = {client_id: _submit(worker, client_id) for client_id in (7, 8)}
+    helper.handle_for_ipc_batched([_output(8), _ended_by_rank_failure(7)])
+    assert worker._enqueue_request.call_args_list[-1].args == (requests[7], )
+    assert worker.outstanding_requests() == {102: 7, 101: 8}
+    assert _sent(worker) == {8: [("output", "sampling params")]}
+
+    helper.handle_for_ipc_batched([_output(7), _ended_by_rank_failure(8)])
+    assert _sent(worker) == {
+        # The first response of the resubmitted request.
+        7: [("output", "sampling params")],
+        8: [("output", "sampling params"), ("error", RankFailureError)],
+    }
+    helper.handle_for_ipc_batched([_ended_by_rank_failure(7)])
+    assert _sent(worker)[7][-1] == ("error", RankFailureError)
+    assert worker._enqueue_request.call_count == 3
+
+    _submit(worker, 9)
+    helper.handle_for_ipc_batched([_ended_by_rank_failure(9)])
+    # It was resubmitted already.
+    helper.handle_for_ipc_batched([_ended_by_rank_failure(9)])
+    assert _sent(worker)[9] == [("error", RankFailureError)]
+    assert worker._enqueue_request.call_count == 5
+    assert worker.outstanding_requests() == {}
+
+
+@pytest.mark.cpu_only
+def test_worker_reenqueues_multimodal_input(monkeypatch):
+    """Check that a multimodal request is resubmitted with its multimodal input."""
+    worker, helper = _ipc_worker(monkeypatch)
+    multimodal_input = object()
+    params = SimpleNamespace(multimodal_input=multimodal_input)
+    enqueued = []
+
+    def enqueue(request):  # The enqueue consumes the multimodal input.
+        enqueued.append((request.multimodal_params,
+                         request.multimodal_params.multimodal_input))
+        request.multimodal_params.multimodal_input = None
+        return 100 + len(enqueued)
+
+    worker._enqueue_request = Mock(side_effect=enqueue)
+    request = _submit(worker, 7, multimodal_params=params)
+    del request.multimodal_params
+    helper.handle_for_ipc_batched([_ended_by_rank_failure(7)])
+    assert enqueued == [(params, multimodal_input)] * 2
+    assert _sent(worker) == {}
+    assert worker.outstanding_requests() == {102: 7}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("case", [
+    "cancelled", "cancelled_during_enqueue", "flag_off", "waits_for_replacement"
+])
+def test_worker_ends_request_after_rank_failure(monkeypatch, case):
+    """Check that a request a rank failure ended is not resubmitted.
+
+    Its client cancelled it, before or during the resubmit, it cannot run before a replacement
+    joins, or the flag is off.
+    """
+    worker, helper = _ipc_worker(monkeypatch,
+                                 fault_tolerance=case != "flag_off")
+    worker.engine = Mock(**{"can_enqueue_requests.return_value": True})
+    _submit(worker, 7)
+    during_enqueue = case == "cancelled_during_enqueue"
+    if during_enqueue:
+        worker._enqueue_request.side_effect = lambda request: (
+            worker.abort_request(7), 101)[1]
+    elif case == "cancelled":
+        worker.abort_request(7)
+    helper.handle_for_ipc_batched(
+        [_ended_by_rank_failure(7, resubmit=case != "waits_for_replacement")])
+    if during_enqueue:
+        assert worker.engine.cancel_request.call_args.args == (101, )
+        assert _sent(worker) == {}
+    else:
+        assert worker._enqueue_request.call_count == 1
+        assert _sent(worker) == {7: [("error", RankFailureError)]}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("same_batch", [True, False])
+@pytest.mark.parametrize("resubmit", [True, False])
+def test_worker_withholds_rank_failure_after_final_response(
+        monkeypatch, resubmit, same_batch):
+    """Check that a request's RankFailureError after its final response does not reach the client.
+
+    Rank 0 fails the requests that were outstanding when it read them, so a request that got its
+    final response meanwhile still gets the error.
+    """
+    worker, helper = _ipc_worker(monkeypatch)
+    _submit(worker, 7)
+    responses = [
+        _output(7, final=True),
+        _ended_by_rank_failure(7, resubmit=resubmit)
+    ]
+    if same_batch:
+        helper.handle_for_ipc_batched(responses)
+    else:
+        for response in responses:
+            helper.handle_for_ipc_batched([response])
+    assert _sent(worker) == {7: [("output", "sampling params")]}
+    assert worker._enqueue_request.call_count == 1
+    assert worker.outstanding_requests() == {}
+
+
+@pytest.mark.cpu_only
+def test_worker_fails_request_before_id_stored(monkeypatch):
+    """Check that a request a rank failure ended before its submit returned is not resubmitted."""
+    worker, helper = _ipc_worker(monkeypatch)
+
+    def enqueue(request):
+        if worker._enqueue_request.call_count == 1:
+            helper.handle_for_ipc_batched([_ended_by_rank_failure(7)])
+        return 99 + worker._enqueue_request.call_count
+
+    worker._enqueue_request.side_effect = enqueue
+    _submit(worker, 7)
+    assert worker._enqueue_request.call_count == 1
+    assert _sent(worker) == {7: [("error", RankFailureError)]}
+    # The submit stored the request id after the error, so the id stays without a result.
+    assert worker._client_id_to_request_id == {7: 100}
+    assert worker.outstanding_requests() == {}
+
+
+@pytest.mark.cpu_only
+def test_resubmit_stores_the_new_request_id(monkeypatch):
+    """Check that a resubmit enqueues the request again only while its result is pending."""
+    worker, _ = _ipc_worker(monkeypatch, fault_tolerance=False)
+    request = _submit(worker, 7)
+    assert worker.resubmit(7, request)
+    assert worker._enqueue_request.call_args.args == (request, )
+    assert worker._client_id_to_request_id == {7: 101}
+    worker._enqueue_request.side_effect = RequestError("shutting down")
+    assert not worker.resubmit(7, request)
+    assert worker._client_id_to_request_id == {7: 101}
+    worker._results.pop(7)
+    assert not worker.resubmit(7, request)
 
 
 def _set_up_engine(monkeypatch, worker, rank_failure_recovery):

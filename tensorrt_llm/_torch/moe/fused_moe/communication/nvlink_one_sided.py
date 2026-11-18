@@ -958,7 +958,10 @@ class NVLinkOneSided(Communication):
             )
         state.register_layer(self.reset_state)
         state.register_workspace(
-            self.mnnvl_mem, self._reset_local_workspace, self._check_incomplete_round
+            self.mnnvl_mem,
+            self._reset_local_workspace,
+            self._check_incomplete_round,
+            self.workspace,
         )
         self.execution_state = state
 

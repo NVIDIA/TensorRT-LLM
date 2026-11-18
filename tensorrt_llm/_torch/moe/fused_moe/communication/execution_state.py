@@ -52,6 +52,20 @@ def _mask_words(mask: int, ep_rank: int) -> tuple[int, ...]:
     return words
 
 
+class MembershipWorkspace(Protocol):
+    """Peer-writable memory that a membership change remaps among the active ranks in place."""
+
+    @property
+    def local_device_bytes(self) -> int:
+        """Return the device bytes that :meth:`remap` allocates for this rank's row."""
+
+    def rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
+        """Return every row if a former member may still write into the workspace, else no row."""
+
+    def remap(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
+        """Map the workspace among the active ranks with ``fresh_rows`` on fresh pages."""
+
+
 class BindableCommunication(Protocol):
     """MoE communication strategy whose collectives can run under a :class:`MoeExecutionState`."""
 
@@ -84,7 +98,9 @@ class MoeExecutionState:
         if not self.abort.is_pinned():
             raise RuntimeError("The MoE All-to-All abort state requires pinned host memory")
         self._abort_words = self.abort.numpy()[_ABORT_WORDS]
-        self._workspaces: dict[object, tuple[Callable[[], None], Callable[[], None]]] = {}
+        self._workspaces: dict[
+            MembershipWorkspace, tuple[Callable[[], None], Callable[[], None], torch.Tensor]
+        ] = {}
         self._layer_resets: list[Callable[[], None]] = []
         snapshot = ep_group_health.snapshot()
         self._generation = snapshot.generation
@@ -106,16 +122,28 @@ class MoeExecutionState:
 
     def register_workspace(
         self,
-        workspace: object,
+        workspace: MembershipWorkspace,
         reset_workspace: Callable[[], None],
         check_incomplete_round: Callable[[], None],
+        rows: torch.Tensor,
     ) -> None:
         """Register a bound layer's workspace, once per workspace that layers share.
 
-        ``reset_workspace`` resets this rank's row of it, and ``check_incomplete_round`` enqueues the
-        check of this rank's incomplete-round word in it (:meth:`check_incomplete_rounds`).
+        ``reset_workspace`` resets this rank's row of it, ``check_incomplete_round`` enqueues the
+        check of this rank's incomplete-round word in it (:meth:`check_incomplete_rounds`), and
+        ``rows`` is the workspace's ``[ep_size, bytes]`` uint8 view.
         """
-        self._workspaces.setdefault(workspace, (reset_workspace, check_incomplete_round))
+        self._workspaces.setdefault(workspace, (reset_workspace, check_incomplete_round, rows))
+
+    def staging_workspace(self) -> torch.Tensor:
+        """Return the rows of the largest bound workspace.
+
+        The workspace is idle from :meth:`remap_workspaces` until :meth:`rearm`, so restores may
+        stage expert weights through it.
+        """
+        return max(
+            (rows for _, _, rows in self._workspaces.values()), key=lambda rows: rows.shape[1]
+        )
 
     def workspace_bytes(self) -> int:
         """Return the device memory :meth:`remap_workspaces` allocates on this rank."""
@@ -152,7 +180,7 @@ class MoeExecutionState:
         forward, on the stream of its last combine, before the event that the host waits on to
         accept the forward.
         """
-        for _, check_incomplete_round in self._workspaces.values():
+        for _, check_incomplete_round, _ in self._workspaces.values():
             check_incomplete_round()
 
     def waited_flags(self) -> dict[int, int]:
@@ -172,7 +200,7 @@ class MoeExecutionState:
         """
         torch.cuda.synchronize(self._device)
         self.abort.zero_()
-        for reset_workspace, _ in self._workspaces.values():
+        for reset_workspace, _, _ in self._workspaces.values():
             reset_workspace()
         for reset_state in self._layer_resets:
             reset_state()
