@@ -59,7 +59,6 @@ class _Metadata:
 def test_prefill_fullgraph_keeps_token_rows_dynamic(
     monkeypatch: pytest.MonkeyPatch, modeling: ModuleType, tp: int, attention_kind: str
 ) -> None:
-    # Construct the real core without allocating checkpoint weights or GPU resources.
     core = object.__new__(getattr(modeling, f"MiniMaxM3Tp{tp}ModelingV2"))
     torch.nn.Module.__init__(core)
     core.num_layers = 1
@@ -133,8 +132,14 @@ def test_prefill_fullgraph_keeps_token_rows_dynamic(
         output.copy_(q + 1)
         return output
 
-    # Keep actual attention host dispatch and its runtime boundary; replace only
-    # native GPU math and the surrounding collective layer scaffolding.
+    # Exercise real attention dispatch with CPU math and collective stand-ins.
+    def producer(
+        packed: torch.Tensor, position_ids: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert packed.shape[0] == live_metadata.num_tokens
+        assert position_ids is None or position_ids.shape[-1] == live_metadata.num_tokens
+        return packed[:, :16], packed[:, :16]
+
     def layer(
         self: _Prefill,
         i: int,
@@ -153,7 +158,7 @@ def test_prefill_fullgraph_keeps_token_rows_dynamic(
     monkeypatch.setattr(
         modeling,
         "_sparse_qkv_producer",
-        lambda core, i, packed, *args: (packed[:, :16], packed[:, :16]),
+        lambda core, i, packed, position_ids, *args: producer(packed, position_ids),
     )
     monkeypatch.setattr(modeling, "_producer_covered", lambda core: False)
     monkeypatch.setattr(modeling, "m3_bf16_linear", lambda x, w: x @ w.t())
@@ -169,7 +174,9 @@ def test_prefill_fullgraph_keeps_token_rows_dynamic(
 
     def forward(inputs_embeds: torch.Tensor) -> torch.Tensor:
         rows = inputs_embeds.shape[0]
-        return target.forward(_Metadata(1, rows, rows), None, None, inputs_embeds, None, None, None)
+        md = _Metadata(1, rows, rows)
+        pos = torch.arange(rows)[None]
+        return target.forward(md, None, pos, inputs_embeds, None, None, None)
 
     torch._dynamo.reset()
     counter = CompileCounter()
@@ -182,9 +189,7 @@ def test_prefill_fullgraph_keeps_token_rows_dynamic(
         return compiler(gm, inputs)
 
     compiled = torch.compile(forward, fullgraph=True, dynamic=True, backend=compile_piecewise)
-    # The compile policy must win over a surrounding decode-graph tuning scope,
-    # just as it does for the built-in MXFP8 linear implementation.
-    # The CPU SwiGLU stand-in uses scalar clamp bounds; model constants are static.
+    # Keep CPU SwiGLU scalars static; compilation overrides decode-graph tuning scopes.
     with (
         torch._dynamo.config.patch(specialize_float=True),
         torch_compiling(False),
@@ -206,7 +211,7 @@ def test_prefill_fullgraph_keeps_token_rows_dynamic(
     assert counter.frame_count == 1
     assert len(compiler._piecewise_runners) == 2
     with torch_compiling(False):
-        eager, _ = target._attention(0, None, x, target.step_args(live_metadata))
+        eager, _ = target._attention(0, None, x[:rows], target.step_args(live_metadata))
         torch.testing.assert_close(eager[:rows], x[:rows] + 1)
 
     core.mxfp8.quant_method.backend = "auto"
