@@ -190,6 +190,10 @@ class ScheduledEncoderExecutor:
         self._last_staged: torch.cuda.Event | None = None
         self._completion_thread: threading.Thread | None = None
         self._completion_error: BaseException | None = None
+        # Ids of the launched, unpublished requests, and of those among them cancelled since.
+        self._cancel_lock = threading.Lock()
+        self._launched_ids: set[int] = set()
+        self._cancelled_after_launch: set[int] = set()
         self._response_channel = ResponseChannel()
         self._iter_counter = 0
         self._profiler = ProfileController(
@@ -349,7 +353,7 @@ class ScheduledEncoderExecutor:
         )
 
     def cancel_request(self, id: int) -> None:
-        """Cancel a request; a queued one finishes as cancelled, a finished one is ignored.
+        """Cancel a request; it finishes as cancelled unless its result was already published.
 
         Args:
             id: The request id.
@@ -548,6 +552,8 @@ class ScheduledEncoderExecutor:
         if self.dist.rank == 0:
             self._respond_with_errors(rejected)
         if canceled_ids:
+            with self._cancel_lock:
+                self._cancelled_after_launch.update(canceled_ids & self._launched_ids)
             self._cancel_waiting(canceled_ids)
 
     @nvtx_range("_check_admissible")
@@ -569,7 +575,7 @@ class ScheduledEncoderExecutor:
             )
 
     def _cancel_waiting(self, request_ids: set[int]) -> None:
-        """Finish queued requests as cancelled; ids no longer queued have already completed."""
+        """Finish queued requests as cancelled; ids no longer queued are launched or completed."""
         items = [item for item in self._waiting_queue if item.id in request_ids]
         if not items:
             return
@@ -645,6 +651,8 @@ class ScheduledEncoderExecutor:
             self._completion.retire(requests)
             self._fail(requests, error)
             return
+        with self._cancel_lock:
+            self._launched_ids.update(item.id for item in items)
         self._in_flight.put(
             _InFlight(
                 requests=requests,
@@ -666,10 +674,9 @@ class ScheduledEncoderExecutor:
                 with nvtx_range("synchronize"):
                     # Responses carry device tensors that other threads and processes read.
                     flight.done.synchronize()
+                responses = self._cancel_launched(flight)
                 if self.dist.rank == 0:
-                    self._publish(
-                        flight.responses, (request.py_request_id for request in flight.requests)
-                    )
+                    self._publish(responses, (request.py_request_id for request in flight.requests))
                 if self._iter_log:
                     self._log_iteration(flight)
             except Exception as error:
@@ -681,6 +688,40 @@ class ScheduledEncoderExecutor:
                     self._request_queue.enqueue_shutdown_request()
             finally:
                 self._slots.release()
+
+    def _cancel_launched(self, flight: _InFlight) -> list[tuple[int, LlmResponse]]:
+        """The batch's responses, with those of requests cancelled since its launch replaced.
+
+        A cancelled request's exports are retired and it finishes as cancelled; a
+        cancellation that arrives after this point finds the request completed.
+        """
+        request_ids = {request.py_request_id for request in flight.requests if not request.is_child}
+        with self._cancel_lock:
+            self._launched_ids -= request_ids
+            cancelled_ids = self._cancelled_after_launch & request_ids
+            self._cancelled_after_launch -= cancelled_ids
+        if not cancelled_ids:
+            return flight.responses
+        cancelled = [
+            request
+            for request in flight.requests
+            if (request.parent_request_id if request.is_child else request.py_request_id)
+            in cancelled_ids
+        ]
+        self._completion.retire(cancelled)
+        # A child's response carries its parent's request id.
+        responses = [
+            (request_id, response)
+            for request_id, response in flight.responses
+            if response.request_id not in cancelled_ids
+        ]
+        for request in cancelled:
+            # Replaces the reason LENGTH set by _complete.
+            request.set_finished_reason(FinishReason.CANCELLED, 0)
+            response = request.create_response()
+            if response is not None:
+                responses.append((request.py_request_id, response))
+        return responses
 
     def _log_iteration(self, flight: _InFlight) -> None:
         """Log one batch: its size, the host time until it was published and the GPU time of its forward."""

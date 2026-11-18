@@ -9,6 +9,7 @@ It can hold or fail a forward. The executor's queue, admission, batching, comple
 delivery are real.
 """
 
+import gc
 import re
 import threading
 import time
@@ -82,6 +83,7 @@ class _Runner:
 
     def __init__(self, max_batch_size: int, multimodal: bool):
         self.multimodal = multimodal
+        self.embedding_device = "cpu"
         self.output = torch.zeros(max_batch_size, WIDTH, device="cuda")
         self.batches: list[list[int]] = []
         self.errors: list[Exception] = []
@@ -125,7 +127,10 @@ class _Runner:
         if self.multimodal:
             return {
                 "mm_embeddings": [
-                    torch.full((1, WIDTH), float(request.py_request_id)) for request in requests
+                    torch.full(
+                        (1, WIDTH), float(request.py_request_id), device=self.embedding_device
+                    )
+                    for request in requests
                 ],
                 "mm_embedding_request_indices": list(range(len(requests))),
                 "mm_embedding_lengths": [[1]] * len(requests),
@@ -386,6 +391,66 @@ def test_cancelling_a_queued_request_finishes_it_once_as_cancelled(completion):
         assert h.responses(running, NO_WAIT) == []
         assert h.responses(queued, NO_WAIT) == []
         assert h.runner.batches == [[running], [later]]
+
+
+def test_cancelling_a_launched_request_finishes_it_once_as_cancelled(completion):
+    with _harness(completion=completion, max_batch_size=1) as h:
+        h.runner.hold()
+        # The launched forward is still running when the loop takes the cancellation.
+        h.runner.gpu_cycles = GPU_CYCLES
+        launched, later = h.submit(), h.submit()
+        h.executor.start_worker()
+        assert h.runner.entered.wait(timeout=30)
+
+        h.executor.cancel_request(launched)
+        h.runner.release.set()
+
+        (cancelled,) = h.responses(launched)
+        assert cancelled.result.is_final
+        assert cancelled.result.finish_reasons == [FinishReason.CANCELLED]
+        assert cancelled.result.mm_embedding_handles is None
+        h.result(later)
+        assert h.responses(launched, NO_WAIT) == []
+        assert h.runner.batches == [[launched], [later]]
+
+
+def _cuda_memory_allocated() -> int:
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.ipc_collect()
+    return torch.cuda.memory_allocated()
+
+
+@pytest.mark.parametrize("cause", ["cancelled", "failed"])
+def test_a_launched_request_whose_result_is_not_delivered_frees_its_exports(cause):
+    with _harness(completion="multimodal", max_batch_size=1) as h:
+        h.runner.embedding_device = "cuda"
+        h.runner.gpu_cycles = GPU_CYCLES
+        if cause == "failed":
+
+            def fail_after_the_export(*args, **kwargs):
+                raise RuntimeError("bad step")
+
+            h.executor._perf_manager.append_step_metrics = fail_after_the_export
+        allocated = _cuda_memory_allocated()
+        h.runner.hold()
+        launched = h.submit(py_multimodal_data={"image": {}})
+        h.executor.start_worker()
+        assert h.runner.entered.wait(timeout=30)
+        if cause == "cancelled":
+            h.executor.cancel_request(launched)
+        h.runner.release.set()
+
+        (response,) = h.responses(launched)
+        undelivered = (
+            response.result.finish_reasons == [FinishReason.CANCELLED]
+            if cause == "cancelled"
+            else response.error_msg == "bad step"
+        )
+        del response
+
+        assert _cuda_memory_allocated() == allocated
+        assert undelivered
 
 
 def test_a_survivable_forward_error_fails_only_its_batch(completion):
