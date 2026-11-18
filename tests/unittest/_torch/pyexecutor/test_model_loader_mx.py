@@ -63,6 +63,9 @@ from tensorrt_llm._torch.modules import linear as linear_mod
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassUnquantizedImpl
+from tensorrt_llm._torch.moe.fused_moe.cutlass.fp8_block_scales_hopper import (
+    DeepgemmCudaHopperFp8BlockScalesImpl,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoEEnvironment
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep, override_moe_environment
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
@@ -3389,6 +3392,21 @@ def test_qwen3_moe_auto_backend_resolves_to_qualified_cutlass(
     assert _qwen3_moe_profile().runtime_constraints.moe_backends == frozenset({resolved})
 
 
+# The routed-expert implementation that a MoE profile's pinned quantization
+# realizes under its pinned `CUTLASS` literal on the SMs the profile admits.
+_PINNED_MOE_IMPLEMENTATIONS = {
+    "none": TrtllmCutlassUnquantizedImpl.__name__,
+    QuantAlgo.FP8_BLOCK_SCALES.value: DeepgemmCudaHopperFp8BlockScalesImpl.__name__,
+}
+
+
+def _moe_profile_quant_config(quant_algorithm: str) -> QuantConfig:
+    """The model quantization of a MoE profile's pinned quantization algorithm."""
+    if quant_algorithm == "none":
+        return QuantConfig()
+    return QuantConfig(quant_algo=QuantAlgo(quant_algorithm), group_size=_FP8_BLOCK_SIZE)
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("sm", [80, 89, 90, 100, 103, 107, 120, 121])
 @pytest.mark.parametrize(
@@ -3406,11 +3424,12 @@ def test_moe_profile_backend_literals_realize_one_implementation(
 
     MoE profiles pin the configured literal and the model quantization, not the
     realized implementation. That is exact only while one implementation can
-    serve the pinned format under the literal, on every SM and admitted
-    partition, so neither a degraded resolution nor a newer architecture
-    realizes a different expert layout. A family that gains a second
-    implementation for that format needs a realized-implementation dimension
-    first.
+    serve the pinned format under the literal, on every SM the profile admits
+    and every admitted partition, so neither a degraded resolution nor a newer
+    architecture realizes a different expert layout. A family that gains a
+    second implementation for that format needs a realized-implementation
+    dimension first. A profile that pins its SM versions is checked on those
+    SMs only.
     """
     moe_profiles = [
         profile
@@ -3426,7 +3445,10 @@ def test_moe_profile_backend_literals_realize_one_implementation(
     environment = MoEEnvironment(sm=sm, available_deps=tuple(dep.value for dep in MoEDep))
     for profile in moe_profiles:
         constraints = profile.runtime_constraints
-        assert constraints.quant_algorithms == frozenset({"none"})
+        if constraints.sm_versions is not None and sm not in constraints.sm_versions:
+            continue
+        (quant_algorithm,) = constraints.quant_algorithms
+        expected_implementation = _PINNED_MOE_IMPLEMENTATIONS[quant_algorithm]
         # Each MoE profile must admit every partition parametrized here, or it goes unchecked.
         assert mapping.tp_size in constraints.tp_sizes, (
             f"{profile.profile_id} does not admit TP={mapping.tp_size}; "
@@ -3435,14 +3457,15 @@ def test_moe_profile_backend_literals_realize_one_implementation(
         for moe_backend in constraints.moe_backends:
             model_config = ModelConfig(
                 pretrained_config=_MOE_PROFILE_CANARY_CONFIGS[profile.profile_id](),
+                quant_config=_moe_profile_quant_config(quant_algorithm),
                 mapping=mapping,
                 moe_backend=moe_backend,
             )
             with override_moe_environment(environment):
                 report = resolve_moe_impl(model_config)
 
-            assert report.eligible == (TrtllmCutlassUnquantizedImpl.__name__,), profile.profile_id
-            assert report.winner == TrtllmCutlassUnquantizedImpl.__name__
+            assert report.eligible == (expected_implementation,), profile.profile_id
+            assert report.winner == expected_implementation
             assert not report.degraded
 
 
