@@ -1160,12 +1160,17 @@ class BaseLLM:
                         _check_mrope_bytes_handle(name, handle,
                                                   len(prompt_token_ids))
                 if has_mm_tokens:
+                    # The configured value: the worker does not report back
+                    # when it turns reuse off on its own (model defaults).
                     kv_config = getattr(self.args, "kv_cache_config", None)
                     if (getattr(kv_config, "enable_block_reuse", False)
                             and disaggregated_params.multimodal_input is None):
                         raise ValueError(
                             "Generation-only multimodal input with KV reuse "
-                            "requires cache identity from the context worker")
+                            "requires cache identity from the context worker. "
+                            "To serve it without one, set "
+                            "kv_cache_config.enable_block_reuse=False on the "
+                            "generation worker.")
             multimodal_data = {}
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
