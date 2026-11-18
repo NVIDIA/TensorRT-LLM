@@ -6,13 +6,14 @@ The table's rows are cut into `CHUNKS` fixed chunks (`chunk_rows`); a rank of a 
 `world` ranks is responsible for chunks `[rank * CHUNKS / world, (rank + 1) * CHUNKS / world)`.
 `PLE_HOST_TABLE_ENV` picks how the rows are stored and looked up:
 
-* `rank` (default): every rank holds the whole table in private host memory.
+* `rank`: every rank holds the whole table in private host memory.
 * `server`: under attention TP every rank holds only the rows of its chunks; the n-gram gather
   reads those rows and writes zeros for the others (`window`), and the caller sums the gathered
   rows over the attention-TP group (`needs_sum`). One copy per server, no inter-process state.
   Exact: every element has one nonzero term.
-* `node`: every chunk is one CUDA VMM allocation on host NUMA memory, shared by every process of
-  the host through `chunk_broker`; every rank maps all chunks back to back and gathers locally.
+* `node` (default): every chunk is one CUDA VMM allocation on host NUMA memory, shared by every
+  process of the host through `chunk_broker`; every rank maps all chunks back to back and gathers
+  locally.
   A rank fills the chunks it is responsible for and attaches to the others. One copy per node.
   Processes share a chunk when their tables have one `table_identity`: the bytes of a strided
   sample of every chunk's rows, whatever directory the checkpoint was read from. A rank that
@@ -41,7 +42,7 @@ from tensorrt_llm.logger import logger
 
 from . import chunk_broker as _broker
 
-#: `rank`, `server` or `node` (see the module docstring); default `rank`.
+#: `rank`, `server` or `node` (see the module docstring); default `node`.
 PLE_HOST_TABLE_ENV = "TRTLLM_MODELING_V2_PLE_HOST_TABLE"
 RANK = "rank"
 SERVER = "server"
@@ -69,7 +70,7 @@ Private = Callable[[int, int, torch.dtype, torch.device], tuple]
 
 def host_table_mode() -> str:
     """The requested mode from `PLE_HOST_TABLE_ENV`."""
-    value = os.environ.get(PLE_HOST_TABLE_ENV, RANK).strip().lower() or RANK
+    value = os.environ.get(PLE_HOST_TABLE_ENV, NODE).strip().lower() or NODE
     if value not in _MODES:
         raise ValueError(f"{PLE_HOST_TABLE_ENV}={value!r}: expected one of {', '.join(_MODES)}")
     return value
