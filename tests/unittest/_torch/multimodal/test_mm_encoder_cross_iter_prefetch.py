@@ -25,6 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from _torch.pyexecutor.executor_test_utils import make_partial_executor
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_multimodal_mixin as mm_mixin
@@ -35,7 +36,6 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
 )
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
@@ -648,10 +648,10 @@ def test_request_terminated_after_prefetch_holds_nothing() -> None:
     req = _make_cacheable_request(request_id=0, num_tokens=4)
     assert maybe_prefetch_mm_encoder_for_next_iter(model, [req], max_prefetch_ahead=2) == 1
     cache = model._multimodal_encoder_cache
-    executor = SimpleNamespace(model_engine=SimpleNamespace(mm_encoder_cache=cache))
+    executor = make_partial_executor(model_engine=SimpleNamespace(mm_encoder_cache=cache))
 
     for _ in range(2):
-        PyExecutor._release_multimodal_resources(executor, req)
+        executor._release_multimodal_resources(req)
         assert req.py_mm_encoder_event is None
         assert req.py_multimodal_data == {}
         stats = cache.stats()
