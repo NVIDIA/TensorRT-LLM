@@ -22,6 +22,9 @@ says how the ranks that share a request split it.
 
 Speculative buffers such as replay history are not base state; they are declared as regions (see
 ``pyexecutor/kv_cache/REGIONS_DEVELOPER_GUIDE.md``).
+
+``pyexecutor/kv_cache/mamba_cache_manager/RECURRENT_STATE_DEVELOPER_GUIDE.md`` describes how the
+declaration is found and what else a recurrent family provides.
 """
 
 from __future__ import annotations
