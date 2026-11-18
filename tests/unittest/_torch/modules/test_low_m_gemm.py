@@ -15,11 +15,14 @@ import torch
 
 import tensorrt_llm._torch.modules.low_m_gemm as _mod
 from tensorrt_llm._torch.autotuner import AutoTuner, TunableRunner, autotune
+from tensorrt_llm._torch.modules.linear import flashinfer_mxfp8_decode_graph_capture
 from tensorrt_llm._torch.modules.low_m_gemm import (
     _BACKEND_ENV,
     LOW_M_GEMM_OPT_IN_ATTR,
     LowMGemmDispatcher,
     _parse_enabled,
+    bf16_lowm_linear,
+    fp8_grouped_lowm,
     lowm_fp8_supported,
     mxfp8_lowm_linear,
 )
@@ -607,6 +610,77 @@ def test_fp8_lowm_rms_norm_matches_norm_then_gemm(m):
     torch.testing.assert_close(actual, ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
     separate = mxfp8_lowm_linear((normalized * gamma.float()).to(torch.bfloat16), w, s).float()
     torch.testing.assert_close(actual, separate, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
+
+
+def _lowm_call(variant: str, m: int):
+    """A small-M MMA GEMM call of ``variant`` on ``m`` rows, as a no-argument function."""
+    g = torch.Generator(device="cuda").manual_seed(m)
+    n, k = 512, 1024
+    x = torch.randn(m, k, device="cuda", generator=g).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+    s = torch.randint(115, 128, (n, k // 32), device="cuda", dtype=torch.uint8, generator=g)
+    positions = torch.randint(0, 64, (m,), device="cuda", dtype=torch.int32, generator=g)
+    cos_sin = torch.randn(64, 2, 32, device="cuda", generator=g)
+    if variant == "rope":
+        return lambda: mxfp8_lowm_linear(x, w, s, rope=(positions, cos_sin, 128))
+    if variant == "rms_norm":
+        gamma = (torch.rand(k, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
+        return lambda: mxfp8_lowm_linear(x, w, s, rms_norm=(gamma, 1e-6))
+    if variant == "split_n":
+        return lambda: mxfp8_lowm_linear(x, w, s, split_n=128)
+    if variant == "grouped_inverse_rope":
+        groups = 2
+        xg = torch.randn(m, groups * k, device="cuda", generator=g).to(torch.bfloat16)
+        block = torch.exp2(torch.randint(-3, 3, (n // 128, k // 128), device="cuda", generator=g))
+        return lambda: fp8_grouped_lowm(
+            xg, w, block.float(), n // groups, (positions, cos_sin, 128)
+        )
+    wb = torch.randn(n, k, device="cuda", generator=g).to(torch.bfloat16)
+    return lambda: bf16_lowm_linear(x, wb)
+
+
+@_skip_no_lowm_fp8
+@pytest.mark.parametrize("m", [13, 17])
+@pytest.mark.parametrize("variant", ["rope", "rms_norm", "split_n", "grouped_inverse_rope", "bf16"])
+def test_eager_rows_run_the_row_bucket_kernel_bitwise(variant, m, monkeypatch):
+    """An eager call runs the kernel of its row bucket on zero-padded rows; a decode-graph call
+    runs the kernel of its exact rows. The real rows of both results carry the same bits."""
+    compiled_rows = []
+    compiled_mma = _mod._compiled_mma
+
+    def record(rows, *args, **kwargs):
+        compiled_rows.append(rows)
+        return compiled_mma(rows, *args, **kwargs)
+
+    monkeypatch.setattr(_mod, "_compiled_mma", record)
+    monkeypatch.setattr(_mod, "_MMA_SIGNATURES", {})
+    call = _lowm_call(variant, m)
+    eager = call()
+    with flashinfer_mxfp8_decode_graph_capture():
+        graph = call()
+    assert compiled_rows == [16 if m <= 16 else 32, m]
+    for e, r in zip(eager, graph) if isinstance(eager, tuple) else [(eager, graph)]:
+        assert e.shape[0] == m and e.is_contiguous()
+        assert torch.equal(e, r)
+    assert len(_mod._MMA_SIGNATURES) == 1
+
+
+@_skip_no_lowm_fp8
+def test_prewarm_compiles_every_row_bucket_of_eager_calls_only(monkeypatch):
+    monkeypatch.setattr(_mod, "_MMA_SIGNATURES", {})
+    x = torch.randn(3, 512, device="cuda").to(torch.bfloat16)
+    eager_w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    graph_w = torch.randn(72, 512, device="cuda").to(torch.bfloat16)
+    bf16_lowm_linear(x, eager_w)
+    with flashinfer_mxfp8_decode_graph_capture():
+        bf16_lowm_linear(x, graph_w)
+    _mod.prewarm_mma_row_buckets()
+    misses = _mod._compiled_mma.cache_info().misses
+    for m in range(1, 65):
+        bf16_lowm_linear(torch.zeros(m, 512, device="cuda", dtype=torch.bfloat16), eager_w)
+    assert _mod._compiled_mma.cache_info().misses == misses
+    bf16_lowm_linear(torch.zeros(13, 512, device="cuda", dtype=torch.bfloat16), graph_w)
+    assert _mod._compiled_mma.cache_info().misses == misses + 1
 
 
 # ---------------------------------------------------------------------------

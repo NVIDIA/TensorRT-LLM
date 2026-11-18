@@ -629,6 +629,9 @@ class DecoderWarmup:
                 self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 
+        with self._warmup_timer.phase("lowm_mma_row_buckets"):
+            self._prewarm_lowm_mma_row_buckets()
+
         # Allocate the CUDA graph padding dummies now, while the KV cache is
         # empty. Waiting for the first padded step can race KV saturation:
         # once the cache is full, the lazy allocation in _get_padded_batch
@@ -948,6 +951,30 @@ class DecoderWarmup:
                 self.dist.tp_allgather(1)
         if ready:
             logger.info(f"Throwaway Top-K prewarm complete ({time.perf_counter() - start:.1f} s)")
+
+    def _prewarm_lowm_mma_row_buckets(self) -> None:
+        """Compile every row bucket of the low-M MMA GEMMs the warmup forwards ran eagerly, then
+        barrier.
+
+        Eager forwards run these GEMMs on their row count rounded up to a bucket
+        (``low_m_gemm._MMA_ROW_BUCKETS``), and the warmup forwards reach only the buckets of their
+        own row counts. The TP group is held until its slowest rank has finished: the GEMMs a rank
+        ran eagerly, and so its compiles, can differ between ranks.
+        """
+        from tensorrt_llm._torch.modules.low_m_gemm import prewarm_mma_row_buckets
+
+        start = time.perf_counter()
+        compiled = prewarm_mma_row_buckets()
+        if self.dist is not None:
+            if self.mapping.cp_size > 1:
+                self.dist.tp_cp_allgather(1)
+            elif self.mapping.tp_size > 1:
+                self.dist.tp_allgather(1)
+        if compiled:
+            logger.info(
+                f"Low-M MMA GEMM row-bucket prewarm complete ({compiled} kernels, "
+                f"{time.perf_counter() - start:.1f} s)"
+            )
 
     def _prewarm_model_decode_kernels(self, kv_cache_manager) -> None:
         """Call ``prewarm_decode_kernels`` on every module of the model that defines it, then
