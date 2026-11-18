@@ -839,6 +839,7 @@ def test_request_finishing_on_its_first_token_is_sampled():
     request.py_decoding_iter = 1
     request.return_perf_metrics = False
     request.py_total_draft_tokens = 0
+    request.py_stream_lead_in_tokens = 0
     request.is_disagg_context_complete_state = False
     request.is_disagg_context_transmission_state = False
     executor = object.__new__(PyExecutor)

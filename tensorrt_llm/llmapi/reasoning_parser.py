@@ -195,6 +195,15 @@ class BaseReasoningParser(ABC):
         implementation returns an empty result."""
         return ReasoningParserResult()
 
+    def stream_lead_in(self) -> str:
+        """Longest markup this parser hides before the first visible text.
+
+        The server streams every step until this markup has passed. Must
+        depend only on the ``thinking``/``enable_thinking`` kwargs (the
+        server caches it per mode). Empty: the first token is visible.
+        """
+        return ""
+
 
 class IdentityReasoningParser(BaseReasoningParser):
     """Reasoning parser that treats all model output as visible content."""
@@ -1382,6 +1391,13 @@ class KimiK3ReasoningParser(BaseReasoningParser):
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
         return self._feed(delta_text)
+
+    def stream_lead_in(self) -> str:
+        # A reply that skips reasoning closes think and opens response.
+        if self._initial_channel == "think":
+            return (self.CLOSE + "think" + self.SEP + self.OPEN + "response" +
+                    self.SEP)
+        return ""
 
     def finish(self) -> ReasoningParserResult:
         remaining = self._buffer

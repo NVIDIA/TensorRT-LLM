@@ -361,6 +361,9 @@ class SamplingParams:
     # Currently, _stream_interval is only used to pass llm.args.stream_interval to tokenizer.
     # TODO: make this a per-request parameter.
     _stream_interval: Optional[int] = field(default=None, init=False, repr=False)
+    # Streaming: emit every step until more than this many tokens were
+    # generated (the reasoning parser's hidden lead-in; set by the server).
+    _stream_lead_in_tokens: int = field(default=0, init=False, repr=False)
     # None identifies direct LLM API SamplingParams, where non-None values are
     # request-provided. Serving adapters set this to preserve which fields were
     # explicitly present before they materialize their protocol defaults.

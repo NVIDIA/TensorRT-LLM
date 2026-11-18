@@ -1019,6 +1019,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_mamba_inforward_snapshot_point: Optional[int] = None
         # Whether the first GEN step of a generation-only request was streamed.
         self.py_gen_first_emitted = False
+        # Streaming: emit every step until a response carried more than
+        # py_stream_lead_in_tokens generated tokens (0: off).
+        self.py_stream_lead_in_tokens = 0
+        self.py_stream_emitted_tokens = 0
         # KVCacheV2Scheduler context ordering: the scheduler iteration the
         # request was first pending.
         self.py_ctx_sched_since_iter: Optional[int] = None
@@ -1427,6 +1431,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child.py_conversation_params = deepcopy(self.py_conversation_params)
         child.py_kv_hints = self.py_kv_hints
         child.py_uncached_prefill_tokens = self.py_uncached_prefill_tokens
+        child.py_stream_lead_in_tokens = self.py_stream_lead_in_tokens
         child.py_disable_speculative_decoding = self.py_disable_speculative_decoding
         child.is_attention_dp_dummy = self.is_attention_dp_dummy
         child.is_cuda_graph_dummy = self.is_cuda_graph_dummy
@@ -1951,6 +1956,7 @@ def executor_request_to_llm_request(
     llm_request.py_uncached_prefill_tokens = inputs.uncached_prefill_tokens
     llm_request.py_kv_hints = inputs.kv_hints
     llm_request.py_prompt_token_bound = prompt_token_bound
+    llm_request.py_stream_lead_in_tokens = inputs.stream_lead_in_tokens
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

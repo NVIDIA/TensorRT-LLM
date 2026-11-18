@@ -548,6 +548,7 @@ def _preemption_victim(request_id: int = 1) -> SimpleNamespace:
     request.py_per_pos_drafted = None
     request.py_per_pos_accepted = None
     request.py_total_draft_tokens = 0
+    request.py_stream_lead_in_tokens = 0
     request.py_kv_transfer_timed_out = False
     request.is_attention_dp_dummy = False
     request.is_generation_only_request = False

@@ -43,6 +43,8 @@ class PythonRequestInputs:
     kv_hints: KvHintsSnapshot | None = None
     watermarking: bool | None = None
     prompt_trimmed_prefix: int = 0
+    # See SamplingParams._stream_lead_in_tokens.
+    stream_lead_in_tokens: int = 0
 
     @classmethod
     def from_native_request(cls, request: Request) -> "PythonRequestInputs":
@@ -74,6 +76,7 @@ class PythonRequestInputs:
             kv_hints=getattr(request, "py_kv_hints", None),
             watermarking=getattr(request, "py_watermarking", None),
             prompt_trimmed_prefix=getattr(request, "py_prompt_trimmed_prefix", 0),
+            stream_lead_in_tokens=getattr(request, "py_stream_lead_in_tokens", 0),
         )
 
 

@@ -528,6 +528,7 @@ class TestConsumePreviousBatch:
             request.py_decoding_iter = 2
             request.py_draft_tokens = []
             request.py_total_draft_tokens = 0
+            request.py_stream_lead_in_tokens = 0
             request.create_response.return_value = responses[rank]
             previous_batch = MagicMock() if rank in batch_ranks else None
             if previous_batch is not None:

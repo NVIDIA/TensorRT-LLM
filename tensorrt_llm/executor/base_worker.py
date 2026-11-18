@@ -598,6 +598,9 @@ class BaseWorker(GenerationExecutor):
                     arrival_time=request.arrival_time,
                     watermarking=request.sampling_params.watermarking,
                     prompt_trimmed_prefix=trimmed_prefix,
+                    stream_lead_in_tokens=(
+                        request.sampling_params._stream_lead_in_tokens
+                        if request.streaming else 0),
                 ),
             )
 

@@ -730,6 +730,8 @@ class OpenAIServer(_VideoRoutesMixin):
             max_workers=input_processor_workers,
             thread_name_prefix="trtllm_inputproc",
         )
+        # (parser, thinking, enable_thinking) -> lead-in token count.
+        self._stream_lead_in_token_counts: Dict[tuple, int] = {}
         self._media_load_executor = ThreadPoolExecutor(
             max_workers=media_load_workers,
             thread_name_prefix="trtllm_media_load",
@@ -1122,6 +1124,31 @@ class OpenAIServer(_VideoRoutesMixin):
             if vocab_size is not None:
                 return int(vocab_size)
         return int(self.tokenizer.tokenizer.vocab_size)
+
+    def _stream_lead_in_token_count(
+            self, reasoning_parser: Optional[str],
+            chat_template_kwargs: Optional[Dict[str, Any]]) -> int:
+        """Token count of the reasoning parser's lead-in in this request's mode.
+
+        Cached per parser and mode when both mode kwargs are unset or bool.
+        """
+        if not reasoning_parser or self.tokenizer is None:
+            return 0
+        kwargs = chat_template_kwargs or {}
+        mode = (kwargs.get("thinking"), kwargs.get("enable_thinking"))
+        key = None
+        if all(v is None or isinstance(v, bool) for v in mode):
+            key = (reasoning_parser.lower(), *mode)
+            count = self._stream_lead_in_token_counts.get(key)
+            if count is not None:
+                return count
+        lead_in = ReasoningParserFactory.create_reasoning_parser(
+            reasoning_parser, chat_template_kwargs).stream_lead_in()
+        count = len(self.tokenizer.encode(
+            lead_in, add_special_tokens=False)) if lead_in else 0
+        if key is not None:
+            self._stream_lead_in_token_counts[key] = count
+        return count
 
     def _validate_internal_disagg_request(
             self, request, raw_request: Optional[Request]) -> None:
@@ -2633,6 +2660,12 @@ class OpenAIServer(_VideoRoutesMixin):
                         "thinking": thinking,
                         "enable_thinking": thinking,
                     }
+            if request.stream:
+                # Uses the mode resolved above.
+                sampling_params._stream_lead_in_tokens = (
+                    self._stream_lead_in_token_count(
+                        postproc_args.reasoning_parser,
+                        postproc_args.chat_template_kwargs))
             if required_tool_grammar:
                 if thinking is None:
                     raise ValueError(

@@ -1305,6 +1305,27 @@ def test_kimi_k3_reasoning_parser_stream_matches_parse(chunk_size: int,
     assert "".join(reasoning) == oneshot.reasoning_content
 
 
+def test_kimi_k3_stream_lead_in():
+    """Thinking mode: the no-reasoning markup, dropped whole. Thinking off: none."""
+    parser = ReasoningParserFactory.create_reasoning_parser("kimi_k3")
+    lead_in = parser.stream_lead_in()
+    assert lead_in == f"{K3_CLOSE}think{K3_SEP}{K3_OPEN}response{K3_SEP}"
+    first = parser.parse_delta(lead_in)
+    assert first.content == "" and first.reasoning_content == ""
+    assert parser.parse_delta("Hi").content == "Hi"
+
+    assert ReasoningParserFactory.create_reasoning_parser(
+        "kimi_k3", {
+            "thinking": False
+        }).stream_lead_in() == ""
+
+
+@pytest.mark.parametrize("name", ["deepseek-r1", "qwen3", "kimi_k2"])
+def test_default_stream_lead_in_is_empty(name: str):
+    assert ReasoningParserFactory.create_reasoning_parser(
+        name).stream_lead_in() == ""
+
+
 def test_kimi_k3_needs_raw_special_tokens():
     """The K3 delimiters are special tokens.
 

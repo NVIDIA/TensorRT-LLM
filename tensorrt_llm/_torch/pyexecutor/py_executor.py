@@ -13348,8 +13348,10 @@ class PyExecutor:
         """Whether ``_handle_responses`` emits a response for ``request`` now.
 
         Emits on decoding iteration 1, on finish, every ``stream_interval``
-        iterations, on the first generation-only content, and on iterations
-        ``2..first_content_emit_iters``.
+        iterations, on the first generation-only content, on iterations
+        ``2..first_content_emit_iters``, and on every iteration until a
+        response has carried more than ``py_stream_lead_in_tokens`` generated
+        tokens (the reasoning parser's hidden lead-in).
         """
         decoding_iter = request.py_decoding_iter
         if request.is_finished:
@@ -13361,7 +13363,18 @@ class PyExecutor:
         if (self.first_content_emit_iters > 1
                 and 1 < decoding_iter <= self.first_content_emit_iters):
             return True
-        return first_gen_emit or decoding_iter % self.stream_interval == 0
+        if first_gen_emit or decoding_iter % self.stream_interval == 0:
+            return True
+        return (request.py_stream_lead_in_tokens > 0
+                and request.py_stream_emitted_tokens
+                <= request.py_stream_lead_in_tokens)
+
+    @staticmethod
+    def _record_stream_emission(request: LlmRequest) -> None:
+        """Record the generated-token count of the response just emitted."""
+        if request.py_stream_lead_in_tokens > 0:
+            request.py_stream_emitted_tokens = (request.max_beam_num_tokens -
+                                                request.orig_prompt_len)
 
     def _create_request_response(
             self, request: LlmRequest,
@@ -13520,6 +13533,8 @@ class PyExecutor:
                 if response:
                     if first_gen_emit:
                         request.py_gen_first_emitted = True
+                    if request.py_stream_lead_in_tokens > 0:
+                        self._record_stream_emission(request)
                     request_done = request.is_finished
                     new_responses.append((req_id, response))
 

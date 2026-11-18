@@ -5163,6 +5163,7 @@ def _make_gen_only_stream_request(request_id, decoding_iter):
     request.is_finished = False
     request.py_gen_first_emitted = False
     request.py_total_draft_tokens = 0
+    request.py_stream_lead_in_tokens = 0
     return request
 
 

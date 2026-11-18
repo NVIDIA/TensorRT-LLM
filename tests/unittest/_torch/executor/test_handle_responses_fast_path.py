@@ -24,6 +24,7 @@ def _request(request_id, *, streaming, finished=False, perf_metrics=False, decod
     request.is_finished = finished
     request.return_perf_metrics = perf_metrics
     request.py_total_draft_tokens = 0
+    request.py_stream_lead_in_tokens = 0
     request.is_disagg_context_complete_state = False
     request.is_disagg_context_transmission_state = False
     request.create_response.return_value = None
@@ -108,3 +109,26 @@ def test_step_metrics_skipped_while_disabled_and_kept_when_enabled():
     executor.perf_manager.enabled = True
     PyExecutor._handle_responses(executor)
     executor.perf_manager.append_step_metrics.assert_called_once()
+
+
+def test_lead_in_window_closes_after_the_response_that_carried_more_than_the_lead_in():
+    """Lead-in 2, interval 20: emits on iterations 1-3, then on 20."""
+    prompt_len = 100
+    request = _request(1, streaming=True, decoding_iter=0)
+    request.py_stream_lead_in_tokens = 2
+    request.py_stream_emitted_tokens = 0
+    request.orig_prompt_len = prompt_len
+    request.max_beam_num_tokens = prompt_len
+    request.create_response.return_value = MagicMock()
+    executor = _executor([request], stream_interval=20)
+    emitted = []
+    for it in range(1, 21):
+        request.py_decoding_iter = it
+        request.max_beam_num_tokens += 1
+        calls = request.create_response.call_count
+        PyExecutor._handle_responses(executor)
+        if request.create_response.call_count > calls:
+            emitted.append(it)
+    assert emitted == [1, 2, 3, 20]
+    assert request.py_stream_emitted_tokens == 20
+    assert executor.active_requests == [request]
