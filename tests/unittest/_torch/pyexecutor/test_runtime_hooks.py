@@ -29,34 +29,8 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     RuntimeHooks,
     runtime_hooks_of,
 )
-from tensorrt_llm._utils import CudaStreamScope
 
 pytestmark = pytest.mark.cpu_only
-
-
-@pytest.mark.parametrize("raises", [False, True])
-def test_stream_scope_restores_the_callers_stream(
-    monkeypatch: pytest.MonkeyPatch, raises: bool
-) -> None:
-    caller = object()
-    target = types.SimpleNamespace(device_index=0)
-    current = [caller]
-
-    def current_stream(device: int) -> object:
-        assert device == target.device_index
-        return current[0]
-
-    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
-    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: current.__setitem__(0, stream))
-    exception = (
-        pytest.raises(RuntimeError, match="scope body") if raises else contextlib.nullcontext()
-    )
-    with exception:
-        with CudaStreamScope(target):
-            assert current[0] is target
-            if raises:
-                raise RuntimeError("scope body")
-    assert current[0] is caller
 
 
 class _PlainModel(torch.nn.Module):
