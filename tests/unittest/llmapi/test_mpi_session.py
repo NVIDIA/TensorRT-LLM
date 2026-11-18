@@ -795,8 +795,9 @@ def test_llmapi_launch_single_rank_without_pmi(
         assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=" not in result.stdout
     else:
         workspace = home / ".cache" / "tensorrt_llm" / "flashinfer" / "rank-0"
-        assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
-        assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
+        stdout_lines = result.stdout.splitlines()
+        assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in stdout_lines
+        assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in stdout_lines
     assert "FLASHINFER_CUBIN_DIR=" not in result.stdout
 
 

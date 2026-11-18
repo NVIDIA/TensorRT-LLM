@@ -242,7 +242,7 @@ configured environment variable takes precedence.
 | `TORCHINDUCTOR_CACHE_DIR` | `/tmp/torchinductor_$USER` | `inductor` |
 | `TRITON_CACHE_DIR` | `$HOME/.triton/cache` | `triton` |
 | `TORCH_EXTENSIONS_DIR` | `$HOME/.cache/torch_extensions` | `torch_extensions` |
-| `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/tensorrt_llm/flashinfer/rank-N` for MPI sessions; `$HOME/.cache/flashinfer` otherwise | `flashinfer/rank-N` for MPI sessions; `flashinfer` otherwise |
+| `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/tensorrt_llm/flashinfer/rank-N` for `trtllm-llmapi-launch` ranks and `MpiPoolSession` workers; `$HOME/.cache/flashinfer` otherwise | `flashinfer/rank-N` for `trtllm-llmapi-launch` ranks and `MpiPoolSession` workers; `flashinfer` otherwise |
 | `CUTE_DSL_CACHE_DIR` | `/tmp/$USER/cutlass_python_cache` | `cute_dsl` |
 | `DG_JIT_CACHE_DIR` | `$HOME/.deep_gemm` | `deep_gemm` |
 | `TLLM_JIT_SHARE_DIR` | Disabled | Not set (one directory per launch, see below) |
@@ -424,9 +424,16 @@ process-unique temporary workspace that is removed, artifacts included, when
 the process exits.
 
 An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence in both
-launch modes, while setting `TRTLLM_CACHE_DIR` does not. An explicitly configured
-`FLASHINFER_CUBIN_DIR` is propagated unchanged to every rank and is the way to
-share downloaded artifacts between ranks.
+launch modes when it differs from the automatically managed root. Setting
+`TRTLLM_CACHE_DIR` alone does not disable isolation. The launcher computes its
+root as `$TRTLLM_CACHE_DIR/flashinfer`, or
+`$HOME/.cache/tensorrt_llm/flashinfer` when `TRTLLM_CACHE_DIR` is unset. If an
+explicit workspace equals that root, the launcher can still claim a rank-specific
+slot beneath it while isolation is enabled. Other explicit workspace paths are
+left unchanged.
+
+An explicitly configured `FLASHINFER_CUBIN_DIR` is propagated unchanged to every
+rank and is the way to share downloaded artifacts between ranks.
 
 For offline use on one GPU or multiple GPUs, install the `flashinfer-cubin`
 package matching `flashinfer-python` and set `FLASHINFER_CUBIN_DIR` to the
