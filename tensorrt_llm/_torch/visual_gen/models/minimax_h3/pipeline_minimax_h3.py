@@ -17,12 +17,10 @@
 
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
-import json
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from io import BytesIO
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
@@ -53,6 +51,8 @@ from tensorrt_llm.mapping import MpiTopology
 from tensorrt_llm.visual_gen.args import AttentionConfig
 from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
 
+from .checkpoint import load_fasth3_manifest
+from .fasth3.schedule import set_dmd_timesteps
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
     MINIMAX_H3_CANVAS_MULTIPLE,
@@ -493,20 +493,10 @@ class MiniMaxH3Pipeline(BasePipeline):
         )
 
     @staticmethod
-    def _load_fasth3_manifest(checkpoint_dir: str) -> dict:
-        manifest_path = Path(checkpoint_dir) / "fastvideo_inference.json"
-        if manifest_path.exists():
-            with manifest_path.open() as f:
-                manifest = json.load(f)
-            if str(manifest.get("schema_version", "")).startswith("fasth3-"):
-                return manifest
-        return {}
-
-    @classmethod
-    def _configure_fasth3_attention(cls, config: DiffusionPipelineConfig) -> None:
+    def _configure_fasth3_attention(config: DiffusionPipelineConfig) -> None:
         pretrained = getattr(config, "primary_pretrained_config", None)
         checkpoint_dir = getattr(pretrained, "_name_or_path", None)
-        manifest = cls._load_fasth3_manifest(checkpoint_dir) if checkpoint_dir else {}
+        manifest = load_fasth3_manifest(checkpoint_dir) if checkpoint_dir else {}
         if not manifest:
             return
 
@@ -583,7 +573,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         skip_components = skip_components or []
         offloaded = self.offloader.requested_components()
 
-        self._fastvideo_inference = self._load_fasth3_manifest(checkpoint_dir)
+        self._fastvideo_inference = load_fasth3_manifest(checkpoint_dir)
 
         if not _component_skipped(skip_components, PipelineComponent.TOKENIZER):
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
@@ -653,32 +643,13 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     def _set_timesteps(self, num_inference_steps: int) -> None:
         manifest = getattr(self, "_fastvideo_inference", {})
-        steps = manifest.get("dmd_denoising_steps")
-        if steps is None:
+        if manifest.get("dmd_denoising_steps") is None:
             self.scheduler.set_timesteps(num_inference_steps, device=self.device)
             self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
             return
-        if (
-            not steps
-            or any(type(step) is not int or not 0 < step <= 1000 for step in steps)
-            or any(left <= right for left, right in zip(steps, steps[1:]))
-        ):
-            raise ValueError("FastH3 DMD steps must be strictly decreasing integers in (0, 1000].")
-        if num_inference_steps != len(steps) + 1:
-            raise ValueError(
-                f"FastH3 requires {len(steps) + 1} sigma-grid points for {len(steps)} forwards."
-            )
-        base = torch.tensor([step / 1000.0 for step in steps] + [0.0], dtype=torch.float32)
-        for scheduler, shift_key in (
-            (self.scheduler, "video_scheduler_shift"),
-            (self.audio_scheduler, "audio_scheduler_shift"),
-        ):
-            shift = float(scheduler.shift)
-            if shift_key in manifest and shift != float(manifest[shift_key]):
-                raise ValueError(f"FastH3 {shift_key} disagrees with the checkpoint scheduler.")
-            # Shift each modality's trained noise clock once; explicit sigmas are not shifted.
-            sigmas = shift * base / (1 + (shift - 1) * base)
-            scheduler.set_timesteps(sigmas=sigmas, device=self.device)
+        set_dmd_timesteps(
+            self.scheduler, self.audio_scheduler, manifest, num_inference_steps, self.device
+        )
 
     def torch_compile(self) -> None:
         super().torch_compile()
