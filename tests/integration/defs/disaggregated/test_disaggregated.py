@@ -3234,15 +3234,20 @@ def test_disaggregated_gpt_oss_20b_kv_cache_aware(disaggregated_test_root,
 @pytest.mark.parametrize("model_path", ['Qwen3/Qwen3-32B-FP8'])
 def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
                                      disaggregated_example_root, llm_venv,
-                                     model_path):
+                                     model_path, tmp_path):
     model_dir = resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
+
+    # The servers' processes tune the same DeepGEMM kernels; sharing their JIT
+    # builds compiles each kernel once instead of concurrently in every process.
+    env = llm_venv._new_env.copy()
+    env["TLLM_JIT_SHARE_DIR"] = str(tmp_path / "jit_share")
 
     # Cold-cache startup on B200 takes 544-700s, mostly autotuner warmup, past
     # the 300s default (https://nvbugs/6888251).
     run_disaggregated_test(disaggregated_example_root,
                            "qwen3_32b_fp8_stress",
-                           env=llm_venv._new_env,
+                           env=env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory(),
                            server_start_timeout=900)

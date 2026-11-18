@@ -65,7 +65,6 @@ full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[in
 full:B300/accuracy/test_kimi3.py::TestKimiK3::test_gsm8k_nvfp4_kv_dep8 SKIP (https://nvbugs/7023200)
 full:B300/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-trtllm-auto] SKIP (https://nvbugs/7023202)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8] SKIP (https://nvbugs/7088440)
-full:B300/disaggregated/test_disaggregated.py::test_disaggregated_qwen3_32b_fp8[Qwen3/Qwen3-32B-FP8] SKIP (https://nvbugs/7099626)
 full:CPU/unittest/_torch/pyexecutor/test_idle_iter_stats.py::test_idle_fetch_parks_with_local_heartbeats[False] SKIP (https://nvbugs/7117788)
 full:CPU/unittest/_torch/pyexecutor/test_idle_iter_stats.py::test_idle_fetch_parks_with_local_heartbeats[True] SKIP (https://nvbugs/7117788)
 full:CPU/unittest/_torch/pyexecutor/test_idle_iter_stats.py::test_idle_fetch_reports_nothing_while_work_remains[control-arrival-False] SKIP (https://nvbugs/7117788)
