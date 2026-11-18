@@ -487,9 +487,9 @@ def test_fused_conv_post_conv_matches_unfused(
         for fused_output, unfused_output in zip(fused[:3], unfused[:3]):
             assert torch.equal(fused_output, unfused_output)
         return
-    torch.testing.assert_close(fused[0], unfused[0], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(fused[0], unfused[0], rtol=1e-2, atol=1e-5)
     assert torch.equal(fused[1], unfused[1])
-    torch.testing.assert_close(fused[2], unfused[2], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(fused[2], unfused[2], rtol=0, atol=2e-5)
 
 
 def test_fused_conv_post_conv_matches_unfused_target_verify(
@@ -517,9 +517,9 @@ def test_fused_conv_post_conv_matches_unfused_target_verify(
         intermediate_state_indices=torch.arange(num_decodes, device="cuda", dtype=torch.int32),
     )
     assert (fused[4], unfused[4]) == (1, 0)
-    torch.testing.assert_close(fused[0], unfused[0], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(fused[0], unfused[0], rtol=1e-2, atol=1e-5)
     assert torch.equal(fused[1], unfused[1])
-    torch.testing.assert_close(fused[2], unfused[2], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(fused[2], unfused[2], rtol=0, atol=2e-5)
     assert torch.equal(fused[3], unfused[3])
     # The verify steps of the decode rows write their SSM states here.
     assert fused[5].abs().amax() > 0
