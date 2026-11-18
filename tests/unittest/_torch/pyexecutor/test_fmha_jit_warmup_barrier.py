@@ -122,12 +122,19 @@ def _engine(
     engine._metadata = SimpleNamespace(attn_metadata=None)
     engine._context_warmups_supported = False
     engine._eager_workspace_reclaimable = False
+    engine._context_logits_heads = []
+    engine.sparse_attention_config = None
     # Model-specific prewarms the scheduled path runs unconditionally; each
     # needs a model or a device to decide it has nothing to do.
+    engine._prewarm_fmha_libraries = mock.Mock()
     engine._prewarm_engram_kernels = mock.Mock()
     engine._prewarm_csa2_sparse_indexer = mock.Mock()
     engine._prewarm_cute_dsl_indexer_q = mock.Mock()
     engine._prewarm_minimax_m3_msa_indexer = mock.Mock()
+    engine._prewarm_throwaway_topk = mock.Mock()
+    engine._prewarm_model_decode_kernels = mock.Mock()
+    engine._warmup_dg_paged_mqa_logits_metadata = mock.Mock()
+    engine._warmup_cute_dsl_radix_topk = mock.Mock()
     engine._ensure_dsa_attn_metadata_for_warmup = mock.Mock()
     return engine
 

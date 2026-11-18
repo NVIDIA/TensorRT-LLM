@@ -637,9 +637,12 @@ class DecoderWarmup:
         instead of on the first real request. Runs whether or not CUDA graphs
         are enabled, so configurations without graphs still finish
         verification before readiness. A no-op unless async warmup is enabled
-        (``TRTLLM_GEN_FMHA_ASYNC_WARMUP=1``).
+(``TRTLLM_GEN_FMHA_ASYNC_WARMUP=1``).
         """
-        if not issubclass(self._config.attention_backend.Metadata, TrtllmAttentionMetadata):
+        attention_backend = getattr(self._config, "attention_backend", None)
+        if attention_backend is None or not issubclass(
+            attention_backend.Metadata, TrtllmAttentionMetadata
+        ):
             return
         if not torch.ops.trtllm.trtllm_gen_fmha_async_jit_warmup_enabled():
             return
@@ -1151,7 +1154,10 @@ class DecoderWarmup:
     def _run_attention_warmup(
         self, resource_manager: ResourceManager, can_run_general_warmup: bool = True
     ) -> None:
-        if not issubclass(self._config.attention_backend.Metadata, TrtllmAttentionMetadata):
+        attention_backend = getattr(self._config, "attention_backend", None)
+        if attention_backend is None or not issubclass(
+            attention_backend.Metadata, TrtllmAttentionMetadata
+        ):
             return
 
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")

@@ -120,12 +120,16 @@ def test_first_requests_after_readiness_do_not_jit_compile(
         "unknown cache status; the miss count cannot be trusted"
     )
 
-    # The warmup must have gone through the NVRTC path, otherwise the
-    # invariant below would hold vacuously.
-    assert result["misses_ready"] > result["misses_before"], (
-        "warmup reported no kernel-cache misses; this model/config does not "
-        "exercise the TRTLLM-Gen JIT path"
-    )
+# The warmup must have gone through the NVRTC path, otherwise the
+    # invariant below would hold vacuously.  Skip when the model/config does
+    # not trigger NVRTC compilation on this GPU (e.g. dense models on B200,
+    # where shouldUseNvrtc only fires for sparse-token or head-dim-per-stage
+    # configurations); the test is only meaningful on configs that do.
+    if result["misses_ready"] == result["misses_before"]:
+        pytest.skip(
+            "this model/config does not exercise the TRTLLM-Gen JIT path "
+            "(no NVRTC compilation during warmup on this GPU)"
+        )
 
     # No cache miss after readiness, i.e. the first requests compiled nothing:
     # every kernel they needed was compiled (and, for the async arm, verified)
