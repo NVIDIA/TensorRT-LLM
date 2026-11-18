@@ -3,6 +3,7 @@
 
 import copy
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -378,6 +379,115 @@ class TestQwen3VL(TestModelingMultimodal):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("wrapper_cls", "architecture"),
+    [
+        (Qwen2VLModel, "Qwen2VLForConditionalGeneration"),
+        (Qwen2_5_VLModel, "Qwen2_5_VLForConditionalGeneration"),
+    ],
+)
+def test_qwenvl_breakable_prefill_rejects_custom_decoder(monkeypatch, wrapper_cls, architecture):
+    from _torch.helpers import check_breakable_prefill_startup
+
+    from tensorrt_llm._torch.models.modeling_qwen import Qwen2ForCausalLM
+    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+
+    class CustomDecoder(Qwen2ForCausalLM):
+        pass
+
+    class CustomWrapper(wrapper_cls):
+        pass
+
+    monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
+    # Checking Qwen2 must leave an unrelated lazy decoder registration untouched.
+    monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.models.modeling_exaone4", None)
+    config = ModelConfig(
+        pretrained_config=PretrainedConfig(
+            architectures=[architecture],
+            image_token_id=1,
+            hidden_size=4,
+            vocab_size=8,
+            num_hidden_layers=0,
+            rms_norm_eps=1e-6,
+            dtype=torch.bfloat16,
+        )
+    )
+    stock = wrapper_cls(config, disable_fuse_rope=True)
+    assert type(stock.language_model) is Qwen2ForCausalLM
+    check_breakable_prefill_startup(stock)
+
+    wrapped = CustomWrapper(config, disable_fuse_rope=True)
+    wrapped.language_model.model = torch.nn.Identity()
+    check_breakable_prefill_startup(wrapped)
+
+    monkeypatch.setitem(MODEL_CLASS_MAPPING, "Qwen2ForCausalLM", CustomDecoder)
+    custom = wrapper_cls(config, disable_fuse_rope=True)
+    assert type(custom.language_model) is CustomDecoder
+    with pytest.raises(ValueError, match="CustomDecoder comes from a custom module"):
+        check_breakable_prefill_startup(custom)
+
+
+@pytest.mark.cpu_only
+def test_qwen25vl_breakable_prefill_rejects_decoder_equal_by_name():
+    from _torch.helpers import check_breakable_prefill_startup, make_stand_in_multimodal_model
+
+    from tensorrt_llm._torch.models.modeling_qwen import Qwen2ForCausalLM as StockDecoder
+    from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+
+    class ArchitectureMeta(type(DecoderModelForCausalLM)):
+        def __eq__(cls, other):
+            if not isinstance(other, type):
+                return NotImplemented
+            return cls.__name__ == other.__name__
+
+        def __hash__(cls):
+            return hash(StockDecoder)
+
+    class Qwen2ForCausalLM(DecoderModelForCausalLM, metaclass=ArchitectureMeta):
+        pass
+
+    assert Qwen2ForCausalLM is not StockDecoder
+    assert Qwen2ForCausalLM == StockDecoder
+    model = make_stand_in_multimodal_model(Qwen2_5_VLModel, Qwen2ForCausalLM, torch.nn.Identity())
+    with pytest.raises(ValueError, match="Qwen2ForCausalLM comes from a custom module"):
+        check_breakable_prefill_startup(model)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("wrapper_cls", "decoder_arch"),
+    [(Qwen2_5_VLModel, "Qwen2ForCausalLM"), (Qwen3VLModel, "Qwen3ForCausalLM")],
+)
+def test_qwenvl_breakable_prefill_rejects_custom_language_model(
+    wrapper_cls: type, decoder_arch: str
+) -> None:
+    from _torch.helpers import check_breakable_prefill_startup, make_stand_in_multimodal_model
+
+    from tensorrt_llm._torch.models.modeling_utils import (
+        DecoderModelForCausalLM,
+        get_registered_model_class,
+    )
+
+    class CustomWrapper(wrapper_cls):
+        @property
+        def language_model(self) -> DecoderModelForCausalLM:
+            return self.adapter
+
+    class CustomDecoder(DecoderModelForCausalLM):
+        pass
+
+    decoder_cls = get_registered_model_class(decoder_arch)
+    assert decoder_cls is not None
+    model = make_stand_in_multimodal_model(CustomWrapper, decoder_cls, torch.nn.Identity())
+    adapter = object.__new__(CustomDecoder)
+    torch.nn.Module.__init__(adapter)
+    adapter.model = torch.nn.Identity()
+    model.adapter = adapter
+    with pytest.raises(ValueError, match="CustomDecoder comes from a custom module"):
+        check_breakable_prefill_startup(model)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_levels", [0, 2])
 def test_qwen3vl_breakable_inputs_text_clears_stale_visual_features(num_levels):
     model = Qwen3VLModel.__new__(Qwen3VLModel)
@@ -494,6 +604,7 @@ def test_qwen35_breakable_inputs_match_while_media_requests_decode(moe) -> None:
         ("qwen3", 0),
         ("qwen3", 2),
         ("qwen3_moe", 2),
+        ("cosmos3", 2),
         ("qwen3_5", 0),
         ("qwen3_5_moe", 0),
         ("cosmos3_edge", 0),
@@ -502,6 +613,14 @@ def test_qwen35_breakable_inputs_match_while_media_requests_decode(moe) -> None:
 )
 @torch.inference_mode()
 def test_qwenvl_opted_in_decoder_captures_and_refreshes(family, num_levels):
+    from _torch.helpers import (
+        check_breakable_prefill_startup,
+        check_stand_in_body_replay,
+        make_breakable_prefill_runner,
+        make_stand_in_multimodal_model,
+    )
+
+    from tensorrt_llm._torch.models.modeling_cosmos3 import Cosmos3Model
     from tensorrt_llm._torch.models.modeling_cosmos3_edge import (
         Cosmos3EdgeForCausalLM,
         Cosmos3EdgeModel,
@@ -518,9 +637,6 @@ def test_qwenvl_opted_in_decoder_captures_and_refreshes(family, num_levels):
         Qwen3_5VLModel,
     )
     from tensorrt_llm._torch.models.modeling_qwen3_moe import Qwen3MoeForCausalLM
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
-    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
-    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
     class Body(torch.nn.Module):
         def __init__(self):
@@ -540,72 +656,39 @@ def test_qwenvl_opted_in_decoder_captures_and_refreshes(family, num_levels):
         "qwen2.5": (Qwen2_5_VLModel, Qwen2ForCausalLM),
         "qwen3": (Qwen3VLModel, Qwen3ForCausalLM),
         "qwen3_moe": (Qwen3MoeVLModel, Qwen3MoeForCausalLM),
+        "cosmos3": (Cosmos3Model, Qwen3ForCausalLM),
         "qwen3_5": (Qwen3_5VLModel, Qwen3_5ForCausalLM),
         "qwen3_5_moe": (Qwen3_5MoeVLModel, Qwen3_5MoeForCausalLM),
         "cosmos3_edge": (Cosmos3EdgeModel, Cosmos3EdgeForCausalLM),
         "exaone4_5": (Exaone4_5_ForConditionalGeneration, Exaone4ForCausalLM),
     }[family]
-    decoder = object.__new__(decoder_cls)
-    torch.nn.Module.__init__(decoder)
-    body = decoder.model = Body()
-    owner = object.__new__(owner_cls)
-    torch.nn.Module.__init__(owner)
-    owner.llm = decoder
-    owner.model_config = SimpleNamespace(disable_mm_encoder=False)
+    body = Body()
+    owner = make_stand_in_multimodal_model(owner_cls, decoder_cls, body)
     owner.deepstack_num_level = num_levels
     owner.deepstack_input_embeds = torch.zeros((num_levels, 4, 4), device="cuda")
-    model_engine = object.__new__(ModelEngine)
-    model_engine.model = owner
-    model_engine.mapping = SimpleNamespace(pp_size=1)
-    model_engine.llm_args = SimpleNamespace(
-        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE, disable_mm_encoder=False
-    )
-    model_engine._validate_breakable_cuda_graph_compatibility()
-    decoder_runner = object.__new__(DecoderRunner)
-    decoder_runner._model = owner
-    decoder_runner._config = SimpleNamespace(
-        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
-        prefill_cuda_graph_num_tokens=[4],
-        enable_attention_dp=False,
-    )
-    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
+    check_breakable_prefill_startup(owner)
+    runner = make_breakable_prefill_runner(owner, 4)
     assert runner.stages_inputs
-    inputs = {
-        "inputs_embeds": torch.zeros((4, 4), device="cuda"),
-        "deepstack_embeds": [torch.ones((4, 4), device="cuda") for _ in range(num_levels)],
-    }
 
-    def outer():
-        return body(**inputs)
-
-    def engine():
-        return runner.capture_model_body(outer) if runner.is_capturing else outer()
-
-    try:
-        runner.capture(4, engine)
-        assert runner.has_graph(4)
-        calls_after_capture = body.forward_calls
+    def image_step(inputs):
         inputs["inputs_embeds"] = torch.full((4, 4), 3.0, device="cuda")
         # As in `_fuse_multimodal_embeddings`, image rows are views of the wrapper's DeepStack
         # buffer, and the text batch below reuses that buffer.
         owner.deepstack_input_embeds.fill_(5.0)
         inputs["deepstack_embeds"] = list(owner.deepstack_input_embeds.unbind(0))
-        actual = runner.execute(4, engine)
-        torch.cuda.synchronize()
+        return torch.full((4, 4), 4.0 + 5 * num_levels, device="cuda")
 
-        torch.testing.assert_close(
-            actual, torch.full_like(actual, 4 + 5 * num_levels), rtol=0, atol=0
-        )
+    def text_step(inputs):
         # A text batch replays the same graph on the wrapper's token embeddings.
         input_ids = torch.tensor([1, 5, 2, 7], device="cuda")
         inputs.update(input_ids=input_ids, inputs_embeds=None, deepstack_embeds=[])
-        actual = runner.execute(4, engine)
-        torch.cuda.synchronize()
+        return body.embed_tokens(input_ids) + 1
 
-        torch.testing.assert_close(actual, body.embed_tokens(input_ids) + 1, rtol=0, atol=0)
-        assert body.forward_calls == calls_after_capture
-    finally:
-        runner.clear()
+    inputs = {
+        "inputs_embeds": torch.zeros((4, 4), device="cuda"),
+        "deepstack_embeds": [torch.ones((4, 4), device="cuda") for _ in range(num_levels)],
+    }
+    check_stand_in_body_replay(runner, body, inputs, [image_step, text_step], num_tokens=4)
 
 
 @pytest.mark.cpu_only

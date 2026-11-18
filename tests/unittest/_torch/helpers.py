@@ -297,6 +297,56 @@ def check_breakable_prefill_startup(model: torch.nn.Module) -> None:
     engine._validate_breakable_cuda_graph_compatibility()
 
 
+def make_breakable_prefill_runner(model: torch.nn.Module,
+                                  num_tokens: int,
+                                  *,
+                                  enable_attention_dp: bool = False,
+                                  tp_size: int = 1,
+                                  dist=None):
+    """The decoder runner's breakable prefill graph runner for ``model``."""
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import \
+        DecoderRunner
+    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+
+    decoder_runner = object.__new__(DecoderRunner)
+    decoder_runner._model = model
+    decoder_runner._dist = dist
+    decoder_runner._mapping = SimpleNamespace(tp_size=tp_size)
+    decoder_runner._config = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        prefill_cuda_graph_num_tokens=[num_tokens],
+        enable_attention_dp=enable_attention_dp)
+    return decoder_runner._initialize_breakable_cuda_graph_runner()
+
+
+def check_stand_in_body_replay(runner, body: torch.nn.Module, inputs: dict,
+                               steps: List[Callable[[dict], torch.Tensor]],
+                               num_tokens: int) -> None:
+    """Capture ``body(**inputs)`` for one bucket. Each step then changes ``inputs``
+    in place and returns the expected output; the replay must match it exactly
+    without running the body eagerly."""
+
+    def outer():
+        return body(**inputs)
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(outer)
+        return outer()
+
+    try:
+        assert runner.capture(num_tokens, engine_forward)
+        calls_after_capture = body.forward_calls
+        for step in steps:
+            expected = step(inputs)
+            actual = runner.execute(num_tokens, engine_forward)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert body.forward_calls == calls_after_capture
+    finally:
+        runner.clear()
+
+
 def check_breakable_prefill_replay(model: torch.nn.Module, extra_attrs: dict,
                                    forward: Callable[[dict], torch.Tensor],
                                    steps: List[dict], num_tokens: int) -> None:
@@ -307,20 +357,10 @@ def check_breakable_prefill_replay(model: torch.nn.Module, extra_attrs: dict,
     must change the eager output, and each replay must run the captured graph
     and match the eager output exactly.
     """
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import \
-        DecoderRunner
     from tensorrt_llm._torch.utils import model_extra_attrs
-    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
-    backend = PrefillCudaGraphBackend.BREAKABLE
     check_breakable_prefill_startup(model)
-    decoder_runner = object.__new__(DecoderRunner)
-    decoder_runner._model = model
-    decoder_runner._config = SimpleNamespace(
-        prefill_cuda_graph_backend=backend,
-        prefill_cuda_graph_num_tokens=[num_tokens],
-        enable_attention_dp=False)
-    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
+    runner = make_breakable_prefill_runner(model, num_tokens)
     assert runner.stages_inputs
     replay_calls = []
     replay = runner.replay
