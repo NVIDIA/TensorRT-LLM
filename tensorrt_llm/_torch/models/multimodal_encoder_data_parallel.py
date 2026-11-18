@@ -26,7 +26,7 @@ for reconstruction.
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import accumulate, pairwise
-from typing import TYPE_CHECKING, Callable, Iterator, Sequence, TypeVar
+from typing import TYPE_CHECKING, Callable, Iterator, Sequence
 
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
@@ -78,108 +78,20 @@ class EncoderParallelLayout:
         )
 
 
-@dataclass(frozen=True)
-class EncoderDpItem:
-    """An ordered atomic item passed to multimodal encoder data parallelism.
+def plan_encoder_dp_items(costs: Sequence[int], num_ranks: int) -> tuple[int, ...]:
+    """Place items on ranks with deterministic LPT scheduling.
 
-    The caller owns the item payload and lifecycle. The DP layer uses
-    ``input_token_count`` as its initial placement-cost signal and
-    ``output_row_count`` only to reconstruct the result in ordinal order.
+    Items go largest cost first to the rank with the smallest total cost.
+    Ties go to the lower item index and then the lower rank. Returns the rank
+    of each item, in item order.
     """
-
-    ordinal: int
-    input_token_count: int
-    output_row_count: int
-
-
-@dataclass(frozen=True)
-class EncoderDpPlacement:
-    """The rank assigned to one encoder item."""
-
-    item: EncoderDpItem
-    rank: int
-
-
-@dataclass(frozen=True)
-class EncoderDpPlan:
-    """A deterministic placement of ordered encoder items onto DP ranks."""
-
-    placements: tuple[EncoderDpPlacement, ...]
-    rank_input_token_counts: tuple[int, ...]
-    rank_output_row_counts: tuple[int, ...]
-    total_output_rows: int
-
-    def local_placements(self, rank: int) -> tuple[EncoderDpPlacement, ...]:
-        """Return placements for ``rank`` in global output order."""
-        if rank < 0 or rank >= len(self.rank_input_token_counts):
-            raise ValueError(
-                f"Encoder DP rank must be in [0, {len(self.rank_input_token_counts)}), got {rank}."
-            )
-        return tuple(placement for placement in self.placements if placement.rank == rank)
-
-
-def plan_encoder_dp_items(
-    items: Sequence[EncoderDpItem],
-    num_ranks: int,
-) -> EncoderDpPlan:
-    """Place atomic encoder items using deterministic LPT scheduling.
-
-    Items are assigned largest-input-first to the rank with the smallest
-    accumulated input-token count. Placements are returned in ordinal order so
-    caller-provided preparation and encoder callbacks have one stable ordering
-    contract independent of request or scheduler representation.
-    """
-    if num_ranks <= 0:
-        raise ValueError(f"Encoder DP requires at least one rank, got {num_ranks}.")
-
-    ordered_items = sorted(items, key=lambda item: item.ordinal)
-    ordinals = [item.ordinal for item in ordered_items]
-    if len(set(ordinals)) != len(ordinals):
-        raise ValueError("Encoder DP item ordinals must be unique.")
-    for item in ordered_items:
-        if item.ordinal < 0:
-            raise ValueError(f"Encoder DP item ordinal must be non-negative, got {item.ordinal}.")
-        if item.input_token_count <= 0:
-            raise ValueError(
-                "Encoder DP item input_token_count must be positive, "
-                f"got {item.input_token_count} for ordinal {item.ordinal}."
-            )
-        if item.output_row_count <= 0:
-            raise ValueError(
-                "Encoder DP item output_row_count must be positive, "
-                f"got {item.output_row_count} for ordinal {item.ordinal}."
-            )
-
-    rank_input_token_counts = [0] * num_ranks
-    rank_output_row_counts = [0] * num_ranks
-    item_ranks: dict[int, int] = {}
-    for item in sorted(
-        ordered_items,
-        key=lambda candidate: (-candidate.input_token_count, candidate.ordinal),
-    ):
-        target_rank = min(
-            range(num_ranks),
-            key=lambda rank: (rank_input_token_counts[rank], rank),
-        )
-        item_ranks[item.ordinal] = target_rank
-        rank_input_token_counts[target_rank] += item.input_token_count
-        rank_output_row_counts[target_rank] += item.output_row_count
-
-    placements: list[EncoderDpPlacement] = []
-    for item in ordered_items:
-        placements.append(
-            EncoderDpPlacement(
-                item=item,
-                rank=item_ranks[item.ordinal],
-            )
-        )
-
-    return EncoderDpPlan(
-        placements=tuple(placements),
-        rank_input_token_counts=tuple(rank_input_token_counts),
-        rank_output_row_counts=tuple(rank_output_row_counts),
-        total_output_rows=sum(rank_output_row_counts),
-    )
+    rank_costs = [0] * num_ranks
+    ranks = [0] * len(costs)
+    for index in sorted(range(len(costs)), key=lambda i: (-costs[i], i)):
+        rank = min(range(num_ranks), key=lambda r: (rank_costs[r], r))
+        ranks[index] = rank
+        rank_costs[rank] += costs[index]
+    return tuple(ranks)
 
 
 class EncoderDpError(RuntimeError):
@@ -206,72 +118,58 @@ def encoder_dp_error_guard(any_rank_failed: Callable[[bool], bool]) -> Iterator[
         raise EncoderDpError("Multimodal encoder data-parallel peer rank failed.")
 
 
-_LocalInputsT = TypeVar("_LocalInputsT")
-
-
 def execute_encoder_dp_items(
-    items: Sequence[EncoderDpItem],
+    costs: Sequence[int],
+    row_counts: Sequence[int],
     *,
-    rank: int,
-    num_ranks: int,
-    prepare_local_inputs: Callable[[Sequence[EncoderDpItem]], _LocalInputsT],
-    encode_local_inputs: Callable[[_LocalInputsT], torch.Tensor],
+    layout: EncoderParallelLayout,
+    encode_local: Callable[[list[int]], torch.Tensor],
     any_rank_failed: Callable[[bool], bool],
     allgather: Callable[[torch.Tensor, list[int]], torch.Tensor],
-    output_dim: int,
-    output_dtype: torch.dtype,
-    output_device: torch.device,
+    empty_output: torch.Tensor,
 ) -> torch.Tensor:
-    """Place, execute, and reconstruct atomic multimodal encoder items.
+    """Place, run, and reorder atomic multimodal encoder items.
 
-    Every rank independently derives the same plan. The callbacks see only the
-    items assigned to the local rank, in global output order. A CPU status
-    exchange propagates local preparation and encoder failures before gathering
-    compact per-rank outputs. ``allgather`` concatenates these ``[rows, dim]``
-    tensors in rank order using the supplied per-rank row counts, including zero
-    rows on empty ranks.
+    Every rank derives the same plan from ``costs`` (physical encoder input
+    tokens). ``encode_local`` gets the indices placed on this replica, in item
+    order, and returns their output rows. A replica with no items skips it and
+    sends ``empty_output``, a ``[0, dim]`` tensor with the output dtype and
+    device. A CPU status exchange shares local failures before the output
+    gather. ``allgather`` concatenates the per-replica outputs in replica order
+    using the given row counts, including zero rows.
 
-    The return value is one dense tensor with item row blocks in ordinal order.
-    The full-request path consumes it directly; runtime item scheduling splits
-    it by ``output_row_count`` and feeds the existing per-item request-state
-    ``record`` path.
+    Returns one dense tensor with each item's ``row_counts`` rows, in item order.
     """
     with encoder_dp_error_guard(any_rank_failed):
-        plan = plan_encoder_dp_items(items, num_ranks)
-        local_placements = plan.local_placements(rank)
-        if local_placements:
-            local_items = [placement.item for placement in local_placements]
-            local_inputs = prepare_local_inputs(local_items)
-            local_output = encode_local_inputs(local_inputs)
-
-            expected_local_rows = sum(item.output_row_count for item in local_items)
-            if local_output.ndim != 2 or local_output.shape != (
-                expected_local_rows,
-                output_dim,
-            ):
+        ranks = plan_encoder_dp_items(costs, layout.dp_size)
+        local = [index for index, rank in enumerate(ranks) if rank == layout.dp_rank]
+        if local:
+            local_output = encode_local(local)
+            expected_shape = (sum(row_counts[index] for index in local), empty_output.shape[1])
+            if local_output.shape != expected_shape:
                 raise ValueError(
                     "Multimodal encoder output shape does not match its local DP assignment: "
-                    f"expected ({expected_local_rows}, {output_dim}), "
-                    f"got {tuple(local_output.shape)}."
+                    f"expected {expected_shape}, got {tuple(local_output.shape)}."
                 )
-            local_output = local_output.to(device=output_device, dtype=output_dtype).contiguous()
+            local_output = local_output.to(empty_output).contiguous()
         else:
-            local_output = torch.empty((0, output_dim), dtype=output_dtype, device=output_device)
+            local_output = empty_output
 
-    if plan.total_output_rows == 0:
+    rank_row_counts = [0] * layout.dp_size
+    for rank, rows in zip(ranks, row_counts, strict=True):
+        rank_row_counts[rank] += rows
+    if not sum(rank_row_counts):
         return local_output
 
-    gathered = allgather(local_output, list(plan.rank_output_row_counts))
-    if all(left.rank <= right.rank for left, right in pairwise(plan.placements)):
-        # Rank order already matches prompt order; avoid another full-size copy.
+    gathered = allgather(local_output, rank_row_counts)
+    if all(left <= right for left, right in pairwise(ranks)):
+        # Rank order already matches item order; avoid another full-size copy.
         return gathered
-    rank_row_starts = list(accumulate(plan.rank_output_row_counts, initial=0))
+    rank_row_starts = list(accumulate(rank_row_counts, initial=0))
     ordered_outputs = []
-    for placement in plan.placements:
-        row_start = rank_row_starts[placement.rank]
-        row_end = row_start + placement.item.output_row_count
-        ordered_outputs.append(gathered[row_start:row_end])
-        rank_row_starts[placement.rank] = row_end
+    for rank, rows in zip(ranks, row_counts, strict=True):
+        ordered_outputs.append(gathered[rank_row_starts[rank] : rank_row_starts[rank] + rows])
+        rank_row_starts[rank] += rows
     return torch.cat(ordered_outputs, dim=0)
 
 

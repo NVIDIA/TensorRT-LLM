@@ -63,7 +63,6 @@ from .modeling_multimodal_utils import (
     get_multimodal_embeddings,
 )
 from .multimodal_encoder_data_parallel import (
-    EncoderDpItem,
     EncoderParallelLayout,
     encoder_dp_error_guard,
     execute_encoder_dp_items,
@@ -856,70 +855,52 @@ class MultimodalModelMixin:
         """Exchange CPU status without waiting for queued encoder CUDA work."""
         return bool(Distributed.get(self.model_config.mapping).tp_allreduce(int(local_failed)))
 
-    def _build_encoder_dp_items(
-        self,
+    @staticmethod
+    def _encoder_dp_items(
         multimodal_params: Sequence[MultimodalParams],
-    ) -> tuple[list[EncoderDpItem], list[tuple[int, int | None]]] | None:
-        """Describe encoder work using the shared request item metadata.
+    ) -> tuple[list[tuple[MultimodalParams, int | None]], list[int], list[int]]:
+        """Split requests into DP items: `(param, item index)`, cost, output rows.
 
-        Physical input tokens determine placement; output rows determine
-        reconstruction. Requests whose item metadata has no encoder token
-        lengths stay atomic and use output rows as a fallback cost. This can
-        underestimate physical input work (e.g. spatial merging) and skew
-        placement in mixed batches. Providers should supply
-        encoder_token_lengths for comparable costs.
+        The cost is the item's physical encoder input tokens. A request without
+        encoder token lengths stays one atomic item (index `None`) and uses its
+        output rows as the cost. The producer and admission boundaries already
+        validated the item metadata.
         """
-        items: list[EncoderDpItem] = []
-        item_inputs: list[tuple[int, int | None]] = []
-
-        for param_index, param in enumerate(multimodal_params):
-            item_metadata = param.item_metadata
-            raw_lengths = None if item_metadata is None else item_metadata.output_embedding_lengths
-            if not raw_lengths:
-                return None
-            lengths = [int(length) for length in raw_lengths]
-            if any(length <= 0 for length in lengths):
-                raise ValueError("MM item output embedding lengths must be positive.")
-            if item_metadata.encoder_token_lengths is None:
-                row_count = sum(lengths)
-                items.append(EncoderDpItem(len(items), row_count, row_count))
-                item_inputs.append((param_index, None))
-                continue
-            for item_index, row_count in enumerate(lengths):
-                items.append(
-                    EncoderDpItem(
-                        ordinal=len(items),
-                        input_token_count=item_metadata.encoder_token_lengths[item_index],
-                        output_row_count=row_count,
-                    )
+        items: list[tuple[MultimodalParams, int | None]] = []
+        costs: list[int] = []
+        row_counts: list[int] = []
+        for param in multimodal_params:
+            metadata = param.item_metadata
+            if metadata is None or metadata.output_embedding_lengths is None:
+                raise MultimodalEncoderContractError(
+                    "MM item metadata with output lengths is required for encoder data parallelism"
                 )
-                item_inputs.append((param_index, item_index))
-
-        return items, item_inputs
+            lengths = metadata.output_embedding_lengths
+            if metadata.encoder_token_lengths is None:
+                items.append((param, None))
+                costs.append(sum(lengths))
+                row_counts.append(sum(lengths))
+                continue
+            items.extend((param, index) for index in range(len(lengths)))
+            costs.extend(metadata.encoder_token_lengths)
+            row_counts.extend(lengths)
+        return items, costs, row_counts
 
     def _prepare_encoder_dp_inputs(
         self,
-        local_items: Sequence[EncoderDpItem],
-        multimodal_params: Sequence[MultimodalParams],
-        item_inputs: Sequence[tuple[int, int | None]],
+        items: Sequence[tuple[MultimodalParams, int | None]],
     ) -> list[MultimodalParams]:
-        """Prepare assigned items through the model's shared item interface."""
-        selected = [item_inputs[item.ordinal] for item in local_items]
+        """Slice this replica's items with one call; atomic requests pass through whole."""
         local_params: list[MultimodalParams] = []
-        for param_index, grouped_items_iter in itertools.groupby(
-            selected, key=lambda item_input: item_input[0]
-        ):
-            param = multimodal_params[param_index]
-            item_indices = [index for _, index in grouped_items_iter if index is not None]
-            if not item_indices:
-                local_params.append(param)
+        selected: list[tuple[MultimodalParams, int]] = []
+        for param, index in items:
+            if index is not None:
+                selected.append((param, index))
                 continue
-            local_params.extend(
-                local_param
-                for local_param, _, _ in self.prepare_multimodal_encoder_inputs(
-                    [(param, index) for index in item_indices]
-                )
-            )
+            local_params.extend(p for p, _, _ in self.prepare_multimodal_encoder_inputs(selected))
+            selected.clear()
+            local_params.append(param)
+        local_params.extend(p for p, _, _ in self.prepare_multimodal_encoder_inputs(selected))
         return local_params
 
     def _encode_multimodal_inputs_dp(
@@ -927,49 +908,31 @@ class MultimodalModelMixin:
         multimodal_params: Sequence[MultimodalParams],
         **encoder_kwargs: Any,
     ) -> torch.Tensor:
-        """Run the model encoder with the configured multimodal DP behavior."""
+        """Run the model encoder, splitting items between encoder DP replicas."""
         params = list(multimodal_params)
         layout = self.encoder_parallel_layout
         if not layout.distributes_items:
             return self.encode_multimodal_inputs(params, **encoder_kwargs)
 
-        encoder_dp_inputs = self._build_encoder_dp_items(params)
-        if encoder_dp_inputs is not None:
-            items, item_inputs = encoder_dp_inputs
+        items, costs, row_counts = self._encoder_dp_items(params)
 
-            def prepare_local_inputs(
-                local_items: Sequence[EncoderDpItem],
-            ) -> list[MultimodalParams]:
-                return self._prepare_encoder_dp_inputs(
-                    local_items,
-                    params,
-                    item_inputs,
-                )
+        def encode_local(indices: list[int]) -> torch.Tensor:
+            local_params = self._prepare_encoder_dp_inputs([items[index] for index in indices])
+            return self.encode_multimodal_inputs(local_params, **encoder_kwargs)
 
-            def encode_local_inputs(local_params: list[MultimodalParams]) -> torch.Tensor:
-                return self.encode_multimodal_inputs(local_params, **encoder_kwargs)
-
-            embedding_weight = self.text_embedding_layer.weight
-            return execute_encoder_dp_items(
-                items,
-                rank=layout.dp_rank,
-                num_ranks=layout.dp_size,
-                prepare_local_inputs=prepare_local_inputs,
-                encode_local_inputs=encode_local_inputs,
-                any_rank_failed=self._any_encoder_dp_rank_failed,
-                allgather=self._allgather_encoder_dp_output,
-                output_dim=self.embedding_dim,
-                output_dtype=self.embedding_dtype,
-                output_device=embedding_weight.device,
-            )
-
-        # Encoder memory profiling omits the row metadata needed for work
-        # partitioning, so every rank measures the full dummy encoder. Retain a
-        # status collective so a rank-local profiling failure is not observed as
-        # success by peer ranks.
-        with encoder_dp_error_guard(self._any_encoder_dp_rank_failed):
-            local_output = self.encode_multimodal_inputs(params, **encoder_kwargs)
-        return local_output
+        return execute_encoder_dp_items(
+            costs,
+            row_counts,
+            layout=layout,
+            encode_local=encode_local,
+            any_rank_failed=self._any_encoder_dp_rank_failed,
+            allgather=self._allgather_encoder_dp_output,
+            empty_output=torch.empty(
+                (0, self.embedding_dim),
+                dtype=self.embedding_dtype,
+                device=self.text_embedding_layer.weight.device,
+            ),
+        )
 
     @property
     def encoder_cache_active(self) -> bool:

@@ -25,6 +25,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     EncoderParallelMode,
+    MultimodalEncoderContractError,
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
     make_multimodal_encoder_model_config,
@@ -513,6 +514,20 @@ def test_encoder_dp_keeps_requests_atomic_without_encoder_token_lengths() -> Non
     assert model.encoded_item_ids == [10, 20, 30]
     expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
     torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.cpu_only
+def test_encoder_dp_rejects_requests_without_output_lengths() -> None:
+    param = make_encoder_dp_param()
+    del param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    model = DataParallelEncoderMultimodalModel(rank=0)
+    model.peer_output = torch.empty(0, 2)
+
+    # Without output lengths a rank cannot know its share, so it must not
+    # quietly encode the whole batch.
+    with pytest.raises(MultimodalEncoderContractError, match="output lengths is required"):
+        model._run_multimodal_encoder([param])
+    assert model.encoded_item_ids == []
 
 
 @pytest.mark.cpu_only
