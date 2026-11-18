@@ -54,8 +54,9 @@ CONTROL_DIRECTIVE_TEMPLATE = (
     " signal at every frame."
 )
 
-# Per-hint guidance tuning: text guidance_scale, control_guidance, and flow_shift,
-# chosen empirically per control modality.
+# Default guidance tuning per kind of transfer request: text guidance_scale,
+# control_guidance, and flow_shift. A request with one control uses that control's
+# row; a request with two or more uses "mixed" (see ``transfer_defaults``).
 TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
     "edge": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
     "blur": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
@@ -74,7 +75,17 @@ TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
         "fps": 10,
         "num_video_frames_per_chunk": 101,
     },
+    # Two or more controls: the reference runs its general (edge-family) values
+    # rather than combining the controls' rows.
+    "mixed": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
 }
+
+
+def transfer_defaults(hints: Mapping[str, Any]) -> dict[str, Any]:
+    """The default row of a transfer request: the control's own row for a single
+    control, the ``"mixed"`` row for two or more."""
+    return TRANSFER_DEFAULTS[next(iter(hints)) if len(hints) == 1 else "mixed"]
+
 
 # Canny (lower, upper) hysteresis thresholds per edge-strength preset;
 # higher preset = higher thresholds = sparser edges.
@@ -249,13 +260,10 @@ def resolve_transfer_config(
     # a caller's value from a merged one.
     specified = getattr(req_params, "model_fields_set", frozenset())
 
-    # Stays None unless the caller asked for a value, so the single-hint preset
-    # below can apply. Reading `req_params.guidance_scale` unconditionally would
+    # Stays None unless the caller asked for a value, so the default row below
+    # can apply. Reading `req_params.guidance_scale` unconditionally would
     # capture the executor-merged default and make every request look explicit,
-    # which pins transfer to the generic scale and never reaches the tuned
-    # per-hint presets. With no preset (multi-hint), `_forward_transfer` falls
-    # back to the generic video default -- matching the reference, where the
-    # per-task table applies only to a single hint.
+    # which pins transfer to the generic scale and never reaches the tuned rows.
     guidance_scale_user_set = (
         "guidance_scale" in specified or extra_params.get("guidance_scale", None) is not None
     )
@@ -319,21 +327,21 @@ def resolve_transfer_config(
         fps=getattr(req_params, "frame_rate", None) if "frame_rate" in specified else None,
     )
 
-    if len(hints) == 1:
-        hint_key = next(iter(hints))
-        for field_name, default_value in TRANSFER_DEFAULTS[hint_key].items():
-            if field_name == "guidance_scale":
-                user_set = guidance_scale_user_set
-            elif field_name == "flow_shift":
-                user_set = extra_params.get("flow_shift", None) is not None
-            elif field_name == "fps":
-                user_set = "frame_rate" in specified
-            elif field_name == "num_frames":
-                user_set = "num_frames" in specified
-            else:
-                user_set = extra_params.get(field_name, None) is not None
-            if not user_set:
-                setattr(config, field_name, default_value)
+    for field_name, default_value in transfer_defaults(hints).items():
+        if field_name == "flow_shift":
+            # ``config.flow_shift`` carries only the caller's value: the pipeline
+            # consults the checkpoint scheduler's shift before this default.
+            continue
+        if field_name == "guidance_scale":
+            user_set = guidance_scale_user_set
+        elif field_name == "fps":
+            user_set = "frame_rate" in specified
+        elif field_name == "num_frames":
+            user_set = "num_frames" in specified
+        else:
+            user_set = extra_params.get(field_name, None) is not None
+        if not user_set:
+            setattr(config, field_name, default_value)
 
     if config.num_video_frames_per_chunk <= 0:
         raise ValueError("Cosmos3 transfer num_video_frames_per_chunk must be positive.")

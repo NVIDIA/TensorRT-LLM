@@ -287,9 +287,27 @@ class TestTransferConfig:
         merged = resolve_transfer_config({"edge": True}, _merged_req(guidance_scale=7.0))
         assert merged.guidance_scale == 3.0
         assert cfg.control_guidance == 1.5
-        assert cfg.flow_shift == 10.0
+        # Only a caller's shift lands in the config; the row's default sits behind
+        # the checkpoint scheduler's shift and is applied by the pipeline.
+        assert cfg.flow_shift is None
+        assert resolve_transfer_config({"edge": True, "flow_shift": 4.0}, _req()).flow_shift == 4.0
         assert cfg.num_video_frames_per_chunk == 93
         assert cfg.share_vision_temporal_positions is True
+
+    @pytest.mark.parametrize("hints", [("edge", "blur"), ("seg", "wsm"), ("edge", "blur", "depth")])
+    def test_two_or_more_controls_use_the_mixed_row(self, hints):
+        """A mixed request does not combine the controls' rows and does not fall
+        back to the generic video values: it has its own row."""
+        mixed = transfer_module.TRANSFER_DEFAULTS["mixed"]
+        extra = {key: {"control": b"clip"} for key in hints}
+        cfg = resolve_transfer_config(extra, _req())
+        assert cfg.guidance_scale == mixed["guidance_scale"]
+        assert cfg.control_guidance == mixed["control_guidance"]
+        assert transfer_module.transfer_defaults(cfg.hints) is mixed
+        explicit = resolve_transfer_config(
+            {**extra, "control_guidance": 2.5}, _req(guidance_scale=6.0)
+        )
+        assert (explicit.guidance_scale, explicit.control_guidance) == (6.0, 2.5)
 
     def test_control_directive_is_appended_by_default(self):
         """Reference parity: cosmos-framework names the active control modality
@@ -1209,6 +1227,28 @@ class TestTransferSamplingAndSafety:
         assert pipeline.scheduler is not baseline, (
             "transfer built a scheduler but never installed it"
         )
+
+    TWO_CONTROLS = {"blur": {"control": b"clip"}}
+
+    @pytest.mark.parametrize("extra", [None, TWO_CONTROLS], ids=["one-control", "two-controls"])
+    def test_flow_shift_is_request_then_checkpoint_then_default(self, monkeypatch, extra):
+        """The same order for one control and for several: the caller's shift, else
+        the checkpoint scheduler's, else the request's default row."""
+        row = "mixed" if extra else "edge"
+
+        def shift(*, checkpoint=None, request=None):
+            sampling = StubSamplingPolicy()
+            pipeline = _make_pipeline(sampling=sampling)
+            pipeline.resolver = bare_resolver(QWEN3_RECIPE.name, flow_shift=checkpoint)
+            cfg_extra = dict(extra or {})
+            if request is not None:
+                cfg_extra["flow_shift"] = request
+            self._run(pipeline, monkeypatch, cfg_extra=cfg_extra)
+            return sampling.flow_shift_calls
+
+        assert shift() == [transfer_module.TRANSFER_DEFAULTS[row]["flow_shift"]]
+        assert shift(checkpoint=1.0) == [1.0]
+        assert shift(checkpoint=1.0, request=4.0) == [4.0]
 
     def test_schedule_is_programmed_through_the_sampling_policy(self, monkeypatch):
         """A distilled checkpoint runs a fixed sigma list, not a step count."""

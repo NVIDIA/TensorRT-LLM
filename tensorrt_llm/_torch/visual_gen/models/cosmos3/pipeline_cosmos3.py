@@ -69,7 +69,6 @@ from .action import (
     resolve_domain_id,
 )
 from .defaults import (
-    COSMOS3_720P_PARAMS,
     COSMOS3_ASPECT_RATIO_BUCKETS,
     COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
     COSMOS3_DEFAULT_SYSTEM_PROMPT,
@@ -85,7 +84,7 @@ from .defaults import (
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
-from .parameter_resolver import ParameterResolver, RequestParameters
+from .parameter_resolver import ParameterResolver, RequestParameters, select
 from .sampling import DISTILLED_GUIDANCE_SCALE, Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
@@ -95,6 +94,7 @@ from .transfer import (
     load_or_compute_control_frames,
     pad_temporal_frames,
     resolve_transfer_config,
+    transfer_defaults,
     uint8_cthw_to_normalized_5d,
 )
 from .transformer_cosmos3 import NEMOTRON_DENSE_RECIPE, Cosmos3VFMTransformer, resolve_arch_recipe
@@ -2830,11 +2830,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         frame_rate = (
             self._positive_float(transfer_config.fps) or self._positive_float(frame_rate) or 24.0
         )
-        num_inference_steps = num_inference_steps or COSMOS3_720P_PARAMS["num_inference_steps"]
-        guidance_scale = (
-            float(transfer_config.guidance_scale)
+        defaults = transfer_defaults(transfer_config.hints)
+        guidance_scale = float(
+            transfer_config.guidance_scale
             if transfer_config.guidance_scale is not None
-            else COSMOS3_720P_PARAMS["guidance_scale"]
+            else defaults["guidance_scale"]
         )
         if self.sampling.is_distilled:
             # A distilled checkpoint runs one schedule and bakes guidance into
@@ -2848,9 +2848,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     f"{DISTILLED_GUIDANCE_SCALE}; per-hint guidance presets do not apply."
                 )
             guidance_scale = DISTILLED_GUIDANCE_SCALE
-        # The hint preset's shift, or the request's; ``None`` keeps the checkpoint's.
-        flow_shift_target = transfer_config.flow_shift
-        max_sequence_length = max_sequence_length or COSMOS3_720P_PARAMS["max_sequence_length"]
+        flow_shift_target = select(
+            transfer_config.flow_shift,
+            self.resolver.config().sampling.flow_shift,
+            defaults["flow_shift"],
+        ).value
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
         # forward() skips its own scheduler rebuild for transfer, so this is the
