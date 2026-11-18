@@ -1152,9 +1152,6 @@ class LlamaModel(DecoderModel):
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
 
-    # The embedding is the only reader of context token ids.
-    supports_prompt_embeds = True
-
     @classmethod
     def get_preferred_kv_cache_manager_version(
         cls,
@@ -1607,14 +1604,24 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                     for multimodal_param in multimodal_params
                 ]
 
-        input_ids, inputs_embeds = fuse_input_embeds(
-            self.model.embed_tokens,
-            input_ids,
-            mm_embeds,
-            mm_token_ids=self.mm_token_ids,
-            mm_token_indices=kwargs.get("mm_token_indices"),
-            text_token_indices=kwargs.get("text_token_indices"),
-        )
+        if inputs_embeds is None:
+            input_ids, inputs_embeds = fuse_input_embeds(
+                self.model.embed_tokens,
+                input_ids,
+                mm_embeds,
+                mm_token_ids=self.mm_token_ids,
+                mm_token_indices=kwargs.get("mm_token_indices"),
+                text_token_indices=kwargs.get("text_token_indices"),
+            )
+        elif mm_embeds:
+            # Supplied embeddings (prompt_embeds) already cover text rows.
+            mm_token_indices = kwargs.get("mm_token_indices")
+            if mm_token_indices is None:
+                raise ValueError(
+                    "Image features with inputs_embeds need mm_token_indices.")
+            inputs_embeds = inputs_embeds.index_copy(
+                0, mm_token_indices,
+                torch.cat(mm_embeds).to(inputs_embeds.dtype))
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,

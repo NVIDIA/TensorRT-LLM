@@ -963,9 +963,15 @@ class DecoderRunner(ScheduledModelRunner):
         tokens are already in ``input_ids``; the model then gets embeddings
         instead of ids.
         """
-        embeds = self._model.embed_prompt_tokens(inputs["input_ids"])
+        input_ids = inputs["input_ids"]
+        embeds = self._model.embed_prompt_tokens(input_ids)
         embeds.index_copy_(0, dst_rows, src_rows.to(embeds.dtype))
-        return {**inputs, "input_ids": None, "inputs_embeds": embeds}
+        return {
+            **inputs,
+            **self._model.prompt_embeds_model_inputs(input_ids, dst_rows),
+            "input_ids": None,
+            "inputs_embeds": embeds,
+        }
 
     @nvtx_range("_forward_step")
     def _forward_step(
@@ -981,7 +987,8 @@ class DecoderRunner(ScheduledModelRunner):
             inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
         )
         prompt_embeds_overlay = inputs.pop("prompt_embeds_overlay", None)
-        if prompt_embeds_overlay is not None:
+        # Later pipeline stages receive hidden states, not embeddings.
+        if prompt_embeds_overlay is not None and self._mapping.is_first_pp_rank():
             inputs = self._apply_prompt_embeds_overlay(inputs, *prompt_embeds_overlay)
         spec_metadata = inputs.get("spec_metadata")
         gather_ids = spec_metadata.gather_ids if spec_metadata is not None else None

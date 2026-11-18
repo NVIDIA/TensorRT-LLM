@@ -3530,6 +3530,19 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
     logits_processor_cls = DeepseekV4LogitsProcessor
     weight_loader_cls = DeepseekV4WeightLoader
 
+    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
+        """Engram hashes n-grams of token ids, which embedding rows lack."""
+        if getattr(self.config, "has_engram", False):
+            return "Engram n-gram hashing has no ids for embedding rows"
+        return None
+
+    def prompt_embeds_model_inputs(
+        self, input_ids: torch.Tensor, embed_rows: torch.Tensor
+    ) -> Dict[str, Any]:
+        """Hash routing reads ids; embedding rows route on their placeholder id,
+        as image positions do in the multimodal wrapper."""
+        return {"orig_input_ids": input_ids}
+
     @property
     def runtime_hooks(self) -> RuntimeHooks:
         """Staged decode inputs and priority decode graphs; speculative decoding also runs

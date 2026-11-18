@@ -3201,6 +3201,10 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
 
     lora_owner = DecoderLoraOwner(module_path="model")
 
+    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
+        """The vision tower is skipped whenever ``inputs_embeds`` is given."""
+        return "its forward drops image features when inputs_embeds is given"
+
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         # Capture the raw VL config before ``super().__init__`` swaps in
         # the text subconfig so we can read ``vision_config`` /

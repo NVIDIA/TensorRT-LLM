@@ -426,17 +426,20 @@ class BaseWorker(GenerationExecutor):
         parallel_config = self.llm_args.parallel_config
         if parallel_config.enable_attention_dp:
             unsupported.append("attention data parallelism")
-        if parallel_config.pp_size > 1:
-            unsupported.append("pipeline parallelism")
         if parallel_config.cp_size > 1:
             unsupported.append("context parallelism")
         if unsupported:
             raise RequestError("prompt_embeds is not supported with " +
                                ", ".join(unsupported) + ".")
         model = self.engine.model_engine.model
-        if not getattr(model, "supports_prompt_embeds", False):
+        unsupported_reason = getattr(model, "prompt_embeds_unsupported_reason",
+                                     None)
+        reason = ("it is not a decoder LLM"
+                  if unsupported_reason is None else unsupported_reason())
+        if reason is not None:
             raise RequestError(
-                f"prompt_embeds is not supported by {type(model).__name__}.")
+                f"prompt_embeds is not supported by {type(model).__name__}: "
+                f"{reason}.")
         hidden_size = model.config.hidden_size
         if prompt_embeds.hidden_size != hidden_size:
             raise RequestError(

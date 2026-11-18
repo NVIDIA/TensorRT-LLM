@@ -248,9 +248,6 @@ class QwenModel(DecoderModel):
 @register_auto_model("Qwen2ForCausalLM")
 class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
 
-    # The embedding is the only reader of context token ids.
-    supports_prompt_embeds = True
-
     def __init__(
         self,
         model_config: ModelConfig[Qwen2Config],

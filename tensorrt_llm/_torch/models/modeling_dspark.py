@@ -3938,6 +3938,10 @@ class K3DsparkForCausalLM(SpecDecOneEngineForCausalLM[K3DsparkModel, PretrainedC
     the Laguna precedent in ``modeling_dflash.py``.
     """
 
+    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
+        """Draft models never receive the request prompt."""
+        return "it is a draft model"
+
     def __init__(self, model_config):
         super().__init__(K3DsparkModel(model_config), model_config)
 
@@ -5339,6 +5343,10 @@ class MiniMaxDSparkModel(DecoderModel):
 class MiniMaxDSparkBackbone(DecoderModelForCausalLM[MiniMaxDSparkModel, PretrainedConfig]):
     """Registry entry for the MiniMax DSpark drafter checkpoint
     (``config.architectures == ["DSparkMiniMaxDraftModel"]``)."""
+
+    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
+        """Draft models never receive the request prompt."""
+        return "it is a draft model"
 
     def __init__(self, model_config: ModelConfig) -> None:
         config = model_config.pretrained_config

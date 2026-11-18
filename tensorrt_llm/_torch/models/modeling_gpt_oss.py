@@ -536,7 +536,8 @@ class Transformer(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        hidden_states = inputs_embeds or self.embedding(input_ids)
+        hidden_states = (inputs_embeds if inputs_embeds is not None else
+                         self.embedding(input_ids))
 
         residual = None
         for block in self.block:

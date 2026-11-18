@@ -663,10 +663,16 @@ class DecoderModelForCausalLM(nn.Module,
     # The model-specific TorchLlmArgs fields this model implements; the loader
     # rejects a set one that is not listed.
     model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
-    # True when the input embedding is the only reader of a context token id,
-    # so precomputed rows (tensorrt_llm.inputs.prompt_embeds) can replace it.
-    # Each model opts in after its forward has been audited for other readers.
-    supports_prompt_embeds: ClassVar[bool] = False
+
+    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
+        """Return why this model cannot take ``prompt_embeds``, or None if it can.
+
+        A prompt-embedding position has no token, like a multimodal position.
+        Models that read token ids after the input embedding treat it the way
+        they treat their own image positions (``prompt_embeds_model_inputs``)
+        or refuse here until they do.
+        """
+        return None
 
     def embed_prompt_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Return the input embeddings ``forward`` computes from ``input_ids``.
@@ -675,6 +681,18 @@ class DecoderModelForCausalLM(nn.Module,
         the result as ``inputs_embeds``.
         """
         return self.model.embed_tokens(input_ids)
+
+    def prompt_embeds_model_inputs(self, input_ids: torch.Tensor,
+                                   embed_rows: torch.Tensor) -> Dict[str, Any]:
+        """Return extra ``forward`` kwargs for a pass with prompt-embedding rows.
+
+        Args:
+            input_ids: Token ids of the pass; prompt-embedding rows hold
+                placeholder ids.
+            embed_rows: Indices into ``input_ids`` of the rows replaced by
+                supplied embeddings.
+        """
+        return {}
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(

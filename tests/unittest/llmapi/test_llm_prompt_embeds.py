@@ -262,3 +262,30 @@ def test_chunked_prefill(
             {"prompt_embeds": table[torch.tensor(ids[1])]},
         ]
         assert _run(chunked, requests) == expected
+
+
+@pytest.mark.gpu2
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("tp_size, pp_size", [(2, 1), (1, 2)], ids=["tp2", "pp2"])
+def test_multi_gpu(model_dir: str, table: torch.Tensor, tp_size: int, pp_size: int) -> None:
+    with LLM(
+        model=model_dir,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.3, enable_block_reuse=True),
+        tensor_parallel_size=tp_size,
+        pipeline_parallel_size=pp_size,
+        max_batch_size=4,
+    ) as parallel:
+        ids = _token_ids(parallel, PROMPTS)
+        expected = _run(parallel, ids)
+        n = len(ids[0])
+        mask = [p % 2 == 1 for p in range(n)]
+        requests = [
+            {
+                "prompt_token_ids": ids[0],
+                "prompt_embeds": table[torch.tensor([t for t, m in zip(ids[0], mask) if m])],
+                "prompt_embeds_mask": mask,
+            },
+            {"prompt_embeds": table[torch.tensor(ids[1])]},
+            ids[2],
+        ]
+        assert _run(parallel, requests) == expected
