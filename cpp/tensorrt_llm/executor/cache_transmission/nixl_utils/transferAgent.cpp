@@ -944,14 +944,31 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
     status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(splitDescs), &mExtraParams);
     TLLM_CHECK(status == NIXL_SUCCESS);
 
-    // Remove entries from registry: every region (run of equal chunks) the desc was registered as
+    // Remove entries from registry: the regions (runs of equal chunks) the desc was registered as.
+    // Follow the desc's own chain of adjacent runs from its base instead of erasing every key in its
+    // range, so the entries of another registration inside that range survive. A desc made of one run,
+    // always the case without larger KV cache chunks, erases only its own key.
     if (descs.getType() == MemoryType::kVRAM)
     {
         for (auto const& desc : descs.getDescs())
         {
-            auto const end = desc.getAddr() + std::max<size_t>(desc.getLen(), 1);
-            mLocalVramRegionInfo.erase(
-                mLocalVramRegionInfo.lower_bound(desc.getAddr()), mLocalVramRegionInfo.lower_bound(end));
+            uintptr_t const end = desc.getAddr() + desc.getLen();
+            uintptr_t key = desc.getAddr();
+            do
+            {
+                auto const it = mLocalVramRegionInfo.find(key);
+                if (it == mLocalVramRegionInfo.end())
+                {
+                    break;
+                }
+                size_t const len = it->second.totalLen;
+                mLocalVramRegionInfo.erase(it);
+                if (len == 0)
+                {
+                    break;
+                }
+                key += len;
+            } while (key < end);
         }
     }
 }

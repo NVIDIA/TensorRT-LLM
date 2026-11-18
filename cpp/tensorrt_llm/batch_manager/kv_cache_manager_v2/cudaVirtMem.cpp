@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 
+#include <algorithm>
 #include <numeric>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -101,9 +102,10 @@ PooledPhysMemAllocator::PooledPhysMemAllocator(size_t physMemSize, int numLocali
             [](PhysMemWrapper* chunk) { delete chunk; }));
     }
 
-    // Larger chunks only with one domain: localized chunks are placed per domain at explicit offsets,
-    // one physMemSize() unit at a time.
-    if (numLocalityDomains == 1)
+    // Larger chunks only with one domain (localized chunks are placed per domain at explicit offsets,
+    // one physMemSize() unit at a time) and a power-of-two unit, so every chunk size is a valid
+    // cuMemAddressReserve alignment. tierAllocationGranularity always returns a power of two.
+    if (numLocalityDomains == 1 && (mPhysMemSize & (mPhysMemSize - 1)) == 0)
     {
         for (size_t size = mPhysMemSize << 1; size > mPhysMemSize && size <= maxChunkSize; size <<= 1)
         {
@@ -353,6 +355,8 @@ void VirtMem::pop(LocalityDomainId localityDomainId)
     mMappedOffsets.erase(offset);
     mMappedBytes[localityDomainId] -= size;
     mappings.pop_back(); // PhysMemHandle destructor returns to pool
+    // Keep usableBytes <= mappedBytes even when a later pop of the same shrink throws.
+    mUsableBytes[localityDomainId] = std::min(mUsableBytes[localityDomainId], mMappedBytes[localityDomainId]);
 }
 
 void VirtMem::resizeAtEnd(size_t target)
