@@ -586,52 +586,6 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
         kv.stop_committing()
         kv.close()
 
-    def test_dead_donor_fails_the_promotion_instead_of_reusing(self) -> None:
-        """The promotion itself raises."""
-        if self.transport == "fabric":
-            self.skipTest(_NIXL_DEATH_ONLY)
-        directory = tempfile.mkdtemp(prefix="kvcm2_dead_")
-        donor = _Donor(directory, 1 << 30, self.transport)
-        try:
-            self.cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
-            self.manager = KVCacheManager(self.cfg)
-            self.engine = FakeEngine(self.cfg)
-            stream_holder = base.CachedCudaStream()
-            stream = cast(CudaStream, stream_holder.handle)
-            prompt = self._prompt(4 * self.tokens_per_block)
-            self._prefill(prompt, stream)
-            self._push_to_last_level(prompt, stream)
-            # The donor goes away with its memory registration and agent (its files go too; this client has loaded
-            # it already), so the next READ of the prompt's pages has nowhere to go.
-            donor.stop()
-            kv = self.manager.create_kv_cache(input_tokens=prompt)
-            # Its own class, not RuntimeError: callers tell a retired remote level from any other failure.
-            with self.assertRaisesRegex(RemoteMemError, "remote level"):
-                kv.resume(stream)
-            try:
-                kv.close()
-            except Exception:
-                pass
-            del kv
-            # The failed resume gave back the GPU slots it had taken for the promotion: with no cache open, every
-            # GPU slot is free or evictable.
-            gpu = cast(CacheLevel, CacheLevel(0))
-            for pool in self.manager.get_storage_statistics(gpu):
-                self.assertEqual(pool.available, pool.total)
-        finally:
-            donor.stop()
-            if hasattr(self, "manager"):
-                try:
-                    self.manager.shutdown()
-                except Exception:
-                    pass
-                del self.manager
-            # Fail-stop: after a failed transfer the manager is not expected to tear down cleanly. Collect what is
-            # left now, so a destructor's poison lands here and is cleared, not in the next test.
-            gc.collect()
-            base.take_poison()
-            shutil.rmtree(directory, ignore_errors=True)
-
     def test_failed_level_drops_its_pages_and_takes_no_more(self) -> None:
         """After a failed transfer the level is retired instead of failing every later request.
 
@@ -652,10 +606,14 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             self._push_to_last_level(prompt, stream)
             donor.stop()
             kv = self.manager.create_kv_cache(input_tokens=prompt)
-            with self.assertRaisesRegex(Exception, "remote level"):
+            with self.assertRaisesRegex(RemoteMemError, "remote level"):
                 kv.resume(stream)
             kv.close()
             del kv
+            # A failed promotion must return its GPU slots before another request runs.
+            gpu = cast(CacheLevel, CacheLevel(0))
+            for pool in self.manager.get_storage_statistics(gpu):
+                self.assertEqual(pool.available, pool.total)
             self.assertEqual(self._residency(prompt)[-1], 0, "the failed level still offers pages")
             # Prefills evict through the host level and past the failed one; a fresh prompt round-trips.
             for _ in range(8):

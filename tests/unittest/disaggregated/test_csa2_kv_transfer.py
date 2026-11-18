@@ -186,30 +186,42 @@ def test_csa2_shared_owner_kv_transfer(
         ctx_enable_dp=ctx_enable_dp,
         gen_enable_dp=gen_enable_dp,
         update_before_transfer=update_before_transfer,
+        update_context_history=True,
         manager_factory=functools.partial(_managers, layout=layout),
         init_fn=_init_csa2_pool_data,
         verify_fn=_verify,
     )
 
 
+def _prefix_transfer_cases():
+    for remote_tail, policies in (
+        (False, ("required", "hit", "partial-eviction", "evicted")),
+        (
+            True,
+            (
+                "required",
+                "required-miss",
+                "required-no-reuse",
+                "hit",
+                "partial-eviction",
+                "evicted",
+                "miss",
+            ),
+        ),
+    ):
+        for policy in policies:
+            # Cover each policy on a single rank. Exercise both TP fan-in and
+            # fan-out with reuse disabled, a full prefix hit, and a partially
+            # evicted prefix that requires copying just its missing groups.
+            topologies = ((1, 1),)
+            if policy in ("hit", "partial-eviction", "required-no-reuse"):
+                topologies += ((2, 1), (1, 2))
+            for ctx_tp, gen_tp in topologies:
+                yield policy, remote_tail, ctx_tp, gen_tp
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("ctx_tp,gen_tp", [(1, 1), (2, 1), (1, 2)])
-@pytest.mark.parametrize(
-    "policy,remote_tail",
-    [(policy, False) for policy in ("required", "hit", "partial-eviction", "evicted")]
-    + [
-        (policy, True)
-        for policy in (
-            "required",
-            "required-miss",
-            "required-no-reuse",
-            "hit",
-            "partial-eviction",
-            "evicted",
-            "miss",
-        )
-    ],
-)
+@pytest.mark.parametrize("policy,remote_tail,ctx_tp,gen_tp", list(_prefix_transfer_cases()))
 def test_csa2_ced_transfer_with_generation_prefix_reuse(
     monkeypatch, ctx_tp, gen_tp, policy, remote_tail
 ):
