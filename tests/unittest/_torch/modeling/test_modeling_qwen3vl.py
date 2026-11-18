@@ -447,6 +447,37 @@ def test_qwenvl_breakable_inputs_leave_unfused_mrope_unchanged(owner_cls, mrope_
     assert prepared["mrope_config"] is mrope_config
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+def test_qwen35_breakable_inputs_match_while_media_requests_decode(moe) -> None:
+    """Qwen3.5 has no cos/sin table, so its MRoPE deltas exist only while a media request
+    decodes. The body reads neither them nor the token IDs, so a mixed batch must still
+    match the captured inputs and replay."""
+    from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen3_5MoeVLModel, Qwen3_5VLModel
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import _find_input_mismatch
+
+    model_cls = Qwen3_5MoeVLModel if moe else Qwen3_5VLModel
+    model = model_cls.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    model.deepstack_num_level = 0
+
+    def prepare(mrope_config):
+        return model.prepare_breakable_cuda_graph_inputs(
+            {
+                "inputs_embeds": torch.zeros(4, 2),
+                "position_ids": torch.zeros((3, 1, 4), dtype=torch.int32),
+                "mrope_config": mrope_config,
+                "orig_input_ids": torch.arange(4),
+            }
+        )
+
+    captured = prepare({})
+    mixed = prepare({"mrope_position_deltas": torch.ones((1, 1), dtype=torch.int32)})
+
+    assert "mrope_config" not in mixed and "orig_input_ids" not in mixed
+    assert _find_input_mismatch(captured, mixed) is None
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     ("family", "num_levels"),
