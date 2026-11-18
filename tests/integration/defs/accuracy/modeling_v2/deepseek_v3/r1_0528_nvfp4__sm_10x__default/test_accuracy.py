@@ -41,6 +41,7 @@ from ....accuracy_core import (
     GSM8K,
     LlmapiAccuracyTestHarness,
     assert_acceptance_length,
+    assert_acceptance_length_for_llm,
     compute_acceptance_length,
 )
 from ..._env import scoped_env_overrides
@@ -335,7 +336,9 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         288 slots hold the 256 experts of every routed layer. Every layer registers
         with the engine's load balancer, loads its experts by slot and routes the
         router's ids to slots, so this is the whole EPLB path of the target against
-        the same GSM8K reference as the identity cases.
+        the same GSM8K reference as the identity cases. With the MTP layer the acceptance
+        length is read against the target's MTP minimum too: EPLB changes no expert's math,
+        and a draft routed to the wrong slots would be rejected without moving the score.
         """
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
         cfg_layers, first_moe, num_slots = 61, 3, 288
@@ -347,7 +350,16 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         load_balancer = MoeLoadBalancerConfig(
             num_slots=num_slots, initial_global_assignments=assignments
         )
-        spec = dict(speculative_config=self.MTP3, kv_cache_config=self.MTP3_KV) if mtp else {}
+        spec = (
+            dict(
+                speculative_config=self.MTP3,
+                kv_cache_config=self.MTP3_KV,
+                cuda_graph_config=CudaGraphConfig(),
+                enable_iter_perf_stats=True,
+            )
+            if mtp
+            else {}
+        )
 
         with (
             scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
@@ -362,3 +374,5 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         ):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            if mtp:
+                assert_acceptance_length_for_llm(self.ACCEPTANCE_KEY, llm)
