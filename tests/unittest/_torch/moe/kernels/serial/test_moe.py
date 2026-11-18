@@ -2306,9 +2306,16 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
                          ids=["autotune", "no_autotune"])
 @pytest.mark.parametrize("use_topk_as_input", [False, True],
                          ids=["use_score_as_input", "use_topk_as_input"])
-def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
-                            routing_info, dtype_activation, act_type_str,
-                            use_autotune, use_topk_as_input):
+def test_moe_mxe2m1_weights(num_tokens,
+                            hidden_size,
+                            intermediate_size,
+                            routing_info,
+                            dtype_activation,
+                            act_type_str,
+                            use_autotune,
+                            use_topk_as_input,
+                            valid_hidden_size=None,
+                            valid_intermediate_size=None):
     torch.random.manual_seed(0)
 
     #
@@ -2428,6 +2435,22 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                                        dtype=torch.float)
         gemm2_bias = 50 * torch.randn(
             num_experts, hidden_size, device='cuda', dtype=torch.float)
+
+    if valid_hidden_size is not None:
+        hidden_states[:, valid_hidden_size:] = 0
+        gemm1_weights[:, :, valid_hidden_size:] = 0
+        gemm2_weights[:, valid_hidden_size:, :] = 0
+        if gemm2_bias is not None:
+            gemm2_bias[:, valid_hidden_size:] = 0
+    if valid_intermediate_size is not None:
+        # Gate and up projections are padded separately before interleaving.
+        for offset in (0, intermediate_size):
+            gemm1_weights[:, offset + valid_intermediate_size:offset +
+                          intermediate_size, :] = 0
+            if gemm1_bias is not None:
+                gemm1_bias[:, offset + valid_intermediate_size:offset +
+                           intermediate_size] = 0
+        gemm2_weights[:, :, valid_intermediate_size:] = 0
 
     hidden_states_mxe4m3 = None
     hidden_states_scale_linear_mxe4m3 = None
@@ -2641,7 +2664,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     #
     # Run the TRT-LLM kernel
     #
-    unpadded_hidden_size = hidden_size
+    unpadded_hidden_size = valid_hidden_size or hidden_size
     if test_invalid_topk_input:
         top_k = top_k + 1
     AutoTuner.get().clear_cache()
@@ -2686,11 +2709,12 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 else None, gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
                 gemm2_weights_mxe2m1_shuffled.cuda(),
                 gemm2_scales_mxe2m1_shuffled.cuda(),
-                gemm2_bias_shuffled.cuda() if gemm2_bias_shuffled is not None
-                else None, scale_c_fc1, scale_gate_fc1, scale_c_fc2,
-                num_experts, top_k, n_groups, top_k_groups, intermediate_size,
-                None, None, 0, num_experts, routed_scaling, routing_method_type,
-                act_type.value, topk_weights, topk_ids)
+                gemm2_bias_shuffled.cuda()
+                if gemm2_bias_shuffled is not None else None, scale_c_fc1,
+                scale_gate_fc1, scale_c_fc2, num_experts, top_k, n_groups,
+                top_k_groups, intermediate_size, valid_hidden_size,
+                valid_intermediate_size, 0, num_experts, routed_scaling,
+                routing_method_type, act_type.value, topk_weights, topk_ids)
         else:
             raise ValueError("Invalid dtype_activation")
     torch.cuda.synchronize()
@@ -2711,6 +2735,41 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                        atol=0.0,
                        rtol=0.10,
                        percent=percent)
+
+
+@pytest.mark.skipif(
+    not (100 <= getSMVersion() < 110),
+    reason="The kernel requires Blackwell.",
+)
+@pytest.mark.parametrize(
+    "valid_hidden_size,valid_intermediate_size",
+    [(512, 352), (352, 512), (2880, 2880)],
+    ids=["h512_i352", "h352_i512", "h2880_i2880"],
+)
+def test_moe_mxe2m1_weights_valid_dimensions(valid_hidden_size,
+                                             valid_intermediate_size):
+    """Exercise C++ TMA alignment with lean sizes and zero-padded weights."""
+    # Reuse the direct-op reference without enabling the deprecated test matrix.
+    test_moe_mxe2m1_weights(
+        num_tokens=16,
+        hidden_size=((valid_hidden_size + 127) // 128) * 128,
+        intermediate_size=((valid_intermediate_size + 127) // 128) * 128,
+        routing_info={
+            "num_experts": 16,
+            "top_k": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+        },
+        dtype_activation="fp8",
+        act_type_str="SwiGlu",
+        use_autotune=True,
+        use_topk_as_input=False,
+        valid_hidden_size=valid_hidden_size,
+        valid_intermediate_size=valid_intermediate_size,
+    )
 
 
 @pytest.mark.skipif(

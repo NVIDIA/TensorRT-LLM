@@ -497,14 +497,6 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
     void* bmm1Workspace, bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex,
     int32_t validHiddenSize, int32_t validIntermediateSize)
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && (mDtypeAct == btg::Dtype::MxE4m3 || mDtypeAct == btg::Dtype::E4m3))
-    {
-        // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types.
-        // FIXME: MxE4m3 enforces valid hidden dim to be multiple of 512 due to unhandled OOB read in TMA routeAct;
-        // keep in sync with MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment in quantization.py.
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, mDtypeAct == btg::Dtype::MxE4m3 ? 512 : 128);
-        validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     int32_t intermediateSizeFactor = (is_gated_activation ? 2 : 1);
@@ -530,12 +522,6 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && (mDtypeAct == btg::Dtype::MxE4m3 || mDtypeAct == btg::Dtype::E4m3))
-    {
-        // Keep in sync with run().
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, mDtypeAct == btg::Dtype::MxE4m3 ? 512 : 128);
-        validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     return mRunner.getDefaultValidConfigIndex(numTokens, is_gated_activation ? 2 * intermediateSize : intermediateSize,
@@ -546,11 +532,6 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && (mDtypeAct == btg::Dtype::MxE4m3 || mDtypeAct == btg::Dtype::E4m3))
-    {
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, mDtypeAct == btg::Dtype::MxE4m3 ? 512 : 128);
-        validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens,
@@ -615,12 +596,6 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
     void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize,
     int32_t validIntermediateSize)
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && (mDtypeAct == btg::Dtype::MxE4m3 || mDtypeAct == btg::Dtype::E4m3))
-    {
-        // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 128);
-        validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     mRunner.run(numTokens, hiddenSize, intermediateSize, numTokens, validHiddenSize, validIntermediateSize, {},
         numTokens, numExperts, maxNumCgasInBatchDim, permutedHiddenState, permutedHiddenStateScale, weights,
@@ -642,12 +617,6 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && (mDtypeAct == btg::Dtype::MxE4m3 || mDtypeAct == btg::Dtype::E4m3))
-    {
-        // Keep in sync with run().
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 128);
-        validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     return mRunner.getDefaultValidConfigIndex(numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts,
         maxNumCgasInBatchDim, numTokens, validHiddenSize, validIntermediateSize);
@@ -656,11 +625,6 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && (mDtypeAct == btg::Dtype::MxE4m3 || mDtypeAct == btg::Dtype::E4m3))
-    {
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 128);
-        validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
-    }
     auto const maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens, hiddenSize, intermediateSize, {}, numTokens,
