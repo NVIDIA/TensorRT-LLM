@@ -5300,6 +5300,7 @@ class TransferWorker:
                 return
 
             def recover() -> None:
+                generation = self._sender._agent_generation
                 started_at = time.monotonic()
                 while not self._agent_recovery_stop.is_set():
                     try:
@@ -5314,6 +5315,9 @@ class TransferWorker:
                         ):
                             self._agent_recovery_thread = None
                             return
+                        if generation != self._sender._agent_generation:
+                            generation = self._sender._agent_generation
+                            started_at = time.monotonic()
                     remaining = self._sender._retirement_timeout_s - (time.monotonic() - started_at)
                     if remaining <= 0:
                         self._sender._fail_agent_recovery(

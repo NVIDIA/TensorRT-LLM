@@ -660,7 +660,9 @@ def test_shutdown_drains_a_new_failed_generation_before_recovery_thread_exits():
 
     sender._recover_agent = request_recovery
     task = make_task()
+    clock = [0.0]
     with (
+        patch.object(transfer.time, "monotonic", side_effect=lambda: clock[0]),
         patch.object(transfer.torch.cuda, "set_device"),
         patch.object(transfer.cudart, "cudaSetDevice", return_value=0),
         patch.object(transfer, "CUASSERT"),
@@ -676,6 +678,7 @@ def test_shutdown_drains_a_new_failed_generation_before_recovery_thread_exits():
                 sender._submit_transfer, task, 11, make_request(), agent_generation=1
             )
             assert rooted.wait(2)
+            clock[0] = sender._retirement_timeout_s
             worker.request_shutdown()
             resume.set()
             assert pending.result(timeout=3)[0] is False
