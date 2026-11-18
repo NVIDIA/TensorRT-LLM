@@ -397,10 +397,15 @@ directory, copy the contents of the package's artifact directory into it first;
 installing the package alone does not populate that directory.
 
 Alternatively, populate the explicit directory with an online warm-up run using
-the same directory. Then set `FLASHINFER_NO_DOWNLOAD=1` so a
-missing artifact fails instead of being downloaded concurrently into the shared
-directory. This also makes the pre-populated artifacts available to new replica
-slots. Alternatively, set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` to retain
+the same directory. For the offline session, set `FLASHINFER_NO_DOWNLOAD=1`
+before starting the process that creates MPI pools, so a missing artifact fails
+instead of being downloaded concurrently into the shared directory. If the
+current process has already created an MPI pool, start a fresh process with the
+flag already set; later pools may otherwise inherit the earlier environment.
+
+Using the explicit directory also makes the pre-populated artifacts available
+to new replica slots. Alternatively, set
+`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` to retain
 the shared default cache (`~/.cache/flashinfer`, or
 `$TRTLLM_CACHE_DIR/flashinfer` when configured); concurrent writers can contend
 in that cache.
