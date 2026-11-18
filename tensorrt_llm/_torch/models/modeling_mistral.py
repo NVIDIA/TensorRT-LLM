@@ -834,6 +834,11 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
     def get_vocab_size(self) -> int:
         return self.config.get_text_config().vocab_size
 
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        # mistral-common encodes PIL images, so the decoded image is passed on
+        # as loaded; other formats are converted back to PIL first.
+        return {"image": {"format": "pil"}}
+
     def get_mm_token_ids(self) -> torch.Tensor:
         return torch.tensor([
             self.processor.image_token_id,

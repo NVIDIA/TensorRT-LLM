@@ -103,6 +103,22 @@ def test_an_unknown_type_is_refused():
         _to_pil([1, 2, 3])
 
 
+@pytest.mark.parametrize("encoding", ["JPEG", "PNG"])
+def test_the_preferred_loader_hands_over_the_pil_image_used_as_loaded(encoding):
+    """The media loader format the processor asks for yields a PIL image, used as loaded."""
+    from tensorrt_llm._torch.models.modeling_mistral import MistralNativeInputProcessor
+    from tensorrt_llm.inputs.media_io import ImageMediaIO
+
+    preferred = MistralNativeInputProcessor.__new__(
+        MistralNativeInputProcessor
+    ).get_preferred_media_io_kwargs()
+    buffer = BytesIO()
+    _rgb(3).save(buffer, encoding)
+    loaded = ImageMediaIO.create(preferred.get("image"), None).load_bytes(buffer.getvalue())
+    assert isinstance(loaded, Image.Image)
+    assert _to_pil(loaded) is loaded
+
+
 @pytest.fixture(scope="module")
 def native_processor():
     pytest.importorskip("cv2")
@@ -136,7 +152,8 @@ def test_pixels_are_what_mistral_common_makes_of_the_loaded_image(
 ):
     """Nothing lies between the loaded image and mistral-common's resize and normalize.
 
-    The server loads images as ``pt`` tensors; no image is serialized on the way.
+    The server loads PIL images; other callers may pass ``pt`` tensors. No image is
+    serialized on the way.
     """
     from mistral_common.protocol.instruct.chunk import ImageChunk
 
