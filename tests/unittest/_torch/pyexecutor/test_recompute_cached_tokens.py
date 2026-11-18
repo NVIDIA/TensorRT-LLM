@@ -110,6 +110,31 @@ def test_executor_response_reports_the_first_prefill_cached_tokens(
     assert response.result.cached_tokens == 8
 
 
+def test_context_cancellation_response_reports_the_first_prefill_cached_tokens() -> None:
+    req = _first_token_after_recompute()
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [req]
+    executor.canceled_req_ids = [req.py_request_id]
+    executor.kv_cache_transceiver = MagicMock()
+    executor.kv_connector_manager = None
+    executor.previous_batch = None
+    executor.inflight_req_ids = set()
+    executor.async_transfer_manager = MagicMock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {}
+    executor._disagg_coordinator = MagicMock()
+    executor.disagg.supports_logical_context_cancellation.return_value = True
+    executor.disagg.request_logical_context_cancellation.return_value = True
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor._flush_pending_transfer_responses = MagicMock()
+
+    assert executor._progress_context_cancellations([]) == []
+
+    ((request_id, response),) = executor._pending_transfer_responses
+    assert request_id == req.py_request_id
+    assert response.result.cached_tokens == 8
+
+
 @pytest.mark.parametrize("first_reuse", [0, 8], ids=["cold_cache", "prefix_hit"])
 def test_kv_cache_aware_router_counts_the_recompute_prefill(first_reuse: int) -> None:
     req = _recomputed_request(first_reuse)

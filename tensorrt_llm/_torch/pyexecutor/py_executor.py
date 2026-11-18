@@ -12680,7 +12680,7 @@ class PyExecutor:
             request.decoding_iter = request.py_decoding_iter
             response = request.create_response()
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens = request.reported_cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
