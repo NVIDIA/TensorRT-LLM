@@ -314,6 +314,8 @@ def test_prequantized_matches_sdpa(out_fp8):
     batch, seq, heads = 2, 1560, 40
     trtllm = _backend("TRTLLM", heads)
     assert trtllm.accepts_fp8_qkv()
+    # SM107 ships the e4m3-output kernel for head_dim 128.
+    assert trtllm.accepts_fp8_qkv(fp8_output=True)
     q, k, v = _qkv(batch, seq, heads, seed=1)
     qk_mul = math.sqrt(math.log2(math.e) / math.sqrt(HEAD_DIM))
     v_descale = (v.float().abs().amax() / E4M3_MAX).reshape(1)

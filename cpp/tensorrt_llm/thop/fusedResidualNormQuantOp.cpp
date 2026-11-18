@@ -34,14 +34,16 @@ namespace
 
 namespace tk = tensorrt_llm::kernels;
 
-void checkContiguousAligned(torch::Tensor const& t, char const* name)
+void checkContiguousAligned(torch::Tensor const& t, char const* name, c10::Device device)
 {
     TORCH_CHECK(t.is_cuda() && t.is_contiguous(), name, " must be a contiguous CUDA tensor");
+    TORCH_CHECK(t.device() == device, name, " must be on the device of x");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, name, " must be 16-byte aligned");
 }
 
 // fp32 tensor of `rows` x hidden elements (rows = 1 for per-channel tensors).
-float const* fp32Rows(c10::optional<torch::Tensor> const& t, int64_t rows, int64_t hidden, char const* name)
+float const* fp32Rows(
+    c10::optional<torch::Tensor> const& t, int64_t rows, int64_t hidden, char const* name, c10::Device device)
 {
     if (!t.has_value())
     {
@@ -49,7 +51,7 @@ float const* fp32Rows(c10::optional<torch::Tensor> const& t, int64_t rows, int64
     }
     TORCH_CHECK(t->scalar_type() == torch::kFloat32, name, " must be float32");
     TORCH_CHECK(t->numel() == rows * hidden, name, " must have ", rows * hidden, " elements, got ", t->numel());
-    checkContiguousAligned(*t, name);
+    checkContiguousAligned(*t, name, device);
     return t->data_ptr<float>();
 }
 
@@ -69,7 +71,7 @@ std::tuple<torch::Tensor, torch::Tensor> fused_residual_norm_quant(torch::Tensor
 {
     TORCH_CHECK(mode >= 0 && mode <= 2, "fused_residual_norm_quant: mode must be 0, 1 or 2");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
-    checkContiguousAligned(x, "x");
+    checkContiguousAligned(x, "x", x.device());
     TORCH_CHECK(x.dim() >= 1 && x.size(-1) > 0, "fused_residual_norm_quant: x must have a non-empty last dimension");
     int64_t const hidden = x.size(-1);
     int64_t const rows = x.numel() / hidden;
@@ -89,24 +91,24 @@ std::tuple<torch::Tensor, torch::Tensor> fused_residual_norm_quant(torch::Tensor
     {
         TORCH_CHECK(
             y->scalar_type() == torch::kBFloat16 && y->sizes() == x.sizes(), "y must be bfloat16 shaped like x");
-        checkContiguousAligned(*y, "y");
+        checkContiguousAligned(*y, "y", x.device());
         p.y = y->data_ptr();
     }
     if (y_bias.has_value())
     {
         TORCH_CHECK(
             y_bias->scalar_type() == torch::kBFloat16 && y_bias->numel() == hidden, "y_bias must be bfloat16 [hidden]");
-        checkContiguousAligned(*y_bias, "y_bias");
+        checkContiguousAligned(*y_bias, "y_bias", x.device());
         p.y_bias = y_bias->data_ptr();
     }
-    p.gate = fp32Rows(gate, batch, hidden, "gate");
+    p.gate = fp32Rows(gate, batch, hidden, "gate", x.device());
     int64_t const modRows = mode == 2 ? batch : 1;
     if (normalizes)
     {
         TORCH_CHECK(weight.has_value() && bias.has_value() && inv_out_scale.has_value(),
             "modes 1 and 2 need weight, bias and inv_out_scale");
-        p.weight = fp32Rows(weight, modRows, hidden, "weight");
-        p.bias = fp32Rows(bias, modRows, hidden, "bias");
+        p.weight = fp32Rows(weight, modRows, hidden, "weight", x.device());
+        p.bias = fp32Rows(bias, modRows, hidden, "bias", x.device());
         TORCH_CHECK(inv_out_scale->scalar_type() == torch::kFloat32 && inv_out_scale->numel() == 1,
             "inv_out_scale must be float32 [1]");
         TORCH_CHECK(inv_out_scale->is_cuda() && inv_out_scale->device() == x.device(),

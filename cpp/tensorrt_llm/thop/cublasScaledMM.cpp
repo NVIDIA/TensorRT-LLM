@@ -363,6 +363,8 @@ void cublaslt_fp8_epilogue_gemm(Tensor& out, Tensor const& a, Tensor const& b, T
             "cublas_scaled_mm: d_scale must be float32 [1]");
     }
     TORCH_CHECK(scale_a.numel() == 1 && scale_b.numel() == 1, "cublas_scaled_mm epilogues need per-tensor scales");
+    TORCH_CHECK(scale_a.scalar_type() == torch::kFloat32 && scale_b.scalar_type() == torch::kFloat32,
+        "cublas_scaled_mm epilogues need float32 scales");
 
     at::cuda::CUDAGuard deviceGuard(a.device());
     auto const handle = getCublasWrapper()->getCublasLtHandle();
@@ -402,6 +404,7 @@ void cublaslt_fp8_epilogue_gemm(Tensor& out, Tensor const& a, Tensor const& b, T
     if (bias.has_value())
     {
         TORCH_CHECK(bias->numel() == n && bias->is_contiguous(), "bias must be contiguous [n]");
+        TORCH_CHECK(bias->is_cuda() && bias->device() == a.device(), "bias must be on the device of mat_a");
         biasType = convert_torch_dtype(bias->scalar_type());
         void const* biasPtr = bias->data_ptr();
         check_cuda_error(
@@ -447,7 +450,8 @@ void cublaslt_fp8_epilogue_gemm(Tensor& out, Tensor const& a, Tensor const& b, T
             check_cuda_error(cublasLtMatmulAlgoGetHeuristic(
                 handle, op, layoutA.get(), layoutB.get(), layoutC.get(), layoutD.get(), pref, 1, &result, &found));
             check_cuda_error(cublasLtMatmulPreferenceDestroy(pref));
-            TORCH_CHECK(found > 0, "cublas_scaled_mm: no cuBLASLt algorithm for m=", m, " n=", n, " k=", k,
+            TORCH_CHECK(found > 0 && result.state == CUBLAS_STATUS_SUCCESS,
+                "cublas_scaled_mm: no cuBLASLt algorithm for m=", m, " n=", n, " k=", k,
                 " epilogue=", static_cast<int>(epi));
             it = algos.emplace(key, result.algo).first;
         }

@@ -119,8 +119,11 @@ class Fmha(ABC):
         """
         return True
 
-    def supports_prequantized_fp8(self) -> bool:
-        """Whether ``run_prequantized`` serves this layer's head layout on this device."""
+    def supports_prequantized_fp8(self, fp8_output: bool = False) -> bool:
+        """Whether ``run_prequantized`` serves this layer's head layout on this device.
+
+        With ``fp8_output``, whether it also writes an e4m3 output (``out_scale`` given).
+        """
         return False
 
     def run_prequantized(

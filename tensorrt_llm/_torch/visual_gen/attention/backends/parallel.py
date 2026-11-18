@@ -901,9 +901,9 @@ class UlyssesAttention(AttentionBackend):
     ) -> bool:
         return self.inner_backend.support_kv_cache_page_size(tokens_per_page, dtype)
 
-    def accepts_fp8_qkv(self) -> bool:
+    def accepts_fp8_qkv(self, fp8_output: bool = False) -> bool:
         """FP8 Q/K/V pass through when the inner backend takes them and no side stream is used."""
-        return self._async_side_stream is None and self.inner_backend.accepts_fp8_qkv()
+        return self._async_side_stream is None and self.inner_backend.accepts_fp8_qkv(fp8_output)
 
     def fp8_v_amax(self, qkv: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
         """|V| maximum over the Ulysses group, so every rank quantizes V with one scale."""

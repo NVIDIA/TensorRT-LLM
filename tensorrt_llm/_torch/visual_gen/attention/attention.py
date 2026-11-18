@@ -669,10 +669,15 @@ class Attention(nn.Module):
     def enable_fp8_output(self) -> bool:
         """Quantize the FP8 attention output to e4m3 with to_out's static input scale, so to_out
         skips its own quantization. Call after weights are loaded; returns whether it applies
-        (FP8 Q/K/V producer on and a static FP8 to_out)."""
+        (FP8 Q/K/V producer on, an e4m3-output kernel for this head layout and a static FP8
+        to_out)."""
         to_out = self.to_out[0]
         self._fp8_out_scale = None
-        if self._fp8_qkv_producer and to_out.quant_method.supports_cublas_epilogues(to_out):
+        if (
+            self._fp8_qkv_producer
+            and self.attn.accepts_fp8_qkv(fp8_output=True)
+            and to_out.quant_method.supports_cublas_epilogues(to_out)
+        ):
             self._fp8_out_scale = to_out.input_scale
         return self._fp8_out_scale is not None
 

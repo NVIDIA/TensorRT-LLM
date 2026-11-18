@@ -197,6 +197,11 @@ class TrtllmGenDenseFp8Fmha(Fmha):
         attn = self.attn
         batch_size = int(metadata.num_contexts)
         seq_len = int(metadata.max_seq_len)
+        # Library selection is cached without sequence lengths, so a ragged batch can reach
+        # this path on a cache hit. Re-check before the uniform-length kernel call.
+        host_lens = metadata.prompt_lens_cpu_runtime[:batch_size]
+        if q.shape[0] != batch_size * seq_len or not bool((host_lens == seq_len).all()):
+            raise RuntimeError("trtllm-gen dense FP8 attention requires uniform sequence lengths.")
         num_heads, head_dim = attn.num_heads, attn.head_dim
         tokens = q.shape[0]
         q8, q_descale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(q)
@@ -217,10 +222,12 @@ class TrtllmGenDenseFp8Fmha(Fmha):
         )
         forward_args.output.view(tokens, num_heads, head_dim).copy_(out)
 
-    def supports_prequantized_fp8(self) -> bool:
-        """Whether a kernel takes e4m3 Q/K/V with the softmax scale folded into Q and K."""
+    def supports_prequantized_fp8(self, fp8_output: bool = False) -> bool:
+        """Whether a kernel takes e4m3 Q/K/V with the softmax scale folded into Q and K, and
+        with ``fp8_output`` writes an e4m3 output."""
         attn = self.attn
-        return dense_fp8_supported(attn.head_dim, attn.num_heads, torch.bfloat16, True)
+        out_dtype = torch.float8_e4m3fn if fp8_output else torch.bfloat16
+        return dense_fp8_supported(attn.head_dim, attn.num_heads, out_dtype, True)
 
     def run_prequantized(
         self,

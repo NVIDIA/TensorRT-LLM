@@ -521,6 +521,13 @@ class WanBlock(nn.Module):
         the FFN up-projection GELU with FP8 output, and FP8 attention output into to_out.
         """
         attn1, attn2, ffn = self.attn1, self.attn2, self.ffn
+        # Start from the unfused state, so a rejected or failed plan leaves no fusion enabled.
+        self._fp8_block = False
+        ffn._use_fp8_gelu_fusion = False
+        attn1._fp8_out_scale = None
+        for linear in (getattr(attn1, "qkv_proj", None), getattr(attn2, "to_q", None)):
+            if linear is not None:
+                linear._fp8_fuse_bias = False
         linears = {
             "attn1.qkv_proj": getattr(attn1, "qkv_proj", None),
             "attn1.to_out": attn1.to_out[0],
@@ -636,7 +643,13 @@ class WanBlock(nn.Module):
                     self.scale_shift_table.float() + temb.float()
                 ).chunk(6, dim=1)
 
-        fp8_block = self._fp8_block and pertoken_adaln is None and temb.ndim == 3
+        # The fused row kernels take one modulation row per batch entry of x.
+        fp8_block = (
+            self._fp8_block
+            and pertoken_adaln is None
+            and temb.ndim == 3
+            and temb.shape[0] == x.shape[0]
+        )
         seq_len = x.shape[1]
         if fp8_block:
             # AdaLN1 + static FP8 quantization for the QKV projection.

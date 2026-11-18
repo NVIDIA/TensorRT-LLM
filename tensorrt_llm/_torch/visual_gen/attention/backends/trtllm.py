@@ -880,9 +880,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         full[num_tokens:].zero_()
         return full
 
-    def accepts_fp8_qkv(self) -> bool:
-        """Whether the dense FP8 library takes prequantized Q/K/V for this layer."""
-        return self._prequantized_fp8_lib is not None
+    def accepts_fp8_qkv(self, fp8_output: bool = False) -> bool:
+        """Whether the dense FP8 library takes prequantized Q/K/V (and writes e4m3 output)."""
+        lib = self._prequantized_fp8_lib
+        return lib is not None and (not fp8_output or lib.supports_prequantized_fp8(fp8_output))
 
     def forward_fp8(
         self,

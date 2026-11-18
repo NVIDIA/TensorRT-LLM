@@ -138,8 +138,11 @@ class AttentionBackend(ABC):
     def support_fused_qkv(cls) -> bool:
         return False
 
-    def accepts_fp8_qkv(self) -> bool:
-        """Whether ``forward_fp8`` serves per-tensor e4m3 Q/K/V with the softmax scale in Q/K."""
+    def accepts_fp8_qkv(self, fp8_output: bool = False) -> bool:
+        """Whether ``forward_fp8`` serves per-tensor e4m3 Q/K/V with the softmax scale in Q/K.
+
+        With ``fp8_output``, whether it also returns an e4m3 output when given ``out_scale``.
+        """
         return False
 
     def fp8_v_amax(self, qkv: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor | None:
