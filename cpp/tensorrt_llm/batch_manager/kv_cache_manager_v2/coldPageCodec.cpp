@@ -22,9 +22,12 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -33,12 +36,90 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
+//! One byte range of a hot slot kept in the cold page.
+struct CopySegment
+{
+    size_t hotOffset;
+    size_t coldOffset;
+    size_t bytes;
+};
+
 struct PoolCopyPlan
 {
     std::byte* hotBase;
     size_t hotPageBytes;
+    //! Ranges of the hot slot stored in the cold page, at coldPageOffset + segment.coldOffset.
+    //! One segment covering the whole slot unless a keep-segment spec matches the pool.
+    std::vector<CopySegment> segments;
     size_t coldPageOffset;
 };
+
+//! A pool holding exactly one buffer of `role` and `bufferBytes` a slot keeps only `segments`
+//! (hot offset, bytes) in the cold tier; the rest of the slot is not stored and is undefined
+//! after a decode. Set by the owner of that buffer's layout, which knows which bytes are dead
+//! once a page leaves the hot tier (TRTLLM_KVCM2_COLD_KEEP_SEGMENTS="role:bufferBytes:off+len,...").
+struct KeepSegmentSpec
+{
+    std::string role;
+    size_t bufferBytes = 0;
+    std::vector<std::pair<size_t, size_t>> segments;
+};
+
+std::optional<KeepSegmentSpec> parseKeepSegmentSpec()
+{
+    char const* const env = std::getenv("TRTLLM_KVCM2_COLD_KEEP_SEGMENTS");
+    if (env == nullptr || *env == '\0')
+    {
+        return std::nullopt;
+    }
+    std::string const text(env);
+    auto const first = text.find(':');
+    auto const second = first == std::string::npos ? std::string::npos : text.find(':', first + 1);
+    TLLM_CHECK_WITH_INFO(
+        second != std::string::npos, "TRTLLM_KVCM2_COLD_KEEP_SEGMENTS must be role:bufferBytes:off+len,...: %s", env);
+    KeepSegmentSpec spec;
+    spec.role = text.substr(0, first);
+    spec.bufferBytes = std::stoull(text.substr(first + 1, second - first - 1));
+    size_t pos = second + 1;
+    size_t end = 0;
+    while (pos < text.size())
+    {
+        auto const comma = text.find(',', pos);
+        std::string const item = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        auto const plus = item.find('+');
+        TLLM_CHECK_WITH_INFO(plus != std::string::npos, "Bad keep segment '%s' in %s", item.c_str(), env);
+        size_t const offset = std::stoull(item.substr(0, plus));
+        size_t const bytes = std::stoull(item.substr(plus + 1));
+        // The copy paths move 16-byte vectors; segments must be ordered and disjoint.
+        TLLM_CHECK_WITH_INFO(
+            offset % 16 == 0 && bytes % 16 == 0 && bytes > 0 && offset >= end && offset + bytes <= spec.bufferBytes,
+            "Keep segment '%s' must be 16-byte aligned, ordered and inside the buffer: %s", item.c_str(), env);
+        spec.segments.emplace_back(offset, bytes);
+        end = offset + bytes;
+        if (comma == std::string::npos)
+        {
+            break;
+        }
+        pos = comma + 1;
+    }
+    TLLM_CHECK_WITH_INFO(!spec.segments.empty(), "TRTLLM_KVCM2_COLD_KEEP_SEGMENTS has no segments: %s", env);
+    return spec;
+}
+
+//! Whether every life cycle of the group stores exactly one `spec` buffer in `poolIndex`.
+bool poolMatchesSpec(PoolGroupDesc const& gpuDesc, PoolIndex poolIndex, KeepSegmentSpec const& spec)
+{
+    for (auto const& variant : gpuDesc.slotDesc.variants)
+    {
+        CoalescedBuffer const& buffers = variant.coalescedBuffers.at(poolIndex);
+        if (buffers.numBuffers() != 1 || buffers.singleBufferSize != spec.bufferBytes
+            || buffers.bufferIds.front().role != spec.role)
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 class ConcatKvCacheColdPageCodec final : public IKvCacheColdPageCodec
 {
@@ -147,6 +228,7 @@ private:
             }
         }
 
+        std::optional<KeepSegmentSpec> const keepSpec = parseKeepSegmentSpec();
         TypedVec<PoolGroupIndex, std::unique_ptr<GroupConfig>> groups(numGpuDescs);
         TypedVec<LifeCycleId, PoolGroupIndex> lifeCycleToGroup(numLifeCycles, PoolGroupIndex{-1});
         for (PoolGroupIndex poolGroupIndex{0}; poolGroupIndex < numGpuDescs; ++poolGroupIndex)
@@ -161,9 +243,30 @@ private:
                 PoolDesc const& pool = gpuDesc.pools.at(poolIndex);
                 TLLM_CHECK(pool.poolIndex == poolIndex && pool.baseAddress != 0 && pool.slotBytes > 0
                     && pool.slotBytes <= std::numeric_limits<size_t>::max() - coldOffset);
-                copyPlans.push_back(
-                    PoolCopyPlan{reinterpret_cast<std::byte*>(pool.baseAddress), pool.slotBytes, coldOffset});
-                coldOffset += pool.slotBytes;
+                std::vector<CopySegment> segments;
+                size_t coldBytes = 0;
+                if (keepSpec && pool.slotBytes == keepSpec->bufferBytes
+                    && poolMatchesSpec(gpuDesc, poolIndex, *keepSpec))
+                {
+                    for (auto const& [hotOffset, bytes] : keepSpec->segments)
+                    {
+                        segments.push_back(CopySegment{hotOffset, coldBytes, bytes});
+                        coldBytes += bytes;
+                    }
+                    TLLM_LOG_INFO(
+                        "KVCM2 cold-page codec: pool group %d pool %d (%s) keeps %zu of %zu bytes a slot "
+                        "in %zu segment(s)",
+                        poolGroupIndex.value(), poolIndex.value(), keepSpec->role.c_str(), coldBytes, pool.slotBytes,
+                        segments.size());
+                }
+                else
+                {
+                    segments.push_back(CopySegment{0, 0, pool.slotBytes});
+                    coldBytes = pool.slotBytes;
+                }
+                copyPlans.push_back(PoolCopyPlan{
+                    reinterpret_cast<std::byte*>(pool.baseAddress), pool.slotBytes, std::move(segments), coldOffset});
+                coldOffset += coldBytes;
             }
 
             LayerGroupId batchingLayerGroupId = gpuDesc.slotDesc.variants.front().lifeCycleId;
@@ -237,27 +340,32 @@ private:
             TLLM_CHECK(numBasePages <= std::numeric_limits<uint32_t>::max());
             for (PoolCopyPlan const& plan : group->copyPlans)
             {
-                TLLM_CHECK(plan.hotPageBytes <= std::numeric_limits<uint32_t>::max());
-                PoolCopyArgs args{};
-                args.bytesPerPage = static_cast<uint32_t>(plan.hotPageBytes);
-                args.pairs = pageIndices;
-                args.numPairs = static_cast<uint32_t>(numBasePages);
-                if constexpr (isEncode)
+                for (CopySegment const& segment : plan.segments)
                 {
-                    args.dstBase = reinterpret_cast<CUdeviceptr>(coldDstBase + plan.coldPageOffset);
-                    args.dstStride = group->coldPageBytes;
-                    args.srcBase = reinterpret_cast<CUdeviceptr>(plan.hotBase);
-                    args.srcStride = plan.hotPageBytes;
+                    TLLM_CHECK(segment.bytes <= std::numeric_limits<uint32_t>::max());
+                    PoolCopyArgs args{};
+                    args.bytesPerPage = static_cast<uint32_t>(segment.bytes);
+                    args.pairs = pageIndices;
+                    args.numPairs = static_cast<uint32_t>(numBasePages);
+                    std::byte* const hot = plan.hotBase + segment.hotOffset;
+                    size_t const coldOffset = plan.coldPageOffset + segment.coldOffset;
+                    if constexpr (isEncode)
+                    {
+                        args.dstBase = reinterpret_cast<CUdeviceptr>(coldDstBase + coldOffset);
+                        args.dstStride = group->coldPageBytes;
+                        args.srcBase = reinterpret_cast<CUdeviceptr>(hot);
+                        args.srcStride = plan.hotPageBytes;
+                    }
+                    else
+                    {
+                        args.dstBase = reinterpret_cast<CUdeviceptr>(hot);
+                        args.dstStride = plan.hotPageBytes;
+                        args.srcBase = reinterpret_cast<CUdeviceptr>(coldSrcBase + coldOffset);
+                        args.srcStride = group->coldPageBytes;
+                    }
+                    mCopier.launch(
+                        args, isEncode ? CopyDirection::kD2H : CopyDirection::kH2D, reinterpret_cast<CUstream>(stream));
                 }
-                else
-                {
-                    args.dstBase = reinterpret_cast<CUdeviceptr>(plan.hotBase);
-                    args.dstStride = plan.hotPageBytes;
-                    args.srcBase = reinterpret_cast<CUdeviceptr>(coldSrcBase + plan.coldPageOffset);
-                    args.srcStride = group->coldPageBytes;
-                }
-                mCopier.launch(
-                    args, isEncode ? CopyDirection::kD2H : CopyDirection::kH2D, reinterpret_cast<CUstream>(stream));
             }
         }
         return true;

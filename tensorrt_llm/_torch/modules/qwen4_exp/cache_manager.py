@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 import sys
 from dataclasses import replace
 from functools import cached_property
@@ -59,6 +60,15 @@ _NVFP4_BLOCK_SIZE = 16
 _SIDE_PLANES_SIZE_STEP = 16
 _INDEX_K_ELEMENT_BYTES = torch.empty((), dtype=QSA_INDEX_K_CACHE_DTYPE).element_size()
 _POSITION_ELEMENT_BYTES = torch.empty((), dtype=QSA_POSITION_CACHE_DTYPE).element_size()
+_COLD_DROP_RAW_INDEX_ROWS_ENV = "TRTLLM_QSA_COLD_DROP_RAW_INDEX_ROWS"
+_COLD_KEEP_SEGMENTS_ENV = "TRTLLM_KVCM2_COLD_KEEP_SEGMENTS"
+
+
+def _cold_drop_raw_index_rows() -> bool:
+    """Whether compact index pages leave their dead raw rows out of the host tier."""
+    value = os.environ.get(_COLD_DROP_RAW_INDEX_ROWS_ENV, "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
 
 # Per-token RoPE/mRoPE coordinates used when raw index keys are compressed.
 # They are request state shared by all local QSA layers.
@@ -321,6 +331,10 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             while packed_size in main_page_sizes:
                 packed_size += _SIDE_PLANES_SIZE_STEP
             self.qsa_side_planes_size = packed_size
+            if self.qsa_index_compact and _cold_drop_raw_index_rows():
+                self._publish_cold_keep_segments(
+                    tokens_per_block, len(local_sparse_layers), index_size, position_size
+                )
             return {position_local_idx: [BufferConfig(role=QSA_SIDE_PLANES, size=packed_size)]}
         if self.qsa_index_compact:
             raise ValueError(
@@ -333,6 +347,34 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         }
         result[position_local_idx].append(BufferConfig(role=QSA_INDEX_POSITION, size=position_size))
         return result
+
+    def _publish_cold_keep_segments(
+        self, tokens_per_block: int, num_layers: int, index_size: int, position_size: int
+    ) -> None:
+        """Store only the live rows of the packed side page in the host tier.
+
+        A compact index page holds the page's compressed keys in its first rows and the raw
+        keys of not yet pooled groups after them (`index_plane_layout`). Once every group of a
+        page is complete its raw rows are dead, and every reuse point is a group edge, so a
+        page leaving the device keeps its compressed rows and the position plane only. A
+        request that will still write into its last group must not have that page moved to
+        the host tier: true on a context server (a request is suspended only on its first
+        chunk or after a chunk, both group edges, and is done after its last one), not on a
+        generation server (opt-in env `TRTLLM_QSA_COLD_DROP_RAW_INDEX_ROWS`, context only).
+        """
+        groups = tokens_per_block // self.qsa_compress_ratio
+        kept = groups * self.qsa_index_kv_heads * self.qsa_index_dim * _INDEX_K_ELEMENT_BYTES
+        segments = [(layer * index_size, kept) for layer in range(num_layers)]
+        segments.append((num_layers * index_size, position_size))
+        spec = f"{QSA_SIDE_PLANES}:{self.qsa_side_planes_size}:" + ",".join(
+            f"{offset}+{size}" for offset, size in segments
+        )
+        os.environ[_COLD_KEEP_SEGMENTS_ENV] = spec
+        kept_bytes = sum(size for _, size in segments)
+        logger.info(
+            f"QSA compact index pages: the host tier keeps {kept_bytes} of "
+            f"{self.qsa_side_planes_size} side-plane bytes a page ({_COLD_KEEP_SEGMENTS_ENV}={spec})"
+        )
 
     @override
     def get_index_k_buffer(

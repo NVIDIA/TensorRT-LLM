@@ -24,6 +24,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -336,6 +337,83 @@ TEST(KvCacheManagerV2DefaultColdPageCodecTest, ValidatesHostIndexArgumentsBefore
     EXPECT_FALSE(codec->decode(LifeCycleId{0}, cold.get(), &validIndex, 1, nullptr));
     EXPECT_TRUE(codec->decode(LifeCycleId{0}, nullptr, nullptr, 0, nullptr));
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerV2DefaultColdPageCodecTest, KeepSegmentsStoreOnlyListedBytesOfAMatchingPool)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    constexpr size_t kNumSlots = 257;
+    constexpr size_t kPool0Bytes = 96; // "side": keeps [0, 32) and [64, 80)
+    constexpr size_t kPool1Bytes = 48; // "value": kept whole
+    constexpr size_t kKeptBytes = 32 + 16;
+    CudaAllocation pool0 = allocateCuda(kPool0Bytes * kNumSlots);
+    CudaAllocation pool1 = allocateCuda(kPool1Bytes * kNumSlots);
+    CudaAllocation cold = allocateCuda((kKeptBytes + kPool1Bytes) * kNumSlots);
+    ASSERT_NE(pool0, nullptr);
+    ASSERT_NE(pool1, nullptr);
+    ASSERT_NE(cold, nullptr);
+    std::vector<uint8_t> const pool0Input = makePattern(kPool0Bytes, kNumSlots, 3);
+    std::vector<uint8_t> const pool1Input = makePattern(kPool1Bytes, kNumSlots, 5);
+    ASSERT_EQ(cudaMemcpy(pool0.get(), pool0Input.data(), pool0Input.size(), cudaMemcpyHostToDevice), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(pool1.get(), pool1Input.data(), pool1Input.size(), cudaMemcpyHostToDevice), cudaSuccess);
+
+    SlotDescVariant variant0{LifeCycleId{0},
+        TypedVec<PoolIndex, CoalescedBuffer>{
+            makeCoalescedBuffer(kPool0Bytes, 0, "side"), makeCoalescedBuffer(kPool1Bytes, 0, "value")}};
+    SlotDescVariant variant1{LifeCycleId{1},
+        TypedVec<PoolIndex, CoalescedBuffer>{
+            makeCoalescedBuffer(kPool0Bytes, 1, "side"), makeCoalescedBuffer(kPool1Bytes, 1, "value")}};
+    PoolGroupDesc const desc{PoolGroupIndex{0}, static_cast<SlotCount>(kNumSlots),
+        SlotDesc{{std::move(variant0), std::move(variant1)}},
+        TypedVec<PoolIndex, PoolDesc>{PoolDesc{PoolIndex{0}, reinterpret_cast<MemAddress>(pool0.get()), kPool0Bytes},
+            PoolDesc{PoolIndex{1}, reinterpret_cast<MemAddress>(pool1.get()), kPool1Bytes}}};
+
+    ASSERT_EQ(setenv("TRTLLM_KVCM2_COLD_KEEP_SEGMENTS", "side:96:0+32,64+16", 1), 0);
+    auto codec = createDefaultKvCacheColdPageCodec();
+    bool const configured = configureOne(*codec, desc);
+    ASSERT_EQ(unsetenv("TRTLLM_KVCM2_COLD_KEEP_SEGMENTS"), 0);
+    ASSERT_TRUE(configured);
+    EXPECT_EQ(codec->queryColdPageBytes(LifeCycleId{0}), kKeptBytes + kPool1Bytes);
+
+    std::vector<PageIndexPair> encodePairs(kNumSlots);
+    std::vector<PageIndexPair> decodePairs(kNumSlots);
+    for (size_t index = 0; index < kNumSlots; ++index)
+    {
+        int32_t const hot = static_cast<int32_t>((index * 31) % kNumSlots);
+        int32_t const coldIndex = static_cast<int32_t>(kNumSlots - 1 - index);
+        encodePairs[index] = PageIndexPair{coldIndex, hot};
+        decodePairs[index] = PageIndexPair{hot, coldIndex};
+    }
+    auto const location = codec->queryPageIndexLocation(LifeCycleId{0});
+    auto encodeIndices = preparePageIndices(location, encodePairs.data(), encodePairs.size());
+    auto decodeIndices = preparePageIndices(location, decodePairs.data(), decodePairs.size());
+    ASSERT_NE(encodeIndices.data, nullptr);
+    ASSERT_NE(decodeIndices.data, nullptr);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    ASSERT_TRUE(codec->encode(LifeCycleId{0}, cold.get(), encodeIndices.data, kNumSlots, stream));
+    ASSERT_EQ(cudaMemsetAsync(pool0.get(), 0, pool0Input.size(), stream), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(pool1.get(), 0, pool1Input.size(), stream), cudaSuccess);
+    ASSERT_TRUE(codec->decode(LifeCycleId{0}, cold.get(), decodeIndices.data, kNumSlots, stream));
+    std::vector<uint8_t> pool0Output(pool0Input.size());
+    std::vector<uint8_t> pool1Output(pool1Input.size());
+    ASSERT_EQ(cudaMemcpyAsync(pool0Output.data(), pool0.get(), pool0Output.size(), cudaMemcpyDeviceToHost, stream),
+        cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(pool1Output.data(), pool1.get(), pool1Output.size(), cudaMemcpyDeviceToHost, stream),
+        cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+
+    std::vector<uint8_t> pool0Expected(pool0Input.size(), 0);
+    for (size_t slot = 0; slot < kNumSlots; ++slot)
+    {
+        size_t const base = slot * kPool0Bytes;
+        std::copy_n(pool0Input.begin() + base, 32, pool0Expected.begin() + base);
+        std::copy_n(pool0Input.begin() + base + 64, 16, pool0Expected.begin() + base + 64);
+    }
+    EXPECT_EQ(pool0Output, pool0Expected);
+    EXPECT_EQ(pool1Output, pool1Input);
 }
 
 } // namespace
