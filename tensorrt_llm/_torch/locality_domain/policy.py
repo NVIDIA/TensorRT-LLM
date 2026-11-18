@@ -337,8 +337,9 @@ class LocalityDomainExecutionPlanner:
                 reason_if_disabled="locality domain MoE only supports NVFP4, MXFP8 or BF16",
             )
 
-        # Both locality-domain MoE kernels fuse SwiGLU. Staying unpartitioned is
-        # the right answer for any other activation, not an error.
+        # The locality-domain MoE kernels (NVFP4, MXFP8 and BF16) all fuse
+        # SwiGLU. Staying unpartitioned is the right answer for any other
+        # activation, not an error.
         if activation != "Swiglu":
             return PartitionPlan(
                 enabled=False,
