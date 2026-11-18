@@ -359,9 +359,7 @@ def test_logit_edits_unsupported_reason_names_the_deploy_limit(overrides, expect
 @pytest.mark.cpu_only
 def test_sa_config_does_not_serve_logit_edits_even_when_enabled():
     """The real config object: SA verifies outside the logits-edit pass."""
-    spec_config = SADecodingConfig(
-        max_draft_len=4, max_matching_ngram_size=-1, enable_penalty=True
-    )
+    spec_config = SADecodingConfig(max_draft_len=4, max_matching_ngram_size=-1, enable_penalty=True)
     assert logit_edits_unsupported_reason(spec_config) == LOGIT_EDITS_MODE_MSG
 
 
