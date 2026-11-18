@@ -106,8 +106,27 @@ def test_batched_with_image_request(llm: LLM, model_dir: str) -> None:
     assert _run(llm, [image, {"prompt_embeds": table[torch.tensor(ids)]}]) == expected
 
 
-def test_rejects_prompt_embeds_with_image(llm: LLM, model_dir: str) -> None:
+def test_prompt_embeds_with_image_in_one_request(llm: LLM, model_dir: str) -> None:
+    # The mask indexes the ids before the image placeholder expands.
     table = _text_embedding_table(model_dir)
     image = _image_request(llm, model_dir)
-    with pytest.raises(ValueError, match="cannot be combined"):
-        llm.generate({**image, "prompt_embeds": table[:4]}, _greedy())
+    ids = llm.tokenizer.encode(image["prompt"], add_special_tokens=False)
+    plain = {"prompt_token_ids": ids, "multi_modal_data": image["multi_modal_data"]}
+    expected = _run(llm, [plain])
+    vision_ids = set(
+        llm.tokenizer.convert_tokens_to_ids(["<|vision_start|>", "<|image_pad|>", "<|vision_end|>"])
+    )
+    mask = [t not in vision_ids and p % 2 == 0 for p, t in enumerate(ids)]
+    request = {
+        **plain,
+        "prompt_embeds": table[torch.tensor([t for t, m in zip(ids, mask) if m])],
+        "prompt_embeds_mask": mask,
+    }
+    assert _run(llm, [request]) == expected
+
+    image_pos = ids.index(llm.tokenizer.convert_tokens_to_ids("<|image_pad|>"))
+    on_image = [p == image_pos for p in range(len(ids))]
+    with pytest.raises(ValueError, match="multimodal placeholder"):
+        llm.generate(
+            {**plain, "prompt_embeds": table[:1], "prompt_embeds_mask": on_image}, _greedy()
+        )

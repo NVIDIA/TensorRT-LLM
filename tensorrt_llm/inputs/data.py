@@ -115,7 +115,11 @@ class TokensPrompt(TypedDict):
     prompt_embeds_mask: NotRequired[Union[List[bool], torch.Tensor]]
     """Length-``len(prompt_token_ids)`` bools, True where a ``prompt_embeds`` row
     replaces the token embedding; rows are consumed in position order. May be
-    omitted when ``prompt_embeds`` has one row per prompt token.
+    omitted when ``prompt_embeds`` has one row per prompt token. With
+    ``multi_modal_data`` (models whose multimodal wrapper accepts
+    prompt_embeds) the mask is required and indexes ``prompt_token_ids`` before
+    multimodal placeholder expansion; it must not select a placeholder, and the
+    ids outside placeholders must survive processing unchanged.
     """
 
 

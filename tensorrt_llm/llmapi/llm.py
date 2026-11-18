@@ -57,7 +57,8 @@ from ..executor.utils import (RequestError, create_mpi_comm_session,
 from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
                       create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
-from ..inputs.prompt_embeds import PromptEmbeds, build_prompt_embeds
+from ..inputs.prompt_embeds import (PromptEmbeds, build_prompt_embeds,
+                                    multimodal_row_mask, remap_prompt_embeds)
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -890,10 +891,6 @@ class BaseLLM:
         if isinstance(inputs, dict) and ("prompt_embeds" in inputs
                                          or "prompt_embeds_mask" in inputs):
             inputs, prompt_embeds = self._split_prompt_embeds(inputs)
-            if is_gen_only:
-                # The prompt's KV arrives from the context worker; only the
-                # identity that salts its blocks travels.
-                prompt_embeds = prompt_embeds.identity_only()
 
         if isinstance(inputs, PreprocessedInputs):
             prompt_token_ids = inputs.prompt_token_ids
@@ -916,6 +913,20 @@ class BaseLLM:
                  sampling_params,
                  disaggregated_params,
              )
+
+        if prompt_embeds is not None:
+            if multimodal_params is not None:
+                # The mask indexes the ids before placeholder expansion.
+                multimodal_input = multimodal_params.multimodal_input
+                prompt_embeds = remap_prompt_embeds(
+                    prompt_embeds, inputs["prompt_token_ids"], prompt_token_ids,
+                    multimodal_row_mask(multimodal_input, len(prompt_token_ids))
+                    if multimodal_input is not None else torch.zeros(
+                        len(prompt_token_ids), dtype=torch.bool))
+            if is_gen_only:
+                # The prompt's KV arrives from the context worker; only the
+                # identity that keys its blocks travels.
+                prompt_embeds = prompt_embeds.identity_only()
 
         if (not self.args.mm_encoder_only and disaggregated_params is not None
                 and disaggregated_params.multimodal_input_layout is not None):
@@ -975,18 +986,34 @@ class BaseLLM:
 
     _PROMPT_EMBEDS_ALLOWED_KEYS = frozenset(
         ("prompt_token_ids", "prompt_embeds", "prompt_embeds_mask"))
+    _PROMPT_EMBEDS_MULTIMODAL_KEYS = frozenset(
+        ("multi_modal_data", "multi_modal_uuids", "mm_processor_kwargs"))
 
     def _split_prompt_embeds(
             self, inputs: Dict[str, Any]) -> Tuple[TokensPrompt, PromptEmbeds]:
         """Validate a prompt-embedding request and split off its rows.
 
-        Positions are taken as given, so only finalized token ids are
-        accepted: nothing may expand, render or truncate the prompt afterwards.
-        Execution-mode restrictions are enforced by the worker at admission.
+        Positions index ``prompt_token_ids``, so text prompts are rejected.
+        With ``multi_modal_data`` the mask indexes the ids before multimodal
+        placeholder expansion; ``generate_async`` moves the positions through
+        it. Execution-mode restrictions are enforced by the worker at
+        admission.
         """
         if inputs.get("prompt_embeds") is None:
             raise ValueError("prompt_embeds_mask requires prompt_embeds.")
-        extra_keys = sorted(set(inputs) - self._PROMPT_EMBEDS_ALLOWED_KEYS)
+        multimodal = {
+            key: inputs[key]
+            for key in self._PROMPT_EMBEDS_MULTIMODAL_KEYS
+            if inputs.get(key) is not None
+        }
+        if multimodal and ("prompt_token_ids" not in inputs
+                           or inputs.get("prompt_embeds_mask") is None):
+            raise ValueError(
+                "prompt_embeds with multi_modal_data needs prompt_token_ids and "
+                "prompt_embeds_mask.")
+        extra_keys = sorted(
+            set(inputs) - self._PROMPT_EMBEDS_ALLOWED_KEYS -
+            self._PROMPT_EMBEDS_MULTIMODAL_KEYS)
         if extra_keys:
             raise ValueError(
                 f"prompt_embeds cannot be combined with {extra_keys}; pass "
@@ -1006,7 +1033,8 @@ class BaseLLM:
         prompt_token_ids, prompt_embeds = build_prompt_embeds(
             prompt_token_ids, inputs["prompt_embeds"],
             inputs.get("prompt_embeds_mask"))
-        return TokensPrompt(prompt_token_ids=prompt_token_ids), prompt_embeds
+        return TokensPrompt(prompt_token_ids=prompt_token_ids,
+                            **multimodal), prompt_embeds
 
     def _preprocess(
         self,

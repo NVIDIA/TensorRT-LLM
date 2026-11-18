@@ -177,3 +177,27 @@ def test_pickle_round_trip() -> None:
     assert torch.equal(restored.embeds, pe.embeds)
     assert torch.equal(restored.positions, pe.positions)
     assert restored.digest == pe.digest
+
+
+def test_remap_through_placeholder_expansion() -> None:
+    from tensorrt_llm.inputs.prompt_embeds import remap_prompt_embeds
+
+    # 50 = vision start, 51 = image placeholder (expanded to 3 rows), 52 = end.
+    original = [1, 50, 51, 52, 2, 3]
+    expanded = [1, 50, 51, 51, 51, 52, 2, 3]
+    mm_rows = torch.tensor([False, True, True, True, True, True, False, False])
+    _, pe = build_prompt_embeds(original, _rows(2), [True, False, False, False, False, True])
+    moved = remap_prompt_embeds(pe, original, expanded, mm_rows)
+    assert moved.positions.tolist() == [0, 7]
+    assert moved.row_digests == pe.row_digests
+    assert moved.digest != pe.digest
+    _, on_image = build_prompt_embeds(original, _rows(1), [False, False, True, False, False, False])
+    with pytest.raises(ValueError, match="multimodal placeholder"):
+        remap_prompt_embeds(on_image, original, expanded, mm_rows)
+    with pytest.raises(ValueError, match="did not survive"):
+        remap_prompt_embeds(
+            pe,
+            original,
+            [1, 50, 51, 51, 51, 52, 2, 9, 3],
+            torch.cat([mm_rows, torch.tensor([False])]),
+        )

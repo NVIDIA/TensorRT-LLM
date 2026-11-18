@@ -231,3 +231,78 @@ def prompt_embeds_cache_salt(user_salt: Optional[str], digest: str) -> str:
         h.update(b"|salt|")
         h.update(user_salt.encode("utf-8"))
     return _SALT_PREFIX + h.hexdigest()
+
+
+def remap_prompt_embeds(
+    prompt_embeds: PromptEmbeds,
+    original_ids: Sequence[int],
+    expanded_ids: Sequence[int],
+    multimodal_rows: torch.Tensor,
+) -> PromptEmbeds:
+    """Move prompt-embedding positions through multimodal placeholder expansion.
+
+    Input processors replace each multimodal placeholder with its expanded
+    tokens. Every original token is matched, in order, to the next equal
+    expanded token; any expanded token left unmatched must be a multimodal row,
+    and no embedding position may land on one.
+
+    Args:
+        prompt_embeds: Snapshot whose positions index ``original_ids``.
+        original_ids: Prompt ids before expansion.
+        expanded_ids: Prompt ids the engine schedules.
+        multimodal_rows: ``[len(expanded_ids)]`` bool mask of multimodal rows.
+
+    Returns:
+        A snapshot with the same rows whose positions index ``expanded_ids``.
+    """
+    if prompt_embeds.embeds is None:
+        raise ValueError("Remapping prompt_embeds needs the rows.")
+    matched = torch.zeros(len(expanded_ids), dtype=torch.bool)
+    mapping = []
+    j = 0
+    for token in original_ids:
+        while j < len(expanded_ids) and expanded_ids[j] != token:
+            j += 1
+        if j == len(expanded_ids):
+            break
+        mapping.append(j)
+        matched[j] = True
+        j += 1
+    if len(mapping) != len(original_ids) or bool((~matched & ~multimodal_rows).any()):
+        raise ValueError(
+            "prompt_token_ids did not survive multimodal processing unchanged "
+            "outside the multimodal placeholders; use placeholder ids that "
+            "detokenize and retokenize to themselves (for example the ids of "
+            "the replaced tokens)."
+        )
+    mapping_t = torch.tensor(mapping, dtype=torch.int64)
+    positions = mapping_t[prompt_embeds.positions]
+    if bool(multimodal_rows[positions].any()):
+        raise ValueError("prompt_embeds_mask selects a multimodal placeholder position.")
+    embeds = prompt_embeds.embeds
+    return PromptEmbeds(
+        embeds=embeds,
+        positions=positions,
+        hidden_size=prompt_embeds.hidden_size,
+        row_digests=prompt_embeds.row_digests,
+        digest=_digest(embeds, positions, prompt_embeds.row_digests),
+    )
+
+
+def multimodal_row_mask(multimodal_input: Any, num_tokens: int) -> torch.Tensor:
+    """Return a ``[num_tokens]`` bool mask of a request's multimodal rows.
+
+    Args:
+        multimodal_input: ``tensorrt_llm.inputs.multimodal.MultimodalInput``.
+        num_tokens: Prompt length.
+    """
+    mask = torch.zeros(num_tokens, dtype=torch.bool)
+    if multimodal_input.multimodal_run_positions is not None:
+        starts = multimodal_input.multimodal_run_positions
+        lengths = multimodal_input.multimodal_run_lengths
+    else:
+        starts = multimodal_input.multimodal_positions
+        lengths = multimodal_input.multimodal_lengths
+    for start, length in zip(starts, lengths):
+        mask[int(start) : int(start) + int(length)] = True
+    return mask
