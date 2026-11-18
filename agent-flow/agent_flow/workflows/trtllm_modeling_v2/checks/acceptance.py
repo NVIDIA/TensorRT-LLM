@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from typing import Any, Callable, Mapping
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
 from ..spec.task_schema import (
+    SPECULATORS,
     TaskSchemaError,
     load_prompts_file,
     resolve_gate_timeout,
@@ -153,10 +155,12 @@ class AcceptanceFloor:
 
 
 def resolve_acceptance_floor_spec(
-    accuracy: Mapping[str, Any], unit: str | None
+    accuracy: Mapping[str, Any], unit: str | None, features: Any = ()
 ) -> AcceptanceFloor | None:
-    """The absolute floor ``unit`` declares in ``accuracy.acceptance``, if any.
+    """The absolute floor ``accuracy.acceptance`` sets for ``unit``, if any.
 
+    ``unit``'s own entry; else that of the last speculator among ``features``
+    (the units it builds on), whose drafter it runs; else ``default``.
     ``min_absolute`` is the floor itself. ``measured_reference`` is what a
     reference drafter measured on this workload; with no ``min_absolute``
     the floor is that times :data:`MIN_ACCEPTANCE_RATIO`. ``floor_source``
@@ -165,9 +169,15 @@ def resolve_acceptance_floor_spec(
     block = accuracy.get("acceptance")
     if not isinstance(block, dict):
         return None
-    chosen = block.get(unit)
-    if chosen is None:
-        chosen = block.get("default")
+    drafters = [str(f) for f in features or () if str(f) in SPECULATORS]
+    chosen = next(
+        (
+            b
+            for name in (unit, *reversed(drafters), "default")
+            if (b := block.get(name)) is not None
+        ),
+        None,
+    )
     if isinstance(chosen, dict):
         source = chosen.get("floor_source")
         measured = chosen.get("measured_reference")
@@ -412,7 +422,9 @@ def run_acceptance_gate(
             f"rejected — the draft path is computing the wrong thing",
             **ran,
         )
-    floor = resolve_acceptance_floor_spec(accuracy, unit)
+    floor = resolve_acceptance_floor_spec(
+        accuracy, unit, task_data.get("features") if features is None else features
+    )
     if floor is None:
         return _verdict(
             passed=True,
@@ -428,6 +440,11 @@ def run_acceptance_gate(
             **ran,
         )
     source = f" (from {floor.source})" if floor.source else ""
+    derived = floor.measured is not None and math.isclose(
+        floor.value, floor.measured * MIN_ACCEPTANCE_RATIO
+    )
+    if derived:
+        source = f" ({MIN_ACCEPTANCE_RATIO} x measured reference {floor.measured}){source}"
     passed = reading.value >= floor.value
     return _verdict(
         passed=passed,

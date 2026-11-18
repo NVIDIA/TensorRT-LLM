@@ -239,6 +239,17 @@ def test_a_delivery_check_runs_again_only_when_a_task_that_claims_it_lands(
     assert status.latest()[serve.key].marker == served_on
 
 
+def test_a_check_task_owes_the_delivery_checks_it_names(tmp_path):
+    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    contract = c.Contract(checks=(_STANDING.checks[1], serve), confirm=_CORE[1])
+    status = c.ContractStatus.load(tmp_path)
+    orchestrator = GraphOrchestrator(_moving_target(_plan_once()), contract, status, tmp_path)
+    recheck = _task("recheck", "check", [serve.key], touches=[])
+    assert orchestrator._start_check_task(recheck).result()[1] == []
+    # Like a worker's landing, it has the serve run with the delivery tier, though it passed.
+    assert serve.key in orchestrator._owed
+
+
 def test_a_claim_that_lands_while_its_check_runs_stays_owed(tmp_path):
     serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
     state = {"tree": 1, "land": ""}  # land: where a task lands and claims the serve

@@ -205,6 +205,7 @@ def test_a_goal_that_names_its_features_gets_those_and_what_derive_cannot_know_i
         ("acceptance", {"mpt": 2.5}),  # a misspelt unit: its floor would never be applied
         ("acceptance", {"min_prompts": 32}),  # a key that is gone
         ("boot", {"mpt": {"max_tokens": 64}}),
+        ("boot", {"default": {"max_tokens": 64}}),  # read under acceptance only
     ],
 )
 def test_a_unit_entry_under_acceptance_or_boot_names_a_unit_of_the_spec(tmp_path, block, entry):

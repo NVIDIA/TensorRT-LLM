@@ -280,8 +280,8 @@ class GraphOrchestrator:
         #: The feature units and variants (their ``ref``), and the core's checks: a
         #: worker's task on one of them starts once any of those checks has shown the
         #: engine answering (it passed, or it is a benchmark that came back with a score).
-        refs, boots = after_core
-        self._feature_refs, self._core_boots = frozenset(refs), tuple(boots)
+        refs, core = after_core
+        self._feature_refs, self._core_checks = frozenset(refs), tuple(core)
         self.revision_cap = revision_cap
         #: How many worker runs one task gets (``graph.apply_revision``).
         self.max_attempts = max(1, max_attempts)
@@ -493,8 +493,8 @@ class GraphOrchestrator:
     def _run_check(self, check: contract_mod.Check) -> bool:
         """One check, in a pool thread, recorded under the target as it was when it started.
 
-        A check that already passed on this very target (its own verdict, or an
-        equivalent check's) does not run again; that is asked as the check
+        A check that already passed on this very target does not run again;
+        that is asked as the check
         starts, and the target is read then. A pass on an earlier state of the
         target stands for the contract (``contract.evaluate``) and does not
         stop the check from running here: whoever asks for it has a reason, a
@@ -736,19 +736,19 @@ class GraphOrchestrator:
         (a test it owes, its processor) starts at once, and kernel and
         investigate tasks are not held: the core's own work needs them.
         """
-        if not self._feature_refs or not self._core_boots:
+        if not self._feature_refs or not self._core_checks:
             return set()
         with self._status_lock:
             latest = self.status.latest()
         # The engine answered: a check passed, or a benchmark came back with a score.
         if any(
             latest[key].passed or (latest[key].measured is not None and not latest[key].void)
-            for key in self._core_boots
+            for key in self._core_checks
             if key in latest
         ):
             return set()
-        boots = set(self._core_boots)
-        core = {t.id for t in self.graph.tasks if boots & set(t.satisfies)}
+        checks = set(self._core_checks)
+        core = {t.id for t in self.graph.tasks if checks & set(t.satisfies)}
         tasks = self.graph.by_id()
         return {
             t.id
@@ -1319,6 +1319,7 @@ class GraphOrchestrator:
         wait for the delivery tier, as any task's do.
         """
         delivery = self._delivery_keys()
+        self._claim(k for k in task.satisfies if k in delivery)
         submitted = self._submit_checks(
             self._check_pool, [k for k in task.satisfies if k not in delivery]
         )

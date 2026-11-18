@@ -546,7 +546,7 @@ def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
     The spool admits a job only where it can finish before its allocation ends, so a
     gate whose limit is longer than a whole allocation is never admitted: it would wait
     for ever. The benchmark's limit is ``accuracy.timeout`` (default four hours), the
-    disaggregated test's ``accuracy.disagg.timeout``, and a boot's or an acceptance leg's
+    disaggregated test's ``accuracy.disagg.timeout``, and a boot's or the acceptance gate's
     the longest ``timeout`` ``accuracy.boot`` or ``accuracy.acceptance`` declares.
     """
     sessions = [s for s in sessions_from_task(task_data) if s.role in GATE_ROLES and s.time_limit_s]

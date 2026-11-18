@@ -88,7 +88,7 @@ trtllm_repo_path: /path/to/TensorRT-LLM
 #   chunked_prefill: false     # default false
 #   overlap_scheduler: true    # default true  (--disable_overlap_scheduler)
 #   kv_cache_reuse: false      # default false: block reuse is a non-core feature, proven by a
-#                              # `reuse` variant (kv_cache_config.enable_block_reuse: true)
+#                              # `reuse` variant (runtime: {kv_cache_reuse: true})
 #   # Anything else the gate command needs, verbatim. Without --max_seq_len the engine sizes its
 #   # cache for `max_position_embeddings` (`Impossible to fit in any sequence in kvCache`).
 #   # max_seq_len = isl + osl; max_batch_size >= the concurrency the workload claims (a global total).

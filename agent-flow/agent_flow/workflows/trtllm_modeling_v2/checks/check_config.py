@@ -625,14 +625,6 @@ def launch_kv_caches(task_data: Mapping[str, Any]) -> list[LaunchKvCache]:
     return launches
 
 
-def llm_api_block_reuse(options: Mapping[str, Any]) -> bool:
-    """Whether LLM-API ``options`` ask for KV-cache block reuse (``enable_block_reuse``, default on)."""
-    kv_cache = options.get("kv_cache_config")
-    if not isinstance(kv_cache, Mapping):
-        return True
-    return bool(kv_cache.get("enable_block_reuse", True))
-
-
 def check_configuration(
     task_data: Mapping[str, Any],
     environment: RunEnvironment,
@@ -864,7 +856,6 @@ __all__ = [
     "launch_conflicts",
     "launch_kv_caches",
     "llm_api_batch_sizes",
-    "llm_api_block_reuse",
     "load_llm_api_options",
     "member_llm_api_overlay",
     "merge_options",

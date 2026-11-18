@@ -14,7 +14,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Collection, Iterable, Sequence
+from typing import Iterable, Sequence
 
 from ..infra.git import git_output
 from .harness.test_driver import RECORD_VERSION, SESSIONS_DIRNAME
@@ -98,16 +98,12 @@ class Results:
             return None
         return Result(nodeid, str(entry.get("outcome") or "error"), str(entry.get("message") or ""))
 
-    def unrun(self, files: Iterable[str], settled: Collection[str] = ()) -> list[str]:
-        """The ``files`` holding a test with no result here: what is still to run.
-
-        A test in ``settled`` is not waited for: it is left out on purpose.
-        """
+    def unrun(self, files: Iterable[str]) -> list[str]:
+        """The ``files`` holding a test with no result here: what is still to run."""
         return [
             file
             for file in files
-            if (ids := self.test_ids(file)) is None
-            or any(i not in self.tests and i not in settled for i in ids)
+            if (ids := self.test_ids(file)) is None or any(i not in self.tests for i in ids)
         ]
 
 
@@ -203,16 +199,10 @@ def driver_command(
     cache: str | Path,
     tree: str | Path,
     selection: str | Path,
-    skip: str | Path | None = None,
 ) -> str:
-    """The driver's command line over the tests ``selection`` lists, run in ``tree``.
-
-    ``skip`` lists node ids to leave out of the files the selection names.
-    """
+    """The driver's command line over the tests ``selection`` lists, run in ``tree``."""
     words = [str(DRIVER), "run", "--cache", str(cache), "--repo", str(tree)]
     words += ["--selection", str(selection)]
-    if skip is not None:
-        words += ["--skip", str(skip)]
     return (
         f"{python} {' '.join(shlex.quote(w) for w in words)} "
         "-- -p no:cacheprovider -rA --timeout=180"

@@ -73,8 +73,8 @@ STATUS_FILENAME = "contract_status.jsonl"
 #: One line per milestone: each state of the target the contract first held on,
 #: and the bring-up; the last of each tier is where it stands.
 MILESTONE_FILENAME = "correctness.jsonl"
-#: A milestone's tier: the first unit's boot and accuracy at its accuracy
-#: member, or every required check.
+#: A milestone's tier: the first unit's checks at its narrowest accuracy member
+#: (its benchmark, and its boot where it owes one), or every required check.
 MILESTONE_BRINGUP = "bringup"
 MILESTONE_CORRECTNESS = "correctness"
 
@@ -780,8 +780,9 @@ def measured_commit(
 class Milestone:
     """A tier delivered on one commit of the target.
 
-    ``correctness``: every required check held there. ``bringup``: the first
-    unit's boot and accuracy held at its narrowest member (:func:`bringup_checks`).
+    ``correctness``: every required check passed. ``bringup``: the first unit's
+    benchmark, and its boot where it owes one, passed at its narrowest member
+    (:func:`bringup_checks`).
     ``marker`` is the state of the target the checks measured, and ``sha`` the
     commit that holds exactly that state.
     """
@@ -874,9 +875,10 @@ def standing(evaluation: Evaluation, workspace: Path, marker: str | None = None)
 
 
 def bringup_checks(contract: Contract) -> tuple[Check, ...]:
-    """The checks whose passes deliver the bring-up: the first unit's boot and accuracy at its accuracy member.
+    """The checks whose passes deliver the bring-up: the first unit's benchmark at one member.
 
-    Where its accuracy runs at several members, the narrowest of them.
+    Its boot there too, where it owes one. Where its benchmark runs at several
+    members, the narrowest of them.
 
     Empty for a contract with no such checks.
     """
@@ -898,7 +900,7 @@ def bringup_checks(contract: Contract) -> tuple[Check, ...]:
 
 
 def bringup_holds(contract: Contract, evaluation: Evaluation) -> bool:
-    """Whether every bring-up check passed in ``evaluation`` (its own verdict or an equivalent's)."""
+    """Whether every bring-up check passed in ``evaluation``."""
     owed = bringup_checks(contract)
     passed = {c.key for c in evaluation.passed}
     return bool(owed) and all(c.key in passed for c in owed)

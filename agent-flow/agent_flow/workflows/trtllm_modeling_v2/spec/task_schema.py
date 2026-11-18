@@ -259,7 +259,7 @@ BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_EVERY,)
 # Boot workloads allow run-wide keys and per-unit overlays. Absent multimodal images use
 # the repository asset.
 BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "max_tokens")
-# How long one boot gate, or one acceptance leg, may run: `timeout` at either level of
+# How long one boot gate, or one acceptance gate, may run: `timeout` at either level of
 # `accuracy.boot` and `accuracy.acceptance` (default 1800 s). Not a workload key: it
 # changes no verdict, only how long a slow load is waited for.
 GATE_TIMEOUT_KEY = "timeout"
@@ -1278,16 +1278,17 @@ def _require_named_units(data: Mapping[str, Any], errors: list[str]) -> None:
     if not isinstance(accuracy, Mapping):
         return
     named = _unit_names(data)
-    for block, keys in (
-        ("acceptance", ACCEPTANCE_BLOCK_KEYS),
-        ("boot", (*BOOT_KEYS, GATE_TIMEOUT_KEY)),
+    # `accuracy.acceptance` reads a `default` entry; `accuracy.boot` reads a unit's own only.
+    for block, keys, units in (
+        ("acceptance", ACCEPTANCE_BLOCK_KEYS, named),
+        ("boot", (*BOOT_KEYS, GATE_TIMEOUT_KEY), named - {"default"}),
     ):
         entries = accuracy.get(block)
         for unit in entries if isinstance(entries, Mapping) else ():
-            if unit not in keys and unit not in named:
+            if unit not in keys and unit not in units:
                 errors.append(
                     f"'{ACCURACY_FIELD}.{block}.{unit}' names no unit or variant of this spec "
-                    f"({sorted(named)})"
+                    f"({sorted(units)})"
                 )
 
 

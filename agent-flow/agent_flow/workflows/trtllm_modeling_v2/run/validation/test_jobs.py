@@ -14,7 +14,7 @@ import math
 import re
 import shlex
 from pathlib import Path
-from typing import Any, Callable, Collection, ContextManager, Sequence
+from typing import Any, Callable, ContextManager, Sequence
 
 from ...checks import test_results
 from ...infra.compute.commands import CommandSpec
@@ -139,13 +139,11 @@ def record_at(
     tree_at: TreeAt,
     run_job: RunJob,
     python: str,
-    leave_out: Callable[[str], Collection[str]] | None = None,
 ) -> tuple[test_results.Results, int, int, str]:
     """Probe the current environment, then run missing ``files`` at ``commit``.
 
     The probe is one short job (:data:`PROBE_TIMEOUT_S`); the test jobs, as many as
     :data:`TEST_BUDGET_S` holds at the runner's job size (:func:`_run_unrun`).
-    ``leave_out`` names, given the probed environment's digest, the node ids not to run.
     Returns results, test jobs run, and the last job's exit code and output tail.
     A failed probe returns empty results, never historical results.
     """
@@ -164,7 +162,6 @@ def record_at(
         tree_at=tree_at,
         run_job=run_job,
         python=python,
-        skip=leave_out(match.group(1)) if leave_out is not None else (),
     )
 
 
@@ -178,31 +175,25 @@ def _run_unrun(
     tree_at: TreeAt,
     run_job: RunJob,
     python: str,
-    skip: Collection[str] = (),
 ) -> tuple[test_results.Results, int, int, str]:
     """Run the ``items`` (test files, node ids) with no result at ``commit`` in ``env_digest``.
 
     A job at a time, each resuming from what the last recorded, while one makes progress and
-    :func:`max_jobs` of the runner's job size are not spent. The node ids in ``skip`` are left
-    out and not waited for. Returns what :func:`record_at` does.
+    :func:`max_jobs` of the runner's job size are not spent. Returns what :func:`record_at`
+    does.
     """
     allowed = max_jobs(getattr(run_job, "timeout_s", JOB_TIMEOUT_S))
     results = test_results.recorded(cache_dir, commit, env_digest)
-    unrun = results.unrun(items, skip)
-    skipped = (
-        test_results.write_selection(out / f"{commit[:12]}.skip.txt", sorted(skip))
-        if skip
-        else None
-    )
+    unrun = results.unrun(items)
     jobs, code, tail = 0, 0, ""
     while unrun and jobs < allowed:
         listed = test_results.write_selection(out / f"{commit[:12]}.txt", unrun)
         with tree_at(commit) as tree:
-            command = test_results.driver_command(python, cache_dir, tree, listed, skipped)
+            command = test_results.driver_command(python, cache_dir, tree, listed)
             code, tail = run_job(command, tree)
         jobs += 1
         results = test_results.recorded(cache_dir, commit, env_digest)
-        left = results.unrun(items, skip)
+        left = results.unrun(items)
         if len(left) >= len(unrun):
             break
         unrun = left

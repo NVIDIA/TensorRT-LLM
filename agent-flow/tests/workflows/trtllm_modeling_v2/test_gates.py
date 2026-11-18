@@ -689,7 +689,10 @@ def test_acceptance_is_one_load_held_to_one_and_to_the_declared_floor(tmp_path, 
     assert result.passed and result.reference == 1.5
     assert "vs declared floor 1.5000 (from a measured drafter): met" in result.detail
     result, _ = _acceptance(tmp_path, monkeypatch, _BASE, dspark={"measured_reference": 3.32})
-    assert not result.passed and "vs declared floor 3.1540: NOT met" in result.detail
+    assert (
+        not result.passed
+        and "vs declared floor 3.1540 (0.95 x measured reference 3.32): NOT met" in result.detail
+    )
 
 
 def test_a_workload_too_short_to_measure_fails_as_the_workload_not_the_target(
@@ -1166,3 +1169,13 @@ def test_a_module_that_skips_itself_on_import_has_a_result_not_a_hole(tmp_path):
     assert results.unrun(["tests/test_other_arch.py"]) == []
     skip = results.result("tests/test_other_arch.py")
     assert skip.outcome == "skipped" and "sm_100 only" in skip.message
+
+
+def test_a_unit_that_drafts_with_an_earlier_units_drafter_is_held_to_its_floor():
+    resolve = acceptance_checks.resolve_acceptance_floor_spec
+    accuracy = {"acceptance": {"mtp": {"min_absolute": 1.5}}}
+    # `multimodal` comes after `mtp` and runs its drafter: mtp's floor holds it.
+    assert resolve(accuracy, "multimodal", ["mtp", "multimodal"]).value == 1.5
+    assert resolve(accuracy, "multimodal", ["multimodal"]) is None
+    accuracy["acceptance"]["multimodal"] = 1.8
+    assert resolve(accuracy, "multimodal", ["mtp", "multimodal"]).value == 1.8

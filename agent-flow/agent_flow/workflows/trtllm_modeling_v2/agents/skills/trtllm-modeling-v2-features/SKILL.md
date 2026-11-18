@@ -85,7 +85,7 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 
 | feature | on in `task.yaml` by | proof that it ran | judged by |
 |---|---|---|---|
-| block reuse | a `reuse` variant (`kv_cache_config.enable_block_reuse: true`); off in core | reuse probe of a boot or an acceptance load: a repeated prompt reports `cached_tokens` > 0. A variant with `gates: [accuracy]` runs neither | variant accuracy |
+| block reuse | a `reuse` variant (`runtime: {kv_cache_reuse: true}`); off in core | reuse probe of a boot or an acceptance load: a repeated prompt reports `cached_tokens` > 0. A variant with `gates: [accuracy]` runs neither | variant accuracy |
 | chunked prefill | a `chunked` variant with a small `max_num_tokens`; off in core | benchmark prompts longer than `max_num_tokens`, served and scored; a boot of the variant, where it owes one, sends one such prompt | variant accuracy |
 | KV-cache dtype | a variant setting `llm_api_options.kv_cache_config.dtype` | the loader's KV-quantization log line, which no gate reads | variant accuracy |
 | CUDA graphs | `runtime.cuda_graph` (default on) | the options sent; no gate reads the captures | accuracy |

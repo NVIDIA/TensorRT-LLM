@@ -128,7 +128,7 @@ class ExecutionStage:
         self.state = state
         units = assembly_units(self.workflow.task_data)
         # What shows the core runs: any of its checks (a pass, or a benchmark's score).
-        core_boots = [c.key for c in contract.required() if units and c.unit == units[0]]
+        core_checks = [c.key for c in contract.required() if units and c.unit == units[0]]
         feature_refs = [*units[1:], *variants_mod.variants(self.workflow.task_data)]
         total = max(len(state.devices), self.workflow._gate_env().world_size, 1)
         self._integration = self._make_integration(state)
@@ -171,7 +171,7 @@ class ExecutionStage:
             revision_cap=self.workflow.revision_cap,
             max_attempts=getattr(self.workflow, "max_attempts", graph_mod.MAX_ATTEMPTS),
             event_window_s=self.workflow.event_window_s,
-            after_core=(feature_refs, core_boots),
+            after_core=(feature_refs, core_checks),
             own_paths=self._own_paths,
             repo_root=self.workflow.task_data.get("trtllm_repo_path") or "",
         )
