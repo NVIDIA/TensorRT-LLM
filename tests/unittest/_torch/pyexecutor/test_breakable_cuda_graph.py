@@ -904,7 +904,7 @@ def test_runner_prepared_inputs_share_the_largest_bucket_storage(monkeypatch):
             return torch.full((num_tokens, 4), float(value + offset), device="cuda") + rows
 
         inputs.update(value=full(0), config={"features": [full(1)], "offset": (full(2),)})
-        # A host tensor and a tensor whose first dimension is not the token count.
+        # A host tensor and a tensor whose other dimensions change with the bucket.
         inputs.update(extra=full(3), host_scale=torch.tensor(1.0))
         inputs.update(positions=torch.zeros((3, 1, num_tokens), device="cuda"))
 
@@ -949,6 +949,34 @@ def test_runner_prepared_inputs_share_the_largest_bucket_storage(monkeypatch):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert body.forward_calls == calls_after_capture
     assert replay_calls == [num_tokens for num_tokens, _ in steps]
+
+
+def test_stage_inputs_share_only_views_with_the_layout_of_a_clone():
+    """A smaller bucket views the largest bucket's input only when both have the same
+    rank and are contiguous; a scalar or a transposed largest input is cloned instead."""
+    largest = runner_module._stage_inputs(
+        {
+            "rows": torch.zeros((8, 4), device="cuda"),
+            "scalar": torch.zeros((), device="cuda"),
+            "transposed": torch.zeros((4, 8), device="cuda").t(),
+        },
+        None,
+    )
+    inputs = {
+        "rows": torch.ones((4, 4), device="cuda"),
+        "scalar": torch.ones((4,), device="cuda"),
+        "transposed": torch.ones((4, 4), device="cuda"),
+    }
+    staged = runner_module._stage_inputs(inputs, largest)
+
+    assert staged["rows"].data_ptr() == largest["rows"].data_ptr()
+    for name in ("scalar", "transposed"):
+        assert (
+            staged[name].untyped_storage().data_ptr() != largest[name].untyped_storage().data_ptr()
+        )
+        assert staged[name].stride() == inputs[name].stride()
+    for name, value in inputs.items():
+        torch.testing.assert_close(staged[name], value, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
