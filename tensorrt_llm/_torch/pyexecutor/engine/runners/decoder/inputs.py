@@ -673,6 +673,7 @@ class DecoderInputPreparer:
             if counts[0] != runner.graph_num_tokens(replay_key) or spec_counts[1:] != (
                 replay_key.batch_size,
                 replay_key.batch_size,
+                replay_key.draft_len,
             ):
                 raise RuntimeError(
                     f"Attention-DP counts {counts}, {spec_counts} do not match the agreed "

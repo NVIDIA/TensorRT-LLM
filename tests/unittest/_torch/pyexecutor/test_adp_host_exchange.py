@@ -169,7 +169,12 @@ def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str)
             get_adp_token_counts=lambda: [tokens],
             set_adp_token_counts=lambda columns: columns[0],
         )
-        spec = SimpleNamespace(dp_num_tokens=lambda: tokens, seq_lens=[2] * 4, num_generations=4)
+        spec = SimpleNamespace(
+            dp_num_tokens=lambda: tokens,
+            seq_lens=[key.draft_len + 1] * 4,
+            num_generations=4,
+            runtime_draft_len=key.draft_len,
+        )
         runner.graph_metadata = (
             {}
             if rank == 1 and variant == "missing_capture"
@@ -199,11 +204,12 @@ def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str)
     )
 
     counts = [8, 12] if variant == "tokens" else [8, 8]
-    expected = (counts, [counts, [4, 4], [4, 4]])
+    draft_lens = [1, 2] if variant == "tokens" else [1, 1]
+    expected = (counts, [counts, [4, 4], [4, 4], draft_lens])
     assert results == ((expected, expected), (expected, expected))
     for calls in dist.calls.values():
         assert len(calls) == (2 if variant == "same" else 3)
-        assert len(calls[-1]) == 4
+        assert len(calls[-1]) == 5
 
 
 def _assert_payload_types(dist):
