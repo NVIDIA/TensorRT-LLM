@@ -62,6 +62,17 @@ from .accuracy_core import (
 
 # Keep helper definitions below imports so new imports do not need E402
 # suppressions in this legacy test file.
+def _check_dummy_generation(llm):
+    # Dummy weights have no accuracy target. Exercise prefill and several
+    # decode iterations, even when the random weights would emit EOS early.
+    outputs = llm.generate(["A short passage about testing. " * 24],
+                           SamplingParams(temperature=0,
+                                          max_tokens=4,
+                                          ignore_eos=True))
+    assert len(outputs) == 1 and len(outputs[0].outputs) == 1
+    assert len(outputs[0].outputs[0].token_ids) == 4
+
+
 def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
     """Patch MpiPoolSession._start_mpi_pool to propagate environment variables to MPI child processes.
 
@@ -1467,13 +1478,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_dummy_load_format(self):
         llm = LLM(
             f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+            max_batch_size=1,
+            max_seq_len=256,
+            max_num_tokens=256,
             load_format="dummy",
             moe_config=MoeConfig(
                 backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"),
         )
         with llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, is_integration_test=True)
+            _check_dummy_generation(llm)
 
 
 @pytest.mark.timeout(14400)
@@ -2463,6 +2476,8 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             detokenize=False,
             add_special_tokens=False,
         )
+        # Capture for the two live requests: 64 prefill tokens, then
+        # 129 context tokens alongside a decoding request.
         common_llm_kwargs = dict(
             tensor_parallel_size=tp_size,
             moe_expert_parallel_size=tp_size,
@@ -2477,7 +2492,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                 free_gpu_memory_fraction=0.6,
             ),
             cuda_graph_config=CudaGraphConfig(
-                batch_sizes=[1, 2, 4, 6, 8],
+                batch_sizes=[1, 2],
                 enable_padding=True,
             ),
         )
@@ -2487,7 +2502,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                     self.MODEL_PATH,
                     **common_llm_kwargs,
                     prefill_cuda_graph_backend=backend,
-                    prefill_capture_num_tokens=[128, 256, 512, 1024],
+                    prefill_capture_num_tokens=[128, 256],
             ) as llm:
                 generation_request = llm.generate_async(
                     generation_prompt,
@@ -4452,11 +4467,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         llm = LLM(
             self.MODEL_PATH,
             load_format="dummy",
+            max_batch_size=1,
+            max_seq_len=256,
+            max_num_tokens=256,
         )
         with llm:
-            model_name = "GPT-OSS/20B-MXFP4"
-            task = GSM8K(model_name)
-            task.evaluate(llm, is_integration_test=True)
+            _check_dummy_generation(llm)
 
     def test_dflash(self, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
