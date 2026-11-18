@@ -176,6 +176,68 @@ def test_builds_too_short_for_a_worker_are_not_listed(builder, tmp_path):
 
 
 @pytest.fixture
+def cute(monkeypatch):
+    """build_pool_targets' stand-in CuTe DSL compile function, whose kernels the workers export
+    to the rank's store and this process loads from there."""
+    monkeypatch.setattr(_jit_share, "_load_kernel", targets.load_kernel)
+    monkeypatch.setattr(_jit_share, "_cute_identity", lambda: targets.IDENTITY)
+    targets.compile_kernel.cache_clear()
+    yield targets.compile_kernel
+    targets.compile_kernel.cache_clear()
+
+
+def _kernels(*arg_lists):
+    return [(targets.compile_kernel, args) for args in arg_lists]
+
+
+def test_in_build_mode_listed_kernels_build_in_worker_processes(builder, cute):
+    with builder.build_pass("test"):
+        assert builder.build_kernels(_kernels((1,), (2,), (1,))) == 2
+        # Built, and loaded by the calls.
+        assert cute.cache_info().currsize == 2
+    assert all(cute(value).pid != os.getpid() for value in (1, 2))
+    stats = builder.stats(targets.NAME)
+    assert (stats.built, stats.inline) == (2, 0)
+    report = "\n".join(builder.report("test"))
+    assert f"{targets.NAME}: 2 kernels built in worker processes" in report
+
+
+def test_in_inference_mode_listed_kernels_compile_in_their_calls(builder, cute):
+    assert builder.build_kernels(_kernels((3,))) == 1
+    assert cute(3).pid == os.getpid()
+    assert builder.stats(targets.NAME).built == 0
+
+
+@pytest.mark.parametrize(
+    "min_build_s, in_workers", [(5.0, False), (1e-9, True)], ids=["short", "long"]
+)
+def test_until_a_function_is_measured_its_first_listed_kernel_compiles_here(
+    builder, cute, min_build_s, in_workers
+):
+    BuildPool.get().min_build_s = min_build_s
+    with builder.build_pass("test"):
+        assert builder.build_kernels(_kernels((50,), (51,), (52,))) == 3
+    pids = [cute(value).pid for value in (50, 51, 52)]
+    assert pids[0] == os.getpid()
+    assert [pid != os.getpid() for pid in pids[1:]] == [in_workers] * 2
+    stats = builder.stats(targets.NAME)
+    assert (stats.built, stats.inline) == ((2, 1) if in_workers else (0, 3))
+
+
+def test_a_listed_function_that_is_not_process_built_is_called(builder, cute):
+    calls = []
+
+    def compile_here(value):
+        calls.append(value)
+
+    assert builder.build_kernels([(compile_here, (1,)), (compile_here, (1,))]) == 1
+    with builder.build_pass("test"):
+        assert builder.build_kernels([(compile_here, (2,)), (cute, (4,))]) == 2
+    assert calls == [1, 2]
+    assert cute(4).pid != os.getpid()
+
+
+@pytest.fixture
 def shared(monkeypatch, tmp_path):
     """Ranks that share their JIT builds through a directory."""
     share = tmp_path / "share"

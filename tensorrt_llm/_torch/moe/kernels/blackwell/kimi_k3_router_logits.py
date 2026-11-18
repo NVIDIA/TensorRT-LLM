@@ -43,7 +43,8 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ....build_pool import build_kernels, process_built
+from ....build_pool import process_built
+from ....kernel_builder import KernelBuilder
 from ....kernels.blackwell.utils import TRTLLM_ENABLE_PDL
 from . import raw_ptx as ptx
 
@@ -422,7 +423,7 @@ def precompile(use_pdl: bool = TRTLLM_ENABLE_PDL) -> int:
     compiled (0 when the device is not one the kernel serves)."""
     if not _is_supported_device(torch.cuda.current_device()):
         return 0
-    return build_kernels([(_compiled, (use_pdl,))])
+    return KernelBuilder.get().build_kernels([(_compiled, (use_pdl,))])
 
 
 __all__ = [

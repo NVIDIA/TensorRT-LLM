@@ -15,7 +15,7 @@ import pytest
 
 from tensorrt_llm import _jit_share
 from tensorrt_llm._torch import build_pool
-from tensorrt_llm._torch.build_pool import Build, BuildPool, BuildResult, build_kernels
+from tensorrt_llm._torch.build_pool import Build, BuildPool, BuildResult
 
 pytestmark = pytest.mark.cpu_only
 
@@ -65,14 +65,19 @@ def _record(path, value):
 
 
 def _build_kernels(*arg_lists):
-    """Build the stand-in kernels of ``arg_lists`` together."""
-    return build_kernels((targets.compile_kernel, args) for args in arg_lists)
+    """Build the stand-in kernels of ``arg_lists`` on the workers, together, then call them:
+    each call loads its kernel, or compiles one no worker built."""
+    arg_lists = list(dict.fromkeys(arg_lists))
+    BuildPool.get().build_kernels([(targets.compile_kernel, args) for args in arg_lists])
+    for args in arg_lists:
+        targets.compile_kernel(*args)
+    return len(arg_lists)
 
 
 def test_kernels_built_together_are_built_by_workers_and_loaded_here(pool):
     with pool.pass_scope():
         assert _build_kernels((1,), (2,), (1,)) == 2
-        # Built and loaded before build_kernels returned.
+        # Built, and loaded by the calls.
         assert targets.compile_kernel.cache_info().currsize == 2
         kernels = [targets.compile_kernel(1), targets.compile_kernel(2)]
     assert [kernel.value for kernel in kernels] == [1, 2]
@@ -83,18 +88,13 @@ def test_kernels_built_together_are_built_by_workers_and_loaded_here(pool):
     assert pool.counts() == {"built": 2}
 
 
-def test_a_function_that_is_not_process_built_compiles_in_its_call(pool):
-    calls = []
-
-    def compile_here(value):
-        calls.append(value)
-
-    assert build_kernels([(compile_here, (1,)), (compile_here, (1,))]) == 1
+def test_kernels_get_a_result_each(pool):
+    assert pool.build_kernels([(targets.compile_kernel, (60,))]) == [BuildResult("refused")]
     with pool.pass_scope():
-        assert build_kernels([(compile_here, (2,)), (targets.compile_kernel, (3,))]) == 2
-        assert targets.compile_kernel(3).pid != os.getpid()
-    assert calls == [1, 2]
-    assert pool.counts() == {"built": 1}
+        [built] = pool.build_kernels([(targets.compile_kernel, (60,))])
+        # In the store already.
+        [present] = pool.build_kernels([(targets.compile_kernel, (60,))])
+    assert (built.status, present.status) == ("built", "present")
 
 
 def test_a_build_returns_every_result_in_order_once_all_have_ended(pool, tmp_path):
@@ -238,21 +238,6 @@ def test_a_worker_takes_only_builds_long_enough_to_repay_it(pool):
     pool.min_build_s = 0.0
     with pool.pass_scope():
         assert pool.worth_a_worker("new") and not pool.unmeasured("other")
-
-
-@pytest.mark.parametrize(
-    "min_build_s, in_workers", [(5.0, False), (1e-9, True)], ids=["short", "long"]
-)
-def test_until_its_compiles_are_measured_a_function_compiles_one_here(
-    pool, min_build_s, in_workers
-):
-    pool.min_build_s = min_build_s
-    with pool.pass_scope():
-        assert _build_kernels((50,), (51,), (52,)) == 3
-        pids = [targets.compile_kernel(value).pid for value in (50, 51, 52)]
-    assert pids[0] == os.getpid()
-    assert [pid != os.getpid() for pid in pids[1:]] == [in_workers] * 2
-    assert pool.build_seconds(targets.NAME) is not None
 
 
 def test_a_build_in_a_worker_measures_its_kind(pool, tmp_path):

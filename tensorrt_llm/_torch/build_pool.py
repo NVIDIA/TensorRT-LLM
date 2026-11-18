@@ -12,8 +12,9 @@ compilers run there too, so every op builds the same way.
   (DeepGEMM, FlashInfer, Triton, fmha_sm100, PyTorch extensions), or, for a CuTe DSL kernel, as an
   object file in the pool's store, which ``process_built`` functions and the runners' shared
   ``kernel_cache`` dicts (``tensorrt_llm._jit_share``) load.
-* :func:`process_built` memoizes a CuTe DSL compile function whose kernels :func:`build_kernels`
-  builds several at a time; ``fn(*args)`` then loads a kernel a worker built.
+* :func:`process_built` memoizes a CuTe DSL compile function whose kernels the workers build
+  several at a time (:meth:`BuildPool.build_kernels`, which ``KernelBuilder.build_kernels`` calls);
+  ``fn(*args)`` then loads a kernel a worker built.
 * The workers live inside a pass (:meth:`BuildPool.pass_scope`, which KernelBuilder's build pass
   opens, in the memory-profiling warmup only): they start with the pass's first builds, while the
   GPU keeps ``_MIN_FREE_GPU_BYTES`` free, and stop when the outermost pass ends. Each holds a CUDA
@@ -61,19 +62,7 @@ import tempfile
 import threading
 import time
 import traceback
-from typing import (
-    IO,
-    Any,
-    Callable,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
-    NamedTuple,
-    Optional,
-    Sequence,
-    Tuple,
-)
+from typing import IO, Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -83,7 +72,6 @@ __all__ = [
     "BuildResult",
     "BuildStrategy",
     "Claim",
-    "build_kernels",
     "process_built",
 ]
 
@@ -184,10 +172,11 @@ def process_built(
 
     Use it in place of ``functools.cache`` on a function that compiles one kernel from hashable,
     picklable positional arguments and returns the compiled kernel (what ``cute.compile``
-    returns). The function keeps ``cache_info()`` and ``cache_clear()``; :func:`build_kernels`
-    compiles several of its kernels at a time. A call loads the kernel from the store when a
-    worker built it, and compiles it here otherwise. In a worker, a call compiles the kernel and
-    exports it to the store, so that its rank loads it. ``raw`` is the undecorated function.
+    returns). The function keeps ``cache_info()`` and ``cache_clear()``;
+    ``KernelBuilder.build_kernels`` compiles several of its kernels at a time. A call loads the
+    kernel from the store when a worker built it, and compiles it here otherwise. In a worker, a
+    call compiles the kernel and exports it to the store, so that its rank loads it. ``raw`` is
+    the undecorated function.
 
     Args:
         name: Names the function's kernels in the store; unique per compile function.
@@ -237,34 +226,6 @@ def process_built(
         return compiled
 
     return decorate
-
-
-def build_kernels(builds: Iterable[Tuple[Callable[..., Any], tuple]]) -> int:
-    """Compile the kernels of ``(function, args)`` pairs, calling each ``function(*args)``, and
-    return the number of pairs.
-
-    Inside a pass, the kernels of a ``process_built`` function whose compiles take long enough to
-    repay a worker (:meth:`BuildPool.worth_a_worker`) build on the pool's workers first, all
-    together, and the calls load them; until a function's compiles are measured, its first kernel
-    compiles here, timed. The other kernels, any a worker did not build, and those of any other
-    function compile in the calls.
-    """
-    builds = list(dict.fromkeys(builds))
-    pool = BuildPool.get()
-    if pool.accepting():
-        to_workers = []
-        for fn, args in builds:
-            compiler = getattr(fn, "_compiler", None)
-            if compiler is None or args in compiler.memo:
-                continue
-            if pool.unmeasured(compiler.name, compiler.build_seconds):
-                fn(*args)  # Measured here: the rule decides for the function's other kernels.
-            elif pool.worth_a_worker(compiler.name, compiler.build_seconds):
-                to_workers.append((compiler, args))
-        pool._build_kernels(to_workers)
-    for fn, args in builds:
-        fn(*args)
-    return len(builds)
 
 
 class _Paths(NamedTuple):
@@ -497,13 +458,21 @@ class BuildPool:
             return None
         return message
 
-    def _build_kernels(self, kernels: Sequence[Tuple[_Compiler, tuple]]) -> None:
-        """Build the kernels of ``process_built`` functions into the store on the workers, those
-        not there already; with a shared store, the ranks split them."""
-        if not kernels or self._usable_store() is None:
-            return
-        builds = []
-        for compiler, args in kernels:
+    def build_kernels(
+        self, kernels: Sequence[Tuple[Callable[..., Any], tuple]]
+    ) -> List[BuildResult]:
+        """Build the kernels of ``(function, args)`` pairs of ``process_built`` functions into the
+        store on the workers, and return each one's result: ``"present"`` for a kernel in the store
+        already. With a shared store, the ranks split them. The calls ``function(*args)`` then load
+        them."""
+        if not kernels:
+            return []
+        if not self.accepting() or self._usable_store() is None:
+            return [BuildResult(REFUSED)] * len(kernels)
+        results: List[BuildResult] = [BuildResult(PRESENT)] * len(kernels)
+        builds, indices = [], []
+        for index, (fn, args) in enumerate(kernels):
+            compiler = fn._compiler
             _, paths = self._paths(compiler.name, args)
             if os.path.exists(paths.obj):
                 continue
@@ -516,7 +485,9 @@ class BuildPool:
                     claim,
                 )
             )
-        for build, result in zip(builds, self.build(builds)):
+            indices.append(index)
+        for index, build, result in zip(indices, builds, self.build(builds)):
+            results[index] = result
             if result.status == FAILED:
                 error = result.error.splitlines()[0] if result.error else ""
                 logger.warning_once(
@@ -524,6 +495,7 @@ class BuildPool:
                     f"here ({error})",
                     key=("build_pool", build.family, error),
                 )
+        return results
 
     def load(self, name: str, args: tuple) -> Any:
         """The kernel of ``name(*args)`` in the store, or None. With a store the ranks share,

@@ -23,8 +23,9 @@ that starts a build first makes it, and the other ranks wait for it.
 
 A build is a module-level function and picklable arguments (:class:`BuildTask`). The worker
 calls it; the kernel reaches this process through its compiler's disk cache or, for a CuTe DSL
-kernel, through the rank's store (``process_built``, whose functions build their kernels with
-``build_kernels``).
+kernel, through the rank's store. An op that knows the CuTe DSL kernels it needs, such as a
+model's prewarm list, hands them to :meth:`KernelBuilder.build_kernels` as calls of its
+``process_built`` compile functions.
 
 ``TLLM_KERNEL_BUILDER=0`` turns KernelBuilder and the worker processes off: every kernel compiles
 on first use.
@@ -41,6 +42,7 @@ import os
 import threading
 import time
 from typing import (
+    Any,
     Callable,
     ContextManager,
     Dict,
@@ -163,8 +165,8 @@ class KernelBuilder:
     """The rank's kernel builds of ops outside the autotuner.
 
     ``prebuild`` is called at an op's entry point; outside a build pass it returns after one
-    check. ``build`` builds kernels that need only the configuration, and ``op_compiled`` records
-    a kernel the op compiled itself.
+    check. ``build`` builds kernels that need only the configuration, ``build_kernels`` the CuTe
+    DSL kernels an op lists itself, and ``op_compiled`` records a kernel the op compiled itself.
     """
 
     _instance: Optional["KernelBuilder"] = None
@@ -329,6 +331,57 @@ class KernelBuilder:
             f"{counts[FAILED]} failed, {counts[REFUSED]} left to the op, in {seconds:.1f}s"
         )
 
+    def build_kernels(self, kernels: Iterable[Tuple[Callable[..., Any], tuple]]) -> int:
+        """Compile the kernels of ``(function, args)`` pairs, calling each ``function(*args)``,
+        and return the number of pairs: kernels an op knows it needs, such as a model's prewarm
+        list. Each ``process_built`` CuTe DSL compile function (``tensorrt_llm._torch.build_pool``)
+        is an op here, under its name.
+
+        In build mode, the kernels of a function whose compiles take long enough to repay a worker
+        (``BuildPool.worth_a_worker``) build on the rank's worker processes first, all together,
+        and the calls load them; until a function's compiles are measured, its first kernel
+        compiles here, timed. The other kernels, any a worker did not build, and those of any
+        other function compile in the calls, as in inference mode.
+        """
+        kernels = list(dict.fromkeys(kernels))
+        if self.active():
+            pool = BuildPool.get()
+            counts: Dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+            to_workers = []
+            for fn, args in kernels:
+                compiler = getattr(fn, "_compiler", None)
+                if compiler is None or args in compiler.memo:
+                    continue
+                if pool.worth_a_worker(compiler.name, compiler.build_seconds):
+                    to_workers.append((fn, args))
+                    continue
+                if pool.unmeasured(compiler.name, compiler.build_seconds):
+                    fn(*args)  # Measured here: the rule decides for the function's other kernels.
+                counts[compiler.name][REFUSED] += 1
+            t0 = time.perf_counter()
+            results = pool.build_kernels(to_workers)
+            seconds = time.perf_counter() - t0
+            for (fn, _), result in zip(to_workers, results):
+                counts[fn._compiler.name][result.status] += 1
+            with self._lock:
+                for op, count in counts.items():
+                    stats = self._op_stats(op)
+                    stats.built += count[BUILT]
+                    stats.failed += count[FAILED]
+                    stats.elsewhere += count[PRESENT] + count[CLAIMED]
+                    stats.inline += count[REFUSED]
+                    if count[BUILT] + count[FAILED] + count[CLAIMED]:
+                        stats.build_s += seconds
+            if to_workers:
+                done = sum(result.status == BUILT for result in results)
+                logger.info(
+                    f"[KernelBuilder] {len(to_workers)} listed kernels: {done} built in worker "
+                    f"processes in {seconds:.1f}s"
+                )
+        for fn, args in kernels:
+            fn(*args)
+        return len(kernels)
+
     def _claim(self, op: str, key: Hashable, config: BuildConfig) -> Optional[Claim]:
         """The claim of a PARALLEL build in the directory the ranks share; None for a build that
         is this rank's alone."""
@@ -369,18 +422,22 @@ class KernelBuilder:
             ops = sorted(self._stats.items())
         lines = []
         for op, stats in ops:
-            parts = [
-                f"{stats.signatures} call signatures listed in {stats.list_s:.1f}s",
-                f"{stats.built} kernels built in worker processes ({stats.failed} failed) in "
-                f"{stats.build_s:.1f}s",
-            ]
+            parts = []
+            if stats.signatures:
+                parts.append(f"{stats.signatures} call signatures listed in {stats.list_s:.1f}s")
+            if stats.built or stats.failed:
+                parts.append(
+                    f"{stats.built} kernels built in worker processes ({stats.failed} failed) "
+                    f"in {stats.build_s:.1f}s"
+                )
             if stats.elsewhere:
                 parts.append(f"{stats.elsewhere} built by other ranks")
             if stats.inline:
                 parts.append(f"{stats.inline} left to the op")
             if stats.late:
                 parts.append(f"{stats.late} compiled by the op itself in {stats.late_s:.1f}s")
-            lines.append(f"[KernelBuilder] {name}: {op}: " + "; ".join(parts))
+            if parts:
+                lines.append(f"[KernelBuilder] {name}: {op}: " + "; ".join(parts))
         if lines:
             lines.append(f"[KernelBuilder] {name}: the pass took {seconds:.1f}s")
         return lines

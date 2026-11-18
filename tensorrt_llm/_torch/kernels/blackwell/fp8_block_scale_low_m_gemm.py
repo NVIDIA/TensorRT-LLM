@@ -97,7 +97,8 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ...build_pool import build_kernels, process_built
+from ...build_pool import process_built
+from ...kernel_builder import KernelBuilder
 from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 
 #: K extent of one pipeline stage (one 128x128 FP8 weight block).
@@ -3598,7 +3599,7 @@ def precompile_prequantized(n: int, k: int, max_m: int) -> int:
     """JIT-compile the kernels ``trtllm::fp8_block_scale_low_m_gemm_prequantized`` launches for
     an ``[N, K]`` weight at ``1..max_m`` rows (one per distinct tactic); returns their count."""
     tactics = {default_prequantized_tactic(m, n, k) for m in range(1, max_m + 1)}
-    return build_kernels(
+    return KernelBuilder.get().build_kernels(
         (_compiled_mid_kernel, (n, k, t, TRTLLM_ENABLE_PDL, False, True)) for t in tactics
     )
 

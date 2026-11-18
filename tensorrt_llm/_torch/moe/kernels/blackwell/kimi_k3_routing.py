@@ -47,7 +47,8 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ....build_pool import build_kernels, process_built
+from ....build_pool import process_built
+from ....kernel_builder import KernelBuilder
 from ....kernels.blackwell.utils import TRTLLM_ENABLE_PDL
 from . import raw_ptx as ptx
 
@@ -1057,7 +1058,7 @@ def precompile(num_experts: int, use_pdl: bool = TRTLLM_ENABLE_PDL) -> int:
         for local_cap in sorted(local_caps):
             args = (num_experts, num_warps, warps_per_token, local_cap, use_pdl)
             builds.append((_compiled_kernel, args))
-    return build_kernels(builds)
+    return KernelBuilder.get().build_kernels(builds)
 
 
 def can_run(
