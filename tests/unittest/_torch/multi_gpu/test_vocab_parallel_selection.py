@@ -27,17 +27,32 @@ import platform
 import sys
 import traceback
 from types import SimpleNamespace
+from typing import Callable
 
 import cloudpickle
 import pytest
 import torch
 from _torch.helpers import dspark_markov_chain_logits_reference
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
+from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.modules.embedding import LMHead
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+from tensorrt_llm._torch.speculative.vocab_parallel import (
+    VocabParallelHead,
+    VocabShardedLogits,
+    _PairExchange,
+    _select_tokens,
+    markov_chain_logits,
+    tp_pair_exchange,
+)
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -91,10 +106,6 @@ def _run(fn, *args):
 def _make_head(rank, tp, mnnvl):
     # Selects MNNVL for the pair all-reduce on a single node.
     os.environ["TLLM_TEST_MNNVL"] = "1" if mnnvl else "0"
-    from tensorrt_llm._torch.modules.embedding import LMHead
-    from tensorrt_llm._torch.modules.linear import TensorParallelMode
-    from tensorrt_llm._torch.speculative.vocab_parallel import VocabParallelHead
-
     mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
     vocab = SHARD * tp
     lm_head = LMHead(
@@ -176,12 +187,8 @@ def _argmax_check(rank, tp, mnnvl):
 
 @torch.inference_mode()
 def _sample_check(rank, tp, mnnvl):
-    from tensorrt_llm._torch.speculative.vocab_parallel import (
-        VocabShardedLogits,
-        _local_sample_kernel,
-        _PairExchange,
-        _select_tokens,
-    )
+    # A Triton kernel holds a lock, so cloudpickle cannot ship it as a global of this check.
+    from tensorrt_llm._torch.speculative.vocab_parallel import _local_sample_kernel
 
     head, vocab = _make_head(rank, tp, mnnvl)
     for rows in (1, 64, 257):
@@ -236,10 +243,8 @@ def _markov_check(rank, tp, mnnvl):
             anchors[0] = -1  # out-of-vocab anchor: zero bias
         expected = _markov_reference(full, anchors, w1, w2)
         assert torch.equal(head.markov_tokens(_shard(full, rank), anchors, w1, w2), expected)
-    # The biased shard logits of a vocab-sharded draft head.
-    from tensorrt_llm._torch.distributed import AllReduceStrategy
-    from tensorrt_llm._torch.speculative.vocab_parallel import markov_chain_logits, tp_pair_exchange
 
+    # The biased shard logits of a vocab-sharded draft head.
     def global_argmax(step_logits):
         gathered = MPI.COMM_WORLD.allgather(step_logits.cpu())
         return torch.cat(gathered, dim=-1).argmax(dim=-1).cuda()
@@ -277,8 +282,6 @@ def _markov_check(rank, tp, mnnvl):
 @torch.inference_mode()
 def _worker_accept_check(rank, tp, mnnvl):
     """Strict acceptance on shard logits equals acceptance on gathered logits."""
-    from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
-    from tensorrt_llm._torch.speculative.vocab_parallel import VocabShardedLogits
 
     class _Worker(SpecWorkerBase):
         @property
@@ -313,12 +316,113 @@ def _worker_accept_check(rank, tp, mnnvl):
     assert torch.equal(out[1], ref[1])
 
 
+@torch.inference_mode()
+def _worker_argmax_check(rank, tp, mnnvl):
+    """The vocab-parallel greedy argmax of the stock one-model workers
+    (``SpecWorkerBase.enable_vocab_parallel_argmax``), through the TP key
+    exchange and through the NCCL pair exchange: target and draft tokens equal
+    ``torch.argmax`` over the gathered logits, ties included, eagerly and under
+    CUDA-graph replay."""
+    from tensorrt_llm._torch.distributed.ll_exchange import TPKeyExchange
+    from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+
+    class _Worker(SpecWorkerBase):
+        verifies_on_target_shard = True
+
+        @property
+        def max_draft_len(self):
+            return 4
+
+        def _forward_impl(self, *args, **kwargs):
+            raise NotImplementedError
+
+    head, vocab = _make_head(rank, tp, mnnvl)
+    lm_head = head.lm_head
+    mapping = lm_head.mapping
+    key_exchange = TPKeyExchange.create(mapping, max_rows=512)
+    assert key_exchange is not None, "no peer memory for the key exchange"
+    try:
+        for use_key_exchange in (True, False):
+            worker = _Worker()
+            assert worker.enable_vocab_parallel_argmax(
+                lm_head, key_exchange if use_key_exchange else None
+            )
+            assert (worker.key_exchange is not None) == use_key_exchange
+            assert worker._target_head_mapping is mapping
+            worker.mapping = mapping  # the draft head's TP rank
+            for rows in (1, 7, 64, 300):
+                gen = torch.Generator(device="cuda").manual_seed(rows)
+                full = torch.randint(-4, 4, (rows, vocab), device="cuda", generator=gen).to(
+                    torch.bfloat16
+                )
+                if rows >= 5:
+                    full = _special_rows(full)
+                    # NaN logits do not occur in decoding; the key exchange
+                    # orders them by their bit pattern.
+                    full[2] = 0.0
+                expected = torch.argmax(full.float(), dim=-1).to(torch.int32)
+                assert torch.equal(worker._sharded_argmax(_shard(full, rank)), expected)
+
+            # Through target_logits and the target sampler, from the real head.
+            md = SimpleNamespace(
+                is_all_greedy_sample=True,
+                temperature_only=False,
+                enable_penalty=False,
+                sharded_target_logits=False,
+                is_cuda_graph=False,
+                is_ragged_verify=False,
+            )
+            hidden = torch.randn(48, HIDDEN, device="cuda").to(torch.bfloat16)
+            expected = torch.argmax(lm_head(hidden).float(), dim=-1).to(torch.int32)
+
+            def target_tokens():
+                logits = worker.target_logits(hidden, lm_head, LogitsProcessor(), None, md, None)
+                assert md.sharded_target_logits and logits.shape[-1] == SHARD
+                return worker._sample_tokens_for_batch(logits, md, 0, hidden.shape[0])
+
+            assert torch.equal(target_tokens(), expected)
+            graph, out = _capture(target_tokens, hidden)
+            for _ in range(3):
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(out, expected)
+
+            # Greedy draft tokens of a vocab-sharded draft head, then d2t.
+            gen = torch.Generator(device="cuda").manual_seed(3)
+            full = torch.randint(-4, 4, (33, vocab), device="cuda", generator=gen).to(
+                torch.bfloat16
+            )
+            full[0] = 1.0  # tied across every shard: id 0
+            full[1, SHARD - 1] = full[1, vocab - 1] = 9.0  # tied across shards: id SHARD - 1
+            worker._d2t = torch.arange(vocab, device="cuda") % 7
+            draft_md = SimpleNamespace(
+                wants_advanced_draft_sampling=False,
+                draft_vocab_size=vocab,
+                vocab_size=vocab,
+                is_cuda_graph=False,
+            )
+            greedy = torch.argmax(full.float(), dim=-1)
+            assert greedy[:2].tolist() == [0, SHARD - 1]
+            draft = worker.sample_draft_tokens(_shard(full, rank), draft_md, full.shape[0])
+            assert torch.equal(draft, (greedy + worker._d2t[greedy]).to(torch.int32))
+            gathered = MPI.COMM_WORLD.allgather(draft.cpu())
+            assert all(torch.equal(g, gathered[0]) for g in gathered)
+    finally:
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.barrier()
+        key_exchange.close()
+
+
 _CHECKS = {
     "argmax": _argmax_check,
     "sample": _sample_check,
     "markov": _markov_check,
     "worker_accept": _worker_accept_check,
+    "worker_argmax": _worker_argmax_check,
 }
+# Checks that run at TP2 only: what they add over the other checks (the worker
+# plumbing) does not depend on the TP size.
+_TP2_ONLY_CHECKS = {"worker_argmax"}
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
@@ -333,9 +437,92 @@ def test_vocab_parallel_selection_tp2(check, mnnvl, mpi_pool_executor):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
 @pytest.mark.parametrize("mnnvl", _EXCHANGES)
-@pytest.mark.parametrize("check", list(_CHECKS))
+@pytest.mark.parametrize("check", [c for c in _CHECKS if c not in _TP2_ONLY_CHECKS])
 @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
 def test_vocab_parallel_selection_tp4(check, mnnvl, mpi_pool_executor):
     tp = mpi_pool_executor.num_workers
     results = mpi_pool_executor.map(_run, *zip(*[(_CHECKS[check], tp, mnnvl)] * tp))
+    assert all(results)
+
+
+# About 10 ms of GPU time: long enough for the other rank's Lamport kernel to
+# read the late rank's part of its buffer before that rank writes it.
+_LATE_RANK_SLEEP_CYCLES = 20_000_000
+_MODEL_HIDDEN = 6144
+
+
+@torch.inference_mode()
+def _after_large_allreduce_check(rank: int, tp: int, order: str) -> None:
+    """The pair exchange right after a large bf16 one-shot all-reduce, and the reverse.
+
+    The model's bf16 all-reduces and the float32 pair exchange share the
+    mapping's Lamport workspace, and each call clears the sub-buffer of the
+    call before it by the size that call left there. ``bf16_then_fp32`` runs
+    the exchange right after a bf16 call filling 0.9x the workspace, where
+    clearing more than the bf16 call wrote runs into a live sub-buffer.
+    ``fp32_then_bf16`` runs a large exchange, then small bf16 calls and a
+    large bf16 call on the exchange's sub-buffer, where clearing less leaves
+    stale values that the large call takes as already arrived. One rank per
+    round starts each call late, so the other rank reads its part of the
+    buffer before it arrives and takes any stale value.
+    """
+    head, vocab = _make_head(rank, tp, mnnvl=False)
+    mapping = head.lm_head.mapping
+    # Untuned AUTO runs the exchange on NCCL; the autotuner profiles it on the
+    # one-shot kernel at warm-up, right after the model's bf16 all-reduces.
+    head._exchange = tp_pair_exchange(mapping, AllReduceStrategy.ONESHOT)
+    model_allreduce = AllReduce(mapping, strategy=AllReduceStrategy.ONESHOT, dtype=torch.bfloat16)
+    max_bytes = CustomAllReduceHelper.max_workspace_size_auto(tp, support_deterministic=False)
+    big_rows = int(0.9 * max_bytes) // (_MODEL_HIDDEN * torch.bfloat16.itemsize)
+
+    def exchange(rows: int, seed: int) -> tuple[Callable[[], torch.Tensor], torch.Tensor]:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        full = torch.randint(-4, 4, (rows, vocab), device="cuda", generator=gen).to(torch.bfloat16)
+        expected = torch.argmax(full.float(), dim=-1)
+        return lambda: head.argmax(_shard(full, rank)), expected
+
+    def model(rows: int, seed: int) -> tuple[Callable[[], torch.Tensor], torch.Tensor]:
+        # Small integers sum exactly in bf16, so any stale or cleared element
+        # shows up.
+        parts = [
+            torch.randint(
+                -8,
+                9,
+                (rows, _MODEL_HIDDEN),
+                device="cuda",
+                generator=torch.Generator(device="cuda").manual_seed(seed + r),
+            ).to(torch.bfloat16)
+            for r in range(tp)
+        ]
+        expected = torch.stack(parts).float().sum(dim=0).to(torch.bfloat16)
+        return lambda: model_allreduce(parts[rank]), expected
+
+    if order == "bf16_then_fp32":
+        calls = [(model, big_rows), (exchange, 64), (exchange, 1), (model, 8)]
+    else:
+        # The large call lands on the exchange's sub-buffer three calls later.
+        calls = [(exchange, 8192), (model, 8), (model, 8), (model, big_rows), (model, 8)]
+    for step, (make, rows) in enumerate(calls * 3):
+        run, expected = make(rows, 100 * step)
+        if rank == step // len(calls) % tp:
+            torch.cuda._sleep(_LATE_RANK_SLEEP_CYCLES)
+        out = run()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected), (
+            f"step {step} {make.__name__} rows={rows}: "
+            f"{(out != expected).sum().item()} of {expected.numel()} differ"
+        )
+
+
+# A wrong clear size can hang the ranks inside the kernel; the thread method
+# ends the session with a failure instead of waiting on the MPI pool.
+@pytest.mark.timeout(300, method="thread")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("order", ["bf16_then_fp32", "fp32_then_bf16"])
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_vocab_parallel_exchange_after_large_allreduce(
+    order: str, mpi_pool_executor: MPIPoolExecutor
+) -> None:
+    tp = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(_run, *zip(*[(_after_large_allreduce_check, tp, order)] * tp))
     assert all(results)

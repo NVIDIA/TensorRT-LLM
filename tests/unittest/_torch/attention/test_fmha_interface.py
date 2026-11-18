@@ -35,6 +35,8 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _MinimalFmha(Fmha):
     def forward(
@@ -239,6 +241,13 @@ def test_inherited_availability_hook_uses_subclass_capabilities() -> None:
         ),
         ("supports_per_tensor_fp8", {"qk_fp8_per_tensor": True}),
         ("supports_per_tensor_fp8", {"v_fp8_per_tensor": True}),
+        (
+            "supports_variable_window",
+            {
+                "variable_window_token_starts": torch.zeros(1, dtype=torch.int32),
+                "variable_window_token_ends": torch.zeros(1, dtype=torch.int32),
+            },
+        ),
     ],
 )
 @pytest.mark.parametrize("requested", [False, True])

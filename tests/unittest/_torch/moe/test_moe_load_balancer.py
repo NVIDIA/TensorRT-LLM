@@ -370,6 +370,18 @@ class TestMoeLoadBalancer(unittest.TestCase):
             # Test passed if we got here without exceptions
             self.assertTrue(True, "Statistic kernel ran successfully")
 
+            # A rank without tokens counts nothing.
+            with MoeLoadBalancerIterContext(balancer):
+                layer.start_wait_gpu_stage()
+                layer.done_wait_gpu_stage()
+                layer.update_local_statistic(gathered_raw_expert_ids[:0], True,
+                                             True)
+                local_statistic = layer.get_local_statistic_tensor()
+                layer.start_set_cpu_stage()
+                layer.done_set_cpu_stage()
+            torch.cuda.synchronize()
+            self.assertEqual(local_statistic.tolist(), [0] * expert_count)
+
         except Exception as e:
             self.fail(f"Statistic kernel test failed with exception: {e}")
         finally:
@@ -445,6 +457,16 @@ class TestMoeLoadBalancer(unittest.TestCase):
                 torch.all(torch.eq(routed_slots, expected_slots)),
                 f"Routing results don't match expected slots.\nExpected: {expected_slots}\nGot: {routed_slots}"
             )
+
+            # A rank without tokens routes an empty batch.
+            with MoeLoadBalancerIterContext(balancer):
+                layer.start_wait_gpu_stage()
+                layer.done_wait_gpu_stage()
+                empty_slots = layer.route(token_selected_experts[:0])
+                layer.start_set_cpu_stage()
+                layer.done_set_cpu_stage()
+            torch.cuda.synchronize()
+            self.assertEqual(tuple(empty_slots.shape), (0, top_k))
 
         except Exception as e:
             self.fail(f"Routing kernel test failed with exception: {e}")
@@ -561,6 +583,25 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
         finally:
             balancer.shutdown()
     assert get_moe_load_balancer() is None
+
+
+@pytest.mark.cpu_only
+def test_shutdown_stops_cpp_before_closing_host_weights(
+        mock_runtime: MagicMock) -> None:
+    """The C++ load balancer shuts down before the host weights its updates read are closed."""
+    balancer = MoeLoadBalancer(ep_rank=0, ep_size=4, layer_updates_per_iter=2)
+    # Every rank reports that it is safe to shut down.
+    balancer.shared_mpi_comm.allgather.return_value = [True]
+    layer = MagicMock(spec=SingleLayerMoeLoadBalancer)
+    balancer.single_layer_load_balancers.append(layer)
+    order = []
+    mock_runtime.return_value.shutdown.side_effect = lambda: order.append(
+        "C++ shutdown")
+    layer.py_pre_shutdown_cleanup.side_effect = lambda: order.append(
+        "host weights closed")
+
+    assert balancer.shutdown()
+    assert order == ["C++ shutdown", "host weights closed"]
 
 
 if __name__ == '__main__':
