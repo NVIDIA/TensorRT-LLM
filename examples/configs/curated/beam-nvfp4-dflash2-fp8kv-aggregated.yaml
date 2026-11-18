@@ -15,7 +15,6 @@
 # change it.
 modeling_v2: require
 checkpoint_format: beam_nvfp4
-custom_tokenizer: tensorrt_llm._torch.models.checkpoints.beam.tokenizer.BeamFastTokenizer
 reasoning_parser: beam_harmony_text
 tensor_parallel_size: 4
 pipeline_parallel_size: 1

@@ -4,7 +4,7 @@
 
 ``trtllm-serve <checkpoint> --config <recipe>`` and ``LLM(...)`` reach the target through three
 names in the shared registries (``checkpoint_format: beam_nvfp4`` from
-``_torch/models/checkpoints/beam``, the ``custom_tokenizer`` import path of ``BeamFastTokenizer``
+``_torch/models/checkpoints/beam``, the ``beam`` config/tokenizer registration
 and the ``beam_harmony_text`` reasoning parser of ``llmapi/reasoning_parser.py``) and one
 environment setting (``TRTLLM_MODELING_V2_KV_CACHE_SCALES``). Generated tokenizers and scale
 tables only; no checkpoint, no GPU.
@@ -28,13 +28,11 @@ from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 i
 from tensorrt_llm._torch.models.checkpoints.beam.checkpoint_loader import (
     BEAM_NVFP4_CHECKPOINT_FORMAT,
 )
-from tensorrt_llm._torch.models.checkpoints.beam.tokenizer import BeamFastTokenizer
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.tokenizer import TransformersTokenizer
 
 pytestmark = pytest.mark.cpu_only
 
-#: The recipes' ``custom_tokenizer`` import path.
-_TOKENIZER = "tensorrt_llm._torch.models.checkpoints.beam.tokenizer.BeamFastTokenizer"
 _ENV = weights.KV_CACHE_SCALES_ENV
 _REPO = Path(__file__).resolve().parents[7]
 _RECIPES = {
@@ -58,13 +56,16 @@ def _scale_file(path: Path, **sections) -> str:
 
 
 def _tokenizer_dir(path: Path) -> str:
-    """A checkpoint-like directory holding only a small fast tokenizer (tokenizer.json)."""
+    """A generated Beam config and fast tokenizer, with no tokenizer-class metadata."""
     from tokenizers import Tokenizer, models, pre_tokenizers
+
+    from tensorrt_llm._torch.configs import BeamConfig
 
     words = ["<unk>", "What", "is", "12", "plus", "7", "?"]
     tokenizer = Tokenizer(models.WordLevel({w: i for i, w in enumerate(words)}, unk_token="<unk>"))
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
     path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text(json.dumps(BeamConfig().to_dict()))
     tokenizer.save(str(path / "tokenizer.json"))
     return str(path)
 
@@ -160,10 +161,10 @@ import json
 import sys
 
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-from tensorrt_llm.tokenizer import load_custom_tokenizer
+from tensorrt_llm.tokenizer import load_hf_tokenizer
 
 parser = "beam_harmony_text" in ReasoningParserFactory.keys()
-tokenizer = load_custom_tokenizer({tokenizer!r}, {directory!r}, trust_remote_code=False)
+tokenizer = load_hf_tokenizer({directory!r}, trust_remote_code=False)
 print(json.dumps({{
     "parser": parser,
     "parser_class": type(ReasoningParserFactory.create_reasoning_parser("beam_harmony_text")).__name__,
@@ -180,36 +181,33 @@ print(json.dumps({{
 
 def test_fresh_server_resolves_the_parser_and_tokenizer_from_shared_registries(tmp_path):
     """The server process has the parser as soon as it imports the parser registry, and loads
-    the tokenizer from its ``custom_tokenizer`` path, without the model loader or Beam modeling."""
-    source = _SERVER_PATH.format(tokenizer=_TOKENIZER, directory=_tokenizer_dir(tmp_path / "ckpt"))
+    the tokenizer through the shared loader, without the model loader or Beam modeling."""
+    source = _SERVER_PATH.format(directory=_tokenizer_dir(tmp_path / "ckpt"))
     record = _run_fresh(tmp_path, source, dict(os.environ))
     assert record == {
         "parser": True,
         "parser_class": "BeamHarmonyTextParser",
-        "tokenizer": "BeamFastTokenizer",
+        "tokenizer": "TransformersTokenizer",
         "ids": [1, 2, 3, 4, 5, 6],
         "model_loader_imported": False,
         "beam_modeling_imported": False,
     }
 
 
-def test_custom_tokenizer_is_the_concrete_fast_class(tmp_path):
+def test_standard_tokenizer_loads_and_survives_pickling(tmp_path):
     from transformers import PreTrainedTokenizerFast
 
-    from tensorrt_llm.tokenizer import TokenizerBase, load_custom_tokenizer
+    from tensorrt_llm.tokenizer import TokenizerBase, load_hf_tokenizer
 
     directory = _tokenizer_dir(tmp_path / "ckpt")
-    with mock.patch("transformers.AutoTokenizer.from_pretrained") as auto:
-        tokenizer = load_custom_tokenizer(_TOKENIZER, directory)
-    auto.assert_not_called()
-    assert isinstance(tokenizer, BeamFastTokenizer)
+    tokenizer = load_hf_tokenizer(directory, trust_remote_code=False)
+    assert isinstance(tokenizer, TransformersTokenizer)
     assert isinstance(tokenizer, TokenizerBase)
     assert isinstance(tokenizer.tokenizer, PreTrainedTokenizerFast)
     copy = pickle.loads(pickle.dumps(tokenizer))
-    assert type(copy) is BeamFastTokenizer
+    assert type(copy) is TransformersTokenizer
     assert copy.encode("What is 12 plus 7 ?") == tokenizer.encode("What is 12 plus 7 ?")
-    with pytest.raises(ValueError, match="slow"):
-        BeamFastTokenizer.from_pretrained(directory, use_fast=False)
+    assert copy.encode("What is 12 plus 7 ?", truncation=True, max_length=3) == [4, 5, 6]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -470,7 +468,6 @@ _COMMON = {
     "modeling_v2": "require",
     "checkpoint_format": "beam_nvfp4",
     "checkpoint_loader": None,
-    "custom_tokenizer": _TOKENIZER,
     "reasoning_parser": "beam_harmony_text",
     "tensor_parallel_size": 4,
     "pipeline_parallel_size": 1,
@@ -538,7 +535,7 @@ def test_recipe_effective_settings_through_trtllm_serve(tmp_path, cuda_shape, mo
     kwargs = _serve_llm_kwargs(model, config)
     assert kwargs["cuda_graph_config"] is None and kwargs["enable_chunked_prefill"] is False
     args = TorchLlmArgs(**kwargs)
-    assert isinstance(args.tokenizer, BeamFastTokenizer)
+    assert isinstance(args.tokenizer, TransformersTokenizer)
     disagg = mode != "aggregated"
     assert _effective(args) == {
         **_expected_settings(mode),
@@ -568,7 +565,6 @@ def _documented_llm_kwargs(model: str, drafter: str, mode: str) -> dict:
         model=model,
         modeling_v2="require",
         checkpoint_format="beam_nvfp4",
-        custom_tokenizer=_TOKENIZER,
         reasoning_parser="beam_harmony_text",
         tensor_parallel_size=4,
         pipeline_parallel_size=1,
@@ -613,7 +609,7 @@ def test_documented_llm_api_example_matches_the_recipe(tmp_path, cuda_shape, mod
     )
     example = TorchLlmArgs(**_documented_llm_kwargs(model, drafter, mode))
     assert _effective(example) == _effective(recipe)
-    assert type(example.tokenizer) is type(recipe.tokenizer) is BeamFastTokenizer
+    assert type(example.tokenizer) is type(recipe.tokenizer) is TransformersTokenizer
 
 
 def test_recipes_hold_only_public_placeholders():
