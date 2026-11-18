@@ -265,6 +265,15 @@ class EmbeddedDSparkDraftMetadata(DraftMetadata):
     """
 
 
+class SuffixAutomatonDraftMetadata(DraftMetadata):
+    """Drafting from a suffix automaton over the tokens generated so far.
+
+    The draft is a pattern match, not a model forward: it reads no attention
+    metadata and has no draft KV cache, so this mode holds nothing and its
+    hooks do nothing.
+    """
+
+
 class SharedKVCacheStandaloneDSparkDraftMetadata(DraftMetadata):
     """A standalone DSpark drafter without a draft KV cache of its own.
 
