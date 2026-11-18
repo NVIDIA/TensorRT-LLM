@@ -47,6 +47,8 @@ l0_model_express:
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen3_5-bf16-tp2]
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-moe-bf16-tp2]
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-moe-bf16-tp2-ep2]
+  - model_express/test_model_express.py::test_mx_donor_receiver[deepseek-v3-bf16-tp2]
+  - model_express/test_model_express.py::test_mx_donor_receiver[deepseek-v3-bf16-tp2-ep2]
 - condition:
     ranges:
       system_gpu_count:
@@ -70,5 +72,6 @@ l0_model_express:
   - model_express/test_model_express.py::test_mx_donor_receiver[phi3-bf16-tp1]
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen3_5-bf16-tp1]
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-moe-bf16-tp1]
+  - model_express/test_model_express.py::test_mx_donor_receiver[deepseek-v3-bf16-tp1]
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - model_express/test_model_express_accuracy.py::test_mx_receiver_accuracy[qwen3-8b-gsm8k-tp1]
