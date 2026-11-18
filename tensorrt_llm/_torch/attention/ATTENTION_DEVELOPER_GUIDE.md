@@ -289,10 +289,12 @@ the first model forward. Warmup collects the enabled layers' static profiles,
 including cache dtype, sinks, compressed capacity and fused output groups,
 and covers the generation row budget including speculative tokens. Public
 `plan(compile=False)` calls identify unique compile specs without building kernels;
-workspace sizes are cached in TRT-LLM through the public sparse MLA helper. On
-the first eligible pass, a fresh pool imports the vendored PrimTS kernels and
-runs `plan()` on the combined payloads. During memory profiling, the pool exits
-before the rank sizes the final KV cache. On every pass, the rank prepares
+workspace sizes are cached in TRT-LLM through the public sparse MLA helper.
+When parallel precompilation is enabled, the first eligible pass checks each
+distinct specialization with `is_kernel_cached()`. Two or more misses start a
+fresh pool for those variants. The rank handles zero or one miss locally.
+During memory profiling, workers exit before the rank sizes the final KV cache.
+On every pass, the rank prepares
 its own plans and shared workspace for the current metadata, loading cached
 kernels and compiling any missing variants locally. `forward()` only retrieves the
 current row count's plan; it does not launch precompile workers or scan variants.

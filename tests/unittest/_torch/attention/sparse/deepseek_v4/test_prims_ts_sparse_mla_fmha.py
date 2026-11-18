@@ -1117,6 +1117,9 @@ def test_warmup_combines_profiles_and_loads_largest_workspace_first(monkeypatch)
 
     planned, fanned, workspace_calls = [], [], []
     mla_decode = _fake_sparse_plan(monkeypatch, planned)
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "2")
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
 
     def workspace_size(device, rows, heads, **kwargs):
         workspace_calls.append((rows, kwargs["max_extra_topk"]))
@@ -1231,6 +1234,10 @@ def _fake_sparse_plan(monkeypatch, planned, *, signature_div=8):
 
     class _FakeWrapper:
         discovery_rows = []
+        cached_specs: set = set()
+
+        def is_kernel_cached(self):
+            return self._state["compile_spec"] in self.cached_specs
 
         def __init__(self, workspace_buffer=None):
             self._state = None
@@ -1301,7 +1308,9 @@ def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> No
     fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
     mod._warmup_profiles([mod._WarmupProfile(lib, extra=64, **profile)], fresh, use_workers=False)
     assert planned == [(20, 64), (15, 64), (7, 64)]
-    assert mla_decode.BatchSparseMLADecodePagedTSWrapper.discovery_rows == list(range(1, 21)) * 2
+    assert (
+        mla_decode.BatchSparseMLADecodePagedTSWrapper.discovery_rows == list(range(20, 0, -1)) * 2
+    )
     assert len(fanned) == 1
     payloads, workers = fanned[0]
     assert workers == 2
@@ -1309,6 +1318,20 @@ def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> No
     assert payloads[0]["plan_kwargs"]["q_dtype"] == "bfloat16"
     assert payloads[0]["device_index"] == 0
     json.dumps(payloads)
+
+    # Only missing specializations go to workers; every new metadata still gets all its plans.
+    cached = mla_decode.BatchSparseMLADecodePagedTSWrapper.cached_specs
+    for cached_bucket in (0, 1, 2):
+        cached.add((cached_bucket, 32))
+        planned.clear()
+        fanned.clear()
+        fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
+        mod._warmup_profiles([mod._WarmupProfile(lib, extra=32, **profile)], fresh)
+        assert planned == [(20, 32), (15, 32), (7, 32)]
+        assert [[p["rows"] for p in ps] for ps, _ in fanned] == (
+            [[20, 15]] if cached_bucket == 0 else []
+        )
+    cached.clear()
 
     def broken_workers(payloads, workers):
         raise OSError("no subprocesses here")

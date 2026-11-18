@@ -73,6 +73,51 @@ def _kernel_source_files() -> tuple[str, ...]:
     return tuple(sorted(str(path) for path in root.rglob("*.py")))
 
 
+def _attention_kernel_name(
+    kind: str, spec: object, options: str, extra: tuple
+) -> str | None:
+    key = _compile_cache_key(spec, options, extra)
+    if key is None:
+        return None
+    import torch
+
+    # A family target such as sm100f can cover physical GPUs with different
+    # host-selected tuning defaults. The module metadata keys the target;
+    # the specialization must also distinguish the physical capability.
+    major, minor = torch.cuda.get_device_capability()
+    return f"{kind}_sm{major}{minor}_{key}"
+
+
+def is_attention_kernel_cached(
+    family: str,
+    kind: str,
+    spec: object,
+    options: str,
+    compile_fn: Callable[[], Any],
+    *,
+    extra: tuple = (),
+) -> bool:
+    from flashinfer.jit.cute_dsl_core import (
+        JitSpecCuteDsl,
+        _hash_source_files,
+        cute_dsl_cache_disabled,
+    )
+
+    if cute_dsl_cache_disabled():
+        return False
+    name = _attention_kernel_name(kind, spec, options, extra)
+    if name is None:
+        return False
+    try:
+        source_hash = _hash_source_files(_kernel_source_files())
+    except (OSError, TypeError, SyntaxError, ValueError):
+        # Unreadable source also bypasses persistence in build_and_load_cute_dsl_kernel.
+        return False
+    return JitSpecCuteDsl(
+        f"prims_ts_{family}", name, compile_fn, source_hash
+    ).is_compiled
+
+
 def build_and_load_attention_kernel(
     family: str,
     kind: str,
@@ -91,18 +136,12 @@ def build_and_load_attention_kernel(
     if cute_dsl_cache_disabled():
         return compile_fn()
 
-    key = _compile_cache_key(spec, options, extra)
-    if key is None:
+    name = _attention_kernel_name(kind, spec, options, extra)
+    if name is None:
         return compile_fn()
-    import torch
-
-    # A family target such as sm100f can cover physical GPUs with different
-    # host-selected tuning defaults. The module metadata keys the target;
-    # the specialization must also distinguish the physical capability.
-    major, minor = torch.cuda.get_device_capability()
     return build_and_load_cute_dsl_kernel(
         f"prims_ts_{family}",
-        f"{kind}_sm{major}{minor}_{key}",
+        name,
         compile_fn,
         extra_key_files=_kernel_source_files(),
     )

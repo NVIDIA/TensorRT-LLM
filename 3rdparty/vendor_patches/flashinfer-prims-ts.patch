@@ -1,5 +1,5 @@
 diff --git a/_compile_cache.py b/_compile_cache.py
-index b374a65311402982d818d80e9145ab40ed9727a1..db8416f07e37945a8e8764ac202e446f301d54d8 100644
+index c4ea76cb15fd78ab88627718fb2c3a69c3cff760..6b56ecf171fc2f4122c01b3638a5ebc849cbfc9e 100644
 --- a/_compile_cache.py
 +++ b/_compile_cache.py
 @@ -1,3 +1,4 @@
@@ -7,7 +7,7 @@ index b374a65311402982d818d80e9145ab40ed9727a1..db8416f07e37945a8e8764ac202e446f
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -82,7 +83,7 @@ def build_and_load_attention_kernel(
+@@ -127,7 +128,7 @@ def build_and_load_attention_kernel(
      extra: tuple = (),
  ) -> Any:
      """Build or load under the caller's selected CUDA device context."""
@@ -187,7 +187,7 @@ index a6a4261ca8ad3aecf065f8a4c36fca327f307dbc..7b553b20c6d9c924a08db08235b0dbc5
  from .gather import _address, gather4, select_gather_map
  from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
 diff --git a/mla_decode.py b/mla_decode.py
-index d6ef4d01a9b991c557a3a9a98f977834c10700f8..9816542142f04722d8204e8070e33ce4f6041088 100644
+index c282cd5a4c6d4699c636eadd6c8138031c7cdbad..084b254b0c1959c44dcade6125b31894d0a2bb40 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -209,7 +209,7 @@ index d6ef4d01a9b991c557a3a9a98f977834c10700f8..9816542142f04722d8204e8070e33ce4
  
  
  from .decode import (
-@@ -1992,7 +1989,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1986,7 +1983,7 @@ class BatchMLADecodePagedTSWrapper:
              softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
          )
  
@@ -218,7 +218,7 @@ index d6ef4d01a9b991c557a3a9a98f977834c10700f8..9816542142f04722d8204e8070e33ce4
      def run(
          self,
          query: torch.Tensor,
-@@ -2108,7 +2105,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -2102,7 +2099,7 @@ class BatchMLADecodePagedTSWrapper:
          return (result, lse) if return_lse else result
  
  
@@ -227,7 +227,7 @@ index d6ef4d01a9b991c557a3a9a98f977834c10700f8..9816542142f04722d8204e8070e33ce4
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2514,17 +2511,17 @@ def _resolve_sparse_mla_plan(
+@@ -2508,17 +2505,17 @@ def _resolve_sparse_mla_plan(
      affect geometry or workspace sizing.
      """
      import cutlass

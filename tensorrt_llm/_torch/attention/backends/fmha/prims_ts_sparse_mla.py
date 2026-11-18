@@ -568,10 +568,15 @@ class PrimsTSSparseMlaFmha(Fmha):
             )
         return plan_kwargs, holes_possible
 
-    def _kernel_variant_rows(
-        self, metadata: "TrtllmAttentionMetadata", device: torch.device, plan_kwargs: dict
-    ) -> list[int]:
-        """Plan every reachable row count without compiling and retain unique specs."""
+    def _kernel_variants(
+        self,
+        metadata: "TrtllmAttentionMetadata",
+        device: torch.device,
+        plan_kwargs: dict,
+        *,
+        use_workers: bool,
+    ) -> list[tuple[int, bool]]:
+        """Return one row count per specialization and whether a worker should build it."""
         from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
 
         requests = int(metadata.max_num_requests or 0)
@@ -589,16 +594,17 @@ class PrimsTSSparseMlaFmha(Fmha):
         }
         workspace = torch.empty(max(sizes.values()), device=device, dtype=torch.uint8)
         wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper(workspace_buffer=workspace)
-        representatives: dict[object, int] = {}
-        for rows in sizes:
+        variants = []
+        seen = set()
+        # A spec can cover several row counts. Keep the one with the largest
+        # workspace (then the most rows), and query its disk entry only once.
+        for rows in sorted(sizes, key=lambda r: (sizes[r], r), reverse=True):
             wrapper.plan(device, rows, heads, compile=False, **plan_kwargs)
             spec = wrapper._state["compile_spec"]
-            previous = representatives.get(spec)
-            # Split counts can change with rows. Keep the largest workspace,
-            # breaking ties by rows, so later local loading allocates it once.
-            if previous is None or (sizes[rows], rows) > (sizes[previous], previous):
-                representatives[spec] = rows
-        return sorted(representatives.values(), key=lambda rows: (sizes[rows], rows), reverse=True)
+            if spec not in seen:
+                seen.add(spec)
+                variants.append((rows, use_workers and not wrapper.is_kernel_cached()))
+        return variants
 
     @staticmethod
     def _claim_contract_validation(contract_key: tuple) -> bool:
@@ -820,6 +826,9 @@ def _warmup_profiles(
         return False
     from . import prims_ts_precompile
 
+    local_ranks = prims_ts_precompile.local_rank_count(metadata.mapping)
+    # Two missing variants is the smallest batch that can use a worker pool.
+    use_workers = use_workers and prims_ts_precompile.worker_count(2, local_ranks=local_ranks) > 1
     payloads = []
     plans = []
     seen = set()
@@ -830,26 +839,29 @@ def _warmup_profiles(
         if key in seen:
             continue
         seen.add(key)
-        for rows in profile.library._kernel_variant_rows(metadata, profile.device, kwargs):
-            device_index = profile.device.index
-            if device_index is None:
-                device_index = torch.cuda.current_device()
-            payloads.append(prims_ts_precompile.encode_payload(device_index, rows, heads, kwargs))
+        for rows, needs_worker in profile.library._kernel_variants(
+            metadata, profile.device, kwargs, use_workers=use_workers
+        ):
+            if needs_worker:
+                device_index = profile.device.index
+                if device_index is None:
+                    device_index = torch.cuda.current_device()
+                payloads.append(
+                    prims_ts_precompile.encode_payload(device_index, rows, heads, kwargs)
+                )
             workspace_bytes = _workspace_size(profile.device, rows, heads, **kwargs)
             plans.append((workspace_bytes, profile, rows))
-    if not payloads:
+    if not plans:
         return False
     start = time.perf_counter()
-    if use_workers:
-        prims_ts_precompile.precompile_payloads(
-            payloads, local_ranks=prims_ts_precompile.local_rank_count(metadata.mapping)
-        )
+    if payloads:
+        prims_ts_precompile.precompile_payloads(payloads, local_ranks=local_ranks)
     # Allocate the largest workspace first so all profiles can share it. The
     # serving process must load every artifact even when the disk cache is warm.
     for _, profile, rows in sorted(plans, key=lambda plan: plan[0], reverse=True):
         profile.load(metadata, rows)
     logger.info(
-        f"PrimTS sparse MLA warmup loaded {len(payloads)} variants across {len(seen)} profiles "
+        f"PrimTS sparse MLA warmup loaded {len(plans)} variants across {len(seen)} profiles "
         f"in {time.perf_counter() - start:.1f} s"
     )
     return True
