@@ -172,12 +172,24 @@ def _signer(
     return FrameSigner(keys or {1: _KEY}, active_key_id, context)
 
 
-def _signed(frames: list[bytes], signer: Optional[FrameSigner] = None) -> list[bytes]:
-    return list(frames) + (signer or _signer()).sign(
-        list(frames),
-        sender_id=b"sender",
-        recipient_id=b"recipient",
-        flow=FrameSigner.FLOW_TO_ROUTER,
+def _signed(
+    frames: Sequence[bytes],
+    signer: Optional[FrameSigner] = None,
+    *,
+    sender_id: bytes = b"sender",
+    recipient_id: bytes = b"recipient",
+    flow: int = FrameSigner.FLOW_TO_ROUTER,
+    seq: int = 1,
+    stream_id: bytes = bytes(FrameSigner.STREAM_ID_SIZE),
+) -> list[bytes]:
+    frames = list(frames)
+    return frames + (signer or _signer()).sign(
+        frames,
+        sender_id=sender_id,
+        recipient_id=recipient_id,
+        flow=flow,
+        seq=seq,
+        stream_id=stream_id,
     )
 
 
@@ -422,17 +434,15 @@ def test_signed_dealer_rejects_reply_for_other_recipient_or_from_other_peer(
     signed_pair: _MessengerPair,
 ) -> None:
     router, dealer = signed_pair
-    signer = _signer()
-    router_id = router.endpoint.encode()
-    for_other = [b"reply"] + signer.sign(
+    for_other = _signed(
         [b"reply"],
-        sender_id=router_id,
+        sender_id=router.endpoint.encode(),
         recipient_id=b"tcp://127.0.0.1:40003",
         flow=FrameSigner.FLOW_TO_DEALER,
     )
     with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
         dealer._verify(for_other)
-    from_other = [b"reply"] + signer.sign(
+    from_other = _signed(
         [b"reply"],
         sender_id=b"tcp://10.0.0.9:1",
         recipient_id=b"tcp://127.0.0.1:40001",
@@ -444,7 +454,7 @@ def test_signed_dealer_rejects_reply_for_other_recipient_or_from_other_peer(
 
 def test_signed_dealer_rejects_repeated_reply(signed_pair: _MessengerPair) -> None:
     router, dealer = signed_pair
-    reply = [b"reply"] + _signer().sign(
+    reply = _signed(
         [b"reply"],
         sender_id=router.endpoint.encode(),
         recipient_id=b"tcp://127.0.0.1:40001",
@@ -463,14 +473,11 @@ def _raw_signed(
     seq: int,
     stream_id: bytes,
     payload: Sequence[bytes] = (b"TAG",),
-    sender_id: bytes = b"tcp://127.0.0.1:40009",
 ) -> list[bytes]:
-    payload = list(payload)
-    return payload + _signer().sign(
+    return _signed(
         payload,
-        sender_id=sender_id,
+        sender_id=b"tcp://127.0.0.1:40009",
         recipient_id=router.endpoint.encode(),
-        flow=FrameSigner.FLOW_TO_ROUTER,
         seq=seq,
         stream_id=stream_id,
     )

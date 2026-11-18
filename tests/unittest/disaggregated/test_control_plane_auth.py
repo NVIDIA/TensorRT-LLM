@@ -41,7 +41,12 @@ def test_frame_signer_only_when_key_configured() -> None:
     assert _make_native_frame_signer(None) is None
     signer = _make_native_frame_signer(_MASTER_KEY)
     message = [b"KV_AGENT_RESULT"] + signer.sign(
-        [b"KV_AGENT_RESULT"], sender_id=b"a", recipient_id=b"b", flow=FrameSigner.FLOW_TO_ROUTER
+        [b"KV_AGENT_RESULT"],
+        sender_id=b"a",
+        recipient_id=b"b",
+        flow=FrameSigner.FLOW_TO_ROUTER,
+        seq=1,
+        stream_id=bytes(FrameSigner.STREAM_ID_SIZE),
     )
     signer.verify(message, recipient_id=b"b", flow=FrameSigner.FLOW_TO_ROUTER)
     with pytest.raises(PermissionError):
@@ -150,6 +155,8 @@ def test_signed_server_drops_message_without_payload_and_keeps_serving() -> None
             sender_id=_RECEIVER_ENDPOINT.encode(),
             recipient_id=server.endpoint.encode(),
             flow=FrameSigner.FLOW_TO_ROUTER,
+            seq=1,
+            stream_id=bytes(FrameSigner.STREAM_ID_SIZE),
         )
         with ZMQMessenger("DEALER", server.endpoint, signer=None) as raw:
             raw.send(auth_frames)

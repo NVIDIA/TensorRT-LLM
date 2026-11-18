@@ -82,7 +82,11 @@ def decode_message(
 
 
 class FrameAuthenticationError(PermissionError):
-    """A signed control message failed verification."""
+    """A signed control message was not accepted or could not be sent.
+
+    Raised on receive when a message fails verification, and by a signed
+    ROUTER's ``send()`` when no verified message came from the routing id.
+    """
 
 
 class SignedHeader(NamedTuple):
@@ -114,17 +118,6 @@ class FrameSigner:
         context: Domain-separation string chosen by the caller. Two protocols
             sharing a key must use different contexts, otherwise a frame valid
             in one verifies in the other.
-
-    Message ordering. Each signed socket draws a random 16-byte stream id
-    and numbers its messages from 1. ``ZMQMessenger`` remembers the last seq
-    accepted per (sender id, stream id) and accepts a message only when its
-    seq is larger, so a message is accepted at most once while that state is
-    kept. A gap (lost message) is accepted. A message that arrives after a
-    later one of the same stream is dropped; this can happen when a
-    connection is re-established while earlier messages are still unread at
-    the receiver. A restarted peer draws a new stream id and starts again at
-    1. Senders hold a lock around seq assignment and the socket write, so
-    threads sharing a socket cannot reorder their own messages.
     """
 
     MAC_SIZE = 32
@@ -173,8 +166,8 @@ class FrameSigner:
         sender_id: bytes,
         recipient_id: bytes,
         flow: int,
-        seq: int = 0,
-        stream_id: bytes = bytes(STREAM_ID_SIZE),
+        seq: int,
+        stream_id: bytes,
     ) -> list[bytes]:
         """Return the ``[header, mac]`` frames to append to ``frames``.
 
@@ -186,12 +179,10 @@ class FrameSigner:
                 by the MAC and not sent; the verifier supplies its own id.
             flow: ``FLOW_TO_ROUTER`` or ``FLOW_TO_DEALER``.
             seq: Number of the message within ``stream_id``. ``ZMQMessenger``
-                passes a per-socket counter that starts at 1. With the default
-                of 0 on every message, a ``ZMQMessenger`` accepts only the
-                first message of a (sender id, stream id) pair.
+                passes a per-socket counter that starts at 1.
             stream_id: ``STREAM_ID_SIZE`` bytes that identify the sending
                 socket. ``ZMQMessenger`` passes a random value drawn once per
-                socket. The default is all zero bytes.
+                socket.
         """
         if len(stream_id) != self.STREAM_ID_SIZE:
             raise ValueError(f"stream_id must be {self.STREAM_ID_SIZE} bytes")
@@ -272,9 +263,24 @@ class ZMQMessenger(MessengerInterface):
     verified and stripped before it reaches ``receive()`` callers or the
     listener callback, so handlers see the same frames as without a signer.
 
+    Message ordering. Each signed socket draws a random 16-byte stream id
+    and numbers its messages from 1. The receiving socket remembers the last
+    seq accepted per (sender id, stream id) and accepts a message only when
+    its seq is larger, so a message is accepted at most once while that state
+    is kept. A gap (lost message) is accepted. A message that arrives after a
+    later one of the same stream is dropped; this can happen when a
+    connection is re-established while earlier messages are still unread at
+    the receiver. A restarted peer draws a new stream id and starts again at
+    1. Senders hold a lock around seq assignment and the socket write, so
+    threads sharing a socket cannot reorder their own messages.
+
     Args:
         mode: One of ``SOCKET_MODES``.
         endpoint: Bind address for ROUTER/REP, connect address for DEALER/REQ.
+            A signed DEALER must connect with exactly the id of the ROUTER,
+            which is the string the ROUTER reports as ``endpoint`` unless it
+            was given ``identity``: the MAC covers this string, so another
+            spelling of the same address does not verify.
         signer: Message authenticator, or None to send and accept plain frames.
         identity: This component's id in signed messages. A ROUTER defaults to
             its bound endpoint. A signed DEALER must be given the endpoint of
@@ -340,6 +346,8 @@ class ZMQMessenger(MessengerInterface):
         self._identity = (identity or self._endpoint).encode("utf-8")
         self._peer_ids: "OrderedDict[bytes, bytes]" = OrderedDict()
         self._peer_ids_lock = Lock()
+        # Messages the listener dropped because verification failed, repeated
+        # or out-of-order ones included. receive() callers are not counted.
         self.auth_failures = 0
         self._last_auth_warning = float("-inf")
         self._send_lock = Lock()
@@ -347,6 +355,8 @@ class ZMQMessenger(MessengerInterface):
         self._next_seq = 1
         self._last_seq: "OrderedDict[tuple[bytes, bytes], int]" = OrderedDict()
         self._last_seq_lock = Lock()
+        # Repeated or out-of-order messages, counted for the listener and for
+        # receive() callers alike.
         self.replays_rejected = 0
 
         logger.info(
@@ -424,8 +434,6 @@ class ZMQMessenger(MessengerInterface):
 
     def _verify(self, frames: list[bytes]) -> list[bytes]:
         if self._mode == "ROUTER":
-            if not frames:
-                raise FrameAuthenticationError("Empty message")
             routing_id = frames[0]
             payload, header = self._signer.verify(
                 frames[1:], recipient_id=self._identity, flow=FrameSigner.FLOW_TO_ROUTER
