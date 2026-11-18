@@ -18,13 +18,15 @@ from collections.abc import Iterator
 from typing import Dict
 
 import pytest
-from prometheus_client import REGISTRY
+from prometheus_client import REGISTRY, generate_latest
+from prometheus_client.parser import text_string_to_metric_families
 
+from tensorrt_llm._torch.pyexecutor.iteration_stats import IterationStatsRecord
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2StorageIterationStats,
-    append_kv_cache_iteration_stats,
 )
+from tensorrt_llm.bindings.executor import IterationStats
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MAX_SPEC_DECODE_POSITION_LABELS, MetricsCollector
 from tensorrt_llm.metrics.enums import MetricNames, RequestEventTiming
@@ -199,135 +201,7 @@ class TestKVCacheStats:
         assert _get_gauge_value(collector, "kv_cache_hit_rate", dp_rank=0) == pytest.approx(0.85)
 
 
-class TestIterationLogTimingMetrics:
-    @staticmethod
-    def _sample(collector, name, mode="overlap"):
-        return collector._registry.get_sample_value(
-            "trtllm_" + name, {**collector.labels, "scheduler_mode": mode}
-        )
-
-    def test_units_histograms_and_rank_ownership(self, collector):
-        for host_ms, device_ms, forward_ms in [(1.0, 0.8, 0.5), (3.0, 2.5, 1.5)]:
-            for rank in [1, 0]:
-                collector.log_iteration_stats(
-                    {
-                        "attentionDpRank": rank,
-                        "schedulerMode": "overlap",
-                        "hostStepTimeMS": host_ms,
-                        "prevDeviceStepTimeMS": device_ms,
-                        "gpuForwardTimeMS": forward_ms,
-                    }
-                )
-
-        for name, expected in [
-            ("host_step_time_seconds", 0.003),
-            ("prev_device_step_time_seconds", 0.0025),
-            ("gpu_forward_time_seconds", 0.0015),
-            ("host_step_duration_seconds_count", 2),
-            ("host_step_duration_seconds_sum", 0.004),
-            ("gpu_forward_duration_seconds_count", 2),
-            ("gpu_forward_duration_seconds_sum", 0.002),
-        ]:
-            assert self._sample(collector, name) == pytest.approx(expected)
-        assert (
-            collector._registry.get_sample_value(
-                "trtllm_host_step_duration_seconds_bucket",
-                {**collector.labels, "scheduler_mode": "overlap", "le": "0.001"},
-            )
-            == 1
-        )
-
-    def test_optional_fields_and_legacy_scheduler_mode(self, collector):
-        collector.log_iteration_stats({"iterLatencyMS": 8.0})
-        assert self._sample(collector, "host_step_time_seconds", "unknown") is None
-        collector.log_iteration_stats({"hostStepTimeMS": 0.0, "gpuForwardTimeMS": 2.0})
-        collector.log_iteration_stats({"hostStepTimeMS": 4.0})
-        assert self._sample(collector, "host_step_duration_seconds_count", "unknown") == 2
-        assert self._sample(collector, "host_step_duration_seconds_sum", "unknown") == 0.004
-        assert self._sample(collector, "gpu_forward_duration_seconds_count", "unknown") == 1
-        assert self._sample(collector, "gpu_forward_time_seconds", "unknown") == 0.002
-        assert self._sample(collector, "prev_device_step_time_seconds", "unknown") is None
-        assert _get_gauge_value(collector, "iteration_latency_seconds") == 0.008
-
-
-class TestExistingRankAndTransferMetrics:
-    def test_transfer_outcomes_are_cumulative_and_rank_local(self, collector):
-        for rank, counts in [(0, (2, 1, 0)), (1, (1, 0, 2)), (0, (2, 1, 0)), (0, (5, 2, 1))]:
-            collector.log_iteration_stats(
-                {
-                    "attentionDpRank": rank,
-                    "kvTransferOutcomes": dict(zip(("success", "error", "timeout"), counts)),
-                }
-            )
-        for rank, counts in [(0, (5, 2, 1)), (1, (1, 0, 2))]:
-            for outcome, count in zip(("success", "error", "timeout"), counts):
-                assert (
-                    collector._registry.get_sample_value(
-                        "trtllm_kv_cache_transfer_requests_total",
-                        {**collector.labels, "dp_rank": str(rank), "outcome": outcome},
-                    )
-                    == count
-                )
-        # Missing/invalid values and repeated snapshots must not add outcomes.
-        collector.log_iteration_stats({"kvTransferOutcomes": {"success": -1, "error": "2"}})
-        assert (
-            collector._registry.get_sample_value(
-                "trtllm_kv_cache_transfer_requests_total",
-                {**collector.labels, "dp_rank": "0", "outcome": "success"},
-            )
-            == 5
-        )
-
-    def test_existing_rank_snapshots_and_optional_kv_details(self, collector):
-        for rank, total, new in [(0, 5, 3), (1, 7, 2), (0, 8, 4)]:
-            collector.log_iteration_stats(
-                {
-                    "attentionDpRank": rank,
-                    "kvCacheStats": {"allocTotalBlocks": total, "allocNewBlocks": new},
-                    "inflightBatchingStats": {
-                        "numCtxKvTokens": 100 + rank,
-                        "numGenKvTokens": 200 + rank,
-                        "numPausedKvTokens": 10 + rank,
-                    },
-                }
-            )
-        for rank, total, new in [(0, 8, 4), (1, 7, 2)]:
-            assert _get_counter_value(collector, "kv_cache_allocated_blocks", rank) == total
-            assert _get_counter_value(collector, "kv_cache_new_blocks", rank) == new
-            assert _get_gauge_value(collector, "context_kv_tokens", rank) == 100 + rank
-            assert _get_gauge_value(collector, "generation_kv_tokens", rank) == 200 + rank
-            assert _get_gauge_value(collector, "paused_kv_tokens", rank) == 10 + rank
-        collector.log_iteration_stats(
-            {
-                "attentionDpRank": 0,
-                "iterSuspendedRequests": 2,
-                "iterResumedRequests": 1,
-                "kvCacheIterationStatsByPoolGroup": {
-                    "0": {
-                        "primaryEvictableNumBlocks": 3,
-                        "primaryPeakUsedNumBlocks": 8,
-                        "iterHostDroppedBytes": 1024,
-                    },
-                    "1": {
-                        "primaryEvictableNumBlocks": 4,
-                        "primaryPeakUsedNumBlocks": 9,
-                        "iterHostDroppedBytes": 2048,
-                    },
-                },
-            }
-        )
-        assert _get_gauge_value(collector, "kv_cache_evictable_blocks", 0) == 7
-        assert _get_gauge_value(collector, "kv_cache_peak_used_blocks", 0) == 17
-        assert _get_counter_value(collector, "kv_cache_host_dropped_bytes", 0) == 3072
-        assert _get_counter_value(collector, "kv_cache_requests_suspended", 0) == 2
-        assert _get_counter_value(collector, "kv_cache_requests_resumed", 0) == 1
-        assert (
-            collector._registry.get_sample_value(
-                "trtllm_kv_cache_evictable_blocks", {**collector.labels, "dp_rank": "1"}
-            )
-            is None
-        )
-
+class TestRequestTransferMetrics:
     def test_transfer_perf_metrics_count_once_across_candidates(self, collector):
         from types import SimpleNamespace
 
@@ -1955,359 +1829,165 @@ class TestRequestErrorCounter:
         assert _counter_value_with_labels(collector.counter_request_error, labels) == 1
 
 
-class TestTierStoragePressure:
-    def test_serialized_snapshot_keeps_levels_pools_states_and_movement(
-        self, collector: MetricsCollector
-    ) -> None:
-        report = KVCacheV2IterationStatsReport(
-            {},
-            {},
-            cache_level_tiers=["gpu", "gpu", "host", "disk"],
-            storage_stats=[
-                KVCacheV2StorageIterationStats(0, 0, (64, 64), 10, 2, 7, 3, 4, 0, 1),
-                KVCacheV2StorageIterationStats(0, 1, (1024,), 5, 1, 1, 1, 2, 0, 0),
-                KVCacheV2StorageIterationStats(1, 0, (32,), 20, 0, 20, 5, 6, 0, 0),
-                KVCacheV2StorageIterationStats(2, 0, (16,), 100, 30, 60, 7, 8, 9, 0),
-                KVCacheV2StorageIterationStats(3, 0, (16,), 200, 150, 50, 0, 0, 11, 0),
-            ],
-        )
-        stats = {"attentionDpRank": 2}
-        append_kv_cache_iteration_stats(stats, report)
-        collector.log_iteration_stats(stats)
-        collector.log_iteration_stats(stats)  # Snapshots are cumulative, not iteration deltas.
-        for snapshot in report.storage_stats:
-            labels = {
-                **collector.labels,
-                "dp_rank": "2",
-                "cache_level": str(snapshot.cache_level),
-                "cache_tier": report.cache_level_tiers[snapshot.cache_level],
-                "pool_group": str(snapshot.pool_group_id),
-            }
-            for state, blocks in (
-                ("free", snapshot.free_blocks),
-                ("evictable", snapshot.evictable_blocks),
-                (
-                    "unavailable",
-                    snapshot.total_blocks - snapshot.free_blocks - snapshot.evictable_blocks,
-                ),
-            ):
-                state_labels = {**labels, "state": state}
-                assert collector.kv_cache_tier_blocks.labels(**state_labels)._value.get() == blocks
-                assert collector.kv_cache_tier_bytes.labels(
-                    **state_labels
-                )._value.get() == blocks * sum(snapshot.slot_size)
-            for operation, count in (
-                ("restore", snapshot.restored_blocks),
-                ("evict", snapshot.evicted_blocks),
-                ("drop_capacity", snapshot.capacity_dropped_blocks),
-                ("drop_priority", snapshot.priority_dropped_blocks),
-            ):
-                movement_labels = {**labels, "operation": operation}
-                assert _has_series(collector.kv_cache_tier_moved_blocks, movement_labels)
-                assert (
-                    collector.kv_cache_tier_moved_blocks.labels(**movement_labels)._value.get()
-                    == count
-                )
-                assert collector.kv_cache_tier_moved_bytes.labels(
-                    **movement_labels
-                )._value.get() == count * sum(snapshot.slot_size)
-        # Exercise measured zero, cumulative growth, a full reclaimable pool,
-        # and an older producer that has occupancy but no movement counters.
-        snapshot = report.storage_stats[0]
-        snapshot.free_blocks, snapshot.evictable_blocks = 0, snapshot.total_blocks
-        snapshot.restored_blocks = 8
-        stats = {"attentionDpRank": 2}
-        append_kv_cache_iteration_stats(stats, report)
-        collector.log_iteration_stats(stats)
-        labels = {
-            **collector.labels,
-            "dp_rank": "2",
-            "cache_level": "0",
-            "cache_tier": "gpu",
-            "pool_group": "0",
-        }
-        assert (
-            collector.kv_cache_tier_blocks.labels(**labels, state="unavailable")._value.get() == 0
-        )
-        assert (
-            collector.kv_cache_tier_moved_blocks.labels(**labels, operation="restore")._value.get()
-            == 8
-        )
-        snapshot.restored_blocks = snapshot.evicted_blocks = None
-        snapshot.pool_group_id = 2
-        stats = {"attentionDpRank": 2}
-        append_kv_cache_iteration_stats(stats, report)
-        collector.log_iteration_stats(stats)
-        for operation in ("restore", "evict"):
-            assert not _has_series(
-                collector.kv_cache_tier_moved_blocks,
-                {**labels, "pool_group": "2", "operation": operation},
-            )
-        assert (
-            collector.kv_cache_tier_moved_blocks.labels(**labels, operation="restore")._value.get()
-            == 8
-        )
-        # No detailed snapshots are fabricated for another rank or legacy source.
-        collector.log_iteration_stats({"attentionDpRank": 0, "kvCacheStats": {"usedNumBlocks": 1}})
-        assert all(
-            sample.labels["dp_rank"] == "2"
-            for family in collector.kv_cache_tier_blocks.collect()
+@pytest.fixture
+def scrape(collector):
+    def read(name: str, **labels):
+        return [
+            sample.value
+            for family in text_string_to_metric_families(generate_latest(REGISTRY).decode())
             for sample in family.samples
-        )
-
-    @pytest.mark.parametrize(
-        "changes",
-        [
-            {"totalNumBlocks": -1},
-            {"freeNumBlocks": 9},
-            {"slotSize": []},
-            {"cacheLevel": -1},
-            {"poolGroupId": True},
-        ],
-    )
-    def test_invalid_snapshot_does_not_create_samples(
-        self, collector: MetricsCollector, changes: dict
-    ) -> None:
-        collector.log_iteration_stats(
-            {
-                "kvCacheStorageStats": [
-                    {
-                        "cacheLevel": 0,
-                        "poolGroupId": 0,
-                        "slotSize": [32],
-                        "totalNumBlocks": 10,
-                        "freeNumBlocks": 3,
-                        "evictableNumBlocks": 4,
-                        **changes,
-                    }
-                ]
-            }
-        )
-        assert not [
-            sample
-            for family in collector.kv_cache_tier_blocks.collect()
-            for sample in family.samples
+            if sample.name == "trtllm_" + name
+            and all(sample.labels.get(key) == str(value) for key, value in labels.items())
         ]
 
-    def test_sampled_migration_latency_and_sampling_budget(
-        self, collector: MetricsCollector
-    ) -> None:
-        stats = {
-            "attentionDpRank": 1,
-            "kvCacheLevelTiers": ["gpu", "host", "disk"],
-            "kvCacheMigrationTimingsSkipped": 3,
-            "kvCacheMigrationTimings": [
-                (2, 0, 0, 2.5),
-                (1, 2, 0, 100.0),
-                (2, 0, 0, float("nan")),
-                (2, 0, 0, -1),
-            ],
-        }
-        collector.log_iteration_stats(stats)
-        for level, tier, operation, expected in [
-            (0, "gpu", "restore", 0.0025),
-            (1, "host", "evict", 0.1),
-        ]:
-            labels = {
-                **collector.labels,
-                "dp_rank": "1",
-                "cache_level": str(level),
-                "cache_tier": tier,
-                "pool_group": "0",
-                "operation": operation,
-            }
-            labels.update(
-                source_cache_level="2" if operation == "restore" else "1",
-                source_cache_tier="disk" if operation == "restore" else "host",
-                destination_cache_level="0" if operation == "restore" else "2",
-                destination_cache_tier="gpu" if operation == "restore" else "disk",
-            )
-            histogram = collector.histogram_kv_cache_tier_migration.labels(**labels)
-            assert all(
-                boundary in histogram._upper_bounds
-                for boundary in (0.00025, 0.0005, 0.0025, 0.005, 0.025, 0.05, 0.25, 0.5)
-            )
-            assert histogram._sum.get() == pytest.approx(expected)
-            assert sum(bucket.get() for bucket in histogram._buckets) == 1
-        stats["kvCacheMigrationTimings"] = []
-        collector.log_iteration_stats(stats)
-        assert _get_counter_value(collector, "kv_cache_migration_timing_skipped", 1) == 3
+    return read
 
 
-def test_conversation_count_snapshot_and_gauge(collector):
-    for count in (None, 7, 0):
-        row = {"attentionDpRank": 0}
-        append_kv_cache_iteration_stats(
-            row, KVCacheV2IterationStatsReport({}, {}, num_conversations=count)
+def test_iteration_record_exports_rank_owned_timings_and_transfer_outcomes(collector, scrape):
+    for rank, outcomes in ((1, (1, 0, 2)), (0, (2, 1, 0)), (0, (2, 1, 0)), (0, (5, 2, 1))):
+        collector.log_iteration_stats(
+            IterationStatsRecord(
+                IterationStats(),
+                attention_dp_rank=rank,
+                host_step_time_ms=4.0,
+                gpu_forward_time_ms=2.0,
+                prev_device_step_time_ms=3.0,
+                scheduler_mode="overlap",
+                kv_transfer_outcomes=outcomes,
+            ).to_dict()
         )
-        collector.log_iteration_stats(row)
-        if count is None:
-            assert "kvCacheNumConversations" not in row
-            assert collector.kv_cache_num_conversations.collect()[0].samples == []
-        else:
-            assert row["kvCacheNumConversations"] == count
-            assert _get_gauge_value(collector, "kv_cache_num_conversations", 0) == count
+    assert scrape("host_step_time_seconds", scheduler_mode="overlap") == [0.004]
+    assert scrape("prev_device_step_time_seconds", scheduler_mode="overlap") == [0.003]
+    assert scrape("gpu_forward_duration_seconds_sum", scheduler_mode="overlap") == [0.006]
+    assert scrape("host_step_duration_seconds_count", scheduler_mode="overlap") == [3]
+    assert scrape("kv_cache_transfer_requests_total", dp_rank=0, outcome="success") == [5]
+    assert scrape("kv_cache_transfer_requests_total", dp_rank=1, outcome="timeout") == [2]
 
 
-def test_conversation_count_rejects_invalid_measurements(collector):
-    for value in (-1, True, "3", 1.5):
-        collector.log_iteration_stats({"kvCacheNumConversations": value})
-        assert collector.kv_cache_num_conversations.collect()[0].samples == []
-
-
-def _activity_request(
-    conversation_id="session", *, request_id=1, lora=None, salt=None, dummy=False
-):
-    from types import SimpleNamespace
-
-    return SimpleNamespace(
-        is_dummy_request=dummy,
-        py_request_id=request_id,
-        py_conversation_params=SimpleNamespace(conversation_id=conversation_id),
-        lora_task_id=lora,
-        cache_salt=salt,
+def test_storage_report_exports_capacity_and_cumulative_movement(collector, scrape):
+    report = KVCacheV2IterationStatsReport(
+        {},
+        {},
+        cache_level_tiers=["gpu", "host"],
+        num_conversations=7,
+        storage_stats=[
+            KVCacheV2StorageIterationStats(
+                cache_level=1,
+                pool_group_id=2,
+                slot_size=(32, 32),
+                total_blocks=10,
+                free_blocks=2,
+                evictable_blocks=3,
+                restored_blocks=4,
+            )
+        ],
+        migration_timings=[(1, 0, 2, 2.5)],
+        skipped_migration_timings=3,
     )
+    record = IterationStatsRecord(IterationStats(), kv_iteration_stats=report, attention_dp_rank=3)
+    collector.log_iteration_stats(record.to_dict())
+    # Timing observations are drained once; occupancy and movement are cumulative snapshots.
+    report.migration_timings.clear()
+    for restored in (4, 6):
+        report.storage_stats[0].restored_blocks = restored
+        collector.log_iteration_stats(record.to_dict())
+    labels = dict(dp_rank=3, cache_level=1, cache_tier="host", pool_group=2)
+    assert scrape("kv_cache_tier_blocks", **labels, state="unavailable") == [5]
+    assert scrape("kv_cache_tier_bytes", **labels, state="evictable") == [192]
+    assert scrape("kv_cache_tier_moved_blocks_total", **labels, operation="restore") == [6]
+    assert scrape("kv_cache_tier_moved_bytes_total", **labels, operation="restore") == [384]
+    assert not scrape("kv_cache_tier_blocks", dp_rank=0)
+    assert scrape("kv_cache_num_conversations", dp_rank=3) == [7]
+    assert scrape(
+        "kv_cache_tier_migration_duration_seconds_sum",
+        source_cache_tier="host",
+        destination_cache_tier="gpu",
+    ) == [0.0025]
+    assert scrape("kv_cache_tier_migration_duration_seconds_count") == [1]
+    assert scrape("kv_cache_migration_timing_skipped_total", dp_rank=3) == [3]
 
 
-def _activity_manager(**limits):
+@pytest.fixture
+def conversation_request():
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+    from tensorrt_llm.conversation_params import ConversationParams
+
+    def make(conversation_id="session", *, lora=None, salt=None):
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=1,
+            input_tokens=[1, 2],
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+            lora_task_id=lora,
+            cache_salt=salt,
+        )
+        if conversation_id is not None:
+            request.py_conversation_params = ConversationParams(conversation_id=conversation_id)
+        return request
+
+    return make
+
+
+def test_worker_conversations_export_namespace_refresh_and_idle_expiry(
+    collector, scrape, conversation_request
+):
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
 
     manager = ConversationManager(0, retention_enabled=False)
-    manager.enable_activity_tracking(now=0.0, **limits)
-    return manager
-
-
-def test_conversation_activity_refreshes_scoped_identities_and_survives_retention_clear():
-    manager = _activity_manager()
-    first = _activity_request(" session ")
-    manager.observe_admission(first, 1.0)
-    manager.observe_admission(_activity_request("session", request_id=2), 500.0)
-    manager.observe_admission(_activity_request(lora=1), 501.0)
-    manager.observe_admission(_activity_request(salt="other"), 502.0)
-    manager.observe_admission(_activity_request(" "), 503.0)
-    manager.observe_admission(_activity_request(dummy=True), 504.0)
-    no_params = _activity_request()
-    no_params.py_conversation_params = None
-    manager.observe_admission(no_params, 505.0)
-    manager.prepare_request(first)
-    assert manager.num_conversations == 0  # Activity alone does not enable retention.
-    manager.clear()
-    assert manager.snapshot_activity(600.0).unique_10m == 3
-    assert manager.snapshot_activity(600.0).complete_10m == 1
-    assert manager.snapshot_activity(600.0).complete_1h == 0
-    assert manager.snapshot_activity(1100.0).unique_10m == 2
-    assert manager.snapshot_activity(1102.0).unique_10m == 0
-    assert manager.snapshot_activity(3600.0).unique_1h == 3
-    assert manager.snapshot_activity(3600.0).complete_1h == 1
-    assert manager.snapshot_activity(4102.0).unique_1h == 0
-    assert manager._activity_entries == manager._activity_identity_bytes == 0
-    manager.observe_admission(first, 4103.0)
-    assert manager.snapshot_activity(4103.0).unique_10m == 1
+    manager.enable_activity_tracking(now=0.0)
+    for request in (
+        conversation_request(" session "),
+        conversation_request(),
+        conversation_request(lora=1),
+        conversation_request(salt="other"),
+        conversation_request(None),
+    ):
+        manager.observe_admission(request, 1.0)
+    manager.observe_admission(conversation_request(), 500.0)
+    manager.clear()  # Retention clearing must not erase activity history.
+    for now, short, long, complete in (
+        (600.0, 3, 3, 0),
+        (601.0, 1, 3, 0),
+        (1100.0, 0, 3, 0),
+        (3600.0, 0, 3, 1),
+        (4100.0, 0, 0, 1),
+    ):
+        collector.log_iteration_stats(
+            {"attentionDpRank": 3, "conversationActivity": manager.snapshot_activity(now).to_dict()}
+        )
+        assert scrape("conversation_unique_seen", dp_rank=3, window="10m") == [short]
+        assert scrape("conversation_unique_seen", dp_rank=3, window="1h") == [long]
+        assert scrape("conversation_unique_seen_complete", dp_rank=3, window="1h") == [complete]
+    assert not scrape("conversation_unique_seen", dp_rank=0)
 
 
 @pytest.mark.parametrize("limit", ["entries", "identity_bytes"])
-def test_conversation_activity_limits_preserve_known_sessions_and_recover(limit):
-    import sys
-
-    key = ("a", None, None)
-    size = sys.getsizeof(key) + sum(sys.getsizeof(part) for part in key)
-    limits = {"max_entries": 2} if limit == "entries" else {"max_identity_bytes": 2 * size}
-    manager = _activity_manager(**limits)
-    request = _activity_request("a")
-    for now in (1.0, 2.0, 3.0):
-        manager.observe_admission(request, now)
-    assert manager._activity_entries == 2
-    assert manager._activity_identity_bytes == 2 * size
-    manager.observe_admission(_activity_request("b"), 10.0)
-    manager.observe_admission(request, 11.0)  # Refresh still succeeds at capacity.
-    snapshot = manager.snapshot_activity(600.0)
-    field = "overflowEntries" if limit == "entries" else "overflowIdentityBytes"
-    assert all(row["unique"] == 1 and row[field] == 1 for row in snapshot.to_dict().values())
-    assert snapshot.complete_10m == 0
-    assert manager.snapshot_activity(610.0).complete_10m == 1
-    assert manager.snapshot_activity(611.0).unique_10m == 0
-    assert manager.snapshot_activity(3609.0).complete_1h == 0
-    assert manager.snapshot_activity(3610.0).complete_1h == 1
-    assert manager.snapshot_activity(3611.0).unique_1h == 0
-    assert manager._activity_identity_bytes == 0
-    if limit == "identity_bytes":
-        manager.observe_admission(_activity_request("x" * (2 * size)), 4000.0)
-        assert manager._activity_entries == 0
-        assert manager.snapshot_activity(4000.0).overflow_bytes_1h == 2
-
-
-def test_conversation_activity_disabled_and_restart_warmup():
+def test_worker_conversation_overflow_preserves_refresh_and_recovers(
+    collector, scrape, conversation_request, limit
+):
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
 
-    manager = ConversationManager(2)
-    manager.observe_admission(_activity_request(), 1.0)
-    assert manager.snapshot_activity(3600.0) is None
-    manager.enable_activity_tracking(now=4000.0)
-    assert manager.snapshot_activity(4599.0).complete_10m == 0
-    assert manager.snapshot_activity(4600.0).complete_10m == 1
-    assert manager.snapshot_activity(7600.0).complete_1h == 1
-    assert _activity_manager().snapshot_activity(1.0).complete_10m == 0
-
-
-def test_conversation_activity_metrics_keep_source_rank_and_cumulative_overflows(collector):
-    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
-
-    snapshot = ConversationActivityStats(5, 1, 2, 3, 9, 0, 4, 5)
-    row = {"attentionDpRank": 3, "conversationActivity": snapshot.to_dict()}
-    collector.log_iteration_stats(row)
-    collector.log_iteration_stats(row)
-    labels = {**collector.labels, "dp_rank": "3", "window": "10m"}
-    assert collector.conversation_unique_seen.labels(**labels)._value.get() == 5
-    assert collector.conversation_unique_seen_complete.labels(**labels)._value.get() == 1
-    assert (
-        collector.conversation_tracking_overflow.labels(**labels, reason="entries")._value.get()
-        == 2
-    )
-    assert (
-        collector.conversation_tracking_overflow.labels(
-            **labels, reason="identity_bytes"
-        )._value.get()
-        == 3
-    )
-    assert {
-        s.labels["dp_rank"] for s in collector.conversation_unique_seen.collect()[0].samples
-    } == {"3"}
-    manager = _activity_manager()
-    collector.log_iteration_stats(
-        {"attentionDpRank": 3, "conversationActivity": manager.snapshot_activity(3600.0).to_dict()}
-    )
-    assert collector.conversation_unique_seen.labels(**labels)._value.get() == 0
-    assert collector.conversation_unique_seen_complete.labels(**labels)._value.get() == 1
-
-
-def test_conversation_activity_enablement_keeps_retention_independent(monkeypatch):
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
-        ConversationManager,
-        KVCacheManagerV2,
-    )
-
-    monkeypatch.setenv("TRTLLM_CONVERSATION_ACTIVITY_MAX_ENTRIES", "2")
-    monkeypatch.setenv("TRTLLM_CONVERSATION_ACTIVITY_MAX_IDENTITY_BYTES", "4096")
-    owner = KVCacheManagerV2.__new__(KVCacheManagerV2)
-    owner.conversation_manager = None
-    manager = owner.enable_conversation_activity()
-    assert manager.retention_enabled is False
-    now = 0.0
-    manager.observe_admission(_activity_request(), now)
-    assert owner.enable_conversation_activity() is manager
-    assert manager.snapshot_activity(now).unique_10m == 1
-    manager.prepare_request(_activity_request())
-    assert manager.num_conversations == 0
-    manager.clear()
-    assert manager.snapshot_activity(now).unique_10m == 1
-    owner.conversation_manager = ConversationManager(2)
-    assert owner.enable_conversation_activity().retention_enabled is True
-
-
-def test_conversation_activity_rejects_negative_limits():
-    for limits in ({"max_entries": -1}, {"max_identity_bytes": -1}):
-        with pytest.raises(ValueError, match="nonnegative"):
-            _activity_manager(**limits)
+    manager = ConversationManager(0, retention_enabled=False)
+    limits = {"max_entries": 2} if limit == "entries" else {"max_identity_bytes": 1024}
+    manager.enable_activity_tracking(now=0.0, **limits)
+    request = conversation_request()
+    manager.observe_admission(request, 1.0)
+    rejected = conversation_request("other" if limit == "entries" else "x" * 2048)
+    manager.observe_admission(rejected, 10.0)
+    manager.observe_admission(request, 11.0)
+    for now, count, complete in ((600.0, 1, 0), (610.0, 1, 1), (611.0, 0, 1)):
+        row = {
+            "attentionDpRank": 2,
+            "conversationActivity": manager.snapshot_activity(now).to_dict(),
+        }
+        collector.log_iteration_stats(row)
+        collector.log_iteration_stats(row)
+        assert scrape("conversation_unique_seen", dp_rank=2, window="10m") == [count]
+        assert scrape("conversation_unique_seen_complete", dp_rank=2, window="10m") == [complete]
+        assert scrape(
+            "conversation_tracking_overflow_total", dp_rank=2, window="10m", reason=limit
+        ) == [1]
 
 
 @pytest.mark.parametrize("include_count", [False, True])
