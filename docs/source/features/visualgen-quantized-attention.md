@@ -369,7 +369,9 @@ attention_config:
 **By step.** In this example, Linear layers use BF16 at steps 0 and 1, while
 attention uses the backend's native BF16/FP16 path at steps 0 and 2. Each component
 remains quantized at its other steps. Step 0 is the first denoising step.
-Numbering restarts for every denoising loop, including LTX-2 Stage 2.
+In two-stage generation, numbering continues across stages: with 8 steps in
+Stage 1, `ignore_steps: [9]` selects Stage 2's second step. Each new generation
+starts at 0; indices outside the actual total step count raise an error.
 
 ```yaml
 quant_config:

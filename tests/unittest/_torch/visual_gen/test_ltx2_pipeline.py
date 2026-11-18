@@ -1537,6 +1537,78 @@ class TestLTX2TwoStageLoRAHelpers:
         assert not captures, "post-warmup request re-captured a graph"
         assert len(runner.graphs) == 2
 
+    @pytest.mark.cpu_only
+    def test_two_stage_exclusions_preserve_local_step_metadata(self):
+        from test_common.visual_gen_quantization import ToyDiT
+
+        from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+        from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+        from tensorrt_llm._torch.visual_gen.quantization.transformer_quant_dispatcher import (
+            TransformerQuantSchedule,
+            fixed_quant_config,
+        )
+        from tensorrt_llm.visual_gen.args import LinearQuantConfig, QuantAttentionConfig
+
+        class Pipeline(ltx2_two_stages.LTX2TwoStagesPipeline):
+            def _init_transformer(self):
+                self.transformer = ToyDiT(
+                    block_count=1, model_config=self.pipeline_config.model_configs["transformer"]
+                )
+
+        config = DiffusionPipelineConfig(
+            cuda_graph=CudaGraphConfig(enable=False),
+            model_configs={
+                "transformer": DiffusionModelConfig(
+                    component_name="transformer",
+                    quant_config=LinearQuantConfig(quant_algo="FP8", ignore_steps=[9]),
+                    dynamic_weight_quant=True,
+                    attention=AttentionConfig(
+                        backend="CUTEDSL",
+                        quant_attention_config=QuantAttentionConfig(
+                            qk_dtype="nvfp4", v_dtype="fp8", ignore_steps=[8]
+                        ),
+                    ),
+                )
+            },
+        )
+        pipeline = object.__new__(Pipeline)
+        BasePipeline.__init__(pipeline, config)
+        dispatcher = pipeline._transformer_quant_dispatchers["transformer"]
+        for key in dispatcher.schedule.keys:
+            dispatcher.add(
+                key,
+                ToyDiT(
+                    block_count=1,
+                    model_config=fixed_quant_config(config.model_configs["transformer"], key),
+                ),
+                stage="refinement",
+            )
+        for stage1_count in (8, 10):
+            pipeline.scheduler = SimpleNamespace(timesteps=torch.arange(stage1_count))
+            for stage, offset, count in (
+                ("base", 0, stage1_count),
+                ("refinement", stage1_count, 3),
+            ):
+                with pipeline.transformer_quant_stage(stage, ignore_steps_offset=offset):
+                    for local_step, _ in pipeline._profile_denoise_steps(range(count)):
+                        step = offset + local_step
+                        model_config = pipeline.transformer.model_config
+                        assert dispatcher.step == local_step
+                        assert model_config.attention_metadata_state["denoise_step"] == (
+                            local_step,
+                            count,
+                        )
+                        assert (model_config.quant_config.quant_algo is None) == (step == 9)
+                        assert (model_config.attention.quant_attention_config is None) == (
+                            step == 8
+                        )
+            assert dispatcher.stage == "base" and dispatcher.step is None
+        pipeline.scheduler = SimpleNamespace(timesteps=torch.arange(8))
+        dispatcher.schedule = TransformerQuantSchedule(linear=frozenset({11}))
+        with pytest.raises(ValueError, match="11 steps"):
+            next(pipeline._profile_denoise_steps(range(8)))
+        assert dispatcher.step is None
+
     def test_two_stage_forward_rejects_indivisible_stage2_tokens(self):
         """forward() fails fast at request entry when the full-resolution token
         count does not divide the stage-2 seq-plane size."""

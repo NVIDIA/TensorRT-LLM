@@ -210,14 +210,34 @@ class BasePipeline(nn.Module):
         state, for the attention recipes that follow the step schedule, and
         clears it when the loop ends.
         """
-        steps = enumerate(timesteps) if self._is_warmup else self._profiler.steps(timesteps)
-        num_steps = len(timesteps) if hasattr(timesteps, "__len__") else None
         try:
+            num_steps = len(timesteps) if hasattr(timesteps, "__len__") else None
+            if num_steps is None and getattr(self, "_transformer_quant_dispatchers", {}):
+                timesteps = tuple(timesteps)
+                num_steps = len(timesteps)
+            if not self._is_warmup and num_steps is not None:
+                self._validate_quant_ignore_steps(num_steps)
+            steps = enumerate(timesteps) if self._is_warmup else self._profiler.steps(timesteps)
             for i, t in steps:
                 self._publish_denoise_step(None if num_steps is None else (i, num_steps))
                 yield i, t
         finally:
             self._publish_denoise_step(None)
+
+    def _validate_quant_ignore_steps(self, num_steps: int) -> None:
+        """Validate the exclusions currently used by each dispatcher."""
+        for component, dispatcher in getattr(self, "_transformer_quant_dispatchers", {}).items():
+            for field, ignored in (
+                ("quant_config", dispatcher.schedule.linear),
+                ("attention_config.quant_attention_config", dispatcher.schedule.attention),
+            ):
+                invalid = sorted(step for step in ignored if step >= num_steps)
+                if invalid:
+                    raise ValueError(
+                        f"{field}.ignore_steps contains out-of-range indices {invalid} for "
+                        f"{component} stage '{dispatcher.stage}': the active step schedule has "
+                        f"{num_steps} steps. Every index must be smaller than {num_steps}."
+                    )
 
     def _publish_denoise_step(self, denoise_step: Optional[Tuple[int, int]]) -> None:
         """Record the current denoising step in each transformer component's attention state."""
@@ -430,20 +450,25 @@ class BasePipeline(nn.Module):
         self._cuda_graph_runners = runners
 
     @contextlib.contextmanager
-    def transformer_quant_stage(self, stage: str) -> Iterator[None]:
+    def transformer_quant_stage(
+        self, stage: str, *, ignore_steps_offset: int = 0
+    ) -> Iterator[None]:
         """Select a stable weight version for a complete denoising stage."""
         previous = {
-            name: (dispatcher.stage, dispatcher.step)
+            name: (dispatcher.stage, dispatcher.step, dispatcher.schedule)
             for name, dispatcher in getattr(self, "_transformer_quant_dispatchers", {}).items()
         }
         try:
             for name, dispatcher in getattr(self, "_transformer_quant_dispatchers", {}).items():
                 dispatcher.stage = stage
+                dispatcher.schedule = self._transformer_quant_schedules[name].for_stage(
+                    ignore_steps_offset
+                )
                 setattr(self, name, dispatcher.select(None))
             yield
         finally:
             for name, dispatcher in getattr(self, "_transformer_quant_dispatchers", {}).items():
-                dispatcher.stage, step = previous[name]
+                dispatcher.stage, step, dispatcher.schedule = previous[name]
                 setattr(self, name, dispatcher.select(step))
 
     def build_transformer_quant_stage(self, stage: str, prepare: Callable) -> None:
