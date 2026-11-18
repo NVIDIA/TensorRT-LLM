@@ -52,6 +52,7 @@ from ..configs.deepseek_v41 import (
     decoder_bounded_replay_enabled,
     disagg_context_decoder_skipping_enabled,
     encoder_replay_enabled,
+    engram_table_is_mxfp4,
     quant_role_for_weight_key,
 )
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy, allgather
@@ -434,7 +435,8 @@ def _engram_table_share_key(checkpoint_dir: Optional[str], layer_id: int) -> Opt
 
 
 class DeepseekV41Engram(Engram):
-    """Pinned-CPU FP8 lookup, keys-first WKV and FP32 gating, without convolution.
+    """Pinned-CPU FP8 or MXFP4 (``table_mxfp4``) lookup, keys-first WKV and FP32 gating, without
+    convolution.
 
     WKV splits as ``[hc_mult * dim, dim] -> (keys, value)``. Table scales are
     UE8M0 per 32 values; the gate and residual update cast only at the output.
@@ -452,6 +454,7 @@ class DeepseekV41Engram(Engram):
         fp8_block_size: int = 32,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         table_share_key: Optional[str] = None,
+        table_mxfp4: bool = False,
     ):
         # The base constructor calls _make_multi_head_embedding with these fields.
         self.mapping = mapping
@@ -464,6 +467,7 @@ class DeepseekV41Engram(Engram):
         # Ranks [exchange_start, exchange_start + exchange_size) hold all heads and swap token rows.
         self.exchange_start, self.exchange_size = 0, self.tp_size
         self.table_share_key = table_share_key
+        self.table_mxfp4 = table_mxfp4
 
         super().__init__(
             layer_id=layer_id,
@@ -538,7 +542,7 @@ class DeepseekV41Engram(Engram):
         return super()._load_from_state_dict(*args, **kwargs)
 
     def _make_multi_head_embedding(self, list_of_N: List[int], D: int) -> nn.Module:
-        """Shard the FP8 table without changing hash indices or checkpoint keys.
+        """Shard the FP8 or MXFP4 table without changing hash indices or checkpoint keys.
 
         Head count and TP size select the cut; table shards stay in pinned CPU memory.
         """
@@ -558,6 +562,7 @@ class DeepseekV41Engram(Engram):
             tp_size=self.exchange_size,
             tp_rank=self.tp_rank - self.exchange_start,
             share_key=self.table_share_key,
+            mxfp4=self.table_mxfp4,
         )
 
     def _exchange_ranks(self) -> list[int]:
@@ -931,8 +936,12 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         )
 
     def _make_engram(self, layer_idx: int, engram_config, vocab_sizes_flat, stream):
-        checkpoint_dir = self.model_config.pretrained_config.name_or_path
+        pretrained = self.model_config.pretrained_config
+        checkpoint_dir = pretrained.name_or_path
         share_key = _engram_table_share_key(checkpoint_dir, layer_idx)
+        # The checkpoint loader reads the same quantization_config to check the table's layout.
+        text = getattr(pretrained, "text_config", pretrained)
+        quantization_config = getattr(text, "quantization_config", None)
         return DeepseekV41Engram(
             layer_id=layer_idx,
             config=engram_config,
@@ -941,6 +950,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             mapping=self.mapping,
             allreduce_strategy=self.model_config.allreduce_strategy,
             table_share_key=share_key,
+            table_mxfp4=engram_table_is_mxfp4(quantization_config, layer_idx),
         )
 
     def __init__(self, *args, **kwargs):
@@ -2418,8 +2428,8 @@ _V41_DROP_KEYS = ("image_start", "image_end", "image_newline")
 # Sub-trees whose `.weight`/`.scale` pair must NOT be dequantized:
 #   - routed experts are packed MXFP4 (int8 pairs + a ue8m0 scale per 32 lanes),
 #     consumed quantized by the MoE backend;
-#   - the engram table is 98 GiB of fp8 and stays fp8, row-sharded
-#     (`ShardedFp8MultiHeadEmbedding` dequantizes per lookup).
+#   - each engram table (98 GB of fp8, or half that as MXFP4) stays quantized and
+#     sharded (`ShardedFp8MultiHeadEmbedding` dequantizes per lookup).
 _V41_NO_DEQUANT = (".ffn.experts.", ".engram.embed.")
 
 _V41_FP8_BLOCK_SIZE = 32
@@ -3046,7 +3056,8 @@ class DeepseekV41WeightLoader(DeepseekV4WeightLoader):
       against its role before anything is dequantized, and a mismatch raises.
       V4.1 ships three different quantized layouts under one
       ``quantization_config`` (routed experts MXFP4 element block 1x32 stored
-      1x16, the Engram tables fp8 e4m3 1x32, everything else fp8 e4m3 32x32),
+      1x16, the Engram tables fp8 e4m3 1x32 or MXFP4 like the experts, everything
+      else fp8 e4m3 32x32),
       and ``weight_block_size`` in the config describes only the third.
     * **Census** -- ``consumed + deliberately_ignored`` must equal the number of
       tensors the checkpoint shipped, every ignored group with a name pattern and
@@ -3522,7 +3533,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
                 for e, t in zip(engrams, tables)
             }
             if len(geometry) != 1 or tables[0].dtype != torch.bfloat16:
-                reason = "the Engram tables are not equally shaped BF16-output FP8 head shards"
+                reason = "the Engram tables are not equally shaped BF16-output head shards"
         if reason is not None:
             logger.info(f"DeepSeek-V4.1 Engram ADP exchange off: {reason}")
             return

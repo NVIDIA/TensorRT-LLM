@@ -2523,6 +2523,8 @@
    "test_unittests.py::test_unittests_v2[unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-groups]]": 41.651927083333334,
    "unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-sharded]": 41.54188775510204,
    "test_unittests.py::test_unittests_v2[unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-sharded]]": 41.54188775510204,
+   "unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-sharded-mxfp4]": 41.54188775510204,
+   "test_unittests.py::test_unittests_v2[unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-sharded-mxfp4]]": 41.54188775510204,
    "unittest/_torch/multi_gpu/test_dspark_draft_prep.py": 46.920625,
    "test_unittests.py::test_unittests_v2[unittest/_torch/multi_gpu/test_dspark_draft_prep.py]": 46.920625,
    "unittest/_torch/multi_gpu/test_dspark_drafter_tp_fusion.py": 47.56574468085107,
