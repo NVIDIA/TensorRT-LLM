@@ -95,6 +95,7 @@ encoder weight replication when LLM attention DP is enabled.
 An explicit value divides the LLM TP group into that many encoder replicas.
 Each replica uses `tensor_parallel_size / encoder_data_parallel_size` TP ranks.
 The value must divide `tensor_parallel_size`; PP and CP must both be 1.
+With `orchestrator_type: ray`, it must be 1 or `tensor_parallel_size`.
 For example, on two GPUs:
 
 | LLM attention | `enable_attention_dp` | `encoder_data_parallel_size` | Encoder |

@@ -3001,6 +3001,10 @@ class TestMultimodalConfig:
             ({
                 "tensor_parallel_size": 3
             }, "must divide tensor_parallel_size"),
+            ({
+                "tensor_parallel_size": 4,
+                "orchestrator_type": "ray"
+            }, "must be 1 or tensor_parallel_size"),
         ],
     )
     def test_encoder_dp_rejects_invalid_parallelism_at_startup(

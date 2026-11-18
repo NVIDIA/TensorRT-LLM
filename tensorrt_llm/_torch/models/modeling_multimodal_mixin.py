@@ -40,7 +40,7 @@ import torch
 from tensorrt_llm._torch.distributed import Distributed, allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
-from tensorrt_llm._utils import mpi_disabled, prefer_pinned
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,
@@ -828,9 +828,7 @@ class MultimodalModelMixin:
     ) -> list[torch.Tensor]:
         if not encoder_inputs:
             return []
-        layout = self.encoder_parallel_layout
-        # TorchDist's device mesh has no host process group for a split TP replica.
-        if layout.distributes_items and (layout.tp_size == 1 or not mpi_disabled()):
+        if self.encoder_parallel_layout.distributes_items:
             param_runs = (
                 [param for param, _, _ in run]
                 for _, run in itertools.groupby(encoder_inputs, key=lambda entry: entry[2])
@@ -851,14 +849,7 @@ class MultimodalModelMixin:
         def flush_group() -> None:
             if not group_params:
                 return
-            if layout.distributes_items:
-                embeddings = self._encode_multimodal_input_runs_dp(
-                    [group_params],
-                    prepared_runs=True,
-                    transfer_local_inputs=transfer_local_inputs,
-                )
-            else:
-                embeddings = self._run_multimodal_encoder(group_params)
+            embeddings = self._run_multimodal_encoder(group_params)
             if isinstance(embeddings, tuple):
                 outputs.extend(embeddings)
             else:

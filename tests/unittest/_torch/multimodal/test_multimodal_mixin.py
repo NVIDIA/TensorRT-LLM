@@ -571,29 +571,20 @@ def test_item_scheduled_encoder_dp_stops_before_next_tp_run_on_replica_peer_erro
 
 
 @pytest.mark.cpu_only
-def test_item_scheduled_hybrid_encoder_dp_keeps_run_guards_without_replica_host_group():
-    model = DataParallelEncoderMultimodalModel(rank=0)
-    model.model_config = ModelConfig(
-        mapping=Mapping(world_size=4, rank=0, tp_size=4),
-        multimodal_config=MultimodalConfig(encoder_data_parallel_size=2),
+@pytest.mark.parametrize("encoder_dp_size,supported", [(1, True), (2, False), (4, True)])
+def test_encoder_tp_inside_dp_replicas_needs_mpi(encoder_dp_size, supported):
+    # Without MPI, the device mesh has one TP group, so a TP2 replica of TP4
+    # would get all four ranks.
+    config = ModelConfig(
+        mapping=Mapping(world_size=4, rank=2, tp_size=4),
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=encoder_dp_size),
     )
-    model.peer_output = torch.empty(0, 2)
-    param = make_interleaved_encoder_dp_param()
-    encoder_inputs = model.prepare_multimodal_encoder_inputs([(param, i) for i in range(3)])
-
-    with (
-        patch.object(mixin_module, "mpi_disabled", return_value=True),
-        patch.object(model, "exchange_encoder_status", wraps=model.exchange_encoder_status) as vote,
-        patch.object(
-            model, "_allgather_encoder_dp_output", wraps=model._allgather_encoder_dp_output
-        ) as gather,
-    ):
-        outputs = model.forward_multimodal_encoder_items(encoder_inputs)
-
-    assert model.encoded_item_ids == [10, 20, 30]
-    assert vote.call_count == 6
-    assert gather.call_count == 3
-    assert [output.shape[0] for output in outputs] == [4, 1, 3]
+    with patch.object(dp_module, "mpi_disabled", return_value=True):
+        if supported:
+            assert dp_module.EncoderParallelLayout.from_config(config).dp_size == encoder_dp_size
+        else:
+            with pytest.raises(NotImplementedError, match="needs MPI"):
+                dp_module.EncoderParallelLayout.from_config(config)
 
 
 @pytest.mark.cpu_only

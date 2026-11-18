@@ -34,6 +34,7 @@ import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from tensorrt_llm._torch.distributed import Distributed, allgather
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
@@ -73,6 +74,12 @@ class EncoderParallelLayout:
             raise NotImplementedError(
                 "Explicit encoder parallelism requires pipeline parallel size 1 "
                 "and context parallel size 1."
+            )
+        if mpi_disabled() and 1 < dp_size < mapping.tp_size:
+            # The device mesh has one TP group, so a replica would get the whole group.
+            raise NotImplementedError(
+                "Encoder TP inside encoder DP replicas needs MPI; with the Ray "
+                "orchestrator, use encoder_data_parallel_size 1 or the TP size."
             )
         encoder_mapping = mapping.split_tp(dp_size)
         shared_tp = mapping.enable_attention_dp and dp_size < mapping.tp_size

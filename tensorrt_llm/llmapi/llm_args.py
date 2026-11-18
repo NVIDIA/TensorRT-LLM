@@ -9068,6 +9068,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 "multimodal_config.encoder_data_parallel_size must divide "
                 f"tensor_parallel_size ({self.tensor_parallel_size}), got {size}."
             )
+        if self.orchestrator_type == "ray" and 1 < size < self.tensor_parallel_size:
+            # The Ray device mesh has one TP group, so a replica cannot have its own.
+            raise ValueError(
+                "With orchestrator_type='ray', "
+                "multimodal_config.encoder_data_parallel_size must be 1 or "
+                f"tensor_parallel_size ({self.tensor_parallel_size}), got {size}."
+            )
         # Attention-DP ranks share one encoder TP pass.
         shared_tp = self.enable_attention_dp and size < self.tensor_parallel_size
         if size > 1 or shared_tp:
