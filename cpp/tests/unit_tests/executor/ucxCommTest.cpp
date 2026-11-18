@@ -58,7 +58,7 @@
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
 #if defined(TEST_UCX_ZMQ_AVAILABLE)
 #include <zmq.hpp>
-#endif
+#endif // defined(TEST_UCX_ZMQ_AVAILABLE)
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
@@ -248,7 +248,7 @@ TEST_F(UcxCommTest, malformedMultipartRequestDoesNotStopListener)
         throw;
     }
 }
-#endif
+#endif // defined(TEST_UCX_ZMQ_AVAILABLE)
 
 TEST_F(UcxCommTest, multiSend)
 {

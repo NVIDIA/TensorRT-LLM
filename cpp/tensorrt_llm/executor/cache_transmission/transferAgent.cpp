@@ -124,22 +124,30 @@ AgentDesc AgentDesc::deserialize(std::string const& data)
     auto backendAgentDesc = su::deserialize<std::string>(is);
     auto numRegions = su::deserialize<size_t>(is);
     std::vector<VramRegionMeta> regions;
-    TLLM_CHECK_WITH_INFO(numRegions <= regions.max_size(), "Invalid serialized VRAM region count");
-    for (size_t i = 0; i < numRegions; ++i)
+    try
     {
-        auto baseAddr = su::deserialize<uintptr_t>(is);
-        auto totalLen = su::deserialize<size_t>(is);
-        auto chunkSize = su::deserialize<size_t>(is);
-        regions.push_back({baseAddr, totalLen, chunkSize});
+        TLLM_CHECK_WITH_INFO(numRegions <= regions.max_size(), "Invalid serialized VRAM region count");
+        for (size_t i = 0; i < numRegions; ++i)
+        {
+            auto baseAddr = su::deserialize<uintptr_t>(is);
+            auto totalLen = su::deserialize<size_t>(is);
+            auto chunkSize = su::deserialize<size_t>(is);
+            regions.push_back({baseAddr, totalLen, chunkSize});
+        }
+        // Peers built before the handshake field existed end the stream right after the regions. An empty handshake
+        // means "bounce not advertised" and the peer stays on standard NIXL (registerPeerHandshake treats it that way).
+        std::string bounceHandshake;
+        if (is.peek() != std::char_traits<char>::eof())
+        {
+            bounceHandshake = su::deserialize<std::string>(is);
+        }
+        return AgentDesc{std::move(backendAgentDesc), std::move(regions), std::move(bounceHandshake)};
     }
-    // Peers built before the handshake field existed end the stream right after the regions. An empty handshake
-    // means "bounce not advertised" and the peer stays on standard NIXL (registerPeerHandshake treats it that way).
-    std::string bounceHandshake;
-    if (is.peek() != std::char_traits<char>::eof())
+    catch (common::TllmException const& e)
     {
-        bounceHandshake = su::deserialize<std::string>(is);
+        TLLM_THROW("AgentDesc::deserialize failed after reading %zu/%zu regions (data size=%zu): %s", regions.size(),
+            numRegions, data.size(), e.what());
     }
-    return AgentDesc{std::move(backendAgentDesc), std::move(regions), std::move(bounceHandshake)};
 }
 
 // ── VmmDescSplitter utilities (backend-agnostic, no NIXL dependency) ──

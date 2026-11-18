@@ -135,6 +135,15 @@ TEST(SerializeUtilsTest, RejectMalformedAgentDescLengths)
                 << length;
         }
     }
+    try
+    {
+        (void) AgentDesc::deserialize(bytes.substr(0, legacySize - 1));
+        FAIL() << "Truncated region was accepted";
+    }
+    catch (tensorrt_llm::common::TllmException const& e)
+    {
+        EXPECT_NE(std::string(e.what()).find("after reading 0/1 regions"), std::string::npos);
+    }
     auto const empty = AgentDesc::deserialize(AgentDesc{""}.serialize());
     EXPECT_TRUE(empty.getBackendAgentDesc().empty());
     EXPECT_TRUE(empty.getVramRegions().empty());
