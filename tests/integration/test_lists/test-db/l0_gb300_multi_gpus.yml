@@ -120,8 +120,9 @@ l0_gb300_multi_gpus:
   - unittest/_torch/multi_gpu/test_dspark_drafter_tp_fusion.py
   - unittest/_torch/multi_gpu_modeling -k "deepseek"
   # Aggregated Helix TP1 x CP2 GSM8K with BF16 KV: no reuse, block reuse,
-  # block reuse under a small KV pool that forces suspend/resume, and the same
-  # with a host offload tier. Measured 33m06s for all four on 2 GB300 GPUs.
+  # block reuse under a small KV pool with no host tier that forces
+  # recompute-pause, and the same pool with a host offload tier that suspends
+  # and resumes. Measured 33m06s for all four on 2 GB300 GPUs.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_agg_helix_cp2[no_reuse]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_agg_helix_cp2[reuse]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_agg_helix_cp2[reuse_preempt]

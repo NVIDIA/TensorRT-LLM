@@ -1497,9 +1497,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         (tokens_per_block x cp_size = 128 tokens). max_num_tokens=512 chunks
         the few-shot prompts, so reused prefixes reach the cross-rank
         cached-KV gather. reuse_preempt caps the KV pool at a few requests'
-        worth of tokens, so requests are suspended and resumed while reused
-        blocks are claimed and evicted. reuse_host_offload adds a host tier
-        to that small pool, so evicted blocks move to host memory and reuse
+        worth of tokens with no host tier, so requests are recompute-paused
+        and re-prefilled while reused blocks are claimed and evicted.
+        reuse_host_offload adds a host tier to that small pool, so requests
+        are suspended instead, evicted blocks move to host memory and reuse
         hits bring them back. Set TLLM_HELIX_AGG_CHECK_SCHEDULE=1 on every
         rank to also compare the per-rank schedules each iteration.
         """
@@ -1512,6 +1513,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             # 32 concurrent requests do not.
             kv_cache_kwargs["max_tokens"] = 6144
             llm_kwargs["max_seq_len"] = 4352
+        if mode == "reuse_preempt":
+            # No host tier: under Helix, a request that cannot get pages is
+            # recompute-paused rather than suspended to a lower tier.
+            kv_cache_kwargs["host_cache_size"] = 0
         if mode == "reuse_host_offload":
             kv_cache_kwargs["host_cache_size"] = 8 << 30
         with LLM(
@@ -1544,7 +1549,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             # Count reuse and preemption so a pass is not vacuous: a reuse run
             # that never hit the cache, or a small-pool run that never
-            # suspended a request, would pass without exercising either.
+            # preempted a request, would pass without exercising either.
             stats = llm.get_stats(timeout=2)
             windows = [
                 window for s in stats
@@ -1555,16 +1560,20 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             onboarded = sum(w.get("iterOnboardBlocks", 0) for w in windows)
             suspended = sum(s.get("iterSuspendedRequests", 0) for s in stats)
             resumed = sum(s.get("iterResumedRequests", 0) for s in stats)
+            paused = sum((s.get("inflightBatchingStats")
+                          or {}).get("numPausedRequests", 0) for s in stats)
             print(f"[reuse] reused_blocks = {reused_blocks}, "
                   f"suspended = {suspended}, resumed = {resumed}, "
-                  f"offloaded = {offloaded}, onboarded = {onboarded}")
+                  f"offloaded = {offloaded}, onboarded = {onboarded}, "
+                  f"paused = {paused}")
             if enable_block_reuse:
                 assert reused_blocks > 0
             else:
                 assert reused_blocks == 0
-            if mode in ("reuse_preempt", "reuse_host_offload"):
-                assert suspended > 0 and resumed > 0
+            if mode == "reuse_preempt":
+                assert paused > 0 and offloaded == 0
             if mode == "reuse_host_offload":
+                assert suspended > 0 and resumed > 0
                 assert offloaded > 0 and onboarded > 0
 
     @parametrize_with_ids("mtp_nextn",

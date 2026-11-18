@@ -263,13 +263,14 @@ def _step(
     batch.generation_requests = list(out.generation_requests)
 
     # Forward pass: prefill chunks advance, every finished prefill and every
-    # decode step samples one token.
-    manager.update_context_resources(batch)
+    # decode step samples one token. As in the executor, the chunk advances
+    # before update_context_resources publishes the context blocks.
     for request in out.context_requests:
         request.move_to_next_context_chunk()
         if request.context_remaining_length == 0:
             request.state = LlmRequestState.GENERATION_IN_PROGRESS
             request.add_new_token(0, 0)
+    manager.update_context_resources(batch)
     for request in out.generation_requests:
         request.add_new_token(0, 0)
         request.py_decoding_iter += 1
@@ -407,8 +408,19 @@ def test_agg_helix_reuses_whole_ledger_blocks_identically() -> None:
             is_streaming=False,
         )
 
+    def reused_tokens() -> list[int]:
+        """Prompt tokens a new request with the same prompt reuses, per rank."""
+        reused = []
+        for manager, scheduler in ranks:
+            request = make_request(2)
+            out = scheduler.schedule_request([request], set())
+            assert [r.py_request_id for r in out.context_requests] == [2]
+            reused.append(request.context_current_position)
+            manager.free_resources(request)
+        return reused
+
     active = [[make_request(1)] for _ in ranks]
-    for _ in range(MAX_ITERATIONS):
+    for step in range(MAX_ITERATIONS):
         if not any(active):
             break
         decisions = [
@@ -416,16 +428,12 @@ def test_agg_helix_reuses_whole_ledger_blocks_identically() -> None:
             for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
         ]
         assert all(d == decisions[0] for d in decisions), decisions
+        if step == 0:
+            # The prompt fits one chunk: the prefill alone publishes the
+            # block, before any decode step commits.
+            assert reused_tokens() == [CP_SIZE * TOKENS_PER_BLOCK] * CP_SIZE
     assert not any(active), "request 1 did not finish"
-
-    reused = []
-    for manager, scheduler in ranks:
-        request = make_request(2)
-        out = scheduler.schedule_request([request], set())
-        assert [r.py_request_id for r in out.context_requests] == [2]
-        reused.append(request.context_current_position)
-        manager.free_resources(request)
-    assert reused == [CP_SIZE * TOKENS_PER_BLOCK] * CP_SIZE
+    assert reused_tokens() == [CP_SIZE * TOKENS_PER_BLOCK] * CP_SIZE
 
 
 # The smallest host tier the manager provisions: four pages.
