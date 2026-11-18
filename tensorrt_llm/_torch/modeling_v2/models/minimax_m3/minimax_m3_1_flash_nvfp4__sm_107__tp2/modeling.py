@@ -206,6 +206,8 @@ from ..ops.gemm.m31_bf16_linear import m3_bf16_linear
 from ..ops.gemm.m31_dense_swiglu import m3_dense_swiglu
 from ..ops.gemm.m31_mxfp8_gemm import m3_mxfp8_gemm
 from ..ops.gemm.m31_mxfp8_linear import m3_mxfp8_linear
+from ..ops.moe.m3_moe16_engine import m3_moe16_engine
+from ..ops.moe.m3_moe_engine import m3_moe_engine
 from ..ops.moe.m31_router_tc import m3_router_tc
 from ..ops.spec.m3_draft_silu import m3_draft_silu
 from ..ops.spec.m3_draft_step import MAX_TOKENS as DRAFT_STEP_KERNEL_MAX_TOKENS
@@ -235,6 +237,8 @@ from .kernels import m31_route_ids16 as _route_ids16_kernel
 from .kernels import triton_sparse_decode as _sparse_decode_kernel
 from .kernels.long_select import long_select_blocks
 from .kernels.m3_moe.op import INTER as _MOE_INTER
+from .kernels.m3_moe.op import M3MoeState, ar_push_desc, shared_ctas_for
+from .kernels.m3_moe.op16 import M3Moe16State
 from .kernels.m3_moe_finalize import m3_moe_finalize
 from .kernels.m3_nvfp4_index_decode import Nvfp4IndexDecodeScorer
 from .kernels.mx_gemv import op as mx_gemv
@@ -268,8 +272,6 @@ from .ops.gemm.m3_mxfp8_cublaslt import m3_mxfp8_cublaslt
 from .ops.gemm.m3_mxfp8_pinned_gemm import m3_mxfp8_pinned_gemm
 from .ops.gemm.m3_mxfp8_pinned_quantize import m3_mxfp8_pinned_quantize
 from .ops.moe import m31_s1b_fold
-from .ops.moe.m3_moe16_engine import M3Moe16State, m3_moe16_engine
-from .ops.moe.m3_moe_engine import M3MoeState, ar_push_desc, m3_moe_engine, shared_ctas_for
 from .ops.moe.m3_moe_tactic_pin import run_pinned as _run_pinned_moe
 from .ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
 from .ops.sampling import m31_chain_spec_mc as _chain_spec_mc

@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-M3's MoE layer for 1..8 decode tokens in one CuTe DSL launch (``m3_moe``): the router, the routed NVFP4
-experts and the shared MXFP8 expert, on caller-owned state (an ``M3MoeState`` and one ``M3MoeLayer`` per MoE layer)."""
+experts and the shared MXFP8 expert, on caller-owned state (a target's ``kernels/m3_moe/op.py``: an ``M3MoeState`` and
+one ``M3MoeLayer`` per MoE layer). The reference reads the routed and shared widths per rank off the layer's buffers
+(1536 on the sm_107 TP2 target, 768 on TP4, 384 on TP8)."""
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -15,31 +17,18 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
     get_shuffle_matrix_a_row_indices,
 )
 
-from ...kernels.m3_moe.op import (
-    HIDDEN,
-    INTER,
-    SHARED_INTER,
-    TOP_K,
-    M3MoeLayer,
-    M3MoeState,
-    ar_push_desc,
-    is_supported,
-    shared_ctas_for,
-)
-
 __all__ = [
-    "M3MoeLayer",
-    "M3MoeState",
-    "ar_push_desc",
-    "is_supported",
+    "M3MoeEngine",
     "m3_moe_engine",
     "moe_reference",
     "moe_route",
     "mxfp8_dequant",
     "mxfp8_quant_dequant",
-    "shared_ctas_for",
     "unswizzle_sf",
 ]
+
+HIDDEN = 6144  # capacity: fixed: the checkpoint's hidden size
+TOP_K = 4
 
 # The model's constants the kernels are built with: routed_scaling_factor, the shared expert's SwiGLU-OAI
 # (swiglu_alpha, swiglu_limit, the (up + 1) offset).
@@ -204,7 +193,8 @@ def _shared_expert(x: torch.Tensor, shared_mxfp8) -> torch.Tensor:
     model's alpha / limit / (up + 1) in fp32 (bf16 out), MXFP8 down (bf16 out)."""
     gu_w, gu_sf, dn_w, dn_sf = shared_mxfp8
     gu = _bf16(_gemm(mxfp8_quant_dequant(x), mxfp8_dequant(gu_w, gu_sf)))
-    gate, up = gu[:, :SHARED_INTER], gu[:, SHARED_INTER:]
+    shared_inter = gu.shape[1] // 2  # gate_up is [2 x the shared width per rank, 6144]
+    gate, up = gu[:, :shared_inter], gu[:, shared_inter:]
     a = torch.minimum(gate, torch.full_like(gate, SHARED_LIMIT))
     ub = up.clamp(-SHARED_LIMIT, SHARED_LIMIT) + 1.0
     sg = 1.0 / (
@@ -214,13 +204,14 @@ def _shared_expert(x: torch.Tensor, shared_mxfp8) -> torch.Tensor:
     return _bf16(_gemm(mxfp8_quant_dequant(h), mxfp8_dequant(dn_w, dn_sf)))
 
 
-def moe_reference(hidden: torch.Tensor, layer: M3MoeLayer, shared: bool) -> torch.Tensor:
+def moe_reference(hidden: torch.Tensor, layer: Any, shared: bool) -> torch.Tensor:
     """The MoE layer of the decode engines (both token ranges compute this), in plain torch: bf16 [M, 6144]."""
     x = hidden.float()
     m = x.shape[0]
     ids, weights = moe_route(x, layer.router_weight, layer.bias)
     xr = _nvfp4_act(x, layer.fc31_input_scale.reshape(()).float())
-    inv31 = torch.argsort(_row_perm(2 * INTER, gated=True)).to(x.device)
+    inter = layer.w3_w1_weight.shape[1] // 2  # w3_w1 is [128, 2 x the routed width per rank, 3072]
+    inv31 = torch.argsort(_row_perm(2 * inter, gated=True)).to(x.device)
     inv2 = torch.argsort(_row_perm(HIDDEN, gated=False)).to(x.device)
     y = torch.zeros(m, TOP_K, HIDDEN, dtype=torch.float32, device=x.device)
     for e in torch.unique(ids).tolist():
@@ -230,7 +221,7 @@ def moe_reference(hidden: torch.Tensor, layer: M3MoeLayer, shared: bool) -> torc
         for t, k in (ids == e).nonzero().tolist():
             acc1 = _gemm(xr[t : t + 1], w31)[0]
             # The buffer holds [w3 (up); w1 (gate)].
-            h = _fc1_epilogue(acc1[:INTER], acc1[INTER:], esc)
+            h = _fc1_epilogue(acc1[:inter], acc1[inter:], esc)
             y[t, k] = _bf16(_gemm(h.unsqueeze(0), w2)[0] * esc[5])
     acc = torch.zeros(m, HIDDEN, dtype=torch.float64, device=x.device)
     for k in range(TOP_K):
@@ -260,9 +251,10 @@ class M3MoeEngine(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_107})
 
-    # One cell per token count: m_max is a trace-time constant, so each is its own build, and the target builds all
+    # One cell per token count: m_max is a trace-time constant, so each is its own build, and a target builds all
     # eight (decode batches of 1..8 requests, spec-decode verify rows up to 8). The whys name what the build differs in.
-    CELLS: tuple[Cell, ...] = (
+    # The TP2 and TP4 targets run the same cells; the TP8 builds differ in what the whys name.
+    _CELLS_TP2_TP4: tuple[Cell, ...] = (
         Cell(
             why="1 token: pre-tiled shared expert, last phase balanced without trailing FC2",
             spec=dict(tokens=1),
@@ -289,6 +281,38 @@ class M3MoeEngine(OpWrapper):
             spec=dict(tokens=8),
         ),
     )
+    _CELLS_TP8: tuple[Cell, ...] = (
+        Cell(
+            why="1 token: FC1 -> FC2 records replicated 32x, logits 32x, last phase without trailing FC2",
+            spec=dict(tokens=1),
+        ),
+        Cell(
+            why="2 tokens: records 32x, logits 32x, the one build without AR_PRE",
+            spec=dict(tokens=2),
+        ),
+        Cell(why="3 tokens: records 8x, logits 32x, 4 FC2-B builder warps", spec=dict(tokens=3)),
+        Cell(
+            why="4 tokens: one request verifying 3 drafts (the TP2 b1 point): 6-stage ring, B2IMG hand-off, "
+            "the 4 two-block FC2 CTAs stream no FC1",
+            spec=dict(tokens=4),
+        ),
+        Cell(
+            why="5 tokens: single records, a routing warp takes two tokens, logits 32x",
+            spec=dict(tokens=5),
+        ),
+        Cell(
+            why="6 tokens: single records, routing warps 8.. take tokens 4..5", spec=dict(tokens=6)
+        ),
+        Cell(why="7 tokens: the B2IMG global FC1 -> FC2 hand-off", spec=dict(tokens=7)),
+        Cell(
+            why="8 tokens: two requests verifying 3 drafts (the TP2 b2 point): 5-stage ring, x read from global "
+            "(no XSTAGE), no early group 0, the 4 two-block FC2 CTAs stream no FC1",
+            spec=dict(tokens=8),
+        ),
+    )
+    # The cells each Rubin target runs, by tensor-parallel size; ``CELLS`` is their union.
+    CELLS_BY_TP: dict[int, tuple[Cell, ...]] = {2: _CELLS_TP2_TP4, 4: _CELLS_TP2_TP4, 8: _CELLS_TP8}
+    CELLS: tuple[Cell, ...] = _CELLS_TP2_TP4 + _CELLS_TP8
 
     note = """
     The kernel's elementwise math uses the PTX approximations (rcp.approx, ex2.approx, tanh) where `reference` uses
@@ -298,7 +322,7 @@ class M3MoeEngine(OpWrapper):
     NVFP4 MoE (fp4_quantize + fp4_block_scale_moe_runner) on the same routing; the test checks that too.
 
     Not covered: the all-reduce push (`arp`), which needs a multicast exchange (the decode forward's boundary all-reduce
-    exercises it); the non-shared state (`shared=False`), which this target never builds. Every layer on one state
+    exercises it); the non-shared state (`shared=False`), which no target builds. Every layer on one state
     must run in one stream order: the workspace is shared and tagged per call, never reset.
 
     No `is_valid`: the compiled call checks every buffer's dtype, shape and alignment against its signature and
@@ -308,7 +332,7 @@ class M3MoeEngine(OpWrapper):
     def __call__(
         self,
         hidden: torch.Tensor,
-        layer: M3MoeLayer,
+        layer: Any,
         out: Optional[torch.Tensor] = None,
         arp: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -317,7 +341,7 @@ class M3MoeEngine(OpWrapper):
     def reference(
         self,
         hidden: torch.Tensor,
-        layer: M3MoeLayer,
+        layer: Any,
         out: Optional[torch.Tensor] = None,
         arp: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:

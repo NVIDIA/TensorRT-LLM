@@ -153,9 +153,7 @@ def _block():
     ws = _S["mc"].get_workspace(_S["mapping"], H)
     b8 = ws.for_tokens(T)
     f8 = b8.flags_for(8)
-    eng = importlib.import_module(
-        f"{FAM}.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.moe.m3_moe_engine"
-    )
+    eng = importlib.import_module(f"{FAM}.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.m3_moe.op")
     block.arm(
         eng.ar_push_desc(
             b8.mc.data_ptr(), f8.data_ptr(), env.rank, env.world, b8.max_tokens, f8.device

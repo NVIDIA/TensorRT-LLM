@@ -57,6 +57,7 @@ import torch
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 from tensorrt_llm.logger import logger
 
+from ....kernels.m3_moe import M3_MOE_KERNEL_PATH
 from ...m31_switches import m31_disabled
 from .. import m3_report
 from . import small_decode_engine as m31_moesk
@@ -557,11 +558,9 @@ class M3MoeState:
                 "MiniMax-M3.1 TP2 MOESK engaged: tokens=8 runs the canonical TP4 m3_moe engine "
                 "(kill: TRTLLM_M31_DISABLE_SMALL_DECODE_MOE_ENGINE=1)"
             )
-        self.engine_path = (
-            _ENGINE_PATH
-            if self.moesk_active
-            else os.path.join(os.path.dirname(os.path.abspath(__file__)), "m3_moe_kernel.py")
-        )
+        # The small-decode engine and the default engine run the same kernel file; small-decode builds also guard
+        # the out store (out_store_guard below), as the TP4 target's builds of that kernel do.
+        self.engine_path = _ENGINE_PATH if self.moesk_active else M3_MOE_KERNEL_PATH
         # Work counters: the M3.1 items this engine state carries; ``run`` counts each per call.
         self.items = set()
         _HALFPLAN_TAKEN[0] = False
@@ -585,6 +584,8 @@ class M3MoeState:
             "timing": 0,
             "i_tp": INTER,
         }
+        if self.moesk_active:
+            self.config["out_store_guard"] = 1
         if HB_REPL_BY_M[num_tokens - 1] > 1:
             self.config["hb_repl"] = HB_REPL_BY_M[num_tokens - 1]
         if num_tokens <= LG_REPL_MAX_TOKENS:

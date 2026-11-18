@@ -26,9 +26,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.m3ll import (  # 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.m3_moe import (  # noqa: E501
     op as moe_op,
 )
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.moe.m3_moe_engine import (  # noqa: E501
-    m3_moe_engine,
-)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.moe.m3_moe_engine import m3_moe_engine
 
 __extra_import_path__ = ["../../../..", "."]
 from _m3_moe_operands import (  # noqa: E402

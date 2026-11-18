@@ -41,6 +41,7 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
+from ....kernels.m3_moe import M3_MOE16_KERNEL_PATH
 from ...m31_switches import m31_disabled
 from . import op as _op
 from .op import (
@@ -131,7 +132,7 @@ def make_phase_plan16(num_ctas: int, m_max: int, lag: int = 2, perm: bool = True
     return plan, max(nbs)
 
 
-_ENGINE16_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "m3_moe16_kernel.py")
+_ENGINE16_PATH = M3_MOE16_KERNEL_PATH
 M16_MIN_TOKENS, M16_MAX_TOKENS = 9, 16
 # Default routed CTAs (beside the SHARED_CTAS shared-expert CTAs).
 M16_NUM_CTAS = 128
@@ -173,6 +174,8 @@ class M3Moe16State:
             "fused_router": 1,
             "timing": 0,
             "shared": 1,
+            # the finalize's out store behind the OUT_SKIP test
+            "out_store_guard": 1,
         }
         # MOE-FINALIZE-DEADSTORE (OUT_SKIP), as op.py: a pushing call skips the dead bf16 out store. Kill switch
         # TRTLLM_M31_DISABLE_MOE_OUT_SKIP=1.

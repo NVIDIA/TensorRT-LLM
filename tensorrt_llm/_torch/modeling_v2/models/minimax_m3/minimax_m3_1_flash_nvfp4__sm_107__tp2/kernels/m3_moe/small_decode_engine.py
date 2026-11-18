@@ -2,20 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Small-decode MoE engine (SMALL_DECODE_MOE_ENGINE): host policy and engine for the TP2 small-decode cell.
 
-The engine (``small_decode_engine_kernel.py``, the TP4-geometry m3_moe kernel) accepts
-i_tp=1536 and sh_i=1536, so it runs this target's geometry; the workspaces and
-configs keep this target's sizes and compilation keys.
+The engine (the family ``kernels/m3_moe/m3_moe_kernel.py`` with the keys below, the build the TP4 target runs)
+accepts i_tp=1536 and sh_i=1536, so it runs this target's geometry; the workspaces and configs keep this target's
+sizes.
 """
-
-from pathlib import Path
 
 import torch
 
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.m3_moe import M3_MOE_KERNEL_PATH
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.m31_moe_sfa_image import fc1_scale_image
 
 
 def engine_path() -> str:
-    return str(Path(__file__).resolve().parent / "small_decode_engine_kernel.py")
+    return M3_MOE_KERNEL_PATH
 
 
 def configure(config: dict, disabled, *, enabled: bool = True) -> None:

@@ -172,6 +172,7 @@ from ..ops.gemm.m3_fp32_linear import m3_fp32_linear
 from ..ops.gemm.m31_bf16_linear import m3_bf16_linear
 from ..ops.gemm.m31_mxfp8_gemm import m3_mxfp8_gemm
 from ..ops.gemm.m31_mxfp8_linear import m3_mxfp8_linear
+from ..ops.moe.m3_moe_engine import M3MoeEngine
 from ..ops.spec.m3_draft_input import m3_draft_input
 from ..ops.spec.m31_capture_norm import m3_capture_norm
 from ..ops.spec.m31_chunk_norm import m3_chunk_norm
@@ -194,6 +195,7 @@ from .kernels import m3_shard_accept as m3_shard_accept_kernel
 from .kernels import msa_kv_update as _msa_kv_update_kernel
 from .kernels import triton_sparse_decode as _sparse_decode_kernel
 from .kernels.long_select import long_select_blocks
+from .kernels.m3_moe.op import M3MoeState, ar_push_desc, shared_ctas_for
 from .kernels.mx_gemv import op as mx_gemv
 from .m31_switches import m31_disabled, m31_enabled
 from .ops import gqamix_sparse_decode as _gqamix_kernel
@@ -230,7 +232,6 @@ from .ops.gemm.m3_mx_gemv import (
 )
 from .ops.gemm.m3_mx_gemv_bf16 import m3_mx_gemv_bf16
 from .ops.gemm.m3_mxfp8_cublaslt import m3_mxfp8_cublaslt
-from .ops.moe.m3_moe_engine import M3MoeState, ar_push_desc, m3_moe_engine, shared_ctas_for
 from .ops.moe.m3_router_tc import m3_router_tc
 from .ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
 from .ops.sampling import m31_chain_spec_mc as _chain_spec_mc
@@ -243,6 +244,32 @@ from .ops.spec.m3_sampled_accept import m3_sampled_accept
 from .ops.spec.m3_shard_accept import m3_shard_accept
 from .ops.spec.m3_spec_offsets import m3_spec_offsets
 from .ops.spec.m3_step_prologue import m3_step_prologue
+
+# The MoE engine's engagement line: once per device and token count, on every rank (the first call, eager or captured).
+_MOE_ENGINE_ENGAGED: set = set()
+
+
+class _EngagedM3MoeEngine(M3MoeEngine):
+    """The family ``m3_moe_engine`` entry that also logs this target's engagement line."""
+
+    def __call__(
+        self,
+        hidden: torch.Tensor,
+        layer,
+        out: Optional[torch.Tensor] = None,
+        arp: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        state = layer.state
+        if (state.device, state.m) not in _MOE_ENGINE_ENGAGED:
+            _MOE_ENGINE_ENGAGED.add((state.device, state.m))
+            logger.info(
+                f"[M3 sm_107 tp2] MoE engine m3_moe engaged: {state.m} tokens, {state.num_ctas} routed + "
+                f"{state.mod.NSH} shared CTAs, {state.mod.STAGES}-stage ring, on {state.device}"
+            )
+        return state.run(layer, hidden, out, arp=arp)
+
+
+m3_moe_engine = _EngagedM3MoeEngine()
 
 # The sampler and rejection-sampler override registries the target installs its sampling kernels through; None on a
 # runtime without them, where the stock sampling ops run.

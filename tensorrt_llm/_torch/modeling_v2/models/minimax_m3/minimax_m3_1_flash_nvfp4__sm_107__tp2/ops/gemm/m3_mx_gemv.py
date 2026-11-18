@@ -10,8 +10,8 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ....ops.moe.m3_moe_engine import mxfp8_dequant
 from ...kernels.mx_gemv import op as _gemv
-from ..moe.m3_moe_engine import mxfp8_dequant
 
 __all__ = ["PROJECTIONS", "gemv_is_valid", "m3_mx_gemv", "served_cells"]
 

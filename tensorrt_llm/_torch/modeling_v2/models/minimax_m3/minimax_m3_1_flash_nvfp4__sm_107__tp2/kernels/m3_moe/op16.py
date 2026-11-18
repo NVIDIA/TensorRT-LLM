@@ -41,6 +41,7 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
+from ....kernels.m3_moe import M3_MOE16_KERNEL_PATH
 from .op import (
     HIDDEN,
     SHARED_CTAS,
@@ -125,7 +126,7 @@ def make_phase_plan16(num_ctas: int, m_max: int, lag: int = 2, perm: bool = True
     return plan, max(nbs)
 
 
-_ENGINE16_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "m3_moe16_kernel.py")
+_ENGINE16_PATH = M3_MOE16_KERNEL_PATH
 M16_MIN_TOKENS, M16_MAX_TOKENS = 9, 16
 # Default routed CTAs (beside the SHARED_CTAS shared-expert CTAs).
 M16_NUM_CTAS = 128

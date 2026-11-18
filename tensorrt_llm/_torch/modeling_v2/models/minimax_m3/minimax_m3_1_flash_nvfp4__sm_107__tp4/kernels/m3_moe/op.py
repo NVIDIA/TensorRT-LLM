@@ -57,6 +57,7 @@ import torch
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 from tensorrt_llm.logger import logger
 
+from ....kernels.m3_moe import M3_MOE_KERNEL_PATH
 from ....m31_moe_sfa_image import fc1_scale_image
 from ...m31_switches import m31_disabled
 
@@ -224,7 +225,7 @@ def handoff_lag(num_tokens: int, handoff: bool) -> int:
     return (LAG_BY_M[num_tokens - 1] if handoff else 0) or M3_MOE_LAG
 
 
-_ENGINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "m3_moe_kernel.py")
+_ENGINE_PATH = M3_MOE_KERNEL_PATH
 
 
 def _kernel_module(config: dict, path: str):
@@ -590,6 +591,8 @@ class M3MoeState:
             "fused_router": 1,
             "timing": 0,
             "i_tp": INTER,
+            # the finalize's out store behind the OUT_SKIP test
+            "out_store_guard": 1,
         }
         self.config.update(lag_cfg)
         if HB_REPL_BY_M[num_tokens - 1] > 1:

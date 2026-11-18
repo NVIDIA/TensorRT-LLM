@@ -1,22 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-M3's MoE layer for 9..13 decode rows in one CuTe DSL launch (``m3_moe16``): the router, the routed NVFP4
-experts and the shared MXFP8 expert, on caller-owned state (an ``M3Moe16State`` and one ``M3MoeLayer`` per MoE
-layer)."""
+experts and the shared MXFP8 expert, on caller-owned state (a target's ``kernels/m3_moe/op16.py``: an ``M3Moe16State``
+and one ``M3MoeLayer`` per MoE layer; the sm_107 TP2 and TP4 targets)."""
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from ...kernels.m3_moe.op import M3MoeLayer
-from ...kernels.m3_moe.op16 import M3Moe16State
 from .m3_moe_engine import moe_reference
 
-__all__ = ["M3Moe16State", "m3_moe16_engine"]
+__all__ = ["M3Moe16Engine", "m3_moe16_engine"]
 
 
 class M3Moe16Engine(OpWrapper):
@@ -29,25 +27,25 @@ class M3Moe16Engine(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_107})
 
-    # One build per row count (m_max is a trace-time constant); the target routes 9..13 rows here (spec-decode verify
+    # One build per row count (m_max is a trace-time constant); the targets route 9..13 rows here (spec-decode verify
     # of 2 x 6 rows lands at 12).
     CELLS: tuple[Cell, ...] = (
         Cell(why="9 rows: the smallest build, a partial last slot group", spec=dict(tokens=9)),
         Cell(why="10 rows: its own build (m_max is a trace-time constant)", spec=dict(tokens=10)),
         Cell(why="11 rows: its own build, an odd row count", spec=dict(tokens=11)),
         Cell(why="12 rows: two requests verifying 5-token drafts", spec=dict(tokens=12)),
-        Cell(why="13 rows: the largest the target routes here", spec=dict(tokens=13)),
+        Cell(why="13 rows: the largest the targets route here", spec=dict(tokens=13)),
     )
 
     note = """
     Bands as `m3_moe_engine` (same approximations, same quantization boundaries). Not covered: 14..16 rows, which the
-    state takes and this target never routes here; the all-reduce push (`arp`). No `is_valid`, as `m3_moe_engine`.
+    state takes and no target routes here; the all-reduce push (`arp`). No `is_valid`, as `m3_moe_engine`.
     """
 
     def __call__(
         self,
         hidden: torch.Tensor,
-        layer: M3MoeLayer,
+        layer: Any,
         out: Optional[torch.Tensor] = None,
         arp: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -56,7 +54,7 @@ class M3Moe16Engine(OpWrapper):
     def reference(
         self,
         hidden: torch.Tensor,
-        layer: M3MoeLayer,
+        layer: Any,
         out: Optional[torch.Tensor] = None,
         arp: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:

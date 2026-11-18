@@ -195,6 +195,8 @@ from ..ops.gemm.m31_bf16_linear import m3_bf16_linear
 from ..ops.gemm.m31_dense_swiglu import m3_dense_swiglu
 from ..ops.gemm.m31_mxfp8_gemm import m3_mxfp8_gemm
 from ..ops.gemm.m31_mxfp8_linear import m3_mxfp8_linear
+from ..ops.moe.m3_moe16_engine import m3_moe16_engine
+from ..ops.moe.m3_moe_engine import m3_moe_engine
 from ..ops.moe.m31_router_tc import m3_router_tc
 from ..ops.spec.m3_draft_silu import m3_draft_silu
 from ..ops.spec.m3_draft_step import MAX_TOKENS as DRAFT_STEP_KERNEL_MAX_TOKENS
@@ -218,6 +220,8 @@ from .kernels import m3_shard_accept as m3_shard_accept_kernel
 from .kernels import m3_target_head as m3_target_head_kernel
 from .kernels import m3_tokmap_guard as _tokmap_guard
 from .kernels.long_select import long_select_blocks
+from .kernels.m3_moe.op import M3MoeState, ar_push_desc
+from .kernels.m3_moe.op16 import M3Moe16State
 from .kernels.mx_gemv import op as mx_gemv
 from .kernels.triton_sparse_decode import MERGE_MXFP8, MERGE_MXFP8_MIN_TOKENS
 from .m31_switches import m31_disabled, m31_enabled
@@ -242,8 +246,6 @@ from .ops.gemm.m3_mx_gemv import (
 from .ops.gemm.m3_mx_gemv_bf16 import m3_mx_gemv_bf16
 from .ops.gemm.m3_mxfp8_pinned_gemm import m3_mxfp8_pinned_gemm
 from .ops.gemm.m3_mxfp8_pinned_quantize import m3_mxfp8_pinned_quantize
-from .ops.moe.m3_moe16_engine import M3Moe16State, m3_moe16_engine
-from .ops.moe.m3_moe_engine import M3MoeState, ar_push_desc, m3_moe_engine
 from .ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
 
 # REJ_MC: this target's copy of the rejection-sampling override module.

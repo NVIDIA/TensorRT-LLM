@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MiniMax-M3 routed experts for up to 8 decode tokens on one TP4 rank (routed and shared intermediate 768):
-``m3_moe`` (group-phased weight stream).
+"""MiniMax-M3 routed experts for up to 8 decode tokens on one TP rank (routed and shared intermediate ``i_tp`` /
+``sh_i`` per rank: 1536 on the sm_107 TP2 target, 768 on the sm_107 TP4 target): ``m3_moe`` (group-phased weight
+stream).
 
 One persistent kernel replaces TRTLLM-Gen's MiniMax2 routing, FC1 (NVFP4 x NVFP4 + SwiGLU-OAI + NVFP4 requantization),
 FC2 and finalize, optionally with the router GEMV and the activation's NVFP4 quantization folded in (FUSED_ROUTER). It
@@ -64,7 +65,7 @@ def _cfg(key: str, default):
 # Problem shape (trace-time constants).
 # =============================================================================
 H = 6144  # capacity: fixed: the checkpoint's hidden size
-# routed intermediate per rank: 1536 at TP2 (this target: FC2 K = 6 full 256-K tiles), 768 at TP4, 384 at TP8 (FC2 K
+# routed intermediate per rank: 1536 at TP2 (FC2 K = 6 full 256-K tiles), 768 at TP4, 384 at TP8 (FC2 K
 # = 1.5 256-K tiles: the last tile's A box is half out of bounds, zero-filled by TMA, and only its first KB2_LAST K-64
 # MMAs / scale atoms are issued; no padding, no extra bytes)
 I_TP = _cfg("i_tp", 768)
@@ -88,13 +89,25 @@ YDUMP = bool(
     _cfg("ydump", 0)
 )  # debug only: FC2 outputs per (token, k) into `partials` (breaks its protocol)
 LAG = _cfg("lag", 2)  # phase p runs FC1 of group p and FC2 of group p - LAG
-# fc1_done barriers (this CTA's FC1 share of group g is out; the FC2 B builders wait on barrier g % FC1D, phase parity
-# (g / FC1D) % 2). The epilogue can finish FC1(g + 4) once the builders have committed B2(g + 3 - LAG): for LAG <= 3
-# they have then passed group g, so 4 barriers never alias; from LAG 4 one barrier per group (NG_CAP <= 8: each
-# completes at most once per call).
-FC1D = 4 if LAG <= 3 else 8
+# fc1_done (FC1 -> FC2 B builder hand-off): FC1D mbarriers with no empty barrier; the builders wait on barrier
+# g % FC1D at phase parity (g / FC1D) % 2 for group g. The epilogue can finish FC1(g + 4) once the builders have
+# committed B2(g + 3 - LAG), and warp 5 waits on group g after building group g - 1's B.
+# - LAG <= 3 on 4 barriers: every arrival is ordered after the wait it could alias (safe at any expert count).
+# - From LAG 4 one barrier per group (FC1D 8 >= NG_CAP: each completes at most once per call, so no phase can be
+#   lost, including the heavy_fc2_only CTAs that arrive groups 0 .. LAG in one burst at 8 tokens).
+# - A ring with fewer barriers than groups and LAG >= FC1D can complete a barrier twice before its wait and spin
+#   forever (no HANG_NS trap on these waits); refused below unless lag_unsafe = 1 (experiments
+#   only). The op also caps the admitted lags (op.M3_MOE_LAG_MAX).
+FC1D = _cfg("fc1d", 4 if LAG <= 3 else 8)  # the op never sets it (the default ring for LAG)
+assert FC1D in (4, 8), FC1D
 G_CAP = TOP_K * M_MAX  # distinct experts per call
 NG_CAP = M_MAX  # groups of 4 slots
+FC1_DONE_SLOTS = FC1D  # the fc1_done ring depth (kept for the op's and the tests' checks)
+if LAG < 0 or (LAG >= FC1D and NG_CAP > FC1D and not _cfg("lag_unsafe", 0)):
+    raise ValueError(
+        f"m3_moe: LAG {LAG} with {NG_CAP} groups can deadlock the fc1_done {FC1D}-barrier ring; set lag_unsafe=1 "
+        "only for an experiment"
+    )
 XW = _cfg("xw", 5 if M_MAX > 4 else (4 if M_MAX > 2 else 1))  # FC2 B builder warps: 5, then 8 ..
 THREADS = 256 + 32 * (XW - 1)
 GEMV_THREADS = 256  # capacity: fixed: the CTA size
@@ -115,9 +128,26 @@ LATE_TRIGGER = bool(_cfg("late_trigger", 1))
 # when the other CTAs tear down, onto the SMs they leave, instead of after the last of the heavy CTAs.
 TAIL_TRIGGER = bool(_cfg("tail_trigger", 1))
 NHEAVY = (H // 32) % NCTA if NCTA < H // 32 else 0
+# PROD_TRIGGER (scheduling only; the TP8 MOE_TAIL_TRIGGER): on a call that pushes into the boundary
+# all-reduce, each routed CTA releases the dependents when its weights producer has issued its last stage (the
+# post-stream tail: FC1 drain, hand-off, FC2, finalize), not at teardown. The pushed all-reduce reads only the pushed
+# tagged words, without a grid wait.
+PROD_TRIGGER = bool(_cfg("prod_trigger", 0))
+# With an early release the next kernels' completion no longer implies this kernel's, so the per-CTA call epoch -- read
+# by the NEXT call on this state -- is stored once every thread of the CTA has read it, not at teardown. Every other
+# workspace write of a call lands before the finalize's push.
+EARLY_EPOCH = PROD_TRIGGER
 # AR_PRE: the finalize's all-reduce push uses the call parities and descriptor fields loaded while the last group's
 # FC2 runs (not two dependent global loads per push on the kernel's tail).
 AR_PRE = bool(_cfg("ar_pre", 1))
+# OUT_SKIP (MOE-FINALIZE-DEADSTORE): on a call that pushes into the boundary all-reduce (arp enabled),
+# the finalize does not also store its bf16 rows into ``out``: the pushed all-reduce (prepushed >= 2) never reads them
+# and returns its own tensors, so the store is dead traffic. Calls without a push store as before. Bitwise: the pushed
+# words are unchanged.
+OUT_SKIP = bool(_cfg("out_skip", 0))
+# OUT_STORE_GUARD: the finalize's ``out`` store sits behind the run-time "no push or no OUT_SKIP" test (0: an
+# unconditional store, which a build without OUT_SKIP needs no test for).
+OUT_STORE_GUARD = bool(_cfg("out_store_guard", 0))
 # XSTAGE (fused router): the hidden states land in the (still idle) ring by one bulk copy per token right after the
 # grid dependency; the NVFP4 quantization of B1 reads them from shared memory (one HBM / L2 round trip, not ~8).
 XSTAGE = bool(_cfg("xstage", 1)) and bool(_cfg("fused_router", 0))
@@ -312,6 +342,13 @@ _FIXED_SMEM = (
 # SFA_CP: the A scale words go by 4-byte cp.async straight into the instruction atom layout (no raw scale box, no
 # splicer warp; the MMA warp tcgen05.cp's them), completing on the stage's full barrier: 18 KB stages instead of 26 KB
 SFA_CP = bool(_cfg("sfa_cp", 0))
+# SFA_BULK / K128 (from the low-latency reference fused engine, kernel.py :131 / :408-410; bitwise; the op turns
+# both on unless killed):
+# SFA_BULK (needs SFA_CP): a stage's FC1 scale atoms = one 2 KB bulk copy from the op's pre-spliced image
+# [g, cm, kb, lane, q] (completing the stage's full barrier: + NUM_BYTES_SFA tx), not 32 lanes x 16 4-byte
+# cp.async. K128: 2 x K128 MMAs per 16 KB stage (idesc k_dim bit 3) instead of 4 x K64. Both bitwise there.
+SFA_BULK = bool(_cfg("sfa_bulk", 0)) and SFA_CP
+K128 = bool(_cfg("k128", 0))
 _RAW_STAGE = 0 if SFA_CP else NUM_BYTES_SFA_RAW
 _STAGE_SMEM = NUM_BYTES_A + _RAW_STAGE + NUM_BYTES_SFA
 _STAGES_FIT = (227 * 1024 - _FIXED_SMEM - (128 if SHARED else 0)) // _STAGE_SMEM
@@ -387,6 +424,18 @@ if SHARED:
 # =============================================================================
 # Inline-PTX helpers.
 # =============================================================================
+@dsl_user_op
+def _bulk_g2s(dst_smem, src_gaddr, nbytes, mbar_smem, *, loc=None, ip=None):
+    """(SFA_BULK) cp.async.bulk of nbytes from a raw global address into shared memory, completing mbar."""
+    _llvm.inline_asm(
+        None,
+        [cutlass.Int32(dst_smem).ir_value(loc=loc, ip=ip), cutlass.Int64(src_gaddr).ir_value(loc=loc, ip=ip),
+         cutlass.Int32(nbytes).ir_value(loc=loc, ip=ip), cutlass.Int32(mbar_smem).ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];", "r,l,r,r",
+        has_side_effects=True, is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )  # fmt: skip
+
+
 def _asm(ret, args, ptx, cons, side=False, loc=None, ip=None):
     return _llvm.inline_asm(
         ret,
@@ -1494,15 +1543,32 @@ def _sf1_cp(
         + (c & cutlass.Int32(3))
     )
     dst0 = stage * cutlass.Int32(NUM_WORDS_SFA) + lane * cutlass.Int32(4)
-    for q in cutlass.range_constexpr(C1):
-        for kb in cutlass.range_constexpr(NUM_KB):
-            prims.cp_async_shared_global(
-                sSFA.subview(dst0 + cutlass.Int32(kb * 128 + q)),
-                s1w.subview(src0 + cutlass.Int32((4 * q + kb) * 128)),
-                4,
-                "ca",
+    if cutlass.const_expr(SFA_BULK):
+        # s1w = the op's pre-spliced image: 2 KB block (16-atom raw group g, unit c % 4) = this stage's atoms
+        if lane == 0:
+            blk_ = ((sf_line >> cutlass.Int32(2)) >> cutlass.Int32(4)) * cutlass.Int32(4) + (
+                c & cutlass.Int32(3)
             )
-    prims.cp_async_mbarrier_arrive(ab_full.subview(stage), noinc=True)
+            _bulk_g2s(
+                sSFA.subview(stage * cutlass.Int32(NUM_WORDS_SFA)).data_ptr().toint(),
+                cutlass.Int64(s1w.data_ptr().toint())
+                + cutlass.Int64(blk_) * cutlass.Int64(NUM_BYTES_SFA),
+                NUM_BYTES_SFA,
+                ab_full.subview(stage).data_ptr().toint(),
+            )
+        cute.arch.sync_warp()
+    else:
+        for q in cutlass.range_constexpr(C1):
+            for kb in cutlass.range_constexpr(NUM_KB):
+                prims.cp_async_shared_global(
+                    sSFA.subview(dst0 + cutlass.Int32(kb * 128 + q)),
+                    s1w.subview(src0 + cutlass.Int32((4 * q + kb) * 128)),
+                    4,
+                    "ca",
+                )
+    prims.cp_async_mbarrier_arrive(
+        ab_full.subview(stage), noinc=True
+    )  # (SFA_BULK: no cp.async pending)
     cute.arch.sync_warp()
 
 
@@ -1637,6 +1703,10 @@ def _shared_cta(
     if tidx == 0:
         _stamp(tdbg, bx, 1)
     ep = epochs.load(idx=bx)
+    if cutlass.const_expr(EARLY_EPOCH):
+        prims.barrier_cta_sync(0)  # every thread holds this call's epoch
+        if tidx == 0:
+            epochs.store(ep + cutlass.Int32(1), idx=bx)
     tag16 = (ep & cutlass.Int32(0x7FFF)) | cutlass.Int32(0x8000)
     NQ = THREADS - 64  # activation quant threads (warps 2 ..)
     if warp == 0:
@@ -2128,8 +2198,9 @@ def _shared_cta(
     if warp == 1:
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         prims.tcgen05_dealloc(cutlass.inttoptr(tmem_raw, 6, cutlass.Float32), SH_TMEM)
-    if tidx == 0:
-        epochs.store(ep + cutlass.Int32(1), idx=bx)
+    if cutlass.const_expr(not EARLY_EPOCH):
+        if tidx == 0:
+            epochs.store(ep + cutlass.Int32(1), idx=bx)
 
 
 @cute.kernel
@@ -2655,7 +2726,9 @@ def m3_moe_kernel(
                                 if prims.elect_sync():
                                     prims.mbarrier_arrive_expect_tx(
                                         ab_full.subview(n0),
-                                        NUM_BYTES_A if SFA_CP else NUM_BYTES_A + NUM_BYTES_SFA_RAW,
+                                        (NUM_BYTES_A + (NUM_BYTES_SFA if SFA_BULK else 0))
+                                        if SFA_CP
+                                        else NUM_BYTES_A + NUM_BYTES_SFA_RAW,
                                     )
                                     for q in cutlass.range_constexpr(C1):
                                         prims.cp_async_bulk_tensor_shared_cta_global(
@@ -2720,7 +2793,9 @@ def m3_moe_kernel(
                             if prims.elect_sync():
                                 prims.mbarrier_arrive_expect_tx(
                                     ab_full.subview(n0),
-                                    NUM_BYTES_A if SFA_CP else NUM_BYTES_A + NUM_BYTES_SFA_RAW,
+                                    (NUM_BYTES_A + (NUM_BYTES_SFA if SFA_BULK else 0))
+                                    if SFA_CP
+                                    else NUM_BYTES_A + NUM_BYTES_SFA_RAW,
                                 )
                                 for q in cutlass.range_constexpr(C1):
                                     prims.cp_async_bulk_tensor_shared_cta_global(
@@ -2835,6 +2910,11 @@ def m3_moe_kernel(
         if warp != W_WARP:  # one sync site for every thread but warp 4's (which arrived)
             cute.arch.sync_warp()
             cute.arch.barrier(barrier_id=ROUTE_BAR, number_of_threads=THREADS)
+        if cutlass.const_expr(EARLY_EPOCH):
+            if tidx == 0:
+                epochs.store(
+                    ep + cutlass.Int32(1), idx=bx
+                )  # every thread read it before the route barrier
         if tidx == 0:
             _stamp(tdbg, bx, 2)
             if cutlass.const_expr(TIMING):
@@ -2891,7 +2971,9 @@ def m3_moe_kernel(
                                 if prims.elect_sync():
                                     prims.mbarrier_arrive_expect_tx(
                                         ab_full.subview(stage),
-                                        NUM_BYTES_A if SFA_CP else NUM_BYTES_A + NUM_BYTES_SFA_RAW,
+                                        (NUM_BYTES_A + (NUM_BYTES_SFA if SFA_BULK else 0))
+                                        if SFA_CP
+                                        else NUM_BYTES_A + NUM_BYTES_SFA_RAW,
                                     )
                                     for q in cutlass.range_constexpr(C1):
                                         prims.cp_async_bulk_tensor_shared_cta_global(
@@ -2979,6 +3061,9 @@ def m3_moe_kernel(
                             stage, phase = _adv(stage, phase)
             if lane == 0:
                 _stamp(tdbg, bx, 3)
+            if cutlass.const_expr(PROD_TRIGGER):
+                if ar_on:
+                    cute.arch.griddepcontrol_launch_dependents()
 
         # ---- scale splicer (warp 6): every stage, atom kb word [r][q] = raw atom 4 q + kb word [r][m1]
         if (warp == S_WARP) & cutlass.Boolean(not SFA_CP):  # (SFA_CP: no splicer)
@@ -3457,19 +3542,34 @@ def m3_moe_kernel(
                             if prims.elect_sync():
                                 if cutlass.const_expr(SFA_CP):
                                     _sfa_to_tmem(sSFA, stage, base_row, base_col)
-                                for kb in cutlass.range_constexpr(NUM_KB):
-                                    prims.tcgen05_mma_block_scale(
-                                        prims.MMABlockScaleKind.MXF4NVF4,
-                                        prims.CTAGroup.CTA_1,
-                                        acc_ptr,
-                                        da + INC_K * kb,
-                                        db + INC_K * kb,
-                                        idesc1,
-                                        (j > j0) | cutlass.Boolean(kb > 0),
-                                        cutlass.inttoptr(sfa_c + kb * 4, 6, cutlass.Int32),
-                                        cutlass.inttoptr(sfb_c + kb * 4, 6, cutlass.Int32),
-                                        scale_vec_size=prims.Tcgen05MMABlockScale.BLOCK16,
-                                    )
+                                if cutlass.const_expr(K128):
+                                    for kb in cutlass.range_constexpr(NUM_KB // 2):
+                                        prims.tcgen05_mma_block_scale(
+                                            prims.MMABlockScaleKind.MXF4NVF4,
+                                            prims.CTAGroup.CTA_1,
+                                            acc_ptr,
+                                            da + 2 * INC_K * kb,
+                                            db + 2 * INC_K * kb,
+                                            idesc1 | 8,
+                                            (j > j0) | cutlass.Boolean(kb > 0),
+                                            cutlass.inttoptr(sfa_c + kb * 8, 6, cutlass.Int32),
+                                            cutlass.inttoptr(sfb_c + kb * 8, 6, cutlass.Int32),
+                                            scale_vec_size=prims.Tcgen05MMABlockScale.BLOCK16,
+                                        )
+                                else:
+                                    for kb in cutlass.range_constexpr(NUM_KB):
+                                        prims.tcgen05_mma_block_scale(
+                                            prims.MMABlockScaleKind.MXF4NVF4,
+                                            prims.CTAGroup.CTA_1,
+                                            acc_ptr,
+                                            da + INC_K * kb,
+                                            db + INC_K * kb,
+                                            idesc1,
+                                            (j > j0) | cutlass.Boolean(kb > 0),
+                                            cutlass.inttoptr(sfa_c + kb * 4, 6, cutlass.Int32),
+                                            cutlass.inttoptr(sfb_c + kb * 4, 6, cutlass.Int32),
+                                            scale_vec_size=prims.Tcgen05MMABlockScale.BLOCK16,
+                                        )
                                 prims.tcgen05_commit(ab_empty.subview(stage))
                             stage, phase = _adv(stage, phase)
                         if prims.elect_sync():
@@ -3524,19 +3624,34 @@ def m3_moe_kernel(
                             if prims.elect_sync():
                                 if cutlass.const_expr(SFA_CP):
                                     _sfa_to_tmem(sSFA, stage, base_row, base_col)
-                                for kb in cutlass.range_constexpr(_nkb2(t2)):
-                                    prims.tcgen05_mma_block_scale(
-                                        prims.MMABlockScaleKind.MXF4NVF4,
-                                        prims.CTAGroup.CTA_1,
-                                        acc2_ptr,
-                                        da + INC_K * kb,
-                                        db + INC_K * kb,
-                                        idesc2,
-                                        cutlass.Boolean(t2 > 0 or kb > 0),
-                                        cutlass.inttoptr(sfa_c + kb * 4, 6, cutlass.Int32),
-                                        cutlass.inttoptr(sfb_c + kb * 4, 6, cutlass.Int32),
-                                        scale_vec_size=prims.Tcgen05MMABlockScale.BLOCK16,
-                                    )
+                                if cutlass.const_expr(K128 and _nkb2(t2) % 2 == 0):
+                                    for kb in cutlass.range_constexpr(_nkb2(t2) // 2):
+                                        prims.tcgen05_mma_block_scale(
+                                            prims.MMABlockScaleKind.MXF4NVF4,
+                                            prims.CTAGroup.CTA_1,
+                                            acc2_ptr,
+                                            da + 2 * INC_K * kb,
+                                            db + 2 * INC_K * kb,
+                                            idesc2 | 8,
+                                            cutlass.Boolean(t2 > 0 or kb > 0),
+                                            cutlass.inttoptr(sfa_c + kb * 8, 6, cutlass.Int32),
+                                            cutlass.inttoptr(sfb_c + kb * 8, 6, cutlass.Int32),
+                                            scale_vec_size=prims.Tcgen05MMABlockScale.BLOCK16,
+                                        )
+                                else:
+                                    for kb in cutlass.range_constexpr(_nkb2(t2)):
+                                        prims.tcgen05_mma_block_scale(
+                                            prims.MMABlockScaleKind.MXF4NVF4,
+                                            prims.CTAGroup.CTA_1,
+                                            acc2_ptr,
+                                            da + INC_K * kb,
+                                            db + INC_K * kb,
+                                            idesc2,
+                                            cutlass.Boolean(t2 > 0 or kb > 0),
+                                            cutlass.inttoptr(sfa_c + kb * 4, 6, cutlass.Int32),
+                                            cutlass.inttoptr(sfb_c + kb * 4, 6, cutlass.Int32),
+                                            scale_vec_size=prims.Tcgen05MMABlockScale.BLOCK16,
+                                        )
                                 prims.tcgen05_commit(ab_empty.subview(stage))
                             stage, phase = _adv(stage, phase)
                         if prims.elect_sync():
@@ -3985,7 +4100,11 @@ def m3_moe_kernel(
                         acc_o = _add_rn(
                             (wy << cutlass.Int32(16)).bitcast(cutlass.Float32), _bf16_round(acc_o)
                         )
-                    out.store(cutlass.BFloat16(acc_o), idx=ch)
+                    if cutlass.const_expr(OUT_STORE_GUARD):
+                        if (ar_on == cutlass.Boolean(False)) | cutlass.Boolean(not OUT_SKIP):
+                            out.store(cutlass.BFloat16(acc_o), idx=ch)
+                    else:
+                        out.store(cutlass.BFloat16(acc_o), idx=ch)
                     if ar_on:
                         cl = (
                             (blk0 + bb) * cutlass.Int32(R2)
@@ -4013,7 +4132,8 @@ def m3_moe_kernel(
         # ---- teardown
         if tidx == 0:
             _stamp(tdbg, bx, 7)
-            epochs.store(ep + cutlass.Int32(1), idx=bx)
+            if cutlass.const_expr(not EARLY_EPOCH):
+                epochs.store(ep + cutlass.Int32(1), idx=bx)
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
         cute.arch.sync_warp()
         prims.barrier_cta_sync(0)

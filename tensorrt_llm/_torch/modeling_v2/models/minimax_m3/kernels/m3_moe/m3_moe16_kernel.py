@@ -76,6 +76,9 @@ LATE_TRIGGER = bool(_cfg("late_trigger", 1))
 # and returns its own tensors, so the store is dead traffic. Calls without a push store as before. Bitwise: the pushed
 # words are unchanged.
 OUT_SKIP = bool(_cfg("out_skip", 0))
+# OUT_STORE_GUARD: the finalize's ``out`` store sits behind the run-time "no push or no OUT_SKIP" test (0: an
+# unconditional store, which a build without OUT_SKIP needs no test for).
+OUT_STORE_GUARD = bool(_cfg("out_store_guard", 0))
 # PROD_TRIGGER (scheduling only; the TP8 MOE_TAIL_TRIGGER): on a call that pushes into the boundary
 # all-reduce, each routed CTA releases the dependents when its weights producer has issued its last stage (the
 # post-stream tail: FC1 drain, hand-off, FC2, finalize), not at teardown. The pushed all-reduce reads only the pushed
@@ -3742,7 +3745,10 @@ def m3_moe_kernel(
                     acc_o = _add_rn(
                         (wy << cutlass.Int32(16)).bitcast(cutlass.Float32), _bf16_round(acc_o)
                     )
-                if (ar_on == cutlass.Boolean(False)) | cutlass.Boolean(not OUT_SKIP):
+                if cutlass.const_expr(OUT_STORE_GUARD):
+                    if (ar_on == cutlass.Boolean(False)) | cutlass.Boolean(not OUT_SKIP):
+                        out.store(cutlass.BFloat16(acc_o), idx=ch)
+                else:
                     out.store(cutlass.BFloat16(acc_o), idx=ch)
                 if ar_on:
                     cl = (

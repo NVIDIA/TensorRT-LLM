@@ -12,16 +12,16 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.moe.m3_moe16_engine import (  # noqa: E501
-    M3Moe16State,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.moe.m3_moe16_engine import (  # noqa: E501
-    m3_moe16_engine as op16,
-)
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.moe.m3_moe_engine import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.m3_moe.op import (  # noqa: E501
     M3MoeState,
 )
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.ops.moe.m3_moe_engine import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.m3_moe.op16 import (  # noqa: E501
+    M3Moe16State,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.moe.m3_moe16_engine import (
+    m3_moe16_engine as op16,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.moe.m3_moe_engine import (
     m3_moe_engine as op,
 )
 
@@ -69,7 +69,7 @@ BAND_RMS = 0.5
 
 
 @pytest.mark.parametrize("case", ("random", "concentrated"))
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS_BY_TP[4], ids=[c.why[:44] for c in op.CELLS_BY_TP[4]])
 def test_certified_cells(cell, case) -> None:
     m = cell.spec["tokens"]
     layer = layer_for(_state(m), case)
