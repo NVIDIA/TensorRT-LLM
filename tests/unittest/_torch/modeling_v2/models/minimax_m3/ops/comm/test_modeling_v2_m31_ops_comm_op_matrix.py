@@ -7,6 +7,7 @@ file, each driving its entry's ``.CELLS``).
 - ``dspark_markov_chain``: `ops/dspark/dspark_markov_chain`.
 - ``dspark_markov_chain_ll``: its LL exchange variant (LL tokens == the S4B8 batch-1 kernel's, bitwise, on real
   ranks, including forced cross-rank ties, back-to-back launches and CUDA-graph replays).
+- ``m31_allreduce``: `ops/comm/m31_allreduce` (MiniMax-M3.1-Flash, sm_107 only).
 
 World 4 is collected here. The world-8 cells span two GB300 trays and run as one srun task per rank (see each
 matrix's docstring), like ``comm/_mnnvl_allreduce_op_matrix.py``.
@@ -40,7 +41,19 @@ def _rank_job():
 @pytest.mark.no_xdist
 @pytest.mark.parametrize(
     "entry,world",
-    [("allgather_cast", 4), ("dspark_markov_chain", 4), ("dspark_markov_chain_ll", 4)],
+    [
+        ("allgather_cast", 4),
+        ("dspark_markov_chain", 4),
+        ("dspark_markov_chain_ll", 4),
+        pytest.param(
+            "m31_allreduce",
+            4,
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available() or get_sm_version() != 107,
+                reason="m31_allreduce is certified on sm_107",
+            ),
+        ),
+    ],
 )
 def test_op_matrix(entry: str, world: int) -> None:
     _rank_job().run(entry, world)

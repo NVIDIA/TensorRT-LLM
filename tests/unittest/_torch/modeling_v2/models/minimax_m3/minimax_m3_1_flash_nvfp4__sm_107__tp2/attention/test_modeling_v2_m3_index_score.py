@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the attention/m3_index_score entry of the MiniMax-M3.1 sm_107 tp2 target: the MSA index scorer with
 its pre-wait schedule, at the TP2 per-rank geometry (two index heads over one index-K head): the K7 verify rows (decode
-query length 8), the two-request early-issue step and a BF16 index.
+query length 8), the two-request early-issue step and a BF16 index; also the family entry's (attention/m31_index_score)
+cells of the tp2 and tp4 targets, each at its target's index heads per rank.
 
 Every cell is held to the fp32 reference (a few fp32 ulps: the kernel sums the 128 exact products in its k-split order)
 and to the in-tree scorer (``cute_dsl_minimax_m3_index_decode_score``) bit for bit, which the pre-wait prefetch and the
@@ -28,6 +29,9 @@ try:
 except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)
 
+__extra_import_path__ = ["../../../.."]
+from _validating import validating  # noqa: E402 — needs the path declared above
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
     reason="the sm_107 TP2 target runs on SM107 only",
@@ -37,7 +41,7 @@ HEADS = 2  # index heads per rank at TP2 (4 index heads over 2 ranks)
 HEAD_DIM = 128
 
 
-def _inputs(seq_lens, qlen: int, seed: int, dtype=torch.float8_e4m3fn):
+def _inputs(seq_lens, qlen: int, seed: int, dtype=torch.float8_e4m3fn, heads: int = HEADS):
     g = torch.Generator(device="cuda").manual_seed(seed)
     batch = len(seq_lens)
     max_blocks = (max(seq_lens) + PAGE - 1) // PAGE
@@ -46,15 +50,15 @@ def _inputs(seq_lens, qlen: int, seed: int, dtype=torch.float8_e4m3fn):
     block_table = (
         torch.randperm(pages, device="cuda", generator=g).to(torch.int32).view(batch, max_blocks)
     )
-    idx_q = torch.randn(batch * qlen, HEADS, HEAD_DIM, device="cuda", generator=g).to(dtype)
+    idx_q = torch.randn(batch * qlen, heads, HEAD_DIM, device="cuda", generator=g).to(dtype)
     index_k = torch.randn(pages, PAGE, HEAD_DIM, device="cuda", generator=g).to(dtype)
     seq = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
     return idx_q, index_k, block_table, seq, stride
 
 
-def _score(stride: int, total_q: int):
+def _score(stride: int, total_q: int, heads: int = HEADS):
     backing = torch.full(
-        (HEADS, stride, total_q), -float("inf"), device="cuda", dtype=torch.float32
+        (heads, stride, total_q), -float("inf"), device="cuda", dtype=torch.float32
     )
     return backing.transpose(1, 2)
 
@@ -126,3 +130,28 @@ def test_bf16_index_is_the_in_tree_scorer(early) -> None:
         idx_q, index_k, block_table, seq, stock, 4, SPLIT_K
     )
     assert torch.equal(score, stock)
+
+
+# The entry's cells at each target's index heads per rank (tp2: 2; tp4: 1).
+_TARGET_HEADS = {2: HEADS, 4: 1}
+CELLS = [(tp, cell) for tp, cells in op.CELLS_BY_TP.items() for cell in cells]
+
+
+@pytest.mark.parametrize("tp,cell", CELLS, ids=[f"tp{tp}-{c.why[:40]}" for tp, c in CELLS])
+def test_certified_cells_are_the_in_tree_scorer(tp, cell) -> None:
+    spec, heads = cell.spec, _TARGET_HEADS[tp]
+    idx_q, index_k, block_table, seq, stride = _inputs(
+        spec["seq_lens"], spec["qlen"], zlib.crc32(cell.why.encode()), heads=heads
+    )
+    score = _score(stride, idx_q.shape[0], heads)
+    stock = _score(stride, idx_q.shape[0], heads)
+    args = (idx_q, index_k, block_table, seq, score, spec["qlen"], SPLIT_K, spec["early"])
+    ref = op.reference(*args)
+    with validating(op):
+        op(*args)
+    torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
+        idx_q, index_k, block_table, seq, stock, spec["qlen"], SPLIT_K
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(score, ref, rtol=1e-5, atol=1e-4)
+    assert torch.equal(score, stock), "the scores differ from the in-tree scorer"

@@ -15,12 +15,20 @@ l0_gr100:
   tests:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   # MiniMax-M3 family code shared with MiniMax-M3.1-Flash.
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/activation
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/dspark
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/embedding
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/gemm
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/moe
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/norm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_capture_norm.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_chunk_norm.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_draft_input.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_fold_tail.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_force_vec.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_slot_scatter.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_step_gather.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_add_rmsnorm_gpu.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_native_swiglu_gpu.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_tp_gumbel_draft_gpu.py
