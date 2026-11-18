@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Complete FLUX.2-klein-4B generations with observed quantization routes."""
+"""Complete FLUX.2-dev generations with observed quantization routes and shared goldens."""
 
 import hashlib
 import json
@@ -23,8 +23,11 @@ from test_common.visual_gen_quantization import (
 )
 
 from defs.examples.visual_gen.visual_gen_test_utils import (
+    VISUAL_GEN_LPIPS_GOLDEN_DIR,
     _cleanup_cuda,
     _disable_inductor_compile_worker_quiesce,
+    _golden_media_path,
+    _lpips_deterministic_algorithms,
 )
 from tensorrt_llm import VisualGenArgs
 from tensorrt_llm._torch.modules.linear import Linear
@@ -33,15 +36,14 @@ from tensorrt_llm._torch.visual_gen.attention.backends.utils import get_visual_g
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._utils import get_sm_version
 
-STEPS = 4
-REQUEST = dict(
-    prompt="A small red sailboat on a calm lake, mountains in the distance, morning light.",
-    seed=42,
-    height=512,
-    width=512,
-    num_inference_steps=STEPS,
-    guidance_scale=1.0,
+GOLDEN = json.loads(
+    (Path(VISUAL_GEN_LPIPS_GOLDEN_DIR) / "flux2_lpips_golden.json").read_text(encoding="utf-8")
 )
+REQUEST = {
+    key: GOLDEN[key]
+    for key in ("prompt", "seed", "height", "width", "num_inference_steps", "guidance_scale")
+}
+STEPS = REQUEST["num_inference_steps"]
 
 # Quality bound for this fixed B200 fixture, with headroom for backend rounding.
 LPIPS_LIMIT = 0.03
@@ -98,8 +100,6 @@ QUANT_IGNORE_CASES = (
 @dataclass
 class GenerationResult:
     image: torch.Tensor
-    inventory: dict[str, list[str]]
-    initial_noise_hash: str
     directory: Path
 
 
@@ -115,9 +115,7 @@ def _tensor_storage_bytes(model: torch.nn.Module) -> int:
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _make_case_config(
-    checkpoint: str, case: QuantIgnoreCase | None, inventory: dict[str, list[str]]
-) -> dict:
+def _make_case_config(checkpoint: str, case: QuantIgnoreCase | None) -> dict:
     config = dict(
         model=checkpoint,
         torch_compile_config={"enable": False},
@@ -132,12 +130,25 @@ def _make_case_config(
         else {}
     )
     if case.mode == "layer":
-        prefix = inventory["blocks"][case.target] + "."
-        targets = [name for name in inventory[case.component] if name.startswith(prefix)]
-        assert targets, f"No {case.component} modules in global block {case.target}: {prefix}"
-        ignore_config = {
-            "ignore": [name for name in inventory[case.component] if name not in targets]
-        }
+        transformer_config = json.loads(
+            (Path(checkpoint) / "transformer" / "config.json").read_text(encoding="utf-8")
+        )
+        blocks = [f"transformer_blocks.{i}" for i in range(transformer_config["num_layers"])]
+        blocks += [
+            f"single_transformer_blocks.{i}" for i in range(transformer_config["num_single_layers"])
+        ]
+        ignored = [block + ".*" for index, block in enumerate(blocks) if index != case.target]
+        if case.component == "linear":
+            # Modulation and embedding Linears also live outside the transformer blocks.
+            ignored += [
+                "x_embedder",
+                "context_embedder",
+                "double_stream_modulation_*",
+                "single_stream_modulation",
+                "norm_out",
+                "proj_out",
+            ]
+        ignore_config = {"ignore": ignored}
     if case.component == "linear":
         config["quant_config"] = dict(quant_algo=case.quant_algo, dynamic=True, **ignore_config)
     else:
@@ -215,17 +226,19 @@ def _run_generation(
     checkpoint: str,
     directory: Path,
     case: QuantIgnoreCase | None = None,
-    inventory: dict[str, list[str]] | None = None,
     *,
     compiled: bool = False,
 ) -> GenerationResult:
     directory.mkdir(parents=True, exist_ok=True)
-    config = _make_case_config(checkpoint, case, inventory or {})
+    config = _make_case_config(checkpoint, case)
     if compiled:
         config.update(
             torch_compile_config={"enable": True},
             cuda_graph_config={"enable": True},
-            compilation_config={"resolutions": [[512, 512]], "num_frames": [1]},
+            compilation_config={
+                "resolutions": [[REQUEST["height"], REQUEST["width"]]],
+                "num_frames": [1],
+            },
         )
     yaml_path = directory / "config.yaml"
     yaml_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -240,8 +253,6 @@ def _run_generation(
     }
     try:
         actual_inventory = _module_inventory(pipeline.transformer)
-        if inventory is not None:
-            assert actual_inventory == inventory
         if case is not None and case.component == "attention" and case.mode == "layer":
             for name, module in pipeline.transformer.named_modules():
                 if isinstance(module, Attention):
@@ -336,7 +347,7 @@ def _run_generation(
             state = model.model_config.attention_metadata_state
             if state is not None:
                 assert state["denoise_step"] is None
-        return GenerationResult(image, actual_inventory, initial_noise_hashes[0], directory)
+        return GenerationResult(image, directory)
     finally:
         pipeline.cleanup()
         del pipeline
@@ -344,35 +355,36 @@ def _run_generation(
 
 
 @pytest.fixture(scope="module")
-def bf16_reference(tmp_path_factory: pytest.TempPathFactory) -> GenerationResult:
+def bf16_reference(tmp_path_factory: pytest.TempPathFactory) -> torch.Tensor:
     if get_sm_version() not in (100, 103):
         pytest.skip("This NVFP4/MXFP8 quantization ignore matrix targets B200/SM103")
     _disable_inductor_compile_worker_quiesce()
-    checkpoint = get_checkpoint("FLUX.2-klein-4B")
-    directory = tmp_path_factory.mktemp("flux2_klein_quant_ignore") / "bf16_reference"
-    return _run_generation(checkpoint, directory)
-
-
-def test_flux2_klein_bf16_reference(bf16_reference: GenerationResult) -> None:
-    assert (bf16_reference.directory / "image.png").is_file()
+    directory = tmp_path_factory.mktemp("flux2_quant_ignore_reference")
+    image_path = _golden_media_path(directory, GOLDEN["image"], "FLUX.2 BF16 golden image")
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
+        assert image.size == (REQUEST["width"], REQUEST["height"])
+        return torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8).reshape(
+            1, REQUEST["height"], REQUEST["width"], 3
+        )
 
 
 def _assert_image_quality(
-    case: QuantIgnoreCase, result: GenerationResult, bf16_reference: GenerationResult
+    case: QuantIgnoreCase, result: GenerationResult, bf16_reference: torch.Tensor
 ) -> None:
     import lpips
 
-    assert result.initial_noise_hash == bf16_reference.initial_noise_hash
     metric = lpips.LPIPS(net="alex").eval()
 
     def normalize(image):
         return image.permute(0, 3, 1, 2).float() / 127.5 - 1
 
     with torch.inference_mode():
-        score = metric(normalize(result.image), normalize(bf16_reference.image)).mean().item()
+        score = metric(normalize(result.image), normalize(bf16_reference)).mean().item()
     assert torch.isfinite(torch.tensor(score)), score
     report_path = result.directory / "report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["reference_image"] = GOLDEN["image"]
     report["lpips_against_bf16"] = score
     report["lpips_limit"] = LPIPS_LIMIT
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -383,23 +395,28 @@ def _assert_image_quality(
 
 
 @pytest.mark.parametrize("case", QUANT_IGNORE_CASES, ids=lambda case: case.name)
-def test_flux2_klein_quant_ignore(case: QuantIgnoreCase, bf16_reference: GenerationResult) -> None:
-    result = _run_generation(
-        get_checkpoint("FLUX.2-klein-4B"),
-        bf16_reference.directory.parent / case.name,
-        case,
-        bf16_reference.inventory,
-    )
+def test_flux2_quant_ignore(
+    case: QuantIgnoreCase,
+    bf16_reference: torch.Tensor,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PyTorch's deterministic empty-memory fill does not support packed FP4 tensors.
+    monkeypatch.setattr(torch.utils.deterministic, "fill_uninitialized_memory", False)
+    with _lpips_deterministic_algorithms():
+        result = _run_generation(get_checkpoint(GOLDEN["model"]), tmp_path / case.name, case)
     _assert_image_quality(case, result, bf16_reference)
 
 
-def test_flux2_klein_quant_ignore_compile_cuda_graph(bf16_reference: GenerationResult) -> None:
+def test_flux2_quant_ignore_compile_cuda_graph(
+    bf16_reference: torch.Tensor, tmp_path: Path
+) -> None:
     case = QUANT_IGNORE_CASES[1]
-    result = _run_generation(
-        get_checkpoint("FLUX.2-klein-4B"),
-        bf16_reference.directory.parent / "linear_nvfp4_step_compile_cuda_graph",
-        case,
-        bf16_reference.inventory,
-        compiled=True,
-    )
+    with _lpips_deterministic_algorithms():
+        result = _run_generation(
+            get_checkpoint(GOLDEN["model"]),
+            tmp_path / "linear_nvfp4_step_compile_cuda_graph",
+            case,
+            compiled=True,
+        )
     _assert_image_quality(case, result, bf16_reference)
