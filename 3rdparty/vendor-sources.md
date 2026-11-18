@@ -61,10 +61,9 @@ vendor lock.
 
 Put a vendor used by only one subtree, such as the kernels of one Modeling V2
 model, in a scoped vendor lock for that subtree, and use the repository lock for
-sources shared across subtrees or for vendors that need `promote.py` or
-`bot.py`. A scoped vendor lock keeps the lock entry, patches, and optional
-vendor notes (for example `<scope>/3rdparty/README.md`) with the code that uses
-them:
+sources shared across subtrees. A scoped vendor lock keeps the lock entry,
+patches, and optional vendor notes (for example `<scope>/3rdparty/README.md`)
+with the code that uses them:
 
 ```text
 tensorrt_llm/_torch/modeling_v2/models/<model>/
@@ -85,7 +84,6 @@ destinations must not overlap, and no destination may contain another lock or
 its `3rdparty/vendor_patches` directory.
 
 Scoped locks and patches are owned by the CODEOWNERS of their directory.
-`promote.py` and `bot.py` support only vendors in the repository lock.
 
 ## Include patterns
 
@@ -639,10 +637,12 @@ only in a trusted environment, not with pull-request-controlled scripts.
 ## Promotion and local monitoring
 
 The generic toolkit under `scripts/vendor/` supports every vendor key in the
-repository lock; scoped vendor locks are not supported yet. `promote.py`
-prepares a verified lock-only follow-up after a source-update PR merges;
-`bot.py` can monitor PRs locally, request missing contributor metadata, match
-upstream commits, and publish promotions with squash auto-merge.
+repository lock and in scoped vendor locks. `promote.py` prepares a verified
+lock-only follow-up after a source-update PR merges; `bot.py` can monitor PRs
+locally, request missing contributor metadata, match upstream commits, and
+publish promotions with squash auto-merge. Both take `--lock PATH`, the
+repository-relative path of the lock that defines `--vendor` (default
+`3rdparty/vendor_sources.lock.yaml`).
 
 See the [toolkit guide](../scripts/vendor/README.md) for the workflow diagram,
 contributor description format, author resolution of ambiguous matches,
@@ -658,6 +658,15 @@ code-changing PR with normal CI: stop its monitor or configure an audited
 in the existing workdir after merge. See the toolkit guide's
 [base-branch setup](../scripts/vendor/README.md#different-consumer-base-branches)
 and [refresh cutover](../scripts/vendor/README.md#switching-canonical-branches-after-a-refresh).
+
+A monitor tracks only PRs that change its `--lock`, and every poll first checks
+that its vendor is in that lock on the base branch. Start a monitor after its
+vendor's lock entry has merged. Move a vendor to another lock only after its
+pending promotions have merged, then start a new workdir with `--lock` naming
+the new lock; the old monitor's polls fail until it is stopped. A promotion
+still pending at the move can no longer complete: close it, and repoint the
+moved entry at the canonical repository and branch in a reviewed lock-only
+`manage.py pin` change once the canonical branch contains the pinned commit.
 
 Use the entry points under `scripts/vendor/` directly. The old top-level scripts
 and PrimTS-specific CLI aliases are not retained; callers must migrate to the

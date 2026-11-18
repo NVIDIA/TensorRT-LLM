@@ -238,6 +238,17 @@ def _validate_relative_path(value: object, description: str) -> str:
     return path.as_posix()
 
 
+def _lock_location(value: str, description: str) -> str:
+    """Return a repository-relative lock path that follows the lock layout rule."""
+    relative = PurePosixPath(_validate_relative_path(value, description))
+    if relative.name != _LOCK_FILENAME or relative.parent.name != _CONTROL_DIRECTORY:
+        raise VendorError(
+            f"{description} must be <scope>/{_CONTROL_DIRECTORY}/{_LOCK_FILENAME} "
+            f"relative to the repository root: {value!r}."
+        )
+    return relative.as_posix()
+
+
 def _validate_url(value: object, vendor_name: str) -> str:
     url = _require_string(value, f"Vendor {vendor_name!r} url")
     parsed = urllib.parse.urlsplit(url)
