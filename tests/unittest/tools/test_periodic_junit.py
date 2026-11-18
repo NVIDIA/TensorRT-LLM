@@ -90,7 +90,7 @@ class _Item:
         self._marker = marker
 
     def get_closest_marker(self, name: str) -> _Marker | None:
-        return self._marker
+        return self._marker if name == "timeout" else None
 
 
 class _Report:
