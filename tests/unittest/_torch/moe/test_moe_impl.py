@@ -3515,6 +3515,7 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
         use_cuda_graph=False,
         use_low_precision_moe_combine=False,
         moe_load_balancer=None,
+        enable_wide_ep_fault_tolerance=False,
     )
     constructors = {}
     for name in (
@@ -3527,7 +3528,6 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
     ):
         constructors[name] = MagicMock(name=name)
         monkeypatch.setattr(communication_factory, name, constructors[name])
-    monkeypatch.setattr(communication_factory, "get_wide_ep_ft_options", lambda _: (None, 60, 1))
     backend = TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl)
     # __new__ skips __init__, which normally sets quant_config from model_config.
     backend.quant_config = config.quant_config

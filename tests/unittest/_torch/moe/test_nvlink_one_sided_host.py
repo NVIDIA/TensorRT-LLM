@@ -128,6 +128,64 @@ def test_sentinel_workspace_layout(payload_format: str) -> None:
         )
 
 
+# The workspace regions after the round flag value, in the order calculateWorkspaceLayout places them.
+_REGIONS_AFTER_FLAG_VAL = (
+    "LOCAL_TOKEN_COUNTER",
+    "SEND_COUNTERS",
+    "RECV_COUNTERS",
+    "DISPATCH_COMPLETION_FLAGS",
+    "TOPK_TARGET_RANKS",
+    "TOPK_TARGET_INDICES",
+    "EPLB_GATHERED_STATS",
+    "DISPATCH_PAYLOAD",
+    "COMBINE_COMPLETION_FLAGS",
+    "COMBINE_INPUT",
+)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        # ep_size, max_num_tokens_per_rank, top_k, dispatch_payload_bytes, combine_input_bytes, EPLB experts
+        (8, 128, 8, 1000, 3000, 288),
+        (36, 77, 6, 4096, 70000, None),
+    ],
+)
+def test_workspace_layout_without_rank_mask_has_no_incomplete_round_word(args: tuple) -> None:
+    """Only a rank-mask layout reserves the incomplete-round word, right after the round flag value."""
+    from tensorrt_llm.bindings import internal as _tllm_internal
+
+    thop = _tllm_internal.thop
+
+    def offset(layout: torch.Tensor, region: str) -> int:
+        return int(layout[getattr(thop, f"MOE_A2A_{region}_OFFSET_INDEX")])
+
+    default = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args)
+    without_mask = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args, rank_mask=False)
+    with_mask = torch.ops.trtllm.moe_a2a_get_workspace_layout(*args, rank_mask=True)
+    assert torch.equal(without_mask, default)
+    assert offset(without_mask, "INCOMPLETE_ROUND") == 0
+
+    # The word follows the round flag value, and only the regions after it move.
+    assert offset(with_mask, "FLAG_VAL") == offset(without_mask, "FLAG_VAL")
+    assert offset(with_mask, "FLAG_VAL") < offset(with_mask, "INCOMPLETE_ROUND")
+    assert offset(with_mask, "INCOMPLETE_ROUND") < offset(with_mask, _REGIONS_AFTER_FLAG_VAL[0])
+    for region in _REGIONS_AFTER_FLAG_VAL:
+        assert offset(with_mask, region) >= offset(without_mask, region)
+    unchanged = [
+        int(getattr(thop, f"MOE_A2A_{name}_INDEX"))
+        for name in (
+            "DISPATCH_PAYLOAD_SIZE",
+            "COMBINE_INPUT_SIZE",
+            "MAX_NUM_TOKENS",
+            "TOP_K",
+            "EP_SIZE",
+            "EPLB_STATS_NUM_EXPERTS",
+        )
+    ]
+    assert torch.equal(with_mask[unchanged], without_mask[unchanged])
+
+
 def test_sentinel_row_geometry() -> None:
     hidden_size, top_k = 7168, 8
     # (hidden-state bytes, scale bytes, dispatch blocks per token) per row.

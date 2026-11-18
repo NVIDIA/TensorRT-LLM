@@ -8940,6 +8940,13 @@
       "title": "Enable Tokenization Cache",
       "type": "boolean"
     },
+    "enable_wide_ep_fault_tolerance": {
+      "default": false,
+      "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires the NVLink one-sided all-to-all.",
+      "status": "prototype",
+      "title": "Enable Wide Ep Fault Tolerance",
+      "type": "boolean"
+    },
     "encode_only": {
       "default": false,
       "description": "Set to True to use the batch-forward encode() path, which runs a single forward pass and returns the model output directly, bypassing the scheduler and autoregressive loop. Works for encoder-only models (BERT, RoBERTa, reward models) and decoder models used in single-prefill mode (e.g., extracting embeddings). When False (default), uses the standard generate() path.",

@@ -1403,6 +1403,11 @@ class ModelLoader:
                 config)
 
         validate_lm_head_output_dtype(model, self.llm_args.lm_head_output_dtype)
+        if self.llm_args.enable_wide_ep_fault_tolerance:
+            # Imported here, so that a model without fault tolerance loads
+            # none of its modules.
+            from .rank_failure_model_load import prepare_model
+            prepare_model(model)
 
         # raise error when the built model cannot load the checkpoint as is
         _check_post_init_model_compat(model, load_format, checkpoint_loader)
@@ -1738,6 +1743,8 @@ class ModelLoader:
                 checkpoint_loader),
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
+            enable_wide_ep_fault_tolerance=self.llm_args.
+            enable_wide_ep_fault_tolerance,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
             allowed_backends,
             use_cute_dsl_blockscaling_mm=self.llm_args.
