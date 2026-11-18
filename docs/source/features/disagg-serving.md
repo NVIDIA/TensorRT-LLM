@@ -560,6 +560,7 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
   The Slurm benchmark example generates schedules from `concurrency_list` and `multi_round`. When
   launching manually through Slurm, set this variable inside the container using `env
   TLLM_BENCHMARK_REQ_QUEUES_SIZE=64,128,256 ...`; `srun --export` splits comma-separated values.
+  Repeated levels write results to `concurrency_<N>_repeat_<k>`.
   Stage transitions are logged as `[BENCH-STAGE]`. Existing fill-stall and insufficient-KV errors
   fail the run rather than silently opening a partial batch.
 

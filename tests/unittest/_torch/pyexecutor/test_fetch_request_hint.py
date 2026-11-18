@@ -215,6 +215,7 @@ def test_benchmark_stage_drain_keeps_idle_fetch_nonblocking(draining: bool) -> N
     stub.is_benchmark_disagg = True
     stub.is_warmup = False
     stub._benchmark_sweep = True
+    stub._benchmark_stage_started = False
     stub._benchmark_stage_draining = draining
     _fetch(stub, FCFSWaitingQueue(), total_num_active_requests=0, new_requests_hint=None)
     expected_timeout = datetime.timedelta(0) if draining else None

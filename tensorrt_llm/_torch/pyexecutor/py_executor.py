@@ -347,6 +347,8 @@ class _KvConnectorTransferDeadline:
 
 # Environment variable to control the benchmark disagg fill target.
 BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME = "TLLM_BENCHMARK_REQ_QUEUES_SIZE"
+# Idle seconds before a benchmark stage short of its budget is reported.
+_BENCHMARK_STAGE_STALL_WARN_SECONDS = 120
 
 # How long the benchmark-disagg fill gate may retry without making ANY
 # transfer progress before the rank gives up. Generous by default: a fill that
@@ -9200,8 +9202,15 @@ class PyExecutor:
         # Let the overlap loop retire its previous batch before arming the
         # next stage, even when no further client request has arrived yet.
         if (self.is_benchmark_disagg and self._benchmark_sweep
-                and self._benchmark_stage_draining and not self.is_warmup):
-            timeout = datetime.timedelta(0)
+                and not self.is_warmup):
+            if self._benchmark_stage_draining:
+                timeout = datetime.timedelta(0)
+            elif (self._benchmark_stage_started
+                  and self._benchmark_stage_index < len(self._benchmark_stages)
+                  and timeout is None):
+                # Wake up to report a stage that never reaches its budget.
+                timeout = datetime.timedelta(
+                    seconds=_BENCHMARK_STAGE_STALL_WARN_SECONDS / 2)
 
         # Fetch requests from rank 0
         new_requests = []
@@ -9542,6 +9551,7 @@ class PyExecutor:
         self._benchmark_stage_started = False
         self._benchmark_gate_rearm_pending = False
         self._benchmark_stage_draining = False
+        self._benchmark_stage_idle_since = None
         self.benchmark_req_queues_size = self._benchmark_stages[0].fill_target
         for index, (requested, effective) in enumerate(
                 zip(requested_stages, self._benchmark_stages)):
@@ -9576,6 +9586,19 @@ class PyExecutor:
         stage = self._benchmark_stages[self._benchmark_stage_index]
         self._benchmark_stage_draining = self._benchmark_stage_fetched(
         ) >= stage.num_requests
+        if (self._benchmark_stage_draining or self._benchmark_fill_phase_active
+                or total_num_live_requests != 0):
+            self._benchmark_stage_idle_since = None
+        elif self._benchmark_stage_idle_since is None:
+            self._benchmark_stage_idle_since = time.monotonic()
+        elif (time.monotonic() - self._benchmark_stage_idle_since
+              > _BENCHMARK_STAGE_STALL_WARN_SECONDS):
+            self._benchmark_stage_idle_since = float("inf")  # warn once
+            if self.dist.rank == 0:
+                logger.warning(
+                    f"[BENCH-STAGE] index={self._benchmark_stage_index} "
+                    f"stalled at {self._benchmark_stage_fetched()}/"
+                    f"{stage.num_requests} requests")
         if (not self._benchmark_stage_draining
                 or self._benchmark_fill_phase_active
                 or total_num_live_requests != 0):
@@ -9590,6 +9613,8 @@ class PyExecutor:
             and self.kv_cache_transceiver.check_gen_transfer_complete())
         status = self._allgather_model_parallel_status((int(local_drained), 0))
         if not all(item[0] for item in status):
+            # The draining fetch does not block; avoid a hot spin.
+            time.sleep(0.001)
             return
         self._log_benchmark_stage("drained")
         self._benchmark_stage_index += 1
