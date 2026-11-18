@@ -335,6 +335,8 @@ def _qa_entries(repo: Path) -> list[str]:
     return entries
 
 
+_K3_ULL = "unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp16ep1"
+
 # Unit tests that need hardware no CI stage provides, by test-db path, with what they
 # wait for. No test-db entry may run them.
 _NO_CI_STAGE = {
@@ -346,6 +348,10 @@ _NO_CI_STAGE = {
     ),
     "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/comm": (
         "2, 4 or 8 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
+    f"{_K3_ULL}/test_k3_ull_small_model_graph.py": (
+        "16 ranks on sm_107 in one NVLink domain and the Kimi K3 NVFP4 checkpoint; CI has only "
+        "the single-GPU GR100 stage (auto:gr100-x1)"
     ),
 }
 

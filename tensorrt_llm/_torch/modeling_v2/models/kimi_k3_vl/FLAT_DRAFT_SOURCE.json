@@ -1,0 +1,287 @@
+{
+  "area": "draft",
+  "scope": "GEN step after the last MoE tail: target LM head (vocab shard) + vocab-parallel selection and strict acceptance, the DSpark drafter inputs, the 5-layer MLA drafter on the FP8 Helix-sharded context (as 1007804), the draft LM head + Markov chain, next tokens with the KV rewind; the ctx side stream (fc + MNNVL all-reduce with hidden_norm, all-layer latents).",
+  "source_commit": "6904cd9672",
+  "source_tree": "user/xguan/k3-rubin-ull-chain-mlamoe-gsm (~/dev/tekit_k3r_mlamoe_gsm)",
+  "measured_run": "1007804",
+  "served_features_profile": "helix16_moetp4ep4",
+  "functions": {
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:PrivateMNNVLAllReduce": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/private_mnnvl_allreduce.py:38 class PrivateMNNVLAllReduce:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_PairExchange": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/vocab_parallel.py:589 class _PairExchange:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:VocabParallelHead": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/vocab_parallel.py:728 class VocabParallelHead:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:VocabShardedLogits": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/vocab_parallel.py:1126 class VocabShardedLogits:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:HelixDraftShard": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash_attention.py:212 class HelixDraftShard:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:to_draft_fp8": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash_attention.py:206 def to_draft_fp8(x: torch.Tensor) -> torch.Tensor:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:draft_gemm": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dspark_draft_gemm.py:134 def draft_gemm("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_pins": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dspark_draft_gemm.py:118 def _pins(role: str, n: int, k: int, device: torch.device):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:push_tactic": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dspark_ar_sites.py:56 def push_tactic(role: str, m: int, n: int, k: int, table=None):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:DraftArSites": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dspark_ar_sites.py:76 class DraftArSites:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:draft_embed_site": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dspark_ar_sites.py:140 def draft_embed_site(embedding, ids: torch.Tensor) -> Optional[torch.Tensor]:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:dflash_draft_slot_ids": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:207 def dflash_draft_slot_ids("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:dflash_position_ceiling": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:261 def dflash_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:dflash_allocated_ctx_limit": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:279 def dflash_allocated_ctx_limit("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker.set_draft_model": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:504 def set_draft_model(self, draft_model) -> None:",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dspark.py:75 def set_draft_model(self, draft_model) -> None:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker.bind_target_lm_head": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:536 def bind_target_lm_head(self, lm_head: nn.Module, logits_processor: nn.Module) -> None:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker.target_head_rows": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:601 def target_head_rows(self, hidden_states: torch.Tensor, attn_metadata, spec_metadata):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker.target_logits": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:615 def target_logits("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._vocab_parallel_target_selection_applies": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:655 def _vocab_parallel_target_selection_applies(self, spec_metadata) -> bool:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._draft_vocab_parallel_head": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:670 def _draft_vocab_parallel_head(self, draft_model, spec_metadata):",
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dspark.py:144 def _draft_vocab_parallel_head(self, draft_model, spec_metadata):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._k3_vocab_parallel_draft_tokens": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:694 def _k3_vocab_parallel_draft_tokens("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._forward_impl": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:2029 def _forward_impl("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._launch_ctx_side": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:2370 def _launch_ctx_side(self, draft_model, spec_metadata, attn_metadata, total_target_tokens):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._fused_select_accept": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:2444 def _fused_select_accept(self, logits, attn_metadata, spec_metadata):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._kda_replay_operands": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:2511 def _kda_replay_operands(attn_metadata):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._fused_kv_rewind_operands": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:2546 def _fused_kv_rewind_operands(self, attn_metadata, spec_metadata, batch_size: int):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._sample_and_accept_draft_tokens_base": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:2595 def _sample_and_accept_draft_tokens_base("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._block_gather_ids": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:2645 def _block_gather_ids("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._prepare_next_new_tokens": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:2667 def _prepare_next_new_tokens("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._draft_block_width": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dspark.py:115 def _draft_block_width(self, draft_model) -> int:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._draft_slot_ids": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dspark.py:130 def _draft_slot_ids("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker.prepare_1st_drafter_inputs": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:2859 def prepare_1st_drafter_inputs("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._fused_gen_drafter_inputs_applies": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:3225 def _fused_gen_drafter_inputs_applies(self, draft_model, spec_metadata) -> bool:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._fused_prepare_constants": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:3256 def _fused_prepare_constants("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._prepare_gen_drafter_inputs_fused": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:3279 def _prepare_gen_drafter_inputs_fused("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._blk_owned_mask": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:3424 def _blk_owned_mask(blk_owned: torch.Tensor) -> torch.Tensor:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._store_prefill_context": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:1784 def _store_prefill_context("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._store_context_kv_paged": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:1624 def _store_context_kv_paged("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._managed_ctx_pool": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:981 def _managed_ctx_pool("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3DSparkWorker._ctx_latent_dtype": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:3219 def _ctx_latent_dtype(self, draft_model) -> torch.dtype:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_MLABlockFixup": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:704 class _MLABlockFixup(NamedTuple):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_PendingDown": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:161 class _PendingDown(NamedTuple):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_draft_mlp": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:178 def _draft_mlp(mlp, x: torch.Tensor, down_all_reduce_params, defer_down: bool = False):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_resolve_dspark_mla_rope_params": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:819 def _resolve_dspark_mla_rope_params(pretrained_config, model_config=None, slack: int = 0) -> Dict:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:build_dspark_mla_yarn_freqs_cis": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:406 def build_dspark_mla_yarn_freqs_cis(*, device: str = \"cuda\", **kwargs) -> torch.Tensor:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_DSparkHeadMixin._init_dspark_heads": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:938 def _init_dspark_heads(self, cfg) -> None:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_DSparkHeadMixin._take_dspark_head_weights": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1028 def _take_dspark_head_weights(self, weights: Dict) -> tuple[Dict, Dict]:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_K3DFlashDrafterMixin.project_target_hidden": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1113 def project_target_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_K3DFlashDrafterMixin._resolve_fc_shard": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1165 def _resolve_fc_shard(self):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_shard_context_kv_by_helix": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1428 def _shard_context_kv_by_helix(self, draft_config, attention_backend: str):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:cute_dsl_mla_decode_unavailability_reason": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:730 def cute_dsl_mla_decode_unavailability_reason() -> Optional[str]:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._assert_cute_dsl_can_implement": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1562 def _assert_cute_dsl_can_implement(self, batch, block_size, page_size, dtype) -> None:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._mla_decode_workspace": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1541 def _mla_decode_workspace(self, device, min_bytes: int = 0):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._mla_split_kv_plan": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1621 def _mla_split_kv_plan("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._cute_dsl_block_decode": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1667 def _cute_dsl_block_decode(self, query, layer_cache, fixup, block_size, kernel_query=None):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._mla_freqs_cis": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1858 def _mla_freqs_cis(self, device):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._mla_freqs_real": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1897 def _mla_freqs_real(self, device) -> torch.Tensor:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._build_fused_kv_buffers": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1919 def _build_fused_kv_buffers(self) -> None:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM.precompute_context_kv_layer_major": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1990 def precompute_context_kv_layer_major(self, projected_hidden, positions):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM.precompute_context_kv": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1954 def precompute_context_kv(self, projected_hidden, positions):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM.dflash_forward": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:2056 def dflash_forward("
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._draft3_folded_q_b": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:2553 def _draft3_folded_q_b(self, layer_idx: int) -> Optional[torch.Tensor]:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._mla_fp8_decode_scales": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:1547 def _mla_fp8_decode_scales(self, device) -> tuple[torch.Tensor, torch.Tensor]:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM.draft3_side_launch": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:2575 def draft3_side_launch(self, launch: Callable[[], None], keep=()) -> None:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._draft3_join_side": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:2587 def _draft3_join_side(self) -> None:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._draft_fused_all_reduce": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:2593 def _draft_fused_all_reduce(self):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._draft_ar_sites": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:2605 def _draft_ar_sites(self, fused_ar) -> Optional[DraftArSites]:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._reduce_partial": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:2619 def _reduce_partial(self, fused_ar, sites, partial, residual, norm):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM._draft_fused_a_proj": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:2634 def _draft_fused_a_proj(self, layer_idx: int):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM.load_weights": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:2681 def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLADSparkForCausalLM.load_weights_from_target_model": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:2709 def load_weights_from_target_model(self, target_model: torch.nn.Module) -> None:"
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:build_k3_dspark_draft": [
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/modeling_dspark_mla.py:2724 def build_k3_dspark_draft(model_config, draft_config, lm_head, model) -> nn.Module:"
+    ]
+  },
+  "kernels": {
+    "kernels/k3r_spec/vocab_parallel.py": "_local_argmax_kernel, _local_sample_kernel, _reduce_pairs_kernel (target selection); markov_tokens_v3 -> kernels/dspark_markov_greedy.py DSparkMarkovGreedyKernel",
+    "kernels/k3r_spec/spec_tail_kernels_ull.py": "_ctx_positions_kernel, _select_accept_kernel, _dflash_gen_prepare_kernel, _noise_embedding_kernel, _store_mla_context_kernel (POOL_FP8: to_draft_fp8 of the BF16 latents), _next_new_tokens_rewind_kernel, _fused_strict_accept_kernel",
+    "kernels/k3r_spec/dspark_draft3.py": "_qhead_kernel (draft_qhead: inverse q_a RMS, block RoPE, latent RMSNorm, owner-masked FP8 block store, W_UK absorption, FP8 query); fold_rmsnorm_weight (host, once per layer)",
+    "kernels/k3r_spec/dspark_ull2.py": "draft_helix_tail -> kernels/k3_helix_tail.py K3HelixTailKernel via mla.K3HelixTail",
+    "kernels/k3r_gemm/low_m_bf16_splitk.py": "SplitKDenseGemmKernel (draft_gemm: ctx_latent, q_kv_a, q_b (folded weight, strided q_a rows), gate_up, lm_head)",
+    "kernels/k3r_spec/dspark_draft_gemm_push_ull.py": "SplitKArPushGemm (o_proj / down sites)",
+    "kernels/k3r_spec/dspark_draft_ar_ull.py": "DraftArNorm (sites), DraftEmbedKernel (draft_embed_site)",
+    "kernels/k3r_spec/dspark_mla_rope_ull.py": "DSparkMlaCtxNormRoPEKernel (ops/spec/k3_dspark_mla_ctx_norm_rope)",
+    "kernels/k3r_mla_decode/cute_dsl_mla.py": "_mla_split_kv_plan_kernel (launch_mla_split_kv_plan, piece_cost 60)",
+    "kernels/k3r_mla_decode/mla_decode_fp8.py": "BlackwellMultiHeadLatentAttentionForwardFP8 (FP8 in, BF16 out, softmax stats, kv_bounds, per-request plan) via ops/attention/k3_mla_decode_fp8 (the served CuteDSLNVMlaDecodeBlackwellRunner's only tactic: tilers (128,128)/(128,256), default split of the batch's power-of-two bucket, non-persistent, reduce_unroll 8 (TRTLLM_K3_DRAFT3_REDUCE_UNROLL=8 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it)))"
+  },
+  "deliberate_differences": [
+    "Constants for every served switch of the path: features draft3_glue, dspark_draft_gemm, dspark_tail_v2, spec_tail_fusion, ull2_draft_a2a, ull2_draft_store (all True in helix16_moetp4ep4); TRTLLM_ENABLE_PDL -> _PDL = True, TRTLLM_FORCE_MNNVL_AR -> _FORCE_MNNVL_AR = False (1007804: unset); 1007804's FP8 context as the drafter's class constant draft_kv_dtype = torch.float8_e4m3fn, from which the KV cache creator builds its appended draft layers in FP8 (the context servers' family drafter declares the same).",
+    "Unreached served paths are not copied; where served would fall back, the target raises: the BF16 pool ('auto': q_a_layernorm + unfolded q_b, the fused block RoPE into scratch rows + masked scatter, bmm_out, the BF16 decode), the unused block scratch allocation and its index of the FP8 path, eager / trtllm-gen decode, the unfused per-layer RoPE (_mla_rope_into / _rmsnorm_rope_batched), the un-pinned q_kv_a / q_b fallbacks, the NCCL helix exchange (_draft_helix_post_process), the un-pushed all-reduce fallback (_fused_ar_residual_norm), the eager draft logits path (logits_processor + _refine_block_logits / LiLiCorr / DFlash 2), the Triton Markov chain and the per-step Markov loop (markov_tokens_chain / markov_tokens), the eager drafter-input prep and main's _prepare_paged_latent_gen_inputs, vocab_shard_embedding / embed_tokens fallbacks of the draft embedding, the private context arena (dense or paged), the flashinfer paged append, accept-stats recording.",
+    "Draft cache: served prepares the unified draft cache with engine hooks (prepare_managed_draft_cache, snapshot_managed_draft_history) and passes position_offset = _ctx_position_offset to dflash_gen_prepare; the target binds #21996's appended draft layers in _lazy_init_ctx_buffers (_managed_ctx_pool, _init_ctx_block_offsets, _check_unified_helix) and decodes the draft page table per step with #21996's speculative.spec_tail_kernels.decode_draft_block_table(block_offset=) (_refresh_ctx_block_tables); dflash_gen_prepare gets position_offset=None (served: a zero offset tensor in steady state, the kernel's other specialization, same values).",
+    "target_head_rows falls back to hidden_states[gather_ids] (served: super().target_head_rows); #21996's one-engine forward gathers before target_logits, so the in-place rows need the model's forward to call it.",
+    "_kda_replay_operands also accepts the target's K3UllKdaCheckpointState (served: type(replay) is KDAReplayState only).",
+    "draft_embed_site reads the target's layers.EmbeddingTable (vocab_parallel, vocab_start, all_reduce) instead of a TRT-LLM Embedding (tp_mode COLUMN, vocab_start_index); DraftArSites / draft_embed_site push through layers.lamport_push_target / mnnvl_lamport_push_target (served comm/lamport.py).",
+    "PrivateMNNVLAllReduce sizes its workspace with layers.mnnvl_workspace_bytes (served MNNVLAllReduce.get_required_workspace_size, same formula and threshold).",
+    "Drafter modules are the target's layers.py containers (Bf16Linear, RMSNormWeight, GatedMlp, EmbeddingTable, TpAllReduce) loaded by load_weights by name; the fused [q_a | kv_a] weight is a tensor, not a Linear.",
+    "The FP8 decode is ops/attention/k3_mla_decode_fp8 (the served kernel file, kernels/mla/mla_decode_fp8.py; #21996's copy and runner differ) called as served calls torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell: max_batch_size = batch, device scales (softmax_scale * 1 * 1, 1), workspace max(256 MiB, layout bytes), softmax stats, kv_bounds, the step's plan; no AutoTuner (one candidate tactic, the op computes it). The split plan calls kernels/mla/cute_dsl_mla.launch_mla_split_kv_plan at piece cost 60 with k3_mla_decode_fp8.split_plan_geometry (the served runner's get_split_plan_geometry formula); _mla_split_plan_kwargs' build probe is dropped (the copied planner takes piece_cost). can_implement is probed on the copied kernel class directly (served: through the runner's dtype table).",
+    "to_draft_fp8 / DRAFT_FP8_KV_SCALE live in dflash.py (served dflash_attention.py) next to HelixDraftShard.",
+    "precompute_context_kv (context-request store, not on the GEN step) is the layer-major path transposed (served: cuBLAS + one RMSNorm + RoPE launch per layer): another GEMM, drafter rounding only."
+  ],
+  "runtime_imposed_differences": [],
+  "runtime_gaps_vs_21996": [
+    {
+      "served": "FP8 draft pool",
+      "21996": "draft layers in the drafter dtype (BF16)",
+      "cost": "closed on 21b86d335d: the engine builds the appended draft layers in FP8 for a drafter that declares draft_kv_dtype FP8 E4M3; this drafter and the context servers' family drafter both do"
+    },
+    {
+      "served": "managed draft cache upload skip (019d90ccc2): host page table, uploaded when changed",
+      "21996": "draft layers' pages in kv_cache_block_offsets",
+      "cost": "+1 decode_draft_block_table launch per step (~2-3 us, overlappable only if the model loop forks it)"
+    },
+    {
+      "served": "TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES=2097152 exported as TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES by served distributed/ops.py",
+      "21996": "reads only TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES (default 1 MiB)",
+      "cost": "without it the drafter sites (7 x 7168 x 16 x 2 = 1.6 MB at b1), the ctx fc all-reduce and the target Lamport all-reduces between 1 and 2 MiB run two-shot: other kernel, other summation order; set TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES=2097152 in the GEN env"
+    },
+    {
+      "served": "TLLM_SPEC_HEAD_FUSION=1 in 1007804 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it): fused spec-head prep + embedding gather",
+      "21996": "RuntimeHooks.decode_prologue (modeling.py installs spec_decode_head)",
+      "cost": "none: features.embedding_gather installs spec_decode_head, the same two kernels (_spec_head_prep_kernel, _embedding_gather_kernel)"
+    },
+    {
+      "served": "ull_shell STEP_FOLD / step prep / pinned executor, HistorySnapshot",
+      "21996": "RuntimeHooks.pack_step_inputs / spec_step_fold",
+      "cost": "host only; not reproduced by this area"
+    },
+    {
+      "served": "target_head_rows (head reads hidden_states in place)",
+      "21996": "hidden_states[gather_ids] before target_logits",
+      "cost": "+1 index kernel per step unless modeling.py calls spec_worker.target_head_rows"
+    }
+  ],
+  "gpu_check": "notes/experiments/kimi_k3/1110_k3_ull_v2_target/flatten/draft/draft_vs_served_gpu.py (+ draft_vs_served.sbatch, ocijhb 16 x GB300); not yet run"
+}

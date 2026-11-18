@@ -220,18 +220,22 @@ class DecoderRunner(ScheduledModelRunner):
             if self.runtime_hooks.skip_unchanged_h2d
             else None
         )
-        self._step_pack = (
-            StepInputPack(
-                torch.device("cuda", torch.cuda.current_device()),
+        pack_factory = self.runtime_hooks.step_input_pack_factory
+        pack_device = torch.device("cuda", torch.cuda.current_device())
+        if not self.runtime_hooks.pack_step_inputs:
+            self._step_pack = None
+        elif pack_factory is not None:
+            # The model's own pack (RuntimeHooks.step_input_pack_factory).
+            self._step_pack = pack_factory(pack_device)
+        else:
+            self._step_pack = StepInputPack(
+                pack_device,
                 parallel_scatter=self.runtime_hooks.pack_parallel_scatter,
                 in_graph=self.runtime_hooks.pack_in_graph,
                 early_copy=self.runtime_hooks.pack_early_copy,
                 step_epoch=self.runtime_hooks.pack_step_epoch,
                 prologue_op=self.runtime_hooks.pack_prologue_op,
             )
-            if self.runtime_hooks.pack_step_inputs
-            else None
-        )
         if self._step_pack is not None and self._step_pack.parallel_scatter:
             logger.info("[M3 host] step-input pack: parallel scatter for non-overlapping copies")
         if self._step_pack is not None and self._step_pack.in_graph:
@@ -836,6 +840,9 @@ class DecoderRunner(ScheduledModelRunner):
                     is_dummy=is_dummy,
                     gather_context_logits=gather_context_logits,
                 )
+            if self._step_pack is not None and self._step_pack.issue_after_prepare:
+                # The model's pack is issued here, before the input-copy event below (no-op when it is not open).
+                step_inputs.flush()
             inputs = prepared.kwargs
             runtime_draft_len = prepared.runtime_draft_len
             if moe_warmup_placement.active() and not torch.cuda.is_current_stream_capturing():

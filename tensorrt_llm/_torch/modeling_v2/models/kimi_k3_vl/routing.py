@@ -13,10 +13,13 @@ targets on sm100 are text-only: they load no vision tower and refuse image input
 
 The NVFP4 checkpoint on sm107 (Rubin) has one target per disaggregated layout
 (``_SM107_TARGETS``): the one-GPU DWDP context servers of every deployment, and
-the generation servers over Helix CP8 (MoE EP8, or MoE TP2 x EP4) and over
-attention DP16. ``_sm107_target`` reads the layout from the mapping, the MoE
-backend and the context-parallel config; the layouts exclude each other, so the
-disaggregated role is not needed to choose. Their SM107 kernels launch with PDL as a
+the generation servers over Helix CP8 (MoE EP8, or MoE TP2 x EP4), over
+attention DP16, and the ultra-low-latency (ULL) one over Helix CP16 with the
+routed experts split MoE TP16 (``helix16_moetp16ep1``: DSpark with 7 draft
+tokens, at most 4 requests per step, ``_check_sm107_ull``). ``_sm107_target``
+reads the layout from the mapping, the MoE backend and the context-parallel
+config; the layouts exclude each other, so the disaggregated role is not needed
+to choose. Their SM107 kernels launch with PDL as a
 constant, so a deployment that turns PDL off (``TRTLLM_ENABLE_PDL`` other than ``1``, as the
 workers see it) gets ``NoTarget`` rather than launches that ignore the switch.
 """
@@ -125,6 +128,10 @@ _SM107_SHAPE_FIELDS = (
 )
 
 
+# Generation steps of the ULL target: DSpark verifies 1 + 7 tokens per request, at most 4 requests.
+_ULL_DRAFT_LEN = 7
+_ULL_MAX_BATCH = 4
+
 # Target directory -> the layout it serves (for the NoTarget message).
 _SM107_TARGETS = {
     "kimi_k3_nvfp4__sm_107__tp1": (
@@ -141,6 +148,10 @@ _SM107_TARGETS = {
     "kimi_k3_nvfp4__sm_107__dep16": (
         "generation with attention DP over 16 ranks (tp 16), MoE EP16, "
         "moe_config.backend MEGAMOE_CUTEDSL"
+    ),
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1": (
+        "ultra-low-latency generation over Helix CP16 (tp 1, no attention DP, NCCL off for the "
+        f"all-to-all), MoE TP16, DSpark {_ULL_DRAFT_LEN}, at most {_ULL_MAX_BATCH} requests"
     ),
 }
 
@@ -173,6 +184,15 @@ def _sm107_target(mapping, llm_args) -> Optional[str]:
         if moe == (2, 4):
             return "kimi_k3_nvfp4__sm_107__helix8_moetp2ep4"
     if (
+        helix
+        and mapping.cp_size == 16
+        and mapping.tp_size == 1
+        and not mapping.enable_attention_dp
+        and moe == (16, 1)
+        and mapping.cp_config.get("use_nccl_for_alltoall") is False
+    ):
+        return "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1"
+    if (
         mapping.enable_attention_dp
         and mapping.world_size == 16
         and mapping.tp_size == 16
@@ -191,6 +211,36 @@ def _worker_env(llm_args: TorchLlmArgs, name: str) -> Optional[str]:
     if name in overrides:
         return str(overrides[name])
     return os.environ.get(name)
+
+
+def _check_sm107_ull(llm_args: TorchLlmArgs) -> None:
+    """Raise ``NoTarget`` unless the Helix CP16 / MoE TP16 deployment is the ULL generation server.
+
+    The ULL target runs every KDA + MoE layer and every MoE of an MLA layer on fixed decode
+    kernels compiled for 1 + 7 verified tokens per request and at most 32 rows per step.
+    """
+    spec = llm_args.speculative_config
+    draft_len = getattr(spec, "max_draft_len", None)
+    if draft_len != _ULL_DRAFT_LEN:
+        raise NoTarget(
+            f"the sm107 Kimi K3 ULL target verifies 1 + {_ULL_DRAFT_LEN} tokens, got max_draft_len "
+            f"{draft_len}"
+        )
+    for field in (
+        "acceptance_rate_window_size",
+        "acceptance_rate_threshold",
+        "max_concurrency",
+        "draft_len_schedule",
+    ):
+        if getattr(spec, field, None) is not None:
+            raise NoTarget(
+                f"the sm107 Kimi K3 ULL target requires fixed-length DSpark; {field} is unsupported"
+            )
+    if not 1 <= (llm_args.max_batch_size or 0) <= _ULL_MAX_BATCH:
+        raise NoTarget(
+            f"the sm107 Kimi K3 ULL target serves 1..{_ULL_MAX_BATCH} requests per step, got "
+            f"max_batch_size {llm_args.max_batch_size}"
+        )
 
 
 def _check_sm107(model_config: ModelConfig, llm_args: TorchLlmArgs) -> str:
@@ -259,6 +309,8 @@ def _check_sm107(model_config: ModelConfig, llm_args: TorchLlmArgs) -> str:
         raise NoTarget(
             f"{seen}: no sm107 Kimi K3 target serves this layout. The targets: {layouts}"
         )
+    if target == "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1":
+        _check_sm107_ull(llm_args)
     logger.info(
         f"modeling_v2 kimi_k3_vl: {target} rank={mapping.rank} {seen} kv={kv_algo} "
         f"spec={spec_config.spec_dec_mode.name}"
@@ -293,6 +345,12 @@ def route(
             )
 
             return ModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4
+        if target == "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1":
+            from .kimi_k3_nvfp4__sm_107__helix16_moetp16ep1.modeling import (
+                ModelingV2KimiK3Nvfp4Sm107Helix16Moetp16ep1,
+            )
+
+            return ModelingV2KimiK3Nvfp4Sm107Helix16Moetp16ep1
         from .kimi_k3_nvfp4__sm_107__dep16.modeling import ModelingV2KimiK3Nvfp4Sm107Dep16
 
         return ModelingV2KimiK3Nvfp4Sm107Dep16

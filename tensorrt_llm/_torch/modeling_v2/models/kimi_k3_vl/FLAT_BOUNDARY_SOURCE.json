@@ -1,0 +1,268 @@
+{
+  "area": "boundary",
+  "scope": "GEN step outside the MR8 chain: step prep, layer 0 (MR8 solo KDA, KDA o_proj push + Lamport finish, Dense0), the chain entry mix, the MLA layers' input hand-off / post-attention mix / prefetch forks, the final join, the decoder loop.",
+  "source_commit": "6904cd9672",
+  "source_tree": "user/xguan/k3-rubin-ull-chain-mlamoe-gsm (~/dev/tekit_k3r_mlamoe_gsm)",
+  "measured_run": "1007804",
+  "functions": {
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2.forward (embedding)": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:5447",
+        "symbol": "if inputs_embeds is None:"
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2.forward (prelaunch, bank)": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/decode.py:159",
+        "symbol": "def run("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2.forward (layer 0 input norm + bank row 0)": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/stages.py:76",
+        "symbol": "class PreMix("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2.forward (bind_slots + run_solo)": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/chain.py:405",
+        "symbol": "class ChainKda("
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/chain.py:394",
+        "symbol": "def bind_slots("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2.forward (chained layers, taps)": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/chain.py:332",
+        "symbol": "class ChainLayer("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2.forward (MLA MoE, final rows, joins)": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/chain.py:561",
+        "symbol": "class ChainMoe("
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/stages.py:802",
+        "symbol": "class FinalMix:"
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2._entry_mix": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/chain.py:315",
+        "symbol": "class _EntryMix("
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/stages.py:76",
+        "symbol": "class PreMix("
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:5052",
+        "symbol": "def _snapshot_slot("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2._mla_input": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/chain.py:453",
+        "symbol": "class ChainMlaInput("
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:330",
+        "symbol": "def _serves("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2._mla_layer": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/chain.py:610",
+        "symbol": "def _rewrite("
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/chain.py:542",
+        "symbol": "class ChainPrefetch("
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/stages.py:450",
+        "symbol": "class Oproj("
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/chain.py:509",
+        "symbol": "class ChainPostMix("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2._prelaunch_mla_step_metadata": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:5409",
+        "symbol": "def _prelaunch_mla_step_metadata("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2._capture": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:5065",
+        "symbol": "def _capture_hidden_states("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_SideCopies": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:895",
+        "symbol": "class _SideCopies:"
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:MLAIN_MXFP8_MAX_ROWS": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:46",
+        "symbol": "MAX_ROWS ="
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KdaOutputProjection.forward": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kda/kimi_kda_mixer.py:862",
+        "symbol": "def _project_output("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:Dense0.forward": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/dense0.py:187",
+        "symbol": "def _issue("
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/dense0.py:163",
+        "symbol": "def _mix_entry_applies("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:dense_slice_index": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/dense0.py:86",
+        "symbol": "def _slice_of("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_DeferredRpTail": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:1061",
+        "symbol": "class _DeferredRpTail("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_k3_attn_res_pdl": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:1085",
+        "symbol": "def _k3_attn_res_pdl("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_k3_attn_res_lamport_applies": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:1113",
+        "symbol": "def _k3_attn_res_lamport_applies("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_k3_attn_res_pdl_lamport": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:1134",
+        "symbol": "def _k3_attn_res_pdl_lamport("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_k3_attn_res_pdl_rp_tail": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:1177",
+        "symbol": "def _k3_attn_res_pdl_rp_tail("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_apply_attn_res": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:1425",
+        "symbol": "def _apply_attn_res("
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:734",
+        "symbol": "def _apply_attn_res_fused("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:_apply_attn_res_add_and_rmsnorm": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:1477",
+        "symbol": "def _apply_attn_res_add_and_rmsnorm("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:MNNVL_ONE_SHOT_MAX_BYTES": [
+      {
+        "source": "tensorrt_llm/_torch/distributed/ops.py:59",
+        "symbol": "def _mnnvl_one_shot_threshold_bytes("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:LamportPending": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/comm/lamport.py:83",
+        "symbol": "class LamportPending:"
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:mnnvl_lamport_push_target": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/comm/lamport.py:156",
+        "symbol": "def mnnvl_lamport_push_target("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:lamport_push_target": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/comm/lamport.py:231",
+        "symbol": "def lamport_push_target("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:lamport_push_tensor": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/comm/lamport.py:276",
+        "symbol": "def lamport_push_tensor("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:finish_lamport_push": [
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/comm/lamport.py:290",
+        "symbol": "def finish_lamport_push("
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/comm/lamport.py:212",
+        "symbol": "def _mnnvl_finish("
+      }
+    ],
+    "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllForCausalLM.forward": [
+      {
+        "source": "tensorrt_llm/_torch/models/modeling_speculative.py:1839",
+        "symbol": "def forward(",
+        "in": "SpecDecOneEngineForCausalLM"
+      },
+      {
+        "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py:601",
+        "symbol": "def target_head_rows(",
+        "in": "DFlashWorker"
+      },
+      {
+        "source": "tensorrt_llm/_torch/speculative/interface.py:1731",
+        "symbol": "def target_head_rows(",
+        "in": "SpecWorkerBase"
+      }
+    ]
+  },
+  "source_sha256": {
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/comm/lamport.py": "5c9f8278d0ecf8f7f5784eac4d9601d018c0ed3e1f8a3eeeffbffec6af7def02",
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kda/kimi_kda_mixer.py": "7bd655ea631f817b75090c9773ce68eaa0f744562e2ea31eb84af8aca64c83d0",
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dflash.py": "0f9d2e6cf56986b1364849520cb34c306a23e92dc6c2b06b46b9490d7e722775",
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py": "0a1dc3ba5e0f9952384dd847eb4c33284d9f9fd18caff9867efe0788c63b6bee",
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/chain.py": "5ea7819dc0976eae0f4a843bb1c62ef6c84c502d0fa5cb75c85851d1a85a1bc5",
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/decode.py": "10884a610dbbed1c3eef2cf176a7423a622c1036e31183d2f9caa1d7da9b0d1e",
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/dense0.py": "fa8f18e11096cc406162941ecbe306b8e0680c0289ccaddd7fc7b1f712092a9b",
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py": "4629dea04064be8210b196b05f6facde1e875f2d71843d5302866939bf6a0964",
+    "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/stages.py": "e1889e95c6b10872a63f3fb9c14480f20b739c90b6742b08a17456578bd820fe",
+    "tensorrt_llm/_torch/distributed/ops.py": "a1b55268da76ca575a3770cc524bbff713a91c5b9f08d58fb51d68c396406172",
+    "tensorrt_llm/_torch/models/modeling_speculative.py": "538ea71ca6d2455b765a9d3c89d5eeec376c6514fcbe7432b6f6d3af8933a04a",
+    "tensorrt_llm/_torch/speculative/interface.py": "646424d5f73264a52f47d160f76d2d98d6abc8063a7b647924bfcfc902ef5872"
+  },
+  "deliberate_differences": [
+    "Env reads are constants with 1007804's values: KIMI_K3_AUX_ATTN_RES_STREAM unset -> TAP_MIX=True; TRTLLM_ENABLE_PDL unset -> layers.USE_PDL=True; TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES=2097152 -> layers.MNNVL_ONE_SHOT_MAX_BYTES (push transport, cpp_one_shot reduction order, workspace sizing); TLLM_SPEC_HEAD_FUSION unset -> features.embedding_gather=False (F.embedding, as served nn.Embedding); TLLM_TEST_MNNVL unset -> dropped.",
+    "Served fallbacks the deployment does not reach are not copied and raise instead: the persistent and per-token C++ attn_res(+add)+RMSNorm kernels, the FP32 _apply_attn_res reference, LamportPending.materialize before a mix, Dense0's module path, the UllDecode.plan module fallback (plan_step raises), forward hooks.",
+    "The served program machinery (UllDecode programs, Stage, StepState, OprojCall) is unrolled into explicit calls in served order; the per-step _STATS counters and _note_attn_res_fusion debug logs are dropped.",
+    "Served taps run inside the next layer's program with capture=(spec, i-1); ours tap after the layer from the consumer's aux rows (chained / MoE layers, as served) and in _entry_mix for layer 0 (as served PreMix).",
+    "MLAIN hand-off: served ChainMlaInput sets mixer.next_input_mxfp8 and MlaInAttention.released; ours sets the same on K3MLARuntime (attn.takes_q_fused / attn.stages_weights / attn.released, the MLA area's interface). Whether a layer serves MLAIN (served _serves) is computed once in build_chain.",
+    "No vision tower on the generation target (served wrapper built it unless TLLM_MULTIMODAL_DISAGGREGATED); multimodal params raise. No GEN-step kernel depends on it.",
+    "KimiK3Helix16UllForCausalLM.forward is served SpecDecOneEngineForCausalLM.forward (283e3ddbdf: the target head reads spec_worker.target_head_rows, a generation-only batch's rows in place) where #21996's indexes hidden_states[gather_ids] (one index kernel per step). Not copied: #21996's position hoist (spec_decode_fast_paths, absent in served) and the csa2 encoder-boundary branch (not a K3 path). #21996's SpecWorkerBase has no target_head_rows (served added it to the base), so a configuration that keeps main's worker (install_k3_dspark False) takes #21996's forward unchanged.",
+    "Runtime shell (StepShell step_prep/step_fold/pin_executor/gil_switch_us=200) is #21996's RuntimeHooks: pack_step_inputs + pack_spec_rng_uploads only (gap table in notes run_records 1111_k3_ull_v2_boundary)."
+  ]
+}
