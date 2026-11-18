@@ -244,12 +244,22 @@ def test_context_result_carries_cache_identity():
 
 def test_generation_only_cache_reuse_requires_multimodal_identity(llm):
     llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(enable_block_reuse=True))
-    with pytest.raises(ValueError, match="KV reuse requires cache identity"):
+    with pytest.raises(ValueError, match="KV reuse requires cache identity") as error:
         llm._preprocess(
             {"prompt_token_ids": [1, 91, 2], "multi_modal_data": None},
             SamplingParams(max_tokens=4),
             params(),
         )
+    # The error names the setting that serves the request without an identity.
+    assert "kv_cache_config.enable_block_reuse=False" in str(error.value)
+    llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(enable_block_reuse=False))
+    ids, _, mm, _ = llm._preprocess(
+        {"prompt_token_ids": [1, 91, 2], "multi_modal_data": None},
+        SamplingParams(max_tokens=4),
+        params(),
+    )
+    assert ids == [1, 91, 2]
+    assert mm.multimodal_input is None
 
 
 @pytest.mark.parametrize(

@@ -1588,12 +1588,13 @@ class DecoderInputPreparer:
                 request.py_multimodal_data = multimodal_params.multimodal_data
             multimodal_params_list.append(multimodal_params)
 
-            # Re-register mrope tensors for context-only requests (EPD disaggregated serving).
-            # This creates new IPC handles owned by the prefill worker, so the decode worker
-            # can access them even after the encode worker's GC deallocates the original memory.
-            # Without this, the decode worker would receive handles pointing to freed memory.
+            # Export the mrope tensors of a context-only request for the decode worker.
+            # The export copies them by value, so the decode worker does not depend on
+            # the encode worker's memory. Only the final response carries them, so
+            # export once, on the last context chunk.
             if (
                 request.is_context_only_request
+                and request.is_last_context_chunk
                 and _use_mrope
                 and "mrope_config" in multimodal_params.multimodal_data
             ):
@@ -1601,9 +1602,8 @@ class DecoderInputPreparer:
                 _mrope_position_ids = mrope_config.get("mrope_position_ids")
                 _mrope_position_deltas = mrope_config.get("mrope_position_deltas")
                 if _mrope_position_ids is not None and _mrope_position_deltas is not None:
-                    # Clone to allocate new memory owned by this (prefill) worker.
                     request.py_result.set_mrope_position(
-                        _mrope_position_ids.clone(), _mrope_position_deltas.clone()
+                        _mrope_position_ids, _mrope_position_deltas
                     )
 
     def _classify_generation_requests(

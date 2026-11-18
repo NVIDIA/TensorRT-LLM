@@ -2390,7 +2390,8 @@ def to_llm_disaggregated_params(
         return None
     ctx_usage = disaggregated_params.ctx_usage
     handoff = {}
-    if disaggregated_params.request_type == "generation_only":
+    # LlmDisaggregatedParams lowercases request_type; match it the same way.
+    if disaggregated_params.request_type.lower() == "generation_only":
         handoff = disaggregated_params.model_dump(
             include=set(_MULTIMODAL_HANDOFF_FIELDS))
     return LlmDisaggregatedParams(

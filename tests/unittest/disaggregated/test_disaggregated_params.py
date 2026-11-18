@@ -219,7 +219,8 @@ def _handoff_fields():
     }
 
 
-def test_multimodal_handoff_round_trips_through_openai_json():
+@pytest.mark.parametrize("request_type", ["generation_only", "GENERATION_ONLY"])
+def test_multimodal_handoff_round_trips_through_openai_json(request_type):
     from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
     from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
     from tensorrt_llm.serve.openai_protocol import (
@@ -231,7 +232,7 @@ def test_multimodal_handoff_round_trips_through_openai_json():
     encoded = to_disaggregated_params(original).model_dump_json()
     # The router turns the context reply into the generation request.
     received = OpenAIDisaggregatedParams.model_validate_json(encoded)
-    received.request_type = "generation_only"
+    received.request_type = request_type
     restored = to_llm_disaggregated_params(received)
     assert restored == replace(original, request_type="generation_only")
     positions = SharedTensorContainer.from_dict(restored.mrope_position_ids_handle)

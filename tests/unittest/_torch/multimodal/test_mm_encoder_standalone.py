@@ -738,39 +738,14 @@ def _load_inputs(llm: LLM, prompts, media, mm_embeddings=None):
     return inputs
 
 
-def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
-    # Helper function for checking that two SharedTensorContainer dict representations of the same
-    # underlying data are different. Certain metadata should stay the same (basically those describing
-    # the tensor's contents), while others should actually differ (those pertaining to the underlying
-    # storage).
-    matching_keys = [
-        "dtype",
-        "event_sync_required",
-        "method_key",
-        "requires_grad",
-        # NOTE: this assumes the workers are on the same physical device, which is the case in
-        # the tests in this file since `LLM` API does not expose a way to select the device ID.
-        "storage_device",
-        "storage_size_bytes",
-        "tensor_offset",
-        "tensor_size",
-        "tensor_stride",
-    ]
-
-    different_keys = [
-        "event_handle",
-        "ref_counter_handle",
-        "ref_counter_offset",
-        "storage_handle",
-        "storage_offset_bytes",
-    ]
-
-    assert set(matching_keys + different_keys) == x.keys() == y.keys()
-
-    for key in matching_keys:
-        assert x[key] == y[key]
-    for key in different_keys:
-        assert x[key] != y[key]
+def _assert_handles_hold_same_tensor(x: dict, y: dict) -> None:
+    # mRoPE handles carry the tensor by value, so compare the decoded tensors.
+    torch.testing.assert_close(
+        SharedTensorContainer.from_dict(x).get_local_view(),
+        SharedTensorContainer.from_dict(y).get_local_view(),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -834,7 +809,7 @@ def test_single_request_chat_multiple_images(
         pd_handle = pd_disaggregated_params.mrope_position_ids_handle
         assert type(ep_handle) is type(pd_handle)
         if ep_handle is not None:
-            _assert_handles_are_different(ep_handle, pd_handle)
+            _assert_handles_hold_same_tensor(ep_handle, pd_handle)
         pd_disaggregated_params.request_type = "generation_only"
         sampling_params = SamplingParams(max_tokens=max_tokens)
         # remove multimodal data from input as decoder worker doesn't need it
