@@ -36,7 +36,9 @@ jobs:
       group: pyrefly-diff-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Longer than the step timeouts added together (40 minutes). A step that times out
+    # fails and the report still says why; a job that times out is cancelled with no report.
+    timeout-minutes: 45
     env:
       # actions/checkout skips LFS only for its own git commands.
       GIT_LFS_SKIP_SMUDGE: 1
