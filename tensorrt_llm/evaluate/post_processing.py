@@ -83,7 +83,8 @@ def extract_mmmu_answer(content: str) -> str:
     # --- Step 1: "Answer: X" / "answer is X" explicit pattern ---
     # Covers: "Answer: (B)", "**Answer: B**", "The answer is (C)",
     #         "The answer is (C) 50.4 kip.", "The answer is (E)**."
-    m = re.search(r"\b[Aa]nswer\s*(?:is|:)\s*\(?\s*([A-Ea-e])\s*\)?", answer)
+    # The letter must stand alone: "The answer is approximately 5" is not A.
+    m = re.search(r"\b[Aa]nswer\s*(?:is|:)\s*\(?\s*([A-Ea-e])(?![A-Za-z0-9])\s*\)?", answer)
     if m:
         return m.group(1).upper()
 
@@ -117,9 +118,10 @@ def extract_mmmu_answer(content: str) -> str:
 
     # 4b: trailing option letter — last (X) where X is A-E
     #     e.g. "...therefore\n\n(B)" or "...\n**(C)**"
-    #     Search in the last 200 chars for a standalone option letter
+    #     Search in the last 200 chars for a standalone option letter, not
+    #     the last letter of a word such as "USA."
     tail = answer[-200:]
-    m_tail_option = re.search(r"\(?([A-E])\)?[.\s*]*$", tail)
+    m_tail_option = re.search(r"(?<![A-Za-z0-9])\(?([A-E])\)?[.\s*]*$", tail)
     if m_tail_option:
         return m_tail_option.group(1).upper()
 
