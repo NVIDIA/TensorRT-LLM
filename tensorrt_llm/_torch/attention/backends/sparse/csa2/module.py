@@ -1465,10 +1465,11 @@ class DeepseekV41Attention(nn.Module):
             projected = linear.all_reduce(projected)
         return projected
 
-    def _project_output_mxfp8(self, output, positions, prequantized=None):
+    def _project_output_mxfp8(self, output, positions, prequantized=None, out=None):
         """O-A as MXFP8 GEMMs with inverse RoPE fused into quantization, then O-B; else None.
 
         ``prequantized`` is the MXFP8 O-A input already made of ``output`` (which is then not read).
+        O-B writes into ``out`` on the CuTe DSL route.
         """
         rows = output.shape[0]
         positions = positions.reshape(-1)
@@ -1516,6 +1517,7 @@ class DeepseekV41Attention(nn.Module):
             *o_lora,
             cute_min_rows=_DENSE_O_B_MIN_ROWS,
             allowed_backends=projection_backends(rows, linear.mxfp8_allowed_backends),
+            out=out,
         )
 
     def _project_prequantized_output(self, data, scale, out=None):
@@ -2264,7 +2266,9 @@ class DeepseekV41Attention(nn.Module):
             # PrimTS writes the MXFP8 input only where its plan can, and then says so.
             state.output_mxfp8_written or self.backend.compute_backend != "prims_ts"
         ):
-            projected = self._project_output_mxfp8(output, positions, prequantized=output_mxfp8[:2])
+            projected = self._project_output_mxfp8(
+                output, positions, prequantized=output_mxfp8[:2], out=out
+            )
             if projected is None:
                 raise RuntimeError(
                     "Warm up the CSA2 grouped o_a projection before CUDA Graph capture"

@@ -1124,6 +1124,11 @@ def test_grouped_mxfp8_output_o_b_cute_gemm(monkeypatch, offset):
         quantize_output=True,
     )
     assert torch.equal(projected, native_mxfp8_gemm(model.o_b_proj, *latent))
+    # The CuTe O-B writes into the caller's buffer; the native GEMM returns its own.
+    out = torch.empty_like(projected)
+    into = model._project_output_mxfp8(values, positions, out=out)
+    assert (into.data_ptr() == out.data_ptr()) == (offset >= 0)
+    assert torch.equal(into, projected)
 
 
 @skip_pre_blackwell
@@ -4089,6 +4094,50 @@ def test_grouped_output_mxfp8_matches_reference(rows, groups, heads, rank):
         atol=0,
         rtol=0,
     )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("quantize_output", [False, True])
+@torch.inference_mode()
+def test_grouped_output_mxfp8_tile_orders_match(quantize_output):
+    """The grouped MXFP8 O-A writes the same bits in M-major and N-major tile order."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import projection
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("MXFP8 CuTe DSL GEMMs require SM100/SM103")
+    # A context tile past the N-major threshold, with a partial last M tile.
+    rows, groups, rank, depth = projection._MXFP8_N_MAJOR_MIN_ROWS + 130, 8, 1024, 4096
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    weight = (torch.randn(groups, rank, depth, device="cuda", generator=gen) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    exponents = torch.randint(
+        -9, -4, (groups, rank // 128, depth // 128), device="cuda", generator=gen
+    )
+    weight_scale = projection.mxfp8_weight_scale(torch.exp2(exponents.float()))
+    cos_sin = (torch.rand(512, 2, 32, device="cuda", generator=gen) * 2 - 1).contiguous()
+    output = torch.randn(rows, groups * depth, device="cuda", dtype=torch.bfloat16, generator=gen)
+    positions = torch.randint(0, 512, (rows,), device="cuda", dtype=torch.int32, generator=gen)
+    alpha = torch.ones(1, device="cuda")
+
+    def project(raster_along_m):
+        result = projection.grouped_output_mxfp8(
+            output,
+            positions,
+            cos_sin,
+            weight,
+            weight_scale,
+            alpha,
+            quantize_output=quantize_output,
+            raster_along_m=raster_along_m,
+        )
+        return result if quantize_output else (result,)
+
+    default = project(None)
+    for order in (True, False):
+        for got, want in zip(project(order), default):
+            assert torch.equal(got.view(torch.uint8), want.view(torch.uint8)), order
 
 
 @skip_pre_blackwell

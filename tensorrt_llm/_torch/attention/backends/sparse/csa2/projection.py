@@ -1219,6 +1219,12 @@ def _kernel_type() -> type:
 
 _COMPILED = {}
 
+# Rows from which the 2-CTA kernel walks each 256-row input block's output columns before the
+# next block (N-major), so the block stays in L2 rather than streaming the input once per column
+# tile. GB300, 8 groups, rank 1024, depth 4096, cold weights, MXFP8 output: 8K rows 195 -> 190 us,
+# 16K rows 407 -> 376 us, 32K rows 898 -> 834 us; equal at 2K and 4K.
+_MXFP8_N_MAJOR_MIN_ROWS = 4096  # 4K
+
 
 def grouped_output_mxfp8(
     output: torch.Tensor,
@@ -1230,6 +1236,7 @@ def grouped_output_mxfp8(
     *,
     quantize_output: bool = False,
     prequantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+    raster_along_m: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """Grouped O-A of BF16 attention output with inverse RoPE, as MXFP8 GEMMs.
 
@@ -1240,6 +1247,8 @@ def grouped_output_mxfp8(
     ``[M, groups * R]``, or with ``quantize_output`` its MXFP8 E4M3 values and
     CUTLASS-swizzled UE8M0 scales as ``mxfp8_quantize`` lays them out. Returns None while
     a graph capture would have to compile the GEMM.
+    ``raster_along_m`` sets the persistent tile order of the 2-CTA kernel (same bits); by
+    default N-major from ``_MXFP8_N_MAJOR_MIN_ROWS`` rows.
     """
     import cutlass
     import cutlass.cute as cute
@@ -1271,12 +1280,15 @@ def grouped_output_mxfp8(
     ):
         raise ValueError("CSA2 grouped MXFP8 O-A projection got an unsupported input")
     # Measured on GB300: up to 128 rows the GEMM streams the weight, which one-CTA 128x64
-    # tiles spread over twice the SMs of 128x128 ones; 2-CTA 256x128 tiles beyond.
+    # tiles spread over twice the SMs of 128x128 ones; 2-CTA 256x128 tiles beyond. A plan
+    # of one M tile has no tile order to choose.
     if rows <= 128:
-        tile, cluster = (128, 64), (1, 1)
+        tile, cluster, raster_along_m = (128, 64), (1, 1), True
     else:
         tile, cluster = (256, 128), (2, 1)
-    key = (output.device.index, tile, rank, depth, groups, quantize_output)
+        if raster_along_m is None:
+            raster_along_m = rows < _MXFP8_N_MAJOR_MIN_ROWS
+    key = (output.device.index, tile, raster_along_m, rank, depth, groups, quantize_output)
     if key not in _COMPILED and torch.cuda.is_current_stream_capturing():
         return None
     sf_rows = triton.cdiv(rows, 128) * 128
@@ -1309,7 +1321,9 @@ def grouped_output_mxfp8(
             make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
             for tensor, dtype in zip(tensors, dtypes)
         ]
-        kernel = _kernel_type()(32, tile, cluster, mxfp8_out=quantize_output)
+        kernel = _kernel_type()(
+            32, tile, cluster, raster_along_m=raster_along_m, mxfp8_out=quantize_output
+        )
         active = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
         _COMPILED[key] = cute.compile(
             kernel.wrapper_grouped,
