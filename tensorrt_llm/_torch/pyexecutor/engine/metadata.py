@@ -154,6 +154,7 @@ def build_feature_attention_metadata(
     from tensorrt_llm._torch.attention.metadata.draft import (
         EmbeddedDSparkDraftMetadata,
         LinearDraftMetadata,
+        SharedKVCacheLinearDraftMetadata,
     )
     from tensorrt_llm._torch.attention.metadata.mla_context import MlaContextMetadata
     from tensorrt_llm._torch.attention.metadata.sparse import SparseMetadata
@@ -195,7 +196,15 @@ def build_feature_attention_metadata(
         if getattr(spec_config, "enable_confidence_scheduling", False):
             raise UnsupportedMetadataConfiguration("ragged verification")
         if spec_dec_mode.is_mtp_eagle_one_model() and spec_config.is_linear_tree:
-            metadata_types.append(LinearDraftMetadata)
+            has_separate_draft_cache = (
+                draft_kv_cache_manager is not None
+                and draft_kv_cache_manager is not kv_cache_manager
+            )
+            metadata_types.append(
+                LinearDraftMetadata
+                if has_separate_draft_cache
+                else SharedKVCacheLinearDraftMetadata
+            )
         elif spec_dec_mode.is_dspark() and spec_config.draft_is_embedded_in_target:
             metadata_types.append(EmbeddedDSparkDraftMetadata)
         else:
