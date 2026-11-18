@@ -9075,8 +9075,8 @@ class TorchLlmArgs(BaseLlmArgs):
             unsupported = [
                 name for name, used in (
                     ("mm_encoder_only", self.mm_encoder_only),
-                    ("encoder_cuda_graph", mm_config.encoder_cuda_graph
-                     is not None),
+                    ("encoder_cuda_graph",
+                     mm_config.encoder_cuda_graph is not None),
                     ("encoder_side_stream_max_ahead > 0",
                      mm_config.encoder_side_stream_max_ahead > 0),
                 ) if used

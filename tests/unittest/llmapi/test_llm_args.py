@@ -3051,7 +3051,8 @@ class TestMultimodalConfig:
             )
 
     def test_encoder_only_rejects_attention_dp_with_shared_encoder_tp(self):
-        with pytest.raises(ValueError, match="does not support mm_encoder_only"):
+        with pytest.raises(ValueError,
+                           match="does not support mm_encoder_only"):
             TorchLlmArgs(
                 model=llama_model_path,
                 tensor_parallel_size=2,
