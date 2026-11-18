@@ -381,11 +381,12 @@ def test_encoding_is_deterministic_and_seeded(bits):
 
 
 @requires_cuda
-@pytest.mark.parametrize("bits", (4, 3, 2.5))
-def test_mla_latent_with_a_lossless_auxiliary_buffer(bits):
+@pytest.mark.parametrize("tokens", (32, 64))
+@pytest.mark.parametrize("bits", (4, 3, 3.5, 2.5))
+def test_mla_latent_with_a_lossless_auxiliary_buffer(bits, tokens):
     """A 576-wide key-only latent (not a power of two) plus raw DSA index keys."""
 
-    layers = {layer: {"key": (1, 32, 576), "index_key": (1, 32, 132)} for layer in range(3)}
+    layers = {layer: {"key": (1, tokens, 576), "index_key": (1, tokens, 132)} for layer in range(3)}
     codec = _Codec(_provider(bits), layers, num_kv_heads=(1,) * 3, head_dim=(576,) * 3)
     generator = torch.Generator(device="cuda").manual_seed(7)
     values = {
@@ -393,7 +394,12 @@ def test_mla_latent_with_a_lossless_auxiliary_buffer(bits):
         for key in codec.hot
     }
     restored = _round_trip(codec, values)
-    bound = {4: 1.15 * PAPER_MSE[4], 3: 1.15 * PAPER_MSE[3], 2.5: PAPER_MSE[2]}[bits]
+    bound = {
+        4: 1.15 * PAPER_MSE[4],
+        3.5: PAPER_MSE[3],
+        3: 1.15 * PAPER_MSE[3],
+        2.5: PAPER_MSE[2],
+    }[bits]
     for (layer, role), value in values.items():
         if role == "index_key":
             assert torch.equal(
@@ -401,6 +407,27 @@ def test_mla_latent_with_a_lossless_auxiliary_buffer(bits):
             )
         else:
             assert _nmse(value.to(codec.dtype), restored[(layer, role)]) < bound
+
+
+@requires_cuda
+@pytest.mark.parametrize("tokens", (64, 128))
+@pytest.mark.parametrize("width", (512, 576))
+def test_wide_fractional_heads_decode_in_parts(width, tokens):
+    """Rows wider than 448 do not fit tensor memory in decode tiles of 64+ rows: a head decodes in
+    32-row parts, each reading the channel split of its own head (two heads per Page here)."""
+
+    codec = _Codec(
+        _provider(3.5), {0: {"key": (2, tokens, width)}}, num_kv_heads=(2,), head_dim=(width,)
+    )
+    generator = torch.Generator(device="cuda").manual_seed(15)
+    values = {
+        key: _vectors("outlier_channels", (4, 2, tokens, width), generator) for key in codec.hot
+    }
+    restored = _round_trip(codec, values)
+    for key, value in values.items():
+        for head in range(2):
+            error = _nmse(value[:, head].to(codec.dtype), restored[key][:, head])
+            assert error < PAPER_MSE[3], (head, error)
 
 
 @requires_cuda
