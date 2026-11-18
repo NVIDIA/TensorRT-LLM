@@ -119,6 +119,8 @@ class Flux2Pipeline(BasePipeline):
 
     @property
     def supports_dynamic_batching(self) -> bool:
+        if self.scheduler.config.get("stochastic_sampling", False):
+            return False
         # Inspect loaded layers so mixed per-layer quantization is covered too.
         return not has_unsupported_batch_quantization(
             self.transformer, self.transformer.model_config.attention

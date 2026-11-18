@@ -47,8 +47,15 @@ def resolved_extra_keys_scope(values: Dict[str, Any]):
         _RESOLVED_EXTRA_KEYS.reset(token)
 
 
-# One named graph-key component, e.g. ("hidden_states", (1, 4096, 3072)).
-KeyPart: TypeAlias = Tuple[str, Hashable]
+@dataclass(frozen=True)
+class _TensorKeyName:
+    """Keep callback names distinct from tensor keyword names in graph keys."""
+
+    name: str
+
+
+# Tensor shape names and registered callback names use separate namespaces.
+KeyPart: TypeAlias = Tuple[str | _TensorKeyName, Hashable]
 # Full CUDA graph cache key, stored as a tuple so it can be used as a dict key.
 KeyType: TypeAlias = Tuple[KeyPart, ...]
 
@@ -167,12 +174,12 @@ class CUDAGraphRunner:
         # model.forward call.
         return tuple(
             list(
-                (f"arg{i}", tuple(arg.shape))
+                (_TensorKeyName(f"arg{i}"), tuple(arg.shape))
                 for i, arg in enumerate(args)
                 if isinstance(arg, torch.Tensor)
             )
             + list(
-                (k, tuple(kwargs[k].shape))
+                (_TensorKeyName(k), tuple(kwargs[k].shape))
                 for k in sorted(kwargs.keys())
                 if isinstance(kwargs[k], torch.Tensor)
             )

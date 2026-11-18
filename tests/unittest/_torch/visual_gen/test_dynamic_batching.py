@@ -4,6 +4,7 @@
 
 import asyncio
 import queue
+import threading
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -87,6 +88,8 @@ def test_defaults_and_yaml_round_trip(tmp_path):
         {"max_batch_size": 0},
         {"max_batch_size": -1},
         {"max_batch_size": 1.5},
+        {"max_batch_size": True},
+        {"max_queue_delay_ms": 3_000_000_000},
         {"max_queue_delay_ms": -1},
         {"max_queue_delay_ms": float("inf")},
         {"max_queue_delay_ms": float("nan")},
@@ -96,6 +99,18 @@ def test_defaults_and_yaml_round_trip(tmp_path):
 def test_invalid_batching_config(kwargs):
     with pytest.raises(ValidationError):
         BatchingConfig(**kwargs)
+
+
+@pytest.mark.parametrize("value", ["true", "false"])
+def test_yaml_rejects_boolean_batch_size(tmp_path, value):
+    path = tmp_path / "batching.yaml"
+    path.write_text(f"batching_config:\n  max_batch_size: {value}\n")
+    with pytest.raises(ValidationError, match="boolean"):
+        VisualGenArgs.from_yaml(path)
+
+
+def test_maximum_supported_queue_delay():
+    assert BatchingConfig(max_queue_delay_ms=2_147_483_647).max_queue_delay_ms == 2_147_483_647
 
 
 @pytest.mark.parametrize("enabled,limit", [(False, 4), (True, 1)])
@@ -228,6 +243,19 @@ def test_references_are_never_merged(slot):
     assert requests.poll_timeouts == []
 
 
+def test_inline_image_references_remain_separate_before_preparation():
+    reference = MediaRef(content=b"same reference", format="bytes")
+    originals = [_request(i, image_reference=reference) for i in (1, 2)]
+    requests = _Queue([(0, req) for req in originals])
+    scheduler = DynamicBatchScheduler(2, 100, clock=requests.clock)
+    for original in originals:
+        assert not original.ref_handles and not original.prepared_inputs
+        result = _next(scheduler, requests)
+        assert result is original
+        assert result.batch_info is None
+    assert requests.poll_timeouts == []
+
+
 @pytest.mark.parametrize("reason", ["unseeded", "prepared", "handles", "opaque_extra", "nested"])
 def test_unsafe_requests_remain_singletons(reason):
     req = _request()
@@ -324,7 +352,7 @@ def test_executor_routes_each_success_or_failure_and_continues(failure):
         prepare_request=Mock(),
         request_warmup_cache_key=Mock(return_value=(256, 256)),
         run_inference=Mock(
-            return_value=PipelineOutput(image=torch.zeros(3, 4, 4, 3)),
+            return_value=PipelineOutput(image=torch.zeros(4, 4, 4, 3)),
             side_effect=None if failure == "ipc" else failure,
         ),
         classify_request_failure=lambda exc: (
@@ -332,26 +360,29 @@ def test_executor_routes_each_success_or_failure_and_continues(failure):
         ),
     )
     req = _request(7)
-    req.batch_info = BatchInfo((7, 9), (1, 2), (7, 9))
+    req.batch_info = BatchInfo((7, 9, 11), (1, 2, 1), (7, 9, 11))
     with patch.object(
         PipelineOutput,
         "to_handle",
-        side_effect=[None, RuntimeError("IPC failure")] if failure == "ipc" else None,
+        side_effect=[None, RuntimeError("IPC failure"), None] if failure == "ipc" else None,
     ):
         executor.process_request(req)
-    first, second = executor.response_queue.get_nowait(), executor.response_queue.get_nowait()
-    assert (first.request_id, second.request_id) == (7, 9)
+    first, second, third = [executor.response_queue.get_nowait() for _ in range(3)]
+    assert (first.request_id, second.request_id, third.request_id) == (7, 9, 11)
     assert executor.response_queue.empty()
     if failure == "ipc":
         assert first.error_msg is None
         assert second.error_msg == "IPC failure"
+        assert third.error_msg is None
+        assert third.output.image.shape[0] == 1
     elif failure is None:
         assert first.output.image.shape[0] == 1
         assert second.output.image.shape[0] == 2
-        assert first.generation == second.generation
+        assert third.output.image.shape[0] == 1
+        assert first.generation == second.generation == third.generation
     else:
-        assert first.error_msg == second.error_msg == str(failure)
-        assert first.error_type == second.error_type
+        assert first.error_msg == second.error_msg == third.error_msg == str(failure)
+        assert first.error_type == second.error_type == third.error_type
         executor.pipeline.run_inference.side_effect = None
         with patch.object(PipelineOutput, "to_handle"):
             executor.process_request(_request(10))
@@ -437,5 +468,44 @@ def test_abandoning_one_request_keeps_its_batch_peers():
         assert client.completed_responses == {2: peer}
         assert not client._abandoned_request_ids
         assert client._iter_stats.record_request_completed.call_count == 2
+
+    asyncio.run(check())
+
+
+def test_coordinator_drains_ready_batch_responses_without_repeated_input_wait():
+    async def check():
+        client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+        client.args = VisualGenArgs(batching_config={"max_batch_size": 3})
+        client.shutdown_event = threading.Event()
+        client._event_loop = asyncio.get_running_loop()
+        client._worker_failure = None
+        client._check_worker_liveness = Mock(return_value=None)
+        client._init_ipc = Mock(return_value=True)
+        client._cleanup_ipc = Mock()
+        client._request_to_send = None
+        client.pending_requests = Mock(wraps=queue.Queue())
+        ready = deque(DiffusionResponse(i) for i in range(3))
+        delivered = []
+
+        def receive():
+            response = ready.popleft()
+            if not ready:
+                client.shutdown_event.set()
+            return response
+
+        async def store(response):
+            delivered.append(response.request_id)
+
+        client.responses_ipc = SimpleNamespace(
+            poll=Mock(side_effect=lambda timeout: bool(ready)), get=receive
+        )
+        client._store_response = store
+        await client._serve_forever()
+        assert delivered == [0, 1, 2]
+        assert client.pending_requests.get.call_count == 1
+        assert [call.kwargs["timeout"] for call in client.responses_ipc.poll.call_args_list][
+            1:
+        ] == [0, 0]
+        client._cleanup_ipc.assert_called_once()
 
     asyncio.run(check())

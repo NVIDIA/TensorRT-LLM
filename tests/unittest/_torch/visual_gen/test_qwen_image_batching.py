@@ -3,14 +3,19 @@
 """Numerical-shape and graph-cache contracts for Qwen request batching."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn.functional as F
+from transformers import BatchEncoding
 
 from tensorrt_llm._torch.visual_gen.batching import BatchInfo
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline
+from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image import (
+    _PROMPT_TEMPLATE_START_IDX,
+)
 from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (
     QwenImageEditPlusPipeline,
 )
@@ -24,6 +29,36 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image imp
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("max_sequence_length", [1, 4])
+def test_prompt_encoding_preserves_masked_selection_and_truncation(max_sequence_length):
+    pipe = QwenImagePipeline.__new__(QwenImagePipeline)
+    torch.nn.Module.__init__(pipe)
+    pipe.pipeline_config = SimpleNamespace(torch_dtype=torch.float32)
+    pipe.tokenizer_max_length = 8
+    drop = _PROMPT_TEMPLATE_START_IDX
+    seq_len = drop + 4
+    # Include both left and right padding, so lengths alone cannot pick the tokens.
+    mask = torch.ones(2, seq_len, dtype=torch.long)
+    mask[0, :2] = 0
+    mask[1, -1] = 0
+    tokens = BatchEncoding({"input_ids": torch.zeros_like(mask), "attention_mask": mask})
+    hidden = torch.arange(2 * seq_len * 4, dtype=torch.float32).reshape(2, seq_len, 4)
+    pipe.tokenizer = Mock(return_value=tokens)
+    pipe.text_encoder = Mock(return_value=SimpleNamespace(hidden_states=[hidden]))
+    actual, actual_mask = pipe._encode_prompt(["a", "b"], torch.device("cpu"), max_sequence_length)
+    expected_parts = [row[row_mask.bool()][drop:] for row, row_mask in zip(hidden, mask)]
+    expected = torch.zeros(2, 3, 4)
+    expected_mask = torch.zeros(2, 3, dtype=torch.long)
+    for i, part in enumerate(expected_parts):
+        expected[i, : len(part)] = part
+        expected_mask[i, : len(part)] = 1
+    torch.testing.assert_close(actual, expected[:, :max_sequence_length])
+    if max_sequence_length == 1:
+        assert actual_mask is None
+    else:
+        torch.testing.assert_close(actual_mask, expected_mask)
 
 
 def test_prompt_encoding_preserves_each_request_padding():
@@ -126,6 +161,12 @@ def test_graph_keys_distinguish_request_layout_at_same_tensor_shape():
         QwenImageBatchLayout((1, 2), (2, 3), (False, True)),
     ]
     assert len({runner.get_graph_key(request_batch=layout) for layout in layouts}) == len(layouts)
+
+
+def test_request_batch_cannot_bypass_graph_key_with_positional_argument():
+    model = QwenImageTransformer2DModel.__new__(QwenImageTransformer2DModel)
+    with pytest.raises(TypeError, match="positional"):
+        model.forward(*([None] * 8))
 
 
 @pytest.mark.parametrize(

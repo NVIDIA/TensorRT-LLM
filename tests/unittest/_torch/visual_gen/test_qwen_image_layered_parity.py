@@ -31,6 +31,7 @@ requires_cuda = pytest.mark.skipif(
 
 
 @requires_cuda
+@torch.random.fork_rng()
 def test_qwen_layered_block_singleton_attention_parity() -> None:
     """L2/T1: Layered block image/text outputs match the ordinary unmasked Qwen block.
 

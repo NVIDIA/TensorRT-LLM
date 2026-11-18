@@ -726,14 +726,22 @@ class DiffusionExecutor:
                 # CUDA IPC handles are invalid within the producing process, so
                 # a same-process client takes the media via in-process handoff.
                 for request_id, request_output in zip(request_ids, outputs, strict=True):
-                    request_output.to_handle(local=self.in_client_process)
-                    self.response_queue.put(
-                        DiffusionResponse(
+                    try:
+                        request_output.to_handle(local=self.in_client_process)
+                    except Exception as e:
+                        logger.error(f"Worker {self.device_id}: Output handoff failed: {e}")
+                        response = DiffusionResponse(
+                            request_id=request_id,
+                            error_msg=str(e),
+                            error_type=self.pipeline.classify_request_failure(e),
+                        )
+                    else:
+                        response = DiffusionResponse(
                             request_id=request_id,
                             output=request_output,
                             generation=generation,
                         )
-                    )
+                    self.response_queue.put(response)
                     pending_request_ids.popleft()
         except Exception as e:
             if log_cuda_memory:
@@ -1266,10 +1274,12 @@ class DiffusionRemoteClient:
             logger.error(f"DiffusionClient: Error sending request: {e}")
             logger.error(traceback.format_exc())
 
-    def _process_responses(self):
-        """Poll and process responses."""
+    def _process_responses(self, max_responses: int = 1):
+        """Poll once, then drain a bounded burst of already-ready responses."""
         try:
-            if self.responses_ipc.poll(timeout=POLL_TIMEOUT):
+            for index in range(max_responses):
+                if not self.responses_ipc.poll(timeout=POLL_TIMEOUT if index == 0 else 0):
+                    break
                 response = self.responses_ipc.get()
                 if isinstance(response, DiffusionResponse):
                     if response.request_id == -1:
@@ -1383,7 +1393,7 @@ class DiffusionRemoteClient:
                 self._abort_worker_group(worker_failure)
             if self._worker_failure is None:
                 self._process_requests(max_requests=self.args.batching_config.max_batch_size)
-                self._process_responses()
+                self._process_responses(max_responses=self.args.batching_config.max_batch_size)
             await asyncio.sleep(0.001)  # Yield control to allow other coroutines to run
 
         self._cleanup_ipc()

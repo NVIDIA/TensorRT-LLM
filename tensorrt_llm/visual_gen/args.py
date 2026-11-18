@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import yaml
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import Field
@@ -820,6 +820,7 @@ class BatchingConfig(StrictBaseModel):
     max_queue_delay_ms: float = Field(
         0.0,
         ge=0,
+        le=2_147_483_647,
         allow_inf_nan=False,
         status="prototype",
         description=(
@@ -827,6 +828,13 @@ class BatchingConfig(StrictBaseModel):
             "0 merges only requests already queued."
         ),
     )
+
+    @field_validator("max_batch_size", mode="before")
+    @classmethod
+    def _reject_boolean_batch_size(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("max_batch_size must be an integer, not a boolean")
+        return value
 
 
 class CompilationConfig(StrictBaseModel):

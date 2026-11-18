@@ -38,7 +38,7 @@ def has_unsupported_batch_quantization(
     attention_quant = attention_config.quant_attention_config
     if attention_quant is not None and (
         (attention_config.backend == "CUDNN" and attention_quant.qk_dtype == "fp8")
-        or attention_config.backend == "FLASHINFER"
+        or attention_config.backend in ("FLASHINFER", "CUTEDSL")
         or (
             attention_config.backend == "TRTLLM"
             and (

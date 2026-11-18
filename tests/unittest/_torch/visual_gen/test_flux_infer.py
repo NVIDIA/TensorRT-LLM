@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
 
 from tensorrt_llm._torch.modules.linear import (
     FP8BlockScalesLinearMethod,
@@ -61,6 +62,7 @@ def test_batching_quantization_eligibility(
     layer.input_scale = input_scale
     pipeline = pipeline_cls.__new__(pipeline_cls)
     torch.nn.Module.__init__(pipeline)
+    pipeline.scheduler = FlowMatchEulerDiscreteScheduler()
     # A nested quantized layer among unquantized layers also gates the pipeline.
     pipeline.transformer = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Sequential(layer))
     pipeline.transformer.model_config = SimpleNamespace(attention=AttentionConfig())
@@ -69,16 +71,23 @@ def test_batching_quantization_eligibility(
 
 @pytest.mark.parametrize("pipeline_cls", [FluxPipeline, Flux2Pipeline])
 @pytest.mark.parametrize(
-    "backend,qk_dtype,v_dtype,expected",
+    "backend,qk_dtype,v_dtype,v_block_size,expected",
     [
-        ("CUDNN", None, None, True),
-        ("CUDNN", "fp8", "fp8", False),
-        ("CUDNN", "mxfp8", "mxfp8", True),
-        ("FLASHINFER", None, None, True),
-        ("FLASHINFER", "mxfp8", "fp8", False),
-        ("FLASHINFER", "nvfp4", "fp8", False),
-        ("FLASHINFER", "nvfp4", "nvfp4", False),
-        ("TRTLLM", None, None, True),
+        ("CUDNN", None, None, 0, True),
+        ("CUDNN", "fp8", "fp8", 0, False),
+        ("CUDNN", "mxfp8", "mxfp8", 0, True),
+        ("FLASHINFER", None, None, 0, True),
+        ("FLASHINFER", "mxfp8", "fp8", 0, False),
+        ("FLASHINFER", "nvfp4", "fp8", 0, False),
+        ("FLASHINFER", "nvfp4", "nvfp4", 0, False),
+        ("TRTLLM", None, None, 0, True),
+        ("CUTEDSL", None, None, 0, True),
+        ("CUTEDSL", "bf16", "fp8", 0, False),
+        ("CUTEDSL", "fp8", "fp8", 0, False),
+        ("CUTEDSL", "mxfp8", "fp8", 0, False),
+        ("CUTEDSL", "mxfp8", "fp8", 1, False),
+        ("CUTEDSL", "nvfp4", "fp8", 0, False),
+        ("CUTEDSL", "nvfp4", "fp8", 1, False),
     ],
 )
 def test_batching_attention_quantization_eligibility(
@@ -86,16 +95,20 @@ def test_batching_attention_quantization_eligibility(
     backend: str,
     qk_dtype: str | None,
     v_dtype: str | None,
+    v_block_size: int,
     expected: bool,
 ) -> None:
     pipeline = pipeline_cls.__new__(pipeline_cls)
     torch.nn.Module.__init__(pipeline)
+    pipeline.scheduler = FlowMatchEulerDiscreteScheduler()
     pipeline.transformer = torch.nn.Linear(2, 2)
     pipeline.transformer.model_config = SimpleNamespace(
         attention=AttentionConfig(
             backend=backend,
             quant_attention_config=(
-                {"qk_dtype": qk_dtype, "v_dtype": v_dtype} if qk_dtype is not None else None
+                {"qk_dtype": qk_dtype, "v_dtype": v_dtype, "v_block_size": v_block_size}
+                if qk_dtype is not None
+                else None
             ),
         )
     )
@@ -124,6 +137,7 @@ def test_batching_trtllm_attention_recipe_eligibility(
     monkeypatch.setattr("tensorrt_llm.visual_gen.args.get_sm_version", lambda: 100)
     pipeline = pipeline_cls.__new__(pipeline_cls)
     torch.nn.Module.__init__(pipeline)
+    pipeline.scheduler = FlowMatchEulerDiscreteScheduler()
     pipeline.transformer = torch.nn.Linear(2, 2)
     pipeline.transformer.model_config = SimpleNamespace(
         attention=AttentionConfig(
@@ -149,7 +163,7 @@ def test_infer_forwards_num_images_per_prompt(
     pipeline = pipeline_cls.__new__(pipeline_cls)
     pipeline.forward = Mock(return_value="image")
     request = SimpleNamespace(
-        prompt="a cat",
+        prompt=["a cat", "a dog"] if batch_info else ["a cat"],
         prepared_inputs={},
         batch_info=batch_info,
         params=SimpleNamespace(
@@ -160,7 +174,7 @@ def test_infer_forwards_num_images_per_prompt(
             seed=42,
             max_sequence_length=512,
             num_images_per_prompt=2,
-            image_reference=[SimpleNamespace(content=b"reference")],
+            image_reference=None if batch_info else [SimpleNamespace(content=b"reference")],
         ),
     )
 
@@ -171,7 +185,9 @@ def test_infer_forwards_num_images_per_prompt(
     assert pipeline.forward.call_args.kwargs["num_images_per_prompt"] == 2
     assert pipeline.forward.call_args.kwargs["_batch_info"] is batch_info
     if pipeline_cls is Flux2Pipeline:
-        assert pipeline.forward.call_args.kwargs["image"] == [b"reference"]
+        assert pipeline.forward.call_args.kwargs["image"] == (
+            None if batch_info else [b"reference"]
+        )
     else:
         assert "image" not in pipeline.forward.call_args.kwargs
 
@@ -198,3 +214,14 @@ def test_prepare_latents_preserves_each_requests_noise(pipeline_cls) -> None:
         batch_info=BatchInfo((1, 2), (2, 1), (42, 17)),
     )
     assert torch.equal(merged, torch.cat([first, second]))
+
+
+@pytest.mark.parametrize("pipeline_cls", [FluxPipeline, Flux2Pipeline])
+@pytest.mark.parametrize("stochastic", [False, True])
+def test_batching_scheduler_eligibility(pipeline_cls, stochastic):
+    pipeline = pipeline_cls.__new__(pipeline_cls)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.scheduler = FlowMatchEulerDiscreteScheduler(stochastic_sampling=stochastic)
+    pipeline.transformer = torch.nn.Linear(2, 2)
+    pipeline.transformer.model_config = SimpleNamespace(attention=AttentionConfig())
+    assert pipeline.supports_dynamic_batching is (not stochastic)

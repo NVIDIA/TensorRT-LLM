@@ -334,7 +334,11 @@ class QwenImagePipeline(BasePipeline):
             padding=True,
             truncation=True,
             return_tensors="pt",
-        ).to(device)
+        )
+        token_mask = tok.attention_mask.bool()
+        valid_lengths = token_mask.sum(dim=1).tolist()
+        token_indices = token_mask.flatten().nonzero(as_tuple=True)[0].to(device)
+        tok = tok.to(device)
 
         encoder_outputs = self.text_encoder(
             input_ids=tok.input_ids,
@@ -343,11 +347,10 @@ class QwenImagePipeline(BasePipeline):
         )
         hidden_states = encoder_outputs.hidden_states[-1]
 
-        split_hidden = self._extract_masked_hidden(hidden_states, tok.attention_mask)
+        selected = hidden_states.flatten(0, 1).index_select(0, token_indices)
+        split_hidden = torch.split(selected, valid_lengths, dim=0)
         split_hidden = [h[drop_idx:] for h in split_hidden]
-        attn_masks = [
-            torch.ones(h.size(0), dtype=torch.long, device=h.device) for h in split_hidden
-        ]
+        attn_masks = [torch.ones(h.size(0), dtype=torch.long, device="cpu") for h in split_hidden]
         max_len = max(h.size(0) for h in split_hidden)
         prompt_embeds = torch.stack(
             [torch.cat([h, h.new_zeros(max_len - h.size(0), h.size(1))]) for h in split_hidden]
@@ -362,7 +365,7 @@ class QwenImagePipeline(BasePipeline):
         prompt_embeds = prompt_embeds.to(dtype=self.dtype, device=device)
         if prompt_embeds_mask.bool().all():
             return prompt_embeds, None
-        return prompt_embeds, prompt_embeds_mask
+        return prompt_embeds, prompt_embeds_mask.to(device)
 
     def _encode_prompt_for_requests(
         self,

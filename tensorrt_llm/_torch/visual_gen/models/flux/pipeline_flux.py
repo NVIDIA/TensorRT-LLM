@@ -57,6 +57,8 @@ class FluxPipeline(BasePipeline):
 
     @property
     def supports_dynamic_batching(self) -> bool:
+        if self.scheduler.config.get("stochastic_sampling", False):
+            return False
         return not has_unsupported_batch_quantization(
             self.transformer, self.transformer.model_config.attention
         )

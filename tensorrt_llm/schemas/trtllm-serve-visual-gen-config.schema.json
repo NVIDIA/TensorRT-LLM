@@ -93,6 +93,7 @@
         "max_queue_delay_ms": {
           "default": 0.0,
           "description": "Maximum milliseconds spent collecting compatible requests when a worker is ready; 0 merges only requests already queued.",
+          "maximum": 2147483647,
           "minimum": 0,
           "status": "prototype",
           "title": "Max Queue Delay Ms",

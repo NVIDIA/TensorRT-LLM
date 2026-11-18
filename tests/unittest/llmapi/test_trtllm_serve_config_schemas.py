@@ -301,7 +301,18 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             True,
         ),
         (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_size": 0}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_size": True}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_queue_delay_ms": -1}}, False),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"batching_config": {"max_queue_delay_ms": 3_000_000_000}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"batching_config": {"max_queue_delay_ms": 2_147_483_647}},
+            True,
+        ),
         (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_szie": 4}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_szie": 1}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 0}}, False),

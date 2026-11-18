@@ -61,8 +61,10 @@ single-GPU execution with `VANILLA` attention. Unsupported configurations,
 image-edit requests and denoising-cache configurations run independently.
 FLUX requests also run independently when a transformer layer uses NVFP4
 activation quantization (static or dynamic), dynamic per-tensor FP8, cuDNN FP8
-attention, TRTLLM per-tensor FP8 attention, or FlashInfer quantized attention, to
+attention, TRTLLM per-tensor FP8 attention, or FlashInfer/CuTe DSL quantized attention, to
 preserve per-request image quality.
+FLUX schedulers with `stochastic_sampling` enabled also run independently because
+their denoising steps draw additional noise from the shared RNG.
 Each request keeps its seed and its own outputs, although batched computation
 can introduce small floating-point differences.
 

@@ -1321,6 +1321,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         img_shapes: Optional[list] = None,
         txt_seq_lens: Optional[list] = None,
         return_dict: bool = False,
+        *,
         request_batch: QwenImageBatchLayout | None = None,
         **kwargs,
     ):
