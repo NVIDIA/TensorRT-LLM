@@ -48,28 +48,38 @@ def _gemma4_context_logits(
         request_ids=request_ids,
         prompt_lens=seq_lens,
     )
-    kwargs = {}
+    with torch.inference_mode():
+        attn_metadata.prepare()
+        try:
+            return model.forward(
+                position_ids=positions.unsqueeze(0),
+                attn_metadata=attn_metadata,
+                **_forward_inputs(model, input_ids, embed_rows, ple_input_ids),
+            ).float()
+        finally:
+            kv_cache_manager.shutdown()
+
+
+def _forward_inputs(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    embed_rows: Optional[torch.Tensor],
+    ple_input_ids: Optional[torch.Tensor],
+) -> dict[str, Optional[torch.Tensor]]:
+    """Return forward kwargs, overlaying ``embed_rows`` as the engine does."""
     if embed_rows is not None:
         embeds = model.embed_prompt_tokens(input_ids)
         # Rows equal to the token embedding: only the side channel can differ.
         embeds.index_copy_(0, embed_rows, model.model.embed_tokens(input_ids[embed_rows]))
-        kwargs = {
+        return {
             "input_ids": None,
             "inputs_embeds": embeds,
             **model.prompt_embeds_model_inputs(input_ids, embed_rows),
         }
-    else:
-        kwargs = {"input_ids": input_ids}
-        if ple_input_ids is not None:
-            kwargs["ple_input_ids"] = ple_input_ids
-    try:
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            return model.forward(
-                position_ids=positions.unsqueeze(0), attn_metadata=attn_metadata, **kwargs
-            ).float()
-    finally:
-        kv_cache_manager.shutdown()
+    kwargs = {"input_ids": input_ids}
+    if ple_input_ids is not None:
+        kwargs["ple_input_ids"] = ple_input_ids
+    return kwargs
 
 
 @torch.no_grad()

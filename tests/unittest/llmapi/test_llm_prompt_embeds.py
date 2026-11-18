@@ -195,10 +195,12 @@ def test_reuse_scoped_to_embeddings(llm: LLM, table: torch.Tensor) -> None:
     assert list(second.outputs[0].token_ids) == expected_other
     assert second.cached_tokens > 0
 
-    # Same rows under different placeholder ids do not share blocks either.
+    # Same rows under different placeholder ids share keys only up to the
+    # first differing id.
     other_placeholders = {**request, "prompt_token_ids": other_ids}
+    first_diff = next(p for p, (a, b) in enumerate(zip(ids, other_ids)) if a != b)
     third = llm.generate([other_placeholders], _greedy(), cache_salt=salt)[0]
-    assert third.cached_tokens == 0
+    assert third.cached_tokens <= first_diff
 
     # The plain prompt still reuses its own blocks and is unaffected.
     plain = llm.generate([ids], _greedy(), cache_salt=salt)[0]

@@ -75,7 +75,7 @@ def _image_request(llm: LLM, model_dir: str) -> dict:
         model_type=model_type,
         modality="image",
         prompts=["Describe the color of this image."],
-        media=[image],
+        media=[[image]],
         image_data_format="pt",
     )
     return request

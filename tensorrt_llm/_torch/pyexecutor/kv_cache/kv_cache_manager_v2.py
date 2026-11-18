@@ -1570,6 +1570,63 @@ def _augment_tokens_with_mm_run_metadata(
     return result
 
 
+def _augment_multimodal_tokens(
+    vocab_size: Optional[int], tokens: Sequence[int], req: LlmRequest, start: int, end: int
+) -> Sequence[TokenIdExt]:
+    """Return ``tokens[start:end]`` with multimodal regions keyed by content."""
+    chunk_start = start
+    chunk_end = end
+    is_sliced = chunk_start != 0 or chunk_end != len(tokens)
+
+    if (
+        req.multimodal_hashes is None
+        or req.multimodal_positions is None
+        or req.multimodal_lengths is None
+    ):
+        return tokens[chunk_start:chunk_end] if is_sliced else tokens
+
+    # Reached only with block reuse on, since every caller gates on it, and
+    # only for a multimodal request. Both augment helpers below mint synthetic
+    # ids above vocab_size, so a None here becomes a TypeError inside the key
+    # generator; name the fix instead.
+    if vocab_size is None:
+        raise ValueError(
+            "Block reuse needs vocab_size to build multimodal cache keys, but "
+            "it could not be resolved from the model config. Add this model's "
+            "text-config attribute name to resolve_vocab_size() in "
+            "tensorrt_llm/_torch/pyexecutor/config_utils.py, or disable block "
+            "reuse."
+        )
+
+    # Multimodal path: materialize a Python-int list (digest bytes get spliced in below),
+    # which flows through the per-element binding fallback. tokens may be a zero-copy numpy
+    # int32 view (get_tokens_view) — use tolist() so elements are Python ints, not np.int32.
+    chunk = tokens[chunk_start:chunk_end]
+    result: list[TokenIdExt] = chunk.tolist() if hasattr(chunk, "tolist") else list(chunk)
+    run_metadata = _resolve_multimodal_run_metadata(req)
+    if run_metadata is not None:
+        return _augment_tokens_with_mm_run_metadata(
+            vocab_size,
+            result,
+            req.multimodal_hashes,
+            req.multimodal_uuids,
+            run_metadata,
+            chunk_start,
+            chunk_end,
+        )
+
+    return _augment_tokens_with_contiguous_mm_metadata(
+        vocab_size,
+        result,
+        req.multimodal_hashes,
+        req.multimodal_uuids,
+        req.multimodal_positions,
+        req.multimodal_lengths,
+        chunk_start,
+        chunk_end,
+    )
+
+
 def _augment_tokens_with_prompt_embeds(
     result: list[TokenIdExt],
     prompt_embeds: "PromptEmbeds",
@@ -8081,67 +8138,11 @@ class KVCacheManagerV2(BaseResourceManager):
         if end is None:
             end = len(tokens)
         prompt_embeds = getattr(req, "py_prompt_embeds", None)
-        tokens = self._augment_multimodal_tokens(tokens, req, start, end)
+        tokens = _augment_multimodal_tokens(self.vocab_size, tokens, req, start, end)
         if prompt_embeds is None:
             return tokens
         result = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
         return _augment_tokens_with_prompt_embeds(result, prompt_embeds, start, end)
-
-    def _augment_multimodal_tokens(
-        self, tokens: Sequence[int], req: LlmRequest, start: int, end: int
-    ) -> Sequence[TokenIdExt]:
-        """Return ``tokens[start:end]`` with multimodal regions keyed by content."""
-        chunk_start = start
-        chunk_end = end
-        is_sliced = chunk_start != 0 or chunk_end != len(tokens)
-
-        if (
-            req.multimodal_hashes is None
-            or req.multimodal_positions is None
-            or req.multimodal_lengths is None
-        ):
-            return tokens[chunk_start:chunk_end] if is_sliced else tokens
-
-        # Reached only with block reuse on, since every caller gates on it, and
-        # only for a multimodal request. Both augment helpers below mint synthetic
-        # ids above vocab_size, so a None here becomes a TypeError inside the key
-        # generator; name the fix instead.
-        if self.vocab_size is None:
-            raise ValueError(
-                "Block reuse needs vocab_size to build multimodal cache keys, but "
-                "it could not be resolved from the model config. Add this model's "
-                "text-config attribute name to resolve_vocab_size() in "
-                "tensorrt_llm/_torch/pyexecutor/config_utils.py, or disable block "
-                "reuse."
-            )
-
-        # Multimodal path: materialize a Python-int list (digest bytes get spliced in below),
-        # which flows through the per-element binding fallback. tokens may be a zero-copy numpy
-        # int32 view (get_tokens_view) — use tolist() so elements are Python ints, not np.int32.
-        chunk = tokens[chunk_start:chunk_end]
-        result: list[TokenIdExt] = chunk.tolist() if hasattr(chunk, "tolist") else list(chunk)
-        run_metadata = _resolve_multimodal_run_metadata(req)
-        if run_metadata is not None:
-            return _augment_tokens_with_mm_run_metadata(
-                self.vocab_size,
-                result,
-                req.multimodal_hashes,
-                req.multimodal_uuids,
-                run_metadata,
-                chunk_start,
-                chunk_end,
-            )
-
-        return _augment_tokens_with_contiguous_mm_metadata(
-            self.vocab_size,
-            result,
-            req.multimodal_hashes,
-            req.multimodal_uuids,
-            req.multimodal_positions,
-            req.multimodal_lengths,
-            chunk_start,
-            chunk_end,
-        )
 
     def _stats_window_size(self, window_size: Optional[int]) -> int:
         return self.max_seq_len if window_size is None else int(window_size)
