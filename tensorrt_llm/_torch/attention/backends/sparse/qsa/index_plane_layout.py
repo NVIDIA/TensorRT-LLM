@@ -22,6 +22,10 @@ from __future__ import annotations
 
 import os
 
+import torch
+import triton
+import triton.language as tl
+
 COMPACT_ENV = "TRTLLM_QSA_INDEX_PLANE_COMPACT"
 
 
@@ -58,3 +62,35 @@ def anchor_row(block: int, tokens_per_block: int, compress_ratio: int, compact: 
     if not compact:
         return (block * compress_ratio + compress_ratio - 1) % tokens_per_block
     return block % (tokens_per_block // compress_ratio)
+
+
+def slot_rows(slots: torch.Tensor, tokens_per_block: int, compress_ratio: int, rows: int):
+    """`row_of` of in-page slots (`pos % tokens_per_block`), elementwise; the slots themselves
+    under the plain layout (`rows == tokens_per_block`)."""
+    if rows == tokens_per_block:
+        return slots
+    groups = tokens_per_block // compress_ratio
+    raw = groups + ((slots // compress_ratio) & 1) * (compress_ratio - 1) + slots % compress_ratio
+    return torch.where(slots % compress_ratio == compress_ratio - 1, slots // compress_ratio, raw)
+
+
+@triton.jit
+def index_plane_row(pos, TPB: tl.constexpr, CR: tl.constexpr, ROWS: tl.constexpr):
+    """`row_of` in a kernel: `ROWS` (the index view's rows a page) == `TPB` is the plain layout;
+    `ROWS` 0 takes `pos` as the plain in-page row already (`pos % TPB`) and returns it."""
+    if ROWS == 0:
+        return pos
+    elif ROWS == TPB:
+        return pos % TPB
+    else:
+        raw = TPB // CR + ((pos // CR) & 1) * (CR - 1) + pos % CR
+        return tl.where(pos % CR == CR - 1, (pos % TPB) // CR, raw)
+
+
+@triton.jit
+def index_plane_anchor_row(block, TPB: tl.constexpr, CR: tl.constexpr, ROWS: tl.constexpr):
+    """`anchor_row` in a kernel (`ROWS` as in `index_plane_row`)."""
+    if ROWS == TPB or ROWS == 0:
+        return (block * CR + CR - 1) % TPB
+    else:
+        return block % (TPB // CR)
