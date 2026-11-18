@@ -36,7 +36,7 @@ from qa_selection.core.machine import default_catalog, default_rule_table
     "sm, blocked",
     [(90, True), (100, True), (119, True), (120, False), (121, False), (129, False), (130, False)],
 )
-def test_sm120_family_gate(sm, blocked):
+def test_sm120_family_gate(sm: int, blocked: bool) -> None:
     """Keep the SM120 family; leave the upper-bound skip to runtime pytest."""
     profile = replace(default_catalog().profile_for("B200"), sm=sm)
     rule = default_rule_table()["This test is for SM120"]
