@@ -107,8 +107,8 @@ def test_rank_info_exchange_over_real_sockets(master_key: Optional[bytes]) -> No
     "receiver_key, server_key, match",
     [
         # The signed server drops the frames; the receiver times out.
-        (_OTHER_MASTER_KEY, _MASTER_KEY, "internal_request_auth_key"),
-        (None, _MASTER_KEY, "internal_request_auth_key"),
+        (_OTHER_MASTER_KEY, _MASTER_KEY, "RankInfo exchange timed out"),
+        (None, _MASTER_KEY, "RankInfo exchange timed out"),
         # The unsigned reply fails verification on the signed receiver.
         (_MASTER_KEY, None, "failed control-plane authentication"),
     ],

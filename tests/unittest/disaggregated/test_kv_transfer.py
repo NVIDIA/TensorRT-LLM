@@ -1297,8 +1297,7 @@ def test_transfer_worker_v2_with_native_auth(
         assert sum(m.auth_failures for m in messengers) == 0
         assert sum(m.replays_rejected for m in messengers) == 0
     finally:
-        for worker in workers:
-            worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(120)
