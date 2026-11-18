@@ -167,8 +167,6 @@ unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/multi_gpu
 unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/multi_gpu/test_helix_zero_kv.py SKIP (https://nvbugs/7044056)
 unittest/_torch/attention/multi_gpu/test_mla_helix_context.py::test_k3_mla_helix_owned_prefill[tp1-cp4-gate-fp8-weights-bf16-kv] SKIP (https://nvbugs/7109810)
 unittest/_torch/attention/sparse/csa2/test_module.py::test_fused_native_index_q_and_graph SKIP (https://nvbugs/7039506)
-unittest/_torch/attention/test_fp4_mla.py::test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position[active] SKIP (https://nvbugs/7078630)
-unittest/_torch/attention/test_fp4_mla.py::test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position[inactive] SKIP (https://nvbugs/7078630)
 unittest/_torch/misc/test_guided_decoder_errors.py::test_executor_loop_fails_the_request_once_its_batch_is_synchronized SKIP (https://nvbugs/7068781)
 unittest/_torch/moe/test_dynamic_eplb_contracts.py::test_on_autotune_builds_balanced_powerlaw_input SKIP (https://nvbugs/7034332)
 unittest/_torch/moe/test_moe_backend.py::test_fc1_prologue_wait_keeps_a_longer_stream_open SKIP (https://nvbugs/7099532)
