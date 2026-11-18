@@ -754,3 +754,52 @@ def test_managed_environment_values_are_private_and_rotation_resumes(tmp_path, m
     ):
         assert secret not in persisted
         assert protocol.sha256_text(secret) not in persisted
+
+
+@pytest.mark.parametrize("mode", ["endpoint", "unmonitored", "monitored"])
+def test_gpu_cost_preserves_unknown_and_labels_monitored_estimate(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(protocol, "load_problems", lambda *args: ([_problem(0)], {}))
+    deps = runner.RunDeps(
+        get=lambda *args, **kwargs: SimpleNamespace(
+            status_code=200, json=lambda: {"data": [{"id": "served"}]}
+        ),
+        post=lambda *args, **kwargs: SimpleNamespace(status_code=200, text=_payload()),
+    )
+    managed = (
+        None
+        if mode == "endpoint"
+        else runner.ManagedServer(
+            argv=("unused",), env={}, gpu_ids=("0", "1", "0") if mode == "monitored" else ()
+        )
+    )
+    monkeypatch.setattr(runner, "_serve_and_ask", lambda *args: {"server_lifetime_s": 3600})
+    output = tmp_path / "results"
+    kwargs = dict(
+        dataset_dir=tmp_path,
+        output_dir=output,
+        num_questions=1,
+        concurrency=1,
+        time_budget_s=60,
+        endpoint="http://unused" if managed is None else None,
+        managed=managed,
+        deps=deps,
+        print_report=lambda _: None,
+    )
+    summary = runner.run(**kwargs)
+    assert json.loads((output / "summary.json").read_text()) == summary
+    assert summary["timing"]["gpu_hours"] is None
+    assert summary["timing"]["server_gpu_hours"] is None
+    assert summary["cost"]["gpu_hours_all_attempts"] is None
+    assert summary["cost"]["server_gpu_hours_all_attempts"] is None
+    expected = 2.0 if mode == "monitored" else None
+    assert summary["timing"]["monitored_gpu_hours"] == expected
+    assert summary["cost"]["monitored_gpu_hours_all_attempts"] == expected
+    if mode == "monitored":
+        # A legacy estimate must not be silently treated as zero on resume.
+        path = output / "run_manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["attempts"][0]["timing"] = {"gpu_hours": 99}
+        path.write_text(json.dumps(manifest))
+        resumed = runner.run(**kwargs)
+        assert resumed["timing"]["monitored_gpu_hours"] == 2.0
+        assert resumed["cost"]["monitored_gpu_hours_all_attempts"] is None

@@ -24,6 +24,7 @@ touched.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import signal
 import subprocess
@@ -214,4 +215,11 @@ def gpu_memory_poller(
                 poller.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 poller.kill()
-                poller.wait()
+                try:
+                    poller.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    logging.getLogger(__name__).warning(
+                        "GPU memory poller PID %s did not exit after SIGKILL; "
+                        "continuing without waiting for it",
+                        poller.pid,
+                    )

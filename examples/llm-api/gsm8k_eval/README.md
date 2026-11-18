@@ -133,6 +133,13 @@ The output directory receives:
 - Managed mode also keeps the server log, the reported address and the GPU-memory samples of
   each attempt.
 
+GPU cost fields are `null` because the evaluator cannot verify the server's device
+count. In managed mode, `timing.monitored_gpu_hours` estimates the listed monitored
+devices' GPU-hours over the server lifetime; it is not server utilization or total
+server cost. `cost.monitored_gpu_hours_all_attempts` is `null` if any attempt lacks
+that estimate, including older manifests. GPU-poller shutdown waits at most 10 seconds
+after SIGTERM and another 10 after SIGKILL, then warns and continues saving results.
+
 Running again with the same output directory and the same settings resumes the run: completed
 replies are kept and never asked again, failed attempts stay recorded and their questions are
 asked again, and an interrupted last line is moved aside. A different protocol, selection,

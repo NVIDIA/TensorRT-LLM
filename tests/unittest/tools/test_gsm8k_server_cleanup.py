@@ -182,3 +182,17 @@ finally:
         timeout=15,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("timeouts", [0, 1, 2])
+def test_memory_poller_shutdown_is_bounded(tmp_path, monkeypatch, caplog, timeouts):
+    process = Mock(pid=123)
+    process.wait.side_effect = [subprocess.TimeoutExpired("nvidia-smi", 10)] * timeouts + [0]
+    monkeypatch.setattr(server.subprocess, "Popen", Mock(return_value=process))
+    with server.gpu_memory_poller(tmp_path / "memory.csv", ["0"]):
+        pass
+    process.terminate.assert_called_once_with()
+    assert process.kill.call_count == bool(timeouts)
+    assert len(process.wait.call_args_list) == min(timeouts + 1, 2)
+    assert all(call.kwargs == {"timeout": 10} for call in process.wait.call_args_list)
+    assert ("did not exit after SIGKILL" in caplog.text) == (timeouts == 2)

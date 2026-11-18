@@ -350,8 +350,8 @@ def _report(summary: Mapping[str, Any], timing: Mapping[str, Any]) -> str:
     ]
     if memory:
         lines.append(
-            f"  peak GPU memory {memory.get('max_peak_used_mib')} MiB (largest GPU); GPU-hours "
-            f"{timing.get('gpu_hours')}"
+            f"  peak GPU memory {memory.get('max_peak_used_mib')} MiB (largest GPU); monitored-device GPU-hours "
+            f"{timing.get('monitored_gpu_hours')}"
         )
     lines.append(f"  results: {summary['results_dir']}")
     return "\n".join(lines)
@@ -533,11 +533,14 @@ def run(
                 else:
                     timing.update(_ask(session, base, model, _ExternalEndpoint(), deps))
     timing["total_s"] = deps.monotonic() - started
-    if managed is not None and managed.gpu_ids:
-        timing["gpu_hours"] = records.gpu_hours(len(managed.gpu_ids), timing["total_s"])
-        timing["server_gpu_hours"] = records.gpu_hours(
-            len(managed.gpu_ids), timing.get("server_lifetime_s", 0)
-        )
+    # Monitored devices may be a subset or superset of the server's devices.
+    timing.update(gpu_hours=None, server_gpu_hours=None, monitored_gpu_hours=None)
+    lifetime = timing.get("server_lifetime_s")
+    if managed is not None and managed.gpu_ids and lifetime is not None:
+        timing["monitored_gpu_hours"] = records.gpu_hours(len(set(managed.gpu_ids)), lifetime)
+    monitored_hours = [
+        a.get("timing", {}).get("monitored_gpu_hours") for a in run_manifest["attempts"][:-1]
+    ] + [timing["monitored_gpu_hours"]]
     attempt_info.update(finished_at=records.utc_now(), timing=timing)
     if "refused" in timing:
         _write_json(manifest_file, run_manifest)
@@ -554,15 +557,11 @@ def run(
         results_dir=str(results_dir),
         timing=timing,
         cost={
-            "gpu_hours_all_attempts": round(
-                sum(a.get("timing", {}).get("gpu_hours", 0) for a in run_manifest["attempts"]), 4
-            ),
-            "server_gpu_hours_all_attempts": round(
-                sum(
-                    a.get("timing", {}).get("server_gpu_hours", 0) for a in run_manifest["attempts"]
-                ),
-                4,
-            ),
+            "gpu_hours_all_attempts": None,
+            "server_gpu_hours_all_attempts": None,
+            "monitored_gpu_hours_all_attempts": round(sum(monitored_hours), 4)
+            if all(hours is not None for hours in monitored_hours)
+            else None,
         },
     )
     summary["verdict"] = records.verdict(summary, min_correct)
