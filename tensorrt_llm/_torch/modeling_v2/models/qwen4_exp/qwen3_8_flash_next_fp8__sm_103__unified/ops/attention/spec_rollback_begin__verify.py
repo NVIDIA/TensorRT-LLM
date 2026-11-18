@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa.index_plane_layout import index_plane_row
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: One index-K row: 128 bf16 a token (one 128-wide head).
@@ -44,6 +45,8 @@ def _begin_kernel(
     ROW_: tl.constexpr,
     PLANES: tl.constexpr,
     POS_W_: tl.constexpr,
+    CR: tl.constexpr = 0,
+    IROWS: tl.constexpr = 0,
 ):
     plane = tl.program_id(0)
     r = tl.program_id(1)
@@ -55,7 +58,12 @@ def _begin_kernel(
         base = tl.load(ptrs + plane).to(tl.pointer_type(tl.bfloat16))
         stride = tl.load(page_strides + plane)
         offs = tl.arange(0, ROW_)
-        vals = tl.load(base + page * stride + tok * ROW_ + offs)
+        # The index planes' row of the slot (`index_plane_layout`; IROWS 0: the slot itself).
+        if IROWS != 0:
+            irow = index_plane_row(pos, TPB, CR, IROWS)
+        else:
+            irow = tok
+        vals = tl.load(base + page * stride + irow * ROW_ + offs)
         tl.store(index_out + (plane.to(tl.int64) * rows + r) * ROW_ + offs, vals)
     else:
         w = tl.arange(0, 4)
@@ -110,7 +118,16 @@ class SpecRollbackBegin(OpWrapper):
     """
 
     def __call__(
-        self, req_idx, logical, block_table, tokens_per_block: int, ptrs, page_strides, position
+        self,
+        req_idx,
+        logical,
+        block_table,
+        tokens_per_block: int,
+        ptrs,
+        page_strides,
+        position,
+        index_rows: int = 0,
+        compress_ratio: int = 0,
     ):
         rows = logical.shape[0]
         planes = ptrs.shape[0]
@@ -139,6 +156,8 @@ class SpecRollbackBegin(OpWrapper):
                 ROW_=ROW,
                 PLANES=planes,
                 POS_W_=POS_W,
+                CR=compress_ratio if index_rows != tokens_per_block else 0,
+                IROWS=index_rows if index_rows != tokens_per_block else 0,
                 num_warps=1,
             )
         return pages, within, index_all, position_old
@@ -153,7 +172,16 @@ class SpecRollbackBegin(OpWrapper):
         return pages, within, index_all, position[pages, within]
 
     def is_valid(
-        self, req_idx, logical, block_table, tokens_per_block: int, ptrs, page_strides, position
+        self,
+        req_idx,
+        logical,
+        block_table,
+        tokens_per_block: int,
+        ptrs,
+        page_strides,
+        position,
+        index_rows: int = 0,
+        compress_ratio: int = 0,
     ) -> None:
         rows = logical.shape[0]
         assert logical.dtype == torch.int64 and logical.dim() == 1 and rows >= 1, (
@@ -182,6 +210,10 @@ class SpecRollbackBegin(OpWrapper):
             and position.shape[2] == POS_W
             and position.stride(2) == 1
         ), (position.dtype, position.shape, position.stride())
+        # Compact index pages (`index_rows` below one row a token) are read through the row map.
+        assert index_rows in (0, tokens_per_block) or (
+            compress_ratio > 1 and tokens_per_block % compress_ratio == 0
+        ), (index_rows, tokens_per_block, compress_ratio)
 
 
 spec_rollback_begin = SpecRollbackBegin()
