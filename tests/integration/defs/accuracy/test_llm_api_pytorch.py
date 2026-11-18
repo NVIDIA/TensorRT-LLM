@@ -2079,7 +2079,7 @@ def _make_deepseekv4_eplb_config(model_path, layer_updates_per_iter, ep_size=8):
 
 DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
 # DeepSeek-V4-Pro (~806 GB) fits on 4 GPUs only with 288 GB-class memory.
-DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB = 250000
+DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB = 280000
 
 
 @skip_pre_blackwell
@@ -2667,6 +2667,34 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             assert_acceptance_length(
                 "TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl",
                 acceptance_length)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size,device_memory_gib,should_skip", [
+    pytest.param(4, 256, True, id="dp4-insufficient-memory"),
+    pytest.param(4, 275, False, id="dp4-sufficient-memory"),
+    pytest.param(8, 256, False, id="dp8-smaller-memory"),
+])
+def test_deepseekv4_pro_dspark_memory_eligibility(mocker: MockerFixture,
+                                                  tp_size: int,
+                                                  device_memory_gib: int,
+                                                  should_skip: bool) -> None:
+
+    class CheckpointLoadReached(Exception):
+        pass
+
+    mocker.patch.object(torch.cuda, "device_count", return_value=tp_size)
+    mocker.patch.object(
+        torch.cuda,
+        "get_device_properties",
+        return_value=mocker.Mock(total_memory=device_memory_gib * 1024**3))
+    mocker.patch(f"{__name__}.LLM", side_effect=CheckpointLoadReached)
+    expected_exception = (pytest.skip.Exception
+                          if should_skip else CheckpointLoadReached)
+    accuracy_test = TestDeepSeekV4ProDSpark()
+    with pytest.raises(expected_exception):
+        accuracy_test.test_gsm8k_megamoe_deepgemm(tp_size=tp_size,
+                                                  attention_dp=True)
 
 
 @pytest.mark.timeout(14400)
