@@ -100,7 +100,7 @@ def build_attention_metadata(
 
         # Metadata that implements the ragged rows: the dense TRTLLM metadata itself and
         # the DSA metadata. Other subclasses lay out their own rows. Whether the target is
-        # validated is the model's own declaration, which the caller checks.
+        # validated is the model's own declaration, which the model loader checks.
         metadata_type = attention_backend.Metadata
         if metadata_type is not TrtllmAttentionMetadata and not issubclass(
             metadata_type, DSAtrtllmAttentionMetadata

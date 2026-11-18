@@ -6970,7 +6970,7 @@ class TestDSparkConfidenceScheduling:
         return SimpleNamespace(**values)
 
     def test_confidence_environment_accepts_standalone_dspark(self):
-        # Whether the target is validated for it is the engine's check.
+        # Whether the target is validated for it is the model loader's check.
         environment = self._environment(speculative_config=SimpleNamespace(
             draft_is_embedded_in_target=False))
         TorchLlmArgs._validate_dspark_confidence_environment(environment)

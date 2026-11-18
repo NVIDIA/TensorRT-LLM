@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Focused CPU tests for DSpark decoder-runner ragged runtime state."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
+from transformers import LlamaConfig
 
 from tensorrt_llm._torch import utils as torch_utils
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
@@ -15,6 +17,9 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints import memory_init
+from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, DSparkCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine import metadata as metadata_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
@@ -27,9 +32,15 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import Decoder
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    ModelLoader,
+    validate_confidence_scheduling_support,
+)
 from tensorrt_llm._torch.speculative.dspark_schedule import DSparkScheduleConfig
 from tensorrt_llm._torch.speculative.dspark_select import select_windows_device
 from tensorrt_llm._torch.speculative.ragged_helpers import ragged_gather_index_lists
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.mapping import Mapping
 
 
 def _runner(*, secondary=True):
@@ -517,9 +528,7 @@ def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enable
     model, kwargs = _metadata_inputs(MetadataProbe)
     decoder = object.__new__(DecoderMetadata)
     decoder.attn_metadata = None
-    decoder.model = SimpleNamespace(
-        model_config=model, supports_ragged_verification=lambda _model_config: True
-    )
+    decoder.model = SimpleNamespace(model_config=model)
     decoder._config = SimpleNamespace(
         **kwargs, spec_config=SimpleNamespace(enable_confidence_scheduling=enabled)
     )
@@ -539,22 +548,55 @@ def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enable
     assert seen == [enabled]
 
 
-@pytest.mark.parametrize("declared", [None, False])
-def test_decoder_rejects_ragged_verification_the_model_does_not_declare(declared):
+@pytest.mark.parametrize("declared", [None, False, True])
+def test_loader_rejects_ragged_verification_the_model_does_not_declare(declared):
     """A target is validated by its own declaration, never by its metadata class alone."""
-    model, kwargs = _metadata_inputs(DSAtrtllmAttentionMetadata)
-    decoder = object.__new__(DecoderMetadata)
-    decoder.attn_metadata = None
-    decoder.model = SimpleNamespace(model_config=model)
+    model = SimpleNamespace(model_config=object())
     if declared is not None:
-        decoder.model.supports_ragged_verification = lambda _model_config: declared
-    decoder._config = SimpleNamespace(
-        **kwargs, spec_config=SimpleNamespace(enable_confidence_scheduling=True)
-    )
+        model.supports_ragged_verification = lambda _model_config: declared
+    spec_config = SimpleNamespace(enable_confidence_scheduling=True)
 
-    with pytest.raises(ValueError, match="not validated for SimpleNamespace"):
-        decoder.setup_attention(object())
-    assert decoder.attn_metadata is None
+    if declared:
+        validate_confidence_scheduling_support(model, spec_config)
+    else:
+        with pytest.raises(ValueError, match="not validated for SimpleNamespace"):
+            validate_confidence_scheduling_support(model, spec_config)
+
+    # Without confidence scheduling no declaration is needed.
+    validate_confidence_scheduling_support(
+        model, SimpleNamespace(enable_confidence_scheduling=False)
+    )
+    validate_confidence_scheduling_support(model, None)
+
+
+def test_model_loader_rejects_an_undeclared_target_before_loading_weights(tmp_path, monkeypatch):
+    """The loader refuses the target it built before any checkpoint weights are loaded."""
+    model = torch.nn.Module()
+    config = ModelConfig(pretrained_config=LlamaConfig(architectures=["LlamaForCausalLM"]))
+    loader = ModelLoader(
+        llm_args=TorchLlmArgs(model=str(tmp_path)),
+        mapping=Mapping(),
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=8,
+        max_seq_len=8,
+    )
+    loader.spec_config = SimpleNamespace(enable_confidence_scheduling=True)
+    monkeypatch.setattr(loader, "_load_and_validate_config", lambda *_args: config)
+    monkeypatch.setattr(memory_init, "MetaInitMode", nullcontext)
+    monkeypatch.setattr(
+        model_loader_module, "maybe_create_moe_load_balancer", lambda *_args: nullcontext()
+    )
+    monkeypatch.setattr(model_loader_module, "_checkpoint_startup_metadata", lambda *_args: {})
+    factory = MagicMock(return_value=model)
+    monkeypatch.setattr(model_loader_module.AutoModelForCausalLM, "from_config", factory)
+    checkpoint_loader = MagicMock()
+
+    with pytest.raises(ValueError, match="not validated for Module"):
+        loader.load(str(tmp_path), checkpoint_loader)
+
+    factory.assert_called_once()
+    checkpoint_loader.load_weights.assert_not_called()
 
 
 @pytest.mark.parametrize("graph_type", [CUDAGraphRunner, DSparkCUDAGraphRunner])

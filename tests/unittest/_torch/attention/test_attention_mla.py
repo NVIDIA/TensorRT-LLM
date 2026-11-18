@@ -1678,23 +1678,45 @@ def test_ragged_rows_reject_kv_caches_with_page_tables_of_their_own(
     """The rows expand the block offsets only."""
     metadata = _ragged_metadata(monkeypatch, [2, 2], 0, None)
     metadata.fp4_mla_state = None
-    metadata._validate_ragged_verification_kv_cache()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
+        lambda: 100)
+    metadata._validate_ragged_verification_support()
 
     manager = metadata.kv_cache_manager
     manager.mixed_precision_high_layers = {0: 1}
     manager.mixed_precision_low_dtype = "nvfp4"
     manager.mixed_precision_high_dtype = "fp8"
     with pytest.raises(ValueError, match="NVFP4 or mixed-precision KV cache"):
-        metadata._validate_ragged_verification_kv_cache()
+        metadata._validate_ragged_verification_support()
 
     manager.mixed_precision_high_layers = None
     metadata.fp4_mla_state = object()
     with pytest.raises(ValueError, match="NVFP4 or mixed-precision KV cache"):
-        metadata._validate_ragged_verification_kv_cache()
+        metadata._validate_ragged_verification_support()
 
     # Metadata without the rows is not concerned.
     metadata.enable_ragged_verification = False
-    metadata._validate_ragged_verification_kv_cache()
+    metadata._validate_ragged_verification_support()
+
+
+@pytest.mark.cpu_only
+def test_ragged_rows_need_the_sm100_family_kernels(monkeypatch):
+    """The other kernels verify drafts in spec-decoding mode, without the rows."""
+    metadata = _ragged_metadata(monkeypatch, [2, 2], 0, None)
+    metadata.fp4_mla_state = None
+    sm_version = "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version"
+    monkeypatch.setattr(sm_version, lambda: 90)
+    with pytest.raises(ValueError, match="SM100-family attention kernels"):
+        metadata._validate_ragged_verification_support()
+
+    monkeypatch.setattr(sm_version, lambda: 103)
+    metadata._validate_ragged_verification_support()
+
+    # Metadata without the rows is not concerned.
+    monkeypatch.setattr(sm_version, lambda: 90)
+    metadata.enable_ragged_verification = False
+    metadata._validate_ragged_verification_support()
 
 
 @pytest.mark.cpu_only

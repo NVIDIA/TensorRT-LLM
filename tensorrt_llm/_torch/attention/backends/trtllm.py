@@ -450,11 +450,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 "ragged verification metadata was installed without enabling "
                 "ragged-verification buffers")
 
-    def _validate_ragged_verification_kv_cache(self) -> None:
-        """Reject KV caches whose page tables the token-major rows do not expand."""
+    def _validate_ragged_verification_support(self) -> None:
+        """Reject kernels and KV caches the token-major rows do not serve."""
         if not (self.enable_ragged_verification
                 and self.uses_base_ragged_row_hooks):
             return
+        # The other kernels verify drafts in spec-decoding mode, one row per
+        # request, which prepare() does not build next to the rows.
+        if not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
+            raise ValueError(
+                "Ragged verification on the dense TRTLLM attention metadata "
+                "requires the SM100-family attention kernels")
         # Both read page tables of their own instead of the block offsets.
         if (self.fp4_mla_state is not None
                 or self._has_mixed_precision_staging()):
@@ -789,7 +795,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         None)):
             self.fp4_mla_state = Fp4MlaState.create(self, buffers)
 
-        self._validate_ragged_verification_kv_cache()
+        self._validate_ragged_verification_support()
 
         # Allocate static buffers for helix parallelism support.
         if self.enable_helix:

@@ -53,15 +53,6 @@ def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
     return getattr(model, "mamba_metadata_cls", None) or Mamba2Metadata
 
 
-def model_supports_ragged_verification(model: torch.nn.Module) -> bool:
-    """Whether ``model`` declares ragged verification for its configuration.
-
-    Declaring it is optional for every model class, so absence means it is not validated.
-    """
-    declared = getattr(model, "supports_ragged_verification", None)
-    return declared is not None and bool(declared(model.model_config))
-
-
 class DecoderMetadata:
     """Attention and speculative metadata reused across decoder iterations."""
 
@@ -110,12 +101,6 @@ class DecoderMetadata:
             assert self.attn_metadata.kv_cache_manager is kv_cache_manager
             return self.attn_metadata
 
-        if self._ragged_verification_enabled and not model_supports_ragged_verification(self.model):
-            raise ValueError(
-                "DSpark confidence scheduling is not validated for "
-                f"{type(self.model).__name__} with this speculative configuration; set "
-                "speculative_config.enable_confidence_scheduling=False"
-            )
         config = self.model.model_config.pretrained_config
         self.attn_metadata = build_attention_metadata(
             self.model.model_config,

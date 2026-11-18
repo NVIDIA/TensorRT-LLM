@@ -629,6 +629,7 @@ def test_gqa_dspark_keeps_the_trained_row_of_the_speculative_configs_mask_id():
         attention_backend="VANILLA",
         draft_is_embedded_in_target=False,
         max_draft_len=TINY["block_size"],
+        enable_confidence_scheduling=False,
     )
     drafter = _build_dspark_draft(
         SimpleNamespace(spec_config=spec),
@@ -667,11 +668,38 @@ def test_published_drafter_spelling_activates_the_heads():
     assert drafter.shift_label
     torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_head.markov_w1.weight"])
     torch.testing.assert_close(
+        drafter.confidence_head.proj.weight.cpu(),
+        weights["confidence_head.proj.weight"].float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
         drafter.confidence_head.proj.bias.cpu(),
         weights["confidence_head.proj.bias"].float(),
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize("confidence_scheduling", [False, True])
+def test_confidence_head_of_an_unknown_width_fails_only_under_confidence_scheduling(
+    confidence_scheduling,
+):
+    """Drafting never reads the head, so a width the runtime does not know matters only to the
+    verification scheduler."""
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=TINY["hidden_size"]),
+        has_markov_head=True,
+        _dspark_markov_rank=RANK,
+        _dspark_confidence_scheduling=confidence_scheduling,
+    )
+    weight = torch.zeros(1, TINY["hidden_size"] + RANK + 1)
+    build = GQADSparkForCausalLM._build_confidence_head
+    if confidence_scheduling:
+        with pytest.raises(ValueError, match="Confidence scheduling cannot score drafts with it"):
+            build(drafter, weight, None)
+    else:
+        assert build(drafter, weight, None) is None
 
 
 @needs_gpu
