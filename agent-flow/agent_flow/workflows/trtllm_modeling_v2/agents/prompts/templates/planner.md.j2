@@ -50,6 +50,12 @@ tasks:
                                 # the vocabulary queue row (kernel)
 ```
 
+`satisfies` names the checks you expect a task's work to answer for. Its
+worker, who knows what it changed, names the checks its landing runs, and
+the task's event tells you when that differs. A required check no landing
+has passed runs once no required task is open: plan the work that makes each
+pass, not a claim for every key.
+
 Kinds:
 
 {{ kind_rows }}
@@ -70,7 +76,6 @@ characters: every worker turn of the task carries it.
 
 It refuses a graph that breaks any of these, and tells you why:
 
-- every required check in the contract is in some task's `satisfies`;
 - ids are unique, dependencies exist and form no cycle;
 - `touches` stays inside the paths the commit policy allows, and no task asks
   for more devices than the site has. Within them, a task may reach any file

@@ -68,7 +68,7 @@ goal words cannot say.
 
 **The smallest contract that covers the request.** Every check loads the model (minutes on a
 large checkpoint). A check that passed stands, so each is paid once, and again only after it
-failed or when a task that claims it lands. Prove each requested feature **once**, at the member
+failed or when a landing's worker names it. Prove each requested feature **once**, at the member
 the request validates fully. One check of any kind covers a feature; the delivery report lists
 the checks behind each (`coverage.yaml`):
 
@@ -113,6 +113,12 @@ built), and say so in `notes`; a benchmark you start by hand runs captured too.
 - **What fails a check.** Nothing generated, or a benchmark under its floor: the golden rule
   is the benchmark score close to its reference. Kernel entries are judged by their output
   distribution against their reference (`trtllm-modeling-v2-entry`).
+- **Checks of your own.** When the request names a check the flow does not run (a feature
+  test, another accuracy script, a quick verify path), write it under `checks`: by name, its
+  `purpose` (what it protects and what passing means) and `run` (the command; it passes when
+  it exits 0, so the command holds its own threshold), and where it applies when not `core`
+  at its cheapest member (`covers`, `member`; `timeout` in seconds). It runs from the tree
+  being checked, on that member's devices, and the flow decides when, as for its own checks.
 - **Drafting floors.** A unit's `accuracy.acceptance` entry holds its own drafter; a later
   unit that runs the same drafter (`features: [mtp, multimodal]`) is held to the entry of the
   speculator it builds on unless it has its own, then to `default`.

@@ -598,8 +598,33 @@ class ExecutionStage:
             if tip and tip != before:
                 with self._turn_lock:
                     self._landed_attempts[task.id] = task.attempts
+        if decision.decision in FINISHED:
+            self._take_named_checks(task, decision)
         self._keep_receipt(task, decision)
         return decision.text
+
+    def _take_named_checks(self, task: graph_mod.Task, result: TaskResult) -> None:
+        """What the worker names under ``checks`` is what its landing runs: the task's ``satisfies``.
+
+        The planner names a task's checks before the work; the worker knows what
+        it changed. Without ``checks`` the planner's stand. A key the contract
+        does not hold runs nothing, and the planner hears it.
+        """
+        named = result.data.get("checks")
+        contract = getattr(self.workflow, "_contract", None)
+        if not isinstance(named, list) or contract is None:
+            return
+        known = {c.key for c in contract.checks}
+        keys = list(dict.fromkeys(str(k) for k in named if str(k) in known))
+        unknown = [str(k) for k in named if str(k) not in known]
+        if keys != task.satisfies:
+            result.annotate(
+                f"its worker named the checks its landing runs: {', '.join(keys) or 'none'}"
+                f" (the plan named {', '.join(task.satisfies) or 'none'})"
+            )
+        if unknown:
+            result.annotate(f"not checks of the contract, so not run: {', '.join(unknown)}")
+        task.satisfies = keys
 
     def _integrated_tip(self, task_id: str) -> str:
         """The branch tip the integration last fast-forwarded in for ``task_id``; "" for none."""
@@ -752,8 +777,8 @@ class ExecutionStage:
         header = (
             f"## Your task: `{task.id}` (tags: {', '.join(tags)})\n\n{task.goal}\n\n"
             f"The task envelope is `{envelope}`: the paths you may change (`touches`), the "
-            f"checks your work must pass (`satisfies`, run by the orchestrator, not you), "
-            f"and its priority."
+            f"checks the planner expects your work to answer for (`satisfies`), and its "
+            f"priority."
         )
         context = self._task_context(receipts, unit, task)
         parts = (header, context, tag_section(tags), prompt)

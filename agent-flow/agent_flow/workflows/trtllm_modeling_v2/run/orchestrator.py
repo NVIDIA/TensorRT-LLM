@@ -301,7 +301,6 @@ class GraphOrchestrator:
         #: The checkout a kernel task's files are named from: a multi-rank entry's op matrix.
         self.repo_root = str(repo_root)
         self.validation = {
-            "required_checks": [c.key for c in contract.required()],
             "allowed_paths": tuple(allowed_paths),
             "max_gpus": max_gpus,
             "own_paths": tuple(own_paths),
@@ -776,8 +775,9 @@ class GraphOrchestrator:
           failed and the target has changed since, or its run recorded none
           (``_owed``: a run that recorded none is owed even where an earlier
           pass stands);
-        - once no required task is open, any check that ran and failed and whose
-          target has changed since: the repairs are in, whoever claimed it.
+        - once no required task is open, any required check with no pass to
+          stand on (it failed and the target has changed since, or no landing
+          ran it): every required check passes once, whoever claimed it.
           ``busy``, with foreground work running, these run once per landing;
           otherwise at once. A benchmark among them waits until no required
           task is open, unless the bring-up still needs it;
@@ -795,13 +795,12 @@ class GraphOrchestrator:
         delivery = self._delivery_keys()
         marker, evaluation = self._evaluated()
         with self._status_lock:
-            latest = self.status.latest()
             owed_tier = set(self._owed) & delivery
             owed = set(self._owed) - delivery
-        if not open_work:
-            # The repairs are in: a check that ran and failed runs again on what they
-            # left, whether or not a repair named it.
-            claimed |= {key for key, verdict in latest.items() if not verdict.passed}
+        if not open_work and self._landings:
+            # Every required check passes once: with the work done, one that has not
+            # (it failed, or no landing ran it) runs on what the work left.
+            claimed = {c.key for c in self.contract.required()}
         due = [c.key for c in evaluation.missing if c.key in claimed and c.key not in delivery]
         due += [c.key for c in self.contract.checks if c.key in owed - set(due)]
         if open_work:

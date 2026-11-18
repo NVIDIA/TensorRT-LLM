@@ -108,10 +108,19 @@ must change before that.
    catalog entry lands a local variant in the target's own `ops/`, and the target is delivered
    with it: the run never changes a shared entry, so other models are not disturbed mid-run.
 3. **Prove and deliver:** checks measure fixed-commit snapshots against framework-owned references.
-   A check that passed stands: it runs again when a task that claims it lands, after it failed,
-   or when its inputs change, not because another task changed the target. Before delivery one
-   check runs on the final tree unless one already has, and the report names the commit each
-   check measured. Delivery requires the contract, tests and files to agree.
+   Three rules decide when a check runs:
+   - *A pass is kept.* Every required check passes once. A pass does not run again because
+     other code changed; a check that has not passed (it failed, or no landing ran it) runs
+     again on what the work left.
+   - *Whoever lands code names its checks.* A worker lists the checks of `contract.yaml` its
+     change can affect (its task's `satisfies` when it lists none); they run on what it
+     landed, passed before or not. A run that gives no result leaves them owed.
+   - *The final code is scored once.* Before delivery a benchmark has passed on the final
+     tree; if none has, the cheapest one runs.
+
+   A check the spec defines (`checks`: its purpose, and a command that passes when it exits
+   0) is one more check of the contract, run by the same rules. The report names the commit
+   each check measured. Delivery requires the contract, tests and files to agree.
 4. **Resume:** checkpoints, decision identities and task receipts recover completed work without
    adopting another attempt's answer. Compute sessions own resource allocation and safe cancellation;
    you or the launching agent handle cluster allocations and session renewal.

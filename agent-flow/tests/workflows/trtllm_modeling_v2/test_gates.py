@@ -1171,6 +1171,37 @@ def test_a_module_that_skips_itself_on_import_has_a_result_not_a_hole(tmp_path):
     assert skip.outcome == "skipped" and "sm_100 only" in skip.message
 
 
+@pytest.mark.parametrize(
+    "result, passed, says",
+    [
+        (CommandResult(0, "1 passed"), True, "exited 0: the router picks"),
+        (CommandResult(1, "1 failed"), False, "exited 1: the router picks"),
+        (CommandResult(124, timed_out=True), False, "timed out after 600s"),
+        (CommandResult(1, timed_out=True, infrastructure="the session ended"), False, "verdict"),
+    ],
+)
+def test_a_check_of_the_spec_is_judged_by_its_command(tmp_path, result, passed, says):
+    from agent_flow.workflows.trtllm_modeling_v2.checks.spec_check import run_spec_check
+
+    entry = {
+        "purpose": "the router picks the reference's experts",
+        "run": "pytest t.py",
+        "timeout": 600,
+    }
+    ran = []
+    verdict = run_spec_check(
+        "check[routing]",
+        entry,
+        task_data={"trtllm_repo_path": str(tmp_path)},
+        runner=lambda command, cwd, timeout: ran.append((command, timeout)) or result,
+        member="tp1",
+    )
+    assert ran == [("pytest t.py", 600)]
+    assert verdict.passed is passed and says in verdict.detail
+    # A lost session is no verdict on the target: the check is owed still.
+    assert bool(verdict.infrastructure) is bool(result.infrastructure)
+
+
 def test_a_unit_that_drafts_with_an_earlier_units_drafter_is_held_to_its_floor():
     resolve = acceptance_checks.resolve_acceptance_floor_spec
     accuracy = {"acceptance": {"mtp": {"min_absolute": 1.5}}}

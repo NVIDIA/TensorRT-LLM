@@ -243,7 +243,6 @@ def _cycle(tasks: Mapping[str, Task]) -> list[str]:
 def validate(
     graph: Graph,
     *,
-    required_checks: Iterable[str] = (),
     allowed_paths: Sequence[str] = (),
     max_gpus: int | None = None,
     known_checks: Iterable[str] | None = None,
@@ -288,10 +287,6 @@ def validate(
     cycle = _cycle(tasks)
     if cycle:
         errors.append("dependency cycle: " + " -> ".join(cycle))
-    claimed = {c for t in graph.tasks if t.status != "abandoned" for c in t.satisfies}
-    for check in required_checks:
-        if check not in claimed:
-            errors.append(f"required check {check!r} is in no task's `satisfies`")
     return errors
 
 

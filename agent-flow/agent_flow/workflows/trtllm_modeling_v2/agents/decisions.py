@@ -177,6 +177,8 @@ EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
     # target serves: the planner hears it with the task's end.
     # `macro` is a landed entry that composes native PyTorch calls, nothing better existing:
     # what it composes and where its writer looked.
+    # `checks` (either role) are the contract checks what the work changed can affect:
+    # they run when it lands, in place of the task's `satisfies`.
     "kernel_writer": (
         "entry",
         "receipt",
@@ -184,10 +186,11 @@ EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
         "engine_defect",
         "uncertified",
         "macro",
+        "checks",
     ),
     # `uncertified` names the calls a unit makes, correct, outside their entries'
     # CELLS: the planner hears them with the task's end and adds the certification.
-    "assembler": ("blocked_reason", "missing_entry", "uncertified"),
+    "assembler": ("blocked_reason", "missing_entry", "uncertified", "checks"),
 }
 
 

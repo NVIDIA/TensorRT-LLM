@@ -62,11 +62,18 @@ from ...spec.task_schema import (
     parse_parallel_segment,
     profile_of,
     resolve_per_unit,
+    spec_checks,
 )
 
 TIER_INNER = "inner"
 TIER_PROOF = "proof"
 TIER_DELIVERY = "delivery"
+
+
+def spec_check_gate(name: str) -> str:
+    """The gate of the check the spec defines as ``name`` (``checks``)."""
+    return f"check[{name}]"
+
 
 CONTRACT_FILENAME = "contract.yaml"
 STATUS_FILENAME = "contract_status.jsonl"
@@ -257,6 +264,9 @@ def check_inputs(
         "accuracy": entries,
         "env": environment.get("env") if isinstance(environment, Mapping) else None,
         "variant": variants_mod.variants(task_data).get(unit),
+        "check": next(
+            (e for n, e in spec_checks(task_data).items() if spec_check_gate(n) == gate), None
+        ),
     }
     text = json.dumps(_with_contents(payload, checkout), sort_keys=True, default=str)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
@@ -451,6 +461,22 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
             f"the {profile_of(task_data)} profile gates no configuration variant: "
             + ", ".join(variants_mod.variants(task_data))
         )
+    variants = variants_mod.variants(task_data)
+    for name, entry in spec_checks(task_data).items():
+        unit = str(entry.get("covers") or units[0])
+        if unit in variants:
+            base = variants_mod.base_unit(task_data, unit)
+            built = units[1 : units.index(base) + 1] if base in units else []
+            spec = check_config.variant_spec(task_data, unit, world_size=world_size)
+            at = members_for(spec, unit, world_size)
+        else:
+            built = units[1 : units.index(unit) + 1] if unit in units else []
+            at = members_for(task_data, unit, world_size)
+        member = str(entry.get("member") or (order_members_by_cost(at) or [""])[0])
+        gate = spec_check_gate(name)
+        inputs = check_inputs(task_data, unit, gate, member, built)
+        checks.append(Check(unit, gate, member, TIER_PROOF, inputs=inputs))
+        notes.append(f"{unit}: `{name}`, the spec's own check, at {member}: {entry['purpose']}")
     last_features = units[1:]
     if units and serving and not lean:
         last = units[-1]
@@ -978,6 +1004,7 @@ __all__ = [
     "latest_milestone",
     "load_cells",
     "measured_commit",
+    "spec_check_gate",
     "milestones",
     "record_milestone",
     "save_cells",

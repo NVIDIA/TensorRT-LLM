@@ -239,6 +239,62 @@ def test_a_delivery_check_runs_again_only_when_a_task_that_claims_it_lands(
     assert status.latest()[serve.key].marker == served_on
 
 
+def _naming(services, named):
+    """``services`` whose worker names ``named[task.id]`` as the checks its landing runs."""
+    work = services.work
+
+    def name(task):
+        if task.id in named:
+            task.satisfies = list(named[task.id])  # what the stage takes from `checks`
+        return work(task)
+
+    services.work = name
+    return services
+
+
+def test_a_landing_runs_the_checks_its_worker_names(tmp_path):
+    plan = _plan_once(
+        _task("core", "assemble", _CORE),
+        _task("mtp", "feature", _MTP, deps=["core"]),
+        _task("tidy", "kernel", deps=["mtp"], touches=["catalog/k.py"]),
+    )
+    # mtp's worker changed a path the core's benchmark runs; tidy's changed nothing a
+    # check reaches, though the plan had it run the core's benchmark.
+    named = {"mtp": [*_MTP, _CORE[1]], "tidy": []}
+    services = _naming(_moving_target(plan), named)
+    assert _standing_run(tmp_path, services) == "delivered"
+    assert sorted(k for k, m in services.ran if m == "m2") == sorted([*_MTP, _CORE[1]])
+    # Nothing ran at tidy's landing; the final tree is confirmed by the one benchmark.
+    assert [k for k, m in services.ran if m == "m3"] == [_STANDING.confirm]
+
+
+def test_a_check_no_landing_ran_runs_once_the_work_is_done(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    services = _naming(_moving_target(_plan_once(_task("core", "assemble", _CORE))), {
+        "core": _CORE[1:]})  # fmt: skip
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # Its worker named the benchmark only; the boot, which never passed, runs once the
+    # work is done.
+    assert services.ran == [(_CORE[1], "m1"), (_CORE[0], "m1")]
+
+
+def test_the_worker_names_the_checks_its_landing_runs():
+    from agent_flow.workflows.trtllm_modeling_v2.run.execution.handoff import TaskResult
+    from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
+
+    stage = SimpleNamespace(workflow=SimpleNamespace(_contract=_STANDING))
+    task = _task("mtp", "feature", _MTP)
+    said = TaskResult("UNIT_READY", data={"checks": [_MTP[1], _CORE[1], "core:boot@tp9"]})
+    ExecutionStage._take_named_checks(stage, task, said)
+    assert task.satisfies == [_MTP[1], _CORE[1]]
+    assert "named the checks its landing runs" in said.note and "core:boot@tp9" in said.note
+    # Without `checks`, the plan's stand.
+    task, quiet = _task("mtp", "feature", _MTP), TaskResult("UNIT_READY", data={})
+    ExecutionStage._take_named_checks(stage, task, quiet)
+    assert task.satisfies == _MTP and quiet.note == ""
+
+
 def test_a_check_task_owes_the_delivery_checks_it_names(tmp_path):
     serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
     contract = c.Contract(checks=(_STANDING.checks[1], serve), confirm=_CORE[1])

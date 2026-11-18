@@ -220,6 +220,30 @@ def test_a_unit_entry_under_acceptance_or_boot_names_a_unit_of_the_spec(tmp_path
     load_and_validate_task_yaml(_write(tmp_path, spec))
 
 
+def test_a_check_of_the_spec_is_one_more_check_of_the_contract(tmp_path):
+    spec = _valid_spec(tmp_path)
+    spec["checks"] = {
+        "routing": {"purpose": "the router picks the reference's experts", "run": "pytest t.py"}
+    }
+    contract = contract_mod.compile_contract(
+        load_and_validate_task_yaml(_write(tmp_path, spec)), world_size=4
+    )
+    assert [c.key for c in contract.checks] == [
+        "core:accuracy[gsm8k]@tp1",
+        "core:check[routing]@tp1",
+    ]
+    for entry, says in (
+        ({"run": "pytest t.py"}, "purpose"),
+        ({"purpose": "p"}, "run"),
+        ({"purpose": "p", "run": "pytest t.py", "covers": "mpt"}, "covers"),
+        ({"purpose": "p", "run": "pytest t.py", "timeout": 0}, "timeout"),
+        ({"purpose": "p", "run": "pytest t.py", "pass": "exit 0"}, "pass"),
+    ):
+        spec["checks"] = {"routing": entry}
+        with pytest.raises(task_schema.TaskSchemaError, match=says):
+            load_and_validate_task_yaml(_write(tmp_path, spec))
+
+
 def test_a_spec_that_says_nothing_of_block_reuse_leaves_it_off(tmp_path):
     spec = load_and_validate_task_yaml(_write(tmp_path, _valid_spec(tmp_path)))
     assert spec["runtime"]["kv_cache_reuse"] is False

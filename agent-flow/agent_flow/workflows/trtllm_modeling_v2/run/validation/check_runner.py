@@ -17,7 +17,7 @@ from agent_flow.console import print_message
 from ...checks import acceptance as acceptance_checks
 from ...checks import accuracy as accuracy_checks
 from ...checks import boot as boot_checks
-from ...checks import check_config, disagg, serve
+from ...checks import check_config, disagg, serve, spec_check
 from ...checks import verdict as check_result
 from ...checks.accuracy import resolve_model_key
 from ...infra.compute.environment import RunEnvironment
@@ -34,7 +34,12 @@ from ...infra.compute.executor import (
 from ...infra.compute.sessions import session_wait_from_task
 from ...infra.git import resolve_commit
 from ...spec import variants as variants_mod
-from ...spec.task_schema import assembly_units, features_through, parse_parallel_segment
+from ...spec.task_schema import (
+    assembly_units,
+    features_through,
+    parse_parallel_segment,
+    spec_checks,
+)
 from ..startup import datasets as datasets_mod
 from ..workspace import snapshots as snapshots_mod
 from . import anchors as anchors_mod
@@ -329,6 +334,11 @@ class CheckRunner:
                 boot=boot_checks.resolve_boot_spec(spec, unit, features),
                 **common(runner),
             )  # fmt: skip
+        own = {contract_mod.spec_check_gate(n): e for n, e in spec_checks(self.task_data).items()}
+        if gate in own:
+            return lambda runner: spec_check.run_spec_check(
+                gate, own[gate], task_data=spec, runner=runner, member=member
+            )
         raise ValueError(f"contract check {check.key} names no gate this workflow runs")
 
     def _with_dataset(self, spec: Any, gate: str) -> Any:
@@ -487,7 +497,8 @@ class CheckRunner:
         self.journal.event("gate", result.summary())
         if not result.passed:
             print_message(f"[bold yellow]↻ {escape_markup(result.summary())}[/bold yellow]", log)
-            if check.gate == disagg.GATE_NAME and result.stdout_tail.strip():
+            ran_a_test = check.gate == disagg.GATE_NAME or check.gate.startswith("check[")
+            if ran_a_test and result.stdout_tail.strip():
                 self.journal.section(
                     f"`{check.key}` failed: the test's last lines",
                     f"```\n{result.stdout_tail.rstrip()}\n```",

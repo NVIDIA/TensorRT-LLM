@@ -138,6 +138,15 @@ TARGET_FIELD = "target"
 RUNTIME_FIELD = "runtime"
 SCOPE_FIELD = "scope"
 NOTES_FIELD = "notes"
+#: ``checks``: checks of the spec's own, by name. Each says what it is for
+#: (``purpose``) and how to run it (``run``, a command that passes when it exits 0),
+#: and may say what it judges (``covers``, a unit or variant; ``core`` unsaid),
+#: where it runs (``member``; the cheapest member of ``covers`` unsaid) and for how
+#: long (``timeout``, seconds). It is a check of the contract like the flow's own:
+#: the same rules decide when it runs.
+CHECKS_FIELD = "checks"
+SPEC_CHECK_KEYS: tuple[str, ...] = ("purpose", "run", "covers", "member", "timeout")
+_SPEC_CHECK_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 # Runtime switches the gates must exercise, and which therefore have to be
 # declared rather than left to whatever the engine defaults to.
@@ -175,6 +184,7 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     COMMIT_POLICY_FIELD,
     VARIANTS_FIELD,
     "profile",
+    CHECKS_FIELD,
 )
 #: ``profile``: how much the contract owes, for the run or per unit (a mapping
 #: from unit or variant name, and ``default``, to a profile). ``smoke`` owes a
@@ -1292,6 +1302,58 @@ def _require_named_units(data: Mapping[str, Any], errors: list[str]) -> None:
                 )
 
 
+def spec_checks(task_data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """The checks the spec defines (``checks``), by name; empty when it defines none."""
+    block = task_data.get(CHECKS_FIELD)
+    if not isinstance(block, Mapping):
+        return {}
+    return {str(name): dict(entry) for name, entry in block.items() if isinstance(entry, Mapping)}
+
+
+def _validate_checks(data: Mapping[str, Any], errors: list[str]) -> None:
+    """``checks``: each names its purpose and its command, and judges a unit or variant of the spec."""
+    block = data.get(CHECKS_FIELD)
+    if block is None:
+        return
+    if not isinstance(block, Mapping):
+        errors.append(
+            f"'{CHECKS_FIELD}' must be a mapping from a check's name to its `purpose` and `run`"
+        )
+        return
+    named = _unit_names(data) - {"default"}
+    for name, entry in block.items():
+        where = f"{CHECKS_FIELD}.{name}"
+        if not _SPEC_CHECK_NAME.match(str(name)):
+            errors.append(f"'{where}': a check's name is letters, digits, '_', '.' and '-'")
+        if not isinstance(entry, Mapping):
+            errors.append(f"'{where}' must be a mapping with keys {list(SPEC_CHECK_KEYS)}")
+            continue
+        reject_unknown_keys(entry, SPEC_CHECK_KEYS, errors, where=where)
+        if not isinstance(entry.get("purpose"), str) or not entry["purpose"].strip():
+            errors.append(
+                f"'{where}.purpose' must say what the check is for and what passing means"
+            )
+        if not isinstance(entry.get("run"), str) or not entry["run"].strip():
+            errors.append(
+                f"'{where}.run' must be the command that runs it; it passes when it exits 0"
+            )
+        covers = entry.get("covers")
+        if covers is not None and str(covers) not in named:
+            errors.append(
+                f"'{where}.covers' names no unit or variant of this spec ({sorted(named)})"
+            )
+        if entry.get("member") is not None:
+            try:
+                parse_parallel_segment(str(entry["member"]))
+            except TaskSchemaError as exc:
+                errors.append(f"'{where}.member': {exc}")
+        timeout = entry.get("timeout")
+        if timeout is not None and (
+            isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0
+        ):
+            errors.append(f"'{where}.timeout' must be a positive number of seconds")
+
+
 def _validate_profile(data: Mapping[str, Any], errors: list[str]) -> None:
     """``profile``: one of :data:`PROFILES`, or a mapping from unit, variant or ``default`` to one."""
     profile = data.get(PROFILE_FIELD)
@@ -1536,6 +1598,7 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
 
     _validate_profile(data, errors)
     _require_named_units(data, errors)
+    _validate_checks(data, errors)
 
     if ENVIRONMENT_FIELD not in data:
         errors.append(
@@ -1611,6 +1674,9 @@ def assembly_units(data: Mapping[str, Any]) -> list[str]:
 
 
 __all__ = [
+    "CHECKS_FIELD",
+    "SPEC_CHECK_KEYS",
+    "spec_checks",
     "ANCHOR_RECORDED",
     "ANCHOR_RELATIVE",
     "ANCHOR_STATES",
