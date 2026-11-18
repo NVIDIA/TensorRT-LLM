@@ -66,8 +66,6 @@ def env(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "synchronize", Mock())
-    state.free_bytes = 1 << 40
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (state.free_bytes, 1 << 40))
     state.empty_cache = Mock()
     monkeypatch.setattr(torch.cuda, "empty_cache", state.empty_cache)
     return state
@@ -146,14 +144,34 @@ def test_post_load_installs_once_and_releases_original_bank(env) -> None:
     assert backend.release_ugpu_localized_weights() == 0
 
 
-def test_install_returns_cached_banks_when_the_new_bank_would_not_fit(env) -> None:
+def test_install_returns_cached_banks_and_retries_when_a_die_runs_out(env) -> None:
     backend = _localized(env)
     _packed(backend)
-    env.free_bytes = 1 << 20
+    env.driver.fail_operation = "create"
+    env.driver.fail_error = ugpu_weights.LocalizedAllocationOutOfMemory
     backend._install_ugpu_localized_weights()
     env.empty_cache.assert_called_once()
+    assert env.placements == ["n_split", "n_split"]
+    assert backend._ugpu_weight_owner is not None
     backend.release_ugpu_localized_weights()
     env.driver.assert_empty()
+
+
+def test_install_failing_again_after_the_retry_keeps_the_original_bank(env, monkeypatch) -> None:
+    backend = _localized(env)
+    originals = _packed(backend)
+
+    def out_of_memory(*tensors, mode):
+        env.placements.append(mode)
+        raise ugpu_weights.LocalizedAllocationOutOfMemory("injected")
+
+    monkeypatch.setattr(backend_module, "localize_megamoe_weights", out_of_memory)
+    with pytest.raises(ugpu_weights.LocalizedAllocationOutOfMemory):
+        backend._install_ugpu_localized_weights()
+    env.empty_cache.assert_called_once()
+    assert env.placements == ["n_split", "n_split"]
+    assert backend._ugpu_weight_owner is None
+    assert all(getattr(backend, name) is tensor for name, tensor in originals.items())
 
 
 def test_subclass_with_its_own_dispatch_is_rejected(env) -> None:

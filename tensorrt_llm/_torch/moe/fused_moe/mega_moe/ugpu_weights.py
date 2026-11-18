@@ -167,6 +167,13 @@ class _RawDeviceBytes:
         }
 
 
+_CUDA_ERROR_OUT_OF_MEMORY = 2
+
+
+class LocalizedAllocationOutOfMemory(RuntimeError):
+    """The driver could not back a localized bank on one of the dies."""
+
+
 class _CudaVmm:
     """Small CUDA driver boundary; all allocations are explicit and testable."""
 
@@ -189,6 +196,10 @@ class _CudaVmm:
     def _check(result, operation):
         status, *values = result
         code = int(getattr(status, "value", status))
+        if code == _CUDA_ERROR_OUT_OF_MEMORY:
+            raise LocalizedAllocationOutOfMemory(
+                f"{operation} failed with CUDA driver status {code} (out of memory)"
+            )
         if code:
             raise RuntimeError(f"{operation} failed with CUDA driver status {code}")
         return values[0] if len(values) == 1 else tuple(values)
