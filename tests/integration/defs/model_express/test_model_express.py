@@ -40,6 +40,7 @@ from defs.model_express.mx_harness import (
     donor_session,
     load_payload,
     log_tail,
+    model_worker_args,
     moe_worker_args,
     mx_metadata_ports,
     probe_worker_args,
@@ -366,8 +367,8 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
     donor_gpu_ids = gpu_ids[: case.tp_size]
     receiver_gpu_ids = gpu_ids[case.tp_size :]
     donor_port, receiver_port = mx_metadata_ports(case.tp_size)
-    # Every role of a row gets the same probe and MoE settings.
-    role_args = (*probe_worker_args(case), *moe_worker_args(case))
+    # Every role of a row gets the same probe, MoE, and checkpoint config settings.
+    role_args = (*probe_worker_args(case), *moe_worker_args(case), *model_worker_args(case))
 
     try:
         # Leave donor GPUs untouched in case MPI worker teardown trails the baseline process.

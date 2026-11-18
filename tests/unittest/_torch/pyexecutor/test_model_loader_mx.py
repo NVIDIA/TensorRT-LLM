@@ -1576,7 +1576,8 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
     `_MX_E2E_ROWS` names the rows of each profile and needs one entry per
     qualified profile. The `_MX_CASES` rows must follow the shared naming
     scheme, and `l0_model_express.yml` must list each row exactly once, in a
-    block whose GPU count matches the row's two TP groups.
+    block whose GPU count matches the row's two TP groups. All rows of a
+    profile load the same checkpoint with the same `model_kwargs`, if any.
     """
     profiles = mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.profiles
     assert set(_MX_E2E_ROWS) == {profile.profile_id for profile in profiles}, (
@@ -1609,6 +1610,8 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
                 # MoE rows disable the CUTLASS FC2+finalize fusion, which is not
                 # deterministic for top-k greater than 2.
                 expected_row["moe_disable_finalize_fusion"] = True
+            if "model_kwargs" in cases[f"{case_stem}-tp1"]:
+                expected_row["model_kwargs"] = cases[f"{case_stem}-tp1"]["model_kwargs"]
             assert cases[case_id] == expected_row
             assert case_id in ci_case_ids[2 * tp_size]
         # A MoE profile has one more row for each admitted MoE EP size above 1. It

@@ -37,6 +37,7 @@ from defs.model_express.mx_harness import (  # noqa: E402
     ROLES,
     MxE2ECase,
     assert_moe_partition,
+    model_worker_args,
     moe_worker_args,
 )
 
@@ -91,6 +92,29 @@ def test_moe_row_settings_reach_every_role(
     }
     assert moe_kwargs == expected_moe_kwargs
     assert kwargs == {**_llm_kwargs(_parse_args(argv)), **expected_moe_kwargs}
+
+
+@pytest.mark.parametrize("role", ROLES)
+def test_model_kwargs_reach_every_role(role: str) -> None:
+    """A row's checkpoint config overrides reach `LLM(model_kwargs=...)` in every role."""
+    case = MxE2ECase(
+        model_env="TRTLLM_MX_TEST_MODEL",
+        default_model_subdir="model",
+        repository_cache_prefix="models--trtllm-mx-e2e--test-tp1",
+        tp_size=1,
+        model_kwargs={"num_hidden_layers": 4},
+    )
+    argv = ["--role", role, "--model", "/model", "--tp-size", "1", "--output", "/out.json"]
+    if role != "baseline":
+        argv.extend(("--mx-url", "http://mx:8001"))
+
+    worker_args = model_worker_args(case)
+    kwargs = _llm_kwargs(_parse_args([*argv, *worker_args]))
+
+    assert worker_args == ("--model-kwargs", '{"num_hidden_layers": 4}')
+    assert kwargs == {**_llm_kwargs(_parse_args(argv)), "model_kwargs": {"num_hidden_layers": 4}}
+    assert "model_kwargs" not in _llm_kwargs(_parse_args(argv))
+    assert model_worker_args(_moe_row(1)) == ()
 
 
 # A small MoE checkpoint: 8 experts of intermediate size 64 over hidden size 32.

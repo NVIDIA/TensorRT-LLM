@@ -25,9 +25,10 @@ launching, transfer evidence, and weight-manifest comparison.
 
 from __future__ import annotations
 
-import functools
+import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -36,7 +37,7 @@ import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NoReturn
 from urllib.parse import urlparse
@@ -62,6 +63,9 @@ from tensorrt_llm._torch.weight_sharing import (
 
 WORKER_PATH = Path(__file__).with_name("mx_e2e_worker.py")
 WEIGHT_SUFFIXES = frozenset({".bin", ".ckpt", ".gguf", ".pt", ".pth", ".safetensors"})
+SAFETENSORS_INDEX = "model.safetensors.index.json"
+# The decoder-layer number in a checkpoint tensor name such as `model.layers.3.mlp.gate.weight`.
+_DECODER_LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 MINIMUM_MODELEXPRESS_VERSION = Version("0.5.1")
 _MODELEXPRESS_VERSION_PREFIX = "MODELEXPRESS_VERSION="
 MX_PREFLIGHT_SCRIPT = """
@@ -130,6 +134,10 @@ class MxE2ECase:
     MoE FC2+finalize fusion in every role, because the fused finalize is not
     deterministic for top-k greater than 2 and the roles must produce
     identical greedy tokens.
+
+    `model_kwargs` overrides checkpoint config values in every role, through
+    `LLM(model_kwargs=...)`. `{"num_hidden_layers": N}` loads only the first
+    `N` decoder layers of a checkpoint too large for the row's GPUs.
     """
 
     model_env: str
@@ -140,6 +148,7 @@ class MxE2ECase:
     probe: str = "text"
     moe_ep_size: int = 1
     moe_disable_finalize_fusion: bool = False
+    model_kwargs: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Reject a probe that `mx_e2e_worker.py` does not implement, or an impossible MoE split."""
@@ -315,43 +324,120 @@ def checkpoint_files(model_path: Path) -> tuple[Path, ...]:
     return tuple(sorted(path for path in model_path.rglob("*") if path.is_file()))
 
 
-@functools.cache
-def _checkpoint_identity(
-    model_path: Path, file_stats: tuple[tuple[str, int, int], ...]
+# `ArtifactIdentity` of each snapshot file set this session hashed. See `_snapshot_identity`.
+_SNAPSHOT_IDENTITIES: dict[
+    tuple[Path, tuple[tuple[str, int, int | str], ...]], ArtifactIdentity
+] = {}
+
+
+def _snapshot_identity(
+    model_path: Path,
+    file_stats: tuple[tuple[str, int, int | str], ...],
+    snapshot: Path,
 ) -> ArtifactIdentity:
-    """Hash a local checkpoint once per session.
+    """Hash the files of a donor snapshot once per session.
 
     `ArtifactIdentity.from_checkpoint` reads every byte of a local checkpoint,
     and several rows can share one, such as the Qwen3 MoE rows of one stage.
     `file_stats` holds the relative path, size, and modification time of every
-    file, so the cached identity is reused only for unchanged files.
+    linked checkpoint file, and the content digest of every generated one, so
+    a cached identity is reused only for an unchanged file set.
     """
-    del file_stats  # Only part of the cache key.
-    return ArtifactIdentity.from_checkpoint(model_path)
+    key = (model_path, file_stats)
+    if key not in _SNAPSHOT_IDENTITIES:
+        _SNAPSHOT_IDENTITIES[key] = ArtifactIdentity.from_checkpoint(snapshot)
+    return _SNAPSHOT_IDENTITIES[key]
+
+
+def first_layers_checkpoint_files(
+    model_path: Path, files: tuple[Path, ...], num_hidden_layers: int
+) -> tuple[tuple[Path, ...], bytes]:
+    """Select the files of a sharded SafeTensors checkpoint that its first decoder layers need.
+
+    A load with `model_kwargs={"num_hidden_layers": N}` reads the tensors of
+    the decoder layers below `N` and every tensor outside the decoder layers.
+    The weight shards that hold none of these are left out; a kept shard can
+    still hold tensors of later layers, which the load ignores.
+
+    Args:
+        model_path: Checkpoint directory with a `model.safetensors.index.json`.
+        files: Every file of the checkpoint.
+        num_hidden_layers: Number of leading decoder layers that the load builds.
+
+    Returns:
+        The files to keep, without the index, and the checkpoint's index
+        restricted to the kept shards.
+    """
+    index = json.loads((model_path / SAFETENSORS_INDEX).read_text(encoding="utf-8"))
+    weight_map = index["weight_map"]
+    kept_shards = set()
+    for tensor_name, shard in weight_map.items():
+        layer = _DECODER_LAYER_PATTERN.search(tensor_name)
+        if layer is None or int(layer.group(1)) < num_hidden_layers:
+            kept_shards.add(shard)
+    kept_files = tuple(
+        path
+        for path in files
+        if path.relative_to(model_path).as_posix() != SAFETENSORS_INDEX
+        and (
+            path.suffix.lower() not in WEIGHT_SUFFIXES
+            or path.relative_to(model_path).as_posix() in kept_shards
+        )
+    )
+    restricted_index = {
+        **index,
+        "weight_map": {
+            tensor_name: shard for tensor_name, shard in weight_map.items() if shard in kept_shards
+        },
+    }
+    return kept_files, (json.dumps(restricted_index, indent=2) + "\n").encode()
 
 
 def build_canonical_snapshot(case: MxE2ECase, model_path: Path, run_dir: Path) -> Path:
-    """Symlink the checkpoint into an HF-cache-shaped snapshot keyed by its `ArtifactIdentity`."""
+    """Symlink the checkpoint into an HF-cache-shaped snapshot keyed by its `ArtifactIdentity`.
+
+    When the row's `model_kwargs` limit `num_hidden_layers` and the checkpoint
+    has a SafeTensors index, the snapshot holds only the files that those
+    layers need (see `first_layers_checkpoint_files`), so neither the identity
+    hash nor any role reads the other shards.
+    """
     files = checkpoint_files(model_path)
     if not files:
         pytest.fail(f"MX E2E model directory is empty: {model_path}")
     if not any(path.suffix.lower() in WEIGHT_SUFFIXES for path in files):
         pytest.fail(f"MX E2E donor checkpoint contains no recognized weight files: {model_path}")
 
+    generated_files: dict[str, bytes] = {}
+    num_hidden_layers = case.model_kwargs.get("num_hidden_layers")
+    if num_hidden_layers is not None and (model_path / SAFETENSORS_INDEX).is_file():
+        files, generated_files[SAFETENSORS_INDEX] = first_layers_checkpoint_files(
+            model_path, files, num_hidden_layers
+        )
+
+    run_id = uuid.uuid4().hex[:12]
+    # The files are linked under a staging name first: the snapshot's name is
+    # the identity of exactly these files.
+    staging = run_dir / "donor-hf-cache" / f"staging-{run_id}"
+    for path in files:
+        destination = staging / path.relative_to(model_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.symlink_to(path.resolve())
+    for relative_path, content in generated_files.items():
+        (staging / relative_path).write_bytes(content)
     file_stats = tuple(
         (str(path.relative_to(model_path)), path.stat().st_size, path.stat().st_mtime_ns)
         for path in files
+    ) + tuple(
+        (relative_path, len(content), hashlib.sha256(content).hexdigest())
+        for relative_path, content in generated_files.items()
     )
-    source_identity = _checkpoint_identity(model_path, file_stats)
-    run_id = uuid.uuid4().hex[:12]
+    source_identity = _snapshot_identity(model_path, file_stats, staging)
     repository_cache_name = f"{case.repository_cache_prefix}-{run_id}"
     snapshot = (
         run_dir / "donor-hf-cache" / repository_cache_name / "snapshots" / source_identity.digest
     )
-    for path in files:
-        destination = snapshot / path.relative_to(model_path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.symlink_to(path.resolve())
+    snapshot.parent.mkdir(parents=True)
+    staging.rename(snapshot)
     return snapshot
 
 
@@ -421,6 +507,13 @@ def worker_command(
         command.extend(("--max-serve-seconds", str(max_serve_seconds)))
     command.extend(extra_args)
     return command
+
+
+def model_worker_args(case: MxE2ECase) -> tuple[str, ...]:
+    """Worker flags that apply a row's checkpoint config overrides identically to every role."""
+    if not case.model_kwargs:
+        return ()
+    return ("--model-kwargs", json.dumps(dict(case.model_kwargs), sort_keys=True))
 
 
 def moe_worker_args(case: MxE2ECase) -> tuple[str, ...]:
@@ -900,8 +993,9 @@ def assert_weight_manifests(
             )
 
 
-# Routed-expert tensors of the unquantized CUTLASS MoE backend, the only MoE
-# layout that `assert_moe_partition` knows: `[experts, rows, columns]`.
+# Routed-expert weights of the CUTLASS MoE backend: unquantized, or FP8 block-scale
+# on SM90, the MoE layouts that `assert_moe_partition` knows. Both are
+# `[experts, rows, columns]`; the FP8 block scales beside them are not checked.
 _ROUTED_EXPERT_SUFFIXES = (".w3_w1_weight", ".w2_weight")
 # Config keys that name the routed-expert count: Qwen MoE configs use
 # `num_experts`, and DeepSeek-style configs use `n_routed_experts`.
@@ -978,7 +1072,7 @@ def assert_moe_partition(
     )
     assert not unknown_layout, (
         f"`{unknown_layout[0]}` is not a 3-D `[experts, rows, columns]` tensor of the "
-        "unquantized CUTLASS MoE backend; teach `assert_moe_partition` this MoE layout"
+        "CUTLASS MoE backend; teach `assert_moe_partition` this MoE layout"
     )
 
     moe_tp_size = case.tp_size // case.moe_ep_size

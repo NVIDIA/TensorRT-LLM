@@ -27,10 +27,14 @@ shared storage at the same offset once, at the largest of their sizes, and
 `assert_transfer_within_manifests` rejects a receiver rank whose RDMA record
 moves more than its manifest holds.
 
-Probe arguments: the remaining tests check how a row's probe becomes
+Probe arguments: the probe tests check how a row's probe becomes
 `mx_e2e_worker.py` arguments, including missing probe images, and that the
 worker rejects inconsistent probe arguments and sizes every role of an
 image-probe row alike.
+
+Donor snapshot: a row that loads only the first decoder layers of a sharded
+checkpoint links only the shards those layers need, and its snapshot is named
+by the identity of exactly the linked files.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.weight_sharing import (
+    ArtifactIdentity,
     build_weight_manifest,
     manifest_file_name,
     write_weight_manifest,
@@ -54,14 +59,17 @@ from defs.model_express.mx_harness import (  # noqa: E402
     IMAGE_PROBE_FILES,
     MX_ROLES,
     ROLES,
+    SAFETENSORS_INDEX,
     MxE2ECase,
     MxRunLayout,
     archive_run_artifacts,
     assert_transfer_within_manifests,
     assert_weight_manifests,
+    build_canonical_snapshot,
     collect_available_manifests,
     collect_available_payloads,
     collect_weight_manifests,
+    first_layers_checkpoint_files,
     mx_transfer_upper_bound,
     probe_worker_args,
     report_timings,
@@ -416,3 +424,102 @@ def test_worker_image_probe_sizes_every_role_alike() -> None:
         assert role_kwargs["max_batch_size"] == 2 * len(mx_e2e_worker._IMAGE_PROBE_QUESTIONS)
         for key in ("max_batch_size", "max_num_tokens", "max_seq_len"):
             assert role_kwargs[key] == kwargs["baseline"][key]
+
+
+# A three-layer checkpoint in four shards: layer 0 shares a shard with the
+# embedding, layer 1 has its own shard, layer 2 shares one with the final norm
+# and LM head, and the MTP layer 3 has its own.
+_SHARDED_WEIGHT_MAP = {
+    "model.embed_tokens.weight": "model-00001-of-00004.safetensors",
+    "model.layers.0.self_attn.o_proj.weight": "model-00001-of-00004.safetensors",
+    "model.layers.1.self_attn.o_proj.weight": "model-00002-of-00004.safetensors",
+    "model.layers.1.mlp.gate.weight": "model-00002-of-00004.safetensors",
+    "model.layers.2.self_attn.o_proj.weight": "model-00003-of-00004.safetensors",
+    "model.norm.weight": "model-00003-of-00004.safetensors",
+    "lm_head.weight": "model-00003-of-00004.safetensors",
+    "model.layers.3.eh_proj.weight": "model-00004-of-00004.safetensors",
+}
+
+
+def _sharded_checkpoint(root: Path) -> Path:
+    root.mkdir()
+    (root / "config.json").write_text(json.dumps({"num_hidden_layers": 3}), encoding="utf-8")
+    (root / SAFETENSORS_INDEX).write_text(
+        json.dumps({"metadata": {"total_size": 8}, "weight_map": _SHARDED_WEIGHT_MAP}),
+        encoding="utf-8",
+    )
+    for shard in sorted(set(_SHARDED_WEIGHT_MAP.values())):
+        (root / shard).write_bytes(shard.encode())
+    return root
+
+
+def _snapshot_files(snapshot: Path) -> set[str]:
+    return {path.relative_to(snapshot).as_posix() for path in snapshot.rglob("*")}
+
+
+def test_first_layers_keep_only_the_shards_those_layers_need(tmp_path: Path) -> None:
+    model_path = _sharded_checkpoint(tmp_path / "model")
+    files = tuple(sorted(model_path.iterdir()))
+
+    kept_files, index = first_layers_checkpoint_files(model_path, files, num_hidden_layers=1)
+
+    # Layer 0 and the embedding share shard 1; shard 3 holds the norm and LM
+    # head beside layer 2, which the load ignores.
+    assert {path.name for path in kept_files} == {
+        "config.json",
+        "model-00001-of-00004.safetensors",
+        "model-00003-of-00004.safetensors",
+    }
+    restricted = json.loads(index)
+    assert restricted["metadata"] == {"total_size": 8}
+    assert restricted["weight_map"] == {
+        name: shard
+        for name, shard in _SHARDED_WEIGHT_MAP.items()
+        if shard in ("model-00001-of-00004.safetensors", "model-00003-of-00004.safetensors")
+    }
+
+
+def test_snapshot_of_the_first_layers_holds_and_hashes_only_their_shards(tmp_path: Path) -> None:
+    model_path = _sharded_checkpoint(tmp_path / "model")
+    case = MxE2ECase(
+        model_env="TRTLLM_MX_UNIT_MODEL",
+        default_model_subdir="tiny",
+        repository_cache_prefix="models--trtllm-mx-unit--first-layers-tp1",
+        tp_size=1,
+        model_kwargs={"num_hidden_layers": 2},
+    )
+
+    snapshot = build_canonical_snapshot(case, model_path, tmp_path / "run")
+
+    assert _snapshot_files(snapshot) == {
+        "config.json",
+        SAFETENSORS_INDEX,
+        "model-00001-of-00004.safetensors",
+        "model-00002-of-00004.safetensors",
+        "model-00003-of-00004.safetensors",
+    }
+    assert set(json.loads((snapshot / SAFETENSORS_INDEX).read_text())["weight_map"]) == {
+        name for name in _SHARDED_WEIGHT_MAP if not name.startswith("model.layers.3.")
+    }
+    # The snapshot is named by the identity of exactly its files.
+    expected_identity = ArtifactIdentity.from_checkpoint(_copy_of(snapshot, tmp_path / "copy"))
+    assert snapshot.name == expected_identity.digest
+    assert not list((tmp_path / "run" / "donor-hf-cache").glob("staging-*"))
+
+
+def test_snapshot_of_a_full_row_links_every_checkpoint_file(tmp_path: Path) -> None:
+    model_path = _sharded_checkpoint(tmp_path / "model")
+
+    snapshot = build_canonical_snapshot(_case(), model_path, tmp_path / "run")
+
+    assert _snapshot_files(snapshot) == {path.name for path in model_path.iterdir()}
+    assert all((snapshot / path.name).is_symlink() for path in model_path.iterdir())
+    assert snapshot.name == ArtifactIdentity.from_checkpoint(model_path).digest
+
+
+def _copy_of(snapshot: Path, destination: Path) -> Path:
+    """Copy a snapshot's files, following its symlinks, into a plain directory."""
+    destination.mkdir()
+    for path in snapshot.iterdir():
+        (destination / path.name).write_bytes(path.read_bytes())
+    return destination
