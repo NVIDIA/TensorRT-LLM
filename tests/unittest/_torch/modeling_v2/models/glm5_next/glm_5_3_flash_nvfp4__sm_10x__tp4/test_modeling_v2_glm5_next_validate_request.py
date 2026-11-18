@@ -7,8 +7,9 @@ materializing the logits, so a logits post-processor (a thinking budget, a reque
 own processor) has nothing to edit; without MTP the forward computes each sequence's
 last-token logits only, not the prompt's. Raised inside the step, either would fail
 every active request. With MTP it also refuses the engine's guided decoder, which the
-step has no bitmask for. The checks read only host-side fields, so these run on fake
-objects: no GPU or engine.
+step has no bitmask for. It builds no vision tower, so it refuses a request that carries
+media, which the forward would serve as its text alone. The checks read only host-side
+fields, so these run on fake objects: no GPU or engine.
 """
 
 from __future__ import annotations
@@ -63,6 +64,33 @@ def test_without_mtp_context_logits_are_refused():
 def test_with_mtp_context_logits_are_left_to_the_sampler():
     # SpecSampler.validate_request refuses them before the model's check runs.
     _admit(_request(context_logits=True), mtp=True)
+
+
+@pytest.mark.parametrize(
+    "mm_data, carried",
+    [
+        ({"image": {"pixel_values": None, "image_grid_thw": None}}, "image"),
+        ({"video": {"pixel_values_videos": None, "video_grid_thw": None}}, "video"),
+        ({"audio": object()}, "audio"),
+        ({"multimodal_embedding": object()}, "multimodal_embedding"),
+        ({"image": object(), "video": object()}, "image, video"),
+    ],
+    ids=["image", "video", "audio", "embedding", "image-and-video"],
+)
+def test_media_is_refused(mm_data, carried):
+    with pytest.raises(
+        ValueError, match=f"does not accept multimodal input; the request carries {carried}$"
+    ):
+        Shell.validate_multimodal_request_data(SimpleNamespace(), mm_data)
+
+
+@pytest.mark.parametrize(
+    "mm_data",
+    [{"image": None}, {"mrope_config": {"mrope_position_deltas": None}}],
+    ids=["empty-media-entry", "no-media"],
+)
+def test_a_payload_without_media_is_admitted(mm_data):
+    assert Shell.validate_multimodal_request_data(SimpleNamespace(), mm_data) is None
 
 
 def test_guided_decoding_is_refused():

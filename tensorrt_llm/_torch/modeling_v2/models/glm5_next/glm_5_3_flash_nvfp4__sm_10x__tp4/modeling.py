@@ -10,7 +10,8 @@ Sinkhorn-normalized mixing at every sublayer boundary), dense MLPs in layers 0-2
 12288) and 288-expert MoE layers 3-44 (top 8 sigmoid noaux_tc routing, scale 2.5, one shared
 expert of 2048), clamped SwiGLU (10), and one MTP layer (index 45). Routed experts and the dense
 MLPs are W4A4 NVFP4; attention, router, shared experts and the whole MTP layer are BF16. The
-checkpoint is the text half of `Glm5NextForConditionalGeneration`; the vision tower is not built.
+checkpoint is the text half of `Glm5NextForConditionalGeneration`; the vision tower is not built,
+and a request that carries media is refused at admission (`validate_multimodal_request_data`).
 
 A forward is one call into this target's step program (`csrc/`: the decoder layers, the
 vocabulary-parallel LM head and the MTP draft chain as CUDA kernels, built for sm_100a and sm_103a
@@ -119,6 +120,8 @@ IDX_SPLIT_MIN_T = 1024
 ATTN_TILED_MIN = 64
 # temperatures below this are greedy (the runtime's sampler threshold)
 GREEDY_TEMPERATURE = 1e-4
+# `multimodal_data` entries that carry media for an encoder, or encoder output in place of it
+MEDIA_KEYS = frozenset({"audio", "image", "video", "multimodal_embedding"})
 
 
 def _runtime_model_config(model_config: ModelConfig) -> ModelConfig:
@@ -1133,6 +1136,18 @@ class ModelingV2Glm53FlashNvfp4Sm10xTp4(
                 "return_context_logits / prompt_logprobs are not supported by the GLM-5.3-Flash "
                 "ModelingV2 target: it computes the logits of each sequence's last token only. "
                 "Drop them from the request."
+            )
+
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Admission check of a request's multimodal payload, run by the executor: a payload that
+        carries media is refused, as that request's own error. The target builds no vision tower,
+        so the forward would serve the request's text without the media. A payload without media
+        is admitted."""
+        media = sorted(key for key in MEDIA_KEYS if mm_data.get(key) is not None)
+        if media:
+            raise ValueError(
+                f"{type(self).__name__} serves this checkpoint's language model only and does not "
+                f"accept multimodal input; the request carries {', '.join(media)}"
             )
 
     def forward(
