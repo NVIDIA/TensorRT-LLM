@@ -94,21 +94,6 @@ def _partition_pages_kernel(
             tl.store(dst_indptr + task + 1, (task + 1) * PARTITION_PAGES)
 
 
-@triton.jit
-def _scale_row_max_kernel(
-    maxima,
-    q_scale,
-    kv_scale,
-    COUNT: tl.constexpr,
-    SOFTMAX_SCALE_LOG2: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    scale = SOFTMAX_SCALE_LOG2 / (tl.load(q_scale) * tl.load(kv_scale))
-    values = tl.load(maxima + offsets, offsets < COUNT, other=0)
-    tl.store(maxima + offsets, values * scale, offsets < COUNT)
-
-
 def run_fp4_mla_splitkv(
     module: ModuleType,
     metadata: Any,
@@ -143,7 +128,7 @@ def run_fp4_mla_splitkv(
     All input replication and partition planning execute on the current stream
     on every invocation; graph replay therefore consumes the current inputs.
     """
-    from .fp4_mla_splitkv_reduce import fp4_mla_split_kv_reduce
+    from .fp4_mla_splitkv_vector import reduce_splitkv_vector
     from .layout import _ensure_workspace_tensor
 
     queries, output_heads, value_dim = output.shape
@@ -261,40 +246,16 @@ def run_fp4_mla_splitkv(
     )
     # These tiles cover the small-head TEP and full-head DEP decode shapes.
     default_columns = 512 if output_heads >= 96 else (128 if queries >= 24 else 256)
-    vector_columns = getattr(metadata, "_fp4_mla_splitkv_reduce_tile", default_columns)
-    if vector_columns:
-        from .fp4_mla_splitkv_vector import reduce_splitkv_vector
-
-        reduce_splitkv_vector(
-            partial,
-            maxima,
-            sums,
-            output,
-            q_global_scale,
-            kv_global_scale,
-            splits=splits,
-            queries=queries,
-            softmax_scale_log2=sm_scale * math.log2(math.e),
-            output_scale=1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
-            tile_columns=vector_columns,
-        )
-        return
-
-    # Read global scales on the device so their values need no host sync and
-    # may change between graph replays. The existing reducer then uses scale=1.
-    _scale_row_max_kernel[(triton.cdiv(maxima.numel(), 256),)](
+    reduce_splitkv_vector(
+        partial,
         maxima,
+        sums,
+        output,
         q_global_scale,
         kv_global_scale,
-        maxima.numel(),
-        sm_scale * math.log2(math.e),
-        256,
-    )
-    fp4_mla_split_kv_reduce(
-        partial.view(splits, queries, heads, value_dim)[:, :, :output_heads].permute(0, 2, 3, 1),
-        maxima.view(splits, queries, heads)[:, :, :output_heads].permute(0, 2, 1),
-        sums.view(splits, queries, heads)[:, :, :output_heads].permute(0, 2, 1),
-        output.permute(1, 2, 0),
-        softmax_scale_log2=1.0,
+        splits=splits,
+        queries=queries,
+        softmax_scale_log2=sm_scale * math.log2(math.e),
         output_scale=1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
+        tile_columns=getattr(metadata, "_fp4_mla_splitkv_reduce_tile", None) or default_columns,
     )
