@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Routing for Qwen4ExpForConditionalGeneration.
 
-Qwen3.8-Flash-Next-NVFP4 on sm103 lands on `qwen3_8_flash_next_nvfp4__sm_103__default` at one
+Qwen3.8-Flash-Next-NVFP4 on sm103 lands on `qwen3_8_flash_next_nvfp4__sm_10x__default` at one
 of the layouts in `_LAYOUTS`, and Qwen3.8-Flash-Next-FP8 (FP8_BLOCK_SCALES) on
-`qwen3_8_flash_next_fp8__sm_103__unified` at one of `_FP8_LAYOUTS`, each with one-model
+`qwen3_8_flash_next_fp8__sm_10x__default` at one of `_FP8_LAYOUTS`, each with one-model
 MTP-Eagle (not at dep2) or no speculative decoding. The target's `check_deployment` then
 declines the checkpoints and engine choices it does not run, so `auto` falls back to the
 built-in implementation instead of failing in the build.
@@ -98,15 +98,15 @@ def route(
             "this layout; MTP under attention DP is admitted at dep4"
         )
     if fp8:
-        from .qwen3_8_flash_next_fp8__sm_103__unified.modeling import (
-            ModelingV2Qwen38FlashNextFp8Sm103Unified,
+        from .qwen3_8_flash_next_fp8__sm_10x__default.modeling import (
+            ModelingV2Qwen38FlashNextFp8Sm10xDefault,
         )
 
-        ModelingV2Qwen38FlashNextFp8Sm103Unified.check_deployment(model_config, llm_args, member)
-        return ModelingV2Qwen38FlashNextFp8Sm103Unified
-    from .qwen3_8_flash_next_nvfp4__sm_103__default.modeling import (
-        ModelingV2Qwen38FlashNextNvfp4Sm103Default,
+        ModelingV2Qwen38FlashNextFp8Sm10xDefault.check_deployment(model_config, llm_args, member)
+        return ModelingV2Qwen38FlashNextFp8Sm10xDefault
+    from .qwen3_8_flash_next_nvfp4__sm_10x__default.modeling import (
+        ModelingV2Qwen38FlashNextNvfp4Sm10xDefault,
     )
 
-    ModelingV2Qwen38FlashNextNvfp4Sm103Default.check_deployment(model_config, llm_args, member)
-    return ModelingV2Qwen38FlashNextNvfp4Sm103Default
+    ModelingV2Qwen38FlashNextNvfp4Sm10xDefault.check_deployment(model_config, llm_args, member)
+    return ModelingV2Qwen38FlashNextNvfp4Sm10xDefault

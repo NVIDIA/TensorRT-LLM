@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """`SpeculativeRollback`'s staging and commit of a verify step in one launch each.
 
-Tier 5 (Triton, called by the qwen4_exp target, `qwen3_8_flash_next_nvfp4__sm_103__default`,
+Tier 5 (Triton, called by the qwen4_exp target, `qwen3_8_flash_next_nvfp4__sm_10x__default`,
 at every layout). Each `__call__` is one launch of a Triton kernel of this file,
 JIT-compiled on first use for the device it runs on. A verify step runs `p` rows per generation
 request through the trunk; the PLE pools and the QSA planes are written for every row. The staging

@@ -83,7 +83,7 @@ _FP8_MTP = dict(heads=24, head_dim=256, dtype=torch.bfloat16, gate="interleaved"
 
 #: The shapes each target calls this entry with beyond its own cells, by target directory.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default": (
         Cell(
             why="fp8 tp2/tep2 decode, one token: 12 heads off the 7424-wide row, direct launch",
             spec=dict(tokens=1, direct_launch=True, **_FP8_TP2_ROW),

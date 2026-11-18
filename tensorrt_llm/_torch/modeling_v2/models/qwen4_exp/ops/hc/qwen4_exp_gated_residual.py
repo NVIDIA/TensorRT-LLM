@@ -9,7 +9,7 @@ computes a different hyper-connection (a per-stream scalar gate, a weighted sum,
 the raw stream gated) and does not instantiate hidden 2560. The semantics follow
 the HuggingFace ``Qwen4ExpTextGatedResidual`` minus its norm.
 
-No target calls it: the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`)
+No target calls it: the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_10x__default`)
 runs every mixer, the MTP layer's included, on the fused hyper-connection entries. This
 entry is their unfused form: `gate_ratio` is the band their tests gate `low`, `inject` and
 `mixed` in, and the target's MTP draft hyper-connection test takes `reference` as the

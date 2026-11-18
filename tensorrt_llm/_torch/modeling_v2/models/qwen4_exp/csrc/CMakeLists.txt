@@ -23,7 +23,7 @@ add_modeling_v2_family(qwen4_exp)
 # The hyper-connection all-reduce uses the stock all-reduce's IPC workspace,
 # which exists only in multi-device builds.
 add_modeling_v2_target(
-  qwen4_exp qwen3_8_flash_next_fp8__sm_103__unified
+  qwen4_exp qwen3_8_flash_next_fp8__sm_10x__default
   ARCHS 103a
   SOURCES *.cu *.cpp
   REQUIRES MULTI_DEVICE)

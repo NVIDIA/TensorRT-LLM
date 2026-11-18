@@ -186,13 +186,13 @@ class FusedSigmoidMulInplace(OpWrapper):
 
     Call sites, each the attention output gate between the attention core and
     o_proj:
-      - The target at tp1 (`qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default`): the
+      - The target at tp1 (`qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default`): the
         trunk's gate as the 2-D window of the fused input projection row
         (14080 wide, the gate at column 7168, hidden 6144) at decode and
         prefill row counts; its MTP layer's gate as the strided second half of
         each head of a `[T, 24, 512]` q_proj.
       - The default target's trunk
-        (`qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default`):
+        (`qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default`):
         `DecodeTarget._attention_block` (decode, 1..128 rows at tp4 / tep4,
         1..32 at a dep4 rank), its MTP verify (up to 128 x 8 = 1024 rows, tep4,
         draft 7) and `PrefillTarget._attention_block` (one chunk of up to 8192
