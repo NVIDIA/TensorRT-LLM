@@ -1587,6 +1587,47 @@ def format_multimodal_encoder_output_budget_error(
         f"{chunking_hint}")
 
 
+def get_attached_mm_bytes(mm_data: Any,
+                          bytes_per_encoder_embedding: int) -> int:
+    """Return the bytes of precomputed MM embeddings attached to a request.
+
+    Attached embeddings bypass the encoder and its output cache, and prefill
+    moves them to the device whole, so all of them are resident at once. The
+    tensors' own sizes count; embeddings not yet restored to tensors count
+    their declared rows at the model's row size. Returns 0 when nothing is
+    attached, including after prefill stripped the embeddings. Raises
+    `ValueError` when non-tensor embeddings declare no output lengths.
+    """
+    if not isinstance(mm_data, dict):
+        return 0
+    embedding = mm_data.get("multimodal_embedding")
+    if embedding is None:
+        return 0
+    tensors = embedding if isinstance(embedding, (list, tuple)) else [embedding]
+    if all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+    item_metadata = get_multimodal_item_metadata(mm_data)
+    lengths = (item_metadata.output_embedding_lengths
+               if item_metadata is not None else None)
+    if lengths is None:
+        raise ValueError("Attached multimodal embeddings that are not tensors "
+                         "require output_embedding_lengths")
+    return sum(lengths) * bytes_per_encoder_embedding
+
+
+def format_attached_mm_embedding_budget_error(
+        required_bytes: int,
+        budget_bytes: int,
+        request_id: Optional[int] = None) -> str:
+    """Format guidance for attached embeddings that exceed the MM output budget."""
+    request_label = ("Multimodal request" if request_id is None else
+                     f"Multimodal request {request_id}")
+    return (f"{request_label} attaches {required_bytes} bytes of precomputed "
+            "embeddings but the encoder output budget is only "
+            f"{budget_bytes} bytes; raise encoder_max_num_tokens to serve "
+            "embeddings of this size")
+
+
 def get_mm_max_resident_embeddings(
         request: LlmRequest, embedding_lengths: List[int],
         context_chunk_unit_size: Optional[int]) -> int:
@@ -1640,7 +1681,8 @@ def initialize_multimodal_encoder_request(
     effective encoder token budget, the items' embedding rows do not match
     the prompt's embedding slots, or — when the encoder-output budget is
     supplied — the outputs that must be resident at once could never fit
-    (see `get_mm_max_resident_embeddings`).
+    (see `get_mm_max_resident_embeddings`), or the request's attached
+    precomputed embeddings alone exceed it.
     """
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
@@ -1665,6 +1707,16 @@ def initialize_multimodal_encoder_request(
             raise ValueError(
                 f"Multimodal item requires {largest} encoder tokens, exceeding "
                 f"the effective startup maximum {max_num_tokens}")
+
+    if has_full_embedding and max_output_bytes is not None:
+        attached_bytes = get_attached_mm_bytes(mm_data,
+                                               bytes_per_encoder_embedding)
+        if attached_bytes > max_output_bytes:
+            raise ValueError(
+                format_attached_mm_embedding_budget_error(
+                    attached_bytes,
+                    max_output_bytes,
+                    request_id=request.py_request_id))
 
     request.py_mm_encoder_state = None
     if token_lengths is not None:
