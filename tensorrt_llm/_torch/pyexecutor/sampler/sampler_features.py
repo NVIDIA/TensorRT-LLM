@@ -69,7 +69,7 @@ __all__ = [
     "_StepIndexTranslator",
     "_StridedStepIndexTranslator",
     "_UnpackedStepIndexer",
-    "apply_embedding_bias",
+    "EmbeddingBiasCache",
     "check_stop_words_length",
     "fast_greedy_sample_kernel",
     "first_stop_reason",
@@ -525,14 +525,26 @@ class EmbeddingBiasCache:
         self._vocab_size = vocab_size
         self.CACHE_SENTINEL_ATTR_NAME: Final[str] = "_py_has_cached_embedding_bias"
 
-    def update(self, reqs: list[LlmRequest]) -> None:
+        # Slots can be reused, but request_id is quasi unique (cf. MIN_GLOBAL_ID).
+        # Tracking which request_id is cached in each slot.
+        self._slot_to_request_id: dict[int, int] = {}
+
+    def _is_cached(self, req: LlmRequest) -> bool:
+        if not getattr(req, self.CACHE_SENTINEL_ATTR_NAME, None):
+            return False
+
+        return self._slot_to_request_id[req.py_seq_slot] == req.py_request_id
+
+    def _mark_cached(self, req: LlmRequest) -> None:
+        self._slot_to_request_id[req.py_seq_slot] = req.py_request_id
+        setattr(req, self.CACHE_SENTINEL_ATTR_NAME, True)
+
+    def _update(self, reqs: list[LlmRequest]) -> None:
         # NB: This could be extended to allow reuse of equivalent rows in _flat_cache
         #     (potentially relevant for output sequence length <~ batch size).
 
         reqs_needing_update = [
-            req
-            for req in reqs
-            if req.py_embedding_bias and not getattr(req, self.CACHE_SENTINEL_ATTR_NAME, None)
+            req for req in reqs if req.py_embedding_bias and not self._is_cached(req)
         ]
 
         if not reqs_needing_update:
@@ -605,98 +617,80 @@ class EmbeddingBiasCache:
         ]
 
         for req in reqs_needing_update:
-            setattr(req, self.CACHE_SENTINEL_ATTR_NAME, True)
+            self._mark_cached(req)
 
-    def get(self) -> torch.Tensor:
-        return self._flat_cache
+    def apply_bias(
+        self,
+        logits: torch.Tensor,
+        requests: list[LlmRequest],
+        request_steps: torch.Tensor,
+    ) -> None:
+        """Apply embedding bias (aka logit bias) to logits.
 
+        Arguments:
+        request_steps: Number of steps/tokens for each request.
 
-def apply_embedding_bias(
-    logits: torch.Tensor,
-    requests: list[LlmRequest],
-    request_steps: torch.Tensor,
-    max_num_sequences: int,
-    maybe_embedding_bias_cache: EmbeddingBiasCache | None = None,
-) -> EmbeddingBiasCache | None:
-    """Apply embedding bias (aka logit bias) to logits.
+        Modifies logits in-place.
+        """
+        # NB: Unfortunately, Torch provides no combination of torch.index_select (similar to
+        #     torch.Tensor.gather -- allows one-to-many mapping) and addition, analogous to how
+        #     torch.Tensor.scatter_add_ (and its variant torch.Tensor.index_add_ -- allows
+        #     many-to-one mapping) combine addition with torch.Tensor.scatter_.
+        #
+        #     Notwithstanding the previous point, there are two options:
+        #         (i)  materialize a permuted bias tensor with repeated consecutive rows via
+        #              torch.repeat_interleave and then use torch.Tensor.index_add_ (poor write
+        #              locality / risk of false sharing)
+        #        (ii)  materialize the correctly ordered bias tensor via torch.index_select and then
+        #              perform a masked addition (poor read locality for request batches randomly
+        #              mixing uniform and heterogeneous bias tensors, i.e., mixing slices with high
+        #              and low reuse).
+        #     Since read-caching is expected to help in typical cases, option (ii) is implemented here.
 
-    Arguments:
-      request_steps: Number of steps/tokens for each request.
+        if all(not req.py_embedding_bias for req in requests):
+            return
 
-    Modifies logits in-place.
-    """
-    # NB: Unfortunately, Torch provides no combination of torch.index_select (similar to
-    #     torch.Tensor.gather -- allows one-to-many mapping) and addition, analogous to how
-    #     torch.Tensor.scatter_add_ (and its variant torch.Tensor.index_add_ -- allows
-    #     many-to-one mapping) combine addition with torch.Tensor.scatter_.
-    #
-    #     Notwithstanding the previous point, there are two options:
-    #         (i)  materialize a permuted bias tensor with repeated consecutive rows via
-    #              torch.repeat_interleave and then use torch.Tensor.index_add_ (poor write
-    #              locality / risk of false sharing)
-    #        (ii)  materialize the correctly ordered bias tensor via torch.index_select and then
-    #              perform a masked addition (poor read locality for request batches randomly
-    #              mixing uniform and heterogeneous bias tensors, i.e., mixing slices with high
-    #              and low reuse).
-    #     Since read-caching is expected to help in typical cases, option (ii) is implemented here.
+        # Track which logits require logit bias application
+        request_steps_list = request_steps.tolist()
+        logits_bias_masks = [False] * logits.size(0)
 
-    if all(not req.py_embedding_bias for req in requests):
-        return maybe_embedding_bias_cache
+        # Source indices for bias application
+        bias_gather_indices: list[int] = []
 
-    vocab_size = logits.size(-1)
-    if maybe_embedding_bias_cache is None:
-        embedding_bias_cache = EmbeddingBiasCache(
-            logit_dtype=logits.dtype,
-            vocab_size=vocab_size,
-            max_seq_slots=max_num_sequences,
-            device=logits.device,
+        # Collect bias information
+        #
+        # NB: the mask indexes rows of 'logits', not requests: a request contributes
+        #     'steps' consecutive rows (> 1 under speculative decoding), so the offset
+        #     has to accumulate 'steps' rather than track the request index.
+        row_offset = 0
+        reqs_using_bias = []
+        for req, steps in zip(requests, request_steps_list):
+            req_bias = req.py_embedding_bias
+            if req_bias:
+                reqs_using_bias.append(req)
+                for j in range(row_offset, row_offset + steps):
+                    logits_bias_masks[j] = True
+                seq_slot = req.py_seq_slot
+                assert seq_slot is not None
+                bias_gather_indices.extend(repeat(seq_slot, steps))
+            row_offset += steps
+
+        self._update(reqs_using_bias)
+        biases_by_slot_cuda = self._flat_cache  # indexed by seq_slot
+
+        bias_gather_indices_cuda = torch.tensor(
+            bias_gather_indices, pin_memory=prefer_pinned(), dtype=torch.int32
+        ).to(logits.device, non_blocking=True)
+        logits_bias_mask_cuda = torch.tensor(
+            logits_bias_masks, pin_memory=prefer_pinned(), dtype=torch.bool
+        ).to(logits.device, non_blocking=True)
+
+        Fusions.gather_masked_inplace_add(
+            summands_cuda=biases_by_slot_cuda,
+            summand_indices_cuda=bias_gather_indices_cuda,
+            output_cuda=logits,
+            output_mask_cuda=logits_bias_mask_cuda,
         )
-    else:
-        embedding_bias_cache = maybe_embedding_bias_cache
-
-    # Track which logits require logit bias application
-    request_steps_list = request_steps.tolist()
-    logits_bias_masks = [False] * logits.size(0)
-
-    # Source indices for bias application
-    bias_gather_indices: list[int] = []
-
-    # Collect bias information
-    #
-    # NB: the mask indexes rows of 'logits', not requests: a request contributes
-    #     'steps' consecutive rows (> 1 under speculative decoding), so the offset
-    #     has to accumulate 'steps' rather than track the request index.
-    row_offset = 0
-    reqs_using_bias = []
-    for req, steps in zip(requests, request_steps_list):
-        req_bias = req.py_embedding_bias
-        if req_bias:
-            reqs_using_bias.append(req)
-            for j in range(row_offset, row_offset + steps):
-                logits_bias_masks[j] = True
-            seq_slot = req.py_seq_slot
-            assert seq_slot is not None
-            bias_gather_indices.extend(repeat(seq_slot, steps))
-        row_offset += steps
-
-    embedding_bias_cache.update(reqs_using_bias)
-    biases_by_slot_cuda = embedding_bias_cache.get()  # indexed by seq_slot
-
-    bias_gather_indices_cuda = torch.tensor(
-        bias_gather_indices, pin_memory=prefer_pinned(), dtype=torch.int32
-    ).to(logits.device, non_blocking=True)
-    logits_bias_mask_cuda = torch.tensor(
-        logits_bias_masks, pin_memory=prefer_pinned(), dtype=torch.bool
-    ).to(logits.device, non_blocking=True)
-
-    Fusions.gather_masked_inplace_add(
-        summands_cuda=biases_by_slot_cuda,
-        summand_indices_cuda=bias_gather_indices_cuda,
-        output_cuda=logits,
-        output_mask_cuda=logits_bias_mask_cuda,
-    )
-
-    return embedding_bias_cache
 
 
 # --------------------------------------------------------------------------

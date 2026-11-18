@@ -72,7 +72,6 @@ from .sampler_features import (
     SamplerEvent,
     _PackedStepIndexer,
     _UnpackedStepIndexer,
-    apply_embedding_bias,
     check_stop_words_length,
     fast_greedy_sample_kernel,
     meet_stop_token_criteria,
@@ -2650,12 +2649,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
 
         # Handle embedding bias
-        self._embedding_bias_cache = apply_embedding_bias(
+        if self._embedding_bias_cache is None:
+            # Always initializing to ensure correct KV cache sizing
+            self._embedding_bias_cache = EmbeddingBiasCache(
+                logit_dtype=logits_cuda.dtype,
+                vocab_size=logits_cuda.size(-1),
+                max_seq_slots=self.max_num_sequences,
+                device=logits_cuda.device,
+            )
+        self._embedding_bias_cache.apply_bias(
             logits_cuda,
             sampling_requests,
             sampling_requests_metadata.req_num_steps,
-            max_num_sequences=self.max_num_sequences,
-            maybe_embedding_bias_cache=self._embedding_bias_cache,
         )
 
         # Apply repetition/presence/frequency penalties in place, before the greedy fast
