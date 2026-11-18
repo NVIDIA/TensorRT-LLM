@@ -15,6 +15,7 @@ import runpy
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -35,7 +36,7 @@ b = importlib.import_module(f"{_SPEC.name}.bot")
 _VENDOR = "example-vendor"
 _CONSUMER = "NVIDIA/TensorRT-LLM"
 _UPSTREAM = "flashinfer-ai/flashinfer"
-_SCOPED_LOCK = "models/demo/3rdparty/vendor_sources.lock.yaml"
+_SCOPED_LOCK = "models/démo/3rdparty/vendor_sources.lock.yaml"
 
 pytestmark = pytest.mark.cpu_only
 
@@ -194,8 +195,9 @@ class World(m.GitHub):
             "files": [
                 {"filename": f}
                 for f in _git(
-                    repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha
-                ).splitlines()
+                    repo, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha
+                ).split("\0")
+                if f
             ],
         }
 
@@ -329,7 +331,7 @@ class World(m.GitHub):
             return {"object": {"sha": result.stdout.strip()}}
         if route.startswith("contents/"):
             path, sha = route[len("contents/") :].split("?ref=")
-            content = _git(self.consumer, "show", f"{sha}:{path}") + "\n"
+            content = _git(self.consumer, "show", f"{sha}:{unquote(path)}") + "\n"
             return {"encoding": "base64", "content": base64.b64encode(content.encode()).decode()}
         if route.startswith("commits/"):
             return self.commit_data(self.consumer, route.split("/")[1])
@@ -442,7 +444,7 @@ def test_publish_signed_lock_only_and_repeat(world: World) -> None:
     pr = m._publish(args, world, plan)
     assert _git(world.canonical, "rev-parse", "trtllm-prims-ts-dev") == world.reviewed
     head = pr["head"]["sha"]
-    assert _git(world.consumer, "diff", "--name-only", f"{head}^", head) == world.lock
+    assert _git(world.consumer, "diff", "--name-only", "-z", f"{head}^", head) == world.lock + "\0"
     assert m._lock_at(world, _CONSUMER, head).to_mapping() == plan.promoted
     message = _git(world.consumer, "show", "-s", "--format=%B", head)
     assert m._record_from_message(message) == plan.record

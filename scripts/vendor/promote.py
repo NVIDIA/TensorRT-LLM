@@ -788,10 +788,7 @@ def _recover_plan(args: argparse.Namespace, gh: GitHub, plan: Promotion) -> bool
             if _git(args.repo, "merge-base", sha, plan.main_sha) == sha:
                 return False
             parents = _git(args.repo, "show", "-s", "--format=%P", sha).split()
-            if (
-                len(parents) != 1
-                or _git(args.repo, "diff", "--name-only", parents[0], sha) != plan.lock
-            ):
+            if len(parents) != 1 or _diff_paths(args.repo, parents[0], sha) != {plan.lock}:
                 raise ValueError("Local promotion commit must change only the vendor lock.")
             _git(args.repo, "merge-base", "--is-ancestor", parents[0], plan.main_sha)
             _check_document_change(
@@ -964,11 +961,19 @@ def _local_lock_document(worktree: Path, lock: str, revision: str | None = None)
     return yaml.load(content, Loader=vendor._UniqueKeyLoader)
 
 
+def _diff_paths(worktree: Path, *args: str) -> set[str]:
+    paths = _run(
+        ["git", "diff", "--name-only", "--no-renames", "-z", *args, "--"],
+        cwd=worktree,
+        binary_output=True,
+        strip=False,
+    )
+    return {path for path in paths.split("\0") if path}
+
+
 def _pending_paths(worktree: Path) -> set[str]:
     # A file restored in the working tree can still have an unrelated staged edit.
-    return set(_git(worktree, "diff", "--name-only", "HEAD").splitlines()) | set(
-        _git(worktree, "diff", "--cached", "--name-only", "HEAD").splitlines()
-    )
+    return _diff_paths(worktree, "HEAD") | _diff_paths(worktree, "--cached", "HEAD")
 
 
 def _check_lock_only(worktree: Path, before: dict, plan: Promotion) -> None:
@@ -1086,7 +1091,7 @@ def _check_committed_lock(worktree: Path, before: dict, plan: Promotion) -> None
     _check_document_change(before, _local_lock_document(worktree, plan.lock), plan)
     if len(_git(worktree, "rev-list", "--parents", "-n", "1", "HEAD").split()) != 2:
         raise ValueError("Promotion commit must have exactly one parent.")
-    if _git(worktree, "diff", "--name-only", "HEAD^", "HEAD") != plan.lock:
+    if _diff_paths(worktree, "HEAD^", "HEAD") != {plan.lock}:
         raise ValueError("Commit hooks added changes outside the vendor lock.")
     message = _git(worktree, "log", "-1", "--format=%B")
     if _record_from_message(message) != plan.record:
