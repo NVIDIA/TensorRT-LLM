@@ -1010,17 +1010,6 @@ class MultimodalConfig(StrictBaseModel):
                 f"for {vanilla_graph_encoders}, which does not support "
                 "multimodal_config.encoder_cuda_graph. Select TRTLLM or "
                 "FLASHINFER, or disable CUDA graphs for that encoder.")
-        if (self.encoder_data_parallel_size or 1) > 1:
-            if self.encoder_cuda_graph is not None:
-                raise ValueError(
-                    "multimodal_config.encoder_data_parallel_size > 1 and "
-                    "multimodal_config.encoder_cuda_graph are mutually exclusive."
-                )
-            if self.encoder_side_stream_max_ahead > 0:
-                raise ValueError(
-                    "multimodal_config.encoder_data_parallel_size > 1 and "
-                    "multimodal_config.encoder_side_stream_max_ahead > 0 are "
-                    "mutually exclusive.")
         return self
 
 
@@ -8989,11 +8978,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 "disable_mm_encoder and mm_encoder_only are mutually "
                 "exclusive: one skips the multimodal encoder, the other runs "
                 "only the multimodal encoder.")
-        if (self.mm_encoder_only and
-            (self.multimodal_config.encoder_data_parallel_size or 1) > 1):
-            raise ValueError(
-                "multimodal encoder data parallelism does not support "
-                "mm_encoder_only execution yet.")
         return self
 
     @model_validator(mode="after")
@@ -9070,7 +9054,9 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_encoder_data_parallel(self) -> 'TorchLlmArgs':
-        size = self.multimodal_config.encoder_data_parallel_size
+        """Check every encoder TP/DP config rule in one place."""
+        mm_config = self.multimodal_config
+        size = mm_config.encoder_data_parallel_size
         if size is None:
             return self
         if self.pipeline_parallel_size != 1 or self.context_parallel_size != 1:
@@ -9082,18 +9068,28 @@ class TorchLlmArgs(BaseLlmArgs):
                 "multimodal_config.encoder_data_parallel_size must divide "
                 f"tensor_parallel_size ({self.tensor_parallel_size}), got {size}."
             )
-        if self.enable_attention_dp and size < self.tensor_parallel_size:
-            if (self.mm_encoder_only
-                    or self.multimodal_config.encoder_scheduling_policy
-                    == MultimodalEncoderSchedulingPolicy.DISABLED):
+        # Attention-DP ranks share one encoder TP pass.
+        shared_tp = self.enable_attention_dp and size < self.tensor_parallel_size
+        if size > 1 or shared_tp:
+            # Encoder work is split between replicas or shared between ranks.
+            unsupported = [
+                name for name, used in (
+                    ("mm_encoder_only", self.mm_encoder_only),
+                    ("encoder_cuda_graph", mm_config.encoder_cuda_graph
+                     is not None),
+                    ("encoder_side_stream_max_ahead > 0",
+                     mm_config.encoder_side_stream_max_ahead > 0),
+                ) if used
+            ]
+            if unsupported:
                 raise ValueError(
-                    "Encoder TP with attention DP requires MM item scheduling "
-                    "in aggregated LLM execution.")
-            if (self.multimodal_config.encoder_cuda_graph is not None or
-                    self.multimodal_config.encoder_side_stream_max_ahead > 0):
-                raise ValueError(
-                    "Encoder TP with attention DP does not yet support encoder "
-                    "CUDA graphs or side-stream prefetch.")
+                    "Multimodal encoder parallelism across ranks does not "
+                    f"support {', '.join(unsupported)} yet.")
+        if shared_tp and (mm_config.encoder_scheduling_policy
+                          == MultimodalEncoderSchedulingPolicy.DISABLED):
+            raise ValueError(
+                "Encoder TP with attention DP requires MM encoder item "
+                "scheduling.")
         return self
 
     @model_validator(mode="after")
