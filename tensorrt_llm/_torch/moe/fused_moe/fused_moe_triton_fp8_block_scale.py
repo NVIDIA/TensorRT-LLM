@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 NVIDIA Corporation. All rights reserved.
 """
-Triton FP8 block-scale MoE forward pass for SM120.
+Triton FP8 block-scale MoE forward passes: BF16 activations for SM120, FP8
+activations for decode-sized batches on SM90.
 """
 
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 _BLOCK_SHAPE = [128, 128]  # [group_k, group_n] for FP8 block-scale
 _BLOCK_SIZE_M = 16
@@ -632,3 +634,517 @@ def run_triton_fp8_block_scale_moe(
     if output_dtype is not None and output.dtype != output_dtype:
         output = output.to(output_dtype)
     return output
+
+
+# ---------------------------------------------------------------------------
+# FP8-activation path for decode-sized batches (SM90)
+# ---------------------------------------------------------------------------
+# The activation quantizers' group is the GEMMs' group_k.
+_FP8_GROUP_SIZE = _BLOCK_SHAPE[0]
+_FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+# Largest (token, expert) pair count aligned by the single-program kernel.
+_SMALL_ALIGN_MAX_PAIRS = 128
+
+
+@triton.jit
+def _per_token_group_quant_fp8_kernel(
+    x_ptr,
+    q_ptr,
+    s_ptr,
+    stride_xm,
+    stride_qm,
+    stride_sm,
+    GROUP: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """Quantize one 1 x GROUP slice of a row to FP8 with its own scale.
+
+    Same arithmetic as the CUTLASS MoE's fused 1 x 128 quantization: multiply
+    by FP8_MAX / amax and store the reciprocal as the scale, with both
+    divisions correctly rounded. BF16 inputs often land exactly on an FP8
+    rounding midpoint, where the default approximate division can round the
+    other way.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    group = tl.program_id(1)
+    offs = group * GROUP + tl.arange(0, GROUP)
+    x = tl.load(x_ptr + row * stride_xm + offs).to(tl.float32)
+    quant_scale = tl.math.div_rn(FP8_MAX, tl.maximum(tl.max(tl.abs(x)), 1e-10))
+    tl.store(q_ptr + row * stride_qm + offs, (x * quant_scale).to(tl.float8e4nv))
+    tl.store(s_ptr + row * stride_sm + group, tl.math.div_rn(1.0, quant_scale))
+
+
+@triton.jit
+def _silu_ieee(x):
+    """``x / (1 + expf(-x))`` as the CUTLASS SiLU computes it: accurate ``expf``
+    and a correctly rounded division, where ``tl.sigmoid`` approximates both."""
+    return x * tl.math.div_rn(1.0, 1.0 + libdevice.exp(-x))
+
+
+@triton.jit
+def _swiglu_quant_fp8_kernel(
+    ic1_ptr,
+    q_ptr,
+    s_ptr,
+    INTER,
+    stride_im,
+    stride_qm,
+    stride_sm,
+    limit,
+    HAS_LIMIT: tl.constexpr,
+    CLAMP_AFTER_SILU: tl.constexpr,
+    GROUP: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """SwiGLU over one 1 x GROUP slice of an (up | gate) FC1 row, quantized to FP8.
+
+    With a limit, ``up`` is clamped to [-limit, limit] and ``gate`` to at most
+    ``limit`` before SiLU (or the SiLU output, with CLAMP_AFTER_SILU), as the
+    CUTLASS MoE activation does. Like its epilogue, SiLU uses an accurate
+    ``expf`` and division, and the result is rounded to BF16 and then quantized
+    as in :func:`_per_token_group_quant_fp8_kernel`.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    group = tl.program_id(1)
+    offs = group * GROUP + tl.arange(0, GROUP)
+    up = tl.load(ic1_ptr + row * stride_im + offs).to(tl.float32)
+    gate = tl.load(ic1_ptr + row * stride_im + INTER + offs).to(tl.float32)
+    if HAS_LIMIT:
+        up = tl.minimum(tl.maximum(up, -limit), limit)
+        if CLAMP_AFTER_SILU:
+            act = tl.minimum(_silu_ieee(gate), limit)
+        else:
+            act = _silu_ieee(tl.minimum(gate, limit))
+    else:
+        act = _silu_ieee(gate)
+    y = (act * up).to(tl.bfloat16).to(tl.float32)
+    quant_scale = tl.math.div_rn(FP8_MAX, tl.maximum(tl.max(tl.abs(y)), 1e-10))
+    tl.store(q_ptr + row * stride_qm + offs, (y * quant_scale).to(tl.float8e4nv))
+    tl.store(s_ptr + row * stride_sm + group, tl.math.div_rn(1.0, quant_scale))
+
+
+# ``num_valid_tokens`` changes with the batch and only bounds a mask; left
+# specialized, every new value that is 1 or not a multiple of 16 would compile
+# another kernel in the middle of serving.
+@triton.jit(do_not_specialize=["num_valid_tokens"])
+def _fused_moe_fp8act_fp8w_kernel(
+    a_ptr,
+    a_scale_ptr,
+    b_ptr,
+    b_scale_ptr,
+    c_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N,
+    K,
+    num_valid_tokens,
+    stride_am,
+    stride_ak,
+    stride_asm,
+    stride_ask,
+    stride_be,
+    stride_bn,
+    stride_bk,
+    stride_bse,
+    stride_bsn,
+    stride_bsk,
+    stride_cm,
+    stride_cn,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    top_k: tl.constexpr,
+):
+    """Fused MoE GEMM with FP8 activations (1 x 128 scales) and FP8 weights (128 x 128 scales).
+
+    One program per (expert block of BLOCK_SIZE_M sorted rows, BLOCK_SIZE_N
+    output columns); C row ``r`` holds the (token, expert) slot ``r``.
+        C[m, n] = sum_k dot(A_fp8[m, k], B_fp8[k, n]) * (A_scale[m, k] * B_scale[n, k])
+    The two scales are multiplied first, as the DeepGEMM kernel does, so FP32
+    (non-power-of-two) weight scales round the same way.
+    """
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    if pid_m * BLOCK_SIZE_M >= tl.load(num_tokens_post_padded_ptr):
+        return
+
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+    off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_row = offs_token // top_k
+    a_ptrs = a_ptr + a_row[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = (
+        b_ptr + off_expert * stride_be + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    )
+    a_scale_ptrs = a_scale_ptr + a_row * stride_asm
+    b_scale_ptrs = b_scale_ptr + off_expert * stride_bse + (offs_bn // group_n) * stride_bsn
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+        b = tl.load(b_ptrs)
+        offs_ks = (k * BLOCK_SIZE_K) // group_k
+        a_scale = tl.load(a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0)
+        b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+        accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale[None, :])
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator.to(tl.bfloat16), mask=c_mask)
+
+
+# The pair and slot counts change with the batch and only bound masks and the
+# padding fill; their power-of-two ceilings are the compile-time classes.
+@triton.jit(do_not_specialize=["num_pairs", "num_slots"])
+def _moe_align_small_kernel(
+    flat_ids_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_post_pad_ptr,
+    expert_offsets_ptr,
+    num_pairs,
+    num_slots,
+    NUM_PAIRS_POW2: tl.constexpr,
+    NUM_SLOTS_POW2: tl.constexpr,
+    NUM_EXPERTS_POW2: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """moe_align_block_size in one program for small batches.
+
+    A pair's slot is its expert's padded offset (staged in ``expert_offsets``)
+    plus the number of earlier pairs routed to the same expert, so the pairwise
+    comparison replaces the atomic scatter of the multi-kernel version.
+    """
+    i = tl.arange(0, NUM_PAIRS_POW2)
+    valid = i < num_pairs
+    # Padding pairs go to the last bin, which no real expert uses.
+    ids = tl.load(flat_ids_ptr + i, mask=valid, other=NUM_EXPERTS_POW2 - 1).to(tl.int32)
+    e = tl.arange(0, NUM_EXPERTS_POW2)
+    counts = tl.histogram(ids, NUM_EXPERTS_POW2)
+    padded = ((counts + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    padded = tl.where(e == NUM_EXPERTS_POW2 - 1, 0, padded)
+    tl.store(expert_offsets_ptr + e, tl.cumsum(padded, axis=0) - padded)
+    tl.debug_barrier()
+    pair_offset = tl.load(expert_offsets_ptr + ids)
+    earlier = (ids[None, :] == ids[:, None]) & (i[None, :] < i[:, None]) & valid[None, :]
+    slot = pair_offset + tl.sum(earlier.to(tl.int32), axis=1)
+
+    pad = tl.arange(0, NUM_SLOTS_POW2)
+    tl.store(
+        sorted_token_ids_ptr + pad,
+        tl.full([NUM_SLOTS_POW2], 0, tl.int32) + num_pairs,
+        mask=pad < num_slots,
+    )
+    tl.debug_barrier()
+    tl.store(sorted_token_ids_ptr + slot, i, mask=valid)
+    tl.store(expert_ids_ptr + slot // BLOCK_SIZE, ids, mask=valid)
+    tl.store(num_post_pad_ptr, tl.sum(padded))
+
+
+def _moe_align_small(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int, num_m_blocks: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Same outputs as :func:`moe_align_block_size` for the first ``num_m_blocks`` blocks."""
+    device = topk_ids.device
+    flat_ids = topk_ids.reshape(-1)
+    num_pairs = flat_ids.shape[0]
+    num_slots = num_m_blocks * block_size
+    sorted_token_ids = torch.empty((num_slots,), dtype=torch.int32, device=device)
+    expert_ids = torch.empty((num_m_blocks,), dtype=torch.int32, device=device)
+    num_post_pad = torch.empty(1, dtype=torch.int32, device=device)
+    num_experts_pow2 = triton.next_power_of_2(num_experts + 1)
+    expert_offsets = torch.empty((num_experts_pow2,), dtype=torch.int32, device=device)
+    _moe_align_small_kernel[(1,)](
+        flat_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_post_pad,
+        expert_offsets,
+        num_pairs,
+        num_slots,
+        NUM_PAIRS_POW2=triton.next_power_of_2(max(num_pairs, 2)),
+        NUM_SLOTS_POW2=triton.next_power_of_2(max(num_slots, 2)),
+        NUM_EXPERTS_POW2=num_experts_pow2,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+    return sorted_token_ids, expert_ids, num_post_pad
+
+
+@triton.jit
+def _moe_topk_sum_kernel(
+    in_ptr,
+    weights_ptr,
+    out_ptr,
+    hidden,
+    TOP_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """out[t, :] = sum_k weights[t, k] * in[t * TOP_K + k, :] in FP32.
+
+    As in the CUTLASS MoE finalize, the routing weights scale the BF16 expert
+    outputs rather than the FC2 accumulators.
+    """
+    t = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs < hidden
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(TOP_K):
+        weight = tl.load(weights_ptr + t * TOP_K + k).to(tl.float32)
+        row = tl.load(in_ptr + (t * TOP_K + k) * hidden + offs, mask=mask, other=0.0)
+        acc += weight * row.to(tl.float32)
+    tl.store(out_ptr + t * hidden + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def _per_token_group_quant_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(M, K) BF16 -> (M, K) FP8 and (M, K // 128) FP32 scales."""
+    M, K = x.shape
+    assert K % _FP8_GROUP_SIZE == 0, f"K={K} must be a multiple of {_FP8_GROUP_SIZE}"
+    q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((M, K // _FP8_GROUP_SIZE), dtype=torch.float32, device=x.device)
+    if M > 0:
+        _per_token_group_quant_fp8_kernel[(M, K // _FP8_GROUP_SIZE)](
+            x,
+            q,
+            scales,
+            x.stride(0),
+            q.stride(0),
+            scales.stride(0),
+            GROUP=_FP8_GROUP_SIZE,
+            FP8_MAX=_FP8_E4M3_MAX,
+        )
+    return q, scales
+
+
+def _invoke_fp8act_fp8w_moe_kernel(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    c: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    num_m_blocks: int,
+    num_valid_tokens: int,
+    top_k: int,
+) -> None:
+    """Launch `_fused_moe_fp8act_fp8w_kernel` over at most ``num_m_blocks`` expert blocks.
+
+    b: (E, N, K) FP8, b_scale: (E, N // 128, K // 128) FP32, c: (num_valid_tokens, N) BF16.
+    """
+    N, K = b.shape[1], b.shape[2]
+    # With few expert blocks and a long K, each program streams a long weight
+    # panel; narrower N tiles (with a deeper pipeline) spread those panels over
+    # more programs, so more SMs share the weight read.
+    if K >= 2048 and num_m_blocks <= 32:
+        block_n, num_warps, num_stages = 64, 4, 4
+    else:
+        block_n, num_warps, num_stages = 128, 4, 3
+    grid = (num_m_blocks * triton.cdiv(N, block_n),)
+    _fused_moe_fp8act_fp8w_kernel[grid](
+        a,
+        a_scale,
+        b,
+        b_scale,
+        c,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N,
+        K,
+        num_valid_tokens,
+        a.stride(0),
+        a.stride(1),
+        a_scale.stride(0),
+        a_scale.stride(1),
+        b.stride(0),
+        b.stride(1),
+        b.stride(2),
+        b_scale.stride(0),
+        b_scale.stride(1),
+        b_scale.stride(2),
+        c.stride(0),
+        c.stride(1),
+        group_n=_BLOCK_SHAPE[1],
+        group_k=_BLOCK_SHAPE[0],
+        BLOCK_SIZE_M=_BLOCK_SIZE_M,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=_BLOCK_SHAPE[0],
+        top_k=top_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+
+def run_triton_fp8_block_scale_moe_fp8_act(
+    x: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    w3_w1: torch.Tensor,
+    w3_w1_scales: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scales: torch.Tensor,
+    swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """SwiGLU MoE forward with FP8 activations for decode-sized batches.
+
+    Same weight layout as :func:`run_triton_fp8_block_scale_moe`
+    (DeepSeekFP8BlockScalesFusedMoEMethod without E8M0 resmoothing). Activations
+    are quantized per 1 x 128 group, and each GEMM launches only as many expert
+    blocks as the batch can occupy, so the cost follows the routed experts
+    rather than the expert count. The rounding steps follow the CUTLASS MoE
+    path: activation quantization by a correctly rounded ``448 / amax``,
+    weight and activation scales multiplied before they scale the GEMM
+    accumulator, BF16 FC1 and FC2 outputs, an accurate SiLU rounded to BF16
+    before its quantization, and routing weights applied in FP32 to the BF16
+    expert outputs. The FP8 GEMMs accumulate in a different order than the
+    fused op's, so the two agree to within about one BF16 ulp rather than bit
+    for bit.
+
+    Args:
+        x: (T, H) BF16 input activations.
+        token_selected_experts: (T, K) expert IDs local to ``w3_w1``.
+        token_final_scales: (T, K) F32 routing weights.
+        w3_w1: (E, 2I, H) FP8 up+gate projection weights.
+        w3_w1_scales: (E, 2I // 128, H // 128) F32 block scales.
+        w2: (E, H, I) FP8 down-projection weights.
+        w2_scales: (E, H // 128, I // 128) F32 block scales.
+        swiglu_limit: Optional SwiGLU clamp.
+        swiglu_clamp_after_silu: Clamp the SiLU output instead of the gate.
+        output_dtype: Optional output dtype.
+
+    Returns:
+        (T, H) output tensor.
+    """
+    num_tokens, hidden = x.shape
+    num_experts, gate_up_size, _ = w3_w1.shape
+    intermediate = gate_up_size // 2
+    top_k = token_selected_experts.shape[1]
+    num_pairs = num_tokens * top_k
+    device = x.device
+
+    # Every expert block holds at least one (token, expert) pair.
+    num_m_blocks = min(num_pairs, num_pairs // _BLOCK_SIZE_M + num_experts)
+    if num_pairs <= _SMALL_ALIGN_MAX_PAIRS:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = _moe_align_small(
+            token_selected_experts, _BLOCK_SIZE_M, num_experts, num_m_blocks
+        )
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            token_selected_experts, _BLOCK_SIZE_M, num_experts
+        )
+
+    x_q, x_scales = _per_token_group_quant_fp8(x.contiguous())
+    ic1 = torch.empty((num_pairs, gate_up_size), dtype=torch.bfloat16, device=device)
+    _invoke_fp8act_fp8w_moe_kernel(
+        x_q,
+        x_scales,
+        w3_w1,
+        w3_w1_scales,
+        ic1,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        num_m_blocks,
+        num_pairs,
+        top_k,
+    )
+
+    assert intermediate % _FP8_GROUP_SIZE == 0
+    act_q = torch.empty((num_pairs, intermediate), dtype=torch.float8_e4m3fn, device=device)
+    act_scales = torch.empty(
+        (num_pairs, intermediate // _FP8_GROUP_SIZE), dtype=torch.float32, device=device
+    )
+    if num_pairs > 0:
+        _swiglu_quant_fp8_kernel[(num_pairs, intermediate // _FP8_GROUP_SIZE)](
+            ic1,
+            act_q,
+            act_scales,
+            intermediate,
+            ic1.stride(0),
+            act_q.stride(0),
+            act_scales.stride(0),
+            float(swiglu_limit) if swiglu_limit is not None else 0.0,
+            HAS_LIMIT=swiglu_limit is not None,
+            CLAMP_AFTER_SILU=swiglu_clamp_after_silu,
+            GROUP=_FP8_GROUP_SIZE,
+            FP8_MAX=_FP8_E4M3_MAX,
+        )
+
+    ic2 = torch.empty((num_pairs, hidden), dtype=torch.bfloat16, device=device)
+    _invoke_fp8act_fp8w_moe_kernel(
+        act_q,
+        act_scales,
+        w2,
+        w2_scales,
+        ic2,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        num_m_blocks,
+        num_pairs,
+        1,
+    )
+    output = torch.empty((num_tokens, hidden), dtype=output_dtype or torch.bfloat16, device=device)
+    if num_tokens > 0:
+        block_h = 1024
+        _moe_topk_sum_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+            ic2, token_final_scales.contiguous(), output, hidden, TOP_K=top_k, BLOCK_H=block_h
+        )
+    return output
+
+
+def prewarm_triton_fp8_block_scale_moe_fp8_act(
+    w3_w1: torch.Tensor,
+    w3_w1_scales: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scales: torch.Tensor,
+    top_k: int,
+    max_tokens: int,
+    swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """Compile every kernel :func:`run_triton_fp8_block_scale_moe_fp8_act` uses for 1 to ``max_tokens`` tokens.
+
+    The kernels are compiled per row-count class: the power-of-two pair and slot counts, the alignment variant,
+    the GEMM tile and Triton's ``== 1`` / ``% 16`` integer specializations. Running each count once on these
+    weights compiles all of them, so no later call of at most ``max_tokens`` tokens compiles. Does nothing for
+    weights that are not on a CUDA device.
+    """
+    if not w3_w1.is_cuda:
+        return
+    num_experts, _, hidden = w3_w1.shape
+    device = w3_w1.device
+    with torch.no_grad():
+        for num_tokens in range(1, max_tokens + 1):
+            experts = (
+                torch.arange(num_tokens * top_k, dtype=torch.int32, device=device) % num_experts
+            )
+            run_triton_fp8_block_scale_moe_fp8_act(
+                torch.zeros((num_tokens, hidden), dtype=torch.bfloat16, device=device),
+                experts.view(num_tokens, top_k),
+                torch.ones((num_tokens, top_k), dtype=torch.float32, device=device),
+                w3_w1,
+                w3_w1_scales,
+                w2,
+                w2_scales,
+                swiglu_limit=swiglu_limit,
+                swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+                output_dtype=output_dtype,
+            )
