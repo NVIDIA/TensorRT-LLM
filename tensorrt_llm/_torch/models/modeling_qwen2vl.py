@@ -2421,9 +2421,9 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         # carries a deep-copied dict, so LM `attn_custom_op_inplace`
         # (used under `set_torch_compiling(True)`) fails its layer
         # lookup and the piecewise-CUDA-graph dynamo trace blows up
-        # at the LM's `o_proj` call. Vision attention unregisters
-        # itself from this dict in `Qwen2_5_VLVisionAttention.__init__`
-        # so it does not poison LM lookups.
+        # at the LM's `o_proj` call. Vision attention stays out of
+        # this dict (`register_to_config=False` in
+        # `Qwen2_5_VLVisionAttention`) so it does not poison LM lookups.
         llm_model_config.extra_attrs = model_config.extra_attrs
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 

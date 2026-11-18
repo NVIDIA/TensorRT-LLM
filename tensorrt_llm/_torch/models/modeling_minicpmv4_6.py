@@ -512,9 +512,9 @@ class MiniCPMV4_6VisionModel(nn.Module, MultimodalEncoderMixin):
         self.insert_layer_id = self.vision_config.insert_layer_id
 
         # Replicated, unquantized ModelConfig for the vision sub-modules.
-        # dataclasses.replace gives a fresh extra_attrs (init=False), so the
-        # vision attention's transient layer registration can't collide with
-        # the LLM's.
+        # dataclasses.replace gives a fresh extra_attrs (init=False), apart
+        # from the LLM's; vision attention does not register in it anyway
+        # (register_to_config=False).
         # NOTE: mapping=Mapping() (tp=1) is load-bearing for correctness, not
         # just perf. It makes the whole vision tower run REPLICATED on every
         # rank (all vision Linears use tensor_parallel_mode=None and vision

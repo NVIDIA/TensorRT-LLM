@@ -1087,6 +1087,8 @@ def test_encoder_only_factory_materializes_attention_weights(deferred):
         for projection in (block.attn.qkv_proj, block.attn.o_proj, block.mlp.down_proj):
             assert projection._weights_created
             assert projection.weight is not None
+        # Vision attention stays out of the registry the decoder's custom op reads.
+        assert not block.attn.register_to_config
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
