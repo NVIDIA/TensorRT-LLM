@@ -88,7 +88,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 from cuda.bindings import runtime as _cudart
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -859,81 +859,14 @@ class UnpoolDirectBoundary(OpWrapper):
     with programmatic dependent launch.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="DFlash2 K=7 verify: 8 rows, the one row count the target publishes at",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="the second buffer: odd layers publish into buffer 1",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, parity=1),
-        ),
-        Cell(
-            why="the third buffer: the last fused layer of an odd count (61 in the model)",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, parity=2),
-        ),
-        Cell(
-            why="early release: dependents launched at entry, the next QKV streams its weight meanwhile",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, trigger="entry"),
-        ),
-        Cell(
-            why="capture with early release: the DFlash capture from a boundary releasing the next QKV at entry",
-            spec=dict(
-                rows=8, with_gain=True, norm_fp32_residual=False, trigger="entry", capture=True
-            ),
-        ),
-        Cell(
-            why="the FP32-residual pre-QKV norm ordering switch",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=True),
-        ),
-        Cell(
-            why="a weightless first norm (the boundary's other arm)",
-            spec=dict(rows=8, with_gain=False, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="dependents launched right after the wait",
-            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, trigger="after_wait"),
-        ),
-        Cell(
-            why="1 row: the cluster of 16 CTAs, two CTAs per peer slice",
-            spec=dict(rows=1, with_gain=True, norm_fp32_residual=False),
-        ),
-        Cell(
-            why="3 rows, a short draft between the two cluster shapes",
-            spec=dict(rows=3, with_gain=True, norm_fp32_residual=False, parity=1),
-        ),
-        Cell(
-            why="tep4 wide layout: two requests' K=7 verify (16 rows), cluster of 4 CTAs",
-            spec=dict(rows=16, with_gain=True, norm_fp32_residual=False, wide=True),
-        ),
-        Cell(
-            why="tep4 wide layout: 24 rows with the capture and the early release, buffer 1",
-            spec=dict(
-                rows=24,
-                with_gain=True,
-                norm_fp32_residual=False,
-                trigger="entry",
-                capture=True,
-                parity=1,
-                wide=True,
-            ),
-        ),
-        Cell(
-            why="tep4 wide layout: 32 rows (four requests), the third buffer",
-            spec=dict(rows=32, with_gain=True, norm_fp32_residual=False, parity=2, wide=True),
-        ),
-    )
-
     note = """
     Certified against ``unpool_gather_boundary`` on the same slices bit for bit (the test publishes with
     the production split-K GEMM and with an elementwise copy, through CUDA-graph
     replays with changing inputs, back-to-back 62-layer graphs with in-graph
     rank delays, and a delayed rank), and against `reference` within its band.
     A concurrent poller checks that every half of a slot is first seen with its
-    final value. The target serves 8 rows only; the other row counts are cells
-    because the kernel has the gather boundary's geometry at every row count 1..8.
+    final value. The target serves 8 rows only; the kernel
+    keeps the gather boundary's geometry at every row count 1..8.
     """
 
     def __call__(

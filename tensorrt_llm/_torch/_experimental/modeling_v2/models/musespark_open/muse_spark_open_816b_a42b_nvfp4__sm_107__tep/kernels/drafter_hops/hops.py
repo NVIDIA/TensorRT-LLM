@@ -82,7 +82,8 @@ def configure(
 
     Raises:
         ValueError: for a value outside ``TEP8_WIDE_ROWS_BAND`` / 0 or 9..``TWO_SHOT_MAX_ROWS`` /
-            9..``TWO_SHOT_MAX_ROWS`` and not below the minimum; nothing is set then.
+        9..``TWO_SHOT_MAX_ROWS``
+            and not below the minimum; nothing is set then.
     """
     global TEP8_WIDE_MAX_ROWS, TEP8_TWO_SHOT_MIN_ROWS, TEP8_TWO_SHOT_MAX_ROWS
     rows = int(tep8_wide_max_rows)

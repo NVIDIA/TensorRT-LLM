@@ -38,8 +38,10 @@ built-in sampled walk (``dflash2_sample_candidate_paths`` with the worker's
 in one launch, bit for bit on the lattice the merge built. The candidates are
 ``torch.topk``'s over the full vocabulary, as on a single rank; the built-in
 sampled path of a sharded head tops each shard first (``_dflash2_global_top_k``),
-which differs only in the order of exactly tied logits. Without the fast path
-these batches take the built-in path on the drafter's transformed fp32 shard.
+which differs only in the order of exactly tied logits (and so, for a tie
+across the ``top_k`` boundary, in which of the tied tokens is a candidate).
+Without the fast path these batches take the built-in path on the drafter's
+transformed fp32 shard.
 
 A drafter that declares a logit transform (``DFlashForCausalLM.
 apply_draft_logit_transform``: a multiplier and a tanh softcap, in fp32) is
@@ -111,6 +113,8 @@ TOKENS_ATTR = "_draft_head_tokens"
 
 #: Worker attribute: sampled drafts take ``draft_path_sample`` (fast path ``draft_head_sampled``).
 SAMPLED_ATTR = "_draft_head_sampled"
+#: The head sampler library's op that ``draft_path_sample`` calls; ``install_sampled`` checks it is bound.
+SAMPLED_OP = "draft_path_sample"
 #: Worker attribute holding the drafter's ``DraftLogitTransform`` (absent without a transform).
 TRANSFORM_ATTR = "_draft_head_transform"
 #: Worker attribute: this step's logits were kept untransformed for the sharded selector.
@@ -130,6 +134,8 @@ STALE_TABLES = "the drafter's logit_multiplier or logit_softcap differs from the
 NOT_DEFERRED = "the draft logits are not the shard the deferring transform handed back"
 #: Why the sharded selector does not take a step: its drafts are sampled (rejection sampling).
 SAMPLED_DRAFTS = "sampled drafts"
+#: Why ``draft_head_sampled`` does not take a sampled step: ``draft_path_sample`` runs the fused sampler only.
+SAMPLED_OTHER_MODE = "sampled drafts in a sampling mode other than the fused one"
 
 #: Largest shard the 16-bit column field of a shard key holds.
 MAX_SHARD = 65536
@@ -533,7 +539,7 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
             if not self.__dict__.get(SAMPLED_ATTR) or self.__dict__.get("_rs") is not None:
                 return SAMPLED_DRAFTS
             if not spec_metadata.advanced_sampling_mode.is_fused:
-                return "sampled drafts in a sampling mode other than the fused one"
+                return SAMPLED_OTHER_MODE
         if self._d2t is not None:
             return "a d2t draft vocab map"
         return None
@@ -717,7 +723,7 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
             # The built-in zeroing of the rows the walk writes, as the built-in method runs it.
             draft_probs[slots, : unary.shape[1], :full_vocab] = draft_probs.new_zeros(())
             spec_metadata.draft_probs_last_dim = full_vocab
-        tokens, _ = draft_path_sample(
+        tokens, proposal = draft_path_sample(
             edges,
             unary,
             ids,
@@ -732,6 +738,12 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
             draft_probs,
             slots,
         )
+        compact = getattr(spec_metadata, "compact_draft_probs", None)
+        if compact is not None:
+            # TRTLLM_RS_COMPACT_DRAFT_PROBS: the rows the kernel would scatter (it writes
+            # ``proposal`` at ``ids``), kept as records.
+            compact.write_rows(spec_metadata.batch_slot_ids[gen], ids, proposal, full_vocab)
+            spec_metadata.draft_probs_last_dim = full_vocab
         return tokens, full_vocab
 
     def sample_draft_tokens(self, logits, spec_metadata, batch_size, **kwargs):
@@ -841,13 +853,15 @@ def install_sampled(llm: nn.Module, load=head_sampler.load_library_agreed) -> bo
 
     Needs ``install`` first. ``load(mapping)`` loads the head sampler library on
     every rank of the TP group and agrees on the result (collective: every rank
-    installs at the same point of the load). A second call changes nothing.
+    installs at the same point of the load), then every rank checks that the
+    library binds ``SAMPLED_OP`` and agrees on that too. A second call changes nothing.
 
     Raises:
         ValueError: when the draft head is not installed, or the worker or the
             drafter samples its walk other than as the built-in classes do
             (``sampled_unsupported_reason``, agreed over the TP group).
-        RuntimeError: when the library fails to load on some rank (every rank raises).
+        RuntimeError: when the library fails to load on some rank, or some rank's
+            library lacks the ``SAMPLED_OP`` op (every rank raises).
     """
     worker = getattr(llm, "spec_worker", None)
     if not installed(llm):
@@ -860,6 +874,13 @@ def install_sampled(llm: nn.Module, load=head_sampler.load_library_agreed) -> bo
     if reason is not None:
         raise ValueError(f"[musespark_open] draft_head_sampled cannot run here: {reason}")
     path = load(worker.mapping)
+    # A library built without the binding loads, and would raise at the first sampled step.
+    missing = None
+    if not hasattr(getattr(torch.ops, head_sampler.LIBRARY_NAME), SAMPLED_OP):
+        missing = f"the head sampler library ({path}) has no {SAMPLED_OP} op"
+    missing = agreed_refusal(worker.mapping, missing)
+    if missing is not None:
+        raise RuntimeError(f"[musespark_open] draft_head_sampled cannot run here: {missing}")
     worker.__dict__[SAMPLED_ATTR] = True
     logger.info(
         "[musespark_open] draft_head_sampled: sampled DFlash 2 drafts walked in one launch on the "

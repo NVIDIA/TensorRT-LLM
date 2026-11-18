@@ -20,8 +20,9 @@ The fast paths change both ends, and nothing in between:
   no gather at all: the processor runs only the local LM-head GEMM and leaves a
   ``[rows, vocab]`` BF16 placeholder pending (allocated, not written); the worker samples
   the step from the ranks' shards (``head_sampler.vocab_parallel_sample``: each rank folds
-  its own shard, the ranks exchange per-virtual-thread partial states and crossings over a
-  multicast buffer) and argmaxes greedy batches the same way
+  its own shard onto the previous rank's per-virtual-thread states and continues its walk,
+  over a multicast buffer, so the states and tokens are the built-in's) and argmaxes greedy
+  batches the same way
   (``vocab_parallel_argmax``, ``torch.argmax``'s token exactly). Every other consumer
   gathers the shards with the built-in all-gather first (``materialize``).
 
@@ -41,7 +42,8 @@ derived from ``TargetHeadDFlashWorker`` and its current class. Both share one
   all-gather;
 * the worker's ``_sample_tokens_for_batch`` samples it on non-greedy batches
   with the fused sampling mode; every other consumer first **materializes**
-  the built-in FP32 capped logits from it with the built-in torch chain --
+  the built-in FP32 capped logits from it with the built-in processor's
+  one-pass soft cap (``soft_capped_logits``) --
   ``_accept_draft_tokens`` before occurrence penalties or rejection sampling
   read the logits, ``_sample_tokens_for_batch`` for greedy batches and a
   non-fused sampling mode -- then runs the built-in code;
@@ -102,14 +104,16 @@ from __future__ import annotations
 
 import socket
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenLogitsProcessor
 from tensorrt_llm._torch.modules import low_m_gemm as _low_m
+from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.logit_soft_cap import soft_capped_logits
+from tensorrt_llm._torch.speculative.compact_draft_probs import mark_private_verify_logits
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.logger import logger
 
@@ -118,6 +122,7 @@ from ...dispatch import LAUNCH_PDL
 from ...ops.spec import head_sampler as _hs
 from ..pv_logits import gather as _pv_logits
 from ..rs_sampler import rs_common as _rs_common
+from .head_gemm_report import HeadGemmReport
 
 #: The feature ids this module installs.
 
@@ -174,6 +179,73 @@ def lm_head_gemm_into(lm_head: Linear, x: torch.Tensor, out: torch.Tensor) -> No
     ):
         runner, tactic = cublas, -1
     runner([x2d, weight_t], tactic=tactic, bias=None, out=out)
+
+
+def _chunkable(lm_head) -> bool:
+    """Whether ``lm_head``'s forward is the built-in column-parallel gathered GEMM (``Linear`` / ``LMHead``)
+    that ``TargetHead.produce``'s HEAD_CHUNK_ROWS path reproduces with the GEMM in chunks."""
+    return (
+        type(lm_head).forward in (Linear.forward, LMHead.forward)
+        and lm_head.tp_mode == TensorParallelMode.COLUMN
+        and lm_head.gather_output
+        and lm_head.tp_size > 1
+    )
+
+
+def low_m_head_choice(lm_head: Linear, x: torch.Tensor) -> Tuple[bool, str]:
+    """Whether the autotuner's cache holds ``lm_head``'s GEMM at ``x``'s rows on this rank, and
+    the GEMM the built-in low-M dispatcher runs for it, in words.
+
+    Read from the autotuner's cache as ``LowMGemmDispatcher.apply`` reads it, with its direct-kernel
+    fallback: nothing is profiled or launched. The race is per rank and per process, so ranks can
+    differ (cuBLAS, the split-K kernel at some split_k and stage count, or the direct kernel). A
+    call that takes no low-M race counts as decided.
+    """
+    dispatcher = getattr(lm_head, "_low_m_gemm_dispatcher", _low_m._DISPATCHER)
+    weight = lm_head.weight
+    if not (
+        dispatcher._prepared
+        and _low_m._should_apply_low_m_gemm(x)
+        and not getattr(lm_head, "use_custom_cublas_mm", False)
+        and dispatcher._is_candidate_shape(x, weight, lm_head.bias)
+    ):
+        return True, "the built-in GEMM (no low-M race for this call)"
+    from tensorrt_llm._torch.autotuner import AutoTuner
+
+    x2d = x.view(-1, x.shape[-1])
+    weight_t = weight.detach().t()
+    has_bias = lm_head.bias is not None
+    cublas = dispatcher._cublas_with_bias if has_bias else dispatcher._cublas_no_bias
+    splitk = dispatcher._runner_with_bias if has_bias else dispatcher._runner_no_bias
+    runners = [cublas, splitk] + ([] if has_bias else [dispatcher._direct])
+    tuner = AutoTuner.get()
+    hit, index, tactic, _ = tuner.profiling_cache.search_cache(
+        _low_m._AUTOTUNER_OP_NAME,
+        runners,
+        tuple(tuner._get_input_sizes([x2d, weight_t])),
+        dispatcher._tuning_config,
+    )
+    runner = runners[index]
+    if runner is dispatcher._direct and not dispatcher._direct.is_tactic_compatible(
+        [x2d, weight_t], tactic
+    ):
+        runner, tactic = cublas, -1
+    source = "tuned" if hit else "cache miss, fallback"
+    if runner is cublas:
+        return hit, f"cuBLAS ({source})"
+    if runner is splitk:
+        if tactic == -1:
+            import dataclasses
+
+            from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import default_tactic
+
+            m, k, n = int(x2d.shape[0]), int(x2d.shape[1]), int(weight_t.shape[1])
+            tactic = dataclasses.astuple(default_tactic(m, n, k))
+        mma_m, mma_n, split_k, stages = tactic
+        return hit, (
+            f"split-K split_k {split_k} (mma_m {mma_m}, mma_n {mma_n}, {stages} stages; {source})"
+        )
+    return hit, f"direct kernel {tuple(tactic) if tactic != -1 else 'default'} ({source})"
 
 
 def context_kv_head_fork(lm_head) -> tuple:
@@ -406,6 +478,15 @@ class TargetHead:
     dist: Optional[_hs.DistWorkspace] = None
     #: Whether the pending row is a distributed-sampler step's (``pending_local`` holds this rank's shard).
     pending_dist = False
+    #: ``lm_head_row_owner``'s owner head (``kernels/lm_head_row_owner/owner.install`` attaches it),
+    #: or None.
+    row_owner = None
+    #: Whether the pending row's LM-head output sits in the owners' pages (``row_owner``): the
+    #: pending tensor is a placeholder until the owner verify consumes the pages, a consumer
+    #: gathers the row into it (``RowOwnerHead.gather_into``) or the drain resets them.
+    pending_row_owner = False
+    #: When this rank logs its LM-head GEMM choice (``_report_head_gemm``); built at the first call.
+    head_gemm_report: Optional[HeadGemmReport] = None
 
     def __init__(
         self,
@@ -462,6 +543,14 @@ class TargetHead:
         )
         self.pending_dist = False
         self._dist_logged = False
+        # w256 (``widen``'s HEAD_CHUNK_ROWS, 0: off): the local LM-head GEMM of a call above MAX_ROWS rows as
+        # GEMMs of at most this many rows (each row gets the bits of its <= MAX_ROWS-row call's shape).
+        self.head_chunk_rows = 0
+        self._chunk_logged = False
+        # w256 (``widen``'s DIST_CHUNK, False: off): calls of MAX_ROWS + 1..2 x the distributed sampler's
+        # rows sample on it in consecutive calls of at most its rows (each row the tokens of the
+        # 1024-thread block, as at <= 128 rows; the 512-thread block's otherwise).
+        self.dist_chunk = False
         # head_multimem_gather: the MULTIMEM logits gather of MULTIMEM_GATHER_ROWS-row steps,
         # when every rank can build it (collective). Its row band (8) is below
         # vocab_parallel_head's (VP_MIN_ROWS..max_rows), so the two never take the same step
@@ -507,6 +596,8 @@ class TargetHead:
         self.pending_inbox = False
         self.pending_local = None
         self.pending_s2 = False
+        self.row_owner = None
+        self.pending_row_owner = False
         self._bypass_logged = False
         self._wide_capture_logged = False
         self.hook_handle = None
@@ -566,8 +657,33 @@ class TargetHead:
         )
         return True
 
-    def produce(self, hidden_states: torch.Tensor, lm_head: Linear) -> torch.Tensor:
+    def local_gemm(self, hidden_states: torch.Tensor, lm_head: Linear) -> torch.Tensor:
+        """The built-in Linear.forward's local GEMM (``apply_linear``); above ``MAX_ROWS`` rows with
+        ``head_chunk_rows`` set, as ``apply_linear`` calls of at most that many rows, concatenated."""
+        rows, chunk = hidden_states.shape[0], self.head_chunk_rows
+        # An instance apply_linear (context_kv_fork's head fork point) fires once per call: no chunks.
+        if not chunk or rows <= _hs.MAX_ROWS or "apply_linear" in vars(lm_head):
+            return lm_head.apply_linear(hidden_states, lm_head.bias, None, None)
+        if not self._chunk_logged:
+            self._chunk_logged = True
+            logger.info(
+                f"[musespark_open] wide_split_sampler HEAD_CHUNK_ROWS={chunk}: a {rows}-row LM-head GEMM as "
+                f"{-(-rows // chunk)} calls of at most {chunk} rows"
+            )
+        return torch.cat(
+            [
+                lm_head.apply_linear(hidden_states[i : i + chunk], lm_head.bias, None, None)
+                for i in range(0, rows, chunk)
+            ]
+        )
+
+    def produce(
+        self, hidden_states: torch.Tensor, lm_head: Linear, attn_metadata=None
+    ) -> torch.Tensor:
         """The LM head of this call, left pending as BF16 (gathered by NCCL, or into the inbox).
+
+        With ``lm_head_row_owner`` (``row_owner``), a call it takes (``attn_metadata``'s request
+        count) writes into the owners' pages instead and leaves a placeholder pending.
 
         Raises:
             RuntimeError: if the previous call's row is still pending. It is
@@ -583,10 +699,13 @@ class TargetHead:
                 "drained within its step"
             )
         rows = hidden_states.shape[0]
-        if self.dist is not None and self.dist_min_rows <= rows <= self.dist.max_rows:
+        if self.dist is not None and (
+            self.dist_min_rows <= rows <= self.dist.max_rows
+            or (self.dist_chunk and _hs.MAX_ROWS < rows <= 2 * self.dist.max_rows)
+        ):
             # head_sampler_coop_fold DIST_MIN_ROWS: the built-in Linear.forward's local GEMM, no all-gather; the
             # distributed sampler reads the shards (vocab_parallel_head's statements).
-            local = lm_head.apply_linear(hidden_states, lm_head.bias, None, None)
+            local = self.local_gemm(hidden_states, lm_head)
             logits = torch.empty(
                 (rows, self.dist.vocab), dtype=torch.bfloat16, device=hidden_states.device
             )
@@ -598,7 +717,7 @@ class TargetHead:
         if self.vp is not None and _hs.VP_MIN_ROWS <= rows <= self.vp.max_rows:
             # The built-in Linear.forward's local GEMM (column-parallel: apply_linear, then the
             # all-gather this path leaves out), through the instance's apply_linear.
-            local = lm_head.apply_linear(hidden_states, lm_head.bias, None, None)
+            local = self.local_gemm(hidden_states, lm_head)
             logits = torch.empty(
                 (rows, self.vp.vocab), dtype=torch.bfloat16, device=hidden_states.device
             )
@@ -633,14 +752,104 @@ class TargetHead:
         elif self.multimem is not None and self.multimem.takes(hidden_states, lm_head):
             logits = self.multimem(lm_head, hidden_states)
             self.pending_inbox = False
+        elif self.row_owner is not None and self.row_owner.takes(hidden_states, attn_metadata):
+            # lm_head_row_owner: the GEMM into the owners' pages, then the instance's head fork
+            # point as the built-in apply_linear fires it, then the gather fork point.
+            _, fork = context_kv_head_fork(lm_head)
+            logits = self.row_owner.produce(lm_head, hidden_states)
+            if fork is not None:
+                fork.fire("head")
+            self.pending_inbox = False
+            self.pending_row_owner = True
+            fork = vars(lm_head).get("_context_kv_fork")
+            if fork is not None and fork.paged_wide_max_requests is not None:
+                from ..context_kv_fork.fork import GATHER_POINT
+
+                fork.fire(GATHER_POINT)
+        elif (
+            self.head_chunk_rows
+            and hidden_states.shape[0] > _hs.MAX_ROWS
+            and _chunkable(lm_head)
+            and "apply_linear" not in vars(lm_head)
+        ):
+            # w256 HEAD_CHUNK_ROWS: the built-in LMHead / Linear forward (column-parallel GEMM, its
+            # all-gather, LMHead's padding slice), the GEMM in chunks.
+            from tensorrt_llm._torch.distributed import allgather
+
+            logits = allgather(
+                self.local_gemm(hidden_states, lm_head),
+                lm_head.mapping,
+                sizes=lm_head.gather_output_sizes,
+            )
+            if type(lm_head).forward is LMHead.forward and lm_head.padding_size > 0:
+                logits = logits[..., : -lm_head.padding_size]
+            self.pending_inbox = False
         else:
             logits = lm_head(hidden_states)
             self.pending_inbox = False
+            fork = vars(lm_head).get("_context_kv_fork")
+            if fork is not None and fork.paged_wide_max_requests is not None:
+                # context_kv_fork_paged_wide: the fork point behind the head's logits gather.
+                from ..context_kv_fork.fork import GATHER_POINT
+
+                fork.fire(GATHER_POINT)
         self.pending = logits
+        self._report_head_gemm(lm_head, hidden_states)
         return logits
+
+    def _report_head_gemm(self, lm_head: Linear, hidden_states: torch.Tensor) -> None:
+        """Log which GEMM this rank's LM head runs at this row count, once the autotuner's choice
+        is final, and again if it changes (``HeadGemmReport``). For decode steps the first such
+        call is the batch size's graph warmup or capture, after the autotuner's warmup."""
+        from tensorrt_llm._torch.autotuner import AutoTuner
+
+        if self.head_gemm_report is None:
+            self.head_gemm_report = HeadGemmReport()
+        tuner = AutoTuner.get()
+        cache = getattr(getattr(tuner, "profiling_cache", None), "cache", None)
+        message = self.head_gemm_report.observe(
+            int(hidden_states.shape[0]),
+            bool(tuner.is_tuning_mode),
+            -1 if cache is None else len(cache),
+            lambda: self._head_gemm_choice(lm_head, hidden_states),
+        )
+        if message is not None:
+            logger.info(
+                f"[musespark_open] lm_head: rank {getattr(self.mapping, 'tp_rank', '?')} runs its "
+                f"{int(hidden_states.shape[0])}-row LM-head GEMM on {message}"
+            )
+
+    def _head_gemm_choice(self, lm_head: Linear, hidden_states: torch.Tensor) -> Tuple[bool, str]:
+        """``low_m_head_choice`` for this call, or the pinned tactic of the distributed sampler."""
+        if self.pending_s2:
+            return True, "the distributed head sampler's pinned split-K tactic"
+        try:
+            return low_m_head_choice(lm_head, hidden_states)
+        except (AttributeError, KeyError, TypeError, ValueError, ImportError) as error:
+            return True, f"not read ({type(error).__name__}: {error})"
 
     def owns(self, logits) -> bool:
         return self.pending is not None and logits is self.pending
+
+    def release_row_owner(self) -> None:
+        """The owner verify consumed the pending row-owned row (``lm_head_row_owner``)."""
+        self.pending = None
+        self.pending_row_owner = False
+
+    def row_owner_verifies(self, worker, spec_metadata, num_contexts: int, batch_size: int) -> bool:
+        """Whether the pending row-owned row goes to the rejection verify unmaterialized.
+
+        The worker's built-in acceptance then hands it to ``RowOwnerVerifyDFlashWorker``'s
+        rejection body (the owner verify, or its own gather when it declines). False whenever
+        no row-owned row is pending.
+        """
+        return (
+            self.pending_row_owner
+            and spec_metadata is not None
+            and not getattr(spec_metadata, "enable_penalty", False)
+            and batch_size > num_contexts
+            and worker._can_use_rejection_sampling(spec_metadata)
+        )
 
     def check_routed(self, logits, where: str) -> None:
         """Raise when a row is pending and a different tensor reached ``where`` as the logits.
@@ -667,6 +876,10 @@ class TargetHead:
         offset: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """The fused sampler's tokens for the pending row; consumes it."""
+        if self.pending_row_owner:
+            # lm_head_row_owner: the whole row from the pages first.
+            self.row_owner.gather_into(logits)
+            self.pending_row_owner = False
         local = self.pending_local
         inbox = self.pending_inbox
         s2_row = self.pending_s2
@@ -683,22 +896,27 @@ class TargetHead:
                     f"[musespark_open] head_sampler_coop_fold DIST_MIN_ROWS={self.dist_min_rows}: engaged on a "
                     f"{local.shape[0]}-row decode step (ds_sample: no logits all-gather)"
                 )
-            return _hs.dist_sample(
-                self.dist.view,
-                logits,
-                local,
-                temperatures,
-                top_ks,
-                top_ps,
-                min_ps,
-                seed,
-                offset,
-                self.multiplier,
-                self.soft_cap,
-                self.pdl,
-                self.verify_pdl and self.pdl,
-                fabric=_hs.DIST_FABRIC,
-            )
+            rows, step = local.shape[0], self.dist.max_rows
+            calls = [
+                _hs.dist_sample(
+                    self.dist.view,
+                    logits[i : i + step],
+                    local[i : i + step],
+                    temperatures[i : i + step],
+                    top_ks[i : i + step],
+                    top_ps[i : i + step],
+                    min_ps[i : i + step],
+                    None if seed is None else seed[i : i + step],
+                    None if offset is None else offset[i : i + step],
+                    self.multiplier,
+                    self.soft_cap,
+                    self.pdl,
+                    self.verify_pdl and self.pdl and i + step >= rows,
+                    fabric=_hs.DIST_FABRIC,
+                )
+                for i in range(0, rows, step)
+            ]
+            return calls[0] if len(calls) == 1 else torch.cat(calls)
         if s2_row:
             return self.s2.sample(
                 temperatures,
@@ -829,6 +1047,12 @@ class TargetHead:
 
     def _gather_now(self, logits: torch.Tensor) -> Optional[torch.Tensor]:
         """Consume the pending row; returns the gathered BF16 row of a vocab-parallel one."""
+        if self.pending_row_owner:
+            # lm_head_row_owner: the whole row from the pages, into the pending object.
+            self.row_owner.gather_into(logits)
+            self.pending = None
+            self.pending_row_owner = False
+            return None
         if self.pending_s2:
             # distributed_head_sampler: the row in vocabulary order, into the pending object
             # (the one-shot gather + inverse permutation).
@@ -871,10 +1095,18 @@ class TargetHead:
         return None
 
     def materialize(self, logits: torch.Tensor) -> torch.Tensor:
-        """The built-in processor's FP32 capped logits for the pending row; consumes it."""
+        """The built-in processor's FP32 capped logits for the pending row; consumes it.
+
+        The result is a new tensor only its caller reads (the step's ``logits`` output
+        is the pending row), so it is marked private to the verify that receives it:
+        under ``TRTLLM_RS_COMPACT_DRAFT_PROBS`` that verify rebuilds the draft rows in
+        its storage once the target probabilities exist.
+        """
         gathered = self._gather_now(logits)
-        return soft_capped_logits(
-            logits if gathered is None else gathered, self.multiplier, self.soft_cap
+        return mark_private_verify_logits(
+            soft_capped_logits(
+                logits if gathered is None else gathered, self.multiplier, self.soft_cap
+            )
         )
 
     def drain(self) -> None:
@@ -889,6 +1121,11 @@ class TargetHead:
             self.pending = None
             self.pending_local = None
             self.pending_dist = False
+        elif self.pending_row_owner:
+            # Each owner polls and resets its rows; nobody reads them.
+            self.row_owner.drain(int(self.pending.shape[0]))
+            self.pending = None
+            self.pending_row_owner = False
         elif self.pending is not None:
             self._gather_now(self.pending)
 
@@ -907,7 +1144,7 @@ class SplitSamplerLogitsProcessor(MuseSparkOpenLogitsProcessor):
     ) -> torch.Tensor:
         head = self._split_head
         if head.takes(hidden_states, attn_metadata, return_context_logits):
-            return head.produce(hidden_states, lm_head)
+            return head.produce(hidden_states, lm_head, attn_metadata)
         return super().forward(hidden_states, lm_head, attn_metadata, return_context_logits)
 
 
@@ -980,10 +1217,14 @@ class TargetHeadDFlashWorker(DFlashWorker):
             ):
                 # Before any ownership test: a mixed step has no pending row but may verify a fused step's drafts.
                 rs.densify(spec_metadata, num_contexts, batch_size)
-        if head.owns(logits) and (
-            spec_metadata is None
-            or getattr(spec_metadata, "enable_penalty", False)
-            or (batch_size > num_contexts and self._can_use_rejection_sampling(spec_metadata))
+        if (
+            head.owns(logits)
+            and (
+                spec_metadata is None
+                or getattr(spec_metadata, "enable_penalty", False)
+                or (batch_size > num_contexts and self._can_use_rejection_sampling(spec_metadata))
+            )
+            and not head.row_owner_verifies(self, spec_metadata, num_contexts, batch_size)
         ):
             logits = head.materialize(logits)
         return super()._accept_draft_tokens(
@@ -1153,8 +1394,15 @@ def installed(llm) -> bool:
     ) and isinstance(getattr(llm, "spec_worker", None), TargetHeadDFlashWorker)
 
 
-def widen(llm) -> bool:
+def widen(llm, vp_max_rows: int = 0, head_chunk_rows: int = 0, dist_chunk: bool = False) -> bool:
     """``wide_split_sampler``: let the installed head take decode steps of up to ``WIDE_MAX_ROWS`` rows.
+
+    w256 (TEP8, both default 0: off; only calls above ``MAX_ROWS`` rows change): ``vp_max_rows``
+    (VP_MAX_ROWS) builds the vocabulary-parallel head's workspace for calls of ``MAX_ROWS + 1``..
+    ``vp_max_rows`` rows next to the distributed sampler (DIST_MIN_ROWS..MAX_ROWS): no logits
+    all-gather there, the same tokens (``vocab_parallel_sample`` reproduces the 512-thread block);
+    ``head_chunk_rows`` (HEAD_CHUNK_ROWS) runs the local LM-head GEMM of such calls as GEMMs of at
+    most that many rows (order-only: each row gets its <= MAX_ROWS-row call's bits).
 
     The split sampler reproduces the shipped sampler's 512-thread block above 128
     rows bit for bit (``head_sampler``), so steps of 129..1024 rows (17 to 128
@@ -1170,6 +1418,21 @@ def widen(llm) -> bool:
             "[musespark_open] wide_split_sampler cannot run here: the split_sampler head is not installed"
         )
     head = llm.logits_processor._split_head
+    if not 0 <= head_chunk_rows <= _hs.MAX_ROWS:
+        raise ValueError(
+            f"[musespark_open] wide_split_sampler HEAD_CHUNK_ROWS is 0..{_hs.MAX_ROWS}, got {head_chunk_rows}"
+        )
+    head.head_chunk_rows = int(head_chunk_rows)
+    if dist_chunk:
+        if head.dist is None:
+            raise ValueError(
+                "[musespark_open] wide_split_sampler DIST_CHUNK: needs head_sampler_coop_fold's distributed sampler"
+            )
+        head.dist_chunk = True
+        logger.info(
+            f"[musespark_open] wide_split_sampler DIST_CHUNK: decode steps of {_hs.MAX_ROWS + 1}.."
+            f"{2 * head.dist.max_rows} rows on the distributed sampler in calls of at most {head.dist.max_rows} rows"
+        )
     if head.max_rows == _hs.WIDE_MAX_ROWS:
         return False
     if head.pending is not None:
@@ -1181,6 +1444,26 @@ def widen(llm) -> bool:
         logger.info(
             f"[musespark_open] vocab_parallel_head: decode steps of {_hs.VP_MIN_ROWS}..{head.max_rows} "
             f"rows; {head.vp.nbytes() / 2**20:.1f} MiB of fabric buffers on this rank"
+        )
+    elif vp_max_rows > _hs.MAX_ROWS:
+        if head.dist is None or head.s2 is not None:
+            raise ValueError(
+                "[musespark_open] wide_split_sampler VP_MAX_ROWS: needs head_sampler_coop_fold's distributed sampler "
+                "(DIST_MIN_ROWS) and no distributed_head_sampler"
+            )
+        if vp_max_rows > _hs.WIDE_MAX_ROWS:
+            raise ValueError(
+                f"[musespark_open] wide_split_sampler VP_MAX_ROWS is at most {_hs.WIDE_MAX_ROWS}"
+            )
+        # Collective (every rank at the same point of the load). ``produce`` checks the distributed
+        # sampler's band (..MAX_ROWS) first, so this workspace takes MAX_ROWS + 1..vp_max_rows only.
+        head.vp = _hs.VocabParallelWorkspace(
+            head.mapping, int(head.lm_head.weight.shape[0]), int(vp_max_rows)
+        )
+        logger.info(
+            f"[musespark_open] wide_split_sampler VP_MAX_ROWS={vp_max_rows}: decode steps of {_hs.MAX_ROWS + 1}.."
+            f"{vp_max_rows} rows on the vocabulary-parallel head (no logits all-gather); "
+            f"{head.vp.nbytes() / 2**20:.1f} MiB of fabric buffers on this rank"
         )
     logger.info(
         f"[musespark_open] wide_split_sampler: the split sampler takes decode steps of up to "

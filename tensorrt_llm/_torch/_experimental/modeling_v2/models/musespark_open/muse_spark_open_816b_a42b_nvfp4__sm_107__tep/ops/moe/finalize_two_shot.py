@@ -207,7 +207,15 @@ if HAS_CUTE_DSL:
         vector of all eight slots. ``timeout_ns`` (0 = unbounded) bounds every poll.
         """
 
-        def __init__(self, ranks: int, pdl: bool, timeout_ns: int, max_rows: int, min_blocks: int):
+        def __init__(
+            self,
+            ranks: int,
+            pdl: bool,
+            timeout_ns: int,
+            max_rows: int,
+            min_blocks: int,
+            phase1_only: bool = False,
+        ):
             if ranks not in RANK_COUNTS:
                 raise ValueError(f"the two-shot finalize serves {RANK_COUNTS} ranks, got {ranks}")
             self.ranks = ranks
@@ -215,6 +223,10 @@ if HAS_CUTE_DSL:
             self.timeout_ns = int(timeout_ns)
             self.max_rows = int(max_rows)
             self.min_blocks = int(min_blocks)
+            #: Row-owner mode (``row_owner_moe``): the scatter shot only. A non-owner CTA
+            #: publishes its partial and exits; the owner sums and stores the token at its
+            #: compact row ``token // ranks`` of ``out``; no gather area is written or read.
+            self.phase1_only = bool(phase1_only)
             self.source_bytes = (self.max_rows // ranks) * ROW_BYTES
             self.gather_base = BUFFERS * ranks * self.source_bytes
 
@@ -476,19 +488,20 @@ if HAS_CUTE_DSL:
                             own[2],
                             own[3],
                         )
-                    self.wait_slots(
-                        values,
-                        own[0],
-                        own[1],
-                        own[2],
-                        own[3],
-                        Uint32(1),
-                        receive_address + gather,
-                        Int64(0),
-                    )
-                    _reset_x4(receive_address + gather, Uint32(1))
-                    for w in cutlass.range_constexpr(4):
-                        reduced[w] = values[0, w]
+                    if cutlass.const_expr(not self.phase1_only):
+                        self.wait_slots(
+                            values,
+                            own[0],
+                            own[1],
+                            own[2],
+                            own[3],
+                            Uint32(1),
+                            receive_address + gather,
+                            Int64(0),
+                        )
+                        _reset_x4(receive_address + gather, Uint32(1))
+                        for w in cutlass.range_constexpr(4):
+                            reduced[w] = values[0, w]
                 else:
                     # The owner: every peer's partial of this token (its own is `own`).
                     stale = Uint32((1 << self.ranks) - 1) & ~(Uint32(1) << Uint32(rank))
@@ -516,26 +529,38 @@ if HAS_CUTE_DSL:
                             total_out[2 * w + 1] = total_out[2 * w + 1] + high
                     for w in cutlass.range_constexpr(4):
                         reduced[w] = _pack_bf16x2(total_out[2 * w], total_out[2 * w + 1])
-                    for p in cutlass.range_constexpr(self.ranks):
-                        _store_peer_x4_if(
-                            peers[p].toint() + gather,
-                            Uint32(rank != p),
+                    if cutlass.const_expr(not self.phase1_only):
+                        for p in cutlass.range_constexpr(self.ranks):
+                            _store_peer_x4_if(
+                                peers[p].toint() + gather,
+                                Uint32(rank != p),
+                                reduced[0],
+                                reduced[1],
+                                reduced[2],
+                                reduced[3],
+                            )
+                # Past the last transport access: a dependent may start its prologue now;
+                # its griddepcontrol.wait still returns only once this grid has completed.
+                if cutlass.const_expr(self.pdl):
+                    cute.arch.griddepcontrol_launch_dependents()
+                if cutlass.const_expr(self.phase1_only):
+                    # Row-owner mode: only the owner stores, at its compact row.
+                    if owner == rank:
+                        _store_x4(
+                            out.toint() + Int64(token // self.ranks) * ROW_BYTES + vector,
                             reduced[0],
                             reduced[1],
                             reduced[2],
                             reduced[3],
                         )
-                # Past the last transport access: a dependent may start its prologue now;
-                # its griddepcontrol.wait still returns only once this grid has completed.
-                if cutlass.const_expr(self.pdl):
-                    cute.arch.griddepcontrol_launch_dependents()
-                _store_x4(
-                    out.toint() + Int64(token) * ROW_BYTES + vector,
-                    reduced[0],
-                    reduced[1],
-                    reduced[2],
-                    reduced[3],
-                )
+                else:
+                    _store_x4(
+                        out.toint() + Int64(token) * ROW_BYTES + vector,
+                        reduced[0],
+                        reduced[1],
+                        reduced[2],
+                        reduced[3],
+                    )
 
     _POINTER_DTYPES = (
         BFloat16,  # gemm
@@ -551,9 +576,15 @@ if HAS_CUTE_DSL:
 
     @functools.lru_cache(maxsize=16)
     def _compiled_kernel(
-        device_index: int, ranks: int, pdl: bool, timeout_ns: int, max_rows: int, min_blocks: int
+        device_index: int,
+        ranks: int,
+        pdl: bool,
+        timeout_ns: int,
+        max_rows: int,
+        min_blocks: int,
+        phase1_only: bool = False,
     ):
-        kernel = _FinalizeTwoShotKernel(ranks, pdl, timeout_ns, max_rows, min_blocks)
+        kernel = _FinalizeTwoShotKernel(ranks, pdl, timeout_ns, max_rows, min_blocks, phase1_only)
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
             return cute.compile(
@@ -606,6 +637,7 @@ class FinalizeTwoShotWorkspace:
         *,
         timeout_ns: int = 0,
         max_rows: int = MAX_ROWS,
+        phase1_only: bool = False,
     ):
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
@@ -626,6 +658,13 @@ class FinalizeTwoShotWorkspace:
         self.rank = mapping.tp_rank
         self.max_rows = int(max_rows)
         self.timeout_ns = int(timeout_ns)
+        # Row-owner mode: the scatter shot only, the owner's tokens at compact rows (the
+        # ``row_owner_moe`` island; never the served finalize). Its own allocation, so the
+        # buffer-reuse argument of the module docstring holds per workspace: every call
+        # has at least ``ranks`` tokens, so each rank owns a token and its call completes
+        # only after every peer's scatter of the same call arrived, which a peer issues only
+        # after its previous call (resets included) completed.
+        self.phase1_only = bool(phase1_only)
         self.pdl = _pdl_enabled()
         self.active = False
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
@@ -677,6 +716,7 @@ class FinalizeTwoShotWorkspace:
                     self.timeout_ns,
                     self.max_rows,
                     blocks,
+                    self.phase1_only,
                 )
                 for blocks in (MIN_BLOCKS, WIDE_MIN_BLOCKS)
             }
@@ -779,7 +819,16 @@ class FinalizeTwoShotWorkspace:
         rows, row_stride = self._validate(
             gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens
         )
-        out = torch.empty((num_tokens, HIDDEN), dtype=torch.bfloat16, device=self.device)
+        if self.phase1_only:
+            if num_tokens % self.ranks:
+                raise ValueError(
+                    f"phase1_only takes a multiple of {self.ranks} tokens, got {num_tokens}"
+                )
+            out = torch.empty(
+                (num_tokens // self.ranks, HIDDEN), dtype=torch.bfloat16, device=self.device
+            )
+        else:
+            out = torch.empty((num_tokens, HIDDEN), dtype=torch.bfloat16, device=self.device)
         self._launch(
             gemm2_output.data_ptr() if rows > 0 else 0,
             indices.data_ptr(),
@@ -860,7 +909,8 @@ class FinalizeTwoShot(OpWrapper):
     ``finalize_chunked`` above) by its own four-rank test (every cell, a delayed rank,
     back-to-back calls of changing token counts, CUDA-graph replays with changing
     inputs) and against `reference` within a band. Not certified: TP8, more than 512
-    tokens.
+    tokens (a workspace of ``max_rows`` above 512 serves only a wide generation server's
+    raised row cap, ``levers.row_cap``).
     """
 
     def __call__(

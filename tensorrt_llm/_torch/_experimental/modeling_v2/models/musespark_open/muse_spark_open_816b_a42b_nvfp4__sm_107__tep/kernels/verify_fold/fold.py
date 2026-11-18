@@ -1168,6 +1168,21 @@ def _is_context_kv_fork(owner: type) -> bool:
     return owner is context_kv_fork.ContextKvForkDFlashWorker
 
 
+def _is_row_owner_verify(owner: type) -> bool:
+    """Whether ``owner`` is ``lm_head_row_owner``'s ``RowOwnerVerifyDFlashWorker``.
+
+    Admitted below this class in the MRO: its ``_sample_and_accept_draft_tokens_rejection``
+    returns the built-in rejection body's accepted tokens and counts (owner-sliced on the
+    steps it takes, the next body's otherwise), which ``rejection_fold`` folds as it folds the
+    built-in's.
+    """
+    if owner.__name__ != "RowOwnerVerifyDFlashWorker":
+        return False
+    from ..lm_head_row_owner import owner as lm_head_row_owner
+
+    return owner is lm_head_row_owner.RowOwnerVerifyDFlashWorker
+
+
 def unsupported_reason(
     spec_worker, verify_fold: bool = True, path_walk_tail: bool = True
 ) -> Optional[str]:
@@ -1188,7 +1203,12 @@ def unsupported_reason(
     }
     for name in OVERRIDDEN:
         owner = next((klass for klass in cls.__mro__ if name in vars(klass)), None)
-        if owner is not None and owner not in allowed and not _is_context_kv_fork(owner):
+        if (
+            owner is not None
+            and owner not in allowed
+            and not _is_context_kv_fork(owner)
+            and not _is_row_owner_verify(owner)
+        ):
             return f"the spec worker class {cls.__name__} overrides {name} in {owner.__name__}"
         if name in vars(spec_worker):
             return f"{name} is already replaced on this worker instance"

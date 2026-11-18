@@ -55,7 +55,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import gdc_wait
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
@@ -76,6 +76,12 @@ RING_SIZES = {8: EXPERTS // 8, 4: EXPERTS // 4}
 #: tail instead of following it (the traced top-8 -> ring buddy gap is 0.7 us). Launch timing
 #: only: values unchanged.
 _RB_PDL = False
+#: The ``tep8_ring_buddy_pdl`` lever's TRIGGER (``configure(rb_trigger=True)``): under ``_RB_PDL`` the
+#: table-writing program releases its dependent (the expert call's FC1, a PDL launch whose kernels wait
+#: for their prerequisite grid before reading the tables) right after its own dependency wait instead of
+#: at its exit, so FC1's launch and prologue overlap the placement. FC1's wait still returns only once
+#: this program completed: launch timing only, values unchanged. Off: the trigger at exit.
+_RB_TRIGGER = False
 #: The ``tep8_router_push`` lever's ``RB_CUDA`` (``configure(cuda_tables=True)``): the 8-rank balanced
 #: two-window calls with tables (``meta_tile``; the count rule or ``tep8_tile_placement``'s) of at most
 #: 128 rows run ``ring_buddy_cuda.rb_tables`` (one 1024-thread CUDA CTA, PDL) instead of this module's
@@ -104,7 +110,11 @@ def block_of(ranks: int) -> int:
 #: and, with its MAX_ROWS raised to 128, the 65..128-row ones (a 1024-slot tile); the kernel is
 #: the same [SLOTS, RANKS] program at every tile, and smaller calls keep their tile. (The GB300
 #: port, ``sm_103__tep8``, serves 128 rows on this program: device gate kernel == reference.)
-MAX_SLOTS = 1024
+MAX_SLOTS = 2048
+#: (w256) ``MAX_SLOTS`` was 1024 (128 rows); 2048 lets the same program place the 129..256-row TEP8 steps
+#: (17..32 requests) when ``tep8_ring_buddy_wide``'s MAX_ROWS is raised past 128 (a 2048-slot tile). The
+#: CUDA tables program (``ring_buddy_cuda``, one 1024-thread CTA) keeps its own 1024-slot bound.
+CUDA_MAX_SLOTS = 1024
 
 #: The half window (``half_window_experts``, tep4): a block's upper half starts at this
 #: local index, and the stack ``[own block | the predecessor's upper half]`` holds
@@ -190,6 +200,7 @@ BF16_TILE_CHOICES = (8, 16, 32, 64)
 def configure(
     *,
     rb_pdl: bool = False,
+    rb_trigger: bool = False,
     tile_placement: bool = False,
     tile_min_rows: int = 33,
     tile_max_rows: int = 64,
@@ -230,7 +241,14 @@ def configure(
             not one of ``BF16_TILE_CHOICES``, or ``wide_warps`` not one of
             ``WIDE_WARPS_CHOICES`` (nothing is set).
     """
-    global _RB_PDL, _TILE_PLACEMENT, _TILE_MIN_ROWS, _TILE_MAX_ROWS, _TILE_COST, _WIDE_WARPS
+    global \
+        _RB_PDL, \
+        _RB_TRIGGER, \
+        _TILE_PLACEMENT, \
+        _TILE_MIN_ROWS, \
+        _TILE_MAX_ROWS, \
+        _TILE_COST, \
+        _WIDE_WARPS
     global _CUDA_TABLES
     global _BF16_TILE_COST, _BF16_TILE
     if int(wide_warps) not in WIDE_WARPS_CHOICES:
@@ -263,6 +281,7 @@ def configure(
     _TILE_COST = cost
     _WIDE_WARPS = int(wide_warps)
     _RB_PDL = bool(rb_pdl)
+    _RB_TRIGGER = bool(rb_trigger)
     _CUDA_TABLES = bool(cuda_tables)
     _TILE_PLACEMENT = bool(tile_placement)
     _TILE_MIN_ROWS = int(tile_min_rows)
@@ -307,7 +326,9 @@ def program_warps(slots: int, tables: bool) -> int:
     return _WIDE_WARPS if slots >= WIDE_WARPS_FROM_SLOTS else _META_WARPS
 
 
-def cuda_tables_take(ranks: int, balance: bool, half: bool, slots: int, tile: Optional[int]) -> bool:
+def cuda_tables_take(
+    ranks: int, balance: bool, half: bool, slots: int, tile: Optional[int]
+) -> bool:
     """Whether a table-writing call runs ``ring_buddy_cuda``'s CUDA program (``_CUDA_TABLES``, ``RB_CUDA``):
     8 ranks, the balanced two-window placement (by count or, ``_TILE_PLACEMENT``, by tile cost; not the half
     window), at most 1024 slots, a ``meta_tile`` of 8..64. Rank-uniform facts only."""
@@ -316,7 +337,7 @@ def cuda_tables_take(ranks: int, balance: bool, half: bool, slots: int, tile: Op
         and ranks == 8
         and bool(balance)
         and not half
-        and 0 < slots <= MAX_SLOTS
+        and 0 < slots <= CUDA_MAX_SLOTS
         and tile in (8, 16, 32, 64)
     )
 
@@ -421,11 +442,15 @@ def _ring_buddy_assign_kernel(
     COST_A: tl.constexpr = 20,
     COST_B: tl.constexpr = 11,
     PDL: tl.constexpr = False,
+    TRIGGER: tl.constexpr = False,
 ):
     if PDL:
         # tep8_ring_buddy_pdl: wait for the routing kernel (a PDL predecessor) before reading
         # anything it wrote
         gdc_wait()
+        if TRIGGER:
+            # TRIGGER: let the expert call's FC1 launch now (it waits for this grid before reading)
+            gdc_launch_dependents()
     tl.static_assert(BLOCK == 32 or BLOCK == 64, "one 32- or 64-bit presence word per block")
     tl.static_assert(not HALF or (BLOCK == 64 and BALANCE), "the half window: tep4, balanced")
     WIDE: tl.constexpr = BLOCK == 64
@@ -744,7 +769,9 @@ class RingBuddyAssign(OpWrapper):
         dummy = stats
         rule = tile_rule(selected.shape[0], meta_tile, balance, half, ranks, bf16)
         tilew = rule is not None
-        cost_a, cost_b, tile = rule if tilew else (*_TILE_COST, meta_tile if meta is not None else 8)
+        cost_a, cost_b, tile = (
+            rule if tilew else (*_TILE_COST, meta_tile if meta is not None else 8)
+        )
         pdl = _RB_PDL and meta is not None and ranks == 8
         if (
             _CUDA_TABLES
@@ -794,6 +821,7 @@ class RingBuddyAssign(OpWrapper):
             COST_A=cost_a,
             COST_B=cost_b,
             PDL=pdl,
+            **({"TRIGGER": True} if pdl and _RB_TRIGGER else {}),
             num_warps=program_warps(slots, meta is not None),
             launch_pdl=pdl,
         )

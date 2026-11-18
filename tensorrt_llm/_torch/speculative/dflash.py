@@ -46,6 +46,12 @@ from .dflash_attention import (
     validate_dflash_fa4_runtime,
     validate_dflash_trtllm_gen_runtime,
 )
+from .dflash_kv_storage import (
+    fp8_draft_kv_requested,
+    is_storage_only_dtype,
+    kv_compute_dtype,
+    to_kv_storage,
+)
 from .interface import SpecMetadata, SpecWorkerBase
 
 # Backends that keep the draft's private context K/V in a paged HND pool.
@@ -810,6 +816,9 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_buf = None
         # The manager _ctx_kv_buf is borrowed from, so a swap can be detected.
         self._ctx_kv_manager = None
+        # The drafter's activation dtype, which its context K/V are computed in.
+        # The pool may store them in a narrower dtype (``dflash_kv_storage``).
+        self._ctx_compute_dtype = None
         # Static per-slot page table for the private arena. When bound to the
         # manager it is replaced by _ctx_block_tables, refreshed per iteration.
         self._ctx_page_table = None
@@ -981,6 +990,11 @@ class DFlashWorker(SpecWorkerBase):
         Note the page count is not the drafter's to interpret: a V2 view spans
         the whole interleaved pool, not this layer's slice, so only shape[1:] is
         checked here and the index space is settled in _init_ctx_block_tables.
+
+        Every layer must have one dtype: ``dtype`` (the drafter's activation
+        dtype), or, with ``TRTLLM_DFLASH_FP8_DRAFT_KV=1`` (opt-in, off by
+        default), FP8 E4M3 for a BF16 drafter whose draft layers the target's
+        manager stores in FP8 (``dflash_kv_storage``).
         """
         if draft_kv_cache_manager is None:
             # No separate draft KV cache. Attention DP alone does NOT disable
@@ -1003,14 +1017,25 @@ class DFlashWorker(SpecWorkerBase):
         base = layers[0]
         # kv_factor 1 is the MLA drafter's SELFKONLY pool: one latent, no V.
         expected = (kv_factor, nkv, base.size(-2), hd)
+        pool_dtype = base.dtype
+        if not (
+            pool_dtype == dtype
+            or (
+                pool_dtype == torch.float8_e4m3fn
+                and dtype == torch.bfloat16
+                and kv_factor == 2
+                and fp8_draft_kv_requested()
+            )
+        ):
+            pool_dtype = dtype
         for i, layer in enumerate(layers):
-            if tuple(layer.shape[1:]) != expected or layer.dtype != dtype:
+            if tuple(layer.shape[1:]) != expected or layer.dtype != pool_dtype:
                 # Fall back rather than fail: the private arena is what every
                 # DFlash model shipped with, so an unrecognized pool costs the
                 # old memory footprint, not the run.
                 logger.warning(
                     f"DFlash: draft KV pool layer {i} is {tuple(layer.shape)} / {layer.dtype}, "
-                    f"not {('pages',) + expected} / {dtype}; using the private ctx arena."
+                    f"not {('pages',) + expected} / {pool_dtype}; using the private ctx arena."
                 )
                 return None
         logger.info(
@@ -1248,6 +1273,8 @@ class DFlashWorker(SpecWorkerBase):
             )
 
         dtype = draft_model.fc.weight.dtype if hasattr(draft_model, "fc") else torch.bfloat16
+        # The context K/V are computed in this dtype; a pool may store them narrower.
+        self._ctx_compute_dtype = dtype
 
         # Reserve slot index max_batch as a scratch slot for padding/unknown
         # dummies; real requests only draw slots 0..max_batch-1, so dummy
@@ -1556,6 +1583,18 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_paged_append = get_dflash_paged_append()
         return self._ctx_paged_append
 
+    def _ctx_store_compute_dtype(self) -> torch.dtype:
+        """The dtype the context K/V are computed in before they are stored.
+
+        The context cache's dtype, except for a storage-only one (an FP8 draft
+        pool), whose K/V are computed in the drafter's activation dtype and cast
+        on store (``_store_context_kv_paged``).
+        """
+        cache_dtype = self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
+        if not is_storage_only_dtype(cache_dtype):
+            return cache_dtype
+        return kv_compute_dtype(cache_dtype, self._ctx_compute_dtype)
+
     def _store_context_kv_paged(
         self,
         k: torch.Tensor,
@@ -1563,6 +1602,11 @@ class DFlashWorker(SpecWorkerBase):
         rows: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        """Append the context K/V ``[rows, L, nkv, hd]`` into the paged context, per layer.
+
+        K/V in the pool's dtype are appended as they are; a storage-only pool
+        (FP8) gets them through ``to_kv_storage``'s saturating cast.
+        """
         if v is None:
             # Single-latent (MLA) cache: one vector per token per layer, so
             # there is no K/V interleave for append_paged_kv_cache to do and the
@@ -1587,12 +1631,13 @@ class DFlashWorker(SpecWorkerBase):
         positions_i32 = positions.to(torch.int32)
         kv_indices, kv_indptr = self._ctx_paged_index_args()
         for layer_idx in range(k.size(1)):
+            cache = self._ctx_kv_buf[layer_idx]
             append_paged_kv_cache(
-                append_key=k[:, layer_idx].contiguous(),
-                append_value=v[:, layer_idx].contiguous(),
+                append_key=to_kv_storage(k[:, layer_idx], cache.dtype).contiguous(),
+                append_value=to_kv_storage(v[:, layer_idx], cache.dtype).contiguous(),
                 batch_indices=rows_i32,
                 positions=positions_i32,
-                paged_kv_cache=self._ctx_kv_buf[layer_idx],
+                paged_kv_cache=cache,
                 kv_indices=kv_indices,
                 kv_indptr=kv_indptr,
                 kv_last_page_len=self._ctx_kv_last_page_len,
@@ -1729,9 +1774,9 @@ class DFlashWorker(SpecWorkerBase):
 
         # Fast path: store the pre-projected/pre-RoPE'd K/V.
         # dflash_forward reads these directly via cache_batch_idx.
-        cache_dtype = self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
+        compute_dtype = self._ctx_store_compute_dtype()
         k_new, v_new = draft_model.precompute_context_kv(
-            projected_to_store.to(cache_dtype), pos_flat
+            projected_to_store.to(compute_dtype), pos_flat
         )
         if num_accepted is not None:
             # Fixed-size writes for CUDA graph compatibility:
@@ -1987,10 +2032,7 @@ class DFlashWorker(SpecWorkerBase):
             # continuation.
             self._req_ctx_pos[req_id] = first_pos + slen
             if actual > 0:
-                cache_dtype = (
-                    self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
-                )
-                chunk_proj_cast = chunk_proj[:actual].to(cache_dtype)
+                chunk_proj_cast = chunk_proj[:actual].to(self._ctx_store_compute_dtype())
                 ctx_len_updates[slot] = end
                 # Precompute post-norm/post-RoPE K,V for this prefill chunk
                 # so decode iters can read without re-projecting.
@@ -2466,7 +2508,14 @@ class DFlashWorker(SpecWorkerBase):
         tokens, proposal = draft_model.sample_candidate_path(
             candidate_ids, unary_logits, block_hidden_states, anchor_tokens.long(), sample_step
         )
-        if spec_metadata.draft_probs is not None:
+        compact = getattr(spec_metadata, "compact_draft_probs", None)
+        if compact is not None:
+            # TRTLLM_RS_COMPACT_DRAFT_PROBS: the same rows as records.
+            compact.write_rows(
+                spec_metadata.batch_slot_ids[gen], candidate_ids, proposal, full_vocab
+            )
+            spec_metadata.draft_probs_last_dim = full_vocab
+        elif spec_metadata.draft_probs is not None:
             draft_probs = spec_metadata.draft_probs
             slots = spec_metadata.batch_slot_ids[gen]
             num_steps = tokens.shape[1]

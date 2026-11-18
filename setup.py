@@ -245,6 +245,8 @@ package_data += [
     'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/rs_sampler/*.cu',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
     'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/rs_sampler/*.cuh',
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/kernels/lm_head_row_owner/*.cu',
 ]
 
 

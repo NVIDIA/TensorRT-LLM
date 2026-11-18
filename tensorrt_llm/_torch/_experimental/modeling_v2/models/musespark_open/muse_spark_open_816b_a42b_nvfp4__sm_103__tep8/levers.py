@@ -12,9 +12,9 @@ arena), the structural rules ``dispatch`` derives from it, and the environment s
 
 Knobs. These are the only variables the target reads for levers::
 
-    MUSESPARK_OPEN_LEVER_<LEVER>=auto|on|off          one per lever; unset or empty: the default
-    MUSESPARK_OPEN_LEVER_<LEVER>__<PARAM>=<value>      a parameter the lever declares (Rule.params)
-    MUSESPARK_OPEN_LEVER__DEFAULT=auto|baseline        what an unset lever knob means
+    MUSESPARK_OPEN_LEVER_<LEVER>=auto|on|off          one per lever; unset, empty or auto: its default
+    MUSESPARK_OPEN_LEVER_<LEVER>__<PARAM>=<value>      a parameter the lever declares (Lever.params)
+    MUSESPARK_OPEN_LEVER__DEFAULT=on|off               off: every lever off but the upstream ones' stock rule
     MUSESPARK_OPEN_LEVER__ROLE=auto|agg|ctx|gen        the server's role; unset or auto: derived
 
 ``<LEVER>`` is the lever's name upper-cased; ``__`` introduces a parameter or a resolver
@@ -23,18 +23,26 @@ whitespace-stripped. Two shared-path variables are read as facts and never set o
 here: ``TRTLLM_KV_DEFER_CLOSE`` (on iff exactly ``1``, the KV cache manager's own test) and
 ``UCX_RNDV_THRESH`` (set or not).
 
+The table. ``LEVERS`` is the one list of this target's levers: each row is a ``Lever`` with its
+``kind`` (what it changes, ``Kind``) and ``on_by_default``, the condition under which it is on
+when no knob speaks for it. Every other deployment runs it only when its knob says ``on``
+(opt-in). The conditions are written from a few combinators: ``ALWAYS`` (wherever it can run),
+``NEVER`` (opt-in only), ``unless_on(...)``, ``gated(...)`` (a lossless-numeric lever's own
+accuracy gates, ``Lever.gates``, must hold), ``_off_at_hc(...)`` (off on the high-concurrency
+selection), and the target's deployment rules (``_at_most``, ``_sm107_at_most``, ...).
+
 Semantics, in the order a lever is resolved:
 
 * structural: a fact the lever's code needs (an arena kind, an architecture, a fact
-  variable; ``dispatch.structural_rules``) excludes it; nothing overrides that;
+  variable; ``dispatch.structural_rules``, ``Lever.excluded``) excludes it; nothing
+  overrides that;
 * dependency: a lever it builds on (``dispatch.FastPath.depends_on``) or requires
-  (``Rule.requires``) is off;
+  (``Lever.requires``) is off;
 * knob: ``off`` removes it, and with it every lever built on it or requiring it; ``on``
-  keeps it whatever its deployment rule and gates say;
-* default: ``auto`` runs the lever's deployment rule (``Rule.auto``), and a lossless-numeric
-  lever also needs one of its accuracy gates (``Rule.gates``); ``baseline`` turns every
-  lever off that is not the upstream target's, and gives the upstream ones their upstream
-  rule (``Rule.baseline``).
+  keeps it whatever its default says, and turns on the levers it builds on or requires;
+* ``__DEFAULT=off``: a lever with a ``stock`` rule (the upstream target's own levers) runs
+  that rule; every other lever is off;
+* default: its row's ``on_by_default``.
 
 ``on`` for a lever the composition does not serve, that a structural rule excludes, whose
 dependency or requirement is off, or that conflicts with another lever that is on, raises.
@@ -72,7 +80,8 @@ HC_MIN_BATCH = 48
 PREFIX = "MUSESPARK_OPEN_LEVER_"
 #: Separates a lever name from a parameter key.
 SEP = "__"
-#: What an unset lever knob means: ``auto`` (the default) or ``baseline``.
+#: What an unset lever knob means: ``on`` (each row's default, the default) or ``off``
+#: (only the upstream levers' stock rules).
 DEFAULT_KNOB = PREFIX + "_DEFAULT"
 #: The server's role: ``auto`` (derived, the default), ``agg``, ``ctx`` or ``gen``.
 ROLE_KNOB = PREFIX + "_ROLE"
@@ -83,12 +92,11 @@ UCX_RNDV_THRESH_ENV = "UCX_RNDV_THRESH"
 AUTO = "auto"
 ON = "on"
 OFF = "off"
-BASELINE = "baseline"
 LEVER_VALUES = (AUTO, ON, OFF)
-DEFAULT_VALUES = (AUTO, BASELINE)
+DEFAULT_VALUES = (ON, OFF)
 
 #: The decision sources, in the order a lever is resolved.
-SOURCES = ("structural", "dependency", "knob", "baseline", "auto", "gate")
+SOURCES = ("structural", "dependency", "knob", "stock", "default")
 
 #: Retired switches and what replaced them. Setting one, to any value, raises.
 RETIRED: Mapping[str, str] = types.MappingProxyType(
@@ -142,17 +150,18 @@ def retired_replacement(name: str) -> Optional[str]:
 
 
 class Kind(str, enum.Enum):
-    """What a lever changes, which fixes what evidence ``auto`` needs (module docstring)."""
+    """What a lever changes, which fixes what evidence its default needs (module docstring)."""
 
-    #: A fast path validated with its composition: ``auto`` serves it where the rule says.
+    #: A fast path validated with its composition: on by default where its row says.
     COMPOSITION = "composition"
     #: Writes the bytes of the path it replaces.
     BITWISE = "lossless-bitwise"
-    #: Same precision, another rounding or summation order: ``auto`` also needs a gate.
+    #: Same precision, another rounding or summation order: its default also needs a gate
+    #: (``gated``).
     NUMERIC = "lossless-numeric"
-    #: Lower precision: never on under ``auto``.
+    #: Lower precision: never on by default.
     LOSSY = "lossy"
-    #: Lossless, with an open safety check: never on under ``auto``.
+    #: Lossless, with an open safety check: never on by default.
     FLAGGED = "flagged"
 
 
@@ -303,23 +312,21 @@ RuleFn = Callable[["Deployment", "Resolving", Mapping[str, object]], Tuple[bool,
 
 
 @dataclasses.dataclass(frozen=True)
-class Rule:
-    """How one lever resolves when its rule is not the default (served, on).
+class Lever:
+    """One row of the lever table: what the lever is and when it is on by default.
 
-    ``origin`` is ``upstream`` for the upstream target's own paths and their upstream
-    behaviour, else the serving region the lever targets (``HC`` high concurrency,
-    ``midc`` mid concurrency, ``LL`` low latency): under ``__DEFAULT=baseline`` a
-    non-upstream lever is off unless its knob is set, and an upstream one runs
-    ``baseline`` (or ``auto`` when it has none). ``after`` names the decisions ``auto`` /
-    ``baseline`` read; ``requires`` levers that must be on;
-    ``conflicts`` levers that may not be on with it; ``excluded`` a structural reason it
-    cannot be on, from the decisions so far.
+    ``on_by_default`` decides it for a deployment no knob speaks for; anywhere else it runs only
+    when its knob says ``on`` (opt-in). ``stock`` is the upstream target's own rule for a lever
+    the upstream compositions also serve: what ``__DEFAULT=off`` keeps (None: off there).
+    ``gates`` are the accuracy gates a lossless-numeric lever's ``gated(...)`` default needs, and
+    the scope a knob ``on`` outside them is warned about. ``after`` names the decisions its
+    conditions read; ``requires`` levers that must be on; ``conflicts`` levers that may not be on
+    with it; ``excluded`` a structural reason it cannot be on, from the decisions so far.
     """
 
-    origin: str
     kind: Kind
-    auto: RuleFn
-    baseline: Optional[RuleFn] = None
+    on_by_default: RuleFn
+    stock: Optional[RuleFn] = None
     params: Tuple[Param, ...] = ()
     gates: Tuple[Gate, ...] = ()
     after: Tuple[str, ...] = ()
@@ -346,18 +353,21 @@ class Decision:
 
 
 class Resolving:
-    """The decisions made so far, as a rule reads them (``Rule.after``)."""
+    """The decisions made so far, as a lever's conditions read them (``Lever.after``)."""
 
     def __init__(self, served: FrozenSet[str], decisions: Mapping[str, Decision]) -> None:
         self._served = served
         self._decisions = decisions
+        #: The lever being decided and its parameters (``resolve`` sets it): ``gated`` reads
+        #: its row, its own ``Lever.excluded`` its parameters through ``param``.
+        self.pending: Optional[Tuple[str, Mapping[str, object]]] = None
 
     def on(self, name: str) -> bool:
         """Whether ``name`` resolved on; False for a lever the composition does not serve.
 
         Raises:
             RuntimeError: for a served lever not decided yet (a rule that reads it must
-                name it in ``Rule.after``).
+                name it in ``Lever.after``).
         """
         if name not in self._served:
             return False
@@ -367,11 +377,14 @@ class Resolving:
         return decision.on
 
     def param(self, name: str, key: str) -> object:
-        """``name``'s parameter ``key`` as resolved, or its default when ``name`` is not served."""
+        """``name``'s parameter ``key`` as resolved (for the lever being decided, as its knob
+        sets it), or its default when ``name`` is not served."""
         decision = self._decisions.get(name)
         if decision is not None and key in decision.params:
             return decision.params[key]
-        return RULES[name].param(key).default
+        if self.pending is not None and self.pending[0] == name and key in self.pending[1]:
+            return self.pending[1][key]
+        return LEVERS[name].param(key).default
 
 
 # --------------------------------------------------------------------------
@@ -467,6 +480,50 @@ def _always(why: str) -> RuleFn:
     return rule
 
 
+def _never(why: str) -> RuleFn:
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        return False, why
+
+    return rule
+
+
+#: On wherever the lever can run (no structural, dependency or conflict rule excludes it).
+ALWAYS = _always("on by default wherever it can run")
+#: Opt-in: on only by its knob.
+NEVER = _never("opt-in: on only by its knob")
+
+
+def unless_on(others: Tuple[str, ...], rule: Optional[RuleFn] = None) -> RuleFn:
+    """``rule`` (``ALWAYS`` when not given), off while one of ``others`` is on (they serve the
+    same steps, or one may not be on with it); ``others`` go in the row's ``after``."""
+    rule = rule if rule is not None else ALWAYS
+
+    def wrapped(d: Deployment, t: "Resolving", p: Mapping[str, object]) -> Tuple[bool, str]:
+        for other in others:
+            if t.on(other):
+                return False, f"yields to {other}, which serves these steps where it is on"
+        return rule(d, t, p)
+
+    return wrapped
+
+
+def gated(rule: RuleFn) -> RuleFn:
+    """``rule``, and one of the lever's own accuracy gates (``Lever.gates``) holds."""
+
+    def wrapped(d: Deployment, t: "Resolving", p: Mapping[str, object]) -> Tuple[bool, str]:
+        on, why = rule(d, t, p)
+        if not on:
+            return on, why
+        gates = LEVERS[t.pending[0]].gates
+        held = [gate for gate in gates if gate.holds(d)]
+        if not held:
+            scopes = "; ".join(gate.scope for gate in gates)
+            return False, f"{why}, but no accuracy gate holds ({scopes})"
+        return True, f"{why}; gate: {held[0].scope}"
+
+    return wrapped
+
+
 def f11_tep8(d: "Deployment") -> bool:
     """Whether ``d`` takes the sm107 rules of the F11 compositions: sm107, or sm103 TEP8 under
     ``MUSESPARK_OPEN_SM103_TEP8_F11=1`` (``modeling._SM103_TEP8_F11_TARGET``). Off by default on sm103."""
@@ -499,13 +556,13 @@ def _coop_fold(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bo
     return True, f"head calls of at most {p['MAX_ROWS']} rows"
 
 
-def _hot_replicas(requires_decode: bool) -> RuleFn:
+def _decoding(why: str) -> RuleFn:
+    """On while the server runs decode steps."""
+
     def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-        if requires_decode and not d.decodes():
+        if not d.decodes():
             return False, _NO_DECODE
-        if t.on("half_window_experts"):
-            return False, "yields to half_window_experts, which places each step's experts"
-        return True, "33..512-row decode steps"
+        return True, why
 
     return rule
 
@@ -540,26 +597,23 @@ def _router_gate(role: Role, scope: str) -> Gate:
     return Gate(holds, scope)
 
 
-#: Every lever whose rule is not the default; every other served lever is on under ``auto``
-#: and ``baseline``.
-RULES: Mapping[str, Rule] = types.MappingProxyType(
+#: Every lever of this target (``dispatch.DEPENDS_ON``), its kind, and when it is on by default.
+#: A row with a ``stock`` rule is an upstream lever: ``__DEFAULT=off`` keeps that rule.
+LEVERS: Mapping[str, Lever] = types.MappingProxyType(
     {
-        "packed_prep_append": Rule(
-            "HC",
+        "packed_prep_append": Lever(
             Kind.BITWISE,
             _packed_prep_append,
             params=(Param("MIN_ROWS", 33, 8, 1024),),
         ),
-        "windowed_commit_parallel": Rule(
-            "HC",
+        "windowed_commit_parallel": Lever(
             Kind.BITWISE,
             _windowed_commit_parallel,
             params=(
                 Param("MIN_REQUESTS", 5, 1, 64, default_for=lambda d: 1 if _hc_selection(d) else 5),
             ),
         ),
-        "context_fp8_dense": Rule(
-            "HC",
+        "context_fp8_dense": Lever(
             Kind.LOSSY,
             _lossy,
             params=(
@@ -571,97 +625,155 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 ),
             ),
         ),
-        "context_fp8_attn_gather": Rule(
-            "HC", Kind.LOSSY, _lossy, after=("context_fp8_dense",), excluded=_attn_gather_excluded
+        "context_fp8_attn_gather": Lever(
+            Kind.LOSSY, _lossy, after=("context_fp8_dense",), excluded=_attn_gather_excluded
         ),
-        "wide_direct_transports": Rule("midc", Kind.BITWISE, _off_at_hc(_wide_steps)),
-        "wide_router_per_row": Rule(
-            "midc",
+        "wide_direct_transports": Lever(Kind.BITWISE, _off_at_hc(_wide_steps)),
+        "wide_router_per_row": Lever(
             Kind.NUMERIC,
-            _wide_steps,
+            gated(_wide_steps),
             gates=(_router_gate(Role.GEN, "generation servers at tep4 with max_batch_size 2..4"),),
         ),
-        "wide_oproj_publish": Rule("midc", Kind.BITWISE, _off_at_hc(_wide_steps)),
-        "wide_finalize_transport": Rule(
-            "midc",
+        "wide_oproj_publish": Lever(Kind.BITWISE, _off_at_hc(_wide_steps)),
+        "wide_finalize_transport": Lever(
             Kind.BITWISE,
             _off_at_hc(_always("17..32-token finalize calls on a 32-token transport")),
         ),
-        "lm_head_inbox": Rule(
-            "upstream",
+        "lm_head_inbox": Lever(
             Kind.COMPOSITION,
             _not_on_sm107(
                 "the sm107 compositions gather the 8-row head without the inbox", "8-row heads"
             ),
-            baseline=_always("8-row heads"),
+            stock=_always("8-row heads"),
         ),
-        "graph_start_qkv_prefetch": Rule(
-            "upstream",
+        "graph_start_qkv_prefetch": Lever(
             Kind.COMPOSITION,
             _graph_start_prefetch,
-            baseline=_always("graph starts of split-K row counts"),
+            stock=_always("graph starts of split-K row counts"),
         ),
-        "step_loop_on_execution_stream": Rule(
-            "LL",
+        "step_loop_on_execution_stream": Lever(
             Kind.BITWISE,
             _at_most("MAX_BATCH"),
             params=(Param("MAX_BATCH", 4, 1, 64),),
         ),
-        "incremental_block_offsets": Rule(
-            "LL",
+        "incremental_block_offsets": Lever(
             Kind.BITWISE,
             _at_most("MAX_BATCH"),
             params=(Param("MAX_BATCH", 8, 1, 64),),
         ),
-        "drafter_kv_side_chain": Rule(
-            "LL", Kind.BITWISE, _always("decode steps of 1..64 requests over a dense arena")
+        "drafter_kv_side_chain": Lever(
+            Kind.BITWISE, _always("decode steps of 1..64 requests over a dense arena")
         ),
-        "drafter_fc_early_fork": Rule("LL", Kind.BITWISE, _always("forked side-chain steps")),
-        "drafter_preamble_from_commit": Rule(
-            "LL", Kind.BITWISE, _always("folded steps over a dense arena")
+        "drafter_fc_early_fork": Lever(Kind.BITWISE, _always("forked side-chain steps")),
+        "drafter_preamble_from_commit": Lever(
+            Kind.BITWISE, _always("folded steps over a dense arena")
         ),
-        "head_sampler_coop_fold": Rule(
-            "LL",
+        "head_sampler_coop_fold": Lever(
             Kind.BITWISE,
             _off_at_hc(_coop_fold),
             params=(Param("MAX_ROWS", 16, 1, 128),),
         ),
-        "head_multimem_gather": Rule(
-            "LL",
+        "head_multimem_gather": Lever(
             Kind.FLAGGED,
             _flagged,
             requires=("step_loop_on_execution_stream",),
             conflicts=("lm_head_inbox",),
         ),
-        "half_window_experts": Rule(
-            "upstream",
+        "half_window_experts": Lever(
             Kind.COMPOSITION,
             _at_most("MAX_BATCH"),
-            baseline=_at_most("MAX_BATCH", requires_decode=False),
+            stock=_at_most("MAX_BATCH", requires_decode=False),
             params=(Param("MAX_BATCH", 8, 1, 64),),
         ),
         # sm107: measured on decode steps of 1..8 requests; its exchange and staging buffers
         # take 151 MiB of fabric memory per TP4 rank, which an engine admitting more requests
         # (a context worker among them) would hold without sampling a step on it. sm103 serves
         # the head at any capacity.
-        "vocab_parallel_head": Rule(
-            "upstream",
+        "vocab_parallel_head": Lever(
             Kind.COMPOSITION,
             _sm107_at_most("MAX_BATCH"),
-            baseline=_sm107_at_most("MAX_BATCH", requires_decode=False),
+            stock=_sm107_at_most("MAX_BATCH", requires_decode=False),
             params=(Param("MAX_BATCH", 8, 1, 64),),
         ),
-        "hot_replicas": Rule(
-            "upstream",
+        # Yields to half_window_experts, which places each step's experts.
+        "hot_replicas": Lever(
             Kind.COMPOSITION,
-            _hot_replicas(requires_decode=True),
-            baseline=_hot_replicas(requires_decode=False),
+            unless_on(("half_window_experts",), _decoding("33..512-row decode steps")),
+            stock=unless_on(("half_window_experts",), _always("33..512-row decode steps")),
             after=("half_window_experts",),
             conflicts=("half_window_experts",),
         ),
-        "prefill_cutedsl_experts": Rule(
-            "upstream", Kind.COMPOSITION, _always("expert calls of 4096..8192 rows")
+        "prefill_cutedsl_experts": Lever(
+            Kind.COMPOSITION,
+            _always("expert calls of 4096..8192 rows"),
+            stock=_always("expert calls of 4096..8192 rows"),
         ),
+        # The compositions' own paths: on wherever a composition serves them, under either
+        # ``__DEFAULT``.
+        "preattn_prep": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "swa_paged_decode": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "swa_block": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_swa_block": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "full_attention_prep_append": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "full_attention_split_kv": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "full_attention_prep_fold": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_full_attention": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "multi_request_split_kv": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "multi_request_prep_append": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "decode_kv_splits": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "mixed_step_gen_rows": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "dense_gemms": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_dense_gemms": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "dense_gemm_prefetch": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "next_qkv_prefetch": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "batch_dense_gemms": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "post_attention_hop": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_post_attention_hop": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "attention_output_into_hop": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "multi_request_post_attention_hop": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "projection_gathers": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "boundary_early_release": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "unpool_into_boundary": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "capture_fold": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_projection_gathers": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "projection_publish": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "moe_prologue": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "pool_into_route": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_prologue": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "finalize_transport": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "router_gemm": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_moe_allreduce": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "finalize_two_shot": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "context_sequence_parallel": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "context_prep": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "replicated_experts": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "persistent_experts": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_persistent_experts": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "three_window_placement": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "bf16_routed_experts": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "early_expert_ids": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "replicated_embedding": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "model_boundary": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_block_conv": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_block_decode": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_drafter_window_attention": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "draft_head": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_draft_topk": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_fc_shard": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_fc_inbox": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "fused_accept": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_fixed_gemms": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "context_kv_fork": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_window_compact": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "verify_fold": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "path_walk_tail": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_hops": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_drafter_hops": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_pdl_chain": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "split_sampler": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_split_sampler": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "deferred_input_prep": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "sampler_store": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
     }
 )
 
@@ -672,7 +784,7 @@ def default_param(name: str, key: str) -> object:
     Raises:
         KeyError: when ``name`` declares no parameter ``key``.
     """
-    rule = RULES.get(name)
+    rule = LEVERS.get(name)
     if rule is None:
         raise KeyError(f"lever {name} declares no parameter {key}")
     return rule.param(key).default
@@ -772,7 +884,7 @@ def parse_knobs(snapshot: Mapping[str, str], names: Iterable[str]) -> Knobs:
             errors.append(f"{name} is retired (use {replacement})")
     modes: Dict[str, str] = {}
     params: Dict[Tuple[str, str], object] = {}
-    default, role = AUTO, AUTO
+    default, role = ON, AUTO
     raw: Dict[str, str] = {}
     for name in sorted(snapshot):
         if not name.startswith(PREFIX):
@@ -804,7 +916,7 @@ def parse_knobs(snapshot: Mapping[str, str], names: Iterable[str]) -> Knobs:
             else:
                 modes[lever] = value
             continue
-        rule = RULES.get(lever)
+        rule = LEVERS.get(lever)
         declared = [param.key for param in rule.params] if rule is not None else []
         if key not in declared:
             errors.append(
@@ -935,7 +1047,8 @@ class LeverTable:
     unserved: FrozenSet[str]
     #: The knobs as set (names under ``PREFIX``).
     knobs: Mapping[str, str]
-    default: str = AUTO
+    #: ``__DEFAULT``: ``on`` or ``off``.
+    default: str = ON
     #: Things the log should say as warnings (an unknown role, ``on`` outside a gate, ...).
     warnings: Tuple[str, ...] = ()
 
@@ -955,7 +1068,7 @@ class LeverTable:
         return default_param(name, key)
 
     def paths(self) -> FrozenSet[str]:
-        """The levers on: closed under ``depends_on`` and ``Rule.requires`` by construction."""
+        """The levers on: closed under ``depends_on`` and ``Lever.requires`` by construction."""
         return frozenset(name for name, decision in self.decisions.items() if decision.on)
 
     def describe(self) -> Tuple[str, ...]:
@@ -966,19 +1079,17 @@ class LeverTable:
             f"{self.deployment.facts.describe()}; knobs set: {knobs}"
         ]
         for name, decision in self.decisions.items():
-            rule = RULES.get(name)
-            if rule is None and decision.on:
-                continue
-            kind, origin = (rule.kind.value, rule.origin) if rule else ("composition", "upstream")
+            lever = LEVERS.get(name)
+            kind = lever.kind.value if lever is not None else "composition"
             lines.append(
                 f"lever {name} {ON if decision.on else OFF} ({decision.source}: {decision.why})"
                 + (f" {dict(decision.params)}" if decision.params else "")
-                + f" [{kind}, {origin}]"
+                + f" [{kind}]"
             )
         if self.unserved:
             lines.append(
                 f"levers not served at sm{self.deployment.sm} tep{self.deployment.tp}: "
-                + ", ".join(name for name in RULES if name in self.unserved)
+                + ", ".join(name for name in LEVERS if name in self.unserved)
             )
         lines.append(f"lever table json (resolved): {self.as_json()}")
         return tuple(lines)
@@ -1027,8 +1138,8 @@ def _order(
             for other in (
                 *depends_on[name],
                 *requires.get(name, ()),
-                *(RULES[name].requires if name in RULES else ()),
-                *(RULES[name].after if name in RULES else ()),
+                *(LEVERS[name].requires if name in LEVERS else ()),
+                *(LEVERS[name].after if name in LEVERS else ()),
             )
             if other in served and other != name
         }
@@ -1066,8 +1177,37 @@ def resolve(
         ValueError: on every error of the module docstring, all named in one message.
     """
     knobs = parse_knobs(snapshot, depends_on)
+    served = frozenset(served)
+    decisions, errors, warnings = _resolve_pass(
+        deployment, served, structural, knobs, depends_on, dict(requires or {})
+    )
+    if errors:
+        raise ValueError("; ".join(errors))
+    ordered = {name: decisions[name] for name in depends_on if name in decisions}
+    return LeverTable(
+        deployment=deployment,
+        decisions=types.MappingProxyType(ordered),
+        unserved=frozenset(LEVERS) - served,
+        knobs=types.MappingProxyType(dict(knobs.raw)),
+        default=knobs.default,
+        warnings=tuple(warnings),
+    )
+
+
+def _resolve_pass(
+    deployment: Deployment,
+    served: FrozenSet[str],
+    structural: Mapping[str, str],
+    knobs: Knobs,
+    depends_on: Mapping[str, Sequence[str]],
+    requires: Mapping[str, Sequence[str]],
+) -> Tuple[Dict[str, Decision], List[str], List[str]]:
+    """Every served lever's decision, the errors and the warnings."""
     requires = dict(requires or {})
     served = frozenset(served)
+    needed = _built_on(
+        {name for name, mode in knobs.modes.items() if mode == ON}, depends_on, requires
+    )
     d = deployment
     errors: List[str] = []
     warnings: List[str] = []
@@ -1086,32 +1226,43 @@ def resolve(
     decisions: Dict[str, Decision] = {}
     t = Resolving(served, decisions)
     for name in _order(served, depends_on, requires):
-        rule = RULES.get(name)
+        lever = LEVERS.get(name)
         mode = knobs.modes.get(name)
         params = {
             param.key: knobs.params.get((name, param.key), param.default_of(d))
-            for param in (rule.params if rule is not None else ())
+            for param in (lever.params if lever is not None else ())
         }
+        t.pending = (name, params)
         decision = _decide(
-            name, rule, mode, knobs.default, params, d, t, structural, depends_on, requires
+            name,
+            lever,
+            mode,
+            knobs.default,
+            params,
+            d,
+            t,
+            structural,
+            depends_on,
+            requires,
+            needed,
         )
         if mode == ON and not decision.on:
             errors.append(f"{knob_name(name)}=on, but {decision.why}")
         if (
             mode == ON
             and decision.on
-            and rule is not None
-            and rule.kind is Kind.NUMERIC
-            and not any(gate.holds(d) for gate in rule.gates)
+            and lever is not None
+            and lever.kind is Kind.NUMERIC
+            and not any(gate.holds(d) for gate in lever.gates)
         ):
             warnings.append(
                 f"{knob_name(name)}=on outside its accuracy gates ("
-                + "; ".join(gate.scope for gate in rule.gates)
+                + "; ".join(gate.scope for gate in lever.gates)
                 + ")"
             )
         decisions[name] = decision
     for name, decision in decisions.items():
-        rule = RULES.get(name)
+        rule = LEVERS.get(name)
         if not decision.on or rule is None:
             continue
         for other in rule.conflicts:
@@ -1142,22 +1293,33 @@ def resolve(
     for name, key in knobs.params:
         if name not in served:
             warnings.append(f"{knob_name(name, key)} has no effect: {name} is not served here")
-    if errors:
-        raise ValueError("; ".join(errors))
-    ordered = {name: decisions[name] for name in depends_on if name in decisions}
-    return LeverTable(
-        deployment=d,
-        decisions=types.MappingProxyType(ordered),
-        unserved=frozenset(RULES) - served,
-        knobs=types.MappingProxyType(dict(knobs.raw)),
-        default=knobs.default,
-        warnings=tuple(warnings),
-    )
+    return decisions, errors, warnings
+
+
+def _built_on(
+    names: Iterable[str],
+    depends_on: Mapping[str, Sequence[str]],
+    requires: Mapping[str, Sequence[str]],
+) -> FrozenSet[str]:
+    """Every lever ``names`` build on or require, transitively (``names`` themselves excluded)."""
+    found: set = set()
+    stack = list(names)
+    while stack:
+        name = stack.pop()
+        for other in (
+            *depends_on.get(name, ()),
+            *requires.get(name, ()),
+            *(LEVERS[name].requires if name in LEVERS else ()),
+        ):
+            if other not in found:
+                found.add(other)
+                stack.append(other)
+    return frozenset(found)
 
 
 def _decide(
     name: str,
-    rule: Optional[Rule],
+    lever: Optional[Lever],
     mode: Optional[str],
     default: str,
     params: Mapping[str, object],
@@ -1166,8 +1328,13 @@ def _decide(
     structural: Mapping[str, str],
     depends_on: Mapping[str, Sequence[str]],
     requires: Mapping[str, Sequence[str]],
+    needed: FrozenSet[str] = frozenset(),
 ) -> Decision:
-    """One lever's decision, from the decisions already made (``resolve``'s order)."""
+    """One lever's decision, from the decisions already made (``resolve``'s order).
+
+    ``needed`` are the levers a lever turned on by its knob builds on or requires: they come on
+    with it (where they can run).
+    """
     if name in structural:
         return Decision(name, False, "structural", structural[name], params)
     for other in depends_on[name]:
@@ -1175,35 +1342,25 @@ def _decide(
             return Decision(
                 name, False, "dependency", f"it builds on {other}, which is off", params
             )
-    for other in (*requires.get(name, ()), *(rule.requires if rule is not None else ())):
+    for other in (*requires.get(name, ()), *(lever.requires if lever is not None else ())):
         if not t.on(other):
             return Decision(name, False, "dependency", f"it requires {other}, which is off", params)
-    if rule is not None and rule.excluded is not None:
-        reason = rule.excluded(d, t)
+    if lever is not None and lever.excluded is not None:
+        reason = lever.excluded(d, t)
         if reason is not None:
             return Decision(name, False, "structural", reason, params)
     if mode == OFF:
         return Decision(name, False, "knob", f"{knob_name(name)}=off", params)
     if mode == ON:
         return Decision(name, True, "knob", f"{knob_name(name)}=on", params)
-    baseline = mode is None and default == BASELINE
-    if rule is None:
-        return Decision(name, True, BASELINE if baseline else AUTO, "served", params)
-    if baseline:
-        if rule.baseline is not None:
-            on, why = rule.baseline(d, t, params)
-        elif rule.origin == "upstream":
-            on, why = rule.auto(d, t, params)
-        else:
-            on, why = False, f"not an upstream lever ({rule.origin}): off unless its knob is set"
-        return Decision(name, on, BASELINE, why, params)
-    on, why = rule.auto(d, t, params)
-    if on and rule.kind is Kind.NUMERIC:
-        held = [gate for gate in rule.gates if gate.holds(d)]
-        if not held:
-            scopes = "; ".join(gate.scope for gate in rule.gates)
-            return Decision(
-                name, False, "gate", f"{why}, but no accuracy gate holds ({scopes})", params
-            )
-        why = f"{why}; gate: {held[0].scope}"
-    return Decision(name, on, AUTO, why, params)
+    if name in needed:
+        return Decision(name, True, "knob", "a lever turned on by its knob needs it", params)
+    if lever is None:
+        raise RuntimeError(f"{name} is served but has no row in LEVERS")
+    if default == OFF:
+        if lever.stock is None:
+            return Decision(name, False, "stock", f"{DEFAULT_KNOB}=off", params)
+        on, why = lever.stock(d, t, params)
+        return Decision(name, on, "stock", f"{DEFAULT_KNOB}=off, its upstream rule: {why}", params)
+    on, why = lever.on_by_default(d, t, params)
+    return Decision(name, on, "default", why, params)

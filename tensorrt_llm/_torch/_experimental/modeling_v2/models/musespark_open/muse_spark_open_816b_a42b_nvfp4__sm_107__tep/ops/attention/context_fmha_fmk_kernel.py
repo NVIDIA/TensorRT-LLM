@@ -126,17 +126,27 @@ role walks the same unit list in the same order with the same per-unit counts):
   warp's ``s_empty`` wait before QK_j(n + s_stages) is for the load of S_j(n), which softmax ``j``
   performs before it arrives P_j(n). No cross-CTA wait exists (partials are merged by a separate
   launch).
+* P in shared memory (``p_smem`` build, one S stage). P_j(t) goes to instance ``j``'s E4M3 buffer
+  in shared memory (``M_TILE x tile_n``, 128-bit stores of its row by each softmax thread, then
+  ``fence.proxy.async.shared::cta``) instead of over S_j, and P.V_j reads it as the A operand
+  from shared memory. S_j is then free once softmax ``j`` has loaded it, so per key tile the MMA
+  warp waits for V(t) and K(t + 1), issues QK_j(t + 1) for every instance after its
+  ``s_empty_j`` (the load of S_j(t)), and then P.V_j(t) for every instance after its
+  ``p_full[j]``. Softmax ``j`` writes P_j(t) only after ``p_empty[j]`` for P.V_j(t - 1) (the
+  wait it already makes before rescaling O_j), and a unit's first P_j only after the previous
+  unit's drain, so no P.V reads a buffer being rewritten. Same MMAs on the same operand values
+  in the same order as the TMEM build.
 * Programmatic dependent launch. Every warp executes ``griddepcontrol.wait`` before it reads any
   input; the MMA warp issues ``griddepcontrol.launch_dependents`` after its unit loop (a dependent
   grid's own wait returns only after this grid completed and its memory is visible).
 
-Numerics: S = Q K^T in fp32 on the tensor core; online softmax in log2 units with the running
-maximum raised on every increase; P = 2^(s * scale_log2 - max * scale_log2 + 8) rounded to E4M3;
-the row sum of the fp32 P in registers; O accumulated in fp32 on the tensor core and multiplied by
-``scale_output / row_sum``. The scales are read at run time from two device scalars,
-``scale_log2`` and ``scale_output`` (the context preprocess writes them: its BMM1 scale's second
-entry and its BMM2 scale), so a CUDA-graph replay sees their current values.
-"""
+Numerics (the ``exp_f16x2`` build differs as its parameter says): S = Q K^T in fp32 on the tensor
+core; online softmax in log2 units with the running maximum raised on every increase; P = 2^(s *
+scale_log2 - max * scale_log2 + 8) rounded to E4M3; the row sum of the fp32 P in registers; O
+accumulated in fp32 on the tensor core and multiplied by ``scale_output / row_sum``. The scales are
+read at run time from two device scalars, ``scale_log2`` and ``scale_output`` (the context
+preprocess writes them: its BMM1 scale's second entry and its BMM2 scale), so a CUDA-graph replay
+sees their current values."""
 
 import math
 
@@ -152,8 +162,33 @@ from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+try:  # the KF build's Rubin K=64 MMA (``rubin_mma``); the sm100 build does not need it
+    import cutlass.utils.rubin_helpers as sm107_utils
+except ImportError:  # pragma: no cover - a CUTLASS DSL without the Rubin helpers
+    sm107_utils = None
+
 F8 = cutlass.Float8E4M3FN
 BF16 = cutlass.BFloat16
+
+
+@dsl_user_op
+def make_rubin_f8_mma(
+    a_major, b_major, mn, a_source=tcgen05.OperandSource.SMEM, *, loc=None, ip=None
+):
+    """Rubin dense FP8 MMA with the native K=64 instruction depth."""
+    return sm107_utils.make_trivial_tiled_mma(
+        F8,
+        F8,
+        a_major,
+        b_major,
+        Float32,
+        tcgen05.CtaGroup.ONE,
+        (mn[0], mn[1], 64),
+        a_source=a_source,
+        loc=loc,
+        ip=ip,
+    )
+
 
 #: Tokens per KV page, head width, query rows per instance.
 PAGE = 32
@@ -192,6 +227,97 @@ def _cvt_f32x4_to_e4m3x4(a, b, c, d, *, loc=None, ip=None) -> Int32:
     )
 
 
+@dsl_user_op
+def _tc_fence_after_sync(*, loc=None, ip=None) -> Int32:
+    """tcgen05.fence::after_thread_sync (orders this thread's next tcgen05 ops after a thread sync)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [],
+            "{\n\ttcgen05.fence::after_thread_sync;\n\tmov.u32 $0, 0;\n\t}\n",
+            "=r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def _asm_i32(asm, constraints, args, loc, ip):
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [x.ir_value(loc=loc, ip=ip) for x in args],
+            asm,
+            constraints,
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _ex2_f16x2(a, b, *, loc=None, ip=None) -> Int32:
+    """2^a and 2^b in fp16, packed into one word (a in the low half); a and b are rounded to fp16
+    first (round to nearest)."""
+    return _asm_i32(
+        "{\n\t.reg .b32 h;\n\tcvt.rn.f16x2.f32 h, $2, $1;\n\tex2.approx.f16x2 $0, h;\n\t}\n",
+        "=r,f,f",
+        [Float32(a), Float32(b)],
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def _cvt_f16x2x2_to_e4m3x4(lo, hi, *, loc=None, ip=None) -> Int32:
+    """Two fp16x2 words rounded (satfinite) to E4M3 and packed into one word, lo's low half
+    lowest."""
+    return _asm_i32(
+        "{\n\t.reg .b16 a, b;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f16x2 a, $1;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f16x2 b, $2;\n\t"
+        "mov.b32 $0, {a, b};\n\t}\n",
+        "=r,r,r",
+        [Int32(lo), Int32(hi)],
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def _hadd2(a, b, *, loc=None, ip=None) -> Int32:
+    """fp16x2 a + b (round to nearest)."""
+    return _asm_i32("add.rn.f16x2 $0, $1, $2;", "=r,r,r", [Int32(a), Int32(b)], loc, ip)
+
+
+@dsl_user_op
+def _f16x2_sum_f32(a, *, loc=None, ip=None) -> Float32:
+    """The two fp16 halves of a, converted to fp32 and added."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(a).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 l, h;\n\t.reg .f32 x, y;\n\tmov.b32 {l, h}, $1;\n\t"
+            "cvt.f32.f16 x, l;\n\tcvt.f32.f16 y, h;\n\tadd.f32 $0, x, y;\n\t}\n",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def _hadd2_tree(words):
+    """The fp16x2 sum of ``words`` (a power-of-two count) as a pairwise tree of ``_hadd2``.
+
+    Plain Python at trace time (a static unroll), outside the DSL's control-flow rewrite."""
+    while len(words) > 1:
+        words = [_hadd2(words[k], words[k + 1]) for k in range(0, len(words), 2)]
+    return words[0]
+
+
 class PagedContextFmhaFmk:
     """Compiled per (heads, KV heads, instances, key tile, options); sizes and pointers are runtime
     arguments.
@@ -204,6 +330,16 @@ class PagedContextFmhaFmk:
     :param s_stages: S buffers per instance (1 or 2). With 2, QK_j(t + 1) is issued before P.V_j(t)
         and computes while softmax ``j`` works on S_j(t).
     :param kv_stage: K / V ring slots (one key tile of K or V each).
+    :param p_smem: P_j in shared memory (one ``M_TILE x tile_n`` E4M3 buffer per instance)
+        instead of over S_j in TMEM, with one S stage: the MMA warp then issues QK_j(t + 1) as
+        soon as softmax ``j`` has read S_j(t) (``s_empty``), before P.V_j(t), so S_j(t + 1)
+        computes while softmax ``j`` works on S_j(t). The same MMAs on the same operand values
+        in the same order as the TMEM build, so the output is the same bitwise.
+    :param exp_f16x2: the softmax exponent in fp16 pairs (``ex2.approx.f16x2``, two results per
+        MUFU instruction, half the exp-unit work of the fp32 build): the fp32 ``s * scale - max``
+        is rounded to fp16, 2^x is rounded from fp16 to E4M3 for P, and the row sum adds each
+        tile's fp16 values in a pairwise fp16 tree, converted to fp32 per tile. Not bitwise
+        equal to the fp32 build (fp16 arguments and results, fp16 tile sums).
     :param write_stats: mode-0 units also write the natural-log row max and the row sum.
     :param ablate_mufu: diagnostic build, wrong values: exp2 becomes a multiply (no MUFU), to time
         everything else.
@@ -229,15 +365,26 @@ class PagedContextFmhaFmk:
         tile_n: int = 64,
         kv_stage: int = 12,
         s_stages: int = 1,
+        turn_groups: int = 0,
+        self_issue: bool = False,
+        pair_s: bool = False,
         write_stats: bool = False,
         ablate_mufu: bool = False,
         trace: bool = False,
+        p_smem: bool = False,
+        exp_f16x2: bool = False,
+        rubin_mma: bool = False,
     ):
         assert num_heads % num_kv_heads == 0
         assert (num_heads // num_kv_heads) % num_inst == 0, "instances must share one KV head"
         assert num_inst in (1, 2, 4) and tile_n in (32, 64, 128) and s_stages in (1, 2)
         assert num_inst * (s_stages * tile_n + D) <= 512, "TMEM columns"
         assert not (trace and write_stats), "the trace build uses the stats buffer"
+        assert not (p_smem and s_stages != 1), "P in shared memory frees S after its load"
+        assert not (exp_f16x2 and ablate_mufu), "the ablation replaces the fp32 exponent"
+        assert not (p_smem and (pair_s or self_issue or turn_groups > 1)), (
+            "P in shared memory is a build of its own (no pair-shared S, self issue or turn groups)"
+        )
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.h_r = num_heads // num_kv_heads
@@ -249,10 +396,37 @@ class PagedContextFmhaFmk:
         self.row_words = D // 4
         self.kv_stage = kv_stage
         self.s_stages = s_stages
+        # Softmax turn-taking: the instances form ``turn_groups`` groups whose exp loops run one
+        # group at a time (round robin over named barriers 3 ..), so one group's MMA round trip
+        # overlaps another group's exps instead of every instance waiting at the same time.
+        assert turn_groups in (0, 1, 2, 4) and (turn_groups == 0 or num_inst % turn_groups == 0)
+        self.turn_groups = turn_groups if turn_groups > 1 else 0
+        # Self issue: the first warp of every softmax warpgroup issues its instance's MMAs (P.V
+        # and the next QK) right after a warpgroup barrier, instead of a round trip through the
+        # MMA warp; the load warp zeroes the V rows past a request's last key before kv_full.
+        assert not (self_issue and (s_stages != 1 or trace or turn_groups > 1))
+        self.self_issue = self_issue
+        # Pair-shared S: instances 2p and 2p + 1 share S buffer p (QKs alternate between them),
+        # every instance has its own P (tile_n / 4 columns) and O, so QK_j(n + 1) waits only for
+        # the partner to have read its S, not for P.V_j(n) (P no longer aliases S).
+        assert not pair_s or (
+            num_inst == 4
+            and s_stages == 1
+            and tile_n == 64
+            and not trace
+            and not self_issue
+            and turn_groups < 2
+        )
+        self.pair_s = pair_s
         self.q_stage = 3 * num_inst
         self.write_stats = write_stats
         self.ablate_mufu = ablate_mufu
         self.trace = trace
+        self.p_smem = p_smem
+        self.exp_f16x2 = exp_f16x2
+        #: The tensor-core FP8 MMAs at Rubin's native K=64 instruction depth (``make_rubin_f8_mma``,
+        #: the KF build) instead of the sm100 K=32 tiled MMA (order-only against it).
+        self.rubin_mma = rubin_mma
         self.qk_mma_tiler = (M_TILE, tile_n, D)
         self.pv_mma_tiler = (M_TILE, D, tile_n)
         self.inst_cols = s_stages * tile_n + D
@@ -274,6 +448,36 @@ class PagedContextFmhaFmk:
             barrier_id=2, num_threads=32 * (4 * num_inst + 1)
         )
         self.buffer_align_bytes = 1024
+
+    def f8_mma(self, a_major, b_major, mn, a_source=None):
+        """An FP8 tiled MMA (fp32 accumulator, one CTA): Rubin K=64 under ``rubin_mma``, else the
+        sm100 tiled MMA (``a_source`` None: its default, A from shared memory)."""
+        if self.rubin_mma:
+            if a_source is None:
+                return make_rubin_f8_mma(a_major, b_major, mn)
+            return make_rubin_f8_mma(a_major, b_major, mn, a_source)
+        if a_source is None:
+            return sm100_utils.make_trivial_tiled_mma(
+                F8, F8, a_major, b_major, Float32, tcgen05.CtaGroup.ONE, mn
+            )
+        return sm100_utils.make_trivial_tiled_mma(
+            F8, F8, a_major, b_major, Float32, tcgen05.CtaGroup.ONE, mn, a_source
+        )
+
+    def col_s(self, j):
+        if self.pair_s:
+            return (j // 2) * self.tile_n
+        return j * self.inst_cols
+
+    def col_p(self, j):
+        if self.pair_s:
+            return 2 * self.tile_n + j * (self.tile_n // 4)
+        return j * self.inst_cols
+
+    def col_o(self, j):
+        if self.pair_s:
+            return 2 * self.tile_n + self.ni * (self.tile_n // 4) + j * D
+        return j * self.inst_cols + self.s_stages * self.tile_n
 
     # ------------------------------------------------------------------ host side
     @cute.jit
@@ -318,17 +522,10 @@ class PagedContextFmhaFmk:
 
         cta_group = tcgen05.CtaGroup.ONE
         K = OperandMajorMode.K
-        MN = OperandMajorMode.MN
-        qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            F8, F8, K, K, Float32, cta_group, self.qk_mma_tiler[:2]
-        )
-        pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            F8, F8, K, MN, Float32, cta_group, self.pv_mma_tiler[:2], tcgen05.OperandSource.TMEM
-        )
+        qk_tiled_mma = self.f8_mma(K, K, self.qk_mma_tiler[:2])
+        pv_tiled_mma = self.fresh_pv_mma()
         # The K operand of one page (N = 32): the shape of one TMA box in shared memory.
-        qk_box_mma = sm100_utils.make_trivial_tiled_mma(
-            F8, F8, K, K, Float32, cta_group, (M_TILE, PAGE)
-        )
+        qk_box_mma = self.f8_mma(K, K, (M_TILE, PAGE))
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((1, 1, 1)), (qk_tiled_mma.thr_id.shape,)
         )
@@ -342,6 +539,12 @@ class PagedContextFmhaFmk:
         p_tmem_layout_staged = sm100_utils.make_smem_layout_a(
             pv_tiled_mma, self.pv_mma_tiler, F8, 1
         )
+        # P_j buffers in shared memory (``p_smem``): one stage per instance.
+        p_smem_layout_staged = p_tmem_layout_staged
+        if cutlass.const_expr(self.p_smem):
+            p_smem_layout_staged = sm100_utils.make_smem_layout_a(
+                pv_tiled_mma, self.pv_mma_tiler, F8, self.ni
+            )
         v_smem_layout_staged = sm100_utils.make_smem_layout_b(
             pv_tiled_mma, self.pv_mma_tiler, F8, self.kv_stage
         )
@@ -368,27 +571,58 @@ class PagedContextFmhaFmk:
 
         ni = self.ni
 
-        @cute.struct
-        class SharedStorage:
-            q_full: cute.struct.MemRange[Int64, self.q_stage]
-            q_empty: cute.struct.MemRange[Int64, self.q_stage]
-            kv_full: cute.struct.MemRange[Int64, self.kv_stage]
-            kv_empty: cute.struct.MemRange[Int64, self.kv_stage]
-            s_full: cute.struct.MemRange[Int64, ni * self.s_stages]
-            s_empty: cute.struct.MemRange[Int64, ni * self.s_stages]
-            p_full: cute.struct.MemRange[Int64, ni]
-            p_empty: cute.struct.MemRange[Int64, ni]
-            tmem_holding_buf: Int32
-            sQ: cute.struct.Align[
-                cute.struct.MemRange[F8, cute.cosize(q_smem_layout_staged)],
-                self.buffer_align_bytes,
-            ]
-            sK: cute.struct.Align[
-                cute.struct.MemRange[F8, cute.cosize(k_smem_layout_staged)],
-                self.buffer_align_bytes,
-            ]
+        if cutlass.const_expr(self.p_smem):
 
-        self.shared_storage = SharedStorage
+            @cute.struct
+            class SharedStorageP:
+                q_full: cute.struct.MemRange[Int64, self.q_stage]
+                q_empty: cute.struct.MemRange[Int64, self.q_stage]
+                kv_full: cute.struct.MemRange[Int64, self.kv_stage]
+                kv_empty: cute.struct.MemRange[Int64, self.kv_stage]
+                s_full: cute.struct.MemRange[Int64, ni * self.s_stages]
+                s_empty: cute.struct.MemRange[Int64, ni * self.s_stages]
+                p_full: cute.struct.MemRange[Int64, ni]
+                p_empty: cute.struct.MemRange[Int64, ni]
+                kz_full: cute.struct.MemRange[Int64, 1]
+                tmem_holding_buf: Int32
+                sQ: cute.struct.Align[
+                    cute.struct.MemRange[F8, cute.cosize(q_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                sK: cute.struct.Align[
+                    cute.struct.MemRange[F8, cute.cosize(k_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                sP: cute.struct.Align[
+                    cute.struct.MemRange[F8, cute.cosize(p_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+
+            self.shared_storage = SharedStorageP
+        else:
+
+            @cute.struct
+            class SharedStorage:
+                q_full: cute.struct.MemRange[Int64, self.q_stage]
+                q_empty: cute.struct.MemRange[Int64, self.q_stage]
+                kv_full: cute.struct.MemRange[Int64, self.kv_stage]
+                kv_empty: cute.struct.MemRange[Int64, self.kv_stage]
+                s_full: cute.struct.MemRange[Int64, ni * self.s_stages]
+                s_empty: cute.struct.MemRange[Int64, ni * self.s_stages]
+                p_full: cute.struct.MemRange[Int64, ni]
+                p_empty: cute.struct.MemRange[Int64, ni]
+                kz_full: cute.struct.MemRange[Int64, 1]
+                tmem_holding_buf: Int32
+                sQ: cute.struct.Align[
+                    cute.struct.MemRange[F8, cute.cosize(q_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                sK: cute.struct.Align[
+                    cute.struct.MemRange[F8, cute.cosize(k_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+
+            self.shared_storage = SharedStorage
 
         self.kernel(
             qk_tiled_mma,
@@ -416,6 +650,7 @@ class PagedContextFmhaFmk:
             p_tmem_layout_staged,
             v_smem_layout_staged,
             box_smem_layout_staged,
+            p_smem_layout_staged,
         ).launch(
             grid=(num_ctas, 1, 1),
             block=[self.threads_per_cta, 1, 1],
@@ -453,6 +688,7 @@ class PagedContextFmhaFmk:
         p_tmem_layout_staged: cute.ComposedLayout,
         v_smem_layout_staged: cute.ComposedLayout,
         box_smem_layout_staged: cute.ComposedLayout,
+        p_smem_layout_staged: cute.ComposedLayout,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -473,6 +709,8 @@ class PagedContextFmhaFmk:
         s_empty = storage.s_empty.data_ptr()
         p_full = storage.p_full.data_ptr()
         p_empty = storage.p_empty.data_ptr()
+        kz_full = storage.kz_full.data_ptr()
+        kv_empty_count = ni if self.self_issue else 1
         if warp_idx == 0:
             with cute.arch.elect_one():
                 for i in cutlass.range_constexpr(self.q_stage):
@@ -480,7 +718,8 @@ class PagedContextFmhaFmk:
                     cute.arch.mbarrier_init(q_empty + i, 1)
                 for i in cutlass.range_constexpr(self.kv_stage):
                     cute.arch.mbarrier_init(kv_full + i, 1)
-                    cute.arch.mbarrier_init(kv_empty + i, 1)
+                    cute.arch.mbarrier_init(kv_empty + i, kv_empty_count)
+                cute.arch.mbarrier_init(kz_full, 1)
                 for i in cutlass.range_constexpr(ni * self.s_stages):
                     cute.arch.mbarrier_init(s_full + i, 1)
                     cute.arch.mbarrier_init(s_empty + i, 128)
@@ -502,6 +741,11 @@ class PagedContextFmhaFmk:
         sBox = storage.sK.get_tensor(
             box_smem_layout_staged.outer, swizzle=box_smem_layout_staged.inner
         )
+        sP = None
+        if cutlass.const_expr(self.p_smem):
+            sP = storage.sP.get_tensor(
+                p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
+            )
         ring_words = cute.make_tensor(
             cute.recast_ptr(storage.sK.data_ptr(), dtype=Int32),
             cute.make_layout(self.kv_stage * self.slot_words),
@@ -551,6 +795,7 @@ class PagedContextFmhaFmk:
             q_ph = Int32(1)
             kv_idx = Int32(0)
             kv_ph = Int32(1)
+            kz_ph = Int32(0)
             q_ring = (tma_atom_q, mQ, sQ, qk_thr_mma, units, cu_q, q_full, q_empty)
             if u_begin < u_end:
                 q_base, q_ph = self.load_q(q_ring, u_begin, q_base, q_ph)
@@ -603,7 +848,25 @@ class PagedContextFmhaFmk:
                             kv_idx, kv_ph = self.load_tile(kv_ring, kid_next, t + 1, kv_idx, kv_ph)
                         kv_idx, kv_ph = self.load_tile(kv_ring, vid, t, kv_idx, kv_ph)
                     else:
-                        kv_idx, kv_ph = self.load_tile(kv_ring, vid, t, kv_idx, kv_ph)
+                        if cutlass.const_expr(self.self_issue):
+                            rows_valid = kv_len - t * self.tile_n
+                            if rows_valid < self.tile_n:
+                                kv_idx, kv_ph, kz_ph = self.load_tile_zero(
+                                    kv_ring,
+                                    vid,
+                                    t,
+                                    kv_idx,
+                                    kv_ph,
+                                    kz_full,
+                                    kz_ph,
+                                    ring_words,
+                                    rows_valid,
+                                    lane,
+                                )
+                            else:
+                                kv_idx, kv_ph = self.load_tile(kv_ring, vid, t, kv_idx, kv_ph)
+                        else:
+                            kv_idx, kv_ph = self.load_tile(kv_ring, vid, t, kv_idx, kv_ph)
                         if t + 1 < t1:
                             kv_idx, kv_ph = self.load_tile(kv_ring, kid_next, t + 1, kv_idx, kv_ph)
                 if cutlass.const_expr(self.trace):
@@ -619,6 +882,9 @@ class PagedContextFmhaFmk:
             tStS, tOtO, tOrP = self.make_tmem_tensors(
                 qk_thr_mma, pv_thr_mma, p_tmem_layout_staged, tmem_ptr
             )
+            tOrPs = None
+            if cutlass.const_expr(self.p_smem):
+                tOrPs = pv_thr_mma.make_fragment_A(sP)
             lane = cute.arch.lane_idx()
             q_base = Int32(0)
             q_ph = Int32(0)
@@ -627,7 +893,35 @@ class PagedContextFmhaFmk:
             p_ph = Int32(0)
             # S tiles of this CTA's earlier units (the softmax warps count the same).
             n0 = Int32(0)
-            for u in cutlass.range(u_begin, u_end, 1, unroll=1):
+            u_stop = u_end
+            if cutlass.const_expr(self.self_issue or self.pair_s):
+                u_stop = u_begin
+            if cutlass.const_expr(self.pair_s):
+                q_base, q_ph, kv_idx, kv_ph = self.mma_pair_loop(
+                    u_begin,
+                    u_end,
+                    units,
+                    kv_lens,
+                    q_full,
+                    q_empty,
+                    kv_full,
+                    kv_empty,
+                    s_full,
+                    s_empty,
+                    p_full,
+                    p_empty,
+                    qk_tiled_mma,
+                    pv_tiled_mma,
+                    tStS,
+                    tOtO,
+                    tOrP,
+                    tSrQ,
+                    tSrK,
+                    tOrV,
+                    ring_words,
+                    lane,
+                )
+            for u in cutlass.range(u_begin, u_stop, 1, unroll=1):
                 rec = (bidx == 0) & (u == u_begin)
                 if cutlass.const_expr(self.trace):
                     if lane == 0:
@@ -658,61 +952,73 @@ class PagedContextFmhaFmk:
                     has_next = t + 1 < t1
                     k_slot = kv_idx
                     v_slot = kv_idx
-                    if cutlass.const_expr(self.s_stages == 2):
-                        if has_next:
-                            cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
-                            kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
-                        v_slot = kv_idx
-                        cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
+                    if cutlass.const_expr(self.p_smem):
+                        self.mma_step_p_smem(
+                            (qk_tiled_mma, pv_tiled_mma, tStS, tOtO, tSrQ, tSrK, tOrV, tOrPs),
+                            (kv_full, kv_empty, s_full, s_empty, p_full, p_empty),
+                            (t, t0, n, has_next, last_tile, kv_len, q_base, kv_idx, kv_ph, p_ph),
+                            ring_words, lane, (trace, step_base, rec),
+                        )  # fmt: skip
                         kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+                        if has_next:
+                            kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+                        p_ph ^= 1
                     else:
-                        cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
-                        kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
-                        k_slot = kv_idx
-                        if has_next:
-                            cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
-                            kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
-                    if t == last_tile:
-                        # Zero the V rows past the request's last key (any bytes, see the record).
-                        rows_valid = kv_len - t * self.tile_n
-                        if rows_valid < self.tile_n:
-                            n_words = (self.tile_n - rows_valid) * self.row_words
-                            base = v_slot * self.slot_words + rows_valid * self.row_words
-                            for w in cutlass.range(lane, n_words, 32, unroll=1):
-                                ring_words[base + w] = Int32(0)
-                            cute.arch.fence_proxy("async.shared", space="cta")
-                            cute.arch.sync_warp()
-                    for j in cutlass.range_constexpr(ni):
                         if cutlass.const_expr(self.s_stages == 2):
                             if has_next:
-                                self.issue_qk(qk_tiled_mma, tStS[j],
-                                              tSrQ[None, None, None, q_base + j],
-                                              tSrK[None, None, None, k_slot],
-                                              s_full, s_empty, j, n + 1)  # fmt: skip
-                        cute.arch.mbarrier_wait(p_full + j, p_ph)
-                        if cutlass.const_expr(self.trace):
-                            if rec & (lane == 0) & (t - t0 < TRACE_STEPS):
-                                trace[step_base + (8 + j) * TRACE_STEPS + t - t0] = (
-                                    cute.arch.clock64()
-                                )
-                        self.issue_pv(pv_tiled_mma, tOtO[j], tOrP[j],
-                                      tOrV[None, None, None, v_slot], t > t0, n)  # fmt: skip
-                        self.commit(p_empty + j)
-                        if cutlass.const_expr(self.s_stages == 1):
+                                cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
+                                kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+                            v_slot = kv_idx
+                            cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
+                            kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+                        else:
+                            cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
+                            kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+                            k_slot = kv_idx
                             if has_next:
-                                self.issue_qk(qk_tiled_mma, tStS[j],
-                                              tSrQ[None, None, None, q_base + j],
-                                              tSrK[None, None, None, k_slot],
-                                              s_full, s_empty, j, n + 1)  # fmt: skip
-                        if cutlass.const_expr(self.trace):
-                            if rec & (lane == 0) & (t - t0 < TRACE_STEPS):
-                                trace[step_base + (12 + j) * TRACE_STEPS + t - t0] = (
-                                    cute.arch.clock64()
-                                )
-                    p_ph ^= 1
-                    self.commit(kv_empty + v_slot)
-                    if has_next:
-                        self.commit(kv_empty + k_slot)
+                                cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
+                                kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+                        if t == last_tile:
+                            # Zero the V rows past the request's last key (any bytes, see the record).
+                            rows_valid = kv_len - t * self.tile_n
+                            if rows_valid < self.tile_n:
+                                n_words = (self.tile_n - rows_valid) * self.row_words
+                                base = v_slot * self.slot_words + rows_valid * self.row_words
+                                for w in cutlass.range(lane, n_words, 32, unroll=1):
+                                    ring_words[base + w] = Int32(0)
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                                cute.arch.sync_warp()
+                        for j in cutlass.range_constexpr(ni):
+                            if cutlass.const_expr(self.s_stages == 2):
+                                if has_next:
+                                    self.issue_qk(qk_tiled_mma, tStS[j],
+                                                  tSrQ[None, None, None, q_base + j],
+                                                  tSrK[None, None, None, k_slot],
+                                                  s_full, s_empty, j, n + 1)  # fmt: skip
+                            cute.arch.mbarrier_wait(p_full + j, p_ph)
+                            if cutlass.const_expr(self.trace):
+                                if rec & (lane == 0) & (t - t0 < TRACE_STEPS):
+                                    trace[step_base + (8 + j) * TRACE_STEPS + t - t0] = (
+                                        cute.arch.clock64()
+                                    )
+                            self.issue_pv(pv_tiled_mma, tOtO[j], tOrP[j],
+                                          tOrV[None, None, None, v_slot], t > t0, n)  # fmt: skip
+                            self.commit(p_empty + j)
+                            if cutlass.const_expr(self.s_stages == 1):
+                                if has_next:
+                                    self.issue_qk(qk_tiled_mma, tStS[j],
+                                                  tSrQ[None, None, None, q_base + j],
+                                                  tSrK[None, None, None, k_slot],
+                                                  s_full, s_empty, j, n + 1)  # fmt: skip
+                            if cutlass.const_expr(self.trace):
+                                if rec & (lane == 0) & (t - t0 < TRACE_STEPS):
+                                    trace[step_base + (12 + j) * TRACE_STEPS + t - t0] = (
+                                        cute.arch.clock64()
+                                    )
+                        p_ph ^= 1
+                        self.commit(kv_empty + v_slot)
+                        if has_next:
+                            self.commit(kv_empty + k_slot)
                 n0 += t1 - t0
                 if cutlass.const_expr(self.trace):
                     if lane == 0:
@@ -733,17 +1039,38 @@ class PagedContextFmhaFmk:
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
+            if cutlass.const_expr(self.turn_groups > 0):
+                # The last group opens group 0's first turn.
+                if warp_idx // 4 // (ni // self.turn_groups) == self.turn_groups - 1:
+                    self.turn_arrive(0)
             self.softmax(
                 warp_idx // 4,
                 tidx % 128,
                 tmem_ptr,
                 qk_thr_mma,
                 pv_thr_mma,
-                (s_full, s_empty, p_full, p_empty),
+                (s_full, s_empty, p_full, p_empty, sP),
                 (units, u_begin, u_end, cu_q, kv_lens, mO, part_o_ptr, part_ml_ptr, stats_ptr),
                 (scale_qk, scale_o),
                 (trace, step_base, bidx),
+                (
+                    qk_tiled_mma,
+                    pv_tiled_mma,
+                    tSrQ,
+                    tSrK,
+                    tOrV,
+                    p_tmem_layout_staged,
+                    q_full,
+                    q_empty,
+                    kv_full,
+                    kv_empty,
+                    warp_idx % 4 == (warp_idx // 4) % 4,
+                ),
             )
+            if cutlass.const_expr(self.turn_groups > 0):
+                # Group 0 takes the turn the last group's last loop opened (balances the barrier).
+                if warp_idx // 4 // (ni // self.turn_groups) == 0:
+                    self.turn_wait(0)
             self.tmem_dealloc_barrier.arrive()
         return
 
@@ -755,6 +1082,17 @@ class PagedContextFmhaFmk:
             idx = Int32(0)
             ph ^= 1
         return idx, ph
+
+    def turn_threads(self):
+        return 2 * 128 * (self.ni // self.turn_groups)
+
+    @cute.jit
+    def turn_wait(self, g):
+        cute.arch.barrier(barrier_id=8 + g, number_of_threads=self.turn_threads())
+
+    @cute.jit
+    def turn_arrive(self, g):
+        cute.arch.barrier_arrive(barrier_id=8 + g, number_of_threads=self.turn_threads())
 
     @cute.jit
     def commit(self, mbar_ptr):
@@ -815,6 +1153,149 @@ class PagedContextFmhaFmk:
         return self.ring_advance(kv_idx, kv_ph, self.kv_stage)
 
     @cute.jit
+    def mma_pair_loop(
+        self,
+        u_begin,
+        u_end,
+        units,
+        kv_lens,
+        q_full,
+        q_empty,
+        kv_full,
+        kv_empty,
+        s_full,
+        s_empty,
+        p_full,
+        p_empty,
+        qk_tiled_mma,
+        pv_tiled_mma,
+        tStS,
+        tOtO,
+        tOrP,
+        tSrQ,
+        tSrK,
+        tOrV,
+        ring_words,
+        lane,
+    ):
+        """MMA warp with pair-shared S buffers. Per key tile t: QK_0(t + 1), QK_2(t + 1),
+        P.V_0(t), P.V_2(t), QK_1(t + 1), QK_3(t + 1), P.V_1(t), P.V_3(t). QK of the even
+        instance of a pair at S tile n waits until the odd one read its S tile n - 1, QK of the
+        odd one until the even one read tile n (the pair's buffer alternates between them)."""
+        ni = self.ni
+        q_base = Int32(0)
+        q_ph = Int32(0)
+        kv_idx = Int32(0)
+        kv_ph = Int32(0)
+        p_ph = Int32(0)
+        n0 = Int32(0)
+        for u in cutlass.range(u_begin, u_end, 1, unroll=1):
+            b = units[u * UNIT_FIELDS + 0]
+            t0 = units[u * UNIT_FIELDS + 3]
+            t1 = units[u * UNIT_FIELDS + 4]
+            kv_len = kv_lens[b]
+            last_tile = (kv_len - 1) // self.tile_n
+            for j in cutlass.range_constexpr(ni):
+                cute.arch.mbarrier_wait(q_full + q_base + j, q_ph)
+            cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
+            k_slot = kv_idx
+            kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+            for j in cutlass.range_constexpr(ni):
+                jj = (0, 2, 1, 3)[j]
+                self.pair_qk(qk_tiled_mma, tStS[jj], tSrQ[None, None, None, q_base + jj],
+                             tSrK[None, None, None, k_slot], s_full, s_empty, jj, n0)  # fmt: skip
+            self.commit(kv_empty + k_slot)
+            for t in cutlass.range(t0, t1, 1, unroll=1):
+                n = n0 + t - t0
+                has_next = t + 1 < t1
+                cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
+                v_slot = kv_idx
+                kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+                k_slot = kv_idx
+                if has_next:
+                    cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
+                    kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+                if t == last_tile:
+                    rows_valid = kv_len - t * self.tile_n
+                    if rows_valid < self.tile_n:
+                        n_words = (self.tile_n - rows_valid) * self.row_words
+                        base = v_slot * self.slot_words + rows_valid * self.row_words
+                        for w in cutlass.range(lane, n_words, 32, unroll=1):
+                            ring_words[base + w] = Int32(0)
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.arch.sync_warp()
+                for h in cutlass.range_constexpr(2):
+                    if has_next:
+                        for p in cutlass.range_constexpr(2):
+                            jj = 2 * p + h
+                            self.pair_qk(qk_tiled_mma, tStS[jj],
+                                         tSrQ[None, None, None, q_base + jj],
+                                         tSrK[None, None, None, k_slot], s_full, s_empty, jj,
+                                         n + 1)  # fmt: skip
+                    for p in cutlass.range_constexpr(2):
+                        jj = 2 * p + h
+                        cute.arch.mbarrier_wait(p_full + jj, p_ph)
+                        self.gemm_pv(pv_tiled_mma, tOtO[jj], tOrP[jj][0],
+                                     tOrV[None, None, None, v_slot], t > t0)  # fmt: skip
+                        self.commit(p_empty + jj)
+                p_ph ^= 1
+                self.commit(kv_empty + v_slot)
+                if has_next:
+                    self.commit(kv_empty + k_slot)
+            n0 += t1 - t0
+            for j in cutlass.range_constexpr(ni):
+                self.commit(q_empty + q_base + j)
+            q_base += ni
+            if q_base == self.q_stage:
+                q_base = Int32(0)
+                q_ph ^= 1
+        return q_base, q_ph, kv_idx, kv_ph
+
+    @cute.jit
+    def pair_qk(self, tiled_mma, tStS_j, tSrQ, tSrK, s_full, s_empty, j: cutlass.Constexpr, n):
+        """S tile ``n`` of instance ``j`` into its pair's buffer, once the previous user of the
+        buffer (partner tile n - 1 for an even j, partner tile n for an odd j) has read it."""
+        if cutlass.const_expr(j % 2 == 0):
+            if n > 0:
+                cute.arch.mbarrier_wait(s_empty + j + 1, (n - 1) & 1)
+        else:
+            cute.arch.mbarrier_wait(s_empty + j - 1, n & 1)
+        self.gemm_qk(tiled_mma, tStS_j, tSrQ, tSrK)
+        self.commit(s_full + j)
+
+    @cute.jit
+    def load_tile_zero(
+        self, kv_ring, ids, x, kv_idx, kv_ph, kz_full, kz_ph, ring_words, rows_valid, lane
+    ):
+        """``load_tile`` for a V tile with rows past the request's last key: the copy completes on
+        ``kz_full``, this warp zeroes those rows, then arrives on the slot's ``kv_full``."""
+        tma_atom_kv, tBgB, tBsB, kvh, oob_box, kv_full, kv_empty = kv_ring
+        cute.arch.mbarrier_wait(kv_empty + kv_idx, kv_ph)
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(kz_full, self.kv_bytes)
+        for p in cutlass.range_constexpr(self.pages_per_tile):
+            pid = cute.arch.shuffle_sync(ids, (x % self.tiles_per_batch) * self.pages_per_tile + p)
+            box = cutlass.select_(pid >= 0, pid * self.num_kv_heads + kvh, oob_box)
+            cute.copy(
+                tma_atom_kv,
+                tBgB[None, 0, 0, box],
+                tBsB[None, kv_idx * self.pages_per_tile + p],
+                tma_bar_ptr=kz_full,
+            )
+        cute.arch.mbarrier_wait(kz_full, kz_ph)
+        kz_ph ^= 1
+        n_words = (self.tile_n - rows_valid) * self.row_words
+        base = kv_idx * self.slot_words + rows_valid * self.row_words
+        for w in cutlass.range(lane, n_words, 32, unroll=1):
+            ring_words[base + w] = Int32(0)
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive(kv_full + kv_idx)
+        kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+        return kv_idx, kv_ph, kz_ph
+
+    @cute.jit
     def issue_qk(self, tiled_mma, tStS_j, tSrQ, tSrK, s_full, s_empty, j: cutlass.Constexpr, n):
         """S tile ``n`` of instance ``j`` into its S buffer ``n % s_stages``, once softmax ``j``
         has read that buffer's previous tile; commits ``s_full``."""
@@ -837,6 +1318,62 @@ class PagedContextFmhaFmk:
             self.gemm_pv(tiled_mma, tOtO_j, tOrP_j[0], tOrV, accumulate)
 
     @cute.jit
+    def mma_step_p_smem(self, mmas, bars, step, ring_words, lane, tr):
+        """One key tile ``t`` of the MMA warp in the ``p_smem`` build: wait V(t) and K(t + 1),
+        issue QK_j(t + 1) for every instance once softmax ``j`` has read S_j(t), then P.V_j(t)
+        once P_j(t) is in shared memory; release the K / V slots. The caller advances the ring
+        (V(t), then K(t + 1) when there is one) and the P parity."""
+        qk_tiled_mma, pv_tiled_mma, tStS, tOtO, tSrQ, tSrK, tOrV, tOrPs = mmas
+        kv_full, kv_empty, s_full, s_empty, p_full, p_empty = bars
+        t, t0, n, has_next, last_tile, kv_len, q_base, kv_idx, kv_ph, p_ph = step
+        trace, step_base, rec = tr
+        v_slot = kv_idx
+        cute.arch.mbarrier_wait(kv_full + v_slot, kv_ph)
+        k_slot, k_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+        if has_next:
+            cute.arch.mbarrier_wait(kv_full + k_slot, k_ph)
+        if t == last_tile:
+            # Zero the V rows past the request's last key (any bytes, see the record).
+            rows_valid = kv_len - t * self.tile_n
+            if rows_valid < self.tile_n:
+                n_words = (self.tile_n - rows_valid) * self.row_words
+                base = v_slot * self.slot_words + rows_valid * self.row_words
+                for w in cutlass.range(lane, n_words, 32, unroll=1):
+                    ring_words[base + w] = Int32(0)
+                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.sync_warp()
+        if has_next:
+            for j in cutlass.range_constexpr(self.ni):
+                self.issue_qk(qk_tiled_mma, tStS[j], tSrQ[None, None, None, q_base + j],
+                              tSrK[None, None, None, k_slot], s_full, s_empty, j, n + 1)  # fmt: skip
+                if cutlass.const_expr(self.trace):
+                    if rec & (lane == 0) & (t - t0 < TRACE_STEPS):
+                        trace[step_base + (12 + j) * TRACE_STEPS + t - t0] = cute.arch.clock64()
+        for j in cutlass.range_constexpr(self.ni):
+            cute.arch.mbarrier_wait(p_full + j, p_ph)
+            if cutlass.const_expr(self.trace):
+                if rec & (lane == 0) & (t - t0 < TRACE_STEPS):
+                    trace[step_base + (8 + j) * TRACE_STEPS + t - t0] = cute.arch.clock64()
+            self.gemm_pv(pv_tiled_mma, tOtO[j], tOrPs[None, None, None, j],
+                         tOrV[None, None, None, v_slot], t > t0)  # fmt: skip
+            self.commit(p_empty + j)
+        self.commit(kv_empty + v_slot)
+        if has_next:
+            self.commit(kv_empty + k_slot)
+
+    @cute.jit
+    def store_p_smem(self, sP, rP, inst, row):
+        """Row ``row`` of P_inst (``tile_n`` E4M3 in key order, packed four to a word in ``rP``)
+        into its shared-memory buffer, then make it visible to the tensor core."""
+        dst = sP[((row, None), 0, None, inst)]
+        src = cute.make_tensor(
+            cute.recast_ptr(rP.iterator, dtype=F8),
+            cute.make_layout(dst.shape, stride=(1, cute.size(dst, mode=[0]))),
+        )
+        cute.autovec_copy(src, dst)
+        cute.arch.fence_proxy("async.shared", space="cta")
+
+    @cute.jit
     def load_page_ids(self, table, b, bj, num_pages, lane, stride_b, stride_kv):
         """Lane ``l``: the K and V blocks of page ``32 bj + l`` of request ``b``, -1 past its last
         page."""
@@ -850,22 +1387,25 @@ class PagedContextFmhaFmk:
 
     def make_tmem_tensors(self, qk_thr_mma, pv_thr_mma, p_tmem_layout_staged, tmem_ptr):
         """Per instance: S buffer 0 (fp32, tile_n columns; buffer 1 follows it), O (fp32, 64
-        columns, after the S buffers), P per S buffer (E4M3 over its start)."""
+        columns, after the S buffers), P per S buffer (E4M3 over its start; none in the
+        ``p_smem`` build, whose P is in shared memory)."""
         tStS_fake = qk_thr_mma.make_fragment_C(
             qk_thr_mma.partition_shape_C((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
         )
         tOtO_fake = pv_thr_mma.make_fragment_C(
             pv_thr_mma.partition_shape_C((self.pv_mma_tiler[0], self.pv_mma_tiler[1]))
         )
-        tP = cute.make_tensor(tmem_ptr, p_tmem_layout_staged.outer)
-        tOrP_fake = pv_thr_mma.make_fragment_A(tP)[None, None, None, 0]
+        tOrP_fake = None
+        if not self.p_smem:
+            tP = cute.make_tensor(tmem_ptr, p_tmem_layout_staged.outer)
+            tOrP_fake = pv_thr_mma.make_fragment_A(tP)[None, None, None, 0]
         tStS, tOtO, tOrP = [], [], []
         for j in range(self.ni):
-            base = j * self.inst_cols
-            tStS.append(cute.make_tensor(tmem_ptr + base, tStS_fake.layout))
-            tOtO.append(
-                cute.make_tensor(tmem_ptr + base + self.s_stages * self.tile_n, tOtO_fake.layout)
-            )
+            base = self.col_p(j)
+            tStS.append(cute.make_tensor(tmem_ptr + self.col_s(j), tStS_fake.layout))
+            tOtO.append(cute.make_tensor(tmem_ptr + self.col_o(j), tOtO_fake.layout))
+            if self.p_smem:
+                continue
             tOrP.append(
                 [
                     cute.make_tensor(
@@ -880,16 +1420,12 @@ class PagedContextFmhaFmk:
     def fresh_qk_mma(self):
         """A new QK tiled MMA: its runtime fields (accumulate) start from the atom's value in the
         region where it is built, so no update from another region is used."""
-        return sm100_utils.make_trivial_tiled_mma(
-            F8, F8, OperandMajorMode.K, OperandMajorMode.K, Float32, tcgen05.CtaGroup.ONE,
-            self.qk_mma_tiler[:2],
-        )  # fmt: skip
+        return self.f8_mma(OperandMajorMode.K, OperandMajorMode.K, self.qk_mma_tiler[:2])
 
     def fresh_pv_mma(self):
-        return sm100_utils.make_trivial_tiled_mma(
-            F8, F8, OperandMajorMode.K, OperandMajorMode.MN, Float32, tcgen05.CtaGroup.ONE,
-            self.pv_mma_tiler[:2], tcgen05.OperandSource.TMEM,
-        )  # fmt: skip
+        """A new P.V tiled MMA: P from TMEM, or from shared memory in the ``p_smem`` build."""
+        source = tcgen05.OperandSource.SMEM if self.p_smem else tcgen05.OperandSource.TMEM
+        return self.f8_mma(OperandMajorMode.K, OperandMajorMode.MN, self.pv_mma_tiler[:2], source)
 
     @cute.jit
     def gemm_qk(self, tiled_mma, tStS, tSrQ, tSrK):
@@ -913,10 +1449,10 @@ class PagedContextFmhaFmk:
 
     # ------------------------------------------------------------------ softmax
     @cute.jit
-    def softmax(self, inst, row, tmem_ptr, qk_thr_mma, pv_thr_mma, bars, work, scales, tr):
+    def softmax(self, inst, row, tmem_ptr, qk_thr_mma, pv_thr_mma, bars, work, scales, tr, iss):
         """Softmax warpgroup of instance ``inst``; thread ``row`` owns TMEM lane / query row
         ``row`` of every unit."""
-        s_full, s_empty, p_full, p_empty = bars
+        s_full, s_empty, p_full, p_empty, sP = bars
         units, u_begin, u_end, cu_q, kv_lens, mO, part_o_ptr, part_ml_ptr, stats_ptr = work
         s_full_j = s_full + inst * self.s_stages
         s_empty_j = s_empty + inst * self.s_stages
@@ -927,11 +1463,11 @@ class PagedContextFmhaFmk:
         tStS_fake = qk_thr_mma.make_fragment_C(
             qk_thr_mma.partition_shape_C((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
         )
-        tStS = cute.make_tensor(tmem_ptr + base_col, tStS_fake.layout)
+        tStS = cute.make_tensor(tmem_ptr + self.col_s(inst), tStS_fake.layout)
         tOtO_fake = pv_thr_mma.make_fragment_C(
             pv_thr_mma.partition_shape_C((self.pv_mma_tiler[0], self.pv_mma_tiler[1]))
         )
-        tOtO = cute.make_tensor(tmem_ptr + base_col + self.s_stages * n, tOtO_fake.layout)
+        tOtO = cute.make_tensor(tmem_ptr + self.col_o(inst), tOtO_fake.layout)
         # S loads with the per-32-column max (tcgen05.ld.red.max).
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.LdRed32x32bOp(
@@ -948,7 +1484,8 @@ class PagedContextFmhaFmk:
         # P (E4M3, tile_n / 4 columns) over the start of S.
         p_cols = n // 4
         tStS_P = cute.make_tensor(
-            tStS.iterator, cute.composition(tStS.layout, cute.make_layout((M_TILE, p_cols)))
+            tmem_ptr + self.col_p(inst),
+            cute.composition(tStS.layout, cute.make_layout((M_TILE, p_cols))),
         )
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(p_cols)), Float32
@@ -969,6 +1506,20 @@ class PagedContextFmhaFmk:
         # waited so far (parity).
         n0 = Int32(0)
         pe_ph = Int32(0)
+        # Self-issue state (the issuing warp walks the Q and K / V rings like the MMA warp).
+        (qk_tiled_mma, pv_tiled_mma, tSrQ, tSrK, tOrV, p_tmem_layout_staged,
+         q_full, q_empty, kv_full, kv_empty, is_issuer) = iss  # fmt: skip
+        tP_i = None
+        if cutlass.const_expr(self.self_issue):
+            tP_fake = cute.make_tensor(tmem_ptr, p_tmem_layout_staged.outer)
+            tOrP_fake = pv_thr_mma.make_fragment_A(tP_fake)[None, None, None, 0]
+            tP_i = cute.make_tensor(
+                cute.recast_ptr(tmem_ptr + base_col, dtype=tOrP_fake.dtype), tOrP_fake.layout
+            )
+        q_base = Int32(0)
+        q_ph = Int32(0)
+        kv_idx = Int32(0)
+        kv_ph = Int32(0)
         for u in cutlass.range(u_begin, u_end, 1, unroll=1):
             rec = (bidx == 0) & (u == u_begin) & (row == 0)
             if cutlass.const_expr(self.trace):
@@ -992,28 +1543,53 @@ class PagedContextFmhaFmk:
             t_mid = cutlass.max(t0, cutlass.min(t1, first_masked))
             row_max = -Float32.inf
             row_sum = Float32(0.0)
+            if cutlass.const_expr(self.self_issue):
+                if is_issuer:
+                    # Prologue: S(t0) of this instance (P.V of the previous unit was issued
+                    # before by this thread, so it has read its P before this QK writes S).
+                    cute.arch.mbarrier_wait(q_full + q_base + inst, q_ph)
+                    cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
+                    k_slot = kv_idx
+                    kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+                    _tc_fence_after_sync()
+                    self.gemm_qk(qk_tiled_mma, tStS, tSrQ[None, None, None, q_base + inst],
+                                 tSrK[None, None, None, k_slot])  # fmt: skip
+                    self.commit(s_full_j)
+                    self.commit(kv_empty + k_slot)
+            istate = (qk_tiled_mma, pv_tiled_mma, tSrQ, tSrK, tOrV, tP_i, tOtO, tStS, q_base,
+                   kv_full, kv_empty, is_issuer)  # fmt: skip
             for t in cutlass.range(t0, t_mid, 1, unroll=1):
-                row_max, row_sum, pe_ph = self.softmax_step(
+                row_max, row_sum, pe_ph, kv_idx, kv_ph = self.softmax_step(
                     False, t == t0, t, key_limit, row_max, row_sum, n0 + t - t0, pe_ph, scale,
                     (s_full_j, s_empty_j, p_full_j, p_empty_j),
                     (tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADcS, tiled_tmem_store,
-                     tTMEM_STOREtP, tTMEM_STOREcP, n_chunks, tOtO, pv_thr_mma, row),
+                     tTMEM_STOREtP, tTMEM_STOREcP, n_chunks, tOtO, pv_thr_mma, row, sP),
                     (trace, step_base, rec, t - t0, inst),
+                    (istate, kv_idx, kv_ph, t + 1 < t1, t > t0),
                 )  # fmt: skip
             if cutlass.const_expr(self.trace):
                 if row == 0:
                     trace[u * TRACE_FIELDS + 12 + inst] = cute.arch.globaltimer()
             for t in cutlass.range(t_mid, t1, 1, unroll=1):
-                row_max, row_sum, pe_ph = self.softmax_step(
+                row_max, row_sum, pe_ph, kv_idx, kv_ph = self.softmax_step(
                     True, t == t0, t, key_limit, row_max, row_sum, n0 + t - t0, pe_ph, scale,
                     (s_full_j, s_empty_j, p_full_j, p_empty_j),
                     (tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADcS, tiled_tmem_store,
-                     tTMEM_STOREtP, tTMEM_STOREcP, n_chunks, tOtO, pv_thr_mma, row),
+                     tTMEM_STOREtP, tTMEM_STOREcP, n_chunks, tOtO, pv_thr_mma, row, sP),
                     (trace, step_base, rec, t - t0, inst),
+                    (istate, kv_idx, kv_ph, t + 1 < t1, t > t0),
                 )  # fmt: skip
             if cutlass.const_expr(self.trace):
                 if row == 0:
                     trace[u * TRACE_FIELDS + 16 + inst] = cute.arch.globaltimer()
+            if cutlass.const_expr(self.self_issue):
+                if is_issuer:
+                    # The unit's last QK has been issued: release this instance's Q slot.
+                    self.commit(q_empty + q_base + inst)
+                q_base += self.ni
+                if q_base == self.q_stage:
+                    q_base = Int32(0)
+                    q_ph ^= 1
             # Drain: the unit's last P.V of this instance has completed.
             cute.arch.mbarrier_wait(p_empty_j, pe_ph)
             pe_ph ^= 1
@@ -1060,11 +1636,13 @@ class PagedContextFmhaFmk:
         bars,
         atoms,
         tr,
+        isx,
     ):
         s_full_j, s_empty_j, p_full_j, p_empty_j = bars
+        istate, kv_idx, kv_ph, has_next, acc_pv = isx
         trace, step_base, rec, step, inst = tr
         (tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADcS, tiled_tmem_store, tTMEM_STOREtP,
-         tTMEM_STOREcP, n_chunks, tOtO, pv_thr_mma, row) = atoms  # fmt: skip
+         tTMEM_STOREcP, n_chunks, tOtO, pv_thr_mma, row, sP) = atoms  # fmt: skip
         n = self.tile_n
         sb = n_step % self.s_stages
         cute.arch.mbarrier_wait(s_full_j + sb, (n_step // self.s_stages) & 1)
@@ -1079,7 +1657,8 @@ class PagedContextFmhaFmk:
                 tiled_tmem_load, tS[None, c, 0, 0], (rS[None, c, 0, 0], rMax[None, c])
             )
         cute.arch.fence_view_async_tmem_load()
-        cute.arch.mbarrier_arrive(s_empty_j + sb)
+        if cutlass.const_expr(not self.self_issue):
+            cute.arch.mbarrier_arrive(s_empty_j + sb)
         tile_max = -Float32.inf
         if cutlass.const_expr(masked):
             # Register i of a 32x32b TMEM load holds column i of this thread's row.
@@ -1095,34 +1674,87 @@ class PagedContextFmhaFmk:
             new_max = Float32(0.0)
         acc_log2 = scale * (old_max - new_max)
         neg = (Float32(0.0) - new_max) * scale + Float32(P_PRESCALE_LOG2)
-        half = cute.math.exp2(acc_log2, fastmath=True) * Float32(0.5)
-        sum2 = (row_sum * half, row_sum * half)
         rP = cute.make_rmem_tensor(tTMEM_STOREcP.shape, Float32)
         rP_i32 = cute.recast_tensor(rP, Int32)
-        for i in cutlass.range_constexpr(0, cute.size(rS), 4):
-            a0, a1 = cute.arch.fma_packed_f32x2((rS[i], rS[i + 1]), (scale, scale), (neg, neg))
-            a2, a3 = cute.arch.fma_packed_f32x2((rS[i + 2], rS[i + 3]), (scale, scale), (neg, neg))
-            e0 = self.ex2(a0)
-            e1 = self.ex2(a1)
-            e2 = self.ex2(a2)
-            e3 = self.ex2(a3)
-            sum2 = cute.arch.add_packed_f32x2(sum2, (e0, e1))
-            sum2 = cute.arch.add_packed_f32x2(sum2, (e2, e3))
-            rP_i32[i // 4] = _cvt_f32x4_to_e4m3x4(e0, e1, e2, e3)
+        if cutlass.const_expr(self.turn_groups > 0):
+            self.turn_wait(inst // (self.ni // self.turn_groups))
+        new_sum = Float32(0.0)
+        if cutlass.const_expr(self.exp_f16x2):
+            words = []
+            for i in cutlass.range_constexpr(0, cute.size(rS), 4):
+                a0, a1 = cute.arch.fma_packed_f32x2((rS[i], rS[i + 1]), (scale, scale), (neg, neg))
+                a2, a3 = cute.arch.fma_packed_f32x2(
+                    (rS[i + 2], rS[i + 3]), (scale, scale), (neg, neg)
+                )
+                e01 = _ex2_f16x2(a0, a1)
+                e23 = _ex2_f16x2(a2, a3)
+                rP_i32[i // 4] = _cvt_f16x2x2_to_e4m3x4(e01, e23)
+                words.append(e01)
+                words.append(e23)
+            # The tile's sum: a pairwise fp16x2 tree, then the two halves in fp32.
+            new_sum = row_sum * cute.math.exp2(acc_log2, fastmath=True) + _f16x2_sum_f32(
+                _hadd2_tree(words)
+            )
+        else:
+            half = cute.math.exp2(acc_log2, fastmath=True) * Float32(0.5)
+            sum2 = (row_sum * half, row_sum * half)
+            for i in cutlass.range_constexpr(0, cute.size(rS), 4):
+                a0, a1 = cute.arch.fma_packed_f32x2((rS[i], rS[i + 1]), (scale, scale), (neg, neg))
+                a2, a3 = cute.arch.fma_packed_f32x2(
+                    (rS[i + 2], rS[i + 3]), (scale, scale), (neg, neg)
+                )
+                e0 = self.ex2(a0)
+                e1 = self.ex2(a1)
+                e2 = self.ex2(a2)
+                e3 = self.ex2(a3)
+                sum2 = cute.arch.add_packed_f32x2(sum2, (e0, e1))
+                sum2 = cute.arch.add_packed_f32x2(sum2, (e2, e3))
+                rP_i32[i // 4] = _cvt_f32x4_to_e4m3x4(e0, e1, e2, e3)
+            new_sum = sum2[0] + sum2[1]
+        if cutlass.const_expr(self.turn_groups > 0):
+            g = inst // (self.ni // self.turn_groups)
+            self.turn_arrive((g + 1) % self.turn_groups)
         if not is_first:
             # P.V of the previous step has completed: O is stable until this step's P arrives.
             cute.arch.mbarrier_wait(p_empty_j, pe_ph)
             pe_ph ^= 1
             if cute.arch.vote_ballot_sync(old_max != new_max) != 0:
                 self.rescale_o(pv_thr_mma, tOtO, cute.math.exp2(acc_log2, fastmath=True), row)
-        tP = cute.make_tensor(tTMEM_STOREtP.iterator + sb * n, tTMEM_STOREtP.layout)
-        cute.copy(tiled_tmem_store, rP, tP)
-        cute.arch.fence_view_async_tmem_store()
-        cute.arch.mbarrier_arrive(p_full_j)
+        if cutlass.const_expr(self.p_smem):
+            self.store_p_smem(sP, rP, inst, row)
+        else:
+            tP = cute.make_tensor(tTMEM_STOREtP.iterator + sb * n, tTMEM_STOREtP.layout)
+            cute.copy(tiled_tmem_store, rP, tP)
+            cute.arch.fence_view_async_tmem_store()
+        if cutlass.const_expr(self.self_issue):
+            (qk_tiled_mma, pv_tiled_mma, tSrQ, tSrK, tOrV, tP_i, tOtO_i, tStS_m, q_base,
+             kv_full, kv_empty, is_issuer) = istate  # fmt: skip
+            # Every thread of the warpgroup has stored its P row and read S / O.
+            cute.arch.barrier(barrier_id=3 + inst, number_of_threads=128)
+            if is_issuer:
+                _tc_fence_after_sync()
+                cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
+                v_slot = kv_idx
+                kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+                k_slot = kv_idx
+                if has_next:
+                    cute.arch.mbarrier_wait(kv_full + kv_idx, kv_ph)
+                    kv_idx, kv_ph = self.ring_advance(kv_idx, kv_ph, self.kv_stage)
+                self.gemm_pv(pv_tiled_mma, tOtO_i, tP_i, tOrV[None, None, None, v_slot],
+                             acc_pv)  # fmt: skip
+                self.commit(p_empty_j)
+                self.commit(kv_empty + v_slot)
+                if has_next:
+                    self.gemm_qk(qk_tiled_mma, tStS_m, tSrQ[None, None, None, q_base + inst],
+                                 tSrK[None, None, None, k_slot])  # fmt: skip
+                    self.commit(s_full_j + sb)
+                    self.commit(kv_empty + k_slot)
+        else:
+            cute.arch.mbarrier_arrive(p_full_j)
         if cutlass.const_expr(self.trace):
             if rec & (step < TRACE_STEPS):
                 trace[step_base + (4 + inst) * TRACE_STEPS + step] = cute.arch.clock64()
-        return new_max, sum2[0] + sum2[1], pe_ph
+        return new_max, new_sum, pe_ph, kv_idx, kv_ph
 
     @cute.jit
     def rescale_o(self, thr_mma, tOtO, scale, row):

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """``decode_qkv_mxfp8``: the QKV projections of published decode steps on an MXFP8 GEMM (sm107).
 
-A lossy lever (``levers.RULES``), on only by its knob. Needs ``context_fp8_dense`` with its
+A lossy lever (``levers.LEVERS``), on only by its knob. Needs ``context_fp8_dense`` with its
 QKV copies (``qkv`` among its PROJECTIONS), ``projection_publish`` and ``batch_dense_gemms``.
 
 On a decode step that ``projection_publish`` serves (33..448 rows), the post-FFN join of layer

@@ -6,7 +6,8 @@ The store of a step's drafter context K/V into a paged drafter context must leav
 pages bit for bit as ``DFlashWorker._store_context_kv_paged`` (flashinfer's
 ``append_paged_kv_cache``, one layer at a time) leaves them -- over the KV cache
 manager's per-layer views and over the worker's private pool -- and every case the op
-does not take must stay the worker's.
+does not take must stay the worker's. FP8 E4M3 pages (the FP8 draft KV pool) take BF16
+K/V through the saturating cast of ``to_kv_storage``, bit for bit the worker's appends.
 """
 
 import pytest
@@ -25,20 +26,26 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 PAGE = 32
 LAYERS = 5
 HEAD_DIM = 128
+FP8 = torch.float8_e4m3fn
 
 
-def _state(manager, heads, slots, blocks, seed):
+def _bits(pool):
+    """The pool's bytes, so FP8 pools (and NaN) compare bit for bit."""
+    return pool.view(torch.uint8) if pool.dtype == FP8 else pool
+
+
+def _state(manager, heads, slots, blocks, seed, page_dtype=torch.bfloat16):
     """The worker attributes ``_store_context_kv_paged`` reads, over a fresh pool."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     pages = slots * blocks + 3
     if manager:
         # The manager's interleaved pool: one view per layer, the same strides for each.
         pool = torch.randn((pages, LAYERS, 2, heads, PAGE, HEAD_DIM), generator=g, device="cuda")
-        pool = pool.to(torch.bfloat16)
+        pool = pool.to(page_dtype)
         caches = [pool[:, layer] for layer in range(LAYERS)]
     else:
         pool = torch.randn((LAYERS, pages, 2, heads, PAGE, HEAD_DIM), generator=g, device="cuda")
-        pool = pool.to(torch.bfloat16)
+        pool = pool.to(page_dtype)
         caches = pool
     # Every (row, block) its own page, so no two entries share a destination.
     table = torch.randperm(pages, generator=g, device="cuda")[: slots * blocks]
@@ -145,3 +152,61 @@ def test_the_rest_stays_the_workers(case, monkeypatch):
     worker._store_context_kv_paged(k, v, rows, positions)
     assert not calls
     assert torch.equal(pool, want_pool)
+
+
+def _kv_wide(n, heads, g):
+    """BF16 K/V spanning past E4M3's range, with infinities and NaN, as [n, layers, heads, hd]."""
+    k, v = _kv(n, heads, g, False)
+    k, v = k * 300, v * 300
+    k.view(-1)[:4] = torch.tensor([1e4, -1e4, float("inf"), float("nan")], dtype=k.dtype)
+    v.view(-1)[:4] = torch.tensor([-float("inf"), 449.0, -449.0, 1e-9], dtype=v.dtype)
+    return k, v
+
+
+@pytest.mark.parametrize("manager", [True, False])
+@pytest.mark.parametrize("n", [1, 64, 520])
+def test_fp8_pages_bitwise_the_reference(manager, n):
+    slots, blocks, heads = 70, 12, 2
+    state, pool = _state(manager, heads, slots, blocks, seed=n + 5, page_dtype=FP8)
+    ref_state, ref_pool = _state(manager, heads, slots, blocks, seed=n + 5, page_dtype=FP8)
+    rows, positions, g = _entries(n, slots, blocks, seed=n + 6)
+    k, v = _kv_wide(n, heads, g)
+    table = state["_ctx_block_tables"] if manager else state["_ctx_page_table"]
+    ref_table = ref_state["_ctx_block_tables"] if manager else ref_state["_ctx_page_table"]
+    args = (k, v, rows, positions, table, PAGE, state["_ctx_kv_buf"])
+    mod.ctx_kv_store_paged.is_valid(*args)
+    mod.ctx_kv_store_paged(*args)
+    mod.ctx_kv_store_paged.reference(
+        k, v, rows, positions, ref_table, PAGE, ref_state["_ctx_kv_buf"]
+    )
+    assert torch.equal(_bits(pool), _bits(ref_pool))
+
+
+@pytest.mark.parametrize("manager", [True, False])
+@pytest.mark.parametrize("n", [1, 8, 520])
+def test_fp8_pages_bitwise_the_worker(manager, n):
+    slots, blocks, heads = 70, 12, 2
+    state, pool = _state(manager, heads, slots, blocks, seed=n + 9, page_dtype=FP8)
+    want_state, want_pool = _state(manager, heads, slots, blocks, seed=n + 9, page_dtype=FP8)
+    rows, positions, g = _entries(n, slots, blocks, seed=n + 10)
+    k, v = _kv(n, heads, g, False)
+    DFlashWorker._store_context_kv_paged(_worker(DFlashWorker, want_state), k, v, rows, positions)
+    worker = _worker(fork_mod.ContextKvForkDFlashWorker, state, _fork(True))
+    assert fork_mod._paged_store_fits(worker, k, v, rows, positions)
+    worker._store_context_kv_paged(k, v, rows, positions)
+    assert torch.equal(_bits(pool), _bits(want_pool))
+
+
+@pytest.mark.parametrize("case", ["fp16_kv", "mixed_pages"])
+def test_fp8_pages_the_op_does_not_take(case):
+    slots, blocks, n, heads = 16, 6, 24, 1
+    state, _ = _state(True, heads, slots, blocks, seed=31, page_dtype=FP8)
+    rows, positions, g = _entries(n, slots, blocks, seed=32)
+    k, v = _kv(n, heads, g, False)
+    if case == "fp16_kv":
+        k, v = k.to(torch.float16), v.to(torch.float16)
+    else:
+        bf16_state, _ = _state(True, heads, slots, blocks, seed=31)
+        state["_ctx_kv_buf"] = state["_ctx_kv_buf"][:-1] + bf16_state["_ctx_kv_buf"][-1:]
+    worker = _worker(fork_mod.ContextKvForkDFlashWorker, state, _fork(True))
+    assert not fork_mod._paged_store_fits(worker, k, v, rows, positions)

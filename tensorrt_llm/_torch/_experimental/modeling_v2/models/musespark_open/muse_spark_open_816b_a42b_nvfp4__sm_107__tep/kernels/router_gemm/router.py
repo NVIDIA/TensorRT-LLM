@@ -13,7 +13,10 @@ the built-in ``router_logits`` runs the TF32x3 ``_router_tensorcore_kernel`` at
 ``install`` re-classes every layer's MoE with ``RouterGemmMoE`` in front of the
 class it has (whatever the other MoE fast paths made it) and returns one
 ``RouterGemmCall`` that the model keeps. ``DecodeTarget`` arms it for the forward
-of a decode step of ``min_rows..MAX_ROWS`` rows (``min_rows`` is ``MIN_ROWS``, or
+of a decode step of ``min_rows..max_rows`` rows (``max_rows`` is the op's ``MAX_ROWS``,
+raised to the op's ``LIMIT_ROWS`` on a wide generation server, ``levers.row_cap``; the
+rows it adds leave the built-in FP32 ``Linear``, so a raised cap is lossless-numeric
+against it; ``min_rows`` is ``MIN_ROWS``, or
 ``WIDE_PROLOGUE_MIN_ROWS`` where ``wide_prologue`` serves the 16..32-row steps'
 router as its own shard, bit for bit the built-in tensor-core router's); while it is armed, a
 ``router_logits`` call of contiguous BF16 rows over the FP32 ``[256, 8192]``
@@ -94,10 +97,13 @@ class RouterGemmCall:
     (and why), so a served log shows what the decode steps it captured actually run.
     """
 
-    def __init__(self, min_rows: int = _op.MIN_ROWS) -> None:
-        if not _op.MIN_ROWS <= min_rows <= _op.MAX_ROWS:
-            raise ValueError(f"min_rows {min_rows} outside {_op.MIN_ROWS}..{_op.MAX_ROWS}")
+    def __init__(self, min_rows: int = _op.MIN_ROWS, max_rows: int = _op.MAX_ROWS) -> None:
+        if not _op.MAX_ROWS <= max_rows <= _op.LIMIT_ROWS:
+            raise ValueError(f"max_rows {max_rows} outside {_op.MAX_ROWS}..{_op.LIMIT_ROWS}")
+        if not _op.MIN_ROWS <= min_rows <= max_rows:
+            raise ValueError(f"min_rows {min_rows} outside {_op.MIN_ROWS}..{max_rows}")
         self.min_rows = min_rows
+        self.max_rows = max_rows
         self._armed = False
         self._reported = set()
 
@@ -118,7 +124,7 @@ class RouterGemmCall:
 
     def takes(self, rows: int) -> bool:
         """Whether a decode step of ``rows`` rows runs its router logits on the op."""
-        return self.min_rows <= rows <= _op.MAX_ROWS
+        return self.min_rows <= rows <= self.max_rows
 
     @property
     def is_armed(self) -> bool:
@@ -134,15 +140,18 @@ class RouterGemmCall:
             self._armed = False
 
 
-def takes(hidden_states: torch.Tensor, weight: Optional[torch.Tensor]) -> bool:
-    """Whether an armed ``router_logits`` call on ``hidden_states`` over ``weight`` runs the op."""
+def takes(
+    hidden_states: torch.Tensor, weight: Optional[torch.Tensor], max_rows: int = _op.MAX_ROWS
+) -> bool:
+    """Whether an armed ``router_logits`` call on ``hidden_states`` over ``weight`` runs the op
+    (a call of at most ``max_rows`` rows, the armed call's cap)."""
     return (
         weight is not None
         and not torch.compiler.is_compiling()
         and hidden_states.is_cuda
         and hidden_states.dtype == torch.bfloat16
         and hidden_states.dim() == 2
-        and _op.MIN_ROWS <= hidden_states.shape[0] <= _op.MAX_ROWS
+        and _op.MIN_ROWS <= hidden_states.shape[0] <= max_rows
         and hidden_states.shape[1] == _op.HIDDEN
         and hidden_states.is_contiguous()
         and weight.device == hidden_states.device
@@ -161,7 +170,7 @@ class RouterGemmMoE:
         call = self._router_gemm_call
         if call is not None and call.is_armed:
             weight = getattr(self.router, "weight", None)
-            served = takes(hidden_states, weight)
+            served = takes(hidden_states, weight, call.max_rows)
             call.report(hidden_states, served)
             if served:
                 if _router_push_module() is not None and _router_push.armed():
@@ -216,18 +225,23 @@ def _router_gemm_class(base: type) -> type:
 
 
 def install(
-    model: torch.nn.Module, min_rows: int = _op.MIN_ROWS, staged_epilogue: Optional[str] = None
+    model: torch.nn.Module,
+    min_rows: int = _op.MIN_ROWS,
+    staged_epilogue: Optional[str] = None,
+    max_rows: int = _op.MAX_ROWS,
 ) -> RouterGemmCall:
     """Re-class every layer's MoE with ``RouterGemmMoE`` in front; returns the call to arm
-    on decode steps of ``min_rows..MAX_ROWS`` rows. ``staged_epilogue``
-    (``router_staged_epilogue``) is the GEMM's staged epilogue, None for the tree's kernel.
+    on decode steps of ``min_rows..max_rows`` rows (``max_rows``: the path's ``MAX_ROWS``
+    parameter). ``staged_epilogue`` (``router_staged_epilogue``) is the GEMM's staged
+    epilogue, None for the tree's kernel.
 
     Every layer is checked before any is re-classed; a layer already carrying the
     mixin is re-pointed at the returned call.
 
     Raises:
-        ValueError: if a layer's feed-forward is not a ``MuseSparkOpenMoE``, or the
-            device is not one of ``VALIDATED_CAPABILITIES``.
+        ValueError: if a layer's feed-forward is not a ``MuseSparkOpenMoE``, the device is
+            not one of ``VALIDATED_CAPABILITIES``, or ``max_rows`` is outside
+            ``MAX_ROWS..LIMIT_ROWS``.
     """
     if (
         not torch.cuda.is_available()
@@ -242,8 +256,8 @@ def install(
         raise ValueError(
             f"[musespark_open] router_gemm replaces the MoE router; layers {wrong} have no MoE"
         )
+    call = RouterGemmCall(min_rows, max_rows)
     _op.set_staged_epilogue(staged_epilogue)
-    call = RouterGemmCall(min_rows)
     for layer in layers:
         moe = layer.feed_forward
         if not isinstance(moe, RouterGemmMoE):
@@ -251,7 +265,7 @@ def install(
         moe._router_gemm_call = call
     logger.info(
         f"[musespark_open] router_gemm: router logits of decode steps of {min_rows}.."
-        f"{_op.MAX_ROWS} rows on the BF16x3 split-K GEMM (one CTA per SM, K splits = SMs // "
+        f"{max_rows} rows on the BF16x3 split-K GEMM (one CTA per SM, K splits = SMs // "
         f"(2 x 128-row tiles)"
         + (f", {staged_epilogue} staged epilogue" if staged_epilogue is not None else "")
         + f") in {len(layers)} MoE layers; other steps keep the built-in router"

@@ -36,6 +36,16 @@ the arena and of the lengths the commit wrote -- so the drafter's first input no
 convolution ``prepare``, QKV GEMM and QK-norm + RoPE run while the commit is still on
 the side stream.
 
+With ``context_kv_fork_paged_wide`` (``ContextKvFork.paged_wide_max_requests``, opt-in) the
+fork also takes a paged context's decode steps of ``MAX_REQUESTS + 1`` to 128 requests. Those
+steps fork at ``GATHER_POINT`` -- once the LM head returned its gathered row -- instead of
+right after the LM-head GEMM: the side chain's ``fc`` gather and the head's logits gather
+are NCCL all-gathers on one communicator, which runs them in issue order, so forked at the
+GEMM the logits gather would wait for the side chain's page-table decode, ``fc`` GEMM and
+``fc`` gather. Their page-table decode is ``drafter_block_table_decode``'s launch (or the
+built-in's) and their commit the worker's ``_commit_context`` (``context_kv_commit_paged``
+takes up to ``MAX_REQUESTS`` requests).
+
 Over a windowed arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA``: the worker keeps
 the last ``_ctx_keep`` columns of each slot, physical column 0 holding logical
 token ``_ctx_base``) the worker's store writes the physical columns, with the
@@ -70,6 +80,13 @@ their columns are the drafter block append's, which overwrites them in the same
 step before anything reads them. Under ``drafter_kv_side_chain`` the store over pages
 is the fused one too (``_fused_side_chain_paged``), and under ``drafter_fc_early_fork``
 the page-table decode runs in the early part, ahead of the ``fc`` GEMM.
+
+With ``drafter_block_table_decode`` (``ContextKvFork.block_table_on``, opt-in) the
+worker's own page-table decode -- on every step the fork did not launch, such as a
+step of more requests than the fork takes over pages -- is one launch
+(``block_table.py``) with the built-in's words, instead of the built-in's tensor
+statements; so is the side chain's decode where ``paged_ctx_block_tables`` leaves
+it to the built-in.
 """
 
 from __future__ import annotations
@@ -89,17 +106,19 @@ from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.logger import logger
 
 from ...ops.spec.context_kv_commit import MAX_REQUESTS, context_kv_commit
+from ...ops.spec.context_kv_commit_paged import MAX_REQUESTS as PAGED_COMMIT_MAX_REQUESTS
 from ...ops.spec.context_kv_commit_paged import (
     PagedPreamble,
     context_kv_commit_paged,
     context_kv_commit_paged_preamble,
 )
-from ...ops.spec.context_kv_commit_windowed import context_kv_commit_windowed
+from ...ops.spec.context_kv_commit_windowed import PARALLEL_MAX_REQUESTS, context_kv_commit_windowed
 from ...ops.spec.ctx_block_tables_paged import MAX_REQUESTS as TABLES_MAX_REQUESTS
 from ...ops.spec.ctx_block_tables_paged import ctx_block_tables_paged
 from ...ops.spec.ctx_kv_prep_paged import ctx_kv_prep_paged
 from ...ops.spec.ctx_kv_store_paged import MAX_LAYERS as STORE_MAX_LAYERS
-from ...ops.spec.ctx_kv_store_paged import ctx_kv_store_paged
+from ...ops.spec.ctx_kv_store_paged import ctx_kv_store_paged, takes_page_dtype
+from . import block_table as _block_table
 
 #: ``drafter_kv_glue`` (``ContextKvFork.glue_on``): the side chain's index math and its arena
 #: stores run as two Triton launches instead of ~11 torch kernels: the slots / columns /
@@ -277,9 +296,10 @@ def _rope_with_positions(drafter, pos_rep, fallback):
     return fused_rope_inplace
 
 
-#: ``paged_side_chain`` (``configure``; ``drafter_kv_fork_before_head__PAGED_CHAIN``, 0..2): over the KV cache manager's
-#: pages the side chain runs ``_fused_paged_side_chain`` (``ops/spec/context_kv_store_paged``: the block-table decode,
-#: extents, columns and positions in one launch, every layer's K / V into the pages in one) instead of the built-in
+#: ``paged_side_chain`` (``configure``; ``drafter_kv_fork_before_head__PAGED_CHAIN``, 0..2): over the KV cache
+#: manager's pages the side
+#: chain runs ``_fused_paged_side_chain`` (``ops/spec/context_kv_store_paged``: the block-table decode, extents,
+#: columns and positions in one launch, every layer's K / V into the pages in one) instead of the built-in
 #: ``_refresh_ctx_block_tables`` + ``_store_step_context`` (~45 launches). The same GEMMs, norms and RoPE as
 #: ``_fused_side_chain``; integer math and copies elsewhere: bitwise. A step it cannot take logs ERROR with the knob.
 #: 2: also its prep and the sharded ``fc`` GEMM at the early fork (``fire_early``, with ``drafter_fc_early_fork``: right
@@ -298,7 +318,7 @@ def configure(*, paged_side_chain: int = 0) -> None:
     value = int(paged_side_chain)
     if not 0 <= value <= 2:
         raise ValueError(
-            "[musespark_open] context_kv_fork: paged_side_chain must be in 0..2 "
+            f"[musespark_open] context_kv_fork: paged_side_chain must be in 0..2 "
             f"(drafter_kv_fork_before_head__PAGED_CHAIN), got {value}"
         )
     PAGED_SIDE_CHAIN = value
@@ -306,6 +326,13 @@ def configure(*, paged_side_chain: int = 0) -> None:
 
 #: Where the side chain forks: right after the LM head's GEMM.
 POINT = "head"
+#: Where ``context_kv_fork_paged_wide`` forks a paged context's steps of more than
+#: ``MAX_REQUESTS`` requests: right after the LM head returned its gathered row
+#: (``split_sampler.TargetHead.produce``). The side chain's ``fc`` gather and the head's
+#: logits gather are NCCL all-gathers on the same communicator, which runs them in issue
+#: order; forked here, the ``fc`` gather is issued behind the logits gather instead of ahead
+#: of it, so the main stream's gather does not wait for the side chain's ``fc``.
+GATHER_POINT = "gather"
 
 
 def column_limit(worker: DFlashWorker) -> int:
@@ -427,8 +454,8 @@ class ContextKvFork:
         self.point = point
         self.stream = dedicated_stream()
         #: A decode step's batch rows (``[:requests]``), as the worker's stages take them.
-        self.rows = torch.arange(MAX_REQUESTS, device="cuda")
-        self.launches = {"head": 0, "verify": 0}
+        self.rows = torch.arange(PARALLEL_MAX_REQUESTS, device="cuda")
+        self.launches = {"head": 0, "verify": 0, GATHER_POINT: 0}
         self._armed: Optional[tuple] = None
         self._launched: Optional[Launched] = None
         self._fallback_logged = False
@@ -445,6 +472,14 @@ class ContextKvFork:
         self.fork_before_head = False
         #: ``windowed_commit_parallel``'s MIN_REQUESTS for the windowed commit, or None.
         self.parallel_min_requests: Optional[int] = None
+        #: ``context_kv_fork_wide``'s bound, or None: the most requests the fork takes
+        #: when its commit is the parallel windowed commit (``max_requests``).
+        self.wide_max_requests: Optional[int] = None
+        #: ``context_kv_fork_paged_wide``'s bound, or None: the most requests the fork takes over
+        #: a paged context (``max_requests``); its steps of more than ``MAX_REQUESTS`` requests
+        #: fork at ``GATHER_POINT`` (``fire``).
+        self.paged_wide_max_requests: Optional[int] = None
+        self._gather_point_logged = False
         #: ``context_kv_late_join``: the prepare may leave the join to the drafter (``defer_join``).
         self.late_join_on = False
         #: ``paged_context_commit``: a paged context's commit runs ``context_kv_commit_paged``.
@@ -458,6 +493,10 @@ class ContextKvFork:
         #: ``paged_ctx_kv_store``: the worker stores a paged context's K/V of every drafter layer
         #: with ``ctx_kv_store_paged``.
         self.paged_store_on = False
+        #: ``drafter_block_table_decode``: a decode of a paged context's page table that
+        #: ``paged_ctx_block_tables`` does not take runs as one launch (``block_table.refresh``)
+        #: where it applies.
+        self.block_table_on = False
         #: Reports a step a lever left to the path below it (``dispatch.Plan.declined``), or None.
         self.declined: Optional[Callable[..., None]] = None
 
@@ -482,6 +521,22 @@ class ContextKvFork:
         if self.declined is not None:
             self.declined(lever, reason, f"{num_gens} requests")
 
+    def decode_block_table(self, attn_metadata, num_seqs: int) -> Optional[bool]:
+        """This step's page-table decode in one launch (``block_table_on``), or None.
+
+        Returns:
+            True once ``block_table.refresh`` issued it; None when the lever is off or the
+            call is one it leaves to the worker's built-in ``_refresh_ctx_block_tables``.
+        """
+        if not self.block_table_on:
+            return None
+        return _block_table.refresh(
+            self.worker,
+            attn_metadata,
+            num_seqs,
+            lambda reason: self._decline("drafter_block_table_decode", reason, num_seqs),
+        )
+
     def fire_early(self) -> None:
         """The last capture layer has run: launch the fused side chain's local part (``_side_chain_early``).
 
@@ -502,8 +557,8 @@ class ContextKvFork:
         if plan is None:
             return
         num_gens, k = plan
-        # drafter_kv_fork_before_head__PAGED_CHAIN 2: the paged chain's early part (its refusal is logged
-        # at the head fork).
+        # drafter_kv_fork_before_head__PAGED_CHAIN 2: the paged chain's early part (its refusal is logged at the head
+        # fork).
         paged = PAGED_SIDE_CHAIN >= 2 and self.worker._ctx_paged
         if paged:
             if (
@@ -552,18 +607,44 @@ class ContextKvFork:
                 "(drafter_kv_fork_before_head__PAGED_CHAIN 2)"
             )
 
+    def _forks_at_gather(self, attn_metadata) -> bool:
+        """Whether the armed step forks at ``GATHER_POINT`` (``context_kv_fork_paged_wide``).
+
+        A step of more than ``MAX_REQUESTS`` requests over a paged context with the lever on.
+        Host-side reads only (a per-capture constant under a CUDA graph).
+        """
+        return (
+            self.paged_wide_max_requests is not None
+            and self.worker._ctx_paged
+            and attn_metadata.num_seqs > MAX_REQUESTS
+        )
+
     def fire(self, point: str) -> None:
-        """A fork point was reached: launch the armed step's side chain if this is its point."""
+        """A fork point was reached: launch the armed step's side chain if this is its point.
+
+        A step that forks at ``GATHER_POINT`` (``_forks_at_gather``) forks there only; the
+        verify is not its fallback: when the gather point did not fire before the verify, the
+        step keeps the built-in store (``take`` finds nothing launched).
+        """
         if self._armed is None or self._launched is not None:
             return
-        if point != self.point and point != "verify":
+        if self._forks_at_gather(self._armed[1]):
+            if point != GATHER_POINT:
+                if point == "verify" and not self._gather_point_logged:
+                    logger.info(
+                        "[musespark_open] context_kv_fork_paged_wide: the gather fork point did not "
+                        "fire before the verify; such steps run the built-in store"
+                    )
+                    self._gather_point_logged = True
+                return
+        elif point != self.point and point != "verify":
             return
         spec_metadata, attn_metadata = self._armed
         self._armed = None
         plan = self.plan(spec_metadata, attn_metadata)
         if plan is None:
             return
-        if point != self.point and not self._fallback_logged:
+        if point not in (self.point, GATHER_POINT) and not self._fallback_logged:
             logger.warning(
                 f"[musespark_open] context_kv_fork: the '{self.point}' fork point did not fire; "
                 "forked at the verify instead"
@@ -591,6 +672,11 @@ class ContextKvFork:
                 prefetch.first(num_gens * (k + 1))
         self._early = None
         self._launched = Launched(main, capture, num_gens, k, point, gen_hs)
+        if point == GATHER_POINT and self.launches[point] == 0:
+            logger.info(
+                f"[musespark_open] context_kv_fork_paged_wide: a step of {num_gens} requests "
+                "forked at the gather point"
+            )
         self.launches[point] += 1
 
     # -- the worker side ---------------------------------------------------
@@ -664,7 +750,11 @@ class ContextKvFork:
         base, last = arena_columns(worker)
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
-            if worker._ctx_paged and self._commits_paged(worker, slots, num_accepted):
+            if (
+                worker._ctx_paged
+                and launched.num_gens <= PAGED_COMMIT_MAX_REQUESTS
+                and self._commits_paged(worker, slots, num_accepted)
+            ):
                 self._count_paged_commit(preamble=False)
                 context_kv_commit_paged(
                     worker._ctx_len,
@@ -718,7 +808,8 @@ class ContextKvFork:
         """The side chain's decode of a paged context's page table (``_refresh_ctx_block_tables``).
 
         Under ``paged_ctx_block_tables``, ``ctx_block_tables_paged`` writes the table rows and
-        the extents in two launches; any other case, and a missing table, is the worker's.
+        the extents in two launches; any other case is ``drafter_block_table_decode``'s one
+        launch where it applies, and otherwise, as is a missing table, the worker's.
         """
         worker = self.worker
         tables, counts = worker._ctx_block_tables, worker._ctx_block_counts
@@ -753,7 +844,8 @@ class ContextKvFork:
                     counts,
                 )
                 return
-        DFlashWorker._refresh_ctx_block_tables(worker, attn_metadata, num_seqs)
+        if self.decode_block_table(attn_metadata, num_seqs) is None:
+            DFlashWorker._refresh_ctx_block_tables(worker, attn_metadata, num_seqs)
 
     def _commits_paged(self, worker, slots, num_accepted) -> bool:
         """Whether ``context_kv_commit_paged`` takes this paged context's commit (``paged_context_commit``)."""
@@ -979,12 +1071,35 @@ class ContextKvFork:
             torch.cuda.current_stream().wait_stream(self.stream)
 
     # -- what forks ----------------------------------------------------------
+    def max_requests(self) -> int:
+        """The most generation requests a forked step may have.
+
+        ``MAX_REQUESTS`` (the one-program commits' bound), or with ``context_kv_fork_wide``
+        its bound where every step above ``MAX_REQUESTS`` commits on the parallel
+        windowed commit: a worker-owned windowed arena that keeps a window, compacted by that
+        commit, with ``windowed_commit_parallel`` on (its MIN_REQUESTS is at most
+        ``MAX_REQUESTS``). Host-side reads only.
+        """
+        worker = self.worker
+        if self.paged_wide_max_requests is not None and worker._ctx_paged:
+            return self.paged_wide_max_requests
+        if (
+            self.wide_max_requests is not None
+            and self.parallel_min_requests is not None
+            and self.parallel_min_requests <= MAX_REQUESTS
+            and not worker._ctx_paged
+            and worker._ctx_base is not None
+            and worker._ctx_keep
+        ):
+            return self.wide_max_requests
+        return MAX_REQUESTS
+
     def plan(self, spec_metadata, attn_metadata) -> Optional[tuple[int, int]]:
         """``(generation requests, K)`` when the side chain reproduces this step's store, else None.
 
         Host-side reads only (per-capture constants under a CUDA graph): the
         context is allocated (pages, or a BF16 dense arena, full-length or
-        windowed), the step has no context rows and at most ``MAX_REQUESTS``
+        windowed), the step has no context rows and at most ``max_requests()``
         requests of ``K + 1`` target rows each, the target features were captured
         and the drafter has ``fc`` + ``hidden_norm`` (the built-in's
         ``has_target_features``).
@@ -1008,7 +1123,7 @@ class ContextKvFork:
         if attn_metadata.num_contexts != 0:
             return None
         num_gens = attn_metadata.num_seqs
-        if not 1 <= num_gens <= MAX_REQUESTS:
+        if not 1 <= num_gens <= self.max_requests():
             return None
         k = spec_metadata.runtime_draft_len
         if k < 1 or k + 1 != worker._draft_tokens_per_req:
@@ -1065,8 +1180,8 @@ class ContextKvFork:
             if paged_refusal not in _PAGED_LOGGED:
                 _PAGED_LOGGED.append(paged_refusal)
                 logger.error(
-                    "[musespark_open] drafter_kv_fork_before_head__PAGED_CHAIN is set but this step's side chain "
-                    "cannot take it "
+                    "[musespark_open] "
+                    "drafter_kv_fork_before_head__PAGED_CHAIN is set but this step's side chain cannot take it "
                     f"({paged_refusal}): the built-in store runs"
                 )
         refusal = _side_chain_refusal(worker, drafter) if self.side_chain_on else None
@@ -1176,7 +1291,9 @@ def _side_chain_refusal(worker, drafter) -> Optional[str]:
             or worker._batch_to_slot.dtype != torch.int64
         ):
             return "the context lengths, slots or allocation extents are not int64"
-        cache_dtype = worker._ctx_kv_buf[0].dtype
+        # The dtype the K/V are computed in: the pages' own, or the drafter's activation dtype
+        # for FP8 pages, which ``_store_context_kv_paged`` stores with the saturating cast.
+        cache_dtype = worker._ctx_store_compute_dtype()
     elif worker._ctx_block_tables is not None:
         return "the context is in the KV cache manager's pages"
     else:
@@ -1461,7 +1578,9 @@ def _fused_side_chain_paged(
     else:
         pro = _side_chain_prologue_paged(worker, drafter, spec_metadata, num_gens, k)
         projected = drafter.project_target_hidden(pro.gen_hs.reshape(-1, pro.gen_hs.shape[-1]))
-    k_new, kv_flat = _side_chain_kv(drafter, projected.to(worker._ctx_kv_buf[0].dtype), pro.pos_i32)
+    k_new, kv_flat = _side_chain_kv(
+        drafter, projected.to(worker._ctx_store_compute_dtype()), pro.pos_i32
+    )
     v_new = kv_flat.view(k_new.shape[0], k_new.shape[1], 2, *k_new.shape[2:])[:, :, 1]
     worker._store_context_kv_paged(k_new, v_new, pro.keys, pro.col)
     return pro.gen_hs
@@ -1729,6 +1848,11 @@ class ContextKvForkDFlashWorker(DFlashWorker):
         if fork is not None and fork.launched:
             # The side chain decoded this step's table at the fork point.
             return self._ctx_block_tables is not None
+        if fork is not None:
+            # ``drafter_block_table_decode``: the worker's own decode in one launch.
+            decoded = fork.decode_block_table(attn_metadata, num_seqs)
+            if decoded is not None:
+                return decoded
         return super()._refresh_ctx_block_tables(attn_metadata, num_seqs)
 
     def _store_context_kv_paged(self, k, v, rows, positions) -> None:
@@ -1968,7 +2092,8 @@ def _paged_store_fits(worker, k, v, rows, positions) -> bool:
         and table.stride(1) == 1
         and all(
             cache.dim() == 5
-            and cache.dtype == k.dtype
+            and takes_page_dtype(k.dtype, cache.dtype)
+            and cache.dtype == first.dtype
             and cache.shape[1:] == (2, heads, worker._ctx_page_size, head_dim)
             and cache.stride() == first.stride()
             for cache in caches
@@ -2054,10 +2179,13 @@ def install(
     fork_before_head: bool = False,
     parallel_min_requests: Optional[int] = None,
     late_join: bool = False,
+    wide_max_requests: Optional[int] = None,
+    paged_wide_max_requests: Optional[int] = None,
     declined: Optional[Callable[..., None]] = None,
     paged_commit: bool = False,
     paged_tables: bool = False,
     paged_store: bool = False,
+    block_table: bool = False,
 ) -> None:
     """Install the fork on the DFlash worker, the target core and the LM head (``POINT``).
 
@@ -2068,12 +2196,16 @@ def install(
     ``early_fc`` (``drafter_fc_early_fork``), ``glue`` (``drafter_kv_glue``),
     ``fork_before_head`` (``drafter_kv_fork_before_head``), ``parallel_min_requests``
     (``windowed_commit_parallel``'s MIN_REQUESTS, None for off), ``late_join``
-    (``context_kv_late_join``), ``declined`` (``dispatch.Plan.declined``) and ``paged_commit``
+    (``context_kv_late_join``), ``wide_max_requests`` (``context_kv_fork_wide``'s bound, None
+    for off), ``paged_wide_max_requests`` (``context_kv_fork_paged_wide``'s bound, None for
+    off), ``declined`` (``dispatch.Plan.declined``) and ``paged_commit``
     (``paged_context_commit``: a paged context's commit in one launch; refused when the
     worker's class overrides one of the methods it stands in for, ``PAGED_COMMIT_METHODS``),
     ``paged_tables`` (``paged_ctx_block_tables``: the side chain's decode of a paged
-    context's page table in two launches) and ``paged_store`` (``paged_ctx_kv_store``: a paged
-    context's K/V store of every drafter layer in one launch).
+    context's page table in two launches), ``paged_store`` (``paged_ctx_kv_store``: a paged
+    context's K/V store of every drafter layer in one launch) and ``block_table``
+    (``drafter_block_table_decode``: the worker's own decode of a paged context's page table,
+    and the side chain's where ``paged_tables`` leaves it, in one launch).
 
     Raises:
         ValueError: if the fork cannot be installed (the reason), so the
@@ -2086,6 +2218,24 @@ def install(
     reason = worker_unsupported_reason(worker, drafter)
     if reason is None and point == "head":
         reason = head_unsupported_reason(getattr(llm, "lm_head", None))
+    if (
+        reason is None
+        and wide_max_requests is not None
+        and not (MAX_REQUESTS < wide_max_requests <= PARALLEL_MAX_REQUESTS)
+    ):
+        reason = (
+            f"context_kv_fork_wide's bound {wide_max_requests} is outside "
+            f"{MAX_REQUESTS + 1}..{PARALLEL_MAX_REQUESTS}"
+        )
+    if (
+        reason is None
+        and paged_wide_max_requests is not None
+        and not (MAX_REQUESTS < paged_wide_max_requests <= PARALLEL_MAX_REQUESTS)
+    ):
+        reason = (
+            f"context_kv_fork_paged_wide's bound {paged_wide_max_requests} is outside "
+            f"{MAX_REQUESTS + 1}..{PARALLEL_MAX_REQUESTS}"
+        )
     if reason is not None:
         raise ValueError(f"[musespark_open] {name} cannot run here: {reason}")
     if paged_commit:
@@ -2105,10 +2255,13 @@ def install(
     fork.fork_before_head = bool(fork_before_head)
     fork.parallel_min_requests = parallel_min_requests
     fork.late_join_on = bool(late_join)
+    fork.wide_max_requests = wide_max_requests
+    fork.paged_wide_max_requests = paged_wide_max_requests
     fork.declined = declined
     fork.paged_commit_on = bool(paged_commit)
     fork.paged_tables_on = bool(paged_tables)
     fork.paged_store_on = bool(paged_store)
+    fork.block_table_on = bool(block_table)
     core._context_kv_fork = fork
     if point == "head":
         lm_head = llm.lm_head

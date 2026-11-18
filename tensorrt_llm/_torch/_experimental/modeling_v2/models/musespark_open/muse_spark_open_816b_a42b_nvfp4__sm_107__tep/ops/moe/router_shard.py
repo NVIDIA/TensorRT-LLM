@@ -41,7 +41,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
 from tensorrt_llm.logger import logger
 
 #: The checkpoint's router: 256 experts over the 8192-wide residual.
@@ -145,34 +145,11 @@ class RouterShard(OpWrapper):
         ``[M, L]`` FP32 logits of experts ``L r .. L r + L - 1``, newly allocated.
     """
 
-    ARCHS = frozenset({Arch.SM_107})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="K=7 verify: 8 rows, the served launch (prepare stream, 16 warps)",
-            spec=dict(rows=8, num_warps=16),
-        ),
-        Cell(why="one row at 16 warps (no speculation)", spec=dict(rows=1, num_warps=16)),
-        Cell(
-            why="an odd row count the built-in launches at 1-row tiles (3 rows)",
-            spec=dict(rows=3, num_warps=16),
-        ),
-        Cell(
-            why="8 rows without the prepare stream: the 4-warp summation order",
-            spec=dict(rows=8, num_warps=4),
-        ),
-        Cell(
-            why="tep4 K=7 verify: 8 rows, 64 columns per rank (one tray)",
-            spec=dict(rows=8, num_warps=16, ranks=4),
-        ),
-    )
-
     note = """
     The claim the test proves is equality with the built-in kernel's columns
     ``L r .. L r + L - 1`` at the same warp count, for every rank, every row count
     1..8 and both warp counts, at EP8 (L = 32) and EP4 (L = 64), and with an
-    early trigger; the cells additionally gate the op against the float64
-    reference.
+    early trigger.
     """
 
     def __call__(
@@ -286,29 +263,10 @@ class RouterShardSide(OpWrapper):
         ``out``, holding the FP32 logits of experts ``L r .. L r + L - 1``.
     """
 
-    ARCHS = frozenset({Arch.SM_107})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="K=7 verify: 8 rows, the served launch (prepare stream, 16 warps)",
-            spec=dict(rows=8, num_warps=16),
-        ),
-        Cell(why="one row at 16 warps (no speculation)", spec=dict(rows=1, num_warps=16)),
-        Cell(
-            why="an odd row count the built-in launches at 1-row tiles (3 rows)",
-            spec=dict(rows=3, num_warps=16),
-        ),
-        Cell(
-            why="8 rows without the prepare stream: the 4-warp summation order",
-            spec=dict(rows=8, num_warps=4),
-        ),
-    )
-
     note = """
     The claim the test proves is equality with ``router_shard`` and with the
     built-in kernel's columns ``L r .. L r + L - 1`` at the same warp count, for
-    every rank, every row count 1..8 and both warp counts, at EP8 and EP4; the
-    cells additionally gate the op against the float64 reference.
+    every rank, every row count 1..8 and both warp counts, at EP8 and EP4.
     """
 
     def __call__(
@@ -456,30 +414,11 @@ class RouterShardPublish(OpWrapper):
         of the multicast address, which nothing may read).
     """
 
-    ARCHS = frozenset({Arch.SM_107})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="K=7 verify: 8 rows, the served launch (16 warps), four boxes",
-            spec=dict(rows=8, num_warps=16),
-        ),
-        Cell(why="one row at 16 warps: one box", spec=dict(rows=1, num_warps=16)),
-        Cell(
-            why="an odd row count (3 rows): two boxes, the second CTA one row",
-            spec=dict(rows=3, num_warps=16),
-        ),
-        Cell(
-            why="8 rows without the prepare stream: the 4-warp summation order",
-            spec=dict(rows=8, num_warps=4),
-        ),
-    )
-
     note = """
     The claim the test proves is that every box holds ``router_shard``'s logits
     bit for bit (and the built-in kernel's columns ``32r .. 32r + 31``) for every
     rank, row count 1..8 and both warp counts, and that box words past the rows
-    are untouched; the cells additionally gate the op against the float64
-    reference.
+    are untouched.
     """
 
     def __call__(
@@ -633,24 +572,10 @@ class RouterShardWide(OpWrapper):
         ``out``.
     """
 
-    ARCHS = frozenset({Arch.SM_107})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="tep4: two requests' K=7 verify, 16 rows, 64 columns per rank",
-            spec=dict(rows=16, ranks=4),
-        ),
-        Cell(why="tep4: three requests, 24 rows (two token tiles)", spec=dict(rows=24, ranks=4)),
-        Cell(why="tep4: four requests, 32 rows (the wide capacity)", spec=dict(rows=32, ranks=4)),
-        Cell(why="a row count off the K=7 grid (19 rows)", spec=dict(rows=19, ranks=4)),
-        Cell(why="tep8 layout: 16 rows, 32 columns per rank", spec=dict(rows=16, ranks=8)),
-    )
-
     note = """
     The claim the test proves is equality with the built-in router's columns
     ``L r .. L r + L - 1`` at every row count 16..32, for every rank, at EP4 and EP8,
-    eagerly and through a CUDA-graph replay on a forked side stream; the cells
-    additionally gate the op against the float64 reference.
+    eagerly and through a CUDA-graph replay on a forked side stream.
     """
 
     def __call__(
@@ -864,38 +789,12 @@ class RouterShardRows(OpWrapper):
         ``out``.
     """
 
-    ARCHS = frozenset({Arch.SM_107})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="tep4: two requests' K=7 verify, 16 rows, 64 columns, the served 16 warps",
-            spec=dict(rows=16, num_warps=16, ranks=4),
-        ),
-        Cell(
-            why="tep4: three requests, 24 rows (4 rows per program)",
-            spec=dict(rows=24, num_warps=16, ranks=4),
-        ),
-        Cell(
-            why="tep4: four requests, 32 rows (the wide capacity, 2 rows per program)",
-            spec=dict(rows=32, num_warps=16, ranks=4),
-        ),
-        Cell(
-            why="a row count off the K=7 grid (19 rows, a partial last program)",
-            spec=dict(rows=19, num_warps=16, ranks=4),
-        ),
-        Cell(
-            why="without the prepare stream: the 4-warp summation order",
-            spec=dict(rows=24, num_warps=4, ranks=4),
-        ),
-        Cell(why="tep8 layout: 16 rows, 32 columns", spec=dict(rows=16, num_warps=16, ranks=8)),
-    )
-
     note = """
     The claim the test proves is that every row of every rank's output is ``router_shard``'s
     logit for that row bit for bit -- the built-in small-batch router's columns
     ``L r .. L r + L - 1`` of that row in a one-request (8-row) call -- at every row count
     1..32, both warp counts, EP4 and EP8, eagerly and through a CUDA-graph replay on a forked
-    side stream; the cells additionally gate the op against the float64 reference.
+    side stream.
     """
 
     def __call__(

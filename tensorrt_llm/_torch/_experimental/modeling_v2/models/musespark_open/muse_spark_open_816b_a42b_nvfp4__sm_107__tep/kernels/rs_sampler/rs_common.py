@@ -248,7 +248,7 @@ def policy_applies(sm: int, tp: int, snapshot: Optional[Mapping[str, str]] = Non
     tensor-parallel size ``tp``.
 
     True only at ``POLICY_SM`` / ``POLICY_TP`` with the ``rejection_sampler`` lever not turned off: its knob is not
-    ``off``, and an unset knob under ``MUSESPARK_OPEN_LEVER__DEFAULT=baseline`` is off (the resolver's own order;
+    ``off``, and an unset knob under ``MUSESPARK_OPEN_LEVER__DEFAULT=off`` is off (the resolver's own order;
     ``levers.environment``, or ``snapshot`` in its place). Elsewhere a forced acceptance count leaves the engine's own
     rejection sampling running and forces the count after it. The engine facts (``max_batch_size``, the server's role)
     are not known where the route calls this, so a forced sm107 TP8 deployment outside the lever's single-request band
@@ -262,7 +262,7 @@ def policy_applies(sm: int, tp: int, snapshot: Optional[Mapping[str, str]] = Non
     mode = snapshot.get(_levers.knob_name("rejection_sampler"), "").strip().lower()
     if mode:
         return mode != _levers.OFF
-    return snapshot.get(_levers.DEFAULT_KNOB, "").strip().lower() != _levers.BASELINE
+    return snapshot.get(_levers.DEFAULT_KNOB, "").strip().lower() != _levers.OFF
 
 
 def _switch_off(spec) -> ForcedInert:

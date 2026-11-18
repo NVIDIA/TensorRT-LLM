@@ -71,7 +71,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
 
 from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, ProjectionInbox
 
@@ -652,35 +652,6 @@ class UnpoolFinalBoundary(OpWrapper):
     the same order relative to its other calls on ``inbox``. Launched with programmatic dependent
     launch.
     """
-
-    ARCHS = frozenset({Arch.SM_107})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="DFlash2 K=7 verify: 8 rows, exact orders (value-identical route)",
-            spec=dict(rows=8, route=1),
-        ),
-        Cell(
-            why="a short block (3 rows), exact orders",
-            spec=dict(rows=3, route=1),
-        ),
-        Cell(
-            why="decode without drafts: 1 row, exact orders",
-            spec=dict(rows=1, route=1),
-        ),
-        Cell(
-            why="weights read before the dependency wait (load-time constants)",
-            spec=dict(rows=8, route=1, prewait=True),
-        ),
-        Cell(
-            why="dependents released at entry",
-            spec=dict(rows=8, route=1, trigger="entry"),
-        ),
-        Cell(
-            why="route 2: the final norm's sum in this kernel's order (not value-identical)",
-            spec=dict(rows=8, route=2),
-        ),
-    )
 
     note = """
     Route 1 is certified against the built-in gather + gated residual + final norm bit for bit (the

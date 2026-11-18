@@ -7,13 +7,14 @@
 logger); the compositions are ``modeling.py``'s ``TARGET_PATHS`` statements run over that
 ``dispatch``. The tests pin:
 
-* the table of every region deployment under ``auto``, and of the replay knob sets (``R_LL``, ``R_H``, ``B_LL``);
+* the default table of every region deployment (each lever's row), and of the replay knob sets
+  (``R_LL``, ``R_H``, ``B_LL``);
 * the ladder shapes, where an agg and a gen server resolve alike;
-* ``baseline``: every key's plan is the composition before the lever table
+* ``__DEFAULT=off``: every key's plan is the composition before the lever table
   (``C55_SERVED`` under ``c55_plan``'s rules) plus the two installs the plan adds to it;
 * the knob grammar's errors, the overrides, the facts and the drafter arena;
-* the context-step reduce-scatter overlaps: off unless their knobs set them, their parameters,
-  what the tail pipeline needs and the MXFP8 projections they stand aside for;
+* the context-step reduce-scatter overlaps: on by default (bitwise), off by their knobs, their
+  parameters, what the tail pipeline needs and the MXFP8 projections they stand aside for;
 * ``compose`` agreed over a stubbed TP group, and the ``Plan`` reports.
 """
 
@@ -157,9 +158,20 @@ def _compositions(dispatch):
 
 LEVERS, DISPATCH = _load()
 TARGET_PATHS = _compositions(DISPATCH)
-RULES = LEVERS.RULES
+LEVER_ROWS = LEVERS.LEVERS
+#: The compositions' own base paths: rows that are on wherever they can run, ``__DEFAULT=off``
+#: included (composition kind, ``ALWAYS`` both by default and as their stock rule).
+BASE_PATHS = {
+    name
+    for name, row in LEVER_ROWS.items()
+    if row.kind is LEVERS.Kind.COMPOSITION
+    and row.on_by_default is LEVERS.ALWAYS
+    and row.stock is LEVERS.ALWAYS
+}
+#: Every other row: the levers whose tables the tests below pin.
+RULE_LEVERS = set(LEVER_ROWS) - BASE_PATHS
 HC_MIN_BATCH = LEVERS.HC_MIN_BATCH
-BASELINE = {LEVERS.DEFAULT_KNOB: "baseline"}
+ALL_OFF = {LEVERS.DEFAULT_KNOB: "off"}
 
 
 def knobs(**values) -> dict:
@@ -172,19 +184,28 @@ def knobs(**values) -> dict:
 
 
 def table(key, mbs, role, arena, knob_set=None, facts=None):
+    """The table as a served deployment resolves it (each lever's row, then the knobs)."""
     sm, tp = key
     return DISPATCH.table_for(TARGET_PATHS, sm, tp, mbs, role, arena, knob_set, facts)
 
 
+default_table = table
+
+
+def rule_table_for(compositions, sm, tp, mbs, role, arena, knob_set=None, *args, **kwargs):
+    """``DISPATCH.table_for`` over ``compositions``."""
+    return DISPATCH.table_for(compositions, sm, tp, mbs, role, arena, knob_set, *args, **kwargs)
+
+
 def rule_levers_on(lever_table) -> set:
-    return {name for name in RULES if lever_table.on(name)}
+    return {name for name in RULE_LEVERS if lever_table.on(name)}
 
 
 def base_off(lever_table) -> set:
     return {
         name
         for name, decision in lever_table.decisions.items()
-        if name not in RULES and not decision.on
+        if name in BASE_PATHS and not decision.on
     }
 
 
@@ -258,11 +279,22 @@ SERVED_AT = {
     "tep8_wide_projection_gathers": ({(107, 8)}, "lossless-numeric", "LL"),
     "step_window_compact": ({(107, 4)}, "lossless-bitwise", "HC"),
     "fmk_context_fmha": ({(107, 4)}, "lossless-numeric", "HC"),
+    "fmk_pure_context_fmha": ({(107, 4)}, "lossless-numeric", "HC"),
+    "context_last_layer_tail": ({(107, 4)}, "lossless-numeric", "HC"),
     "context_kv_late_join": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "context_kv_fork_wide": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "multi_request_ffn_join": ({(107, 4)}, "lossless-bitwise", "HC"),
     "hop_cluster_split": ({(107, 4)}, "lossless-bitwise", "HC"),
     "drafter_fc_inbox_wide": ({(107, 4)}, "lossless-bitwise", "HC"),
     "l061_tile32_pin": ({(107, 4)}, "lossless-numeric", "HC"),
     "router_staged_epilogue": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "pool_gemm_pin": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "expert_tactic_pin": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "drafter_block_table_decode": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "context_kv_fork_paged_wide": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "lm_head_row_owner": ({(107, 4)}, "lossless-numeric", "HC"),
+    "row_owner_moe": ({(107, 4)}, "lossless-bitwise", "HC"),
+    "pool_group_tail_marks": ({(107, 4)}, "lossless-bitwise", "HC"),
     "decode_qkv_mxfp8": ({(107, 4)}, "lossy", "HC"),
     "split_kv_deep_ring": ({(107, 4)}, "lossless-bitwise", "HC"),
     "context_prep_rows_vec": ({(107, 4)}, "lossless-bitwise", "HC"),
@@ -293,12 +325,12 @@ SERVED_AT = {
 
 
 def test_the_rule_table_is_the_lever_registry():
-    assert set(RULES) == set(SERVED_AT)
-    assert set(RULES) <= DISPATCH.FAST_PATH_NAMES
+    assert set(LEVER_ROWS) == set(SERVED_AT)
+    assert set(LEVER_ROWS) <= DISPATCH.FAST_PATH_NAMES
     for name, (keys, kind, origin) in SERVED_AT.items():
         served = {key for key, paths in TARGET_PATHS.items() if name in paths.served}
         assert served == keys, name
-        assert (RULES[name].kind.value, RULES[name].origin) == (kind, origin), name
+        assert (LEVER_ROWS[name].kind.value, LEVER_ROWS[name].origin) == (kind, origin), name
 
 
 # --------------------------------------------------------------------------
@@ -358,7 +390,9 @@ VR_TEP8_DENSE = VR_TEP8 - {"drafter_kv_glue"}
 #: on wherever served.
 TEP4_PATHS = set(LEVERS.SM107_TEP8_TEP4_PATHS)
 #: The numeric low-latency levers: an unknown role passes none of their accuracy gates.
-VR_NUMERIC = {name for name in VR_TEP4 | VR_TEP8 if RULES[name].kind.value == "lossless-numeric"}
+VR_NUMERIC = {
+    name for name in VR_TEP4 | VR_TEP8 if LEVER_ROWS[name].kind.value == "lossless-numeric"
+}
 
 #: The bitwise levers of 2..4-request decode steps: on aggregated sm107 TEP4 servers of
 #: max_batch_size 2..8 (``levers.WIDE_AGG_BATCH``); the default band does not run them.
@@ -434,17 +468,33 @@ VR_YIELD_WIDE = {
 #: The context-K/V levers that stand down where ``context_kv_late_join`` is on (aggregated
 #: sm107 TEP4 servers of max_batch_size 4 and up).
 VR_YIELD_LATE_JOIN = {"drafter_kv_glue", "drafter_kv_fork_before_head"}
-#: The levers that stand down on the single-request decode schedule (``SINGLE``).
+#: The levers that stood down on the single-request decode schedule (``SINGLE``) under their
+#: deployment rules: by default only the vocabulary-parallel head does (the others are bitwise,
+#: on wherever they can run).
 VR_YIELD_SINGLE = {
     "vocab_parallel_head",
     "step_commit_v2",
     "drafter_kv_fork_before_head",
     "weight_prefetch_after_join",
 }
-#: What the default band's sm107 TEP8 set leaves on beside the single-request schedule under
-#: ``auto``: nothing, an aggregated sm107 server is the aggregated sm107 band's
-#: (``levers.band_of``).
-VR_SINGLE: set = set()
+#: What the default table leaves on beside the single-request schedule (aggregated sm107 TEP8,
+#: max_batch_size 1): the lossless-bitwise levers that are on wherever they can run.
+VR_SINGLE = {
+    "drafter_kv_fork_before_head",
+    "finalize_entry_trigger",
+    "full_attention_fold_multi",
+    "hop_entry_trigger",
+    "next_qkv_prefetch_skip",
+    "prerouted_experts",
+    "step_commit_v2",
+    "swa_prep_split",
+    "tep8_finalize_transport_64",
+    "tep8_ring_buddy_pdl",
+    "tep8_unpool_direct_wide",
+    "weight_prefetch_after_join",
+    "wide_norm_gate_pdl",
+    "wide_split_sampler",
+}
 
 REGIONS = [
     pytest.param(
@@ -694,8 +744,15 @@ def test_the_two_launch_side_chain_yields_to_the_fused_one():
     for key in ((107, 4), (107, 8)):
         assert table(key, 4, "gen", "windowed").on("drafter_kv_glue"), key
         assert not table(key, 4, "gen", "paged").on("drafter_kv_glue"), key
-    with pytest.raises(ValueError, match="drafter_kv_glue"):
-        table((107, 8), 4, "gen", "dense", knobs(drafter_kv_glue="on"))
+    # Turned on by its knob over a dense arena, the fused side chain (on by default) steps aside.
+    forced = table((107, 8), 4, "gen", "dense", knobs(drafter_kv_glue="on"))
+    assert forced.on("drafter_kv_glue") and not forced.on("drafter_kv_side_chain")
+    decision = forced.decisions["drafter_kv_side_chain"]
+    assert decision.source == "default"
+    assert decision.why == "steps aside for drafter_kv_glue, turned on by its knob"
+    # Both on by their knobs: an error.
+    with pytest.raises(ValueError, match="cannot both be on"):
+        table((107, 8), 4, "gen", "dense", knobs(drafter_kv_glue="on", drafter_kv_side_chain="on"))
 
 
 def test_the_context_lever_runs_where_context_steps_run():
@@ -708,12 +765,13 @@ def test_the_context_lever_runs_where_context_steps_run():
             "shard_routing",
             "router_input",
         )
-    # An aggregated sm107 server runs its own band's context levers instead.
-    for mbs in (8, 16):
-        agg = table((107, 4), mbs, "agg", "windowed")
-        assert not agg.on("context_sp_extra_parts"), mbs
-        assert agg.decisions["context_sp_extra_parts"].source == "band", mbs
-    assert not table((107, 4), 8, "gen", "windowed").on("context_sp_extra_parts")
+    # Its row is on wherever it can run: an aggregated or a generation server runs it too, with
+    # its stock parts (the router input and the CE gather).
+    for role, mbs in (("agg", 8), ("agg", 16), ("gen", 8)):
+        other = table((107, 4), mbs, role, "windowed")
+        assert other.on("context_sp_extra_parts"), (role, mbs)
+        assert other.decisions["context_sp_extra_parts"].source == "default", (role, mbs)
+        assert other.param("context_sp_extra_parts", "PARTS") == ("router_input", "ce_gather")
     parts = table(
         (107, 4), 64, "ctx", "windowed", knobs(context_sp_extra_parts__PARTS="router_input")
     )
@@ -727,10 +785,16 @@ def test_the_context_lever_runs_where_context_steps_run():
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize("mbs", [2, 3, 4])
 def test_the_low_latency_levers_yield_to_the_two_to_four_request_steps(mbs):
-    # A generation server runs the low-latency levers, not the 2..4-request step levers.
+    # The lossless-numeric ones yield; the bitwise prefetch after the join is on wherever it can run.
+    numeric = {name for name in VR_YIELD_WIDE if LEVER_ROWS[name].kind is LEVERS.Kind.NUMERIC}
+    assert numeric == VR_YIELD_WIDE - {"swa_prep_split", "weight_prefetch_after_join"}
+    # A generation server runs the low-latency levers, not the 2..4-request step levers (but the
+    # bitwise capture fold, on wherever it can run).
     gen = table((107, 4), mbs, "gen", "windowed")
-    assert VR_YIELD_WIDE <= rule_levers_on(gen) and not WIDE_STEPS & rule_levers_on(gen)
-    # The step levers turned on by their knobs take those steps: the low-latency ones yield.
+    assert VR_YIELD_WIDE <= rule_levers_on(gen)
+    assert WIDE_STEPS & rule_levers_on(gen) == {"wide_capture_fold"}
+    # The step levers turned on by their knobs take those steps: the sliding-window builds they
+    # conflict with (the prep split, on here by default, too) step aside, the frontier tables yield.
     forced = table(
         (107, 4),
         mbs,
@@ -738,56 +802,113 @@ def test_the_low_latency_levers_yield_to_the_two_to_four_request_steps(mbs):
         "windowed",
         knobs(swa_blocks_per_program="on", wide_qkv_prefetch="on"),
     )
-    for name in VR_YIELD_WIDE:
+    assert forced.on("swa_blocks_per_program") and forced.on("wide_qkv_prefetch")
+    for name in numeric | {"swa_prep_split"}:
         decision = forced.decisions[name]
-        assert not decision.on and decision.source == "auto", (mbs, name)
-        assert "yields to" in decision.why, (mbs, name)
-    # An aggregated server runs the step levers; the low-latency ones are off by band.
+        assert not decision.on and decision.source == "default", (mbs, name)
+        if name == "splitk_frontier_tables":
+            assert "yields to wide_qkv_prefetch" in decision.why, mbs
+        else:
+            assert decision.why == (
+                "steps aside for swa_blocks_per_program, turned on by its knob"
+            ), (mbs, name)
+    assert forced.on("weight_prefetch_after_join")
+    # Both turned on by their knobs: they cannot both be on.
+    with pytest.raises(ValueError, match="cannot both be on"):
+        table(
+            (107, 4),
+            mbs,
+            "gen",
+            "windowed",
+            knobs(swa_blocks_per_program="on", swa_prep_split="on"),
+        )
+    # An aggregated server runs the step levers; the numeric low-latency ones and the prep split
+    # are off by their rows there.
     agg = table((107, 4), mbs, "agg", "windowed")
     assert WIDE_STEPS <= rule_levers_on(agg), mbs
+    assert rule_levers_on(agg) & VR_YIELD_WIDE == {"weight_prefetch_after_join"}, mbs
     for name in VR_YIELD_WIDE:
-        assert agg.decisions[name].source == "band", (mbs, name)
+        assert agg.decisions[name].source == "default", (mbs, name)
+    assert "leaves these steps to swa_blocks_per_program" in agg.decisions["swa_prep_split"].why
 
 
 def test_the_other_sliding_window_builds_cannot_join_the_split_programs():
     for name in ("swa_one_cluster_block", "swa_prep_split", "swa_eight_requests"):
+        # Both on by their knobs: an error.
         with pytest.raises(ValueError, match="cannot both be on"):
-            table((107, 4), 3, "agg", "windowed", knobs(**{name: "on"}))
+            table(
+                (107, 4),
+                3,
+                "agg",
+                "windowed",
+                knobs(**{name: "on", "swa_blocks_per_program": "on"}),
+            )
+        # On by its knob beside the split programs on by default: they step aside.
+        aside = table((107, 4), 3, "agg", "windowed", knobs(**{name: "on"}))
+        assert aside.on(name) and not aside.on("swa_blocks_per_program")
+        decision = aside.decisions["swa_blocks_per_program"]
+        assert decision.source == "default"
+        assert decision.why == f"steps aside for {name}, turned on by its knob"
         lever_table = table(
             (107, 4), 3, "agg", "windowed", knobs(**{name: "on", "swa_blocks_per_program": "off"})
         )
         assert lever_table.on(name)
 
 
-def test_the_context_kv_levers_yield_to_the_late_join():
+def test_the_context_kv_levers_beside_the_late_join():
+    # The low-latency context-K/V levers are bitwise and on wherever they can run: beside the late
+    # join on aggregated sm107 TEP4 servers of max_batch_size 4 and up too.
+    assert all(LEVER_ROWS[name].kind is LEVERS.Kind.BITWISE for name in VR_YIELD_LATE_JOIN)
     for mbs in (4, 8):
         lever_table = table((107, 4), mbs, "agg", "windowed")
         assert lever_table.on("context_kv_late_join")
-        assert not rule_levers_on(lever_table) & VR_YIELD_LATE_JOIN, mbs
-    # A generation server runs the low-latency context-K/V levers; the late join turned on
-    # by its knob takes their steps.
+        assert VR_YIELD_LATE_JOIN <= rule_levers_on(lever_table), mbs
+        for name in VR_YIELD_LATE_JOIN:
+            assert lever_table.decisions[name].source == "default", (mbs, name)
+    # A generation server runs them; the late join leaves its steps to the fork before the head
+    # there, and its knob still turns it on beside them.
     gen = table((107, 4), 4, "gen", "windowed")
     assert VR_YIELD_LATE_JOIN <= rule_levers_on(gen) and not gen.on("context_kv_late_join")
+    assert "leaves these steps to drafter_kv_fork_before_head" in (
+        gen.decisions["context_kv_late_join"].why
+    )
     forced = table((107, 4), 4, "gen", "windowed", knobs(context_kv_late_join="on"))
     assert forced.on("context_kv_late_join")
-    for name in VR_YIELD_LATE_JOIN:
-        assert "yields to context_kv_late_join" in forced.decisions[name].why, name
+    assert forced.decisions["context_kv_late_join"].source == "knob"
+    assert VR_YIELD_LATE_JOIN <= rule_levers_on(forced)
 
 
 def test_the_low_latency_levers_yield_to_the_single_request_schedule():
+    # The single-request schedule samples on the distributed head sampler: the vocabulary-parallel
+    # head is off there; the bitwise others are on wherever they can run, beside the schedule too.
     lever_table = table((107, 8), 1, "agg", "dense")
+    bitwise = {name for name in VR_YIELD_SINGLE if LEVER_ROWS[name].kind is LEVERS.Kind.BITWISE}
+    assert bitwise == VR_YIELD_SINGLE - {"vocab_parallel_head"}
+    assert rule_levers_on(lever_table) & VR_YIELD_SINGLE == bitwise
     for name in VR_YIELD_SINGLE:
-        assert not lever_table.on(name), name
-        assert lever_table.decisions[name].source == "band", name
-    # The vocabulary-parallel head would take the distributed sampler's 8-row verify heads.
+        assert lever_table.decisions[name].source == "default", name
+    # The vocabulary-parallel head would take the distributed sampler's 8-row verify heads: on by
+    # its knob, the sampler (on by default) steps aside; both on by their knobs is an error.
+    aside = table((107, 8), 1, "agg", "dense", knobs(vocab_parallel_head="on"))
+    assert aside.on("vocab_parallel_head") and not aside.on("distributed_head_sampler")
+    assert aside.decisions["distributed_head_sampler"].source == "default"
+    assert aside.decisions["distributed_head_sampler"].why == (
+        "steps aside for vocab_parallel_head, turned on by its knob"
+    )
     with pytest.raises(ValueError, match="cannot both be on"):
-        table((107, 8), 1, "agg", "dense", knobs(vocab_parallel_head="on"))
+        table(
+            (107, 8),
+            1,
+            "agg",
+            "dense",
+            knobs(vocab_parallel_head="on", distributed_head_sampler="on"),
+        )
     alone = table(
         (107, 8), 1, "agg", "dense", knobs(distributed_head_sampler="off", vocab_parallel_head="on")
     )
     assert alone.on("vocab_parallel_head")
     # A generation server of one request runs the low-latency levers; the single-request
-    # schedule's levers turned on by their knobs take their steps.
+    # schedule's levers turned on by their knobs take the verify heads (the bitwise others stay on).
     gen = table((107, 8), 1, "gen", "dense")
     assert VR_YIELD_SINGLE <= rule_levers_on(gen)
     forced = table(
@@ -802,8 +923,11 @@ def test_the_low_latency_levers_yield_to_the_single_request_schedule():
             context_kv_fork_last_layer="on",
         ),
     )
-    for name in VR_YIELD_SINGLE:
-        assert not forced.on(name) and "yields to" in forced.decisions[name].why, name
+    assert not forced.on("vocab_parallel_head")
+    assert forced.decisions["vocab_parallel_head"].why == (
+        "steps aside for distributed_head_sampler, turned on by its knob"
+    )
+    assert rule_levers_on(forced) & VR_YIELD_SINGLE == bitwise
 
 
 class _SettingsPlan:
@@ -841,13 +965,14 @@ def test_the_duplicate_rings_and_context_parts_share_one_configure():
     ring = "ops.attention.multi_request_split_kv"
     fa_ring = "ops.attention.full_attention_split_kv_kernel"
     parts = "kernels.context_sequence_parallel.forward"
-    # The aggregated sm107 band, at any max_batch_size from 4: the 20-page multi-request ring
-    # and the router input.
+    # An aggregated sm107 TEP4 server, at any max_batch_size from 4, runs both duplicates by
+    # default (the aggregated ring and router input, and the bitwise deep rings and extra parts,
+    # on wherever they can run): one configure each, the union.
     for mbs in (48, 8):
         hc = _settings(table((107, 4), mbs, "agg", "windowed"))
         assert hc[ring][0] == {"sm107_stages": 20}, mbs
-        assert hc[fa_ring][0] == {"stages": 16}, mbs
-        assert hc[parts][0] == {"sm107_extra_parts": ("router_input",)}, mbs
+        assert hc[fa_ring][0] == {"stages": 20}, mbs
+        assert hc[parts][0] == {"sm107_extra_parts": ("router_input", "ce_gather")}, mbs
     # The default band's levers: both rings on a generation server of 8 requests, the shard
     # routing and the router input on a context server (int1 default; no CE gather since int4).
     gen = _settings(table((107, 4), 8, "gen", "windowed"))
@@ -879,15 +1004,40 @@ def test_the_duplicate_rings_and_context_parts_share_one_configure():
     assert low[fa_ring][0] == {"stages": 20}
     assert low[parts][0] == {"sm107_extra_parts": ("router_input", "ce_gather")}
     # Each alone.
-    only_hc = _settings(table((107, 4), 8, "agg", "windowed", knobs(split_kv_deep_rings="off")))
+    only_hc = _settings(
+        table(
+            (107, 4),
+            8,
+            "agg",
+            "windowed",
+            knobs(split_kv_deep_rings="off", context_sp_extra_parts="off"),
+        )
+    )
     assert only_hc[ring][0] == {"sm107_stages": 20} and only_hc[fa_ring][0] == {"stages": 16}
+    assert only_hc[parts][0] == {"sm107_extra_parts": ("router_input",)}
+    only_low = _settings(
+        table(
+            (107, 4),
+            8,
+            "agg",
+            "windowed",
+            knobs(split_kv_deep_ring="off", context_sp_router_input="off"),
+        )
+    )
+    assert only_low[ring][0] == {"sm107_stages": 20} and only_low[fa_ring][0] == {"stages": 20}
+    assert only_low[parts][0] == {"sm107_extra_parts": ("router_input", "ce_gather")}
     neither = _settings(
         table(
             (107, 4),
             48,
             "agg",
             "windowed",
-            knobs(split_kv_deep_ring="off", context_sp_router_input="off"),
+            knobs(
+                split_kv_deep_ring="off",
+                split_kv_deep_rings="off",
+                context_sp_router_input="off",
+                context_sp_extra_parts="off",
+            ),
         )
     )
     assert neither[ring][0] == {"sm107_stages": None}
@@ -912,21 +1062,29 @@ CTX_OVERLAP_OFF = {
     "role, sizes",
     [("agg", (1, 4, 16, 48)), ("gen", (1, 8, 64))],
 )
-def test_the_context_sp_overlaps_are_off_unless_their_knobs_set_them(role, sizes):
+def test_the_context_sp_overlaps_are_on_by_default_and_off_by_their_knobs(role, sizes):
+    # Bitwise, so on wherever they can run (the old bitwise default), whatever the role.
+    assert all(LEVER_ROWS[name].kind is LEVERS.Kind.BITWISE for name in CTX_OVERLAPS)
+    on = {**CTX_OVERLAP_OFF, "oproj_chunks": 2, "tail_pipeline": True, "moe_rs_chunks": 2}
     for mbs in sizes:
         lever_table = table((107, 4), mbs, role, "windowed")
         for name in CTX_OVERLAPS:
             decision = lever_table.decisions[name]
-            assert not decision.on, (role, mbs, name)
-            # The tail pipeline is off with the projection overlap it builds on.
-            if name == "context_sp_tail_pipeline":
-                assert decision.source == "dependency", (role, mbs)
-            else:
-                assert decision.source == "auto", (role, mbs, name)
-                assert "not yet measured on sm107" in decision.why, (role, mbs, name)
+            assert decision.on and decision.source == "default", (role, mbs, name)
         settings = _settings(lever_table)
-        assert settings[CTX_OVERLAP_MODULE] == (CTX_OVERLAP_OFF, CTX_OVERLAP_OFF), (role, mbs)
-        baseline = table((107, 4), mbs, role, "windowed", BASELINE)
+        assert settings[CTX_OVERLAP_MODULE] == (on, CTX_OVERLAP_OFF), (role, mbs)
+        # Their knobs turn them off: the tail pipeline with the projection overlap it builds on.
+        off = table(
+            (107, 4),
+            mbs,
+            role,
+            "windowed",
+            knobs(context_sp_oproj_overlap="off", context_sp_moe_rs_overlap="off"),
+        )
+        assert not any(off.on(name) for name in CTX_OVERLAPS), (role, mbs)
+        assert off.decisions["context_sp_tail_pipeline"].source == "dependency", (role, mbs)
+        assert _settings(off)[CTX_OVERLAP_MODULE] == (CTX_OVERLAP_OFF, CTX_OVERLAP_OFF)
+        baseline = table((107, 4), mbs, role, "windowed", ALL_OFF)
         assert not any(baseline.on(name) for name in CTX_OVERLAPS), (role, mbs)
     # Not served at TEP8: its context steps are not sequence-parallel.
     assert not set(CTX_OVERLAPS) & TARGET_PATHS[(107, 8)].served
@@ -936,29 +1094,29 @@ def test_the_context_sp_overlaps_are_off_unless_their_knobs_set_them(role, sizes
 
 def test_a_context_server_runs_the_projection_overlap_and_the_tail_pipeline_by_default():
     # int1: 'ovts' (o_proj overlap + tail pipeline + shard routing) is the TEP4 ctx role's default;
-    # the experts' overlap stays off until measured.
+    # the experts' overlap, bitwise too, is on by default as well (on wherever it can run).
     for mbs in (8, 32, 64, None):
         lever_table = table((107, 4), mbs, "ctx", "windowed")
-        for name in ("context_sp_oproj_overlap", "context_sp_tail_pipeline"):
+        for name in CTX_OVERLAPS:
             decision = lever_table.decisions[name]
-            assert decision.on and decision.source == "auto", (mbs, name)
-            assert "context servers" in decision.why, (mbs, name)
-        moe = lever_table.decisions["context_sp_moe_rs_overlap"]
-        assert not moe.on and "not yet measured on sm107" in moe.why, mbs
+            assert decision.on and decision.source == "default", (mbs, name)
         assert _settings(lever_table)[CTX_OVERLAP_MODULE][0] == {
             **CTX_OVERLAP_OFF,
             "oproj_chunks": 2,
             "tail_pipeline": True,
+            "moe_rs_chunks": 2,
         }, mbs
-        # Their knobs still turn them off; baseline leaves them out.
+        # Their knobs still turn them off; all-off leaves them out.
         off = table((107, 4), mbs, "ctx", "windowed", knobs(context_sp_oproj_overlap="off"))
         assert not off.on("context_sp_oproj_overlap") and not off.on("context_sp_tail_pipeline")
         assert off.decisions["context_sp_tail_pipeline"].source == "dependency", mbs
         tail_off = table((107, 4), mbs, "ctx", "windowed", knobs(context_sp_tail_pipeline="off"))
-        assert tail_off.on("context_sp_oproj_overlap") and not tail_off.on("context_sp_tail_pipeline")
-        baseline = table((107, 4), mbs, "ctx", "windowed", BASELINE)
+        assert tail_off.on("context_sp_oproj_overlap") and not tail_off.on(
+            "context_sp_tail_pipeline"
+        )
+        baseline = table((107, 4), mbs, "ctx", "windowed", ALL_OFF)
         assert not any(baseline.on(name) for name in CTX_OVERLAPS), mbs
-    # Without the router-input join the tail pipeline stands aside under auto (no error).
+    # Without the router-input join the tail pipeline stands aside by default (no error).
     no_join = table(
         (107, 4),
         64,
@@ -1035,9 +1193,11 @@ def test_the_context_sp_overlaps_follow_their_knobs_and_parameters():
 
 
 def test_the_tail_pipeline_needs_the_projection_overlap_and_the_router_input_join():
-    # It builds on the projection overlap.
-    with pytest.raises(ValueError, match="builds on context_sp_oproj_overlap, which is off"):
-        table((107, 4), 16, "agg", "windowed", knobs(context_sp_tail_pipeline="on"))
+    # It builds on the projection overlap: its knob on turns the overlap on too.
+    alone = table((107, 4), 16, "agg", "windowed", knobs(context_sp_tail_pipeline="on"))
+    assert alone.on("context_sp_oproj_overlap") and alone.on("context_sp_tail_pipeline")
+    assert alone.decisions["context_sp_oproj_overlap"].source == "knob"
+    assert "needs it" in alone.decisions["context_sp_oproj_overlap"].why
     both = knobs(context_sp_oproj_overlap="on", context_sp_tail_pipeline="on")
     # The router-input join: context_sp_router_input, or context_sp_extra_parts' router_input part.
     for knob_set in (
@@ -1144,13 +1304,13 @@ def test_agg_tep8_mbs1_paged():
 )
 def test_the_draft_head_tail_waits_for_a_drafter_without_a_logit_transform(transform, expected):
     sm, tp = 107, 8
-    lever_table = DISPATCH.table_for(
+    lever_table = rule_table_for(
         TARGET_PATHS, sm, tp, 1, "agg", "dense", None, None, draft_logit_transform=transform
     )
     assert rule_levers_on(lever_table) == LL | DENSE | SINGLE | VR_SINGLE | expected
     if not expected:
         with pytest.raises(ValueError, match="logit transform"):
-            DISPATCH.table_for(
+            rule_table_for(
                 TARGET_PATHS,
                 sm,
                 tp,
@@ -1163,20 +1323,58 @@ def test_the_draft_head_tail_waits_for_a_drafter_without_a_logit_transform(trans
             )
 
 
+#: The single-request set's lossless-bitwise levers that are on wherever they can run.
+_SINGLE_EVERYWHERE = {
+    "edge_bf16_moe_front",
+    "last_layer_boundary",
+    "layer0_qkv_table",
+    "step_loop_inline_commits",
+    "drafter_preamble_late_join",
+    "context_kv_fork_last_layer",
+}
+
+
 @pytest.mark.parametrize(
-    "key, mbs, role, arena",
+    "key, mbs, role, arena, beside",
     [
-        ((107, 8), 2, "agg", "dense"),
-        ((107, 8), 1, "gen", "dense"),
-        ((107, 8), 1, "agg", "windowed"),
-        ((107, 4), 1, "agg", "windowed"),
+        ((107, 8), 2, "agg", "dense", _SINGLE_EVERYWHERE),
+        (
+            (107, 8),
+            1,
+            "gen",
+            "dense",
+            {
+                "edge_bf16_moe_front",
+                "last_layer_boundary",
+                "drafter_preamble_late_join",
+                "drafter_folds",
+            },
+        ),
+        (
+            (107, 8),
+            1,
+            "agg",
+            "windowed",
+            {
+                "edge_bf16_moe_front",
+                "last_layer_boundary",
+                "layer0_qkv_table",
+                "step_loop_inline_commits",
+                "drafter_folds",
+            },
+        ),
+        ((107, 4), 1, "agg", "windowed", set()),
     ],
 )
-def test_the_single_request_set_stays_off_outside_its_deployment(key, mbs, role, arena):
+def test_the_single_request_set_stays_off_outside_its_deployment(key, mbs, role, arena, beside):
+    """The schedule itself (the megakernel, the distributed head sampler, the rejection sampler)
+    stays off outside its deployment; ``beside``: its lossless-bitwise levers, which the default
+    table runs wherever they can run (``drafter_folds`` at max_batch_size 1)."""
+    assert all(LEVER_ROWS[name].kind is LEVERS.Kind.BITWISE for name in beside)
     lever_table = table(key, mbs, role, arena, facts=None)
-    assert not rule_levers_on(lever_table) & (SINGLE | SINGLE_TAIL | SINGLE_RS)
+    assert rule_levers_on(lever_table) & (SINGLE | SINGLE_TAIL | SINGLE_RS) == beside
     if key in TARGET_PATHS:
-        rs_table = DISPATCH.table_for(
+        rs_table = rule_table_for(
             TARGET_PATHS,
             *key,
             mbs,
@@ -1185,14 +1383,16 @@ def test_the_single_request_set_stays_off_outside_its_deployment(key, mbs, role,
             draft_logit_transform=False,
             rejection_sampling=True,
         )
-        assert not rule_levers_on(rs_table) & (SINGLE | SINGLE_TAIL | SINGLE_RS)
+        # The draft head's tail is bitwise too: on beside the drafter folds.
+        tail = SINGLE_TAIL if "drafter_folds" in beside else set()
+        assert rule_levers_on(rs_table) & (SINGLE | SINGLE_TAIL | SINGLE_RS) == beside | tail
 
 
 def rs_table(key=(107, 8), mbs=1, role="agg", arena="dense", knob_set=None, **facts):
     """``table_for`` with the drafter-transform and rejection-sampling facts (default: no
     transform, rejection sampling asked for)."""
     facts = {"draft_logit_transform": False, "rejection_sampling": True, **facts}
-    return DISPATCH.table_for(TARGET_PATHS, *key, mbs, role, arena, knob_set, None, **facts)
+    return rule_table_for(TARGET_PATHS, *key, mbs, role, arena, knob_set, None, **facts)
 
 
 @pytest.mark.parametrize(
@@ -1218,7 +1418,7 @@ def test_the_rejection_sampler_needs_rejection_sampling(transform, rejection_sam
     lever_table = rs_table(draft_logit_transform=transform, rejection_sampling=rejection_sampling)
     assert rule_levers_on(lever_table) == LL | DENSE | SINGLE | VR_SINGLE | expected
     decision = lever_table.decisions["rejection_sampler"]
-    assert decision.source == ("auto" if rejection_sampling is True else "structural")
+    assert decision.source == ("default" if rejection_sampling is True else "structural")
 
 
 def test_the_rejection_sampler_is_the_only_difference_rejection_sampling_makes():
@@ -1228,7 +1428,7 @@ def test_the_rejection_sampler_is_the_only_difference_rejection_sampling_makes()
                 for arena in ("dense", "windowed", "paged"):
                     for transform in (None, True, False):
                         tables = [
-                            DISPATCH.table_for(
+                            rule_table_for(
                                 TARGET_PATHS,
                                 *key,
                                 mbs,
@@ -1257,12 +1457,20 @@ def test_the_rejection_sampler_follows_its_knob():
     assert off.decisions["rejection_sampler"].source == "knob"
     off_tail = rs_table(knob_set=knobs(draft_head_tail="off"))
     assert rule_levers_on(off_tail) == LL | DENSE | SINGLE | VR_SINGLE | SINGLE_RS
-    assert off_tail.decisions["rejection_sampler"].source == "auto"
+    assert off_tail.decisions["rejection_sampler"].source == "default"
     off_folds = rs_table(knob_set=knobs(drafter_folds="off"))
     assert off_folds.decisions["rejection_sampler"].source == "dependency"
+    # On by its knob outside its deployment: it turns on the levers it builds on.
+    forced = rs_table(mbs=2, knob_set=knobs(rejection_sampler="on"))
+    assert forced.on("rejection_sampler") and forced.decisions["rejection_sampler"].source == "knob"
+    for name in ("distributed_head_sampler", "drafter_folds"):
+        decision = forced.decisions[name]
+        assert decision.on and decision.source == "knob", name
+        assert "turned on by its knob needs it" in decision.why, name
+    # ... unless a knob turns one of them off.
     with pytest.raises(ValueError, match="builds on distributed_head_sampler, which is off"):
-        rs_table(mbs=2, knob_set=knobs(rejection_sampler="on"))
-    baseline = rs_table(knob_set={**BASELINE})
+        rs_table(mbs=2, knob_set=knobs(rejection_sampler="on", distributed_head_sampler="off"))
+    baseline = rs_table(knob_set={**ALL_OFF})
     assert "rejection_sampler" not in rule_levers_on(baseline)
 
 
@@ -1282,10 +1490,19 @@ def test_the_rejection_sampler_on_raises_where_it_cannot_be_on(facts, message):
 def test_the_rejection_sampler_beside_the_single_request_yields():
     lever_table = rs_table(draft_logit_transform=True)
     assert lever_table.on("rejection_sampler")
-    assert not rule_levers_on(lever_table) & VR_YIELD_SINGLE
-    # The vocabulary-parallel head conflicts with the distributed sampler RS builds on.
+    # Of the levers that stood down there, only the vocabulary-parallel head does by default; the
+    # bitwise others are on wherever they can run, RS beside them.
+    assert rule_levers_on(lever_table) & VR_YIELD_SINGLE == VR_YIELD_SINGLE - {
+        "vocab_parallel_head"
+    }
+    # The vocabulary-parallel head conflicts with the distributed sampler RS builds on: on by its
+    # knob, the sampler steps aside and RS goes with it; both on by their knobs is an error.
+    aside = rs_table(knob_set=knobs(vocab_parallel_head="on"))
+    assert aside.on("vocab_parallel_head") and not aside.on("distributed_head_sampler")
+    assert "steps aside for vocab_parallel_head" in aside.decisions["distributed_head_sampler"].why
+    assert aside.decisions["rejection_sampler"].source == "dependency"
     with pytest.raises(ValueError, match="cannot both be on"):
-        rs_table(knob_set=knobs(vocab_parallel_head="on"))
+        rs_table(knob_set=knobs(vocab_parallel_head="on", distributed_head_sampler="on"))
     vocab_parallel = rs_table(
         knob_set=knobs(vocab_parallel_head="on", distributed_head_sampler="off")
     )
@@ -1361,39 +1578,44 @@ def test_the_numerics_levers_are_switchable_and_the_megakernel_needs_them():
 
 def test_the_router_per_row_gates():
     on = table((107, 4), 4, "gen", "windowed").decisions["wide_router_per_row"]
-    assert on.on and on.source == "auto" and "gate" in on.why
-    off = table((107, 4), 8, "agg", "windowed").decisions["wide_router_per_row"]
-    assert not off.on and off.source == "gate"
-    for mbs in (2, 3, 4):
+    assert on.on and on.source == "default" and "gate:" in on.why
+    # Outside its gate its row is off by default, saying which gate does not hold.
+    for mbs in (2, 3, 4, 8):
         off = table((107, 4), mbs, "agg", "windowed").decisions["wide_router_per_row"]
-        assert not off.on and off.source == "gate", mbs
+        assert not off.on and off.source == "default", mbs
+        assert "no accuracy gate holds" in off.why, mbs
     assert not table((107, 4), 1, "agg", "windowed").on("wide_router_per_row")
+
+
+#: The capture fold is on wherever it can run; the QKV prefetch too, except where the dense
+#: prefetch after the join (the low-latency levers' MAX_BATCH) takes those steps.
+_CAPTURE = {"wide_capture_fold"}
+_CAPTURE_QKV = {"wide_capture_fold", "wide_qkv_prefetch"}
 
 
 @pytest.mark.parametrize(
     "role, sizes, on",
     [
-        ("gen", (None, 1, 2, 3, 4, 5, 8, 16, 48), False),
-        ("agg", (2, 3, 4, 5, 6, 7, 8), True),
-        ("agg", (None, 1, 9, 16, 47, HC_MIN_BATCH, 64), False),
-        ("ctx", (1, 4, 8, 64), False),
-        ("unknown", (2, 4, 8), False),
+        ("gen", (1, 2, 3, 4, 5, 8), _CAPTURE),
+        ("gen", (None, 16, 48), _CAPTURE_QKV),
+        ("agg", (2, 3, 4, 5, 6, 7, 8), WIDE_STEPS),
+        ("agg", (None, 1, 9, 16, 47, HC_MIN_BATCH, 64), _CAPTURE_QKV),
+        ("ctx", (1, 4, 8, 64), _CAPTURE_QKV),
+        ("unknown", (2, 4, 8), _CAPTURE),
     ],
 )
-def test_the_two_to_four_request_step_levers_under_auto(role, sizes, on):
+def test_the_two_to_four_request_step_levers_by_default(role, sizes, on):
+    """The split programs run only on aggregated sm107 TEP4 servers of max_batch_size 2..8 (their
+    row's condition); the other two, bitwise, also run wherever nothing else takes their steps."""
     for mbs in sizes:
         lever_table = table((107, 4), mbs, role, "windowed")
+        assert rule_levers_on(lever_table) & WIDE_STEPS == on, (role, mbs)
         for name in WIDE_STEPS:
             decision = lever_table.decisions[name]
-            assert decision.on is on, (name, mbs)
-            # wide_capture_fold builds on wide_direct_transports, off where no decode step
-            # reaches 16 rows and on the high-concurrency selection; the other roles are
-            # the default band's.
-            first = "auto" if role == "agg" else "band"
-            sources = {first} if on else {first, "dependency"}
-            assert decision.source in sources, (name, mbs, decision.source)
-            assert decision.source == first or name == "wide_capture_fold", (name, mbs)
-            assert RULES[name].kind.value == "lossless-bitwise", name
+            assert decision.source == "default", (name, mbs, decision.source)
+            assert LEVER_ROWS[name].kind.value == "lossless-bitwise", name
+            if name in WIDE_STEPS - _CAPTURE_QKV and on is WIDE_STEPS:
+                assert "2..4 key blocks" in decision.why, mbs
     assert LEVERS.WIDE_AGG_BATCH == (2, 8)
 
 
@@ -1422,7 +1644,7 @@ def test_the_two_to_four_request_step_levers_follow_their_knobs_and_paths():
         lever_table = table((107, 4), 3, "agg", "windowed", knobs(**{base: "off"}))
         assert lever_table.decisions[lever].source == "dependency", (base, lever)
         assert not lever_table.on(lever), (base, lever)
-    baseline = table((107, 4), 3, "agg", "windowed", BASELINE)
+    baseline = table((107, 4), 3, "agg", "windowed", ALL_OFF)
     assert not WIDE_STEPS & rule_levers_on(baseline)
 
 
@@ -1443,7 +1665,7 @@ def test_the_lossy_and_flagged_levers_are_never_on_under_auto():
     for key, paths in TARGET_PATHS.items():
         for mbs in (1, 4, 8, 64):
             lever_table = table(key, mbs, "agg", "dense")
-            for name, rule in RULES.items():
+            for name, rule in LEVER_ROWS.items():
                 if rule.kind.value in ("lossy", "flagged") and name in paths.served:
                     assert not lever_table.on(name), (key, mbs, name)
 
@@ -1456,7 +1678,62 @@ def test_the_lossy_and_flagged_levers_are_never_on_under_auto():
 #: one of those states turns it off.
 VR_OFF_TEP8 = knobs(**{name: "off" for name in VR_TEP8 | TEP4_PATHS})
 VR_OFF_TEP4 = knobs(**{name: "off" for name in VR_TEP4 | CONTEXT_SP})
-R_LL = {**knobs(head_multimem_gather="on"), **VR_OFF_TEP8}
+
+
+def _off(names) -> dict:
+    return knobs(**{name: "off" for name in sorted(names)})
+
+
+#: The lossless-bitwise levers the default table runs wherever they can run, beyond the levers
+#: the sets above name, that the replayed states did not run: each replay turns them off too.
+GAINED_BITWISE = {
+    "context_kv_fork_paged_wide",
+    "context_kv_fork_wide",
+    "drafter_block_table_decode",
+    "expert_tactic_pin",
+    "multi_request_ffn_join",
+    "pool_gemm_pin",
+    "pool_group_tail_marks",
+}
+GAINED_LL = {"tep8_unpool_direct_wide", "wide_split_sampler"}
+GAINED_HC = GAINED_BITWISE | {
+    "incremental_block_offsets",
+    "step_loop_on_execution_stream",
+    "wide_qkv_prefetch",
+    # the low-latency and context levers on beside the high-concurrency selection
+    "context_sp_extra_parts",
+    "drafter_kv_fork_before_head",
+    "drafter_kv_glue",
+    "finalize_entry_trigger",
+    "full_attention_fold_multi",
+    "hop_entry_trigger",
+    "next_qkv_prefetch_skip",
+    "prerouted_experts",
+    "split_kv_deep_rings",
+    "step_commit_v2",
+    "swa_prep_split",
+    "weight_prefetch_after_join",
+    "wide_norm_gate_pdl",
+    # ... and the split programs, which fill in for the prep split where it is off
+    "swa_blocks_per_program",
+}
+GAINED_GEN_TEP4 = GAINED_BITWISE | {
+    "context_embedding_replicated",
+    "context_prep_rows_vec",
+    "context_sp_router_input",
+    "drafter_fc_inbox_wide",
+    "hop_cluster_split",
+    "router_staged_epilogue",
+    "split_kv_deep_ring",
+    "step_window_compact",
+    "context_sp_oproj_overlap",
+    "context_sp_tail_pipeline",
+    "context_sp_moe_rs_overlap",
+    "packed_prep_append",
+    "windowed_commit_parallel",
+    "wide_capture_fold",
+}
+R_LL = {**knobs(head_multimem_gather="on"), **VR_OFF_TEP8, **_off(GAINED_LL)}
 #: The high-concurrency selection of the wide and fold levers, by knobs.
 R_H_CORE = knobs(
     wide_direct_transports="off",
@@ -1469,7 +1746,7 @@ R_H_CORE = knobs(
     context_fp8_attn_gather="on",
 )
 #: ``R_H_CORE`` with the aggregated TP4 levers off: the selection before them.
-R_H = {**R_H_CORE, **knobs(**{name: "off" for name in sorted(AGG_TEP4 | L061)})}
+R_H = {**R_H_CORE, **_off(AGG_TEP4 | L061 | GAINED_HC)}
 B_LL = {
     **knobs(
         step_loop_on_execution_stream="off",
@@ -1478,6 +1755,7 @@ B_LL = {
         graph_start_qkv_prefetch="on",
     ),
     **VR_OFF_TEP4,
+    **_off(GAINED_GEN_TEP4),
 }
 
 
@@ -1535,11 +1813,16 @@ def test_b_ll_selects_the_generation_set(mbs):
 
 
 def test_baseline_tep8_gen_mbs1_is_the_previous_generation_selection():
-    lever_table = table((107, 8), 1, "gen", "windowed", BASELINE)
+    lever_table = table((107, 8), 1, "gen", "windowed", ALL_OFF)
     assert rule_levers_on(lever_table) == {"lm_head_inbox", "graph_start_qkv_prefetch"}
 
 
-R_B1 = dict(B_LL, **knobs(wide_finalize_transport="off"))
+#: ... at max_batch_size 1, where the replayed state ran none of the wide transports (bitwise:
+#: on by default even where no decode step reaches their rows).
+R_B1 = dict(
+    B_LL,
+    **knobs(wide_finalize_transport="off", wide_direct_transports="off", wide_oproj_publish="off"),
+)
 _LL_REPLAY = LL | DENSE | SINGLE | {"head_multimem_gather"}
 
 
@@ -1590,7 +1873,7 @@ _LL_REPLAY = LL | DENSE | SINGLE | {"head_multimem_gather"}
             1,
             "gen",
             "windowed",
-            BASELINE,
+            ALL_OFF,
             {"graph_start_qkv_prefetch"},
             set(),
             id="baseline-tep8-gen-mbs1",
@@ -1602,14 +1885,37 @@ def test_a_replay_set_is_the_whole_plan_it_replays(key, mbs, role, arena, knob_s
     assert set(table(key, mbs, role, arena, knob_set).paths()) == want
 
 
-def test_auto_at_the_high_concurrency_selection_is_r_h_core():
+#: The wide and fold levers ``R_H_CORE`` turns off: lossless-bitwise, so the default table runs
+#: them at the high-concurrency selection too (the capture fold with the direct transports).
+HC_BITWISE = {
+    "wide_direct_transports",
+    "wide_oproj_publish",
+    "wide_finalize_transport",
+    "head_sampler_coop_fold",
+    "wide_capture_fold",
+}
+
+
+def test_the_default_at_the_high_concurrency_selection_is_r_h_core_with_its_bitwise_levers():
     opt_ins = knobs(context_fp8_dense="on", context_fp8_attn_gather="on")
     for mbs in (HC_MIN_BATCH, 64):
-        auto = table((107, 4), mbs, "agg", "windowed", opt_ins).decisions
+        default = table((107, 4), mbs, "agg", "windowed", opt_ins).decisions
         replay = table((107, 4), mbs, "agg", "windowed", R_H_CORE).decisions
+        differ = {
+            name
+            for name, d in default.items()
+            if (d.on, dict(d.params)) != (replay[name].on, dict(replay[name].params))
+        }
+        assert differ == HC_BITWISE, mbs
+        for name in HC_BITWISE:
+            assert LEVER_ROWS[name].kind is LEVERS.Kind.BITWISE, name
+            assert default[name].on and default[name].source == "default", (mbs, name)
+            assert not replay[name].on, (mbs, name)
+        # With them off too, the default table is the replay's.
+        off = table((107, 4), mbs, "agg", "windowed", {**opt_ins, **_off(HC_BITWISE)}).decisions
         assert {
             name
-            for name, d in auto.items()
+            for name, d in off.items()
             if (d.on, dict(d.params)) != (replay[name].on, dict(replay[name].params))
         } == set(), mbs
 
@@ -1620,42 +1926,51 @@ def test_the_high_concurrency_selection_is_aggregated_tep4_from_its_batch():
     assert below.on("wide_direct_transports") and not below.on("graph_start_qkv_prefetch")
     hc = table((107, 4), HC_MIN_BATCH, "agg", "windowed")
     assert hc.param("windowed_commit_parallel", "MIN_REQUESTS") == 1
-    assert not hc.on("wide_direct_transports") and hc.on("graph_start_qkv_prefetch")
+    assert hc.on("graph_start_qkv_prefetch")
+    # The wide transports are bitwise: on wherever they can run, at the selection too.
+    assert hc.on("wide_direct_transports")
+    assert hc.decisions["wide_direct_transports"].source == "default"
     for key, role in (((107, 4), "gen"), ((107, 8), "agg")):
         other = table(key, HC_MIN_BATCH, role, "windowed")
         assert other.param("windowed_commit_parallel", "MIN_REQUESTS") == 5, (key, role)
         assert not other.on("graph_start_qkv_prefetch"), (key, role)
 
 
-@pytest.mark.parametrize("arm", [None, B_LL, BASELINE], ids=["auto", "b-ll", "baseline"])
+@pytest.mark.parametrize("arm", [None, B_LL, ALL_OFF], ids=["default", "b-ll", "all-off"])
 @pytest.mark.parametrize("key, mbs", [((107, 4), 4), ((107, 4), 1), ((107, 8), 1)])
 def test_the_ladder_shapes_resolve_alike_on_agg_and_gen(key, mbs, arm):
     # The TEP8 generation role's own parameter default (int1: the router push from 9 rows) is
     # a role default, not a band difference (test_the_disaggregated_role_defaults).
     role_params = {("tep8_router_push", "MIN_ROWS"), ("swa_one_cluster_block", "TEP8_MIN_REQUESTS")}
 
+    tables = {role: table(key, mbs, role, "windowed", arm) for role in ("agg", "gen")}
+
     def selection(role):
-        lever_table = table(key, mbs, role, "windowed", arm)
         return {
             n: (d.on, {k: v for k, v in d.params.items() if (n, k) not in role_params})
-            for n, d in lever_table.decisions.items()
+            for n, d in tables[role].decisions.items()
         }
 
     agg, gen = selection("agg"), selection("gen")
     # The router-per-row accuracy gate holds on generation servers only.
     gated = {"wide_router_per_row"} if gen.get("wide_router_per_row", (False,))[0] else set()
-    # Every other difference is a lever of one band's selection, on in its own band only
-    # (the full-attention fold serves both bands, with each band's rule).
-    banded = {n for n in agg if LEVERS.lever_band(n) is not None} | {"full_attention_fold_multi"}
-    # Both bands' by rule: on for aggregated servers and the ctx role.
+    # On for aggregated servers and the ctx role by their rows.
     by_rule = CTX_STEP_LEVERS | {"fmk_context_fmha"}
-    banded |= by_rule
     differ = {n for n in agg if agg[n] != gen[n]}
-    assert differ - banded == gated
     assert all(not agg[n][0] for n in gated)
-    for name in differ & banded - {"full_attention_fold_multi"} - by_rule:
-        mine = LEVERS.lever_band(name) is LEVERS.Band.AGGREGATED_SM107
-        assert (agg[name][0], gen[name][0]) == (mine, not mine), name
+    # Every other difference is a lever whose row is on in one band only (``in_band``: off, or
+    # its upstream rule, in the other), one built on such a lever, or one leaving its steps to
+    # such a lever where that one is on.
+    for name in differ - gated - by_rule:
+        assert agg[name][0] != gen[name][0], name  # no parameter-only difference
+        off_role = "gen" if agg[name][0] else "agg"
+        decision = tables[off_role].decisions[name]
+        own_band = "default" if off_role == "agg" else "aggregated sm107"
+        assert (
+            decision.source == "dependency"
+            or "leaves these steps to" in decision.why
+            or decision.why.startswith(f"a {own_band} lever")
+        ), (name, off_role, decision.why)
 
 
 @pytest.mark.parametrize("mbs", [1, 4, 8, 64])
@@ -1663,18 +1978,22 @@ def test_the_context_step_levers_run_on_the_tep4_context_role(mbs):
     ctx = table((107, 4), mbs, "ctx", "windowed")
     # A context server runs the context steps whatever its max_batch_size: all three are on.
     assert all(ctx.on(name) for name in CTX_STEP_LEVERS), mbs
-    # ... as a rule of both bands, not of the aggregated band's selection.
-    assert all(LEVERS.lever_band(name) is None for name in CTX_STEP_LEVERS)
-    # A generation server runs no context step: off. TEP8 does not serve them: off.
+    # They are bitwise and on wherever they can run: a generation server and an aggregated one of
+    # any max_batch_size run them too. TEP8 does not serve them: off.
+    assert all(LEVER_ROWS[name].kind is LEVERS.Kind.BITWISE for name in CTX_STEP_LEVERS)
     gen = table((107, 4), mbs, "gen", "windowed")
-    assert not any(gen.on(name) for name in CTX_STEP_LEVERS), mbs
+    assert all(gen.on(name) for name in CTX_STEP_LEVERS), mbs
     assert not any(table((107, 8), mbs, "ctx", "windowed").on(n) for n in CTX_STEP_LEVERS), mbs
-    # The aggregated selection is as before: on from HC_MIN_BATCH.
-    for agg_mbs in (LEVERS.HC_LEVERS_MIN_BATCH, 64):
+    for agg_mbs in (LEVERS.HC_LEVERS_MIN_BATCH - 1, LEVERS.HC_LEVERS_MIN_BATCH, 64):
         agg = table((107, 4), agg_mbs, "agg", "windowed")
         assert all(agg.on(name) for name in CTX_STEP_LEVERS), agg_mbs
-    below = table((107, 4), LEVERS.HC_LEVERS_MIN_BATCH - 1, "agg", "windowed")
-    assert not any(below.on(name) for name in CTX_STEP_LEVERS)
+        assert all(agg.decisions[name].source == "default" for name in CTX_STEP_LEVERS)
+    # Their knobs turn them off; all-off leaves them out.
+    off = table((107, 4), mbs, "ctx", "windowed", _off(CTX_STEP_LEVERS))
+    assert not any(off.on(name) for name in CTX_STEP_LEVERS), mbs
+    assert not any(
+        table((107, 4), mbs, "ctx", "windowed", ALL_OFF).on(n) for n in CTX_STEP_LEVERS
+    ), mbs
 
 
 # --------------------------------------------------------------------------
@@ -1839,17 +2158,18 @@ def test_baseline_is_the_previous_composition(key, arena, role):
             want.add("graph_start_qkv_prefetch")
         if key == (107, 4):
             want.add("prefill_cutedsl_experts")
-        assert table(key, mbs, role, arena, BASELINE).paths() == want, mbs
+        assert table(key, mbs, role, arena, ALL_OFF).paths() == want, mbs
 
 
-def test_baseline_leaves_every_other_origin_off_unless_its_knob_sets_it():
+def test_all_off_leaves_every_lever_without_a_stock_rule_off_unless_its_knob_sets_it():
     lever_table = table(
-        (107, 4), 4, "agg", "windowed", {**BASELINE, **knobs(head_sampler_coop_fold="on")}
+        (107, 4), 4, "agg", "windowed", {**ALL_OFF, **knobs(head_sampler_coop_fold="on")}
     )
-    others = {name for name, rule in RULES.items() if rule.origin != "upstream"}
+    others = {name for name, row in LEVER_ROWS.items() if row.stock is None}
     assert rule_levers_on(lever_table) & others == {"head_sampler_coop_fold"}
     decision = lever_table.decisions["wide_direct_transports"]
-    assert decision.source == "baseline" and "midc" in decision.why
+    assert not decision.on and decision.source == "stock"
+    assert decision.why == f"{LEVERS.DEFAULT_KNOB}=off"
 
 
 # --------------------------------------------------------------------------
@@ -1860,7 +2180,7 @@ def test_baseline_leaves_every_other_origin_off_unless_its_knob_sets_it():
     [
         (knobs(packed_prep_apend="on"), "did you mean MUSESPARK_OPEN_LEVER_PACKED_PREP_APPEND"),
         (knobs(step_loop_on_execution_stream="yes"), "expected one of ['auto', 'on', 'off']"),
-        ({LEVERS.DEFAULT_KNOB: "fast"}, "expected one of ['auto', 'baseline']"),
+        ({LEVERS.DEFAULT_KNOB: "fast"}, "expected one of ['on', 'off']"),
         ({LEVERS.ROLE_KNOB: "decode"}, "MUSESPARK_OPEN_LEVER__ROLE='decode'"),
         (knobs(packed_prep_append__MIN_ROWS=7), "expected an integer in 8..1024, got 7"),
         (knobs(packed_prep_append__MIN_ROWS="many"), "expected an integer in 8..1024"),
@@ -2039,6 +2359,9 @@ SPEC_RETIRED = (
     "MUSESPARK_OPEN_IA_FOLD",
     "MUSESPARK_OPEN_RS_FUSED",
     "MUSESPARK_OPEN_RS_FORCED",
+    # The resolver settings the one lever table replaced.
+    "MUSESPARK_OPEN_LEVER__BITWISE",
+    "MUSESPARK_OPEN_LEVER__NUMERICS",
 )
 
 
@@ -2080,12 +2403,22 @@ def test_a_retired_switch_raises_naming_its_replacement(name):
             knobs(drafter_kv_side_chain="off", drafter_fc_early_fork="on"),
             "builds on drafter_kv_side_chain, which is off",
         ),
-        ((107, 4), 4, "windowed", knobs(hot_replicas="on"), "cannot both be on"),
+        # Both on by their knobs (hot_replicas alone: half_window_experts steps aside,
+        # test_a_knob_on_makes_a_conflicting_default_step_aside).
+        (
+            (107, 4),
+            4,
+            "windowed",
+            knobs(hot_replicas="on", half_window_experts="on"),
+            "cannot both be on",
+        ),
         (
             (107, 8),
             8,
             "dense",
-            knobs(head_multimem_gather="on"),
+            # Its knob on turns the one-stream step loop on (it requires it), unless a knob turns
+            # that off (test_a_knob_on_turns_on_what_it_requires).
+            knobs(head_multimem_gather="on", step_loop_on_execution_stream="off"),
             "requires step_loop_on_execution_stream, which is off",
         ),
         (
@@ -2113,6 +2446,22 @@ def test_on_raises_where_the_lever_cannot_be_on(key, mbs, arena, snapshot, messa
         table(key, mbs, "agg", arena, snapshot)
 
 
+def test_a_knob_on_makes_a_conflicting_default_step_aside():
+    lever_table = table((107, 4), 4, "agg", "windowed", knobs(hot_replicas="on"))
+    assert lever_table.on("hot_replicas") and not lever_table.on("half_window_experts")
+    decision = lever_table.decisions["half_window_experts"]
+    assert decision.source == "default"
+    assert decision.why == "steps aside for hot_replicas, turned on by its knob"
+
+
+def test_a_knob_on_turns_on_what_it_requires():
+    lever_table = table((107, 8), 8, "agg", "dense", knobs(head_multimem_gather="on"))
+    assert lever_table.on("head_multimem_gather")
+    decision = lever_table.decisions["step_loop_on_execution_stream"]
+    assert decision.on and decision.source == "knob"
+    assert decision.why == "a lever turned on by its knob needs it"
+
+
 # --------------------------------------------------------------------------
 # Overrides
 # --------------------------------------------------------------------------
@@ -2137,8 +2486,8 @@ def test_every_single_off_gives_a_closed_plan(key, arena):
         for name in sorted(TARGET_PATHS[key].served):
             paths = table(key, mbs, "agg", arena, knobs(**{name: "off"})).paths()
             DISPATCH.Plan(paths)  # raises when not closed under depends_on
-            for lever in paths & set(RULES):
-                assert set(RULES[lever].requires) <= paths, (key, mbs, name, lever)
+            for lever in paths & set(LEVER_ROWS):
+                assert set(LEVER_ROWS[lever].requires) <= paths, (key, mbs, name, lever)
 
 
 def test_a_base_path_knob_turns_its_dependents_off():
@@ -2166,7 +2515,11 @@ def test_the_tep8_row_floors_are_lever_parameters():
     with the old values as defaults, so a deployment moves them by knob alone. A TEP8 generation
     server pushes the router from 9 rows by default (int1: rp9); every other deployment from 33."""
     base = table((107, 8), 8, "gen", "paged")
-    assert base.on("tep8_router_push") and base.on("tep8_tile_placement") and base.on("tep8_ring_buddy_wide")
+    assert (
+        base.on("tep8_router_push")
+        and base.on("tep8_tile_placement")
+        and base.on("tep8_ring_buddy_wide")
+    )
     assert base.param("tep8_router_push", "MIN_ROWS") == LEVERS.TEP8_GEN_ROUTER_PUSH_MIN_ROWS == 9
     assert base.param("tep8_tile_placement", "MIN_ROWS") == 41
     assert base.param("tep8_ring_buddy_wide", "MAX_ROWS") == 64
@@ -2232,7 +2585,7 @@ def _ll_on(mbs: int, names) -> dict:
     out = {}
     for name in sorted(names):
         out.update(knobs(**{name: "on"}))
-        if any(param.key == "MAX_BATCH" for param in RULES[name].params):
+        if any(param.key == "MAX_BATCH" for param in LEVER_ROWS[name].params):
             out.update(knobs(**{f"{name}__MAX_BATCH": mbs}))
     return out
 
@@ -2264,10 +2617,14 @@ def test_the_wide128_parameters_default_to_the_served_bands():
     # int2: a TEP8 generation server runs CL8 from 2 requests (TEP8_GEN_CL8_MIN_REQUESTS).
     assert base.param("swa_one_cluster_block", "TEP8_MIN_REQUESTS") == 2
     assert calls["ops.attention.swa_block"][0]["cl8_tep8_min_requests"] == 2
-    # Off (a server above sixteen requests under auto): every new setting is its module default.
-    off = _settings(table((107, 8), 17, "gen", "windowed"))
+    # Off (a server above sixteen requests by default): every new setting is its module default,
+    # but the bitwise 64-token finalize transport's, on wherever it can run (at its 64 tokens).
+    above = table((107, 8), 17, "gen", "windowed")
+    off = _settings(above)
+    assert above.on("tep8_finalize_transport_64")
+    assert above.param("tep8_finalize_transport_64", "TOKENS") == 64
+    assert off["ops.moe.finalize_allreduce_transport"][0]["tep8_max_tokens"] == 64
     for module, key in (
-        ("ops.moe.finalize_allreduce_transport", "tep8_max_tokens"),
         ("kernels.replicated_experts.ring_buddy", "tep8_prerouted_max_rows"),
         ("kernels.replicated_experts.ring_buddy", "tep8_max_rows"),
         ("ops.moe.ring_buddy_assign", "tile_max_rows"),
@@ -3359,7 +3716,9 @@ def test_dense_gemms_wide_tiles_takes_the_2cta_kernel_and_refuses_loudly():
     )
     real = dispatcher._wide_2cta
     dispatcher._wide_2cta = lambda x, w, rows, k: "2cta"
-    assert dispatcher._wide_tiles(_HostTensor(96, 8192), _HostTensor(2304, 8192), 96, 8192) == "2cta"
+    assert (
+        dispatcher._wide_tiles(_HostTensor(96, 8192), _HostTensor(2304, 8192), 96, 8192) == "2cta"
+    )
     with pytest.raises(ValueError, match="WIDE_TILE 2cta: N 2300"):
         real(_HostTensor(96, 8192), _HostTensor(2300, 8192), 96, 8192)
     host.configure()
@@ -3909,7 +4268,13 @@ def test_the_tep8_cl8_min_requests_parameter_defaults_to_the_served_band():
     """TEP8_MIN_REQUESTS defaults to 2 (CL8 on 2..8-request TEP8 steps, gated: int2) on every TEP8
     generation table that serves the lever, and to 5 (the band before it) elsewhere, e.g. an
     aggregated server that turns the lever on by its knob; swa_block's own default stays 5."""
-    for mbs, arena in ((8, "windowed"), (4, "windowed"), (4, "paged"), (2, "windowed"), (16, "paged")):
+    for mbs, arena in (
+        (8, "windowed"),
+        (4, "windowed"),
+        (4, "paged"),
+        (2, "windowed"),
+        (16, "paged"),
+    ):
         lever_table = table((107, 8), mbs, "gen", arena)
         assert lever_table.on("swa_one_cluster_block"), (mbs, arena)
         assert lever_table.param("swa_one_cluster_block", "TEP8_MIN_REQUESTS") == 2
@@ -4093,28 +4458,37 @@ def test_the_aggregated_tep4_levers_and_their_parameters():
 
 
 def test_the_aggregated_tep4_floor_and_the_inbox_reach():
+    """The floor holds for the lossless-numeric multi-instance FMHA only: the bitwise levers of the
+    aggregated TP4 set (the router epilogue, the wider drafter fc inbox, ...) are on wherever
+    they can run, below the floor and below the inbox's 129-row reach too."""
     assert LEVERS.HC_LEVERS_MIN_BATCH == 4
-    for mbs in (1, 2, 3):
+    bitwise = {name for name in AGG_TEP4 if LEVER_ROWS[name].kind is LEVERS.Kind.BITWISE}
+    assert bitwise == AGG_TEP4 - {"fmk_context_fmha"}
+    for mbs in (1, 2, 3, None):
         low = table((107, 4), mbs, "agg", "windowed")
-        for name in AGG_TEP4:
-            assert not low.on(name), (mbs, name)
-        assert "max_batch_size 4 and up" in low.decisions["router_staged_epilogue"].why
-        assert low.decisions["fmk_context_fmha"].source == "auto"
-    unknown = table((107, 4), None, "agg", "windowed")
-    assert not unknown.on("router_staged_epilogue")
-    capped = table((107, 4), 16, "agg", "windowed")
-    assert capped.on("router_staged_epilogue")
-    assert not capped.on("drafter_fc_inbox_wide")
-    assert "129 rows" in capped.decisions["drafter_fc_inbox_wide"].why
-    assert table((107, 4), 17, "agg", "windowed").on("drafter_fc_inbox_wide")
+        assert rule_levers_on(low) & AGG_TEP4 == bitwise, mbs
+        decision = low.decisions["fmk_context_fmha"]
+        assert decision.source == "default" and "max_batch_size 4 and up" in decision.why, mbs
+    for mbs in (16, 17):
+        assert AGG_TEP4 <= rule_levers_on(table((107, 4), mbs, "agg", "windowed")), mbs
 
 
 def test_decode_qkv_mxfp8_needs_the_context_fp8_qkv_copies():
     off = table((107, 4), 48, "agg", "windowed", knobs(decode_qkv_mxfp8="auto"))
     assert not off.on("decode_qkv_mxfp8")
     assert off.decisions["decode_qkv_mxfp8"].source == "dependency"
+    # Its knob on turns on the context FP8 copies it builds on, unless a knob turns them off.
+    alone = table((107, 4), 48, "agg", "windowed", knobs(decode_qkv_mxfp8="on"))
+    assert alone.on("decode_qkv_mxfp8") and alone.on("context_fp8_dense")
+    assert alone.decisions["context_fp8_dense"].source == "knob"
     with pytest.raises(ValueError, match="DECODE_QKV_MXFP8=on"):
-        table((107, 4), 48, "agg", "windowed", knobs(decode_qkv_mxfp8="on"))
+        table(
+            (107, 4),
+            48,
+            "agg",
+            "windowed",
+            knobs(decode_qkv_mxfp8="on", context_fp8_dense="off"),
+        )
     on = table((107, 4), 48, "agg", "windowed", {**knobs(decode_qkv_mxfp8="on"), **R_H_CORE})
     assert on.on("decode_qkv_mxfp8") and on.decisions["decode_qkv_mxfp8"].source == "knob"
     no_qkv = {
@@ -4126,9 +4500,14 @@ def test_decode_qkv_mxfp8_needs_the_context_fp8_qkv_copies():
 
 
 def test_an_aggregated_tep4_lever_on_a_generation_server_only_by_its_knob():
+    # The numeric multi-instance FMHA is off on a generation server by its row (its gate holds on
+    # aggregated servers only); the bitwise aggregated TP4 levers are on there too.
     gen = table((107, 4), 48, "gen", "windowed")
-    assert not gen.on("router_staged_epilogue")
-    assert gen.decisions["router_staged_epilogue"].source == "band"
+    assert gen.on("router_staged_epilogue")
+    assert gen.decisions["router_staged_epilogue"].source == "default"
+    assert not gen.on("fmk_context_fmha")
+    assert gen.decisions["fmk_context_fmha"].source == "default"
+    assert "this is a gen server" in gen.decisions["fmk_context_fmha"].why
     forced = table((107, 4), 48, "gen", "windowed", knobs(fmk_context_fmha="on"))
     assert forced.on("fmk_context_fmha")
     assert any("FMK_CONTEXT_FMHA=on outside its accuracy gates" in w for w in forced.warnings)
@@ -4193,7 +4572,7 @@ def test_rndv_on_an_unhinted_disaggregated_server_raises():
     facts = LEVERS.Facts(ucx_rndv_thresh_set=True)
     with pytest.raises(ValueError, match=LEVERS.UCX_RNDV_THRESH_ENV):
         table((107, 4), 4, "unknown", "windowed", facts=facts)
-    lever_table = DISPATCH.table_for(
+    lever_table = rule_table_for(
         TARGET_PATHS, 107, 4, 4, "unknown", "windowed", facts=facts, role_source="no engine facts"
     )
     assert lever_table.deployment.role is LEVERS.Role.UNKNOWN
@@ -4222,13 +4601,19 @@ def test_a_paged_arena_leaves_the_arena_writing_levers_out():
     assert lever_table.on("incremental_block_offsets")
 
 
-def test_packed_prep_append_at_tep8_is_on_only_by_its_knob():
-    # The composite turns the multi-request prep append on by its knob.
+def test_packed_prep_append_at_tep8_follows_the_prep_append_it_builds_on():
+    # An aggregated TEP8 server runs no multi-request prep append by default: the packed one,
+    # built on it, is off with it.
+    plain = table((107, 8), 16, "agg", "paged").decisions["packed_prep_append"]
+    assert (plain.on, plain.source) == (False, "dependency")
+    # The composite turns the multi-request prep append on by its knob; the packed one is
+    # bitwise, on by default wherever it can run, and its knob still turns it off.
     prep = knobs(multi_request_prep_append="on")
     for mbs in (8, 16):
         decision = table((107, 8), mbs, "agg", "paged", prep).decisions["packed_prep_append"]
-        assert (decision.on, decision.source) == (False, "auto"), mbs
-        assert "only by its knob" in decision.why
+        assert (decision.on, decision.source) == (True, "default"), mbs
+        off = table((107, 8), mbs, "agg", "paged", {**prep, **knobs(packed_prep_append="off")})
+        assert not off.on("packed_prep_append"), mbs
     on = table((107, 8), 16, "agg", "paged", {**prep, **knobs(packed_prep_append="on")})
     assert on.on("packed_prep_append") and on.param("packed_prep_append", "MIN_ROWS") == 33
     moved = {**prep, **knobs(packed_prep_append="on", packed_prep_append__MIN_ROWS=96)}
@@ -4247,17 +4632,30 @@ def test_step_commit_v2_overlap_fold_and_inline_params():
             16,
             "agg",
             "paged",
-            knobs(step_commit_v2="on", step_commit_v2__OVERLAP_FOLD=fold),
+            knobs(
+                step_commit_v2="on",
+                step_commit_v2__OVERLAP_FOLD=fold,
+                step_loop_on_execution_stream="off",
+            ),
         )
         assert folded.on("step_commit_v2")
         assert folded.param("step_commit_v2", "OVERLAP_FOLD") == fold
-        # Independent of the step loop's stream.
+        # Independent of the step loop's stream: it does not need it on.
         assert not folded.on("step_loop_on_execution_stream")
     with pytest.raises(ValueError, match="expected an integer in 0..2"):
         table((107, 8), 8, "agg", "paged", knobs(step_commit_v2__OVERLAP_FOLD=3))
     inline = table(
-        (107, 8), 8, "agg", "paged", knobs(step_commit_v2="on", step_commit_v2__INLINE_COMMIT=1)
+        (107, 8),
+        8,
+        "agg",
+        "paged",
+        knobs(
+            step_commit_v2="on",
+            step_commit_v2__INLINE_COMMIT=1,
+            step_loop_inline_commits="off",
+        ),
     )
+    assert inline.on("step_commit_v2")
     assert inline.param("step_commit_v2", "INLINE_COMMIT") == 1
     assert not inline.on("step_loop_inline_commits")
 
@@ -4283,14 +4681,17 @@ def test_pool_groups_is_an_alias_over_a_paged_arena():
     # paged arena no longer excludes the lever; POOL_GROUPS is kept only as an accepted alias.
     for mbs in (8, 16):
         plain = table((107, 8), mbs, "agg", "paged")
-        groups = table((107, 8), mbs, "agg", "paged", knobs(incremental_block_offsets__POOL_GROUPS=1))
+        groups = table(
+            (107, 8), mbs, "agg", "paged", knobs(incremental_block_offsets__POOL_GROUPS=1)
+        )
         assert plain.decisions["incremental_block_offsets"].source != "structural"
         assert plain.on("incremental_block_offsets") == groups.on("incremental_block_offsets")
         assert plain.paths() == groups.paths()
         assert groups.param("incremental_block_offsets", "POOL_GROUPS") == 1
-    # On by default up to MAX_BATCH (8); the knob turns it on at mbs16 with or without the alias.
+    # Bitwise, so on by default wherever it can run (beyond its MAX_BATCH too); the knob turns it
+    # on with or without the alias.
     assert table((107, 8), 8, "agg", "paged").on("incremental_block_offsets")
-    assert not table((107, 8), 16, "agg", "paged").on("incremental_block_offsets")
+    assert table((107, 8), 16, "agg", "paged").on("incremental_block_offsets")
     for extra in ({}, {"incremental_block_offsets__POOL_GROUPS": 1}):
         on16 = table((107, 8), 16, "agg", "paged", knobs(incremental_block_offsets="on", **extra))
         assert on16.on("incremental_block_offsets")
@@ -4301,10 +4702,6 @@ def test_pool_groups_is_an_alias_over_a_paged_arena():
     source = (_TARGET / "runtime.py").read_text()
     assert "def _group_block_offsets(" not in source
     assert "memo.table_runs(step_keys, step_pages)" in source
-
-
-
-
 
 
 def test_the_window_compaction_needs_a_windowed_arena_and_the_full_context_paths_need_it():
@@ -4352,14 +4749,19 @@ def test_the_role():
         LEVERS.role_of(hint, False)
     unknown = table((107, 4), 4, "unknown", "windowed")
     assert any("role unknown" in warning for warning in unknown.warnings)
-    # Counted as a decoding server of the default band; no accuracy gate names an unknown
-    # role, and the context lever runs on servers that may take context steps.
+    # Counted as a decoding server of the default band: the generation server's table less the
+    # numeric levers, since no accuracy gate names an unknown role; the context lever runs on
+    # servers that may take context steps.
     gen = rule_levers_on(table((107, 4), 4, "gen", "windowed"))
-    assert rule_levers_on(unknown) == (gen - {"wide_router_per_row"} - VR_NUMERIC) | CONTEXT_SP
-    assert unknown.decisions["wide_router_per_row"].source == "gate"
-    for name in WIDE_STEPS:
+    assert rule_levers_on(unknown) == gen - {"wide_router_per_row"} - VR_NUMERIC
+    assert CONTEXT_SP <= rule_levers_on(unknown)
+    for name in ({"wide_router_per_row"} | VR_NUMERIC) & gen:
         decision = unknown.decisions[name]
-        assert decision.source == "band" and "default band" in decision.why, name
+        assert decision.source == "default" and "no accuracy gate holds" in decision.why, name
+    # The 2..4-request step levers resolve as on a generation server (the capture fold only).
+    assert rule_levers_on(unknown) & WIDE_STEPS == {"wide_capture_fold"}
+    for name in WIDE_STEPS:
+        assert unknown.decisions[name].source == "default", name
 
 
 def test_the_table_lines_and_json():
@@ -4370,7 +4772,11 @@ def test_the_table_lines_and_json():
     assert resolved == json.loads(lever_table.as_json())
     assert resolved["levers"]["hot_replicas"] == {"resolved": "off", "source": "knob"}
     assert resolved["knobs"] == {LEVERS.knob_name("hot_replicas"): "off"}
+    assert resolved["default"] == "on" and "numerics" not in resolved
     assert resolved["deployment"]["max_batch_size"] == 4
+    # Each lever line names its kind only (no origin).
+    line = next(line for line in lines if line.startswith("lever wide_direct_transports "))
+    assert line.endswith("[lossless-bitwise]"), line
     installed = json.loads(lever_table.as_json({"wide_oproj_publish": False}))
     assert installed["levers"]["wide_oproj_publish"]["installed"] is False
     assert installed["levers"]["wide_direct_transports"]["installed"] is True
@@ -4426,7 +4832,8 @@ def compose(monkeypatch):
 
 def test_compose_plans_the_table_and_logs_it_on_rank_0(compose):
     plan = compose((107, 4), 4, arena="windowed")
-    assert plan.paths == table((107, 4), 4, "agg", "windowed").paths()
+    # compose resolves the default table: lossless-bitwise levers on by default.
+    assert plan.paths == default_table((107, 4), 4, "agg", "windowed").paths()
     assert plan.levers.deployment.role_source == "no cache transceiver"
     assert any("lever table json (resolved)" in m for m in _LOG.messages("info"))
     _LOG.records.clear()
@@ -4456,7 +4863,12 @@ def test_compose_raises_another_ranks_missing_precondition(compose):
 
 def test_compose_raises_this_ranks_lever_error_after_the_agreement(compose):
     with pytest.raises(ValueError, match="cannot both be on"):
-        compose((107, 4), 4, knobs(hot_replicas="on"), arena="windowed")
+        compose(
+            (107, 4),
+            4,
+            knobs(hot_replicas="on", half_window_experts="on"),
+            arena="windowed",
+        )
 
 
 def test_compose_without_a_composition_still_checks_the_knobs(compose, monkeypatch):
@@ -4576,8 +4988,24 @@ class _FakePushKernel:
     max_clusters_by_cl: dict = {}
     built: list = []
 
-    def __init__(self, device_index, world, cluster=16, tpl=8, max_rows=384, extra=(), timing=False, route=False):
-        self.world, self.cluster, self.tpl, self.max_rows, self.route = world, cluster, tpl, max_rows, route
+    def __init__(
+        self,
+        device_index,
+        world,
+        cluster=16,
+        tpl=8,
+        max_rows=384,
+        extra=(),
+        timing=False,
+        route=False,
+    ):
+        self.world, self.cluster, self.tpl, self.max_rows, self.route = (
+            world,
+            cluster,
+            tpl,
+            max_rows,
+            route,
+        )
         self.neg = (256 // world) // 16
         self.max_clusters = self.max_clusters_by_cl.get(cluster, 64)
         self.regs, self.local_bytes = 96, 0
@@ -4598,7 +5026,10 @@ def _router_push_host() -> types.ModuleType:
         node
         for node in tree.body
         if (isinstance(node, ast.FunctionDef) and node.name in _PUSH_HOST_FUNCTIONS)
-        or (isinstance(node, (ast.Assign, ast.AnnAssign)) and _push_target_names(node) <= _PUSH_HOST_NAMES)
+        or (
+            isinstance(node, (ast.Assign, ast.AnnAssign))
+            and _push_target_names(node) <= _PUSH_HOST_NAMES
+        )
         or (isinstance(node, ast.ClassDef) and node.name == "RouterPush")
     ]
     _FakePushKernel.built = []
@@ -4611,13 +5042,17 @@ def _router_push_host() -> types.ModuleType:
         torch=_module("torch", zeros=lambda *a, **k: None, int32=None),
     )
     exec(compile(ast.Module(body=body, type_ignores=[]), str(_ROUTER_PUSH), "exec"), host.__dict__)
-    assert _PUSH_HOST_NAMES | _PUSH_HOST_FUNCTIONS | {"RouterPush"} <= set(vars(host)), "a name moved in router_push"
+    assert _PUSH_HOST_NAMES | _PUSH_HOST_FUNCTIONS | {"RouterPush"} <= set(vars(host)), (
+        "a name moved in router_push"
+    )
     return host
 
 
 def _push_target_names(node) -> set:
     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-    return {name.id for target in targets for name in ast.walk(target) if isinstance(name, ast.Name)}
+    return {
+        name.id for target in targets for name in ast.walk(target) if isinstance(name, ast.Name)
+    }
 
 
 def _push_object(host, cluster=8):
@@ -4663,7 +5098,11 @@ def test_the_router_push_cl16_knob_reaches_configure(value):
     call = _settings(moved)["ops.moe.router_push"][0]
     assert call["tep8_cl16_max_rows"] == value and call["tep8_push"] and call["tep8_route"]
     off = table(
-        (107, 8), 8, "gen", "paged", knobs(tep8_router_push="off", tep8_router_push__CL16_MAX_ROWS=value)
+        (107, 8),
+        8,
+        "gen",
+        "paged",
+        knobs(tep8_router_push="off", tep8_router_push__CL16_MAX_ROWS=value),
     )
     assert not off.on("tep8_router_push")
     values, defaults = _settings(off)["ops.moe.router_push"]
@@ -4715,7 +5154,9 @@ def test_router_push_cl16_band_and_build_choice():
     try:
         failed = _push_object(host)
         assert "clusters resident" in failed.prepare_cl16(route=True)
-        assert failed.cl16_build(16, route=True) is None and failed.cl16_build(16, route=False) is None
+        assert (
+            failed.cl16_build(16, route=True) is None and failed.cl16_build(16, route=False) is None
+        )
     finally:
         _FakePushKernel.max_clusters_by_cl = {}
     # a push built at CL 16 already has nothing to add
@@ -4845,7 +5286,9 @@ _RBA_HOST_NAMES = frozenset(
         "BF16_TILE_CHOICES",
     }
 )
-_RBA_HOST_FUNCTIONS = frozenset({"configure", "expert_cost", "program_warps", "cuda_tables_take", "tile_rule"})
+_RBA_HOST_FUNCTIONS = frozenset(
+    {"configure", "expert_cost", "program_warps", "cuda_tables_take", "tile_rule"}
+)
 
 
 def _ring_buddy_assign_host() -> types.ModuleType:
@@ -4859,8 +5302,13 @@ def _ring_buddy_assign_host() -> types.ModuleType:
         or (isinstance(node, ast.Assign) and _target_names(node) <= _RBA_HOST_NAMES)
     ]
     host = _module("_ring_buddy_assign_host", Tuple=tuple, Optional=__import__("typing").Optional)
-    exec(compile(ast.Module(body=body, type_ignores=[]), str(_RING_BUDDY_ASSIGN), "exec"), host.__dict__)
-    assert _RBA_HOST_NAMES | _RBA_HOST_FUNCTIONS <= set(vars(host)), "a name moved in ring_buddy_assign"
+    exec(
+        compile(ast.Module(body=body, type_ignores=[]), str(_RING_BUDDY_ASSIGN), "exec"),
+        host.__dict__,
+    )
+    assert _RBA_HOST_NAMES | _RBA_HOST_FUNCTIONS <= set(vars(host)), (
+        "a name moved in ring_buddy_assign"
+    )
     return host
 
 
@@ -4879,7 +5327,9 @@ def test_the_tile_cost_parameters_default_to_the_gb300_costs():
         assert call["tile_cost"] == (20, 11), (mbs, arena)
     rba = _ring_buddy_assign_host()
     assert rba._TILE_COST == (20, 11)
-    assert rba.expert_cost(0, 8) == 0 and rba.expert_cost(8, 8) == 20 and rba.expert_cost(17, 8) == 42
+    assert (
+        rba.expert_cost(0, 8) == 0 and rba.expert_cost(8, 8) == 20 and rba.expert_cost(17, 8) == 42
+    )
 
 
 @pytest.mark.parametrize("cost", [(14, 11), (14, 14), (10, 20), (1, 0), (255, 255)])
@@ -4888,7 +5338,13 @@ def test_the_tile_cost_knobs_reach_ring_buddy_assign(cost):
     ``ring_buddy_assign.configure`` as ``tile_cost`` only while the lever is on (off: (20, 11))."""
     a, b = cost
     base = table((107, 8), 8, "gen", "paged")
-    moved = table((107, 8), 8, "gen", "paged", knobs(tep8_tile_placement__COST_A=a, tep8_tile_placement__COST_B=b))
+    moved = table(
+        (107, 8),
+        8,
+        "gen",
+        "paged",
+        knobs(tep8_tile_placement__COST_A=a, tep8_tile_placement__COST_B=b),
+    )
     assert moved.paths() == base.paths()
     assert rule_levers_on(moved) == rule_levers_on(base)
     call = _settings(moved)["ops.moe.ring_buddy_assign"][0]
@@ -4898,7 +5354,9 @@ def test_the_tile_cost_knobs_reach_ring_buddy_assign(cost):
         8,
         "gen",
         "paged",
-        knobs(tep8_tile_placement="off", tep8_tile_placement__COST_A=a, tep8_tile_placement__COST_B=b),
+        knobs(
+            tep8_tile_placement="off", tep8_tile_placement__COST_A=a, tep8_tile_placement__COST_B=b
+        ),
     )
     values, defaults = _settings(off)["ops.moe.ring_buddy_assign"]
     assert values["tile_cost"] == defaults["tile_cost"] == (20, 11)
@@ -4909,7 +5367,9 @@ def test_the_tile_cost_knobs_reach_ring_buddy_assign(cost):
     assert rba.expert_cost(9, 8, cost=(20, 11)) == 31  # an explicit cost still wins
 
 
-@pytest.mark.parametrize("knob,bad", [("COST_A", 0), ("COST_A", 256), ("COST_B", -1), ("COST_B", 256)])
+@pytest.mark.parametrize(
+    "knob,bad", [("COST_A", 0), ("COST_A", 256), ("COST_B", -1), ("COST_B", 256)]
+)
 def test_the_tile_cost_knobs_refuse_out_of_range_costs(knob, bad):
     with pytest.raises(ValueError, match=knob):
         table((107, 8), 8, "gen", "paged", knobs(**{f"tep8_tile_placement__{knob}": bad}))
@@ -4932,7 +5392,9 @@ def test_the_placement_kernel_reads_the_configured_cost_at_launch():
     assert "rule if tilew else (*_TILE_COST, meta_tile if meta is not None else 8)" in text
     assert "COST_A=cost_a," in text and "COST_B=cost_b," in text and "TILE=tile," in text
     tree = ast.parse(text)
-    (ref,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "place_tile_reference"]
+    (ref,) = [
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "place_tile_reference"
+    ]
     assert "cost = _TILE_COST if cost is None else cost" in ast.unparse(ref)
 
 
@@ -4962,22 +5424,34 @@ def test_the_disaggregated_role_defaults():
         # (over a paged arena the two-launch side chain is not served: drafter_kv_glue off; the
         # int2 X400 composite samples on the split sampler: vocab_parallel_head off at MAX_BATCH 8)
         assert VR_TEP8 - {"drafter_kv_glue", "vocab_parallel_head"} <= rule_levers_on(gen), mbs
-        assert not gen.on("vocab_parallel_head") and gen.param("vocab_parallel_head", "MAX_BATCH") == 8
-        assert gen.param("swa_one_cluster_block", "TEP8_MAX_REQUESTS") == LEVERS.TEP8_GEN_CL8_MAX_REQUESTS == 11
+        assert (
+            not gen.on("vocab_parallel_head") and gen.param("vocab_parallel_head", "MAX_BATCH") == 8
+        )
+        assert (
+            gen.param("swa_one_cluster_block", "TEP8_MAX_REQUESTS")
+            == LEVERS.TEP8_GEN_CL8_MAX_REQUESTS
+            == 11
+        )
         assert gen.param("tep8_router_push", "ROUTE_ROW_MAX") == 128
         for name in VR_TEP8 - {"drafter_kv_glue", "vocab_parallel_head"}:
-            if any(param.key == "MAX_BATCH" for param in RULES[name].params):
+            if any(param.key == "MAX_BATCH" for param in LEVER_ROWS[name].params):
                 assert gen.param(name, "MAX_BATCH") == LEVERS.LL_MAX_BATCH_TEP8_GEN == 16, name
-        # Over a windowed arena too (the E2E gen arena): the gated set, without the side chain.
+        # Over a windowed arena too (the E2E gen arena): the gated set; the two-launch side chain
+        # is bitwise, so on wherever it can run (past its MAX_BATCH 8 too).
         windowed = table((107, 8), mbs, "gen", "windowed")
-        assert not windowed.on("drafter_kv_glue"), mbs
+        assert windowed.on("drafter_kv_glue"), mbs
+        assert windowed.decisions["drafter_kv_glue"].source == "default", mbs
         assert windowed.param("drafter_kv_glue", "MAX_BATCH") == 8, mbs
         assert VR_TEP8 - {"drafter_kv_glue", "vocab_parallel_head"} <= rule_levers_on(windowed), mbs
         for (name, key), (_, value) in WIDE128_PARAMS.items():
             assert gen.param(name, key) == value, (mbs, name, key)
         assert gen.param("tep8_router_push", "MIN_ROWS") == 9
         assert gen.param("tep8_tile_placement", "MAX_ROWS") == 64
-        assert gen.param("swa_one_cluster_block", "TEP8_MIN_REQUESTS") == LEVERS.TEP8_GEN_CL8_MIN_REQUESTS == 2
+        assert (
+            gen.param("swa_one_cluster_block", "TEP8_MIN_REQUESTS")
+            == LEVERS.TEP8_GEN_CL8_MIN_REQUESTS
+            == 2
+        )
         assert not any("outside its accuracy gates" in warning for warning in gen.warnings)
         # ... the same table as the knob set the gate ran (on an aggregated ruler).
         wall = {
@@ -5007,23 +5481,31 @@ def test_the_disaggregated_role_defaults():
             assert gen.param(name, key) == default, (mbs, name, key)
         assert gen.param("swa_prep_split", "MAX_BATCH") == 8
         assert gen.param("tep8_router_push", "MIN_ROWS") == 9
-    # A TEP4 generation server and every aggregated server keep the old defaults.
-    assert not table((107, 4), 12, "gen", "windowed").on("swa_prep_split")
+    # A TEP4 generation server and every aggregated server keep the old parameter defaults (the
+    # numeric low-latency levers stop at 8 requests there; the bitwise ones run wherever they can).
+    tep4_gen = table((107, 4), 12, "gen", "windowed")
+    assert tep4_gen.param("swa_prep_split", "MAX_BATCH") == 8
+    assert not tep4_gen.on("swa_one_cluster_block")
+    assert tep4_gen.decisions["swa_one_cluster_block"].why == "max_batch_size 12 is above 8"
     for key in ((107, 4), (107, 8)):
         for mbs in (8, 16):
             agg = table(key, mbs, "agg", "windowed")
             assert agg.param("swa_prep_split", "MAX_BATCH") == 8, (key, mbs)
             assert not agg.on("fmk_context_fmha") or key == (107, 4)
             assert agg.param("fmk_context_fmha", "PURE_CONTEXT") == 0, (key, mbs)
-            assert not agg.on("context_sp_oproj_overlap"), (key, mbs)
-    assert table((107, 8), 16, "agg", "windowed", _ll_on(16, VR_TEP8)).param(
-        "tep8_router_push", "MIN_ROWS"
-    ) == 33
+            # The context-step overlap is bitwise: on wherever it can run (TEP4 only).
+            assert agg.on("context_sp_oproj_overlap") is (key == (107, 4)), (key, mbs)
+    assert (
+        table((107, 8), 16, "agg", "windowed", _ll_on(16, VR_TEP8)).param(
+            "tep8_router_push", "MIN_ROWS"
+        )
+        == 33
+    )
     # A TEP4 context server: fmk on every pure context step, ovts.
     for mbs in (8, 32, 64):
         ctx = table((107, 4), mbs, "ctx", "windowed")
         assert CTX_ROLE_DEFAULTS <= rule_levers_on(ctx), mbs
-        assert ctx.decisions["fmk_context_fmha"].source == "auto", mbs
+        assert ctx.decisions["fmk_context_fmha"].source == "default", mbs
         assert ctx.param("fmk_context_fmha", "PURE_CONTEXT") == 1, mbs
         assert ctx.param("context_sp_extra_parts", "PARTS") == (
             "shard_routing",
@@ -5032,10 +5514,11 @@ def test_the_disaggregated_role_defaults():
         assert not any("outside its accuracy gates" in warning for warning in ctx.warnings)
         off = table((107, 4), mbs, "ctx", "windowed", knobs(fmk_context_fmha="off"))
         assert not off.on("fmk_context_fmha")
-        mixed_only = table((107, 4), mbs, "ctx", "windowed", knobs(fmk_context_fmha__PURE_CONTEXT=0))
+        mixed_only = table(
+            (107, 4), mbs, "ctx", "windowed", knobs(fmk_context_fmha__PURE_CONTEXT=0)
+        )
         assert mixed_only.param("fmk_context_fmha", "PURE_CONTEXT") == 0
-    # fmk_context_fmha serves both bands by rule; an unhinted or generation server runs none.
-    assert LEVERS.lever_band("fmk_context_fmha") is None
+    # An unhinted or generation server runs none.
     assert not table((107, 4), 8, "gen", "windowed").on("fmk_context_fmha")
 
 
@@ -5120,7 +5603,13 @@ def test_a_zero_bf16_cost_a_is_off_whatever_b():
 
 @pytest.mark.parametrize(
     "knob,bad",
-    [("BF16_COST_A", -1), ("BF16_COST_A", 256), ("BF16_COST_B", -1), ("BF16_COST_B", 256), ("BF16_TILE", 12)],
+    [
+        ("BF16_COST_A", -1),
+        ("BF16_COST_A", 256),
+        ("BF16_COST_B", -1),
+        ("BF16_COST_B", 256),
+        ("BF16_TILE", 12),
+    ],
 )
 def test_the_bf16_tile_knobs_refuse_out_of_range_values(knob, bad):
     with pytest.raises(ValueError, match=knob):
@@ -5140,7 +5629,9 @@ def test_ring_buddy_assign_configure_refuses_a_bad_bf16_rule(kwargs, match):
     rba = _ring_buddy_assign_host()
     with pytest.raises(ValueError, match=match):
         rba.configure(tile_placement=True, **kwargs)
-    assert rba._BF16_TILE_COST == (0, 0) and rba._BF16_TILE == 8 and not rba._TILE_PLACEMENT  # nothing set
+    assert (
+        rba._BF16_TILE_COST == (0, 0) and rba._BF16_TILE == 8 and not rba._TILE_PLACEMENT
+    )  # nothing set
 
 
 def test_ring_buddy_marks_the_bf16_layers_calls():
@@ -5152,7 +5643,9 @@ def test_ring_buddy_marks_the_bf16_layers_calls():
     calls = [
         n
         for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "ring_buddy_assign"
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "ring_buddy_assign"
     ]
     with_meta = [c for c in calls if any(k.arg == "meta_tile" for k in c.keywords)]
     without = [c for c in calls if not any(k.arg == "meta_tile" for k in c.keywords)]
@@ -5198,14 +5691,20 @@ def test_the_router_push_v2_band_knob_reaches_configure(value):
     assert call["tep8_route_row_max"] == value and call["tep8_route"]
     assert call["tep8_cl16_max_rows"] == 0  # independent of the CL16 band
     off = table(
-        (107, 8), 8, "gen", "paged", knobs(tep8_router_push="off", tep8_router_push__ROUTE_ROW_MAX=value)
+        (107, 8),
+        8,
+        "gen",
+        "paged",
+        knobs(tep8_router_push="off", tep8_router_push__ROUTE_ROW_MAX=value),
     )
     values, defaults = _settings(off)["ops.moe.router_push"]
     assert values["tep8_route_row_max"] == defaults["tep8_route_row_max"] == 64
     host = _router_push_host()
     host.configure(tep8_push=True, tep8_route=True, tep8_route_row_max=value, tep8_cl16_max_rows=64)
     assert host.TEP8_ROUTE_ROW_MAX == value
-    assert [n for n in range(1, 130) if host.cl16_takes(n)] == list(range(1, 65))  # CL16 stays <= 64
+    assert [n for n in range(1, 130) if host.cl16_takes(n)] == list(
+        range(1, 65)
+    )  # CL16 stays <= 64
 
 
 @pytest.mark.parametrize("bad", [63, 129, 0])
@@ -5241,7 +5740,12 @@ def test_the_ring_buddy_wide_warps_default_to_the_served_program():
         assert lever_table.param("tep8_ring_buddy_wide", "WIDE_WARPS") == 8
         assert _settings(lever_table)["ops.moe.ring_buddy_assign"][0]["wide_warps"] == 8
     rba = _ring_buddy_assign_host()
-    assert (rba._WIDE_WARPS, rba._META_WARPS, rba.NUM_WARPS, rba.WIDE_WARPS_FROM_SLOTS) == (8, 8, 4, 1024)
+    assert (rba._WIDE_WARPS, rba._META_WARPS, rba.NUM_WARPS, rba.WIDE_WARPS_FROM_SLOTS) == (
+        8,
+        8,
+        4,
+        1024,
+    )
     # 512-slot (33..64 rows) and 1024-slot (65..128 rows) table-writing programs: 8 warps, as served
     assert [rba.program_warps(n, True) for n in (16, 256, 512, 1024)] == [8, 8, 8, 8]
     assert [rba.program_warps(n, False) for n in (16, 512, 1024)] == [4, 4, 4]
@@ -5255,7 +5759,11 @@ def test_the_ring_buddy_wide_warps_knob_reaches_the_1024_slot_program_only(warps
     assert rule_levers_on(moved) == rule_levers_on(base)
     assert _settings(moved)["ops.moe.ring_buddy_assign"][0]["wide_warps"] == warps
     off = table(
-        (107, 8), 8, "gen", "paged", knobs(tep8_ring_buddy_wide="off", tep8_ring_buddy_wide__WIDE_WARPS=warps)
+        (107, 8),
+        8,
+        "gen",
+        "paged",
+        knobs(tep8_ring_buddy_wide="off", tep8_ring_buddy_wide__WIDE_WARPS=warps),
     )
     values, defaults = _settings(off)["ops.moe.ring_buddy_assign"]
     assert values["wide_warps"] == defaults["wide_warps"] == 8
@@ -5301,7 +5809,10 @@ def test_the_router_push_rows_per_cta_defaults_to_one():
 def test_the_router_push_rows_per_cta_knob_reaches_the_cl8_routed_build_only():
     base = table((107, 8), 8, "gen", "paged")
     moved = table(
-        (107, 8), 8, "gen", "paged",
+        (107, 8),
+        8,
+        "gen",
+        "paged",
         knobs(tep8_router_push__ROUTE_ROWS_PER_CTA=2, tep8_router_push__ROUTE_ROW_MAX=128),
     )
     assert moved.paths() == base.paths()
@@ -5309,14 +5820,20 @@ def test_the_router_push_rows_per_cta_knob_reaches_the_cl8_routed_build_only():
     call = _settings(moved)["ops.moe.router_push"][0]
     assert (call["tep8_route_rows_per_cta"], call["tep8_route_row_max"]) == (2, 128)
     off = table(
-        (107, 8), 8, "gen", "paged", knobs(tep8_router_push="off", tep8_router_push__ROUTE_ROWS_PER_CTA=2)
+        (107, 8),
+        8,
+        "gen",
+        "paged",
+        knobs(tep8_router_push="off", tep8_router_push__ROUTE_ROWS_PER_CTA=2),
     )
     values, defaults = _settings(off)["ops.moe.router_push"]
     assert values["tep8_route_rows_per_cta"] == defaults["tep8_route_rows_per_cta"] == 1
     host = _router_push_host()
     host.configure(tep8_push=True, tep8_route=True, tep8_route_rows_per_cta=2)
     assert host.route_extra(8, 8) == ("-DROW_PAIRS=1",)
-    assert host.route_extra(8, 16) == () and host.route_extra(16, 16) == ()  # CL16 / TP16 builds: one row per CTA
+    assert (
+        host.route_extra(8, 16) == () and host.route_extra(16, 16) == ()
+    )  # CL16 / TP16 builds: one row per CTA
     tree = ast.parse(_ROUTER_PUSH.read_text())
     (cls,) = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "RouterPush"]
     (build,) = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "route_build"]
@@ -5349,14 +5866,20 @@ def test_router_push_row_pairs_source():
     pairs = _resolve_cl16_blocks(src, 8, 8, row_pairs=1)
     assert v2 not in pairs and row not in pairs
     assert "if (crank != 0 && !(per_row && eg == 0)) { FLUSH(); return; }" in pairs
-    assert "const int grow = eg == 0 ? rb * BM + (int)crank : rows;  // and row grow + CL, below" in pairs
+    assert (
+        "const int grow = eg == 0 ? rb * BM + (int)crank : rows;  // and row grow + CL, below"
+        in pairs
+    )
     assert second in pairs
     i = pairs.index("if (grow + CL < rows) {")
     assert pairs.index("__syncthreads();", i) < pairs.index(second, i)
-    assert 'static_assert(CL * 2 == BM && NEG == 2' in pairs
+    assert "static_assert(CL * 2 == BM && NEG == 2" in pairs
     # the CL16 build ignores ROW_PAIRS (its own branch comes first)
     cl16 = _resolve_cl16_blocks(src, 8, 16, row_pairs=1)
-    assert second not in cl16 and "const int grow = eg == 0 ? rb * BM + (int)crank : rows;  // only" in cl16
+    assert (
+        second not in cl16
+        and "const int grow = eg == 0 ? rb * BM + (int)crank : rows;  // only" in cl16
+    )
 
 
 @pytest.mark.parametrize("rows", [9, 16, 24, 40, 64, 65, 72, 96, 127, 128])
@@ -5403,7 +5926,10 @@ def _balance_ring():
     tree = ast.parse(_RING_BUDDY_ASSIGN.read_text())
     body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "balance_ring"]
     host = _module("_balance_ring_host", List=list, Tuple=tuple)
-    exec(compile(ast.Module(body=body, type_ignores=[]), str(_RING_BUDDY_ASSIGN), "exec"), host.__dict__)
+    exec(
+        compile(ast.Module(body=body, type_ignores=[]), str(_RING_BUDDY_ASSIGN), "exec"),
+        host.__dict__,
+    )
     return host.balance_ring
 
 
@@ -5456,7 +5982,11 @@ def test_the_router_push_rb_cuda_defaults_to_off():
         assert settings["ops.moe.router_push"][0]["tep8_early_trigger"] is False
         assert settings["ops.moe.ring_buddy_assign"][0]["cuda_tables"] is False
     host = _router_push_host()
-    assert host.TEP8_EARLY_TRIGGER is False and host.route_extra(8, 8) == () and host.route_extra(8, 16) == ()
+    assert (
+        host.TEP8_EARLY_TRIGGER is False
+        and host.route_extra(8, 8) == ()
+        and host.route_extra(8, 16) == ()
+    )
     rba = _ring_buddy_assign_host()
     assert rba._CUDA_TABLES is False and not rba.cuda_tables_take(8, True, False, 512, 8)
 
@@ -5469,16 +5999,22 @@ def test_the_router_push_rb_cuda_knob_reaches_the_push_and_the_placement():
     settings = _settings(moved)
     assert settings["ops.moe.router_push"][0]["tep8_early_trigger"] is True
     assert settings["ops.moe.ring_buddy_assign"][0]["cuda_tables"] is True
-    off = table((107, 8), 8, "gen", "paged", knobs(tep8_router_push="off", tep8_router_push__RB_CUDA=1))
+    off = table(
+        (107, 8), 8, "gen", "paged", knobs(tep8_router_push="off", tep8_router_push__RB_CUDA=1)
+    )
     push_values, push_defaults = _settings(off)["ops.moe.router_push"]
     assert push_values["tep8_early_trigger"] is push_defaults["tep8_early_trigger"] is False
     rb_values, rb_defaults = _settings(off)["ops.moe.ring_buddy_assign"]
     assert rb_values["cuda_tables"] is rb_defaults["cuda_tables"] is False
     host = _router_push_host()
     host.configure(tep8_push=True, tep8_route=True, tep8_early_trigger=True)
-    assert host.route_extra(8, 8) == ("-DEARLY_TRIGGER=1",) and host.route_extra(8, 16) == ("-DEARLY_TRIGGER=1",)
+    assert host.route_extra(8, 8) == ("-DEARLY_TRIGGER=1",) and host.route_extra(8, 16) == (
+        "-DEARLY_TRIGGER=1",
+    )
     assert host.route_extra(16, 16) == ()  # the TP16 layout is not served
-    host.configure(tep8_push=True, tep8_route=True, tep8_route_rows_per_cta=2, tep8_early_trigger=True)
+    host.configure(
+        tep8_push=True, tep8_route=True, tep8_route_rows_per_cta=2, tep8_early_trigger=True
+    )
     assert host.route_extra(8, 8) == ("-DROW_PAIRS=1", "-DEARLY_TRIGGER=1")
     host.configure()
     assert host.TEP8_EARLY_TRIGGER is False
@@ -5504,9 +6040,9 @@ def test_router_push_early_trigger_source():
     assert src.count(head) == 1
     i = src.index(head)
     block = src[i + len(head) : src.index("#endif", i)]
-    assert [ln.strip() for ln in block.splitlines() if ln.strip() and not ln.strip().startswith("//")] == [
-        'asm volatile("griddepcontrol.launch_dependents;" ::: "memory");'
-    ]
+    assert [
+        ln.strip() for ln in block.splitlines() if ln.strip() and not ln.strip().startswith("//")
+    ] == ['asm volatile("griddepcontrol.launch_dependents;" ::: "memory");']
     assert src.count("griddepcontrol.launch_dependents;") == 3
     assert src.count("#if EARLY_TRIGGER") == 1
 
@@ -5564,10 +6100,14 @@ def test_rb_tables_source_reads_nothing_before_its_dependency_wait():
     # the predecessor's ids and weights: coherent volatile loads after the wait, never a plain / read-only load
     for read in ("ld_dep(sel + t)", "ld_dep(wts + t)"):
         assert src.count(read) == 1 and src.index(read) > wait
-    assert 'asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");' in src
+    assert (
+        'asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");' in src
+    )
     assert not re.search(r"\b(sel|wts)\s*\[", src) and "__ldg" not in src
     signature = src[src.index("rb_tables(") : src.index("{", src.index("rb_tables("))]
-    assert "__restrict__" not in signature  # a const __restrict__ load may be issued as ld.global.nc above the wait
+    assert (
+        "__restrict__" not in signature
+    )  # a const __restrict__ load may be issued as ld.global.nc above the wait
     before = src[src.index("rb_tables(") : wait]
     stores = re.findall(r"(\w+)\[[^\]]*\](?:\[[^\]]*\])? = ", before)
     assert stores and all(name.startswith("s_") for name in stores), stores  # shared memory only
@@ -5575,7 +6115,9 @@ def test_rb_tables_source_reads_nothing_before_its_dependency_wait():
     assert "cvt.rn.bf16.f32" in src  # Triton's FP32 -> BF16 cast
     # positions by warp ranking (token order, not arrival order): the one atomicAdd is tilew's token count
     assert src.count("atomicAdd") == 1 and "atomicAdd(&s_tok[" in src
-    assert "launch_dependents" not in src  # FC1 launches at its completion, as after the Triton program
+    assert (
+        "launch_dependents" not in src
+    )  # FC1 launches at its completion, as after the Triton program
 
 
 @pytest.mark.parametrize("rows", [9, 16, 33, 48, 64, 65, 72, 96, 128])
@@ -5614,8 +6156,15 @@ def test_rb_tables_model_equals_the_placement_reference(rows):
                 assert m["p2t"][m["e2p"][s]] == s // 8
             for k in range(64):
                 ps = [m["e2p"][s] for s in mine if local[s] == k]
-                assert ps == list(range(offs[k] * tile, offs[k] * tile + counts[k])), (rows, rank, k)
-        assert owners == [1] * len(flat), (rows, seed)  # every (token, slot) runs on exactly one rank
+                assert ps == list(range(offs[k] * tile, offs[k] * tile + counts[k])), (
+                    rows,
+                    rank,
+                    k,
+                )
+        assert owners == [1] * len(flat), (
+            rows,
+            seed,
+        )  # every (token, slot) runs on exactly one rank
 
 
 def test_rb_tables_model_covers_an_expert_every_row_selects():
@@ -5638,9 +6187,17 @@ def _place_tile_reference():
     names = {"place_tile_reference", "balance_ring", "expert_cost", "block_of"}
     body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     host = _module(
-        "_place_tile_host", List=list, Tuple=tuple, EXPERTS=256, RING_SIZES={8: 32, 4: 64}, _TILE_COST=(20, 11)
+        "_place_tile_host",
+        List=list,
+        Tuple=tuple,
+        EXPERTS=256,
+        RING_SIZES={8: 32, 4: 64},
+        _TILE_COST=(20, 11),
     )
-    exec(compile(ast.Module(body=body, type_ignores=[]), str(_RING_BUDDY_ASSIGN), "exec"), host.__dict__)
+    exec(
+        compile(ast.Module(body=body, type_ignores=[]), str(_RING_BUDDY_ASSIGN), "exec"),
+        host.__dict__,
+    )
     return host.place_tile_reference
 
 
@@ -5664,12 +6221,16 @@ def test_rb_tables_model_tile_placement_equals_the_reference(rows, cost):
         for rank in range(ranks):
             m = rbc.model(flat, rank, tile, tilew=True, cost=cost)
             local = [
-                (e % size if e // size == rank else size + e % size) if r == rank else 2 * size + e % (256 - 2 * size)
+                (e % size if e // size == rank else size + e % size)
+                if r == rank
+                else 2 * size + e % (256 - 2 * size)
                 for e, r in zip(flat, runs_on)
             ]
             assert m["local"] == local and m["stats"] == stats, (rows, cost, seed, rank)
             counts = [local.count(k) for k in range(64)]
             assert m["nnc"] == sum((c + tile - 1) // tile for c in counts)
+
+
 # role_env: the TEP4 ctx role's shared-path environment defaults (prefix-aware scheduling skip)
 # ---------------------------------------------------------------------------
 _PSKIP = {
@@ -5704,9 +6265,17 @@ def test_the_ctx_role_defaults_the_prefix_aware_scheduling_skip(monkeypatch):
     assert environ["TRTLLM_SCHED_PREFIX_SKIP_PENDING"] == "0"
     assert chosen == {k: v for k, v in _PSKIP.items() if k != "TRTLLM_SCHED_PREFIX_SKIP_PENDING"}
     # Generation, aggregated (the rulers) and TEP8 servers: nothing.
-    for key, mbs, role in (((107, 8), 16, "gen"), ((107, 8), 8, "gen"), ((107, 4), 64, "agg"), ((107, 8), 8, "agg")):
+    for key, mbs, role in (
+        ((107, 8), 16, "gen"),
+        ((107, 8), 8, "gen"),
+        ((107, 4), 64, "agg"),
+        ((107, 8), 8, "agg"),
+    ):
         environ = {}
-        assert role_env.apply(_RoleEnvPlan(table(key, mbs, role, "paged")), environ) == {}, (key, role)
+        assert role_env.apply(_RoleEnvPlan(table(key, mbs, role, "paged")), environ) == {}, (
+            key,
+            role,
+        )
         assert environ == {}, (key, role)
     # No plan / no lever table (NO_PATHS): nothing.
     assert role_env.apply(None, {}) == {}
@@ -5736,10 +6305,6 @@ def test_the_coop_fold_topp_rounds_defaults_to_off_up_to_8_requests():
         assert lever_table.param("head_sampler_coop_fold", "TOPP_ROUNDS") == rounds
         values, defaults = _settings(lever_table)["ops.spec.head_sampler"]
         assert values["topp_rounds"] == rounds and defaults["topp_rounds"] == 0
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -5776,14 +6341,15 @@ def test_the_coop_fold_dist_min_rows_knob_reaches_the_head_sampler(floor):
     assert values["dist_min_rows"] == defaults["dist_min_rows"] == 0
 
 
-
-
 # ---------------------------------------------------------------------------
 # tep8_pool_programmatic_fork__NORM_PREFETCH: the pool branch's norm + NVFP4 kernels load the norm gain and the
 # global scale before their dependency wait / poll
 # ---------------------------------------------------------------------------
 
-_POOL_NORM_KERNELS = (_TARGET / "ops/comm/pool_publish_fp4quant.py", _TARGET / "ops/comm/pool_gather_fp4quant.py")
+_POOL_NORM_KERNELS = (
+    _TARGET / "ops/comm/pool_publish_fp4quant.py",
+    _TARGET / "ops/comm/pool_gather_fp4quant.py",
+)
 
 
 def test_the_norm_prefetch_defaults_to_off_up_to_8_requests():
@@ -5795,7 +6361,10 @@ def test_the_norm_prefetch_defaults_to_off_up_to_8_requests():
         assert lever_table.param("tep8_pool_programmatic_fork", "NORM_PREFETCH") == int(on)
         settings = _settings(lever_table)
         for module in ("ops.comm.pool_publish_fp4quant", "ops.comm.pool_gather_fp4quant"):
-            assert settings[module][0]["norm_prefetch"] is on and settings[module][1]["norm_prefetch"] is False
+            assert (
+                settings[module][0]["norm_prefetch"] is on
+                and settings[module][1]["norm_prefetch"] is False
+            )
 
 
 def test_the_norm_prefetch_knob_reaches_both_kernels_only():
@@ -5810,7 +6379,10 @@ def test_the_norm_prefetch_knob_reaches_both_kernels_only():
         if module not in ("ops.comm.pool_publish_fp4quant", "ops.comm.pool_gather_fp4quant"):
             assert settings[module] == base_settings[module], module
     off = table(
-        (107, 8), 8, "gen", "paged",
+        (107, 8),
+        8,
+        "gen",
+        "paged",
         knobs(tep8_pool_programmatic_fork="off", tep8_pool_programmatic_fork__NORM_PREFETCH=1),
     )
     for module in ("ops.comm.pool_publish_fp4quant", "ops.comm.pool_gather_fp4quant"):
@@ -5829,7 +6401,9 @@ def _norm_host(path):
         n
         for n in tree.body
         if (isinstance(n, ast.FunctionDef) and n.name in {"configure", "_log_prefetch"})
-        or (isinstance(n, ast.Assign) and _target_names(n) <= {"_NORM_PREFETCH", "_PREFETCH_LOGGED"})
+        or (
+            isinstance(n, ast.Assign) and _target_names(n) <= {"_NORM_PREFETCH", "_PREFETCH_LOGGED"}
+        )
     ]
     host = _module(f"_norm_host_{path.stem}")
     exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), host.__dict__)
@@ -5846,11 +6420,22 @@ def test_the_norm_prefetch_configure_and_compile_key(path):
     assert host._NORM_PREFETCH is False
     text = path.read_text()
     tree = ast.parse(text)
-    (compile_fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_compile"]
-    assert "prefetch: bool = False" in ast.unparse(compile_fn.args) or compile_fn.args.args[-1].arg == "prefetch"
-    assert "_log_prefetch(" in ast.unparse(compile_fn)  # the engagement line when the prefetched kernel builds
+    (compile_fn,) = [
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_compile"
+    ]
+    assert (
+        "prefetch: bool = False" in ast.unparse(compile_fn.args)
+        or compile_fn.args.args[-1].arg == "prefetch"
+    )
+    assert "_log_prefetch(" in ast.unparse(
+        compile_fn
+    )  # the engagement line when the prefetched kernel builds
     # the op passes the setting as the last _compile key
-    call = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_compile"]
+    call = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_compile"
+    ]
     assert len(call) == 1 and ast.unparse(call[0].args[-1]) == "_NORM_PREFETCH"
 
 
@@ -5873,13 +6458,21 @@ def test_the_norm_prefetch_source(path):
     assert "gs_pre = mGlobalScale[0]" in prologue
     assert re.findall(r"get_ptr_as_int64\((\w+)", prologue) == ["mW", "mW"]  # only the gain is read
     gsv = body.index("global_scale_val = gs_pre")
-    assert body.index("global_scale_val = mGlobalScale[0]", gsv) > gsv  # the served load in the else branch
+    assert (
+        body.index("global_scale_val = mGlobalScale[0]", gsv) > gsv
+    )  # the served load in the else branch
     i = body.index("# NORM_PREFETCH: the same blocks and operations, unrolled, the gain from w_pre")
     j = body.index("                else:\n", i)
-    k = body.index("            if enable_pdl:\n                cute.arch.griddepcontrol_launch_dependents()", j)
+    k = body.index(
+        "            if enable_pdl:\n                cute.arch.griddepcontrol_launch_dependents()",
+        j,
+    )
     fast = [ln.strip() for ln in body[i:j].splitlines()[1:] if ln.strip()]
     served = [ln.strip() for ln in body[j:k].splitlines()[1:] if ln.strip()]
-    assert served[0].startswith("num_sf_per_thread = ") and served[1] == "for sf_iter in range(num_sf_per_thread):"
+    assert (
+        served[0].startswith("num_sf_per_thread = ")
+        and served[1] == "for sf_iter in range(num_sf_per_thread):"
+    )
     assert fast[0] == "for sf_iter in cutlass.range_constexpr(self.sf_per_thread):"
     gain_loads = [
         "w_ptr0 = _fp4.get_ptr_as_int64(mW, block_start)",
@@ -5887,8 +6480,16 @@ def test_the_norm_prefetch_source(path):
         "w_h2[0], w_h2[1], w_h2[2], w_h2[3] = _fp4.ld_global_v4_u32(w_ptr0)",
         "w_h2[4], w_h2[5], w_h2[6], w_h2[7] = _fp4.ld_global_v4_u32(w_ptr1)",
     ]
-    served_ops = [ln for ln in served[2:] if ln != "if sf_idx < num_sf_blocks_per_row:" and ln not in gain_loads]
-    fast_ops = [ln for ln in fast[1:] if ln not in ("for k in cutlass.range_constexpr(8):", "w_h2[k] = w_pre[8 * sf_iter + k]")]
+    served_ops = [
+        ln
+        for ln in served[2:]
+        if ln != "if sf_idx < num_sf_blocks_per_row:" and ln not in gain_loads
+    ]
+    fast_ops = [
+        ln
+        for ln in fast[1:]
+        if ln not in ("for k in cutlass.range_constexpr(8):", "w_h2[k] = w_pre[8 * sf_iter + k]")
+    ]
     assert fast_ops == served_ops
     assert all(g in served for g in gain_loads)
 
@@ -5898,7 +6499,9 @@ def test_the_norm_prefetch_source(path):
 # ---------------------------------------------------------------------------
 
 _FINALIZE_TRANSPORT = _TARGET / "ops/moe/finalize_allreduce_transport.py"
-_FIN_HOST_NAMES = frozenset({"TP8_MAX_TOKENS", "TP8_LAYOUTS", "DEFAULT", "ENTRY_TRIGGER", "STAMP_STAGES"})
+_FIN_HOST_NAMES = frozenset(
+    {"TP8_MAX_TOKENS", "TP8_LAYOUTS", "DEFAULT", "ENTRY_TRIGGER", "STAMP_STAGES"}
+)
 
 
 def _finalize_host() -> types.ModuleType:
@@ -5910,17 +6513,25 @@ def _finalize_host() -> types.ModuleType:
         for node in tree.body
         if (isinstance(node, ast.ClassDef) and node.name == "Transport")
         or (isinstance(node, ast.FunctionDef) and node.name == "configure")
-        or (isinstance(node, (ast.Assign, ast.AnnAssign)) and _push_target_names(node) <= _FIN_HOST_NAMES)
+        or (
+            isinstance(node, (ast.Assign, ast.AnnAssign))
+            and _push_target_names(node) <= _FIN_HOST_NAMES
+        )
     ]
     import dataclasses as _dataclasses
 
     host = _module("_finalize_host", dataclasses=_dataclasses)
     sys.modules["_finalize_host"] = host  # dataclasses resolves the class's module by name
     try:
-        exec(compile(ast.Module(body=body, type_ignores=[]), str(_FINALIZE_TRANSPORT), "exec"), host.__dict__)
+        exec(
+            compile(ast.Module(body=body, type_ignores=[]), str(_FINALIZE_TRANSPORT), "exec"),
+            host.__dict__,
+        )
     finally:
         sys.modules.pop("_finalize_host", None)
-    assert _FIN_HOST_NAMES | {"Transport", "configure"} <= set(vars(host)), "a name moved in the finalize transport"
+    assert _FIN_HOST_NAMES | {"Transport", "configure"} <= set(vars(host)), (
+        "a name moved in the finalize transport"
+    )
     return host
 
 
@@ -5940,7 +6551,10 @@ def test_the_finalize_index_prefetch_defaults_to_off():
         if not lever_table.on("tep8_finalize_transport_64"):
             continue
         assert lever_table.param("tep8_finalize_transport_64", "INDEX_PREFETCH") == 0
-        assert _settings(lever_table)["ops.moe.finalize_allreduce_transport"][0]["index_prefetch"] is False
+        assert (
+            _settings(lever_table)["ops.moe.finalize_allreduce_transport"][0]["index_prefetch"]
+            is False
+        )
     fin = _finalize_host()
     assert fin.DEFAULT == fin.Transport() and not fin.DEFAULT.prefetch and fin.DEFAULT.stamps == 0
     assert fin.DEFAULT.label() == "multicast/red/warp/late"
@@ -5956,9 +6570,15 @@ def test_the_finalize_index_prefetch_knob_reaches_the_default_transport():
     assert rule_levers_on(moved) == rule_levers_on(base)
     call = _settings(moved)["ops.moe.finalize_allreduce_transport"][0]
     assert call["index_prefetch"] is True
-    assert call["tep8_max_tokens"] == _settings(base)["ops.moe.finalize_allreduce_transport"][0]["tep8_max_tokens"]
+    assert (
+        call["tep8_max_tokens"]
+        == _settings(base)["ops.moe.finalize_allreduce_transport"][0]["tep8_max_tokens"]
+    )
     off = table(
-        (107, 8), 8, "gen", "paged",
+        (107, 8),
+        8,
+        "gen",
+        "paged",
         knobs(tep8_finalize_transport_64="off", tep8_finalize_transport_64__INDEX_PREFETCH=1),
     )
     values, defaults = _settings(off)["ops.moe.finalize_allreduce_transport"]
@@ -5996,12 +6616,16 @@ def test_finalize_prefetch_reads_the_row_map_before_the_wait_and_verifies_after(
     assert text.index("if cutlass.const_expr(self.prefetch):") < early < wait
     after = text[wait:]
     verify = after.index("index, valid = self.select_row(indices, rows, token, k)")
-    early_rows = after.index("row_words.append(_load_row_x4(gemm_address + offset * 2, early_valid))")
-    reload = after.index("_reload_row_x4(gemm_address + offset * 2, row_valid[k] & changed, changed")
+    early_rows = after.index(
+        "row_words.append(_load_row_x4(gemm_address + offset * 2, early_valid))"
+    )
+    reload = after.index(
+        "_reload_row_x4(gemm_address + offset * 2, row_valid[k] & changed, changed"
+    )
     assert early_rows < verify < reload
     assert "changed = Uint32(row_index[k] != early_index[k])" in after
     # the default path keeps today's statements, in order
-    default = after[after.index("else:", reload):]
+    default = after[after.index("else:", reload) :]
     seq = [
         "index, valid = self.select_row(indices, rows, token, k)",
         "row_weight.append(_load_f32(weights.toint() + (selection + k) * 4))",
@@ -6032,12 +6656,22 @@ def test_finalize_prefetch_correction_gives_the_post_wait_entry_words(early_vali
     early_words = row_early if early_valid else [0, 0, 0, 0]  # _load_row_x4: zeros when not valid
     changed = not same
     got = _reload_model(early_words, new_valid and changed, changed, row_new)
-    expected = row_new if new_valid else [0, 0, 0, 0]  # the default path's words for the post-wait entry
+    expected = (
+        row_new if new_valid else [0, 0, 0, 0]
+    )  # the default path's words for the post-wait entry
     assert got == expected
     src = _FINALIZE_TRANSPORT.read_text()
     i = src.index("def _reload_row_x4(")
     asm = src[i : src.index("return _split_words", i)]
-    q, z, p, ld = (asm.index(t) for t in ("setp.ne.u32 q, $6, 0", "@q mov.b32 a, 0", "setp.ne.u32 p, $5, 0", "@p ld.global.v4.b32"))
+    q, z, p, ld = (
+        asm.index(t)
+        for t in (
+            "setp.ne.u32 q, $6, 0",
+            "@q mov.b32 a, 0",
+            "setp.ne.u32 p, $5, 0",
+            "@p ld.global.v4.b32",
+        )
+    )
     assert q < z < p < ld
 
 
@@ -6047,7 +6681,9 @@ def test_finalize_stamps_are_compiled_out_by_default():
     # every stamp sits under the compile-time stamps switch, issued by thread 0
     assert text.count("if cutlass.const_expr(self.stamps != 0):") == 8
     src = _FINALIZE_TRANSPORT.read_text()
-    assert "self.stamps = int(transport.stamps)" in src and "self.prefetch = transport.prefetch" in src
+    assert (
+        "self.stamps = int(transport.stamps)" in src and "self.prefetch = transport.prefetch" in src
+    )
 
 
 # --------------------------------------------------------------------------
@@ -6058,30 +6694,10 @@ def test_finalize_stamps_are_compiled_out_by_default():
 _CL8_SRC_MD5 = "10334d867210ce7cb83cb59337e2eb51"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # head_sampler_coop_fold__TOPP_ROUNDS: the split sampler's top-p-only rows decided by the multi-CTA top-p test
 # (head_sampler.draw_topp), default off
 # ---------------------------------------------------------------------------
-
-
 
 
 @pytest.mark.parametrize("rounds", [1, 2, 3, 4])
@@ -6115,10 +6731,6 @@ def test_the_coop_fold_topp_rounds_refuses_other_values(bad):
 # ---------------------------------------------------------------------------
 # head_sampler_coop_fold__DIST_MIN_ROWS: the distributed sampler (head_sampler.ds_sample), default off
 # ---------------------------------------------------------------------------
-
-
-
-
 
 
 @pytest.mark.parametrize("bad", [129, -1])
@@ -6223,7 +6835,9 @@ def test_the_drafter_wide_max_rows_knobs_reach_only_the_fixed_gemm_table(rows, t
         ("tep8_drafter_wide_gemms__SITES", "", "non-empty comma-separated subset"),
     ],
 )
-def test_the_drafter_wide_max_rows_parameters_refuse_values_outside_their_kernel(knob, value, message):
+def test_the_drafter_wide_max_rows_parameters_refuse_values_outside_their_kernel(
+    knob, value, message
+):
     with pytest.raises(ValueError, match=message):
         table((107, 8), 8, "gen", "windowed", knobs(**{knob: value}))
 
@@ -6302,21 +6916,37 @@ def test_fixed_gemm_tep8_drafter_max_rows_refusals():
     host = _fixed_gemm_host()
     on = dict(tep8_wide64=True, tep8_drafter_wide=True)
     host.configure(**on, tep8_drafter_max_rows=96, tep8_drafter_wide_tile="64x128")
-    before = (dict(host.SM107_SPLITK_TACTICS), host.MAX_M, host.TEP8_DRAFTER_MAX_ROWS,
-              host.TEP8_DRAFTER_WIDE_TILE, host.TEP8_DRAFTER_WIDE_SITES)
+    before = (
+        dict(host.SM107_SPLITK_TACTICS),
+        host.MAX_M,
+        host.TEP8_DRAFTER_MAX_ROWS,
+        host.TEP8_DRAFTER_WIDE_TILE,
+        host.TEP8_DRAFTER_WIDE_SITES,
+    )
     for kwargs, match in (
         (dict(on, tep8_drafter_max_rows=63), "must be in 64..128"),
         (dict(on, tep8_drafter_max_rows=129), "must be in 64..128"),
-        (dict(tep8_wide64=True, tep8_drafter_max_rows=72), "needs tep8_wide64 and tep8_drafter_wide"),
-        (dict(tep8_drafter_wide=True, tep8_drafter_max_rows=72), "needs tep8_wide64 and tep8_drafter_wide"),
+        (
+            dict(tep8_wide64=True, tep8_drafter_max_rows=72),
+            "needs tep8_wide64 and tep8_drafter_wide",
+        ),
+        (
+            dict(tep8_drafter_wide=True, tep8_drafter_max_rows=72),
+            "needs tep8_wide64 and tep8_drafter_wide",
+        ),
         (dict(on, tep8_drafter_wide_tile="128x128"), "tep8_drafter_wide_tile"),
         (dict(on, tep8_drafter_wide_sites=()), "tep8_drafter_wide_sites"),
         (dict(on, tep8_drafter_wide_sites=("qkv", "fc")), "tep8_drafter_wide_sites"),
     ):
         with pytest.raises(ValueError, match=match):
             host.configure(**kwargs)
-        assert before == (dict(host.SM107_SPLITK_TACTICS), host.MAX_M, host.TEP8_DRAFTER_MAX_ROWS,
-                          host.TEP8_DRAFTER_WIDE_TILE, host.TEP8_DRAFTER_WIDE_SITES), kwargs
+        assert before == (
+            dict(host.SM107_SPLITK_TACTICS),
+            host.MAX_M,
+            host.TEP8_DRAFTER_MAX_ROWS,
+            host.TEP8_DRAFTER_WIDE_TILE,
+            host.TEP8_DRAFTER_WIDE_SITES,
+        ), kwargs
 
 
 def test_fixed_gemm_wide_launch_tactics_resolve_only_the_one_launch_rows():
@@ -6349,7 +6979,9 @@ def test_the_drafter_deep_stages_knob_reaches_only_the_fixed_gemm_table():
         assert values["tep8_drafter_deep_stages"] is defaults["tep8_drafter_deep_stages"] is False
     ll16 = _ll_on(16, VR_TEP8)
     plain = table((107, 8), 16, "gen", "windowed", ll16)
-    moved = table((107, 8), 16, "gen", "windowed", {**ll16, **knobs(tep8_drafter_wide_gemms__DEEP_STAGES=1)})
+    moved = table(
+        (107, 8), 16, "gen", "windowed", {**ll16, **knobs(tep8_drafter_wide_gemms__DEEP_STAGES=1)}
+    )
     assert moved.paths() == plain.paths() and rule_levers_on(moved) == rule_levers_on(plain)
     calls, before = _settings(moved), _settings(plain)
     assert calls[_FIXED_GEMM][0] == {**before[_FIXED_GEMM][0], "tep8_drafter_deep_stages": True}
@@ -6370,10 +7002,15 @@ def test_fixed_gemm_deep_stages_move_only_stages_of_the_listed_entries():
     their tile and split_k (the same bits); every other entry (the 8-row cell, the fc shard, 65+ rows, the
     unlisted sites) is the plain table's; without tep8_drafter_wide the knob is refused and nothing is set."""
     host = _fixed_gemm_host()
-    host.configure(tep8_wide64=True, tep8_drafter_wide=True, tep8_fc_wide=True, tep8_drafter_max_rows=128)
+    host.configure(
+        tep8_wide64=True, tep8_drafter_wide=True, tep8_fc_wide=True, tep8_drafter_max_rows=128
+    )
     plain = dict(host.SM107_SPLITK_TACTICS)
     host.configure(
-        tep8_wide64=True, tep8_drafter_wide=True, tep8_fc_wide=True, tep8_drafter_max_rows=128,
+        tep8_wide64=True,
+        tep8_drafter_wide=True,
+        tep8_fc_wide=True,
+        tep8_drafter_max_rows=128,
         tep8_drafter_deep_stages=True,
     )
     deep = dict(host.SM107_SPLITK_TACTICS)
@@ -6397,7 +7034,8 @@ def test_fixed_gemm_deep_stages_move_only_stages_of_the_listed_entries():
     with pytest.raises(ValueError, match="DEEP_STAGES"):
         host.configure(tep8_wide64=True, tep8_fc_wide=True, tep8_drafter_deep_stages=True)
     assert host.TEP8_DRAFTER_DEEP_STAGES is False and host.SM107_SPLITK_TACTICS == {
-        **host._SM107_SPLITK_TACTICS_BASE, **{k: v for k, v in host.SM107_TP8_DRAFTER_WIDE_TACTICS.items()}
+        **host._SM107_SPLITK_TACTICS_BASE,
+        **{k: v for k, v in host.SM107_TP8_DRAFTER_WIDE_TACTICS.items()},
     }
     src = (_TARGET / "ops/gemm/fixed_low_m_gemm.py").read_text()
     assert "def deep_stage_tactics(" in src and "validate_tactic(candidate, rows, n, k)" in src
@@ -6422,12 +7060,18 @@ def test_the_wide_drafter_hops_tep8_max_rows_defaults_to_the_served_rows():
         assert base.on("wide_drafter_hops"), (key, mbs)
         assert base.param("wide_drafter_hops", "TEP8_MAX_ROWS") == 64, (key, mbs)
         values, defaults = _settings(base)[_DRAFTER_HOPS]
-        stock = {"tep8_wide_max_rows": 64, "tep8_two_shot_min_rows": 0, "tep8_two_shot_max_rows": 128}
+        stock = {
+            "tep8_wide_max_rows": 64,
+            "tep8_two_shot_min_rows": 0,
+            "tep8_two_shot_max_rows": 128,
+        }
         assert defaults == stock, (key, mbs)
         # int5: a TEP8 generation server of 9..16 requests runs the two-shot hop on 25..64 rows.
         wide = key == (107, 8) and mbs == 16
-        assert values == ({**stock, "tep8_two_shot_min_rows": 25, "tep8_two_shot_max_rows": 64} if wide else stock), (key, mbs)
-    baseline = table((107, 8), 8, "gen", "windowed", BASELINE)
+        assert values == (
+            {**stock, "tep8_two_shot_min_rows": 25, "tep8_two_shot_max_rows": 64} if wide else stock
+        ), (key, mbs)
+    baseline = table((107, 8), 8, "gen", "windowed", ALL_OFF)
     assert not baseline.on("wide_drafter_hops")
     values, defaults = _settings(baseline)[_DRAFTER_HOPS]
     assert values == defaults
@@ -6439,13 +7083,19 @@ def test_the_wide_drafter_hops_tep8_max_rows_knob_reaches_only_the_hops(rows):
     no path; it reaches the hops module's ``configure`` and nothing else."""
     ll16 = _ll_on(16, VR_TEP8)
     plain = table((107, 8), 16, "gen", "windowed", ll16)
-    moved = table((107, 8), 16, "gen", "windowed", {**ll16, **knobs(wide_drafter_hops__TEP8_MAX_ROWS=rows)})
+    moved = table(
+        (107, 8), 16, "gen", "windowed", {**ll16, **knobs(wide_drafter_hops__TEP8_MAX_ROWS=rows)}
+    )
     assert moved.paths() == plain.paths()
     assert rule_levers_on(moved) == rule_levers_on(plain)
     assert moved.param("wide_drafter_hops", "TEP8_MAX_ROWS") == rows
     calls, before = _settings(moved), _settings(plain)
     # (the int5 two-shot band 25..64 at 9..16 requests rides along)
-    assert calls[_DRAFTER_HOPS][0] == {"tep8_wide_max_rows": rows, "tep8_two_shot_min_rows": 25, "tep8_two_shot_max_rows": 64}
+    assert calls[_DRAFTER_HOPS][0] == {
+        "tep8_wide_max_rows": rows,
+        "tep8_two_shot_min_rows": 25,
+        "tep8_two_shot_max_rows": 64,
+    }
     assert {m: c for m, c in calls.items() if m != _DRAFTER_HOPS} == {
         m: c for m, c in before.items() if m != _DRAFTER_HOPS
     }
@@ -6463,7 +7113,13 @@ def test_drafter_hops_tep8_wide_max_rows_sizes_only_tep8_workspaces():
     outside raises and sets nothing."""
     host = _host_module(
         _TARGET / "kernels/drafter_hops/hops.py",
-        ("TEP8_WIDE_MAX_ROWS", "TEP8_WIDE_ROWS_BAND", "TEP8_TWO_SHOT_MIN_ROWS", "TWO_SHOT_MAX_ROWS", "TEP8_TWO_SHOT_MAX_ROWS"),
+        (
+            "TEP8_WIDE_MAX_ROWS",
+            "TEP8_WIDE_ROWS_BAND",
+            "TEP8_TWO_SHOT_MIN_ROWS",
+            "TWO_SHOT_MAX_ROWS",
+            "TEP8_TWO_SHOT_MAX_ROWS",
+        ),
         ("configure", "wide_rows"),
     )
     assert host.TEP8_WIDE_MAX_ROWS == 64 and host.TEP8_WIDE_ROWS_BAND == (64, 128)
@@ -6592,7 +7248,10 @@ def test_the_drafter_prefetch_defaults_to_off():
         assert base.param("tep8_drafter_wide_gemms", "PREFETCH") == 0, (mbs, arena)
         assert base.param("tep8_drafter_wide_gemms", "PREFETCH_MIN_ROWS") == 1, (mbs, arena)
         values, defaults = _settings(base)[_DRAFTER_PREFETCH]
-        assert values == defaults == {"level": 0, "min_rows": 1, "weights": _ALL_PREFETCH}, (mbs, arena)
+        assert values == defaults == {"level": 0, "min_rows": 1, "weights": _ALL_PREFETCH}, (
+            mbs,
+            arena,
+        )
         assert base.param("tep8_drafter_wide_gemms", "PREFETCH_WEIGHTS") == _ALL_PREFETCH
     for key, mbs in (((107, 8), 16), ((107, 4), 8)):
         values, defaults = _settings(table(key, mbs, "gen", "windowed"))[_DRAFTER_PREFETCH]
@@ -6610,7 +7269,11 @@ def test_the_drafter_prefetch_knobs_reach_only_the_prefetch_module(level, min_ro
     assert moved.paths() == plain.paths()
     assert rule_levers_on(moved) == rule_levers_on(plain)
     calls, before = _settings(moved), _settings(plain)
-    assert calls[_DRAFTER_PREFETCH][0] == {"level": level, "min_rows": min_rows, "weights": _ALL_PREFETCH}
+    assert calls[_DRAFTER_PREFETCH][0] == {
+        "level": level,
+        "min_rows": min_rows,
+        "weights": _ALL_PREFETCH,
+    }
     subset = table(
         (107, 8), 16, "gen", "windowed",
         {**ll16, **set_, **knobs(tep8_drafter_wide_gemms__PREFETCH_WEIGHTS="down,o_proj,qkv")},
@@ -6709,7 +7372,7 @@ def test_the_block_decode_forks_and_joins_the_drafter_prefetch():
     assert i_win < body.index('prefetch.fork("mlp"') < body.index("hops.attention(")
     i_join = body.index("prefetch.join()")
     assert i_join < body.index("return prenormed") and i_join < body.index("hidden_states_out, _ =")
-    assert '_drafter_l2_prefetch' in body
+    assert "_drafter_l2_prefetch" in body
 
 
 # --------------------------------------------------------------------------
@@ -6721,7 +7384,11 @@ _FOLD = "kernels.verify_fold.fold"
 
 
 def test_the_paged_commit_defaults_to_off():
-    for key, mbs, arena in (((107, 8), 8, "paged"), ((107, 8), 8, "windowed"), ((107, 4), 8, "paged")):
+    for key, mbs, arena in (
+        ((107, 8), 8, "paged"),
+        ((107, 8), 8, "windowed"),
+        ((107, 4), 8, "paged"),
+    ):
         base = table(key, mbs, "gen", arena)
         assert base.param("drafter_kv_fork_before_head", "PAGED_COMMIT") == 0, (key, mbs, arena)
         # The verify fold has no setting of its own: the preamble rides on paged_context_commit.
@@ -6734,7 +7401,9 @@ def test_the_paged_commit_knob_is_an_alias_that_configures_nothing(arena):
     # context_kv_fork): it configures nothing (the preamble rides on paged_context_commit itself).
     ll16 = _ll_on(16, VR_TEP8_DENSE)  # drafter_kv_glue refuses a paged context
     plain = table((107, 8), 16, "gen", arena, ll16)
-    moved = table((107, 8), 16, "gen", arena, {**ll16, **knobs(drafter_kv_fork_before_head__PAGED_COMMIT=1)})
+    moved = table(
+        (107, 8), 16, "gen", arena, {**ll16, **knobs(drafter_kv_fork_before_head__PAGED_COMMIT=1)}
+    )
     assert moved.on("drafter_kv_fork_before_head")
     assert moved.param("drafter_kv_fork_before_head", "PAGED_COMMIT") == 1
     assert moved.paths() == plain.paths() and rule_levers_on(moved) == rule_levers_on(plain)
@@ -6742,9 +7411,17 @@ def test_the_paged_commit_knob_is_an_alias_that_configures_nothing(arena):
     assert _FOLD not in calls
     assert calls == before
     source = (_TARGET / "drafter.py").read_text()
-    assert 'PAGED_COMMIT=1: alias of "' in source and 'plan.enabled("paged_context_commit")' in source
-    # Off with the lever (an aggregated mbs16 server under auto; the TEP8 gen role runs it at 9..16): nothing.
-    off = table((107, 8), 16, "agg", arena, knobs(drafter_kv_fork_before_head__PAGED_COMMIT=1))
+    assert (
+        'PAGED_COMMIT=1: alias of "' in source and 'plan.enabled("paged_context_commit")' in source
+    )
+    # Off with the lever (bitwise, so on by default wherever it can run: off by its knob): nothing.
+    off = table(
+        (107, 8),
+        16,
+        "agg",
+        arena,
+        knobs(drafter_kv_fork_before_head="off", drafter_kv_fork_before_head__PAGED_COMMIT=1),
+    )
     assert not off.on("drafter_kv_fork_before_head")
     assert _FOLD not in _settings(off)
 
@@ -6785,29 +7462,46 @@ def test_the_paged_commit_refusal_and_routing_on_the_host():
             return n
 
     fork = ns(rows=_T((64,), "i64"))
-    worker = types.SimpleNamespace(_ctx_paged=True, _ctx_block_tables=object(), _ctx_block_counts=object(),
-                                   _ctx_page_size=32)
+    worker = types.SimpleNamespace(
+        _ctx_paged=True, _ctx_block_tables=object(), _ctx_block_counts=object(), _ctx_page_size=32
+    )
     worker._kv_fork = fork
     fold = ns(query_positions=_T((12, 8), "i64"), gen_rows=_T((12,), "i64"))
     meta = ns(_seq_lens_cuda=_T((16,), "i32"))
     assert host._paged_preamble_refusal(worker, fold, meta, 12, 8) is None
     for rows in (_T((13,), "i64"), _T((12,), "i64", contiguous=False), _T((12,), "f32")):
-        assert "batch rows" in host._paged_preamble_refusal(worker, ns(**{**vars(fold), "gen_rows": rows}), meta, 12, 8)
-    assert "not paged" in host._paged_preamble_refusal(ns(**{**vars(worker), "_ctx_paged": False}), fold, meta, 12, 8)
-    assert "exceed" in host._paged_preamble_refusal(worker, ns(query_positions=_T((65, 8), "i64")), meta, 65, 8)
+        assert "batch rows" in host._paged_preamble_refusal(
+            worker, ns(**{**vars(fold), "gen_rows": rows}), meta, 12, 8
+        )
+    assert "not paged" in host._paged_preamble_refusal(
+        ns(**{**vars(worker), "_ctx_paged": False}), fold, meta, 12, 8
+    )
+    assert "exceed" in host._paged_preamble_refusal(
+        worker, ns(query_positions=_T((65, 8), "i64")), meta, 65, 8
+    )
     rows = _T((12,), "i64")
-    assert "query positions" in host._paged_preamble_refusal(worker, ns(query_positions=_T((12, 7), "i64"), gen_rows=rows), meta, 12, 8)
-    assert "query positions" in host._paged_preamble_refusal(worker, ns(query_positions=_T((12, 8), "i32"), gen_rows=rows), meta, 12, 8)
-    assert "_seq_lens_cuda" in host._paged_preamble_refusal(worker, fold, ns(_seq_lens_cuda=_T((8,), "i32")), 12, 8)
+    assert "query positions" in host._paged_preamble_refusal(
+        worker, ns(query_positions=_T((12, 7), "i64"), gen_rows=rows), meta, 12, 8
+    )
+    assert "query positions" in host._paged_preamble_refusal(
+        worker, ns(query_positions=_T((12, 8), "i32"), gen_rows=rows), meta, 12, 8
+    )
+    assert "_seq_lens_cuda" in host._paged_preamble_refusal(
+        worker, fold, ns(_seq_lens_cuda=_T((8,), "i32")), 12, 8
+    )
     no_counts = types.SimpleNamespace(**{**vars(worker), "_ctx_block_counts": None})
     assert "block counts" in host._paged_preamble_refusal(no_counts, fold, meta, 12, 8)
-    no_tables = types.SimpleNamespace(**{**vars(worker), "_ctx_block_tables": None, "_ctx_block_counts": None})
+    no_tables = types.SimpleNamespace(
+        **{**vars(worker), "_ctx_block_tables": None, "_ctx_block_counts": None}
+    )
     assert host._paged_preamble_refusal(no_tables, fold, meta, 12, 8) is None
     # The prepare's routing (source): the commit + preamble launch whenever paged_context_commit takes
     # the step's commit (fork._commits_paged), the drafter's own batch index (the rows with block tables,
     # as _drafter_inputs gives it), a refusal logged once per reason, the engaged path one INFO line.
     src = (_TARGET / "kernels/verify_fold/fold.py").read_text()
-    body = src[src.index("    def _fold_forked_inputs(") : src.index("    def _path_walk_tail_args(")]
+    body = src[
+        src.index("    def _fold_forked_inputs(") : src.index("    def _path_walk_tail_args(")
+    ]
     assert "if self._ctx_paged and fork._commits_paged(self, slots, gen_num_accepted):" in body
     assert "num_ctx, i32s = fork.commit_paged_preamble(" in body
     # The drafter's batch index is hoisted into batch_idx (feat's commit_with_preamble takes it too).
@@ -6836,10 +7530,15 @@ def test_the_finish_norm_defaults_to_off_and_reaches_only_the_block_decode():
         assert values == defaults == {"finish_norm": False, "qk_fold": False}
     ll16 = _ll_on(16, VR_TEP8)
     plain = table((107, 8), 16, "gen", "windowed", ll16)
-    moved = table((107, 8), 16, "gen", "windowed", {**ll16, **knobs(tep8_drafter_wide_gemms__FINISH_NORM=1)})
+    moved = table(
+        (107, 8), 16, "gen", "windowed", {**ll16, **knobs(tep8_drafter_wide_gemms__FINISH_NORM=1)}
+    )
     assert moved.paths() == plain.paths() and rule_levers_on(moved) == rule_levers_on(plain)
     calls, before = _settings(moved), _settings(plain)
-    assert calls[_BLOCK_DECODE][0] == {"finish_norm": True, "qk_fold": False}  # int7: QK fold off again at 9..16
+    assert calls[_BLOCK_DECODE][0] == {
+        "finish_norm": True,
+        "qk_fold": False,
+    }  # int7: QK fold off again at 9..16
     assert {m: c for m, c in calls.items() if m != _BLOCK_DECODE} == {
         m: c for m, c in before.items() if m != _BLOCK_DECODE
     }
@@ -6859,9 +7558,16 @@ def test_the_block_decode_routes_the_hop_tails_through_finish_norm():
     assert body.count("_finish_norm(") == 2 and body.count("if FINISH_NORM and has_block_conv") == 2
     i_attn = body.index("hidden_out = attn_mod.o_proj(attn_output)")
     i_fused = body.index("layer.post_attention_layernorm,\n", i_attn)
-    assert i_attn < i_fused < body.index("hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)")
-    i_mlp = body.index("hidden_out = layer.mlp(hidden_out)")
-    assert i_mlp < body.index("self.mlp_convs[layer_idx], next_norm, hidden_out, mlp_conv_coefficients", i_mlp)
+    assert (
+        i_attn
+        < i_fused
+        < body.index("hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)")
+    )
+    # The call's arguments in order, whatever the formatter's line breaks.
+    flat = " ".join(body.split())
+    assert flat.index("hidden_out = layer.mlp(hidden_out)") < flat.index(
+        "self.mlp_convs[layer_idx], next_norm, hidden_out, mlp_conv_coefficients"
+    )
     assert "prenormed = fused" in body and "prenormed = None" in body
     assert "if hops is not None or prenormed is not None:" in body
     host = _host_module(
@@ -6896,11 +7602,16 @@ def test_the_qk_fold_knob_and_its_block_decode_routing():
     values, defaults = _settings(base)[_BLOCK_DECODE]
     assert values == defaults == {"finish_norm": False, "qk_fold": False}
     ll16 = _ll_on(16, VR_TEP8)
-    moved = table((107, 8), 16, "gen", "windowed", {**ll16, **knobs(tep8_drafter_wide_gemms__QK_FOLD=1)})
+    moved = table(
+        (107, 8), 16, "gen", "windowed", {**ll16, **knobs(tep8_drafter_wide_gemms__QK_FOLD=1)}
+    )
     assert _settings(moved)[_BLOCK_DECODE][0] == {"finish_norm": False, "qk_fold": True}
     src = (_TARGET / "kernels/drafter_block_decode/block_decode.py").read_text()
     assert 'qk_fold = self.__dict__.get("_dr3_qf") if not plain_qf else None' in src
-    assert 'qk_fold = self.__dict__.get("_dr3_qf") if QK_FOLD and plain_qf and wide is None else None' in src
+    assert (
+        'qk_fold = self.__dict__.get("_dr3_qf") if QK_FOLD and plain_qf and wide is None else None'
+        in src
+    )
     folds = (_TARGET / "kernels/dr3_folds/folds.py").read_text()
     assert 'draft_model.__dict__["_dr3_qf_plain"] = True' in folds
     assert "tep8_drafter_wide_gemms__QK_FOLD cannot run here" in folds
@@ -6916,13 +7627,28 @@ def test_the_pdl_conv_max_rows_knob_and_candidates():
     assert values == defaults == {"conv_max_rows": 32, "selector_max_rows": 7}
     ll16 = _ll_on(16, VR_TEP8)
     plain = table((107, 8), 16, "gen", "windowed", ll16)
-    moved = table((107, 8), 16, "gen", "windowed", {**ll16, **knobs(tep8_drafter_wide_gemms__PDL_CONV_MAX_ROWS=64)})
+    moved = table(
+        (107, 8),
+        16,
+        "gen",
+        "windowed",
+        {**ll16, **knobs(tep8_drafter_wide_gemms__PDL_CONV_MAX_ROWS=64)},
+    )
     calls, before = _settings(moved), _settings(plain)
     assert calls[chain][0] == {"conv_max_rows": 64, "selector_max_rows": 7}
-    assert {m: c for m, c in calls.items() if m != chain} == {m: c for m, c in before.items() if m != chain}
+    assert {m: c for m, c in calls.items() if m != chain} == {
+        m: c for m, c in before.items() if m != chain
+    }
     host = _host_module(
         _TARGET / "kernels/drafter_pdl_chain/chain.py",
-        ("ROWS", "ENTRY_ROW_CANDIDATES", "CONV_MAX_ROWS", "HEAD_ROWS", "SELECTOR_MAX_ROWS", "SELECTOR_LIMIT"),
+        (
+            "ROWS",
+            "ENTRY_ROW_CANDIDATES",
+            "CONV_MAX_ROWS",
+            "HEAD_ROWS",
+            "SELECTOR_MAX_ROWS",
+            "SELECTOR_LIMIT",
+        ),
         ("configure", "conv_candidates"),
     )
     assert host.conv_candidates() == (8, 16, 24, 32)
@@ -6948,14 +7674,30 @@ def test_the_selector_fork_max_rows_knob_and_rows():
     ll16 = _ll_on(16, VR_TEP8)
     plain = table((107, 8), 16, "gen", "windowed", ll16)
     moved = table(
-        (107, 8), 16, "gen", "windowed", {**ll16, **knobs(tep8_drafter_wide_gemms__SELECTOR_FORK_MAX_ROWS=112)}
+        (107, 8),
+        16,
+        "gen",
+        "windowed",
+        {**ll16, **knobs(tep8_drafter_wide_gemms__SELECTOR_FORK_MAX_ROWS=112)},
     )
     calls, before = _settings(moved), _settings(plain)
-    assert calls[chain][0] == {"conv_max_rows": 64, "selector_max_rows": 112}  # conv entry 64: int5 at 9..16
-    assert {m: c for m, c in calls.items() if m != chain} == {m: c for m, c in before.items() if m != chain}
+    assert calls[chain][0] == {
+        "conv_max_rows": 64,
+        "selector_max_rows": 112,
+    }  # conv entry 64: int5 at 9..16
+    assert {m: c for m, c in calls.items() if m != chain} == {
+        m: c for m, c in before.items() if m != chain
+    }
     host = _host_module(
         _TARGET / "kernels/drafter_pdl_chain/chain.py",
-        ("ROWS", "ENTRY_ROW_CANDIDATES", "CONV_MAX_ROWS", "HEAD_ROWS", "SELECTOR_MAX_ROWS", "SELECTOR_LIMIT"),
+        (
+            "ROWS",
+            "ENTRY_ROW_CANDIDATES",
+            "CONV_MAX_ROWS",
+            "HEAD_ROWS",
+            "SELECTOR_MAX_ROWS",
+            "SELECTOR_LIMIT",
+        ),
         ("configure", "selector_forks"),
     )
     assert host.HEAD_ROWS == 7 and host.SELECTOR_MAX_ROWS == 7 and host.SELECTOR_LIMIT == 112
@@ -6975,7 +7717,6 @@ def test_the_selector_fork_max_rows_knob_and_rows():
     assert "if source.shape[0] > HEAD_ROWS and not self.refused:" in src
 
 
-
 def test_the_drafter_two_shot_hop_knob_and_routing():
     """wide_drafter_hops__TEP8_TWO_SHOT_MIN_ROWS (0 or 9..128, default 0) reaches only the hops' configure; the
     hops route forwards of MIN..TWO_SHOT_MAX_ROWS rows to the two-shot workspace ahead of the wide one; the kernel's
@@ -6983,15 +7724,33 @@ def test_the_drafter_two_shot_hop_knob_and_routing():
     base = table((107, 8), 8, "gen", "windowed")
     assert base.param("wide_drafter_hops", "TEP8_TWO_SHOT_MIN_ROWS") == 0
     ll16 = _ll_on(16, VR_TEP8)
-    moved = table((107, 8), 16, "gen", "windowed", {**ll16, **knobs(wide_drafter_hops__TEP8_TWO_SHOT_MIN_ROWS=17)})
+    moved = table(
+        (107, 8),
+        16,
+        "gen",
+        "windowed",
+        {**ll16, **knobs(wide_drafter_hops__TEP8_TWO_SHOT_MIN_ROWS=17)},
+    )
     # (the two-shot cap 64 is the int5 default at 9..16 requests)
-    assert _settings(moved)[_DRAFTER_HOPS][0] == {"tep8_wide_max_rows": 64, "tep8_two_shot_min_rows": 17, "tep8_two_shot_max_rows": 64}
+    assert _settings(moved)[_DRAFTER_HOPS][0] == {
+        "tep8_wide_max_rows": 64,
+        "tep8_two_shot_min_rows": 17,
+        "tep8_two_shot_max_rows": 64,
+    }
     for bad in (1, 8, 129):
         with pytest.raises(ValueError, match="TEP8_TWO_SHOT_MIN_ROWS"):
-            table((107, 8), 8, "gen", "windowed", knobs(wide_drafter_hops__TEP8_TWO_SHOT_MIN_ROWS=bad))
+            table(
+                (107, 8), 8, "gen", "windowed", knobs(wide_drafter_hops__TEP8_TWO_SHOT_MIN_ROWS=bad)
+            )
     host = _host_module(
         _TARGET / "kernels/drafter_hops/hops.py",
-        ("TEP8_WIDE_MAX_ROWS", "TEP8_WIDE_ROWS_BAND", "TEP8_TWO_SHOT_MIN_ROWS", "TWO_SHOT_MAX_ROWS", "TEP8_TWO_SHOT_MAX_ROWS"),
+        (
+            "TEP8_WIDE_MAX_ROWS",
+            "TEP8_WIDE_ROWS_BAND",
+            "TEP8_TWO_SHOT_MIN_ROWS",
+            "TWO_SHOT_MAX_ROWS",
+            "TEP8_TWO_SHOT_MAX_ROWS",
+        ),
         ("configure",),
     )
     host.configure(tep8_two_shot_min_rows=24)
@@ -7009,17 +7768,30 @@ def test_the_drafter_two_shot_hop_knob_and_routing():
             host.configure(tep8_two_shot_min_rows=lo, tep8_two_shot_max_rows=hi)
         assert (host.TEP8_TWO_SHOT_MIN_ROWS, host.TEP8_TWO_SHOT_MAX_ROWS) == (25, 64)
     capped = table(
-        (107, 8), 16, "gen", "windowed",
-        {**ll16, **knobs(wide_drafter_hops__TEP8_TWO_SHOT_MIN_ROWS=25, wide_drafter_hops__TEP8_TWO_SHOT_MAX_ROWS=64)},
+        (107, 8),
+        16,
+        "gen",
+        "windowed",
+        {
+            **ll16,
+            **knobs(
+                wide_drafter_hops__TEP8_TWO_SHOT_MIN_ROWS=25,
+                wide_drafter_hops__TEP8_TWO_SHOT_MAX_ROWS=64,
+            ),
+        },
     )
     assert _settings(capped)[_DRAFTER_HOPS][0] == {
-        "tep8_wide_max_rows": 64, "tep8_two_shot_min_rows": 25, "tep8_two_shot_max_rows": 64
+        "tep8_wide_max_rows": 64,
+        "tep8_two_shot_min_rows": 25,
+        "tep8_two_shot_max_rows": 64,
     }
     for bad in (8, 129):
         with pytest.raises(ValueError, match="TEP8_TWO_SHOT_MAX_ROWS"):
-            table((107, 8), 8, "gen", "windowed", knobs(wide_drafter_hops__TEP8_TWO_SHOT_MAX_ROWS=bad))
+            table(
+                (107, 8), 8, "gen", "windowed", knobs(wide_drafter_hops__TEP8_TWO_SHOT_MAX_ROWS=bad)
+            )
     src = (_TARGET / "kernels/drafter_hops/hops.py").read_text()
-    takes = src[src.index("    def takes(self, rows: int"): src.index("    def begin_forward(")]
+    takes = src[src.index("    def takes(self, rows: int") : src.index("    def begin_forward(")]
     assert takes.index("self.two_shot is not None") < takes.index("if self.wide is not None")
     assert "self.two_shot_min_rows <= rows <= self.two_shot_max_rows" in takes
     assert "call.two_shot_max_rows = min(TEP8_TWO_SHOT_MAX_ROWS, call.two_shot.max_rows)" in src
@@ -7051,11 +7823,15 @@ def test_the_silu_fold_knob_reaches_only_the_fold():
         assert values == defaults == {"silu_fold": False}
     ll16 = _ll_on(16, VR_TEP8)
     plain = table((107, 8), 16, "gen", "windowed", ll16)
-    moved = table((107, 8), 16, "gen", "windowed", {**ll16, **knobs(tep8_drafter_wide_gemms__SILU_FOLD=1)})
+    moved = table(
+        (107, 8), 16, "gen", "windowed", {**ll16, **knobs(tep8_drafter_wide_gemms__SILU_FOLD=1)}
+    )
     assert moved.paths() == plain.paths() and rule_levers_on(moved) == rule_levers_on(plain)
     calls, before = _settings(moved), _settings(plain)
     assert calls[_SILU_FOLD][0] == {"silu_fold": True}
-    assert {m: c for m, c in calls.items() if m != _SILU_FOLD} == {m: c for m, c in before.items() if m != _SILU_FOLD}
+    assert {m: c for m, c in calls.items() if m != _SILU_FOLD} == {
+        m: c for m, c in before.items() if m != _SILU_FOLD
+    }
     off = table((107, 8), 16, "agg", "windowed", knobs(tep8_drafter_wide_gemms__SILU_FOLD=1))
     assert not off.on("tep8_drafter_wide_gemms")
     values, defaults = _settings(off)[_SILU_FOLD]
@@ -7081,18 +7857,29 @@ def test_the_silu_fold_routing_and_its_loud_refusals():
     host.configure(silu_fold=True)
     assert host.SILU_FOLD is True
     table_ = {
-        (8, 8192, 7168): (64, 16, 1, 9), (16, 8192, 7168): (64, 16, 1, 11), (64, 8192, 7168): (64, 64, 1, 7),
-        (72, 8192, 7168): (64, 128, 1, 7), (8, 8192, 2048): (64, 8, 4, 10),
+        (8, 8192, 7168): (64, 16, 1, 9),
+        (16, 8192, 7168): (64, 16, 1, 11),
+        (64, 8192, 7168): (64, 64, 1, 7),
+        (72, 8192, 7168): (64, 128, 1, 7),
+        (8, 8192, 2048): (64, 8, 4, 10),
     }
     linear = types.SimpleNamespace(quant_method=types.SimpleNamespace(tactics=table_))
     entries = host._gate_up_entries(linear, 8192, 7168)
     assert set(entries) == {8, 16, 64}  # 72 rows: above the fold; other shapes: other sites
     fold = host.SiluFold(64, {8: "t8", 64: "t64"}, 3)
-    assert fold.half == 32 and fold.tactic(64) == "t64" and fold.tactic(72) is None and fold.version == 3
+    assert (
+        fold.half == 32
+        and fold.tactic(64) == "t64"
+        and fold.tactic(72) is None
+        and fold.version == 3
+    )
     src = (_TARGET / "kernels/drafter_silu_fold/fold.py").read_text()
-    body = src[src.index("def folded_forward("):]
+    body = src[src.index("def folded_forward(") :]
     assert "if tactic is not None and takes(flat, weight, tactic):" in body
-    assert "fold.refused(rows, " in body and "drafter_silu_and_mul(h.reshape(-1, h.shape[-1]), False, fold.half)" in body
+    assert (
+        "fold.refused(rows, " in body
+        and "drafter_silu_and_mul(h.reshape(-1, h.shape[-1]), False, fold.half)" in body
+    )
     assert "tep8_drafter_wide_gemms__SILU_FOLD: the {rows}-row drafter MLP did not take the" in src
     assert "tep8_drafter_wide_gemms__SILU_FOLD cannot run here: " in src
     assert "weight.data.copy_(interleave_gate_up(weight.data, mma_m))" in src
@@ -7100,23 +7887,36 @@ def test_the_silu_fold_routing_and_its_loud_refusals():
     assert "if weight._version != fold.version:" in body and "a weight reload?" in body
     # A load hook after a reload through .data (which _version does not see) finds the fingerprint changed and
     # interleaves again instead of keeping the fold on plain rows.
-    install = src[src.index("def install("):src.index("def folded_forward(")]
+    install = src[src.index("def install(") : src.index("def folded_forward(")]
     assert "if isinstance(fold, SiluFold) and not _still_interleaved(layer.mlp, fold):" in install
-    assert install.index("_still_interleaved(") < install.index("reason = unsupported_reason(draft_model)")
+    assert install.index("_still_interleaved(") < install.index(
+        "reason = unsupported_reason(draft_model)"
+    )
     assert "return weight.detach()[mma_m // 2, :FINGERPRINT].clone()" in src
-    for needle in ("not the PDL chain's MLP (select drafter_pdl_chain)", "already runs drafter_folds' silu fold",
-                   "mix kernel-M tiles", "has no fold (split_k > 1 or no stage fits)"):
+    for needle in (
+        "not the PDL chain's MLP (select drafter_pdl_chain)",
+        "already runs drafter_folds' silu fold",
+        "mix kernel-M tiles",
+        "has no fold (split_k > 1 or no stage fits)",
+    ):
         assert needle in src, needle
     chain = (_TARGET / "kernels/drafter_pdl_chain/chain.py").read_text()
-    forward = chain[chain.index("class EntryTriggerGatedMLP"):chain.index("def _mlp_reason")]
-    assert forward.index('self.__dict__.get("_silu_fold")') < forward.index('self.__dict__.get("_dr3_sf")')
+    forward = chain[chain.index("class EntryTriggerGatedMLP") : chain.index("def _mlp_reason")]
+    assert forward.index('self.__dict__.get("_silu_fold")') < forward.index(
+        'self.__dict__.get("_dr3_sf")'
+    )
     drafter = (_TARGET / "drafter.py").read_text()
     assert drafter.index("_drafter_pdl.install(shell.llm, shell._mapping)") < drafter.index(
-        "_silu_fold.install(getattr(shell.llm, \"draft_model\", None))"
+        '_silu_fold.install(getattr(shell.llm, "draft_model", None))'
     )
     gemm = (_TARGET / "ops/gemm/silu_fold_gemm.py").read_text()
-    assert "class SiluFoldKernel(_splitk.SplitKDenseGemmKernel):" in gemm  # this target's kernel (wide64, oversized)
-    assert "_splitk._smem_bytes(candidate, stages) + _stage_bytes(candidate) + 1024 <= _splitk._SMEM_CAPACITY_BYTES" in gemm
+    assert (
+        "class SiluFoldKernel(_splitk.SplitKDenseGemmKernel):" in gemm
+    )  # this target's kernel (wide64, oversized)
+    assert (
+        "_splitk._smem_bytes(candidate, stages) + _stage_bytes(candidate) + 1024 <= _splitk._SMEM_CAPACITY_BYTES"
+        in gemm
+    )
     assert "if t.split_k != 1 or t.mma_m not in (64, 128):" in gemm
 
 
@@ -7130,7 +7930,7 @@ def test_the_interleaved_activation_reads_the_interleave_of_the_fold(half, width
     # interleave_gate_up's row order: per tile, half gate rows then the matching half up rows
     order = []
     for t in range(d // half):
-        order += gate_rows[t * half:(t + 1) * half] + up_rows[t * half:(t + 1) * half]
+        order += gate_rows[t * half : (t + 1) * half] + up_rows[t * half : (t + 1) * half]
     position = {row: i for i, row in enumerate(order)}
     for j in range(d):
         gate = (j // half) * (2 * half) + j % half
@@ -7138,7 +7938,9 @@ def test_the_interleaved_activation_reads_the_interleave_of_the_fold(half, width
     src = (_TARGET / "ops/spec/drafter_silu_and_mul.py").read_text()
     assert "gate = (offsets // HALF) * (2 * HALF) + offsets % HALF" in src
     assert "b = tl.load(x_row_ptr + gate + HALF, mask=mask).to(tl.float32)" in src
-    assert "result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)" in src  # one statement for both orders
+    assert (
+        "result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)" in src
+    )  # one statement for both orders
 
 
 # ---------------------------------------------------------------------------
@@ -7161,7 +7963,11 @@ def test_the_coop_fold_verify_grid_knob_reaches_the_fold():
     assert rule_levers_on(moved) == rule_levers_on(base)
     assert _settings(moved)["ops.spec.dflash_verify_fold"] == ({"grid": True}, {"grid": False})
     off = table(
-        (107, 8), 16, "gen", "paged", knobs(head_sampler_coop_fold="off", head_sampler_coop_fold__VERIFY_GRID=1)
+        (107, 8),
+        16,
+        "gen",
+        "paged",
+        knobs(head_sampler_coop_fold="off", head_sampler_coop_fold__VERIFY_GRID=1),
     )
     assert _settings(off)["ops.spec.dflash_verify_fold"] == ({"grid": False}, {"grid": False})
 
@@ -7185,7 +7991,11 @@ def test_the_coop_fold_dist_fabric_defaults_off_and_reaches_the_head_sampler():
     )
     assert moved.paths() == base.paths()
     values, defaults = _settings(moved)["ops.spec.head_sampler"]
-    assert values["dist_fabric"] is True and values["dist_min_rows"] == 16 and defaults["dist_fabric"] is False
+    assert (
+        values["dist_fabric"] is True
+        and values["dist_min_rows"] == 16
+        and defaults["dist_fabric"] is False
+    )
     with pytest.raises(ValueError, match="DIST_FABRIC"):
         table((107, 8), 16, "gen", "paged", knobs(head_sampler_coop_fold__DIST_FABRIC=2))
 
@@ -7206,11 +8016,21 @@ def test_the_paged_side_chain_knob_reaches_only_the_fork():
         base = table((107, 8), mbs, "gen", arena)
         values, defaults = _settings(base)[_KV_FORK]
         assert values == defaults == {"paged_side_chain": 0}
-    ll16 = _ll_on(16, VR_TEP8 - {"drafter_kv_glue"}) if "drafter_kv_glue" in VR_TEP8 else _ll_on(16, VR_TEP8)
+    ll16 = (
+        _ll_on(16, VR_TEP8 - {"drafter_kv_glue"})
+        if "drafter_kv_glue" in VR_TEP8
+        else _ll_on(16, VR_TEP8)
+    )
     plain = table((107, 8), 16, "gen", "paged", ll16)
     assert plain.on("drafter_kv_fork_before_head") and plain.on("drafter_kv_side_chain")
     for value in (1, 2):
-        moved = table((107, 8), 16, "gen", "paged", {**ll16, **knobs(drafter_kv_fork_before_head__PAGED_CHAIN=value)})
+        moved = table(
+            (107, 8),
+            16,
+            "gen",
+            "paged",
+            {**ll16, **knobs(drafter_kv_fork_before_head__PAGED_CHAIN=value)},
+        )
         assert moved.paths() == plain.paths() and rule_levers_on(moved) == rule_levers_on(plain)
         calls, before = _settings(moved), _settings(plain)
         assert calls[_KV_FORK][0] == {"paged_side_chain": value}
@@ -7227,8 +8047,10 @@ class _FakePool:
 
     def __init__(self, shape, strides=None, dtype="bf16", device="cuda:0") -> None:
         self.shape = tuple(shape)
-        self._strides = tuple(strides) if strides is not None else tuple(
-            int(_prod(self.shape[i + 1:])) for i in range(len(self.shape))
+        self._strides = (
+            tuple(strides)
+            if strides is not None
+            else tuple(int(_prod(self.shape[i + 1 :])) for i in range(len(self.shape)))
         )
         self.dtype, self.device = dtype, device
 
@@ -7265,10 +8087,22 @@ def test_the_paged_side_chain_takes_v2_pools_whose_page_counts_differ():
     assert host._paged_layer_pools(worker) == worker._ctx_kv_buf
     strided = _FakePool((4096, *row), strides=(5 * 2 * 32 * 128, 32 * 128, 32 * 128, 128, 1))
     for bad, needle in (
-        ([_FakePool((4096, *row)), _FakePool((4096, 2, 2, 32, 128))], "drafter layer 1's pool is (4096, 2, 2, 32, 128)"),
-        ([_FakePool((4096, *row)), strided], "drafter layer 1's pool is (4096, 2, 1, 32, 128) / (40960,"),
-        ([_FakePool((4096, *row)), _FakePool((4096, *row), dtype="fp8")], "dtype or device differs"),
-        ([_FakePool((4096, *row)), _FakePool((4096, 32, 128))], "drafter layer 1's pool is not a 5-d tensor"),
+        (
+            [_FakePool((4096, *row)), _FakePool((4096, 2, 2, 32, 128))],
+            "drafter layer 1's pool is (4096, 2, 2, 32, 128)",
+        ),
+        (
+            [_FakePool((4096, *row)), strided],
+            "drafter layer 1's pool is (4096, 2, 1, 32, 128) / (40960,",
+        ),
+        (
+            [_FakePool((4096, *row)), _FakePool((4096, *row), dtype="fp8")],
+            "dtype or device differs",
+        ),
+        (
+            [_FakePool((4096, *row)), _FakePool((4096, 32, 128))],
+            "drafter layer 1's pool is not a 5-d tensor",
+        ),
         ([], "has no layers"),
     ):
         pools, why = host._paged_layer_pools_or_reason(types.SimpleNamespace(_ctx_kv_buf=bad))
@@ -7284,7 +8118,9 @@ def test_the_paged_side_chain_routes_and_refuses_loudly():
     INFO line; the refusals cover the private paged arena, the metadata's offsets, the pools' layout, the RoPE, the
     K/V GEMM and a pointer table first asked for inside a capture. The kernels carry the built-in's statements."""
     host = _host_module(
-        _TARGET / "kernels/context_kv_fork/fork.py", ("PAGED_SIDE_CHAIN", "_PAGED_LOGGED"), ("configure",)
+        _TARGET / "kernels/context_kv_fork/fork.py",
+        ("PAGED_SIDE_CHAIN", "_PAGED_LOGGED"),
+        ("configure",),
     )
     assert host.PAGED_SIDE_CHAIN == 0
     host.configure(paged_side_chain=2)
@@ -7294,45 +8130,78 @@ def test_the_paged_side_chain_routes_and_refuses_loudly():
             host.configure(paged_side_chain=bad)
         assert host.PAGED_SIDE_CHAIN == 2
     src = (_TARGET / "kernels/context_kv_fork/fork.py").read_text()
-    body = src[src.index("    def side_chain(self, spec_metadata"):src.index("    def _glue_side_chain(")]
+    body = src[
+        src.index("    def side_chain(self, spec_metadata") : src.index("    def _glue_side_chain(")
+    ]
     assert body.index("if PAGED_SIDE_CHAIN and worker._ctx_paged:") < body.index(
         "refusal = _side_chain_refusal(worker, drafter) if self.side_chain_on else None"
     )
-    assert "drafter_kv_fork_before_head__PAGED_CHAIN is set but this step's side chain cannot take it" in body
-    assert "PAGED_CHAIN is set but the drafter context is not" in body  # set over a dense arena: ERROR, not silence
+    assert (
+        "drafter_kv_fork_before_head__PAGED_CHAIN is set but this step's side chain cannot take it"
+        in body
+    )
+    assert (
+        "PAGED_CHAIN is set but the drafter context is not" in body
+    )  # set over a dense arena: ERROR, not silence
     assert "logger.error(" in body and "if paged_refusal not in _PAGED_LOGGED:" in body
     assert "the paged context-K/V side chain in two launches around its" in body
-    refusal = src[src.index("def _paged_side_chain_refusal("):src.index("def _fused_paged_side_chain(")]
-    for needle in ("the private paged arena", "is not [pools, batch, 2, blocks]", "no flashinfer RoPE",
-                   "not uniform [pages, 2, kv_heads, page, head_dim]", "precompute_context_kv is replaced",
-                   "was not built before the capture"):
+    refusal = src[
+        src.index("def _paged_side_chain_refusal(") : src.index("def _fused_paged_side_chain(")
+    ]
+    for needle in (
+        "the private paged arena",
+        "is not [pools, batch, 2, blocks]",
+        "no flashinfer RoPE",
+        "not uniform [pages, 2, kv_heads, page, head_dim]",
+        "precompute_context_kv is replaced",
+        "was not built before the capture",
+    ):
         assert needle in refusal, needle
     # PAGED 2: fire_early runs the paged prep + sharded fc early (PAGED 1: no early part over pages); the head fork
     # consumes it after checking it is this step's and capture's.
-    fire = src[src.index("    def fire_early(self)"):src.index("    def fire(self, point: str)")]
+    fire = src[src.index("    def fire_early(self)") : src.index("    def fire(self, point: str)")]
     assert "paged = PAGED_SIDE_CHAIN >= 2 and self.worker._ctx_paged" in fire
     assert "if not ((self.early_fc_on and self.side_chain_on) or self.paged_early_on):" in fire
     modeling = (_TARGET / "modeling.py").read_text()
     assert 'if not (fork.early_fc_on or getattr(fork, "paged_early_on", False)):' in modeling
     assert "early = _paged_side_chain_early(" in fire
     assert "the early paged side-chain part was launched for" in body
-    early_src = src[src.index("def _paged_side_chain_early("):src.index("def _fused_paged_side_chain(")]
-    assert early_src.index("prologue = _paged_side_chain_prologue(") < early_src.index("local = _drafter_worker._gemm(")
-    chain = src[src.index("def _fused_paged_side_chain("):src.index("class ContextKvForkDFlashWorker")]
+    early_src = src[
+        src.index("def _paged_side_chain_early(") : src.index("def _fused_paged_side_chain(")
+    ]
+    assert early_src.index("prologue = _paged_side_chain_prologue(") < early_src.index(
+        "local = _drafter_worker._gemm("
+    )
+    chain = src[
+        src.index("def _fused_paged_side_chain(") : src.index("class ContextKvForkDFlashWorker")
+    ]
     assert "projected = drafter.hidden_norm(early.gather.gather(early.local))" in chain
     # precompute_context_kv written out exactly as _fused_side_chain writes it.
-    for needle in ("kv_flat = _kv_gemm(drafter)(projected)", "k_new = kv[:, :, 0].contiguous()",
-                   "k_new = torch.nn.functional.rms_norm(k_new, (hd,), eps=drafter._k_norm_eps)",
-                   "k_new = k_new * drafter._k_norm_stacked.view(1, layers, 1, hd)",
-                   "modeling_dflash._flashinfer_rope(", "projected = drafter.project_target_hidden("):
+    for needle in (
+        "kv_flat = _kv_gemm(drafter)(projected)",
+        "k_new = kv[:, :, 0].contiguous()",
+        "k_new = torch.nn.functional.rms_norm(k_new, (hd,), eps=drafter._k_norm_eps)",
+        "k_new = k_new * drafter._k_norm_stacked.view(1, layers, 1, hd)",
+        "modeling_dflash._flashinfer_rope(",
+        "projected = drafter.project_target_hidden(",
+    ):
         assert needle in chain, needle
-    assert "pools, why = _paged_layer_pools_or_reason(worker)" in refusal and "tensors: {why}" in refusal
+    assert (
+        "pools, why = _paged_layer_pools_or_reason(worker)" in refusal
+        and "tensors: {why}" in refusal
+    )
     kern = (_TARGET / "ops/spec/context_kv_store_paged.py").read_text()
-    for needle in (".to(tl.int64) - block_offset", "valid = tl.where((encoded >= 0) & keep, (cols + 1).to(tl.int64), 0)",
-                   "decoded = tl.maximum(encoded, 0) // divisor", "col = tl.maximum(tl.minimum(col, count * page_size - 1), 0)",
-                   "page = tl.load(table_ptr + g.to(tl.int64) * table_row_stride + col // page_size)",
-                   "tl.store(dst + plane_stride, v, mask=m)"):
+    for needle in (
+        ".to(tl.int64) - block_offset",
+        "valid = tl.where((encoded >= 0) & keep, (cols + 1).to(tl.int64), 0)",
+        "decoded = tl.maximum(encoded, 0) // divisor",
+        "col = tl.maximum(tl.minimum(col, count * page_size - 1), 0)",
+        "page = tl.load(table_ptr + g.to(tl.int64) * table_row_stride + col // page_size)",
+        "tl.store(dst + plane_stride, v, mask=m)",
+    ):
         assert needle in kern, needle
+
+
 # --------------------------------------------------------------------------
 # int5: the gen lane's stacked winners are the TEP8 gen role's defaults at 9..16 requests
 # --------------------------------------------------------------------------
@@ -7363,7 +8232,9 @@ def test_the_tep8_gen_role_runs_the_stacked_winners_at_9_to_16_requests():
             for (lever, key), (value, _) in INT5_GEN_WIDE_DEFAULTS.items():
                 assert wide.param(lever, key) == value, (lever, key, mbs, arena)
             assert wide.on("incremental_block_offsets"), (mbs, arena)
-            assert wide.param("incremental_block_offsets", "POOL_GROUPS") == int(arena == "paged"), (mbs, arena)
+            assert wide.param("incremental_block_offsets", "POOL_GROUPS") == int(
+                arena == "paged"
+            ), (mbs, arena)
         narrow = table((107, 8), 8, "gen", arena)
         for (lever, key), (_, stock) in INT5_GEN_WIDE_DEFAULTS.items():
             assert narrow.param(lever, key) == stock, (lever, key, arena)
@@ -7382,6 +8253,8 @@ def test_the_tep8_gen_role_runs_the_stacked_winners_at_9_to_16_requests():
     )
     assert knobbed.param("head_sampler_coop_fold", "TOPP_ROUNDS") == 0
     assert knobbed.param("tep8_wide64_splitk", "WIDE_TILE") == "64x64"
+
+
 # --------------------------------------------------------------------------
 # The TEP8 one-cluster SWA block, one cluster per request (swa_one_cluster_block__TEP8_WIDE_MIN_REQUESTS)
 # --------------------------------------------------------------------------
@@ -7604,7 +8477,9 @@ def test_the_cl8_exact_parameter_is_fixed_on_and_reaches_swa_block():
     assert base.on("swa_one_cluster_block")
     assert base.param("swa_one_cluster_block", "EXACT") == 1
     values, defaults = _settings(base)["ops.attention.swa_block"]
-    assert values["cl8_exact"] is True and values["cl8_tep8"] is True and "cl8_exact" not in defaults
+    assert (
+        values["cl8_exact"] is True and values["cl8_tep8"] is True and "cl8_exact" not in defaults
+    )
     off = table((107, 8), 8, "gen", "windowed", knobs(swa_one_cluster_block="off"))
     values = _settings(off)["ops.attention.swa_block"][0]
     assert "cl8_exact" not in values and values["cl8_tep8"] is False
@@ -7619,7 +8494,10 @@ def test_swa_block_cl8_exact_logs_error_without_a_cl8_path():
     swa = _swa_block_host()
     swa.configure(cl8_exact=True)
     assert swa._CL8_EXACT is True
-    assert any(line.startswith("ERROR") and "cl8_exact is set but no CL8 path is on" in line for line in swa.log)
+    assert any(
+        line.startswith("ERROR") and "cl8_exact is set but no CL8 path is on" in line
+        for line in swa.log
+    )
     swa.log.clear()
     swa.configure(cl8_tep8=True, one2=True, cl8_exact=True)
     assert any(line.startswith("[musespark_open] swa_block CL8 cl8_exact:") for line in swa.log)
@@ -7666,7 +8544,15 @@ def test_the_cl8_exact_build_uses_the_replaced_paths_operations(name):
         assert statement in exact, statement
         assert statement not in default, statement
     body = exact.split('extern "C" __global__')[1]
-    for gone in ("ex2h2(", "f16x2(fmaf(", "mma16816(", "e4m3x2_f16x2(v.", "f_ex2(", "__fdiv_rn(", "n0 / den"):
+    for gone in (
+        "ex2h2(",
+        "f16x2(fmaf(",
+        "mma16816(",
+        "e4m3x2_f16x2(v.",
+        "f_ex2(",
+        "__fdiv_rn(",
+        "n0 / den",
+    ):
         assert gone not in body, gone
     src = _SWA_BLOCK.read_text()
     assert "opts.append(f'-DTRITON_EX2=\"{CL8_EXACT_EX2}\"'.encode())" in src
@@ -7678,5 +8564,359 @@ def test_verify_grid_leaves_accepted_given_steps_to_the_loop_kernel():
     rejection_fold), so a given-counts step keeps the loop kernel, which reads them."""
     source = (_TARGET / "ops/spec/dflash_verify_fold.py").read_text()
     assert "if GRID and not pre_wait and force_mode != ACCEPTED_GIVEN:" in source
-    grid = source[source.index("def _dflash_verify_fold_grid_kernel(") : source.index("def _launch_grid(")]
+    grid = source[
+        source.index("def _dflash_verify_fold_grid_kernel(") : source.index("def _launch_grid(")
+    ]
     assert "given_counts" not in grid.split('"""')[0]
+
+
+def test_the_pure_context_fmha_is_on_only_by_its_knob_until_its_gate_passes():
+    for role, mbs in (("ctx", 64), ("ctx", 8), ("agg", 48), ("gen", 96)):
+        lever_table = table((107, 4), mbs, role, "windowed")
+        assert not lever_table.on("fmk_pure_context_fmha"), (role, mbs)
+    # Its row's condition holds on a context server, but none of its accuracy gates does yet.
+    ctx = table((107, 4), 64, "ctx", "windowed").decisions["fmk_pure_context_fmha"]
+    assert ctx.source == "default" and "no accuracy gate holds" in ctx.why
+    assert "gate pending" in ctx.why
+    agg = table((107, 4), 48, "agg", "windowed").decisions["fmk_pure_context_fmha"]
+    assert agg.source == "default" and "role is agg" in agg.why
+    forced = table((107, 4), 64, "ctx", "windowed", knobs(fmk_pure_context_fmha="on"))
+    assert forced.on("fmk_pure_context_fmha")
+    assert forced.decisions["fmk_pure_context_fmha"].source == "knob"
+    assert any("FMK_PURE_CONTEXT_FMHA=on outside its accuracy gates" in w for w in forced.warnings)
+    assert forced.paths() == table((107, 4), 64, "ctx", "windowed").paths() | {
+        "fmk_pure_context_fmha"
+    }
+    # It needs neither the mixed-step library nor fmk_context_fmha.
+    assert DISPATCH.DEPENDS_ON["fmk_pure_context_fmha"] == ()
+    # On a TEP4 context server fmk_context_fmha is on by itself, at PURE_CONTEXT 1.
+    assert forced.on("fmk_context_fmha")
+    assert forced.param("fmk_context_fmha", "PURE_CONTEXT") == 1
+    with pytest.raises(ValueError, match="does not serve fmk_pure_context_fmha"):
+        table((107, 8), 64, "ctx", "windowed", knobs(fmk_pure_context_fmha="on"))
+
+
+def test_the_last_layer_tail_is_on_only_by_its_knob_until_its_gate_passes():
+    for role, mbs in (("ctx", 64), ("ctx", 96), ("agg", 48), ("gen", 96)):
+        lever_table = table((107, 4), mbs, role, "windowed")
+        assert not lever_table.on("context_last_layer_tail"), (role, mbs)
+    ctx = table((107, 4), 96, "ctx", "windowed").decisions["context_last_layer_tail"]
+    # Its row's condition holds on a context server, but none of its accuracy gates does yet.
+    assert ctx.source == "default" and "no accuracy gate holds" in ctx.why
+    assert "gate pending" in ctx.why
+    gen = table((107, 4), 96, "gen", "windowed").decisions["context_last_layer_tail"]
+    assert gen.source == "default" and "role is gen" in gen.why
+    forced = table((107, 4), 96, "ctx", "windowed", knobs(context_last_layer_tail="on"))
+    assert forced.on("context_last_layer_tail")
+    assert forced.decisions["context_last_layer_tail"].source == "knob"
+    assert any(
+        "CONTEXT_LAST_LAYER_TAIL=on outside its accuracy gates" in w for w in forced.warnings
+    )
+    assert forced.paths() == table((107, 4), 96, "ctx", "windowed").paths() | {
+        "context_last_layer_tail"
+    }
+    # It runs on the sequence-parallel context path only.
+    assert DISPATCH.DEPENDS_ON["context_last_layer_tail"] == ("context_sequence_parallel",)
+    with pytest.raises(ValueError, match="does not serve context_last_layer_tail"):
+        table((107, 8), 96, "ctx", "windowed", knobs(context_last_layer_tail="on"))
+
+
+def test_the_last_layer_tail_depth_cap_defaults_to_256k_keys_and_takes_its_knob():
+    forced = table((107, 4), 96, "ctx", "windowed", knobs(context_last_layer_tail="on"))
+    assert forced.param("context_last_layer_tail", "MAX_DEPTH") == 262144
+    assert LEVERS.default_param("context_last_layer_tail", "MAX_DEPTH") == 262144
+    capped = table(
+        (107, 4),
+        96,
+        "ctx",
+        "windowed",
+        knobs(context_last_layer_tail="on", context_last_layer_tail__MAX_DEPTH=196608),
+    )
+    assert capped.param("context_last_layer_tail", "MAX_DEPTH") == 196608
+    # The cap changes no decision: the same paths as the default cap.
+    assert capped.paths() == forced.paths()
+    assert LEVERS.knob_name("context_last_layer_tail", "MAX_DEPTH") == (
+        "MUSESPARK_OPEN_LEVER_CONTEXT_LAST_LAYER_TAIL__MAX_DEPTH"
+    )
+    for raw in ("0", "deep", str((1 << 30) + 1)):
+        with pytest.raises(ValueError, match="expected an integer in 1..1073741824"):
+            table(
+                (107, 4),
+                96,
+                "ctx",
+                "windowed",
+                knobs(context_last_layer_tail="on", context_last_layer_tail__MAX_DEPTH=raw),
+            )
+
+
+def test_the_pool_gemm_pin_is_on_by_default_and_off_by_its_knob():
+    # Bitwise: on by default on every sm107 TEP4 deployment (wherever it can run).
+    assert LEVER_ROWS["pool_gemm_pin"].kind is LEVERS.Kind.BITWISE
+    for role, mbs in (("gen", 96), ("gen", 8), ("agg", 48), ("agg", 96), ("ctx", 64)):
+        decision = table((107, 4), mbs, role, "windowed").decisions["pool_gemm_pin"]
+        assert decision.on and decision.source == "default", (role, mbs)
+    default = table((107, 4), 96, "gen", "windowed")
+    decision = default.decisions["pool_gemm_pin"]
+    # The default rows: the 744..768-row decode graphs.
+    assert decision.params == {"ROWS": ((744, 768),)}
+    forced = table((107, 4), 96, "gen", "windowed", knobs(pool_gemm_pin="on"))
+    assert forced.decisions["pool_gemm_pin"].source == "knob"
+    assert forced.paths() == default.paths()
+    # Its knob off takes it out and changes nothing else.
+    off = table((107, 4), 96, "gen", "windowed", knobs(pool_gemm_pin="off"))
+    assert off.decisions["pool_gemm_pin"].source == "knob"
+    assert off.paths() == default.paths() - {"pool_gemm_pin"}
+    assert DISPATCH.DEPENDS_ON["pool_gemm_pin"] == ()
+    tuned = table(
+        (107, 4),
+        96,
+        "gen",
+        "windowed",
+        knobs(pool_gemm_pin="on", pool_gemm_pin__ROWS="648-672,744-768"),
+    )
+    assert tuned.decisions["pool_gemm_pin"].params == {"ROWS": ((648, 672), (744, 768))}
+    with pytest.raises(ValueError, match="520..768"):
+        table(
+            (107, 4),
+            96,
+            "gen",
+            "windowed",
+            knobs(pool_gemm_pin="on", pool_gemm_pin__ROWS="512-768"),
+        )
+    with pytest.raises(ValueError, match="does not serve pool_gemm_pin"):
+        table((107, 8), 96, "gen", "windowed", knobs(pool_gemm_pin="on"))
+
+
+@pytest.mark.parametrize(
+    "name", ["drafter_block_table_decode", "context_kv_fork_paged_wide", "pool_group_tail_marks"]
+)
+def test_the_paged_generation_trims_are_on_by_default_and_off_by_their_knobs(name):
+    # Bitwise: on by default on every sm107 TEP4 deployment and arena (wherever they can run).
+    assert LEVER_ROWS[name].kind is LEVERS.Kind.BITWISE
+    for role, mbs in (("gen", 96), ("gen", 8), ("agg", 48), ("agg", 96), ("ctx", 64)):
+        for arena in ("dense", "windowed", "paged"):
+            decision = table((107, 4), mbs, role, arena).decisions[name]
+            assert decision.on and decision.source == "default", (role, mbs, arena)
+    for arena in ("windowed", "paged"):
+        default = table((107, 4), 96, "gen", arena)
+        assert default.decisions[name].params == {}
+        forced = table((107, 4), 96, "gen", arena, knobs(**{name: "on"}))
+        assert forced.decisions[name].source == "knob"
+        assert forced.paths() == default.paths()
+        # The knob off takes the lever out and changes nothing else.
+        off = table((107, 4), 96, "gen", arena, knobs(**{name: "off"}))
+        assert off.decisions[name].source == "knob"
+        assert off.paths() == default.paths() - {name}
+    assert DISPATCH.DEPENDS_ON[name] == (
+        ("deferred_input_prep",) if name == "pool_group_tail_marks" else ("context_kv_fork",)
+    )
+    with pytest.raises(ValueError, match=f"does not serve {name}"):
+        table((107, 8), 96, "gen", "paged", knobs(**{name: "on"}))
+
+
+def test_the_lm_head_row_owner_is_on_only_by_its_knob():
+    # Off by default on every sm107 TEP4 deployment and arena (opt-in: its row is NEVER).
+    name = "lm_head_row_owner"
+    for role, mbs in (("gen", 96), ("gen", 8), ("agg", 48), ("agg", 96), ("ctx", 64)):
+        for arena in ("dense", "windowed", "paged"):
+            decision = table((107, 4), mbs, role, arena).decisions[name]
+            assert not decision.on and decision.source == "default", (role, mbs, arena)
+            assert decision.why == "opt-in: on only by its knob", (role, mbs, arena)
+    for arena in ("windowed", "paged"):
+        forced = table((107, 4), 96, "gen", arena, knobs(**{name: "on"}))
+        decision = forced.decisions[name]
+        assert decision.on and decision.source == "knob"
+        assert decision.params == {}
+        # The knob adds the lever and changes nothing else.
+        assert forced.paths() == table((107, 4), 96, "gen", arena).paths() | {name}
+    assert DISPATCH.DEPENDS_ON[name] == ("wide_split_sampler",)
+    with pytest.raises(ValueError, match=f"does not serve {name}"):
+        table((107, 8), 96, "gen", "paged", knobs(**{name: "on"}))
+
+
+def test_the_row_owner_island_runs_on_wide_generation_servers_by_its_knob():
+    # Off by default on every sm107 TEP4 deployment: on a wide generation server it yields to the
+    # router epilogue and the pool GEMM pin (bitwise, on by default); elsewhere it cannot run.
+    for role, mbs in (("gen", 96), ("gen", 8), ("agg", 48), ("agg", 96), ("ctx", 64)):
+        for arena in ("windowed", "paged"):
+            decision = table((107, 4), mbs, role, arena).decisions["row_owner_moe"]
+            assert not decision.on, (role, mbs, arena)
+            wide = (role, mbs) == ("gen", 96)
+            assert decision.source == ("default" if wide else "structural"), (role, mbs, arena)
+            if wide:
+                assert "yields to router_staged_epilogue" in decision.why, arena
+    for arena in ("windowed", "paged"):
+        # Its knob on: the router epilogue and the pool GEMM pin (on by default) step aside, and
+        # nothing else changes.
+        default = table((107, 4), 96, "gen", arena)
+        forced = table((107, 4), 96, "gen", arena, knobs(row_owner_moe="on"))
+        decision = forced.decisions["row_owner_moe"]
+        assert decision.on and decision.source == "knob"
+        assert decision.params == {"ROWS": ((584, 768),)}
+        for other in ("router_staged_epilogue", "pool_gemm_pin"):
+            aside = forced.decisions[other]
+            assert not aside.on and aside.source == "default", (arena, other)
+            assert aside.why == "steps aside for row_owner_moe, turned on by its knob"
+        assert forced.paths() == (default.paths() - {"router_staged_epilogue", "pool_gemm_pin"}) | {
+            "row_owner_moe"
+        }
+    others_off = knobs(router_staged_epilogue="off", pool_gemm_pin="off")
+    for arena in ("windowed", "paged"):
+        # With them off by their knobs, the island takes their steps by default ...
+        default = table((107, 4), 96, "gen", arena, others_off)
+        assert default.on("row_owner_moe")
+        assert default.decisions["row_owner_moe"].source == "default"
+        # The default rows: the decode graphs of 73..96 requests.
+        assert default.decisions["row_owner_moe"].params == {"ROWS": ((584, 768),)}
+        # ... and its knob on changes nothing else.
+        forced = table((107, 4), 96, "gen", arena, {**others_off, **knobs(row_owner_moe="on")})
+        decision = forced.decisions["row_owner_moe"]
+        assert decision.on and decision.source == "knob"
+        assert forced.paths() == default.paths()
+    assert DISPATCH.DEPENDS_ON["row_owner_moe"] == (
+        "multi_request_post_attention_hop",
+        "router_gemm",
+        "finalize_two_shot",
+    )
+    tuned = table(
+        (107, 4),
+        96,
+        "gen",
+        "paged",
+        {**others_off, **knobs(row_owner_moe="on", row_owner_moe__ROWS="520-768")},
+    )
+    assert tuned.decisions["row_owner_moe"].params == {"ROWS": ((520, 768),)}
+    with pytest.raises(ValueError, match="520..768"):
+        table(
+            (107, 4), 96, "gen", "paged", knobs(row_owner_moe="on", row_owner_moe__ROWS="256-768")
+        )
+    # Only on a wide generation server (the 768-row cap of the calls it reproduces).
+    for role, mbs, arena in (("gen", 64, "paged"), ("agg", 96, "paged"), ("gen", 96, "dense")):
+        with pytest.raises(ValueError, match="ROW_OWNER_MOE=on, but"):
+            table((107, 4), mbs, role, arena, {**others_off, **knobs(row_owner_moe="on")})
+    # Not with a lever that changes the router GEMM or the pool GEMM it reproduces.
+    for other in ("router_staged_epilogue", "pool_gemm_pin"):
+        with pytest.raises(ValueError, match="row_owner_moe|conflict"):
+            table((107, 4), 96, "gen", "paged", knobs(row_owner_moe="on", **{other: "on"}))
+    with pytest.raises(ValueError, match="does not serve row_owner_moe"):
+        table((107, 8), 96, "gen", "paged", knobs(row_owner_moe="on"))
+
+
+def test_the_expert_tactic_pin_is_on_by_default_and_off_by_its_knob():
+    # Bitwise: on by default on every sm107 TEP4 deployment (wherever it can run).
+    assert LEVER_ROWS["expert_tactic_pin"].kind is LEVERS.Kind.BITWISE
+    for role, mbs in (("gen", 96), ("gen", 8), ("agg", 48), ("agg", 96), ("ctx", 64)):
+        decision = table((107, 4), mbs, role, "windowed").decisions["expert_tactic_pin"]
+        assert decision.on and decision.source == "default", (role, mbs)
+    default = table((107, 4), 96, "gen", "windowed")
+    # The default tactic: the 64-token tile.
+    assert default.decisions["expert_tactic_pin"].params == {"TILE_N": 64, "CONFIG": 26}
+    forced = table((107, 4), 96, "gen", "windowed", knobs(expert_tactic_pin="on"))
+    assert forced.decisions["expert_tactic_pin"].source == "knob"
+    assert forced.paths() == default.paths()
+    off = table((107, 4), 96, "gen", "windowed", knobs(expert_tactic_pin="off"))
+    assert off.decisions["expert_tactic_pin"].source == "knob"
+    assert off.paths() == default.paths() - {"expert_tactic_pin"}
+    assert DISPATCH.DEPENDS_ON["expert_tactic_pin"] == ()
+    tuned = table(
+        (107, 4),
+        96,
+        "gen",
+        "windowed",
+        knobs(
+            expert_tactic_pin="on", expert_tactic_pin__TILE_N="64", expert_tactic_pin__CONFIG="31"
+        ),
+    )
+    assert tuned.decisions["expert_tactic_pin"].params == {"TILE_N": 64, "CONFIG": 31}
+    with pytest.raises(ValueError, match="8..256"):
+        table(
+            (107, 4),
+            96,
+            "gen",
+            "windowed",
+            knobs(expert_tactic_pin="on", expert_tactic_pin__TILE_N="4"),
+        )
+    with pytest.raises(ValueError, match="does not serve expert_tactic_pin"):
+        table((107, 8), 96, "gen", "windowed", knobs(expert_tactic_pin="on"))
+
+
+# --------------------------------------------------------------------------
+# The lever table: one row per lever (its kind, when it is on by default); anywhere else opt-in
+# --------------------------------------------------------------------------
+Kind = LEVERS.Kind
+
+_TABLE_DEPLOYMENTS = (
+    ((107, 4), 1, "agg"),
+    ((107, 4), 4, "agg"),
+    ((107, 4), 64, "agg"),
+    ((107, 4), 4, "gen"),
+    ((107, 4), 8, "ctx"),
+    ((107, 8), 1, "agg"),
+    ((107, 8), 8, "agg"),
+    ((107, 8), 1, "gen"),
+    ((107, 8), 4, "gen"),
+    ((107, 8), 16, "gen"),
+)
+
+
+def test_every_served_lever_has_a_row():
+    assert set(DISPATCH.DEPENDS_ON) <= set(LEVER_ROWS)
+    for key, paths in TARGET_PATHS.items():
+        assert set(paths.served) <= set(LEVER_ROWS), key
+
+
+@pytest.mark.parametrize("arena", ["windowed", "paged"])
+@pytest.mark.parametrize("key,mbs,role", _TABLE_DEPLOYMENTS)
+def test_defaults_follow_each_levers_kind(key, mbs, role, arena):
+    """No lossy or flagged lever is on by default; a lossless-numeric one only where one of its
+    accuracy gates holds."""
+    lever_table = table(key, mbs, role, arena)
+    for name, decision in lever_table.decisions.items():
+        if not (decision.on and decision.source == "default"):
+            continue
+        row = LEVER_ROWS[name]
+        assert row.kind not in (Kind.LOSSY, Kind.FLAGGED), name
+        if row.kind is Kind.NUMERIC:
+            assert any(gate.holds(lever_table.deployment) for gate in row.gates), name
+
+
+@pytest.mark.parametrize("arena", ["windowed", "paged"])
+@pytest.mark.parametrize("key,mbs,role", _TABLE_DEPLOYMENTS)
+def test_all_off_keeps_only_the_upstream_levers_stock_rules(key, mbs, role, arena):
+    lever_table = table(key, mbs, role, arena, ALL_OFF)
+    for name, decision in lever_table.decisions.items():
+        if decision.on:
+            assert LEVER_ROWS[name].stock is not None, name
+        if decision.source == "stock" and LEVER_ROWS[name].stock is None:
+            assert not decision.on, name
+
+
+def test_a_levers_knob_overrides_its_row():
+    default = table((107, 8), 4, "gen", "paged")
+    assert default.on("step_commit_v2") and default.decisions["step_commit_v2"].source == "default"
+    off = table((107, 8), 4, "gen", "paged", knobs(step_commit_v2="off"))
+    assert not off.on("step_commit_v2") and off.decisions["step_commit_v2"].source == "knob"
+
+
+def test_the_retired_resolver_settings_raise():
+    for setting in ("_BITWISE", "_NUMERICS"):
+        with pytest.raises(ValueError, match="retired"):
+            table((107, 8), 16, "gen", "windowed", {LEVERS.PREFIX + setting: "on"})
+
+
+@pytest.mark.parametrize("value", ["auto", "baseline", "rule"])
+def test_the_default_knob_takes_on_or_off_only(value):
+    with pytest.raises(ValueError, match="_DEFAULT"):
+        table((107, 8), 16, "gen", "windowed", {LEVERS.DEFAULT_KNOB: value})
+
+
+@pytest.mark.parametrize("mbs", [2, 4, 16])
+def test_drafter_folds_is_on_by_default_only_at_max_batch_one(mbs):
+    """Its folds relayout drafter weights, so multi-request steps pay an unpermute per layer: on by
+    default at max_batch_size 1 only; the knob still turns it on elsewhere."""
+    assert table((107, 8), 1, "gen", "paged").on("drafter_folds")
+    lever_table = table((107, 8), mbs, "gen", "paged")
+    assert not lever_table.on("drafter_folds")
+    assert lever_table.decisions["drafter_folds"].source == "default"
+    forced = table((107, 8), mbs, "gen", "paged", knobs(drafter_folds="on"))
+    assert forced.on("drafter_folds")

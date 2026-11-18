@@ -666,7 +666,7 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
             # The built-in zeroing of the rows the walk writes, as the built-in method runs it.
             draft_probs[slots, : unary.shape[1], :full_vocab] = draft_probs.new_zeros(())
             spec_metadata.draft_probs_last_dim = full_vocab
-        tokens, _ = draft_path_sample(
+        tokens, proposal = draft_path_sample(
             edges,
             unary,
             ids,
@@ -681,6 +681,12 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
             draft_probs,
             slots,
         )
+        compact = getattr(spec_metadata, "compact_draft_probs", None)
+        if compact is not None:
+            # TRTLLM_RS_COMPACT_DRAFT_PROBS: the rows the kernel would scatter (it writes
+            # ``proposal`` at ``ids``), kept as records.
+            compact.write_rows(spec_metadata.batch_slot_ids[gen], ids, proposal, full_vocab)
+            spec_metadata.draft_probs_last_dim = full_vocab
         return tokens, full_vocab
 
     def sample_draft_tokens(self, logits, spec_metadata, batch_size, **kwargs):

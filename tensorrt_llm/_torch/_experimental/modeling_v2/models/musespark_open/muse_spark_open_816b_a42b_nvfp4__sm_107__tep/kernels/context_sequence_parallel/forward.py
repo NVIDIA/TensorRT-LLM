@@ -41,6 +41,11 @@ buffer, which the layers' own capture calls fill; after the last layer it is
 all-gathered together with the final hidden states and copied into the step
 buffer's rows, so the drafter reads what it reads after the replicated forward.
 
+With ``last_layer_tail`` set (the ``context_last_layer_tail`` lever,
+``kernels/context_last_layer_tail``), the last layer runs past its K/V append on the
+rows the LM head reads only; the step then returns those rows of the final hidden
+states (zero elsewhere) and all-gathers the capture buffer alone.
+
 Numerics: not bitwise against the replicated forward. The per-row kernels compute
 the same values per row. The reductions run in another order (a reduce-scatter of
 the output projection's and the experts' BF16 partials instead of their
@@ -316,6 +321,9 @@ class ContextSequenceParallel:
         self.step = SequenceParallelStep()
         #: The fewest rows of an eager step that runs sequence-parallel.
         self.eager_min_rows = EAGER_MIN_ROWS
+        #: ``context_last_layer_tail``'s tail (``kernels/context_last_layer_tail``); None runs
+        #: the last layer as every other.
+        self.last_layer_tail = None
 
     def reserve(self, model: MuseSparkOpenModel) -> None:
         """Grow ``model``'s MNNVL all-reduce workspaces once, on the first prefill step.
@@ -387,14 +395,28 @@ class ContextSequenceParallel:
         ce_gather = (
             self.ce_gather if self.ce_gather is not None and self.ce_gather.takes(rows) else None
         )
+        tail = self.last_layer_tail
+        output = None
         with _shard_capture(kwargs.get("spec_metadata"), shard) as (capture, step_capture):
             layers = core.layers
+            stop = len(layers) - 1 if tail is not None else len(layers)
             precomputed_attn_input = None
             self.step.active = True
             if ce_gather is not None:
                 ce_gather.begin()
             try:
                 for index, decoder_layer in enumerate(layers):
+                    if index == stop:
+                        output = tail.forward(
+                            hidden_states,
+                            precomputed_attn_input,
+                            attn_metadata,
+                            position_ids,
+                            rows,
+                            kwargs,
+                        )
+                        if output is not None:
+                            break
                     next_norm = (
                         layers[index + 1].pre_qkv_proj_norm if index + 1 < len(layers) else None
                     )
@@ -417,6 +439,11 @@ class ContextSequenceParallel:
                 # its queued work does, rather than a forward that never ends.
                 if ce_gather is not None:
                     ce_gather.end()
+        if output is not None:
+            # The last layer ran on the LM-head rows only; its rows are already in place.
+            if capture is not None:
+                step_capture[:rows].copy_(allgather(capture, mapping, dim=0)[:rows])
+            return output
         output = core.norm(hidden_states.to(core.dtype))
         if capture is None:
             return allgather(output, mapping, dim=0)[:rows]

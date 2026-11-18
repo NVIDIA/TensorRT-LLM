@@ -28,6 +28,7 @@ from ..speculative.dflash_attention import (
     get_dflash_paged_append,
     get_dflash_trtllm_gen_ops,
 )
+from ..speculative.dflash_kv_storage import is_storage_only_dtype, to_kv_storage
 from ..speculative.interface import SpeculativeDecodingMode
 from ..utils import maybe_compile
 from .modeling_utils import (
@@ -1838,12 +1839,16 @@ class DFlashForCausalLM(nn.Module):
             causal, window_size = self._resolve_block_attention(layer_idx)
             if self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
+                # An FP8 draft pool (dflash_kv_storage) stores the block's K/V
+                # with the saturating cast every context write uses.
                 trtllm_gen_ops.append_paged_kv_cache(
-                    append_key=k_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
+                    append_key=to_kv_storage(
+                        k_noise_bshd.reshape(-1, num_kv_heads_per_rank, head_dim),
+                        layer_cache.dtype,
                     ).contiguous(),
-                    append_value=v_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
+                    append_value=to_kv_storage(
+                        v_noise_bshd.reshape(-1, num_kv_heads_per_rank, head_dim),
+                        layer_cache.dtype,
                     ).contiguous(),
                     batch_indices=append_batch_indices,
                     positions=append_positions,
@@ -1901,6 +1906,12 @@ class DFlashForCausalLM(nn.Module):
                             (offsets[None, :] > offsets[:, None]).tril(window_size[1]),
                         )
                 else:
+                    if is_storage_only_dtype(layer_cache.dtype):
+                        raise NotImplementedError(
+                            f"DFlash layer {layer_idx}: the trtllm-gen context attention of an "
+                            "unwindowed non-causal block does not read a "
+                            f"{layer_cache.dtype} draft KV pool"
+                        )
                     cum_seq_lens_q = torch.arange(
                         0,
                         (B + 1) * block_size,

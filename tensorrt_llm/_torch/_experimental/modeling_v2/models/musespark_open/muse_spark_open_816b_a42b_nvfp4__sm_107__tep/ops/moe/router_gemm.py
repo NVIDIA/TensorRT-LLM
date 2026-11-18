@@ -65,6 +65,10 @@ HIDDEN = 8192
 #: last accepted token and 7 drafts, the router shard's) up to 64 requests.
 MIN_ROWS = 9
 MAX_ROWS = 512
+#: The most rows a call may have when the fast path's row cap is raised above ``MAX_ROWS``
+#: (on a wide generation server, ``levers.row_cap``: 96 requests at K = 7). The GEMM has no
+#: row limit of its own: a call of more row tiles runs fewer K splits.
+LIMIT_ROWS = 768
 #: The GEMM's expert tiles (M) and row tiles (N) of 128.
 EXPERT_TILES = EXPERTS // 128
 ROW_TILE = 128
@@ -156,10 +160,11 @@ def _router_gemm_sum_kernel(
 
 
 class RouterGemm(OpWrapper):
-    """``(hidden_states.float() @ weight.T) * scale`` for ``MIN_ROWS..MAX_ROWS`` rows.
+    """``(hidden_states.float() @ weight.T) * scale`` for ``MIN_ROWS..LIMIT_ROWS`` rows.
 
     Args:
-        hidden_states: ``[M, 8192]`` BF16, contiguous, ``MIN_ROWS <= M <= MAX_ROWS``.
+        hidden_states: ``[M, 8192]`` BF16, contiguous, ``MIN_ROWS <= M <= LIMIT_ROWS``
+            (the fast path takes ``MAX_ROWS`` unless its row cap is raised).
         weight: the router weight ``[256, 8192]`` FP32, contiguous, read on every call.
         scale: the metap multiplier, a Python float (applied in FP32 after the sum).
 
@@ -217,8 +222,8 @@ class RouterGemm(OpWrapper):
             raise ValueError(f"hidden_states must be 2-D BF16, got {hidden_states.dtype}")
         if not hidden_states.is_contiguous() or hidden_states.shape[1] != HIDDEN:
             raise ValueError(f"hidden_states must be contiguous [M, {HIDDEN}]")
-        if not MIN_ROWS <= hidden_states.shape[0] <= MAX_ROWS:
-            raise ValueError(f"{MIN_ROWS}..{MAX_ROWS} rows, got {hidden_states.shape[0]}")
+        if not MIN_ROWS <= hidden_states.shape[0] <= LIMIT_ROWS:
+            raise ValueError(f"{MIN_ROWS}..{LIMIT_ROWS} rows, got {hidden_states.shape[0]}")
         if weight.dtype != torch.float32 or tuple(weight.shape) != (EXPERTS, HIDDEN):
             raise ValueError(f"weight must be FP32 [{EXPERTS}, {HIDDEN}]")
         if not weight.is_contiguous() or weight.device != hidden_states.device:

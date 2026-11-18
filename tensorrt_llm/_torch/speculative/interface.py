@@ -50,6 +50,9 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .compact_draft_probs import (CompactDraftProbs, DeferredDraftProbs,
+                                  compact_draft_probs_requested,
+                                  compact_store_refusal, private_verify_scratch)
 
 
 @triton.jit
@@ -501,6 +504,44 @@ _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 # slot leaves them room before the next one starts.
 _RNG_SLOT_SPAN = 32
 
+# Whether the TRTLLM_RS_COMPACT_DRAFT_PROBS decision was logged (once).
+_COMPACT_DRAFT_PROBS_LOGGED = False
+
+
+def _wants_compact_draft_probs(meta) -> bool:
+    """Whether ``meta``'s RS slot rows go to the compact store (opt-in)."""
+    global _COMPACT_DRAFT_PROBS_LOGGED
+    if not compact_draft_probs_requested():
+        return False
+    refusal = compact_store_refusal(getattr(meta, "spec_dec_mode", None),
+                                    meta.vocab_size,
+                                    getattr(meta, "draft_vocab_size", 0))
+    if not _COMPACT_DRAFT_PROBS_LOGGED:
+        _COMPACT_DRAFT_PROBS_LOGGED = True
+        if refusal is not None:
+            logger.warning("TRTLLM_RS_COMPACT_DRAFT_PROBS is set but the dense "
+                           f"draft_probs store is kept: {refusal}")
+        else:
+            logger.info(
+                "TRTLLM_RS_COMPACT_DRAFT_PROBS: rejection-sampling draft "
+                "rows kept as (token id, prob) records instead of a "
+                f"dense [slots, {meta.max_draft_len}, {meta.vocab_size}] "
+                "FP32 store")
+    return refusal is None
+
+
+def _refuse_dense_write_to_compact_store(spec_metadata, writer: str) -> None:
+    """Raise when a full-vocab draft sampler would store into the compact store.
+
+    The compact store (TRTLLM_RS_COMPACT_DRAFT_PROBS) holds sparse rows only;
+    skipping the write would leave the verify a stale distribution.
+    """
+    if getattr(spec_metadata, "compact_draft_probs", None) is not None:
+        raise RuntimeError(
+            f"TRTLLM_RS_COMPACT_DRAFT_PROBS: {writer} stores full-vocab draft "
+            "distributions, which the compact store cannot hold; unset the knob "
+            "for this drafter")
+
 
 @dataclass
 class SpecMetadata:
@@ -529,6 +570,11 @@ class SpecMetadata:
     # Shape: [max_num_requests]. Final-chunk rows contain
     # INVALID_PROMPT_LOOKAHEAD_TOKEN.
     context_prompt_lookahead_tokens: Optional[torch.Tensor] = None
+    # The first prompt position whose drafter context each context request's
+    # chunk writes, one per context request, when the KV cache manager keeps
+    # only a drafter context window (KVCacheManagerV2.draft_context_keep_tokens);
+    # None writes the drafter context of every prompt position.
+    draft_context_keep_from: Optional[List[int]] = None
     # The request ID of each sequence in the batch.
     # The shape is (batch_size).
     request_ids: Optional[List[int]] = None
@@ -775,6 +821,10 @@ class SpecMetadata:
     # Cached d2t-projected target vocab indices, computed once on first use.
     # Shape: [draft_vocab_size], dtype long.
     d2t_target_indices: Optional[torch.Tensor] = None
+    # Opt-in (TRTLLM_RS_COMPACT_DRAFT_PROBS) stand-in for draft_probs: the same
+    # slot rows as (token id, prob) records; draft_probs stays None while it is
+    # set. See compact_draft_probs.py.
+    compact_draft_probs: Optional[CompactDraftProbs] = None
 
     def __post_init__(self):
         pass
@@ -962,12 +1012,20 @@ class SpecMetadata:
         slot_capacity = self.num_seq_slots or self.max_num_requests
         num_slot_rows = slot_capacity + 1
 
-        if self.draft_probs is None and self.vocab_size > 0:
-            # [slot, draft_step, vocab]: scatter/gather by stable slot id.
-            self.draft_probs = torch.empty(
-                (num_slot_rows, self.max_draft_len, self.vocab_size),
-                dtype=torch.float32,
-                device='cuda')
+        if (self.draft_probs is None
+                and getattr(self, "compact_draft_probs", None) is None
+                and self.vocab_size > 0):
+            if _wants_compact_draft_probs(self):
+                self.compact_draft_probs = CompactDraftProbs(num_slot_rows,
+                                                             self.max_draft_len,
+                                                             self.vocab_size,
+                                                             device='cuda')
+            else:
+                # [slot, draft_step, vocab]: scatter/gather by stable slot id.
+                self.draft_probs = torch.empty(
+                    (num_slot_rows, self.max_draft_len, self.vocab_size),
+                    dtype=torch.float32,
+                    device='cuda')
             self.draft_probs_vocab_size = self.vocab_size
             # Dummy requests route to the extra scratch row (the buffer's last
             # row at index ``slot_capacity``). Capture it here against the real
@@ -1167,12 +1225,19 @@ class SpecMetadata:
         overwritten here. No-op unless rejection is enabled and slots exist.
         Static shapes -> CUDA-graph safe.
         """
+        compact = getattr(self, "compact_draft_probs", None)
         if (not padding_slot_ids
                 or not getattr(self, "use_rejection_sampling", False)
-                or self.draft_probs is None):
+                or (self.draft_probs is None and compact is None)):
             return
         onehot_vocab = (self.draft_probs_last_dim if self.draft_probs_last_dim
                         > 0 else self.draft_probs_vocab_size)
+        if compact is not None:
+            compact.write_onehot(
+                torch.tensor(padding_slot_ids,
+                             dtype=torch.long,
+                             device=compact.device), draft_len, onehot_vocab)
+            return
         if _ONEHOT_INDEXED_PUT:
             slots = torch.tensor(padding_slot_ids,
                                  dtype=torch.long,
@@ -2241,8 +2306,15 @@ class SpecWorkerBase(nn.Module, ABC):
                 # step indexed by py_seq_slot.
                 gen_slot_ids = spec_metadata.batch_slot_ids[
                     num_contexts:batch_size]
-                draft_probs = spec_metadata.draft_probs[
-                    gen_slot_ids, :draft_len, :stored_vocab]
+                compact = getattr(spec_metadata, "compact_draft_probs", None)
+                if compact is not None:
+                    # Rebuilt from the records inside the rejection body, once
+                    # the target probabilities exist (DeferredDraftProbs).
+                    draft_probs = DeferredDraftProbs(compact, gen_slot_ids,
+                                                     draft_len, stored_vocab)
+                else:
+                    draft_probs = spec_metadata.draft_probs[
+                        gen_slot_ids, :draft_len, :stored_vocab]
                 accepted = self._sample_and_accept_draft_tokens_rejection(
                     logits, draft_tokens, draft_probs, num_contexts, batch_size,
                     spec_metadata)
@@ -2497,6 +2569,8 @@ class SpecWorkerBase(nn.Module, ABC):
             end=batch_size,
             slot=spec_metadata.rng_draft_slot(draft_step or 0))
         if spec_metadata.use_rejection_sampling and draft_step is not None:
+            _refuse_dense_write_to_compact_store(spec_metadata,
+                                                 "advanced_sample_draft")
             # The proposal stored below is read back by next iteration's
             # rejection kernel, so a padding row must not poison it either.
             logits = self._zero_padding_rows(logits, spec_metadata, 0,
@@ -2592,6 +2666,12 @@ class SpecWorkerBase(nn.Module, ABC):
         so it stays CUDA-graph-capture safe.
         """
         draft_probs = spec_metadata.draft_probs
+        compact = getattr(spec_metadata, "compact_draft_probs", None)
+        if draft_probs is None and compact is not None:
+            # The compact store rebuilds rows of exactly its vocab width.
+            if stored_vocab != compact.vocab_size:
+                return False
+            draft_probs = compact
         batch_slot_ids = spec_metadata.batch_slot_ids
         if draft_probs is None or batch_slot_ids is None:
             return False
@@ -2599,7 +2679,7 @@ class SpecWorkerBase(nn.Module, ABC):
             return False
         num_gens = batch_size - num_contexts
         # draft_probs must cover the slice [:, :draft_len, :stored_vocab].
-        if draft_probs.dim() != 3:
+        if len(draft_probs.shape) != 3:
             return False
         if draft_probs.shape[1] < draft_len or draft_probs.shape[
                 2] < stored_vocab:
@@ -2726,6 +2806,14 @@ class SpecWorkerBase(nn.Module, ABC):
             else:
                 target_probs = target_probs_flat.reshape(
                     num_gens, runtime_draft_len + 1, vocab_size)
+
+            if isinstance(draft_probs, DeferredDraftProbs):
+                # Compact store: rebuild the verified rows now. Logits private
+                # to this verify are dead once target_probs exists, so the rows
+                # may take their storage instead of a new allocation.
+                draft_probs = draft_probs.materialize(
+                    private_verify_scratch(logits, target_probs_flat,
+                                           target_probs))
 
             draft_vocab_size = draft_probs.shape[-1]
             assert draft_probs.shape[0] == num_gens, (
@@ -3030,6 +3118,8 @@ class SpecWorkerBase(nn.Module, ABC):
                 seed=seed,
                 offset=offset)
             # Scatter the K prob rows per gen request into its stable slot row.
+            _refuse_dense_write_to_compact_store(spec_metadata,
+                                                 "advanced_sample_draft_block")
             if spec_metadata.draft_probs is not None:
                 assert spec_metadata.batch_slot_ids is not None, (
                     "batch_slot_ids must be populated before block draft prob "
@@ -3072,9 +3162,10 @@ class SpecWorkerBase(nn.Module, ABC):
         next iter reads this scalar). No-op unless rejection is enabled and the
         slot-indexed buffers exist. Static shapes -> CUDA-graph safe.
         """
+        compact = getattr(spec_metadata, "compact_draft_probs", None)
         if (num_contexts <= 0
                 or not getattr(spec_metadata, "use_rejection_sampling", False)
-                or spec_metadata.draft_probs is None):
+                or (spec_metadata.draft_probs is None and compact is None)):
             return
         ctx_slot_ids = spec_metadata.batch_slot_ids[:num_contexts]
         if num_gens > 0:
@@ -3082,6 +3173,10 @@ class SpecWorkerBase(nn.Module, ABC):
         else:
             onehot_vocab = spec_metadata.draft_probs_vocab_size
             spec_metadata.draft_probs_last_dim = onehot_vocab
+        if compact is not None:
+            compact.write_onehot_index_fill(ctx_slot_ids, draft_len,
+                                            onehot_vocab)
+            return
         if _ONEHOT_INDEXED_PUT:
             spec_metadata.draft_probs[
                 ctx_slot_ids, :draft_len, :onehot_vocab] = 0.0

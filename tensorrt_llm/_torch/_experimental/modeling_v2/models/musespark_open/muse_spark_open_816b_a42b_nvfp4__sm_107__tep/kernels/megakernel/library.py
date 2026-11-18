@@ -26,11 +26,14 @@ import os
 import re
 import subprocess  # nosec B404 - runs cuobjdump with a fixed argv, no shell
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
 import torch
+
+from tensorrt_llm.logger import logger
 
 from . import schedule
 
@@ -1668,7 +1671,14 @@ def _build(mode: str, verbose: bool = False) -> str:
 @functools.lru_cache(maxsize=None)
 def _library(mode: str, device: int) -> Library:
     with _LOCK:
-        return Library(_build(mode), mode)
+        start = time.perf_counter()
+        path = _build(mode)
+        # The build (or its load from the extension cache) once per process and mode.
+        logger.info(
+            f"[musespark_open] megakernel: {mode} library {path} "
+            f"(build or load {time.perf_counter() - start:.2f} s)"
+        )
+        return Library(path, mode)
 
 
 def library(mode: str = "check") -> Library:

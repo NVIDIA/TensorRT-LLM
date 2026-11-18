@@ -165,14 +165,21 @@ LAYOUT_RANK_COUNTS = {MAX_TOKENS: (4, 8), WIDE_MAX_TOKENS: (4,)}
 #: The built-in TP8 kernel's cluster-8 range; above it the built-in runs one CTA per token.
 CLUSTER8_TOKENS = 16
 #: The layout of a TP8 workspace (``configure``'s ``tep8_max_tokens``: 16, 32, 64 or 128; the
-#: ``tep8_finalize_transport_64`` lever sets its TOKENS, 64 by default), whose calls of 17..TP8_MAX_TOKENS tokens add their
+#: ``tep8_finalize_transport_64`` lever sets its TOKENS, 64 by default), whose calls of 17..TP8_MAX_TOKENS tokens add
+#: their
 #: slot sums flat, in the built-in one-CTA-per-token order (``flat_sum``, as at TP4; the built-in
 #: runs one CTA per token up to 128). TP4 workspaces ignore it (their 17..32-token calls are
 #: ``serve_wide_calls``'). Kept out of ``LAYOUT_RANK_COUNTS`` (``has_layout``), so a 32-token TP8
 #: layout never makes the TP4 wide layout's entry admit TP8.
 TP8_MAX_TOKENS = 16
-#: The TP8 layouts ``configure`` accepts (128: the built-in TP8 kernel's own bound).
-TP8_LAYOUTS = (16, 32, 64, 128)
+#: The TP8 layouts ``configure`` accepts (128: the built-in TP8 kernel's own bound; w256: 256, whose
+#: 129..256-token calls -- the built-in forward's ``finalize_chunked`` calls, ``TP8_CHUNKED`` -- run ONE
+#: flat-build launch of 2048 CTAs in 256 clusters of 8 instead of 128-token chunks; every token keeps
+#: the flat order, so each row is what a <= 128-token call of it returns. 32 MiB of fabric per rank).
+TP8_LAYOUTS = (16, 32, 64, 128, 256)
+#: The largest call the built-in TP8 kernel takes (its ``_MAX_TOKENS``); the per-token-count split
+#: check at workspace build covers 1..min(layout, this).
+BUILTIN_MAX_TOKENS = 128
 #: CTAs per token (one cluster), threads per CTA, BF16 values per thread.
 CLUSTER = 8
 VECTOR = 8
@@ -307,7 +314,41 @@ DEFAULT = Transport()
 ENTRY_TRIGGER = Transport(trigger="entry")
 
 
-def configure(*, tep8_max_tokens: int = 16, trigger: str = "late", index_prefetch: bool = False) -> None:
+#: ``configure``'s ``tep8_chunked`` (the ``tep8_finalize_transport_64`` lever's CHUNKED): a TP8
+#: workspace also exposes ``finalize_chunked``, so the built-in MoE forward hands its calls of
+#: 129..``_finalize_ar_max_tokens`` tokens (17..64 requests at K = 7; 512 under
+#: ``MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED``) to this transport as consecutive calls of at most
+#: ``TP8_MAX_TOKENS`` tokens, evenly split, instead of the unfused FP32 combine + BF16 cast +
+#: all-reduce it runs for a workspace without one. Off: no ``finalize_chunked`` attribute (the
+#: built-in forward's unfused path above 128 tokens, as before). Same precision either way (BF16
+#: partials, FP32 rank-order sum); the unfused path's cross-rank summation order is the all-reduce's,
+#: so this is order-only against it.
+TP8_CHUNKED = False
+#: ``configure``'s ``tep8_two_phase_min_tokens`` (the lever's TWO_PHASE_MIN_TOKENS; 0 off): TP8 calls of that many
+#: tokens up to ``finalize_two_phase.MAX_TOKENS`` (256) run the two-phase finalize (``finalize_two_phase``, ported from
+#: the TEP16 target's B(ii)): each rank reduces its 512 columns of every token in rank order and multicasts the sums,
+#: instead of every rank pulling all seven peers' partials. The same arithmetic as this transport's builds (cluster-8 up
+#: to 16 tokens, flat above), so the same bits by another route (8-rank gate: vr_fin256_ranks.py TWO_PHASE=1).
+TP8_TWO_PHASE_MIN_TOKENS = 0
+
+
+def chunk_counts(num_tokens: int, max_tokens: int) -> list:
+    """The token counts of ``finalize_chunked``'s consecutive calls: ``ceil(num_tokens / max_tokens)``
+    calls, evenly split (the first ``num_tokens % calls`` one token larger), so a 129..144-token call
+    is two flat-build calls rather than one of ``max_tokens`` and a 1..16-token cluster-8 remainder."""
+    calls = -(-int(num_tokens) // int(max_tokens))
+    base, extra = divmod(int(num_tokens), calls)
+    return [base + 1] * extra + [base] * (calls - extra)
+
+
+def configure(
+    *,
+    tep8_max_tokens: int = 16,
+    trigger: str = "late",
+    index_prefetch: bool = False,
+    tep8_chunked: bool = False,
+    tep8_two_phase_min_tokens: int = 0,
+) -> None:
     """Set the TP8 workspace layout and the trigger of the transport ``finalize_transport`` builds.
 
     ``lever_settings.apply`` sets them from the model's plan before any install; a workspace
@@ -321,12 +362,16 @@ def configure(*, tep8_max_tokens: int = 16, trigger: str = "late", index_prefetc
             (an empty value is ``"late"``).
         index_prefetch: ``DEFAULT``'s ``prefetch`` (``Transport.prefetch``): the row map read
             before the dependency wait, verified after it.
+        tep8_chunked: ``TP8_CHUNKED``: TP8 workspaces built afterwards serve the built-in's
+            chunked calls (129.. tokens) as consecutive calls on this transport.
 
     Raises:
         ValueError: if ``tep8_max_tokens`` is not one of ``TP8_LAYOUTS``, or ``trigger`` is not
             a ``Transport`` trigger.
     """
-    global TP8_MAX_TOKENS, DEFAULT
+    global TP8_MAX_TOKENS, DEFAULT, TP8_CHUNKED, TP8_TWO_PHASE_MIN_TOKENS
+    if not 0 <= int(tep8_two_phase_min_tokens) <= 256:
+        raise ValueError(f"tep8_two_phase_min_tokens is 0..256, got {tep8_two_phase_min_tokens}")
     tokens = int(tep8_max_tokens)
     if tokens not in TP8_LAYOUTS:
         raise ValueError(
@@ -335,6 +380,8 @@ def configure(*, tep8_max_tokens: int = 16, trigger: str = "late", index_prefetc
     transport = Transport(trigger=str(trigger).strip() or "late", prefetch=bool(index_prefetch))
     TP8_MAX_TOKENS = tokens
     DEFAULT = transport
+    TP8_CHUNKED = bool(tep8_chunked)
+    TP8_TWO_PHASE_MIN_TOKENS = int(tep8_two_phase_min_tokens)
 
 
 try:
@@ -1184,6 +1231,9 @@ class FinalizeTransportWorkspace:
         self.grid_step = 1 << grid_shift(self.max_tokens)
         #: The workspace of the calls above ``max_tokens`` (``serve_wide_calls``), or None.
         self.wide: Optional["FinalizeTransportWorkspace"] = None
+        if self.ranks == 8 and TP8_CHUNKED:
+            # ``TP8_CHUNKED``: the attribute the built-in MoE forward looks up for 129.. tokens.
+            self.finalize_chunked = self._finalize_chunked
         self.pdl = _pdl_enabled()
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
         self._comm = _get_mnnvl_workspace_comm(mapping)
@@ -1204,7 +1254,7 @@ class FinalizeTransportWorkspace:
             # Every call this workspace takes must be split by the built-in kernel the way the
             # build that runs it adds (``kernel_cluster``): checked at every token count, since a
             # TP8 layout above CLUSTER8_TOKENS spans both of the built-in's TP8 splits.
-            for tokens in range(1, self.max_tokens + 1):
+            for tokens in range(1, min(self.max_tokens, BUILTIN_MAX_TOKENS) + 1):
                 if _legacy._cluster_for_tokens(tokens, self.ranks) != kernel_cluster(
                     tokens, self.ranks
                 ):
@@ -1272,6 +1322,20 @@ class FinalizeTransportWorkspace:
                 "finalize transport kernel compilation failed on at least one rank"
                 f"{f' (this rank: {error!r})' if error is not None else ''}"
             ) from error
+        #: (w256) The two-phase finalize of this workspace's TP8 calls of ``TP8_TWO_PHASE_MIN_TOKENS``.. tokens.
+        self.two_phase = None
+        self.two_phase_min_tokens = TP8_TWO_PHASE_MIN_TOKENS
+        if self.ranks == 8 and self.two_phase_min_tokens > 0:
+            from . import finalize_two_phase as _two_phase
+
+            self.two_phase = _two_phase.TwoPhaseWorkspace(
+                mapping, self.device, self.pdl, transport.trigger
+            )
+            logger.info(
+                f"[musespark_open] finalize_transport TWO_PHASE: TP8 calls of {self.two_phase_min_tokens}.."
+                f"{_two_phase.MAX_TOKENS} tokens on the two-phase finalize (owner-reduce + multicast gather, "
+                f"{self.two_phase.nbytes / 2**20:.1f} MiB fabric per rank; the transport's arithmetic)"
+            )
 
     def _launch(self, gemm, indices, weights, norm, out, rows, row_stride, tokens, eps, dry=0):
         compiled = self._compiled_flat if tokens > CLUSTER8_TOKENS else self._compiled
@@ -1346,6 +1410,10 @@ class FinalizeTransportWorkspace:
 
         Calls the wide workspace takes go to it, every other call to the built-in.
         """
+        if self._two_phase_takes(num_tokens):
+            return self._finalize_two_phase(
+                gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens
+            )
         if not self.takes(num_tokens):
             if self.wide is not None and self.wide.takes(num_tokens):
                 return self.wide.finalize(
@@ -1371,6 +1439,124 @@ class FinalizeTransportWorkspace:
             num_tokens,
             float(eps),
         )
+        return out
+
+    def _two_phase_takes(self, num_tokens) -> bool:
+        return (
+            self.two_phase is not None
+            and isinstance(num_tokens, int)
+            and not isinstance(num_tokens, bool)
+            and self.two_phase_min_tokens <= num_tokens
+            and self.two_phase.takes(num_tokens)
+        )
+
+    def _finalize_two_phase(
+        self, gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens
+    ):
+        """One two-phase launch of 1..256 tokens, validated in built-in-sized slices first."""
+        if self.legacy._closed:
+            raise RuntimeError("the wrapped MuseSparkOpen finalize workspace is closed")
+        top_k = _legacy._TOP_K
+        flat_indices = indices.reshape(-1)
+        flat_weights = routing_weights.reshape(-1)
+        if flat_indices.numel() != num_tokens * top_k or flat_weights.numel() != num_tokens * top_k:
+            raise ValueError(
+                f"indices and routing_weights must hold {num_tokens * top_k} entries for {num_tokens} tokens"
+            )
+        rows = row_stride = None
+        for begin in range(0, num_tokens, BUILTIN_MAX_TOKENS):
+            count = min(BUILTIN_MAX_TOKENS, num_tokens - begin)
+            slots = slice(begin * top_k, (begin + count) * top_k)
+            rows, row_stride = self.legacy._validate(
+                gemm2_output, flat_indices[slots], flat_weights[slots], norm_weight, eps, count
+            )
+        out = torch.empty((num_tokens, HIDDEN), dtype=torch.bfloat16, device=self.device)
+        self.two_phase.launch(
+            gemm2_output.data_ptr() if rows > 0 else 0,
+            flat_indices.data_ptr(),
+            flat_weights.data_ptr(),
+            norm_weight.data_ptr(),
+            out.data_ptr(),
+            rows,
+            row_stride,
+            num_tokens,
+            float(eps),
+        )
+        return out
+
+    def _finalize_chunked(
+        self,
+        gemm2_output: torch.Tensor,
+        indices: torch.Tensor,
+        routing_weights: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """``FinalizeIpcWorkspace.finalize_chunked`` on this transport (``TP8_CHUNKED``): tokens
+        ``[a, a + n)`` are one ``finalize`` call (this kernel; ``chunk_counts``' even split of at
+        most ``max_tokens`` tokens) on the matching slices of ``indices`` and ``routing_weights``,
+        written into rows ``[a, a + n)`` of one ``[num_tokens, 4096]`` BF16 result. A token's
+        result depends only on its own slots and the build its call runs (flat above 16 tokens),
+        so every row is what a single call covering it returns. Every chunk is validated before
+        the first launch; each is one launch and one turn of the arrival counter, as consecutive
+        ``finalize`` calls, so every rank must make the matching call."""
+        if isinstance(num_tokens, bool) or not isinstance(num_tokens, int) or num_tokens < 1:
+            raise ValueError(f"num_tokens must be a positive int, got {num_tokens!r}")
+        logger.info_once(
+            f"[musespark_open] finalize_transport CHUNKED: the built-in's 129.. -token MoE finalize calls "
+            f"run on the TP8 transport ({self.max_tokens}-token layout: "
+            + ("one launch up to 256 tokens" if self.max_tokens >= 256 else "evenly split calls")
+            + ") instead of the unfused combine + all-reduce",
+            key="musespark_open.finalize_transport_chunked",
+        )
+        if self._two_phase_takes(num_tokens):
+            return self._finalize_two_phase(
+                gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens
+            )
+        if num_tokens <= min(self.max_tokens, BUILTIN_MAX_TOKENS):
+            return self.finalize(
+                gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens
+            )
+        if self.legacy._closed:
+            raise RuntimeError("the wrapped MuseSparkOpen finalize workspace is closed")
+        top_k = _legacy._TOP_K
+        flat_indices = indices.reshape(-1)
+        flat_weights = routing_weights.reshape(-1)
+        expected = num_tokens * top_k
+        if flat_indices.numel() != expected or flat_weights.numel() != expected:
+            raise ValueError(
+                f"indices and routing_weights must hold {expected} entries for {num_tokens} tokens"
+            )
+        # The built-in validation takes at most BUILTIN_MAX_TOKENS tokens: check every such slice
+        # (rows / row_stride are the expert output's, the same for every slice) before any launch.
+        rows = row_stride = None
+        for begin in range(0, num_tokens, BUILTIN_MAX_TOKENS):
+            count = min(BUILTIN_MAX_TOKENS, num_tokens - begin)
+            slots = slice(begin * top_k, (begin + count) * top_k)
+            rows, row_stride = self.legacy._validate(
+                gemm2_output, flat_indices[slots], flat_weights[slots], norm_weight, eps, count
+            )
+        # One launch per call of at most ``max_tokens`` tokens (one launch on the 256-token layout).
+        chunks = []
+        begin = 0
+        for count in chunk_counts(num_tokens, self.max_tokens):
+            slots = slice(begin * top_k, (begin + count) * top_k)
+            chunks.append((begin, count, slots, rows, row_stride))
+            begin += count
+        out = torch.empty((num_tokens, HIDDEN), dtype=torch.bfloat16, device=self.device)
+        for begin, count, slots, rows, row_stride in chunks:
+            self._launch(
+                gemm2_output.data_ptr() if rows > 0 else 0,
+                flat_indices[slots].data_ptr(),
+                flat_weights[slots].data_ptr(),
+                norm_weight.data_ptr(),
+                out[begin : begin + count].data_ptr(),
+                rows,
+                row_stride,
+                count,
+                float(eps),
+            )
         return out
 
 

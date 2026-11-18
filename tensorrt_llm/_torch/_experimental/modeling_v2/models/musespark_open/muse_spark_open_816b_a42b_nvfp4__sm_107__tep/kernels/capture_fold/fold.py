@@ -44,6 +44,11 @@ the transport's row capacity as its limit (``capture_rows``), so its boundary
 stores the capture as at 8 rows; without it the limit stays ``fused_rows`` and
 those calls make the built-in cast and copy.
 
+Decode steps of 33..768 rows with the ``multi_request_ffn_join`` lever: a capture layer's join
+runs that lever's kernel, which stores the capture of every call it takes (``capture_limit``
+hands it the view); a call it declines makes the built-in cast and copy after the layer. The
+lever takes only the capture layers' joins; the other layers' joins keep the built-in join.
+
 Every reader of the buffer is the DFlash worker's prepare after the target
 forward, on the same stream (or on a stream forked after the last capture
 layer), so it still runs after the writer. The buffer address the kernel is
@@ -58,7 +63,7 @@ This rests on built-in code: the decoder layer's forward
 
 from __future__ import annotations
 
-from typing import FrozenSet, Optional, Tuple
+from typing import Dict, FrozenSet, Optional, Tuple
 
 import torch
 
@@ -91,6 +96,21 @@ def capture_rows(join, wide: bool) -> int:
     return fused_rows(join)
 
 
+def capture_limit(join, wide: bool, hidden_states: torch.Tensor) -> int:
+    """``capture_rows``, or the call's own row count when ``multi_request_ffn_join`` serves it.
+
+    The multi-request join (the ``_multi_request_join`` op of the post-FFN ``join``) stores the
+    capture of every call it takes; ``serves`` reads only the row count and construction-time and
+    per-capture host state, so the limit is a per-capture constant under a CUDA graph.
+    """
+    limit = capture_rows(join, wide)
+    joiner = getattr(join, "_multi_request_join", None)
+    rows = hidden_states.shape[0] if hidden_states.dim() == 2 else 0
+    if joiner is not None and rows > limit and joiner.serves(join, rows):
+        return rows
+    return limit
+
+
 #: The row counts above 8 whose first capture stored by the wide direct boundary was logged.
 _LOGGED_WIDE_ROWS: FrozenSet[int] = frozenset()
 
@@ -104,6 +124,27 @@ def _log_wide_once(rows: int) -> None:
         f"[musespark_open] capture_fold: on {rows}-row decode steps the wide direct boundary writes "
         "the DFlash capture"
     )
+
+
+#: ``install``'s folded layers (``folded_layers``): the capture layers a step's joins store.
+_FOLDED_LAYERS: FrozenSet[int] = frozenset()
+#: Per row count above ``capture_rows``: the folded layers whose capture ``multi_request_ffn_join``
+#: stored (host-side; under a CUDA graph, at capture).
+_JOINED_ROWS: Dict[int, FrozenSet[int]] = {}
+
+
+def _log_joined_once(rows: int, layer_idx: int) -> None:
+    """Log once per row count, when ``multi_request_ffn_join`` stored the capture of every folded layer."""
+    seen = _JOINED_ROWS.get(rows, frozenset())
+    if layer_idx in seen:
+        return
+    seen = seen | {layer_idx}
+    _JOINED_ROWS[rows] = seen
+    if seen == _FOLDED_LAYERS:
+        logger.info(
+            f"[musespark_open] capture_fold: on {rows}-row decode steps multi_request_ffn_join stores "
+            f"the DFlash capture of layers {sorted(seen)}"
+        )
 
 
 def capture_layers(spec_config) -> Tuple[int, ...]:
@@ -222,7 +263,7 @@ class MuseSparkOpenTepCaptureDecoderLayer(MuseSparkOpenTepDecoderLayer):
                 spec_metadata,
                 self.layer_idx,
                 hidden_states,
-                capture_rows(self.add_ffn, self._capture_fold_wide),
+                capture_limit(self.add_ffn, self._capture_fold_wide, hidden_states),
             )
             if capture_fold
             else (None, None)
@@ -262,7 +303,10 @@ class MuseSparkOpenTepCaptureDecoderLayer(MuseSparkOpenTepDecoderLayer):
             join._capture_stored = False
         updated = result[0] if isinstance(result, tuple) else result
         if stored and view.shape[0] > MAX_ROWS:
-            _log_wide_once(int(view.shape[0]))
+            if view.shape[0] <= capture_rows(join, self._capture_fold_wide):
+                _log_wide_once(int(view.shape[0]))
+            else:
+                _log_joined_once(int(view.shape[0]), self.layer_idx)
         if not stored:
             # The boundary took the built-in path: the built-in capture, where the
             # built-in layer makes it (after its last kernel).
@@ -310,6 +354,7 @@ def install(model, spec_config, wide: bool = False) -> dict:
         ValueError: without a DFlash drafter's capture layers, or when a layer is
             not the projection-gather decoder layer with its fused post-FFN join.
     """
+    global _FOLDED_LAYERS
     layers = capture_layers(spec_config)
     for layer in model.layers:
         if type(layer) is not MuseSparkOpenTepDecoderLayer or not isinstance(
@@ -320,6 +365,7 @@ def install(model, spec_config, wide: bool = False) -> dict:
                 f"{layer.layer_idx} is {type(layer).__name__} with {type(layer.add_ffn).__name__}"
             )
     folded = sorted(folded_layers(model, spec_config))
+    _FOLDED_LAYERS = frozenset(folded)
     wide = bool(wide)
     for layer in model.layers:
         layer.__class__ = MuseSparkOpenTepCaptureDecoderLayer

@@ -172,7 +172,9 @@ SPLITK_MIN_ROWS, SPLITK_MAX_ROWS = 33, 64
 #: census at 65..128 rows before a served run (``CERTIFIED_SPLITK_PRODUCERS_TP8`` keys the device
 #: code, which this does not change). Calls above the bound keep cuBLAS.
 SPLITK_WIDE_MAX_ROWS = 64
-SPLITK_WIDE_LIMIT = 128
+#: (w256: was 128) up to 256 rows (17..32 requests): the same one launch, 2..4 more token tiles on grid
+#: y; each row keeps its one-request bits (GB300 served this launch to 448 rows).
+SPLITK_WIDE_LIMIT = 256
 #: ``configure``'s ``tep8_publish_splitk_wide_pool_tile`` (the ``tep8_publish_splitk`` lever's
 #: WIDE_POOL_TILE): the pool slice's tile in that one launch (65..``SPLITK_WIDE_MAX_ROWS`` rows).
 #: ``64x16`` (default) is the 33..64-row tactic (64, 16, 4, 10): 8 x ceil(R / 16) x 4 CTAs (192 at
@@ -473,6 +475,16 @@ TEP8_POOL_PROGRAMMATIC = False
 #: launch order changes: bitwise. Off: the plain launch.
 TEP8_JOIN_PDL = False
 
+#: ``join_entry_trigger`` (``configure``; the ``tep8_publish_join`` lever's ENTRY_TRIGGER): under
+#: ``tep8_join_pdl`` the post-FFN join releases its dependents at entry, before its own
+#: ``griddepcontrol.wait``, instead of right after it. The next layer's QKV GEMM then becomes resident
+#: while the unpool GEMM (the join's predecessor) still runs and stages its weight beside the MoE tail
+#: (the HBM is idle there: the experts are done, the finalize is an exchange); as with the 8- / 32-row
+#: boundaries' entry release (``boundary_early_release``). Its own ``griddepcontrol.wait`` still returns
+#: only once the join completed, which implies the unpool GEMM's completion (the join waits for it
+#: before any read): launch order only, bitwise. Off: the trigger after the wait.
+JOIN_ENTRY_TRIGGER = False
+
 
 _join_pdl_logged: list = []
 
@@ -529,6 +541,7 @@ def configure(
     tep8_pool_programmatic: bool = False,
     tep8_join_pdl: bool = False,
     join_cluster: bool = False,
+    join_entry_trigger: bool = False,
 ) -> None:
     """Set the TP8 publication and post-FFN join settings this module reads at install and launch.
 
@@ -555,6 +568,8 @@ def configure(
         tep8_join_pdl: the post-FFN join launches with PDL and an entry trigger
             (``TEP8_JOIN_PDL``).
         join_cluster: the post-FFN join runs as the bitwise cluster kernel (``JOIN_CLUSTER``).
+        join_entry_trigger: under ``tep8_join_pdl`` the join releases its dependents at entry
+            (``JOIN_ENTRY_TRIGGER``).
 
     Raises:
         ValueError: for a ``tep8_publish_splitk_max_rows`` outside
@@ -564,7 +579,12 @@ def configure(
             tile not in ``SPLITK_WIDE_UNPOOL_TILES``), or a ``tep8_publish_splitk_wide_tile_min_rows``
             outside ``SPLITK_MAX_ROWS`` + 1..``SPLITK_WIDE_LIMIT``; nothing is set then.
     """
-    global TEP8_PUBLISH_SPLITK, TEP8_POOL_PROGRAMMATIC, TEP8_JOIN_PDL, JOIN_CLUSTER
+    global \
+        TEP8_PUBLISH_SPLITK, \
+        TEP8_POOL_PROGRAMMATIC, \
+        TEP8_JOIN_PDL, \
+        JOIN_CLUSTER, \
+        JOIN_ENTRY_TRIGGER
     global SPLITK_WIDE_MAX_ROWS, PUBLISH_MIN_ROWS, SPLITK_WIDE_POOL_TILE, SPLITK_WIDE_UNPOOL_TILE
     global SPLITK_WIDE_TILE_MIN_ROWS
     tile_rows = int(tep8_publish_splitk_wide_tile_min_rows)
@@ -604,6 +624,7 @@ def configure(
     TEP8_POOL_PROGRAMMATIC = bool(tep8_pool_programmatic)
     TEP8_JOIN_PDL = bool(tep8_join_pdl)
     JOIN_CLUSTER = bool(join_cluster)
+    JOIN_ENTRY_TRIGGER = bool(join_entry_trigger)
     # The split-K producer is decided once from TEP8_PUBLISH_SPLITK (``_splitk_publisher``).
     _splitk_state.clear()
     if JOIN_CLUSTER:
@@ -628,6 +649,9 @@ typedef unsigned long long u64;
 #endif
 #ifndef CL
 #define CL 4  // CTAs a row; each runs 512 / CL of the Triton join's 512 threads
+#endif
+#ifndef ENTRY_TRIG
+#define ENTRY_TRIG 0  // join_entry_trigger: release the dependents at entry (before the wait)
 #endif
 #define NT (512 / CL)
 #define NW (NT / 32)
@@ -696,6 +720,9 @@ pubjoin4(float* out, const float* residual, const u16* branch, const u16* gain, 
   __shared__ __align__(16) float wsum0[16];
   __shared__ __align__(16) float wsum1[16];
   __shared__ __align__(8) u64 bars[2];
+#if ENTRY_TRIG
+  if (trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
   const int t = threadIdx.x, rank = blockIdx.x % CL, row = blockIdx.x / CL;
   const int T = rank * NT + t;
   const int c0 = 8 * T, c1 = 4096 + 8 * T;
@@ -710,7 +737,9 @@ pubjoin4(float* out, const float* residual, const u16* branch, const u16* gain, 
   __syncthreads();
   asm volatile("barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.aligned;" ::: "memory");
   asm volatile("griddepcontrol.wait;" ::: "memory");
+#if !ENTRY_TRIG
   if (trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
   // every input first (their latencies overlap), the branch last
   const long long rb = (long long)row * 8192;
   uint4 g0q = ld16(gain + c0), g1q = ld16(gain + c1), w0q = ld16(next_w + c0), w1q = ld16(next_w + c1);
@@ -807,7 +836,7 @@ def _join_cl_check(r):
 def _join_cl_function(device: torch.device, has_gain: bool, norm_fp32: bool, cl: int):
     """The compiled cluster join, or ``None`` if it is not compiled yet and a capture is running."""
     index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, bool(has_gain), bool(norm_fp32), int(cl))
+    key = (index, bool(has_gain), bool(norm_fp32), int(cl), bool(JOIN_ENTRY_TRIGGER))
     fn = _JOIN_CL_FN.get(key)
     if fn is not None:
         return fn
@@ -837,6 +866,7 @@ def _join_cl_function(device: torch.device, has_gain: bool, norm_fp32: bool, cl:
         f"-DHAS_GAIN={int(bool(has_gain))}".encode(),
         f"-DNORM_FP32={int(bool(norm_fp32))}".encode(),
         f"-DCL={int(cl)}".encode(),
+        f"-DENTRY_TRIG={int(bool(JOIN_ENTRY_TRIGGER))}".encode(),
     ]
     r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
     if int(r[0]) != 0:
@@ -865,7 +895,8 @@ def _join_cl_function(device: torch.device, has_gain: bool, norm_fp32: bool, cl:
     logger.info(
         "[musespark_open] projection_publish: join_cluster: post-FFN join cluster kernel "
         f"compiled for sm_{major}{minor} on device {index} (cluster {cl} x {512 // cl} threads, gain {bool(has_gain)}, "
-        f"FP32 next-norm residual {bool(norm_fp32)}, regs {regs}, local {lmem} B)"
+        f"FP32 next-norm residual {bool(norm_fp32)}, entry trigger {bool(JOIN_ENTRY_TRIGGER)}, regs {regs}, "
+        f"local {lmem} B)"
     )
     return _JOIN_CL_FN[key]
 
@@ -1362,7 +1393,9 @@ def _low_rows_operands(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.T
     return tactic, hidden, weight
 
 
-def _run_splitk_wide(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor, tactic) -> None:
+def _run_splitk_wide(
+    hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor, tactic
+) -> None:
     """``SPLITK_WIDE_MAX_ROWS``: ``run_splitk_dense`` of a 65..``SPLITK_WIDE_LIMIT``-row slice in ONE
     launch, compiled exactly as the 64-row launch (``_launch_options(SPLITK_MAX_ROWS, split_k)``: the
     33..64-row publication's producer key). The tactic is validated at the 64-row launch's M (tile,
@@ -1440,6 +1473,7 @@ if triton is not None:
         GUARD: tl.constexpr,
         GUARD_BREAK: tl.constexpr,
         PDL: tl.constexpr = False,
+        ENTRY: tl.constexpr = False,
     ):
         """The built-in ``_gated_residual_after_rmsnorm_kernel`` (FUSE_NEXT_NORM) on a published branch.
 
@@ -1451,9 +1485,12 @@ if triton is not None:
         """
         if PDL:
             # TEP8_JOIN_PDL: wait for the prerequisite grid before any read, then let the dependent
-            # (the next QKV GEMM) become resident and stage its weight.
+            # (the next QKV GEMM) become resident and stage its weight (JOIN_ENTRY_TRIGGER: before the wait).
+            if ENTRY:
+                tl.extra.cuda.gdc_launch_dependents()
             tl.extra.cuda.gdc_wait()
-            tl.extra.cuda.gdc_launch_dependents()
+            if not ENTRY:
+                tl.extra.cuda.gdc_launch_dependents()
         token = tl.program_id(0)
         offs = tl.arange(0, BLOCK_H)
         mask = offs < HIDDEN
@@ -1736,6 +1773,7 @@ class UnpoolPublishJoin(OpWrapper):
             num_warps=_residual_num_warps(),
             # Passed only under TEP8_JOIN_PDL, so the plain build is unchanged.
             **({"PDL": True, "launch_pdl": True} if pdl else {}),
+            **({"ENTRY": True} if pdl and JOIN_ENTRY_TRIGGER else {}),
         )
         return updated, next_input
 

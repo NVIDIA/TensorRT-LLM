@@ -13,11 +13,14 @@ expert rows unfused in FP32, casts the combine to BF16 and all-reduces it over
 in front of the workspace every layer already shares in that attribute -- the
 ``finalize_transport`` one, or the built-in one -- and puts it in every layer's
 attribute (the model's own attribute keeps the built-in workspace). It returns
-the switch ``DecodeTarget`` arms around a decode forward of ``MIN_ROWS..MAX_ROWS``
-rows. While armed, the workspace runs its kernel for calls of ``MIN_ROWS..MAX_ROWS``
-tokens, and every layer's ``_finalize_ar_max_tokens`` is ``MAX_ROWS``, so the
-built-in forward hands calls of 129..512 tokens to ``finalize_chunked`` (this
-kernel) instead of its unfused combine, cast and all-reduce. Disarmed, every
+the switch ``DecodeTarget`` arms around a decode forward of ``MIN_ROWS..max_rows``
+rows. While armed, the workspace runs its kernel for calls of ``MIN_ROWS..max_rows``
+tokens, and every layer's ``_finalize_ar_max_tokens`` is ``max_rows``, so the
+built-in forward hands calls of 129..``max_rows`` tokens to ``finalize_chunked`` (this
+kernel) instead of its unfused combine, cast and all-reduce. ``max_rows`` is
+``MAX_ROWS``, raised to ``LIMIT_ROWS`` on a wide generation server (``levers.row_cap``;
+the workspace grows with it); the rows it adds leave the unfused combine, so a raised cap
+is lossless-numeric against it. Disarmed, every
 attribute holds its own value again and every call takes the path it took
 without this fast path: prefill and mixed steps, decode steps outside the band,
 and calls under ``MIN_ROWS`` tokens never reach the kernel. The new workspace has
@@ -50,19 +53,29 @@ MAX_TOKENS_ATTRIBUTE = "_finalize_ar_max_tokens"
 #: to 80 rows and the two-shot leads from 96 (12 requests).
 MIN_ROWS = 96
 MAX_ROWS = _two.MAX_ROWS
+#: The most rows a raised cap may arm: 96 requests at K = 7, within the kernel's
+#: ``GRID_STEP`` and a multiple of every served TP size.
+LIMIT_ROWS = 768
 
 
 class FinalizeTwoShotSwitch:
     """What ``DecodeTarget`` arms: the workspace's ``active`` flag and the layers' chunk bound."""
 
-    def __init__(self, workspace, moes: List[torch.nn.Module], min_rows: int = MIN_ROWS) -> None:
+    def __init__(
+        self,
+        workspace,
+        moes: List[torch.nn.Module],
+        min_rows: int = MIN_ROWS,
+        max_rows: int = MAX_ROWS,
+    ) -> None:
         self.workspace = workspace
         self.moes = moes
         self.min_rows = int(min_rows)
+        self.max_rows = int(max_rows)
 
     def takes(self, rows: int) -> bool:
         """Whether a decode forward of ``rows`` rows is armed."""
-        return self.min_rows <= rows <= MAX_ROWS
+        return self.min_rows <= rows <= self.max_rows
 
     @contextlib.contextmanager
     def armed(self) -> Iterator[None]:
@@ -71,7 +84,7 @@ class FinalizeTwoShotSwitch:
         self.workspace.active = True
         try:
             for moe in self.moes:
-                setattr(moe, MAX_TOKENS_ATTRIBUTE, MAX_ROWS)
+                setattr(moe, MAX_TOKENS_ATTRIBUTE, self.max_rows)
             yield
         finally:
             self.workspace.active = False
@@ -129,20 +142,37 @@ def bound_unarmed_calls(wrapped, moes: List[torch.nn.Module]) -> None:
             setattr(moe, MAX_TOKENS_ATTRIBUTE, _two.BUILTIN_MAX_TOKENS)
 
 
-def install(model: MuseSparkOpenModel) -> FinalizeTwoShotSwitch:
+def check_max_rows(max_rows: int) -> None:
+    """Refuse a row cap outside ``MAX_ROWS..LIMIT_ROWS`` (the same answer on every rank).
+
+    Raises:
+        ValueError: for such a cap.
+    """
+    if not MAX_ROWS <= int(max_rows) <= LIMIT_ROWS:
+        raise ValueError(f"max_rows {max_rows} outside {MAX_ROWS}..{LIMIT_ROWS}")
+
+
+def install(model: MuseSparkOpenModel, max_rows: int = MAX_ROWS) -> FinalizeTwoShotSwitch:
     """Put a ``FinalizeTwoShotWorkspace`` in every layer's finalize attribute (collective).
 
     Call it on every rank once ``refusal`` has been agreed to be None on every rank;
     the workspace's construction is collective over the TP group. Unarmed calls keep
-    their path (``bound_unarmed_calls``). Returns the switch ``DecodeTarget`` arms.
+    their path (``bound_unarmed_calls``). Returns the switch ``DecodeTarget`` arms on
+    decode forwards of up to ``max_rows`` rows (the path's ``MAX_ROWS`` parameter; the
+    workspace is sized for it).
+
+    Raises:
+        ValueError: for ``max_rows`` outside ``MAX_ROWS..LIMIT_ROWS`` (``check_max_rows``),
+            before any collective.
     """
+    check_max_rows(max_rows)
     wrapped = getattr(model.layers[0].feed_forward, ATTRIBUTE)
     mapping = model.layers[0].mapping
-    workspace = _two.FinalizeTwoShotWorkspace(wrapped, mapping)
+    workspace = _two.FinalizeTwoShotWorkspace(wrapped, mapping, max_rows=int(max_rows))
     moes = []
     for layer in model.layers:
         setattr(layer.feed_forward, ATTRIBUTE, workspace)
         moes.append(layer.feed_forward)
     bound_unarmed_calls(wrapped, moes)
     _two.log_once_enabled(len(model.layers), workspace.max_rows, MIN_ROWS)
-    return FinalizeTwoShotSwitch(workspace, moes, MIN_ROWS)
+    return FinalizeTwoShotSwitch(workspace, moes, MIN_ROWS, workspace.max_rows)

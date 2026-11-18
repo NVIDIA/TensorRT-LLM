@@ -524,6 +524,8 @@ class MultiRequestPrepAppendAttention:
             _dense.TEP8_WIDE64_PREP_FOLD
             and _dense.TEP8_WIDE64_WIDE_2CTA
             and _dense.TEP8_WIDE64_MAX_ROWS < rows <= _dense.TEP8_WIDE64_WIDE_MAX_ROWS
+            # w256: the fold's epilogue covers one 128-token tile; wider QKV calls run unfolded.
+            and rows <= _dense.TEP8_WIDE64_PREP_FOLD_MAX_ROWS
         ):
             return None
         dispatcher = self.qkv_proj.__dict__.get("_low_m_dispatcher")

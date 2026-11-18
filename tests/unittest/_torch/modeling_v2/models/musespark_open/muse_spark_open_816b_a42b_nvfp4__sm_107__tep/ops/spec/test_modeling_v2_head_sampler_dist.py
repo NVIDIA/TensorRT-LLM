@@ -55,13 +55,21 @@ _HS_NAMES = {
 }
 
 
-def _host(path: Path, names: set, functions: set, classes: set = frozenset(), **attrs) -> types.ModuleType:
+def _host(
+    path: Path, names: set, functions: set, classes: set = frozenset(), **attrs
+) -> types.ModuleType:
     tree = ast.parse(path.read_text())
     body = []
     for node in tree.body:
-        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names for t in node.targets):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id in names for t in node.targets
+        ):
             body.append(node)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id in names:
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id in names
+        ):
             body.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in functions:
             body.append(node)
@@ -121,7 +129,9 @@ def test_the_dist_layout():
         assert off % 16 == 0
     assert lay.staging_bytes == 2 * 128 * 25256 * 2
     assert hs.DistLayout(8, 25256, 128, ll_staging=True).staging_bytes == 2 * lay.staging_bytes
-    assert lay.smem_bytes == 50 * 128 * 16 <= 227 * 1024 - 48 * 1024  # 50 stripes of 1024 vectors, 128 slots each
+    assert (
+        lay.smem_bytes == 50 * 128 * 16 <= 227 * 1024 - 48 * 1024
+    )  # 50 stripes of 1024 vectors, 128 slots each
     assert set(lay.offsets()) == {"ready_offset", "states_offset", "cand_offset", "partial_offset"}
     for bad in ((3, 25256, 128), (8, 25255, 128), (8, 25256, 129), (8, 25256, 0), (16, 25256, 128)):
         with pytest.raises(ValueError):
@@ -195,17 +205,32 @@ def _methods():
 def test_the_head_routes_dist_steps():
     m = _methods()
     init = m["__init__"]
-    assert "dist_setup(_hs.DIST_MIN_ROWS, mapping, int(lm_head.weight.shape[0]), vocab_parallel)" in init
+    assert (
+        "dist_setup(_hs.DIST_MIN_ROWS, mapping, int(lm_head.weight.shape[0]), vocab_parallel)"
+        in init
+    )
     produce = m["produce"]
     # The distributed step comes first (it also takes 8-row steps at a floor of 8), with the built-in local GEMM.
-    assert produce.index("self.dist_min_rows <= rows <= self.dist.max_rows") < produce.index("self.vp is not None")
-    assert produce.index("self.dist_min_rows <= rows") < produce.index("self.workspace is not None and rows == ")
-    dist_branch = produce.split("self.dist_min_rows <= rows <= self.dist.max_rows")[1].split("return logits")[0]
+    assert produce.index("self.dist_min_rows <= rows <= self.dist.max_rows") < produce.index(
+        "self.vp is not None"
+    )
+    assert produce.index("self.dist_min_rows <= rows") < produce.index(
+        "self.workspace is not None and rows == "
+    )
+    dist_branch = produce.split("self.dist_min_rows <= rows <= self.dist.max_rows")[1].split(
+        "return logits"
+    )[0]
     assert "lm_head.apply_linear(hidden_states, lm_head.bias, None, None)" in dist_branch
     assert "self.pending_dist = True" in dist_branch
     sample = m["sample"]
-    assert sample.index("if dist_row:") < sample.index("if s2_row:") < sample.index("if local is not None:")
-    assert "_hs.dist_sample(self.dist.view, logits, local" in sample.replace("\n", " ").replace("    ", "")
+    assert (
+        sample.index("if dist_row:")
+        < sample.index("if s2_row:")
+        < sample.index("if local is not None:")
+    )
+    assert "_hs.dist_sample(self.dist.view, logits, local" in sample.replace("\n", " ").replace(
+        "    ", ""
+    )
     # Greedy batches do not take the vocabulary-parallel argmax: they gather the shards (materialize).
     assert "not self.pending_dist" in m["vocab_parallel"]
     for name in ("_gather_now", "drain"):
@@ -230,11 +255,16 @@ def test_the_cuda_constants_match():
         ("kDsPairBytes", hs.DIST_PAIR_BYTES),
         ("kDsSlotBytes", hs.DIST_SLOT_BYTES),
     ):
-        assert re.search(rf"constexpr unsigned long long {name} = (\d+);", src).group(1) == str(value), name
+        assert re.search(rf"constexpr unsigned long long {name} = (\d+);", src).group(1) == str(
+            value
+        ), name
     assert 'm.impl("ds_sample", &dsSample);' in src
     assert re.search(r"constexpr int kDsStamps = (\d+);", src).group(1) == str(hs.DIST_STAMPS)
     # the stamps exist only in the instrumented instantiation (the served one compiles none)
-    assert "if constexpr (kStamp)" in src and "template <bool kTrigger, bool kStamp = false, bool kFabric = false>" in src
+    assert (
+        "if constexpr (kStamp)" in src
+        and "template <bool kTrigger, bool kStamp = false, bool kFabric = false>" in src
+    )
 
 
 def test_the_ds_sample_schema_matches_its_call():
@@ -245,7 +275,9 @@ def test_the_ds_sample_schema_matches_its_call():
     (cls,) = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_DistRank"]
     (sample,) = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "sample"]
     (call,) = [
-        n for n in ast.walk(sample) if isinstance(n, ast.Call) and ast.unparse(n.func).endswith(".ds_sample")
+        n
+        for n in ast.walk(sample)
+        if isinstance(n, ast.Call) and ast.unparse(n.func).endswith(".ds_sample")
     ]
     args = [ast.unparse(a) for a in call.args]
     assert len(params) == len(args) == 29
@@ -280,7 +312,16 @@ def test_the_ds_sample_schema_matches_its_call():
         "stamps",
         "bool(fabric)",
     ]
-    assert params[:8] == ["local", "pending", "temperatures", "top_ks", "top_ps", "min_ps", "seed", "offset"]
+    assert params[:8] == [
+        "local",
+        "pending",
+        "temperatures",
+        "top_ks",
+        "top_ps",
+        "min_ps",
+        "seed",
+        "offset",
+    ]
     assert params[-4:] == ["pdl", "early_trigger", "stamps", "fabric"]
 
 
@@ -302,22 +343,31 @@ def test_the_kernel_uses_kernel_a_and_b_statements():
         assert stmt in coop and stmt in body, stmt
     assert "runSum = keep ? runSum + 1.0f * w : 1.0f + runSum * w;" in body
     assert "runSum = keep ? runSum + 1.0f * w : 1.0f + runSum * w;" in coop
-    assert "float runMax = -FLT_MAX;" in body and "float runSum = 0.0f;" in body and "int runArg = 0;" in body
+    assert (
+        "float runMax = -FLT_MAX;" in body
+        and "float runSum = 0.0f;" in body
+        and "int runArg = 0;" in body
+    )
     assert "cachedThreadStats.sum * __expf(cachedThreadStats.max - maxScaled)" in body
     assert "shared.massTarget = rp.topP * supportMass;" in body
     assert "shared.target = curand_uniform(&shared.rejectRng) * supportMass;" in body
     assert "if (w >= 0.0f && w > candWeight)" in body
-    assert "sKeep = above.mass <= shared.massTarget ? 1 : 0;" in body
+    assert "sKeepToken = above.mass <= shared.massTarget ? 1 : 0;" in body
     assert "BlockReduceCountMass(shared.temp.reduceCountMass).Reduce(part, CountMassOp())" in body
     assert "fusedSamplingBody<CapBf16, kDsThreads, true, false>(fs, shared);" in body
     assert "if (filtered && !splitTopPOnly(rp))" in body
     # the fabric variant: LL staging written with the call's flag, pulled with an inline flag check (no fence /
     # ready flag on that path); the third state word as one LL element
     assert "template <bool kTrigger, bool kStamp = false, bool kFabric = false>" in src
-    assert "dsStorePair(mineLL + static_cast<unsigned long long>(v) * 16u, tag | w.x, tag | w.y);" in body
+    assert (
+        "dsStorePair(mineLL + static_cast<unsigned long long>(v) * 16u, tag | w.x, tag | w.y);"
+        in body
+    )
     assert body.count("if (!dsFresh(a[u], b[u], flag0))") == 2  # the pull and the fallback gather
     assert "dsAwaitPair(llAt(v), flag0, p.status, p.timeoutNs, a[u], b[u]);" in body
-    ready = body.split("if constexpr (!kFabric)\n    {\n        // The CTA's staging stores")[1].split("stamp(2);")[0]
+    ready = body.split("if constexpr (!kFabric)\n    {\n        // The CTA's staging stores")[
+        1
+    ].split("stamp(2);")[0]
     assert "__threadfence_system();" in ready and "dsAwaitPair(copy + readyRow" in ready
     assert "dsPublishOne(p, at + 16u, dsTag(flag0) | static_cast<uint32_t>(own.argmax));" in body
     assert "e2 = dsAwaitOne(at + 16u, flag0, p.status, p.timeoutNs);" in body
@@ -351,7 +401,11 @@ def test_rank_vectors_are_its_virtual_threads_in_kernel_a_order(world):
                 vt = local_threads * r + a
                 served = list(range(vt, vec_count, vb))  # kernel A: v = vt + 1024 j, increasing
                 # the fold / sweep: slot a + L j while vt + 1024 j < vec_count
-                ours = [slot_vector[a + local_threads * j] for j in range(stripes) if vt + vb * j < vec_count]
+                ours = [
+                    slot_vector[a + local_threads * j]
+                    for j in range(stripes)
+                    if vt + vb * j < vec_count
+                ]
                 assert ours == served, (world, vec_count, r, a)
                 # the walk: element j of the walker at slot a + L j, j < ceil((vec_count - vt) / 1024)
                 walk = -(-(vec_count - vt) // vb)
@@ -364,7 +418,9 @@ def test_rank_vectors_are_its_virtual_threads_in_kernel_a_order(world):
             run = [slot_vector[i] for i in range(local_threads)]
             assert run == list(range(local_threads * r, local_threads * (r + 1)))
         assert seen == set(range(vec_count))  # every vector once, over the ranks
-        for t in range(vb):  # the reader: thread t is virtual thread t, owner t // L, entry (owner, t % L) == t
+        for t in range(
+            vb
+        ):  # the reader: thread t is virtual thread t, owner t // L, entry (owner, t % L) == t
             assert (t // local_threads) * local_threads + t % local_threads == t
 
 
@@ -422,15 +478,35 @@ def test_gpu_dist_emulation_matches_the_split_sampler():
     for mode in ("served", "flat", "sharp", "mixed"):
         for rows in sorted({1, most // 2 or 1, most, 8 if most >= 8 else most}):
             for seed in range(3):
-                logits, temps, top_ks, top_ps, min_ps, seeds, offsets = _inputs(torch, rows, mode, 100 * calls + seed)
+                logits, temps, top_ks, top_ps, min_ps, seeds, offsets = _inputs(
+                    torch, rows, mode, 100 * calls + seed
+                )
                 ref = hs.split_sample(
-                    logits, temps, top_ks, top_ps, min_ps, seeds, offsets, _MULTIPLIER, _SOFT_CAP, states
+                    logits,
+                    temps,
+                    top_ks,
+                    top_ps,
+                    min_ps,
+                    seeds,
+                    offsets,
+                    _MULTIPLIER,
+                    _SOFT_CAP,
+                    states,
                 )
                 locals_ = [logits[:, r * SHARD : (r + 1) * SHARD].contiguous() for r in range(8)]
                 for fabric in (False, True):
                     emu = emus[fabric]
                     tokens, pending = emu.sample(
-                        locals_, temps, top_ks, top_ps, min_ps, seeds, offsets, _MULTIPLIER, _SOFT_CAP, fabric=fabric
+                        locals_,
+                        temps,
+                        top_ks,
+                        top_ps,
+                        min_ps,
+                        seeds,
+                        offsets,
+                        _MULTIPLIER,
+                        _SOFT_CAP,
+                        fabric=fabric,
                     )
                     torch.cuda.synchronize()
                     assert emu.status.item() == 0
@@ -448,11 +524,23 @@ def test_gpu_dist_emulation_fallback_rows_gather_the_row():
         top_ks.fill_(40)  # every row: top-k + top-p
         locals_ = [logits[:, r * SHARD : (r + 1) * SHARD].contiguous() for r in range(8)]
         tokens, pending = emu.sample(
-            locals_, temps, top_ks, top_ps, min_ps, seeds, offsets, _MULTIPLIER, _SOFT_CAP, fabric=fabric
+            locals_,
+            temps,
+            top_ks,
+            top_ps,
+            min_ps,
+            seeds,
+            offsets,
+            _MULTIPLIER,
+            _SOFT_CAP,
+            fabric=fabric,
         )
         torch.cuda.synchronize()
         for r in range(8):
-            assert torch.equal(pending[r], logits), (r, fabric)  # the gathered row, vocabulary order, every rank
+            assert torch.equal(pending[r], logits), (
+                r,
+                fabric,
+            )  # the gathered row, vocabulary order, every rank
 
 
 def _bench(iters=200):
@@ -472,18 +560,51 @@ def _bench(iters=200):
 
             def dist():
                 return emus[False].view.sample(
-                    local, pending, temps, top_ks, top_ps, min_ps, seeds, offsets, _MULTIPLIER, _SOFT_CAP, True, False
+                    local,
+                    pending,
+                    temps,
+                    top_ks,
+                    top_ps,
+                    min_ps,
+                    seeds,
+                    offsets,
+                    _MULTIPLIER,
+                    _SOFT_CAP,
+                    True,
+                    False,
                 )
 
             def dist_fabric():
                 return emus[True].view.sample(
-                    local, pending, temps, top_ks, top_ps, min_ps, seeds, offsets, _MULTIPLIER, _SOFT_CAP, True, False,
-                    None, True,
+                    local,
+                    pending,
+                    temps,
+                    top_ks,
+                    top_ps,
+                    min_ps,
+                    seeds,
+                    offsets,
+                    _MULTIPLIER,
+                    _SOFT_CAP,
+                    True,
+                    False,
+                    None,
+                    True,
                 )
 
             def today():
                 return hs.split_sample(
-                    logits, temps, top_ks, top_ps, min_ps, seeds, offsets, _MULTIPLIER, _SOFT_CAP, states, pdl=True
+                    logits,
+                    temps,
+                    top_ks,
+                    top_ps,
+                    min_ps,
+                    seeds,
+                    offsets,
+                    _MULTIPLIER,
+                    _SOFT_CAP,
+                    states,
+                    pdl=True,
                 )
 
             line = [f"rows {rows} {mode}:"]
@@ -497,7 +618,10 @@ def _bench(iters=200):
                 with torch.cuda.graph(graph):
                     fn()
                 graph.replay()
-                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start, end = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
                 start.record()
                 for _ in range(iters):
                     graph.replay()

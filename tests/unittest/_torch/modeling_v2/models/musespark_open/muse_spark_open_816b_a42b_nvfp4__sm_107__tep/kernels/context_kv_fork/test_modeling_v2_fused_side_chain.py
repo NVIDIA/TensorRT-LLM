@@ -7,8 +7,10 @@ From its fork point and from its early part (``_side_chain_early``), the fused s
 must leave the drafter's context bit for bit as the worker's ``_store_step_context`` leaves
 it (unmasked, as the fork's built-in side chain calls it): over a dense full-length arena
 (``_fused_side_chain``) and over the KV cache manager's pages (``_fused_side_chain_paged``,
-with and without ``paged_ctx_kv_store``). The paged prologue's op must match its reference,
-and the side chain must leave the arenas it does not write to the worker.
+with and without ``paged_ctx_kv_store``), also over FP8 E4M3 pages (the FP8 draft KV
+pool: K/V computed in BF16, stored with the saturating cast). The paged prologue's op must
+match its reference, and the side chain must leave the arenas it does not write to the
+worker.
 """
 
 import types
@@ -99,12 +101,12 @@ def _lengths(num_gens, seed, capacity):
     return batch_to_slot, ctx_len
 
 
-def _paged_state(num_gens, seed):
+def _paged_state(num_gens, seed, page_dtype=torch.bfloat16):
     """A worker state over the manager's pages (one view per layer), and its pool."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     pages = num_gens * BLOCKS + 3
     pool = torch.randn((pages, LAYERS, 2, KV_HEADS, PAGE, HEAD_DIM), generator=g, device="cuda")
-    pool = pool.to(torch.bfloat16)
+    pool = pool.to(page_dtype)
     # Every (row, block) its own page, so no two entries share a destination.
     table = torch.randperm(pages, generator=g, device="cuda")[: num_gens * BLOCKS]
     table = table.to(torch.int32).view(num_gens, BLOCKS).contiguous()
@@ -127,6 +129,8 @@ def _paged_state(num_gens, seed):
         _ctx_paged_append=None,
         _ctx_len=ctx_len,
         _batch_to_slot=batch_to_slot,
+        # The drafter's activation dtype (``_lazy_init_ctx_buffers``), read for FP8 pages.
+        _ctx_compute_dtype=torch.bfloat16,
     )
     return state, pool
 
@@ -273,3 +277,37 @@ def test_the_side_chain_leaves_other_arenas_to_the_worker(case, reason):
         state["_ctx_block_counts"] = state["_ctx_block_counts"].to(torch.int32)
     worker = _worker(fork_mod.ContextKvForkDFlashWorker, state)
     assert reason in fork_mod._side_chain_refusal(worker, drafter)
+
+
+@pytest.mark.parametrize("num_gens", [1, 8])
+@pytest.mark.parametrize("store_op", [False, True], ids=["appends", "store_op"])
+@pytest.mark.parametrize("early", [False, True], ids=["fork_point", "early"])
+def test_the_paged_side_chain_over_fp8_pages_is_the_worker_store(
+    num_gens, store_op, early, monkeypatch
+):
+    fp8 = torch.float8_e4m3fn
+    seed = num_gens * 17 + 3
+    drafter = _drafter(seed)
+    spec_metadata = _spec_metadata(num_gens, seed)
+    want_state, want_pool = _paged_state(num_gens, seed, fp8)
+    _builtin(want_state, drafter, spec_metadata, num_gens)
+
+    state, pool = _paged_state(num_gens, seed, fp8)
+    worker = _worker(fork_mod.ContextKvForkDFlashWorker, state, store_op)
+    assert fork_mod._side_chain_refusal(worker, drafter) is None
+    part = None
+    if early:
+        refreshed = []
+        part = fork_mod._side_chain_early(
+            worker, drafter, spec_metadata, num_gens, K, lambda: refreshed.append(True)
+        )
+        assert part is not None and refreshed == [True]
+    calls = []
+    real = fork_mod.ctx_kv_store_paged
+    monkeypatch.setattr(
+        fork_mod, "ctx_kv_store_paged", lambda *a, **kw: (calls.append(a), real(*a, **kw))
+    )
+    fork_mod._fused_side_chain_paged(worker, drafter, spec_metadata, num_gens, K, part)
+    torch.cuda.synchronize()
+    assert len(calls) == int(store_op)
+    assert torch.equal(pool.view(torch.uint8), want_pool.view(torch.uint8))

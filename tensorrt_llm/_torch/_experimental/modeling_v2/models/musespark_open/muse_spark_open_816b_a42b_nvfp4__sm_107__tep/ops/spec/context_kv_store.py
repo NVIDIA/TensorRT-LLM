@@ -28,7 +28,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
 
 #: Generation requests one prep call takes (``context_kv_commit.MAX_REQUESTS``).
 MAX_REQUESTS = 64
@@ -70,23 +70,6 @@ class ContextKvPrep(OpWrapper):
     * ``col = positions.clamp(max=max_ctx - 1)``;
     * ``pos_i32 = positions.to(int32).repeat_interleave(layers)``.
     """
-
-    ARCHS = frozenset({Arch.SM_107})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the served decode step: one request, K + 1 = 8 rows, 5 drafter layers",
-            spec=dict(gens=1, rows=8, layers=5, slots=2),
-        ),
-        Cell(
-            why="a context at the arena's end: columns clamp, positions do not",
-            spec=dict(gens=1, rows=8, layers=5, slots=2, at_end=True),
-        ),
-        Cell(
-            why="several requests in distinct slots",
-            spec=dict(gens=3, rows=4, layers=2, slots=5),
-        ),
-    )
 
     note = """
     Metadata consumed: none. One Triton program (grid 1, 1 warp) looping over
@@ -208,23 +191,6 @@ class ContextKvScatter(OpWrapper):
     Where rows of a request clamp onto the arena's last column, the last of them is
     stored (a deterministic ``index_put``'s last-duplicate-wins).
     """
-
-    ARCHS = frozenset({Arch.SM_107})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the served decode step: one request, 8 rows, 5 layers, 1 kv head x 128",
-            spec=dict(gens=1, rows=8, layers=5, kv_heads=1, head_dim=128, slots=2),
-        ),
-        Cell(
-            why="a context at the arena's end: duplicate columns, the last row stored",
-            spec=dict(gens=1, rows=8, layers=5, kv_heads=1, head_dim=128, slots=2, at_end=True),
-        ),
-        Cell(
-            why="several requests, 2 kv heads x 64",
-            spec=dict(gens=3, rows=4, layers=2, kv_heads=2, head_dim=64, slots=5),
-        ),
-    )
 
     note = """
     Metadata consumed: none. Grid ``gens * rows`` Triton programs (1 warp), each

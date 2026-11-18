@@ -30,7 +30,7 @@ Sample (``SampleStoreWriter``, the model's sampler store writer): the sampler
 store's four ``index_copy_`` and the three device-to-host snapshots become one
 launch that writes the store rows and the pinned host snapshots directly.
 
-Two levers of the plan (``make_runtime_hooks`` reads ``model._plan``) change where and
+Three levers of the plan (``make_runtime_hooks`` reads ``model._plan``) change where and
 how much of this runs:
 
 * ``step_loop_on_execution_stream`` declares
@@ -46,6 +46,11 @@ how much of this runs:
   drafter in one ``KVCacheManagerV2``) is staged too, one table per group, as the
   manager's own copy writes it (upstream #21789). Its parameter ``POOL_GROUPS`` is an
   accepted alias with no effect (kept for the round-3 / E2E envs).
+* ``pool_group_tail_marks`` (opt-in) bounds the copy of a KV cache manager with
+  attention-op pool groups past the readable columns: each row of those tables must hold
+  ``BAD_PAGE_INDEX`` there, and the copy fills only the columns a row may not already
+  hold as that word (``_BlockTailMarks``) instead of every column to the row's end on
+  every step. The device table holds the same words either way.
 
 ``step_loop_inline_commits`` (on top of both) changes how the launches are issued, with the
 same words written:
@@ -288,6 +293,58 @@ def _runs_of(diff: np.ndarray, m: int, n: int) -> list[tuple[int, int]]:
     return runs
 
 
+class _BlockTailMarks:
+    """Per row of a pool-group device block table: the first column from which the row holds
+    ``BAD_PAGE_INDEX`` through its last column (``pool_group_tail_marks``).
+
+    The pool-group copy writes a row's readable columns ``[0, cols)`` from the host row and
+    must leave ``BAD_PAGE_INDEX`` in the others, as the manager's own copy does. A row whose
+    columns from ``m`` on already hold that word needs only ``[cols, m)`` filled, and nothing
+    when ``m <= cols``; once the copy has run the row holds the word from ``cols`` on. A row
+    without a mark (a table first seen, or after ``forget``) is filled from ``cols`` to its
+    end. So the steady-state fill is the drop of the batch's readable width, not the row
+    width, and the launch's grid keeps the width of its longest readable copy.
+
+    Ownership is ``_BlockOffsetsMemo``'s: the device table's writers are this stager's
+    launches and the KV cache manager's own copy, every native copy happens in a step the
+    stager saw, and each of those calls ``forget``. The marks describe device words, so they
+    are kept per table storage (data pointer and shape; the entry holds the tensor, so its
+    storage is not reused while marked), and marking a table drops the marks of every other
+    table whose words overlap it: attention metadata of different batch sizes may take their
+    tables from one buffer.
+    """
+
+    def __init__(self, max_tables: int = 16):
+        self._max_tables = max_tables
+        #: (data pointer, shape) -> (table, first byte, end byte, int64 marks [tables, rows]),
+        #: least recently marked first.
+        self._tables: dict[tuple[int, tuple], tuple[Any, int, int, np.ndarray]] = {}
+
+    def forget(self) -> None:
+        """Drop every mark: the next copy of each row fills every column past the readable ones."""
+        self._tables.clear()
+
+    def marks(self, dst: Any) -> np.ndarray:
+        """The marks of ``dst`` ``[tables, rows, 2, columns]``, the row width where none is known.
+
+        The returned int64 ``[tables, rows]`` array is the stored one: the caller writes the
+        marks of the rows it records.
+        """
+        shape = tuple(dst.shape)
+        key = (dst.data_ptr(), shape)
+        entry = self._tables.pop(key, None)
+        if entry is None:
+            lo = dst.data_ptr()
+            hi = lo + math.prod(shape) * dst.element_size()
+            for other in [k for k, (_, a, b, _) in self._tables.items() if a < hi and lo < b]:
+                del self._tables[other]
+            entry = (dst, lo, hi, np.full(shape[:2], shape[3], dtype=np.int64))
+        self._tables[key] = entry
+        while len(self._tables) > self._max_tables:
+            del self._tables[next(iter(self._tables))]
+        return entry[3]
+
+
 class _PrepareStager:
     """One step's window, the model's ``StepInputStager``: records the prepare-phase device
     writes (see the module docstring).
@@ -309,8 +366,13 @@ class _PrepareStager:
         blocks_memo: Optional[_BlockOffsetsMemo] = None,
         plan: Any = None,
         stages_batch_slot_ids: bool = False,
+        tail_marks: Optional[_BlockTailMarks] = None,
     ):
         self.staging = staging
+        #: When set (``pool_group_tail_marks``), a pool-group copy without the changed-column
+        #: memo fills only the columns past the readable ones that its rows may not already
+        #: hold as ``BAD_PAGE_INDEX``; without it every column past the readable ones.
+        self.tail_marks = tail_marks
         #: Whether ``copy`` takes the slot-id table upload (``StepInputStager``): with the
         #: ``rejection_sampler`` fast path installed (``rs.installed``).
         self.stages_batch_slot_ids = stages_batch_slot_ids
@@ -619,6 +681,16 @@ class _PrepareStager:
             step_keys[..., 1] = np.array([scale for _, scale, _, _ in tables])[:, None]
             step_keys[..., 2] = np.array([kv_offset for _, _, kv_offset, _ in tables])[:, None]
             widths, step_runs = memo.table_runs(step_keys, step_pages)
+        # ``pool_group_tail_marks``: per (table, seq), the column from which the device row is
+        # known to hold the bad-page word (the row width where unknown). The memo's recorded
+        # widths bound the fill instead where it is on.
+        marks = None
+        if self.tail_marks is not None:
+            if clear_tail and memo is None:
+                marks = self.tail_marks.marks(dst)
+            else:
+                # A per-pool copy, or the memo's, writes words the marks may describe.
+                self.tail_marks.forget()
         # (table, seq, host row, column runs, columns past them to clear): one full-width run
         # per row without a memo.
         plan = []
@@ -632,6 +704,8 @@ class _PrepareStager:
                     written = None if width < 0 else width
                     runs = step_runs[table][seq]
                     unchanged += not runs
+                if marks is not None:
+                    written = int(marks[table, seq])
                 tail = (cols, num_blocks if written is None else written) if clear_tail else (0, 0)
                 plan.append((table, seq, row, runs, tail))
         num_descriptors = sum(len(runs) + 2 * (hi > lo) for *_, runs, (lo, hi) in plan)
@@ -659,6 +733,12 @@ class _PrepareStager:
                 n = hi_tail - lo_tail
                 st.fill(self._dst(k + lo_tail * 4, n * 4), 1, n, bad_page)
                 st.fill(self._dst(v + lo_tail * 4, n * 4), 1, n, bad_page)
+        if marks is not None:
+            # Once the launch has run, the recorded rows hold the bad-page word from ``cols`` on.
+            marks[:, :num_seqs] = cols
+            filled = sum(max(hi - lo, 0) for *_, (lo, hi) in plan)
+            self.counts["block tail columns filled"] += filled
+            self.counts["block tail columns kept"] += (num_blocks - cols) * len(plan) - filled
         if memo is not None:
             self.counts["block columns copied"] += copied
             self.counts["block columns kept"] += cols * len(plan) - copied
@@ -671,6 +751,8 @@ class _PrepareStager:
     def _forget_blocks(self) -> None:
         if self.blocks_memo is not None:
             self.blocks_memo.forget()
+        if self.tail_marks is not None:
+            self.tail_marks.forget()
 
     def _decline_blocks(self, reason: str) -> bool:
         """Decline the block-offset copy: the caller's native copy rewrites the table, so the memo resets."""
@@ -801,6 +883,7 @@ class StepInputStaging:
         incremental_blocks: bool = False,
         plan: Any = None,
         inline_commit: bool = False,
+        tail_marks: bool = False,
     ):
         """Allocate the pinned staging block.
 
@@ -813,6 +896,9 @@ class StepInputStaging:
                 steps (``Plan.step``) and reports the steps ``incremental_block_offsets``
                 declined (``Plan.declined``); None reports nothing.
             inline_commit: the staging block's ``inline_commit`` (``step_commit.StepStaging``).
+            tail_marks: fill only the pool-group tables' tail columns a row may not already
+                hold as ``BAD_PAGE_INDEX`` (``_BlockTailMarks``, the ``pool_group_tail_marks``
+                lever); otherwise every column past the readable ones, every step.
         """
         self.pp_size = pp_size
         self.plan = plan
@@ -821,6 +907,7 @@ class StepInputStaging:
         self.blocks_memo: Optional[_BlockOffsetsMemo] = (
             _BlockOffsetsMemo() if incremental_blocks else None
         )
+        self.tail_marks: Optional[_BlockTailMarks] = _BlockTailMarks() if tail_marks else None
 
     def ineligible(
         self,
@@ -925,6 +1012,8 @@ class StepInputStaging:
             self.plan.step()
         if reason is not None:
             # The native prepare of this step rewrites the block table.
+            if self.tail_marks is not None:
+                self.tail_marks.forget()
             if self.blocks_memo is not None:
                 self.blocks_memo.forget()
                 if reason in CONFIG_DECLINES and self.plan is not None:
@@ -953,6 +1042,7 @@ class StepInputStaging:
             self.blocks_memo,
             self.plan,
             stages_batch_slot_ids=_rs.installed(),
+            tail_marks=self.tail_marks,
         )
 
 
@@ -1231,8 +1321,9 @@ def make_runtime_hooks(model: Any) -> RuntimeHooks:
     Args:
         model: the shell; both parts get its ``_mapping.pp_size`` (1 without one). Its plan
             (``_plan``) selects the parts (``deferred_input_prep``, ``sampler_store``) and the
-            levers ``step_loop_on_execution_stream``, ``incremental_block_offsets`` and
-            ``step_loop_inline_commits``; a model without one gets both parts and no lever.
+            levers ``step_loop_on_execution_stream``, ``incremental_block_offsets``,
+            ``pool_group_tail_marks`` and ``step_loop_inline_commits``; a model without one
+            gets both parts and no lever.
 
     Returns:
         ``RuntimeHooks`` declaring the step-input stager (``StepInputStaging``) and the
@@ -1281,6 +1372,7 @@ def make_runtime_hooks(model: Any) -> RuntimeHooks:
                     f"the inline commit kernel is unavailable: {_sci.unavailable_reason()}"
                 )
             inline_commit = True
+    tail_marks = plan is not None and plan.enabled("pool_group_tail_marks")
     hooks = RuntimeHooks(
         step_input_stager=(
             StepInputStaging(
@@ -1288,6 +1380,7 @@ def make_runtime_hooks(model: Any) -> RuntimeHooks:
                 incremental_blocks,
                 plan,
                 inline_commit=inline_commit,
+                tail_marks=tail_marks,
             )
             if stager
             else None
@@ -1309,7 +1402,7 @@ def make_runtime_hooks(model: Any) -> RuntimeHooks:
             if pool_groups
             else ""
         )
-        + f"inline commit tables={inline_commit}, "
+        + f"pool-group tail marks={tail_marks}, inline commit tables={inline_commit}, "
         f"overlap offsets fold={hooks.overlap_offsets_applier is not None}"
     )
     return hooks

@@ -326,7 +326,11 @@ def install(
     # over the TP group by wide_prologue.install, the same on every rank).
     wide = None
     if all(
-        join._gather_inbox_wide is not None and getattr(layer.feed_forward, "_wide_direct", False)
+        join._gather_inbox_wide is not None
+        and (
+            getattr(layer.feed_forward, "_wide_direct", False)
+            or (_direct.wide_tp8_enabled() and layers[0].mapping.tp_size == 8)
+        )
         for _, layer, join, _ in fused
     ):
         wide = _direct.shared_workspace(layers[0].mapping, max_rows=WIDE_MAX_ROWS)

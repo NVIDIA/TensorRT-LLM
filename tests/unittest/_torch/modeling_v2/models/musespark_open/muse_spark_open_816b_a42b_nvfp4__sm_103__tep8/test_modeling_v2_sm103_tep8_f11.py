@@ -170,7 +170,7 @@ def _table(compositions, key, mbs, role, arena):
 
 
 def _on_levers(table):
-    return {name for name in LEVERS.RULES if table.on(name)}
+    return {name for name in _base.RULES if table.on(name)}
 
 
 GEN_CASES = [

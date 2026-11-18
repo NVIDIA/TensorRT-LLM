@@ -1000,7 +1000,8 @@ __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1) splitTopP
     __syncthreads();
     for (;;)
     {
-        CountMass const above = cub::BlockReduce<CountMass, VB>(shared.temp.reduceCountMass).Reduce(local, CountMassOp());
+        CountMass const above
+            = cub::BlockReduce<CountMass, VB>(shared.temp.reduceCountMass).Reduce(local, CountMassOp());
         __syncthreads();
         if (tid == 0)
         {
@@ -1147,29 +1148,37 @@ __global__ void splitWatchKernel(uint32_t const* buf, uint32_t* firstSeen, int64
 // The vocabulary-parallel head (vp_*): each rank folds only its own LM-head shard.
 //
 // Virtual thread vt of the shipped VB-thread block owns the vectors v = vt (mod VB) of the
-// whole vocabulary; rank r holds the vectors [r * shardVecs, (r + 1) * shardVecs). vp_fold
-// folds, per (row, vt), the vectors of vt that lie in this rank's shard, in increasing
-// order, with the shipped per-element statements, and publishes that partial state to
-// every rank. vp_draw combines the R partials of its vt in rank order (the vocabulary
-// order of vt's vectors), then runs the shipped first round (block reduce, scan, Philox
-// draw, claimants); every rank walks its own portion of each claimant's elements, from
-// the claimant's base plus the masses of the earlier ranks' portions, and publishes the
-// crossing it finds (or none). vp_decide takes, per claimant, the first rank in rank order
-// with a crossing, and kernel B's rule across claimants. Greedy batches: vp_fold reduces
-// torch.argmax's comparator over each CTA and vp_argmax over the ranks' CTAs.
+// whole vocabulary; rank r holds the vectors [r * shardVecs, (r + 1) * shardVecs), so vt's
+// elements in vocabulary order are rank 0's portion, then rank 1's, and so on. The shipped
+// fold and walk are sequential over those elements (combineOnlineSoftmax and the walk's
+// running sum are not associative in FP32), so the ranks continue them in rank order instead
+// of combining independent partials: vp_fold on rank r > 0 waits for rank r - 1's state of
+// (row, vt) and folds its own portion onto it, with the shipped per-element statements, and
+// publishes the result to every rank; rank R - 1's state is the shipped state of vt, bit for
+// bit. vp_draw runs the shipped first round on those states (block reduce, scan, Philox draw,
+// claimants); for each claimant, rank 0 walks its portion from the claimant's base and every
+// later rank continues from the running sum the rank before it published, so each rank's
+// crossing (or none) is the shipped walk's. vp_decide takes, per claimant, the first rank in
+// rank order with a crossing, and kernel B's rule across claimants. Greedy batches: vp_fold
+// reduces torch.argmax's comparator over each CTA and vp_argmax over the ranks' CTAs (an
+// exact max, any order).
 //
 // Exchange buffer (one copy per rank, every 32-bit word holds kSplitSentinel between
-// calls): states [ranks][stateStride] x 16 B, greedy words [ranks][greedyStride] x 8 B at
-// greedyOffset, candidates [ranks][candStride] x 4 B at candOffset. Each value is stored
-// through every publish target (the multicast address in service; every rank's copy in
-// the single-GPU emulation); every rank reads and resets its own copy.
+// calls): states [ranks][stateStride] x 16 B (rank r's slot: vt's state after ranks 0..r),
+// greedy words [ranks][greedyStride] x 8 B at greedyOffset, walk records [ranks][candStride]
+// x 8 B at candOffset (the crossing or kVpNone / kVpUpstream, and the running sum at the end
+// of the rank's portion). Each value is stored through every publish target (the multicast
+// address in service; every rank's copy in the single-GPU emulation); every rank reads and
+// resets its own copy.
 
 //! Ranks the vocabulary-parallel head takes.
 constexpr int kVpMaxRanks = 8;
 //! Claimants of a row whose crossings the head exchanges (in thread order).
 constexpr int kVpClaimants = 4;
-//! A candidate word: no crossing in this rank's portion.
+//! A candidate word: no crossing up to the end of this rank's portion.
 constexpr uint32_t kVpNone = 0x7FFFFFFEu;
+//! A candidate word: an earlier rank's portion holds the crossing (this rank did not walk).
+constexpr uint32_t kVpUpstream = 0x7FFFFFFDu;
 //! Most vectors of one virtual thread in one shard (the walk's shared-memory stage).
 constexpr int kVpWalkVectors = 64;
 //! Threads per CTA of vp_fold.
@@ -1208,6 +1217,11 @@ struct VpParams
     long long candOffset{0};
     long long candStride{0};
     unsigned long long timeoutNs{0};
+    //! Sampling rows: 1 continues the fold and the walk in rank order (each rank's state is the
+    //! single-rank sampler's, bit for bit; vocab_parallel_head__RANK_CHAIN); 0 folds independent
+    //! per-rank partials and combines them in rank order in vp_draw, each rank walking from the
+    //! claimant's base plus the earlier ranks' masses (the partial-combine form).
+    int chain{1};
 };
 
 __device__ __forceinline__ uint4* vpState(char* base, VpParams const& p, int rank, int row, int vt, int vb)
@@ -1221,9 +1235,10 @@ __device__ __forceinline__ uint2* vpGreedy(char* base, VpParams const& p, int ra
         + static_cast<long long>(row) * kVpGreedySlots + slot;
 }
 
-__device__ __forceinline__ uint32_t* vpCand(char* base, VpParams const& p, int rank, int row, int c)
+//! The walk record of (rank, row, claimant c): {candidate word, running-sum bits}.
+__device__ __forceinline__ uint2* vpCand(char* base, VpParams const& p, int rank, int row, int c)
 {
-    return reinterpret_cast<uint32_t*>(base + p.candOffset) + rank * p.candStride
+    return reinterpret_cast<uint2*>(base + p.candOffset) + rank * p.candStride
         + static_cast<long long>(row) * kVpClaimants + c;
 }
 
@@ -1345,8 +1360,17 @@ __device__ __forceinline__ int vpLead(int vt, int first, int vb)
     return ((vt - first) % vb + vb) % vb;
 }
 
+//! The state of (row, vt) that rank `rank` published (vt's fold over ranks 0..rank).
+__device__ __forceinline__ OnlineSoftmax vpAwaitState(VpParams const& p, int rank, int row, int vt, int vb)
+{
+    uint4 const w = vpAwait<3>(vpState(p.copy, p, rank, row, vt, vb), p.status, p.timeoutNs);
+    return OnlineSoftmax{__uint_as_float(w.x), __uint_as_float(w.y), static_cast<int>(w.z)};
+}
+
 //! vp_fold: grid (numRows, VB / kVpFoldThreads), kVpFoldThreads threads. PDL: waits on
 //! the LM-head GEMM before reading anything; releases its dependent after publishing.
+//! Sampling (not GREEDY) on rank r > 0: the fold starts from rank r - 1's published state of
+//! (row, vt), read from this rank's copy once the first loads are issued.
 template <bool GREEDY, int VB>
 __global__ void __launch_bounds__(kVpFoldThreads) vpFoldKernel(VpParams p)
 {
@@ -1367,6 +1391,9 @@ __global__ void __launch_bounds__(kVpFoldThreads) vpFoldKernel(VpParams p)
     }
     uint2* stagingRow = p.staging + static_cast<size_t>(row) * sv;
     OnlineSoftmax st{-FLT_MAX, 0.0f, 0};
+    // Whether st holds the fold of the earlier ranks' portions (rank 0: the empty fold). The
+    // partial-combine form (!p.chain) folds this rank's portion alone.
+    bool seeded = GREEDY || p.rank == 0 || !p.chain;
     VpMaxArg best{-INFINITY, INT_MAX};
     for (int l0 = lead; l0 < sv; l0 += kSplitPrefetch * VB)
     {
@@ -1379,6 +1406,11 @@ __global__ void __launch_bounds__(kVpFoldThreads) vpFoldKernel(VpParams p)
             {
                 buf[u] = __ldg(localRow + l);
             }
+        }
+        if (!seeded)
+        {
+            st = vpAwaitState(p, p.rank - 1, row, vt, VB);
+            seeded = true;
         }
 #pragma unroll
         for (int u = 0; u < kSplitPrefetch; ++u)
@@ -1427,6 +1459,11 @@ __global__ void __launch_bounds__(kVpFoldThreads) vpFoldKernel(VpParams p)
     }
     else
     {
+        if (!seeded)
+        {
+            // No vector of vt in this shard: the state passes through.
+            st = vpAwaitState(p, p.rank - 1, row, vt, VB);
+        }
         if (stage)
         {
             // The staged row reaches the peers before this thread's state does.
@@ -1462,14 +1499,15 @@ __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1) vpDrawKer
     gridDependencyWait();
     RowParams const rp = loadRowParams(p.fs, row);
     bool const filtered = rp.needTopK || rp.needTopP || rp.needMinP;
-    // This thread's R partial states, combined in rank order. They stay in the copy until
-    // the end of the call (a claimant reads the earlier ranks' again for its walk offset).
+    // This thread's state: the last rank's slot (the fold over every rank's portion); in the
+    // partial-combine form (!p.chain) the R partial states, combined in rank order (a claimant
+    // reads the earlier ranks' again for its walk offset). Every slot is awaited, so each has
+    // landed in this copy before the reset below.
     OnlineSoftmax st{-FLT_MAX, 0.0f, 0};
     for (int r = 0; r < p.ranks; ++r)
     {
-        uint4 const w = vpAwait<3>(vpState(p.copy, p, r, row, tid, VB), p.status, p.timeoutNs);
-        OnlineSoftmax const part{__uint_as_float(w.x), __uint_as_float(w.y), static_cast<int>(w.z)};
-        st = r == 0 ? part : combineOnlineSoftmax(st, part);
+        OnlineSoftmax const part = vpAwaitState(p, r, row, tid, VB);
+        st = (p.chain || r == 0) ? part : combineOnlineSoftmax(st, part);
     }
     uint4 const sentinel4 = make_uint4(kSplitSentinel, kSplitSentinel, kSplitSentinel, kSplitSentinel);
     int const sv = p.shardVecs;
@@ -1498,7 +1536,7 @@ __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1) vpDrawKer
         {
             for (int i = 0; i < p.numPublish; ++i)
             {
-                *vpCand(p.publish[i], p, p.rank, row, tid) = kVpNone;
+                *vpCand(p.publish[i], p, p.rank, row, tid) = make_uint2(kVpNone, 0u);
             }
         }
         if (tid == 0)
@@ -1540,15 +1578,22 @@ __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1) vpDrawKer
     cub::BlockScan<int, VB>(scanClaims).ExclusiveSum(claims ? 1 : 0, claimIdx, claimants);
     if (claims && claimIdx < kVpClaimants)
     {
-        // The masses of this thread's portions on the ranks before this one.
-        float earlier = 0.0f;
-        for (int r = 0; r < p.rank; ++r)
-        {
-            uint4 const w = loadRelaxedSys4(vpState(p.copy, p, r, row, tid, VB));
-            earlier += __uint_as_float(w.y) * __expf(__uint_as_float(w.x) - maxScaled);
-        }
         sClaimTid[claimIdx] = tid;
-        sClaimStart[claimIdx] = base + earlier;
+        if (p.chain)
+        {
+            sClaimStart[claimIdx] = base;
+        }
+        else
+        {
+            // The partial-combine form: the masses of this thread's portions on the ranks before this one.
+            float earlier = 0.0f;
+            for (int r = 0; r < p.rank; ++r)
+            {
+                uint4 const w = loadRelaxedSys4(vpState(p.copy, p, r, row, tid, VB));
+                earlier += __uint_as_float(w.y) * __expf(__uint_as_float(w.x) - maxScaled);
+            }
+            sClaimStart[claimIdx] = base + earlier;
+        }
     }
     for (int r = 0; r < p.ranks; ++r)
     {
@@ -1576,8 +1621,19 @@ __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1) vpDrawKer
         __syncthreads();
         if (tid == 0)
         {
+            // The shipped walk's running sum at the start of this rank's portion: the base on
+            // rank 0, else where the rank before ended (or its crossing already decided).
             float running = sClaimStart[c];
             uint32_t cand = kVpNone;
+            if (p.chain && p.rank > 0)
+            {
+                uint4 const prev = vpAwait<2>(vpCand(p.copy, p, p.rank - 1, row, c), p.status, p.timeoutNs);
+                if (prev.x != kVpNone)
+                {
+                    cand = kVpUpstream;
+                }
+                running = __uint_as_float(prev.y);
+            }
             float4 const* w4 = reinterpret_cast<float4 const*>(wbuf);
             for (int q = 0; q < walkVectors && cand == kVpNone; ++q)
             {
@@ -1597,16 +1653,20 @@ __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1) vpDrawKer
                     }
                 }
             }
-            sCand[c] = cand;
+            // Published at once: the next rank's walk of this claimant waits for it.
+            uint2 const record = make_uint2(cand, __float_as_uint(running));
+            for (int i = 0; i < p.numPublish; ++i)
+            {
+                *vpCand(p.publish[i], p, p.rank, row, c) = record;
+            }
         }
         __syncthreads();
     }
-    if (tid < kVpClaimants)
+    if (tid >= walkers && tid < kVpClaimants)
     {
-        uint32_t const cand = tid < walkers ? sCand[tid] : kVpNone;
         for (int i = 0; i < p.numPublish; ++i)
         {
-            *vpCand(p.publish[i], p, p.rank, row, tid) = cand;
+            *vpCand(p.publish[i], p, p.rank, row, tid) = make_uint2(kVpNone, 0u);
         }
     }
     if (tid == 0)
@@ -1630,9 +1690,9 @@ __global__ void __launch_bounds__(32) vpDecideKernel(VpParams p, int vb)
     uint32_t mine = kVpNone;
     if (lane < p.ranks * kVpClaimants)
     {
-        uint32_t* const slot = vpCand(p.copy, p, lane / kVpClaimants, row, lane % kVpClaimants);
-        mine = vpAwait<1>(slot, p.status, p.timeoutNs).x;
-        storeRelaxedSys1(slot, kSplitSentinel);
+        uint2* const slot = vpCand(p.copy, p, lane / kVpClaimants, row, lane % kVpClaimants);
+        mine = vpAwait<2>(slot, p.status, p.timeoutNs).x;
+        storeRelaxedSys(slot, make_uint2(kSplitSentinel, kSplitSentinel));
     }
     uint32_t words[kVpMaxRanks * kVpClaimants];
 #pragma unroll
@@ -1651,12 +1711,13 @@ __global__ void __launch_bounds__(32) vpDecideKernel(VpParams p, int vb)
             int const walkers = min(claimants, kVpClaimants);
             for (int c = 0; c < walkers; ++c)
             {
+                // The first rank in rank order with a crossing; later ranks hold kVpUpstream.
                 uint32_t cand = kVpNone;
                 for (int r = 0; r < p.ranks && cand == kVpNone; ++r)
                 {
                     cand = words[r * kVpClaimants + c];
                 }
-                if (cand == kVpNone)
+                if (cand == kVpNone || cand == kVpUpstream)
                 {
                     continue;
                 }
@@ -1952,7 +2013,7 @@ __global__ void __launch_bounds__(kDsThreads, 1) dsSampleKernel(DsParams const p
     __shared__ float sCrossWeight;
     __shared__ int sCand;
     __shared__ float sCandWeight;
-    __shared__ int sKeep;
+    __shared__ int sKeepToken;
 
     int const row = blockIdx.x;
     int const tid = threadIdx.x;
@@ -1988,7 +2049,7 @@ __global__ void __launch_bounds__(kDsThreads, 1) dsSampleKernel(DsParams const p
         uint32_t epoch = *counter + 1u;
         if ((epoch & 0x07FFFFFFu) == 0u)
         {
-            epoch += 2u;  // never flag 0 (the zeroed areas); the parity keeps alternating
+            epoch += 2u; // never flag 0 (the zeroed areas); the parity keeps alternating
         }
         sEpoch = epoch;
     }
@@ -2009,8 +2070,8 @@ __global__ void __launch_bounds__(kDsThreads, 1) dsSampleKernel(DsParams const p
         uint2 const* const localRow = p.local + (static_cast<size_t>(here) * p.fs.numRows + row) * sv;
         if constexpr (kFabric)
         {
-            unsigned long long const mineLL
-                = reinterpret_cast<unsigned long long>(p.staging[rank]) + static_cast<unsigned long long>(stagedRow) * 16u;
+            unsigned long long const mineLL = reinterpret_cast<unsigned long long>(p.staging[rank])
+                + static_cast<unsigned long long>(stagedRow) * 16u;
             unsigned long long const tag = dsTag(flag0);
             for (int v = tid; v < sv; v += kDsThreads)
             {
@@ -2093,29 +2154,29 @@ __global__ void __launch_bounds__(kDsThreads, 1) dsSampleKernel(DsParams const p
             }
         }
         else
-        for (int v0 = tid; v0 < vecCount; v0 += kDsThreads * kDsBatch)
-        {
-            uint2 buf[kDsBatch];
-#pragma unroll
-            for (int u = 0; u < kDsBatch; ++u)
+            for (int v0 = tid; v0 < vecCount; v0 += kDsThreads * kDsBatch)
             {
-                int const v = v0 + u * kDsThreads;
-                if (v < vecCount)
+                uint2 buf[kDsBatch];
+#pragma unroll
+                for (int u = 0; u < kDsBatch; ++u)
                 {
-                    int const q = v / sv;
-                    buf[u] = loadRelaxedSys(p.staging[q] + stagedRow + (v - q * sv));
+                    int const v = v0 + u * kDsThreads;
+                    if (v < vecCount)
+                    {
+                        int const q = v / sv;
+                        buf[u] = loadRelaxedSys(p.staging[q] + stagedRow + (v - q * sv));
+                    }
+                }
+#pragma unroll
+                for (int u = 0; u < kDsBatch; ++u)
+                {
+                    int const v = v0 + u * kDsThreads;
+                    if (v < vecCount)
+                    {
+                        dst[v] = buf[u];
+                    }
                 }
             }
-#pragma unroll
-            for (int u = 0; u < kDsBatch; ++u)
-            {
-                int const v = v0 + u * kDsThreads;
-                if (v < vecCount)
-                {
-                    dst[v] = buf[u];
-                }
-            }
-        }
         __syncthreads();
         fusedSamplingBody<CapBf16, kDsThreads, true, false>(fs, shared);
         __syncthreads();
@@ -2175,36 +2236,36 @@ __global__ void __launch_bounds__(kDsThreads, 1) dsSampleKernel(DsParams const p
     }
     else
     {
-    for (int i0 = tid; i0 < slots; i0 += kDsThreads * kDsBatch)
-    {
-        uint2 buf[kDsBatch];
-#pragma unroll
-        for (int u = 0; u < kDsBatch; ++u)
+        for (int i0 = tid; i0 < slots; i0 += kDsThreads * kDsBatch)
         {
-            int const i = i0 + u * kDsThreads;
-            int const v = slotVector(i);
-            if (i < slots && v < vecCount)
+            uint2 buf[kDsBatch];
+#pragma unroll
+            for (int u = 0; u < kDsBatch; ++u)
             {
-                int const q = v / sv;
-                buf[u] = loadRelaxedSys(p.staging[q] + stagedRow + (v - q * sv));
+                int const i = i0 + u * kDsThreads;
+                int const v = slotVector(i);
+                if (i < slots && v < vecCount)
+                {
+                    int const q = v / sv;
+                    buf[u] = loadRelaxedSys(p.staging[q] + stagedRow + (v - q * sv));
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < kDsBatch; ++u)
+            {
+                int const i = i0 + u * kDsThreads;
+                if (i < slots && slotVector(i) < vecCount)
+                {
+                    __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&buf[u]);
+                    float4 x;
+                    x.x = __fmul_rn(capOf(__bfloat162float(elems[0]), p.cap), rp.tempInv);
+                    x.y = __fmul_rn(capOf(__bfloat162float(elems[1]), p.cap), rp.tempInv);
+                    x.z = __fmul_rn(capOf(__bfloat162float(elems[2]), p.cap), rp.tempInv);
+                    x.w = __fmul_rn(capOf(__bfloat162float(elems[3]), p.cap), rp.tempInv);
+                    sx[i] = x;
+                }
             }
         }
-#pragma unroll
-        for (int u = 0; u < kDsBatch; ++u)
-        {
-            int const i = i0 + u * kDsThreads;
-            if (i < slots && slotVector(i) < vecCount)
-            {
-                __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&buf[u]);
-                float4 x;
-                x.x = __fmul_rn(capOf(__bfloat162float(elems[0]), p.cap), rp.tempInv);
-                x.y = __fmul_rn(capOf(__bfloat162float(elems[1]), p.cap), rp.tempInv);
-                x.z = __fmul_rn(capOf(__bfloat162float(elems[2]), p.cap), rp.tempInv);
-                x.w = __fmul_rn(capOf(__bfloat162float(elems[3]), p.cap), rp.tempInv);
-                sx[i] = x;
-            }
-        }
-    }
     }
     __syncthreads();
     stamp(3);
@@ -2524,17 +2585,16 @@ __global__ void __launch_bounds__(kDsThreads, 1) dsSampleKernel(DsParams const p
                 unsigned long long a, b;
                 dsAwaitPair(copy + partRow + static_cast<unsigned long long>(tid) * kDsPairBytes, flag, p.status,
                     p.timeoutNs, a, b);
-                part = CountMass{
-                    __uint_as_float(static_cast<uint32_t>(a)), __uint_as_float(static_cast<uint32_t>(b))};
+                part = CountMass{__uint_as_float(static_cast<uint32_t>(a)), __uint_as_float(static_cast<uint32_t>(b))};
             }
             CountMass const above = BlockReduceCountMass(shared.temp.reduceCountMass).Reduce(part, CountMassOp());
             __syncthreads();
             if (tid == 0)
             {
-                sKeep = above.mass <= shared.massTarget ? 1 : 0;
+                sKeepToken = above.mass <= shared.massTarget ? 1 : 0;
             }
             __syncthreads();
-            if (sKeep)
+            if (sKeepToken)
             {
                 token = cand;
                 break;
@@ -2920,8 +2980,8 @@ at::Tensor drawTopP(at::Tensor const& logits, at::Tensor const& temperatures, at
     {
         launch(fs::splitTopPCountKernel<fs::kSplitBlock>,
             dim3(static_cast<unsigned>(params.numRows), fs::kSplitBlock / fs::kTopPCountThreads),
-            dim3(fs::kTopPCountThreads), pdl, params, threadStates, static_cast<fs::SplitTopPRecord const*>(recs), parts,
-            capv);
+            dim3(fs::kTopPCountThreads), pdl, params, threadStates, static_cast<fs::SplitTopPRecord const*>(recs),
+            parts, capv);
         auto const* const done = static_cast<fs::CountMass const*>(parts);
         if (r + 1 < rounds)
         {
@@ -3033,11 +3093,12 @@ void checkVpRows(
     TORCH_CHECK(ranks * shardVecs * 4 <= INT32_MAX, "vocabulary too large");
 }
 
-//! vp_fold: this rank's shard folded per (row, virtual thread), published to every rank.
+//! vp_fold: this rank's shard folded per (row, virtual thread) onto the previous rank's states
+//! (read from `copy`, this rank's exchange copy), published to every rank.
 void vpFold(at::Tensor const& local, at::Tensor const& temperatures, at::Tensor const& topKs, at::Tensor const& topPs,
-    at::Tensor const& minPs, int64_t staging, at::IntArrayRef publish, int64_t rank, int64_t ranks, int64_t stateStride,
-    int64_t greedyOffset, int64_t greedyStride, int64_t candStride, bool greedy, double multiplier, double invCap,
-    double cap, bool pdl)
+    at::Tensor const& minPs, int64_t staging, at::Tensor const& status, int64_t copy, at::IntArrayRef publish,
+    int64_t rank, int64_t ranks, int64_t stateStride, int64_t greedyOffset, int64_t greedyStride, int64_t candStride,
+    int64_t timeoutS, bool greedy, double multiplier, double invCap, double cap, bool pdl, bool chain)
 {
     TORCH_CHECK(local.scalar_type() == at::kBFloat16 && local.dim() == 2 && local.is_contiguous() && local.is_cuda(),
         "local must be a contiguous CUDA BF16 [rows, shard] tensor");
@@ -3047,8 +3108,11 @@ void vpFold(at::Tensor const& local, at::Tensor const& temperatures, at::Tensor 
     auto const shardVecs = local.size(1) / 4;
     checkVpRows(rows, shardVecs, ranks, stateStride, greedyStride, candStride);
     at::cuda::CUDAGuard guard(local.device());
+    TORCH_CHECK(status.is_cuda() && status.scalar_type() == at::kInt && status.numel() >= 1, "status int32[1]");
     auto p = vpLayout(
-        rank, ranks, shardVecs, publish[0], publish, stateStride, greedyOffset, greedyStride, 0, candStride, 0);
+        rank, ranks, shardVecs, copy, publish, stateStride, greedyOffset, greedyStride, 0, candStride, timeoutS);
+    p.status = status.data_ptr<int32_t>();
+    p.chain = chain ? 1 : 0;
     p.fs.numRows = static_cast<int32_t>(rows);
     p.fs.vocabSize = static_cast<int32_t>(ranks * shardVecs * 4);
     if (!greedy)
@@ -3089,14 +3153,14 @@ void vpFold(at::Tensor const& local, at::Tensor const& temperatures, at::Tensor 
     }
 }
 
-//! vp_draw: combine, reduce, scan, draw, walk this rank's portions; publishes candidates.
+//! vp_draw: reduce, scan, draw, walk this rank's portions after the previous rank's; publishes walk records.
 //! Returns the token tensor vp_decide completes (filtered rows are written here).
 at::Tensor vpDraw(at::Tensor const& pending, at::Tensor const& local, at::Tensor const& temperatures,
     at::Tensor const& topKs, at::Tensor const& topPs, at::Tensor const& minPs, std::optional<at::Tensor> const& seed,
     std::optional<at::Tensor> const& offset, at::Tensor const& info, at::Tensor const& status, int64_t copy,
     at::IntArrayRef stagingOf, at::IntArrayRef publish, int64_t rank, int64_t ranks, int64_t stateStride,
     int64_t greedyStride, int64_t candOffset, int64_t candStride, int64_t timeoutS, double multiplier, double invCap,
-    double cap, bool pdl)
+    double cap, bool pdl, bool chain)
 {
     TORCH_CHECK(pending.scalar_type() == at::kBFloat16, "pending must be BF16");
     TORCH_CHECK(
@@ -3123,6 +3187,7 @@ at::Tensor vpDraw(at::Tensor const& pending, at::Tensor const& local, at::Tensor
     p.local = reinterpret_cast<uint2 const*>(local.data_ptr());
     p.info = info.data_ptr<int32_t>();
     p.status = status.data_ptr<int32_t>();
+    p.chain = chain ? 1 : 0;
     p.cap = softCap(multiplier, invCap, cap);
     auto tokens = at::empty({rows}, pending.options().dtype(at::kInt));
     p.fs.outputTokens = tokens.data_ptr<int32_t>();
@@ -3194,9 +3259,8 @@ size_t dsRaiseSmem(int device)
         int optin = 0;
         C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
         size_t const limit = static_cast<size_t>(optin) - attributes.sharedSizeBytes;
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            fs::dsSampleKernel<kTrigger, kStamp, kFabric>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(limit)));
+        C10_CUDA_CHECK(cudaFuncSetAttribute(fs::dsSampleKernel<kTrigger, kStamp, kFabric>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(limit)));
         limits[device] = limit;
     }
     return limits[device];
@@ -3356,6 +3420,8 @@ std::tuple<at::Tensor, at::Tensor> draftPathSample(at::Tensor const& edges, at::
         "edges must be a contiguous FP32 [B, K, top_k, top_k] tensor");
     TORCH_CHECK(ids.scalar_type() == at::kLong && ids.is_contiguous() && ids.sizes() == unary.sizes(),
         "candidate ids must be a contiguous int64 [B, K, top_k] tensor");
+    TORCH_CHECK(edges.device() == unary.device() && ids.device() == unary.device(),
+        "edges and candidate ids must be on the device of unary");
     checkRowVector(temperatures, "temperatures", at::kFloat, rows);
     checkRowVector(topKs, "top_ks", at::kInt, rows);
     checkRowVector(topPs, "top_ps", at::kFloat, rows);
@@ -3397,6 +3463,8 @@ std::tuple<at::Tensor, at::Tensor> draftPathSample(at::Tensor const& edges, at::
             dp.is_cuda() && dp.scalar_type() == at::kFloat && dp.dim() == 3 && dp.stride(2) == 1 && dp.size(1) >= steps,
             "draft_probs must be an FP32 [slots, >= K, vocab] tensor with unit vocabulary stride");
         checkRowVector(sl, "slots", at::kLong, rows);
+        TORCH_CHECK(dp.device() == unary.device() && sl.device() == unary.device(),
+            "draft_probs and slots must be on the device of unary");
         p.draftProbs = dp.data_ptr<float>();
         p.slots = sl.data_ptr<int64_t>();
         p.draftProbsSlotStride = dp.stride(0);
@@ -3446,14 +3514,15 @@ TORCH_LIBRARY(musespark_open_sm107_head_sampler, m)
     m.def("watch(Tensor buf, Tensor(a!) first_seen, int blocks, int timeout_ms) -> ()");
     m.def(
         "vp_fold(Tensor local, Tensor temperatures, Tensor top_ks, Tensor top_ps, Tensor min_ps, int staging, "
-        "int[] publish, int rank, int ranks, int state_stride, int greedy_offset, int greedy_stride, "
-        "int cand_stride, bool greedy, float multiplier, float inv_cap, float cap, bool pdl) -> ()");
+        "Tensor(a!) status, int copy, int[] publish, int rank, int ranks, int state_stride, int greedy_offset, "
+        "int greedy_stride, int cand_stride, int timeout_s, bool greedy, float multiplier, float inv_cap, float cap, "
+        "bool pdl, bool chain=True) -> ()");
     m.def(
         "vp_draw(Tensor(a!) pending, Tensor local, Tensor temperatures, Tensor top_ks, Tensor top_ps, "
         "Tensor min_ps, Tensor? seed, Tensor? offset, Tensor(b!) info, Tensor(c!) status, int copy, "
         "int[] staging_of, int[] publish, int rank, int ranks, int state_stride, int greedy_stride, "
         "int cand_offset, int cand_stride, int timeout_s, float multiplier, float inv_cap, float cap, "
-        "bool pdl) -> Tensor");
+        "bool pdl, bool chain=True) -> Tensor");
     m.def(
         "vp_decide(Tensor(a!) tokens, Tensor info, Tensor(b!) status, int copy, int rank, int ranks, "
         "int shard_vecs, int state_stride, int greedy_stride, int cand_offset, int cand_stride, int timeout_s, "

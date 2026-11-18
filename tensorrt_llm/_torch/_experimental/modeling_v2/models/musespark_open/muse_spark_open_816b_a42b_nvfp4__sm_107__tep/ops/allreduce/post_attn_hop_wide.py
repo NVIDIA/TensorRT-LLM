@@ -186,6 +186,7 @@ def configure(
     direct_producer_stages: int = 0,
     direct_min_rows: int = 33,
     direct_poll_first: bool = False,
+    direct_l2_prefetch: bool = False,
     early_launch: bool = False,
     multicast: bool = False,
     pad_rows: Tuple[int, int] = (0, 1024),
@@ -230,8 +231,10 @@ def configure(
     global SERVED_DIRECT_ROWS, DIRECT_MAX_ROWS, DIRECT128, DIRECT128_PRODUCER, DIRECT_POLL_FIRST
     if r2 not in ("0", "1", "w"):
         raise ValueError(f"r2 is '0', '1' or 'w', got {r2!r}")
-    if int(direct_max_rows) not in (64, DIRECT128_MAX_ROWS):
-        raise ValueError(f"direct_max_rows is 64 or {DIRECT128_MAX_ROWS}, got {direct_max_rows}")
+    if int(direct_max_rows) not in (64, DIRECT128_MAX_ROWS, DIRECT256_MAX_ROWS):
+        raise ValueError(
+            f"direct_max_rows is 64, {DIRECT128_MAX_ROWS} or {DIRECT256_MAX_ROWS}, got {direct_max_rows}"
+        )
     if direct_producer not in DIRECT128_PRODUCER_STAGES:
         raise ValueError(
             f"direct_producer is one of {sorted(DIRECT128_PRODUCER_STAGES)}, "
@@ -250,6 +253,8 @@ def configure(
     )
     SERVED_DIRECT = bool(direct)
     DIRECT_POLL_FIRST = bool(direct) and bool(direct_poll_first)
+    global DIRECT_L2_PREFETCH
+    DIRECT_L2_PREFETCH = bool(direct) and bool(direct_l2_prefetch)
     SERVED_EARLY_LAUNCH = bool(early_launch)
     SERVED_MULTICAST = bool(multicast)
     SERVED_PAD_ROWS = (int(pad_rows[0]), int(pad_rows[1]))
@@ -2701,13 +2706,22 @@ DIRECT_MAX_ROWS = 64
 #: Rubin's cuBLAS needs the same check (the cuBLAS kernel it picks there is its own).
 DIRECT128 = False
 DIRECT128_MAX_ROWS = 128
+#: (w256) ``direct_max_rows`` 256: the direct hop also takes 129..256 rows (17..32 requests) on a
+#: 256-row workspace (32 slots per source; 16 MiB of fabric per rank), o_proj of those steps on the
+#: same split_k-1 one-launch producer (``DIRECT128_PRODUCER``'s grid / tile128 tiles over 2..4
+#: token tiles, or 64-row chunks). Order-only against the cuBLAS o_proj it replaces there.
+DIRECT256_MAX_ROWS = 256
 DIRECT128_PAD_ROWS = (0, 64)
 #: ``(mode, ab_stages)`` of the 65..128-row o_proj producer: ``chunks`` (two serial 64-row
 #: launches of the served tactic, PDL-chained), ``grid`` (one launch, a 64-row token tile per
 #: blockIdx.y; 3 stages keep two CTAs per SM, so both token tiles' CTAs are resident) or
 #: ``tile128`` (one launch of 128-token tiles, the weight streamed once; 4 stages). Every mode is
 #: split_k 1, so all store the same bits; only the launch differs. GB300 served ``grid``.
-DIRECT128_PRODUCER_STAGES = {"chunks": 7, "grid": 3, "tile128": 4}
+DIRECT128_PRODUCER_STAGES = {"chunks": 7, "grid": 3, "tile128": 4, "2cta": 1}
+#: ``2cta`` (B4, xchg lane): one launch of ``ops/gemm/splitk_gemm_2cta`` at split_k 1 (2-CTA 128 x 128 pair tiles,
+#: weight slice prefetched / prestaged before the PDL wait) with its scatter epilogue
+#: (``run_splitk_2cta_scatter``): every element one full-K FP32 accumulation in K order, rounded once -- the
+#: ``grid`` producer's bits (x85: whole slot buffer identical at 80 / 104 / 128 rows); stages are the kernel's own.
 DIRECT128_PRODUCER = ("grid", 3)
 #: ``direct_poll_first`` (``configure``; the ``tep8_direct_hop`` lever's POLL_FIRST): the direct
 #: consumer (``WideDirectWorkspace``'s ``wait_first`` False) polls its scatter / gather slots as soon
@@ -2718,6 +2732,9 @@ DIRECT128_PRODUCER = ("grid", 3)
 #: and the gather start as the last source row lands, not after the local grid's exit: the same
 #: arithmetic, the same bits. Off (default): the wait first, as the 8-row direct consumer.
 DIRECT_POLL_FIRST = False
+#: ``direct_l2_prefetch`` (``configure``; the ``tep8_direct_hop`` lever's L2_PREFETCH): the scatter o_proj
+#: producer's idle warp 3 prefetches its CTA's weight tile into L2 at kernel entry (loads only, same bits).
+DIRECT_L2_PREFETCH = False
 #: The direct consumer's grid: two rows per 512-thread CTA from this many (even) rows; its SMEM
 #: pad (bytes, 0 off).
 SERVED_DIRECT_WIDE_MIN_ROWS = 41
@@ -3095,6 +3112,20 @@ try:
         validate_tactic,
     )
 
+    @dsl_user_op
+    def _prefetch_l2(address, *, loc=None, ip=None):
+        """``prefetch.global.L2`` of the 128-byte line at ``address`` (tep8_direct_hop L2_PREFETCH)."""
+        llvm.inline_asm(
+            None,
+            [Int64(address).ir_value(loc=loc, ip=ip)],
+            "prefetch.global.L2 [$0];",
+            "l",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+
     HAS_SCATTER_GEMM = HAS_CUTE_DSL
 except Exception:  # noqa: BLE001 - no scatter producer: the direct transport refuses to build
     HAS_SCATTER_GEMM = False
@@ -3141,9 +3172,7 @@ if HAS_SCATTER_GEMM:
                 self.scatter_smem = (
                     (_smem_bytes(tactic, tactic.ab_stages) + 1023) // 1024
                 ) * 1024 + 1024
-            elif tactic.split_k != 1 or (
-                fb_layout and (tactic.mma_m != 64 or tactic.mma_n != 64)
-            ):
+            elif tactic.split_k != 1 or (fb_layout and (tactic.mma_m != 64 or tactic.mma_n != 64)):
                 raise ValueError(
                     f"the scatter epilogue serves split_k 1 (fb layout: 64 x 64 tiles) only, got {tactic}"
                 )
@@ -3154,6 +3183,16 @@ if HAS_SCATTER_GEMM:
                     f"the scatter epilogue's slots per source are a multiple of 8, got {slots}"
                 )
             self.scatter = True
+            #: ``DIRECT_L2_PREFETCH`` (the tep8_direct_hop lever's L2_PREFETCH, default off): the idle warp 3 of each
+            #: token-tile-0 CTA prefetches the CTA's whole weight tile into L2 at kernel entry, before
+            #: the activation DMA's dependency wait (the mainloop stages only ab_stages k-tiles there).
+            #: Loads only: the same mainloop, the same bits.
+            self.l2_prefetch = bool(DIRECT_L2_PREFETCH)
+            if self.l2_prefetch:
+                logger.info_once(
+                    "[musespark_open] tep8_direct_hop L2_PREFETCH: scatter o_proj weight L2 prefetch on",
+                    key="musespark_open.tep8_direct_hop_l2_prefetch",
+                )
             self.fb_layout = bool(fb_layout)
             #: Slots per source of the workspace (max_rows / 8): 8 on the 64-row workspace, 16 on
             #: hop128's. Only the feature-block stride of the fb layout depends on it.
@@ -3311,6 +3350,19 @@ if HAS_SCATTER_GEMM:
 
             if cutlass.const_expr(self.split_k > 1):
                 cute.arch.cluster_wait()
+
+            # L2_PREFETCH: warp 3 (otherwise idle) streams this CTA's weight tile into L2 first.
+            if cutlass.const_expr(self.l2_prefetch):
+                if warp_idx == 3 and block_idx[1] == 0:
+                    lines = (cute.size(mA, mode=[1]) * 2) // 128
+                    base = (
+                        mA.iterator.toint()
+                        + Int64(cute.crd2idx((bidx * self.cta_m, 0, l_idx), mA.layout)) * 2
+                    )
+                    row_bytes = Int64(cute.crd2idx((1, 0, 0), mA.layout)) * 2
+                    for i in cutlass.range(cute.arch.lane_idx(), self.cta_m * lines, 32, unroll=1):
+                        r = i // lines
+                        _prefetch_l2(base + Int64(r) * row_bytes + Int64(i - r * lines) * 128)
 
             # Warp 3 is idle; warps 4-7 run the epilogue.
             if warp_idx == 0:
@@ -3723,9 +3775,9 @@ if HAS_SCATTER_GEMM:
         m, n, k = _validate_runtime_tensors(a, b, None, out)
         if tactic.split_k != 1 or tactic.mma_m != 64 or tactic.mma_n not in (64, 128):
             raise ValueError(f"wide scatter: split_k 1, 64 x (64 | 128) tiles; got {tactic}")
-        if not 1 <= m <= DIRECT128_MAX_ROWS or n != 8192 or k <= 0 or k % _CTA_K:
+        if not 1 <= m <= DIRECT256_MAX_ROWS or n != 8192 or k <= 0 or k % _CTA_K:
             raise ValueError(
-                f"wide scatter: 1..{DIRECT128_MAX_ROWS} rows, 8192 columns, K a multiple of "
+                f"wide scatter: 1..{DIRECT256_MAX_ROWS} rows, 8192 columns, K a multiple of "
                 f"{_CTA_K}; got {m} x {n} x {k}"
             )
         if peer_stride_bytes % 16 or slots * 8 < m or slots % 8:

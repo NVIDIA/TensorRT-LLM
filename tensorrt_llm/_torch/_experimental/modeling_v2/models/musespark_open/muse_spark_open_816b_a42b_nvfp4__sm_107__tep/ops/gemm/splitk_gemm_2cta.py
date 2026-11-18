@@ -40,7 +40,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch as _torch
-from cutlass import Int32
+from cutlass import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
@@ -54,12 +54,15 @@ from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import (
 
 #: The pair tile (kernel M x kernel N): 128 weight columns (64 per CTA) x 128 tokens.
 PAIR_TILE_MN = (128, 128)
-#: The most activation rows one launch takes (one 128-token tile).
+#: The rows of one token tile (the pair tile's N).
 MAX_ROWS = 128
+#: (w256) The most activation rows one launch takes: ceil(rows / MAX_ROWS) token tiles on grid y
+#: (``tile_n = blockIdx.y // split_k``), each tile's rows computed as in a one-tile launch.
+MAX_CALL_ROWS = 256
 #: K extents of one A/B stage.
 K_TILES = (64, 128)
 #: Split-K sizes this kernel serves (cluster (2, split_k) <= 8 CTAs: portable).
-SPLIT_KS = (2, 4)
+SPLIT_KS = (1, 2, 4)
 _OPTIN_SMEM_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
 
 
@@ -112,7 +115,14 @@ class SplitK2CtaGemmKernel:
         rs: bool = False,
         k_tile: int = 64,
         prestage: bool = False,
+        scatter_slots: int = 0,
+        scatter_peer_stride_el: int = 0,
     ):
+        #: Scatter epilogue (the TEP8 direct hop's o_proj producer, hop128 fb layout): element (feature m,
+        #: token t) goes to C + (m // 64) * slots * 64 + (t // 8) * 64 + m % 64 + (t % 8) * peer_stride_el
+        #: instead of C[m, t] -- the same rounded value, only the address moves. 0: the plain store.
+        self.scatter_slots = int(scatter_slots)
+        self.scatter_peer = int(scatter_peer_stride_el)
         if split_k not in SPLIT_KS:
             raise ValueError(f"split_k must be one of {SPLIT_KS}, got {split_k}")
         self.split_k = int(split_k)
@@ -340,7 +350,7 @@ class SplitK2CtaGemmKernel:
         )
         mailbox = smem.allocate_tensor(
             element_type=cutlass.Float32,
-            layout=cute.make_layout(self.mailbox_elems),
+            layout=cute.make_layout(max(self.mailbox_elems, 32)),  # split_k 1: no partials
             byte_alignment=128,
         )
 
@@ -492,6 +502,8 @@ class SplitK2CtaGemmKernel:
             ]
             tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
             tTR_rAcc = cute.make_rmem_tensor(tTR_gC[(None, None, None, 0)].shape, self.acc_dtype)
+            pitch = 64 + 8
+            sT_ptr = cute.recast_ptr(sA.iterator, dtype=self.c_dtype)
             subtiles = cute.size(tTR_tAcc.shape, mode=[3])
             vals = cute.size(tTR_rAcc)
             groups = vals // 4
@@ -583,9 +595,53 @@ class SplitK2CtaGemmKernel:
                                     tTR_rAcc[4 * g + i] = tTR_rAcc[4 * g + i] + mailbox[off + i]
                         tTR_gC_s = tTR_gC[(None, None, None, s)]
                         tTR_cC_s = tTR_cC[(None, None, None, s)]
-                        for v in cutlass.range_constexpr(vals):
-                            if cute.elem_less(tTR_cC_s[v], mC_mnl.shape):
-                                tTR_gC_s[v] = tTR_rAcc[v].to(self.c_dtype)
+                        if cutlass.const_expr(self.scatter_slots > 0):
+                            # Scatter: stage the rounded tile token-major in the (now free) A stages, as the
+                            # 1-CTA scatter producer does; the 16-byte stores follow after the subtile loop.
+                            for v in cutlass.range_constexpr(vals):
+                                crd = tTR_cC_s[v]
+                                st = cute.make_tensor(
+                                    sT_ptr + (crd[0] % 64) + (crd[1] % 128) * pitch,
+                                    cute.make_layout(1),
+                                )
+                                st[0] = tTR_rAcc[v].to(self.c_dtype)
+                        else:
+                            for v in cutlass.range_constexpr(vals):
+                                if cute.elem_less(tTR_cC_s[v], mC_mnl.shape):
+                                    tTR_gC_s[v] = tTR_rAcc[v].to(self.c_dtype)
+            if cutlass.const_expr(self.scatter_slots > 0):
+                # hop128 fb layout from the staged tile (the 1-CTA scatter producer's wide-tile store, cta_m 64,
+                # cta_n 128): token tok of this tile (owner p = tok % 8, slot s = tok // 8) goes to slot
+                # t0 / 8 + s of owner p; each 8-thread group writes one 128-byte run.
+                cute.arch.barrier(barrier_id=3, number_of_threads=self.epilog_threads)
+                atom = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), self.c_dtype, num_bits_per_copy=128
+                )
+                vec = cute.make_rmem_tensor(cute.make_layout((8,)), self.c_dtype)
+                warp = tidx // 32
+                lane = tidx % 32
+                fchunk = lane % 8
+                t0 = tile_n * 128
+                for j in cutlass.range_constexpr(8):
+                    p = warp + 4 * ((j // 2) % 2)
+                    sl = 4 * (j % 2) + lane // 8 + 8 * (j // 4)
+                    tok = p + 8 * sl
+                    src = cute.make_tensor(
+                        (sT_ptr + tok * pitch + fchunk * 8).align(16), cute.make_layout((8,))
+                    )
+                    dst = cute.make_tensor(
+                        (
+                            mC_mnl.iterator
+                            + Int64(bidx) * (self.scatter_slots * 64)
+                            + Int64(p) * self.scatter_peer
+                            + Int64(t0 // 8 + sl) * 64
+                            + fchunk * 8
+                        ).align(16),
+                        cute.make_layout((8,)),
+                    )
+                    if t0 + tok < cute.size(mC_mnl, mode=[1]):
+                        cute.copy(atom, src, vec)
+                        cute.copy(atom, vec, dst)
             with cute.arch.elect_one():
                 acc_pipeline.consumer_release(acc_state)
             acc_state.advance()
@@ -619,8 +675,20 @@ def _compiled(
     rs: bool = False,
     k_tile: int = 64,
     prestage: bool = False,
+    scatter_slots: int = 0,
+    scatter_peer_stride_el: int = 0,
 ):
-    kernel = SplitK2CtaGemmKernel(split_k, use_pdl, ab_stages, prefetch_a, rs, k_tile, prestage)
+    kernel = SplitK2CtaGemmKernel(
+        split_k,
+        use_pdl,
+        ab_stages,
+        prefetch_a,
+        rs,
+        k_tile,
+        prestage,
+        scatter_slots,
+        scatter_peer_stride_el,
+    )
     dummy = _torch.empty(16, dtype=_torch.bfloat16, device="cuda")
     ptr = lambda: make_ptr(  # noqa: E731
         cutlass.BFloat16, dummy.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
@@ -645,8 +713,8 @@ def check(
         raise ValueError(
             f"2-CTA split-K shapes: x {tuple(x.shape)}, w {tuple(w.shape)}, out {tuple(out.shape)}"
         )
-    if not 1 <= rows <= MAX_ROWS:
-        raise ValueError(f"2-CTA split-K takes 1..{MAX_ROWS} rows, got {rows}")
+    if not 1 <= rows <= MAX_CALL_ROWS:
+        raise ValueError(f"2-CTA split-K takes 1..{MAX_CALL_ROWS} rows, got {rows}")
     if n % PAIR_TILE_MN[0] or k % (k_tile * split_k):
         raise ValueError(f"2-CTA split-K: N {n} % 128 or K {k} % {k_tile * split_k} is not 0")
     if any(t.data_ptr() % 16 for t in (x, w, out)):
@@ -677,6 +745,44 @@ def run_splitk_2cta(
         bool(rs),
         int(k_tile),
         bool(prestage),
+    )
+    mk = lambda t: make_ptr(  # noqa: E731
+        cutlass.BFloat16, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    stream = _cuda.CUstream(_torch.cuda.current_stream(x.device).cuda_stream)
+    compiled(n, rows, k, mk(w), mk(x), mk(out), stream)
+    return out
+
+
+def run_splitk_2cta_scatter(
+    x: _torch.Tensor,
+    w: _torch.Tensor,
+    out: _torch.Tensor,
+    pdl: bool,
+    peer_stride_bytes: int,
+    slots: int,
+    prestage: bool = True,
+    prefetch_a: bool = True,
+) -> _torch.Tensor:
+    """The hop128 direct-scatter o_proj producer on the 2-CTA kernel at split_k 1 (B4): ``out`` [rows, 8192] is
+    the producer view of token 0 (only its address is used); token t of feature m lands as ``run_splitk_scatter_wide``
+    stores it (fb layout, ``slots`` slots per source). split_k 1: one full-K FP32 accumulation in K order per
+    element, rounded once -- the served producer's bits."""
+    rows, n, k = check(x, w, out, 1, 64)
+    if n != 8192 or peer_stride_bytes % 16 or slots % 8 or slots * 8 < rows:
+        raise ValueError(
+            f"2-CTA scatter: 8192 columns, {slots} slots >= rows / 8, 16-B stride; got {rows} x {n}"
+        )
+    compiled = _compiled(
+        1,
+        bool(pdl),
+        0,
+        bool(prefetch_a),
+        False,
+        64,
+        bool(prestage),
+        int(slots),
+        int(peer_stride_bytes // 2),
     )
     mk = lambda t: make_ptr(  # noqa: E731
         cutlass.BFloat16, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16

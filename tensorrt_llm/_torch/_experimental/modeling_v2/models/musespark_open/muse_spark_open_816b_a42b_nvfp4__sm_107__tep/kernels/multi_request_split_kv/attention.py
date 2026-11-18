@@ -58,6 +58,12 @@ from ...attention import trtllm_gen_fmha
 from ...attention_forward import decode_reachable, intercepting
 from ...ops.attention import multi_request_split_kv as _mr
 
+#: s316 NORM_GATE_FOLD (measurement knob ``MUSESPARK_OPEN_S316_MR_FOLD=1``, default off): on a step of
+#: 5+ sequences the call defers its combine and the layer's output gate runs it folded into the
+#: attention norm-gate (``_mr.combine_norm_gate``): one launch instead of two, the same bits.
+NORM_GATE_FOLD = __import__("os").environ.get("MUSESPARK_OPEN_S316_MR_FOLD", "") == "1"
+_KF651_LOGGED: list = []
+
 #: The keyword arguments ``run_generation`` passes to the decode FMHA (and no others).
 DECODE_KWARGS = frozenset(
     {
@@ -154,6 +160,11 @@ class MultiRequestCall:
     window: int
     launched: bool = False
     fallback: Optional[str] = None
+    #: NORM_GATE_FOLD: defer the combine (5+ sequences) and keep the op's pending tuple.
+    defer: bool = False
+    #: dieexp KF651 (``_mr.KF651``): this launch ran the KF651 build, its combine deferred into the output gate.
+    kf651: bool = False
+    pending: Optional[tuple] = None
 
     def decline(self, kwargs: dict) -> Optional[str]:
         """Why this decode FMHA call is not the plain case, or ``None``. Host-side reads only."""
@@ -250,7 +261,18 @@ class MultiRequestCall:
     def launch(self, kwargs: dict) -> None:
         query = kwargs["query"]
         rows = query.shape[0]
-        _mr.multi_request_split_kv(
+        requests = kwargs["seq_lens"].numel()
+        self.kf651 = _mr.kf651_build(
+            kwargs["kv_cache"][0].shape[1],
+            self.window,
+            query.dtype == torch.float8_e4m3fn,
+            isinstance(kwargs["bmm1_scale"], torch.Tensor),
+            requests,
+        )
+        defer = self.kf651 or (
+            self.defer and next(s[2] for s in _mr.COMBINE_SHAPES if requests <= s[0]) == 4
+        )
+        result = _mr.multi_request_split_kv(
             query.view(rows, -1),
             kwargs["kv_cache"][0],
             kwargs["block_tables"],
@@ -260,7 +282,10 @@ class MultiRequestCall:
             kwargs["out"].view(rows, -1),
             window=self.window,
             enable_pdl=bool(kwargs["enable_pdl"]),
+            **({"defer_combine": True} if defer else {}),
         )
+        if defer:
+            self.pending = result
         self.launched = True
 
 
@@ -323,12 +348,20 @@ class MultiRequestSplitKvAttention:
     _mr_kv_heads: int = 4
     _mr_min_requests: int = 2
     _mr_census: Optional[MultiRequestCensus] = None
+    _mr_pending: Optional[tuple] = None
 
     def forward(self, position_ids, hidden_states, attn_metadata, *args, **kwargs):
         census = self._mr_census
         if census is not None and self.layer_idx == census.layers[0]:
             census.begin()
+        self._mr_pending = None
         result = super().forward(position_ids, hidden_states, attn_metadata, *args, **kwargs)
+        if self._mr_pending is not None:
+            self._mr_pending = None
+            raise RuntimeError(
+                f"[musespark_open] multi_request_split_kv: layer {self.layer_idx} left its combine pending "
+                "(NORM_GATE_FOLD): its attention output was never merged"
+            )
         if census is not None and self.layer_idx == census.layers[-1]:
             census.end()
         return result
@@ -336,9 +369,13 @@ class MultiRequestSplitKvAttention:
     def _attn_impl(self, q, k, v, attn_metadata, *args, **kwargs):
         if not takes_step(attn_metadata, self._mr_min_requests):
             return super()._attn_impl(q, k, v, attn_metadata, *args, **kwargs)
-        call = MultiRequestCall(kv_heads=self._mr_kv_heads, window=self._mr_window)
+        call = MultiRequestCall(
+            kv_heads=self._mr_kv_heads, window=self._mr_window, defer=NORM_GATE_FOLD
+        )
         with intercepting(call):
             result = super()._attn_impl(q, k, v, attn_metadata, *args, **kwargs)
+        self._mr_pending = call.pending
+        self._mr_kf651 = call.kf651
         census = self._mr_census
         if census is not None:
             if call.launched:
@@ -346,6 +383,44 @@ class MultiRequestSplitKvAttention:
             else:
                 census.record(self.layer_idx, BUILTIN, call.fallback or "the FMHA was not called")
         return result
+
+    def apply_output_gate(self, attention_output, gate):
+        pending = self._mr_pending
+        if pending is None:
+            return super().apply_output_gate(attention_output, gate)
+        self._mr_pending = None
+        out2 = pending[3]
+        if (
+            gate is None
+            or not isinstance(attention_output, torch.Tensor)
+            or attention_output.data_ptr() != out2.data_ptr()
+            or attention_output.shape[0] != out2.shape[0]
+        ):
+            raise RuntimeError(
+                f"[musespark_open] multi_request_split_kv: layer {self.layer_idx}'s output gate did not get "
+                "the attention output whose combine is pending"
+            )
+        if getattr(self, "_mr_kf651", False):
+            # dieexp KF651: the KF build's combine with the norm-gate folded in (its own partition).
+            gated = torch.empty(
+                (out2.shape[0], pending[10] * _mr.HEAD_DIM),
+                dtype=torch.bfloat16,
+                device=out2.device,
+            )
+            if not _KF651_LOGGED:
+                _KF651_LOGGED.append(True)
+                logger.info(
+                    f"[musespark_open] mr_kf651: engaged (layer {self.layer_idx}, {pending[6]} requests)"
+                    + (" v2" if _mr.KF651_V2 else "")
+                    + (" v3" if hasattr(_mr, "KF651_SEG_PAD") else "")
+                )
+            return _mr.kf651_post(pending, gate, self.o_head_norm.variance_epsilon, gated)
+        from ...ops.attention import norm_gate as _ng
+
+        trigger = getattr(self, "_norm_gate_trigger", None) or "exit"
+        return _mr.combine_norm_gate(
+            pending, gate, self.o_head_norm.variance_epsilon, _ng.TRIGGERS[trigger]
+        )
 
 
 @functools.lru_cache(maxsize=None)

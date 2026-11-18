@@ -20,7 +20,9 @@ code. Each claims every tensor-parallel size of its layout. Which fast paths a
 deployment runs is the target's own decision at construction
 (``dispatch.compose``): the composition of its tensor-parallel size when the GPU
 topology and the speculative decoding mode are the ones the compositions are
-written for, and the built-in forward through the target otherwise. So
+written for (or, on a context server of the sm107 target, when there is no
+speculative decoding: ``dispatch.drafterless_context``), and the built-in forward
+through the target otherwise. So
 ``route`` decides on neither the speculative-decoding config nor the GPUs per node
 (launcher state: the visible devices, or the tensor-parallel size under Ray),
 and a deployment a target serves without fast paths still lands there.

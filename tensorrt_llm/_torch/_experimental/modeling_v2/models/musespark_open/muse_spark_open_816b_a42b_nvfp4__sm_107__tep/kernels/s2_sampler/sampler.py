@@ -38,7 +38,7 @@ Every token, state and logit is the one the stock head gives with its LM-head GE
 bit for bit (by construction; ``test_modeling_v2_s2_head_gemm.py`` checks the GEMM on one GPU). The stock head runs the
 autotuner's choice for the shape instead, so where that choice gives other bits than ``PINNED_TACTIC`` (a tactic
 outside ``BIT_EQUIVALENT_TACTICS``, another split-K factor, cuBLAS) the logits differ from its logits in rounding:
-the ``distributed_head_sampler`` lever is lossless-numeric (``levers.RULES``). Nothing imports this module's kernels
+the ``distributed_head_sampler`` lever is lossless-numeric (``levers.LEVERS``). Nothing imports this module's kernels
 outside the ``distributed_head_sampler`` install (``install``).
 """
 

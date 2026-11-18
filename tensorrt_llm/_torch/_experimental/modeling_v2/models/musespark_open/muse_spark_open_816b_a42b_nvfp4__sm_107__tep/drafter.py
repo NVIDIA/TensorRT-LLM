@@ -107,10 +107,23 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
                 plan.param("windowed_commit_parallel", "MIN_REQUESTS") if parallel else None
             ),
             late_join=plan.enabled("context_kv_late_join"),
+            # context_kv_fork_wide: up to the parallel windowed commit's 128 requests.
+            wide_max_requests=(
+                _context_kv_fork.PARALLEL_MAX_REQUESTS
+                if plan.enabled("context_kv_fork_wide")
+                else None
+            ),
+            # context_kv_fork_paged_wide: a paged context's steps of up to 128 requests.
+            **(
+                {"paged_wide_max_requests": _context_kv_fork.PARALLEL_MAX_REQUESTS}
+                if plan.enabled("context_kv_fork_paged_wide")
+                else {}
+            ),
             declined=plan.declined,
             paged_commit=plan.enabled("paged_context_commit"),
             paged_tables=plan.enabled("paged_ctx_block_tables"),
             paged_store=plan.enabled("paged_ctx_kv_store"),
+            block_table=plan.enabled("drafter_block_table_decode"),
         )
     if plan.enabled("drafter_kv_fork_before_head") and plan.param(
         "drafter_kv_fork_before_head", "PAGED_COMMIT"
@@ -133,6 +146,13 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
     verify_fold = plan.enabled("verify_fold")
     path_walk_tail = plan.enabled("path_walk_tail")
     distributed_head_sampler = plan.enabled("distributed_head_sampler")
+    row_owner = plan.enabled("lm_head_row_owner")
+    if row_owner:
+        # lm_head_row_owner: the owner rejection verify, below the step folds in the worker's
+        # class (rejection_fold folds what it returns).
+        from .kernels.lm_head_row_owner import owner as _row_owner
+
+        _row_owner.install_worker(getattr(shell.llm, "spec_worker", None))
     if verify_fold or path_walk_tail:
         from .kernels.verify_fold import fold as _spec_loop_fold
 
@@ -237,7 +257,15 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
                 # head tail's walk. After s2 (whose fabric holds its areas). Collective.
                 _rs_sampler.install(shell.llm, shell._mapping)
         if plan.enabled("wide_split_sampler"):
-            _target_head.widen(shell.llm)
+            _target_head.widen(
+                shell.llm,
+                vp_max_rows=plan.param("wide_split_sampler", "VP_MAX_ROWS"),
+                head_chunk_rows=plan.param("wide_split_sampler", "HEAD_CHUNK_ROWS"),
+                dist_chunk=bool(plan.param("wide_split_sampler", "DIST_CHUNK")),
+            )
+        if row_owner:
+            # lm_head_row_owner: the owner pages on the widened head. Collective.
+            _row_owner.install(shell.llm, shell._mapping)
     if drafter_folds:
         # drafter_folds: the drafter's layer-0 front as a per-token table. After the head paths:
         # the table is built by running the layer-0 modules as every install above left them,

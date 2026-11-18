@@ -76,6 +76,13 @@ MAX_ROWS_PER_SEQ = 8
 #: Sequences one call takes.
 MAX_SEQS = 128
 
+#: dieexp KF651 v2 (knob ``MUSESPARK_OPEN_DX_MR_KF651_V2=1``, default off; KF fa-block-vr4 48f1a399): the TMA warp
+#: triggers the dependent (the attention) right after its dependency wait, so the FMHA becomes resident and streams the
+#: cached (immutable) KV while this grid computes; the FMHA still waits for this grid's completion before reading
+#: anything it writes. And no A-operand L2 prefetch beyond the prestaged tiles (the candidate's setting). Order and
+#: arithmetic unchanged.
+KF651_V2 = __import__("os").environ.get("MUSESPARK_OPEN_DX_MR_KF651_V2", "") == "1"
+
 
 class PrepFold(NamedTuple):
     """The compile-time shape of the folded prep."""
@@ -359,7 +366,10 @@ class SplitK2CtaPrepFoldKernel(_two.SplitK2CtaGemmKernel):
     module docstring."""
 
     def __init__(self, split_k: int, use_pdl: bool, fold: PrepFold, prestage: bool = False):
-        super().__init__(split_k, use_pdl, 0, True, True, 64, prestage)
+        super().__init__(
+            split_k, use_pdl, 0, True, True, 64, prestage
+        )  # dieexp v3: A prefetch on (62963e84); the operand-load hoist NOT ported (PDL transitivity risk in-server)
+        self.early_trigger = KF651_V2
         self.fold = fold
         #: Token blocks this CTA reduces and preps (4 blocks of 32 tokens per 128-token tile).
         self.blocks_per_cta = (_two.MAX_ROWS // TOKEN_BLOCK) // self.split_k
@@ -704,6 +714,8 @@ class SplitK2CtaPrepFoldKernel(_two.SplitK2CtaGemmKernel):
                     cute.prefetch(tma_atom_a, tAgA_slice[(None, k_begin + k_tile)])
             if cutlass.const_expr(self.use_pdl):
                 cute.arch.griddepcontrol_wait()
+                if cutlass.const_expr(self.early_trigger):
+                    cute.arch.griddepcontrol_launch_dependents()
             if cutlass.const_expr(self.prestage):
                 for kk in cutlass.range(0, pre, 1, unroll=1):
                     cute.copy(

@@ -24,6 +24,12 @@ with the same arithmetic and fewer edges:
   combine kernel applies the output norm-gate to the head it has merged and lets
   the output projection launch after its own wait, as the PDL norm-gate copy of
   ``boundary_early_release`` does.
+* Long splits (``SwaBlockPlan.long_split_keys``, the ``swa_block_long_splits``
+  lever): decode steps of ``long_split_min_rows`` rows or more cut the window
+  into tiles of that many cached keys plus a step program for the step's own
+  keys (``split_keys`` of ``ops/attention/swa_block``). The cache bytes are the
+  same; the attention is merged at other points, so its output may differ in the
+  last BF16 place.
 
 * Key blocks per split program (the ``swa_blocks_per_program`` lever, installed by
   ``install_multi``): off, every step runs the one-block split grid; on (``AUTO``),
@@ -84,10 +90,12 @@ from ...ops.attention.paged_decode_attention import window_splits
 from ...ops.attention.preattn_prep import HEAD_DIM, preattn_prep
 from ...ops.attention.swa_block import (
     _ONE2_MAX_REQUESTS,
+    BLOCK_N,
     MAX_BLOCKS_PER_PROGRAM,
     MAX_ROWS,
     MULTI_MAX_REQUESTS,
     SPLIT_REGISTER_CAP,
+    long_splits,
     max_blocks,
     swa_block_attention,
     swa_block_multi_attention,
@@ -156,10 +164,23 @@ class SwaBlockPlan:
     Attributes:
         fused_prep: the split kernel runs the prep.
         fused_gate: the combine kernel runs the output norm-gate.
+        long_split_keys: keys per split on decode steps of ``long_split_min_rows`` rows or
+            more (``ops/attention/swa_block.LONG_SPLIT_KEYS``); 0 keeps every step on the
+            32-key blocks.
+        long_split_min_rows: the fewest decode rows (all sequences of the call) a step needs
+            for ``long_split_keys``.
     """
 
     fused_prep: bool
     fused_gate: bool
+    long_split_keys: int = 0
+    long_split_min_rows: int = 0
+
+    def split_keys(self, rows: int) -> int:
+        """Keys per split of a ``rows``-row decode step."""
+        if self.long_split_keys and rows >= self.long_split_min_rows:
+            return self.long_split_keys
+        return BLOCK_N
 
 
 class _SwaBlock:
@@ -455,6 +476,15 @@ class _SwaBlock:
         rope = raw and not self.skip_rope
         multi = requests > 1
         op = swa_block_multi_attention if multi else swa_block_attention
+        keys = self._swa_block.split_keys(rows)
+        num_splits = window_splits(window)
+        if keys != BLOCK_N:
+            num_splits = long_splits(window, keys)
+            logger.info_once(
+                f"[musespark_open] swa_block_long_splits: {rows}-row decode steps run the "
+                f"sliding-window block on {num_splits} splits of {keys} cached keys and a step program",
+                key=f"musespark_open.swa_block.long_splits_{rows}",
+            )
         return op(
             q[:rows],
             kv_pool,
@@ -464,7 +494,7 @@ class _SwaBlock:
             self.num_heads,
             self.num_key_value_heads,
             window,
-            window_splits(window),
+            num_splits,
             q_fp8,
             fused_prep=raw,
             cos_sin=self.rotary_emb.rotary_cos_sin if rope else None,
@@ -477,6 +507,7 @@ class _SwaBlock:
             enable_pdl=LAUNCH_PDL,
             blocks_per_program=bpp,
             split_max_registers=max_registers,
+            split_keys=keys,
         )
 
     def apply_output_gate(self, attention_output, gate):
@@ -552,6 +583,11 @@ def log_installed(layers, plan: SwaBlockPlan) -> None:
         f"[musespark_open] swa_block on the decode path of {sliding} sliding-window layers "
         f"(pre-wait loads; fused prep {plan.fused_prep}; fused norm-gate {plan.fused_gate}"
         + ("; prep triggers at entry" if not plan.fused_prep else "")
+        + (
+            f"; {plan.long_split_keys}-key splits from {plan.long_split_min_rows} rows"
+            if plan.long_split_keys
+            else ""
+        )
         + ")"
     )
 

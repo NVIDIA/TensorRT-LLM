@@ -11,6 +11,12 @@ of the layer's HND pages (``[pages, 2, heads, page_size, head_dim]``, K then V).
 
 This entry writes every layer's K and V of each entry in one program per entry, reading
 the inputs in place. Copies only: bitwise the built-in.
+
+The pages may be FP8 E4M3 for BF16 K/V (a drafter whose draft KV the KV cache manager
+stores in FP8, ``_torch/speculative/dflash_kv_storage.py``): each value is then stored
+clamped to +-448 in fp32 with NaN kept and rounded to nearest even, the cast of
+``to_kv_storage`` that the built-in applies before its appends; still bitwise the
+built-in.
 """
 
 from __future__ import annotations
@@ -22,9 +28,26 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm._torch.speculative.dflash_kv_storage import to_kv_storage
 
 #: Drafter layers one call takes (one pointer argument each).
 MAX_LAYERS = 8
+#: Page dtypes besides the K/V dtype, per K/V dtype: FP8 E4M3 pages store BF16 K/V.
+NARROW_PAGE_DTYPES = {torch.bfloat16: (torch.float8_e4m3fn,)}
+
+
+def takes_page_dtype(kv_dtype: torch.dtype, page_dtype: torch.dtype) -> bool:
+    """Whether pages of ``page_dtype`` take K/V of ``kv_dtype`` (the same, or a narrow one)."""
+    return page_dtype == kv_dtype or page_dtype in NARROW_PAGE_DTYPES.get(kv_dtype, ())
+
+
+@triton.jit
+def _to_e4m3(x):
+    """``x`` as an FP8 E4M3 page stores it: clamped to +-448 in fp32 with NaN kept, rounded
+    to nearest even."""
+    return tl.clamp(x.to(tl.float32), -448.0, 448.0, propagate_nan=tl.PropagateNan.ALL).to(
+        tl.float8e4nv
+    )
 
 
 @triton.jit
@@ -57,6 +80,7 @@ def _ctx_kv_store_paged_kernel(
     LAYERS: tl.constexpr,
     HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    OUT_FP8: tl.constexpr = False,
 ):
     i = tl.program_id(0).to(tl.int64)
     row = tl.load(rows_ptr + i).to(tl.int64)
@@ -97,6 +121,9 @@ def _ctx_kv_store_paged_kernel(
             + h[:, None] * stride_v_head
             + d[None, :]
         )
+        if OUT_FP8:
+            key = _to_e4m3(key)
+            value = _to_e4m3(value)
         tl.store(cache + dst, key)
         tl.store(cache + stride_kv + dst, value)
 
@@ -115,7 +142,7 @@ class CtxKvStorePaged(OpWrapper):
         page_size      the pages' rows (``_ctx_page_size``)
         caches         the layers' HND pages (``_ctx_kv_buf``), [pages, 2, heads,
                        page_size, head_dim] each, the same strides for every layer, head_dim
-                       stride 1, dtype of k and v
+                       stride 1, one dtype: that of k and v, or FP8 E4M3 for BF16 k and v
     """
 
     ARCHS = frozenset({Arch.SM_107})
@@ -128,7 +155,8 @@ class CtxKvStorePaged(OpWrapper):
     Call site: ``ContextKvForkDFlashWorker._store_context_kv_paged`` under the
     ``paged_ctx_kv_store`` fast path, in place of the worker's per-layer appends.
 
-    Numerics: copies, bitwise the built-in method (the reference).
+    Numerics: copies, bitwise the built-in method (the reference); into FP8 E4M3 pages the
+    saturating round-to-nearest-even cast of ``to_kv_storage``.
 
     Hard limits
       layers <= MAX_LAYERS; heads and head_dim powers of two.
@@ -169,6 +197,7 @@ class CtxKvStorePaged(OpWrapper):
             LAYERS=layers,
             HEADS=heads,
             HEAD_DIM=head_dim,
+            OUT_FP8=first.dtype == torch.float8_e4m3fn,
             num_warps=1,
         )
 
@@ -186,8 +215,8 @@ class CtxKvStorePaged(OpWrapper):
         pages = table[rows.long(), positions.long() // page_size].long()
         entries = positions.long() % page_size
         for layer, cache in enumerate(caches):
-            cache[pages, 0, :, entries] = k[:, layer]
-            cache[pages, 1, :, entries] = v[:, layer]
+            cache[pages, 0, :, entries] = to_kv_storage(k[:, layer], cache.dtype)
+            cache[pages, 1, :, entries] = to_kv_storage(v[:, layer], cache.dtype)
 
     def is_valid(
         self,
@@ -221,7 +250,8 @@ class CtxKvStorePaged(OpWrapper):
         for cache in caches:
             if (
                 cache.dim() != 5
-                or cache.dtype != k.dtype
+                or not takes_page_dtype(k.dtype, cache.dtype)
+                or cache.dtype != first.dtype
                 or cache.shape[1] != 2
                 or cache.shape[2] != heads
                 or cache.shape[3] != page_size

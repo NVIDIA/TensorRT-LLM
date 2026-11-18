@@ -12,9 +12,9 @@ arena), the structural rules ``dispatch`` derives from it, and the environment s
 
 Knobs. These are the only variables the target reads for levers::
 
-    MUSESPARK_OPEN_LEVER_<LEVER>=auto|on|off          one per lever; unset or empty: the default
-    MUSESPARK_OPEN_LEVER_<LEVER>__<PARAM>=<value>      a parameter the lever declares (Rule.params)
-    MUSESPARK_OPEN_LEVER__DEFAULT=auto|baseline        what an unset lever knob means
+    MUSESPARK_OPEN_LEVER_<LEVER>=auto|on|off          one per lever; unset, empty or auto: its default
+    MUSESPARK_OPEN_LEVER_<LEVER>__<PARAM>=<value>      a parameter the lever declares (Lever.params)
+    MUSESPARK_OPEN_LEVER__DEFAULT=on|off               off: every lever off but the upstream ones' stock rule
     MUSESPARK_OPEN_LEVER__ROLE=auto|agg|ctx|gen        the server's role; unset or auto: derived
 
 ``<LEVER>`` is the lever's name upper-cased; ``__`` introduces a parameter or a resolver
@@ -23,53 +23,27 @@ whitespace-stripped. Two shared-path variables are read as facts and never set o
 here: ``TRTLLM_KV_DEFER_CLOSE`` (on iff exactly ``1``, the KV cache manager's own test) and
 ``UCX_RNDV_THRESH`` (set or not).
 
+The table. ``LEVERS`` is the one list of this target's levers: each row is a ``Lever`` with its
+``kind`` (what it changes, ``Kind``) and ``on_by_default``, the condition under which it is on
+when no knob speaks for it. Every other deployment runs it only when its knob says ``on``
+(opt-in). The conditions are written from a few combinators: ``ALWAYS`` (wherever it can run),
+``NEVER`` (opt-in only), ``unless_on(...)``, ``gated(...)`` (a lossless-numeric lever's own
+accuracy gates, ``Lever.gates``, must hold), ``in_band(...)`` (aggregated vs disaggregated
+deployments, ``band_of``), and the target's deployment rules (``_at_most``,
+``_on_single_request``, ...).
+
 Semantics, in the order a lever is resolved:
 
 * structural: a fact the lever's code needs (an arena kind, a fact variable, the drafter's
-  logit transform, rejection sampling; ``dispatch.structural_rules``) excludes it; nothing
-  overrides that;
+  logit transform, rejection sampling; ``dispatch.structural_rules``, ``Lever.excluded``)
+  excludes it; nothing overrides that;
 * dependency: a lever it builds on (``dispatch.FastPath.depends_on``) or requires
-  (``Rule.requires``) is off;
+  (``Lever.requires``) is off;
 * knob: ``off`` removes it, and with it every lever built on it or requiring it; ``on``
-  keeps it whatever its deployment rule and gates say;
-* band: under ``auto``, a lever of the other band's selection (below) resolves as under
-  ``baseline``, unless a lever turned ``on`` by its knob builds on it or requires it;
-* default: ``auto`` runs the lever's deployment rule (``Rule.auto``), and a lossless-numeric
-  lever also needs one of its accuracy gates (``Rule.gates``); ``baseline`` turns every
-  lever off that is not the upstream target's, and gives the upstream ones their upstream
-  rule (``Rule.baseline``).
-
-Bands. Every deployment belongs to exactly one band, by ``band_of``: an aggregated server
-(no cache transceiver, or the ``agg`` role hint), at any TEP size, ``max_batch_size`` and
-arena, to ``Band.AGGREGATED_SM107``; every other deployment (a context, generation or
-unhinted disaggregated server) to ``Band.DEFAULT``.
-Each band owns a selection of levers (``BAND_LEVERS``): the aggregated sm107 band the
-high-concurrency TEP4, the 2..4-request TEP4 and the single-request TEP8 levers; the default
-band the low-latency levers of the sm107 compositions and the upstream rules they changed. A
-lever in neither selection is both bands' (``full_attention_fold_multi``'s rule names the band
-itself, ``_full_attention_fold_multi``; the three context-step levers of the TEP4 context
-servers, ``context_prep_rows_vec``, ``context_embedding_replicated`` and
-``context_sp_router_input``, are on for the ``ctx`` role and for aggregated servers by rule,
-and so is ``fmk_context_fmha``, on every pure context step of a ``ctx`` server; of the
-context-step reduce-scatter overlaps, ``context_sp_oproj_overlap`` and
-``context_sp_tail_pipeline`` are on for TEP4 ``ctx`` servers and on by their knobs elsewhere,
-and ``context_sp_moe_rs_overlap`` is off under ``auto`` until measured on sm107).
-
-Role defaults of the default band (the disaggregated deployment, integration 'int1'): a TEP8
-``gen`` server of ``max_batch_size`` 9..16 runs the low-latency levers at MAX_BATCH 16 with
-their 65..128-row bands (``_tep8_gen_wide``), and every TEP8 ``gen`` server pushes the router
-from 9 rows (``TEP8_GEN_ROUTER_PUSH_MIN_ROWS``) and runs the one-cluster SWA block from 2 requests
-(``TEP8_GEN_CL8_MIN_REQUESTS``); a TEP8 ``gen`` server of 9..16 requests also runs the
-X400 composite (CL8 to 11 requests, ``TEP8_GEN_CL8_MAX_REQUESTS``; router v2 to 128 rows; the
-vocabulary-parallel head off, i.e. its MAX_BATCH stays 8); a TEP4 ``ctx`` server runs
-``fmk_context_fmha`` at PURE_CONTEXT 1, the o_proj overlap, the tail pipeline and
-``context_sp_extra_parts``'s ``shard_routing``, without its ``ce_gather`` (int4: the copy
-engines stay free for the KV transfers). Aggregated servers keep the 1..8-request
-defaults and these levers' agg rules. Under ``auto`` a lever of the
-other band's selection resolves as under ``baseline`` (off, or its upstream rule), so each
-band's table is its own selection; its knob still turns it on where its structural and
-dependency rules allow, and the levers it builds on or requires then resolve by their own
-rules.
+  keeps it whatever its default says, and turns on the levers it builds on or requires;
+* ``__DEFAULT=off``: a lever with a ``stock`` rule (the upstream sm107 compositions' own
+  levers) runs that rule; every other lever is off;
+* default: its row's ``on_by_default``.
 
 ``on`` for a lever the composition does not serve, that a structural rule excludes, whose
 dependency or requirement is off, or that conflicts with another lever that is on, raises.
@@ -105,7 +79,8 @@ HC_MIN_BATCH = 48
 PREFIX = "MUSESPARK_OPEN_LEVER_"
 #: Separates a lever name from a parameter key.
 SEP = "__"
-#: What an unset lever knob means: ``auto`` (the default) or ``baseline``.
+#: ``on`` (the default): every lever by its row's ``on_by_default``; ``off``: every lever off but
+#: the upstream ones' ``stock`` rule (a stock engine).
 DEFAULT_KNOB = PREFIX + "_DEFAULT"
 #: The server's role: ``auto`` (derived, the default), ``agg``, ``ctx`` or ``gen``.
 ROLE_KNOB = PREFIX + "_ROLE"
@@ -116,12 +91,11 @@ UCX_RNDV_THRESH_ENV = "UCX_RNDV_THRESH"
 AUTO = "auto"
 ON = "on"
 OFF = "off"
-BASELINE = "baseline"
 LEVER_VALUES = (AUTO, ON, OFF)
-DEFAULT_VALUES = (AUTO, BASELINE)
+DEFAULT_VALUES = (ON, OFF)
 
 #: The decision sources, in the order a lever is resolved.
-SOURCES = ("structural", "dependency", "knob", "baseline", "band", "auto", "gate")
+SOURCES = ("structural", "dependency", "knob", "stock", "default")
 
 #: Retired switches and what replaced them. Setting one, to any value, raises.
 RETIRED: Mapping[str, str] = types.MappingProxyType(
@@ -287,6 +261,9 @@ RETIRED: Mapping[str, str] = types.MappingProxyType(
         "MUSESPARK_OPEN_RS_FORCED": (
             "nothing: forced acceptance always leaves rejection sampling inert"
         ),
+        # The resolver settings the one lever table replaced.
+        PREFIX + "_BITWISE": "nothing: each lever's row in LEVERS says when it is on by default",
+        PREFIX + "_NUMERICS": "the " + PREFIX + "<LEVER>=off knobs",
     }
 )
 #: Name prefixes only retired switches carry; any other name under them raises too.
@@ -348,6 +325,9 @@ class Arena(str, enum.Enum):
     WINDOWED = "windowed"
     #: Pages of a KV cache manager.
     PAGED = "paged"
+    #: No drafter: a context server without speculative decoding
+    #: (``dispatch.drafterless_context``); every drafter lever is left out.
+    NONE = "none"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -561,23 +541,21 @@ RuleFn = Callable[["Deployment", "Resolving", Mapping[str, object]], Tuple[bool,
 
 
 @dataclasses.dataclass(frozen=True)
-class Rule:
-    """How one lever resolves when its rule is not the default (served, on).
+class Lever:
+    """One row of the lever table: what the lever is and when it is on by default.
 
-    ``origin`` is ``upstream`` for the upstream target's own paths and their upstream
-    behaviour, else the serving region the lever targets (``HC`` high concurrency,
-    ``midc`` mid concurrency, ``LL`` low latency): under ``__DEFAULT=baseline`` a
-    non-upstream lever is off unless its knob is set, and an upstream one runs
-    ``baseline`` (or ``auto`` when it has none). ``after`` names the decisions ``auto`` /
-    ``baseline`` read; ``requires`` levers that must be on;
-    ``conflicts`` levers that may not be on with it; ``excluded`` a structural reason it
-    cannot be on, from the decisions so far.
+    ``on_by_default`` decides it for a deployment no knob speaks for; anywhere else it runs only
+    when its knob says ``on`` (opt-in). ``stock`` is the upstream target's own rule for a lever
+    the upstream sm107 compositions also serve: what ``__DEFAULT=off`` keeps (None: off there).
+    ``gates`` are the accuracy gates a lossless-numeric lever's ``gated(...)`` default needs, and
+    the scope a knob ``on`` outside them is warned about. ``after`` names the decisions its
+    conditions read; ``requires`` levers that must be on; ``conflicts`` levers that may not be on
+    with it; ``excluded`` a structural reason it cannot be on, from the decisions so far.
     """
 
-    origin: str
     kind: Kind
-    auto: RuleFn
-    baseline: Optional[RuleFn] = None
+    on_by_default: RuleFn
+    stock: Optional[RuleFn] = None
     params: Tuple[Param, ...] = ()
     gates: Tuple[Gate, ...] = ()
     after: Tuple[str, ...] = ()
@@ -604,13 +582,13 @@ class Decision:
 
 
 class Resolving:
-    """The decisions made so far, as a rule reads them (``Rule.after``)."""
+    """The decisions made so far, as a lever's conditions read them (``Lever.after``)."""
 
     def __init__(self, served: FrozenSet[str], decisions: Mapping[str, Decision]) -> None:
         self._served = served
         self._decisions = decisions
         #: The lever being decided and its parameters (``resolve`` sets it): its own
-        #: ``Rule.excluded`` reads them through ``param``.
+        #: ``Lever.excluded`` reads them through ``param``.
         self.pending: Optional[Tuple[str, Mapping[str, object]]] = None
 
     def on(self, name: str) -> bool:
@@ -618,7 +596,7 @@ class Resolving:
 
         Raises:
             RuntimeError: for a served lever not decided yet (a rule that reads it must
-                name it in ``Rule.after``).
+                name it in ``Lever.after``).
         """
         if name not in self._served:
             return False
@@ -635,7 +613,7 @@ class Resolving:
             return decision.params[key]
         if self.pending is not None and self.pending[0] == name and key in self.pending[1]:
             return self.pending[1][key]
-        return RULES[name].param(key).default
+        return LEVERS[name].param(key).default
 
 
 # --------------------------------------------------------------------------
@@ -767,6 +745,13 @@ def _hot_replicas(requires_decode: bool) -> RuleFn:
     return rule
 
 
+def _swa_block_long_splits(
+    d: Deployment, t: Resolving, p: Mapping[str, object]
+) -> Tuple[bool, str]:
+    rows = int(p["MIN_ROWS"])
+    return _reaching(rows, f"sliding-window decode steps of {rows} or more rows")(d, t, p)
+
+
 def _attn_gather_excluded(d: Deployment, t: Resolving) -> Optional[str]:
     if "qkv" not in t.param("context_fp8_dense", "PROJECTIONS"):
         return "its gathered rows feed the QKV projection, which context_fp8_dense__PROJECTIONS leaves out"
@@ -870,6 +855,92 @@ def _tep8_gen_cl8_max_requests(d: Deployment) -> int:
     return TEP8_GEN_CL8_MAX_REQUESTS if _tep8_gen_wide(d) else 8
 
 
+#: On wherever the lever can run (no structural, dependency or conflict rule excludes it).
+ALWAYS = _always("on by default wherever it can run")
+#: Opt-in: on only by its knob.
+NEVER = _never("opt-in: on only by its knob")
+
+
+def unless_on(others: Tuple[str, ...], rule: Optional[RuleFn] = None) -> RuleFn:
+    """``rule`` (``ALWAYS`` when not given), off while one of ``others`` is on (they serve the
+    same steps, or one may not be on with it); ``others`` go in the row's ``after``."""
+    return _yielding(others, rule if rule is not None else ALWAYS)
+
+
+def gated(rule: RuleFn) -> RuleFn:
+    """``rule``, and one of the lever's own accuracy gates (``Lever.gates``) holds."""
+
+    def wrapped(d: Deployment, t: "Resolving", p: Mapping[str, object]) -> Tuple[bool, str]:
+        on, why = rule(d, t, p)
+        if not on:
+            return on, why
+        gates = LEVERS[t.pending[0]].gates
+        held = [gate for gate in gates if gate.holds(d)]
+        if not held:
+            scopes = "; ".join(gate.scope for gate in gates)
+            return False, f"{why}, but no accuracy gate holds ({scopes})"
+        return True, f"{why}; gate: {held[0].scope}"
+
+    return wrapped
+
+
+def in_band(band: Band, rule: RuleFn, stock: bool = True) -> RuleFn:
+    """``rule`` on deployments of ``band`` (``band_of``); elsewhere the lever's ``stock`` rule,
+    or off for a lever without one (or with ``stock=False``)."""
+
+    def wrapped(d: Deployment, t: "Resolving", p: Mapping[str, object]) -> Tuple[bool, str]:
+        here = band_of(d)
+        if here is band:
+            return rule(d, t, p)
+        stock = LEVERS[t.pending[0]].stock if use_stock else None
+        if stock is None:
+            return False, f"a {band.value} lever, off on a {here.value} deployment"
+        on, why = stock(d, t, p)
+        return on, f"a {band.value} lever on a {here.value} deployment, its upstream rule: {why}"
+
+    use_stock = stock
+    return wrapped
+
+
+def either(first: RuleFn, second: RuleFn) -> RuleFn:
+    """On where ``first`` is; elsewhere ``second``."""
+
+    def wrapped(d: Deployment, t: "Resolving", p: Mapping[str, object]) -> Tuple[bool, str]:
+        on, why = first(d, t, p)
+        return (on, why) if on else second(d, t, p)
+
+    return wrapped
+
+
+def unless_rule(others: Mapping[str, RuleFn], rule: Optional[RuleFn] = None) -> RuleFn:
+    """``rule`` (``ALWAYS`` when not given), off where one of ``others`` would be on by the rule
+    given for it (evaluated as that lever: its parameters and gates), since this lever would take
+    those steps from it."""
+    rule = rule if rule is not None else ALWAYS
+
+    def wrapped(d: Deployment, t: "Resolving", p: Mapping[str, object]) -> Tuple[bool, str]:
+        own = t.pending
+        for name, other_rule in others.items():
+            if name not in t._served:
+                continue
+            decided = t._decisions.get(name)
+            params = (
+                dict(decided.params)
+                if decided is not None
+                else {param.key: param.default_of(d) for param in LEVERS[name].params}
+            )
+            t.pending = (name, params)
+            try:
+                held = other_rule(d, t, params)[0]
+            finally:
+                t.pending = own
+            if held:
+                return False, f"leaves these steps to {name}, on here by its rule"
+        return rule(d, t, p)
+
+    return wrapped
+
+
 def _ll_params() -> Tuple[Param, ...]:
     return (Param("MAX_BATCH", LL_MAX_BATCH, 1, 64, default_for=_ll_max_batch),)
 
@@ -910,33 +981,6 @@ def _yielding(yields_to: Tuple[str, ...], rule: RuleFn) -> RuleFn:
     return yielding
 
 
-def _ll(
-    kind: Kind,
-    yields_to: Tuple[str, ...] = (),
-    exclusive: bool = False,
-    params: Tuple[Param, ...] = (),
-) -> Rule:
-    """A low-latency lever of decode steps: on while ``max_batch_size`` is at most MAX_BATCH.
-
-    With ``yields_to`` it is off while one of those levers is on (``_yielding``); with
-    ``exclusive`` it also may not be on with one of them (it would take their steps), so
-    turning it on by its knob next to one of them raises.
-    """
-    gates = (_ll_gate(),) if kind is Kind.NUMERIC else ()
-    rule = _at_most("MAX_BATCH")
-    if yields_to:
-        rule = _yielding(yields_to, rule)
-    return Rule(
-        "LL",
-        kind,
-        rule,
-        params=_ll_params() + params,
-        gates=gates,
-        after=yields_to,
-        conflicts=yields_to if exclusive else (),
-    )
-
-
 def _context_workers(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
     """On context servers; on aggregated ones only while ``max_batch_size`` is at most MAX_BATCH."""
     if d.role is Role.GEN:
@@ -969,18 +1013,6 @@ SM107_TEP8_TEP4_PATHS = (
     "wide_dense_gemms",
     "projection_publish",
 )
-
-
-def _tep4_path_rule(params: Tuple[Param, ...] = ()) -> Rule:
-    return Rule(
-        "upstream",
-        Kind.COMPOSITION,
-        _always("its rows, wherever served"),
-        baseline=_not_on_tep8(
-            "the upstream sm107 tep8 composition does not serve it", "its rows, wherever served"
-        ),
-        params=params,
-    )
 
 
 #: Parameters of the ``SM107_TEP8_TEP4_PATHS`` rules (each default the band served before).
@@ -1130,6 +1162,135 @@ def _full_attention_fold_multi(
     return _at_most("MAX_BATCH")(d, t, p)
 
 
+_CTX_TEP4 = "disaggregated context servers at sm107 tep4"
+
+
+def _ctx_sm107_tep4(d: Deployment) -> bool:
+    """Whether ``d`` is a disaggregated context server at sm107 TEP4."""
+    return d.sm == 107 and d.tp == 4 and d.role is Role.CTX
+
+
+def _on_ctx_sm107_tep4(what: str) -> RuleFn:
+    """A rule on for ``what`` on disaggregated sm107 TEP4 context servers, off elsewhere."""
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if _ctx_sm107_tep4(d):
+            return True, f"{what} on {_CTX_TEP4}"
+        return False, f"measured on {_CTX_TEP4} only; this server's role is {d.role.value}"
+
+    return rule
+
+
+#: The accuracy gate of ``fmk_pure_context_fmha``: its class, whose gate is still to run, so
+#: it holds nowhere yet and the lever is on only by its knob.
+_CTX_TEP4_GATE_PENDING = Gate(lambda d: False, f"{_CTX_TEP4} (gate pending)")
+#: The accuracy gate of ``context_last_layer_tail`` (acceptance length and accuracy on the TEP4
+#: context server):
+#: still to run, so the lever is on only by its knob.
+_CTX_TEP4_TAIL_GATE_PENDING = Gate(lambda d: False, f"{_CTX_TEP4} (gate pending)")
+
+
+_GEN_TEP4 = "disaggregated generation servers at sm107 tep4"
+
+#: The requests the context-K/V fork takes without ``context_kv_fork_wide``
+#: (``ops/spec/context_kv_commit.MAX_REQUESTS``).
+FORK_MAX_REQUESTS = 64
+#: The requests the context-K/V fork takes with ``context_kv_fork_wide``: the parallel
+#: windowed commit's bound (``ops/spec/context_kv_commit_windowed.PARALLEL_MAX_REQUESTS``).
+FORK_WIDE_MAX_REQUESTS = 128
+
+
+#: The drafter context arenas of a wide generation server (``_wide_generation_refusal``).
+WIDE_GENERATION_ARENAS = (Arena.WINDOWED, Arena.PAGED)
+
+
+def _wide_generation_refusal(d: Deployment) -> Optional[str]:
+    """Why ``d`` is not a wide generation server, or None when it is one.
+
+    A wide generation server is a disaggregated sm107 TEP4 generation server with a windowed
+    or a paged drafter context arena (``WIDE_GENERATION_ARENAS``) whose decode steps can
+    exceed ``FORK_MAX_REQUESTS`` requests. Its decode steps are served by
+    ``multi_request_ffn_join`` and the raised row cap of ``router_gemm`` and
+    ``finalize_two_shot`` (``row_cap``), and over a windowed arena also by
+    ``context_kv_fork_wide`` (``_wide_fork_refusal``); every other deployment runs those
+    steps as without them.
+
+    None of the three reads the drafter context arena: the router GEMM and the two-shot
+    finalize take the target's decode rows, and the join stores the DFlash capture into the
+    speculative metadata's capture buffer (``capture_fold.destination``), which the worker
+    reads after the target forward whatever arena it then writes the drafter's context to.
+    """
+    if not (d.sm == 107 and d.tp == 4 and d.role is Role.GEN):
+        return f"measured on {_GEN_TEP4} only; this server's role is {d.role.value}"
+    if d.arena not in WIDE_GENERATION_ARENAS:
+        return f"for a windowed or paged drafter context arena; this server's is {d.arena.value}"
+    if d.max_batch_size is None or d.max_batch_size <= FORK_MAX_REQUESTS:
+        return (
+            f"max_batch_size {_count(d.max_batch_size)} never exceeds {FORK_MAX_REQUESTS} requests"
+        )
+    return None
+
+
+def _wide_fork_refusal(d: Deployment) -> Optional[str]:
+    """Why the context-K/V fork does not take ``d``'s decode steps of more than
+    ``FORK_MAX_REQUESTS`` requests (``context_kv_fork_wide``), or None.
+
+    A wide generation server (``_wide_generation_refusal``) with the windowed drafter
+    context arena: the fork of those steps commits through the parallel windowed commit.
+    """
+    refusal = _wide_generation_refusal(d)
+    if refusal is not None:
+        return refusal
+    if d.arena is not Arena.WINDOWED:
+        return (
+            "its commit is the parallel windowed commit, which needs the windowed drafter "
+            f"context arena; this server's is {d.arena.value}"
+        )
+    return None
+
+
+def _context_kv_fork_wide(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+    """On for wide generation servers over a windowed arena (``_wide_fork_refusal``), off
+    elsewhere."""
+    refusal = _wide_fork_refusal(d)
+    if refusal is not None:
+        return False, refusal
+    most = min(d.max_batch_size, FORK_WIDE_MAX_REQUESTS)
+    return True, (
+        f"decode steps of {FORK_MAX_REQUESTS + 1}..{most} requests on the context-K/V fork "
+        f"on {_GEN_TEP4}"
+    )
+
+
+def _multi_request_ffn_join(
+    d: Deployment, t: Resolving, p: Mapping[str, object]
+) -> Tuple[bool, str]:
+    """On for wide generation servers (``_wide_generation_refusal``), off elsewhere."""
+    refusal = _wide_generation_refusal(d)
+    if refusal is not None:
+        return False, refusal
+    return True, f"the capture layers' post-FFN joins of 33..768-row calls on {_GEN_TEP4}"
+
+
+#: The most rows of a decode step ``router_gemm`` and ``finalize_two_shot`` arm: ``ROW_CAP``,
+#: or ``WIDE_ROW_CAP`` (96 requests at K = 7) on a wide generation server (``row_cap``).
+ROW_CAP = 512
+WIDE_ROW_CAP = 768
+
+
+def row_cap(d: Deployment, default: str = AUTO) -> int:
+    """The row cap of ``router_gemm`` and ``finalize_two_shot`` on ``d``.
+
+    ``WIDE_ROW_CAP`` on a wide generation server (``_wide_generation_refusal``) under the
+    ``auto`` default, ``ROW_CAP`` everywhere else (and under ``baseline``). The rows above
+    ``ROW_CAP`` leave the built-in FP32 router and the unfused expert combine for these
+    paths, which is lossless-numeric against them.
+    """
+    if default == AUTO and _wide_generation_refusal(d) is None:
+        return WIDE_ROW_CAP
+    return ROW_CAP
+
+
 def _decode_qkv_excluded(d: Deployment, t: Resolving) -> Optional[str]:
     if "qkv" not in t.param("context_fp8_dense", "PROJECTIONS"):
         return "it reads context_fp8_dense's QKV copies, which context_fp8_dense__PROJECTIONS leaves out"
@@ -1227,6 +1388,13 @@ def _ctx_overlap_params() -> Tuple[Param, ...]:
     )
 
 
+def _row_owner_excluded(d: Deployment, t: Resolving) -> Optional[str]:
+    """Why ``row_owner_moe`` cannot be on ``d``: it builds on the wide generation server's
+    row cap of ``router_gemm`` and ``finalize_two_shot`` (``row_cap``), whose 520..768-row
+    calls it reproduces per owner row."""
+    return _wide_generation_refusal(d)
+
+
 #: The deployments the single-request decode schedule of sm107 TEP8 was measured on.
 _SINGLE_REQUEST = (
     "aggregated sm107 tep8 servers of max_batch_size 1 over a dense or paged drafter context arena"
@@ -1262,6 +1430,17 @@ def _on_single_request(what: str) -> RuleFn:
     return rule
 
 
+def _on_max_batch_one(what: str) -> RuleFn:
+    """On for ``what`` on a server of max_batch_size 1 (any role), off elsewhere."""
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if d.max_batch_size == 1:
+            return True, f"{what} on a server of max_batch_size 1"
+        return False, f"max_batch_size is {_count(d.max_batch_size)}, not 1"
+
+    return rule
+
+
 #: The accuracy gate of the single-request lossless-numeric levers: the megakernel's
 #: numerics-budget levers and the distributed head sampler.
 _SINGLE_REQUEST_GATE = Gate(_single_request_tep8, _SINGLE_REQUEST)
@@ -1282,24 +1461,54 @@ def _megakernel_variant_excluded(d: Deployment, t: Resolving) -> Optional[str]:
 
 #: Every lever whose rule is not the default; every other served lever is on under ``auto``
 #: and ``baseline``.
-RULES: Mapping[str, Rule] = types.MappingProxyType(
+#: The deployment rules of the levers others step aside for: where one holds, that lever is on and
+#: the levers yielding to it (``unless_rule``) are off; elsewhere those run, and it fills in where
+#: they are off (``either(<rule>, unless_on(...))``).
+_STEP_LOOP_INLINE_COMMITS = in_band(
+    Band.AGGREGATED_SM107, _on_single_request("the one-stream step loop's commits"), stock=False
+)
+_LAYER0_QKV_TABLE = in_band(
+    Band.AGGREGATED_SM107, _on_single_request("8-row decode steps' layer-0 QKV rows"), stock=False
+)
+_WIDE_QKV_PREFETCH = in_band(
+    Band.AGGREGATED_SM107,
+    _two_to_four_request_steps("the 9..32-row next-QKV prefetch after the experts"),
+    stock=False,
+)
+_CONTEXT_KV_LATE_JOIN = in_band(
+    Band.AGGREGATED_SM107, _on_agg_tep4("windowed block decodes after a forked commit"), stock=False
+)
+_CONTEXT_KV_FORK_LAST_LAYER = in_band(
+    Band.AGGREGATED_SM107, _on_single_request("forked side-chain steps"), stock=False
+)
+_SWA_BLOCKS_PER_PROGRAM = in_band(
+    Band.AGGREGATED_SM107,
+    _two_to_four_request_steps("sliding-window split programs over 2..4 key blocks"),
+    stock=False,
+)
+#: The low-latency rule of the disaggregated deployments' levers (``_at_most`` MAX_BATCH), as the
+#: levers stepping aside read it; ``_LL_GATED`` with the lever's own accuracy gate.
+_LL_DEFAULT_BAND = in_band(Band.DEFAULT, _at_most("MAX_BATCH"), stock=False)
+_LL_GATED = in_band(Band.DEFAULT, gated(_at_most("MAX_BATCH")), stock=False)
+_DRAFTER_KV_GLUE_RULE = in_band(
+    Band.DEFAULT, _yielding(("drafter_kv_side_chain",), _at_most("MAX_BATCH")), stock=False
+)
+
+LEVERS: Mapping[str, Lever] = types.MappingProxyType(
     {
-        "packed_prep_append": Rule(
-            "HC",
+        "packed_prep_append": Lever(
             Kind.BITWISE,
-            _packed_prep_append,
+            ALWAYS,
             params=(Param("MIN_ROWS", 33, 8, 1024),),
         ),
-        "windowed_commit_parallel": Rule(
-            "HC",
+        "windowed_commit_parallel": Lever(
             Kind.BITWISE,
-            _windowed_commit_parallel,
+            ALWAYS,
             params=(
                 Param("MIN_REQUESTS", 5, 1, 64, default_for=lambda d: 1 if _hc_selection(d) else 5),
             ),
         ),
-        "context_fp8_dense": Rule(
-            "HC",
+        "context_fp8_dense": Lever(
             Kind.LOSSY,
             _lossy,
             params=(
@@ -1311,44 +1520,47 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 ),
             ),
         ),
-        "context_fp8_attn_gather": Rule(
-            "HC", Kind.LOSSY, _lossy, after=("context_fp8_dense",), excluded=_attn_gather_excluded
+        "context_fp8_attn_gather": Lever(
+            Kind.LOSSY,
+            _lossy,
+            after=("context_fp8_dense",),
+            excluded=_attn_gather_excluded,
         ),
-        "wide_direct_transports": Rule("midc", Kind.BITWISE, _off_at_hc(_wide_steps)),
-        "wide_router_per_row": Rule(
-            "midc",
+        "wide_direct_transports": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        "wide_router_per_row": Lever(
             Kind.NUMERIC,
-            _wide_steps,
+            gated(_wide_steps),
             gates=(_router_gate(Role.GEN, "generation servers at tep4 with max_batch_size 2..4"),),
         ),
-        "wide_oproj_publish": Rule("midc", Kind.BITWISE, _off_at_hc(_wide_steps)),
-        "wide_finalize_transport": Rule(
-            "midc",
+        "wide_oproj_publish": Lever(
             Kind.BITWISE,
-            _off_at_hc(_always("17..32-token finalize calls on a 32-token transport")),
+            ALWAYS,
         ),
-        "lm_head_inbox": Rule(
-            "upstream",
+        "wide_finalize_transport": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        "lm_head_inbox": Lever(
             Kind.COMPOSITION,
             _never("the sm107 compositions gather the 8-row head without the inbox"),
-            baseline=_always("8-row heads"),
+            stock=_always("8-row heads"),
         ),
-        "graph_start_qkv_prefetch": Rule(
-            "upstream",
+        "graph_start_qkv_prefetch": Lever(
             Kind.COMPOSITION,
             _graph_start_prefetch,
-            baseline=_always("graph starts of split-K row counts"),
+            stock=_always("graph starts of split-K row counts"),
         ),
-        "step_loop_on_execution_stream": Rule(
-            "LL",
+        "step_loop_on_execution_stream": Lever(
             Kind.BITWISE,
-            _at_most("MAX_BATCH"),
+            ALWAYS,
             params=(Param("MAX_BATCH", 4, 1, 64),),
         ),
-        "incremental_block_offsets": Rule(
-            "LL",
+        "incremental_block_offsets": Lever(
             Kind.BITWISE,
-            _at_most("MAX_BATCH"),
+            ALWAYS,
             params=(
                 Param("MAX_BATCH", 8, 1, 64, default_for=_tep8_gen_wide_winner(16, 8)),
                 # Alias only (kept for the round-3 / E2E envs): upstream #21789 stages a manager
@@ -1364,19 +1576,44 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 ),
             ),
         ),
-        "drafter_kv_side_chain": Rule(
-            "LL",
+        # w256: served at TEP8 too (modeling._SM107_TEP8_PATHS), but on there only by its knob: decode
+        # steps of 129..1024 rows (17+ requests at K = 7) keep their BF16 head row and the split sampler
+        # (the shipped 512-thread block bit for bit: the same tokens) instead of the built-in chain
+        # (logits cat, FP32 copy, soft cap, fusedSampling). TEP4 as before.
+        "wide_split_sampler": Lever(
             Kind.BITWISE,
-            _always("decode steps of 1..64 requests over a dense arena or pages"),
+            ALWAYS,
+            stock=_not_on_tep8(
+                "on at TEP8 only by its knob (w256: 129..1024-row steps on the split sampler)",
+                "the split verify sampler on 129..1024-row decode steps",
+            ),
+            params=(
+                # w256 (0: off): steps of 129..VP_MAX_ROWS rows on the vocabulary-parallel head next to
+                # head_sampler_coop_fold's distributed sampler (no logits all-gather; the same tokens).
+                Param("VP_MAX_ROWS", 0, 0, 1024),
+                # w256 (0: off; order-only, gated): the > 128-row LM-head GEMM as calls of at most this
+                # many rows (each row the bits of its <= 128-row call's shape).
+                Param("HEAD_CHUNK_ROWS", 0, 0, 128),
+                # w256 (0: off): steps of 129..256 rows on head_sampler_coop_fold's distributed sampler in
+                # 128-row calls (each row the 1024-thread block's tokens, as at <= 128 rows; gated).
+                Param("DIST_CHUNK", 0, 0, 1),
+            ),
         ),
-        "drafter_fc_early_fork": Rule("LL", Kind.BITWISE, _always("forked side-chain steps")),
-        "drafter_preamble_from_commit": Rule(
-            "LL", Kind.BITWISE, _always("folded steps over a dense arena or pages")
-        ),
-        "head_sampler_coop_fold": Rule(
-            "LL",
+        "drafter_kv_side_chain": Lever(
             Kind.BITWISE,
-            _off_at_hc(_coop_fold),
+            ALWAYS,
+        ),
+        "drafter_fc_early_fork": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        "drafter_preamble_from_commit": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        "head_sampler_coop_fold": Lever(
+            Kind.BITWISE,
+            ALWAYS,
             params=(
                 Param("MAX_ROWS", 16, 1, 128),
                 # 1..4: the split sampler's top-p-only rows (calls of at most 128 rows) take the
@@ -1396,62 +1633,87 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 Param("VERIFY_GRID", 0, 0, 1),
             ),
         ),
-        "head_multimem_gather": Rule(
-            "LL",
+        "head_multimem_gather": Lever(
             Kind.FLAGGED,
             _flagged,
             requires=("step_loop_on_execution_stream",),
             conflicts=("lm_head_inbox",),
         ),
-        "half_window_experts": Rule(
-            "upstream",
+        "half_window_experts": Lever(
             Kind.COMPOSITION,
             _at_most("MAX_BATCH"),
-            baseline=_at_most("MAX_BATCH", requires_decode=False),
+            stock=_at_most("MAX_BATCH", requires_decode=False),
             params=(Param("MAX_BATCH", 8, 1, 64),),
         ),
-        "hot_replicas": Rule(
-            "upstream",
+        "hot_replicas": Lever(
             Kind.COMPOSITION,
             _hot_replicas(requires_decode=True),
-            baseline=_hot_replicas(requires_decode=False),
+            stock=_hot_replicas(requires_decode=False),
             after=("half_window_experts",),
             conflicts=("half_window_experts",),
         ),
-        "prefill_cutedsl_experts": Rule(
-            "upstream", Kind.COMPOSITION, _always("expert calls of 4096..8192 rows")
-        ),
-        "vocab_parallel_head": Rule(
-            "upstream",
+        "prefill_cutedsl_experts": Lever(
             Kind.COMPOSITION,
-            _vocab_parallel_head,
-            baseline=_never("the upstream sm107 compositions sample on the split sampler"),
+            _always("expert calls of 4096..8192 rows"),
+            stock=_always("expert calls of 4096..8192 rows"),
+        ),
+        "vocab_parallel_head": Lever(
+            Kind.COMPOSITION,
+            in_band(Band.DEFAULT, _vocab_parallel_head),
+            stock=_never("the upstream sm107 compositions sample on the split sampler"),
             params=(
                 # Not raised with the LL levers at 9..16 requests: the X400 composite samples a TEP8
                 # generation server of max_batch_size 9..16 on the split sampler (the gated path;
                 # bs13-16 -0.12..-0.18 ms, bs8 -0.15 ms).
                 Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),
                 Param("MIN_ROWS", 8, 8, 16),
+                # 1: a sampled row walks the ranks' vocabulary slices as one chain (the single-rank
+                # sampler's draws, bit for bit; xiaow 58f1bf57d70). 0: independent per-rank partials
+                # combined in rank order (the pcastonguay campaign's draws). Greedy rows: the same.
+                Param("RANK_CHAIN", 1, 0, 1),
             ),
             after=("distributed_head_sampler",),
             conflicts=("distributed_head_sampler",),
         ),
         **{
-            name: _tep4_path_rule(_TEP4_PATH_PARAMS.get(name, ())) for name in SM107_TEP8_TEP4_PATHS
+            name: Lever(
+                Kind.COMPOSITION,
+                in_band(Band.DEFAULT, _always("its rows, wherever served")),
+                stock=_not_on_tep8(
+                    "the upstream sm107 tep8 composition does not serve it",
+                    "its rows, wherever served",
+                ),
+                params=_TEP4_PATH_PARAMS.get(name, ()),
+            )
+            for name in SM107_TEP8_TEP4_PATHS
         },
         # The Vera Rubin low-latency levers.
-        "splitk_pool_split8": _ll(Kind.NUMERIC),
-        "splitk_frontier_tables": _ll(Kind.NUMERIC, yields_to=("wide_qkv_prefetch",)),
-        "tep8_wide64_splitk": _ll(
+        "splitk_pool_split8": Lever(
             Kind.NUMERIC,
+            in_band(Band.DEFAULT, gated(_at_most("MAX_BATCH"))),
+            params=_ll_params(),
+            gates=(_ll_gate(),),
+        ),
+        "splitk_frontier_tables": Lever(
+            Kind.NUMERIC,
+            in_band(Band.DEFAULT, gated(_yielding(("wide_qkv_prefetch",), _at_most("MAX_BATCH")))),
+            after=("wide_qkv_prefetch",),
+            params=_ll_params(),
+            gates=(_ll_gate(),),
+        ),
+        "tep8_wide64_splitk": Lever(
+            Kind.NUMERIC,
+            in_band(Band.DEFAULT, gated(_at_most("MAX_BATCH"))),
             # The fewest rows of a TP8 QKV / o_proj call on the wide64 tactics (33: the 5..8-request
             # band; down to 9, the 2..4-request steps' calls leave the 9..32-row wide table).
-            params=(
+            params=_ll_params()
+            + (
                 Param("MIN_ROWS", 33, 9, 33),
                 # The most rows of a TP8 QKV call on the wide64 tactic (64: cuBLAS above); 65..MAX_ROWS
                 # (9..16 requests) in one launch of it, 64-row token tiles on the grid (each row's
                 # 1..64-row bits). o_proj keeps its 65..128-row paths (hop128 / cuBLAS).
-                Param("MAX_ROWS", 64, 64, 128, default_for=_tep8_gen_wide_winner(128, 64)),
+                # (w256: to 256 with WIDE_TILE 2cta only: two 128-token pair tiles; PREP_FOLD to 128.)
+                Param("MAX_ROWS", 64, 64, 256, default_for=_tep8_gen_wide_winner(128, 64)),
                 # That launch's tile, output columns x rows: 64x64 (the served tactic as is, two token
                 # tiles, 288 CTAs), 128x64 (144 CTAs) or 64x128 (one token tile, 144 CTAs: each weight
                 # slab read once); stages lowered to fit; same split_k, same bits. 2cta: the 2-CTA
@@ -1472,14 +1734,24 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 # 2-CTA kernel's epilogue (ops/gemm/splitk_gemm_2cta_prep): no prep launch, no
                 # GEMM -> prep edge; the same bytes. Needs multi_request_prep_append.
                 Param("PREP_FOLD", 0, 0, 1),
+                # (w256) The most rows PREP_FOLD folds: 128 (one token tile, default) .. 256 (both token
+                # tiles of a 129..256-row call; the same bytes as the GEMM + the packed prep).
+                Param("PREP_FOLD_MAX_ROWS", 128, 128, 256),
+                # (w256, 0: off) The 2cta launch's split_k above 128 rows (2: one wave of 144 CTAs instead
+                # of 288 on 212 SMs; order-only for those rows, gated).
+                Param("WIDE2_SPLIT_K", 0, 0, 4, values=(0, 2, 4)),
             ),
+            gates=(_ll_gate(),),
         ),
-        "tep8_publish_splitk": _ll(
+        "tep8_publish_splitk": Lever(
             Kind.NUMERIC,
-            params=(
+            in_band(Band.DEFAULT, gated(_at_most("MAX_BATCH"))),
+            params=_ll_params()
+            + (
                 # The most rows of a TP8 slice the split-K producer publishes; 65..MAX_ROWS in one
                 # launch of the 33..64-row tactics (each row keeps its one-request bits).
-                Param("MAX_ROWS", 64, 64, 128, default_for=_wide128(64)),
+                # (w256: to 256 in the same one launch.)
+                Param("MAX_ROWS", 64, 64, 256, default_for=_wide128(64)),
                 # The fewest rows of a decode step the publication takes (33: the cuBLAS census's
                 # floor). Below 33 only on the split-K producer: the 2..4-request steps then publish
                 # and join as 5..8-request steps do, instead of the 9..32-row gathers.
@@ -1506,12 +1778,15 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 # The fewest rows of a slice on those two tiles (65: the whole one-launch band; 97:
                 # only where the served tiles' grid spills into a second wave of 212 SMs); fewer
                 # rows keep the served tile, the same bits.
-                Param("WIDE_TILE_MIN_ROWS", 65, 65, 128, default_for=_tep8_gen_wide_winner(97, 65)),
+                Param("WIDE_TILE_MIN_ROWS", 65, 65, 256, default_for=_tep8_gen_wide_winner(97, 65)),
             ),
+            gates=(_ll_gate(),),
         ),
-        "tep8_drafter_wide_gemms": _ll(
+        "tep8_drafter_wide_gemms": Lever(
             Kind.NUMERIC,
-            params=(
+            in_band(Band.DEFAULT, gated(_at_most("MAX_BATCH"))),
+            params=_ll_params()
+            + (
                 # The most rows of a TP8 drafter GEMM on the fixed split-K tactics (64: cuBLAS
                 # above, nvjet + a splitKreduce launch on conv_coef / qkv, and gate_up at 96 rows);
                 # 65..MAX_ROWS (9..16 requests) in ONE launch of the site's 64-row tactic, 64-row
@@ -1578,18 +1853,25 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 # interleaved activation kernel). Same bits. Needs drafter_pdl_chain.
                 Param("SILU_FOLD", 0, 0, 1),
             ),
+            gates=(_ll_gate(),),
         ),
-        "tep8_fc_shard_wide": _ll(
+        "tep8_fc_shard_wide": Lever(
             Kind.NUMERIC,
+            in_band(Band.DEFAULT, gated(_at_most("MAX_BATCH"))),
             # The most rows the TP8 sharded drafter fc takes (its fabric gather holds 128).
-            params=(Param("MAX_ROWS", 64, 8, 128, default_for=_wide128(64)),),
+            params=_ll_params() + (Param("MAX_ROWS", 64, 8, 128, default_for=_wide128(64)),),
+            gates=(_ll_gate(),),
         ),
-        "weight_prefetch_after_join": _ll(
-            Kind.BITWISE, yields_to=("wide_qkv_prefetch", "layer0_qkv_table")
-        ),
-        "next_qkv_prefetch_skip": _ll(
+        "weight_prefetch_after_join": Lever(
             Kind.BITWISE,
-            params=(
+            ALWAYS,
+            params=_ll_params(),
+        ),
+        "next_qkv_prefetch_skip": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+            params=_ll_params()
+            + (
                 Param("MAX_ROWS", 8, 8, 64),
             ),  # the largest decode step (rows) that forks no next-QKV prefetch
         ),
@@ -1599,58 +1881,101 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         # gate, mean 0.377 vs 0.372 ulp vs fp64). ``auto`` runs it where the original ran (the default
         # band's TEP8 gen steps of 2..8 requests, 2..11 at 9..16). The original f16 build (int7b: LOSSY)
         # is gone: EXACT is fixed at 1, so no knob selects it.
-        "swa_one_cluster_block": _ll(
+        "swa_one_cluster_block": Lever(
             Kind.NUMERIC,
-            yields_to=("swa_blocks_per_program",),
-            exclusive=True,
+            in_band(
+                Band.DEFAULT, gated(_yielding(("swa_blocks_per_program",), _at_most("MAX_BATCH")))
+            ),
+            after=("swa_blocks_per_program",),
             # The fewest and the most requests of a TEP8 step the one-cluster block takes (5..8:
             # the ONE2 range it replaces; from 2, the split kernels' 2..4-request steps, and up to
             # 16, each request's clusters as at 5..8 requests).
-            params=(
+            params=_ll_params()
+            + (
                 Param("TEP8_MIN_REQUESTS", 5, 2, 5, default_for=_tep8_gen_cl8_min_requests),
                 Param("TEP8_MAX_REQUESTS", 8, 8, 16, default_for=_tep8_gen_cl8_max_requests),
                 # From this many requests (0: none) a TEP8 step runs ONE 8-CTA cluster per request over
                 # both KV heads (swa_cl8w, the same bits): one wave up to 22 requests, where the
                 # per-(request, KV head) clusters need two from 12.
                 Param("TEP8_WIDE_MIN_REQUESTS", 0, 0, 16),
+                # From this many requests (0: none) a TEP8 step runs swa_cl8 compiled for two CTAs per SM
+                # (registers capped at 102, 100 KB SMEM; the same source, the same bits): 46 co-resident clusters,
+                # one wave up to 23 requests (1 GPU: 11.8 vs 14.4 us at 12..16 requests).
+                Param("TEP8_TWO_CTA_MIN_REQUESTS", 0, 0, 16),
                 # Every CL8 build is the exact variant (int9: fixed at 1; the f16 build is not offered).
                 Param("EXACT", 1, 1, 1),
             ),
+            gates=(_ll_gate(),),
+            conflicts=("swa_blocks_per_program",),
         ),
-        "swa_prep_split": _ll(Kind.BITWISE, yields_to=("swa_blocks_per_program",), exclusive=True),
-        "swa_eight_requests": _ll(
-            Kind.NUMERIC, yields_to=("swa_blocks_per_program",), exclusive=True
-        ),
-        "full_attention_fold_multi": Rule(
-            "LL",
+        "swa_prep_split": Lever(
             Kind.BITWISE,
-            _full_attention_fold_multi,
+            unless_rule({"swa_blocks_per_program": _SWA_BLOCKS_PER_PROGRAM}),
+            params=_ll_params(),
+            conflicts=("swa_blocks_per_program",),
+        ),
+        "swa_eight_requests": Lever(
+            Kind.NUMERIC,
+            in_band(
+                Band.DEFAULT, gated(_yielding(("swa_blocks_per_program",), _at_most("MAX_BATCH")))
+            ),
+            after=("swa_blocks_per_program",),
+            params=_ll_params(),
+            gates=(_ll_gate(),),
+            conflicts=("swa_blocks_per_program",),
+        ),
+        "full_attention_fold_multi": Lever(
+            Kind.BITWISE,
+            ALWAYS,
             params=_ll_params(),
             after=("wide_full_attention",),
         ),
-        "split_kv_deep_rings": _ll(Kind.BITWISE),
-        "bf16_half_window": _ll(Kind.NUMERIC),
-        "prerouted_experts": _ll(
+        "split_kv_deep_rings": Lever(
             Kind.BITWISE,
+            ALWAYS,
+            params=_ll_params(),
+        ),
+        "bf16_half_window": Lever(
+            Kind.NUMERIC,
+            in_band(Band.DEFAULT, gated(_at_most("MAX_BATCH"))),
+            params=_ll_params(),
+            gates=(_ll_gate(),),
+        ),
+        "prerouted_experts": Lever(
+            Kind.BITWISE,
+            ALWAYS,
             # The most rows of a TP8 two-window call on the prerouted tables (16-token tiles
             # above 64 rows, the stock call's tile there).
-            params=(Param("TEP8_MAX_ROWS", 64, 64, 128, default_for=_wide128(64)),),
+            # (w256: to 256, 32-token tiles at 129..256 rows.)
+            params=_ll_params() + (Param("TEP8_MAX_ROWS", 64, 64, 256, default_for=_wide128(64)),),
         ),
-        "tep8_ring_buddy_wide": _ll(
+        "tep8_ring_buddy_wide": Lever(
             Kind.NUMERIC,
-            params=(
-                # The most rows the TP8 ring-buddy placement takes (its one program covers 128).
-                Param("MAX_ROWS", 64, 9, 128, default_for=_wide128(64)),
+            in_band(Band.DEFAULT, gated(_at_most("MAX_BATCH"))),
+            params=_ll_params()
+            + (
+                # The most rows the TP8 ring-buddy placement takes (its one program covers 256;
+                # w256: 129..256 on a 2048-slot tile).
+                Param("MAX_ROWS", 64, 9, 256, default_for=_wide128(64)),
                 # Warps of its table-writing program on the 1024-slot tile (65..128 rows).
                 Param("WIDE_WARPS", 8, 4, 32, values=(4, 8, 16, 32)),
             ),
+            gates=(_ll_gate(),),
         ),
-        "tep8_ring_buddy_pdl": _ll(Kind.BITWISE),
-        "tep8_tile_placement": _ll(
+        "tep8_ring_buddy_pdl": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+            # 1: the table-writing program releases the expert call (FC1) right after its own
+            # dependency wait instead of at exit (launch timing only; s316 lane, default off).
+            params=_ll_params() + (Param("TRIGGER", 0, 0, 1),),
+        ),
+        "tep8_tile_placement": Lever(
             Kind.NUMERIC,
-            params=(
+            in_band(Band.DEFAULT, gated(_at_most("MAX_BATCH"))),
+            params=_ll_params()
+            + (
                 Param("MIN_ROWS", 41, 9, 64),  # the fewest rows placed by tile cost
-                Param("MAX_ROWS", 64, 9, 128),  # the most rows placed by tile cost
+                Param("MAX_ROWS", 64, 9, 256),  # the most rows placed by tile cost (w256: to 256)
                 # An expert's cost A + B * (tiles - 1), in 0.1 us (GB300's 20 and 11 by default).
                 Param("COST_A", 20, 1, 255),
                 Param("COST_B", 11, 0, 255),
@@ -1663,10 +1988,13 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 Param("BF16_COST_B", 0, 0, 255),
                 Param("BF16_TILE", 8, 8, 64, values=(8, 16, 32, 64)),
             ),
+            gates=(_ll_gate(),),
         ),
-        "tep8_router_push": _ll(
+        "tep8_router_push": Lever(
             Kind.NUMERIC,
-            params=(
+            in_band(Band.DEFAULT, gated(_at_most("MAX_BATCH"))),
+            params=_ll_params()
+            + (
                 # The fewest rows the router push takes (kernel floor 9; 9 on a TEP8 generation
                 # server, ``TEP8_GEN_ROUTER_PUSH_MIN_ROWS``).
                 Param("MIN_ROWS", 33, 9, 64, default_for=_tep8_gen_router_push_min_rows),
@@ -1681,23 +2009,58 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 # 1: the ring-buddy placement + prerouted tables after the push run as one CUDA CTA
                 # (ring_buddy_cuda.rb_tables) that the routed push triggers right after its dependency wait.
                 Param("RB_CUDA", 0, 0, 1),
+                # (w256) The most rows a push call takes (128: the band served before; to 256, 17..32
+                # requests; v1 routing above ROUTE_ROW_MAX). The same logits / routing as at <= 128.
+                Param("TEP8_MAX_ROWS", 128, 128, 256),
+                # (w256, 0: off) Calls above 128 rows route in a v2-only routed build (2 CTAs per SM, so 192 / 256
+                # rows stay resident and route in the push instead of the separate routing kernel); same bits.
+                Param("ROUTE_WIDE_V2", 0, 0, 1),
+                # (w256) the fewest rows ROUTE_WIDE_V2's v2-only build takes (129: every call above 128 rows);
+                # calls of 129..(this - 1) rows keep the v1 routed build (same bits: both _full_routing_kernel's).
+                Param("ROUTE_WIDE_V2_MIN_ROWS", 129, 129, 256),
             ),
+            gates=(_ll_gate(),),
         ),
-        "tep8_router_prewait": _ll(Kind.BITWISE),
-        "finalize_entry_trigger": _ll(Kind.BITWISE),
-        "tep8_finalize_transport_64": _ll(
+        "tep8_router_prewait": Lever(
             Kind.BITWISE,
+            ALWAYS,
+            params=_ll_params(),
+        ),
+        "finalize_entry_trigger": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+            params=_ll_params(),
+        ),
+        "tep8_finalize_transport_64": Lever(
+            Kind.BITWISE,
+            ALWAYS,
             # The TP8 transport's token layout: its 17..TOKENS-token calls run the flat build.
-            params=(
-                Param("TOKENS", 64, 16, 128, values=(16, 32, 64, 128), default_for=_wide128(64)),
+            params=_ll_params()
+            + (
+                # (w256: 256 -- with CHUNKED, the 129..256-token calls in one launch.)
+                Param(
+                    "TOKENS", 64, 16, 256, values=(16, 32, 64, 128, 256), default_for=_wide128(64)
+                ),
                 # 1: the row map read before the dependency wait and verified after it
                 # (finalize_allreduce_transport.Transport.prefetch; the same bits).
                 Param("INDEX_PREFETCH", 0, 0, 1),
+                # 1 (w256): the TP8 workspace also takes the built-in's chunked calls of 129..
+                # tokens (17+ requests at K = 7) as consecutive calls of at most TOKENS tokens
+                # (TP8_CHUNKED), instead of the built-in forward's unfused combine + cast +
+                # all-reduce above 128 tokens. Order-only against that path (same BF16 partials,
+                # FP32 rank-order sum); every row is what a <= TOKENS-token call returns. 0: off.
+                Param("CHUNKED", 0, 0, 1),
+                # (w256) TP8 calls of at least this many tokens (to 256) on the two-phase finalize
+                # (ops/moe/finalize_two_phase, from the TEP16 target's B(ii)): owner-reduce + multicast gather,
+                # this transport's arithmetic (the same bits). 0: off.
+                Param("TWO_PHASE_MIN_TOKENS", 0, 0, 256),
             ),
         ),
-        "hop_entry_trigger": _ll(
+        "hop_entry_trigger": Lever(
             Kind.BITWISE,
-            params=(
+            ALWAYS,
+            params=_ll_params()
+            + (
                 # 1: the decode input boundary (model_boundary) also releases its dependent,
                 # layer 0's QKV GEMM, at entry on steps of INPUT_BOUNDARY_MIN_ROWS (9) rows or
                 # more, so the GEMM streams its weight during the boundary as every later
@@ -1705,15 +2068,22 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 Param("INPUT_BOUNDARY", 0, 0, 1),
             ),
         ),
-        "tep8_early_multicast_hop": _ll(Kind.BITWISE),
-        "tep8_direct_hop": _ll(
+        "tep8_early_multicast_hop": Lever(
             Kind.BITWISE,
-            params=(
-                # The direct hop's last row count: 128 also publishes the 65..128-row o_proj.
-                Param("MAX_ROWS", 64, 64, 128, values=(64, 128), default_for=_wide128(64)),
+            ALWAYS,
+            params=_ll_params(),
+        ),
+        "tep8_direct_hop": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+            params=_ll_params()
+            + (
+                # The direct hop's last row count: 128 also publishes the 65..128-row o_proj;
+                # w256: 256 the 129..256-row o_proj too (a 256-row workspace).
+                Param("MAX_ROWS", 64, 64, 256, values=(64, 128, 256), default_for=_wide128(64)),
                 # How o_proj of a 65..128-row step publishes: two 64-row launches, or one
                 # launch of 64-row (grid) or 128-row (tile128) token tiles; split_k 1 in each.
-                Param("PRODUCER", "grid", choices=("chunks", "grid", "tile128"), one=True),
+                Param("PRODUCER", "grid", choices=("chunks", "grid", "tile128", "2cta"), one=True),
                 # The one-launch producer's stages (0: the mode's, grid 3 / tile128 4).
                 Param("PRODUCER_STAGES", 0, 0, 12),
                 # The direct hop's first row count (33: the 5..8-request band; down to 9, the
@@ -1724,20 +2094,46 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 Param("PREFETCH_MIN_ROWS", 0, 0, 128),
                 # 1: the direct consumer polls its slots before its dependency wait (same bits).
                 Param("POLL_FIRST", 0, 0, 1),
+                # 1: the 33..128-row scatter o_proj producer's idle warp prefetches its CTA's
+                # weight tile into L2 at kernel entry, before the dependency wait (loads only;
+                # same bits). x82: -0.05..-0.14 ms at bs10..16, bs4 unchanged.
+                Param("L2_PREFETCH", 0, 0, 1),
             ),
         ),
-        "tep8_publish_join": _ll(Kind.BITWISE),
-        "tep8_pool_programmatic_fork": _ll(
+        "tep8_publish_join": Lever(
             Kind.BITWISE,
+            ALWAYS,
+            # 1: the post-FFN join releases its dependent (the next QKV GEMM) at entry, before its own
+            # dependency wait (launch order only; s316 lane, default off).
+            params=_ll_params() + (Param("ENTRY_TRIGGER", 0, 0, 1),),
+        ),
+        # UNPOOL_DIRECT_WIDE: the 2..4-request (16..32-row) steps at TP8 take the direct unpool
+        # transport's wide layout (unpool_into_boundary): the unpool split-K's epilogue publishes its
+        # slice and the post-FFN boundary only polls (same GEMM, same boundary arithmetic).
+        "tep8_unpool_direct_wide": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+            params=_ll_params(),
+        ),
+        "tep8_pool_programmatic_fork": Lever(
+            Kind.BITWISE,
+            ALWAYS,
             # 1: the pool branch's norm + NVFP4 kernels (pool publication, pool gather) load the norm gain and the
             # global scale before their dependency wait / poll (the same bits).
-            params=(Param("NORM_PREFETCH", 0, 0, 1, default_for=_tep8_gen_wide_winner(1, 0)),),
+            params=_ll_params()
+            + (Param("NORM_PREFETCH", 0, 0, 1, default_for=_tep8_gen_wide_winner(1, 0)),),
         ),
-        "tep8_wide_projection_gathers": _ll(Kind.NUMERIC),
-        "step_commit_v2": _ll(
+        "tep8_wide_projection_gathers": Lever(
+            Kind.NUMERIC,
+            in_band(Band.DEFAULT, gated(_at_most("MAX_BATCH"))),
+            params=_ll_params(),
+            gates=(_ll_gate(),),
+        ),
+        "step_commit_v2": Lever(
             Kind.BITWISE,
-            yields_to=("step_loop_inline_commits",),
-            params=(
+            ALWAYS,
+            params=_ll_params()
+            + (
                 # The overlap scheduler's two input corrections of a captured decode graph as
                 # one launch (ops/runtime/overlap_offsets, step_loop_inline_commits' applier):
                 # 0 the two built-in adds, 1 one launch, 2 one launch that releases its
@@ -1749,25 +2145,41 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 Param("INLINE_COMMIT", 0, 0, 1),
             ),
         ),
-        "wide_norm_gate_pdl": _ll(Kind.BITWISE),
-        "drafter_kv_glue": Rule(
-            "LL",
+        "wide_norm_gate_pdl": Lever(
             Kind.BITWISE,
-            _drafter_kv_glue,
+            ALWAYS,
+            params=_ll_params()
+            + (
+                # (row, head) pairs per program of the PDL norm-gate on its 9..128-row steps (1: the
+                # built-in grid). Larger values make the grid one wave, so its after-wait trigger
+                # releases the output projection (which streams its weight before its own wait) as
+                # soon as the attention completes instead of at the last wave. Same statements per
+                # pair: bitwise.
+                Param("HEADS_PER_PROGRAM", 1, 1, 32, values=(1, 2, 4, 8, 16, 32)),
+                # When it releases the output projection on those steps: after its wait (stock) or at
+                # its entry (the projection may also stream its weight under the attention's tail).
+                # Launch order only: bitwise.
+                Param("TRIGGER", "after_wait", choices=("after_wait", "entry"), one=True),
+            ),
+        ),
+        "drafter_kv_glue": Lever(
+            Kind.BITWISE,
+            unless_on(("drafter_kv_side_chain",)),
+            after=("drafter_kv_side_chain",),
             # Not in the 'wall' set the TEP8 9..16-request gate ran (the rulers emulate the
             # generation role over a windowed arena, where it was off at max_batch_size 16): its
             # default stays at 8 requests on every deployment.
             params=(Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),),
-            after=("drafter_kv_side_chain", "context_kv_late_join"),
             conflicts=("drafter_kv_side_chain",),
         ),
-        "drafter_kv_fork_before_head": _ll(
+        "drafter_kv_fork_before_head": Lever(
             Kind.BITWISE,
-            yields_to=("context_kv_late_join", "context_kv_fork_last_layer"),
+            ALWAYS,
             # PAGED_COMMIT: alias only (kept for the round-3 / E2E envs) of upstream #21789's
             # paged_context_commit, the one-launch paged commit on the context-K/V fork; the value
             # engages nothing of its own (drafter.py logs the mapping).
-            params=(
+            params=_ll_params()
+            + (
                 Param("PAGED_COMMIT", 0, 0, 1),
                 # 1: over a paged drafter context, the forked side chain's block-table decode, columns and
                 # positions in one launch and every layer's K / V into the pages in one
@@ -1776,10 +2188,9 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 Param("PAGED_CHAIN", 0, 0, 2),
             ),
         ),
-        "context_sp_extra_parts": Rule(
-            "LL",
+        "context_sp_extra_parts": Lever(
             Kind.BITWISE,
-            _context_workers,
+            ALWAYS,
             params=(
                 Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),
                 Param(
@@ -1792,281 +2203,392 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 ),
             ),
         ),
-        "step_window_compact": Rule(
-            "HC", Kind.BITWISE, _on_agg_tep4("the windowed arena compaction of mixed steps")
-        ),
-        "fmk_context_fmha": Rule(
-            "HC",
+        "swa_block_long_splits": Lever(
             Kind.NUMERIC,
-            _fmk_context_fmha,
+            NEVER,
+            params=(Param("KEYS", 128, 64, 256), Param("MIN_ROWS", 8, 1, 32)),
+            # The 32-key builds of the same steps: the one-cluster block and the multi-block
+            # programs take a step before the split path, and run no long split.
+            conflicts=("swa_one_cluster_block", "swa_blocks_per_program"),
+        ),
+        "step_window_compact": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        "fmk_context_fmha": Lever(
+            Kind.NUMERIC,
+            gated(_fmk_context_fmha),
             gates=(_AGG_TEP4_GATE, _CTX_TEP4_FMK_GATE),
             # 1: also every pure context step (ctx-only / prefill steps): the default on sm107
             # TEP4 context servers (gated there, _CTX_TEP4_FMK_GATE); 0 elsewhere, where the
             # accuracy gate covers mixed steps only.
             params=(Param("PURE_CONTEXT", 0, 0, 1, default_for=lambda d: int(_ctx_tep4(d))),),
         ),
-        "context_kv_late_join": Rule(
-            "HC", Kind.BITWISE, _on_agg_tep4("windowed block decodes after a forked commit")
+        # Pure context steps of a disaggregated context server on the same multi-instance
+        # context FMHA (its own install, its own gate); the pipeline stage target serves it at
+        # the stage's heads. On only by its knob until its gate holds.
+        "fmk_pure_context_fmha": Lever(
+            Kind.NUMERIC,
+            gated(_on_ctx_sm107_tep4("the context FMHA of pure context steps")),
+            gates=(_CTX_TEP4_GATE_PENDING,),
         ),
-        "hop_cluster_split": Rule(
-            "HC",
+        # The last layer of a disaggregated context server's sequence-parallel steps past its K/V
+        # append on the LM-head rows only (``kernels/context_last_layer_tail``). On only by its
+        # knob until its gate holds. ``MAX_DEPTH``: a step whose deepest context request reaches
+        # that many keys runs the layer unchanged (past it the tail's one-row-per-request decode
+        # FMHA over every key costs more than it saves).
+        "context_last_layer_tail": Lever(
+            Kind.NUMERIC,
+            gated(
+                _on_ctx_sm107_tep4("the last layer of large context steps on the LM-head rows only")
+            ),
+            gates=(_CTX_TEP4_TAIL_GATE_PENDING,),
+            params=(Param("MAX_DEPTH", 262144, 1, 1 << 30),),
+        ),
+        "context_kv_late_join": Lever(
             Kind.BITWISE,
-            _on_agg_tep4("wide post-attention hops of the ROWS row counts"),
+            either(
+                _CONTEXT_KV_LATE_JOIN,
+                unless_rule(
+                    {
+                        "drafter_kv_fork_before_head": _LL_DEFAULT_BAND,
+                        "drafter_kv_glue": _DRAFTER_KV_GLUE_RULE,
+                    }
+                ),
+            ),
+            after=("drafter_kv_side_chain",),
+        ),
+        "context_kv_fork_wide": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        # Writes the bytes of the built-in Triton join (the arithmetic of ``tep8_publish_join``'s
+        # bitwise cluster join) and of the built-in capture cast. It takes only the capture
+        # layers' joins of 33..768-row calls (``kernels/multi_request_ffn_join``'s install
+        # defaults), where it also replaces the built-in capture's cast and copy.
+        "multi_request_ffn_join": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        "hop_cluster_split": Lever(
+            Kind.BITWISE,
+            ALWAYS,
             params=(
                 Param("CLUSTER", 2, 1, 2),
                 Param("ROWS", ((192, 208), (248, 264)), 9, 1024, ranges=True),
             ),
         ),
-        "drafter_fc_inbox_wide": Rule(
-            "HC",
+        "drafter_fc_inbox_wide": Lever(
             Kind.BITWISE,
-            _on_agg_tep4("drafter fc gathers of up to MAX_ROWS rows", min_rows=129),
+            ALWAYS,
             params=(Param("MAX_ROWS", 384, 128, 512), Param("PROGRAMS", 128, 1, 256)),
         ),
-        "l061_tile32_pin": Rule(
-            "HC",
+        "l061_tile32_pin": Lever(
             Kind.NUMERIC,
-            _on_agg_tep4("layer 0 / 61 owner-window expert calls of 256..384 rows"),
+            in_band(
+                Band.AGGREGATED_SM107,
+                gated(_on_agg_tep4("layer 0 / 61 owner-window expert calls of 256..384 rows")),
+            ),
             gates=(_AGG_TEP4_GATE,),
         ),
-        "router_staged_epilogue": Rule(
-            "HC", Kind.BITWISE, _on_agg_tep4("router GEMM calls of 9..512 rows")
-        ),
-        "split_kv_deep_ring": Rule(
-            "HC", Kind.BITWISE, _on_agg_tep4("a 20-page ring in the E4M3-query split-KV decode")
-        ),
-        "context_prep_rows_vec": Rule(
-            "HC",
+        "router_staged_epilogue": Lever(
             Kind.BITWISE,
-            _ctx_or_agg_tep4("context steps' prep on the vectorized rows kernel"),
+            ALWAYS,
         ),
-        "context_embedding_replicated": Rule(
-            "HC",
+        # Writes the bytes of the built-in pool GEMM (cuBLAS's split-K-1 kernels share its K
+        # order; bitwise at every served row count 584..768 on the checkpoint's weights).
+        # ROWS: the decode row counts whose pool GEMM runs the pinned algorithm; the default is
+        # the 744..768-row graphs, which only a wide generation server's row cap reaches.
+        # Lossless-bitwise, so on by default wherever it can run.
+        "pool_gemm_pin": Lever(
             Kind.BITWISE,
-            _ctx_or_agg_tep4("context steps' token embedding from the replicated table"),
+            ALWAYS,
+            params=(Param("ROWS", ((744, 768),), 520, 768, ranges=True),),
         ),
-        "context_sp_router_input": Rule(
-            "HC",
+        # Pins one TRTLLM-gen [TILE_N, CONFIG] for the NVFP4 expert calls of 512..1023 rows (the
+        # AutoTuner's 512-row bucket) on every rank, in place of each rank's own profiled pick.
+        # The tactics of these calls write the same expert rows.
+        # Lossless-bitwise, so on by default wherever it can run.
+        "expert_tactic_pin": Lever(
             Kind.BITWISE,
-            _ctx_or_agg_tep4("the router's FP32 input from the sequence-parallel residual join"),
+            ALWAYS,
+            params=(Param("TILE_N", 64, 8, 256), Param("CONFIG", 26, 0, 4095)),
+        ),
+        # The context-K/V fork over a paged drafter context on decode steps of 65..128 requests,
+        # forked behind the LM head's logits gather (``context_kv_fork.GATHER_POINT``) so the side
+        # chain's fc gather is ordered after it on the TP communicator; the store, the table
+        # decode and the commit are the built-in's or the existing paged launches. Same ops on
+        # another stream: bitwise, so on by default wherever it can run.
+        "context_kv_fork_paged_wide": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        # The LM head of decode steps of 65..96 requests written by every rank straight into the
+        # owner ranks' pages (each request's rows owned by one rank of four), the owners soft-cap,
+        # take the target probabilities of and chain-verify their slice, and the tokens and
+        # counts are all-gathered: no logits gather, a quarter of the verify per rank. The same
+        # kernels on the same rows (the chain kernel with the request's batch index as its
+        # Philox subsequence) as the built-in verify on the owner rank. Each request is decided
+        # with the owner's draft-probability rows, which are not bitwise equal across TP ranks,
+        # where the built-in emits rank 0's decision: numeric. On only by its knob.
+        "lm_head_row_owner": Lever(Kind.NUMERIC, _never("opt-in: on only by its knob")),
+        # The NVFP4 MoE layers of the ROWS decode row counts as a row-owner island
+        # (``kernels/row_owner_moe``): each rank runs the post-attention join, the MoE
+        # prologue, the expert finalize, the unpool GEMM and the post-FFN join on the rows it
+        # owns, and the expert dispatch and the next layer's input travel as owner-row
+        # pushes. Every stored value is the built-in kernels' (same kernels, same per-row
+        # launch choices); bitwise. Not with a lever that changes the router GEMM or the pool
+        # GEMM it reproduces; ROWS starts above hot_replicas' 512 rows. On by default where
+        # neither of its conflicts is on (in practice: by its knob, on wide generation servers).
+        "row_owner_moe": Lever(
+            Kind.BITWISE,
+            unless_on(("router_staged_epilogue", "pool_gemm_pin")),
+            params=(Param("ROWS", ((584, 768),), 520, 768, ranges=True),),
+            conflicts=("router_staged_epilogue", "pool_gemm_pin"),
+            excluded=_row_owner_excluded,
+        ),
+        # Integer words of the built-in decode, bitwise (block_table.py). On a generation
+        # server whose drafter context is in the KV cache manager's pages, the worker's own
+        # page-table decode of steps the context-K/V fork does not take (more than 64
+        # requests) in one launch instead of the built-in's eleven. Lossless-bitwise, so on by default wherever it can
+        # run.
+        "drafter_block_table_decode": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        # The device words of the staged copy are unchanged: past a row's readable columns it
+        # holds the bad-page word either way (runtime._BlockTailMarks). The copy of a manager
+        # with attention-op pool groups fills only the columns a row may not already hold as
+        # that word, instead of every column past the readable ones every step.
+        # Lossless-bitwise, so on by default wherever it can run.
+        "pool_group_tail_marks": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        "split_kv_deep_ring": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        "context_prep_rows_vec": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        "context_embedding_replicated": Lever(
+            Kind.BITWISE,
+            ALWAYS,
+        ),
+        "context_sp_router_input": Lever(
+            Kind.BITWISE,
+            ALWAYS,
         ),
         # The context-step reduce-scatter overlaps: bitwise where the chunked BF16 GEMMs are
         # row-split invariant and NCCL reduces a chunk as the whole buffer (both held on GB300;
         # their sm107 GPU tests decide it), else lossless-numeric.
         # The o_proj overlap and the tail pipeline ('ovts', bitwise on sm107) are on by default
         # on sm107 TEP4 context servers; the experts' overlap is not measured yet.
-        "context_sp_oproj_overlap": Rule(
-            "HC",
+        "context_sp_oproj_overlap": Lever(
             Kind.BITWISE,
-            _on_ctx_tep4(
-                "the o_proj reduce-scatter behind its row chunks", _CTX_OVERLAP_UNMEASURED
-            ),
+            ALWAYS,
             params=_ctx_overlap_params(),
             after=("context_fp8_dense",),
             excluded=_ctx_overlap_excluded("o_proj"),
         ),
-        "context_sp_tail_pipeline": Rule(
-            "HC",
+        "context_sp_tail_pipeline": Lever(
             Kind.BITWISE,
-            _on_ctx_tep4(
-                "the attention-side join, pooler GEMM and quantization behind the later chunks' "
-                "reduce-scatter",
-                _CTX_OVERLAP_UNMEASURED,
-            ),
+            ALWAYS,
             after=("context_fp8_dense", "context_sp_router_input", "context_sp_extra_parts"),
             excluded=_ctx_overlap_excluded("pool", needs_router_input=True),
         ),
-        "context_sp_moe_rs_overlap": Rule(
-            "HC",
+        "context_sp_moe_rs_overlap": Lever(
             Kind.BITWISE,
-            _never(_CTX_OVERLAP_UNMEASURED),
+            ALWAYS,
             params=_ctx_overlap_params(),
             after=("context_fp8_dense",),
             excluded=_ctx_overlap_excluded("unpool"),
         ),
-        "decode_qkv_mxfp8": Rule(
-            "HC", Kind.LOSSY, _lossy, after=("context_fp8_dense",), excluded=_decode_qkv_excluded
+        "decode_qkv_mxfp8": Lever(
+            Kind.LOSSY,
+            in_band(Band.AGGREGATED_SM107, _lossy),
+            after=("context_fp8_dense",),
+            excluded=_decode_qkv_excluded,
         ),
-        "swa_blocks_per_program": Rule(
-            "midc",
+        "swa_blocks_per_program": Lever(
             Kind.BITWISE,
-            _two_to_four_request_steps("sliding-window split programs over 2..4 key blocks"),
+            either(
+                _SWA_BLOCKS_PER_PROGRAM,
+                unless_rule(
+                    {"swa_one_cluster_block": _LL_GATED, "swa_eight_requests": _LL_GATED},
+                    unless_on(("swa_prep_split",)),
+                ),
+            ),
+            after=("swa_prep_split",),
         ),
-        "wide_qkv_prefetch": Rule(
-            "midc",
+        "wide_qkv_prefetch": Lever(
             Kind.BITWISE,
-            _two_to_four_request_steps("the 9..32-row next-QKV prefetch after the experts"),
+            either(
+                _WIDE_QKV_PREFETCH,
+                unless_rule(
+                    {
+                        "weight_prefetch_after_join": _LL_DEFAULT_BAND,
+                        "splitk_frontier_tables": _LL_GATED,
+                    }
+                ),
+            ),
         ),
-        "wide_capture_fold": Rule(
-            "midc",
+        "wide_capture_fold": Lever(
             Kind.BITWISE,
-            _two_to_four_request_steps("the wide direct boundary's DFlash capture"),
+            ALWAYS,
         ),
-        "megakernel": Rule(
-            "LL",
+        "megakernel": Lever(
             Kind.BITWISE,
-            _on_single_request("one-sequence 8-row decode steps"),
+            ALWAYS,
             requires=MEGAKERNEL_NUMERICS,
         ),
-        "megakernel_one_exchange_boundaries": Rule(
-            "LL",
+        "megakernel_one_exchange_boundaries": Lever(
             Kind.NUMERIC,
-            _on_single_request("the megakernel's MoE boundaries"),
+            in_band(
+                Band.AGGREGATED_SM107, gated(_on_single_request("the megakernel's MoE boundaries"))
+            ),
             gates=(_SINGLE_REQUEST_GATE,),
         ),
-        "megakernel_two_term_pool": Rule(
-            "LL",
+        "megakernel_two_term_pool": Lever(
             Kind.NUMERIC,
-            _on_single_request("the megakernel's pool and router GEMVs"),
+            in_band(
+                Band.AGGREGATED_SM107,
+                gated(_on_single_request("the megakernel's pool and router GEMVs")),
+            ),
             gates=(_SINGLE_REQUEST_GATE,),
             requires=("megakernel_one_exchange_boundaries",),
         ),
-        "megakernel_router_by_linearity": Rule(
-            "LL",
+        "megakernel_router_by_linearity": Lever(
             Kind.NUMERIC,
-            _on_single_request("the megakernel's router logits"),
+            in_band(
+                Band.AGGREGATED_SM107, gated(_on_single_request("the megakernel's router logits"))
+            ),
             gates=(_SINGLE_REQUEST_GATE,),
         ),
-        "megakernel_zero_exchange_boundary": Rule(
-            "LL",
+        "megakernel_zero_exchange_boundary": Lever(
             Kind.BITWISE,
-            _always("the megakernel's post-attention boundaries"),
+            ALWAYS,
             requires=("megakernel_one_exchange_boundaries",),
             excluded=_megakernel_variant_excluded,
         ),
-        "layer0_qkv_table": Rule(
-            "LL", Kind.BITWISE, _on_single_request("8-row decode steps' layer-0 QKV rows")
+        "layer0_qkv_table": Lever(
+            Kind.BITWISE,
+            either(
+                _LAYER0_QKV_TABLE, unless_rule({"weight_prefetch_after_join": _LL_DEFAULT_BAND})
+            ),
         ),
-        "edge_bf16_moe_front": Rule(
-            "LL", Kind.BITWISE, _on_single_request("the BF16 expert layers' 8-row MoE fronts")
+        "edge_bf16_moe_front": Lever(
+            Kind.BITWISE,
+            ALWAYS,
         ),
-        "last_layer_boundary": Rule(
-            "LL", Kind.BITWISE, _on_single_request("the last layer's 1..8-row boundaries")
+        "last_layer_boundary": Lever(
+            Kind.BITWISE,
+            ALWAYS,
         ),
-        "context_kv_fork_last_layer": Rule(
-            "LL", Kind.BITWISE, _on_single_request("forked side-chain steps")
+        "context_kv_fork_last_layer": Lever(
+            Kind.BITWISE,
+            either(
+                _CONTEXT_KV_FORK_LAST_LAYER,
+                unless_rule({"drafter_kv_fork_before_head": _LL_DEFAULT_BAND}),
+            ),
         ),
         # Its LM-head GEMM runs at one fixed split-K tactic on every rank, which can differ from
         # the autotuner's per-rank choice for the stock 8-row head it replaces.
-        "distributed_head_sampler": Rule(
-            "LL",
+        "distributed_head_sampler": Lever(
             Kind.NUMERIC,
-            _on_single_request("8-row verify heads"),
+            in_band(Band.AGGREGATED_SM107, gated(_on_single_request("8-row verify heads"))),
             gates=(_SINGLE_REQUEST_GATE,),
             requires=("step_loop_on_execution_stream",),
             conflicts=("lm_head_inbox",),
         ),
-        "drafter_preamble_late_join": Rule(
-            "LL", Kind.BITWISE, _on_single_request("folded steps with a commit-written preamble")
+        "drafter_preamble_late_join": Lever(
+            Kind.BITWISE,
+            ALWAYS,
         ),
-        "drafter_folds": Rule(
-            "LL", Kind.BITWISE, _on_single_request("one-request 8-row drafter block decodes")
+        # On by default at max_batch_size 1 only: its CF / SF folds relayout drafter weights at install, so every
+        # multi-request drafter step pays an unpermute / deinterleave per layer. Hecate TEP8 gens
+        # 2026-11-17 (max batch 4 and 16, leave-one-out, two cycles): with it on the decode step is
+        # 0.9-1.1 % faster at bs1 and 0.35-1.95 % slower at bs2-16 than with it off.
+        "drafter_folds": Lever(
+            Kind.BITWISE,
+            _on_max_batch_one("one-request 8-row drafter block decodes"),
         ),
-        "draft_head_tail": Rule(
-            "LL", Kind.BITWISE, _on_single_request("one-request 7-position draft steps")
+        "draft_head_tail": Lever(
+            Kind.BITWISE,
+            ALWAYS,
         ),
-        "step_loop_inline_commits": Rule(
-            "LL", Kind.BITWISE, _on_single_request("the one-stream step loop's commits")
+        "step_loop_inline_commits": Lever(
+            Kind.BITWISE,
+            either(_STEP_LOOP_INLINE_COMMITS, unless_rule({"step_commit_v2": _LL_DEFAULT_BAND})),
         ),
-        "rejection_sampler": Rule(
-            "LL",
+        "rejection_sampler": Lever(
             Kind.COMPOSITION,
-            _on_single_request("rejection-sampled one-request decode steps"),
+            in_band(
+                Band.AGGREGATED_SM107,
+                _on_single_request("rejection-sampled one-request decode steps"),
+            ),
         ),
+        # The compositions' own paths: on wherever the composition serves them, in the stock engine too.
+        "attention_output_into_hop": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "batch_dense_gemms": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "bf16_routed_experts": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "boundary_early_release": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "capture_fold": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "context_kv_fork": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "context_prep": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "context_sequence_parallel": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "deferred_input_prep": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "dense_gemm_prefetch": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "dense_gemms": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "draft_head": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "draft_head_sampled": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_block_conv": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_block_decode": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_fc_inbox": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_fc_shard": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_fixed_gemms": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_hops": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_pdl_chain": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "early_expert_ids": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "finalize_transport": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "finalize_two_shot": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "full_attention_prep_append": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "full_attention_prep_fold": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "full_attention_split_kv": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "fused_accept": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "mixed_step_gen_rows": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "model_boundary": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "moe_prologue": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "next_qkv_prefetch": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "paged_context_commit": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "paged_ctx_block_tables": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "paged_ctx_kv_store": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "path_walk_tail": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "persistent_experts": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "pool_into_route": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "post_attention_hop": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "preattn_prep": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "projection_gathers": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "rejection_fold": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "replicated_embedding": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "replicated_experts": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "sampler_store": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "split_sampler": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "swa_block": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "swa_paged_decode": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "three_window_placement": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "unpool_into_boundary": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "verify_fold": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_draft_topk": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_drafter_window_attention": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_moe_allreduce": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_persistent_experts": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_post_attention_hop": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_prologue": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
     }
 )
-
-
-#: Each band's lever selection (module docstring): under ``auto`` a lever listed for one
-#: band resolves as under ``baseline`` in the other. ``full_attention_fold_multi`` is in
-#: neither: its rule serves each band's steps (``_full_attention_fold_multi``).
-BAND_LEVERS: Mapping[Band, FrozenSet[str]] = types.MappingProxyType(
-    {
-        Band.AGGREGATED_SM107: frozenset(
-            {
-                # High-concurrency TEP4 (``fmk_context_fmha`` is in neither selection: its rule
-                # serves aggregated TEP4 servers' mixed steps and context servers' pure steps).
-                "step_window_compact",
-                "context_kv_late_join",
-                "hop_cluster_split",
-                "drafter_fc_inbox_wide",
-                "l061_tile32_pin",
-                "router_staged_epilogue",
-                "split_kv_deep_ring",
-                "decode_qkv_mxfp8",
-                # 2..4-request TEP4 decode steps.
-                "swa_blocks_per_program",
-                "wide_qkv_prefetch",
-                "wide_capture_fold",
-                # The single-request TEP8 decode schedule.
-                "megakernel",
-                "megakernel_one_exchange_boundaries",
-                "megakernel_two_term_pool",
-                "megakernel_router_by_linearity",
-                "megakernel_zero_exchange_boundary",
-                "layer0_qkv_table",
-                "edge_bf16_moe_front",
-                "last_layer_boundary",
-                "context_kv_fork_last_layer",
-                "distributed_head_sampler",
-                "drafter_preamble_late_join",
-                "drafter_folds",
-                "draft_head_tail",
-                "step_loop_inline_commits",
-                "rejection_sampler",
-            }
-        ),
-        Band.DEFAULT: frozenset(
-            {
-                # The upstream rules the sm107 compositions changed: under baseline (and in
-                # the aggregated sm107 band) their upstream sm107 rule.
-                "vocab_parallel_head",
-                *SM107_TEP8_TEP4_PATHS,
-                # The Vera Rubin low-latency levers.
-                "splitk_pool_split8",
-                "splitk_frontier_tables",
-                "tep8_wide64_splitk",
-                "tep8_publish_splitk",
-                "tep8_drafter_wide_gemms",
-                "tep8_fc_shard_wide",
-                "weight_prefetch_after_join",
-                "next_qkv_prefetch_skip",
-                "swa_one_cluster_block",
-                "swa_prep_split",
-                "swa_eight_requests",
-                "split_kv_deep_rings",
-                "bf16_half_window",
-                "prerouted_experts",
-                "tep8_ring_buddy_wide",
-                "tep8_ring_buddy_pdl",
-                "tep8_tile_placement",
-                "tep8_router_push",
-                "tep8_router_prewait",
-                "finalize_entry_trigger",
-                "tep8_finalize_transport_64",
-                "hop_entry_trigger",
-                "tep8_early_multicast_hop",
-                "tep8_direct_hop",
-                "tep8_publish_join",
-                "tep8_pool_programmatic_fork",
-                "tep8_wide_projection_gathers",
-                "step_commit_v2",
-                "wide_norm_gate_pdl",
-                "drafter_kv_glue",
-                "drafter_kv_fork_before_head",
-                "context_sp_extra_parts",
-            }
-        ),
-    }
-)
-
-
-def lever_band(name: str) -> Optional[Band]:
-    """The band whose selection lever ``name`` belongs to, or None for a lever of both."""
-    for band, names in BAND_LEVERS.items():
-        if name in names:
-            return band
-    return None
 
 
 def default_param(name: str, key: str) -> object:
@@ -2075,7 +2597,7 @@ def default_param(name: str, key: str) -> object:
     Raises:
         KeyError: when ``name`` declares no parameter ``key``.
     """
-    rule = RULES.get(name)
+    rule = LEVERS.get(name)
     if rule is None:
         raise KeyError(f"lever {name} declares no parameter {key}")
     return rule.param(key).default
@@ -2175,7 +2697,7 @@ def parse_knobs(snapshot: Mapping[str, str], names: Iterable[str]) -> Knobs:
             errors.append(f"{name} is retired (use {replacement})")
     modes: Dict[str, str] = {}
     params: Dict[Tuple[str, str], object] = {}
-    default, role = AUTO, AUTO
+    default, role = ON, AUTO
     raw: Dict[str, str] = {}
     for name in sorted(snapshot):
         if not name.startswith(PREFIX):
@@ -2183,6 +2705,8 @@ def parse_knobs(snapshot: Mapping[str, str], names: Iterable[str]) -> Knobs:
         value = snapshot[name].strip().lower()
         raw[name] = snapshot[name].strip()
         rest = name[len(PREFIX) :]
+        if rest in ("_BITWISE", "_NUMERICS"):
+            continue  # retired: reported above
         if rest == "_DEFAULT":
             if value not in DEFAULT_VALUES:
                 errors.append(f"{name}={value!r}: expected one of {list(DEFAULT_VALUES)}")
@@ -2207,7 +2731,7 @@ def parse_knobs(snapshot: Mapping[str, str], names: Iterable[str]) -> Knobs:
             else:
                 modes[lever] = value
             continue
-        rule = RULES.get(lever)
+        rule = LEVERS.get(lever)
         declared = [param.key for param in rule.params] if rule is not None else []
         if key not in declared:
             errors.append(
@@ -2273,6 +2797,14 @@ def worker_arena(spec_worker) -> Optional[Arena]:
 DISAGGREGATED_UNHINTED = "no hint on a disaggregated server"
 
 
+def role_hint(snapshot: Mapping[str, str]) -> str:
+    """The role hint ``ROLE_KNOB`` of ``snapshot`` as set (lower-cased), ``auto`` when unset.
+
+    Not validated here: ``parse_knobs`` names a bad value with every other grammar error.
+    """
+    return snapshot.get(ROLE_KNOB, AUTO).strip().lower() or AUTO
+
+
 def role_of(snapshot: Mapping[str, str], disaggregated: Optional[bool]) -> Tuple[Role, str]:
     """The server's role and where it came from.
 
@@ -2283,7 +2815,7 @@ def role_of(snapshot: Mapping[str, str], disaggregated: Optional[bool]) -> Tuple
         ValueError: for a hint the server contradicts: ``agg`` with a cache transceiver,
             ``ctx`` or ``gen`` without one.
     """
-    hint = snapshot.get(ROLE_KNOB, AUTO).strip().lower() or AUTO
+    hint = role_hint(snapshot)
     if hint != AUTO:
         role = Role(hint)
         if role is Role.AGG and disaggregated is True:
@@ -2362,7 +2894,8 @@ class LeverTable:
     unserved: FrozenSet[str]
     #: The knobs as set (names under ``PREFIX``).
     knobs: Mapping[str, str]
-    default: str = AUTO
+    #: ``__DEFAULT``: ``on`` or ``off``.
+    default: str = ON
     #: Things the log should say as warnings (an unknown role, ``on`` outside a gate, ...).
     warnings: Tuple[str, ...] = ()
 
@@ -2382,7 +2915,7 @@ class LeverTable:
         return default_param(name, key)
 
     def paths(self) -> FrozenSet[str]:
-        """The levers on: closed under ``depends_on`` and ``Rule.requires`` by construction."""
+        """The levers on: closed under ``depends_on`` and ``Lever.requires`` by construction."""
         return frozenset(name for name, decision in self.decisions.items() if decision.on)
 
     def describe(self) -> Tuple[str, ...]:
@@ -2393,19 +2926,17 @@ class LeverTable:
             f"{self.deployment.facts.describe()}; knobs set: {knobs}"
         ]
         for name, decision in self.decisions.items():
-            rule = RULES.get(name)
-            if rule is None and decision.on:
-                continue
-            kind, origin = (rule.kind.value, rule.origin) if rule else ("composition", "upstream")
+            lever = LEVERS.get(name)
+            kind = lever.kind.value if lever is not None else "composition"
             lines.append(
                 f"lever {name} {ON if decision.on else OFF} ({decision.source}: {decision.why})"
                 + (f" {dict(decision.params)}" if decision.params else "")
-                + f" [{kind}, {origin}]"
+                + f" [{kind}]"
             )
         if self.unserved:
             lines.append(
                 f"levers not served at sm{self.deployment.sm} tep{self.deployment.tp}: "
-                + ", ".join(name for name in RULES if name in self.unserved)
+                + ", ".join(name for name in LEVERS if name in self.unserved)
             )
         lines.append(f"lever table json (resolved): {self.as_json()}")
         return tuple(lines)
@@ -2454,8 +2985,8 @@ def _order(
             for other in (
                 *depends_on[name],
                 *requires.get(name, ()),
-                *(RULES[name].requires if name in RULES else ()),
-                *(RULES[name].after if name in RULES else ()),
+                *(LEVERS[name].requires if name in LEVERS else ()),
+                *(LEVERS[name].after if name in LEVERS else ()),
             )
             if other in served and other != name
         }
@@ -2493,11 +3024,36 @@ def resolve(
         ValueError: on every error of the module docstring, all named in one message.
     """
     knobs = parse_knobs(snapshot, depends_on)
+    served = frozenset(served)
+    decisions, errors, warnings = _resolve_pass(
+        deployment, served, structural, knobs, depends_on, dict(requires or {})
+    )
+    if errors:
+        raise ValueError("; ".join(errors))
+    ordered = {name: decisions[name] for name in depends_on if name in decisions}
+    return LeverTable(
+        deployment=deployment,
+        decisions=types.MappingProxyType(ordered),
+        unserved=frozenset(LEVERS) - served,
+        knobs=types.MappingProxyType(dict(knobs.raw)),
+        default=knobs.default,
+        warnings=tuple(warnings),
+    )
+
+
+def _resolve_pass(
+    deployment: Deployment,
+    served: FrozenSet[str],
+    structural: Mapping[str, str],
+    knobs: Knobs,
+    depends_on: Mapping[str, Sequence[str]],
+    requires: Mapping[str, Sequence[str]],
+) -> Tuple[Dict[str, Decision], List[str], List[str]]:
+    """Every served lever's decision, the errors and the warnings."""
     requires = dict(requires or {})
     served = frozenset(served)
-    needed = _built_on(
-        {name for name, mode in knobs.modes.items() if mode == ON}, depends_on, requires
-    )
+    knob_on = frozenset(name for name, mode in knobs.modes.items() if mode == ON)
+    needed = _built_on(knob_on, depends_on, requires)
     d = deployment
     errors: List[str] = []
     warnings: List[str] = []
@@ -2516,33 +3072,44 @@ def resolve(
     decisions: Dict[str, Decision] = {}
     t = Resolving(served, decisions)
     for name in _order(served, depends_on, requires):
-        rule = RULES.get(name)
+        lever = LEVERS.get(name)
         mode = knobs.modes.get(name)
         params = {
             param.key: knobs.params.get((name, param.key), param.default_of(d))
-            for param in (rule.params if rule is not None else ())
+            for param in (lever.params if lever is not None else ())
         }
         t.pending = (name, params)
         decision = _decide(
-            name, rule, mode, knobs.default, params, d, t, structural, depends_on, requires, needed
+            name,
+            lever,
+            mode,
+            knobs.default,
+            params,
+            d,
+            t,
+            structural,
+            depends_on,
+            requires,
+            needed,
+            knob_on,
         )
         if mode == ON and not decision.on:
             errors.append(f"{knob_name(name)}=on, but {decision.why}")
         if (
             mode == ON
             and decision.on
-            and rule is not None
-            and rule.kind is Kind.NUMERIC
-            and not any(gate.holds(d) for gate in rule.gates)
+            and lever is not None
+            and lever.kind is Kind.NUMERIC
+            and not any(gate.holds(d) for gate in lever.gates)
         ):
             warnings.append(
                 f"{knob_name(name)}=on outside its accuracy gates ("
-                + "; ".join(gate.scope for gate in rule.gates)
+                + "; ".join(gate.scope for gate in lever.gates)
                 + ")"
             )
         decisions[name] = decision
     for name, decision in decisions.items():
-        rule = RULES.get(name)
+        rule = LEVERS.get(name)
         if not decision.on or rule is None:
             continue
         for other in rule.conflicts:
@@ -2573,17 +3140,7 @@ def resolve(
     for name, key in knobs.params:
         if name not in served:
             warnings.append(f"{knob_name(name, key)} has no effect: {name} is not served here")
-    if errors:
-        raise ValueError("; ".join(errors))
-    ordered = {name: decisions[name] for name in depends_on if name in decisions}
-    return LeverTable(
-        deployment=d,
-        decisions=types.MappingProxyType(ordered),
-        unserved=frozenset(RULES) - served,
-        knobs=types.MappingProxyType(dict(knobs.raw)),
-        default=knobs.default,
-        warnings=tuple(warnings),
-    )
+    return decisions, errors, warnings
 
 
 def _built_on(
@@ -2599,7 +3156,7 @@ def _built_on(
         for other in (
             *depends_on.get(name, ()),
             *requires.get(name, ()),
-            *(RULES[name].requires if name in RULES else ()),
+            *(LEVERS[name].requires if name in LEVERS else ()),
         ):
             if other not in found:
                 found.add(other)
@@ -2609,7 +3166,7 @@ def _built_on(
 
 def _decide(
     name: str,
-    rule: Optional[Rule],
+    lever: Optional[Lever],
     mode: Optional[str],
     default: str,
     params: Mapping[str, object],
@@ -2619,11 +3176,13 @@ def _decide(
     depends_on: Mapping[str, Sequence[str]],
     requires: Mapping[str, Sequence[str]],
     needed: FrozenSet[str] = frozenset(),
+    knob_on: FrozenSet[str] = frozenset(),
 ) -> Decision:
     """One lever's decision, from the decisions already made (``resolve``'s order).
 
-    ``needed`` are the levers a lever turned on by its knob builds on or requires: they
-    resolve by their own rule in either band, so the band never blocks such a knob.
+    ``needed`` are the levers a lever turned on by its knob builds on or requires: they come on
+    with it (where they can run). A lever ``knob_on`` turns on that it conflicts with (either
+    row's ``conflicts``) stays off by default: the knob's lever takes those steps.
     """
     if name in structural:
         return Decision(name, False, "structural", structural[name], params)
@@ -2632,43 +3191,36 @@ def _decide(
             return Decision(
                 name, False, "dependency", f"it builds on {other}, which is off", params
             )
-    for other in (*requires.get(name, ()), *(rule.requires if rule is not None else ())):
+    for other in (*requires.get(name, ()), *(lever.requires if lever is not None else ())):
         if not t.on(other):
             return Decision(name, False, "dependency", f"it requires {other}, which is off", params)
-    if rule is not None and rule.excluded is not None:
-        reason = rule.excluded(d, t)
+    if lever is not None and lever.excluded is not None:
+        reason = lever.excluded(d, t)
         if reason is not None:
             return Decision(name, False, "structural", reason, params)
     if mode == OFF:
         return Decision(name, False, "knob", f"{knob_name(name)}=off", params)
     if mode == ON:
         return Decision(name, True, "knob", f"{knob_name(name)}=on", params)
-    baseline = mode is None and default == BASELINE
-    if rule is None:
-        return Decision(name, True, BASELINE if baseline else AUTO, "served", params)
-    owner, band = lever_band(name), band_of(d)
-    outside = not baseline and owner is not None and owner is not band and name not in needed
-    if baseline or outside:
-        if rule.baseline is not None:
-            on, why = rule.baseline(d, t, params)
-        elif rule.origin == "upstream":
-            on, why = rule.auto(d, t, params)
-        else:
-            on, why = False, f"not an upstream lever ({rule.origin}): off unless its knob is set"
-        if outside:
-            why = (
-                f"a lever of the {owner.value} band on a {band.value} band deployment, as under "
-                f"baseline: {why}"
-            )
-            return Decision(name, on, "band", why, params)
-        return Decision(name, on, BASELINE, why, params)
-    on, why = rule.auto(d, t, params)
-    if on and rule.kind is Kind.NUMERIC:
-        held = [gate for gate in rule.gates if gate.holds(d)]
-        if not held:
-            scopes = "; ".join(gate.scope for gate in rule.gates)
-            return Decision(
-                name, False, "gate", f"{why}, but no accuracy gate holds ({scopes})", params
-            )
-        why = f"{why}; gate: {held[0].scope}"
-    return Decision(name, on, AUTO, why, params)
+    if name in needed:
+        return Decision(name, True, "knob", "a lever turned on by its knob needs it", params)
+    if lever is None:
+        raise RuntimeError(f"{name} is served but has no row in LEVERS")
+    if default == OFF:
+        if lever.stock is None:
+            return Decision(name, False, "stock", f"{DEFAULT_KNOB}=off", params)
+        on, why = lever.stock(d, t, params)
+        return Decision(name, on, "stock", f"{DEFAULT_KNOB}=off, its upstream rule: {why}", params)
+    for other in sorted(_conflict_partners(name) & knob_on):
+        return Decision(
+            name, False, "default", f"steps aside for {other}, turned on by its knob", params
+        )
+    on, why = lever.on_by_default(d, t, params)
+    return Decision(name, on, "default", why, params)
+
+
+def _conflict_partners(name: str) -> FrozenSet[str]:
+    """The levers ``name`` may not be on with: its row's ``conflicts`` and the rows naming it."""
+    row = LEVERS.get(name)
+    mine = set(row.conflicts) if row is not None else set()
+    return frozenset(mine | {other for other, lever in LEVERS.items() if name in lever.conflicts})

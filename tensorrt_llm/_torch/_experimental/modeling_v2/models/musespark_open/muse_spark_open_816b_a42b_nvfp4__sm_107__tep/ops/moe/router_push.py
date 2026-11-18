@@ -102,6 +102,19 @@ CLUSTER = 16
 #: TP8: the most rows a call may carry (capped at ``MAX_ROWS``) and the cluster size.
 TEP8_MAX_ROWS = 128
 TEP8_CLUSTER = 8
+#: (w256) The most ``configure``'s ``tep8_max_rows`` may set (``TEP8_MAX_ROWS``), and the v2 band's
+#: cap (``tep8_route_row_max``: the 128 rows measured).
+TEP8_WIDE_LIMIT = 256
+TEP8_V2_LIMIT = 128
+#: (w256, ``configure``'s ``tep8_route_wide_v2``; the ``tep8_router_push`` lever's ROUTE_WIDE_V2) calls above
+#: ``TEP8_V2_LIMIT`` rows take a v2-only routed build (``-DV2_ONLY``: every CTA routes its row; no v1 [BM][E] tile, so
+#: 2 CTAs per SM like the plain build): the v1 routed build keeps 22 clusters resident on VR (1 CTA per SM at
+#: 120.8 KiB), short of 24 / 32 at 192 / 256 rows, so those calls ran the routing method's separate kernel
+#: (3.2 / 5.0 us per layer on the critical path). Same bits (v2 = v1 = _full_routing_kernel).
+TEP8_ROUTE_WIDE_V2 = False
+#: (w256, ``configure``'s ``tep8_route_wide_v2_min_rows``; the lever's ROUTE_WIDE_V2_MIN_ROWS) the fewest rows the
+#: v2-only wide build takes; 129..(this - 1)-row calls keep the v1 routed build (same bits). Default 129: all.
+TEP8_ROUTE_WIDE_V2_MIN_ROWS = TEP8_V2_LIMIT + 1
 
 #: Settings (``configure``): the push at TP8 (``_TEP8_PUSH``), the fewest rows it takes
 #: (``TEP8_MIN_ROWS``), step A on top of it (``_TEP8_ROUTE``) and the CL16 band
@@ -168,6 +181,9 @@ def configure(
     tep8_route_row_max: int = 64,
     tep8_route_rows_per_cta: int = 1,
     tep8_early_trigger: bool = False,
+    tep8_max_rows: int = 128,
+    tep8_route_wide_v2: bool = False,
+    tep8_route_wide_v2_min_rows: int = TEP8_V2_LIMIT + 1,
 ) -> None:
     """Set whether and where the push serves TP8 router calls.
 
@@ -186,6 +202,11 @@ def configure(
         tep8_route_rows_per_cta: v2's rows per CTA (``TEP8_ROUTE_ROWS_PER_CTA``): 1 (default) or 2.
         tep8_early_trigger: the routed builds trigger their PDL dependents right after the dependency
             wait (``TEP8_EARLY_TRIGGER``; off by default).
+        tep8_max_rows: (w256) the most rows a TP8 call takes the push at (``TEP8_MAX_ROWS``): 128
+            (default, the band served before) .. ``TEP8_WIDE_LIMIT`` (256, 17..32 requests; the gather
+            buffer and every build are laid out for ``MAX_ROWS`` = 384). 129.. rows route in the
+            row-block leader (v1) unless ``tep8_route_row_max`` reaches them; a call whose clusters a
+            build cannot keep resident stays on the caller's op (``build_for``).
 
     Raises:
         ValueError: if ``tep8_cl16_max_rows`` is outside 0..``ROUTE_ROW_MAX`` or
@@ -193,16 +214,23 @@ def configure(
             ``tep8_route_rows_per_cta`` not 1 or 2 (nothing is set).
     """
     global _TEP8_PUSH, TEP8_MIN_ROWS, _TEP8_ROUTE, TEP8_CL16_MAX_ROWS, TEP8_ROUTE_ROW_MAX
-    global TEP8_ROUTE_ROWS_PER_CTA, TEP8_EARLY_TRIGGER
+    global TEP8_ROUTE_ROWS_PER_CTA, TEP8_EARLY_TRIGGER, TEP8_MAX_ROWS
+    if not 128 <= int(tep8_max_rows) <= TEP8_WIDE_LIMIT:
+        raise ValueError(f"tep8_max_rows is 128..{TEP8_WIDE_LIMIT}, got {tep8_max_rows!r}")
+    if not TEP8_V2_LIMIT < int(tep8_route_wide_v2_min_rows) <= TEP8_WIDE_LIMIT:
+        raise ValueError(
+            f"tep8_route_wide_v2_min_rows is {TEP8_V2_LIMIT + 1}..{TEP8_WIDE_LIMIT}, "
+            f"got {tep8_route_wide_v2_min_rows!r}"
+        )
     if int(tep8_route_rows_per_cta) not in (1, 2):
         raise ValueError(f"tep8_route_rows_per_cta is 1 or 2, got {tep8_route_rows_per_cta!r}")
     cl16 = int(tep8_cl16_max_rows)
     if not 0 <= cl16 <= ROUTE_ROW_MAX:
         raise ValueError(f"tep8_cl16_max_rows is 0..{ROUTE_ROW_MAX}, got {tep8_cl16_max_rows!r}")
     v2 = int(tep8_route_row_max)
-    if not ROUTE_ROW_MAX <= v2 <= TEP8_MAX_ROWS:
+    if not ROUTE_ROW_MAX <= v2 <= TEP8_V2_LIMIT:
         raise ValueError(
-            f"tep8_route_row_max is {ROUTE_ROW_MAX}..{TEP8_MAX_ROWS}, got {tep8_route_row_max!r}"
+            f"tep8_route_row_max is {ROUTE_ROW_MAX}..{TEP8_V2_LIMIT}, got {tep8_route_row_max!r}"
         )
     TEP8_ROUTE_ROW_MAX = v2
     TEP8_ROUTE_ROWS_PER_CTA = int(tep8_route_rows_per_cta)
@@ -211,6 +239,10 @@ def configure(
     TEP8_MIN_ROWS = int(tep8_min_rows)
     _TEP8_ROUTE = bool(tep8_route)
     TEP8_CL16_MAX_ROWS = cl16
+    TEP8_MAX_ROWS = int(tep8_max_rows)
+    global TEP8_ROUTE_WIDE_V2, TEP8_ROUTE_WIDE_V2_MIN_ROWS
+    TEP8_ROUTE_WIDE_V2 = bool(tep8_route_wide_v2)
+    TEP8_ROUTE_WIDE_V2_MIN_ROWS = int(tep8_route_wide_v2_min_rows)
 
 
 def route_extra(world: int, cluster: int) -> Tuple[str, ...]:
@@ -435,6 +467,11 @@ __device__ __forceinline__ long long goff(u32 buf, int row, int col) {
 #ifndef ROUTE_ROW_MAX
 #define ROUTE_ROW_MAX 64
 #endif
+// (w256) V2_ONLY: every call of the build routes per row (v2; ROUTE_ROW_MAX >= the build's MAX_ROWS), so the v1 tile
+// and its epilogue are compiled out: the routed build's shared memory stays the plain build's + the bias.
+#ifndef V2_ONLY
+#define V2_ONLY 0
+#endif
 static_assert(NT == E, "one expert per thread in the per-row epilogue");
 __device__ __forceinline__ u32 ld_relaxed_gpu(const u32* p) {
   u32 v;
@@ -506,7 +543,10 @@ tp_router_push(const u16* x, const float* w, float scale, float* out, u32* rbcnt
   extern __shared__ __align__(16) unsigned char dyn[];
   u16* xs = reinterpret_cast<u16*>(dyn);                          // [BM][P][QX] BF16
   float* ws = reinterpret_cast<float*>(dyn + BM * P * QX * 2);    // [EG][P][QW] FP32
-#if ROUTE
+#if ROUTE && V2_ONLY
+  // (w256) v2-only build: no v1 routing tile; red holds the CL splits and route_row_cta's [3][E] scratch
+  __shared__ __align__(16) float red[(CL * NL > 3 * E) ? CL * NL : 3 * E];
+#elif ROUTE
   // the v1 routing tile ([BM][E] floats) reuses red, which CL < 16 (TP8) makes smaller than that
   __shared__ __align__(16) float red[(CL * NL > BM * E) ? CL * NL : BM * E];
 #else
@@ -514,8 +554,10 @@ tp_router_push(const u16* x, const float* w, float scale, float* out, u32* rbcnt
 #endif
   __shared__ __align__(16) float lg[NL];
   __shared__ u32 s_buf;
-#if ROUTE
+#if ROUTE && !V2_ONLY
   static_assert(((CL * NL > BM * E) ? CL * NL : BM * E) >= BM * E, "the routing tile reuses red");
+#endif
+#if ROUTE
   __shared__ __align__(16) float bias_s[E];
 #endif
   const int t = threadIdx.x, lane = t & 31;
@@ -742,7 +784,7 @@ tp_router_push(const u16* x, const float* w, float scale, float* out, u32* rbcnt
     st_plain(out + (long long)(rb * BM + v / (E / 4)) * E + (v % (E / 4)) * 4, q[i]);
   }
   STAMP(7);
-#if ROUTE
+#if ROUTE && !V2_ONLY
   // step A: the block's rows into the (consumed) split-partial buffer, then the routing method's selection
   {
     float* lgb = red;
@@ -801,6 +843,7 @@ class Kernel:
         extra: Tuple[str, ...] = (),
         timing: bool = False,
         route: bool = False,
+        route_row_max: Optional[int] = None,
     ):
         from cuda.bindings import driver as cu
         from cuda.bindings import nvrtc
@@ -821,7 +864,11 @@ class Kernel:
                 f"-DMAX_ROWS={int(max_rows)}".encode(),
                 f"-DTIMING={int(bool(timing))}".encode(),
             ]
-            + ([b"-DROUTE=1", f"-DROUTE_ROW_MAX={TEP8_ROUTE_ROW_MAX}".encode()] if self.route else [])
+            + (
+                [b"-DROUTE=1", f"-DROUTE_ROW_MAX={route_row_max or TEP8_ROUTE_ROW_MAX}".encode()]
+                if self.route
+                else []
+            )
             + [e.encode() for e in extra]
         )
         r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
@@ -1037,6 +1084,8 @@ class RouterPush:
         self.cluster = cluster
         #: step A's build (``ROUTE``), compiled at the first routed call (eager: the first call is never captured)
         self.route_kernel: Optional[Kernel] = None
+        #: (w256 ROUTE_WIDE_V2) the v2-only routed build for calls above TEP8_V2_LIMIT rows (compiled with route_build)
+        self.route_wide_kernel: Optional[Kernel] = None
         #: the CL16 band's builds (``prepare_cl16``, at the transport's eager creation): plain and routed
         self.cl16_kernel: Optional[Kernel] = None
         self.cl16_route_kernel: Optional[Kernel] = None
@@ -1056,7 +1105,32 @@ class RouterPush:
                 route=True,
                 extra=route_extra(self.world, self.cluster),
             )
+            if TEP8_ROUTE_WIDE_V2 and self.world == 8 and self.cluster == TEP8_CLUSTER:
+                self.route_wide_kernel = Kernel(
+                    self.device.index,
+                    self.world,
+                    self.cluster,
+                    self.kernel.tpl,
+                    route=True,
+                    extra=tuple(
+                        e for e in route_extra(self.world, self.cluster) if "ROW_PAIRS" not in e
+                    )
+                    + ("-DV2_ONLY=1",),
+                    route_row_max=MAX_ROWS,
+                )
         return self.route_kernel
+
+    def route_build_for(self, rows: int) -> Kernel:
+        """The routed build of a ``rows``-row call: the v2-only wide build above ``TEP8_V2_LIMIT`` rows when
+        ROUTE_WIDE_V2 built it (the same bits: v2 and v1 are both ``_full_routing_kernel``'s), else ``route_build``."""
+        k = self.route_build()
+        if (
+            rows > TEP8_V2_LIMIT
+            and rows >= TEP8_ROUTE_WIDE_V2_MIN_ROWS
+            and self.route_wide_kernel is not None
+        ):
+            return self.route_wide_kernel
+        return k
 
     def prepare_cl16(self, route: bool) -> Optional[str]:
         """Compile the CL16 band's builds once (eager; never under capture): plain, and routed when ``route``.
@@ -1154,16 +1228,16 @@ class RouterPush:
         rargs = None
         if route is not None:
             bias, eps, sel, wts = route
-            k = self.cl16_build(rows, route=True) or self.route_build()
+            k = self.cl16_build(rows, route=True) or self.route_build_for(rows)
             if not k.fits(rows):
                 raise RuntimeError(
                     f"tp_router_push: the routed build does not keep {rows} rows resident"
                 )
             rargs = (bias.data_ptr(), float(eps), sel.data_ptr(), wts.data_ptr())
         else:
-            k = (self.cl16_build(rows, route=False) if tpl is None and timing is None else None) or (
-                self.build_for(rows, tpl)
-            )
+            k = (
+                self.cl16_build(rows, route=False) if tpl is None and timing is None else None
+            ) or (self.build_for(rows, tpl))
             if k is None:
                 raise RuntimeError(f"tp_router_push: no build keeps {rows} rows resident")
             if timing is not None:
@@ -1304,7 +1378,7 @@ def logits_routed(mapping, x: torch.Tensor, weight: torch.Tensor, scale: float, 
     if (
         route_eligible(routing, rows)
         and not (capturing and push.route_kernel is None)
-        and push.route_build().fits(rows)
+        and push.route_build_for(rows).fits(rows)
     ):
         sel = torch.empty((rows, TOP_K), dtype=torch.int32, device=x.device)
         wts = torch.empty((rows, TOP_K), dtype=torch.float32, device=x.device)

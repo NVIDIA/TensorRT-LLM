@@ -18,7 +18,11 @@ A unified cache whose life cycles mix page sizes (FP8 target, BF16 draft) has on
 attention-op table per pool group. The stager's copy of the batch's rows, full or
 incremental, must leave the device table bit for bit as the manager's own copy leaves
 it: the rows' every column, since a drafter in the manager reads a whole row for its
-extent, and nothing outside the batch's rows.
+extent, and nothing outside the batch's rows. Each descriptor reader runs the same
+descriptors: the per-field read, the 64-byte read with host-split pieces and on the
+two-dimensional grid, and the parameter-block launch. With ``pool_group_tail_marks`` the
+copy fills only the tail columns a row may not already hold as the bad-page word, and the
+table still ends every step as the manager's own copy leaves it.
 """
 
 from collections import Counter
@@ -34,6 +38,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_107__tep.ops.runtime import (  # noqa: E501
     step_commit,
+    step_commit_inline,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
@@ -56,6 +61,27 @@ SENTINEL = -7
 REQUESTS = ((11, 40, 36, False), (12, 8, 0, False), (13, 4, 0, True), (14, 24, 20, False))
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+#: Descriptor readers: (``step_commit.configure``'s ``v2_mode``, ``inline_commit``).
+READERS = {
+    "per-field": ("", False),
+    "64-byte-split": ("1", False),
+    "64-byte-grid": ("nosplit", False),
+    "parameter-block": ("", True),
+}
+
+
+@pytest.fixture(params=sorted(READERS))
+def reader(request):
+    """Builds staging blocks whose launches read the descriptors with one reader."""
+    v2_mode, inline_commit = READERS[request.param]
+    if inline_commit and not step_commit_inline.available():
+        pytest.skip(f"no parameter-block launch: {step_commit_inline.unavailable_reason()}")
+    step_commit.configure(v2_mode=v2_mode)
+    try:
+        yield lambda: step_commit.StepStaging(inline_commit=inline_commit)
+    finally:
+        step_commit.configure(v2_mode="")
 
 
 def _layer_specs():
@@ -126,14 +152,15 @@ def _native(manager, request_ids):
     return dst
 
 
-def _staged(manager, dst, request_ids, memo, attn_metadata):
+def _staged(manager, dst, request_ids, memo, attn_metadata, staging=None, tail_marks=None):
     stager = runtime._PrepareStager(
-        step_commit.StepStaging(),
+        staging if staging is not None else step_commit.StepStaging(),
         Counter(),
         SimpleNamespace(),
         attn_metadata,
         None,
         blocks_memo=memo,
+        tail_marks=tail_marks,
     )
     assert stager.block_offsets(manager, dst, request_ids, 1, 0, len(request_ids)), stager.declined
     # A step whose rows all match what the memo recorded has nothing to launch.
@@ -143,12 +170,12 @@ def _staged(manager, dst, request_ids, memo, attn_metadata):
 
 
 @pytest.mark.parametrize("incremental", [False, True], ids=["full", "incremental"])
-def test_staged_copy_is_the_native_copy(manager, incremental):
+def test_staged_copy_is_the_native_copy(manager, reader, incremental):
     request_ids = [11, 12, 13]
     want = _native(manager, request_ids)
     dst = _table(manager)
     memo = runtime._BlockOffsetsMemo() if incremental else None
-    stager = _staged(manager, dst, request_ids, memo, SimpleNamespace())
+    stager = _staged(manager, dst, request_ids, memo, SimpleNamespace(), reader())
     cols = stager.block_cols
     assert cols < manager.max_blocks_per_seq
     # The long request's windowed tables carry BAD_PAGE_INDEX inside the copied columns.
@@ -373,17 +400,24 @@ def test_memo_tracks_admissions_evictions_and_growth(manager, seed):
     assert calls["rows"] > calls["rows unchanged"] > 0
 
 
-def test_blocks_descriptor_bad_page_word():
-    pages = torch.tensor([3, BAD_PAGE_INDEX, 5, BAD_PAGE_INDEX], dtype=torch.int32).pin_memory()
+@pytest.mark.parametrize("count", [4, 3 * 1024 + 5])
+def test_blocks_descriptor_bad_page_word(reader, count):
+    """Every reader writes a BLOCKS descriptor's ``bad_page`` word for a BAD_PAGE_INDEX page,
+    on a row of one chunk and on one longer than several chunks (host-split pieces)."""
+    pages = torch.arange(count, dtype=torch.int32)
+    pages[1::3] = BAD_PAGE_INDEX
+    pages = pages.pin_memory()
     for bad_page in (0, BAD_PAGE_INDEX):
-        k = torch.full((4,), SENTINEL, dtype=torch.int32, device="cuda")
-        v = torch.full((4,), SENTINEL, dtype=torch.int32, device="cuda")
-        staging = step_commit.StepStaging()
-        staging.blocks(k.data_ptr(), v.data_ptr(), pages.data_ptr(), 4, 2, 1, bad_page)
+        k = torch.full((count,), SENTINEL, dtype=torch.int32, device="cuda")
+        v = torch.full((count,), SENTINEL, dtype=torch.int32, device="cuda")
+        staging = reader()
+        staging.blocks(k.data_ptr(), v.data_ptr(), pages.data_ptr(), count, 2, 1, bad_page)
         assert staging.launch()
         torch.cuda.synchronize()
-        assert k.tolist() == [6, bad_page, 10, bad_page]
-        assert v.tolist() == [7, bad_page, 11, bad_page]
+        bad = pages.cuda() == BAD_PAGE_INDEX
+        assert torch.equal(k, torch.where(bad, bad_page, 2 * pages.cuda()))
+        assert torch.equal(v, torch.where(bad, bad_page, 2 * pages.cuda() + 1))
+        staging.reset()
 
 
 # --------------------------------------------------------------------------
@@ -443,3 +477,20 @@ def test_blocks_descriptor_bad_page_word_in_split_pieces():
         )
     finally:
         step_commit.configure(v2_mode="")
+
+
+def test_tail_marked_steps_track_the_native_copy(manager, reader):
+    marks, attn_metadata = runtime._BlockTailMarks(), SimpleNamespace()
+    dst = _table(manager)
+    # A batch, the same batch, a narrower batch in the same rows, a request that grows, and a
+    # wider batch again.
+    steps = ([11, 12, 13], [11, 12, 13], [14, 12, 13], [14, 12, 13], [11, 12, 13])
+    filled = []
+    for step, request_ids in enumerate(steps):
+        if step == 3:
+            assert manager.kv_cache_map[14].resize(32, 28)
+        stager = _staged(manager, dst, request_ids, None, attn_metadata, reader(), marks)
+        filled.append(stager.counts["block tail columns filled"])
+        assert torch.equal(dst, _native(manager, request_ids)), step
+    # The first step fills every row's tail; the repeated batch fills nothing.
+    assert filled[0] > 0 and filled[1] == 0

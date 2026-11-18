@@ -109,6 +109,7 @@ from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenLogi
 from tensorrt_llm._torch.modules import low_m_gemm as _low_m
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.logit_soft_cap import soft_capped_logits
+from tensorrt_llm._torch.speculative.compact_draft_probs import mark_private_verify_logits
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.logger import logger
 
@@ -486,10 +487,18 @@ class TargetHead:
         return None
 
     def materialize(self, logits: torch.Tensor) -> torch.Tensor:
-        """The built-in processor's FP32 capped logits for the pending row; consumes it."""
+        """The built-in processor's FP32 capped logits for the pending row; consumes it.
+
+        The result is a new tensor only its caller reads (the step's ``logits`` output
+        is the pending row), so it is marked private to the verify that receives it:
+        under ``TRTLLM_RS_COMPACT_DRAFT_PROBS`` that verify rebuilds the draft rows in
+        its storage once the target probabilities exist.
+        """
         gathered = self._gather_now(logits)
-        return soft_capped_logits(
-            logits if gathered is None else gathered, self.multiplier, self.soft_cap
+        return mark_private_verify_logits(
+            soft_capped_logits(
+                logits if gathered is None else gathered, self.multiplier, self.soft_cap
+            )
         )
 
     def drain(self) -> None:

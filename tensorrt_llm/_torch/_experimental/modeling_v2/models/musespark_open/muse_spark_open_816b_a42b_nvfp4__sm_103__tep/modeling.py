@@ -323,7 +323,7 @@ installed by the shell's ``load_weights`` after the built-in loader
 * ``half_window_experts`` (tp 4) stacks the ring predecessor's upper expert half on
   them, which the prologue's routed kernel places onto (and, on calls of 9..32 rows
   that reach the routing method, ``ring_buddy_assign``'s half flow); only up to its
-  lever's ``MAX_BATCH`` (``levers.RULES``).
+  lever's ``MAX_BATCH`` (``levers.LEVERS``).
 * ``bf16_routed_experts`` gives the two BF16 layers' stacked calls unpacked
   routing (on the owner-only window as well).
 * ``hot_replicas`` (tep4, in a plan without ``half_window_experts``: the two
@@ -1039,7 +1039,7 @@ _TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard", "draft_head_s
 #: multi-request router GEMM and projection gathers) by ``ring_buddy_assign``'s half
 #: flow, both balancing the selected experts over the four ranks. The
 #: window costs 45 GiB of KV cache per rank and is carried only up to its lever's
-#: ``MAX_BATCH`` (``levers.RULES``); a plan carrying it leaves ``hot_replicas`` out (the
+#: ``MAX_BATCH`` (``levers.LEVERS``); a plan carrying it leaves ``hot_replicas`` out (the
 #: two levers conflict).
 _SM103_TEP4_PATHS = (
     _TEP4_PATHS
@@ -1082,8 +1082,8 @@ _PREFETCH_LEVERS = frozenset({"graph_start_qkv_prefetch"})
 
 #: ``MUSESPARK_OPEN_SM103_TEP4_EXTRA_PATHS`` (comma-separated fast-path names; unset or empty:
 #: nothing changes) adds to the sm103 TEP4 composition fast paths that the sm103 TEP8
-#: composition serves and this one leaves out, so the lever table resolves them (on under
-#: ``auto``, like every served lever without a rule): the early-ids start of the persistent
+#: composition serves and this one leaves out, so the lever table resolves them (on by
+#: default, like every composition path of ``levers.LEVERS``): the early-ids start of the persistent
 #: expert kernel (``early_expert_ids``, which builds on ``moe_prologue``) and the projection
 #: GEMMs writing straight into their consumers' transports (``pool_into_route``,
 #: ``unpool_into_boundary``, ``attention_output_into_hop``). Read once, at import: the

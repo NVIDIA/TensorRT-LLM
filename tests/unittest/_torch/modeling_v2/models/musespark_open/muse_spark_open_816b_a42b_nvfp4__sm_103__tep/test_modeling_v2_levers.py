@@ -7,9 +7,10 @@
 logger); the compositions are ``modeling.py``'s ``TARGET_PATHS`` statements run over that
 ``dispatch``. The tests pin:
 
-* the table of every region deployment under ``auto``, which is the table under ``baseline``;
+* ``LEVERS`` has a row for every lever, and what each row says (kind, stock rule, defaults);
+* the table of every region deployment by default, which is the table under ``__DEFAULT=off``;
 * every decoding role (aggregated, generation, unknown) resolves alike;
-* ``baseline``: every key's plan is the composition before the lever table
+* ``__DEFAULT=off``: every key's plan is the composition before the lever table
   (``C55_SERVED`` under ``c55_plan``'s rules) plus the install the plan adds to it;
 * a knob naming a lever this target does not have raises, and no stale switch is retired here;
 * the knob grammar's errors, the overrides, the facts and the drafter arena;
@@ -155,8 +156,15 @@ def _compositions(dispatch):
 
 LEVERS, DISPATCH = _load()
 TARGET_PATHS = _compositions(DISPATCH)
-RULES = LEVERS.RULES
-BASELINE = {LEVERS.DEFAULT_KNOB: "baseline"}
+TABLE = LEVERS.LEVERS
+#: The rows with a condition of their own: every lever but the composition's plain paths
+#: (``Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS)``).
+CONDITIONED = {
+    name
+    for name, lever in TABLE.items()
+    if not (lever.on_by_default is LEVERS.ALWAYS and lever.stock is LEVERS.ALWAYS)
+}
+OFF = {LEVERS.DEFAULT_KNOB: "off"}
 
 
 def knobs(**values) -> dict:
@@ -174,45 +182,80 @@ def table(key, mbs, role, arena, knob_set=None, facts=None):
 
 
 def rule_levers_on(lever_table) -> set:
-    return {name for name in RULES if lever_table.on(name)}
+    return {name for name in CONDITIONED if lever_table.on(name)}
 
 
 def base_off(lever_table) -> set:
     return {
         name
         for name, decision in lever_table.decisions.items()
-        if name not in RULES and not decision.on
+        if name not in CONDITIONED and not decision.on
     }
 
 
 # --------------------------------------------------------------------------
 # The registry
 # --------------------------------------------------------------------------
-#: Where each rule-table lever is served, and its kind and origin.
+#: Where each conditioned lever is served, its kind, and whether it has a stock rule (an
+#: upstream lever, kept by ``__DEFAULT=off``).
 SERVED_AT = {
-    "lm_head_inbox": ({(103, 4), (103, 8)}, "composition", "upstream"),
-    "graph_start_qkv_prefetch": ({(103, 8)}, "composition", "upstream"),
-    "half_window_experts": ({(103, 4)}, "composition", "upstream"),
-    "hot_replicas": ({(103, 4)}, "composition", "upstream"),
-    "vocab_parallel_head": ({(103, 4), (103, 8)}, "composition", "upstream"),
-    "multi_request_prep_append": ({(103, 4), (103, 8)}, "composition", "upstream"),
-    "multi_request_split_kv": ({(103, 4), (103, 8)}, "composition", "upstream"),
-    "multi_request_post_attention_hop": ({(103, 4), (103, 8)}, "composition", "upstream"),
-    "wide_drafter_hops": ({(103, 4)}, "composition", "upstream"),
-    "router_gemm": ({(103, 4), (103, 8)}, "composition", "upstream"),
-    "projection_publish": ({(103, 4), (103, 8)}, "composition", "upstream"),
+    "lm_head_inbox": ({(103, 4), (103, 8)}, "composition", True),
+    "context_sequence_parallel": ({(103, 4)}, "composition", True),
+    "graph_start_qkv_prefetch": ({(103, 8)}, "composition", True),
+    "half_window_experts": ({(103, 4)}, "composition", True),
+    "hot_replicas": ({(103, 4)}, "composition", True),
+    "vocab_parallel_head": ({(103, 4), (103, 8)}, "composition", True),
+    "wide_drafter_hops": ({(103, 4), (103, 8)}, "composition", True),
+    "finalize_two_shot": ({(103, 4), (103, 8)}, "composition", True),
+    "tep8_fc_shard_wide": ({(103, 8)}, "flagged", False),
+    "tep8_persistent_batch_experts": ({(103, 8)}, "flagged", False),
+    "tep8_experts_in_kernel_placement": ({(103, 8)}, "flagged", False),
+    "tep8_experts_early_start": ({(103, 8)}, "flagged", False),
+    "tep8_router_shard": ({(103, 8)}, "flagged", False),
+    "tep8_router_shard_early": ({(103, 8)}, "lossless-bitwise", False),
+    "tep8_router_shard_wide": ({(103, 8)}, "flagged", False),
+    "tep8_wide_direct_pool": ({(103, 8)}, "flagged", False),
+    "tep8_wide_direct_transports": ({(103, 4)}, "flagged", False),
+    "tep8_batch_splitk": ({(103, 8)}, "lossless-bitwise", False),
+    "finalize_entry_trigger": ({(103, 4), (103, 8)}, "lossless-bitwise", False),
+    "tep8_finalize_transport_wide": ({(103, 8)}, "flagged", False),
+    "multi_request_combine_gate": ({(103, 4), (103, 8)}, "lossless-bitwise", False),
+    "router_staged_gemm": ({(103, 4), (103, 8)}, "flagged", False),
+    "drafter_fused_prep": ({(103, 4), (103, 8)}, "flagged", False),
+    "tep8_ring_buddy_wide": ({(103, 8)}, "flagged", False),
+    "tep8_wide_balance": ({(103, 8)}, "flagged", False),
+    "tep8_experts_interleaved_fetch": ({(103, 8)}, "flagged", False),
+    "drafter_conv_epilogue": ({(103, 8)}, "lossless-bitwise", False),
+    "drafter_finish_norm": ({(103, 8)}, "lossless-bitwise", False),
+    "drafter_silu_epilogue": ({(103, 8)}, "lossless-bitwise", False),
+    "tep8_attn_block_splitk": ({(103, 8)}, "lossless-numeric", False),
+    "swa_block_single_early_loads": ({(103, 8)}, "lossless-bitwise", False),
+    "drafter_multi_request_cells": ({(103, 8)}, "lossless-numeric", False),
     # Opt-in at (103, 4) only.
-    "prefill_cutedsl_experts": ({(103, 4)}, "composition", "HC"),
+    "prefill_cutedsl_experts": ({(103, 4)}, "composition", False),
+    "multi_request_prep_append": ({(103, 4), (103, 8)}, "composition", True),
+    "multi_request_split_kv": ({(103, 4), (103, 8)}, "composition", True),
+    "multi_request_post_attention_hop": ({(103, 4), (103, 8)}, "composition", True),
+    "router_gemm": ({(103, 4), (103, 8)}, "composition", True),
+    "projection_publish": ({(103, 4), (103, 8)}, "composition", True),
 }
 
 
-def test_the_rule_table_is_the_lever_registry():
-    assert set(RULES) == set(SERVED_AT)
-    assert set(RULES) <= DISPATCH.FAST_PATH_NAMES
-    for name, (keys, kind, origin) in SERVED_AT.items():
+def test_the_lever_table_has_a_row_for_every_lever():
+    assert set(TABLE) == set(DISPATCH.DEPENDS_ON) == DISPATCH.FAST_PATH_NAMES
+    for key, paths in TARGET_PATHS.items():
+        assert set(paths.served) <= set(TABLE), key
+    for name in set(TABLE) - CONDITIONED:
+        assert TABLE[name].kind is LEVERS.Kind.COMPOSITION, name
+    assert not hasattr(LEVERS, "RULES")
+
+
+def test_the_conditioned_rows():
+    assert CONDITIONED == set(SERVED_AT)
+    for name, (keys, kind, stock) in SERVED_AT.items():
         served = {key for key, paths in TARGET_PATHS.items() if name in paths.served}
         assert served == keys, name
-        assert (RULES[name].kind.value, RULES[name].origin) == (kind, origin), name
+        assert (TABLE[name].kind.value, TABLE[name].stock is not None) == (kind, stock), name
 
 
 def test_the_compositions_and_the_fast_paths():
@@ -245,12 +288,18 @@ def test_the_lever_records_carry_no_field_of_another_target():
 
 
 # --------------------------------------------------------------------------
-# The regions under auto
+# The regions by default
 # --------------------------------------------------------------------------
 VP = {"vocab_parallel_head"}
-#: The TP4 paths of the composition that are rule levers, on wherever served.
-TEP4_PATHS = set(LEVERS.TEP4_PATHS)
-#: The rule levers among the multi-request paths TEP8 serves (``SM103_TEP8_ADDED``).
+#: The TP4 paths of the composition that are conditioned levers, on wherever served.
+TEP4_PATHS = {
+    "multi_request_prep_append",
+    "multi_request_split_kv",
+    "multi_request_post_attention_hop",
+    "router_gemm",
+    "projection_publish",
+}
+#: The conditioned levers among the multi-request paths TEP8 serves (``SM103_TEP8_ADDED``).
 TEP8_MULTI_REQUEST = {
     "multi_request_prep_append",
     "multi_request_split_kv",
@@ -288,7 +337,7 @@ REGIONS = [
 
 
 @pytest.mark.parametrize("key, role, sizes, arena, expected", REGIONS)
-def test_region_tables_under_auto(key, role, sizes, arena, expected):
+def test_region_tables_by_default(key, role, sizes, arena, expected):
     for mbs in sizes:
         lever_table = table(key, mbs, role, arena)
         assert rule_levers_on(lever_table) == expected, mbs
@@ -299,14 +348,16 @@ def test_region_tables_under_auto(key, role, sizes, arena, expected):
 
 
 def test_the_tep4_paths():
-    assert TEP4_PATHS == {
-        "multi_request_prep_append",
-        "multi_request_split_kv",
-        "multi_request_post_attention_hop",
-        "wide_drafter_hops",
-        "router_gemm",
-        "projection_publish",
-    }
+    # On wherever served, by default and under __DEFAULT=off alike (their rows keep the
+    # upstream rule as their stock rule).
+    for key, paths in TARGET_PATHS.items():
+        for knob_set in (None, OFF):
+            for mbs in (1, 4, 64):
+                lever_table = table(key, mbs, "agg", "windowed", knob_set)
+                for name in TEP4_PATHS & set(paths.served):
+                    assert lever_table.on(name), (key, knob_set, mbs, name)
+    for name in TEP4_PATHS:
+        assert TABLE[name].kind is LEVERS.Kind.COMPOSITION and TABLE[name].stock is not None
 
 
 def test_the_vocabulary_parallel_head_rule():
@@ -319,13 +370,13 @@ def test_the_vocabulary_parallel_head_rule():
 
 
 @pytest.mark.parametrize("key", [(103, 4), (103, 8)])
-def test_auto_resolves_as_baseline(key):
+def test_the_default_resolves_as_off(key):
     for role in ("agg", "gen"):
         for arena in ("dense", "windowed", "paged"):
             for mbs in (None, 1, 4, 8, 9, 64):
-                auto = table(key, mbs, role, arena)
-                baseline = table(key, mbs, role, arena, BASELINE)
-                assert auto.paths() == baseline.paths(), (role, arena, mbs)
+                default = table(key, mbs, role, arena)
+                off = table(key, mbs, role, arena, OFF)
+                assert default.paths() == off.paths(), (role, arena, mbs)
 
 
 @pytest.mark.parametrize("key", [(103, 4), (103, 8)])
@@ -341,7 +392,7 @@ def test_every_decoding_role_resolves_alike(key, mbs):
 
 
 # --------------------------------------------------------------------------
-# baseline: the composition before the lever table
+# __DEFAULT=off: the composition before the lever table
 # --------------------------------------------------------------------------
 #: The served sets of the compositions at c55183f445 (its ``modeling.py`` tables over its
 #: ``dispatch.FAST_PATH_NAMES``).
@@ -451,7 +502,7 @@ C55_SERVED = {
 
 #: The paths TEP8 serves beyond ``C55_SERVED``: the multi-request decode paths of
 #: ``modeling._SM103_TEP8_MULTI_REQUEST_PATHS`` and ``wide_dense_gemms``, TEP8's alone. The
-#: baseline serves them like the rest of the composition.
+#: ``__DEFAULT=off`` serves them like the rest of the composition.
 SM103_TEP8_ADDED = frozenset(
     {
         "drafter_window_compact",
@@ -503,13 +554,154 @@ def c55_plan(key, max_batch_size, arena) -> set:
 @pytest.mark.parametrize("key", sorted(C55_SERVED))
 @pytest.mark.parametrize("arena", ["dense", "windowed", "paged"])
 @pytest.mark.parametrize("role", ["agg", "gen", "ctx"])
-def test_baseline_is_the_previous_composition(key, arena, role):
+def test_off_is_the_previous_composition(key, arena, role):
     for mbs in (None, 1, 2, 4, 8, 9, 16, 64):
         want = c55_plan(key, mbs, arena)
         # The install the plan adds to c55_plan: the graph-start fork of next_qkv_prefetch.
         if "next_qkv_prefetch" in want:
             want.add("graph_start_qkv_prefetch")
-        assert table(key, mbs, role, arena, BASELINE).paths() == want, mbs
+        assert table(key, mbs, role, arena, OFF).paths() == want, mbs
+
+
+#: Every deployment the default tests walk: both keys, sizes around the measured tep8 gen points
+#: (1, 3, 4, 24, 31) and the band edges, every role and arena.
+GRID = [
+    (key, mbs, role, arena)
+    for key in sorted(TARGET_PATHS)
+    for mbs in (None, 1, 2, 3, 4, 8, 9, 16, 24, 31, 32, 64)
+    for role in ("agg", "ctx", "gen", "unknown")
+    for arena in ("dense", "windowed", "paged")
+]
+
+
+def test_off_keeps_only_the_stock_rules():
+    for key, mbs, role, arena in GRID:
+        lever_table = table(key, mbs, role, arena, OFF)
+        for name, decision in lever_table.decisions.items():
+            if decision.source in ("structural", "dependency"):
+                assert not decision.on, (key, mbs, role, arena, name)
+                continue
+            assert decision.source == "stock", (key, mbs, role, arena, name)
+            stock = TABLE[name].stock
+            if stock is None:
+                assert not decision.on, (key, mbs, role, arena, name)
+
+
+def test_default_on_is_the_unset_default():
+    for key, mbs, role, arena in GRID[::7]:
+        unset = table(key, mbs, role, arena)
+        assert unset.default == "on"
+        explicit = table(key, mbs, role, arena, {LEVERS.DEFAULT_KNOB: "on"})
+        assert explicit.paths() == unset.paths(), (key, mbs, role, arena)
+    assert LEVERS.DEFAULT_VALUES == ("on", "off")
+
+
+#: The flagged levers on by default somewhere today: the ported sm103 tep8 decode stack, on at
+#: tep8 (``_tep8_only``) by the operator's decision and the SPEED-Bench token-identity evidence
+#: in ``_tep8_only``'s docstring, and at the measured tep8 gen points by their recipes. Their
+#: kind still says an open safety check: no other flagged lever may join them by default.
+FLAGGED_ON_BY_DEFAULT = {
+    "drafter_fused_prep",
+    "router_staged_gemm",
+    "tep8_experts_early_start",
+    "tep8_experts_interleaved_fetch",
+    "tep8_fc_shard_wide",
+    "tep8_finalize_transport_wide",
+    "tep8_persistent_batch_experts",
+    "tep8_ring_buddy_wide",
+    "tep8_router_shard",
+    "tep8_router_shard_wide",
+    "tep8_wide_balance",
+    "tep8_wide_direct_pool",
+}
+
+
+def test_no_lossy_or_flagged_lever_is_on_by_default():
+    seen = set()
+    for key, mbs, role, arena in GRID:
+        for name, decision in table(key, mbs, role, arena).decisions.items():
+            kind = TABLE[name].kind
+            if not decision.on or kind not in (LEVERS.Kind.LOSSY, LEVERS.Kind.FLAGGED):
+                continue
+            assert kind is LEVERS.Kind.FLAGGED, (key, mbs, role, arena, name)
+            assert name in FLAGGED_ON_BY_DEFAULT, (key, mbs, role, arena, name)
+            assert key == (103, 8), (key, mbs, role, arena, name)
+            seen.add(name)
+    assert seen == FLAGGED_ON_BY_DEFAULT
+
+
+def test_a_numeric_lever_is_on_by_default_only_inside_its_gates():
+    numeric = {name for name, lever in TABLE.items() if lever.kind is LEVERS.Kind.NUMERIC}
+    assert numeric == {"tep8_attn_block_splitk", "drafter_multi_request_cells"}
+    for key, mbs, role, arena in GRID:
+        lever_table = table(key, mbs, role, arena)
+        for name in numeric & set(lever_table.decisions):
+            if lever_table.on(name):
+                deployment = lever_table.deployment
+                assert any(gate.holds(deployment) for gate in TABLE[name].gates), (
+                    key,
+                    mbs,
+                    role,
+                    name,
+                )
+
+
+def test_default_and_explicit_auto_agree():
+    for key, mbs, role, arena in GRID[::11]:
+        lever_table = table(key, mbs, role, arena)
+        auto = {LEVERS.knob_name(name): "auto" for name in lever_table.decisions}
+        assert table(key, mbs, role, arena, auto).paths() == lever_table.paths()
+
+
+# --------------------------------------------------------------------------
+# The measured tep8 gen points, carried by their rows
+# --------------------------------------------------------------------------
+def test_a_measured_point_resolves_to_its_recipe():
+    p02 = table((103, 8), 3, "gen", "windowed")
+    assert p02.on("tep8_ring_buddy_wide") and p02.param("tep8_ring_buddy_wide", "MAX_ROWS") == 64
+    assert p02.on("wide_drafter_hops")
+    assert p02.param("wide_drafter_hops", "TP8_MAX_ROWS") == 24
+    assert not p02.on("router_staged_gemm") and not p02.on("tep8_batch_splitk")
+    assert p02.decisions["tep8_ring_buddy_wide"].why.endswith("(pareto02)")
+    p05 = table((103, 8), 31, "gen", "windowed")
+    assert p05.on("tep8_ring_buddy_wide") and p05.param("tep8_ring_buddy_wide", "MAX_ROWS") == 128
+    assert p05.on("router_staged_gemm") and not p05.on("tep8_router_shard")
+    # The same size on an aggregated server is no measured point: the rows' own conditions
+    # and the declared parameter defaults.
+    agg = table((103, 8), 3, "agg", "windowed")
+    assert agg.on("tep8_router_shard_wide") and not agg.on("wide_drafter_hops")
+    assert agg.param("tep8_ring_buddy_wide", "MAX_ROWS") == LEVERS.RING_BUDDY_MAX_ROWS
+    # A knob still wins over the recipe's parameter.
+    knob = table((103, 8), 3, "gen", "windowed", knobs(tep8_ring_buddy_wide__MAX_ROWS=96))
+    assert knob.param("tep8_ring_buddy_wide", "MAX_ROWS") == 96
+
+
+def test_a_measured_condition_names_only_measured_points():
+    with pytest.raises(ValueError, match="no measured tep8 gen point"):
+        LEVERS.at_measured_points((2,), LEVERS.ALWAYS)
+    with pytest.raises(ValueError, match="no measured tep8 gen point"):
+        LEVERS.measured_default({5: 1})
+
+
+def test_a_knob_on_turns_on_what_the_lever_needs():
+    # pareto04 leaves the persistent batch builds off; the in-kernel placement requires them.
+    plain = table((103, 8), 24, "gen", "windowed")
+    assert not plain.on("tep8_persistent_batch_experts")
+    lever_table = table(
+        (103, 8), 24, "gen", "windowed", knobs(tep8_experts_in_kernel_placement="on")
+    )
+    assert lever_table.on("tep8_experts_in_kernel_placement")
+    needed = lever_table.decisions["tep8_persistent_batch_experts"]
+    assert (needed.on, needed.source) == (True, "knob")
+    # An explicit off still wins over the need, and the knob that needs it raises.
+    with pytest.raises(ValueError, match="tep8_persistent_batch_experts, which is off"):
+        table(
+            (103, 8),
+            24,
+            "gen",
+            "windowed",
+            knobs(tep8_experts_in_kernel_placement="on", tep8_persistent_batch_experts="off"),
+        )
 
 
 # --------------------------------------------------------------------------
@@ -520,7 +712,9 @@ def test_baseline_is_the_previous_composition(key, arena, role):
     [
         (knobs(lm_head_inbx="on"), "did you mean MUSESPARK_OPEN_LEVER_LM_HEAD_INBOX"),
         (knobs(hot_replicas="yes"), "expected one of ['auto', 'on', 'off']"),
-        ({LEVERS.DEFAULT_KNOB: "fast"}, "expected one of ['auto', 'baseline']"),
+        ({LEVERS.DEFAULT_KNOB: "fast"}, "expected one of ['on', 'off']"),
+        ({LEVERS.DEFAULT_KNOB: "auto"}, "expected one of ['on', 'off']"),
+        ({LEVERS.DEFAULT_KNOB: "baseline"}, "expected one of ['on', 'off']"),
         ({LEVERS.ROLE_KNOB: "decode"}, "MUSESPARK_OPEN_LEVER__ROLE='decode'"),
         (knobs(vocab_parallel_head__MIN_ROWS=7), "expected an integer in 8..16, got 7"),
         (knobs(vocab_parallel_head__MIN_ROWS="many"), "expected an integer in 8..16"),
@@ -579,8 +773,8 @@ def test_every_single_off_gives_a_closed_plan(key, arena):
         for name in sorted(TARGET_PATHS[key].served):
             paths = table(key, mbs, "agg", arena, knobs(**{name: "off"})).paths()
             DISPATCH.Plan(paths)  # raises when not closed under depends_on
-            for lever in paths & set(RULES):
-                assert set(RULES[lever].requires) <= paths, (key, mbs, name, lever)
+            for lever in paths & set(TABLE):
+                assert set(TABLE[lever].requires) <= paths, (key, mbs, name, lever)
 
 
 def test_a_parameter_moves_the_band():

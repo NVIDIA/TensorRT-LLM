@@ -548,7 +548,7 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     FastPath("deferred_input_prep", "a decode step's input writes as one launch", "executor"),
     FastPath("sampler_store", "the sampler's store update and snapshots as one launch", "executor"),
     # Levers on the paths above (``LEVER_NAMES``): each changes how the path it builds on
-    # runs, or is an install the plan carries; their rules are ``levers.RULES``.
+    # runs, or is an install the plan carries; their rows are ``levers.LEVERS``.
     FastPath(
         "graph_start_qkv_prefetch",
         "layer 0's QKV weight prefetch forked at the start of a decode forward",

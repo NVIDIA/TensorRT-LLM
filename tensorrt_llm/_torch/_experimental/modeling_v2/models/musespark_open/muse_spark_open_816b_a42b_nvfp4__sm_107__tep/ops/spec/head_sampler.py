@@ -496,9 +496,13 @@ class SplitSample(OpWrapper):
             raise ValueError(f"topp_rounds must be in 0..{TOPP_MAX_ROUNDS}")
         if topp_takes(rows, topp_rounds):
             want = topp_scratch_words(rows)
-            for name, t, words in zip(("topp_records", "topp_partials"), (topp_records, topp_partials), want):
+            for name, t, words in zip(
+                ("topp_records", "topp_partials"), (topp_records, topp_partials), want
+            ):
                 if t is None or t.dtype != torch.int32 or t.numel() < words:
-                    raise ValueError(f"{name} must be int32 of at least {words} words (new_topp_scratch)")
+                    raise ValueError(
+                        f"{name} must be int32 of at least {words} words (new_topp_scratch)"
+                    )
 
 
 split_sample = SplitSample()
@@ -772,14 +776,26 @@ def shared_gather_workspace(mapping: Mapping, shard: int) -> HeadGatherWorkspace
 #: Fewest rows the vocabulary-parallel head takes (two K=7 verify blocks); 8-row steps keep
 #: the ``lm_head_inbox`` gather.
 VP_MIN_ROWS = 16
+#: Sampling rows of the vocabulary-parallel head: True continues the fold and the walk in rank
+#: order (each rank's state is the single-rank sampler's, bit for bit); False folds independent
+#: per-rank partials and combines them in rank order (the partial-combine form, which the
+#: feat/pcastonguay/mso_pareto_vr_cons_aria runs used). Greedy rows are the same either way.
+VP_RANK_CHAIN = True
 
 
 def configure(
-    *, vp_min_rows: int = 16, topp_rounds: int = 0, dist_min_rows: int = 0, dist_fabric: bool = False
+    *,
+    vp_min_rows: int = 16,
+    topp_rounds: int = 0,
+    dist_min_rows: int = 0,
+    dist_fabric: bool = False,
+    vp_rank_chain: bool = True,
 ) -> None:
     """Set the vocabulary-parallel head's row floor (``vocab_parallel_head``'s MIN_ROWS), the
     multi-CTA top-p test's rounds (``head_sampler_coop_fold``'s TOPP_ROUNDS, 0: off) and the
-    distributed sampler's row floor (``head_sampler_coop_fold``'s DIST_MIN_ROWS, 0: off).
+    distributed sampler's row floor (``head_sampler_coop_fold``'s DIST_MIN_ROWS, 0: off), and
+    whether the vocabulary-parallel head's sampling rows chain the ranks (``vocab_parallel_head``'s
+    RANK_CHAIN, ``VP_RANK_CHAIN``).
 
     ``lever_settings.apply`` calls it from the model's plan before any install; 8 takes one
     K=7 verify block (for a composition that serves no ``lm_head_inbox``), 16 two. The split
@@ -790,7 +806,7 @@ def configure(
         ValueError: for a floor other than 8 or 16, rounds outside 0..TOPP_MAX_ROUNDS, or a
             distributed floor other than 0 or 8..DIST_MAX_ROWS.
     """
-    global VP_MIN_ROWS, TOPP_ROUNDS, DIST_MIN_ROWS, DIST_FABRIC
+    global VP_MIN_ROWS, TOPP_ROUNDS, DIST_MIN_ROWS, DIST_FABRIC, VP_RANK_CHAIN
     if vp_min_rows not in (8, 16):
         raise ValueError(f"the vocabulary-parallel head's row floor is 8 or 16, got {vp_min_rows}")
     if isinstance(topp_rounds, bool) or not isinstance(topp_rounds, int):
@@ -800,7 +816,9 @@ def configure(
             f"the multi-CTA top-p test's rounds are 0..{TOPP_MAX_ROUNDS}, got {topp_rounds}"
         )
     if isinstance(dist_min_rows, bool) or not isinstance(dist_min_rows, int):
-        raise ValueError(f"the distributed sampler's row floor is an integer, got {dist_min_rows!r}")
+        raise ValueError(
+            f"the distributed sampler's row floor is an integer, got {dist_min_rows!r}"
+        )
     if dist_min_rows != 0 and not DIST_FLOOR <= dist_min_rows <= DIST_MAX_ROWS:
         raise ValueError(
             f"the distributed sampler's row floor is 0 (off) or {DIST_FLOOR}..{DIST_MAX_ROWS}, "
@@ -808,7 +826,12 @@ def configure(
         )
     if not isinstance(dist_fabric, bool):
         raise ValueError(f"the distributed sampler's fabric switch is a bool, got {dist_fabric!r}")
+    if not isinstance(vp_rank_chain, (bool, int)) or vp_rank_chain not in (0, 1):
+        raise ValueError(
+            f"the vocabulary-parallel head's rank chain is a bool, got {vp_rank_chain!r}"
+        )
     VP_MIN_ROWS = vp_min_rows
+    VP_RANK_CHAIN = bool(vp_rank_chain)
     TOPP_ROUNDS = topp_rounds
     DIST_MIN_ROWS = dist_min_rows
     DIST_FABRIC = dist_fabric
@@ -829,9 +852,10 @@ class VocabParallelLayout:
     elements and calls of at most ``max_rows`` rows.
 
     One copy per rank, every 32-bit word the sentinel ``0xFFFFFFFF`` between calls:
-    ``[ranks][state_stride]`` 16-byte states (``vp_fold``'s per-virtual-thread partials), then
-    ``[ranks][greedy_stride]`` 8-byte greedy words at ``greedy_offset``, then
-    ``[ranks][cand_stride]`` 4-byte candidates at ``cand_offset``; ``nbytes`` in all.
+    ``[ranks][state_stride]`` 16-byte states (rank ``r``'s slot: ``vp_fold``'s per-virtual-thread
+    state after the portions of ranks ``0..r``), then ``[ranks][greedy_stride]`` 8-byte greedy
+    words at ``greedy_offset``, then ``[ranks][cand_stride]`` 8-byte walk records (candidate,
+    running sum at the end of the rank's portion) at ``cand_offset``; ``nbytes`` in all.
     """
 
     def __init__(self, ranks: int, shard: int, max_rows: int):
@@ -856,7 +880,7 @@ class VocabParallelLayout:
         self.cand_stride = self.max_rows * VP_CLAIMANTS
         self.greedy_offset = self.ranks * self.state_stride * 16
         self.cand_offset = self.greedy_offset + self.ranks * self.greedy_stride * 8
-        self.nbytes = -(-(self.cand_offset + self.ranks * self.cand_stride * 4) // 16) * 16
+        self.nbytes = -(-(self.cand_offset + self.ranks * self.cand_stride * 8) // 16) * 16
         self.staging_bytes = self.max_rows * self.shard * 2
 
     def strides(self) -> dict:
@@ -900,6 +924,8 @@ class _VocabParallelRank:
             top_ps,
             min_ps,
             self.staging,
+            self.status,
+            self.copy,
             self.publish,
             self.rank,
             lay.ranks,
@@ -907,11 +933,13 @@ class _VocabParallelRank:
             lay.greedy_offset,
             lay.greedy_stride,
             lay.cand_stride,
+            POLL_TIMEOUT_S,
             greedy,
             m,
             inv,
             cap,
             pdl,
+            VP_RANK_CHAIN,
         )
 
     def draw(
@@ -955,6 +983,7 @@ class _VocabParallelRank:
             inv,
             cap,
             pdl,
+            VP_RANK_CHAIN,
         )
 
     def decide(self, tokens, pdl):
@@ -1175,7 +1204,11 @@ class VocabParallelWorkspace:
 
     Protocol: (1) every exchange slot has one writer per call (``vp_fold`` per (rank, row,
     virtual thread) or (rank, row, CTA); ``vp_draw`` per (rank, row, claimant)); every rank
-    reads each slot of its own copy once per call and resets it. (2) At the start of every call
+    resets each slot of its own copy once per call, after it has read it (rank ``r + 1``'s
+    ``vp_fold`` and ``vp_draw`` also read rank ``r``'s states and walk records before that
+    reset). No wait cycle: ``vp_fold`` waits only on the lower ranks' ``vp_fold``, ``vp_draw`` on
+    every rank's ``vp_fold`` and the lower ranks' ``vp_draw``, ``vp_decide`` on every rank's
+    ``vp_draw``. (2) At the start of every call
     every word of every copy is the sentinel: after construction (fill, synchronize, agreement)
     and restored by the call's readers. (3) Reuse across calls: a peer stores into this copy (and
     into its staging rows) again only in a later call, which it reaches after a collective of
@@ -1303,7 +1336,9 @@ class DistLayout:
         self.max_rows = int(max_rows)
         self.ready_offset = 0
         self.states_offset = self.ready_offset + 2 * self.max_rows * self.ranks * DIST_PAIR_BYTES
-        self.cand_offset = self.states_offset + 2 * self.max_rows * VIRTUAL_THREADS * DIST_STATE_BYTES
+        self.cand_offset = (
+            self.states_offset + 2 * self.max_rows * VIRTUAL_THREADS * DIST_STATE_BYTES
+        )
         self.partial_offset = self.cand_offset + 4 * self.max_rows * self.ranks * DIST_SLOT_BYTES
         self.nbytes = self.partial_offset + 4 * self.max_rows * VIRTUAL_THREADS * DIST_PAIR_BYTES
         #: DIST_FABRIC's LL staging holds each 8-byte vector as a 16-byte pair of LL elements.
@@ -1311,7 +1346,9 @@ class DistLayout:
         self.staging_bytes = 2 * self.max_rows * self.shard * 2 * (2 if self.ll_staging else 1)
         #: Dynamic shared memory of one CTA: this rank's vectors of a row as FP32, 1024 / ranks slots per
         #: 1024-vector stripe (rank r's virtual threads are r * 1024 / ranks ..).
-        self.smem_bytes = -(-(self.vocab // 4) // VIRTUAL_THREADS) * (VIRTUAL_THREADS // self.ranks) * 16
+        self.smem_bytes = (
+            -(-(self.vocab // 4) // VIRTUAL_THREADS) * (VIRTUAL_THREADS // self.ranks) * 16
+        )
 
     def offsets(self) -> dict:
         return dict(
@@ -1447,7 +1484,8 @@ class DistEmulation:
         lay = self.layout
         self.device = torch.device(device)
         self.copies = [
-            torch.zeros(lay.nbytes // 4, dtype=torch.int32, device=self.device) for _ in range(ranks)
+            torch.zeros(lay.nbytes // 4, dtype=torch.int32, device=self.device)
+            for _ in range(ranks)
         ]
         self.staging = [
             torch.zeros(lay.staging_bytes // 2, dtype=torch.bfloat16, device=self.device)
@@ -1467,13 +1505,25 @@ class DistEmulation:
         )
 
     def sample(
-        self, locals_, temperatures, top_ks, top_ps, min_ps, seed, offset, multiplier, soft_cap, fabric=False
+        self,
+        locals_,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        seed,
+        offset,
+        multiplier,
+        soft_cap,
+        fabric=False,
     ):
         """Every rank's tokens (``[ranks, rows]`` int32) and pending rows (``[ranks, rows, vocab]``)."""
         rows = locals_[0].shape[0]
         lay = self.layout
         local = torch.cat(list(locals_), dim=0).contiguous()
-        pending = torch.zeros((lay.ranks * rows, lay.vocab), dtype=torch.bfloat16, device=self.device)
+        pending = torch.zeros(
+            (lay.ranks * rows, lay.vocab), dtype=torch.bfloat16, device=self.device
+        )
         tokens = self.view.sample(
             local,
             pending,
@@ -1537,7 +1587,9 @@ class DistWorkspace:
         try:
             multi_node = mapping.is_multi_node()
             self._area = _make_mnnvl_mcast_buffer(self._comm, lay.nbytes, mapping, multi_node)
-            self._staging = _make_mnnvl_mcast_buffer(self._comm, lay.staging_bytes, mapping, multi_node)
+            self._staging = _make_mnnvl_mcast_buffer(
+                self._comm, lay.staging_bytes, mapping, multi_node
+            )
             self.copy = self._area.get_uc_buffer(self.rank, (lay.nbytes // 4,), torch.int32, 0)
             self._mc = self._area.get_mc_buffer((lay.nbytes // 4,), torch.int32, 0)
             self.staging_of = [

@@ -114,15 +114,41 @@ NORM_GATE_TRIGGER = "after_wait"
 _PDL_MAX_ROWS = min(128, _norm_gate.MAX_ROWS)
 
 
-def configure(*, norm_gate_pdl_max_rows: int = 0) -> None:
+#: ``wide_norm_gate_pdl__HEADS_PER_PROGRAM`` / ``__TRIGGER`` (``configure``): on the PDL norm-gate's steps above 8 rows,
+#: (row, head) pairs per program (``ops/attention/norm_gate``'s heads kernel: the same statements per pair) and the
+#: trigger position. 1 / "after_wait": the stock launch.
+_WIDE_HEADS_PER_PROGRAM = 1
+_WIDE_TRIGGER = "after_wait"
+_WIDE_LOGGED = False
+
+
+def configure(
+    *,
+    norm_gate_pdl_max_rows: int = 0,
+    norm_gate_wide_heads_per_program: int = 1,
+    norm_gate_wide_trigger: str = "after_wait",
+) -> None:
     """Set the PDL norm-gate's row bound on decode steps ``batch_dense_gemms`` does not serve.
 
     ``lever_settings.apply`` sets it from the model's plan before any install. The bound is
     ``norm_gate_pdl_max_rows`` clamped to ``ops/attention/norm_gate``'s 8 rows at least and 128 at
     most, so 0 keeps 8.
     """
-    global _PDL_MAX_ROWS
+    global _PDL_MAX_ROWS, _WIDE_HEADS_PER_PROGRAM, _WIDE_TRIGGER, _WIDE_LOGGED
     _PDL_MAX_ROWS = min(128, max(_norm_gate.MAX_ROWS, int(norm_gate_pdl_max_rows or 0)))
+    if norm_gate_wide_trigger not in _norm_gate.TRIGGERS:
+        raise ValueError(
+            f"norm_gate_wide_trigger must be one of {sorted(_norm_gate.TRIGGERS)}, got {norm_gate_wide_trigger!r}"
+        )
+    _WIDE_HEADS_PER_PROGRAM = max(1, int(norm_gate_wide_heads_per_program or 1))
+    _WIDE_TRIGGER = str(norm_gate_wide_trigger)
+    _WIDE_LOGGED = False
+    if _WIDE_HEADS_PER_PROGRAM > 1 or _WIDE_TRIGGER != "after_wait":
+        logger.info(
+            "[musespark_open] boundary_early_release: the PDL norm-gate on steps above "
+            f"{_norm_gate.MAX_ROWS} rows runs {_WIDE_HEADS_PER_PROGRAM} (row, head) pairs per program, trigger "
+            f"{_WIDE_TRIGGER} (wide_norm_gate_pdl HEADS_PER_PROGRAM / TRIGGER)"
+        )
     if _PDL_MAX_ROWS > _norm_gate.MAX_ROWS:
         logger.info(
             "[musespark_open] boundary_early_release: the PDL norm-gate also takes decode steps of "
@@ -171,6 +197,24 @@ class _NormGatePdl:
             batch = getattr(self, "_batch_dense_gemms", None)
             out = None if batch is None else batch.norm_gate(self, attention_output, gate, trigger)
             return super().apply_output_gate(attention_output, gate) if out is None else out
+        rows = attention_output.shape[0]
+        if rows > _norm_gate.MAX_ROWS and (_WIDE_HEADS_PER_PROGRAM > 1 or _WIDE_TRIGGER != trigger):
+            heads = attention_output.shape[1] // self.head_dim
+            per_program = _WIDE_HEADS_PER_PROGRAM if heads % _WIDE_HEADS_PER_PROGRAM == 0 else 1
+            global _WIDE_LOGGED
+            if not _WIDE_LOGGED:
+                _WIDE_LOGGED = True
+                logger.info(
+                    f"[musespark_open] wide norm-gate engaged: {rows} rows x {heads} heads, "
+                    f"{per_program} per program, trigger {_WIDE_TRIGGER}"
+                )
+            return _norm_gate.attention_norm_gate(
+                attention_output,
+                gate,
+                self.o_head_norm.variance_epsilon,
+                _WIDE_TRIGGER,
+                heads_per_program=per_program,
+            )
         return _norm_gate.attention_norm_gate(
             attention_output, gate, self.o_head_norm.variance_epsilon, trigger
         )

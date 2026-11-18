@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """``context_fp8_dense``: the dense projections of large context calls on the Rubin MXFP8 GEMM (sm107).
 
-A lossy lever (``levers.RULES``: on only when its knob sets it): MXFP8, E4M3 values with
+A lossy lever (``levers.LEVERS``: on only when its knob sets it): MXFP8, E4M3 values with
 one UE8M0 scale per 1x32 block of weights and of activations. The plan gives ``install``
 its ``MIN_ROWS`` and ``PROJECTIONS`` parameters.
 

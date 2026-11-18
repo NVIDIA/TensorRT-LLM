@@ -332,7 +332,7 @@ installed by the shell's ``load_weights`` after the built-in loader
 * ``half_window_experts`` (tp 4) stacks the ring predecessor's upper expert half on
   them, which the prologue's routed kernel places onto (and, on calls of 9..32 rows
   that reach the routing method, ``ring_buddy_assign``'s half flow); only up to its
-  lever's ``MAX_BATCH`` (``levers.RULES``).
+  lever's ``MAX_BATCH`` (``levers.LEVERS``).
 * ``bf16_routed_experts`` gives the two BF16 layers' stacked calls unpacked
   routing (on the owner-only window as well).
 * ``hot_replicas`` (tep4, in a plan without ``half_window_experts``: the two
@@ -1006,7 +1006,7 @@ _TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard"})
 #: multi-request router GEMM and projection gathers) by ``ring_buddy_assign``'s half
 #: flow, both balancing the selected experts over the four ranks. As on sm107 the
 #: window costs 45 GiB of KV cache per rank and is carried only up to its lever's
-#: ``MAX_BATCH`` (``levers.RULES``); a plan carrying it leaves ``hot_replicas`` out (the
+#: ``MAX_BATCH`` (``levers.LEVERS``); a plan carrying it leaves ``hot_replicas`` out (the
 #: two levers conflict).
 _SM103_TEP4_PATHS = (
     _TEP4_PATHS
@@ -1066,7 +1066,7 @@ _SM107_TEP4_COMM_PATHS = frozenset(
 #: hold their ring predecessor's upper expert half (``half_window_experts``), so the
 #: routed kernel balances the selected experts of a step of at most 8 rows over the
 #: four ranks; that window costs 45 GiB of KV cache per rank, so a plan carries it
-#: only up to its lever's ``MAX_BATCH`` (``levers.RULES``). The sharded drafter fc
+#: only up to its lever's ``MAX_BATCH`` (``levers.LEVERS``). The sharded drafter fc
 #: of up to 128 rows is gathered over the tray's NVLink (``drafter_fc_inbox``). Decode
 #: steps of two to four
 #: requests (16..32 rows) also take the TP4 sharded MoE prologue and projection gathers
@@ -1123,7 +1123,7 @@ _SM107_TEP4_PATHS |= _SM107_TEP4_COMM_PATHS
 #: the attention block's QKV TGV GEMM on the rows of the R200 table and the PDL
 #: norm-gates of 33..512-row decode steps (``batch_dense_gemms``); and the hot NVFP4
 #: expert copies of 33..512-row decode steps, which conflict with ``half_window_experts``
-#: and stay out of a plan that carries it (``levers.RULES``).
+#: and stay out of a plan that carries it (``levers.LEVERS``).
 _SM107_TEP4_GEMM_EXPERT_PATHS = frozenset({"router_gemm", "batch_dense_gemms", "hot_replicas"})
 _SM107_TEP4_PATHS = _SM107_TEP4_PATHS | _SM107_TEP4_GEMM_EXPERT_PATHS
 #: The sm103 tep4 decode-prep and drafter-at-batch paths sm107 TEP4 serves too, above
@@ -1157,7 +1157,7 @@ _PREFETCH_LEVERS = frozenset({"graph_start_qkv_prefetch"})
 #: The levers both sm107 compositions serve on top of their paths: the executor's step loop
 #: on the execution stream and its incremental block-offset copy, the windowed commit's
 #: parallel form (a windowed arena) and the head sampler's cooperative kernel A. Each
-#: lever's rule (``levers.RULES``) decides where it is on; sm103 serves no lever beyond
+#: lever's rule (``levers.LEVERS``) decides where it is on; sm103 serves no lever beyond
 #: the upstream target's.
 _SM107_LEVERS = frozenset(
     {
@@ -1221,7 +1221,7 @@ _SM107_TEP8_PATHS = _TEP8_PATHS | frozenset(
 )
 #: sm107 TEP4 also samples decode steps of 16..1024 rows from each rank's own vocabulary shard
 #: (``ops/spec/head_sampler.vocab_parallel_sample``), bitwise the built-in split sampler by construction,
-#: up to its lever's ``MAX_BATCH`` 8 on sm107 (``levers.RULES``).
+#: up to its lever's ``MAX_BATCH`` 8 on sm107 (``levers.LEVERS``).
 _SM107_TEP4_PATHS = _SM107_TEP4_PATHS | frozenset({"vocab_parallel_head"})
 
 

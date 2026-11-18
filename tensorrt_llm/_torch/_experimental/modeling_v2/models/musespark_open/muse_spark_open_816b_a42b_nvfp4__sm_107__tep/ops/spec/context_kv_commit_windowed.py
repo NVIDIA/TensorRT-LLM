@@ -50,6 +50,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWr
 
 from .context_kv_commit import MAX_REQUESTS, _columns, _times_zero, tile_pairs
 
+#: Requests one call takes on the parallel commit (``parallel_min_requests``): its zeroing
+#: grid has one program per request, its length launch vectorizes over the requests and the
+#: compaction has one program row per request, so the count is a test bound only. The
+#: one-program commit keeps ``context_kv_commit``'s ``MAX_REQUESTS``.
+PARALLEL_MAX_REQUESTS = 128
+
 #: Columns one compaction tile moves (per program, per loop iteration).
 COMPACT_COLUMNS = 512
 
@@ -294,6 +300,91 @@ def _compact_kernel(
             tl.store(ptr + cols.to(tl.int64)[:, None] * col_stride + elems[None, :], x, mask=mask)
 
 
+def _commit_parallel(
+    k_arena, values, has_v, ctx_len, ctx_base, slots, num_accepted, num_ctx_out,
+    scratch, rows, max_ctx, col_limit, keep, layers, width,
+) -> None:  # fmt: skip
+    """The commit of ``ContextKvCommitWindowed`` as a per-request zeroing launch plus a length launch."""
+    num_gens = slots.numel()
+    _commit_zero_kernel[(num_gens,)](
+        k_arena,
+        values,
+        ctx_len,
+        ctx_base,
+        slots,
+        num_accepted,
+        scratch[0],
+        col_limit,
+        k_arena.stride(0),
+        k_arena.stride(1),
+        k_arena.stride(2),
+        values.stride(0),
+        values.stride(1),
+        values.stride(2),
+        ROWS=rows,
+        LAYERS=layers,
+        WIDTH=width,
+        BLOCK=triton.next_power_of_2(width),
+        PAIRS=tile_pairs(rows, layers, width),
+        HAS_V=has_v,
+        num_warps=4,
+    )
+    _commit_lengths_kernel[(1,)](
+        ctx_len,
+        ctx_base,
+        slots,
+        scratch[0],
+        scratch[1],
+        scratch[2],
+        num_ctx_out,
+        num_gens,
+        ctx_len.numel(),
+        max_ctx,
+        keep,
+        GENS=triton.next_power_of_2(max(num_gens, 2)),
+        SLOTS=triton.next_power_of_2(max(ctx_len.numel(), 2)),
+        num_warps=4,
+    )
+
+
+def _commit_one_program(
+    k_arena, values, has_v, ctx_len, ctx_base, slots, num_accepted, num_ctx_out,
+    scratch, rows, max_ctx, col_limit, keep, layers, width,
+) -> None:  # fmt: skip
+    """The commit of ``ContextKvCommitWindowed`` as one program that loops over the requests."""
+    num_gens = slots.numel()
+    _commit_windowed_kernel[(1,)](
+        k_arena,
+        values,
+        ctx_len,
+        ctx_base,
+        slots,
+        num_accepted,
+        scratch[0],
+        scratch[1],
+        scratch[2],
+        num_ctx_out,
+        num_gens,
+        ctx_len.numel(),
+        max_ctx,
+        col_limit,
+        keep,
+        k_arena.stride(0),
+        k_arena.stride(1),
+        k_arena.stride(2),
+        values.stride(0),
+        values.stride(1),
+        values.stride(2),
+        ROWS=rows,
+        LAYERS=layers,
+        WIDTH=width,
+        BLOCK=triton.next_power_of_2(width),
+        PAIRS=tile_pairs(rows, layers, width),
+        HAS_V=has_v,
+        num_warps=4,
+    )
+
+
 class ContextKvCommitWindowed(OpWrapper):
     """``context_kv_commit`` over a windowed arena: zero the masked rows, advance the lengths, compact.
 
@@ -377,12 +468,12 @@ class ContextKvCommitWindowed(OpWrapper):
         has_v = v_arena is not None
         values = v_arena if has_v else k_arena
         if parallel:
-            self._commit_parallel(
+            _commit_parallel(
                 k_arena, values, has_v, ctx_len, ctx_base, slots, num_accepted, num_ctx_out,
                 scratch, rows, max_ctx, col_limit, keep, layers, width,
             )  # fmt: skip
         else:
-            self._commit_one_program(
+            _commit_one_program(
                 k_arena, values, has_v, ctx_len, ctx_base, slots, num_accepted, num_ctx_out,
                 scratch, rows, max_ctx, col_limit, keep, layers, width,
             )  # fmt: skip
@@ -412,87 +503,6 @@ class ContextKvCommitWindowed(OpWrapper):
             GENS=triton.next_power_of_2(max(num_gens, 2)),
             HAS_V=has_v,
             num_warps=warps,
-        )
-
-    def _commit_parallel(
-        self, k_arena, values, has_v, ctx_len, ctx_base, slots, num_accepted, num_ctx_out,
-        scratch, rows, max_ctx, col_limit, keep, layers, width,
-    ) -> None:  # fmt: skip
-        num_gens = slots.numel()
-        _commit_zero_kernel[(num_gens,)](
-            k_arena,
-            values,
-            ctx_len,
-            ctx_base,
-            slots,
-            num_accepted,
-            scratch[0],
-            col_limit,
-            k_arena.stride(0),
-            k_arena.stride(1),
-            k_arena.stride(2),
-            values.stride(0),
-            values.stride(1),
-            values.stride(2),
-            ROWS=rows,
-            LAYERS=layers,
-            WIDTH=width,
-            BLOCK=triton.next_power_of_2(width),
-            PAIRS=tile_pairs(rows, layers, width),
-            HAS_V=has_v,
-            num_warps=4,
-        )
-        _commit_lengths_kernel[(1,)](
-            ctx_len,
-            ctx_base,
-            slots,
-            scratch[0],
-            scratch[1],
-            scratch[2],
-            num_ctx_out,
-            num_gens,
-            ctx_len.numel(),
-            max_ctx,
-            keep,
-            GENS=triton.next_power_of_2(max(num_gens, 2)),
-            SLOTS=triton.next_power_of_2(max(ctx_len.numel(), 2)),
-            num_warps=4,
-        )
-
-    def _commit_one_program(
-        self, k_arena, values, has_v, ctx_len, ctx_base, slots, num_accepted, num_ctx_out,
-        scratch, rows, max_ctx, col_limit, keep, layers, width,
-    ) -> None:  # fmt: skip
-        num_gens = slots.numel()
-        _commit_windowed_kernel[(1,)](
-            k_arena,
-            values,
-            ctx_len,
-            ctx_base,
-            slots,
-            num_accepted,
-            scratch[0],
-            scratch[1],
-            scratch[2],
-            num_ctx_out,
-            num_gens,
-            ctx_len.numel(),
-            max_ctx,
-            col_limit,
-            keep,
-            k_arena.stride(0),
-            k_arena.stride(1),
-            k_arena.stride(2),
-            values.stride(0),
-            values.stride(1),
-            values.stride(2),
-            ROWS=rows,
-            LAYERS=layers,
-            WIDTH=width,
-            BLOCK=triton.next_power_of_2(width),
-            PAIRS=tile_pairs(rows, layers, width),
-            HAS_V=has_v,
-            num_warps=4,
         )
 
     def reference(
@@ -588,7 +598,11 @@ class ContextKvCommitWindowed(OpWrapper):
             and num_ctx_out.dim() == 1
             and num_ctx_out.numel() == slots.numel()
         ), "num_ctx_out must be int64 [gens]"
-        assert slots.numel() <= MAX_REQUESTS, f"at most {MAX_REQUESTS} requests"
+        parallel = parallel_min_requests is not None and slots.numel() >= parallel_min_requests
+        most = PARALLEL_MAX_REQUESTS if parallel else MAX_REQUESTS
+        assert slots.numel() <= most, (
+            f"at most {most} requests on the {'parallel' if parallel else 'one-program'} commit"
+        )
         assert 1 <= rows <= 64, f"rows must be in [1, 64], got {rows}"
         assert keep >= 0 and keep + rows <= k_arena.shape[2], (
             f"keep {keep} + rows {rows} must fit the arena's {k_arena.shape[2]} columns"

@@ -48,6 +48,15 @@ step of several sequences needs.
 kernel under a register cap per thread (Triton's ``maxnreg``): register
 allocation only, so the same instructions on the same values and the same
 bits, with more programs resident per SM (``SPLIT_REGISTER_CAP``: three).
+
+``split_keys`` (64, 128 or 256; the default is the 32-key block above) cuts the
+window into fewer, longer key tiles that hold cached keys only, and adds one
+program per KV head and row group (the step program, ``split == num_splits``)
+that preps, writes and attends the step's own keys as one 16-row tile. No tile
+then preps a tile-sized key operand, and the combine merges ``num_splits + 1``
+partials instead of 66. The arithmetic per key is the same; the softmax and the
+merge are cut at other points, so the attention output may differ from the
+32-key layout's in the last BF16 place (the KV cache bytes do not).
 """
 
 from __future__ import annotations
@@ -90,6 +99,10 @@ SPLIT_REGISTER_CAP = 168
 #: The register caps ``split_max_registers`` takes.
 MIN_SPLIT_REGISTERS = 128
 MAX_SPLIT_REGISTERS = 255
+#: The key tiles ``split_keys`` takes beyond the 32-key block.
+LONG_SPLIT_KEYS = (64, 128, 256)
+#: Warps of a combine program merging ``num_splits + 1`` long-split partials.
+LONG_SPLIT_COMBINE_WARPS = 1
 
 #: The split kernel takes 144 registers: 3 CTAs of 4 warps per SM.
 _SPLIT_CTAS_PER_SM = 3
@@ -226,6 +239,7 @@ def configure(
     cl8_tep8_max_requests: int = 8,
     cl8_tep8_wide_min_requests: int = 0,
     prep_split: bool = False,
+    cl8_tep8_two_cta_min_requests: int = 0,
     one2: bool = False,
     cl8_exact: bool = False,
 ) -> None:
@@ -265,6 +279,14 @@ def configure(
     """
     global _SWA_CL8, _TEP8_SWA_CL8, _SWA_PREP_SPLIT, _SWA_ONE2, _CL8_EXACT
     global _CL8_TEP8_MIN_REQUESTS, _CL8_TEP8_MAX_REQUESTS, _CL8_TEP8_WIDE_MIN_REQUESTS
+    global _CL8_TEP8_TWO_CTA_MIN_REQUESTS
+    two_cta_min = int(cl8_tep8_two_cta_min_requests)
+    if two_cta_min and not CL8_TEP8_MIN_REQUESTS_FLOOR <= two_cta_min <= CL8_TEP8_REQUESTS_LIMIT:
+        raise ValueError(
+            f"swa_block: cl8_tep8_two_cta_min_requests is 0 or {CL8_TEP8_MIN_REQUESTS_FLOOR}.."
+            f"{CL8_TEP8_REQUESTS_LIMIT}, got {cl8_tep8_two_cta_min_requests}"
+        )
+    _CL8_TEP8_TWO_CTA_MIN_REQUESTS = two_cta_min
     wide_min = int(cl8_tep8_wide_min_requests)
     if wide_min and not CL8_TEP8_MIN_REQUESTS_FLOOR <= wide_min <= CL8_TEP8_REQUESTS_LIMIT:
         raise ValueError(
@@ -314,8 +336,18 @@ def configure(
             "[musespark_open] swa_block CL8 gate: cl8_tep8 "
             f"({_CL8_TEP8_MIN_REQUESTS}-{_CL8_TEP8_MAX_REQUESTS} requests per TEP8 decode step "
             "run the one-cluster SWA block)"
-            + ("" if _SWA_ONE2 else "; inactive: it extends one2 (swa_eight_requests), which is off")
+            + (
+                ""
+                if _SWA_ONE2
+                else "; inactive: it extends one2 (swa_eight_requests), which is off"
+            )
         )
+        if _CL8_TEP8_TWO_CTA_MIN_REQUESTS:
+            _cl8_log(
+                "[musespark_open] swa_block CL8 gate: cl8_tep8_two_cta_min_requests "
+                f"{_CL8_TEP8_TWO_CTA_MIN_REQUESTS}: TEP8 steps of {_CL8_TEP8_TWO_CTA_MIN_REQUESTS}+ requests run the "
+                "two-CTA-per-SM build of swa_cl8 (the same bits; 46 co-resident clusters)"
+            )
         if _CL8_TEP8_WIDE_MIN_REQUESTS:
             _cl8_log(
                 "[musespark_open] swa_block CL8 gate: cl8_tep8_wide_min_requests "
@@ -325,6 +357,14 @@ def configure(
 
 
 _CL8_SMEM = 180 * 1024
+#: ``cl8_tep8_two_cta_min_requests`` (``configure``; the ``swa_one_cluster_block`` lever's TEP8_TWO_CTA_MIN_REQUESTS): TEP8 CL8
+#: steps of that many requests or more launch the ``swa_cl8`` source compiled for TWO CTAs per SM
+#: (``__launch_bounds__(NT, 2)``: registers capped at 102, 96 allocated + a 56 B spill) with a ``_CL8_TWO_CTA_SMEM`` request
+#: (the kernel's layout ends at 99,712 B). The same source and statements, so the same bits; what changes is residency:
+#: 46 eight-CTA clusters co-reside instead of 22, so 12..16-request steps (24..32 clusters) run in one wave instead of two
+#: (1 GPU, no PDL: 11.7-11.8 vs 14.2-14.4 us; 0.7 us slower than the one-CTA build at 2..11 requests). 0 (the default): off.
+_CL8_TEP8_TWO_CTA_MIN_REQUESTS = 0
+_CL8_TWO_CTA_SMEM = 100 * 1024
 _CL8_SRC = r"""
 typedef unsigned short u16; typedef unsigned int u32; typedef unsigned char u8;
 typedef unsigned long long u64;
@@ -1510,6 +1550,11 @@ def cl8_tep8_wide_takes(reqs: int) -> bool:
     return bool(_CL8_TEP8_WIDE_MIN_REQUESTS) and reqs >= _CL8_TEP8_WIDE_MIN_REQUESTS
 
 
+def cl8_tep8_two_cta_takes(reqs: int) -> bool:
+    """Whether a TEP8 CL8 step of ``reqs`` requests launches the two-CTA-per-SM build of ``swa_cl8``."""
+    return bool(_CL8_TEP8_TWO_CTA_MIN_REQUESTS) and reqs >= _CL8_TEP8_TWO_CTA_MIN_REQUESTS
+
+
 _CL8_FN = {}
 _CL8_WARNED = set()
 #: ``cl8_exact`` (``configure``): every CL8 build is ``-DCL8_EXACT`` (keyed apart).
@@ -1537,7 +1582,9 @@ def _cl8_check(r):
     return r[1] if len(r) == 2 else r[1:]
 
 
-def _cl8_function(device: torch.device, pos64: bool, hkv: int, wide: bool = False):
+def _cl8_function(
+    device: torch.device, pos64: bool, hkv: int, wide: bool = False, two_cta: bool = False
+):
     """The compiled CL8 kernel of ``device`` (int64 or int32 position ids: two compile-time builds; ``hkv`` KV heads
     per rank: 4 at tep4, 2 at tep8); ``None`` if it is not compiled yet and a capture is running. ``wide``: the
     one-cluster-per-request kernel ``swa_cl8w`` (TEP8 only). Every eager call for the TEP8 build under
@@ -1547,10 +1594,20 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int, wide: bool = Fals
     key = (
         (index, bool(pos64), int(hkv))
         + (("w",) if wide else ())
+        + (("2cta",) if two_cta else ())
         + (("exact", CL8_EXACT_EX2, CL8_EXACT_DIV) if _CL8_EXACT else ())
     )
     fn = _CL8_FN.get(key)
     if fn is not None:
+        if (
+            int(hkv) == 2
+            and not wide
+            and not two_cta
+            and _CL8_TEP8_TWO_CTA_MIN_REQUESTS
+            and key[:3] + ("2cta",) + key[3:] not in _CL8_FN
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            _cl8_function(device, pos64, hkv, two_cta=True)
         if (
             int(hkv) == 2
             and not wide
@@ -1589,7 +1646,13 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int, wide: bool = Fals
         )
     prog = _cl8_check(
         nvrtc.nvrtcCreateProgram(
-            (_CL8W_SRC if wide else _CL8_SRC).encode(),
+            (
+                _CL8W_SRC
+                if wide
+                else _CL8_SRC.replace("__launch_bounds__(NT, 1)", "__launch_bounds__(NT, 2)")
+                if two_cta
+                else _CL8_SRC
+            ).encode(),
             b"swa_cl8w.cu" if wide else b"swa_cl8.cu",
             0,
             [],
@@ -1627,7 +1690,7 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int, wide: bool = Fals
             cu.cuFuncSetAttribute(
                 f,
                 cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                _CL8_SMEM,
+                _CL8_TWO_CTA_SMEM if two_cta else _CL8_SMEM,
             )
         )
     regs = int(
@@ -1648,13 +1711,17 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int, wide: bool = Fals
         if wide:
             head += " swa_cl8w (one cluster per request)"
             heads += "both per cluster, "
+        if two_cta:
+            head += " two CTAs per SM"
     _cl8_log(
         f"{head} compiled for sm_107 on device {index} (regs {regs}, local "
-        f"{lmem} B, smem {_CL8_SMEM // 1024} KB, cluster 8, 320 threads, {heads}"
+        f"{lmem} B, smem {(_CL8_TWO_CTA_SMEM if two_cta else _CL8_SMEM) // 1024} KB, cluster 8, 320 threads, {heads}"
         f"{'int64' if pos64 else 'int32'} positions)"
     )
-    if int(hkv) == 2 and not wide and _CL8_TEP8_WIDE_MIN_REQUESTS:
+    if int(hkv) == 2 and not wide and not two_cta and _CL8_TEP8_WIDE_MIN_REQUESTS:
         _cl8_function(device, pos64, hkv, wide=True)
+    if int(hkv) == 2 and not wide and not two_cta and _CL8_TEP8_TWO_CTA_MIN_REQUESTS:
+        _cl8_function(device, pos64, hkv, two_cta=True)
     return _CL8_FN[key]
 
 
@@ -1713,6 +1780,7 @@ def _cl8_launch(
     enable_pdl,
     rope,
     wide: bool = False,
+    two_cta: bool = False,
 ):
     """Launch a CL8 build: grid 8 x ``hkv`` x requests (``swa_cl8``), or 8 x 1 x requests for
     ``wide`` (``swa_cl8w``: one cluster per request over its KV heads); the same arguments."""
@@ -1732,7 +1800,7 @@ def _cl8_launch(
     cfg = cu.CUlaunchConfig()
     cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = 8, (1 if wide else hkv), reqs
     cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 320, 1, 1
-    cfg.sharedMemBytes = _CL8_SMEM
+    cfg.sharedMemBytes = _CL8_TWO_CTA_SMEM if two_cta else _CL8_SMEM
     cfg.hStream = cu.CUstream(torch.cuda.current_stream(qkv.device).cuda_stream)
     a1 = cu.CUlaunchAttribute()
     a1.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
@@ -1907,12 +1975,17 @@ def _swa_split_kernel(
     APPLY_ROPE: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     REQS: tl.constexpr = 1,
+    STEP_PROGRAM: tl.constexpr = False,
 ):
     G: tl.constexpr = HQ // HKV
     PAGE: tl.constexpr = HKV * P * D
+    # The step program's key rows: the step's keys (at most 8) as one MMA-wide tile.
+    STEP_ROWS: tl.constexpr = 16
     split = tl.program_id(0)
     h = tl.program_id(1)
     row_group = tl.program_id(2)
+    # Partials per row: one per key tile, and with STEP_PROGRAM the step program's.
+    num_parts = num_splits + (1 if STEP_PROGRAM else 0)
     if REQS > 1:
         # Several sequences of M rows each, request-major in the operand: program
         # (split, h, req * RG + row_group) is the one-sequence program of request
@@ -1925,8 +1998,8 @@ def _swa_split_kernel(
         seq_len_ptr += req
         if APPLY_ROPE:
             positions_ptr += req * M
-        part_o_ptr += req * num_splits * HKV * M * G * D
-        part_ml_ptr += req * num_splits * HKV * M * G * 2
+        part_o_ptr += req * num_parts * HKV * M * G * D
+        part_ml_ptr += req * num_parts * HKV * M * G * 2
     d = tl.arange(0, D)
 
     # Column offsets of this program's heads in the operand: the prep output
@@ -1944,7 +2017,8 @@ def _swa_split_kernel(
     # ---- Before the wait: graph inputs and cache bytes no grid in flight writes.
     # seq_lens, the block table and the positions are written before the graph;
     # the cached keys (j < past) were written by earlier steps; this step's own
-    # keys (j >= past) are written by this grid's (0, h, 0) program only.
+    # keys (j >= past) are written by this grid's (0, h, 0) program only (with
+    # STEP_PROGRAM, by its (num_splits, h, 0) program).
     L = tl.load(seq_len_ptr)
     past = L - M
     if WINDOW > 0:
@@ -1980,10 +2054,19 @@ def _swa_split_kernel(
         other=0.0,
     )
 
-    writer = (split == 0) & (row_group == 0)
-    tok = tl.arange(0, 8)
-    tok_ok = tok < M
-    write_ok = tok_ok & writer
+    if STEP_PROGRAM:
+        # The tiles hold cached keys only; the step program (split == num_splits, an
+        # empty tile) preps, writes and attends the step's own keys after the tiles'.
+        tok = tl.arange(0, STEP_ROWS)
+        tok_ok = (tok < M) & (split == num_splits)
+        write_ok = tok_ok & (row_group == 0)
+        rope_ok = tok_ok
+    else:
+        writer = (split == 0) & (row_group == 0)
+        tok = tl.arange(0, 8)
+        tok_ok = tok < M
+        write_ok = tok_ok & writer
+        rope_ok = write_ok
     pos = past + tok
     w_page_k = tl.load(bt_ptr + pos // P, mask=write_ok, other=0).to(tl.int64)
     w_page_v = tl.load(bt_ptr + bt_stride_kv + pos // P, mask=write_ok, other=0).to(tl.int64)
@@ -1996,7 +2079,7 @@ def _swa_split_kernel(
     if FUSED_PREP:
         cos_q, sin_q = _rope_rows(cos_sin_ptr, positions_ptr, t, row_ok, APPLY_ROPE)
         cos_k, sin_k = _rope_rows(cos_sin_ptr, positions_ptr, new_row, new, APPLY_ROPE)
-        cos_w, sin_w = _rope_rows(cos_sin_ptr, positions_ptr, tok, write_ok, APPLY_ROPE)
+        cos_w, sin_w = _rope_rows(cos_sin_ptr, positions_ptr, tok, rope_ok, APPLY_ROPE)
 
     if LAUNCH_WITH_PDL:
         # From here on the operand: the previous kernel's output. The combine
@@ -2004,42 +2087,43 @@ def _swa_split_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    if writer:
-        # The step's K/V into the paged cache: what applyBiasRopeUpdateKVCacheV2 stores.
-        if FUSED_PREP:
-            k_new = _prep_rows(
-                qkv_ptr,
-                tok * qkv_stride,
-                tl.zeros([8], tl.int32) + k_col,
-                tok_ok,
-                cos_w,
-                sin_w,
-                1.0,
-                prep_eps,
-                8,
-                APPLY_ROPE,
-            )
-        else:
-            k_new = tl.load(
-                qkv_ptr + tok[:, None] * qkv_stride + k_col + d[None, :],
+    if not STEP_PROGRAM:
+        if writer:
+            # The step's K/V into the paged cache: what applyBiasRopeUpdateKVCacheV2 stores.
+            if FUSED_PREP:
+                k_new = _prep_rows(
+                    qkv_ptr,
+                    tok * qkv_stride,
+                    tl.zeros([8], tl.int32) + k_col,
+                    tok_ok,
+                    cos_w,
+                    sin_w,
+                    1.0,
+                    prep_eps,
+                    8,
+                    APPLY_ROPE,
+                )
+            else:
+                k_new = tl.load(
+                    qkv_ptr + tok[:, None] * qkv_stride + k_col + d[None, :],
+                    mask=tok_ok[:, None],
+                    other=0.0,
+                )
+            v_new = tl.load(
+                qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :],
                 mask=tok_ok[:, None],
                 other=0.0,
             )
-        v_new = tl.load(
-            qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :],
-            mask=tok_ok[:, None],
-            other=0.0,
-        )
-        tl.store(
-            pool_ptr + (w_page_k * PAGE + slot)[:, None] + d[None, :],
-            _to_cache_fp8(k_new, scale_bf16),
-            mask=tok_ok[:, None],
-        )
-        tl.store(
-            pool_ptr + (w_page_v * PAGE + slot)[:, None] + d[None, :],
-            _to_cache_fp8(v_new, scale_bf16),
-            mask=tok_ok[:, None],
-        )
+            tl.store(
+                pool_ptr + (w_page_k * PAGE + slot)[:, None] + d[None, :],
+                _to_cache_fp8(k_new, scale_bf16),
+                mask=tok_ok[:, None],
+            )
+            tl.store(
+                pool_ptr + (w_page_v * PAGE + slot)[:, None] + d[None, :],
+                _to_cache_fp8(v_new, scale_bf16),
+                mask=tok_ok[:, None],
+            )
 
     q_head = h * G + r % G
     if FUSED_PREP:
@@ -2073,36 +2157,42 @@ def _swa_split_kernel(
     # Whether this program's key block holds any of the step's own keys.
     has_new = base + b0 * BLOCK + BLOCK > past
     for b in range(b0, b1):  # at most once: one key block per program
-        if FUSED_PREP:
-            k_new = tl.zeros([BLOCK, D], tl.bfloat16)
-            if has_new:
-                k_new = _prep_rows(
-                    qkv_ptr,
-                    new_row * qkv_stride,
-                    tl.zeros([BLOCK], tl.int32) + k_col,
-                    new,
-                    cos_k,
-                    sin_k,
-                    1.0,
-                    prep_eps,
-                    BLOCK,
-                    APPLY_ROPE,
-                )
+        if STEP_PROGRAM:
+            k = k_old
+            v = v_old
         else:
-            k_new = tl.load(
-                qkv_ptr + new_row[:, None] * qkv_stride + k_col + d[None, :],
+            if FUSED_PREP:
+                k_new = tl.zeros([BLOCK, D], tl.bfloat16)
+                if has_new:
+                    k_new = _prep_rows(
+                        qkv_ptr,
+                        new_row * qkv_stride,
+                        tl.zeros([BLOCK], tl.int32) + k_col,
+                        new,
+                        cos_k,
+                        sin_k,
+                        1.0,
+                        prep_eps,
+                        BLOCK,
+                        APPLY_ROPE,
+                    )
+            else:
+                k_new = tl.load(
+                    qkv_ptr + new_row[:, None] * qkv_stride + k_col + d[None, :],
+                    mask=new[:, None],
+                    other=0.0,
+                )
+            v_new = tl.load(
+                qkv_ptr + new_row[:, None] * qkv_stride + v_col + d[None, :],
                 mask=new[:, None],
                 other=0.0,
             )
-        v_new = tl.load(
-            qkv_ptr + new_row[:, None] * qkv_stride + v_col + d[None, :],
-            mask=new[:, None],
-            other=0.0,
-        )
-        k = tl.where(new[:, None], _to_cache_fp8(k_new, scale_bf16), k_old)
-        v = tl.where(new[:, None], _to_cache_fp8(v_new, scale_bf16), v_old)
+            k = tl.where(new[:, None], _to_cache_fp8(k_new, scale_bf16), k_old)
+            v = tl.where(new[:, None], _to_cache_fp8(v_new, scale_bf16), v_old)
         s = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * qk_scale
         keep = (j[None, :] <= q_pos[:, None]) & (j[None, :] >= lo)
+        if STEP_PROGRAM:
+            keep = keep & (j[None, :] < past)
         if WINDOW > 0:
             keep = keep & (j[None, :] > q_pos[:, None] - WINDOW)
         s = tl.where(keep, s, -float("inf"))
@@ -2112,6 +2202,55 @@ def _swa_split_kernel(
         l_i = l_i * alpha + tl.sum(p, 1)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v.to(tl.bfloat16))
         m_i = m_new
+    if STEP_PROGRAM:
+        if split == num_splits:
+            # The step's keys, converted as the cache write converts them: row group 0
+            # stores them, every row group attends them (key past + i for row t when i <= t).
+            if FUSED_PREP:
+                k_step = _prep_rows(
+                    qkv_ptr,
+                    tok * qkv_stride,
+                    tl.zeros([STEP_ROWS], tl.int32) + k_col,
+                    tok_ok,
+                    cos_w,
+                    sin_w,
+                    1.0,
+                    prep_eps,
+                    STEP_ROWS,
+                    APPLY_ROPE,
+                )
+            else:
+                k_step = tl.load(
+                    qkv_ptr + tok[:, None] * qkv_stride + k_col + d[None, :],
+                    mask=tok_ok[:, None],
+                    other=0.0,
+                )
+            v_step = tl.load(
+                qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :],
+                mask=tok_ok[:, None],
+                other=0.0,
+            )
+            k_step = _to_cache_fp8(k_step, scale_bf16)
+            v_step = _to_cache_fp8(v_step, scale_bf16)
+            tl.store(
+                pool_ptr + (w_page_k * PAGE + slot)[:, None] + d[None, :],
+                k_step,
+                mask=write_ok[:, None],
+            )
+            tl.store(
+                pool_ptr + (w_page_v * PAGE + slot)[:, None] + d[None, :],
+                v_step,
+                mask=write_ok[:, None],
+            )
+            s = tl.dot(q, tl.trans(k_step.to(tl.bfloat16))) * qk_scale
+            keep = (pos[None, :] <= q_pos[:, None]) & tok_ok[None, :]
+            s = tl.where(keep, s, -float("inf"))
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            alpha = tl.math.exp2(m_i - m_new)
+            p = tl.math.exp2(s - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v_step.to(tl.bfloat16))
+            m_i = m_new
     # An empty split (b0 >= b1) stores l = 0, which the combine weighs as zero.
     part = (split * HKV + h) * (M * G) + r
     tl.store(part_o_ptr + part[:, None] * D + d[None, :], acc * dequant, mask=row_ok[:, None])
@@ -3025,9 +3164,27 @@ def _one2_counters(device: torch.device) -> Optional[torch.Tensor]:
     return buf
 
 
-def max_blocks(window: int, rows: int) -> int:
-    """The most 32-key blocks a ``window``-key step of ``rows`` rows can attend."""
-    return triton.cdiv(window + rows - 2, BLOCK_N) + 1
+def max_blocks(window: int, rows: int, keys: int = BLOCK_N) -> int:
+    """The most ``keys``-key tiles a ``window``-key step of ``rows`` rows can attend."""
+    return triton.cdiv(window + rows - 2, keys) + 1
+
+
+def long_splits(window: int, keys: int) -> int:
+    """The key tiles ``split_keys=keys`` cuts a ``window``-key layer into, for any step."""
+    return max_blocks(window, MAX_ROWS, keys)
+
+
+def _check_split_keys(split_keys: int, blocks_per_program: int = 1) -> None:
+    if split_keys != BLOCK_N and split_keys not in LONG_SPLIT_KEYS:
+        raise ValueError(
+            f"swa_block split_keys must be {BLOCK_N} or one of {LONG_SPLIT_KEYS}, got {split_keys}"
+        )
+    if split_keys != BLOCK_N and blocks_per_program > 1:
+        # The multi-block programs own consecutive 32-key blocks; the long splits are one tile each.
+        raise ValueError(
+            f"swa_block split_keys {split_keys} runs one tile per program; got "
+            f"blocks_per_program {blocks_per_program}"
+        )
 
 
 def gate_head_stride(gate: torch.Tensor) -> int:
@@ -3067,6 +3224,10 @@ class SwaBlockAttention(OpWrapper):
     docstring); 1 is the one-block kernel, every value computes the same bits.
     ``split_max_registers`` (``None`` or, with 2..4 blocks, a register cap per thread):
     the split kernel's compile register cap, the same bits.
+    ``split_keys`` (``LONG_SPLIT_KEYS``): ``num_splits`` tiles of that many cached
+    keys (at least ``max_blocks(window, rows, split_keys)``, ``long_splits`` for any
+    step) plus the step program, and a combine of ``num_splits + 1`` partials. The
+    cache bytes are the same; the output is the same attention cut at other points.
     """
 
     ARCHS = frozenset({Arch.SM_107})
@@ -3126,8 +3287,10 @@ class SwaBlockAttention(OpWrapper):
         enable_pdl: bool = False,
         blocks_per_program: int = 1,
         split_max_registers: Optional[int] = None,
+        split_keys: int = BLOCK_N,
     ) -> torch.Tensor:
         check_blocks_per_program(blocks_per_program, split_max_registers)
+        _check_split_keys(split_keys, blocks_per_program)
         rows = qkv.shape[0]
         page = kv_pool.shape[2] if kv_pool.dim() == 4 else 0
         width = (2 if fused_prep else 1) * (num_q_heads + num_kv_heads) * HEAD_DIM
@@ -3152,7 +3315,7 @@ class SwaBlockAttention(OpWrapper):
             or seq_lens.dtype != torch.int32
             or kv_scale_orig_quant.dtype != torch.float32
             or window <= 0
-            or num_splits < max_blocks(window, rows)
+            or num_splits < max_blocks(window, rows, split_keys)
         ):
             raise ValueError(
                 "swa_block takes BF16 qkv [1..8, "
@@ -3163,7 +3326,7 @@ class SwaBlockAttention(OpWrapper):
                 f"G={num_kv_heads}, pool {kv_pool.dtype} {tuple(kv_pool.shape)}, table "
                 f"{block_tables.dtype} {tuple(block_tables.shape)}, seq_lens {seq_lens.dtype}, scale "
                 f"{kv_scale_orig_quant.dtype}, window {window}, splits {num_splits} (need "
-                f"{max_blocks(window, rows) if window > 0 else 'a window'})"
+                f"{max_blocks(window, rows, split_keys) if window > 0 else 'a window'})"
             )
         rope = fused_prep and cos_sin is not None
         positions = None
@@ -3232,13 +3395,15 @@ class SwaBlockAttention(OpWrapper):
                 )
         out = torch.empty((rows, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
         group_rows = rows * Q_PER_KV
+        long = split_keys != BLOCK_N
+        num_parts = num_splits + 1 if long else num_splits
         part_o = torch.empty(
-            (num_splits * num_kv_heads * group_rows, HEAD_DIM),
+            (num_parts * num_kv_heads * group_rows, HEAD_DIM),
             dtype=torch.float32,
             device=qkv.device,
         )
         part_ml = torch.empty(
-            (num_splits * num_kv_heads * group_rows, 2), dtype=torch.float32, device=qkv.device
+            (num_parts * num_kv_heads * group_rows, 2), dtype=torch.float32, device=qkv.device
         )
         if blocks_per_program > 1:
             launch_split_bpp(
@@ -3250,9 +3415,7 @@ class SwaBlockAttention(OpWrapper):
                 blocks_per_program=blocks_per_program, max_registers=split_max_registers,
             )  # fmt: skip
         else:
-            _swa_split_kernel[
-                (num_splits, num_kv_heads, triton.cdiv(group_rows, ROWS_PER_PROGRAM))
-            ](
+            _swa_split_kernel[(num_parts, num_kv_heads, triton.cdiv(group_rows, ROWS_PER_PROGRAM))](
                 qkv,
                 qkv.stride(0),
                 kv_pool,
@@ -3274,13 +3437,14 @@ class SwaBlockAttention(OpWrapper):
                 D=HEAD_DIM,
                 P=page,
                 WINDOW=window,
-                BLOCK=BLOCK_N,
+                BLOCK=split_keys,
                 R=ROWS_PER_PROGRAM,
                 Q_FP8=q_fp8,
                 FUSED_PREP=fused_prep,
                 QKV_PERMUTED=qkv_permuted,
                 APPLY_ROPE=rope,
                 LAUNCH_WITH_PDL=enable_pdl,
+                STEP_PROGRAM=long,
                 num_warps=NUM_WARPS,
                 num_stages=NUM_STAGES,
                 launch_pdl=enable_pdl,
@@ -3294,15 +3458,15 @@ class SwaBlockAttention(OpWrapper):
             0 if gate is None else gate.stride(0),
             0 if gate is None else gate_head_stride(gate),
             gate_eps,
-            num_splits,
+            num_parts,
             M=rows,
             HQ=num_q_heads,
             HKV=num_kv_heads,
             D=HEAD_DIM,
-            BLOCK_S=triton.next_power_of_2(num_splits),
+            BLOCK_S=triton.next_power_of_2(num_parts),
             FUSED_GATE=gate is not None,
             LAUNCH_WITH_PDL=enable_pdl,
-            num_warps=4,
+            num_warps=LONG_SPLIT_COMBINE_WARPS if long else 4,
             launch_pdl=enable_pdl,
         )
         return out
@@ -3330,13 +3494,15 @@ class SwaBlockAttention(OpWrapper):
         enable_pdl: bool = False,
         blocks_per_program: int = 1,
         split_max_registers: Optional[int] = None,
+        split_keys: int = BLOCK_N,
     ) -> torch.Tensor:
         """The three references in sequence: ``preattn_prep``'s (with ``fused_prep``), then
         ``paged_decode_attention``'s (which writes the step's rows into ``kv_pool``), then the
         norm-gate in float64 between its BF16 rounding points (with ``gate``).
 
-        ``num_splits``, ``enable_pdl``, ``blocks_per_program`` and ``split_max_registers`` change
-        how the op is cut and launched, not what it computes, and are ignored here.
+        ``num_splits``, ``enable_pdl``, ``blocks_per_program``, ``split_max_registers``
+        and ``split_keys`` change how the op is cut and launched, not what it computes,
+        and are ignored here.
         """
         if fused_prep:
             rope = cos_sin is not None
@@ -3395,6 +3561,7 @@ class SwaBlockAttention(OpWrapper):
         enable_pdl: bool = False,
         blocks_per_program: int = 1,
         split_max_registers: Optional[int] = None,
+        split_keys: int = BLOCK_N,
     ) -> None:
         """What the kernels take and answer wrongly with no error: those of
         ``paged_decode_attention`` (a context shorter than the step, a block table too short, page
@@ -3444,8 +3611,8 @@ class SwaBlockMultiAttention(OpWrapper):
     on its sequence's rows, length, page ids, positions and partials (the kernels' ``REQS``
     axis; ``REQS = 1`` is the one-sequence build, unchanged).
 
-    Fusion boundary, PDL and pre-wait loads: as ``swa_block_attention``; ``blocks_per_program``
-    and ``split_max_registers`` as there.
+    Fusion boundary, PDL and pre-wait loads: as ``swa_block_attention``; ``blocks_per_program``,
+    ``split_max_registers`` and ``split_keys`` as there.
     """
 
     ARCHS = frozenset({Arch.SM_107})
@@ -3494,8 +3661,10 @@ class SwaBlockMultiAttention(OpWrapper):
         enable_pdl: bool = False,
         blocks_per_program: int = 1,
         split_max_registers: Optional[int] = None,
+        split_keys: int = BLOCK_N,
     ) -> torch.Tensor:
         check_blocks_per_program(blocks_per_program, split_max_registers)
+        _check_split_keys(split_keys, blocks_per_program)
         total = qkv.shape[0]
         reqs = seq_lens.numel()
         rows = total // reqs if reqs else 0
@@ -3507,9 +3676,7 @@ class SwaBlockMultiAttention(OpWrapper):
             # ONE2 lifts the cap to 8 at TEP8 (2 KV heads), and CL8's TEP8 build to its
             # _CL8_TEP8_MAX_REQUESTS, as kernels/swa_block/attention.py's caller does; 4 KV heads
             # keep 2..4.
-            not 2
-            <= reqs
-            <= (cl8_tep8_requests() if num_kv_heads == 2 else MULTI_MAX_REQUESTS)
+            not 2 <= reqs <= (cl8_tep8_requests() if num_kv_heads == 2 else MULTI_MAX_REQUESTS)
             or rows * reqs != total
             or not 1 <= rows <= MAX_ROWS
             or qkv.dtype != torch.bfloat16
@@ -3531,7 +3698,7 @@ class SwaBlockMultiAttention(OpWrapper):
             or not seq_lens.is_contiguous()
             or kv_scale_orig_quant.dtype != torch.float32
             or window <= 0
-            or num_splits < max_blocks(window, rows)
+            or num_splits < max_blocks(window, rows, split_keys)
         ):
             raise ValueError(
                 f"swa_block_multi takes 2..{MULTI_MAX_REQUESTS} sequences of 1..{MAX_ROWS} rows "
@@ -3641,9 +3808,21 @@ class SwaBlockMultiAttention(OpWrapper):
                 wide_fn = _cl8_function(qkv.device, pos64, num_kv_heads, wide=True)
                 if wide_fn is not None:
                     fn, wide = wide_fn, True
+            two_cta = False
+            if fn is not None and not wide and cl8_tep8_two_cta_takes(reqs):
+                # The two-CTA-per-SM build of swa_cl8 (the same bits); swa_cl8 when a capture finds it not compiled.
+                two_fn = _cl8_function(qkv.device, pos64, num_kv_heads, two_cta=True)
+                if two_fn is not None:
+                    fn, two_cta = two_fn, True
             if fn is not None:
-                if (reqs, wide) not in _CL8_TEP8_LOGGED:
-                    _CL8_TEP8_LOGGED.add((reqs, wide))
+                if (reqs, wide, two_cta) not in _CL8_TEP8_LOGGED:
+                    _CL8_TEP8_LOGGED.add((reqs, wide, two_cta))
+                    if two_cta:
+                        _cl8_log(
+                            f"[musespark_open] swa_block CL8 (TEP8): decode steps of {reqs} requests run the "
+                            "two-CTA-per-SM swa_cl8 build (cl8_tep8_two_cta_min_requests "
+                            f"{_CL8_TEP8_TWO_CTA_MIN_REQUESTS})"
+                        )
                     _cl8_log(
                         f"[musespark_open] swa_block CL8 (TEP8): decode steps of {reqs} requests "
                         f"run the one-cluster SWA block (grid 8 x {1 if wide else num_kv_heads} x {reqs}, band "
@@ -3676,6 +3855,7 @@ class SwaBlockMultiAttention(OpWrapper):
                     enable_pdl,
                     rope,
                     wide,
+                    two_cta,
                 )
         if reqs > _ONE2_MAX_REQUESTS:
             # 9..16 sequences are CL8's alone (cl8_tep8_max_requests): the split / ONE2 builds
@@ -3687,6 +3867,8 @@ class SwaBlockMultiAttention(OpWrapper):
             )
         out = torch.empty((total, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
         group_rows = rows * Q_PER_KV
+        long = split_keys != BLOCK_N
+        num_parts = num_splits + 1 if long else num_splits
         sms = None
         if _SWA_PREP_SPLIT or _SWA_ONE2:
             index = (
@@ -3697,9 +3879,10 @@ class SwaBlockMultiAttention(OpWrapper):
                 sms = _SM_COUNT[index] = torch.cuda.get_device_properties(
                     index
                 ).multi_processor_count
-        # The stock 32-row split grid; prep_split applies only where it takes more than one wave.
+        # The split grid (with split_keys, the long tiles and the step program); prep_split
+        # applies only where it takes more than one wave.
         multi_wave = sms is not None and (
-            num_splits * num_kv_heads * reqs * triton.cdiv(group_rows, ROWS_PER_PROGRAM)
+            num_parts * num_kv_heads * reqs * triton.cdiv(group_rows, ROWS_PER_PROGRAM)
             > _SPLIT_CTAS_PER_SM * sms
         )
         if (
@@ -3797,14 +3980,15 @@ class SwaBlockMultiAttention(OpWrapper):
                 gate=None if gate is None else prep_gate,
                 gate_eps=gate_eps,
                 enable_pdl=enable_pdl,
+                split_keys=split_keys,
             )
         part_o = torch.empty(
-            (reqs * num_splits * num_kv_heads * group_rows, HEAD_DIM),
+            (reqs * num_parts * num_kv_heads * group_rows, HEAD_DIM),
             dtype=torch.float32,
             device=qkv.device,
         )
         part_ml = torch.empty(
-            (reqs * num_splits * num_kv_heads * group_rows, 2),
+            (reqs * num_parts * num_kv_heads * group_rows, 2),
             dtype=torch.float32,
             device=qkv.device,
         )
@@ -3819,7 +4003,7 @@ class SwaBlockMultiAttention(OpWrapper):
             )  # fmt: skip
         else:
             _swa_split_kernel[
-                (num_splits, num_kv_heads, reqs * triton.cdiv(group_rows, ROWS_PER_PROGRAM))
+                (num_parts, num_kv_heads, reqs * triton.cdiv(group_rows, ROWS_PER_PROGRAM))
             ](
                 qkv,
                 qkv.stride(0),
@@ -3842,7 +4026,7 @@ class SwaBlockMultiAttention(OpWrapper):
                 D=HEAD_DIM,
                 P=page,
                 WINDOW=window,
-                BLOCK=BLOCK_N,
+                BLOCK=split_keys,
                 R=ROWS_PER_PROGRAM,
                 Q_FP8=q_fp8,
                 FUSED_PREP=fused_prep,
@@ -3850,6 +4034,7 @@ class SwaBlockMultiAttention(OpWrapper):
                 APPLY_ROPE=rope,
                 LAUNCH_WITH_PDL=enable_pdl,
                 REQS=reqs,
+                STEP_PROGRAM=long,
                 num_warps=NUM_WARPS,
                 num_stages=NUM_STAGES,
                 launch_pdl=enable_pdl,
@@ -3863,16 +4048,16 @@ class SwaBlockMultiAttention(OpWrapper):
             0 if gate is None else gate.stride(0),
             0 if gate is None else gate_head_stride(gate),
             gate_eps,
-            num_splits,
+            num_parts,
             M=rows,
             HQ=num_q_heads,
             HKV=num_kv_heads,
             D=HEAD_DIM,
-            BLOCK_S=triton.next_power_of_2(num_splits),
+            BLOCK_S=triton.next_power_of_2(num_parts),
             FUSED_GATE=gate is not None,
             LAUNCH_WITH_PDL=enable_pdl,
             REQS=reqs,
-            num_warps=4,
+            num_warps=LONG_SPLIT_COMBINE_WARPS if long else 4,
             launch_pdl=enable_pdl,
         )
         return out
@@ -3900,6 +4085,7 @@ class SwaBlockMultiAttention(OpWrapper):
         enable_pdl: bool = False,
         blocks_per_program: int = 1,
         split_max_registers: Optional[int] = None,
+        split_keys: int = BLOCK_N,
     ) -> torch.Tensor:
         """``swa_block_attention.reference`` of each sequence alone, rows concatenated."""
         reqs = seq_lens.numel()
@@ -3955,6 +4141,7 @@ class SwaBlockMultiAttention(OpWrapper):
         enable_pdl: bool = False,
         blocks_per_program: int = 1,
         split_max_registers: Optional[int] = None,
+        split_keys: int = BLOCK_N,
     ) -> None:
         """``swa_block_attention.is_valid`` of each sequence, and no page written by two of them."""
         reqs = seq_lens.numel()

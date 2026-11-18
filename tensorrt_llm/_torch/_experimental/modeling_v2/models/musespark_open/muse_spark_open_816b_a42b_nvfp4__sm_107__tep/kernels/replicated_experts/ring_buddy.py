@@ -139,6 +139,10 @@ STATIC_FROM = 28
 #: tables (``prerouted_experts.available``) and every call is the stock call.
 _TEP8_PREROUTED = False
 _PREROUTED_TILE = 8
+#: s316 measurement only: ``MUSESPARK_OPEN_S316_ROUTE_REC=<path>`` records the decode routing (``route_recorder``).
+_ROUTE_REC = bool(__import__("os").environ.get("MUSESPARK_OPEN_S316_ROUTE_REC"))
+#: s316 X1 (measurement knob, default 0 = off): own-block experts whose FC1 weights are L2-prefetched after the push.
+_X1_EXPERTS = int(__import__("os").environ.get("MUSESPARK_OPEN_S316_EXPERT_L2", "0") or 0)
 #: The TP8 prerouted calls' rows: 9..``configure(tep8_prerouted_max_rows=...)`` (the
 #: ``prerouted_experts`` lever's TEP8_MAX_ROWS, 64 by default). Above 64 rows (9..16 requests at
 #: K = 7; with ``tep8_ring_buddy_wide``'s MAX_ROWS raised so those steps run on the two-window stack)
@@ -149,16 +153,53 @@ _PREROUTED_TILE = 8
 #: ``MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS=128``) passed its device gate and accuracy pair.
 _TEP8_PREROUTED_ROWS = range(9, 65)
 #: The prerouted tables' largest row count (sizes the op's index scratch).
-TEP8_PREROUTED_MAX_ROWS = 128
+TEP8_PREROUTED_MAX_ROWS = 256
+#: (w256: was 128) 129..256 rows (17..32 requests) take 32-token tables (``_prerouted_tile``).
 #: The ``tep8_ring_buddy_wide`` lever (``configure(tep8_max_rows=64)``): the most decode rows the
 #: balanced tep8 stack serves (``_State.max_rows``); None keeps ``MAX_ROWS``.
 _TEP8_MAX_ROWS: Optional[int] = None
 
 
+#: s316 X1 (``MUSESPARK_OPEN_S316_EXPERT_L2`` = experts, default off): the side stream and the pending fork per device.
+_X1_STREAMS: Dict = {}
+_X1_PENDING: Dict = {}
+
+
+def _x1_fork(selected: torch.Tensor, rank: int, stacks) -> None:
+    """Prefetch the first selected own-block experts' FC1 weights on a side stream forked after the router push;
+    joined after the expert call (``_x1_join``), so nothing on the step's chain waits for it before FC2."""
+    from ...ops.moe import expert_l2_prefetch as _x1
+
+    dev = selected.device
+    _x1_join(dev)
+    side = _X1_STREAMS.get(dev)
+    if side is None:
+        side = torch.cuda.Stream(device=dev)
+        _X1_STREAMS[dev] = side
+    main = torch.cuda.current_stream(dev)
+    fork = torch.cuda.Event()
+    fork.record(main)
+    side.wait_event(fork)
+    with torch.cuda.stream(side):
+        _x1.prefetch(selected, rank, stacks["w3_w1_weight"], stacks["w3_w1_weight_scale"])
+        done = torch.cuda.Event()
+        done.record(side)
+    _X1_PENDING[dev] = done
+
+
+def _x1_join(device) -> None:
+    done = _X1_PENDING.pop(device, None)
+    if done is not None:
+        torch.cuda.current_stream(device).wait_event(done)
+
+
 def _prerouted_tile(rows: int) -> int:
     """The token tile of the prerouted tables of a ``rows``-row two-window call: 8 up to 64 rows,
-    16 above (the stock call's fallback tile on the 64-expert window at 65..128 rows)."""
-    return _PREROUTED_TILE if rows <= 64 else 2 * _PREROUTED_TILE
+    16 at 65..128, 32 at 129..256 (the stock call's fallback tile on the 64-expert window there:
+    nextPowerOfTwo(rows * top_k / 64))."""
+    if rows <= 64:
+        return _PREROUTED_TILE
+    return 2 * _PREROUTED_TILE if rows <= 128 else 4 * _PREROUTED_TILE
 
 
 def _stock_tactic(
@@ -349,7 +390,7 @@ def _tep8_prerouted_call(
     if dummy is None:
         dummy = torch.zeros(TEP8_PREROUTED_MAX_ROWS * TOP_K, dtype=torch.int32, device=device)
         _prerouted_state[("tep8_indexes", device)] = dummy
-    return ext.moe(
+    outputs = ext.moe(
         x.fp4_tensor,
         x_sf,
         stacks["w3_w1_weight"],
@@ -378,6 +419,8 @@ def _tep8_prerouted_call(
         act_type,
         False,
     )
+    _x1_join(device)
+    return outputs
 
 
 #: Per-expert tensors the expert call reads, per expert format, in the order
@@ -658,6 +701,17 @@ def _patch_routing(moe, state: _State) -> None:
     def apply(self, router_logits, input_ids=None):
         selected, weights = builtin_apply(router_logits, input_ids)
         if (
+            _ROUTE_REC
+            and state.kind == "nvfp4"
+            and selected.dtype == torch.int32
+            and selected.is_contiguous()
+        ):
+            # s316 measurement only (MUSESPARK_OPEN_S316_ROUTE_REC): record the call's top-8 ids on rank 0
+            from . import route_recorder as _rec
+
+            if _rec.enabled(state.rank):
+                _rec.record(selected)
+        if (
             state.active
             and state.current(router_logits) is None
             and router_logits.is_cuda
@@ -669,6 +723,15 @@ def _patch_routing(moe, state: _State) -> None:
             and not torch.compiler.is_compiling()
         ):
             meta = None
+            if (
+                _X1_EXPERTS > 0
+                and _TEP8_PREROUTED
+                and state.kind == "nvfp4"
+                and not state.half
+                and state.block == 32
+                and router_logits.shape[0] in _TEP8_PREROUTED_ROWS
+            ):
+                _x1_fork(selected, state.rank, state.stacks)
             if (
                 _TEP8_PREROUTED
                 and state.kind == "nvfp4"
@@ -1117,7 +1180,8 @@ def configure(
             the routing tables of the 9..``tep8_prerouted_max_rows``-row two-window calls,
             which run the prerouted expert op (``_TEP8_PREROUTED``).
         tep8_prerouted_max_rows: the last row count of those calls (the lever's TEP8_MAX_ROWS):
-            64..``TEP8_PREROUTED_MAX_ROWS``; above 64 rows their tables have 16-token tiles.
+            64..``TEP8_PREROUTED_MAX_ROWS``; above 64 rows their tables have 16-token tiles, above
+            128 rows 32-token tiles (``_prerouted_tile``).
         bf16_half_window: the ``bf16_half_window`` lever: the BF16 layers get the half
             window too (``_BF16_HALF_WINDOW``).
         tep8_max_rows: the ``tep8_ring_buddy_wide`` lever: the most decode rows the balanced
@@ -1137,7 +1201,7 @@ def configure(
     if tep8_max_rows is not None and not 0 < int(tep8_max_rows) <= TEP8_PREROUTED_MAX_ROWS:
         raise ValueError(
             f"ring_buddy: tep8_max_rows {tep8_max_rows} is outside 1..{TEP8_PREROUTED_MAX_ROWS} "
-            "(ring_buddy_assign's one program covers 128 rows)"
+            f"(ring_buddy_assign's one program covers {TEP8_PREROUTED_MAX_ROWS} rows)"
         )
     _PREROUTED = bool(tep4_prerouted)
     _TEP8_PREROUTED = bool(tep8_prerouted)
@@ -1390,8 +1454,12 @@ def install(
     )
     if _TEP8_PREROUTED and ranks == 8 and windows >= 2 and balance and _prerouted.available():
         wide_tiles = (
-            f", {2 * _PREROUTED_TILE}-token tiles at 65..{_TEP8_PREROUTED_ROWS[-1]} rows"
+            f", {2 * _PREROUTED_TILE}-token tiles at 65..{min(128, _TEP8_PREROUTED_ROWS[-1])} rows"
             if _TEP8_PREROUTED_ROWS[-1] > 64
+            else ""
+        ) + (
+            f", {4 * _PREROUTED_TILE}-token tiles at 129..{_TEP8_PREROUTED_ROWS[-1]} rows"
+            if _TEP8_PREROUTED_ROWS[-1] > 128
             else ""
         )
         logger.info(

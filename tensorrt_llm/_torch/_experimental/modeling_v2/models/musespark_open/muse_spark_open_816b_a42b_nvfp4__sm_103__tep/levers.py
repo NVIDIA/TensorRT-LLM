@@ -12,9 +12,9 @@ arena), the structural rules ``dispatch`` derives from it, and the environment s
 
 Knobs. These are the only variables the target reads for levers::
 
-    MUSESPARK_OPEN_LEVER_<LEVER>=auto|on|off          one per lever; unset or empty: the default
-    MUSESPARK_OPEN_LEVER_<LEVER>__<PARAM>=<value>      a parameter the lever declares (Rule.params)
-    MUSESPARK_OPEN_LEVER__DEFAULT=auto|baseline        what an unset lever knob means
+    MUSESPARK_OPEN_LEVER_<LEVER>=auto|on|off          one per lever; unset, empty or auto: its default
+    MUSESPARK_OPEN_LEVER_<LEVER>__<PARAM>=<value>      a parameter the lever declares (Lever.params)
+    MUSESPARK_OPEN_LEVER__DEFAULT=on|off               off: every lever off but the upstream ones' stock rule
     MUSESPARK_OPEN_LEVER__ROLE=auto|agg|ctx|gen        the server's role; unset or auto: derived
 
 ``<LEVER>`` is the lever's name upper-cased; ``__`` introduces a parameter or a resolver
@@ -26,18 +26,28 @@ composition, so a knob such as ``MUSESPARK_OPEN_LEVER_EARLY_EXPERT_IDS=on`` at T
 facts and never set or retired here: ``TRTLLM_KV_DEFER_CLOSE`` (on iff exactly ``1``, the KV
 cache manager's own test) and ``UCX_RNDV_THRESH`` (set or not).
 
+The table. ``LEVERS`` is the one list of this target's levers: each row is a ``Lever`` with its
+``kind`` (what it changes, ``Kind``) and ``on_by_default``, the condition under which it is on
+when no knob speaks for it. Every other deployment runs it only when its knob says ``on``
+(opt-in). The conditions are written from a few combinators: ``ALWAYS`` (wherever it can run),
+``NEVER`` (opt-in only), ``gated(...)`` (a lossless-numeric lever's own accuracy gates,
+``Lever.gates``, must hold), ``at_measured_points(...)`` (the measured tep8 gen points decide,
+``measured_point``), and the target's deployment rules (``_tep8_only``, ``_tep8_decode``,
+``_at_most``, ...). A parameter whose default a measured point fixes says so in its own
+declaration (``measured_default``).
+
 Semantics, in the order a lever is resolved:
 
 * structural: a fact the lever's code needs (an arena kind, an architecture, a fact
-  variable; ``dispatch.structural_rules``) excludes it; nothing overrides that;
+  variable; ``dispatch.structural_rules``, ``Lever.excluded``) excludes it; nothing overrides
+  that;
 * dependency: a lever it builds on (``dispatch.FastPath.depends_on``) or requires
-  (``Rule.requires``) is off;
+  (``Lever.requires``) is off;
 * knob: ``off`` removes it, and with it every lever built on it or requiring it; ``on``
-  keeps it whatever its deployment rule and gates say;
-* default: ``auto`` runs the lever's deployment rule (``Rule.auto``), and a lossless-numeric
-  lever also needs one of its accuracy gates (``Rule.gates``); ``baseline`` turns every
-  lever off that is not the upstream target's, and gives the upstream ones their upstream
-  rule (``Rule.baseline``).
+  keeps it whatever its default says, and turns on the levers it builds on or requires;
+* ``__DEFAULT=off``: a lever with a ``stock`` rule (the upstream sm103 compositions' own
+  levers) runs that rule; every other lever is off;
+* default: its row's ``on_by_default``.
 
 ``on`` for a lever the composition does not serve, that a structural rule excludes, whose
 dependency or requirement is off, or that conflicts with another lever that is on, raises.
@@ -66,7 +76,8 @@ ROWS_PER_REQUEST = DRAFT_LEN + 1
 PREFIX = "MUSESPARK_OPEN_LEVER_"
 #: Separates a lever name from a parameter key.
 SEP = "__"
-#: What an unset lever knob means: ``auto`` (the default) or ``baseline``.
+#: What an unset lever knob means: ``on`` (each row's default, the default) or ``off`` (only the
+#: upstream levers' stock rules).
 DEFAULT_KNOB = PREFIX + "_DEFAULT"
 #: The server's role: ``auto`` (derived, the default), ``agg``, ``ctx`` or ``gen``.
 ROLE_KNOB = PREFIX + "_ROLE"
@@ -77,12 +88,11 @@ UCX_RNDV_THRESH_ENV = "UCX_RNDV_THRESH"
 AUTO = "auto"
 ON = "on"
 OFF = "off"
-BASELINE = "baseline"
 LEVER_VALUES = (AUTO, ON, OFF)
-DEFAULT_VALUES = (AUTO, BASELINE)
+DEFAULT_VALUES = (ON, OFF)
 
 #: The decision sources, in the order a lever is resolved.
-SOURCES = ("structural", "dependency", "knob", "baseline", "auto", "gate")
+SOURCES = ("structural", "dependency", "knob", "stock", "default")
 
 #: Retired switches and what replaced them. Setting one, to any value, raises.
 #:
@@ -165,17 +175,18 @@ def retired_replacement(name: str) -> Optional[str]:
 
 
 class Kind(str, enum.Enum):
-    """What a lever changes, which fixes what evidence ``auto`` needs (module docstring)."""
+    """What a lever changes, which fixes what evidence its default needs (module docstring)."""
 
-    #: A fast path validated with its composition: ``auto`` serves it where the rule says.
+    #: A fast path validated with its composition: on by default where its row says.
     COMPOSITION = "composition"
     #: Writes the bytes of the path it replaces.
     BITWISE = "lossless-bitwise"
-    #: Same precision, another rounding or summation order: ``auto`` also needs a gate.
+    #: Same precision, another rounding or summation order: its default also needs a gate
+    #: (``gated``).
     NUMERIC = "lossless-numeric"
-    #: Lower precision: never on under ``auto``.
+    #: Lower precision.
     LOSSY = "lossy"
-    #: Lossless, with an open safety check: never on under ``auto``.
+    #: Lossless, with an open safety check.
     FLAGGED = "flagged"
 
 
@@ -273,7 +284,7 @@ class Param:
     inclusive integer ranges in ``low..high`` (``"lo-hi,lo-hi,n"``, as sorted
     ``(lo, hi)`` pairs). A lossy lever's range is a subset of
     the values its accuracy gate covered. ``default_for``, when set, gives the default
-    per deployment; the knob still wins over it.
+    per deployment (None there: the declared ``default``); the knob still wins over it.
     """
 
     key: str
@@ -285,7 +296,10 @@ class Param:
     ranges: bool = False
 
     def default_of(self, deployment: "Deployment") -> object:
-        return self.default if self.default_for is None else self.default_for(deployment)
+        if self.default_for is None:
+            return self.default
+        value = self.default_for(deployment)
+        return self.default if value is None else value
 
     def parse(self, raw: str) -> object:
         """The value ``raw`` gives this parameter.
@@ -351,23 +365,21 @@ RuleFn = Callable[["Deployment", "Resolving", Mapping[str, object]], Tuple[bool,
 
 
 @dataclasses.dataclass(frozen=True)
-class Rule:
-    """How one lever resolves when its rule is not the default (served, on).
+class Lever:
+    """One row of the lever table: what the lever is and when it is on by default.
 
-    ``origin`` is ``upstream`` for the upstream target's own paths and their upstream
-    behaviour, else the serving region the lever targets (``HC`` high concurrency,
-    ``midc`` mid concurrency, ``LL`` low latency): under ``__DEFAULT=baseline`` a
-    non-upstream lever is off unless its knob is set, and an upstream one runs
-    ``baseline`` (or ``auto`` when it has none). ``after`` names the decisions ``auto`` /
-    ``baseline`` read; ``requires`` levers that must be on;
-    ``conflicts`` levers that may not be on with it; ``excluded`` a structural reason it
-    cannot be on, from the decisions so far.
+    ``on_by_default`` decides it for a deployment no knob speaks for; anywhere else it runs only
+    when its knob says ``on`` (opt-in). ``stock`` is the upstream target's own rule for a lever
+    the upstream sm103 compositions also serve: what ``__DEFAULT=off`` keeps (None: off there).
+    ``gates`` are the accuracy gates a lossless-numeric lever's ``gated(...)`` default needs, and
+    the scope a knob ``on`` outside them is warned about. ``after`` names the decisions its
+    conditions read; ``requires`` levers that must be on; ``conflicts`` levers that may not be on
+    with it; ``excluded`` a structural reason it cannot be on, from the decisions so far.
     """
 
-    origin: str
     kind: Kind
-    auto: RuleFn
-    baseline: Optional[RuleFn] = None
+    on_by_default: RuleFn
+    stock: Optional[RuleFn] = None
     params: Tuple[Param, ...] = ()
     gates: Tuple[Gate, ...] = ()
     after: Tuple[str, ...] = ()
@@ -394,18 +406,21 @@ class Decision:
 
 
 class Resolving:
-    """The decisions made so far, as a rule reads them (``Rule.after``)."""
+    """The decisions made so far, as a lever's conditions read them (``Lever.after``)."""
 
     def __init__(self, served: FrozenSet[str], decisions: Mapping[str, Decision]) -> None:
         self._served = served
         self._decisions = decisions
+        #: The lever being decided and its parameters (``resolve`` sets it): ``gated`` reads
+        #: its row's gates through it.
+        self.pending: Optional[Tuple[str, Mapping[str, object]]] = None
 
     def on(self, name: str) -> bool:
         """Whether ``name`` resolved on; False for a lever the composition does not serve.
 
         Raises:
             RuntimeError: for a served lever not decided yet (a rule that reads it must
-                name it in ``Rule.after``).
+                name it in ``Lever.after``).
         """
         if name not in self._served:
             return False
@@ -419,7 +434,7 @@ class Resolving:
         decision = self._decisions.get(name)
         if decision is not None and key in decision.params:
             return decision.params[key]
-        return RULES[name].param(key).default
+        return LEVERS[name].param(key).default
 
 
 # --------------------------------------------------------------------------
@@ -452,7 +467,7 @@ def _always(why: str) -> RuleFn:
 
 
 def _knob_only(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-    """Off under ``auto``: on only by its knob, until this target gates it."""
+    """Off by default: on only by its knob, until this target gates it."""
     return False, "flagged: on only by its knob, until it is gated on this target"
 
 
@@ -488,7 +503,7 @@ def _tep4_only(what: str) -> RuleFn:
     """On at TP4, where the composition carries the path; off at any other size by its knob only.
 
     The two paths that read it (``wide_drafter_hops``, ``finalize_two_shot``) are the sm103 TP4
-    composition's own, served there under ``auto`` as before; the wider composition serves them
+    composition's own, on by default there as before; the wider composition serves them
     too, but leaves them to their knob.
     """
 
@@ -498,36 +513,6 @@ def _tep4_only(what: str) -> RuleFn:
         return False, f"tep{d.tp}: on only by its knob (the tep4 composition's path)"
 
     return rule
-
-
-def _ported_tep8(kind: Kind, what: str, params: Tuple[Param, ...] = ()) -> Rule:
-    """A ported switch that is ON by default at TP8 -- the parallelism it was written for."""
-    return Rule("LL", kind, _tep8_only(what), params=params)
-
-
-def _ported_served(kind: Kind, why: str, params: Tuple[Param, ...] = ()) -> Rule:
-    """A ported switch this target serves by default wherever the composition carries it.
-
-    These gate a path that is only *served* where the deployment actually has it: the resolver
-    turns a lever off with source ``dependency`` when the path it builds on is off
-    (``dispatch.FastPath.depends_on``), whatever this rule says. So "on" here means "on where
-    the configuration needs it" and nothing wider -- there is no size or role test to write,
-    because the composition has already made it.
-
-    The origin stays ``LL`` rather than ``upstream``, so ``MUSESPARK_OPEN_LEVER__DEFAULT=baseline``
-    still returns the deployment to the pre-port paths with one knob.
-    """
-    return Rule("LL", kind, _always(why), params=params)
-
-
-def _ported(kind: Kind, params: Tuple[Param, ...] = ()) -> Rule:
-    """A switch of the sm103 decode stack, ported from an environment variable: default off.
-
-    Every one of them gates a decode step of at most a few hundred rows, so the serving region
-    is ``LL``; it is off under ``auto`` and ``baseline`` (``_knob_only``, and a non-upstream
-    origin), so a deployment that sets no knob runs exactly the paths it ran before.
-    """
-    return Rule("LL", kind, _knob_only, params=params)
 
 
 def _tep8_decode(what: str) -> RuleFn:
@@ -567,20 +552,6 @@ def _served_untwinned() -> Gate:
     return Gate(holds, "sm103 tep8 decode: served by operator decision, no acceptance twin yet")
 
 
-def _ported_on(
-    kind: Kind,
-    what: str,
-    params: Tuple[Param, ...] = (),
-    gates: Tuple[Gate, ...] = (),
-) -> Rule:
-    """A ported switch this target now serves by default on a tep8 decode server.
-
-    ``baseline`` still turns it off (the origin is not ``upstream``), so a deployment can ask
-    for the pre-port paths with one knob.
-    """
-    return Rule("LL", kind, _tep8_decode(what), params=params, gates=gates)
-
-
 def _hot_replicas(requires_decode: bool) -> RuleFn:
     def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
         if requires_decode and not d.decodes():
@@ -594,17 +565,6 @@ def _hot_replicas(requires_decode: bool) -> RuleFn:
 
 LL_MAX_BATCH = 8
 
-
-#: The TP4 paths, some of which TEP8 serves too (``modeling._SM103_TEP8_MULTI_REQUEST_PATHS``):
-#: on wherever served under ``auto``. ``wide_drafter_hops`` was one until the wider composition
-#: began to serve it too; it has its own rule now (``_tep4_only``).
-TEP4_PATHS = (
-    "multi_request_prep_append",
-    "multi_request_split_kv",
-    "multi_request_post_attention_hop",
-    "router_gemm",
-    "projection_publish",
-)
 
 # --------------------------------------------------------------------------
 # The parameter defaults of the ported switches
@@ -653,20 +613,12 @@ WIDE_BALANCE_ROW_CEILING = 512
 
 
 def _never(why_off: str) -> RuleFn:
-    """Served but opt-in: off under ``auto`` unless its knob is ``on``."""
+    """Served but opt-in: off by default unless its knob is ``on``."""
 
     def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
         return False, why_off
 
     return rule
-
-
-def _tep4_path_rule() -> Rule:
-    return Rule(
-        "upstream",
-        Kind.COMPOSITION,
-        _always("its rows, wherever served"),
-    )
 
 
 def _vocab_parallel_head(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
@@ -678,12 +630,15 @@ def _vocab_parallel_head(d: Deployment, t: Resolving, p: Mapping[str, object]) -
 #
 # The AgentX GB300 points pin their levers by hand, one environment variable per lever, in the
 # decode role's env of ``agentx/musespark/gb300/nbommi_repro_musespark_gb300/pareto0N.yaml``
-# (ftp/disaggregated-serving-benchmarking MR !177). The tables below are those files, so a
+# (ftp/disaggregated-serving-benchmarking MR !177). The rows of ``LEVERS`` carry those files: a
+# lever the recipes pin, on or off, names the points that run it on in its condition
+# (``at_measured_points``) and the values they set in its parameters (``measured_default``), so a
 # deployment that *is* one of the measured points resolves to the point's own choice with no
-# knob set, which is the whole purpose: a recipe should not have to carry the measurement.
+# knob set, which is the whole purpose: a recipe should not have to carry the measurement. A lever
+# the recipes never pinned has neither, since the measured points ran it on its default too.
 #
 # They cover only the five gen ``max_batch_size`` values those points run. A tep8 gen server of
-# any other size keeps every lever's own rule, by the operator's decision (2026-11-10) not to
+# any other size keeps every lever's own condition, by the operator's decision (2026-11-10) not to
 # carry a measured set to a size it was not measured at. That is deliberately not monotone: an
 # 8-request server still runs the wider ported stack while the 24-request point runs the two
 # levers pareto04 measured, because nothing was measured in between.
@@ -694,114 +649,8 @@ MEASURED_POINT: Mapping[int, str] = types.MappingProxyType(
     {1: "pareto01", 3: "pareto02", 4: "pareto03", 24: "pareto04", 31: "pareto05"}
 )
 
-#: Every lever those recipes pin, on or off. A lever outside this set keeps its own rule at every
-#: size: the recipes never pinned it, so the measured points ran it on ``auto`` too and
-#: reproducing them means leaving it alone.
-MEASURED_PINNED: FrozenSet[str] = frozenset(
-    {
-        "drafter_conv_epilogue",
-        "drafter_finish_norm",
-        "drafter_fused_prep",
-        "drafter_multi_request_cells",
-        "drafter_silu_epilogue",
-        "finalize_entry_trigger",
-        "finalize_two_shot",
-        "multi_request_combine_gate",
-        "router_staged_gemm",
-        "swa_block_single_early_loads",
-        "tep8_attn_block_splitk",
-        "tep8_batch_splitk",
-        "tep8_experts_early_start",
-        "tep8_experts_interleaved_fetch",
-        "tep8_fc_shard_wide",
-        "tep8_finalize_transport_wide",
-        "tep8_persistent_batch_experts",
-        "tep8_ring_buddy_wide",
-        "tep8_router_shard",
-        "tep8_router_shard_early",
-        "tep8_router_shard_wide",
-        "tep8_wide_balance",
-        "tep8_wide_direct_pool",
-        "wide_drafter_hops",
-    }
-)
 
-#: The levers each measured point pins ON. Every other name in ``MEASURED_PINNED`` is pinned off
-#: at that size. ``tep8_batch_splitk`` and ``tep8_router_shard_wide`` are on at no point.
-_B3_ON = frozenset(
-    {
-        "drafter_fused_prep",
-        "finalize_entry_trigger",
-        "finalize_two_shot",
-        "multi_request_combine_gate",
-        "tep8_experts_early_start",
-        "tep8_experts_interleaved_fetch",
-        "tep8_fc_shard_wide",
-        "tep8_finalize_transport_wide",
-        "tep8_persistent_batch_experts",
-        "tep8_ring_buddy_wide",
-        "tep8_router_shard",
-        "tep8_router_shard_early",
-        "tep8_wide_direct_pool",
-        "wide_drafter_hops",
-    }
-)
-MEASURED_ON: Mapping[int, FrozenSet[str]] = types.MappingProxyType(
-    {
-        1: frozenset(
-            {"drafter_fused_prep", "finalize_entry_trigger", "swa_block_single_early_loads"}
-        ),
-        3: _B3_ON,
-        # pareto03 is pareto02's set plus the drafter block epilogues and the attention split-K.
-        4: _B3_ON
-        | {
-            "drafter_conv_epilogue",
-            "drafter_finish_norm",
-            "drafter_multi_request_cells",
-            "drafter_silu_epilogue",
-            "tep8_attn_block_splitk",
-        },
-        24: frozenset({"router_staged_gemm", "tep8_wide_balance"}),
-        31: frozenset({"router_staged_gemm", "tep8_ring_buddy_wide", "tep8_wide_balance"}),
-    }
-)
-
-#: pareto02's and pareto03's parameters, which are the same.
-_B34_PARAMS: Mapping[str, Mapping[str, object]] = types.MappingProxyType(
-    {
-        "drafter_fused_prep": {"MIN_REQUESTS": 1},
-        "finalize_two_shot": {"TP8_MAX_ROWS": 128},
-        "tep8_fc_shard_wide": {"MAX_ROWS": 40},
-        "tep8_finalize_transport_wide": {"MAX_TOKENS": 40},
-        "tep8_persistent_batch_experts": {"MAX_ROWS": 32},
-        "tep8_ring_buddy_wide": {"MAX_ROWS": 64},
-        "wide_drafter_hops": {"TP8_MAX_ROWS": 24},
-    }
-)
-
-#: Every parameter those recipes set, by size and lever -- including the ones that match the
-#: lever's own default today, so that a later change to a default cannot silently move a measured
-#: point. A lever on at a size with no entry here keeps its declared default.
-MEASURED_PARAMS: Mapping[int, Mapping[str, Mapping[str, object]]] = types.MappingProxyType(
-    {
-        1: {"drafter_fused_prep": {"MIN_REQUESTS": 1}},
-        # pareto03 sets the same parameters as pareto02; only its on-set is wider.
-        3: _B34_PARAMS,
-        4: _B34_PARAMS,
-        24: {
-            "router_staged_gemm": {"BUILD": (ROUTER_STAGED_BUILD,)},
-            "tep8_wide_balance": {"MAX_ROWS": 256},
-        },
-        31: {
-            "router_staged_gemm": {"BUILD": (ROUTER_STAGED_BUILD,)},
-            "tep8_ring_buddy_wide": {"MAX_ROWS": 128},
-            "tep8_wide_balance": {"MAX_ROWS": 256},
-        },
-    }
-)
-
-
-def _measured_point(d: "Deployment") -> Optional[int]:
+def measured_point(d: "Deployment") -> Optional[int]:
     """The measured tep8 gen point ``d`` is, or None for every other deployment.
 
     Only an sm103 tep8 server whose role resolved to ``gen``: those recipes are disaggregated
@@ -811,68 +660,84 @@ def _measured_point(d: "Deployment") -> Optional[int]:
     """
     if d.sm != 103 or d.tp != 8 or d.role is not Role.GEN:
         return None
-    return d.max_batch_size if d.max_batch_size in MEASURED_ON else None
+    return d.max_batch_size if d.max_batch_size in MEASURED_POINT else None
 
 
-def _measured(name: str, fallback: RuleFn) -> RuleFn:
-    """``fallback``, except at a measured point, where the recipe decides."""
+def _measured_sizes(sizes: Iterable[int]) -> FrozenSet[int]:
+    sizes = frozenset(sizes)
+    unknown = sorted(sizes - set(MEASURED_POINT))
+    if unknown:
+        raise ValueError(f"no measured tep8 gen point has max_batch_size {unknown}")
+    return sizes
+
+
+# --------------------------------------------------------------------------
+# The combinators the table's conditions are written in
+# --------------------------------------------------------------------------
+#: On wherever the lever can run (no structural, dependency or conflict rule excludes it).
+ALWAYS = _always("on by default wherever it can run")
+#: Opt-in: on only by its knob.
+NEVER = _never("opt-in: on only by its knob")
+
+
+def gated(rule: RuleFn) -> RuleFn:
+    """``rule``, and one of the lever's own accuracy gates (``Lever.gates``) holds."""
+
+    def wrapped(d: Deployment, t: "Resolving", p: Mapping[str, object]) -> Tuple[bool, str]:
+        on, why = rule(d, t, p)
+        if not on:
+            return on, why
+        gates = LEVERS[t.pending[0]].gates
+        held = [gate for gate in gates if gate.holds(d)]
+        if not held:
+            scopes = "; ".join(gate.scope for gate in gates)
+            return False, f"{why}, but no accuracy gate holds ({scopes})"
+        return True, f"{why}; gate: {held[0].scope}"
+
+    return wrapped
+
+
+def at_measured_points(on: Iterable[int], elsewhere: RuleFn) -> RuleFn:
+    """At a measured tep8 gen point (``measured_point``) the recipe decides: on iff its
+    ``max_batch_size`` is one of ``on`` (off at every other measured point, ``on=()`` included);
+    every other deployment runs ``elsewhere``."""
+    sizes = _measured_sizes(on)
 
     def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-        size = _measured_point(d)
+        size = measured_point(d)
         if size is None:
-            return fallback(d, t, p)
+            return elsewhere(d, t, p)
         where = f"max_batch_size {size}: the measured tep8 gen point ({MEASURED_POINT[size]})"
-        return (name in MEASURED_ON[size]), where
+        return size in sizes, where
 
     return rule
 
 
-def _measured_default(name: str, param: Param) -> Callable[["Deployment"], object]:
-    """``param``'s default, taken from the recipe at a measured point, else as declared.
+def measured_default(values: Mapping[int, object]) -> Callable[["Deployment"], object]:
+    """A parameter's ``default_for``: the recipe's value at the measured tep8 gen points of
+    ``values`` (by ``max_batch_size``), the declared default everywhere else. A knob still wins.
 
-    A knob still wins over it (``resolve`` reads ``default_of`` only where the knob is unset).
+    It lists the values that match the declared default too, so that a later change to a
+    default cannot silently move a measured point.
     """
-    inherited = param.default_for
+    _measured_sizes(values)
+    values = types.MappingProxyType(dict(values))
 
     def default_for(d: "Deployment") -> object:
-        size = _measured_point(d)
-        if size is not None:
-            values = MEASURED_PARAMS.get(size, {}).get(name, {})
-            if param.key in values:
-                return values[param.key]
-        return param.default if inherited is None else inherited(d)
+        size = measured_point(d)
+        return values.get(size) if size is not None else None
 
     return default_for
 
 
-def _with_measured(rules: Mapping[str, Rule]) -> Dict[str, Rule]:
-    """Every lever the measured points pin, reading them before its own rule.
-
-    Raises:
-        KeyError: for a pinned name this target does not declare.
-    """
-    out = dict(rules)
-    for name in sorted(MEASURED_PINNED):
-        rule = out[name]
-        out[name] = dataclasses.replace(
-            rule,
-            auto=_measured(name, rule.auto),
-            params=tuple(
-                dataclasses.replace(param, default_for=_measured_default(name, param))
-                for param in rule.params
-            ),
-        )
-    return out
-
-
-#: Every lever whose rule is not the default; every other served lever is on under ``auto``
-#: and ``baseline``. It is rebound below, with the measured points layered on.
-RULES: Mapping[str, Rule] = types.MappingProxyType(
+#: The lever table: every lever of this target, its kind, and when it is on by default. Every
+#: other case is opt-in (its knob ``on``).
+LEVERS: Mapping[str, Lever] = types.MappingProxyType(
     {
-        "lm_head_inbox": Rule(
-            "upstream",
+        "lm_head_inbox": Lever(
             Kind.COMPOSITION,
             _always("8-row heads"),
+            stock=_always("8-row heads"),
         ),
         # Default off, on by its knob where a configuration wants it.
         #
@@ -889,150 +754,274 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         # An aggregated server sends no KV, so that contention cannot arise there, but nothing
         # has measured the path off on one either: a deployment that wants it -- the agg TEP4
         # line is tuned with it on -- sets MUSESPARK_OPEN_LEVER_CONTEXT_SEQUENCE_PARALLEL=on.
-        "context_sequence_parallel": Rule(
-            "upstream",
+        "context_sequence_parallel": Lever(
             Kind.COMPOSITION,
             _knob_only,
+            stock=_knob_only,
         ),
-        "graph_start_qkv_prefetch": Rule(
-            "upstream",
+        "graph_start_qkv_prefetch": Lever(
             Kind.COMPOSITION,
             _always("graph starts of split-K row counts"),
+            stock=_always("graph starts of split-K row counts"),
         ),
-        "half_window_experts": Rule(
-            "upstream",
+        "half_window_experts": Lever(
             Kind.COMPOSITION,
             _at_most("MAX_BATCH"),
-            baseline=_at_most("MAX_BATCH", requires_decode=False),
+            stock=_at_most("MAX_BATCH", requires_decode=False),
             params=(Param("MAX_BATCH", 8, 1, 64),),
         ),
-        "hot_replicas": Rule(
-            "upstream",
+        "hot_replicas": Lever(
             Kind.COMPOSITION,
             _hot_replicas(requires_decode=True),
-            baseline=_hot_replicas(requires_decode=False),
+            stock=_hot_replicas(requires_decode=False),
             after=("half_window_experts",),
             conflicts=("half_window_experts",),
         ),
-        "vocab_parallel_head": Rule(
-            "upstream",
+        "vocab_parallel_head": Lever(
             Kind.COMPOSITION,
             _vocab_parallel_head,
+            stock=_vocab_parallel_head,
             params=(
                 Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),
                 Param("MIN_ROWS", 16, 8, 16),
             ),
         ),
-        # The two tep4 composition paths the wider composition also serves, on its knob only.
+        # The two tep4 composition paths the wider composition also serves, on its knob only
+        # (but at the measured tep8 gen points, which pin them).
         # ``TP8_MAX_ROWS`` is read only where the tep8 workspace is built; at tep4 each path
         # keeps the rows its own composition serves.
-        "wide_drafter_hops": Rule(
-            "upstream",
+        "wide_drafter_hops": Lever(
             Kind.COMPOSITION,
-            _tep4_only("9..56-row block decodes"),
-            params=(Param("TP8_MAX_ROWS", WIDE_DRAFTER_HOPS_TP8_ROWS, 9, 64),),
+            at_measured_points((3, 4), _tep4_only("9..56-row block decodes")),
+            stock=at_measured_points((3, 4), _tep4_only("9..56-row block decodes")),
+            params=(
+                Param(
+                    "TP8_MAX_ROWS",
+                    WIDE_DRAFTER_HOPS_TP8_ROWS,
+                    9,
+                    64,
+                    default_for=measured_default({3: 24, 4: 24}),
+                ),
+            ),
         ),
-        "finalize_two_shot": Rule(
-            "upstream",
+        "finalize_two_shot": Lever(
             Kind.COMPOSITION,
-            _tep4_only("72..512-row decode steps"),
-            params=(Param("TP8_MAX_ROWS", FINALIZE_TWO_SHOT_TP8_ROWS, 24, 152),),
+            at_measured_points((3, 4), _tep4_only("72..512-row decode steps")),
+            stock=at_measured_points((3, 4), _tep4_only("72..512-row decode steps")),
+            params=(
+                Param(
+                    "TP8_MAX_ROWS",
+                    FINALIZE_TWO_SHOT_TP8_ROWS,
+                    24,
+                    152,
+                    default_for=measured_default({3: 128, 4: 128}),
+                ),
+            ),
         ),
-        # The sm103 decode-stack switches, ported from environment variables: default off.
-        "tep8_fc_shard_wide": _ported_tep8(
+        # The sm103 decode-stack switches, ported from environment variables. Each is on by
+        # default at TP8, the parallelism it was written for (``_tep8_only``), and decided by the
+        # recipe at the measured tep8 gen points; ``__DEFAULT=off`` turns every one off.
+        "tep8_fc_shard_wide": Lever(
             Kind.FLAGGED,
-            "the TP8 sharded drafter fc over the tray's NVLink",
-            (Param("MAX_ROWS", FC_SHARD_TP8_ROWS, 9, 128),),
+            at_measured_points(
+                (3, 4), _tep8_only("the TP8 sharded drafter fc over the tray's NVLink")
+            ),
+            params=(
+                Param(
+                    "MAX_ROWS",
+                    FC_SHARD_TP8_ROWS,
+                    9,
+                    128,
+                    default_for=measured_default({3: 40, 4: 40}),
+                ),
+            ),
         ),
-        "tep8_persistent_batch_experts": _ported_tep8(
+        "tep8_persistent_batch_experts": Lever(
             Kind.FLAGGED,
-            "the persistent expert kernel's batch builds at TP8",
-            (Param("MAX_ROWS", PERSISTENT_BATCH_ROWS, 9, 32),),
+            at_measured_points(
+                (3, 4), _tep8_only("the persistent expert kernel's batch builds at TP8")
+            ),
+            params=(
+                Param(
+                    "MAX_ROWS",
+                    PERSISTENT_BATCH_ROWS,
+                    9,
+                    32,
+                    default_for=measured_default({3: 32, 4: 32}),
+                ),
+            ),
         ),
-        # Off under ``auto``: nothing has measured it. The kernel derives
+        # Off by default: nothing has measured it. The kernel derives
         # ``ring_buddy_assign``'s balanced placement itself, statement for statement, so the
         # placement should be the one the assign program produces -- but no arm has run, so it
         # carries FLAGGED and its own gate rather than a numeric claim. It conflicts with
         # ``tep8_experts_early_start``: the batch build refuses both at once, and that one is
         # on at the measured batch-3 and batch-4 points.
-        "tep8_experts_in_kernel_placement": Rule(
-            "LL",
+        "tep8_experts_in_kernel_placement": Lever(
             Kind.FLAGGED,
             _knob_only,
             requires=("tep8_persistent_batch_experts",),
             conflicts=("tep8_experts_early_start",),
         ),
-        "tep8_experts_early_start": _ported_tep8(
-            Kind.FLAGGED, "the stacked expert call launched with its placement's early trigger"
+        "tep8_experts_early_start": Lever(
+            Kind.FLAGGED,
+            at_measured_points(
+                (3, 4),
+                _tep8_only("the stacked expert call launched with its placement's early trigger"),
+            ),
         ),
-        "tep8_router_shard": _ported_tep8(Kind.FLAGGED, "the TP8 wide-prologue router shard"),
-        "tep8_router_shard_early": _ported_served(
+        "tep8_router_shard": Lever(
+            Kind.FLAGGED,
+            at_measured_points((3, 4), _tep8_only("the TP8 wide-prologue router shard")),
+        ),
+        # On wherever the composition carries it: the path it gates is only *served* where the
+        # deployment actually has it, and the resolver turns a lever off with source
+        # ``dependency`` when the path it builds on is off (``dispatch.FastPath.depends_on``),
+        # whatever its condition says. So "on" here means "on where the configuration needs it"
+        # and nothing wider -- there is no size or role test to write, because the composition
+        # has already made it. No stock rule, so ``__DEFAULT=off`` still returns the deployment
+        # to the pre-port paths with one knob.
+        "tep8_router_shard_early": Lever(
             Kind.BITWISE,
-            "the router shard's programmatic launch, where tep8_router_shard is in rows mode",
+            at_measured_points(
+                (3, 4),
+                _always(
+                    "the router shard's programmatic launch, where tep8_router_shard is in rows "
+                    "mode"
+                ),
+            ),
         ),
-        "tep8_router_shard_wide": _ported_tep8(
-            Kind.FLAGGED, "router_shard_wide's built-in bits on the TP8 wide prologue"
-        ),
-        "tep8_wide_direct_pool": _ported_tep8(
-            Kind.FLAGGED, "pool_into_route's TP8 wide direct sites"
-        ),
-        "tep8_wide_direct_transports": _ported_tep8(
+        "tep8_router_shard_wide": Lever(
             Kind.FLAGGED,
-            "the wide direct transports, where wide_projection_gathers is served",
-            (Param("SITES", WIDE_DIRECT_SITES, choices=WIDE_DIRECT_SITES),),
+            at_measured_points(
+                (), _tep8_only("router_shard_wide's built-in bits on the TP8 wide prologue")
+            ),
         ),
-        "tep8_batch_splitk": _ported_tep8(Kind.BITWISE, "the TP8 batch split-K projection kernels"),
-        "finalize_entry_trigger": _ported_tep8(
-            Kind.BITWISE, "the finalize transport's entry trigger"
-        ),
-        "tep8_finalize_transport_wide": _ported_tep8(
+        "tep8_wide_direct_pool": Lever(
             Kind.FLAGGED,
-            "the widened TP8 finalize transport",
-            (Param("MAX_TOKENS", FINALIZE_TRANSPORT_TOKENS, 17, 40),),
+            at_measured_points((3, 4), _tep8_only("pool_into_route's TP8 wide direct sites")),
         ),
-        "multi_request_combine_gate": _ported_tep8(
-            Kind.BITWISE, "the split-KV combine gate, where multi_request_split_kv is served"
-        ),
-        "router_staged_gemm": _ported_tep8(
+        "tep8_wide_direct_transports": Lever(
             Kind.FLAGGED,
-            "the staged router GEMM, where router_gemm is served",
-            (Param("BUILD", (ROUTER_STAGED_BUILD,), choices=ROUTER_STAGED_BUILDS),),
+            _tep8_only("the wide direct transports, where wide_projection_gathers is served"),
+            params=(Param("SITES", WIDE_DIRECT_SITES, choices=WIDE_DIRECT_SITES),),
         ),
-        "drafter_fused_prep": _ported_tep8(
-            Kind.FLAGGED,
-            "the drafter's fused step prep, where context_kv_fork is served",
-            (Param("MIN_REQUESTS", DRAFTER_PREP_MIN_REQUESTS, 1, 64),),
+        "tep8_batch_splitk": Lever(
+            Kind.BITWISE,
+            at_measured_points((), _tep8_only("the TP8 batch split-K projection kernels")),
         ),
-        "tep8_ring_buddy_wide": _ported_tep8(
-            Kind.FLAGGED,
-            "the TP8 ring-buddy placement's wide row cap",
-            (Param("MAX_ROWS", RING_BUDDY_MAX_ROWS, 1, RING_BUDDY_ROW_CEILING),),
+        "finalize_entry_trigger": Lever(
+            Kind.BITWISE,
+            at_measured_points((1, 3, 4), _tep8_only("the finalize transport's entry trigger")),
         ),
-        "tep8_wide_balance": _ported_tep8(
+        "tep8_finalize_transport_wide": Lever(
             Kind.FLAGGED,
-            "the balanced NVFP4 placement's band above the stacked cap",
-            (
+            at_measured_points((3, 4), _tep8_only("the widened TP8 finalize transport")),
+            params=(
+                Param(
+                    "MAX_TOKENS",
+                    FINALIZE_TRANSPORT_TOKENS,
+                    17,
+                    40,
+                    default_for=measured_default({3: 40, 4: 40}),
+                ),
+            ),
+        ),
+        "multi_request_combine_gate": Lever(
+            Kind.BITWISE,
+            at_measured_points(
+                (3, 4),
+                _tep8_only("the split-KV combine gate, where multi_request_split_kv is served"),
+            ),
+        ),
+        "router_staged_gemm": Lever(
+            Kind.FLAGGED,
+            at_measured_points(
+                (24, 31), _tep8_only("the staged router GEMM, where router_gemm is served")
+            ),
+            params=(
+                Param(
+                    "BUILD",
+                    (ROUTER_STAGED_BUILD,),
+                    choices=ROUTER_STAGED_BUILDS,
+                    default_for=measured_default(
+                        {24: (ROUTER_STAGED_BUILD,), 31: (ROUTER_STAGED_BUILD,)}
+                    ),
+                ),
+            ),
+        ),
+        "drafter_fused_prep": Lever(
+            Kind.FLAGGED,
+            at_measured_points(
+                (1, 3, 4),
+                _tep8_only("the drafter's fused step prep, where context_kv_fork is served"),
+            ),
+            params=(
+                Param(
+                    "MIN_REQUESTS",
+                    DRAFTER_PREP_MIN_REQUESTS,
+                    1,
+                    64,
+                    default_for=measured_default({1: 1, 3: 1, 4: 1}),
+                ),
+            ),
+        ),
+        "tep8_ring_buddy_wide": Lever(
+            Kind.FLAGGED,
+            at_measured_points(
+                (3, 4, 31), _tep8_only("the TP8 ring-buddy placement's wide row cap")
+            ),
+            params=(
+                Param(
+                    "MAX_ROWS",
+                    RING_BUDDY_MAX_ROWS,
+                    1,
+                    RING_BUDDY_ROW_CEILING,
+                    default_for=measured_default({3: 64, 4: 64, 31: 128}),
+                ),
+            ),
+        ),
+        "tep8_wide_balance": Lever(
+            Kind.FLAGGED,
+            at_measured_points(
+                (24, 31),
+                _tep8_only("the balanced NVFP4 placement's band above the stacked cap"),
+            ),
+            params=(
                 Param(
                     "MAX_ROWS",
                     WIDE_BALANCE_ROWS,
                     WIDE_BALANCE_MIN_ROWS,
                     WIDE_BALANCE_ROW_CEILING,
+                    default_for=measured_default({24: 256, 31: 256}),
                 ),
             ),
         ),
-        "tep8_experts_interleaved_fetch": _ported_tep8(
-            Kind.FLAGGED, "the expert kernel's interleaved weight fetch"
+        "tep8_experts_interleaved_fetch": Lever(
+            Kind.FLAGGED,
+            at_measured_points((3, 4), _tep8_only("the expert kernel's interleaved weight fetch")),
         ),
-        "drafter_conv_epilogue": _ported_on(
-            Kind.BITWISE, "9..32-row drafter blocks on a tep8 decode server"
+        # The ported switches this target serves by default on a tep8 decode server
+        # (``_tep8_decode``); no stock rule, so ``__DEFAULT=off`` can ask for the pre-port paths.
+        "drafter_conv_epilogue": Lever(
+            Kind.BITWISE,
+            at_measured_points(
+                (4,), _tep8_decode("9..32-row drafter blocks on a tep8 decode server")
+            ),
         ),
-        "drafter_finish_norm": _ported_on(
-            Kind.BITWISE, "drafter blocks the drafter hops do not take, tep8 decode"
+        "drafter_finish_norm": Lever(
+            Kind.BITWISE,
+            at_measured_points(
+                (4,), _tep8_decode("drafter blocks the drafter hops do not take, tep8 decode")
+            ),
         ),
         # +560 MiB per generation rank for the interleaved gate_up copy, which comes out of
         # the KV cache at a fixed free_gpu_memory_fraction.
-        "drafter_silu_epilogue": _ported_on(
-            Kind.BITWISE, "9..32-row drafter blocks on a tep8 decode server"
+        "drafter_silu_epilogue": Lever(
+            Kind.BITWISE,
+            at_measured_points(
+                (4,), _tep8_decode("9..32-row drafter blocks on a tep8 decode server")
+            ),
         ),
         # The o_proj half is bitwise: split_k 1 reproduces the built-in cuBLAS call, checked
         # on this target. The QKV half is not, at TEP8. It replaces the 9..32-row call with a
@@ -1041,36 +1030,123 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         # (``wide_projection_gathers``) is TEP4-only on sm103. At TEP8 the served call is
         # cuBLAS, so the summation order changes and the decoded text moves with it, which a
         # batch-4 run makes plain. Lossless-numeric, and it needs a gate before it is on.
-        "tep8_attn_block_splitk": _ported_on(
+        "tep8_attn_block_splitk": Lever(
             Kind.NUMERIC,
-            "9..32-row attention-block projections on a tep8 decode server",
+            gated(
+                at_measured_points(
+                    (4,),
+                    _tep8_decode("9..32-row attention-block projections on a tep8 decode server"),
+                )
+            ),
             gates=(_served_untwinned(),),
         ),
-        "swa_block_single_early_loads": _ported_on(
-            Kind.BITWISE, "the one-request sliding-window block on a tep8 decode server"
+        "swa_block_single_early_loads": Lever(
+            Kind.BITWISE,
+            at_measured_points(
+                (1,), _tep8_decode("the one-request sliding-window block on a tep8 decode server")
+            ),
         ),
         # The qkv / gate_up / coefficient cells keep their row's split_k and are bitwise the
         # table's row; the o_proj and down_proj cells reproduced cuBLAS's bits on every checked
         # shape, which cannot be proven against a closed library. Running the model showed a
         # step moving between generation counts, so it is lossless-numeric rather than flagged.
-        "drafter_multi_request_cells": _ported_on(
+        "drafter_multi_request_cells": Lever(
             Kind.NUMERIC,
-            "16, 24 and 32-row drafter blocks on a tep8 decode server",
+            gated(
+                at_measured_points(
+                    (4,), _tep8_decode("16, 24 and 32-row drafter blocks on a tep8 decode server")
+                )
+            ),
             gates=(_served_untwinned(),),
         ),
         # Opt-in on sm103: the SM100-family CuTe DSL port of the sm107 lever.
-        "prefill_cutedsl_experts": Rule(
-            "HC",
+        "prefill_cutedsl_experts": Lever(
             Kind.COMPOSITION,
             _never("opt-in on sm103 (SM100-family CuTe DSL port, ctx5-moe): knob on"),
         ),
-        **{name: _tep4_path_rule() for name in TEP4_PATHS},
+        # The TP4 paths, some of which TEP8 serves too (``modeling._SM103_TEP8_MULTI_REQUEST_PATHS``):
+        # on wherever served. ``wide_drafter_hops`` was one until the wider composition began to
+        # serve it too; it has its own row now (``_tep4_only``).
+        "multi_request_prep_append": Lever(
+            Kind.COMPOSITION,
+            _always("its rows, wherever served"),
+            stock=_always("its rows, wherever served"),
+        ),
+        "multi_request_split_kv": Lever(
+            Kind.COMPOSITION,
+            _always("its rows, wherever served"),
+            stock=_always("its rows, wherever served"),
+        ),
+        "multi_request_post_attention_hop": Lever(
+            Kind.COMPOSITION,
+            _always("its rows, wherever served"),
+            stock=_always("its rows, wherever served"),
+        ),
+        "router_gemm": Lever(
+            Kind.COMPOSITION,
+            _always("its rows, wherever served"),
+            stock=_always("its rows, wherever served"),
+        ),
+        "projection_publish": Lever(
+            Kind.COMPOSITION,
+            _always("its rows, wherever served"),
+            stock=_always("its rows, wherever served"),
+        ),
+        # The composition's own paths: on wherever served, under either default.
+        "preattn_prep": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "swa_paged_decode": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "swa_block": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "full_attention_prep_append": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "full_attention_split_kv": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "full_attention_prep_fold": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "decode_kv_splits": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "dense_gemms": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_dense_gemms": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "dense_gemm_prefetch": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "next_qkv_prefetch": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "batch_dense_gemms": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "post_attention_hop": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "attention_output_into_hop": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "projection_gathers": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "boundary_early_release": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "unpool_into_boundary": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "capture_fold": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_projection_gathers": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "moe_prologue": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "pool_into_route": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "finalize_transport": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_moe_allreduce": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "context_prep": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "replicated_experts": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "persistent_experts": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "three_window_placement": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "bf16_routed_experts": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "early_expert_ids": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "replicated_embedding": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "model_boundary": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_block_conv": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_block_decode": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_drafter_window_attention": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "draft_head": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_draft_topk": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_fc_shard": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "fused_accept": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_fixed_gemms": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "context_kv_fork": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_window_compact": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "verify_fold": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "paged_context_commit": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "rejection_fold": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "path_walk_tail": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "draft_head_sampled": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_hops": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "drafter_pdl_chain": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "split_sampler": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "wide_split_sampler": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "deferred_input_prep": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
+        "sampler_store": Lever(Kind.COMPOSITION, ALWAYS, stock=ALWAYS),
     }
 )
-
-# Rebound, rather than wrapped in place, so the table above stays exactly as it reads: every
-# lever the measured tep8 gen points pin now consults them before its own rule.
-RULES = types.MappingProxyType(_with_measured(RULES))
 
 
 def default_param(name: str, key: str) -> object:
@@ -1079,10 +1155,10 @@ def default_param(name: str, key: str) -> object:
     Raises:
         KeyError: when ``name`` declares no parameter ``key``.
     """
-    rule = RULES.get(name)
-    if rule is None:
+    lever = LEVERS.get(name)
+    if lever is None:
         raise KeyError(f"lever {name} declares no parameter {key}")
-    return rule.param(key).default
+    return lever.param(key).default
 
 
 def knob_name(name: str, key: Optional[str] = None) -> str:
@@ -1179,7 +1255,7 @@ def parse_knobs(snapshot: Mapping[str, str], names: Iterable[str]) -> Knobs:
             errors.append(f"{name} is retired (use {replacement})")
     modes: Dict[str, str] = {}
     params: Dict[Tuple[str, str], object] = {}
-    default, role = AUTO, AUTO
+    default, role = ON, AUTO
     raw: Dict[str, str] = {}
     for name in sorted(snapshot):
         if not name.startswith(PREFIX):
@@ -1211,7 +1287,7 @@ def parse_knobs(snapshot: Mapping[str, str], names: Iterable[str]) -> Knobs:
             else:
                 modes[lever] = value
             continue
-        rule = RULES.get(lever)
+        rule = LEVERS.get(lever)
         declared = [param.key for param in rule.params] if rule is not None else []
         if key not in declared:
             errors.append(
@@ -1346,7 +1422,8 @@ class LeverTable:
     unserved: FrozenSet[str]
     #: The knobs as set (names under ``PREFIX``).
     knobs: Mapping[str, str]
-    default: str = AUTO
+    #: ``__DEFAULT``: ``on`` or ``off``.
+    default: str = ON
     #: Things the log should say as warnings (an unknown role, ``on`` outside a gate, ...).
     warnings: Tuple[str, ...] = ()
 
@@ -1366,7 +1443,7 @@ class LeverTable:
         return default_param(name, key)
 
     def paths(self) -> FrozenSet[str]:
-        """The levers on: closed under ``depends_on`` and ``Rule.requires`` by construction."""
+        """The levers on: closed under ``depends_on`` and ``Lever.requires`` by construction."""
         return frozenset(name for name, decision in self.decisions.items() if decision.on)
 
     def describe(self) -> Tuple[str, ...]:
@@ -1377,19 +1454,17 @@ class LeverTable:
             f"{self.deployment.facts.describe()}; knobs set: {knobs}"
         ]
         for name, decision in self.decisions.items():
-            rule = RULES.get(name)
-            if rule is None and decision.on:
-                continue
-            kind, origin = (rule.kind.value, rule.origin) if rule else ("composition", "upstream")
+            lever = LEVERS.get(name)
+            kind = lever.kind.value if lever is not None else "composition"
             lines.append(
                 f"lever {name} {ON if decision.on else OFF} ({decision.source}: {decision.why})"
                 + (f" {dict(decision.params)}" if decision.params else "")
-                + f" [{kind}, {origin}]"
+                + f" [{kind}]"
             )
         if self.unserved:
             lines.append(
                 f"levers not served at sm{self.deployment.sm} tep{self.deployment.tp}: "
-                + ", ".join(name for name in RULES if name in self.unserved)
+                + ", ".join(name for name in LEVERS if name in self.unserved)
             )
         lines.append(f"lever table json (resolved): {self.as_json()}")
         return tuple(lines)
@@ -1438,8 +1513,8 @@ def _order(
             for other in (
                 *depends_on[name],
                 *requires.get(name, ()),
-                *(RULES[name].requires if name in RULES else ()),
-                *(RULES[name].after if name in RULES else ()),
+                *(LEVERS[name].requires if name in LEVERS else ()),
+                *(LEVERS[name].after if name in LEVERS else ()),
             )
             if other in served and other != name
         }
@@ -1477,8 +1552,35 @@ def resolve(
         ValueError: on every error of the module docstring, all named in one message.
     """
     knobs = parse_knobs(snapshot, depends_on)
-    requires = dict(requires or {})
     served = frozenset(served)
+    decisions, errors, warnings = _resolve_pass(
+        deployment, served, structural, knobs, depends_on, dict(requires or {})
+    )
+    if errors:
+        raise ValueError("; ".join(errors))
+    ordered = {name: decisions[name] for name in depends_on if name in decisions}
+    return LeverTable(
+        deployment=deployment,
+        decisions=types.MappingProxyType(ordered),
+        unserved=frozenset(LEVERS) - served,
+        knobs=types.MappingProxyType(dict(knobs.raw)),
+        default=knobs.default,
+        warnings=tuple(warnings),
+    )
+
+
+def _resolve_pass(
+    deployment: Deployment,
+    served: FrozenSet[str],
+    structural: Mapping[str, str],
+    knobs: Knobs,
+    depends_on: Mapping[str, Sequence[str]],
+    requires: Mapping[str, Sequence[str]],
+) -> Tuple[Dict[str, Decision], List[str], List[str]]:
+    """Every served lever's decision, the errors and the warnings."""
+    needed = _built_on(
+        {name for name, mode in knobs.modes.items() if mode == ON}, depends_on, requires
+    )
     d = deployment
     errors: List[str] = []
     warnings: List[str] = []
@@ -1497,35 +1599,37 @@ def resolve(
     decisions: Dict[str, Decision] = {}
     t = Resolving(served, decisions)
     for name in _order(served, depends_on, requires):
-        rule = RULES.get(name)
+        lever = LEVERS.get(name)
         mode = knobs.modes.get(name)
         params = {
             param.key: knobs.params.get((name, param.key), param.default_of(d))
-            for param in (rule.params if rule is not None else ())
+            for param in (lever.params if lever is not None else ())
         }
+        t.pending = (name, params)
         decision = _decide(
-            name, rule, mode, knobs.default, params, d, t, structural, depends_on, requires
+            name, lever, mode, knobs.default, params, d, t, structural, depends_on, requires, needed
         )
+        t.pending = None
         if mode == ON and not decision.on:
             errors.append(f"{knob_name(name)}=on, but {decision.why}")
         if (
             mode == ON
             and decision.on
-            and rule is not None
-            and rule.kind is Kind.NUMERIC
-            and not any(gate.holds(d) for gate in rule.gates)
+            and lever is not None
+            and lever.kind is Kind.NUMERIC
+            and not any(gate.holds(d) for gate in lever.gates)
         ):
             warnings.append(
                 f"{knob_name(name)}=on outside its accuracy gates ("
-                + "; ".join(gate.scope for gate in rule.gates)
+                + "; ".join(gate.scope for gate in lever.gates)
                 + ")"
             )
         decisions[name] = decision
     for name, decision in decisions.items():
-        rule = RULES.get(name)
-        if not decision.on or rule is None:
+        lever = LEVERS.get(name)
+        if not decision.on or lever is None:
             continue
-        for other in rule.conflicts:
+        for other in lever.conflicts:
             if other in decisions and decisions[other].on:
                 errors.append(
                     f"{name} ({decision.source}) and {other} ({decisions[other].source}) cannot "
@@ -1544,22 +1648,33 @@ def resolve(
     for name, key in knobs.params:
         if name not in served:
             warnings.append(f"{knob_name(name, key)} has no effect: {name} is not served here")
-    if errors:
-        raise ValueError("; ".join(errors))
-    ordered = {name: decisions[name] for name in depends_on if name in decisions}
-    return LeverTable(
-        deployment=d,
-        decisions=types.MappingProxyType(ordered),
-        unserved=frozenset(RULES) - served,
-        knobs=types.MappingProxyType(dict(knobs.raw)),
-        default=knobs.default,
-        warnings=tuple(warnings),
-    )
+    return decisions, errors, warnings
+
+
+def _built_on(
+    names: Iterable[str],
+    depends_on: Mapping[str, Sequence[str]],
+    requires: Mapping[str, Sequence[str]],
+) -> FrozenSet[str]:
+    """Every lever ``names`` build on or require, transitively (``names`` themselves excluded)."""
+    found: set = set()
+    stack = list(names)
+    while stack:
+        name = stack.pop()
+        for other in (
+            *depends_on.get(name, ()),
+            *requires.get(name, ()),
+            *(LEVERS[name].requires if name in LEVERS else ()),
+        ):
+            if other not in found:
+                found.add(other)
+                stack.append(other)
+    return frozenset(found)
 
 
 def _decide(
     name: str,
-    rule: Optional[Rule],
+    lever: Optional[Lever],
     mode: Optional[str],
     default: str,
     params: Mapping[str, object],
@@ -1568,8 +1683,13 @@ def _decide(
     structural: Mapping[str, str],
     depends_on: Mapping[str, Sequence[str]],
     requires: Mapping[str, Sequence[str]],
+    needed: FrozenSet[str] = frozenset(),
 ) -> Decision:
-    """One lever's decision, from the decisions already made (``resolve``'s order)."""
+    """One lever's decision, from the decisions already made (``resolve``'s order).
+
+    ``needed`` are the levers a lever turned on by its knob builds on or requires: they come on
+    with it (where they can run).
+    """
     if name in structural:
         return Decision(name, False, "structural", structural[name], params)
     for other in depends_on[name]:
@@ -1577,35 +1697,25 @@ def _decide(
             return Decision(
                 name, False, "dependency", f"it builds on {other}, which is off", params
             )
-    for other in (*requires.get(name, ()), *(rule.requires if rule is not None else ())):
+    for other in (*requires.get(name, ()), *(lever.requires if lever is not None else ())):
         if not t.on(other):
             return Decision(name, False, "dependency", f"it requires {other}, which is off", params)
-    if rule is not None and rule.excluded is not None:
-        reason = rule.excluded(d, t)
+    if lever is not None and lever.excluded is not None:
+        reason = lever.excluded(d, t)
         if reason is not None:
             return Decision(name, False, "structural", reason, params)
     if mode == OFF:
         return Decision(name, False, "knob", f"{knob_name(name)}=off", params)
     if mode == ON:
         return Decision(name, True, "knob", f"{knob_name(name)}=on", params)
-    baseline = mode is None and default == BASELINE
-    if rule is None:
-        return Decision(name, True, BASELINE if baseline else AUTO, "served", params)
-    if baseline:
-        if rule.baseline is not None:
-            on, why = rule.baseline(d, t, params)
-        elif rule.origin == "upstream":
-            on, why = rule.auto(d, t, params)
-        else:
-            on, why = False, f"not an upstream lever ({rule.origin}): off unless its knob is set"
-        return Decision(name, on, BASELINE, why, params)
-    on, why = rule.auto(d, t, params)
-    if on and rule.kind is Kind.NUMERIC:
-        held = [gate for gate in rule.gates if gate.holds(d)]
-        if not held:
-            scopes = "; ".join(gate.scope for gate in rule.gates)
-            return Decision(
-                name, False, "gate", f"{why}, but no accuracy gate holds ({scopes})", params
-            )
-        why = f"{why}; gate: {held[0].scope}"
-    return Decision(name, on, AUTO, why, params)
+    if name in needed:
+        return Decision(name, True, "knob", "a lever turned on by its knob needs it", params)
+    if lever is None:
+        raise RuntimeError(f"{name} is served but has no row in LEVERS")
+    if default == OFF:
+        if lever.stock is None:
+            return Decision(name, False, "stock", f"{DEFAULT_KNOB}=off", params)
+        on, why = lever.stock(d, t, params)
+        return Decision(name, on, "stock", f"{DEFAULT_KNOB}=off, its upstream rule: {why}", params)
+    on, why = lever.on_by_default(d, t, params)
+    return Decision(name, on, "default", why, params)

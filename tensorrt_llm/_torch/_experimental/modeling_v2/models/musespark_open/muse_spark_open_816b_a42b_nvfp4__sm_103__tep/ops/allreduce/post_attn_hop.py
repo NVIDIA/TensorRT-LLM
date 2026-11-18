@@ -108,7 +108,7 @@ from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -2006,53 +2006,6 @@ class PostAttnConsumerHop(OpWrapper):
     ``post_attn_hop`` returns for the same partials.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="no speculation: one row, the 16-CTA cluster split", spec=dict(rows=1)),
-        Cell(why="two rows: the smallest 8-CTA split", spec=dict(rows=2)),
-        Cell(why="K = 3 verify width", spec=dict(rows=4)),
-        Cell(why="K = 5 verify width", spec=dict(rows=6)),
-        Cell(why="K = 7 verify width, the one row count the target serves", spec=dict(rows=8)),
-        Cell(
-            why="the second buffer: odd layers publish into parity 1",
-            spec=dict(rows=8, parity=1),
-        ),
-        Cell(
-            why="the FP32-residual prenorm ordering (MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL)",
-            spec=dict(rows=8, norm_fp32=True),
-        ),
-        Cell(
-            why="exact zeros and negative zeros published unchanged (0x80000000 is a payload here)",
-            spec=dict(rows=8, zeros=True),
-        ),
-        Cell(
-            why="cancelling partials: the FP32 rank-order sum differs from other orders",
-            spec=dict(rows=8, cancel=True),
-        ),
-        Cell(
-            why="wide direct transport, two requests at K = 7: the 4-CTA split",
-            spec=dict(rows=16, wide=True),
-        ),
-        Cell(
-            why="wide direct transport, three requests at K = 7, the second buffer",
-            spec=dict(rows=24, wide=True, parity=1),
-        ),
-        Cell(why="wide direct transport, four requests at K = 7", spec=dict(rows=32, wide=True)),
-        Cell(
-            why="wide direct transport, the FP32-residual prenorm ordering",
-            spec=dict(rows=32, wide=True, norm_fp32=True),
-        ),
-        Cell(
-            why="wide direct transport, exact zeros and negative zeros",
-            spec=dict(rows=24, wide=True, zeros=True),
-        ),
-        Cell(
-            why="wide direct transport, cancelling partials",
-            spec=dict(rows=32, wide=True, cancel=True),
-        ),
-    )
-
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step of
     the row counts the target serves directly (8 at K = 7), from the target's
@@ -2061,7 +2014,7 @@ class PostAttnConsumerHop(OpWrapper):
 
     Bit-identical to ``post_attn_hop`` on the same partials (on the wide direct
     transport: to ``post_attn_hop`` on its wide transport), gated by its own
-    multi-GPU test (both outputs, every cell, a real cuBLAS o_proj as the
+    multi-GPU test (both outputs, a real cuBLAS o_proj as the
     producer and, on the wide transport, flashinfer's wide split-K o_proj tactics,
     graph replay with changing inputs, a delayed rank, a long burst, calls of mixed
     row counts on one wide buffer, a concurrent poller that records the first
@@ -2173,51 +2126,16 @@ class PostAttnHop(OpWrapper):
     ``bf16(updated)`` (or ``updated`` itself with ``norm_fp32``).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
-
-    # The decode step of this target at K = 7 carries 8 rows; K = 3 / 5 carry 4 / 6;
-    # one row is the no-speculation step and the only shape on the 16-CTA split.
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="no speculation: one row, the 16-CTA cluster split", spec=dict(rows=1)),
-        Cell(why="two rows: the smallest 8-CTA split", spec=dict(rows=2)),
-        Cell(why="K = 3 verify width", spec=dict(rows=4)),
-        Cell(why="K = 5 verify width", spec=dict(rows=6)),
-        Cell(why="K = 7 verify width, the row count the target serves", spec=dict(rows=8)),
-        Cell(
-            why="the FP32-residual prenorm ordering (MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL)",
-            spec=dict(rows=8, norm_fp32=True),
-        ),
-        Cell(
-            why="exact zeros and negative zeros in every rank's partial",
-            spec=dict(rows=8, zeros=True),
-        ),
-        Cell(
-            why="cancelling partials: the FP32 rank-order sum differs from other orders",
-            spec=dict(rows=8, cancel=True),
-        ),
-        Cell(
-            why="wide transport, two requests at K = 7: the 4-CTA split",
-            spec=dict(rows=16, wide=True),
-        ),
-        Cell(why="wide transport, the smallest wide call", spec=dict(rows=9, wide=True)),
-        Cell(why="wide transport, three requests at K = 7", spec=dict(rows=24, wide=True)),
-        Cell(why="wide transport, four requests at K = 7", spec=dict(rows=32, wide=True)),
-        Cell(
-            why="wide transport, cancelling partials",
-            spec=dict(rows=32, wide=True, cancel=True),
-        ),
-    )
-
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step
     of at most 8 rows, from the target's attention-side residual join, in place
     of the built-in MNNVL one-shot all-reduce and cluster boundary.
 
     Bit-identical to that pair, gated by its own multi-GPU test (both outputs,
-    every cell, both transport variants, graph replay with changing inputs and
+    both transport variants, graph replay with changing inputs and
     shapes, a delayed rank, a long burst, the arrival counter's accounting
     across its wrap). Ranks 4 (one node) and 8 (two nodes); the slot layout is
-    sized for 8. The cancelling cell makes the all-reduce's summation order
+    sized for 8. A cancelling input makes the all-reduce's summation order
     observable, so a change of order fails the bitwise gate. The two-buffer
     alternation of the transport is not observable by any test (see the module
     docstring); it rests on the written argument.

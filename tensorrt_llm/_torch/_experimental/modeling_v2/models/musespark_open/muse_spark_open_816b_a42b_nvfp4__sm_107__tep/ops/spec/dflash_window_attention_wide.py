@@ -34,6 +34,8 @@ does.
 
 The context may live in pages (``page_table``), addressed as the single-request
 op addresses them; on the same values a paged call is bitwise the dense call.
+FP8 E4M3 caches are taken for BF16 operands as the single-request op takes them:
+context rows widened to BF16 on load, the append converted to E4M3.
 
 Numerics follow the single-request op: fp32 scores, base-2 online softmax, the
 probabilities rounded to the operand dtype for the P.V product with the row sum
@@ -62,6 +64,7 @@ from .dflash_window_attention import (
     WINDOW,
     _context_rows,
     _page_arguments,
+    _to_e4m3,
     _window_attention_merge_kernel,
     attention_reference,
     unsupported_reason,
@@ -121,6 +124,7 @@ def _window_attention_wide_split_kernel(
     DIRECT: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     PAGE: tl.constexpr,
+    KV_FP8: tl.constexpr = False,
 ):
     split = tl.program_id(0)
     bh = tl.program_id(1)
@@ -161,6 +165,9 @@ def _window_attention_wide_split_kernel(
                 v_new_ptr + new_rows[:, None] * stride_vnt + kvh * stride_vnh + dims[None, :],
                 mask=jj_ok[:, None],
             )
+            if KV_FP8:
+                k_blk = _to_e4m3(k_blk)
+                v_blk = _to_e4m3(v_blk)
             tl.store(
                 k_base + kv_rows[:, None] * stride_kn + dims[None, :], k_blk, mask=jj_ok[:, None]
             )
@@ -202,6 +209,9 @@ def _window_attention_wide_split_kernel(
         v = tl.load(
             v_base + kv_rows[:, None] * stride_vn + dims[None, :], mask=ok[:, None], other=0.0
         )
+        if KV_FP8:
+            k = k.to(q_ptr.dtype.element_ty)
+            v = v.to(q_ptr.dtype.element_ty)
         s = tl.dot(q, tl.trans(k))
         keep = ok[None, :] & (cols[None, :] >= first_key[:, None])
         if WINDOW_RIGHT >= 0:
@@ -243,6 +253,9 @@ def _window_attention_wide_split_kernel(
                 mask=jj_ok[:, None],
                 other=0.0,
             )
+            if KV_FP8:
+                k = k.to(q_ptr.dtype.element_ty)
+                v = v.to(q_ptr.dtype.element_ty)
         s = tl.dot(q, tl.trans(k))
         keep = jj_ok[None, :] & (cols[None, :] >= first_key[:, None])
         if WINDOW_RIGHT >= 0:
@@ -429,6 +442,7 @@ def wide_window_attention_launch(
         DIRECT=direct,
         LAUNCH_WITH_PDL=enable_pdl,
         PAGE=page,
+        KV_FP8=k_cache.dtype == torch.float8_e4m3fn,
         num_warps=num_warps,
         launch_pdl=enable_pdl,
     )

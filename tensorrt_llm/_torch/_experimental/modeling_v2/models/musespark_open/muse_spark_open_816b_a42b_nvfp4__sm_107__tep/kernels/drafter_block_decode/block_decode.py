@@ -33,7 +33,10 @@ gather. The op reads the context where the DFlash worker keeps it: the dense
 arena, or the worker's pages through its page table. This part is installed
 only when every layer's attention geometry is one the op takes (it calls the op
 directly; selected for a drafter outside that path, the install raises); a step
-outside that path runs the built-in forward.
+outside that path runs the built-in forward, which is logged once per reason and block
+width (``fast_path_refusal``). The paged context may be FP8 E4M3 (a draft KV the KV cache
+manager stores in FP8): the op widens it to BF16 on load and stores the block's K/V as
+E4M3.
 
 ``wide_drafter_window_attention`` (tep4) binds a ``WideWindowAttention``
 to the drafter (``kernels/wide_drafter_window_attention``); a block decode of the
@@ -70,6 +73,10 @@ from ..context_kv_fork.fork import join_pending as _join_pending
 
 #: Operand dtypes the fused convolution takes; anything else runs the built-in.
 SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+#: Context K/V dtypes ``windowed_block_decode`` reads with BF16 activations.
+BLOCK_DECODE_KV_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
+#: (reason, block rows) pairs whose built-in fallback has been logged.
+_LOGGED_FALLBACKS: set = set()
 
 #: ``finish_norm`` (``configure``; ``tep8_drafter_wide_gemms__FINISH_NORM``): on a block decode that does not
 #: take the fused drafter hop (the TP8 calls of 65..128 rows), each hop's tail after the projection's
@@ -414,7 +421,8 @@ def block_decode_unsupported_reason(draft_model: nn.Module) -> str | None:
 
     Besides the class checks, every layer's attention geometry -- a block of
     ``draft_model.block_size`` rows, its query / KV head counts and head width,
-    its window, bf16 operands -- must be one the attention op takes:
+    its window, bf16 operands over a bf16 or FP8 E4M3 context -- must be one the
+    attention op takes:
     ``windowed_block_decode`` calls the op directly, with no per-call fallback
     to the built-in attention.
     """
@@ -434,17 +442,64 @@ def block_decode_unsupported_reason(draft_model: nn.Module) -> str | None:
         if causal or window[0] < 0:
             return f"layer {layer_idx} is causal or unwindowed"
         attn = layer.self_attn
-        reason = geometry_unsupported_reason(
-            block_size,
-            attn.num_heads,
-            attn.num_key_value_heads,
-            attn.head_dim,
-            torch.bfloat16,
-            tuple(window),
-        )
-        if reason is not None:
-            return f"layer {layer_idx}: {reason}"
+        # The context's dtype is the pool's, which is bound after the install: check
+        # every one the block decode reads.
+        for kv_dtype in BLOCK_DECODE_KV_DTYPES:
+            reason = geometry_unsupported_reason(
+                block_size,
+                attn.num_heads,
+                attn.num_key_value_heads,
+                attn.head_dim,
+                torch.bfloat16,
+                tuple(window),
+                kv_dtype,
+            )
+            if reason is not None:
+                return f"layer {layer_idx}: {reason}"
     return None
+
+
+def fast_path_refusal(
+    draft_model: nn.Module,
+    noise_embedding: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+) -> str | None:
+    """Why ``windowed_block_decode`` runs the built-in forward for this step, or None.
+
+    ``k_cache`` / ``v_cache``: the first layer's context K/V as the attention op reads them.
+    Host checks only (per-capture constants under a CUDA graph).
+    """
+    if not draft_model._use_fused_qk_norm_rope:
+        return "the drafter has no fused QK norm + RoPE"
+    if noise_embedding.dtype != torch.bfloat16:
+        return f"the activations are {noise_embedding.dtype}, not torch.bfloat16"
+    if k_cache.dtype != v_cache.dtype or k_cache.dtype not in BLOCK_DECODE_KV_DTYPES:
+        return (
+            f"the context K/V are {k_cache.dtype}/{v_cache.dtype}, not one of "
+            f"{BLOCK_DECODE_KV_DTYPES}"
+        )
+    if k_cache.stride(-1) != 1 or v_cache.stride(-1) != 1:
+        return "the context K/V head dimension is strided"
+    if noise_embedding.shape[1] > draft_model.block_size:
+        return (
+            f"a {noise_embedding.shape[1]}-row block is wider than the drafter's "
+            f"{draft_model.block_size}"
+        )
+    return None
+
+
+def _log_fallback(reason: str, rows: int) -> None:
+    """Log the built-in fallback once per (reason, block rows), capture included: a step's
+    decision is taken when its graph is captured, and replays repeat it silently."""
+    key = (reason, rows)
+    if key in _LOGGED_FALLBACKS:
+        return
+    _LOGGED_FALLBACKS.add(key)
+    logger.info(
+        f"[musespark_open] drafter block decode ran the built-in forward ({reason}) for a "
+        f"{rows}-row block decode"
+    )
 
 
 def windowed_block_decode(
@@ -467,7 +522,8 @@ def windowed_block_decode(
     arena or, given ``ctx_page_table``, the pages of ``ctx_kv_cache``. Steps the
     written-out path does not cover (fp16/fp32 activations, a drafter without
     the fused QK-norm + RoPE, a block wider than the one ``install_block_decode``
-    checked the attention geometry for) run the built-in forward.
+    checked the attention geometry for) run the built-in forward
+    (``fast_path_refusal``). The context may be FP8 E4M3 pages.
     """
     if self._fused_kv_weight is None:
         self._build_fused_kv_buffers()
@@ -478,13 +534,9 @@ def windowed_block_decode(
         # Each layer's [pages, K/V, Hkv, page, D] pool as two pools of [page, Hkv, D] rows.
         caches = [(pool[:, 0].transpose(1, 2), pool[:, 1].transpose(1, 2)) for pool in ctx_kv_cache]
     k0, v0 = caches[0]
-    if not (
-        self._use_fused_qk_norm_rope
-        and noise_embedding.dtype == k0.dtype == v0.dtype == torch.bfloat16
-        and k0.stride(-1) == 1
-        and v0.stride(-1) == 1
-        and noise_embedding.shape[1] <= self.block_size
-    ):
+    refusal = fast_path_refusal(self, noise_embedding, k0, v0)
+    if refusal is not None:
+        _log_fallback(refusal, noise_embedding.shape[0] * noise_embedding.shape[1])
         settle_preamble()
         _join_pending(self)
         return DFlashForCausalLM.dflash_forward(

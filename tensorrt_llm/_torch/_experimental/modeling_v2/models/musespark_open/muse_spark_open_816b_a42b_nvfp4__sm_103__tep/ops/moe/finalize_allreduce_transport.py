@@ -139,7 +139,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -1246,48 +1246,6 @@ class FinalizeAllReduceTransport(OpWrapper):
     cleared, then summed over the ranks in FP32 in rank order and rounded to BF16.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
-
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="no speculation: one token", spec=dict(tokens=1)),
-        Cell(why="DFlash2 K=7 verify: 8 tokens", spec=dict(tokens=8)),
-        Cell(
-            why="the widest call on this kernel (the ring-buddy decode bound)", spec=dict(tokens=16)
-        ),
-        Cell(
-            why="every slot of a token on one rank, none on the others",
-            spec=dict(tokens=8, placement="concentrated"),
-        ),
-        Cell(
-            why="ring-buddy placement: each slot on its owner or successor",
-            spec=dict(tokens=8, placement="buddy"),
-        ),
-        Cell(
-            why="exact and negative zeros in the rows, tokens with no valid slot",
-            spec=dict(tokens=8, zeros=True),
-        ),
-        Cell(
-            why="invalid slots and cancelling rows: the rank-order sum is observable",
-            spec=dict(tokens=8, invalid=True, cancel=True),
-        ),
-        Cell(
-            why="wide TP4 layout: three requests at K=7, 24 tokens",
-            spec=dict(tokens=24, placement="buddy", wide=True),
-        ),
-        Cell(
-            why="wide TP4 layout: four requests at K=7, 32 tokens, its widest call",
-            spec=dict(tokens=32, placement="buddy", wide=True),
-        ),
-        Cell(
-            why="wide TP4 layout: zeros, negative zeros and a token with no valid slot",
-            spec=dict(tokens=24, zeros=True, wide=True),
-        ),
-        Cell(
-            why="wide TP4 layout: invalid slots and cancelling rows",
-            spec=dict(tokens=32, invalid=True, cancel=True, wide=True),
-        ),
-    )
-
     note = """
     Metadata consumed: ``indices`` (the expert op's ``[tokens, 8]`` row map,
     read through one function, ``select_row``) and the routing weights. Call
@@ -1299,21 +1257,21 @@ class FinalizeAllReduceTransport(OpWrapper):
     for 17..``TP8_MAX_TOKENS`` tokens) and the built-in kernel otherwise.
 
     Certified bit for bit against the built-in kernel by its own multi-GPU test
-    (8 ranks on two nodes; every cell, every transport variant, tokens 1..16, a
+    (8 ranks on two nodes; every transport variant, tokens 1..16, a
     delayed rank, CUDA-graph replays with changing inputs and token counts, a
     long burst, the arrival counter across its wrap, a producer that triggers
     its dependents before it writes their inputs) and against `reference`
     within a band; the alternation of the two receive buffers by the counter's
     parity is checked white-box; at TP4 (4 ranks on one tray) the same test
     against the built-in TP4 IPC kernel (cluster 1), and there the wide
-    workspace for every token count 17..32 (the wide cells, graph replays and
+    workspace for every token count 17..32 (graph replays and
     bursts mixing both workspaces, a delayed rank, its counter across the wrap,
     its buffer parity). Not certified: more than 32 tokens, or more than 16 at
     TP8 (served by the built-in kernel unless ``TP8_MAX_TOKENS`` is above 16:
     the TP8 flat build was checked bit for bit against the built-in TP8 kernel
     at 8..64 tokens on 8 ranks over two trays, every transport variant, by a
-    standalone benchmark, not by this test, which has no TP8 cell above 16
-    tokens). The wide cells (``wide=True``) run at TP4 only.
+    standalone benchmark, not by this test, which covers TP8 only up
+    to 16 tokens). The wide transport (``wide=True``) runs at TP4 only.
     """
 
     def __call__(

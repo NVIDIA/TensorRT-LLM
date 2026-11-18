@@ -7,9 +7,10 @@
 logger); the compositions are ``modeling.py``'s ``TARGET_PATHS`` statements run over that
 ``dispatch``. The tests pin:
 
-* the table of every region deployment under ``auto``, and of the replay knob sets (``R_LL``, ``R_H``, ``B_LL``);
+* the single table ``levers.LEVERS``: a row for every lever, no lossy or flagged lever on by default;
+* the table of every region deployment by default, and of the replay knob sets (``R_LL``, ``R_H``, ``B_LL``);
 * the ladder shapes, where an agg and a gen server resolve alike;
-* ``baseline``: every key's plan is the composition before the lever table
+* ``__DEFAULT=off`` (``STOCK``): every key's plan is the composition before the lever table
   (``C55_SERVED`` under ``c55_plan``'s rules) plus the two installs the plan adds to it;
 * the knob grammar's errors, the overrides, the facts and the drafter arena;
 * ``compose`` agreed over a stubbed TP group, and the ``Plan`` reports.
@@ -159,9 +160,13 @@ def _compositions(dispatch):
 
 LEVERS, DISPATCH = _load()
 TARGET_PATHS = _compositions(DISPATCH)
-RULES = LEVERS.RULES
+ROWS = LEVERS.LEVERS
+#: The levers whose row has a condition other than ``ALWAYS`` (the compositions' own paths are
+#: on wherever served).
+RULES = {name: row for name, row in ROWS.items() if row.on_by_default is not LEVERS.ALWAYS}
 HC_MIN_BATCH = LEVERS.HC_MIN_BATCH
-BASELINE = {LEVERS.DEFAULT_KNOB: "baseline"}
+#: The all-off switch: only the upstream levers' stock rules.
+STOCK = {LEVERS.DEFAULT_KNOB: "off"}
 
 
 def knobs(**values) -> dict:
@@ -193,45 +198,74 @@ def base_off(lever_table) -> set:
 # --------------------------------------------------------------------------
 # The registry
 # --------------------------------------------------------------------------
-#: Where each rule-table lever is served, and its kind and origin.
+#: Where each lever with its own condition is served, its kind, and whether it has a stock
+#: rule (an upstream lever, kept by ``__DEFAULT=off``).
 SERVED_AT = {
-    "packed_prep_append": ({(107, 4)}, "lossless-bitwise", "HC"),
-    "windowed_commit_parallel": ({(107, 4), (107, 8)}, "lossless-bitwise", "HC"),
-    "context_fp8_dense": ({(107, 4)}, "lossy", "HC"),
-    "context_fp8_attn_gather": ({(107, 4)}, "lossy", "HC"),
-    "wide_direct_transports": ({(107, 4)}, "lossless-bitwise", "midc"),
-    "wide_router_per_row": ({(107, 4)}, "lossless-numeric", "midc"),
-    "wide_oproj_publish": ({(107, 4)}, "lossless-bitwise", "midc"),
-    "wide_finalize_transport": ({(107, 4)}, "lossless-bitwise", "midc"),
-    "lm_head_inbox": ({(103, 4), (103, 8), (107, 8)}, "composition", "upstream"),
-    "graph_start_qkv_prefetch": ({(103, 8), (107, 4), (107, 8)}, "composition", "upstream"),
-    "step_loop_on_execution_stream": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
-    "incremental_block_offsets": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
-    "drafter_kv_side_chain": ({(107, 8)}, "lossless-bitwise", "LL"),
-    "drafter_fc_early_fork": ({(107, 8)}, "lossless-bitwise", "LL"),
-    "drafter_preamble_from_commit": ({(107, 8)}, "lossless-bitwise", "LL"),
-    "head_sampler_coop_fold": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
-    "head_multimem_gather": ({(107, 8)}, "flagged", "LL"),
-    "half_window_experts": ({(103, 4), (107, 4)}, "composition", "upstream"),
-    "hot_replicas": ({(103, 4), (107, 4)}, "composition", "upstream"),
-    "prefill_cutedsl_experts": ({(107, 4)}, "composition", "upstream"),
-    "vocab_parallel_head": ({(103, 4), (107, 4), (107, 8)}, "composition", "upstream"),
+    "packed_prep_append": ({(107, 4)}, "lossless-bitwise", False),
+    "windowed_commit_parallel": ({(107, 4), (107, 8)}, "lossless-bitwise", False),
+    "context_fp8_dense": ({(107, 4)}, "lossy", False),
+    "context_fp8_attn_gather": ({(107, 4)}, "lossy", False),
+    "wide_direct_transports": ({(107, 4)}, "lossless-bitwise", False),
+    "wide_router_per_row": ({(107, 4)}, "lossless-numeric", False),
+    "wide_oproj_publish": ({(107, 4)}, "lossless-bitwise", False),
+    "wide_finalize_transport": ({(107, 4)}, "lossless-bitwise", False),
+    "lm_head_inbox": ({(103, 4), (103, 8), (107, 8)}, "composition", True),
+    "graph_start_qkv_prefetch": ({(103, 8), (107, 4), (107, 8)}, "composition", True),
+    "step_loop_on_execution_stream": ({(107, 4), (107, 8)}, "lossless-bitwise", False),
+    "incremental_block_offsets": ({(107, 4), (107, 8)}, "lossless-bitwise", False),
+    "drafter_kv_side_chain": ({(107, 8)}, "lossless-bitwise", False),
+    "drafter_fc_early_fork": ({(107, 8)}, "lossless-bitwise", False),
+    "drafter_preamble_from_commit": ({(107, 8)}, "lossless-bitwise", False),
+    "head_sampler_coop_fold": ({(107, 4), (107, 8)}, "lossless-bitwise", False),
+    "head_multimem_gather": ({(107, 8)}, "flagged", False),
+    "half_window_experts": ({(103, 4), (107, 4)}, "composition", True),
+    "hot_replicas": ({(103, 4), (107, 4)}, "composition", True),
+    "prefill_cutedsl_experts": ({(107, 4)}, "composition", True),
+    "vocab_parallel_head": ({(103, 4), (107, 4), (107, 8)}, "composition", True),
 }
 
 
-def test_the_rule_table_is_the_registry_of_twenty_one_levers():
+def test_every_lever_of_the_registry_has_a_row():
+    assert list(ROWS) and set(ROWS) == set(DISPATCH.DEPENDS_ON)
+    served = set().union(*(paths.served for paths in TARGET_PATHS.values()))
+    assert served <= set(ROWS)
+    for name, row in ROWS.items():
+        assert isinstance(row, LEVERS.Lever), name
+        assert callable(row.on_by_default), name
+
+
+def test_the_rows_with_their_own_condition_are_the_twenty_one_levers():
     assert set(RULES) == set(SERVED_AT)
     assert set(RULES) <= DISPATCH.FAST_PATH_NAMES
-    for name, (keys, kind, origin) in SERVED_AT.items():
+    for name, (keys, kind, has_stock) in SERVED_AT.items():
         served = {key for key, paths in TARGET_PATHS.items() if name in paths.served}
         assert served == keys, name
-        assert (RULES[name].kind.value, RULES[name].origin) == (kind, origin), name
+        assert (RULES[name].kind.value, RULES[name].stock is not None) == (kind, has_stock), name
+    # Every other row is a composition path, on wherever served under either __DEFAULT.
+    for name, row in ROWS.items():
+        if name not in RULES:
+            assert row.kind is LEVERS.Kind.COMPOSITION and row.stock is LEVERS.ALWAYS, name
 
 
-def test_no_lever_of_another_origin_is_served_on_sm103():
-    others = {name for name, rule in RULES.items() if rule.origin != "upstream"}
+def test_no_lever_without_a_stock_rule_is_served_on_sm103():
+    others = {name for name, row in ROWS.items() if row.stock is None}
     for key in ((103, 4), (103, 8)):
         assert not others & TARGET_PATHS[key].served
+
+
+def test_no_lossy_or_flagged_lever_is_on_by_default_anywhere():
+    lossy = {name for name, row in ROWS.items() if row.kind.value in ("lossy", "flagged")}
+    assert lossy == {"context_fp8_dense", "context_fp8_attn_gather", "head_multimem_gather"}
+    for name in lossy:
+        assert ROWS[name].stock is None, name
+    for key, paths in TARGET_PATHS.items():
+        for role in ("agg", "gen", "ctx", "unknown"):
+            for arena in ("dense", "windowed", "paged"):
+                for mbs in (None, 1, 2, 4, 8, 9, 16, 48, 64, 256):
+                    for knob_set in (None, STOCK):
+                        lever_table = table(key, mbs, role, arena, knob_set)
+                        on = {name for name in lossy & paths.served if lever_table.on(name)}
+                        assert on == set(), (key, role, arena, mbs, knob_set)
 
 
 # --------------------------------------------------------------------------
@@ -380,12 +414,12 @@ def test_region_tables_under_auto(key, role, sizes, arena, expected):
 
 def test_the_router_per_row_gates():
     on = table((107, 4), 4, "gen", "windowed").decisions["wide_router_per_row"]
-    assert on.on and on.source == "auto" and "gate" in on.why
+    assert on.on and on.source == "default" and "gate:" in on.why
     off = table((107, 4), 8, "agg", "windowed").decisions["wide_router_per_row"]
-    assert not off.on and off.source == "gate"
+    assert not off.on and off.source == "default" and "no accuracy gate holds" in off.why
     for mbs in (2, 3, 4):
         off = table((107, 4), mbs, "agg", "windowed").decisions["wide_router_per_row"]
-        assert not off.on and off.source == "gate", mbs
+        assert not off.on and "no accuracy gate holds" in off.why, mbs
     assert not table((107, 4), 1, "agg", "windowed").on("wide_router_per_row")
 
 
@@ -398,7 +432,7 @@ def test_the_vocab_parallel_head_is_on_an_sm107_decode_server_up_to_eight_reques
         for mbs, on in ((1, True), (3, True), (8, True), (9, False), (64, False), (None, False)):
             decision = table(key, mbs, role, "windowed").decisions["vocab_parallel_head"]
             assert decision.on is on, (role, mbs)
-            assert decision.source == "auto", (role, mbs)
+            assert decision.source == "default", (role, mbs)
     for mbs in (1, 8, 32, 64):
         assert not table(key, mbs, "ctx", "windowed").on("vocab_parallel_head"), mbs
     # The parameter and the knob.
@@ -409,10 +443,10 @@ def test_the_vocab_parallel_head_is_on_an_sm107_decode_server_up_to_eight_reques
     assert forced.on("vocab_parallel_head")
     assert forced.decisions["vocab_parallel_head"].source == "knob"
     # baseline gates on the capacity alone.
-    assert table(key, 8, "ctx", "windowed", BASELINE).on("vocab_parallel_head")
-    assert not table(key, 9, "gen", "windowed", BASELINE).on("vocab_parallel_head")
+    assert table(key, 8, "ctx", "windowed", STOCK).on("vocab_parallel_head")
+    assert not table(key, 9, "gen", "windowed", STOCK).on("vocab_parallel_head")
     for mbs in (None, 1, 9, 64):
-        for arm in (None, BASELINE):
+        for arm in (None, STOCK):
             assert table((103, 4), mbs, "ctx", "windowed", arm).on("vocab_parallel_head"), mbs
 
 
@@ -431,7 +465,7 @@ def test_sm103_resolves_under_auto_as_under_baseline(key):
         for arena in ("dense", "windowed", "paged"):
             for mbs in (None, 1, 4, 8, 9, 64):
                 auto = table(key, mbs, role, arena)
-                baseline = table(key, mbs, role, arena, BASELINE)
+                baseline = table(key, mbs, role, arena, STOCK)
                 assert auto.paths() == baseline.paths(), (role, arena, mbs)
 
 
@@ -510,7 +544,7 @@ def test_b_ll_selects_the_generation_set(mbs):
 
 
 def test_baseline_tep8_gen_mbs1_is_the_previous_generation_selection():
-    lever_table = table((107, 8), 1, "gen", "windowed", BASELINE)
+    lever_table = table((107, 8), 1, "gen", "windowed", STOCK)
     assert rule_levers_on(lever_table) == {"lm_head_inbox", "graph_start_qkv_prefetch"} | VPH
 
 
@@ -565,7 +599,7 @@ _LL_REPLAY = LL | DENSE | {"head_multimem_gather"}
             1,
             "gen",
             "windowed",
-            BASELINE,
+            STOCK,
             {"graph_start_qkv_prefetch"},
             set(),
             id="baseline-tep8-gen-mbs1",
@@ -602,7 +636,7 @@ def test_the_high_concurrency_selection_is_aggregated_tep4_from_its_batch():
         assert not other.on("graph_start_qkv_prefetch"), (key, role)
 
 
-@pytest.mark.parametrize("arm", [None, B_LL, BASELINE], ids=["auto", "b-ll", "baseline"])
+@pytest.mark.parametrize("arm", [None, B_LL, STOCK], ids=["default", "b-ll", "stock"])
 @pytest.mark.parametrize("key, mbs", [((107, 4), 4), ((107, 4), 1), ((107, 8), 1)])
 def test_the_ladder_shapes_resolve_alike_on_agg_and_gen(key, mbs, arm):
     def selection(role):
@@ -891,17 +925,46 @@ def test_baseline_is_the_previous_composition(key, arena, role):
             want.add("graph_start_qkv_prefetch")
         if key == (107, 4):
             want.add("prefill_cutedsl_experts")
-        assert table(key, mbs, role, arena, BASELINE).paths() == want, mbs
+        assert table(key, mbs, role, arena, STOCK).paths() == want, mbs
 
 
-def test_baseline_leaves_every_other_origin_off_unless_its_knob_sets_it():
+def test_default_off_leaves_every_lever_without_a_stock_rule_off_unless_its_knob_sets_it():
     lever_table = table(
-        (107, 4), 4, "agg", "windowed", {**BASELINE, **knobs(head_sampler_coop_fold="on")}
+        (107, 4), 4, "agg", "windowed", {**STOCK, **knobs(head_sampler_coop_fold="on")}
     )
-    others = {name for name, rule in RULES.items() if rule.origin != "upstream"}
+    others = {name for name, row in ROWS.items() if row.stock is None}
     assert rule_levers_on(lever_table) & others == {"head_sampler_coop_fold"}
     decision = lever_table.decisions["wide_direct_transports"]
-    assert decision.source == "baseline" and "midc" in decision.why
+    assert decision.source == "stock" and LEVERS.DEFAULT_KNOB in decision.why
+
+
+@pytest.mark.parametrize("key", sorted(TARGET_PATHS))
+def test_default_off_keeps_only_the_stock_rules(key):
+    """Under ``__DEFAULT=off`` each served lever is its row's stock rule (off without one)."""
+    for role in ("agg", "gen", "ctx", "unknown"):
+        for arena in ("dense", "windowed", "paged"):
+            for mbs in (None, 1, 4, 8, 9, 64):
+                lever_table = table(key, mbs, role, arena, STOCK)
+                for name, decision in lever_table.decisions.items():
+                    if decision.source != "stock":
+                        assert decision.source in ("structural", "dependency"), name
+                        continue
+                    if ROWS[name].stock is None:
+                        assert not decision.on, (key, role, arena, mbs, name)
+
+
+@pytest.mark.parametrize("value", ["on", "off", " OFF ", "On"])
+def test_default_takes_on_or_off(value):
+    lever_table = table((107, 4), 4, "agg", "windowed", {LEVERS.DEFAULT_KNOB: value})
+    assert lever_table.default == value.strip().lower()
+    assert LEVERS.DEFAULT_VALUES == ("on", "off")
+    assert table((107, 4), 4, "agg", "windowed").default == "on"
+
+
+@pytest.mark.parametrize("value", ["auto", "baseline", "fast", "1"])
+def test_default_rejects_anything_but_on_or_off(value):
+    with pytest.raises(ValueError, match=re.escape("expected one of ['on', 'off']")):
+        table((107, 4), 4, "agg", "windowed", {LEVERS.DEFAULT_KNOB: value})
 
 
 # --------------------------------------------------------------------------
@@ -912,7 +975,7 @@ def test_baseline_leaves_every_other_origin_off_unless_its_knob_sets_it():
     [
         (knobs(packed_prep_apend="on"), "did you mean MUSESPARK_OPEN_LEVER_PACKED_PREP_APPEND"),
         (knobs(step_loop_on_execution_stream="yes"), "expected one of ['auto', 'on', 'off']"),
-        ({LEVERS.DEFAULT_KNOB: "fast"}, "expected one of ['auto', 'baseline']"),
+        ({LEVERS.DEFAULT_KNOB: "fast"}, "expected one of ['on', 'off']"),
         ({LEVERS.ROLE_KNOB: "decode"}, "MUSESPARK_OPEN_LEVER__ROLE='decode'"),
         (knobs(packed_prep_append__MIN_ROWS=7), "expected an integer in 8..1024, got 7"),
         (knobs(packed_prep_append__MIN_ROWS="many"), "expected an integer in 8..1024"),
@@ -1015,7 +1078,7 @@ def test_a_retired_switch_raises_naming_its_replacement(name):
             (107, 8),
             8,
             "dense",
-            knobs(head_multimem_gather="on"),
+            knobs(head_multimem_gather="on", step_loop_on_execution_stream="off"),
             "requires step_loop_on_execution_stream, which is off",
         ),
         (
@@ -1069,6 +1132,24 @@ def test_every_single_off_gives_a_closed_plan(key, arena):
             DISPATCH.Plan(paths)  # raises when not closed under depends_on
             for lever in paths & set(RULES):
                 assert set(RULES[lever].requires) <= paths, (key, mbs, name, lever)
+
+
+def test_on_turns_on_what_the_lever_requires():
+    """``head_multimem_gather=on`` at a batch where ``step_loop_on_execution_stream`` is off by
+    default turns its requirement on with it (source ``knob``)."""
+    assert not table((107, 8), 8, "agg", "dense").on("step_loop_on_execution_stream")
+    lever_table = table((107, 8), 8, "agg", "dense", knobs(head_multimem_gather="on"))
+    assert lever_table.on("head_multimem_gather")
+    needed = lever_table.decisions["step_loop_on_execution_stream"]
+    assert (needed.on, needed.source) == (True, "knob")
+    assert "needs it" in needed.why
+
+
+def test_on_turns_on_what_the_lever_builds_on():
+    lever_table = table((107, 8), 1, "agg", "dense", {**STOCK, **knobs(drafter_fc_early_fork="on")})
+    assert lever_table.on("drafter_fc_early_fork")
+    assert lever_table.decisions["drafter_kv_side_chain"].source == "knob"
+    assert not lever_table.on("drafter_preamble_from_commit")
 
 
 def test_a_base_path_knob_turns_its_dependents_off():
@@ -1218,7 +1299,8 @@ def test_the_role():
     # Counted as a decoding server; no accuracy gate names an unknown role.
     gen = rule_levers_on(table((107, 4), 4, "gen", "windowed"))
     assert rule_levers_on(unknown) == gen - {"wide_router_per_row"}
-    assert unknown.decisions["wide_router_per_row"].source == "gate"
+    decision = unknown.decisions["wide_router_per_row"]
+    assert decision.source == "default" and "no accuracy gate holds" in decision.why
 
 
 def test_the_table_lines_and_json():

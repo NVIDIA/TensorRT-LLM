@@ -39,9 +39,10 @@ one step and is staged from the next one on.
 
 Descriptor read (``configure``'s ``v2_mode``, the ``step_commit_v2`` lever; ``""``
 or ``"0"``, the default, keeps ``_step_commit_kernel``). Each of its programs loads the
-descriptor's ``count`` and, when its chunk is in range, the six other fields:
-two dependent uncached round trips to pinned host memory and seven requests per
-warp before a COPY / BLOCKS payload read adds a third round trip, and seven of
+descriptor's ``count`` and, when its chunk is in range, the six other fields of
+every kind (a ``BLOCKS`` program also its eighth field, ``bad_page``): two dependent
+uncached round trips to pinned host memory and seven requests per warp (eight for
+``BLOCKS``) before a COPY / BLOCKS payload read adds a third round trip, and seven of
 the eight programs of a short descriptor in a launch with one long one exit
 after the first. With ``"1"`` (or ``"split"``), ``_step_commit_kernel_v2`` loads
 the eight fields as one 64-byte read and then performs ``_step_commit_kernel``'s

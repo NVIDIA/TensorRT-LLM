@@ -13,9 +13,13 @@ DFlash worker pays the same again for the drafter's bonus and mask rows
 ``embed_tokens`` module).
 
 With this fast path every rank also holds the whole ``[202048, 8192]`` bf16
-table (3.08 GiB more per rank, which the KV cache pool does not get), built
-once after the weights load by all-gathering the shards, and a call of at most
-``MAX_ROWS`` ids is one row gather (``ops/embedding/replicated_gather.py``).
+table, built once after the weights load by all-gathering the shards, and a
+call of at most ``MAX_ROWS`` ids is one row gather
+(``ops/embedding/replicated_gather.py``). The rank's shard parameter is then
+rebound to its own rows of the table (``_alias_shard``), so the table costs the
+other ranks' rows only (3.08 GiB less the rank's shard: 2.31 GiB more per rank
+at TP4, 2.70 at TP8, which the KV cache pool does not get), not a second copy
+of the shard on top of the whole table.
 The rows are the sharded path's bits: the all-reduce writes -0.0 as +0.0 and
 adds one owner row to seven +0.0 rows in fp32, which the gather reproduces;
 the install refuses a table holding a subnormal value, the one case where the
@@ -48,6 +52,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ... import dispatch as _tp_agreement
 from ...ops.embedding.replicated_gather import replicated_embedding_gather
+from . import fabric_table as _fabric
 
 #: Largest call (number of ids) served from the replicated table: the target
 #: rows of a decode step of 64 requests (K + 1 = 8 each, 512), with room for
@@ -78,13 +83,17 @@ GATHER_ROWS = 2048
 #: Attribute of the re-classed module that holds the whole table.
 TABLE_ATTR = "_replicated_table"
 
+#: Attribute of the re-classed module that holds the ``fabric_table.FabricTable`` whose mapping
+#: backs ``TABLE_ATTR`` (absent when the install fell back to the replicated table).
+FABRIC_ATTR = "_replicated_fabric_table"
+
 
 class ReplicatedEmbedding(Embedding):
     """The built-in vocab-parallel ``Embedding`` that serves small calls from a whole table.
 
     Never constructed: ``install`` re-classes the built-in module and sets
-    ``TABLE_ATTR``. The parameters (the rank's shard) stay as they are and
-    serve every other call.
+    ``TABLE_ATTR``. The parameter (the rank's shard) is a view of its rows of
+    the table, with the same bits, and serves every other call.
     """
 
     def forward(self, input):
@@ -163,6 +172,20 @@ def _gather_table(
     return table
 
 
+def _shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether ``a`` and ``b`` are views of one storage."""
+    return a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+
+
+def _alias_shard(embedding, mine: torch.Tensor) -> None:
+    """Rebind the shard parameter to ``mine``, its rows of the table (same bits, checked by ``install``).
+
+    The parameter object stays (the drafter shares the module, not the tensor);
+    its own storage is released once ``install`` drops its last reference.
+    """
+    embedding.weight.data = mine
+
+
 def _value_census(table: torch.Tensor) -> tuple[int, int, int]:
     """(subnormal values, non-finite values, -0.0 values) in a bf16 table, counted in row chunks."""
     subnormal = non_finite = negative_zero = 0
@@ -176,6 +199,26 @@ def _value_census(table: torch.Tensor) -> tuple[int, int, int]:
     return subnormal, non_finite, negative_zero
 
 
+def _build_fabric(shard: torch.Tensor, mapping: Mapping, vocab: int):
+    """A ``fabric_table.FabricTable`` for the whole table, or None when any TP rank cannot build one.
+
+    Collective over the TP group (the build and its agreement). A refusal is logged and the
+    caller builds the replicated table instead, on every rank alike.
+    """
+    fabric = _fabric.make_table(vocab, shard.shape[1], shard.dtype, mapping)
+    why = None if fabric is not None else "this rank could not build the fabric table"
+    why = _tp_agreement.agreed_refusal(mapping, why)
+    if why is None:
+        return fabric
+    if fabric is not None:
+        fabric.close()
+    logger.warning(
+        f"[musespark_open] replicated_embedding: fabric table refused ({why}); "
+        "building the replicated table on every rank instead"
+    )
+    return None
+
+
 def install(text_model, mapping: Mapping, context_rows: bool = False) -> None:
     """Build the replicated table and re-class ``text_model.embed_tokens``; collective over TP.
 
@@ -183,7 +226,11 @@ def install(text_model, mapping: Mapping, context_rows: bool = False) -> None:
 
     Every rank must call this at the same point, after the weights are final
     and before any CUDA graph is captured (the shell's ``load_weights``). A
-    repeated call (a reload) refills the existing table in place.
+    repeated call (a reload) refills the existing table in place. On success
+    the shard parameter becomes a view of its rows of the table
+    (``_alias_shard``); a reload that wrote the new shard through that view is
+    copied out first, so the gather never reads the table it overwrites and the
+    shard check below still compares two copies.
 
     Raises:
         ValueError: if the embedding is not the vocab-parallel layout this
@@ -210,7 +257,20 @@ def install(text_model, mapping: Mapping, context_rows: bool = False) -> None:
     free_before = torch.cuda.mem_get_info()[0]
     shard = embedding.weight.detach()
     previous = table_of(embedding)
-    table = _gather_table(shard, mapping, previous)
+    if previous is not None and _shares_storage(shard, previous):
+        # A reload into the aliased parameter: gather from a copy, not from the table being refilled.
+        shard = shard.clone()
+    fabric = embedding.__dict__.get(FABRIC_ATTR)
+    if previous is None:
+        fabric = _build_fabric(shard, mapping, embedding.num_embeddings)
+    if fabric is not None:
+        table = fabric.tensor
+        _fabric.fill_from_shard(table, shard, mapping)
+        # Every rank's rows are written (some into peers' pages) before any rank reads them.
+        torch.cuda.synchronize()
+        fabric.barrier()
+    else:
+        table = _gather_table(shard, mapping, previous)
     width = shard.shape[0]
     mine = table[mapping.tp_rank * width : (mapping.tp_rank + 1) * width]
     subnormal, non_finite, negative_zero = _value_census(table)
@@ -229,6 +289,13 @@ def install(text_model, mapping: Mapping, context_rows: bool = False) -> None:
         )
     else:
         reason = None
+    verified = None
+    if fabric is not None:
+        # Collective, so run on every rank whatever its own reason: every rank has the fabric
+        # table here (agreed in ``_build_fabric``).
+        verified = _fabric.mismatched_rows(table, shard, mapping, GATHER_ROWS)
+        if verified and reason is None:
+            reason = f"the fabric table differs from the gathered shards in {verified} rows"
     reason = _tp_agreement.agreed_refusal(
         mapping,
         None
@@ -242,15 +309,30 @@ def install(text_model, mapping: Mapping, context_rows: bool = False) -> None:
     )
     embedding.__dict__[TABLE_ATTR] = table
     embedding.__dict__[ROWS_ATTR] = rows
+    if fabric is not None:
+        embedding.__dict__[FABRIC_ATTR] = fabric
     changed = type(embedding) is not ReplicatedEmbedding
     embedding.__class__ = ReplicatedEmbedding
+    shard_bytes = shard.numel() * shard.element_size()
+    _alias_shard(embedding, mine)
+    # The last references to the shard's own storage, before the device memory is read.
+    del shard, mine
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     added = free_before - torch.cuda.mem_get_info()[0]
     if changed or previous is None:
+        if fabric is not None:
+            begin, end = fabric.local_rows()
+            held = (
+                f"fabric table, {fabric.local_bytes / 2**30:.2f} GiB of it (rows {begin}..{end}) "
+                f"on this rank, the rest mapped from {mapping.tp_size - 1} peers"
+                + ("" if verified is None else "; bitwise the gathered shards")
+            )
+        else:
+            held = f"+{table.numel() * table.element_size() / 2**30:.2f} GiB table"
         logger.info(
             f"[musespark_open] replicated_embedding: replicated token embedding {tuple(table.shape)} bf16 for calls "
-            f"of at most {rows} ids (+{table.numel() * table.element_size() / 2**30:.2f} GiB "
-            f"table, device +{added / 2**30:.2f} GiB; {negative_zero} -0.0 entries written as "
-            "+0.0, no subnormal or non-finite values)"
+            f"of at most {rows} ids ({held}, device +{added / 2**30:.2f} GiB; {negative_zero} -0.0 "
+            "entries written as +0.0, no subnormal or non-finite values; shard parameter aliased "
+            f"to its table rows, -{shard_bytes / 2**30:.2f} GiB)"
         )

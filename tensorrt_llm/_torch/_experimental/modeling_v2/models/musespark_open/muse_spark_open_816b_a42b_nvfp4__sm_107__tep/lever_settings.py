@@ -153,12 +153,16 @@ def apply(plan: "_dispatch.Plan") -> None:
     # first row count of its lever (33, the band served before, unless its MIN_ROWS knob moves).
     wide64_min_rows = plan.param("tep8_wide64_splitk", "MIN_ROWS") if wide64 else 33
     publish_min_rows = plan.param("tep8_publish_splitk", "MIN_ROWS") if publish_splitk else 33
+    # The deeper stages oversized shared memory allows change no fixed tactic's bits; they also
+    # add tactics to the built-in low-M race (the LM head's GEMM among its calls) that the
+    # image's flashinfer kernel does not offer. Offered on every plan (the lever table's default).
+    oversized = True
     settings = (
         # Dense GEMMs.
         (
             "ops.gemm.splitk_gemm",
-            dict(wide64=wide64),
-            dict(wide64=False),
+            dict(wide64=wide64, oversized_smem=oversized),
+            dict(wide64=False, oversized_smem=True),
         ),
         (
             "kernels.dense_gemms.dispatcher",
@@ -177,9 +181,15 @@ def apply(plan: "_dispatch.Plan") -> None:
                 tep8_wide64_wide_split_k=(
                     plan.param("tep8_wide64_splitk", "WIDE_SPLIT_K") if wide64 else 0
                 ),
+                tep8_wide64_wide2_split_k=(
+                    plan.param("tep8_wide64_splitk", "WIDE2_SPLIT_K") if wide64 else 0
+                ),
                 # PREP_FOLD: the multi-request decode prep in the 2-CTA QKV launch's epilogue.
                 tep8_wide64_prep_fold=(
                     bool(plan.param("tep8_wide64_splitk", "PREP_FOLD")) if wide64 else False
+                ),
+                tep8_wide64_prep_fold_max_rows=(
+                    plan.param("tep8_wide64_splitk", "PREP_FOLD_MAX_ROWS") if wide64 else 128
                 ),
                 # The QKV call of an armed direct-hop step forks o_proj's L2 prefetch (0: none).
                 tep8_direct_prefetch_min_rows=(
@@ -198,7 +208,9 @@ def apply(plan: "_dispatch.Plan") -> None:
                 tep8_wide64_max_rows=64,
                 tep8_wide64_wide_tile="64x64",
                 tep8_wide64_wide_split_k=0,
+                tep8_wide64_wide2_split_k=0,
                 tep8_wide64_prep_fold=False,
+                tep8_wide64_prep_fold_max_rows=128,
                 tep8_direct_prefetch_min_rows=0,
                 prefetch_join="before",
                 drop_weight_prefetch=(),
@@ -349,8 +361,24 @@ def apply(plan: "_dispatch.Plan") -> None:
         ),
         (
             "kernels.boundary_early_release.triggers",
-            dict(norm_gate_pdl_max_rows=NORM_GATE_PDL_MAX_ROWS if on("wide_norm_gate_pdl") else 0),
-            dict(norm_gate_pdl_max_rows=0),
+            dict(
+                norm_gate_pdl_max_rows=NORM_GATE_PDL_MAX_ROWS if on("wide_norm_gate_pdl") else 0,
+                norm_gate_wide_heads_per_program=(
+                    plan.param("wide_norm_gate_pdl", "HEADS_PER_PROGRAM")
+                    if on("wide_norm_gate_pdl")
+                    else 1
+                ),
+                norm_gate_wide_trigger=(
+                    plan.param("wide_norm_gate_pdl", "TRIGGER")
+                    if on("wide_norm_gate_pdl")
+                    else "after_wait"
+                ),
+            ),
+            dict(
+                norm_gate_pdl_max_rows=0,
+                norm_gate_wide_heads_per_program=1,
+                norm_gate_wide_trigger="after_wait",
+            ),
         ),
         # Attention.
         (
@@ -366,6 +394,11 @@ def apply(plan: "_dispatch.Plan") -> None:
                 ),
                 cl8_tep8_wide_min_requests=(
                     plan.param("swa_one_cluster_block", "TEP8_WIDE_MIN_REQUESTS")
+                    if one_cluster
+                    else 0
+                ),
+                cl8_tep8_two_cta_min_requests=(
+                    plan.param("swa_one_cluster_block", "TEP8_TWO_CTA_MIN_REQUESTS")
                     if one_cluster
                     else 0
                 ),
@@ -385,6 +418,7 @@ def apply(plan: "_dispatch.Plan") -> None:
                 cl8_tep8_min_requests=5,
                 cl8_tep8_max_requests=8,
                 cl8_tep8_wide_min_requests=0,
+                cl8_tep8_two_cta_min_requests=0,
                 prep_split=False,
                 one2=False,
             ),
@@ -436,6 +470,11 @@ def apply(plan: "_dispatch.Plan") -> None:
             "ops.moe.ring_buddy_assign",
             dict(
                 rb_pdl=on("tep8_ring_buddy_pdl"),
+                rb_trigger=(
+                    bool(plan.param("tep8_ring_buddy_pdl", "TRIGGER"))
+                    if on("tep8_ring_buddy_pdl")
+                    else False
+                ),
                 tile_placement=tile_placement,
                 tile_min_rows=(
                     plan.param("tep8_tile_placement", "MIN_ROWS") if tile_placement else 33
@@ -469,6 +508,7 @@ def apply(plan: "_dispatch.Plan") -> None:
             ),
             dict(
                 rb_pdl=False,
+                rb_trigger=False,
                 tile_placement=False,
                 tile_min_rows=33,
                 tile_max_rows=64,
@@ -493,6 +533,13 @@ def apply(plan: "_dispatch.Plan") -> None:
                 tep8_early_trigger=(
                     bool(plan.param("tep8_router_push", "RB_CUDA")) if push else False
                 ),
+                tep8_max_rows=plan.param("tep8_router_push", "TEP8_MAX_ROWS") if push else 128,
+                tep8_route_wide_v2=bool(plan.param("tep8_router_push", "ROUTE_WIDE_V2"))
+                if push
+                else False,
+                tep8_route_wide_v2_min_rows=(
+                    int(plan.param("tep8_router_push", "ROUTE_WIDE_V2_MIN_ROWS")) if push else 129
+                ),
             ),
             dict(
                 tep8_push=False,
@@ -502,6 +549,9 @@ def apply(plan: "_dispatch.Plan") -> None:
                 tep8_route_row_max=64,
                 tep8_route_rows_per_cta=1,
                 tep8_early_trigger=False,
+                tep8_max_rows=128,
+                tep8_route_wide_v2=False,
+                tep8_route_wide_v2_min_rows=129,
             ),
         ),
         (
@@ -528,13 +578,34 @@ def apply(plan: "_dispatch.Plan") -> None:
                     if finalize64
                     else False
                 ),
+                tep8_chunked=(
+                    bool(plan.param("tep8_finalize_transport_64", "CHUNKED"))
+                    if finalize64
+                    else False
+                ),
+                tep8_two_phase_min_tokens=(
+                    plan.param("tep8_finalize_transport_64", "TWO_PHASE_MIN_TOKENS")
+                    if finalize64
+                    else 0
+                ),
             ),
-            dict(tep8_max_tokens=16, trigger="late", index_prefetch=False),
+            dict(
+                tep8_max_tokens=16,
+                trigger="late",
+                index_prefetch=False,
+                tep8_chunked=False,
+                tep8_two_phase_min_tokens=0,
+            ),
         ),
         (
             "ops.allreduce.post_attn_hop",
             dict(entry_trigger=on("hop_entry_trigger")),
             dict(entry_trigger=False),
+        ),
+        (
+            "ops.comm.unpool_direct_boundary",
+            dict(wide_tp8=on("tep8_unpool_direct_wide")),
+            dict(wide_tp8=False),
         ),
         (
             "kernels.drafter_hops.hops",
@@ -571,6 +642,9 @@ def apply(plan: "_dispatch.Plan") -> None:
                 direct_poll_first=(
                     bool(plan.param("tep8_direct_hop", "POLL_FIRST")) if direct else False
                 ),
+                direct_l2_prefetch=(
+                    bool(plan.param("tep8_direct_hop", "L2_PREFETCH")) if direct else False
+                ),
                 early_launch=early,
                 multicast=early,
                 pad_rows=HOP_PAD_ROWS if early else (0, 1024),
@@ -585,6 +659,7 @@ def apply(plan: "_dispatch.Plan") -> None:
                 direct_producer_stages=0,
                 direct_min_rows=33,
                 direct_poll_first=False,
+                direct_l2_prefetch=False,
                 early_launch=False,
                 multicast=False,
                 pad_rows=(0, 1024),
@@ -619,6 +694,9 @@ def apply(plan: "_dispatch.Plan") -> None:
                 tep8_pool_programmatic=on("tep8_pool_programmatic_fork"),
                 tep8_join_pdl=join,
                 join_cluster=join,
+                join_entry_trigger=bool(plan.param("tep8_publish_join", "ENTRY_TRIGGER"))
+                if join
+                else False,
             ),
             dict(
                 tep8_publish_splitk=False,
@@ -630,6 +708,7 @@ def apply(plan: "_dispatch.Plan") -> None:
                 tep8_pool_programmatic=False,
                 tep8_join_pdl=False,
                 join_cluster=False,
+                join_entry_trigger=False,
             ),
         ),
         (
@@ -658,6 +737,9 @@ def apply(plan: "_dispatch.Plan") -> None:
                 vp_min_rows=plan.param("vocab_parallel_head", "MIN_ROWS")
                 if on("vocab_parallel_head")
                 else 16,
+                vp_rank_chain=bool(plan.param("vocab_parallel_head", "RANK_CHAIN"))
+                if on("vocab_parallel_head")
+                else True,
                 topp_rounds=plan.param("head_sampler_coop_fold", "TOPP_ROUNDS")
                 if on("head_sampler_coop_fold")
                 else 0,
@@ -668,7 +750,13 @@ def apply(plan: "_dispatch.Plan") -> None:
                 if on("head_sampler_coop_fold")
                 else False,
             ),
-            dict(vp_min_rows=16, topp_rounds=0, dist_min_rows=0, dist_fabric=False),
+            dict(
+                vp_min_rows=16,
+                vp_rank_chain=True,
+                topp_rounds=0,
+                dist_min_rows=0,
+                dist_fabric=False,
+            ),
         ),
         (
             "ops.spec.dflash_verify_fold",

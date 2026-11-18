@@ -235,8 +235,8 @@ def install(draft_model: Optional[nn.Module]) -> bool:
     )
     logger.info(
         f"[musespark_open] drafter_l2_prefetch: drafter GEMM weights asked of the L2 ahead of use "
-        f"(level {LEVEL}: {', '.join(STAGES[:LEVEL])} forks of {','.join(WEIGHTS)}, "
-        f"{per_layer / 2**20:.0f} MiB per layer, "
+        f"(level {LEVEL}: {', '.join(STAGES[:LEVEL])} forks of {','.join(WEIGHTS)}, {per_layer / 2**20:.0f} MiB per "
+        f"layer, "
         f"block decodes of {MIN_ROWS}+ rows)"
     )
     return True

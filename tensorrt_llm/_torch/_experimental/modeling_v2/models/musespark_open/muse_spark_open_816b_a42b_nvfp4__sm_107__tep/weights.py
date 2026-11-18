@@ -63,7 +63,9 @@ def install_loaded_features(
 
     Then ``hot_replicas`` (``hot_replicas.install``: hooks only, at tp 4; the copies are
     gathered on the first forward of a deployment that serves 33..512-row decode steps),
-    then, with ``prefill_cutedsl_experts`` on Rubin (sm107) at tp 4
+    then ``expert_tactic_pin`` (``expert_tactic_pin.install``: a host-side check around every
+    NVFP4 layer's expert forward that pins the 512..1023-row calls' tactic after the tuning
+    pass; agreed over the TP group), then, with ``prefill_cutedsl_experts`` on Rubin (sm107) at tp 4
     (``prefill_cutedsl_experts.serves`` of ``compute_capability``, the device's; None
     installs it nowhere), ``prefill_cutedsl_experts`` (``prefill_cutedsl_experts.install``: the
     4096..8192-row expert calls of the NVFP4 layers on the Rubin CuTe DSL GEMMs),
@@ -88,6 +90,36 @@ def install_loaded_features(
 
         # After the owner-window install, whose expert and routing hooks it wraps.
         _hot_replicas.install(text_model, mapping, pin_l061=plan.enabled("l061_tile32_pin"))
+    if plan.enabled("expert_tactic_pin"):
+        from .kernels.expert_tactic_pin import pin as _expert_tactic_pin
+
+        # After the expert paths above, whose expert forwards it wraps with a host-side cache
+        # check only. Its refusals (device capability, no NVFP4 window) are agreed over the TP
+        # group.
+        tactic = (
+            plan.param("expert_tactic_pin", "TILE_N"),
+            plan.param("expert_tactic_pin", "CONFIG"),
+        )
+        _tp_agreement.agreed_install(
+            mapping, lambda: _expert_tactic_pin.install(text_model, tactic, compute_capability)
+        )
+    if plan.enabled("row_owner_moe"):
+        from .kernels.row_owner_moe import island as _row_owner_moe
+
+        # The island's weight-dependent refusals (NVFP4 TRTLLM experts on every island layer,
+        # the fused pre-expert quantization's global scale), agreed over the TP group.
+        owner_island = getattr(text_model, "_row_owner_moe", None)
+        if owner_island is None:
+            raise ValueError(
+                "[musespark_open] row_owner_moe is planned but the model shell built no island"
+            )
+        _tp_agreement.agreed_install(
+            mapping, lambda: _row_owner_moe.check_loaded(text_model, owner_island.max_rows)
+        )
+        # The receive buffers the shell's meta-device construction left on ``meta``.
+        _tp_agreement.agreed_install(
+            mapping, owner_island.materialize, refusals=(RuntimeError, ValueError)
+        )
     if plan.enabled("prefill_cutedsl_experts"):
         from .kernels.prefill_cutedsl_experts import install as _prefill_cutedsl
 

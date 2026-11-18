@@ -100,6 +100,39 @@ _SM107_RING_STAGES = {1: 16, 2: 16}
 #: The ring depths the builds take (``ring_stages``), as ``configure`` last set them.
 RING_STAGES = dict(_SM107_RING_STAGES)
 
+#: dieexp KF651 (knob ``MUSESPARK_OPEN_DX_MR_KF651=1``, default off): the served build (full layers, E4M3 Q, device
+#: scales, 2 KV heads per rank, the 64-request build) runs the Kernel Factory fa-block-vr2 candidate 651fa0ca's split
+#: kernel (``multi_request_split_kv_kernel_kf651``, ring KF651_STAGES) and its combine (``_kf_post_kernel``: the
+#: kernel's tile-aligned partition, read from the slot map CTA 0 publishes). Order-only vs the served pair.
+KF651 = __import__("os").environ.get("MUSESPARK_OPEN_DX_MR_KF651", "") == "1"
+KF651_STAGES = 24
+KF651_REGS_SOFTMAX = 208
+#: dieexp KF651 v3 (KF fa-block-vr5 62963e84 port): softmax/other register split, SEG_PAD virtual tiles.
+KF651_REGS_OTHER = 80
+KF651_SEG_PAD = 2
+#: The KF651 kernel's CTA 0 publishes the request -> slot map from ONE warp (lanes 0..31): above 32 requests the
+#: combine would read unpublished slots (illegal address at 48, w256 q11), so larger batches take the served pair.
+KF651_MAX_REQUESTS = 32
+#: dieexp KF651 v2 (``MUSESPARK_OPEN_DX_MR_KF651_V2=1`` with KF651; KF fa-block-vr4 48f1a399): ``_kf_post_kernel``
+#: recomputes
+#: the request's slot range from ``seq_lens`` (immutable in the step; the same integers the split kernel's CTA 0
+#: publishes)
+#: before its dependency wait, triggers its dependent (o_proj) before the wait, and runs 2 warps below 8 requests. Same
+#: arithmetic and order (bitwise to KF651). No W_o prefetch here: the banked direct-hop producer prefetches its weight.
+KF651_V2 = __import__("os").environ.get("MUSESPARK_OPEN_DX_MR_KF651_V2", "") == "1"
+
+
+def kf651_build(kv_heads: int, window: int, q_fp8: bool, device_scale: bool, requests: int) -> bool:
+    """Whether a build runs the KF651 pair (``KF651`` on and the served full-attention build)."""
+    return bool(
+        KF651
+        and kv_heads == 2
+        and window == 0
+        and q_fp8
+        and device_scale
+        and int(requests) <= KF651_MAX_REQUESTS
+    )
+
 
 def configure(*, sm107_stages: Optional[int] = None) -> None:
     """Set sm107's ring depth for the served one-term (E4M3) Q build (``split_kv_deep_rings``).
@@ -210,15 +243,21 @@ def _compiled_kernel(
     device_scale: bool = False,
     stages: Optional[int] = None,
     max_requests: int = REQUEST_BUILDS[0],
+    kf651: bool = False,
 ):
     """The compiled split kernel of one build (its ring depth from ``ring_stages`` unless
-    ``stages`` is given)."""
+    ``stages`` is given; ``kf651``: the KF651 kernel)."""
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_ptr
 
-    from . import multi_request_split_kv_kernel as mk
+    if kf651:
+        from . import multi_request_split_kv_kernel_kf651 as mk
+
+        assert mk.SEG_PAD == KF651_SEG_PAD
+    else:
+        from . import multi_request_split_kv_kernel as mk
 
     assert (mk.MAX_ROWS, mk.REQUEST_BUILDS) == (MAX_ROWS, REQUEST_BUILDS)
     if stages is None:
@@ -234,6 +273,7 @@ def _compiled_kernel(
         q_fp8=q_fp8,
         device_scale=device_scale,
         max_requests=max_requests,
+        **({"regs_softmax": KF651_REGS_SOFTMAX, "regs_other": KF651_REGS_OTHER} if kf651 else {}),
     )
     dtypes = (
         cutlass.Float8E4M3FN if q_fp8 else cutlass.BFloat16,  # q
@@ -284,15 +324,17 @@ def compiled_key(
     ``nq`` says."""
     return (int(device_index), bool(enable_pdl), int(kv_heads), int(window),
             1 if q_fp8 else int(nq), int(rescale_cols), bool(q_fp8),
-            bool(device_scale), request_build(int(requests)))  # fmt: skip
+            bool(device_scale), request_build(int(requests)),
+            kf651_build(int(kv_heads), int(window), bool(q_fp8), bool(device_scale), int(requests)))  # fmt: skip
 
 
 def _compile(key: tuple):
     # The ring depth (``ring_stages``, which ``configure`` sets on sm107) is passed explicitly so
     # that it is part of the compiled build's cache key.
     return _compiled_kernel(*key[:4], nq=key[4], rescale_cols=key[5], q_fp8=key[6],
-                            device_scale=key[7], stages=ring_stages(key[0], key[4]),
-                            max_requests=key[8])  # fmt: skip
+                            device_scale=key[7],
+                            stages=KF651_STAGES if key[9] else ring_stages(key[0], key[4]),
+                            max_requests=key[8], kf651=key[9])  # fmt: skip
 
 
 def precompile(
@@ -439,6 +481,392 @@ def _combine_kernel(
     tl.store(out_ptr + row * out_stride + hh[:, None] * D + dd[None, :], res.to(tl.bfloat16))
 
 
+@triton.jit(do_not_specialize=["num_requests", "num_work", "rows", "out_stride", "out_scale"])
+def _combine_norm_gate_kernel(
+    part_o_ptr,
+    part_lse_ptr,
+    seq_lens_ptr,
+    out_ptr,
+    out_stride,
+    out_scale,
+    out_scale_ptr,
+    num_requests,
+    num_work,
+    rows,
+    gate_ptr,
+    gated_ptr,
+    gate_token_stride,
+    gate_head_stride,
+    eps,
+    HQ: tl.constexpr,
+    GH: tl.constexpr,
+    D: tl.constexpr,
+    SLOT_ROWS: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    P: tl.constexpr,
+    WINDOW: tl.constexpr,
+    MIN_P: tl.constexpr,
+    CHUNK: tl.constexpr,
+    MAX_SLOTS: tl.constexpr,
+    DEVICE_SCALE: tl.constexpr,
+    TRIGGER: tl.constexpr,
+):
+    """``_combine_kernel`` followed, in the same program, by ``norm_gate``'s
+    ``_attention_norm_gate_pdl_kernel`` on each of the program's GH heads (s316 ``NORM_GATE_FOLD``).
+
+    The combine part is ``_combine_kernel``'s body statement for statement (same grid, same shapes,
+    same ``num_warps``), so ``out`` gets the same BF16 bits. After a CTA barrier the program reloads
+    each of its heads' 64 BF16 outputs as one ``[64]`` tensor and runs the norm-gate's statements on
+    it -- the same ``[64]`` layout as the standalone kernel at the same ``num_warps`` (4: the combine
+    shape of 5+ requests, the only one the fold takes) -- writing the gated row ``row * HQ + head``
+    of ``gated``. ``TRIGGER`` is the norm-gate's (0 exit, 1 after the wait, 2 entry)."""
+    b = tl.program_id(0)
+    tok = tl.program_id(1)
+    hg = tl.program_id(2)
+    if TRIGGER == 2:
+        tl.extra.cuda.gdc_launch_dependents()
+    tl.extra.cuda.gdc_wait()
+    if TRIGGER == 1:
+        tl.extra.cuda.gdc_launch_dependents()
+    ib = tl.arange(0, BLOCK_B)
+    okb = ib < num_requests
+    L = tl.load(seq_lens_ptr + ib, mask=okb, other=0)
+    if WINDOW > 0:
+        first = tl.maximum(L - rows - WINDOW + 1, 0) // P
+    else:
+        first = L * 0
+    n = tl.where(okb, (L + P - 1) // P - first, 0)
+    total = tl.sum(n, 0)
+    start = tl.sum(tl.where(ib < b, n, 0), 0)
+    end = start + tl.sum(tl.where(ib == b, n, 0), 0)
+    weff = tl.minimum(num_work, (total + MIN_P - 1) // MIN_P)
+    c_first = ((start + 1) * weff - 1) // total
+    c_last = (end * weff - 1) // total
+    n_slots = c_last - c_first + 1
+    s0 = (c_first + b).to(tl.int64)
+    hh = hg * GH + tl.arange(0, GH)
+    dd = tl.arange(0, D)
+    R = tok * HQ + hh
+    ss = tl.arange(0, MAX_SLOTS)
+    lse_all = tl.load(
+        part_lse_ptr + (s0 + ss)[:, None] * SLOT_ROWS + R[None, :],
+        mask=(ss < n_slots)[:, None],
+        other=float("-inf"),
+    )
+    sc = tl.arange(0, CHUNK)
+    ok = sc < n_slots
+    lse = tl.load(
+        part_lse_ptr + (s0 + sc)[:, None] * SLOT_ROWS + R[None, :],
+        mask=ok[:, None],
+        other=float("-inf"),
+    )
+    o = tl.load(
+        part_o_ptr
+        + (((s0 + sc)[:, None] * SLOT_ROWS + R[None, :]) * D)[:, :, None]
+        + dd[None, None, :],
+        mask=ok[:, None, None],
+        other=0.0,
+    ).to(tl.float32)
+    m = tl.max(lse_all, 0)
+    m = tl.where(m == float("-inf"), 0.0, m)
+    w_all = tl.where(lse_all == float("-inf"), 0.0, tl.math.exp2(lse_all - m[None, :]))
+    den = tl.sum(w_all, 0)
+    w = tl.where(lse == float("-inf"), 0.0, tl.math.exp2(lse - m[None, :]))
+    acc = tl.sum(o * w[:, :, None], 0)
+    for c0 in range(CHUNK, n_slots, CHUNK):
+        sc = c0 + tl.arange(0, CHUNK)
+        ok = sc < n_slots
+        slot = s0 + sc
+        lse = tl.load(
+            part_lse_ptr + slot[:, None] * SLOT_ROWS + R[None, :],
+            mask=ok[:, None],
+            other=float("-inf"),
+        )
+        w = tl.where(lse == float("-inf"), 0.0, tl.math.exp2(lse - m[None, :]))
+        o = tl.load(
+            part_o_ptr
+            + ((slot[:, None] * SLOT_ROWS + R[None, :]) * D)[:, :, None]
+            + dd[None, None, :],
+            mask=ok[:, None, None],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(o * w[:, :, None], 0)
+    if DEVICE_SCALE:
+        scale = tl.load(out_scale_ptr)
+    else:
+        scale = out_scale
+    res = acc * (scale / den)[:, None]
+    row = b * rows + tok
+    tl.store(out_ptr + row * out_stride + hh[:, None] * D + dd[None, :], res.to(tl.bfloat16))
+    # The norm-gate of the program's GH heads on the stored BF16 output (norm_gate's statements).
+    tl.debug_barrier()
+    offsets = tl.arange(0, D)
+    for i in tl.static_range(GH):
+        head = hg * GH + i
+        x = tl.load(out_ptr + row * out_stride + head * D + offsets).to(tl.float32)
+        variance = tl.sum(x * x, axis=0) / D
+        normed = (x * tl.rsqrt(variance + eps)).to(tl.bfloat16)
+        g = tl.load(gate_ptr + row * gate_token_stride + head * gate_head_stride + offsets).to(
+            tl.float32
+        )
+        sigmoid = tl.sigmoid(g).to(tl.bfloat16)
+        result = normed.to(tl.float32) * sigmoid.to(tl.float32)
+        tl.store(gated_ptr + (row * HQ + head) * D + offsets, result)
+
+
+#: dieexp KF651: the slots one chunk of ``_kf_post_kernel`` reads, by batch size (651fa0ca's: 32 from 8 requests,
+#: else 64). Unlike the candidate's single chunk, the kernel loops over further chunks (same bits whenever a request's
+#: slots fit one chunk, as at equal lengths; correct when one request of an uneven batch spans more).
+def _kf_chunk(requests: int) -> int:
+    return 32 if requests >= 8 else 64
+
+
+@triton.jit(do_not_specialize=["num_requests", "rows", "workspace_slots", "num_work"])
+def _kf_post_kernel(
+    part_o,
+    part_lse,
+    out_scale,
+    gate,
+    out,
+    seq_lens,
+    num_requests,
+    rows,
+    gate_stride,
+    gate_head_stride,
+    out_stride,
+    workspace_slots,
+    eps,
+    num_work,
+    HQ: tl.constexpr,
+    GH: tl.constexpr,
+    D: tl.constexpr,
+    SLOT_ROWS: tl.constexpr,
+    CHUNK: tl.constexpr,
+    FUSE: tl.constexpr,
+    MAXR: tl.constexpr,
+    PAGE: tl.constexpr,
+    PAGES_PER_TILE: tl.constexpr,
+    SEG_PAD: tl.constexpr,
+):
+    """dieexp KF651: 651fa0ca's fast_post (one program per (request, token, GH adjacent query heads); fp32 merge;
+    the BF16 attention row), looped over ALL chunks of CHUNK slots. FUSE: then ``bf16(rmsnorm(att)) *
+    bf16(sigmoid(gate))`` into ``out`` [rows, HQ * D]; else the attention row into ``out`` (row stride
+    ``out_stride``). PDL: the slot range is derived from seq_lens (immutable) before the wait; every predecessor
+    output (partials, gate, scale) is read after it."""
+    req = tl.program_id(0)
+    tok = tl.program_id(1)
+    head = tl.program_id(2) * GH + tl.arange(0, GH)
+    # Before the dependency wait: the request's partial-slot range from the batch's lengths (an
+    # immutable input), by the formula the KF651 kernel's CTA 0 publishes (full layer: every
+    # request attends pages [0, ceil(L / PAGE)), in tiles of PAGES_PER_TILE pages).
+    rq = tl.arange(0, MAXR)
+    lens = tl.load(seq_lens + rq, mask=rq < num_requests, other=0)
+    tiles = tl.where(
+        rq < num_requests,
+        ((lens + PAGE - 1) // PAGE + PAGES_PER_TILE - 1) // PAGES_PER_TILE + SEG_PAD,
+        0,
+    )
+    total = tl.sum(tiles, 0)
+    start = tl.sum(tl.where(rq < req, tiles, 0), 0)
+    end = start + tl.sum(tl.where(rq == req, tiles, 0), 0)
+    effective = tl.minimum(num_work, total)
+    first = ((start + SEG_PAD + 1) * effective - 1) // total
+    last = (end * effective - 1) // total
+    slot0 = (first + req).to(tl.int64)
+    nslots = last - first + 1
+    d = tl.arange(0, D)
+    row = req * rows + tok
+    tl.extra.cuda.gdc_wait()
+    tl.extra.cuda.gdc_launch_dependents()
+
+    if FUSE:
+        g = tl.load(gate + row * gate_stride + head[:, None] * gate_head_stride + d[None, :]).to(
+            tl.float32
+        )
+    osc = tl.load(out_scale)
+
+    slots = tl.arange(0, CHUNK)
+    valid = slots < nslots
+    rr = tok * HQ + head
+    lse = tl.load(
+        part_lse + (slot0 + slots)[:, None] * SLOT_ROWS + rr[None, :],
+        mask=valid[:, None],
+        other=float("-inf"),
+    )
+    partial = tl.load(
+        part_o
+        + ((slot0 + slots)[:, None] * SLOT_ROWS + rr[None, :])[:, :, None] * D
+        + d[None, None, :],
+        mask=valid[:, None, None],
+        other=0.0,
+    ).to(tl.float32)
+    m = tl.max(lse, 0)
+    for c0 in range(CHUNK, nslots, CHUNK):
+        lse_c = tl.load(
+            part_lse + (slot0 + c0 + slots)[:, None] * SLOT_ROWS + rr[None, :],
+            mask=((c0 + slots) < nslots)[:, None],
+            other=float("-inf"),
+        )
+        m = tl.maximum(m, tl.max(lse_c, 0))
+    m = tl.where(m == float("-inf"), 0.0, m)
+    weight = tl.where(valid[:, None], tl.math.exp2(lse - m[None, :]), 0.0)
+    den = tl.sum(weight, 0)
+    acc = tl.sum(partial * weight[:, :, None], 0)
+    for c0 in range(CHUNK, nslots, CHUNK):
+        ok = (c0 + slots) < nslots
+        slot = slot0 + c0 + slots
+        lse_c = tl.load(
+            part_lse + slot[:, None] * SLOT_ROWS + rr[None, :],
+            mask=ok[:, None],
+            other=float("-inf"),
+        )
+        w_c = tl.where(ok[:, None], tl.math.exp2(lse_c - m[None, :]), 0.0)
+        den += tl.sum(w_c, 0)
+        o_c = tl.load(
+            part_o + (slot[:, None] * SLOT_ROWS + rr[None, :])[:, :, None] * D + d[None, None, :],
+            mask=ok[:, None, None],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(o_c * w_c[:, :, None], 0)
+    xb = (acc * (osc / den)[:, None]).to(tl.bfloat16)
+    if FUSE:
+        x = xb.to(tl.float32)
+        variance = tl.sum(x * x, 1) / D
+        normed = (x * tl.rsqrt(variance[:, None] + eps)).to(tl.bfloat16)
+        sigmoid = tl.sigmoid(g).to(tl.bfloat16)
+        tl.store(
+            out + (row * HQ + head[:, None]) * D + d[None, :],
+            normed.to(tl.float32) * sigmoid.to(tl.float32),
+        )
+    else:
+        tl.store(out + row * out_stride + head[:, None] * D + d[None, :], xb)
+
+
+#: Heads per combine program by batch size (two adjacent heads halve the grid at the batch extremes; one head keeps
+#: occupancy in the middle regime). Override from main.
+POST_GH = {5: 2, 13: 2}
+POST_GH_MIN_WIDE = 24
+
+
+def _post_gh(requests: int) -> int:
+    return POST_GH.get(requests, 2 if requests >= POST_GH_MIN_WIDE else 1)
+
+
+def kf651_post(pending, gate, eps: float, out: torch.Tensor) -> torch.Tensor:
+    """dieexp KF651: the combine of a KF651 launch (``pending``), with the attention norm-gate folded in when ``gate``
+    is given (into ``out`` [rows, HQ * 64] BF16) or else the merged attention output into ``out`` (the call's)."""
+    (
+        part_o,
+        part_lse,
+        seq_lens,
+        out2,
+        bmm2_scale,
+        device_scale,
+        requests,
+        num_work,
+        per,
+        kv_heads,
+        hq,
+        window,
+        enable_pdl,
+    ) = pending
+    assert device_scale and window == 0
+    fuse = gate is not None
+    if fuse:
+        assert gate.dtype == torch.bfloat16 and gate.stride(-1) == 1
+    assert requests <= 64 and window == 0
+    gh = _post_gh(requests)
+    _kf_post_kernel[(requests, per, hq // gh)](
+        part_o,
+        part_lse,
+        bmm2_scale,
+        gate if fuse else part_lse,
+        out,
+        seq_lens,
+        requests,
+        per,
+        gate.stride(0) if fuse else 0,
+        (gate.stride(1) if gate.ndim == 3 else HEAD_DIM) if fuse else 0,
+        out.stride(0),
+        part_lse.shape[0],
+        float(eps),
+        num_work,
+        HQ=hq,
+        GH=gh,
+        D=HEAD_DIM,
+        SLOT_ROWS=MAX_ROWS * hq,
+        CHUNK=_kf_chunk(requests),
+        FUSE=fuse,
+        MAXR=64,
+        PAGE=32,
+        PAGES_PER_TILE=4,
+        SEG_PAD=KF651_SEG_PAD,
+        num_warps=gh,
+        launch_pdl=True,
+    )
+    return out
+
+
+def combine_norm_gate(pending, gate: torch.Tensor, eps: float, trigger: int = 0) -> torch.Tensor:
+    """The deferred combine of ``multi_request_split_kv(..., defer_combine=True)`` (its ``pending``)
+    with the attention norm-gate folded in: returns ``norm_gate``'s output ``[rows, HQ * 64]`` BF16
+    (fresh, contiguous) and leaves the merged attention output in the call's ``out`` as the
+    combine does. ``trigger``: ``norm_gate.TRIGGERS``' value."""
+    (
+        part_o,
+        part_lse,
+        seq_lens,
+        out2,
+        bmm2_scale,
+        device_scale,
+        requests,
+        num_work,
+        per,
+        kv_heads,
+        hq,
+        window,
+        enable_pdl,
+    ) = pending
+    chunk, warps = next(s[1:] for s in COMBINE_SHAPES if requests <= s[0])
+    if warps != 4 or gate.stride(-1) != 1 or gate.dtype != torch.bfloat16:
+        raise ValueError(
+            "combine_norm_gate (multi-request): 5+ requests (4-warp combine) and a BF16 gate"
+        )
+    gated = torch.empty((out2.shape[0], hq * HEAD_DIM), dtype=torch.bfloat16, device=out2.device)
+    _combine_norm_gate_kernel[(requests, per, kv_heads)](
+        part_o,
+        part_lse,
+        seq_lens,
+        out2,
+        out2.stride(0),
+        1.0 if device_scale else float(bmm2_scale),
+        bmm2_scale if device_scale else part_lse,
+        requests,
+        num_work,
+        per,
+        gate,
+        gated,
+        gate.stride(0),
+        gate.stride(1) if gate.ndim == 3 else HEAD_DIM,
+        eps,
+        HQ=hq,
+        GH=Q_PER_KV,
+        D=HEAD_DIM,
+        SLOT_ROWS=MAX_ROWS * hq,
+        BLOCK_B=request_build(requests),
+        P=PAGE,
+        WINDOW=window,
+        MIN_P=MIN_PAGES,
+        CHUNK=chunk,
+        MAX_SLOTS=COMBINE_MAX_SLOTS,
+        DEVICE_SCALE=device_scale,
+        TRIGGER=int(trigger),
+        num_warps=warps,
+        launch_pdl=True,
+    )
+    return gated
+
+
 class MultiRequestSplitKv(OpWrapper):
     """Causal (optionally sliding-window) decode attention of a batch of requests of ``M`` rows
     each over the FP8 paged cache; writes ``out`` and returns it.
@@ -492,7 +920,8 @@ class MultiRequestSplitKv(OpWrapper):
         workspace: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         num_work: Optional[int] = None,
         nq: int = NQ,
-    ) -> torch.Tensor:
+        defer_combine: bool = False,
+    ):
         q2 = q.reshape(q.shape[0], -1) if q.dim() == 3 else q
         rows = q2.shape[0] if q2.dim() == 2 else 0
         kv_heads = kv_pool.shape[1] if kv_pool.dim() == 4 else 0
@@ -614,7 +1043,45 @@ class MultiRequestSplitKv(OpWrapper):
             bmm1_scale.data_ptr() if device_scale else part_lse.data_ptr(),
             cuda.CUstream(stream.cuda_stream),
         )
+        if key[9]:
+            # dieexp KF651: the kernel's partition differs from the served combine's; its own combine.
+            pending = (
+                part_o,
+                part_lse,
+                seq_lens,
+                out2,
+                bmm2_scale,
+                device_scale,
+                requests,
+                num_work,
+                per,
+                kv_heads,
+                hq,
+                window,
+                enable_pdl,
+            )
+            if defer_combine:
+                return pending
+            kf651_post(pending, None, 0.0, out2)
+            return out2
         chunk, warps = next(s[1:] for s in COMBINE_SHAPES if requests <= s[0])
+        if defer_combine:
+            # s316 NORM_GATE_FOLD: the combine runs later, folded into the norm-gate (combine_norm_gate).
+            return (
+                part_o,
+                part_lse,
+                seq_lens,
+                out2,
+                bmm2_scale,
+                device_scale,
+                requests,
+                num_work,
+                per,
+                kv_heads,
+                hq,
+                window,
+                enable_pdl,
+            )
         _combine_kernel[(requests, per, kv_heads)](
             part_o,
             part_lse,

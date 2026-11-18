@@ -329,6 +329,10 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
     _boundary_trigger: str = "exit"
     _capture_fold: Optional[torch.Tensor] = None
     _capture_stored: bool = False
+    #: ``multi_request_ffn_join`` (``kernels/multi_request_ffn_join``): the op a call that reaches the
+    #: built-in join offers itself to first (33..768 rows; as the lever installs it, only a call
+    #: carrying ``_capture_fold``); ``None`` without the lever.
+    _multi_request_join = None
     #: ``last_layer_boundary`` (``modeling.G2_L61_BOUNDARY``, set by ``DecodeTarget`` on the last
     #: layer's join only): the final model norm. A call whose ``next_norm`` is this norm is the last
     #: layer's join followed by the final norm, which ``unpool_final_boundary`` runs on the unpool
@@ -451,6 +455,13 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
                 return result
             # Gather as the built-in would have, then join as it would have.
             branch = self._gather.gather(branch)
+        joiner = self._multi_request_join
+        if joiner is not None:
+            # The built-in Triton join's function on the full-width branch, as one multi-row
+            # cluster kernel (and the DFlash capture when ``capture_fold`` handed one).
+            joined = joiner.join(self, residual, branch, eps, next_norm, gain)
+            if joined is not None:
+                return joined
         return super()._add_after_rmsnorm_and_norm(residual, branch, eps, next_norm, gain)
 
     def _g2_join_and_final_norm(

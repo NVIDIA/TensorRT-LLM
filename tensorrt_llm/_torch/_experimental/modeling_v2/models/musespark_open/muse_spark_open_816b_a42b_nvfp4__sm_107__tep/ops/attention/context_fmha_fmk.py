@@ -32,6 +32,28 @@ assigned longest first to the CTA with the least work (LPT), which ``split=False
 
 Numerics are the kernel's (see ``context_fmha_fmk_kernel``); the merge weights every piece by
 ``l * 2^(m - max m)`` in fp32 and rounds the merged row to BF16 once.
+
+Early QK. With ``MUSESPARK_OPEN_FMK_EARLY_QK=1`` in the environment (read once, at import)
+every call runs the kernel's ``p_smem`` build: P in shared memory, so the next key tile's QK is
+issued as soon as the softmax has read the current S instead of after its P.V. Same MMAs on the
+same operand values in the same order, so the output is the same bitwise; the per-tile chain
+from P to the next S leaves the softmax warps' critical path.
+
+fp16 exponent. With ``MUSESPARK_OPEN_FMK_EXP_F16X2=1`` (read once, at import) every call runs the
+kernel's ``exp_f16x2`` build: the softmax exponent two at a time in fp16
+(``ex2.approx.f16x2``), half the exp-unit work per key tile. Numerics differ from the fp32 build
+(fp16 arguments and results before the E4M3 rounding of P, fp16 tile sums), so it is a numeric
+variant of its own.
+
+KF build. ``MUSESPARK_OPEN_FMK_KF`` (read once, at import) selects the KF context FMHA build
+(f086a525: the tensor-core FP8 MMAs at Rubin's native K=64 instruction depth, ``rubin_mma``;
+compiled at opt-level 2, the merge at 8 warps) against the sm100 K=32 build above (opt-level 1, the
+merge at 4 warps): order-only against each other (maxdiff <= 1e-3). ``1`` selects it, ``0`` the
+sm100 build; unset, the KF build unless ``EARLY_QK`` or ``EXP_F16X2`` asks for a build of the sm100
+kernel. ``KF`` is read by the TEP library (``kernels/fmk_context_fmha``), which passes ``kf`` on every
+call; a call that leaves ``kf`` None runs the KF build only with one of its schedule options
+(``pair_s``, ``self_issue``, ``turn_groups``), else the sm100 build (other callers, e.g. the PP
+target's stage library, keep the build they ran).
 """
 
 from __future__ import annotations
@@ -39,6 +61,7 @@ from __future__ import annotations
 import functools
 import heapq
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -58,6 +81,24 @@ UNIT_FIELDS = 8
 #: for short units; deep units amortise either).
 ITEM_OVERHEAD = 8.0
 PIECE_OVERHEAD = 13.0
+#: The environment variable that selects the kernel's ``p_smem`` build for every call.
+EARLY_QK_ENV = "MUSESPARK_OPEN_FMK_EARLY_QK"
+#: Whether calls run the ``p_smem`` build unless a call says otherwise (see the module docstring).
+EARLY_QK = os.environ.get(EARLY_QK_ENV, "").strip() == "1"
+#: The environment variable that selects the kernel's ``exp_f16x2`` build for every call.
+EXP_F16X2_ENV = "MUSESPARK_OPEN_FMK_EXP_F16X2"
+#: Whether calls run the ``exp_f16x2`` build unless a call says otherwise.
+EXP_F16X2 = os.environ.get(EXP_F16X2_ENV, "").strip() == "1"
+#: The environment variable that selects the KF build (see the module docstring).
+KF_ENV = "MUSESPARK_OPEN_FMK_KF"
+_KF_RAW = os.environ.get(KF_ENV, "").strip()
+#: Whether calls run the KF build unless a call says otherwise.
+KF = (_KF_RAW == "1") if _KF_RAW else not (EARLY_QK or EXP_F16X2)
+
+
+def build_note() -> str:
+    """The builds the knobs select, for install log lines."""
+    return f"early QK {'on' if EARLY_QK else 'off'}, fp16 exponent {'on' if EXP_F16X2 else 'off'}"
 
 
 @dataclass
@@ -265,6 +306,12 @@ def _compiled_kernel(
     kv_stage: int,
     trace: bool = False,
     s_stages: int = 1,
+    turn_groups: int = 0,
+    self_issue: bool = False,
+    pair_s: bool = False,
+    p_smem: bool = False,
+    exp_f16x2: bool = False,
+    rubin_mma: bool = False,
 ):
     """The compiled kernel of one build on one device (every size is a runtime argument)."""
     import cuda.bindings.driver as cuda
@@ -281,9 +328,15 @@ def _compiled_kernel(
         tile_n=tile_n,
         kv_stage=kv_stage,
         s_stages=s_stages,
+        turn_groups=turn_groups,
+        self_issue=self_issue,
+        pair_s=pair_s,
         write_stats=write_stats,
         ablate_mufu=ablate_mufu,
         trace=trace,
+        p_smem=p_smem,
+        exp_f16x2=exp_f16x2,
+        rubin_mma=rubin_mma,
     )
     gmem = cute.AddressSpace.gmem
     ptrs = [
@@ -308,8 +361,9 @@ def _compiled_kernel(
             *ptrs,
             *[cutlass.Int32(1)] * 7,
             stream,
-            # Opt-level 1: level 3 (the DSL default) measured slower on this kernel.
-            options="--enable-tvm-ffi --opt-level=1",
+            # Opt-level 1: level 3 (the DSL default) measured slower on this kernel; the KF build
+            # (``rubin_mma``) was banked at opt-level 2.
+            options=f"--enable-tvm-ffi --opt-level={2 if rubin_mma else 1}",
         )
 
 
@@ -437,6 +491,12 @@ def paged_context_fmha_fmk(
     workspace: Optional[FmkWorkspace] = None,
     trace: Optional[torch.Tensor] = None,
     s_stages: int = 1,
+    turn_groups: int = 0,
+    self_issue: bool = False,
+    pair_s: bool = False,
+    p_smem: Optional[bool] = None,
+    exp_f16x2: Optional[bool] = None,
+    kf: Optional[bool] = None,
 ) -> torch.Tensor:
     """Causal (bottom-right) attention of the packed new rows ``q`` over their paged contexts.
 
@@ -448,7 +508,12 @@ def paged_context_fmha_fmk(
     ``[total_q, heads, 2]`` (natural-log row max, row sum). ``plan`` from ``plan_context_fmha`` on
     the same lengths. ``trace`` (diagnostic): an int64 buffer of ``plan.num_units *
     TRACE_FIELDS + TRACE_STEP_WORDS`` words (``context_fmha_fmk_kernel``) selects the trace build.
-    ``s_stages`` 2 (with ``plan.tile_n`` 32) double-buffers S per instance. No host
+    ``s_stages`` 2 (with ``plan.tile_n`` 32) double-buffers S per instance. ``p_smem`` selects the
+    kernel's build with P in shared memory (``EARLY_QK`` when None; one S stage only), ``exp_f16x2``
+    the build with the fp16 exponent (``EXP_F16X2`` when None; not with ``ablate_mufu``). ``kf``
+    the KF build (Rubin K=64 MMAs, opt-level 2, 8-warp merge; when None: on with ``pair_s``,
+    ``self_issue`` or ``turn_groups`` > 1, else off). ``turn_groups`` / ``self_issue`` /
+    ``pair_s``: the KF kernel's schedule options (``context_fmha_fmk_kernel``). No host
     synchronisation: every input is read on the device, in stream order.
     """
     import cuda.bindings.driver as cuda
@@ -456,6 +521,12 @@ def paged_context_fmha_fmk(
     heads, kv_heads = q.shape[1], kv_pool.shape[1]
     dev = q.device
     assert stats is None or trace is None
+    if p_smem is None:
+        p_smem = EARLY_QK and int(s_stages) == 1
+    if exp_f16x2 is None:
+        exp_f16x2 = EXP_F16X2 and not ablate_mufu
+    if kf is None:
+        kf = bool(pair_s or self_issue or int(turn_groups) > 1) and not p_smem and not exp_f16x2
     compiled = _compiled_kernel(
         dev.index if dev.index is not None else torch.cuda.current_device(),
         heads,
@@ -467,6 +538,12 @@ def paged_context_fmha_fmk(
         int(kv_stage),
         trace is not None,
         int(s_stages),
+        int(turn_groups),
+        bool(self_issue),
+        bool(pair_s),
+        bool(p_smem),
+        bool(exp_f16x2),
+        bool(kf),
     )
     ws = workspace if workspace is not None else _WORKSPACE
     part_o, part_ml = ws.get(plan.num_slots, plan.num_inst, dev)
@@ -513,6 +590,7 @@ def paged_context_fmha_fmk(
             DH=HEAD_DIM,
             MT=M_TILE,
             WRITE_STATS=stats is not None,
-            num_warps=4,
+            # The KF build's merge ran at 8 warps, the sm100 build's at 4.
+            num_warps=8 if kf else 4,
         )
     return out

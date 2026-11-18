@@ -10,7 +10,10 @@ GPU architecture at one tensor-parallel size (its ``CompositionKey``), closed un
 drafter is DFlash drafting a linear chain of ``DRAFT_LEN`` tokens on an NVFP4
 checkpoint. Those facts are structural: a deployment that misses one has no
 composition, and runs the built-in forward under ``modeling_v2="auto"``
-(``NO_PATHS``) or raises under ``require``.
+(``NO_PATHS``) or raises under ``require``. One deployment without the drafter is
+served too: a disaggregated context server (``MUSESPARK_OPEN_LEVER__ROLE=ctx``) that
+runs no speculative decoding (``drafterless_context``) gets the composition of its key
+with every drafter lever left out (``levers.Arena.NONE``, ``structural_rules``).
 
 ``compose`` resolves the composition's lever table (``levers.resolve``): the
 structural rules of the deployment's drafter arena and facts
@@ -377,6 +380,26 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("context_kv_fork",),
     ),
     FastPath(
+        "drafter_block_table_decode",
+        "the DFlash worker's own decode of a paged drafter context's page table in one launch",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
+        "context_kv_fork_paged_wide",
+        "the context-K/V fork on decode steps of 65..128 requests over a paged drafter context, "
+        "forked behind the LM head's logits gather",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
+        "lm_head_row_owner",
+        "the LM head of 65..96-request decode steps written into the owner ranks' pages and "
+        "verified owner-sliced (no logits gather)",
+        "draft",
+        ("wide_split_sampler",),
+    ),
+    FastPath(
         "rejection_fold",
         "a rejection-sampled step's bookkeeping folded into one launch after the rejection sampler",
         "draft",
@@ -442,7 +465,7 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     FastPath("deferred_input_prep", "a decode step's input writes as one launch", "executor"),
     FastPath("sampler_store", "the sampler's store update and snapshots as one launch", "executor"),
     # Levers on the paths above (``LEVER_NAMES``): each changes how the path it builds on
-    # runs, or is an install the plan carries; their rules are ``levers.RULES``.
+    # runs, or is an install the plan carries; their rules are ``levers.LEVERS``.
     FastPath(
         "packed_prep_append",
         "multi-request decode prep-append calls of MIN_ROWS rows or more on the packed kernel",
@@ -506,6 +529,13 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("deferred_input_prep",),
     ),
     FastPath(
+        "pool_group_tail_marks",
+        "the staged attention-op pool-group block-offset copy filling only the columns past "
+        "the readable ones that a row may not already hold as the bad-page word",
+        "executor",
+        ("deferred_input_prep",),
+    ),
+    FastPath(
         "drafter_kv_side_chain",
         "the context-K/V side chain with its prologue and arena store fused (dense arena or pages)",
         "draft",
@@ -541,7 +571,7 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "the NVFP4 experts of 4096..8192-row calls on the Rubin CuTe DSL GEMMs",
         "load",
     ),
-    # The Vera Rubin low-latency levers (sm107 compositions, ``levers.RULES``).
+    # The Vera Rubin low-latency levers (sm107 compositions, ``levers.LEVERS``).
     FastPath(
         "splitk_pool_split8",
         "the pool GEMM of 9..32-row TP4 decode calls summing K in 8 slices, with the split-K "
@@ -717,6 +747,13 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("projection_publish",),
     ),
     FastPath(
+        "tep8_unpool_direct_wide",
+        "the TP8 2..4-request steps' unpool GEMM publishing into the post-FFN boundary's direct "
+        "transport (wide 16..32-row layout) instead of the gather boundary's inbox",
+        "construct",
+        ("unpool_into_boundary",),
+    ),
+    FastPath(
         "tep8_pool_programmatic_fork",
         "the TP8 pool slice GEMM forked programmatically from its producer",
         "construct",
@@ -761,6 +798,13 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("context_sequence_parallel",),
     ),
     FastPath(
+        "swa_block_long_splits",
+        "the sliding-window decode block of MIN_ROWS rows or more on KEYS-key splits of the "
+        "cached keys, the step's own keys attended by one more program",
+        "construct",
+        ("swa_block",),
+    ),
+    FastPath(
         "step_window_compact",
         "windowed drafter arena compaction in place on the steps the context-K/V fork leaves",
         "draft",
@@ -772,10 +816,36 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("mixed_step_gen_rows",),
     ),
     FastPath(
+        "fmk_pure_context_fmha",
+        "the full-attention context FMHA of pure context steps on the multi-instance paged "
+        "context FMHA",
+        "construct",
+    ),
+    FastPath(
+        "context_last_layer_tail",
+        "the last layer of large context steps past its K/V append on the LM-head rows only",
+        "construct",
+        ("context_sequence_parallel",),
+    ),
+    FastPath(
         "context_kv_late_join",
         "the context-K/V side chain joined right before the drafter's first block attention",
         "draft",
         ("context_kv_fork",),
+    ),
+    FastPath(
+        "context_kv_fork_wide",
+        "the context-K/V fork on decode steps of 65..128 requests over a windowed arena, "
+        "committed by the parallel windowed commit",
+        "draft",
+        ("context_kv_fork", "windowed_commit_parallel"),
+    ),
+    FastPath(
+        "multi_request_ffn_join",
+        "the capture layers' post-FFN residual join and next pre-QKV norm of 33..768-row calls "
+        "as a multi-row cluster kernel, which also writes their DFlash capture",
+        "construct",
+        ("projection_gathers",),
     ),
     FastPath(
         "hop_cluster_split",
@@ -800,6 +870,24 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "the router GEMM's partial tiles written through shared memory",
         "construct",
         ("router_gemm",),
+    ),
+    FastPath(
+        "pool_gemm_pin",
+        "the MoE pool GEMM of the ROWS decode row counts on one pinned cuBLASLt algorithm",
+        "construct",
+    ),
+    FastPath(
+        "expert_tactic_pin",
+        "the NVFP4 expert calls of 512..1023 rows on one pinned TRTLLM-gen tactic on every rank",
+        "load",
+    ),
+    FastPath(
+        "row_owner_moe",
+        "the NVFP4 MoE layers of the ROWS decode row counts as a row-owner island: owner-row "
+        "post-attention join, MoE prologue, finalize, unpool and post-FFN join, LL expert "
+        "dispatch and Lamport row publication",
+        "construct",
+        ("multi_request_post_attention_hop", "router_gemm", "finalize_two_shot"),
     ),
     FastPath(
         "decode_qkv_mxfp8",
@@ -1055,6 +1143,7 @@ LEVER_NAMES: FrozenSet[str] = frozenset(
         "tep8_early_multicast_hop",
         "tep8_direct_hop",
         "tep8_publish_join",
+        "tep8_unpool_direct_wide",
         "tep8_pool_programmatic_fork",
         "tep8_wide_projection_gathers",
         "step_commit_v2",
@@ -1064,11 +1153,18 @@ LEVER_NAMES: FrozenSet[str] = frozenset(
         "context_sp_extra_parts",
         "step_window_compact",
         "fmk_context_fmha",
+        "fmk_pure_context_fmha",
+        "context_last_layer_tail",
         "context_kv_late_join",
+        "context_kv_fork_wide",
+        "multi_request_ffn_join",
         "hop_cluster_split",
         "drafter_fc_inbox_wide",
         "l061_tile32_pin",
         "router_staged_epilogue",
+        "pool_gemm_pin",
+        "expert_tactic_pin",
+        "row_owner_moe",
         "decode_qkv_mxfp8",
         "split_kv_deep_ring",
         "context_prep_rows_vec",
@@ -1080,6 +1176,11 @@ LEVER_NAMES: FrozenSet[str] = frozenset(
         "swa_blocks_per_program",
         "wide_qkv_prefetch",
         "wide_capture_fold",
+        "drafter_block_table_decode",
+        "context_kv_fork_paged_wide",
+        "lm_head_row_owner",
+        "pool_group_tail_marks",
+        "swa_block_long_splits",
     }
     | SM107_TEP8_ONLY
 )
@@ -1252,6 +1353,13 @@ class Plan:
             return self.levers.param(name, key)
         return _levers.default_param(name, key)
 
+    def row_cap(self) -> int:
+        """The row cap of ``router_gemm`` and ``finalize_two_shot`` (``levers.row_cap``):
+        ``levers.ROW_CAP`` for a plan without a table."""
+        if self.levers is None:
+            return _levers.ROW_CAP
+        return _levers.row_cap(self.levers.deployment, self.levers.default)
+
     def installed(self, name: str, ok: bool, why: str = "") -> None:
         """An installer's report on lever ``name``: installed, or refused for ``why``.
 
@@ -1377,7 +1485,8 @@ def served_compositions(compositions: Mapping[CompositionKey, TargetPaths]) -> s
     return (
         f"{keys}, each with DFlash drafting a linear chain of {DRAFT_LEN} tokens "
         "(max_draft_len = max_total_draft_tokens = "
-        f"{DRAFT_LEN}, no draft_len_schedule) and an NVFP4 checkpoint"
+        f"{DRAFT_LEN}, no draft_len_schedule), or without speculative decoding on a "
+        f"context server ({_levers.ROLE_KNOB}=ctx), and an NVFP4 checkpoint"
     )
 
 
@@ -1407,6 +1516,41 @@ def composition(
     return served
 
 
+def drafterless_context(
+    model_config: Any,
+    compositions: Mapping[CompositionKey, TargetPaths],
+    compute_capability: Optional[Tuple[int, int]],
+    snapshot: Mapping[str, str],
+) -> Optional[TargetPaths]:
+    """The composition of a context server without the drafter, or None. Pure: reads its arguments.
+
+    A disaggregated context server (the role hint ``levers.ROLE_KNOB`` is ``ctx`` in
+    ``snapshot``) that runs no speculative decoding (``spec_config`` None) on an NVFP4
+    checkpoint is served the composition of its key and topology, as ``composition``
+    finds it. The drafter levers are not served there: ``compose`` resolves its table over
+    ``levers.Arena.NONE``, whose structural rule leaves out ``DRAFTER_LEVERS``. Every
+    deployment ``composition`` serves is served by it alone, so this adds a composition
+    only where there was none: an aggregated or generation server, or a server with
+    any speculative decoding, never reaches it.
+
+    A context server sends the generation server its first token and its first drafts
+    (the request's draft tokens); the generation server fills dummy drafts for a request
+    that carries none and drafts for itself from its next step. Target tokens do not
+    depend on the drafts.
+    """
+    if _levers.role_hint(snapshot) != _levers.Role.CTX.value:
+        return None
+    if getattr(model_config, "spec_config", None) is not None:
+        return None
+    mapping = getattr(model_config, "mapping", None)
+    if mapping is None or not nvfp4_checkpoint(model_config):
+        return None
+    served = compositions.get((sm_of(compute_capability), int(mapping.tp_size)))
+    if served is None or not served.topology.holds(mapping):
+        return None
+    return served
+
+
 def unserved_reason(
     model_config: Any,
     compositions: Mapping[CompositionKey, TargetPaths],
@@ -1429,15 +1573,23 @@ def require_served(
     mode: ModelingV2Mode,
     compositions: Mapping[CompositionKey, TargetPaths],
     compute_capability: Optional[Tuple[int, int]],
+    snapshot: Optional[Mapping[str, str]] = None,
 ) -> None:
     """Raise under ``require`` when the deployment has no composition; before any construction.
 
+    ``snapshot`` stands in for the process's environment snapshot (``levers.environment``),
+    whose role hint ``drafterless_context`` reads.
+
     Raises:
-        ValueError: under ``modeling_v2="require"`` when ``composition`` is None.
+        ValueError: under ``modeling_v2="require"`` when both ``composition`` and
+            ``drafterless_context`` are None.
     """
+    if mode is not ModelingV2Mode.REQUIRE:
+        return
+    snapshot = _levers.environment() if snapshot is None else snapshot
     if (
-        mode is ModelingV2Mode.REQUIRE
-        and composition(model_config, compositions, compute_capability) is None
+        composition(model_config, compositions, compute_capability) is None
+        and drafterless_context(model_config, compositions, compute_capability, snapshot) is None
     ):
         raise ValueError(
             f"modeling_v2='require': {TAG} serves no fast path for this deployment: "
@@ -1769,6 +1921,16 @@ def dependents(names: Iterable[str]) -> FrozenSet[str]:
     return frozenset(path for path in FAST_PATH_NAMES if closure((path,)) & names)
 
 
+#: The levers that need the drafter: every lever installed on the drafter or the DFlash
+#: worker (``FastPath.hook`` ``draft``: the drafter's own paths, the worker's acceptance,
+#: context-K/V store and arena compaction, and the verify head and sampler), the DFlash
+#: capture written by the post-FFN boundary (``capture_fold``), and every lever that
+#: builds on one of them. A server without a drafter (``levers.Arena.NONE``) leaves them
+#: out; every other lever is the target's, and serves its steps as with a drafter.
+DRAFTER_LEVERS: FrozenSet[str] = dependents(
+    [path.name for path in FAST_PATHS if path.hook == "draft"] + ["capture_fold"]
+)
+
 #: The levers whose store is the dense full-length arena's or the KV cache manager's pages,
 #: and so not a windowed arena's: the context-K/V side chain with its fused store, its early fc
 #: fork, and the folded commit that also writes the drafter's preamble.
@@ -1808,6 +1970,8 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
       canonical keys and transformed unary values).
     * A speculative config that does not ask for rejection sampling, or whose request
       forced acceptance left inert, or one not known, leaves out ``rejection_sampler``.
+    * No drafter (``levers.Arena.NONE``) leaves out ``DRAFTER_LEVERS``, whatever the
+      rules above say of them, and requires nothing of them.
     """
     arena = deployment.arena
     exclusions: Dict[str, str] = {}
@@ -1850,6 +2014,10 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
             if deployment.rejection_sampling is False
             else "whether the speculative config asks for rejection sampling is not known"
         )
+    if arena is _levers.Arena.NONE:
+        for name in DRAFTER_LEVERS & frozenset(served):
+            exclusions[name] = "no drafter: the server runs no speculative decoding"
+            requires.pop(name, None)
     return StructuralRules(exclusions, requires)
 
 
@@ -1903,12 +2071,13 @@ def compose(
     """The plan this model is built with: its composition's lever table, or ``NO_PATHS``.
 
     Call after the built-in constructor and before anything is installed. A
-    deployment without a composition (``composition``, structural) gets ``NO_PATHS``
-    under ``auto`` and raises under ``require``; its lever environment is still
-    validated (``levers.no_composition_notes``). Otherwise:
+    deployment without a composition (``composition`` and ``drafterless_context``,
+    structural) gets ``NO_PATHS`` under ``auto`` and raises under ``require``; its lever
+    environment is still validated (``levers.no_composition_notes``). Otherwise:
 
     1. the drafter context arena (``levers.arena_of``, the worker's own predicate over
-       ``spec_worker`` and ``draft_model``) and the ``levers.Deployment``
+       ``spec_worker`` and ``draft_model``; ``levers.Arena.NONE`` for the composition
+       ``drafterless_context`` serves) and the ``levers.Deployment``
        (``levers.deployment_of``; ``facts`` are the engine's
        ``_router_index.DeploymentFacts``, else ``max_batch_size`` alone);
     2. the lever table (``levers.resolve`` under ``structural_rules``), whose levers on
@@ -1928,9 +2097,13 @@ def compose(
     """
     snapshot = _levers.environment() if snapshot is None else snapshot
     served = composition(model_config, compositions, compute_capability)
+    drafterless = False
+    if served is None:
+        served = drafterless_context(model_config, compositions, compute_capability, snapshot)
+        drafterless = served is not None
     mapping = getattr(model_config, "mapping", None)
     if served is None:
-        require_served(model_config, mode, compositions, compute_capability)
+        require_served(model_config, mode, compositions, compute_capability, snapshot)
         notes = _levers.no_composition_notes(snapshot, DEPENDS_ON)
         reason = unserved_reason(model_config, compositions, compute_capability)
         logger.info(
@@ -1939,9 +2112,12 @@ def compose(
         for note in notes:
             logger.info(f"{TAG} {note}")
         return NO_PATHS
-    from tensorrt_llm._torch.speculative.dflash import _PAGED_ATTENTION_BACKENDS
+    if drafterless:
+        arena = _levers.Arena.NONE
+    else:
+        from tensorrt_llm._torch.speculative.dflash import _PAGED_ATTENTION_BACKENDS
 
-    arena = _levers.arena_of(spec_worker, draft_model, _PAGED_ATTENTION_BACKENDS)
+        arena = _levers.arena_of(spec_worker, draft_model, _PAGED_ATTENTION_BACKENDS)
     engine = facts if facts is not None else _EngineFacts(max_batch_size)
     table: Optional[_levers.LeverTable] = None
     local: List[str] = []
@@ -1988,7 +2164,12 @@ def compose(
         raise ValueError(f"{composed}: the fast paths need " + "; ".join(missing))
     rank0 = int(getattr(mapping, "tp_rank", 0) or 0) == 0
     plan = Plan(table.paths(), levers=table, rank0=rank0)
-    logger.info(f"{composed} with a {arena.value} drafter context arena: {plan.describe()}")
+    drafter = (
+        "without a drafter"
+        if arena is _levers.Arena.NONE
+        else f"with a {arena.value} drafter context arena"
+    )
+    logger.info(f"{composed} {drafter}: {plan.describe()}")
     if rank0:
         for line in table.describe():
             logger.info(f"{TAG} {line}")

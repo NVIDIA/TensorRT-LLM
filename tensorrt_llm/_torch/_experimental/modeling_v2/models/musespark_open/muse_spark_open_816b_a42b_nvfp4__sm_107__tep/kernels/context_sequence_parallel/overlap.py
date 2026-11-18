@@ -6,7 +6,7 @@ What it changes. On a sequence-parallel context step (``forward.ContextSequenceP
 every layer reduce-scatters two BF16 partial sums on the main stream, each exposed: the
 output projection's (``[rows, 8192]``, issued by the built-in decoder layer) and the
 experts' (``[rows, 4096]``, ``moe.ContextSequenceParallelMoE``). Three levers, all off by
-default (``levers.RULES``: on only by their knobs), overlap them:
+default (``levers.LEVERS``: on only by their knobs), overlap them:
 
 * ``context_sp_oproj_overlap`` (``CHUNKS``, ``MIN_ROWS``, ``HIGH_PRIORITY``) turns on the
   built-in overlapped output projection (``MuseSparkOpenAttention._overlap_sp_output_projection``,

@@ -38,8 +38,9 @@ go under ``ops/<category>/`` beside this file.
 The fast paths a model is built with are fixed by its composition
 (``TARGET_PATHS``, keyed by the GPU architecture and the tensor-parallel size,
 each with the GPU topology it was validated on, for DFlash drafting seven
-tokens on an NVFP4 checkpoint; ``dispatch.compose``), decided once when the
-shell is constructed: all of them,
+tokens on an NVFP4 checkpoint, or for a context server without speculative
+decoding with the drafter levers left out (``dispatch.drafterless_context``);
+``dispatch.compose``), decided once when the shell is constructed: all of them,
 or none (``dispatch.NO_PATHS``) when the deployment has no composition, and the
 target then runs only the built-in modules as described above. A missing public
 precondition of a planned fast path is an error, whatever the mode. Over a
@@ -308,7 +309,7 @@ installed by the shell's ``load_weights`` after the built-in loader
 * ``half_window_experts`` (tp 4) stacks the ring predecessor's upper expert half on
   them, which the prologue's routed kernel places onto (and, on calls of 9..32 rows
   that reach the routing method, ``ring_buddy_assign``'s half flow); only up to its
-  lever's ``MAX_BATCH`` (``levers.RULES``).
+  lever's ``MAX_BATCH`` (``levers.LEVERS``).
 * ``bf16_routed_experts`` gives the two BF16 layers' stacked calls unpacked
   routing (on the owner-only window as well).
 * ``hot_replicas`` (tep4, in a plan without ``half_window_experts``: the two
@@ -464,6 +465,7 @@ class MuseSparkOpenTepModelingV2(MuseSparkOpenModel):
     _wide_moe_allreduce: Optional[object]
     _finalize_two_shot: Optional[object]
     _wide_hop: Optional[object]
+    _row_owner_moe: Optional[object] = None
     _hot_replicas: Optional[object] = None
 
     @classmethod
@@ -506,6 +508,7 @@ class MuseSparkOpenTepModelingV2(MuseSparkOpenModel):
         model._wide_hop = adopted.wide_hop
         model._published_projections = adopted.published_projections
         model._batch_dense_gemms = adopted.batch_dense_gemms
+        model._row_owner_moe = adopted.row_owner_moe
         model._prefill = PrefillTarget(model, _dispatch.sm_of(compute_capability))
         model._decode = DecodeTarget(model)
         return model
@@ -593,6 +596,28 @@ class PrefillTarget:
             from .kernels.context_sequence_parallel import forward as _context_sp
 
             self.sequence_parallel = _context_sp.install(core, sm)
+            if core._plan.enabled("context_last_layer_tail"):
+                self._install_last_layer_tail(core)
+
+    def _install_last_layer_tail(self, core: MuseSparkOpenTepModelingV2) -> None:
+        """``context_last_layer_tail`` on the sequence-parallel path: agreed over the TP group
+        like the attention-library installs; a refusal leaves the last layer as it was. Steps
+        whose deepest context request reaches the lever's ``MAX_DEPTH`` keys run the layer
+        unchanged."""
+        from .kernels.context_last_layer_tail import tail as _tail
+
+        max_depth = core._plan.param("context_last_layer_tail", "MAX_DEPTH")
+        step = self.sequence_parallel.step
+        try:
+            tail = _dispatch.agreed_install(
+                core.layers[0].mapping,
+                lambda: _tail.install(core, max_depth=max_depth, step=step),
+            )
+        except ValueError as refusal:
+            core._plan.installed("context_last_layer_tail", False, str(refusal))
+        else:
+            self.sequence_parallel.last_layer_tail = tail
+            core._plan.installed("context_last_layer_tail", True)
 
     def forward(
         self,
@@ -913,7 +938,9 @@ class DecodeTarget:
     With ``finalize_two_shot``, a forward of 72..512 rows (9 to 64 requests) is armed
     (``FinalizeTwoShotSwitch.armed``): every layer's expert finalize and all-reduce run
     as one two-shot kernel, in place of the one-shot fused kernel (64..128 rows) or the
-    unfused combine, cast and all-reduce (129..512 rows).
+    unfused combine, cast and all-reduce (129..512 rows). On a wide generation server
+    (``levers.row_cap``) the cap of ``router_gemm`` and of ``finalize_two_shot`` is 768 rows
+    (96 requests) instead of 512.
 
     With ``hot_replicas`` and its copies allocated, a forward of 33..512 rows (5 to 64
     requests) is armed (``HotReplicas.armed``): every NVFP4 layer places the step's
@@ -960,6 +987,7 @@ class DecodeTarget:
         self.wide_hop = getattr(core, "_wide_hop", None)
         self.published_projections = getattr(core, "_published_projections", None)
         self.batch_dense_gemms = getattr(core, "_batch_dense_gemms", None)
+        self.row_owner_moe = getattr(core, "_row_owner_moe", None)
 
     def forward(
         self,
@@ -1106,6 +1134,19 @@ class DecodeTarget:
             if self.last_layer_boundary
             else None
         )
+        # row_owner_moe: the island layers of a step the served chain it reproduces is armed for.
+        island = self.row_owner_moe
+        island_armed = (
+            island is not None
+            and wide_hop_armed
+            and router_armed
+            and two_shot_armed
+            and megakernel is None
+            and g2_norm is None
+            and not (direct_armed or pool_armed or hot_armed or published_armed or batch_armed)
+            and island.takes(rows)
+            and island.begin(rows, kwargs.get("spec_metadata"))
+        )
         precomputed_attn_input = first_attn_input
         if hop_armed:
             arming = hop.armed(hidden_states.shape[0], hidden_states)
@@ -1142,6 +1183,18 @@ class DecodeTarget:
                 next_norm = (
                     layers[index + 1].pre_qkv_proj_norm if index + 1 < len(layers) else g2_norm
                 )
+                if island_armed and island.covers(index):
+                    hidden_states, precomputed_attn_input = island.layer(
+                        index,
+                        decoder_layer,
+                        next_norm,
+                        position_ids=position_ids,
+                        hidden_states=hidden_states,
+                        attn_metadata=attn_metadata,
+                        precomputed_attn_input=precomputed_attn_input,
+                        **kwargs,
+                    )
+                    continue
                 result = decoder_layer(
                     position_ids=position_ids,
                     hidden_states=hidden_states,
@@ -1298,7 +1351,7 @@ _SM107_TEP4_COMM_PATHS = frozenset(
 #: hold their ring predecessor's upper expert half (``half_window_experts``), so the
 #: routed kernel balances the selected experts of a step of at most 8 rows over the
 #: four ranks; that window costs 45 GiB of KV cache per rank, so a plan carries it
-#: only up to its lever's ``MAX_BATCH`` (``levers.RULES``). The sharded drafter fc
+#: only up to its lever's ``MAX_BATCH`` (``levers.LEVERS``). The sharded drafter fc
 #: of up to 128 rows is gathered over the tray's NVLink (``drafter_fc_inbox``). Decode
 #: steps of two to four
 #: requests (16..32 rows) also take the TP4 sharded MoE prologue and projection gathers
@@ -1355,7 +1408,7 @@ _SM107_TEP4_PATHS |= _SM107_TEP4_COMM_PATHS
 #: the attention block's QKV TGV GEMM on the rows of the R200 table and the PDL
 #: norm-gates of 33..512-row decode steps (``batch_dense_gemms``); and the hot NVFP4
 #: expert copies of 33..512-row decode steps, which conflict with ``half_window_experts``
-#: and stay out of a plan that carries it (``levers.RULES``).
+#: and stay out of a plan that carries it (``levers.LEVERS``).
 _SM107_TEP4_GEMM_EXPERT_PATHS = frozenset({"router_gemm", "batch_dense_gemms", "hot_replicas"})
 _SM107_TEP4_PATHS = _SM107_TEP4_PATHS | _SM107_TEP4_GEMM_EXPERT_PATHS
 #: The TEP4 decode-prep and drafter-at-batch paths above the two-to-four-request band its
@@ -1388,14 +1441,16 @@ _SM107_TEP4_CONTEXT_PATHS = frozenset({"context_sequence_parallel", "context_pre
 _PREFETCH_LEVERS = frozenset({"graph_start_qkv_prefetch"})
 #: The levers both sm107 compositions serve on top of their paths: the executor's step loop
 #: on the execution stream and its incremental block-offset copy, the windowed commit's
-#: parallel form (a windowed arena) and the head sampler's cooperative kernel A. Each
-#: lever's rule (``levers.RULES``) decides where it is on.
+#: parallel form (a windowed arena), the head sampler's cooperative kernel A and the
+#: sliding-window decode block on long key splits. Each lever's rule (``levers.LEVERS``)
+#: decides where it is on.
 _SM107_LEVERS = frozenset(
     {
         "step_loop_on_execution_stream",
         "incremental_block_offsets",
         "windowed_commit_parallel",
         "head_sampler_coop_fold",
+        "swa_block_long_splits",
     }
 )
 #: The levers sm107 TEP8 adds: the drafter's fused context-K/V side chain, its early fc fork and
@@ -1417,7 +1472,7 @@ _SM107_TEP8_LEVERS = frozenset(
 #: MoE front, the last layer's boundary with the final norm, the context-K/V side chain forked
 #: on the last decoder layer, the distributed verify head sampler, the preamble's join inside the
 #: drafter forward, the drafter folds and the draft head's tail, and the one-stream loop's inline
-#: commits. Their rules (``levers.RULES``) turn them on only where they were measured.
+#: commits. Their rules (``levers.LEVERS``) turn them on only where they were measured.
 _SM107_TEP8_SINGLE_REQUEST_LEVERS = _dispatch.SM107_TEP8_ONLY
 #: The levers sm107 TEP4 adds, on its TP4 paths: the multi-request prep append's packed
 #: kernel, the 16..32-row steps' direct transports, per-row router shard and o_proj
@@ -1437,7 +1492,23 @@ _SM107_TEP8_SINGLE_REQUEST_LEVERS = _dispatch.SM107_TEP8_ONLY
 #: decode steps: the
 #: sliding-window split programs over several key blocks, the next QKV weight's prefetch
 #: forked after the experts and the DFlash capture written by the wide direct boundary (the
-#: full-attention prep fold of those steps is ``full_attention_fold_multi``).
+#: full-attention prep fold of those steps is ``full_attention_fold_multi``); for
+#: disaggregated context servers, on only by its knob, the multi-instance context FMHA of
+#: pure context steps and the last layer of large context steps on the LM-head rows only; and, for
+#: disaggregated generation servers whose decode steps exceed 64 requests, the context-K/V
+#: fork on those steps over a windowed arena and the post-FFN join of 33..768-row
+#: capture-layer calls (over a windowed or a paged arena) as a multi-row cluster kernel that
+#: also writes the DFlash capture; and, on only by its knob, the pool GEMM of the
+#: 744..768-row decode steps on a pinned cuBLASLt algorithm; and, on only by its knob, the
+#: NVFP4 expert calls of 512..1023 rows on one pinned TRTLLM-gen tactic; and, each on only
+#: by its knob,
+#: the DFlash worker's own page-table decode over a paged drafter context in one launch,
+#: the context-K/V fork over a paged drafter context on decode steps of 65..128 requests
+#: (forked behind the LM head's logits gather), the LM head of 65..96-request decode steps
+#: written into the owner ranks' pages and verified owner-sliced, the NVFP4 MoE layers of the
+#: 584..768-row decode steps as a row-owner island on a wide generation server, and the staged
+#: pool-group block-offset copy filling only the tail columns a row may not already hold as the
+#: bad-page word.
 _SM107_TEP4_LEVERS = frozenset(
     {
         "packed_prep_append",
@@ -1449,11 +1520,17 @@ _SM107_TEP4_LEVERS = frozenset(
         "prefill_cutedsl_experts",
         "step_window_compact",
         "fmk_context_fmha",
+        "fmk_pure_context_fmha",
+        "context_last_layer_tail",
         "context_kv_late_join",
+        "context_kv_fork_wide",
+        "multi_request_ffn_join",
         "hop_cluster_split",
         "drafter_fc_inbox_wide",
         "l061_tile32_pin",
         "router_staged_epilogue",
+        "pool_gemm_pin",
+        "expert_tactic_pin",
         "decode_qkv_mxfp8",
         "split_kv_deep_ring",
         "context_prep_rows_vec",
@@ -1465,10 +1542,15 @@ _SM107_TEP4_LEVERS = frozenset(
         "swa_blocks_per_program",
         "wide_qkv_prefetch",
         "wide_capture_fold",
+        "drafter_block_table_decode",
+        "context_kv_fork_paged_wide",
+        "lm_head_row_owner",
+        "row_owner_moe",
+        "pool_group_tail_marks",
     }
 )
 
-#: The Vera Rubin low-latency levers (origin ``LL``, ``levers.RULES``: on for decode at
+#: The Vera Rubin low-latency levers (origin ``LL``, ``levers.LEVERS``: on for decode at
 #: ``max_batch_size`` up to 8) both sm107 compositions serve: the dense weight prefetches
 #: joined after their consumer and the next-QKV prefetch skipped on 8-row steps, the
 #: one-cluster sliding-window block, its prep split and its merged split kernel (the TP8 steps of
@@ -1527,6 +1609,7 @@ _SM107_TEP8_LL_LEVERS = frozenset(
         "tep8_early_multicast_hop",
         "tep8_direct_hop",
         "tep8_publish_join",
+        "tep8_unpool_direct_wide",
         "tep8_pool_programmatic_fork",
         "tep8_wide_projection_gathers",
     }
@@ -1540,6 +1623,8 @@ _SM107_TEP8_LL_LEVERS = frozenset(
 #: rank shapes.
 _SM107_TEP8_PATHS = _TEP8_PATHS | frozenset(
     {
+        # w256: off at TEP8 unless its knob (levers.LEVERS["wide_split_sampler"]).
+        "wide_split_sampler",
         "multi_request_prep_append",
         "wide_swa_block",
         "wide_full_attention",
@@ -1554,14 +1639,16 @@ _SM107_TEP8_PATHS = _TEP8_PATHS | frozenset(
 )
 #: sm107 TEP4 also samples decode steps from each rank's own vocabulary shard
 #: (``ops/spec/head_sampler.vocab_parallel_sample``), bitwise the built-in split sampler by
-#: construction; its rule (``levers.RULES``) bounds it by ``max_batch_size``.
+#: construction; its rule (``levers.LEVERS``) bounds it by ``max_batch_size``.
 _SM107_TEP4_PATHS = _SM107_TEP4_PATHS | frozenset({"vocab_parallel_head"})
 
 #: The compositions, per (SM, tensor-parallel size) (``dispatch.CompositionKey``):
 #: the fast paths and levers served and the GPU topology they were validated on, with
 #: DFlash drafting a linear chain of ``dispatch.DRAFT_LEN`` tokens on an NVFP4
-#: checkpoint; every other deployment runs the built-in modules only. The lever table
-#: (``dispatch.compose``) decides which served levers a deployment is built with.
+#: checkpoint, or on a context server without speculative decoding with the drafter
+#: levers left out (``dispatch.drafterless_context``); every other deployment runs the
+#: built-in modules only. The lever table (``dispatch.compose``) decides which served
+#: levers a deployment is built with.
 TARGET_PATHS = {
     (107, 8): _dispatch.TargetPaths(
         served=(

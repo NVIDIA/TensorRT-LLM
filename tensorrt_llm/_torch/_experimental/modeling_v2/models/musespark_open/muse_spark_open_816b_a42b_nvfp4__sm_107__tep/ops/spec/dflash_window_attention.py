@@ -53,6 +53,15 @@ table row, which lists its pages in token order, so column ``c`` is row
 differs from a dense one only in which cache row a column is read from or
 appended to; on the same values the two are bitwise equal.
 
+The caches may hold FP8 E4M3 for BF16 operands (a drafter whose draft KV the
+KV cache manager stores in FP8): each loaded context row is widened to BF16
+right after its load, so the products, the softmax and the rounding of the
+probabilities are the BF16 op's, and on the same stored values the FP8 call
+equals the BF16 call over the widened cache bit for bit. The append then
+stores the block's K/V converted to E4M3 (clamped to +-448 in fp32, NaN kept,
+rounded to nearest even); the block's own keys and values are still attended
+from ``k_new`` / ``v_new``.
+
 Numerics follow FlashAttention-2's split path: fp32 scores, base-2 online
 softmax, the probabilities rounded to the operand dtype for the P.V product
 with the row sum taken from the fp32 values, each split normalized and merged
@@ -88,6 +97,9 @@ WINDOW = (2047, 2047)
 
 #: Operand dtypes the kernels take.
 SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
+#: Cache dtypes the kernels take besides the operand dtype, per operand dtype: an FP8 E4M3
+#: cache is widened to BF16 on load.
+NARROW_CACHE_DTYPES = {torch.bfloat16: (torch.float8_e4m3fn,)}
 #: Largest packed tile (query heads per KV head x block rows) one program holds.
 MAX_TILE_ROWS = 128
 #: Keys per tile of a split.
@@ -115,6 +127,15 @@ class QkFold:
     eps: float
     base: float
     attention_factor: float = 1.0
+
+
+@triton.jit
+def _to_e4m3(x):
+    """``x`` as an FP8 E4M3 cache stores it: clamped to +-448 in fp32 with NaN kept, rounded
+    to nearest even."""
+    return tl.clamp(x.to(tl.float32), -448.0, 448.0, propagate_nan=tl.PropagateNan.ALL).to(
+        tl.float8e4nv
+    )
 
 
 @triton.jit
@@ -196,6 +217,7 @@ def _window_attention_split_kernel(
     PAGE: tl.constexpr,
     PRE_WAIT: tl.constexpr = False,
     QK_FOLD: tl.constexpr = False,
+    KV_FP8: tl.constexpr = False,
 ):
     split = tl.program_id(0)
     bh = tl.program_id(1)
@@ -245,6 +267,9 @@ def _window_attention_split_kernel(
             mask=arena_pre[:, None],
             other=0.0,
         )
+        if KV_FP8:
+            k_pre = k_pre.to(q_ptr.dtype.element_ty)
+            v_pre = v_pre.to(q_ptr.dtype.element_ty)
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
     if APPEND:
@@ -282,6 +307,9 @@ def _window_attention_split_kernel(
                 v_new_ptr + new_rows[:, None] * stride_vnt + kvh * stride_vnh + dims[None, :],
                 mask=j_ok[:, None],
             )
+            if KV_FP8:
+                k_blk = _to_e4m3(k_blk)
+                v_blk = _to_e4m3(v_blk)
             tl.store(
                 k_base + kv_rows[:, None] * stride_kn + dims[None, :], k_blk, mask=j_ok[:, None]
             )
@@ -364,6 +392,8 @@ def _window_attention_split_kernel(
                     mask=in_arena[:, None],
                     other=0.0,
                 )
+                if KV_FP8:
+                    k = k.to(q_ptr.dtype.element_ty)
             if QK_FOLD:
                 # Only the tile holding block columns normalizes keys (a scalar branch, so the
                 # other programs skip the arithmetic).
@@ -404,6 +434,8 @@ def _window_attention_split_kernel(
                     mask=in_arena[:, None],
                     other=0.0,
                 )
+                if KV_FP8:
+                    v = v.to(q_ptr.dtype.element_ty)
             v = tl.where(
                 from_new[:, None],
                 tl.load(
@@ -424,6 +456,9 @@ def _window_attention_split_kernel(
                 mask=col_ok[:, None],
                 other=0.0,
             )
+            if KV_FP8:
+                k = k.to(q_ptr.dtype.element_ty)
+                v = v.to(q_ptr.dtype.element_ty)
         s = tl.dot(q, tl.trans(k))
         keep = col_ok[None, :] & (cols[None, :] >= first_key[:, None])
         if WINDOW_RIGHT >= 0:
@@ -710,6 +745,7 @@ def window_attention_launch(
         PAGE=page,
         PRE_WAIT=enable_pdl and append and split_pre_wait,
         QK_FOLD=qk_fold is not None,
+        KV_FP8=k_cache.dtype == torch.float8_e4m3fn,
         num_warps=num_warps,
         launch_pdl=enable_pdl,
     )
@@ -756,7 +792,8 @@ class DflashWindowAttention(OpWrapper):
 
     * ``q`` ``[B, M, Hq, D]``: the block's queries, unit last-dim stride;
     * ``k_cache`` / ``v_cache`` ``[slots, capacity, Hkv, D]``: one layer's view
-      of the arena (any outer strides). Without ``k_new`` / ``v_new`` they
+      of the arena (any outer strides), in ``q``'s dtype or, for BF16 ``q``,
+      FP8 E4M3 (widened to BF16 on load). Without ``k_new`` / ``v_new`` they
       already hold the block's own K/V at ``[L - M, L)``;
     * ``cache_seqlens`` ``[B]`` int32: ``L``, keys per request including the
       block; ``cache_batch_idx`` ``[B]`` int32: the arena slot per request;
@@ -767,8 +804,8 @@ class DflashWindowAttention(OpWrapper):
     * ``softmax_scale``: ``D ** -0.5`` when None;
     * ``k_new`` / ``v_new`` ``[B * M, Hkv, D]`` (any row / head strides, unit
       last-dim stride): the block's K/V, appended by the op -- written into
-      ``k_cache`` / ``v_cache`` at ``[L - M, L)`` of each request's slot and
-      attended from these tensors;
+      ``k_cache`` / ``v_cache`` at ``[L - M, L)`` of each request's slot
+      (converted to E4M3 for an FP8 cache) and attended from these tensors;
     * ``merge_entry_trigger`` (with ``enable_pdl``, the PDL chain's ``pdl_merge``): the merge
       kernel triggers its dependents before its ``griddepcontrol.wait``
       instead of at its exit. It reads only the split's partials and the
@@ -963,16 +1000,21 @@ def geometry_unsupported_reason(
     head_dim: int,
     dtype: torch.dtype,
     window_size: tuple[int, int],
+    kv_dtype: torch.dtype | None = None,
 ) -> str | None:
     """Why the kernels would not take this call geometry, or None.
 
     The tensor-free part of ``unsupported_reason``: a caller that knows the
     shapes before it has the tensors (the drafter install) checks these once.
     The limits only grow with ``m``, so a geometry valid at some block size is
-    valid at every smaller one.
+    valid at every smaller one. ``dtype`` is the operands' (``q``, ``k_new``,
+    ``v_new``), ``kv_dtype`` the caches' (``dtype`` when None).
     """
     if dtype not in SUPPORTED_DTYPES:
         return f"operands must share one of {SUPPORTED_DTYPES}, got {dtype}"
+    narrow = NARROW_CACHE_DTYPES.get(dtype, ())
+    if kv_dtype is not None and kv_dtype != dtype and kv_dtype not in narrow:
+        return f"{dtype} operands take caches of {(dtype, *narrow)}, got {kv_dtype}"
     if head_dim not in (64, 128, 256):
         return f"head width must be 64, 128 or 256, got {head_dim}"
     if num_kv_heads <= 0 or num_q_heads % num_kv_heads:
@@ -1003,7 +1045,9 @@ def unsupported_reason(
     """Why the kernels would answer these inputs wrongly, or None if they take them."""
     if q.dim() != 4 or k_cache.dim() != 4 or v_cache.dim() != 4:
         return "q, k_cache and v_cache must be 4-D ([B, M, Hq, D] / [slots, capacity, Hkv, D])"
-    if not (q.dtype == k_cache.dtype == v_cache.dtype):
+    if k_cache.dtype != v_cache.dtype:
+        return f"k_cache and v_cache dtypes differ, got {k_cache.dtype}/{v_cache.dtype}"
+    if k_cache.dtype != q.dtype and k_cache.dtype not in NARROW_CACHE_DTYPES.get(q.dtype, ()):
         return f"operands must share one of {SUPPORTED_DTYPES}, got {q.dtype}/{k_cache.dtype}"
     if k_cache.shape != v_cache.shape:
         return "k_cache and v_cache shapes differ"
@@ -1011,7 +1055,9 @@ def unsupported_reason(
     if k_cache.shape[3] != d:
         return f"head width must match the cache, got {d} and {k_cache.shape[3]}"
     num_kv_heads = k_cache.shape[2]
-    reason = geometry_unsupported_reason(m, num_q_heads, num_kv_heads, d, q.dtype, window_size)
+    reason = geometry_unsupported_reason(
+        m, num_q_heads, num_kv_heads, d, q.dtype, window_size, k_cache.dtype
+    )
     if reason is not None:
         return reason
     if q.stride(3) != 1 or k_cache.stride(3) != 1 or v_cache.stride(3) != 1:

@@ -943,7 +943,8 @@ def _build_wide_direct(
         variants=variants,
         early_launch=True,
         # hop128 (tep8_direct_hop's MAX_ROWS 128): a 128-row workspace, the pad only up to 64 rows.
-        max_rows=_wide.DIRECT128_MAX_ROWS if _wide.DIRECT128 else 64,
+        # w256: DIRECT_MAX_ROWS 256 -> a 256-row workspace.
+        max_rows=_wide.DIRECT_MAX_ROWS if _wide.DIRECT128 else 64,
         wide_min_rows=_wide.SERVED_DIRECT_WIDE_MIN_ROWS,
         smem_pad=_wide.SERVED_DIRECT_PAD,
         pad_rows=_wide.DIRECT128_PAD_ROWS if _wide.DIRECT128 else (0, 1024),
@@ -1264,6 +1265,7 @@ class AdoptedLayers:
     published_projections: Optional[object] = None
     finalize_two_shot: Optional[object] = None
     batch_dense_gemms: Optional[object] = None
+    row_owner_moe: Optional[object] = None
 
 
 def adopt_model(
@@ -1324,7 +1326,27 @@ def adopt_model(
         # re-classes above picked.
         from .kernels.swa_block import attention as swa_attention_block
 
-        swa_block = swa_attention_block.SwaBlockPlan(fused_prep=True, fused_gate=True)
+        long_keys = long_rows = 0
+        if plan.enabled("swa_block_long_splits"):
+            # swa_block_long_splits: decode steps of MIN_ROWS rows or more on KEYS-key splits.
+            from .ops.attention.swa_block import LONG_SPLIT_KEYS
+
+            long_keys = int(plan.param("swa_block_long_splits", "KEYS"))
+            long_rows = int(plan.param("swa_block_long_splits", "MIN_ROWS"))
+            fits = long_keys in LONG_SPLIT_KEYS
+            plan.installed(
+                "swa_block_long_splits",
+                fits,
+                f"KEYS={long_keys} is not one of {LONG_SPLIT_KEYS}",
+            )
+            if not fits:
+                long_keys = long_rows = 0
+        swa_block = swa_attention_block.SwaBlockPlan(
+            fused_prep=True,
+            fused_gate=True,
+            long_split_keys=long_keys,
+            long_split_min_rows=long_rows,
+        )
         attention_class = swa_attention_block.attention_class(attention_class)
     if attention_class is not None:
         # Every layer is checked before any is re-classed: a refusal changes nothing.
@@ -1486,6 +1508,21 @@ def adopt_model(
             plan.installed("fmk_context_fmha", False, str(refusal))
         else:
             plan.installed("fmk_context_fmha", True)
+    if plan.enabled("fmk_pure_context_fmha"):
+        # After fmk_context_fmha, whose workspace and step plan it shares when that is
+        # installed; it needs only the thop fallback. Agreed like it; a refusal leaves the
+        # pure context steps on the thop op.
+        from .kernels.fmk_context_fmha import attention as fmk_context_fmha
+
+        try:
+            _tp_agreement.agreed_install(
+                model.layers[0].mapping,
+                lambda: fmk_context_fmha.install_pure_context(model, compute_capability),
+            )
+        except ValueError as refusal:
+            plan.installed("fmk_pure_context_fmha", False, str(refusal))
+        else:
+            plan.installed("fmk_pure_context_fmha", True)
     layer_kwargs = {}
     if plan.enabled("projection_gathers"):
         # Imported only when planned: with no fast path the target imports
@@ -1534,8 +1571,22 @@ def adopt_model(
         )
         # router_staged_epilogue: the GEMM's partials through shared memory (same bits).
         staged = "bulk" if plan.enabled("router_staged_epilogue") else None
+        # The row cap: the op's MAX_ROWS, raised on a wide generation server (plan.row_cap).
+        router_max_rows = plan.row_cap()
         router_gemm = _tp_agreement.agreed_install(
-            model.layers[0].mapping, lambda: _router_gemm.install(model, min_rows, staged)
+            model.layers[0].mapping,
+            lambda: _router_gemm.install(model, min_rows, staged, router_max_rows),
+        )
+    if plan.enabled("pool_gemm_pin"):
+        # The pool GEMM of the ROWS decode row counts on the pinned cuBLASLt algorithm (same
+        # bits). After dense_gemms: its mixin goes in front of whatever class each MoE's pool
+        # Linear has (dense_gemms' re-class included). Its refusals (device, library version,
+        # algorithm not listed or not runnable) are agreed over the TP group.
+        from .kernels.pool_gemm_pin import pin as _pool_gemm_pin
+
+        pool_rows = tuple(plan.param("pool_gemm_pin", "ROWS"))
+        _tp_agreement.agreed_install(
+            model.layers[0].mapping, lambda: _pool_gemm_pin.install(model, pool_rows)
         )
     # The capture layers whose boundary writes the DFlash capture (capture_fold): no
     # plain capture copy follows their boundary, so boundary_early_release converts
@@ -1549,6 +1600,24 @@ def adopt_model(
         layer_kwargs = dict(layer_kwargs, **installed)
         if installed:
             capture_folded = capture_fold.folded_layers(model, spec_config)
+    if plan.enabled("multi_request_ffn_join"):
+        # After projection_gathers, whose post-FFN join offers its built-in fallback to the op
+        # first; capture_fold (installed or not) asks the op which calls store the capture, and
+        # the op takes only those (its install defaults: 33..768 rows, clusters of 4, capture
+        # layers only). The kernel is local (no collective); its refusal (a join class, an
+        # NVRTC failure) is agreed over the TP group so every rank raises alike.
+        from .kernels.multi_request_ffn_join import join as _mr_ffn_join
+        from .kernels.projection_gathers.gathers import MuseSparkOpenTepGatedResidual
+
+        _tp_agreement.agreed_install(
+            model.layers[0].mapping,
+            lambda: _mr_ffn_join.install(
+                model,
+                pdl=bool(_tp_agreement.LAUNCH_PDL),
+                join_class=MuseSparkOpenTepGatedResidual,
+            ),
+            refusals=(ValueError, RuntimeError),
+        )
     # post_attention_hop reads each layer (any MuseSparkOpenDecoderLayer, the
     # projection_gathers re-class included) and re-classes only add_attn, which no
     # other fast path touches.
@@ -1670,15 +1739,19 @@ def adopt_model(
     if plan.enabled("finalize_two_shot"):
         # After finalize_transport, whose workspace it wraps (every layer shares it), and
         # wide_moe_allreduce, which stays the reduce of every unarmed unfused finalize.
-        # DecodeTarget arms it around a decode forward of 64..512 rows. Its refusal is
-        # agreed over the TP group before the workspace's collective construction.
+        # DecodeTarget arms it around a decode forward of 64..MAX_ROWS rows (512, raised on a
+        # wide generation server: plan.row_cap). Its refusal and its row cap are agreed over
+        # the TP group before the workspace's collective construction.
         from .kernels.finalize_two_shot import install as _finalize_two_shot
 
-        _tp_agreement.agreed_install(
-            model.layers[0].mapping,
-            lambda: _raise_refusal(_finalize_two_shot.refusal(model), "finalize_two_shot"),
-        )
-        finalize_two_shot = _finalize_two_shot.install(model)
+        finalize_max_rows = plan.row_cap()
+
+        def _finalize_refusal() -> None:
+            _finalize_two_shot.check_max_rows(finalize_max_rows)
+            _raise_refusal(_finalize_two_shot.refusal(model), "finalize_two_shot")
+
+        _tp_agreement.agreed_install(model.layers[0].mapping, _finalize_refusal)
+        finalize_two_shot = _finalize_two_shot.install(model, finalize_max_rows)
     if plan.enabled("attention_output_into_hop"):
         # After dense_gemms (its o_proj dispatchers) and post_attention_hop (its joins).
         post_attn_hop.direct = _build_direct_publish(model, post_attn_hop, early_trigger=True)
@@ -1701,6 +1774,22 @@ def adopt_model(
                 _wide.cluster_rows_of(plan.param("hop_cluster_split", "ROWS")) if split else None
             ),
         )
+    row_owner_moe = None
+    if plan.enabled("row_owner_moe"):
+        # After the wide hop, the router GEMM and the two-shot finalize, whose decode calls of
+        # its ROWS it reproduces per owner row (DecodeTarget arms it only where they are armed).
+        # Its refusal is agreed over the TP group before the island's collective construction.
+        from .kernels.row_owner_moe import island as _row_owner_moe
+
+        owner_rows = tuple(plan.param("row_owner_moe", "ROWS"))
+        owner_cap = plan.row_cap()
+        _tp_agreement.agreed_install(
+            model.layers[0].mapping,
+            lambda: _raise_refusal(
+                _row_owner_moe.refusal(model, owner_rows, owner_cap), "row_owner_moe"
+            ),
+        )
+        row_owner_moe = _row_owner_moe.build(model, owner_rows)
     published_projections = None
     if plan.enabled("projection_publish"):
         # After projection_gathers, whose MoE and join classes carry its hooks. Its refusal is
@@ -1736,4 +1825,5 @@ def adopt_model(
         published_projections=published_projections,
         finalize_two_shot=finalize_two_shot,
         batch_dense_gemms=batch_dense_gemms,
+        row_owner_moe=row_owner_moe,
     )
