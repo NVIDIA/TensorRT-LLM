@@ -126,7 +126,11 @@ from .shared_expert import (
     mxfp8_quantize_megamoe,
     shared_activation_buffers,
 )
-from .ugpu_weights import LocalizedMegaMoEWeights, localize_megamoe_weights
+from .ugpu_weights import (
+    LocalizedAllocationOutOfMemory,
+    LocalizedMegaMoEWeights,
+    localize_megamoe_weights,
+)
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from ....moe.kernels.blackwell.dsv4_route_quant import dsv4_route_nvfp4_quant
@@ -147,8 +151,6 @@ __all__ = [
 
 
 _DEEPSEEK_V4_ARCHITECTURES = _V4_ARCHITECTURES | _V41_ARCHITECTURES
-# Headroom over a layer's packed bank for the die-local copy's per-die rounding.
-_UGPU_ALLOCATION_MARGIN_BYTES = 256 << 20
 
 
 def _warn_shared_expert_fusion_ignored(reason: str) -> None:
@@ -1141,13 +1143,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         _megamoe_ugpu_die_smid_mask()
         originals = {name: self._parameters[name] for name in self._UGPU_PACKED_PARAMS}
         # The die-local bank comes from the driver, while the banks it replaced on earlier
-        # layers sit freed in PyTorch's caching allocator; return them to the driver when
-        # this bank would not otherwise fit. Only when needed: loads that fit keep the
-        # single empty_cache() the model loader runs after the post-load walk.
-        needed = sum(p.numel() * p.element_size() for p in originals.values())
-        if torch.cuda.mem_get_info()[0] < needed + _UGPU_ALLOCATION_MARGIN_BYTES:
+        # layers sit freed in PyTorch's caching allocator. When cuMemCreate runs out, return them
+        # to the driver and retry once. The device-wide free count cannot predict this (a
+        # 3.3 GiB bank failed with 5.5 GiB free), and loads that fit keep the single
+        # empty_cache() the model loader runs after the post-load walk.
+        try:
+            owner = localize_megamoe_weights(*originals.values(), mode=self._ugpu_weight_layout)
+        except LocalizedAllocationOutOfMemory:
             torch.cuda.empty_cache()
-        owner = localize_megamoe_weights(*originals.values(), mode=self._ugpu_weight_layout)
+            owner = localize_megamoe_weights(*originals.values(), mode=self._ugpu_weight_layout)
         committed = False
         try:
             aliases = (owner.fc1_weight, owner.fc1_weight_sf, owner.fc2_weight, owner.fc2_weight_sf)

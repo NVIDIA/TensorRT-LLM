@@ -147,3 +147,13 @@ def test_reorder_rejects_aliases_noncontiguous_and_dtype_mismatches():
         _MODULE.reorder_packed_weight(
             source, torch.empty((8, 64, 256), dtype=torch.uint8).transpose(1, 2), plan
         )
+
+
+def test_driver_out_of_memory_is_distinguished_from_other_errors() -> None:
+    check = _MODULE._CudaVmm._check
+    assert check((0, 7), "cuMemCreate") == 7
+    with pytest.raises(_MODULE.LocalizedAllocationOutOfMemory, match="status 2"):
+        check((2, None), "cuMemCreate")
+    with pytest.raises(RuntimeError, match="status 1") as error:
+        check((1, None), "cuMemMap")
+    assert not isinstance(error.value, _MODULE.LocalizedAllocationOutOfMemory)

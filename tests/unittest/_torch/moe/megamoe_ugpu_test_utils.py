@@ -20,10 +20,13 @@ import torch
 class MockVmm:
     """Track driver resources while the placed tensor uses real CPU storage."""
 
-    def __init__(self, *, granularity=4096, fail_operation=None, fail_index=1):
+    def __init__(
+        self, *, granularity=4096, fail_operation=None, fail_index=1, fail_error=RuntimeError
+    ):
         self.gran = granularity
         self.fail_operation = fail_operation
         self.fail_index = fail_index
+        self.fail_error = fail_error
         self.counts = {}
         self.calls = []
         self.addresses = {}
@@ -36,7 +39,7 @@ class MockVmm:
         self.calls.append(operation)
         self.counts[operation] = self.counts.get(operation, 0) + 1
         if operation == self.fail_operation and self.counts[operation] == self.fail_index:
-            raise RuntimeError(f"injected {operation} failure")
+            raise self.fail_error(f"injected {operation} failure")
 
     def granularity(self):
         self._call("granularity")
