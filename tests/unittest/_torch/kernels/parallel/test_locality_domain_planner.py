@@ -695,7 +695,9 @@ class TestLocalityDomainMoePlanner:
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
     )
-    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE", True)
+    @patch(
+        "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE", True
+    )
     @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
     @patch.dict(
         os.environ,
@@ -714,7 +716,9 @@ class TestLocalityDomainMoePlanner:
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
     )
-    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE", True)
+    @patch(
+        "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE", True
+    )
     @patch.dict(os.environ, {"TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE": "0"})
     def test_moe_disabled_when_mxfp8_not_opted_in(self, mock_locality_domain):
         planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
@@ -725,7 +729,9 @@ class TestLocalityDomainMoePlanner:
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
     )
-    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE", True)
+    @patch(
+        "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE", True
+    )
     @patch.dict(
         os.environ,
         {
@@ -744,7 +750,9 @@ class TestLocalityDomainMoePlanner:
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
     )
-    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE", False)
+    @patch(
+        "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE", False
+    )
     @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
     def test_moe_disabled_when_mxfp8_without_fused_fc12(self, mock_locality_domain):
         planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
@@ -755,7 +763,9 @@ class TestLocalityDomainMoePlanner:
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
     )
-    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE", True)
+    @patch(
+        "tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE", True
+    )
     def test_moe_disabled_when_mxfp8_not_in_allowed_ops(self, mock_locality_domain):
         policy = LocalityDomainPolicy(enabled=True, allowed_ops=frozenset({"nvfp4_moe"}))
         planner = LocalityDomainExecutionPlanner(policy)
