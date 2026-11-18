@@ -51,6 +51,10 @@ _VEC = _ar._BF16_VEC_SIZE
 _ALIGN = _ar._ALIGNMENT_BYTES
 _NEG_ZERO = _ar._NEGATIVE_ZERO_BF16_BITS
 _THREADS = 256
+#: Rows a rank up to which a round trip runs here. A CTA publishes and then waits for the same
+#: CTA of every peer, so every CTA of a launch has to be resident at once on every rank: 512
+#: rows of 2560 are 640 CTAs. Above it the caller keeps NCCL.
+MAX_ROWS = 512
 _raw_stream = torch._C._cuda_getCurrentRawStream
 
 
@@ -114,6 +118,10 @@ def _round_trip_kernel(
     state_signal_ptr = (signal_state.iterator + cutlass.Int64(_ar._SIGNAL_VALUE_INDEX)).llvm_ptr
 
     signal_i32 = cute.arch.load(state_signal_ptr, cutlass.Int32, sem="acquire", scope="gpu")
+    # Every thread of this CTA holds the signal before thread 0 can count the CTA as arrived:
+    # the last arrival rotates the signal, and a thread that loaded it after that would
+    # publish into the next slot.
+    cute.arch.sync_threads()
     signal_i64 = cutlass.Int64(signal_i32)
     ping_slot = signal_i64 % _PING_PONG
     clear_slot = (signal_i64 + cutlass.Int64(1)) % _PING_PONG
@@ -374,6 +382,7 @@ def build(hidden: int, max_rows: int, rank: int, world: int, sum_order=None) -> 
     import torch.distributed._symmetric_memory as symm_mem
 
     assert hidden % _VEC == 0, hidden
+    max_rows = min(max_rows, MAX_ROWS)
     assert dist.is_initialized() and dist.get_world_size() == world and dist.get_rank() == rank
     dev = torch.device("cuda", torch.cuda.current_device())
     buffer = symm_mem.empty(

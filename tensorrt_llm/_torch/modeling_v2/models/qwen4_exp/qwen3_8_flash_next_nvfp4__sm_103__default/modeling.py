@@ -1559,7 +1559,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
 
         # TRTLLM_QWEN4_EXP_MOE_LAMPORT_ROUND_TRIP=1: both collectives of the round trip as
         # one Lamport launch each over symmetric memory (`ops/moe/dep_lamport_round_trip`)
-        # instead of NCCL's ring kernels, for every row count up to the token budget. The same
+        # instead of NCCL's ring kernels, for every row count up to the token budget and
+        # `dep_lamport_round_trip.MAX_ROWS`; more rows keep NCCL. The same
         # rows in the same rank order and the ring's sum order; a -0.0 lane travels as +0.0.
         # One NVLink domain only: a pure SM103 DEP4 worker. Default off.
         lamport = None
