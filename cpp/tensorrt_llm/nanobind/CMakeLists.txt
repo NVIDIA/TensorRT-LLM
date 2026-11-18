@@ -18,6 +18,7 @@ set(SRCS
     kvCacheCompression/bindings.cpp
     process_group/bindings.cpp
     runtime/bindings.cpp
+    runtime/hostExchange.cpp
     runtime/hostfunc.cpp
     runtime/moeBindings.cpp
     suffixAutomaton/bindings.cpp

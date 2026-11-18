@@ -29,6 +29,7 @@ from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
     MnnvlMoe,
     NVLinkTwoSided,
 )
+from tensorrt_llm.bindings import internal as _tllm_internal
 
 
 class _Client:
@@ -636,6 +637,76 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     assert NVLinkOneSided._WORKSPACE_REFCOUNTS == {}
     assert NVLinkOneSided._WORKSPACE is None
     lifecycle.unregister.assert_not_called()
+
+
+def _build_one_sided(
+    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool, **kwargs: object
+) -> tuple[Mock, _FakeComm]:
+    """Build an EP-2 NVLinkOneSided on fake MNNVL memory, with or without Wide-EP fault tolerance.
+
+    Returns the mock of moe_a2a_initialize and the communicator of the fake memory.
+    """
+    comm = _FakeComm()
+
+    class _Memory:
+        mapped = True
+
+        @staticmethod
+        def initialize() -> None:
+            pass
+
+        @classmethod
+        def get_comm(cls, mapping: object) -> _FakeComm:
+            return comm
+
+        def __init__(self, mapping: object, size: int) -> None:
+            pass
+
+        def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(2, 64, dtype=torch.uint8)
+
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
+    monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
+    monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
+    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(
+        NVLinkOneSided,
+        "WORKSPACE_SIZE_INDEX",
+        int(_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX),
+    )
+    for memory in ("MnnvlMemory", "MembershipMnnvlMemory"):
+        monkeypatch.setattr(one_sided_module, memory, _Memory)
+    monkeypatch.setattr(
+        _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=Mock())
+    )
+    initialize = Mock(return_value=torch.tensor([1]))
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_initialize", initialize)
+    mapping = SimpleNamespace(
+        world_size=2, moe_ep_size=2, moe_ep_rank=0, has_cp_helix=Mock(return_value=False)
+    )
+    NVLinkOneSided(
+        mapping=mapping,
+        num_slots=8,
+        top_k=2,
+        max_num_tokens_per_rank=1,
+        enable_wide_ep_fault_tolerance=fault_tolerance,
+        **kwargs,
+    )
+    return initialize, comm
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+def test_rank_mask_workspace_barrier(
+    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
+) -> None:
+    """Only Wide-EP fault tolerance replaces the workspace initialization's barrier with its own."""
+    initialize, comm = _build_one_sided(monkeypatch, fault_tolerance)
+    assert initialize.call_args.kwargs == {"barrier": not fault_tolerance}
+    assert comm.barrier_count == int(fault_tolerance)
 
 
 def _destroyable_one_sided(workspace_key: tuple, workspace_state: dict) -> NVLinkOneSided:

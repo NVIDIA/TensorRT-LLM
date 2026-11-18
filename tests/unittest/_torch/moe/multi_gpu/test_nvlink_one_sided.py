@@ -24,6 +24,7 @@ import pytest
 import torch
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
+from utils.util import skip_no_mnnvl_fabric_handles
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
@@ -885,8 +886,8 @@ def _run_graph_replay_worker(failed_rank: int) -> dict:
 def test_graph_replay_follows_installed_mask() -> None:
     """A CUDA graph captured with every rank active replays without a rank masked out later."""
     ep_size, failed_rank = 4, 2
-    if torch.cuda.device_count() < ep_size:
-        pytest.skip(f"requires {ep_size} GPUs")
+    # Wide-EP fault tolerance runs only on MNNVL memory shared through fabric handles.
+    skip_no_mnnvl_fabric_handles(ep_size)
     # A replay that waited for the masked rank would end at this kernel timeout.
     executor = MPIPoolExecutor(ep_size, env={"TRTLLM_MOE_COMM_TIMEOUT_SEC": "60"})
     try:
@@ -925,7 +926,7 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str, round
         return {"skip": "NVLink one-sided is not supported on every participating GPU"}
 
     hidden, capacity, slots_per_rank = 256, 8, 2
-    evidence = int(internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX)
+    waited = int(internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX)
     health = EPGroupHealth(ep_size)
     mapping = Mapping(rank=rank, world_size=ep_size, tp_size=ep_size, moe_ep_size=ep_size)
     comm = NVLinkOneSided(
@@ -994,8 +995,8 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str, round
                 time.sleep(0.01)
             check(
                 state.waited_flags().get(failed_rank) == stuck_on,
-                f"no wait evidence on rank {failed_rank}: "
-                f"{state.abort[evidence : evidence + ep_size].tolist()}",
+                f"no waited flag for rank {failed_rank}: "
+                f"{state.abort[waited : waited + ep_size].tolist()}",
             )
             check(not done.query(), "the round completed without the stopped rank")
             check(not state.aborted(), "aborted before the request")
@@ -1004,7 +1005,7 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str, round
             torch.cuda.synchronize()
             check(time.monotonic() - start < 10, "the abort did not release the waiting collective")
             check(state.abort[:2].tolist() == [1, 1], f"abort state {state.abort[:2].tolist()}")
-            check(not state.abort[evidence:].any(), "wait evidence left after the abort")
+            check(not state.abort[waited:].any(), "waited flags left after the abort")
             # The combine of an incomplete round takes only the tokens this rank routed to itself.
             expected = torch.zeros_like(x)
             own = torch.arange(capacity, device=x.device) % ep_size == rank
@@ -1039,8 +1040,8 @@ def test_abort_releases_bound_collectives_waiting_on_a_stopped_rank(
     With ``flag_wraps`` the combine waits for round flag value 0, which is still published.
     """
     ep_size, failed_rank = 4, 2
-    if torch.cuda.device_count() < ep_size:
-        pytest.skip(f"requires {ep_size} GPUs")
+    # Wide-EP fault tolerance runs only on MNNVL memory shared through fabric handles.
+    skip_no_mnnvl_fabric_handles(ep_size)
     executor = MPIPoolExecutor(ep_size, env={"TRTLLM_MOE_COMM_TIMEOUT_SEC": "30"})
     try:
         args = [(failed_rank, stop_before, round_flag)] * ep_size

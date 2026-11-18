@@ -261,6 +261,16 @@ def test_bind_refuses_unsupported_layers() -> None:
         _frontend(ep_rank=1).bind_execution_state(state)
 
 
+def test_bind_refused_after_membership_change() -> None:
+    """The remaps of a membership change leave out the workspace of a layer bound afterwards."""
+    health = EPGroupHealth(2)
+    state = MoeExecutionState(health, 0, torch.device("cuda"))
+    _frontend().bind_execution_state(state)
+    health.mark_failed(1)
+    with pytest.raises(RuntimeError, match="only before the EP membership changes"):
+        _frontend().bind_execution_state(state)
+
+
 @pytest.mark.cpu_only
 def test_bound_layer_passes_the_device_mask(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pass the bound state's device mask and abort state to the ops, also during CUDA graph capture."""

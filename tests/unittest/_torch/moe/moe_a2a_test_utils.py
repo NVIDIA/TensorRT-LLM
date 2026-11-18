@@ -45,3 +45,23 @@ def a2a_combine(workspace, meta, payload, offset, controls, tokens=CAPACITY, ran
     """Combine like the MoE layer as ``rank``."""
     args = (payload, tokens, workspace, meta, tokens, rank, workspace.size(0), 1, offset, False)
     return torch.ops.trtllm.moe_a2a_combine(*args, **controls)
+
+
+def nvlink_one_sided_for_binding(
+    *,
+    workspace: torch.Tensor,
+    mnnvl_mem,
+    workspace_lifecycle,
+    ep_rank: int = 0,
+    fault_tolerance: bool = True,
+) -> NVLinkOneSided:
+    """Return an NVLinkOneSided with only the state that binding an execution state reads."""
+    comm = NVLinkOneSided.__new__(NVLinkOneSided)
+    comm._rank_mask_enabled = fault_tolerance
+    comm.execution_state = None
+    comm._dispatch_state = {"phase": "idle"}
+    comm.workspace = workspace
+    comm.ep_rank = ep_rank
+    comm.mnnvl_mem = mnnvl_mem
+    comm._workspace_lifecycle = workspace_lifecycle
+    return comm

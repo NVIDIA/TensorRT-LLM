@@ -24,6 +24,7 @@ cancelled if a peer may have overwritten rows that the forward's combines read.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -31,6 +32,9 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import internal as _tllm_internal
 
 from ..ep_group_health import EP_MASK_NUM_WORDS, EPGroupHealth
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.distributed.membership import StoreGroup
 
 _MASK_WORD_BITS = 64
 _ABORT_REQUESTED = 0
@@ -77,12 +81,20 @@ class MoeExecutionState:
         self._layer_resets: list[Callable[[], None]] = []
         snapshot = ep_group_health.snapshot()
         self._generation = snapshot.generation
+        # A layer bound after a membership change has a workspace that the change's remaps left out.
+        self._bound_generation = snapshot.generation
         self.active_rank_mask = torch.tensor(
             _mask_words(snapshot.mask, ep_rank), dtype=torch.uint64, device=device
         )
 
     def register_layer(self, reset_state: Callable[[], None]) -> None:
-        """Register the reset of a bound layer's dispatch/combine state machine."""
+        """Register the reset of a bound layer's dispatch/combine state machine.
+
+        Raises:
+            RuntimeError: The EP membership changed since this state was created.
+        """
+        if self.ep_group_health.generation != self._bound_generation:
+            raise RuntimeError("Bind MoE layers only before the EP membership changes")
         self._layer_resets.append(reset_state)
 
     def register_workspace(
@@ -97,6 +109,15 @@ class MoeExecutionState:
         check of this rank's incomplete-round word in it (:meth:`check_incomplete_rounds`).
         """
         self._workspaces.setdefault(workspace, (reset_workspace, check_incomplete_round))
+
+    def remap_workspaces(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
+        """Map every bound workspace at the same addresses among the active members of ``comm``.
+
+        Call only while no rank is in a collective. Every rank must :meth:`rearm` before the next
+        collective.
+        """
+        for workspace in self._workspaces:
+            workspace.remap(comm, fresh_rows)
 
     def request_abort(self) -> None:
         """Make running and future collectives return without their peers. Safe from any thread."""
