@@ -27,7 +27,7 @@ import torch
 from torch.overrides import has_torch_function_unary
 from torch.utils._python_dispatch import is_in_torch_dispatch_mode
 
-from ._compile_cache import build_and_load_attention_kernel
+from ._compile_cache import build_and_load_attention_kernel, is_attention_kernel_cached
 from ._hardware import get_max_active_clusters
 from ._scales import (
     GlobalScale,
@@ -1335,15 +1335,22 @@ _cached_mla_decode_compile_spec = functools.cache(_make_mla_decode_compile_spec)
 
 
 @functools.cache
-def _get_compiled_mla_decode(
-    compile_spec: _MLADecodeCompileSpec,
-):
+def _get_compiled_mla_decode(compile_spec: _MLADecodeCompileSpec):
     """Compile and cache one batch-dynamic TS MLA topology."""
+    with torch.cuda.device(compile_spec.device_index):
+        return build_and_load_attention_kernel(
+            "mla_decode",
+            "main",
+            compile_spec,
+            _COMPILE_OPTIONS,
+            functools.partial(_compile_mla_decode, compile_spec),
+        )
 
+
+def _compile_mla_decode(compile_spec: _MLADecodeCompileSpec):
     import cutlass
     import cutlass.cute as cute
 
-    device_index = compile_spec.device_index
     num_qo_heads = compile_spec.num_qo_heads
     kv_lora_rank = compile_spec.kv_lora_rank
     qk_rope_head_dim = compile_spec.qk_rope_head_dim
@@ -1515,44 +1522,30 @@ def _get_compiled_mla_decode(
 
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
-    def compile_kernel():
-        """Compile MLA with opt-in task-builder advisory diagnostics."""
-        from .kernels.mla_decode.helpers.diagnostics import mla_build_diagnostics
+    from .kernels.mla_decode.helpers.diagnostics import mla_build_diagnostics
 
-        with mla_build_diagnostics():
-            return cute.compile[cute.FrontendNext](
-                kernel,
-                q_latent_fake,
-                q_rope_fake,
-                c_latent_fake,
-                c_rope_fake,
-                page_offsets_fake,
-                out_fake,
-                lse_fake,
-                workspace_fake,
-                cutlass.Int32(compile_spec.split_kv),
-                cache_seqs_fake,
-                qo_indptr_fake,
-                sparse_inputs_fake,
-                fake_scale(compile_spec.scale_types[0]),
-                fake_scale(compile_spec.scale_types[1]),
-                stream_fake,
-                output_quant_args,
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                options=_COMPILE_OPTIONS,
-            )
-
-    with torch.cuda.device(device_index):
-        compiled = build_and_load_attention_kernel(
-            "mla_decode",
-            "main",
-            compile_spec,
-            _COMPILE_OPTIONS,
-            compile_kernel,
-            extra=(),
+    with mla_build_diagnostics():
+        return cute.compile[cute.FrontendNext](
+            kernel,
+            q_latent_fake,
+            q_rope_fake,
+            c_latent_fake,
+            c_rope_fake,
+            page_offsets_fake,
+            out_fake,
+            lse_fake,
+            workspace_fake,
+            cutlass.Int32(compile_spec.split_kv),
+            cache_seqs_fake,
+            qo_indptr_fake,
+            sparse_inputs_fake,
+            fake_scale(compile_spec.scale_types[0]),
+            fake_scale(compile_spec.scale_types[1]),
+            stream_fake,
+            output_quant_args=output_quant_args,
+            max_q_len=cutlass.Int32(0),
+            options=_COMPILE_OPTIONS,
         )
-    return compiled
 
 
 def get_prims_ts_batch_mla_decode_workspace_size(
@@ -3122,6 +3115,26 @@ class BatchSparseMLADecodePagedTSWrapper:
         self._workspace_buffer = workspace_buffer
         self._state = None
         self.workspace_size_bytes = 0
+
+    def is_kernel_cached(self) -> bool:
+        """Whether this plan's kernel has a matching on-disk export.
+
+        Call after `plan`, including `plan(compile=False)`. This scheduling hint
+        neither loads nor builds a kernel. An executable plan still requires
+        `plan(compile=True)`, which handles concurrent cache changes.
+        """
+        state = self._state
+        if state is None:
+            raise RuntimeError("plan() must be called before is_kernel_cached()")
+        spec = state["compile_spec"]
+        with torch.cuda.device(state["device"]):
+            return is_attention_kernel_cached(
+                "mla_decode",
+                "main",
+                spec,
+                _COMPILE_OPTIONS,
+                functools.partial(_compile_mla_decode, spec),
+            )
 
     def plan(
         self,
