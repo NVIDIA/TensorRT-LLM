@@ -300,7 +300,7 @@ def qwen3_vl_image_embeddings() -> list[torch.Tensor]:
 
 @pytest.mark.threadleak(enabled=False)
 def test_attached_embeddings_reuse_only_identical_embeddings(
-        qwen3_vl_image_embeddings):
+        qwen3_vl_image_embeddings: list[torch.Tensor]) -> None:
     """Prompts that differ only in their attached image embeddings must not
     share image KV blocks, while an identical request still reuses them."""
     kv_cache_config = KvCacheConfig(

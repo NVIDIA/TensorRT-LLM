@@ -4,14 +4,13 @@
 import hashlib
 import struct
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Callable, Literal, Protocol, get_args
 
 import numpy as np
 import torch
 from blake3 import blake3
 from PIL import Image
-
-from tensorrt_llm._utils import torch_to_numpy
 
 # Canonical media names for input metadata and I/O validation.
 MediaModality = Literal["image", "video", "audio"]
@@ -80,6 +79,16 @@ def serialize_item(obj: object) -> bytes:
     return b"".join(parts)
 
 
+@lru_cache(maxsize=None)
+def _numpy_has_dtype(dtype: torch.dtype) -> bool:
+    """Whether ``Tensor.numpy()`` supports ``dtype`` (bfloat16 and float8 do not)."""
+    try:
+        torch.empty(0, dtype=dtype).numpy()
+    except TypeError:
+        return False
+    return True
+
+
 def _array_payload(array: np.ndarray) -> _Chunk:
     """Return the raw bytes of a C-contiguous array, as ``array.tobytes()``.
 
@@ -140,14 +149,26 @@ def _update_serialized_item(update: Callable[[_Chunk], None], obj: object) -> No
         update(_array_payload(rgba))
         return
 
+    if isinstance(obj, torch.Tensor) and not _numpy_has_dtype(obj.dtype):
+        # NumPy has no such dtype (bfloat16, float8): key the torch dtype name,
+        # the shape and the raw bytes instead.
+        tensor = obj.detach().contiguous().cpu()
+        raw = tensor.reshape(-1).view(torch.uint8).numpy()
+        update(_u8(0x12))
+        update(_len_prefixed(str(tensor.dtype).encode("utf-8")))
+        update(_u8(tensor.dim()))
+        for dim in tensor.shape:
+            update(_u64(dim))
+        update(_u64(raw.nbytes))
+        update(_array_payload(raw))
+        return
+
     if isinstance(obj, (torch.Tensor, np.ndarray)):
         # The container (torch.Tensor vs np.ndarray) is not part of the content
         # identity -- only dtype, shape, and raw bytes are. Normalize both to a
         # contiguous NumPy array so identical content hashes identically.
-        # bfloat16 and float8_e4m3fn tensors become NumPy void arrays of the
-        # same bytes.
         if isinstance(obj, torch.Tensor):
-            obj = torch_to_numpy(obj.contiguous())
+            obj = obj.detach().cpu().contiguous().numpy()
         array = np.ascontiguousarray(obj)
         update(_u8(0x11))
         update(_len_prefixed(array.dtype.str.encode("utf-8")))

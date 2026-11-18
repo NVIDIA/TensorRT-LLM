@@ -207,7 +207,11 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
 
         Args:
             input_ids: Prompt token IDs with one placeholder per image.
-            mm_features: One tensor per image, or one tensor for all images.
+            mm_features: A list with one `[rows, hidden]` or
+                `[frames, rows, hidden]` tensor per placeholder, or one tensor
+                split into equal parts along its first dimension, one per
+                placeholder. A single placeholder takes one
+                `[frames, rows, hidden]` tensor.
 
         Returns:
             The expanded input IDs, the features as `[total_rows, hidden]`,

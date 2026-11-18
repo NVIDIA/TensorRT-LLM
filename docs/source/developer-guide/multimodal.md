@@ -106,6 +106,13 @@ Custom processors must use this common hook and type. The former
 `get_mm_encoder_item_metadata` hook, `MultimodalEncoderItemMetadata` tuple, and
 Params order/length fallbacks have been removed.
 
+A processor that accepts caller-attached embeddings (`multi_modal_embeddings`)
+returns the same record from `_attach_multimodal_embeddings_impl`, with each
+item's attached rows as `output_embedding_lengths`. The wrapper keys each item
+by the content of those rows, and by its `multi_modal_uuids` entry when one is
+given, so KV-cache reuse matches only identical embeddings. Attached requests
+fail for a processor that returns no record.
+
 ## Onboarding a Model
 
 Follow [Adding a New Model](../models/adding-new-model.md) for model definition,

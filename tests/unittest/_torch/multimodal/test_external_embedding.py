@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -11,6 +12,8 @@ from tensorrt_llm._torch.models.modeling_llava_next import \
     LlavaNextInputProcessor
 from tensorrt_llm._torch.models.modeling_qwen3vl import \
     Qwen3VLInputProcessorBase
+from tensorrt_llm.inputs.multimodal import MultimodalInput
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
@@ -43,9 +46,11 @@ def _make_tokenizer(input_ids):
     return tokenizer
 
 
-def _make_qwen3_vl_processor(config,
-                             tokenizer,
-                             processor_cls=Qwen3VLInputProcessorBase):
+def _make_qwen3_vl_processor(
+    config: SimpleNamespace,
+    tokenizer: Mock,
+    processor_cls: type[Qwen3VLInputProcessorBase] = Qwen3VLInputProcessorBase
+) -> Qwen3VLInputProcessorBase:
     with patch("tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor"
                ) as mock_auto_processor:
         mock_auto_processor.from_pretrained.return_value = Mock(
@@ -120,13 +125,14 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     )
 
 
-def _attach(processor, inputs, image_embeddings):
+def _attach(processor: BaseMultimodalInputProcessor, inputs: dict[str, Any],
+            image_embeddings: Any) -> tuple[list[int], dict[str, Any] | None]:
     return processor.attach_multimodal_embeddings(inputs,
                                                   {"image": image_embeddings},
                                                   SamplingParams())
 
 
-def test_qwen3_vl_attached_embeddings_are_keyed_by_content():
+def test_qwen3_vl_attached_embeddings_are_keyed_by_content() -> None:
     config = _make_qwen3_vl_config(hidden_size=4)
     num_levels = 1 + len(config.vision_config.deepstack_visual_indexes)
     width = num_levels * config.text_config.hidden_size
@@ -162,7 +168,7 @@ def test_qwen3_vl_attached_embeddings_are_keyed_by_content():
     assert changed["multimodal_input"].multimodal_hashes[1] != hashes[1]
 
 
-def test_qwen3_vl_attached_embedding_uuid_joins_its_hash():
+def test_qwen3_vl_attached_embedding_uuid_joins_its_hash() -> None:
     hidden_size = 8
     config = _make_qwen3_vl_config(hidden_size)
     embedding_width = hidden_size * (
@@ -208,8 +214,10 @@ def test_qwen3_vl_attached_embedding_uuid_joins_its_hash():
 
 class _NoItemMetadataProcessor(Qwen3VLInputProcessorBase):
 
-    def _attach_multimodal_embeddings_impl(self, inputs, multimodal_embedding,
-                                           sampling_params):
+    def _attach_multimodal_embeddings_impl(
+            self, inputs: dict[str, Any], multimodal_embedding: dict[str, Any],
+            sampling_params: SamplingParams
+    ) -> tuple[list[int], dict[str, Any]]:
         return [7], {
             "multimodal_data": {
                 "multimodal_embedding": multimodal_embedding["image"]
@@ -217,7 +225,7 @@ class _NoItemMetadataProcessor(Qwen3VLInputProcessorBase):
         }
 
 
-def test_attached_embeddings_require_item_metadata():
+def test_attached_embeddings_require_item_metadata() -> None:
     processor = _make_qwen3_vl_processor(_make_qwen3_vl_config(8),
                                          _make_tokenizer([7]),
                                          processor_cls=_NoItemMetadataProcessor)
@@ -226,7 +234,8 @@ def test_attached_embeddings_require_item_metadata():
         _attach(processor, {"prompt": "Describe."}, [torch.zeros(1, 16)])
 
 
-def _make_llava_next_processor(hidden_size, image_token_index):
+def _make_llava_next_processor(
+        hidden_size: int, image_token_index: int) -> LlavaNextInputProcessor:
     config = SimpleNamespace(
         text_config=SimpleNamespace(hidden_size=hidden_size,
                                     torch_dtype=torch.float32),
@@ -244,7 +253,7 @@ def _make_llava_next_processor(hidden_size, image_token_index):
                                        trust_remote_code=True)
 
 
-def test_llava_next_attached_embeddings_are_keyed_per_image():
+def test_llava_next_attached_embeddings_are_keyed_per_image() -> None:
     hidden_size = 8
     image_token_index = 32
     processor = _make_llava_next_processor(hidden_size, image_token_index)
@@ -277,7 +286,7 @@ def test_llava_next_attached_embeddings_are_keyed_per_image():
     assert uneven.multimodal_lengths == [2, 3]
 
 
-def test_llama4_attached_embeddings_are_keyed_per_image():
+def test_llama4_attached_embeddings_are_keyed_per_image() -> None:
     hidden_size = 8
     patch_token, image_start, tile_separator, image_end = 40, 41, 43, 42
     config = SimpleNamespace(
@@ -306,7 +315,7 @@ def test_llama4_attached_embeddings_are_keyed_per_image():
                                          config=config,
                                          tokenizer=tokenizer)
 
-    def attach(*embeddings):
+    def attach(*embeddings: torch.Tensor) -> MultimodalInput:
         items = [{
             "mm_embeddings":
             embedding,
@@ -327,6 +336,9 @@ def test_llama4_attached_embeddings_are_keyed_per_image():
     assert multimodal_input.multimodal_run_lengths == [2, 2, 2, 2]
     assert hashes[0] != hashes[1]
     assert attach(second, first).multimodal_hashes == hashes[::-1]
+    changed = attach(first, second + 1).multimodal_hashes
+    assert changed[0] == hashes[0]
+    assert changed[1] != hashes[1]
 
 
 if __name__ == "__main__":
