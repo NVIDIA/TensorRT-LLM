@@ -19,6 +19,7 @@ from .constants import (
     QSA_SPARSE_KV_CACHE_DTYPES,
     QSA_VALUE_ROLE_INDEX,
 )
+from .index_plane_layout import require_plain_pages
 from .indexer import _is_power_of_two, _logical_to_pages
 from .metadata import QSAAttentionMetadata
 from .params import QSASparseParams
@@ -686,6 +687,7 @@ class QSASparseHooks(AttentionSparseHooks):
             max_seq_len_kv = attn_metadata.qsa_block_table.shape[1] * tokens_per_block
 
         if is_decode:
+            require_plain_pages(attn_metadata.kv_cache_manager)
             index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
             if index_cache is None:
                 raise RuntimeError(
@@ -764,6 +766,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 output = attention.apply_output_gate(output, output_gate)
             return output
 
+        require_plain_pages(attn_metadata.kv_cache_manager)
         index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
         if index_cache is None:
             raise RuntimeError(f"QSA index cache is unavailable for layer {attention.layer_idx}")

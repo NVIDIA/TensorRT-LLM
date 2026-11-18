@@ -35,6 +35,16 @@ def compact_enabled() -> bool:
     return os.environ.get(COMPACT_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def require_plain_pages(kv_cache_manager) -> None:
+    """Refuse a cache manager on the compact layout: for a caller that addresses an index page
+    by `pos % tokens_per_block` and would write past a compact page."""
+    if getattr(kv_cache_manager, "qsa_index_compact", False):
+        raise RuntimeError(
+            f"{COMPACT_ENV}=1: this QSA path reads and writes plain index pages "
+            "(row pos % tokens_per_block); unset it"
+        )
+
+
 def plane_rows(tokens_per_block: int, compress_ratio: int, compact: bool | None = None) -> int:
     """Rows of one index page."""
     if compact is None:
