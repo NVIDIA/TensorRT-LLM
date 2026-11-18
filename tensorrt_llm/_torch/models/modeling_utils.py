@@ -682,15 +682,16 @@ class DecoderModelForCausalLM(nn.Module,
         """
         return self.model.embed_tokens(input_ids)
 
-    def prompt_embeds_model_inputs(self, input_ids: torch.Tensor,
-                                   embed_rows: torch.Tensor) -> Dict[str, Any]:
+    def prompt_embeds_model_inputs(
+            self, input_ids: torch.Tensor,
+            embed_rows: torch.Tensor) -> dict[str, torch.Tensor]:
         """Return extra ``forward`` kwargs for a pass with prompt-embedding rows.
 
         Args:
-            input_ids: Token ids of the pass; prompt-embedding rows hold
-                placeholder ids.
-            embed_rows: Indices into ``input_ids`` of the rows replaced by
-                supplied embeddings.
+            input_ids: ``[N]`` int32 CUDA token ids of the packed pass;
+                prompt-embedding rows hold placeholder ids.
+            embed_rows: ``[K]`` int64 CUDA indices into ``input_ids`` of the
+                rows replaced by supplied embeddings.
         """
         return {}
 

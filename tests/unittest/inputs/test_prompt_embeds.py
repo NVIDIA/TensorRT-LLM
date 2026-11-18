@@ -10,6 +10,7 @@ import torch
 from tensorrt_llm.inputs.prompt_embeds import (
     PromptEmbeds,
     build_prompt_embeds,
+    prompt_embeds_block_key,
     prompt_embeds_cache_salt,
 )
 
@@ -166,8 +167,18 @@ def test_block_reuse_keys(start: int, end: int) -> None:
     keys = _augment_tokens_with_prompt_embeds(list(ids[start:end]), pe, start, end)
     expected = []
     for p in range(start, end):
-        expected.append(pe.row_digest(sum(mask[:p])) if mask[p] else ids[p])
+        row = sum(mask[:p])
+        expected.append(prompt_embeds_block_key(pe.row_digest(row), ids[p]) if mask[p] else ids[p])
     assert keys == expected
+
+
+def test_block_key_covers_placeholder_id() -> None:
+    # Models that still read ids at embedding rows must not share KV across ids.
+    _, pe = build_prompt_embeds([1], _rows(1))
+    assert prompt_embeds_block_key(pe.row_digest(0), 1) != prompt_embeds_block_key(
+        pe.row_digest(0), 2
+    )
+    assert len(prompt_embeds_block_key(pe.row_digest(0), 1)) == 32
 
 
 def test_pickle_round_trip() -> None:

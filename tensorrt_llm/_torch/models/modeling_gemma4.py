@@ -1376,7 +1376,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
 
     def prompt_embeds_model_inputs(
         self, input_ids: torch.Tensor, embed_rows: torch.Tensor
-    ) -> Dict[str, Any]:
+    ) -> dict[str, torch.Tensor]:
         """Per-layer embeddings read ids; embedding rows use ``pad_token_id``,
         as image positions do in the multimodal wrapper."""
         if not self.model.hidden_size_per_layer_input:

@@ -15,7 +15,7 @@
 """TensorRT-LLM text implementation for Qwen3.8-Flash-Next checkpoints."""
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 import torch
 from torch import nn
@@ -1145,7 +1145,7 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
 
     def prompt_embeds_model_inputs(
         self, input_ids: torch.Tensor, embed_rows: torch.Tensor
-    ) -> Dict[str, Any]:
+    ) -> dict[str, torch.Tensor]:
         """Per-layer n-gram embeddings read ids; embedding rows use their
         placeholder id, as image positions do in the multimodal wrapper."""
         return {"orig_input_ids": input_ids}

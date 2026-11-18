@@ -306,3 +306,16 @@ def multimodal_row_mask(multimodal_input: Any, num_tokens: int) -> torch.Tensor:
     for start, length in zip(starts, lengths):
         mask[int(start) : int(start) + int(length)] = True
     return mask
+
+
+def prompt_embeds_block_key(row_digest: bytes, placeholder_id: int) -> bytes:
+    """Return the 32-byte KV block key of one prompt-embedding position.
+
+    Args:
+        row_digest: Digest of the row (``PromptEmbeds.row_digest``).
+        placeholder_id: Token id scheduled at that position.
+    """
+    h = hashlib.sha256(b"prompt_embeds.key|")
+    h.update(row_digest)
+    h.update(int(placeholder_id).to_bytes(8, "little", signed=True))
+    return h.digest()

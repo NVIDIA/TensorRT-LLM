@@ -3538,7 +3538,7 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
 
     def prompt_embeds_model_inputs(
         self, input_ids: torch.Tensor, embed_rows: torch.Tensor
-    ) -> Dict[str, Any]:
+    ) -> dict[str, torch.Tensor]:
         """Hash routing reads ids; embedding rows route on their placeholder id,
         as image positions do in the multimodal wrapper."""
         return {"orig_input_ids": input_ids}

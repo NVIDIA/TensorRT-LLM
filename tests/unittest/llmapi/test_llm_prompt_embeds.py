@@ -189,6 +189,11 @@ def test_reuse_scoped_to_embeddings(llm: LLM, table: torch.Tensor) -> None:
     assert list(second.outputs[0].token_ids) == expected_other
     assert second.cached_tokens > 0
 
+    # Same rows under different placeholder ids do not share blocks either.
+    other_placeholders = {**request, "prompt_token_ids": other_ids}
+    third = llm.generate([other_placeholders], _greedy(), cache_salt=salt)[0]
+    assert third.cached_tokens == 0
+
     # The plain prompt still reuses its own blocks and is unaffected.
     plain = llm.generate([ids], _greedy(), cache_salt=salt)[0]
     assert list(plain.outputs[0].token_ids) == expected
@@ -336,3 +341,20 @@ def test_multi_gpu(model_dir: str, table: torch.Tensor, tp_size: int, pp_size: i
             ids[2],
         ]
         assert _run(parallel, requests) == expected
+
+
+def test_connector_keeps_salt_scoping() -> None:
+    # External KV stores key blocks by ids and salt, even with the V2 manager.
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    v2 = object.__new__(KVCacheManagerV2)
+    with_connector = SimpleNamespace(
+        llm_args=SimpleNamespace(kv_connector_config=object()),
+        engine=SimpleNamespace(kv_cache_manager=v2),
+    )
+    without = SimpleNamespace(
+        llm_args=SimpleNamespace(kv_connector_config=None),
+        engine=SimpleNamespace(kv_cache_manager=v2),
+    )
+    assert not BaseWorker._kv_cache_keys_prompt_embeds(with_connector)
+    assert BaseWorker._kv_cache_keys_prompt_embeds(without)

@@ -421,9 +421,16 @@ class BaseWorker(GenerationExecutor):
                                         request.prompt_embeds.digest)
 
     def _kv_cache_keys_prompt_embeds(self) -> bool:
-        """Return whether the KV cache manager keys blocks by embedding rows."""
+        """Return whether every KV reuse path keys blocks by embedding rows.
+
+        KVCacheManagerV2 does; KV cache connectors (external stores) key blocks
+        by token ids and the cache salt.
+        """
         from .._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
             KVCacheManagerV2
+        if self.llm_args is not None and getattr(
+                self.llm_args, "kv_connector_config", None) is not None:
+            return False
         return isinstance(getattr(self.engine, "kv_cache_manager", None),
                           KVCacheManagerV2)
 

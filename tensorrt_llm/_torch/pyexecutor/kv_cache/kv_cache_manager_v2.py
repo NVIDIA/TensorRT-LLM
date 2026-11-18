@@ -65,6 +65,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_batch_block_offsets_to_device,
     gather_base_page_rows,
 )
+from tensorrt_llm.inputs.prompt_embeds import prompt_embeds_block_key
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     KVEventsConfig,
@@ -1575,16 +1576,18 @@ def _augment_tokens_with_prompt_embeds(
     chunk_start: int,
     chunk_end: int,
 ) -> list[TokenIdExt]:
-    """Replace prompt-embedding positions in ``result`` with their row digests.
+    """Replace prompt-embedding positions in ``result`` with row-derived keys.
 
     ``result`` holds the keys of prompt positions ``[chunk_start, chunk_end)``.
-    Each row is keyed by its own digest, so a block matches only when every
-    embedding row in it is identical; the radix tree chains earlier blocks.
+    Each embedding position is keyed by its row digest and its placeholder id
+    (some models still read the id), so a block matches only when every
+    embedding row and id in it is identical; the radix tree chains earlier
+    blocks.
     """
     lo, hi = prompt_embeds.chunk_rows(chunk_start, chunk_end)
     for row in range(lo, hi):
-        position = int(prompt_embeds.positions[row])
-        result[position - chunk_start] = prompt_embeds.row_digest(row)
+        offset = int(prompt_embeds.positions[row]) - chunk_start
+        result[offset] = prompt_embeds_block_key(prompt_embeds.row_digest(row), int(result[offset]))
     return result
 
 
