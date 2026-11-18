@@ -21,6 +21,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 #include <limits>
@@ -63,6 +64,11 @@ void lmHeadArgmax(torch::Tensor const& input, torch::Tensor const& weight, int64
             && weight.scalar_type() == input.scalar_type(),
         "input and weight must both be bf16 or both fp16");
     TORCH_CHECK(input.is_cuda() && weight.is_cuda() && scratch.is_cuda() && tokens.is_cuda(), "CUDA tensors expected");
+    TORCH_CHECK(
+        weight.device() == input.device() && scratch.device() == input.device() && tokens.device() == input.device(),
+        "input, weight, scratch and tokens must be on the same device");
+    // The capacity query and the launch read the current device.
+    c10::cuda::CUDAGuard const deviceGuard(input.device());
     TORCH_CHECK(input.stride(1) == 1 && weight.stride(1) == 1, "input and weight need a unit inner stride");
     TORCH_CHECK(isAligned16(input) && isAligned16(weight), "input and weight rows must be 16-byte aligned");
     TORCH_CHECK(input.size(1) == weight.size(1), "input and weight disagree on the hidden size");
@@ -99,6 +105,7 @@ void lmHeadArgmax(torch::Tensor const& input, torch::Tensor const& weight, int64
         TORCH_CHECK(exchangeEpoch.has_value() && exchangeEpoch->is_cuda()
                 && exchangeEpoch->scalar_type() == torch::kInt32 && exchangeEpoch->numel() >= 1,
             "several ranks need the exchange channel's int32 epoch counter");
+        TORCH_CHECK(exchangeEpoch->device() == input.device(), "exchange_epoch must be on the input's device");
         TORCH_CHECK(exchangeWords >= 2 * m, "exchange_words must hold two packets per row");
         params.exchangeEpoch = exchangeEpoch->data_ptr<int32_t>();
         params.exchangeWords = static_cast<int>(exchangeWords);
