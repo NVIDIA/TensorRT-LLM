@@ -7,9 +7,9 @@ from __future__ import annotations
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from unittest.mock import Mock, patch
 
 import pytest
@@ -52,6 +52,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 )
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
 )
@@ -64,7 +65,7 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
     from types import TracebackType
 
 # The item-scheduling surface is pure logic: no kernels, no device transfers.
@@ -1111,6 +1112,144 @@ class _ThreadTpGroup:
     def get(self, mapping: Mapping) -> SimpleNamespace:
         """Stands in for ``Distributed.get``."""
         return SimpleNamespace(tp_allgather=lambda obj, **_: self.allgather(mapping.tp_rank, obj))
+
+
+@pytest.mark.parametrize("encoder_dp_size", [None, 2], ids=["encoder_tp", "encoder_dp"])
+def test_item_encoder_transfers_only_its_assigned_pixels(
+    encoder_dp_size: int | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    group = _ThreadTpGroup(2)
+    active_rank = threading.local()
+
+    class Model(MultimodalModelMixin):
+        embedding_dim = 2
+        embedding_dtype = torch.float32
+        multimodal_data_device_paths = ["image.pixel_values"]
+
+        def __init__(self, rank: int) -> None:
+            self.rank = rank
+            self.model_config = ModelConfig(
+                mapping=Mapping(world_size=2, rank=rank, tp_size=2),
+                multimodal_config=MultimodalConfig(encoder_data_parallel_size=encoder_dp_size),
+            )
+            self.text_embedding = torch.nn.Embedding(1, self.embedding_dim)
+            self.residuals: list[MultimodalParams] = []
+            self._encoder_forward_context = self._time_encoder
+
+        @property
+        def text_embedding_layer(self) -> torch.nn.Embedding:
+            return self.text_embedding
+
+        def exchange_encoder_status(self, values: Sequence[int]) -> list[list[int]]:
+            return cast(list[list[int]], group.allgather(self.rank, list(values)))
+
+        def _allgather_encoder_dp_output(
+            self, tensor: torch.Tensor, row_counts: list[int]
+        ) -> torch.Tensor:
+            outputs = cast(list[torch.Tensor], group.allgather(self.rank, tensor))
+            assert [output.shape[0] for output in outputs] == row_counts
+            return torch.cat(outputs)
+
+        def build_multimodal_encoder_input(
+            self,
+            param: MultimodalParams,
+            local_item_indices: Sequence[int],
+            modality: str | None = None,
+        ) -> MultimodalParams:
+            residual = super().build_multimodal_encoder_input(param, local_item_indices, modality)
+            self.residuals.append(residual)
+            return residual
+
+        def encode_multimodal_inputs(self, params: Sequence[MultimodalParams]) -> torch.Tensor:
+            assert active_rank.inside_encoder
+            return torch.cat(
+                [param.multimodal_data["image"]["pixel_values"][:, :2] for param in params]
+            )
+
+        @contextmanager
+        def _time_encoder(self) -> Iterator[None]:
+            assert not active_rank.inside_encoder
+            active_rank.inside_encoder = True
+            try:
+                yield
+            finally:
+                active_rank.inside_encoder = False
+
+    transferred = [[], []]
+
+    def record_transfer(
+        param: MultimodalParams, tensor: torch.Tensor, operation: str, **kwargs: object
+    ) -> torch.Tensor:
+        assert operation == "to_device" and kwargs["device"] == "cuda"
+        assert tensor.device.type == "cpu" and not active_rank.inside_encoder
+        transferred[active_rank.rank].append((param, tensor.nbytes, tensor[:, 0].tolist()))
+        return tensor
+
+    monkeypatch.setattr(MultimodalParams, "_apply_tensor_operation", record_transfer)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.engine.multimodal.prefer_pinned", lambda: False
+    )
+
+    processor = Mock(spec=BaseMultimodalDummyInputsBuilder)
+    processor.get_mm_max_tokens_per_item.return_value = {"image": 8}
+    processor.get_mm_encoder_attention_metadata_capacity.return_value = None
+    processor.get_max_mm_encoder_output_embeddings.return_value = 4
+
+    def run(rank: int) -> Model:
+        active_rank.rank = rank
+        active_rank.inside_encoder = False
+        model = Model(rank)
+        # Install the cache and resolve the actual layout through the scheduler factory.
+        bare_mm_item_scheduler(model)
+        scheduler = MultimodalItemScheduler.create(
+            model=model,
+            input_processor=processor,
+            encoder_max_num_tokens=32,
+            configured_encoder_max_num_tokens=32,
+        )
+        requests = []
+        scheduled = {}
+        for request_id, (costs, values) in enumerate([([8], [10]), ([3, 4, 4], [20, 21, 22])], 1):
+            pixels = torch.tensor(values, dtype=torch.float32)[:, None].expand(-1, 6).contiguous()
+            request = make_llm_request(
+                request_id,
+                {
+                    "image": {"pixel_values": pixels},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        item_refs=[("image", i) for i in range(len(costs))],
+                        encoder_token_lengths=costs,
+                        output_embedding_lengths=[1] * len(costs),
+                        input_partitions={"image": {"pixel_values": MultimodalItemPartition()}},
+                    ),
+                },
+            )
+            initialize_multimodal_encoder_request(request, max_num_tokens=32)
+            _bind_items(scheduler, request)
+            requests.append(request)
+            scheduled[request_id] = list(range(len(costs)))
+
+        scheduler.forward_items(requests, scheduled)
+        for request in requests:
+            state = request.py_mm_encoder_state
+            assert all(state.item_ready)
+            expected = request.py_multimodal_data["image"]["pixel_values"][:, :2]
+            outputs = torch.cat([scheduler.encoder_cache.get(key) for key in state.item_cache_keys])
+            torch.testing.assert_close(outputs, expected)
+        return model
+
+    with ThreadPoolExecutor(2) as ranks:
+        models = list(ranks.map(run, range(2)))
+
+    assert [sum(nbytes for _, nbytes, _ in rank) for rank in transferred] == (
+        [48, 48] if encoder_dp_size == 2 else [96, 96]
+    )
+    if encoder_dp_size == 2:
+        assert [[values for _, _, values in rank] for rank in transferred] == [
+            [[10], [20]],
+            [[21, 22]],
+        ]
+        # Rank 0 owns the first residual in full and stages the same object.
+        assert transferred[0][0][0] is models[0].residuals[0]
 
 
 class _SharedEncoderTpModel(MultimodalModelMixin):

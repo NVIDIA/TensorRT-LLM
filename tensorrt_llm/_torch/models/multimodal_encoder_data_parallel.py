@@ -180,6 +180,7 @@ def execute_encoder_dp_items(
     exchange_status: ExchangeStatus,
     allgather: Callable[[torch.Tensor, list[int]], torch.Tensor],
     empty_output: torch.Tensor,
+    on_prepared: Callable[[], None] | None = None,
 ) -> torch.Tensor:
     """Place, run, and reorder atomic multimodal encoder items.
 
@@ -194,7 +195,8 @@ def execute_encoder_dp_items(
     shares failures, including preparation failures for replicas without TP.
     ``allgather`` concatenates the
     per-replica outputs in replica order using the given row counts,
-    including zero rows.
+    including zero rows. When supplied, ``on_prepared`` runs on every rank
+    after local input preparation and before encoding.
 
     Returns one dense tensor with each item's ``row_counts`` rows, in item order.
     """
@@ -202,7 +204,10 @@ def execute_encoder_dp_items(
     def prepare() -> tuple[tuple[int, ...], list[int], Callable[[], torch.Tensor] | None]:
         ranks = plan_encoder_dp_items(costs, layout.dp_size)
         local = [index for index, rank in enumerate(ranks) if rank == layout.dp_rank]
-        return ranks, local, prepare_local(local) if local else None
+        encode_local = prepare_local(local) if local else None
+        if on_prepared is not None:
+            on_prepared()
+        return ranks, local, encode_local
 
     if layout.tp_size > 1:
         with encoder_dp_error_guard(exchange_status):

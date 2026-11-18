@@ -347,6 +347,7 @@ class MultimodalItemScheduler:
         output_budget_bytes: int | None = None,
         bytes_per_embedding: int | None = None,
         collective: bool = False,
+        defer_encoder_input_transfer: bool = False,
     ) -> None:
         self.model = model
         self.input_processor = input_processor
@@ -358,6 +359,7 @@ class MultimodalItemScheduler:
         # Read from the eager model: whole-model torch.compile wraps the engine's model later.
         self.collective = collective
         """Every TP rank must enter each encoder step to share one encoder TP pass."""
+        self._defer_encoder_input_transfer = defer_encoder_input_transfer
 
     @classmethod
     def maybe_create(
@@ -476,6 +478,7 @@ class MultimodalItemScheduler:
             input_processor, encoder_max_num_tokens, model
         )
 
+        layout = model.encoder_parallel_layout
         return cls(
             model=model,
             input_processor=input_processor,
@@ -484,7 +487,10 @@ class MultimodalItemScheduler:
             encoder_batch_size=encoder_batch_size,
             output_budget_bytes=output_budget_bytes,
             bytes_per_embedding=bytes_per_embedding,
-            collective=model.encoder_parallel_layout.collective,
+            collective=layout.collective,
+            # Replicated requests can select their encoder DP share on the host.
+            # With attention DP, only the request owner stages inputs for sharing.
+            defer_encoder_input_transfer=layout.distributes_items and not layout.collective,
         )
 
     @property
@@ -609,15 +615,25 @@ class MultimodalItemScheduler:
         # quarantine this batch's window buffers for the communicator's
         # lifetime while the executor keeps serving.
         pending_error = request_error
-        with discard_nccl_window_tensor_outputs(encoder_inputs):
+        # The embedding weight anchors the CUDA scope before deferred transfers, even on empty replicas.
+        scope_inputs = (
+            (encoder_inputs, self.model.text_embedding_layer.weight)
+            if self._defer_encoder_input_transfer
+            else encoder_inputs
+        )
+        with discard_nccl_window_tensor_outputs(scope_inputs):
             try:
-                # A shared encoder TP pass groups the ranks' batches within
-                # the limits of one encoder step, which profiling covered.
-                outputs = self.model.forward_multimodal_encoder_items(
-                    encoder_inputs,
-                    max_tokens=self.encoder_max_num_tokens,
-                    max_items=self.encoder_batch_size,
-                )
+                if self._defer_encoder_input_transfer:
+                    outputs = self.model.forward_multimodal_encoder_items(
+                        encoder_inputs, transfer_local_inputs=self._transfer_encoder_inputs
+                    )
+                else:
+                    # Shared encoder TP groups the ranks' batches within the limits of one step.
+                    outputs = self.model.forward_multimodal_encoder_items(
+                        encoder_inputs,
+                        max_tokens=self.encoder_max_num_tokens,
+                        max_items=self.encoder_batch_size,
+                    )
             except Exception as error:
                 pending_error = self._to_request_error(error, producer_request_ids)
                 if pending_error is None:
@@ -722,15 +738,18 @@ class MultimodalItemScheduler:
                 output_targets.append((item_idx, cache_key, embedding_lengths[item_idx]))
 
         encoder_inputs = self.model.prepare_multimodal_encoder_inputs(encoder_items)
-        for encoder_input, _, _ in encoder_inputs:
+        if not self._defer_encoder_input_transfer:
+            self._transfer_encoder_inputs(param for param, _, _ in encoder_inputs)
+        return encoder_inputs, output_targets, scheduled_cache_keys
+
+    def _transfer_encoder_inputs(self, encoder_inputs: Iterable[MultimodalParams]) -> None:
+        for encoder_input in encoder_inputs:
             encoder_input.to_device(
                 "multimodal_data",
                 "cuda",
                 pin_memory=prefer_pinned(),
                 target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
             )
-
-        return encoder_inputs, output_targets, scheduled_cache_keys
 
     def build_multimodal_data_for_llm(
         self, request: LlmRequest, runtime: MultimodalRuntimeData | None = None
