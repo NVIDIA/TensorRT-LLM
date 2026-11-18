@@ -104,6 +104,8 @@ l0_cpu:
   # The qwen4_exp default target's cpu_only tests (its routing among them); this stage runs
   # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
+  # The qwen4_exp FP8 target's cpu_only tests, likewise.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified
   - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_routing.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/executor/test_handle_responses_fast_path.py
@@ -134,6 +136,7 @@ l0_cpu:
   # The GPU stages run with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_decode_step.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_decode_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_fp4_mla_copies.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_mnnvl_workspace.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_k3_decode_worker.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_capture_view.py
@@ -147,6 +150,33 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_weight_table.py
+  # The Kimi K3 SM107 targets' cpu_only cases: CuTe DSL hint tables, the FP4 MLA
+  # decode plan geometry, each target's constants and model defaults, the routing
+  # of the recipes' mappings, the context MLA split-K dispatch gates, the
+  # drafter's binding to the unified draft KV layers and the targets' cache
+  # manager (KDA mid-chunk snapshots, on stubs).
+  # Its GPU tests are in l0_gr100.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_k3_fp4_mla_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_k3_fp4_mla_plan_splits.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_mxfp8_gemm_fp8_out_source.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moeep8
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moetp2ep4
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__tp1
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_sm107_routing.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/dspark/test_k3_unified_draft_binding.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/dspark/test_k3_target_head_rows.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/cache/test_k3_sm107_cache_manager.py
+  # Kimi K3 family glue and kernels: V1 import scan, the FC12 counter layout and die-claim
+  # gating, source parity with V1 / the reference, and the KDA mid-chunk snapshot plan
+  # (their GPU cases are in l0_b300).
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_v1_imports.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_moe/test_k3r_fc12_layout.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_no_env_switches.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_common.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_kda_metadata.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_situ/test_k3r_situ.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_rms_norm_gated/test_k3r_rms_norm_gated.py
   # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_block_table_contract.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_n_valid_contract.py
@@ -180,10 +210,8 @@ l0_cpu:
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_connector.py
   - unittest/_torch/test_connector_adp.py
-  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_parallel_layout
   - unittest/_torch/models/test_qwen3next_moe_input_dual_quant.py
-  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_rejects_incompatible_layout
-  - unittest/_torch/models/test_modeling_utils.py::test_quantization_passes_match_declared_fused_checkpoint_names
+  - unittest/_torch/models/test_modeling_utils.py
   - unittest/_torch/models/test_qwen3next_moe_allreduce_guard.py
   - unittest/_torch/test_connector_shared_pool.py
   - unittest/_torch/test_model_config.py
@@ -258,6 +286,7 @@ l0_cpu:
   - unittest/executor/test_rpc.py
   - unittest/executor/test_multi_frontend_routing.py
   - unittest/executor/test_proxy_request_sender.py
+  - unittest/executor/test_postprocessor_hook.py
   - unittest/executor/test_event_loop_error_broadcast.py
   - unittest/executor/test_forward_error_survival.py
   - unittest/executor/test_rpc_worker_mixin.py
@@ -266,6 +295,7 @@ l0_cpu:
   - unittest/executor/test_rpc_proxy_submit_order.py
   - unittest/executor/test_stats_serializer.py
   - unittest/executor/test_spec_dec_perf_metrics.py
+  - unittest/executor/test_spec_decode_serialization.py
   - unittest/executor/test_stop_word_side_output_trim.py
   - unittest/executor/test_stop_word_streaming_text.py
   - unittest/executor/test_ray_stub.py
@@ -294,6 +324,7 @@ l0_cpu:
   - unittest/kv_cache_manager_v2_tests
   - unittest/llmapi/test_deepseek_v32_encoding.py
   - unittest/llmapi/test_deepseek_v32_tokenizer.py
+  - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/llmapi/test_deepseek_v41_tokenizer.py
   - unittest/llmapi/test_disagg_worker_role.py
   - unittest/llmapi/test_session_reuse.py
@@ -376,6 +407,7 @@ l0_cpu:
   - unittest/llmapi/test_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_rl_control_auth.py
+  - unittest/llmapi/test_rlhf_utils.py
   - unittest/llmapi/test_runtime_control.py
   - unittest/llmapi/test_runtime_memory_api.py
   - unittest/llmapi/test_sampling_params.py
@@ -395,7 +427,9 @@ l0_cpu:
   - unittest/llmapi/test_trtllm_serve_config_schemas.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_visual_gen_startup_shutdown.py
+  - unittest/metrics/test_grafana_dashboard.py
   - unittest/metrics/test_collector.py
+  - unittest/metrics/test_perf.py
   - unittest/models/test_quant_config_utils.py
   - unittest/others
   - unittest/quantization/test_mode.py
