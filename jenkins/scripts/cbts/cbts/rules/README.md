@@ -419,9 +419,8 @@ name a target.
 The MiniMax SM107 TP2, TP4 and TP8 router tests live under their respective
 `models/minimax_m3/minimax_m3_nvfp4__sm_107__tpN/ops/moe/` directories and
 are selected with those targets. Explicit M3 family-source associations also
-retain named communication and MoE cases, as well as checks at the family root
-and in `ops/spec`, even when a mirror unit directory exists. These associations
-add file prefixes rather than the whole family or target.
+retain named communication and MoE cases outside the mirrored unit prefixes.
+These associations add file prefixes rather than the whole family or target.
 
 The rule reads imports from the checkout, which in CI is the PR head: it
 parses every Python file of the subtree and of `tests/unittest/_torch/modeling_v2/`

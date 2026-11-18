@@ -50,8 +50,7 @@ target to have accuracy tests, and every accuracy directory to name a target.
   Either way it adds the tests of every target that imports it. A file no
   target imports, such as `routing.py`, selects the whole family, as does
   any non-Python family file. Exact source-to-test associations also retain
-  named companion tests, including family-root and cross-component checks,
-  outside those prefixes.
+  named companion tests outside those prefixes.
 - A Python file under `catalog/<category>/` selects
   `unittest/_torch/modeling_v2/<category>` plus the tests of every target
   that imports it, or every modeling_v2 entry if that directory is missing.
