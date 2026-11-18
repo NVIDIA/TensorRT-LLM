@@ -362,14 +362,98 @@ class BaseMultimodalInputProcessor(ABC):
         Auto-detokenizes `prompt_token_ids` --> `prompt` for non-fast-path VLMs
         before delegating to `_attach_multimodal_embeddings_impl`. Subclasses
         override `_attach_multimodal_embeddings_impl` (not this wrapper).
+
+        The returned `multimodal_input` keys each attached item by the content
+        of its embedding rows, as `apply_mm_hashes` keys media items, so KV-cache
+        reuse matches only identical embeddings.
         """
+        # Detokenizing rebuilds the prompt without the caller's UUIDs.
+        multimodal_uuids = inputs.get("multi_modal_uuids")
         if (inputs.get("prompt_token_ids") is not None
                 and inputs.get("prompt") is None
                 and not self.supports_token_id_mm_expansion):
             inputs = self._detokenize_to_text_prompt(inputs, sampling_params)
-        return self._attach_multimodal_embeddings_impl(inputs,
-                                                       multimodal_embedding,
-                                                       sampling_params)
+        prompt_token_ids, extra_processed_inputs = (
+            self._attach_multimodal_embeddings_impl(inputs,
+                                                    multimodal_embedding,
+                                                    sampling_params))
+        if extra_processed_inputs is not None:
+            extra_processed_inputs["multimodal_input"] = (
+                self._key_attached_embeddings(
+                    prompt_token_ids,
+                    extra_processed_inputs["multimodal_data"],
+                    multimodal_uuids,
+                ))
+        return prompt_token_ids, extra_processed_inputs
+
+    def _key_attached_embeddings(
+        self,
+        prompt_token_ids: list[int],
+        multimodal_data: dict[str, Any],
+        multimodal_uuids: dict[str, list[str | None]] | None,
+    ) -> MultimodalInput:
+        """Hash each attached item and locate it in the prompt.
+
+        The rows of each item fill that item's embedding slots in prompt order,
+        so positions and runs come from the embedding mask that fusion uses.
+        The mask's prefix sum is also cached in `multimodal_data`.
+
+        Args:
+            prompt_token_ids: Prompt token IDs with expanded placeholders.
+            multimodal_data: Processed data holding the item metadata record and
+                `multimodal_embedding`: one `[rows, hidden]` tensor per item, or
+                all items concatenated along rows.
+            multimodal_uuids: Optional user-provided UUIDs per modality.
+
+        Returns:
+            Hashes, prompt positions, lengths and runs of the attached items.
+        """
+        item_metadata = get_multimodal_item_metadata(multimodal_data)
+        if (item_metadata is None
+                or item_metadata.output_embedding_lengths is None):
+            raise ValueError(
+                f"{type(self).__name__} must publish MultimodalItemMetadata "
+                "with output_embedding_lengths for attached embeddings")
+        item_refs = item_metadata.item_refs
+        item_lengths = list(item_metadata.output_embedding_lengths)
+        embeddings = multimodal_data["multimodal_embedding"]
+        if isinstance(embeddings, torch.Tensor):
+            embeddings = torch.split(embeddings, item_lengths)
+
+        # apply_mm_hashes takes each modality's items in modality-local order.
+        rows_by_modality: dict[str, list[torch.Tensor]] = {}
+        for (modality, _), rows in sorted(zip(item_refs,
+                                              embeddings,
+                                              strict=True),
+                                          key=lambda item: item[0]):
+            rows_by_modality.setdefault(modality, []).append(rows)
+        mm_hashes = apply_mm_hashes(rows_by_modality, multimodal_uuids)
+        hashes = [mm_hashes.hashes[m][i] for m, i in item_refs]
+        uuids = (None if mm_hashes.uuids is None else
+                 [mm_hashes.uuids[m][i] for m, i in item_refs])
+
+        _, embed_mask, _ = _compute_mm_masks(
+            _as_cpu_tensor(prompt_token_ids),
+            vocab_size=self.get_vocab_size(),
+            mm_token_ids=self.get_mm_token_ids(),
+            mm_special_token_ids=self.get_mm_special_token_ids(),
+        )
+        _cache_mm_embed_cumsum(multimodal_data, embed_mask)
+        start_positions, _ = _find_mm_token_start_pos_from_masks(
+            embed_mask, None, item_lengths)
+        item_run_cu_offsets, run_positions, run_lengths = (
+            _find_mm_token_runs_from_mask(embed_mask, item_lengths))
+        validate_mm_inputs(prompt_token_ids, hashes, start_positions,
+                           item_lengths)
+        return MultimodalInput(
+            multimodal_hashes=[hexdigest_to_int32(h) for h in hashes],
+            multimodal_positions=start_positions,
+            multimodal_lengths=item_lengths,
+            multimodal_uuids=uuids,
+            multimodal_item_run_cu_offsets=item_run_cu_offsets,
+            multimodal_run_positions=run_positions,
+            multimodal_run_lengths=run_lengths,
+        )
 
     def _attach_multimodal_embeddings_impl(
         self,
@@ -380,7 +464,10 @@ class BaseMultimodalInputProcessor(ABC):
         """Subclass hook for `attach_multimodal_embeddings`.
 
         Subclasses that support `multi_modal_embeddings` override this method
-        rather than the wrapper `attach_multimodal_embeddings` itself.
+        rather than the wrapper `attach_multimodal_embeddings` itself. The
+        returned `multimodal_data` holds `multimodal_embedding` and a
+        `MultimodalItemMetadata` record whose `output_embedding_lengths` give
+        each item's embedding rows in prompt order.
         Default raises NotImplementedError.
         """
         raise NotImplementedError(

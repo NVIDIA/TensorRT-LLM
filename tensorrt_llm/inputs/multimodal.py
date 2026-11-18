@@ -975,8 +975,8 @@ class MultimodalParams:
         Each entry is a tensor of shape ``[output_rows, feature_size]`` or its
         shared-tensor handle. Item output lengths describe those rows; prompt
         lengths also count model-specific MM framing tokens. Hashes enable
-        the C++ KV-cache representation. Without hashes, only the processed
-        data is retained, as for external embeddings without KV-cache reuse.
+        the C++ KV-cache representation; without them only the processed
+        data is retained.
         """
         item_metadata.validate()
         embedding_lengths = item_metadata.output_embedding_lengths

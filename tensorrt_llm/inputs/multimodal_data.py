@@ -11,6 +11,8 @@ import torch
 from blake3 import blake3
 from PIL import Image
 
+from tensorrt_llm._utils import torch_to_numpy
+
 # Canonical media names for input metadata and I/O validation.
 MediaModality = Literal["image", "video", "audio"]
 MEDIA_MODALITIES: tuple[MediaModality, ...] = get_args(MediaModality)
@@ -142,8 +144,10 @@ def _update_serialized_item(update: Callable[[_Chunk], None], obj: object) -> No
         # The container (torch.Tensor vs np.ndarray) is not part of the content
         # identity -- only dtype, shape, and raw bytes are. Normalize both to a
         # contiguous NumPy array so identical content hashes identically.
+        # bfloat16 and float8_e4m3fn tensors become NumPy void arrays of the
+        # same bytes.
         if isinstance(obj, torch.Tensor):
-            obj = obj.detach().cpu().contiguous().numpy()
+            obj = torch_to_numpy(obj.contiguous())
         array = np.ascontiguousarray(obj)
         update(_u8(0x11))
         update(_len_prefixed(array.dtype.str.encode("utf-8")))
