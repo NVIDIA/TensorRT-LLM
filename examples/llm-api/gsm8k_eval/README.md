@@ -109,6 +109,13 @@ The Beam-specific protocol id is `beam-gsm8k-first100-public-v1`;
 
 ## Outputs and resume
 
+The server inherits the caller's environment, with `--server-env NAME=VALUE` overriding
+individual variables. The evaluator records only the sorted names of these overrides,
+never their values or hashes. Rotating a credential under the same variable name does not
+invalidate resume. Environment values are not compared: if a change affects model behavior,
+use a fresh output directory. Older managed-run manifests that stored `server_env` values
+also require a fresh directory; existing artifacts are not automatically redacted.
+
 The output directory receives:
 
 - `results.jsonl`: one line per question attempt, written and flushed as each reply arrives: the

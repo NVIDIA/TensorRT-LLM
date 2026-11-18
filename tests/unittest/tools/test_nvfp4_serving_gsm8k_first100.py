@@ -25,6 +25,7 @@ import errno
 import json
 import os
 import sys
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -673,3 +674,83 @@ def test_failed_append_does_not_complete_or_corrupt_previous_record(tmp_path, mo
     assert set(ledger.load().completed) == {problems[0].id}
     ledger.append(_record(problems[1]))
     assert set(ledger.load().completed) == {p.id for p in problems}
+
+
+def test_managed_environment_values_are_private_and_rotation_resumes(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.yaml"
+    config.write_text("max_batch_size: 1\nmax_seq_len: 69632\n")
+    output = tmp_path / "results"
+    problems = [_problem(0), _problem(1)]
+    monkeypatch.setattr(protocol, "load_problems", lambda *args: (problems, {}))
+    monkeypatch.setenv("EVAL_INHERITED_TOKEN", "fake-inherited-secret")
+    monkeypatch.setenv("HF_TOKEN", "fake-parent-secret")
+    launches, prompts = [], []
+    replies = iter([200, 500, 200])
+
+    @contextmanager
+    def launch(argv, env, log_path):
+        launches.append(dict(env))
+        yield SimpleNamespace(poll=lambda: None)
+
+    def post(url, *, json, timeout):
+        prompts.append(json["messages"])
+        return SimpleNamespace(status_code=next(replies), text=_payload())
+
+    deps = runner.RunDeps(
+        launch=launch,
+        wait_for_addr=lambda *args: ("localhost", 1234),
+        memory_poller=lambda *args: nullcontext(),
+        get=lambda *args, **kwargs: SimpleNamespace(
+            status_code=200, json=lambda: {"data": [{"id": "served"}]}
+        ),
+        post=post,
+    )
+    monkeypatch.setattr(runner, "RunDeps", lambda: deps)
+    monkeypatch.setattr(eval_gsm8k.signal, "signal", lambda *args: None)
+    common = [
+        "--model",
+        str(tmp_path / "model"),
+        "--config",
+        str(config),
+        "--dataset-dir",
+        str(tmp_path),
+        "--output-dir",
+        str(output),
+        "--num-questions",
+        "2",
+    ]
+    assert (
+        eval_gsm8k.main(
+            common + ["--server-env", "HF_TOKEN=fake-old-secret", "--server-env", "MODE=first"]
+        )
+        == 1
+    )
+    first = json.loads((output / "run_manifest.json").read_text())
+    # Reordering overrides and rotating their values preserve the resume identity.
+    assert (
+        eval_gsm8k.main(
+            common + ["--server-env", "MODE=second", "--server-env", "HF_TOKEN=fake-new-secret"]
+        )
+        == 0
+    )
+    manifest = json.loads((output / "run_manifest.json").read_text())
+    assert manifest["identity_sha256"] == first["identity_sha256"]
+    assert manifest["attempts"][1]["already_completed"] == 1
+    assert len(prompts) == 3 and prompts[1] == prompts[2]
+    assert [env["HF_TOKEN"] for env in launches] == ["fake-old-secret", "fake-new-secret"]
+    assert all(env["EVAL_INHERITED_TOKEN"] == "fake-inherited-secret" for env in launches)
+    settings = [manifest["identity"]["server_settings"]] + [
+        attempt["server_settings"] for attempt in manifest["attempts"]
+    ]
+    assert all(item["server_env_names"] == ["HF_TOKEN", "MODE"] for item in settings)
+    assert all("server_env" not in item for item in settings)
+    captured = capsys.readouterr()
+    persisted = "".join(path.read_text() for path in output.iterdir()) + captured.out + captured.err
+    for secret in (
+        "fake-old-secret",
+        "fake-new-secret",
+        "fake-inherited-secret",
+        "fake-parent-secret",
+    ):
+        assert secret not in persisted
+        assert protocol.sha256_text(secret) not in persisted

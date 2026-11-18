@@ -186,7 +186,7 @@ def _managed(args: argparse.Namespace) -> tuple[runner.ManagedServer, Optional[i
         "chat_template_sha256": protocol.sha256_file(args.chat_template)
         if args.chat_template
         else None,
-        "server_env": dict(args.server_env),
+        "server_env_names": sorted({name for name, _ in args.server_env}),
     }
     batch, seq = config.get("max_batch_size"), config.get("max_seq_len")
     return (
