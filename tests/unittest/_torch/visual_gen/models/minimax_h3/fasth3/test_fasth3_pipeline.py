@@ -72,10 +72,14 @@ def test_fasth3_generation_steps_follow_inference_contract(
     if manifest is not None:
         (tmp_path / "fastvideo_inference.json").write_text(json.dumps(manifest))
     config = SimpleNamespace(
-        attention=AttentionConfig(), model_configs={}, attention_metadata_state=None
+        attention=AttentionConfig(),
+        model_configs={},
+        attention_metadata_state=None,
+        primary_pretrained_config=SimpleNamespace(),
     )
     target = route(config, str(tmp_path))
     pipeline = SyntheticFastH3Pipeline() if target is FastH3Pipeline else SyntheticH3Pipeline()
+    pipeline.pipeline_config = config
     pipeline.load_standard_components(
         str(tmp_path), torch.device("cpu"), skip_components=list(PipelineComponent)
     )

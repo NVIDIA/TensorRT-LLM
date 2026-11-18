@@ -699,9 +699,7 @@ def test_loader_rejects_other_models_before_materializing(
     pipeline = BasePipeline.__new__(BasePipeline)
     torch.nn.Module.__init__(pipeline)
     monkeypatch.setattr(
-        loader_module.AutoPipeline,
-        "from_config",
-        lambda *args: pipeline,
+        loader_module.AutoPipeline, "resolve_class", lambda *args: lambda config: pipeline
     )
     with pytest.raises(
         ValueError, match="Pipeline sleep is currently not supported for this model"
