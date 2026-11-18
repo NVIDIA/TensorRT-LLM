@@ -56,6 +56,7 @@ def _make_stub_executor(rank=0, queued_items=None):
     # No KV connector attached.
     stub.kv_connector_manager = None
     stub._has_pending_connector_transfers = lambda: False
+    stub._has_pending_native_sends = lambda: False
     # No generation-side receive is retiring.
     stub.disagg = SimpleNamespace(has_retiring_gen_receives=False)
     # FCFS waiting queue: no wait cap, so no rank-0 clock.
@@ -179,3 +180,17 @@ def test_idle_transfer_poll_is_tp_wide_under_attention_dp():
     stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
         datetime.timedelta(milliseconds=5000), wait_for_batch=True
     )
+
+
+def test_pending_native_send_keeps_fetch_nonblocking() -> None:
+    stub = _with_tracked_transfers(_make_stub_executor(), local_inflight=True)
+    stub.dist.world_size = 1
+    stub._has_pending_native_sends = lambda: PyExecutor._has_pending_native_sends(stub)
+    waiting_queue = FCFSWaitingQueue()
+
+    _fetch(stub, waiting_queue, total_num_active_requests=0, new_requests_hint=None)
+
+    stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
+        datetime.timedelta(0), wait_for_batch=True
+    )
+    assert stub.request_broadcaster.broadcast.call_args.kwargs["prefer_cpu"] is False
