@@ -32,6 +32,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import pytest
 import torch
 import torch.distributed as dist
+from test_common.visual_gen._worker_pool import run_distributed
 from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import _cute_dsl_import_error
@@ -46,8 +47,6 @@ from tensorrt_llm._torch.visual_gen.config import (
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
-
-from ._worker_pool import run_distributed
 
 _cute_dsl_available = _cute_dsl_import_error is None
 

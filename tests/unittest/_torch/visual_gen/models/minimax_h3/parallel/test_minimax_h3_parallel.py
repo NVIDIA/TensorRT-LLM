@@ -9,24 +9,23 @@ import pytest
 import torch
 import torch.distributed as dist
 from diffusers import AutoencoderKLMiniMaxH3
+from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.components.transformer import (
+    MiniMaxH3Transformer3DModel,
+)
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.default.pipeline import MiniMaxH3Pipeline
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel.vae import (
     TiledAutoencoderKLMiniMaxH3,
-)
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 import (
-    MiniMaxH3Transformer3DModel,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
-
-from ._worker_pool import run_distributed
 
 
 def _make_model_config(

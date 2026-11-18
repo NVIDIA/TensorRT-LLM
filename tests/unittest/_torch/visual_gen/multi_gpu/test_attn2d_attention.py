@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention.backends import Attention2DAttention
@@ -40,8 +41,6 @@ from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
     _flash_attn_fwd as _fa4_fwd,
 )
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
-
-from ._worker_pool import run_distributed
 
 # FA4 kernel availability (separate from the combine kernel used by Attention2DAttention)
 _flash_attn4_available = _fa4_fwd is not None

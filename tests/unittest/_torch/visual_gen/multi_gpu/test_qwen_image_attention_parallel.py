@@ -22,6 +22,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import pytest
 import torch
 import torch.distributed as dist
+from test_common.visual_gen._worker_pool import run_distributed
 from utils.util import skip_num_gpus_less_than, skip_single_gpu
 
 from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
@@ -33,8 +34,6 @@ from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionMode
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenJointAttention
 from tensorrt_llm.visual_gen.args import ParallelConfig
-
-from ._worker_pool import run_distributed
 
 try:
     from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (

@@ -308,3 +308,59 @@ def test_public_api_post_merge_can_use_post_merge_validation() -> None:
     rule._stages_by_yaml["l0_a10"] = [(name, Stage(name, "l0_a10", "x86_64", 1, 1))]
     result = rule.apply(PRInputs(["tensorrt_llm/visual_gen/args.py"], {}, post_merge=True))
     assert result is not None and result.scope == "visualgenonly"
+
+
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        ("tensorrt_llm/_torch/modeling_v2/catalog/_op.py", {"default", "fasth3", "ops"}),
+        ("tensorrt_llm/_torch/modeling_v2/catalog/attention/core.py", {"fasth3", "ops"}),
+        ("tensorrt_llm/_torch/visual_gen/models/minimax_h3/ops/vsa.py", {"fasth3", "ops"}),
+        ("tensorrt_llm/_torch/visual_gen/models/minimax_h3/default/pipeline.py", {"default"}),
+        (
+            "tensorrt_llm/_torch/visual_gen/models/minimax_h3/routing.py",
+            {"default", "fasth3", "ops"},
+        ),
+    ],
+)
+def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
+    family = "minimax_h3"
+    unit = f"unittest/_torch/visual_gen/models/{family}"
+    quality = f"visual_gen/{family}"
+    files = {
+        f"tensorrt_llm/_torch/visual_gen/models/{family}/routing.py": (
+            "from .default.pipeline import Default\nfrom .fasth3.pipeline import Fast\n"
+            "def route(config):\n    if config.fast:\n        return Fast\n    return Default\n"
+        ),
+        f"tensorrt_llm/_torch/visual_gen/models/{family}/default/pipeline.py": "class Default: pass",
+        f"tensorrt_llm/_torch/visual_gen/models/{family}/fasth3/pipeline.py": (
+            "from ..ops.vsa import sparse\nclass Fast: pass\n"
+        ),
+        f"tensorrt_llm/_torch/visual_gen/models/{family}/ops/vsa.py": (
+            "from tensorrt_llm._torch.modeling_v2.catalog.attention.adapter import sparse"
+        ),
+        "tensorrt_llm/_torch/modeling_v2/catalog/attention/adapter.py": "from .core import sparse",
+        f"tests/{unit}/ops/test_vsa.py": (
+            "from tensorrt_llm._torch.visual_gen.models.minimax_h3.ops.vsa import sparse"
+        ),
+    }
+    for name, source in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    entries = {
+        "default": {f"{unit}/default/test_model.py", f"{quality}/default/test_quality.py"},
+        "fasth3": {f"{unit}/fasth3/test_pipeline.py", f"{quality}/fasth3/test_quality.py"},
+        "ops": {f"{unit}/ops/test_vsa.py"},
+    }
+    index = YAMLIndex()
+    index.blocks = [
+        Block("l0_b200", 0, {}, [*set.union(*entries.values()), "visual_gen/test_unrelated.py"])
+    ]
+    rule = VisualGenRule(index, {}, tmp_path)
+    result = rule.apply(PRInputs([changed], {}))
+    assert result is not None
+    selected = {
+        e for block in result.block_filters.values() for tests in block.values() for e in tests
+    }
+    assert selected == set.union(*(entries[key] for key in expected))

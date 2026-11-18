@@ -5,6 +5,23 @@
 from collections.abc import Iterator
 
 import pytest
+from test_common.visual_gen.pool_hooks import (
+    _pool_module_lifetime,
+    pytest_runtest_logfinish,
+    pytest_runtest_logreport,
+    pytest_runtest_setup,
+    pytest_sessionfinish,
+    pytest_sessionstart,
+)
+
+__all__ = [
+    "_pool_module_lifetime",
+    "pytest_runtest_logfinish",
+    "pytest_runtest_logreport",
+    "pytest_runtest_setup",
+    "pytest_sessionfinish",
+    "pytest_sessionstart",
+]
 
 
 @pytest.fixture(scope="module")

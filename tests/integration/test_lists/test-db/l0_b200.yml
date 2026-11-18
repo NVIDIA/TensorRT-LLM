@@ -541,15 +541,20 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cosmos3_edge.py
   - unittest/_torch/visual_gen/test_glm_image_transformer.py
   - unittest/_torch/visual_gen/test_glm_image_pipeline.py
-  - unittest/_torch/visual_gen/test_minimax_h3_transformer.py
-  - unittest/_torch/visual_gen/test_minimax_h3_vsa.py
-  - unittest/_torch/visual_gen/test_minimax_h3_fused_rope.py
-  - unittest/_torch/visual_gen/test_minimax_h3_fused_adaln.py
-  - unittest/_torch/visual_gen/test_minimax_h3_vae_decode.py
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (60)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (60)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (60)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
+  - unittest/_torch/visual_gen/models/minimax_h3/components/test_minimax_h3_transformer.py
+  - unittest/_torch/visual_gen/models/minimax_h3/ops/test_dense_attention.py
+  - unittest/_torch/visual_gen/models/minimax_h3/ops/test_projection.py
+  - unittest/_torch/visual_gen/models/minimax_h3/ops/test_trtllm_attention.py
+  - unittest/_torch/visual_gen/models/minimax_h3/components/test_lora.py
+  - unittest/_torch/visual_gen/models/minimax_h3/default/ops/test_text_attention.py
+  - unittest/_torch/visual_gen/models/minimax_h3/ops/test_minimax_h3_vsa.py
+  - unittest/_torch/visual_gen/models/minimax_h3/kernels/test_minimax_h3_fused_rope.py
+  - unittest/_torch/visual_gen/models/minimax_h3/kernels/test_minimax_h3_fused_adaln.py
+  - unittest/_torch/visual_gen/models/minimax_h3/components/test_minimax_h3_vae_decode.py
+  - visual_gen/minimax_h3/default/test_loading.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (60)
+  - visual_gen/minimax_h3/default/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (60)
+  - visual_gen/minimax_h3/default/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (60)
+  - visual_gen/minimax_h3/default/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
@@ -687,12 +692,12 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_wan.py::test_wan21_t2v_lpips_against_golden
   - examples/visual_gen/test_visual_gen_wan.py::test_wan22_t2v_lpips_against_golden
   # Real-checkpoint cases; the weights come from the shared CI model store.
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_loads_and_runs TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8] TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8_BLOCK_SCALES] TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
-  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)
+  - visual_gen/minimax_h3/default/test_loading.py::test_minimax_h3_released_transformer_loads_and_runs TIMEOUT (30)
+  - visual_gen/minimax_h3/default/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8] TIMEOUT (30)
+  - visual_gen/minimax_h3/default/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8_BLOCK_SCALES] TIMEOUT (30)
+  - visual_gen/minimax_h3/default/test_loading.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
+  - visual_gen/minimax_h3/default/test_loading.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
+  - visual_gen/minimax_h3/default/test_quality.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
   # QwenImage ~5 min, Cosmos3-Nano T2I ~3 min, and T2V ~5 min.
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
@@ -710,7 +715,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_offload_matches_baseline
   - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_fp8_offload_matches_baseline
   - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3Offload::test_cosmos3_offload_matches_baseline
-  - visual_gen/test_minimax_h3_offload.py::test_minimax_h3_offload_memory_and_parity TIMEOUT (30)
+  - visual_gen/minimax_h3/default/test_minimax_h3_offload.py::test_minimax_h3_offload_memory_and_parity TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_lpips_against_golden TIMEOUT (10)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]

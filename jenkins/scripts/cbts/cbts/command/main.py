@@ -102,7 +102,7 @@ def build_rules(
         WaivesRule(yaml_index, stages),
         TestsDefRule(yaml_index, stages, repo_root=repo_root),
         TestListRule(yaml_index, stages, repo_root=repo_root),
-        VisualGenRule(yaml_index, stages),
+        VisualGenRule(yaml_index, stages, repo_root=repo_root),
         SpecDecRule(yaml_index, stages),
         ModelingV2Rule(yaml_index, stages, repo_root=repo_root),
         AgentFlowRule(yaml_index, stages),

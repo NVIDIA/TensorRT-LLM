@@ -16,17 +16,15 @@
 
 import pytest
 import torch
-from test_minimax_h3_transformer import (  # noqa: I001  (sibling test module, pytest prepends its dir)
+
+import tensorrt_llm._torch.visual_gen.models.minimax_h3.components.transformer as h3
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.fused_adaln import h3_adaln_supported
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.ops.adaln import gate_res_norm_mod, norm_mod
+
+from ..components.test_minimax_h3_transformer import (
     _initialize_weights,
     _make_model_config,
     _model_inputs,
-)
-
-import tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 as h3
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.fused_adaln import (
-    h3_adaln_supported,
-    h3_gate_res_norm_mod,
-    h3_norm_mod,
 )
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -51,8 +49,9 @@ def _inputs(rows=1029, hidden=1536, n_mod=6, seed=3, batch=1):
 
 
 @requires_cuda
-@pytest.mark.parametrize("hidden", [12, 1536, 5376, 6144])
-@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize(
+    ("hidden", "batch"), [(c.spec["hidden"], c.spec["batch"]) for c in norm_mod.CELLS]
+)
 def test_norm_mod_matches_reference_within_rounding(hidden, batch):
     x, _, w, mod, idx = _inputs(hidden=hidden, batch=batch)
     hidden = x.shape[-1]
@@ -61,15 +60,17 @@ def test_norm_mod_matches_reference_within_rounding(hidden, batch):
         _rmsnorm_bf16(x, w, 1e-5).float() * (1.0 + scale.index_select(0, idx).float())
         + shift.index_select(0, idx).float()
     )
-    actual = h3_norm_mod(x, w, mod, idx, 1e-5, 1, 0)
+    norm_mod.is_valid(x, w, mod, idx, 1e-5, 1, 0)
+    actual = norm_mod(x, w, mod, idx, 1e-5, 1, 0)
     assert actual.shape == x.shape and actual.dtype == torch.bfloat16
     # FP32 modulation with one rounding vs the FP32 formula: within one BF16 ulp of the output scale.
     assert (actual.float() - expected).abs().max() <= expected.abs().max() * 2**-7
 
 
 @requires_cuda
-@pytest.mark.parametrize("hidden", [12, 1536, 5376, 6144])
-@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize(
+    ("hidden", "batch"), [(c.spec["hidden"], c.spec["batch"]) for c in gate_res_norm_mod.CELLS]
+)
 def test_gate_res_norm_mod_matches_single_rounding_residual_and_norm(hidden, batch):
     x, a, w, mod, idx = _inputs(hidden=hidden, batch=batch)
     hidden = x.shape[-1]
@@ -84,7 +85,8 @@ def test_gate_res_norm_mod_matches_single_rounding_residual_and_norm(hidden, bat
         _rmsnorm_bf16(expected_x1, w, 1e-5).float() * (1.0 + scale.index_select(0, idx).float())
         + shift.index_select(0, idx).float()
     )
-    x1, m = h3_gate_res_norm_mod(x, a, w, mod, idx, 1e-5, 2, 4, 3)
+    gate_res_norm_mod.is_valid(x, a, w, mod, idx, 1e-5, 2, 4, 3)
+    x1, m = gate_res_norm_mod(x, a, w, mod, idx, 1e-5, 2, 4, 3)
     assert torch.equal(x1, expected_x1)
     assert (x1.float() - eager_x1.float()).abs().max() <= eager_x1.float().abs().max() * 2**-7
     assert (m.float() - expected_m).abs().max() <= expected_m.abs().max() * 2**-7

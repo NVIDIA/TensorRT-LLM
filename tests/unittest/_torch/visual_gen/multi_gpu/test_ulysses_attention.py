@@ -28,8 +28,7 @@ from typing import Callable
 import pytest
 import torch
 import torch.nn.functional as F
-
-from ._worker_pool import run_distributed
+from test_common.visual_gen._worker_pool import run_distributed
 
 
 @contextmanager

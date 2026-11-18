@@ -117,7 +117,7 @@ def _worker(rank, world_size, backend, test_fn, port):
 def _run(world_size, test_fn, backend):
     if backend == "nccl" and torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} GPUs, have {torch.cuda.device_count()}")
-    from ._visual_gen_dist_utils import spawn_with_retry
+    from test_common.visual_gen._visual_gen_dist_utils import spawn_with_retry
 
     spawn_with_retry(
         lambda port: mp.spawn(

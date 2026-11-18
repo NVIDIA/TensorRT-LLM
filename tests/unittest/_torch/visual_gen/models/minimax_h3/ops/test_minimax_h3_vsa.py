@@ -4,8 +4,8 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.vsa import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.ops.trtllm_attention import H3TrtllmAttention
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.ops.vsa import (
     build_h3_vsa_metadata,
     h3_vsa_attention,
 )
@@ -37,7 +37,8 @@ def test_h3_vsa_backends_masked_reference(sparsity, batch, segments):
         torch.randn(batch, seq_len, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)
     ]
     gate = torch.randn_like(q) * 0.1
-    backend = TrtllmAttention(
+    backend = H3TrtllmAttention(
+        layer_idx=0,
         num_heads=2,
         num_kv_heads=2,
         head_dim=128,
@@ -84,5 +85,8 @@ def test_h3_vsa_backends_masked_reference(sparsity, batch, segments):
 
     output = h3_vsa_attention(q, k, v, gate, metadata, run)
     torch.testing.assert_close(output, reference[0], atol=0.02, rtol=0.02)
+    torch.testing.assert_close(
+        output, h3_vsa_attention.reference(q, k, v, gate, metadata, None), atol=0.02, rtol=0.02
+    )
     cute_output = h3_vsa_attention(q, k, v, gate, metadata, None, backend="CUTEDSL")
     torch.testing.assert_close(cute_output, reference[0], atol=0.02, rtol=0.02)

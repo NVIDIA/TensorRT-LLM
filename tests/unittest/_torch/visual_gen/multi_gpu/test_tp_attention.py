@@ -36,6 +36,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
@@ -43,8 +44,6 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.visual_gen.args import AttentionConfig
-
-from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True, scope="module")

@@ -80,7 +80,7 @@ def _worker(rank, world_size, test_fn, port):
 
 
 def run_distributed(test_fn):
-    from ._visual_gen_dist_utils import spawn_with_retry
+    from test_common.visual_gen._visual_gen_dist_utils import spawn_with_retry
 
     spawn_with_retry(
         lambda port: mp.spawn(_worker, args=(WORLD, test_fn, port), nprocs=WORLD, join=True)

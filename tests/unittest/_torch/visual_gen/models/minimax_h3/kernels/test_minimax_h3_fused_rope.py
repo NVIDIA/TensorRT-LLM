@@ -7,8 +7,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.fused_rope import (
-    apply_minimax_h3_qk_norm_rope_bf16,
     launch_minimax_h3_qk_norm_rope,
+)
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.ops.rope import (
+    apply_minimax_h3_qk_norm_rope_bf16,
 )
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

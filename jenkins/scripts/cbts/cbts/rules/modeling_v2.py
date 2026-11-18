@@ -237,11 +237,11 @@ def _is_shared(rel: PurePosixPath) -> bool:
     return len(rel.parts) == 1 or (rel.parts[0] in ("models", "catalog") and len(rel.parts) == 2)
 
 
-def _module_name(rel: PurePosixPath) -> str:
+def _module_name(rel: PurePosixPath, package: str = _PKG_MODULE) -> str:
     parts = rel.with_suffix("").parts
     if parts[-1] == "__init__":
         parts = parts[:-1]
-    return ".".join((_PKG_MODULE, *parts))
+    return ".".join((package, *parts))
 
 
 def _parse(path: Path) -> Optional[ast.AST]:
@@ -278,11 +278,18 @@ class _ImportGraph:
     """
 
     def __init__(
-        self, src_root: Path, test_root: Path, parse: Callable[[Path], Optional[ast.AST]]
+        self,
+        src_root: Path,
+        test_root: Path,
+        parse: Callable[[Path], Optional[ast.AST]],
+        *,
+        package: str = PACKAGE,
+        catalog_root: Optional[Path] = None,
     ) -> None:
+        self.package = package
         # Module name -> file path relative to the subtree.
         self.files = {
-            _module_name(rel): rel
+            _module_name(rel, package): rel
             for rel in (
                 PurePosixPath(p.relative_to(src_root).as_posix())
                 for p in sorted(src_root.rglob("*.py"))
@@ -301,17 +308,21 @@ class _ImportGraph:
         self._importers: dict[str, set[str]] = defaultdict(set)
         # Package -> modules that import a computed name, which may be any module under it.
         self._computed: dict[str, set[str]] = defaultdict(set)
-        for module, rel in self.files.items():
-            tree = parse(src_root / rel)
+        paths = {module: src_root / rel for module, rel in self.files.items()}
+        if catalog_root is not None:
+            for path in sorted(catalog_root.rglob("*.py")):
+                paths[_module_name(PurePosixPath(path.relative_to(catalog_root.parent)))] = path
+        for module, path in paths.items():
+            tree = parse(path)
             if tree is None:
                 self.complete = False
                 continue
-            package = module if rel.name == "__init__.py" else module.rpartition(".")[0]
+            package = module if path.name == "__init__.py" else module.rpartition(".")[0]
             names, computed = imported_names(tree, package)
             if computed:
                 self._computed[package].add(module)
             # A module depends on its own packages too: importing it runs their __init__.
-            for dep in package_names(names | {module}) - {module}:
+            for dep in self._package_names(names | {module}) - {module}:
                 self._importers[dep].add(module)
         # A bare name finds every helper of that name: tests put different
         # directories on sys.path, and a wider match only over-selects.
@@ -327,12 +338,18 @@ class _ImportGraph:
             # helper names count, a helper by any part of a dotted name, and a
             # computed name reaches no helper.
             names, _ = imported_names(tree, "")
-            deps = package_names(names)
+            deps = self._package_names(names)
             for name in names | _rank_job_launchers(tree):
                 for part in name.split("."):
                     deps |= helpers.get(part, set())
             for dep in deps - {key}:
                 self._importers[dep].add(key)
+
+    def _package_names(self, names: set[str]) -> set[str]:
+        result = package_names(names)
+        if self.package != PACKAGE:
+            result |= package_names(names, self.package)
+        return result
 
     def _direct_importers(self, name: str) -> set[str]:
         found = set(self._importers.get(name, ()))
@@ -351,8 +368,16 @@ class _ImportGraph:
         todo = [module]
         while todo:
             for importer in self._direct_importers(todo.pop()):
-                if importer in seen or (
-                    importer in self.files and _is_shared(self.files[importer])
+                # A family package re-exports its registry entry. Following it from a
+                # target would make every sibling appear to use that target's operators.
+                if (
+                    importer in seen
+                    or importer == self.package
+                    or (
+                        self.package == PACKAGE
+                        and importer in self.files
+                        and _is_shared(self.files[importer])
+                    )
                 ):
                     continue
                 seen.add(importer)

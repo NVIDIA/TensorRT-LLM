@@ -12,13 +12,11 @@ import torch.multiprocessing as mp
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
 
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import MINIMAX_H3_TEXT_ENCODER_LAYER
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.default.text_encoder_tp import (
+    MiniMaxH3TensorParallelTextEncoder,
     _MiniMaxH3TextEncoderMapping,
 )
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.text_encoder_tp import (
-    MiniMaxH3TensorParallelTextEncoder,
-)
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import MINIMAX_H3_TEXT_ENCODER_LAYER
 
 
 def _assert_projection_shards(
@@ -27,8 +25,7 @@ def _assert_projection_shards(
     group: dist.ProcessGroup,
     rank: int,
 ) -> None:
-    embedding = candidate.model.model.embed_tokens
-    mapping = embedding.mapping
+    mapping = candidate.reduce.mapping
     assert mapping.tp_size == 2
     assert mapping.tp_rank == rank
     assert mapping.tp_group == [0, 1]
@@ -38,27 +35,11 @@ def _assert_projection_shards(
     assert dist.get_rank(mapping.tp_group_pg) == rank
     assert mapping._use_torch_distributed_allreduce
     torch.testing.assert_close(
-        embedding.weight, reference.embed_tokens.weight.chunk(2, dim=0)[rank], rtol=0, atol=0
+        candidate.embedding, reference.embed_tokens.weight.chunk(2, dim=0)[rank], rtol=0, atol=0
     )
-    assert len(candidate.model.model.layers) == MINIMAX_H3_TEXT_ENCODER_LAYER == 50
-    for layer, hf_layer in zip(candidate.model.model.layers, reference.layers):
-        projections = (
-            layer.self_attn.qkv_proj,
-            layer.self_attn.o_proj,
-            layer.mlp.gate_up_proj,
-            layer.mlp.down_proj,
-        )
-        for projection in projections:
-            mapping = projection.mapping
-            assert mapping.tp_size == 2
-            assert mapping.tp_rank == rank
-            assert mapping.tp_group == [0, 1]
-            assert mapping.tp_group_pg is group
-            assert mapping.tp_group_name == group.group_name
-            assert dist.get_world_size(mapping.tp_group_pg) == 2
-            assert dist.get_rank(mapping.tp_group_pg) == rank
-            assert mapping._use_torch_distributed_allreduce
-
+    assert len(candidate.layers) == MINIMAX_H3_TEXT_ENCODER_LAYER == 50
+    for layer, hf_layer in zip(candidate.layers, reference.layers):
+        projections = (layer.qkv_proj, layer.o_proj, layer.gate_up_proj, layer.down_proj)
         expected_qkv = torch.cat(
             [
                 projection.weight.chunk(2, dim=0)[rank]
@@ -155,7 +136,7 @@ def _worker(rank: int, port: int, world_size: int) -> None:
                     # output of the first 50, not the final RMSNorm output.
                     expected = outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]
                     first_layer_outputs: list[torch.Tensor] = []
-                    handle = candidate.model.model.layers[0].register_forward_hook(
+                    handle = candidate.layers[0].register_forward_hook(
                         lambda module, args, output: first_layer_outputs.append(
                             output[0] + output[1]
                         )
@@ -188,7 +169,7 @@ def _worker(rank: int, port: int, world_size: int) -> None:
 
 @pytest.mark.parametrize("world_size", [2, 4], ids=["tp2_world2", "tp2_world4"])
 def test_minimax_h3_text_encoder_tp(monkeypatch: pytest.MonkeyPatch, world_size: int) -> None:
-    from ._visual_gen_dist_utils import spawn_with_retry
+    from test_common.visual_gen._visual_gen_dist_utils import spawn_with_retry
 
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} CUDA GPUs")

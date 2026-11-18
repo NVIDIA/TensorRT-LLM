@@ -25,15 +25,18 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
     MiniMaxH3Transformer3DModel as HFMiniMaxH3Transformer3DModel,
 )
 
-from tensorrt_llm._torch.modules import gated_mlp as gated_mlp_module
-from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
-from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
-from tensorrt_llm._torch.visual_gen.models.minimax_h3 import transformer_minimax_h3 as h3
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.components import (
+    attention as attention_module,
+)
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.components import mlp as gated_mlp_module
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.components import transformer as h3
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.components.attention import QKVMode
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.weights import remap_feed_forward_weights
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -429,7 +432,7 @@ def test_rope_dispatch_compiles_fullgraph():
     hidden_states = torch.randn((1, 17, 2, 128), device="cuda", dtype=torch.bfloat16)
     angles = torch.randn((17, 96), device="cuda")
     cos, sin = angles.cos(), angles.sin()
-    compiled = torch.compile(h3.apply_minimax_h3_rotary_emb, fullgraph=True)
+    compiled = torch.compile(attention_module.apply_minimax_h3_rotary_emb, fullgraph=True)
     # Inductor fuses the products and the add into FP32 with one rounding, so the compiled
     # result differs from the eager reference by BF16 rounding noise only.
     torch.testing.assert_close(
@@ -450,13 +453,13 @@ def test_attention_dispatches_fused_qk_norm_rope_per_instance(monkeypatch):
     """
     inputs = _model_inputs("cuda")
     calls = []
-    fused = h3.apply_minimax_h3_qk_norm_rope_bf16
+    fused = attention_module.apply_minimax_h3_qk_norm_rope_bf16
 
     def tracked(*args, **kwargs):
         calls.append(True)
         return fused(*args, **kwargs)
 
-    monkeypatch.setattr(h3, "apply_minimax_h3_qk_norm_rope_bf16", tracked)
+    monkeypatch.setattr(attention_module, "apply_minimax_h3_qk_norm_rope_bf16", tracked)
     outputs = {}
     for fuse in (True, False):
         torch.manual_seed(0)
@@ -494,7 +497,7 @@ def test_rope_preserves_autograd_fallback(grad_input):
     cos, sin = angles.cos(), angles.sin()
     target = {"hidden_states": hidden_states, "cos": cos, "sin": sin}[grad_input]
     target.requires_grad_(True)
-    actual = h3.apply_minimax_h3_rotary_emb(hidden_states, cos, sin)
+    actual = attention_module.apply_minimax_h3_rotary_emb(hidden_states, cos, sin)
     expected = _reference_rotary_emb(hidden_states, cos, sin)
     (actual_grad,) = torch.autograd.grad(actual.sum(), target)
     (expected_grad,) = torch.autograd.grad(expected.sum(), target)
@@ -663,7 +666,7 @@ def test_partial_rope_matches_split_half_reference_and_preserves_tail() -> None:
     position_ids = torch.tensor([[0, 0, 0], [1, 2, 3]])
     cos, sin = h3.MiniMaxH3RotaryPosEmbed(rope_freq_dim=1)(position_ids)
 
-    actual = h3.apply_minimax_h3_rotary_emb(hidden_states, cos, sin)
+    actual = attention_module.apply_minimax_h3_rotary_emb(hidden_states, cos, sin)
 
     rotary = hidden_states[..., :6]
     first_half, second_half = rotary.chunk(2, dim=-1)
@@ -873,13 +876,14 @@ def test_forward_rejects_invalid_layout_before_the_fused_adaln_gather(
 def test_tiny_nonzero_layer_transformer_matches_cpu_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def _cpu_swiglu(hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
+    def _cpu_swiglu(hidden_states: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
         del kwargs
         gate, up = hidden_states.chunk(2, dim=-1)
         return F.silu(gate) * up
 
     monkeypatch.setattr(
-        "tensorrt_llm._torch.modules.gated_mlp.swiglu",
+        gated_mlp_module,
+        "swiglu",
         _cpu_swiglu,
     )
     torch.manual_seed(11)
@@ -905,13 +909,14 @@ def test_tiny_nonzero_layer_transformer_matches_cpu_reference(
 def test_transformer_block_is_fullgraph_compile_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def _cpu_swiglu(hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
+    def _cpu_swiglu(hidden_states: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
         del kwargs
         gate, up = hidden_states.chunk(2, dim=-1)
         return F.silu(gate) * up
 
     monkeypatch.setattr(
-        "tensorrt_llm._torch.modules.gated_mlp.swiglu",
+        gated_mlp_module,
+        "swiglu",
         _cpu_swiglu,
     )
     model = h3.MiniMaxH3Transformer3DModel(_make_model_config(num_layers=1)).to("cuda")
@@ -1007,13 +1012,7 @@ def test_attention_backends_match_vanilla(backend: str) -> None:
 
 
 def test_excluded_modules_are_physically_unquantized() -> None:
-    """An excluded Linear must be rebuilt, not just reconfigured.
-
-    ``Linear.create_weights`` caches ``quant_method`` and allocates the quantized
-    parameters during ``__init__``, so clearing ``quant_config`` afterwards leaves
-    the module physically quantized while the loader hands it a high-precision
-    weight. Assert the parameter layout, not just the config.
-    """
+    """Check exclusions in the loaded parameter layout."""
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
     quant_config.exclude_modules = ["*audio_proj_in*"]
     model = h3.MiniMaxH3Transformer3DModel(
@@ -1031,7 +1030,7 @@ def test_excluded_modules_are_physically_unquantized() -> None:
     assert "weight_scale" not in excluded_params
     assert "input_scale" not in excluded_params
     assert excluded.weight.dtype is not torch.float8_e4m3fn
-    assert type(excluded.quant_method).__name__ == "UnquantizedLinearMethod"
+    assert not excluded.has_any_quant
 
     # The quantized peer still is quantized, so the exclusion is targeted.
     quantized_params = {name for name, _ in quantized.named_parameters(recurse=False)}
@@ -1068,7 +1067,7 @@ def test_diffusers_swiglu_weight_is_reordered_from_up_gate_to_gate_up() -> None:
     up = torch.full((2, 3), 11.0)
     gate = torch.full((2, 3), 29.0)
     down = torch.full((3, 2), 41.0)
-    remapped = h3.MiniMaxH3Transformer3DModel._remap_feed_forward_weights(
+    remapped = remap_feed_forward_weights(
         {
             "transformer_blocks.0.ff.net.0.proj.weight": torch.cat((up, gate)),
             "transformer_blocks.0.ff.net.2.weight": down,
@@ -1080,103 +1079,27 @@ def test_diffusers_swiglu_weight_is_reordered_from_up_gate_to_gate_up() -> None:
     torch.testing.assert_close(remapped["transformer_blocks.0.ff.down_proj.weight"], down)
 
 
-def test_weight_loader_reports_missing_linear_biases(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_weight_loader_reports_missing_linear_biases() -> None:
     model = h3.MiniMaxH3Transformer3DModel(_make_model_config())
-
-    class _WeightOnlyLoader:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            del args, kwargs
-
-        def get_linear_weights(
-            self,
-            module: nn.Module,
-            name: str,
-            weights: dict[str, torch.Tensor],
-        ) -> list[dict[str, torch.Tensor]]:
-            del module, name, weights
-            return [{"weight": torch.empty(0)}]
-
-        def load_linear_weights(
-            self,
-            module: nn.Module,
-            name: str,
-            weight_dicts: list[dict[str, torch.Tensor]],
-        ) -> None:
-            del module, name, weight_dicts
-
-        def filter_weights(
-            self,
-            name: str,
-            weights: dict[str, torch.Tensor],
-        ) -> dict[str, torch.Tensor]:
-            del name, weights
-            return {}
-
-    monkeypatch.setattr(h3, "DynamicLinearWeightLoader", _WeightOnlyLoader)
+    weights = dict(model.state_dict())
+    del weights["proj_in.bias"]
     with pytest.raises(ValueError, match=r"proj_in\.bias"):
-        model.load_weights({})
+        model.load_weights(weights)
 
 
-def test_deferred_linear_weights_follow_transformer_device(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model_config = _make_model_config()
-    model_config.skip_create_weights_in_init = True
-    model = h3.MiniMaxH3Transformer3DModel(model_config).to("meta")
-
-    class _NoOpWeightLoader:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            del args, kwargs
-
-        def get_linear_weights(
-            self,
-            module: nn.Module,
-            name: str,
-            weights: dict[str, torch.Tensor],
-        ) -> list[dict[str, torch.Tensor]]:
-            del name, weights
-            return [
-                {
-                    parameter_name: torch.empty_like(parameter, device="cpu")
-                    for parameter_name, parameter in module._parameters.items()
-                    if parameter is not None
-                }
-            ]
-
-        def load_linear_weights(
-            self,
-            module: nn.Module,
-            name: str,
-            weight_dicts: list[dict[str, torch.Tensor]],
-        ) -> None:
-            del module, name, weight_dicts
-
-        def filter_weights(
-            self,
-            name: str,
-            weights: dict[str, torch.Tensor],
-        ) -> dict[str, torch.Tensor]:
-            del weights
-            module = dict(model.named_modules())[name]
-            return {
-                parameter_name: torch.empty_like(parameter, device="cpu")
-                for parameter_name, parameter in module._parameters.items()
-                if parameter is not None
-            }
-
-    monkeypatch.setattr(h3, "DynamicLinearWeightLoader", _NoOpWeightLoader)
-    model.load_weights({})
-
-    linear_parameters = [
+def test_deferred_linear_weights_follow_transformer_device() -> None:
+    reference = h3.MiniMaxH3Transformer3DModel(_make_model_config())
+    config = _make_model_config()
+    config.skip_create_weights_in_init = True
+    candidate = h3.MiniMaxH3Transformer3DModel(config).to("meta")
+    candidate.load_weights(dict(reference.state_dict()))
+    parameters = [
         parameter
-        for module in model.modules()
+        for module in candidate.modules()
         if isinstance(module, h3.Linear)
         for parameter in module.parameters(recurse=False)
     ]
-    assert linear_parameters
-    assert all(parameter.device.type == "meta" for parameter in linear_parameters)
+    assert parameters and all(p.device.type == "meta" for p in parameters)
 
 
 def _copy_golden_parameters_to_hf(
@@ -1215,13 +1138,14 @@ def test_tiny_transformer_matches_pinned_diffusers_golden(
 ) -> None:
     """Match Diffusers PR 14355 at abc5e9bf with no draft-package dependency."""
 
-    def _cpu_swiglu(hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
+    def _cpu_swiglu(hidden_states: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
         del kwargs
         gate, up = hidden_states.chunk(2, dim=-1)
         return F.silu(gate) * up
 
     monkeypatch.setattr(
-        "tensorrt_llm._torch.modules.gated_mlp.swiglu",
+        gated_mlp_module,
+        "swiglu",
         _cpu_swiglu,
     )
     model = h3.MiniMaxH3Transformer3DModel(
@@ -1322,9 +1246,11 @@ def test_ref2va_bf16_matches_diffusers_rounding() -> None:
 
 
 @pytest.mark.parametrize("workflow", ["fl2va", "ref2va"])
-def test_workflows_reuse_trtllm_norm_and_swiglu(workflow: str) -> None:
-    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-    from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
+def test_workflows_use_per_head_qk_norm(workflow: str) -> None:
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.components.norm import (
+        PerHeadRMSNorm,
+        RMSNorm,
+    )
 
     config = _make_model_config(num_layers=1, num_refiner_layers=1)
     config.extra_attrs["workflow"] = workflow
@@ -1335,9 +1261,8 @@ def test_workflows_reuse_trtllm_norm_and_swiglu(workflow: str) -> None:
     for block in blocks:
         assert type(block.norm1) is RMSNorm
         assert type(block.norm2) is RMSNorm
-        assert block.ff.activation is F.silu
-        assert isinstance(block.attn.norm_q, RMSNormTPAware)
-        assert isinstance(block.attn.norm_k, RMSNormTPAware)
+        assert isinstance(block.attn.norm_q, PerHeadRMSNorm)
+        assert isinstance(block.attn.norm_k, PerHeadRMSNorm)
 
 
 def test_ref2va_norm_initialization_supports_deferred_weight_loading() -> None:

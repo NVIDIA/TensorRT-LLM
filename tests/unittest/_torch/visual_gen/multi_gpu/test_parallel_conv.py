@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import WanCausalConvHalo
 from tensorrt_llm._torch.visual_gen.modules.vae import HaloExchangeConv, HaloExchangeConv2dStride2
@@ -30,8 +31,6 @@ from tensorrt_llm._torch.visual_gen.modules.vae.conv import (
     _physical_to_logical_channels_last,
     _spatial_channels_last_format,
 )
-
-from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True, scope="module")

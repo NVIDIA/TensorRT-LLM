@@ -7,21 +7,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from diffusers import AutoencoderKLMiniMaxH3
 
-diffusers = pytest.importorskip("diffusers")
-AutoencoderKLMiniMaxH3 = pytest.importorskip(
-    "diffusers.models.autoencoders.autoencoder_kl_minimax_h3"
-).AutoencoderKLMiniMaxH3
-
-import tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel.vae as parallel_vae  # noqa: E402
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel.vae import (  # noqa: E402
+import tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel.vae as parallel_vae
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.default.pipeline import MiniMaxH3Pipeline
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel.vae import (
     TiledAutoencoderKLMiniMaxH3,
 )
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (  # noqa: E402
-    MiniMaxH3Pipeline,
-    _prepare_vae_decoder,
-)
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline import _prepare_vae_decoder
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 

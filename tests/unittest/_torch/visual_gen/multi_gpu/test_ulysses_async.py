@@ -27,10 +27,9 @@ from typing import Callable
 import pytest
 import torch
 import torch.distributed as dist
+from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.distributed import all_to_all_4d
-
-from ._worker_pool import run_distributed
 
 # Loop count must comfortably exceed kNumSlots so the ring wraps at least
 # twice. kNumSlots is 3 today; 8 iterations = ~2.67 full rotations.

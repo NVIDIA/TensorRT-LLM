@@ -36,22 +36,19 @@ from tensorrt_llm._torch.visual_gen.config import (
     discover_pipeline_components,
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-from tensorrt_llm._torch.visual_gen.models.minimax_h3 import pipeline_minimax_h3 as h3_pipeline
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
-    MINIMAX_H3_TEXT_TAG,
-    resolve_canvas_size,
-)
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+from tensorrt_llm._torch.visual_gen.models.minimax_h3 import pipeline as h3_pipeline
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.components import vae as h3_vae
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.default import pipeline as default_pipeline
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.default.pipeline import MiniMaxH3Pipeline
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import resolve_canvas_size
 from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline, PipelineComponent
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.visual_gen.args import (
-    AttentionConfig,
-    ParallelConfig,
-    TorchCompileConfig,
-    VisualGenArgs,
-)
+from tensorrt_llm.visual_gen.args import ParallelConfig, TorchCompileConfig, VisualGenArgs
+
+from .._pipeline_fixtures import SyntheticH3Pipeline as _SyntheticMiniMaxH3Pipeline
+from .._pipeline_fixtures import _FakeMiniMaxH3Transformer
 
 pytestmark = pytest.mark.cpu_only
 
@@ -169,7 +166,7 @@ def test_h3_audio_decoder_enters_offload_context(monkeypatch: pytest.MonkeyPatch
     pipeline.audio_vae.config.latents_mean = [0.0, 0.0, 0.0]
     pipeline.audio_vae.config.latents_std = [1.0, 1.0, 1.0]
     pipeline.audio_vae.decode = decode
-    monkeypatch.setattr(h3_pipeline, "unpack_audio_tokens", lambda rows, count: rows)
+    monkeypatch.setattr(h3_vae, "unpack_audio_tokens", lambda rows, count: rows)
     result = MiniMaxH3Pipeline._decode_audio(pipeline, torch.ones(2, 3, 4), 4)
     assert result.shape == (3, 2, 4)
     assert not active
@@ -186,106 +183,6 @@ def _ulysses_mapping(world_size: int) -> SimpleNamespace:
         attn2d_row_size=1,
         attn2d_col_size=1,
     )
-
-
-class _FakeMiniMaxH3Transformer:
-    def __init__(self) -> None:
-        self.device = torch.device("cpu")
-        self.config = SimpleNamespace(patch_size=(1, 2, 2))
-        self.training = True
-        self.static_context_calls = 0
-        self.forward_calls = 0
-        self.inference_modes: list[bool] = []
-        self.attention_timesteps: list[torch.Tensor] = []
-
-    def eval(self) -> "_FakeMiniMaxH3Transformer":
-        self.training = False
-        return self
-
-    def prepare_static_context(
-        self,
-        prompt_embeds: torch.Tensor,
-        position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        self.static_context_calls += 1
-        return prompt_embeds, position_ids
-
-    def __call__(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        audio_hidden_states: torch.Tensor,
-        static_context: tuple[torch.Tensor, torch.Tensor],
-        **kwargs: object,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        self.attention_timesteps.append(kwargs["timestep"].clone())
-        assert static_context is not None
-        self.forward_calls += 1
-        self.inference_modes.append(torch.is_inference_mode_enabled())
-        # Non-zero: an all-zero velocity is what _check_denoise_step treats
-        # as a corrupt step, so a fake must not emit one.
-        return torch.ones_like(hidden_states), torch.ones_like(audio_hidden_states)
-
-
-class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
-    def __init__(self) -> None:
-        torch.nn.Module.__init__(self)
-        # BasePipeline.__init__ is bypassed here, so set the backing attribute
-        # that BasePipeline.device reads.
-        self.workflow = "fl2va"
-        self._device = torch.device("cpu")
-        self.pipeline_config = SimpleNamespace(
-            visual_gen_mapping=None,
-            primary_model_config=SimpleNamespace(
-                attention=SimpleNamespace(backend="VANILLA", sparse_attention_config=None)
-            ),
-        )
-        self.offloader = PipelineOffloader(self)
-        self.transformer = _FakeMiniMaxH3Transformer()
-        self.vae = SimpleNamespace(
-            config=SimpleNamespace(latent_channels=2),
-            spatial_compression_ratio=2,
-        )
-        self.audio_vae = SimpleNamespace(
-            config=SimpleNamespace(latent_channels=3, sampling_rate=32000)
-        )
-        self.scheduler = MiniMaxH3Scheduler(shift=12.0)
-        self.audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
-        self._is_warmup = True
-        self._parallel_vae_enabled = False
-
-    def _encode_prompt(
-        self,
-        prompt: str,
-        keyframes: list[Image.Image],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        del prompt, keyframes
-        return torch.ones(1, 2, 4), torch.full((2,), MINIMAX_H3_TEXT_TAG)
-
-    def _encode_keyframes(
-        self,
-        keyframes: list[Image.Image],
-        latent_height: int,
-        latent_width: int,
-        generator: torch.Generator,
-    ) -> None:
-        del keyframes, latent_height, latent_width, generator
-        return None
-
-    def _decode_video(
-        self,
-        rows: torch.Tensor,
-        num_condition_rows: int,
-        num_latent_frames: int,
-        latent_height: int,
-        latent_width: int,
-    ) -> torch.Tensor:
-        del rows, num_condition_rows, num_latent_frames, latent_height, latent_width
-        return torch.zeros(1, 124, 32, 32, 3, dtype=torch.uint8)
-
-    def _decode_audio(self, rows: torch.Tensor, num_audio_latents: int) -> torch.Tensor:
-        del rows
-        return torch.zeros(1, 2, num_audio_latents * 800)
 
 
 def test_pipeline_reuses_static_context_across_joint_denoise_steps() -> None:
@@ -655,7 +552,7 @@ def test_text_encoder_residency_skips_non_owner_rank(
 def test_subset_tensor_parallel_text_encoder_loads_on_participant_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(h3_pipeline, "mpi_disabled", lambda: True)
+    monkeypatch.setattr(default_pipeline, "mpi_disabled", lambda: True)
     monkeypatch.setattr(
         h3_pipeline.BasePipeline,
         "__init__",
@@ -745,11 +642,11 @@ def test_tensor_parallel_text_encoder_loader_prefetch_matches_rank_residency(
             return {"weight": torch.ones(1)}
 
     monkeypatch.setattr(
-        h3_pipeline.MiniMaxH3TensorParallelTextEncoder,
+        default_pipeline.MiniMaxH3TensorParallelTextEncoder,
         "from_pretrained_config",
         from_pretrained_config,
     )
-    monkeypatch.setattr(h3_pipeline, "WeightLoader", FakeWeightLoader)
+    monkeypatch.setattr(default_pipeline, "WeightLoader", FakeWeightLoader)
     config = SimpleNamespace(
         extra_attrs={},
         mapping=SimpleNamespace(world_size=world_size, tp_size=1),
@@ -776,7 +673,7 @@ def test_tensor_parallel_text_encoder_loader_prefetch_matches_rank_residency(
 def test_subset_tensor_parallel_text_encoder_skips_nonparticipant_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(h3_pipeline, "mpi_disabled", lambda: True)
+    monkeypatch.setattr(default_pipeline, "mpi_disabled", lambda: True)
     monkeypatch.setattr(
         h3_pipeline.BasePipeline,
         "__init__",
@@ -818,7 +715,7 @@ def test_subset_tensor_parallel_text_encoder_skips_nonparticipant_rank(
 def test_subset_text_encoder_tp_rejects_mpi_before_group_creation(
     monkeypatch: pytest.MonkeyPatch, rank: int
 ) -> None:
-    monkeypatch.setattr(h3_pipeline, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(default_pipeline, "mpi_disabled", lambda: False)
     monkeypatch.setattr(h3_pipeline.dist, "is_initialized", lambda: True)
 
     def unexpected_group_creation(*args, **kwargs):
@@ -1086,109 +983,6 @@ def test_default_generation_steps() -> None:
     assert pipeline.default_generation_params["num_inference_steps"] == 50
 
 
-@pytest.mark.parametrize(
-    "manifest, expected_steps",
-    [
-        (None, 50),
-        ({"schema_version": "fasth3-inference-contract-v1", "num_inference_steps": 9}, 9),
-        ({"schema_version": "fasth3-inference-contract-v1"}, 50),
-        (
-            {
-                "schema_version": "fasth3-inference-contract-v1",
-                "dmd_denoising_steps": list(range(999, 972, -1)),
-            },
-            28,
-        ),
-        (
-            {
-                "schema_version": "fasth3-inference-contract-v1",
-                "dmd_denoising_steps": [999, 500],
-            },
-            3,
-        ),
-        (
-            {
-                "schema_version": "fasth3-inference-contract-v1",
-                "dmd_denoising_steps": [999, 500],
-                "num_inference_steps": 9,
-            },
-            9,
-        ),
-        ({"schema_version": "other-model-v1", "num_inference_steps": 5}, 50),
-    ],
-)
-def test_fasth3_generation_steps_follow_inference_contract(
-    tmp_path: Path, manifest: dict | None, expected_steps: int
-) -> None:
-    if manifest is not None:
-        (tmp_path / "fastvideo_inference.json").write_text(json.dumps(manifest))
-    pipeline = _SyntheticMiniMaxH3Pipeline()
-    pipeline.load_standard_components(
-        str(tmp_path), torch.device("cpu"), skip_components=list(PipelineComponent)
-    )
-
-    assert pipeline.default_generation_params["num_inference_steps"] == expected_steps
-
-
-@pytest.mark.parametrize("fasth3", [False, True])
-def test_warmup_uses_model_schedule(fasth3: bool) -> None:
-    pipeline = _SyntheticMiniMaxH3Pipeline()
-    pipeline.pipeline_config.compilation = SimpleNamespace(resolutions=[(32, 32)], num_frames=[124])
-    if fasth3:
-        pipeline.scheduler = MiniMaxH3Scheduler(shift=10.0)
-        pipeline._fastvideo_inference = {
-            "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
-            "video_scheduler_shift": 10.0,
-            "audio_scheduler_shift": 3.0,
-        }
-    pipeline.post_load_weights()
-    shapes, steps = pipeline.resolve_warmup_plan()
-    assert shapes == [(32, 32, 124)]
-    assert steps == (9 if fasth3 else 2)
-
-    for height, width, num_frames in shapes:
-        pipeline._run_warmup(height, width, num_frames, steps)
-
-    assert pipeline.transformer.forward_calls == steps - 1
-    assert len(pipeline.scheduler.timesteps) == steps - 1
-    assert len(pipeline.audio_scheduler.timesteps) == steps - 1
-
-
-def test_fasth3_v2_trained_schedule() -> None:
-    pipeline = _SyntheticMiniMaxH3Pipeline()
-    pipeline.scheduler = MiniMaxH3Scheduler(shift=10.0)
-    pipeline.audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
-    pipeline._fastvideo_inference = {
-        "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
-        "video_scheduler_shift": 10.0,
-        "audio_scheduler_shift": 3.0,
-    }
-    pipeline.post_load_weights()
-    pipeline._set_timesteps(9)
-    base = torch.tensor([0.999, 0.874, 0.749, 0.624, 0.5, 0.375, 0.25, 0.125, 0.0])
-    for scheduler, shift in ((pipeline.scheduler, 10.0), (pipeline.audio_scheduler, 3.0)):
-        expected = shift * base / (1 + (shift - 1) * base)
-        torch.testing.assert_close(scheduler.sigmas.cpu(), expected, rtol=0, atol=0)
-        torch.testing.assert_close(scheduler.timesteps.cpu(), 1 - expected[:-1], rtol=0, atol=0)
-        assert len(scheduler.timesteps) == 8
-    with pytest.raises(ValueError, match="9 sigma-grid points"):
-        pipeline._set_timesteps(8)
-    pipeline.scheduler.set_shift(12.0)
-    with pytest.raises(ValueError, match="video_scheduler_shift"):
-        pipeline._set_timesteps(9)
-    pipeline._fastvideo_inference = {}
-    pipeline._set_timesteps(50)
-    assert len(pipeline.scheduler.timesteps) == 49
-
-
-@pytest.mark.parametrize("steps", [[], [999, 999], [999, 1000], [1001, 500], [999, 0]])
-def test_fasth3_rejects_invalid_dmd_steps(steps: list[int]) -> None:
-    pipeline = _SyntheticMiniMaxH3Pipeline()
-    pipeline._fastvideo_inference = {"dmd_denoising_steps": steps}
-    with pytest.raises(ValueError, match="strictly decreasing"):
-        pipeline._set_timesteps(len(steps) + 1)
-
-
 def test_hf_download_is_scoped_to_the_supported_h3_components(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1248,84 +1042,6 @@ def test_hf_download_is_scoped_to_the_supported_h3_components(
         ],
         "revision": revision,
     }
-
-
-@pytest.mark.parametrize(
-    "attention_kwargs,expected_backend,expected_sparsity",
-    [
-        ({}, "TRTLLM", 0.8),
-        ({"backend": "TRTLLM"}, "TRTLLM", 0.8),
-        ({"backend": "CUTEDSL"}, "CUTEDSL", 0.8),
-        (
-            {
-                "backend": "CUTEDSL",
-                "sparse_attention_config": {"algorithm": "vsa", "vsa_sparsity": 0.5},
-            },
-            "CUTEDSL",
-            0.5,
-        ),
-    ],
-)
-def test_fasth3_manifest_metadata_controls_pipeline_defaults(
-    tmp_path: Path, attention_kwargs: dict, expected_backend: str, expected_sparsity: float
-) -> None:
-    (tmp_path / "transformer").mkdir()
-    (tmp_path / "transformer" / "config.json").write_text(
-        json.dumps({"hidden_size": 32}),
-        encoding="utf-8",
-    )
-    (tmp_path / "modular_model_index.json").write_text(
-        json.dumps(
-            {
-                "_class_name": "MiniMaxH3ModularPipeline",
-                "transformer": ["diffusers", "MiniMaxH3Transformer3DModel"],
-            }
-        ),
-        encoding="utf-8",
-    )
-    (tmp_path / "fastvideo_inference.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "fasth3-inference-contract-v1",
-                "model_id": "FastVideo/FastVideo-FastH3-8-Step-V2",
-                "num_inference_steps": 9,
-                "vsa_sparsity": 0.8,
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    config = DiffusionPipelineConfig.from_pretrained(str(tmp_path))
-    config.attention = AttentionConfig(**attention_kwargs)
-    MiniMaxH3Pipeline._configure_fasth3_attention(config)
-    assert config.attention.backend == expected_backend
-    assert config.attention.sparse_attention_config.algorithm == "vsa"
-    assert config.attention.sparse_attention_config.vsa_sparsity == expected_sparsity
-    assert config.primary_model_config.attention == config.attention
-    if expected_backend == "TRTLLM":
-        assert config.attention_metadata_state == {"metadata_cache": {}}
-        assert config.primary_model_config.attention_metadata_state == {"metadata_cache": {}}
-        assert (
-            config.primary_model_config.attention_metadata_state
-            is not config.attention_metadata_state
-        )
-
-    assert "fastvideo_inference" not in config.extra_attrs
-    pipeline = _SyntheticMiniMaxH3Pipeline()
-    pipeline.pipeline_config = config
-    pipeline.load_standard_components(
-        str(tmp_path), torch.device("cpu"), skip_components=list(PipelineComponent)
-    )
-    assert pipeline.default_generation_params["num_inference_steps"] == 9
-
-    config.attention = AttentionConfig(backend="VANILLA")
-    with pytest.raises(ValueError, match="FastH3 requires VSA"):
-        MiniMaxH3Pipeline._configure_fasth3_attention(config)
-
-    (tmp_path / "fastvideo_inference.json").unlink()
-    MiniMaxH3Pipeline._configure_fasth3_attention(config)
-    assert config.attention.backend == "VANILLA"
-    assert config.attention.sparse_attention_config is None
 
 
 def test_infer_supports_a_last_frame_without_a_first_frame(
@@ -1672,7 +1388,9 @@ def test_h3_workflow_reference_slots(workflow: str) -> None:
     ["image:0", ["image"], ["image:-1"], ["image:00"], ["image:0", "image:0"], ["unknown:0"], [1]],
 )
 def test_ref2va_invalid_reference_order(order: object) -> None:
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.ref2va import validate_reference_order
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.default.ref2va import (
+        validate_reference_order,
+    )
 
     with pytest.raises(ValueError):
         validate_reference_order(order)
@@ -1682,7 +1400,7 @@ def test_ref2va_invalid_reference_order(order: object) -> None:
 def test_ref2va_cross_modality_order(
     monkeypatch: pytest.MonkeyPatch, order: list[str] | None
 ) -> None:
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3 import ref2va
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.default import ref2va
 
     params = SimpleNamespace(
         image_reference=[
@@ -1707,7 +1425,7 @@ def test_ref2va_cross_modality_order(
 def test_ref2va_image_bytes() -> None:
     from io import BytesIO
 
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.ref2va import load_references
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.default.ref2va import load_references
 
     stream = BytesIO()
     Image.new("RGB", (32, 64), "red").save(stream, format="PNG")
@@ -1723,7 +1441,7 @@ def test_ref2va_image_bytes() -> None:
 def test_ref2va_groups_vae_stages_preserving_reference_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3 import ref2va
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.default import ref2va
 
     pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
@@ -1830,7 +1548,7 @@ def test_ref2va_freezes_audio_and_video_conditions(monkeypatch: pytest.MonkeyPat
         )
         return torch.ones(1, 1, 4), layout, torch.full((1, 8), 7.0), torch.full((1, 3), 9.0)
 
-    monkeypatch.setattr(h3_pipeline, "prepare_references", prepare)
+    monkeypatch.setattr(default_pipeline, "prepare_references", prepare)
     original = _FakeMiniMaxH3Transformer.__call__
 
     def observe(
@@ -1906,12 +1624,12 @@ def test_ref2va_loads_ref_weights(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 
     def load(
-        loader: h3_pipeline.WeightLoader, checkpoint: str, mapping: object
+        loader: default_pipeline.WeightLoader, checkpoint: str, mapping: object
     ) -> dict[str, torch.Tensor]:
         captured.update(components=loader.components, checkpoint=checkpoint, mapping=mapping)
         return {"sentinel": torch.ones(1)}
 
-    monkeypatch.setattr(h3_pipeline.WeightLoader, "load_weights", load)
+    monkeypatch.setattr(default_pipeline.WeightLoader, "load_weights", load)
     result = pipeline.load_transformer_weights("checkpoint")
     assert captured == {
         "components": ["transformer_ref"],
@@ -1939,7 +1657,7 @@ def test_ref2va_rejects_invalid_reference_combinations(kinds: list[str]) -> None
         MiniMaxH3VideoReference,
     )
 
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.ref2va import normalize_references
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.default.ref2va import normalize_references
 
     refs = {
         "image": MiniMaxH3ImageReference(Image.new("RGB", (32, 32))),

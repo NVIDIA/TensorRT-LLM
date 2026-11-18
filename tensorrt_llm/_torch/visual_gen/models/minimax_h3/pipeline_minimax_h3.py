@@ -18,8 +18,7 @@
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 
-from .default.pipeline import MiniMaxH3Pipeline
-from .routing import route
+from .routing import MiniMaxH3Pipeline, route
 
 __all__ = ["MiniMaxH3Pipeline"]
 

@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
+from test_common.visual_gen._worker_pool import run_distributed
 
 from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
     ParallelVAE_TrtllmWan,
@@ -27,8 +28,6 @@ from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
 )
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE, WanVAEConfig
 from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import ParallelVAEFactory
-
-from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True, scope="module")
