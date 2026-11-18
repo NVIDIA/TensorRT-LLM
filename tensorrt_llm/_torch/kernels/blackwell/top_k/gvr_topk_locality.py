@@ -5,13 +5,13 @@
 import operator
 from contextlib import nullcontext
 from dataclasses import dataclass
-from math import gcd
+from math import gcd, lcm
 
 import torch
 from cuda.bindings import driver as cuda
 
 from . import gvr_topk_decode_self_sampling_host as gvr
-from .gvr_topk_locality_policy import COSCHEDULED_SM_COUNT, choose_locality
+from .gvr_topk_locality_policy import COSCHEDULED_SM_COUNT, choose_backfill, choose_locality
 
 
 def _check(result: tuple, operation: str) -> object:
@@ -20,6 +20,19 @@ def _check(result: tuple, operation: str) -> object:
     if len(result) == 2:
         return result[1]
     return result[1:]
+
+
+def _backfill_counts(
+    counts: tuple[int, ...], alignments: tuple[int, ...], remainder: int
+) -> tuple[int, ...]:
+    """Grow aligned budgets without changing the domain ownership proportions."""
+    if not counts or min(counts) <= 0 or remainder <= 0:
+        return counts
+    divisor = gcd(*counts)
+    ratios = tuple(c // divisor for c in counts)
+    quantum = lcm(*(a // gcd(a, r) for a, r in zip(alignments, ratios)))
+    factor = remainder // sum(ratios) // quantum * quantum
+    return tuple(c + factor * r for c, r in zip(counts, ratios))
 
 
 @dataclass
@@ -39,6 +52,8 @@ class LocalityDomainExecutor:
         device: int = 0,
         coscheduled_sm_count: int = COSCHEDULED_SM_COUNT,
         sm_counts: tuple[int, ...] | None = None,
+        *,
+        backfill: bool = False,
     ) -> None:
         self.device = device
         properties = torch.cuda.get_device_properties(device)
@@ -47,6 +62,8 @@ class LocalityDomainExecutor:
         self.coscheduled_sm_count = coscheduled_sm_count
         self.domains: list[_Domain] = []
         self.closed = False
+        self.backfill_requested = backfill
+        self.backfill_applied = False
         with torch.cuda.device(device):
             torch.cuda.init()
             if torch.cuda.is_current_stream_capturing():
@@ -83,6 +100,8 @@ class LocalityDomainExecutor:
             resources, remainder = _check(
                 cuda.cuDevSmResourceSplit(count, resource, 0, params), "split SM resources"
             )
+            if backfill and sm_counts is None:
+                resources, remainder = self._try_backfill(resources, remainder, params)
             self.remainder_sms = int(remainder.sm.smCount)
             try:
                 for ordinal, partition in enumerate(resources):
@@ -90,6 +109,48 @@ class LocalityDomainExecutor:
             except RuntimeError:
                 self.close()
                 raise
+
+    def _try_backfill(
+        self,
+        resources: list[cuda.CUdevResource],
+        remainder: cuda.CUdevResource,
+        params: list[cuda.CU_DEV_SM_RESOURCE_GROUP_PARAMS],
+    ) -> tuple[list[cuda.CUdevResource], cuda.CUdevResource]:
+        flag = getattr(cuda.CUdevSmResourceGroup_flags, "CU_DEV_SM_RESOURCE_GROUP_BACKFILL", None)
+        if flag is None:
+            return resources, remainder
+        counts = tuple(int(r.sm.smCount) for r in resources)
+        alignments = tuple(
+            lcm(self.coscheduled_sm_count, max(1, int(r.sm.smCoscheduledAlignment)))
+            for r in resources
+        )
+        requested = _backfill_counts(counts, alignments, int(remainder.sm.smCount))
+        if requested == counts:
+            return resources, remainder
+        for param, count in zip(params, requested):
+            param.smCount = count
+            param.flags |= int(flag)
+        root = _check(
+            cuda.cuDeviceGetDevResource(
+                self.device, cuda.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+            ),
+            "backfill SM resource",
+        )
+        result = cuda.cuDevSmResourceSplit(len(params), root, 0, params)
+        if result[0] in (
+            cuda.CUresult.CUDA_ERROR_INVALID_VALUE,
+            cuda.CUresult.CUDA_ERROR_NOT_SUPPORTED,
+        ):
+            return resources, remainder
+        filled, rest = _check(result, "backfill SM split")
+        if (
+            tuple(int(r.sm.smCount) for r in filled) != requested
+            or any(int(r.sm.smCoscheduledAlignment) < self.coscheduled_sm_count for r in filled)
+            or sum(requested) + int(rest.sm.smCount) != self.physical_sm_count
+        ):
+            return resources, remainder
+        self.backfill_applied = True
+        return filled, rest
 
     def _add_domain(self, ordinal: int, partition: cuda.CUdevResource) -> None:
         desc = _check(cuda.cuDevResourceGenerateDesc([partition], 1), "resource descriptor")
@@ -166,6 +227,7 @@ class _Bound:
                 use_rubin_tuning=use_rubin_tuning,
             )
         self.ws = gvr.kernel_view(self.workspace)
+        self.cluster_size = getattr(self.launcher, "cluster_size", None)
 
     def __call__(self):
         lc = self.launcher
@@ -244,16 +306,12 @@ def _allocation_rows(x: torch.Tensor, device: int) -> tuple[int, ...] | None:
 
 
 class PreparedRowTopK:
-    """One non-reentrant call, including graph-safe fork/join when locality wins.
+    """Non-reentrant, graph-capturable top-k over caller-owned row allocations.
 
-    Prepare and warm before graph capture. Keep this object, its input allocation,
-    and its resource executor alive until all captured graphs are destroyed.
-    Values and per-row lengths may change; addresses and row ownership may not.
-    Allocation ownership is queried once during preparation. ``co_local=False``
-    disables locality; ``True`` still requires verified allocation ownership.
-    The caller owns placement; this API does not copy or reallocate logits.
-    ``max_seq_len`` and ``kv_lens`` use uncompressed token counts, matching
-    ``run_varlen``. This row API uses ``next_n=1``; MTP batches use ``run_varlen``.
+    Prepare and warm before capture; retain allocations and executor until graphs
+    are destroyed. Values and lengths may change, but addresses and ownership may not.
+    ``co_local=True`` requires verified ownership; ``False`` disables locality.
+    Lengths are uncompressed token counts. Only ``next_n=1`` is supported.
     """
 
     def __init__(
@@ -371,7 +429,11 @@ class PreparedRowTopK:
         if choice is not None and counts is not None:
             mode, budget = choice
             if executor is None:
-                executor = LocalityDomainExecutor(self.device, budget)
+                executor = LocalityDomainExecutor(
+                    self.device,
+                    budget,
+                    backfill=choose_backfill(logits.dtype, k, max_seq_len, rows, sms, sm),
+                )
                 self.owns_executor = True
                 self.executor = executor
             if executor.closed or executor.device != self.device:
@@ -382,8 +444,7 @@ class PreparedRowTopK:
                 raise ValueError("row_counts needs one entry for every queried domain")
             self.executor = executor
             if executor.coscheduled_sm_count == budget:
-                # Unbalanced ownership can exhaust one domain while leaving others idle.
-                # Use the measured policy only when the assigned rows follow SM resources.
+                # Row ownership must match the domain resource proportions.
                 total = sum(d.sm_count for d in executor.domains)
                 balanced = all(
                     abs(c - rows * d.sm_count / total) <= 1
@@ -398,12 +459,14 @@ class PreparedRowTopK:
                         if count:
                             plan_rows = rows if mode == "local_preserve" else count
                             plan_sms = sms if mode == "local_preserve" else domain.sm_count
-                            plan = gvr._route_fp32_varlen(
-                                plan_rows, max(max_seq_len, k + 1), stride, k, plan_sms, sm
-                            )
-                            if plan["cluster"] > executor.coscheduled_sm_count:
-                                prepared = []
-                                break
+                            plan = None
+                            if logits.dtype == torch.float32:
+                                plan = gvr._route_fp32_varlen(
+                                    plan_rows, max(max_seq_len, k + 1), stride, k, plan_sms, sm
+                                )
+                                if plan["cluster"] > executor.coscheduled_sm_count:
+                                    prepared = []
+                                    break
                             bound = _Bound(
                                 x[offset : offset + count],
                                 kv_lens[offset : offset + count],
@@ -414,6 +477,14 @@ class PreparedRowTopK:
                                 plan_sms,
                                 sm,
                             )
+                            if plan is None:
+                                # Check the final cluster size after native dispatch overrides.
+                                if bound.cluster_size is None:
+                                    raise RuntimeError("Native launcher has no cluster metadata")
+                                plan = {"kernel": bound.launcher[0], "cluster": bound.cluster_size}
+                                if plan["cluster"] > executor.coscheduled_sm_count:
+                                    prepared = []
+                                    break
                             prepared.append((domain, bound, torch.cuda.Event()))
                             self.plans.append(plan)
                         offset += count
