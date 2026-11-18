@@ -47,7 +47,6 @@ class TrtllmCoreMetadata(Metadata):
     enable_flash_mla = False
     enable_helix = False
     fp4_mla_state = None
-    mamba_metadata = False
     multi_item_part_lens = None
     position_ids = None
     cu_q_seqlens = None

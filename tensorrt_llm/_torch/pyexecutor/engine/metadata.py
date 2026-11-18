@@ -131,6 +131,7 @@ def build_feature_attention_metadata(
     kv_cache_manager: KVCacheManager | KVCacheManagerV2,
     draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None,
     spec_config: DecodingBaseConfig | None,
+    mamba_metadata_cls: type | None = None,
 ) -> TrtllmCoreMetadata:
     """Construct the feature-split attention metadata (TRTLLM_ATTENTION_METADATA=new).
 
@@ -160,9 +161,13 @@ def build_feature_attention_metadata(
         SharedKVCacheStandaloneDSparkDraftMetadata,
     )
     from tensorrt_llm._torch.attention.metadata.mla_context import MlaContextMetadata
+    from tensorrt_llm._torch.attention.metadata.recurrent import RecurrentStateMetadata
     from tensorrt_llm._torch.attention.metadata.sparse import SparseMetadata
     from tensorrt_llm._torch.attention.metadata.spec_decoding import SpecDecodingMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+        BaseMambaCacheManager,
+    )
 
     is_deepseek_v4 = issubclass(attention_backend, DeepseekV4TrtllmAttention)
     is_csa2 = issubclass(attention_backend, CSA2TrtllmAttention)
@@ -204,6 +209,9 @@ def build_feature_attention_metadata(
         metadata_types.append(CSA2Metadata)
     else:
         metadata_types.append(SparseMetadata)
+    is_hybrid = isinstance(kv_cache_manager, BaseMambaCacheManager)
+    if is_hybrid:
+        metadata_types.append(RecurrentStateMetadata)
     max_draft_tokens = 0
     if spec_config is not None:
         spec_dec_mode = spec_config.spec_dec_mode
@@ -253,6 +261,8 @@ def build_feature_attention_metadata(
             else None
         ),
         enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
+        mamba_metadata_cls=mamba_metadata_cls if is_hybrid else None,
+        mamba_chunk_size=getattr(model_config.pretrained_config, "chunk_size", 128),
         max_draft_tokens=max_draft_tokens,
     )
     return build_metadata(metadata_types, engine_inputs)

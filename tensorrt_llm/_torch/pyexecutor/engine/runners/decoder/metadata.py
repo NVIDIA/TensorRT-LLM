@@ -117,6 +117,7 @@ class DecoderMetadata:
                 kv_cache_manager=kv_cache_manager,
                 draft_kv_cache_manager=draft_kv_cache_manager,
                 spec_config=self._config.spec_config,
+                mamba_metadata_cls=resolve_mamba_metadata_cls(self.model),
             )
             logger.info(
                 "Attention metadata: feature-split ("

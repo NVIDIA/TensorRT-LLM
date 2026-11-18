@@ -119,6 +119,10 @@ class BatchInputs:
     max_num_heads_per_kv: int = 1
     sparse_metadata_params: Optional["SparseMetadataParams"] = None
     enable_context_mla_with_cached_kv: bool = False
+    # The class of the recurrent-state metadata a hybrid model reads, and
+    # the chunk size of its recurrent layers.
+    mamba_metadata_cls: Optional[type] = None
+    mamba_chunk_size: int = 128
     # Draft tokens verified per generation request, at most.
     max_draft_tokens: int = 0
     kv_layout: Literal["NHD", "HND"] = "HND"
