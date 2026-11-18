@@ -53,20 +53,27 @@ def test_asymmetric_admission_failure_uses_request_error_path(parallelism):
         futures = [pool.submit(e._fail_scheduler_requests, b) for e, b in zip(executors, batches)]
         for future in futures:
             future.result(timeout=10)
-    for executor, batch in zip(executors, batches):
+    for rank, (executor, batch) in enumerate(zip(executors, batches)):
         assert batch.generation_requests == []
-        assert executor._handle_errors.call_args.kwargs["charge_budget"] is False
-    assert executors[1]._handle_errors.call_args.kwargs["requests"] == failed
-    assert executors[0]._handle_errors.call_args.kwargs["requests"] == (
-        failed if parallelism == "pp" else []
-    )
+        executor._handle_errors.assert_called_once_with(
+            "KV cache admission made no progress within the scheduler limit",
+            requests=failed if rank == 1 or parallelism == "pp" else [],
+            charge_budget=False,
+        )
     assert batches[0].context_requests == [healthy]
 
 
 def test_admission_failure_delivers_one_error_and_cleans_up_once():
     executor = object.__new__(PyExecutor)
     executor._is_kv_manager_v2 = True
-    executor.dist = SimpleNamespace(rank=0, world_size=1, tp_size=1, cp_size=1, pp_size=1)
+    executor.dist = SimpleNamespace(
+        rank=0,
+        world_size=1,
+        tp_size=1,
+        cp_size=1,
+        pp_size=1,
+        mapping=SimpleNamespace(tp_group=[0]),
+    )
     blocked = SimpleNamespace(
         py_request_id=7,
         request_id=7,
@@ -86,10 +93,18 @@ def test_admission_failure_delivers_one_error_and_cleans_up_once():
     executor._prefetched_request_ids = {7, 8}
     executor._release_multimodal_resources = Mock()
     executor.sampler, executor.resource_manager = Mock(), Mock()
-    executor.disagg = Mock()
     executor.model_engine = executor.draft_model_engine = None
-    executor.result_wait_queues = {}
-    executor._enqueue_responses = Mock()
+    result_queue = Mock()
+    executor.result_wait_queues = {7: result_queue}
+    executor.response_cv, executor.responses = threading.Condition(), {}
+    executor._merged_transfer_flush, executor._stage_responses = None, False
+    executor._maybe_record_hang_diagnostic_phase = Mock()
+
+    def check_delivery_before_free(request):
+        result_queue.put_response.remote.assert_called_once()
+        assert executor.result_wait_queues[7] is result_queue
+
+    executor.resource_manager.free_resources.side_effect = check_delivery_before_free
     batch = ScheduledRequests()
     batch.failed_requests = [blocked]
     batch.reset_context_requests([healthy])
@@ -97,9 +112,12 @@ def test_admission_failure_delivers_one_error_and_cleans_up_once():
     executor._fail_scheduler_requests(batch)
     executor._fail_scheduler_requests(batch)
 
-    executor._enqueue_responses.assert_called_once()
-    [(rid, response)] = executor._enqueue_responses.call_args.args[0]
-    assert rid == blocked.py_request_id
+    result_queue.put_response.remote.assert_called_once()
+    client_id, response = result_queue.put_response.remote.call_args.args
+    assert client_id == 17
+    assert response.request_id == blocked.py_request_id
+    assert executor.responses[7] == [response]
+    assert 7 not in executor.result_wait_queues
     assert response.error_msg == "KV cache admission made no progress within the scheduler limit"
     executor.sampler.release_request.assert_called_once_with(blocked)
     executor.resource_manager.free_resources.assert_called_once_with(blocked)

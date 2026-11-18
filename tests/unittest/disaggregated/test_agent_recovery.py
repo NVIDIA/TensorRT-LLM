@@ -4,7 +4,7 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -377,19 +377,23 @@ def test_group_reserves_native_ownership_between_members():
     session._closed, session.lock = False, threading.Lock()
     session._sender = session._aux_buffer = None
 
+    checked_between_members = threading.Event()
+
     class Members(tuple):
         def __iter__(self):
             yield self[0]
             if first.wait.called:
                 # An auxiliary failure can mark this KV task ERROR here.
                 task.status = transfer.TaskStatus.ERROR
+                checked_between_members.set()
                 assert not session.resources_drained()
                 assert session.close() is False
             yield self[1]
 
-    assert sender._submit_direct_transfer(
-        task, Members((make_request(), make_request())), None, 0
-    ) == (True, None)
+    members = Members((make_request(), make_request()))
+    assert sender._submit_direct_transfer(task, members, None, 0) == (True, None)
+    assert checked_between_members.is_set()
+    assert agent.submit_transfer_requests.call_args_list == [call(members[0]), call(members[1])]
     assert task._native_inflight == 0
     sender._recover_agent.assert_not_called()
 
@@ -421,16 +425,19 @@ def test_unretired_handle_has_a_bounded_fail_stop_without_freeing_roots(active_r
 
 
 @pytest.mark.parametrize(
-    "already_stopped,last_poll_at", [(False, 0.24), (False, 0.25), (True, 0.24)]
+    "already_stopped,last_poll_at,expected_ms",
+    [(False, 0.1875, 62), (False, 0.25, 0), (True, 0.1875, None)],
 )
-def test_interruptible_wait_obeys_deadline_and_initial_stop(already_stopped, last_poll_at):
+def test_interruptible_wait_obeys_deadline_and_initial_stop(
+    already_stopped, last_poll_at, expected_ms
+):
     native = Mock()
     native.wait.return_value = TransferState.IN_PROGRESS
     status = BindingsNixlTransferStatus(native)
     # Initial deadline, first poll, first completion check, final poll/check.
     with patch(
         "tensorrt_llm._torch.disaggregation.nixl._agent_cpp.time.monotonic",
-        side_effect=[0.0, 0.0, 0.2, last_poll_at, 0.25],
+        side_effect=[0.0, 0.0, 0.125, last_poll_at, 0.25],
     ):
         assert not status.wait(timeout_ms=250, stop_requested=lambda: already_stopped)
     if already_stopped:
@@ -438,10 +445,7 @@ def test_interruptible_wait_obeys_deadline_and_initial_stop(already_stopped, las
     else:
         assert native.wait.call_count == 2
         assert native.wait.call_args_list[0].args == (100,)
-        last_poll_ms = native.wait.call_args_list[-1].args[0]
-        assert 0 <= last_poll_ms <= 10
-        if last_poll_at == 0.25:
-            assert last_poll_ms == 0
+        assert native.wait.call_args_list[-1].args == (expected_ms,)
 
 
 @pytest.mark.parametrize("retry_succeeds", [False, True])
@@ -515,6 +519,7 @@ def test_transceiver_shutdown_can_retire_a_failed_release_before_session_close()
         ThreadPoolExecutor(max_workers=1) as pool,
     ):
         pending = pool.submit(sender._submit_transfer, task, 11, make_request(), agent_generation=0)
+        thread = None
         try:
             assert rooted.wait(2)
             sender._recover_agent = worker._request_agent_recovery
@@ -535,4 +540,126 @@ def test_transceiver_shutdown_can_retire_a_failed_release_before_session_close()
             worker._agent_recovery_stop.set()
             for _status, _task, retired in sender._unreleased_statuses:
                 retired.set()
+            thread = thread or worker._agent_recovery_thread
+            if thread is not None:
+                thread.join(timeout=3)
+                assert not thread.is_alive()
             pending.result(timeout=2)
+
+
+@pytest.mark.parametrize("cancel_before_reservation", [True, False])
+def test_aux_cancellation_serializes_with_native_admission(cancel_before_reservation):
+    agent = Mock()
+    sender = make_sender(agent)
+    task = make_task()
+    task.status = transfer.TaskStatus.INIT
+    task.fail = lambda _error: setattr(task, "status", transfer.TaskStatus.ERROR)
+    session = object.__new__(transfer.TxSession)
+    session._enforce_physical_ownership = False
+    session._closed, session.lock = False, threading.Lock()
+    session._terminal_status, session._exception = None, None
+    session._has_last_slice, session._need_aux, session.receiver_ready = False, True, False
+    session._logical_outcomes = Mock()
+    session._base_args = SimpleNamespace(
+        params=SimpleNamespace(disagg_request_id=7, ctx_request_id=None)
+    )
+    session.kv_tasks, session.aux_task = [], task
+    session._sender, session._aux_buffer = Mock(), Mock()
+    session._sender._get_req_info.return_value = {}
+    session.aux_slot = 3
+    session._report_unsubmitted_aux_failures = Mock()
+    entered, resume = threading.Event(), threading.Event()
+
+    def pause():
+        entered.set()
+        assert resume.wait(2)
+        return True
+
+    agent.check_remote_descs.side_effect = (
+        (lambda *_args: pause()) if cancel_before_reservation else None
+    )
+    status = Mock()
+    status.wait.side_effect = lambda **_kwargs: pause()
+    status.release.return_value = True
+    agent.submit_transfer_requests.return_value = status
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            sender._submit_transfer, task, 11, make_request(), agent_generation=0, session=session
+        )
+        try:
+            assert entered.wait(2)
+            assert session.cancel_local(report_unsubmitted_aux=False)
+            assert session.close() == cancel_before_reservation
+            resume.set()
+            if cancel_before_reservation:
+                with pytest.raises(transfer._TransferNotSubmittedError):
+                    pending.result(timeout=2)
+                agent.submit_transfer_requests.assert_not_called()
+            else:
+                session._aux_buffer.free_slot.assert_not_called()
+                assert pending.result(timeout=2) == (True, None)
+                assert session.close()
+            session._aux_buffer.free_slot.assert_called_once_with(3)
+            sender._recover_agent.assert_not_called()
+            assert task._native_inflight == 0
+        finally:
+            resume.set()
+
+
+def test_shutdown_drains_a_new_failed_generation_before_recovery_thread_exits():
+    worker = make_worker()
+    sender = worker._sender
+    installed, resume, rooted = threading.Event(), threading.Event(), threading.Event()
+    replacement, status = Mock(), Mock()
+    replacement.get_local_agent_desc.return_value = b"new-descriptor"
+    status.wait.return_value = status.release.return_value = False
+    replacement.submit_transfer_requests.return_value = status
+    recover = worker._recover_transfer_agent
+
+    def paused_recovery(generation):
+        result = recover(generation)
+        if generation == 0:
+            installed.set()
+            assert resume.wait(2)
+        return result
+
+    def request_recovery(generation):
+        worker._request_agent_recovery(generation)
+        if generation == 1:
+            rooted.set()
+
+    sender._recover_agent = request_recovery
+    task = make_task()
+    with (
+        patch.object(transfer.torch.cuda, "set_device"),
+        patch.object(transfer.cudart, "cudaSetDevice", return_value=0),
+        patch.object(transfer, "CUASSERT"),
+        patch.object(transfer, "_create_nixl_agent", return_value=replacement) as factory,
+        patch.object(worker, "_recover_transfer_agent", side_effect=paused_recovery),
+        ThreadPoolExecutor(max_workers=1) as pool,
+    ):
+        worker._request_agent_recovery(0)
+        thread = worker._agent_recovery_thread
+        try:
+            assert installed.wait(2)
+            pending = pool.submit(
+                sender._submit_transfer, task, 11, make_request(), agent_generation=1
+            )
+            assert rooted.wait(2)
+            worker.request_shutdown()
+            resume.set()
+            assert pending.result(timeout=3)[0] is False
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+            replacement.shutdown.assert_called_once()
+            factory.assert_called_once()
+            assert worker._agent is None
+            assert sender._unreleased_statuses == []
+            assert task._native_inflight == 0
+        finally:
+            resume.set()
+            worker._agent_recovery_stop.set()
+            thread.join(timeout=3)
+            for _status, _task, retired in sender._unreleased_statuses:
+                retired.set()
+            assert not thread.is_alive()

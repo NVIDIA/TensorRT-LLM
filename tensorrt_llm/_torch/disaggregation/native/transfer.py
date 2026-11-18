@@ -1095,6 +1095,7 @@ class Sender(SenderBase):
         requests: tuple[TransferRequest, ...],
         on_submitted: Optional[Callable[[], None]],
         agent_generation: Optional[int],
+        session: Optional["TxSession"] = None,
     ) -> tuple[bool, Optional[str]]:
         recover = self._recover_agent
         assert recover is not None
@@ -1117,8 +1118,17 @@ class Sender(SenderBase):
                     ) from error
                 # Reserve the whole operation: a sibling can fail this task
                 # between group members, while the next member can still submit.
-                with task.lock:
-                    task._native_inflight += 1
+                with session.lock if session is not None else nullcontext():
+                    if session is not None and (
+                        session._closed
+                        or session.has_failed()
+                        or session.status == SessionStatus.TRANSFERRED
+                    ):
+                        raise _TransferNotSubmittedError(
+                            "NIXL transfer session is closed or terminal"
+                        )
+                    with task.lock:
+                        task._native_inflight += 1
                 try:
                     completed, detail = True, None
                     for index, member in enumerate(requests):
@@ -1172,11 +1182,14 @@ class Sender(SenderBase):
         on_submitted: Optional[Callable[[], None]] = None,
         *,
         agent_generation: Optional[int] = None,
+        session: Optional["TxSession"] = None,
     ) -> tuple[bool, Optional[str]]:
         requests = request.requests if isinstance(request, _TransferRequestGroup) else (request,)
         owned = self._owns_task(task)
         if not owned and getattr(self, "_recover_agent", None) is not None:
-            return self._submit_direct_transfer(task, requests, on_submitted, agent_generation)
+            return self._submit_direct_transfer(
+                task, requests, on_submitted, agent_generation, session
+            )
         try:
             # This query cannot submit a transfer. Reject before acquiring backend ownership.
             for member in requests:
@@ -1552,6 +1565,7 @@ class Sender(SenderBase):
                     request,
                     on_submitted=submission_callback,
                     agent_generation=write_meta.agent_generation,
+                    session=session,
                 )
                 if transfer_finished:
                     submitted_and_completed = True
@@ -1702,6 +1716,7 @@ class Sender(SenderBase):
                     write_meta.peer_rank,
                     request,
                     agent_generation=write_meta.agent_generation,
+                    session=session,
                 )
                 if transfer_finished:
                     del request
@@ -5257,10 +5272,10 @@ class TransferWorker:
                 torch.cuda.set_device(self._config.device_id)
                 CUASSERT(cudart.cudaSetDevice(self._config.device_id))
                 while not self._agent_recovery_stop.is_set():
-                    recovered = self._recover_transfer_agent(self._sender._agent_generation)
+                    self._recover_transfer_agent(self._sender._agent_generation)
                     with self._agent_recovery_lock:
                         if not self._sender._agent_failed or (
-                            recovered and self._sender._shutdown_requested
+                            self._sender._shutdown_requested and self._agent is None
                         ):
                             self._agent_recovery_thread = None
                             return
