@@ -15,6 +15,7 @@ import torch
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..ltx2.ltx2_core.diffusion_steps import EulerDiffusionStep
 from ..ltx2.ltx2_core.patchifier import get_pixel_coords
@@ -53,13 +54,19 @@ class _LTX23LatentOutput:
 
 @register_pipeline("LTX23TwoStagesPipeline")
 class LTX23TwoStagesPipeline(LTX23Pipeline):
-    """Opt-in full-dev-model two-stage generation; the baseline is BF16 only."""
+    """Full-dev-model two-stage generation with BF16, FP8, or NVFP4 weights."""
 
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
         if pipeline_config.extra_attrs.get("workflow", "generation") != "generation":
             raise ValueError("LTX-2.3 two-stage supports generation only.")
-        if pipeline_config.quant_config.quant_algo is not None:
-            raise NotImplementedError("LTX-2.3 two-stage baseline requires BF16 weights.")
+        if pipeline_config.quant_config.quant_algo not in (
+            None,
+            QuantAlgo.FP8,
+            QuantAlgo.FP8_BLOCK_SCALES,
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+            QuantAlgo.NVFP4,
+        ):
+            raise NotImplementedError("LTX-2.3 two-stage supports BF16, FP8, or NVFP4 weights.")
         if pipeline_config.torch_dtype != torch.bfloat16:
             raise ValueError("LTX-2.3 two-stage baseline requires torch_dtype=bfloat16.")
         if pipeline_config.cache is not None:
@@ -121,7 +128,12 @@ class LTX23TwoStagesPipeline(LTX23Pipeline):
             if not deltas:
                 raise ValueError("Distilled LoRA did not match any LTX-2.3 transformer weights.")
             # Keep both weight storages resident for CUDA graph replay.
-            self._lora_weights = _PersistentLoRAWeightCache.build(self.transformer, deltas)
+            self._lora_weights = _PersistentLoRAWeightCache.build(
+                self.transformer,
+                deltas,
+                requantize_fp4=True,
+                lora_compute_dtype=torch.bfloat16,
+            )
             if self._lora_weights.applied_count != len(deltas):
                 raise ValueError("Not every LTX-2.3 distilled LoRA delta could be applied.")
             self._lora_weights.bind_original()

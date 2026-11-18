@@ -1522,7 +1522,10 @@ class TestLTX2TwoStageLoRAHelpers:
         assert module.weight.data_ptr() == original_ptr
         assert torch.equal(module.weight, original)
 
-    def test_persistent_fp8_cache_reuses_weight_and_scale_storage(self):
+    @pytest.mark.parametrize("lora_compute_dtype", [None, torch.bfloat16])
+    def test_persistent_fp8_cache_reuses_weight_and_scale_storage(
+        self, monkeypatch, lora_compute_dtype
+    ):
         """Persistent FP8 cache swaps both quantized weight and scale storage."""
 
         class TinyModule(torch.nn.Module):
@@ -1552,10 +1555,25 @@ class TestLTX2TwoStageLoRAHelpers:
         )
         delta = torch.full((2, 2), 0.5, dtype=torch.bfloat16)
 
-        cache = ltx2_two_stages._PersistentLoRAWeightCache.build(
-            module,
-            {"proj.weight": delta},
-        )
+        dequantize = ltx2_two_stages._dequantize_fp8_weight
+        requantize = ltx2_two_stages._requantize_fp8_weight
+
+        def verify_requantize(weight, **kwargs):
+            assert weight.dtype == (lora_compute_dtype or torch.float32)
+            return requantize(weight, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                ltx2_two_stages,
+                "_dequantize_fp8_weight",
+                lambda *args, **kwargs: dequantize(*args, **kwargs).float(),
+            )
+            patch.setattr(ltx2_two_stages, "_requantize_fp8_weight", verify_requantize)
+            cache = ltx2_two_stages._PersistentLoRAWeightCache.build(
+                module,
+                {"proj.weight": delta},
+                lora_compute_dtype=lora_compute_dtype,
+            )
         assert cache.applied_count == 1
         assert cache.precision_counts() == {"fp8": 1}
 
@@ -1592,8 +1610,11 @@ class TestLTX2TwoStageLoRAHelpers:
         assert module.proj.weight.data_ptr() == original_weight_ptr
         assert module.proj.weight_scale.data_ptr() == original_scale_ptr
 
-    def test_persistent_fp4_cache_swaps_quant_method_and_weight_storage(self, monkeypatch):
-        """Persistent FP4 cache binds merged BF16 weight and restores packed state."""
+    @pytest.mark.parametrize("requantize_fp4", [False, True])
+    def test_persistent_fp4_cache_swaps_quant_method_and_weight_storage(
+        self, monkeypatch, requantize_fp4
+    ):
+        """FP4 cache preserves the default BF16 path and supports quantized merged state."""
 
         class TinyModule(torch.nn.Module):
             def __init__(self):
@@ -1618,6 +1639,7 @@ class TestLTX2TwoStageLoRAHelpers:
                     torch.ones((), dtype=torch.float32),
                     requires_grad=False,
                 )
+                self.linear.alpha = torch.nn.Parameter(torch.tensor(2.0), requires_grad=False)
                 self.linear.quant_method = object()
 
         module = TinyModule()
@@ -1625,6 +1647,9 @@ class TestLTX2TwoStageLoRAHelpers:
         original_weight_ptr = module.linear.weight.data_ptr()
         original_weight = module.linear.weight.detach().clone()
         delta = torch.full((2, 2), 0.5, dtype=torch.bfloat16)
+        original_scale_ptr = module.linear.weight_scale.data_ptr()
+        original_scale_2_ptr = module.linear.weight_scale_2.data_ptr()
+        original_alpha_ptr = module.linear.alpha.data_ptr()
 
         def fake_dequantize_fp4_weight(
             packed_weight,
@@ -1644,9 +1669,21 @@ class TestLTX2TwoStageLoRAHelpers:
             fake_dequantize_fp4_weight,
         )
 
+        def fake_requantize_fp4_weight(weight):
+            assert requantize_fp4
+            assert weight.dtype == torch.bfloat16
+            assert torch.equal(weight, torch.ones_like(delta) + delta)
+            return (
+                torch.full((2, 1), 3, dtype=torch.uint8),
+                torch.full((128, 4), 2, dtype=torch.uint8),
+                torch.tensor(0.25, dtype=torch.float32),
+            )
+
+        monkeypatch.setattr(ltx2_two_stages, "_requantize_fp4_weight", fake_requantize_fp4_weight)
         cache = ltx2_two_stages._PersistentLoRAWeightCache.build(
             module,
             {"linear.weight": delta},
+            requantize_fp4=requantize_fp4,
         )
         assert cache.applied_count == 1
         assert cache.precision_counts() == {"fp4": 1}
@@ -1654,14 +1691,30 @@ class TestLTX2TwoStageLoRAHelpers:
         cache.bind_merged()
         merged_weight_ptr = module.linear.weight.data_ptr()
         assert merged_weight_ptr != original_weight_ptr
-        assert module.linear.weight.dtype == torch.bfloat16
-        assert torch.equal(module.linear.weight, torch.ones_like(delta) + delta)
-        assert isinstance(module.linear.quant_method, ltx2_two_stages.UnquantizedLinearMethod)
+        if requantize_fp4:
+            assert module.linear.weight.dtype == torch.uint8
+            assert torch.equal(module.linear.weight, torch.full_like(original_weight, 3))
+            assert module.linear.quant_method is original_quant_method
+            assert torch.all(module.linear.weight_scale == 2)
+            assert module.linear.weight_scale_2.item() == 0.25
+            assert module.linear.alpha.item() == 0.5
+            assert module.linear.weight_scale.data_ptr() != original_scale_ptr
+            assert module.linear.weight_scale_2.data_ptr() != original_scale_2_ptr
+            assert module.linear.alpha.data_ptr() != original_alpha_ptr
+        else:
+            assert module.linear.weight.dtype == torch.bfloat16
+            assert torch.equal(module.linear.weight, torch.ones_like(delta) + delta)
+            assert isinstance(module.linear.quant_method, ltx2_two_stages.UnquantizedLinearMethod)
 
         cache.bind_original()
         assert module.linear.weight.data_ptr() == original_weight_ptr
         assert torch.equal(module.linear.weight, original_weight)
         assert module.linear.quant_method is original_quant_method
+        assert module.linear.weight_scale.data_ptr() == original_scale_ptr
+        assert module.linear.weight_scale_2.data_ptr() == original_scale_2_ptr
+        assert module.linear.alpha.data_ptr() == original_alpha_ptr
+        assert module.linear.weight_scale_2.item() == 1.0
+        assert module.linear.alpha.item() == 2.0
 
         cache.bind_merged()
         assert module.linear.weight.data_ptr() == merged_weight_ptr

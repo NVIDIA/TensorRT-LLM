@@ -826,8 +826,9 @@ class _PersistentLoRAWeightCache:
     Stage 2 distilled LoRA.
     It removes per-request merge/unmerge math by rebinding parameter storage to
     precomputed resident tensors.  FP8 and FP4 keep exact original quantized
-    state.  FP4's merged state is BF16 and swaps the parent Linear to
-    UnquantizedLinearMethod, matching the existing per-request Stage 2 path.
+    state. By default, FP4's merged state is BF16 and swaps the parent Linear
+    to UnquantizedLinearMethod. Callers may instead requantize the merged FP4
+    weights and keep the original quantized Linear method.
     """
 
     def __init__(
@@ -859,7 +860,11 @@ class _PersistentLoRAWeightCache:
         cls,
         module: torch.nn.Module,
         deltas: Dict[str, torch.Tensor],
+        *,
+        requantize_fp4: bool = False,
+        lora_compute_dtype: Optional[torch.dtype] = None,
     ) -> "_PersistentLoRAWeightCache":
+        """Prepare resident original/merged weights, optionally retaining FP4 inference."""
         state, module_dict = cls._module_state(module)
         entries: List[_PersistentLoRAParamState] = []
 
@@ -893,6 +898,8 @@ class _PersistentLoRAWeightCache:
                         ws_param.data,
                         packed=is_packed,
                     )
+                    if lora_compute_dtype is not None:
+                        bf16 = bf16.to(lora_compute_dtype)
                     bf16.add_(delta.to(bf16.device, bf16.dtype))
                     qw, new_scale = _requantize_fp8_weight(
                         bf16,
@@ -963,28 +970,38 @@ class _PersistentLoRAWeightCache:
                         f"Linear module at '{base}'."
                     )
 
+                scale_params = {scale_key: ws_param, scale2_key: ws2_param}
+                original_scales = {key: value.data for key, value in scale_params.items()}
+                merged_scales = dict(original_scales)
+                merged_weight = bf16
+                merged_quant_method = UnquantizedLinearMethod()
+                if requantize_fp4:
+                    merged_weight, merged_scale, merged_scale_2 = _requantize_fp4_weight(bf16)
+                    merged_scales[scale_key] = _scale_like(merged_scale, ws_param.data)
+                    merged_scales[scale2_key] = _scale_like(merged_scale_2, ws2_param.data)
+                    merged_quant_method = linear_mod.quant_method
+                    alpha_key = f"{base}.alpha"
+                    if alpha_key in state:
+                        alpha_param = state[alpha_key]
+                        scale_params[alpha_key] = alpha_param
+                        original_scales[alpha_key] = alpha_param.data
+                        merged_scales[alpha_key] = _scale_like(
+                            alpha_param.data * merged_scale_2 / ws2_param.data, alpha_param.data
+                        )
+
                 entries.append(
                     _PersistentLoRAParamState(
                         param_name=param_name,
                         precision="fp4",
                         weight_param=param,
                         original_weight=param.data,
-                        merged_weight=bf16,
-                        scale_params={
-                            scale_key: ws_param,
-                            scale2_key: ws2_param,
-                        },
-                        original_scales={
-                            scale_key: ws_param.data,
-                            scale2_key: ws2_param.data,
-                        },
-                        merged_scales={
-                            scale_key: ws_param.data,
-                            scale2_key: ws2_param.data,
-                        },
+                        merged_weight=merged_weight,
+                        scale_params=scale_params,
+                        original_scales=original_scales,
+                        merged_scales=merged_scales,
                         linear_module=linear_mod,
                         original_quant_method=linear_mod.quant_method,
-                        merged_quant_method=UnquantizedLinearMethod(),
+                        merged_quant_method=merged_quant_method,
                     )
                 )
                 continue

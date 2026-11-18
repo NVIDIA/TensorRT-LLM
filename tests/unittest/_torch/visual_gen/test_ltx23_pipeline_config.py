@@ -15,6 +15,9 @@ from tensorrt_llm._torch.visual_gen import models  # noqa: F401
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23 import LTX23Pipeline
 from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23_retake import LTX23RetakePipeline
+from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23_two_stages import (
+    LTX23TwoStagesPipeline,
+)
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
@@ -120,6 +123,42 @@ def test_ltx23_config_requires_cfg_size_one(
             with pytest.raises(NotImplementedError, match=r"requires parallel\.cfg_size=1"):
                 pipeline_class(config)
             initialize.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_cuda_graph", [False, True])
+def test_ltx23_cache_dit_requires_cuda_graph_disabled(
+    ltx23_checkpoint: str, enable_cuda_graph: bool
+) -> None:
+    """Reject full-transformer graph replay before initializing a Cache-DiT pipeline."""
+    args = VisualGenArgs(
+        model=ltx23_checkpoint,
+        cache_config={"cache_backend": "cache_dit"},
+        cuda_graph_config={"enable": enable_cuda_graph},
+    )
+    config = DiffusionPipelineConfig.from_pretrained(ltx23_checkpoint, args=args, device="cpu")
+    with patch.object(BasePipeline, "__init__", return_value=None) as initialize:
+        if enable_cuda_graph:
+            with pytest.raises(
+                NotImplementedError, match="requires cuda_graph_config.enable=False"
+            ):
+                LTX23Pipeline(config)
+            initialize.assert_not_called()
+        else:
+            LTX23Pipeline(config)
+            initialize.assert_called_once_with(config)
+
+
+@pytest.mark.parametrize("quant_algo", [None, "FP8_BLOCK_SCALES", "NVFP4"])
+def test_ltx23_two_stage_accepts_weight_quantization(ltx23_checkpoint: str, quant_algo) -> None:
+    """Supported weight quantization keeps BF16 activations and the two-stage class."""
+    args = VisualGenArgs(
+        model=ltx23_checkpoint,
+        quant_config={"quant_algo": quant_algo, "dynamic": True},
+    )
+    config = DiffusionPipelineConfig.from_pretrained(ltx23_checkpoint, args=args, device="cpu")
+    with patch.object(BasePipeline, "__init__", return_value=None) as initialize:
+        LTX23TwoStagesPipeline(config)
+        initialize.assert_called_once_with(config)
 
 
 @pytest.mark.parametrize(
