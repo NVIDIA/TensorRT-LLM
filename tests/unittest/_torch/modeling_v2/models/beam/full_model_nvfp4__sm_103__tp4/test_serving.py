@@ -11,17 +11,8 @@ from tensorrt_llm.llmapi.reasoning_parser import BeamHarmonyTextParser, Reasonin
 
 pytestmark = pytest.mark.cpu_only
 
-#: The parser's registry key and the channel delimiters it consumes.
+#: The parser's registry key.
 PARSER_KEY = "beam_harmony_text"
-TAGS = (
-    "<|start|>",
-    "<|end|>",
-    "<|message|>",
-    "<|channel|>",
-    "<|constrain|>",
-    "<|return|>",
-    "<|call|>",
-)
 
 #: (reply text after the generation prefix, expected content, expected reasoning_content)
 REPLIES = {
@@ -62,6 +53,36 @@ REPLIES = {
         "a <| b and <|x|>",
         "",
     ),
+    "quoted_header_markers": (
+        '<|channel|>final<|message|>Split on "<|channel|>". The header is '
+        "<|start|>assistant; <|message|> starts the body; <|constrain|> labels its format."
+        "<|return|>ignored",
+        'Split on "<|channel|>". The header is '
+        "<|start|>assistant; <|message|> starts the body; <|constrain|> labels its format.",
+        "",
+    ),
+    "quoted_markers_in_analysis": (
+        "<|channel|>analysis<|message|>Explain <|channel|>final<|message|>, "
+        "<|start|>assistant and <|constrain|>json.<|end|><|start|>assistant"
+        "<|channel|>final<|message|>These are header markers.<|return|>",
+        "These are header markers.",
+        "Explain <|channel|>final<|message|>, <|start|>assistant and <|constrain|>json.",
+    ),
+    "partial_header_marker_at_eof": (
+        "<|channel|>final<|message|>Example: <|chan",
+        "Example: <|chan",
+        "",
+    ),
+    "partial_terminator_at_eof": (
+        "<|channel|>final<|message|>Example: <|ret",
+        "Example: <|ret",
+        "",
+    ),
+    "end_closes_body": (
+        "<|channel|>final<|message|>done<|end|>ignored",
+        "done",
+        "",
+    ),
     "tool_channel_ignored": (
         "<|channel|>commentary to=functions.f <|constrain|>json<|message|>{}<|call|>",
         "",
@@ -87,7 +108,6 @@ def test_whole_reply(name):
     text, content, reasoning = REPLIES[name]
     result = BeamHarmonyTextParser().parse(text)
     assert (result.content, result.reasoning_content) == (content, reasoning)
-    assert not any(tag in result.content or tag in result.reasoning_content for tag in TAGS)
 
 
 @pytest.mark.parametrize("name", sorted(REPLIES))
@@ -99,6 +119,14 @@ def test_every_fragmentation_agrees_with_the_whole_reply(name):
     for size in (2, 3, 5, 7, 11):
         pieces = [text[i : i + size] for i in range(0, len(text), size)]
         assert _stream(text, pieces) == (content, reasoning), size
+
+
+def test_body_holds_only_partial_terminators() -> None:
+    parser = BeamHarmonyTextParser()
+    assert parser.parse_delta("<|channel|>final<|message|><|chan").content == "<|chan"
+    assert parser.parse_delta("nel|><|ret").content == "nel|>"
+    assert parser.parse_delta("urn|>ignored").content == ""
+    assert parser.finish().content == ""
 
 
 def test_parse_is_self_contained_and_repeatable():

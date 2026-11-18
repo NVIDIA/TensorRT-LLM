@@ -1404,17 +1404,8 @@ _BEAM_CONSTRAIN, _BEAM_RETURN, _BEAM_CALL = ("<|constrain|>", "<|return|>",
                                              "<|call|>")
 _BEAM_TAGS = (_BEAM_START, _BEAM_END, _BEAM_MESSAGE, _BEAM_CHANNEL,
               _BEAM_CONSTRAIN, _BEAM_RETURN, _BEAM_CALL)
+_BEAM_BODY_TERMINATORS = (_BEAM_END, _BEAM_RETURN, _BEAM_CALL)
 _BEAM_ANALYSIS, _BEAM_FINAL = "analysis", "final"
-
-
-def _beam_held_tail(text: str) -> int:
-    """Length of the longest suffix of ``text`` that is a proper prefix of a
-    Beam channel delimiter."""
-    for n in range(min(len(text), max(len(t) for t in _BEAM_TAGS) - 1), 0, -1):
-        tail = text[-n:]
-        if any(t.startswith(tail) and t != tail for t in _BEAM_TAGS):
-            return n
-    return 0
 
 
 @register_reasoning_parser("beam_harmony_text")
@@ -1431,7 +1422,9 @@ class BeamHarmonyTextParser(BaseReasoningParser):
     Decoding with ``skip_special_tokens=False`` preserves this terminator so
     the parser can enter its completed state. Analysis bodies go to
     ``reasoning_content`` and final bodies to ``content``; every
-    header and terminator is dropped. A reply without channel headers is final
+    header and terminator is dropped. Inside a body, header markers are literal
+    text; only <|end|>, <|return|>, and <|call|> terminate the body.
+    A reply without channel headers is final
     text. Ordinary text before the first header is also final text. Parsing
     is incremental: a possible delimiter split across stream
     chunks is held back until it is resolved, and ``finish`` releases a held
@@ -1477,10 +1470,11 @@ class BeamHarmonyTextParser(BaseReasoningParser):
             if self._state == "done":
                 data = ""
                 break
-            hits = [(data.find(t), t) for t in _BEAM_TAGS if t in data]
+            markers = _BEAM_BODY_TERMINATORS if self._state == "body" else _BEAM_TAGS
+            hits = [(data.find(t), t) for t in markers if t in data]
             pos, tag = min(hits) if hits else (-1, None)
             if tag is None:
-                hold = _beam_held_tail(data)
+                hold = _trailing_partial_marker(data, *markers)
                 chunk = data[:len(data) - hold]
                 self._buffer = data[len(data) - hold:]
                 data = ""
@@ -1529,7 +1523,7 @@ class BeamHarmonyTextParser(BaseReasoningParser):
     def finish(self) -> ReasoningParserResult:
         held, self._buffer = self._buffer, ""
         out = ([], [])
-        if self._state == "body" and held and held not in _BEAM_TAGS:
+        if self._state == "body" and held:
             self._emit(held, out)
         elif (self._state == "header" and not self._saw_header
               and not self._header and held):
