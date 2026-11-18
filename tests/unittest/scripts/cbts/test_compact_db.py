@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
 import os
 import sqlite3
 import tempfile
@@ -628,3 +630,80 @@ class ProcessDiagnosticTest(unittest.TestCase):
                 ),
                 [("cmdline", "python3 worker.py")],
             )
+
+
+def test_early_source_inventory_is_canonical_and_deterministic(tmp_path: Path) -> None:
+    source = tmp_path / "tensorrt_llm"
+    source.mkdir()
+    (source / "model.py").write_text("def run(): pass\nclass Model:\n def forward(self): pass\n")
+    files, functions = pystart_report.enumerate_defs(str(source))
+    assert files == {"tensorrt_llm/model.py"}
+    assert functions == {
+        ("tensorrt_llm/model.py", "run"),
+        ("tensorrt_llm/model.py", "Model.forward"),
+    }
+    with sqlite3.connect(":memory:") as connection:
+        connection.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        pystart_report.write_source_inventory(connection, functions, "abc123", 12)
+        pystart_report.write_source_inventory(connection, functions, "abc123", 12)
+        metadata = dict(connection.execute("SELECT key, value FROM meta"))
+        rows = connection.execute(
+            "SELECT file, qualname FROM coverage_source ORDER BY file, qualname"
+        ).fetchall()
+        assert len(rows) == 2
+        assert metadata["coverage_source_revision"] == "abc123"
+        assert metadata["coverage_input_count"] == "12"
+        assert (
+            metadata["coverage_inventory_sha256"]
+            == hashlib.sha256(json.dumps(rows, separators=(",", ":")).encode()).hexdigest()
+        )
+    connection.close()
+
+
+@pytest.mark.parametrize("functions,revision", [(set(), "abc"), ({("tensorrt_llm/a.py", "f")}, "")])
+def test_early_source_inventory_rejects_missing_denominator_or_revision(
+    functions, revision
+) -> None:
+    with sqlite3.connect(":memory:") as connection:
+        with pytest.raises(ValueError):
+            pystart_report.write_source_inventory(connection, functions, revision, 1)
+    connection.close()
+
+
+def test_early_report_cli_persists_inventory_without_html(tmp_path: Path) -> None:
+    source = tmp_path / "tensorrt_llm"
+    source.mkdir()
+    (source / "a.py").write_text("def run(): pass\n")
+    leaf = tmp_path / ".cbtscov.leaf.sqlite"
+    write_leaf_database(
+        leaf,
+        stage="stage",
+        process_uid="process",
+        touches={"stage/test_one": {(str(source / "a.py"), "run")}},
+        outcomes={"stage/test_one": "passed"},
+    )
+    output = tmp_path / "aggregate.sqlite"
+    result = CliRunner().invoke(
+        pystart_report.main,
+        [
+            "--glob",
+            str(leaf),
+            "--out-sqlite",
+            str(output),
+            "--source-root",
+            str(source),
+            "--source-revision",
+            "abc123",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    validate_database(output)
+    with sqlite3.connect(output) as connection:
+        assert connection.execute("SELECT file, qualname FROM coverage_source").fetchall() == [
+            ("tensorrt_llm/a.py", "run")
+        ]
+        assert (
+            dict(connection.execute("SELECT key, value FROM meta"))["coverage_input_count"] == "1"
+        )
+    connection.close()
+    assert not (tmp_path / "cbts_report").exists()

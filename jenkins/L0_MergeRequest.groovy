@@ -2372,7 +2372,9 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
                             PYTHONPATH=${LLM_ROOT}/jenkins/scripts/cbts \
                             python3 -m cbts.command coverage collection pystart-report \
                                 --glob 'cov/.cbtscov.*.sqlite' \
-                                --out-sqlite cov/cbts_touchmap.sqlite
+                                --out-sqlite cov/cbts_touchmap.sqlite \
+                                --source-root ${LLM_ROOT} \
+                                --source-revision ${env.gitlabCommit}
                         """
                         sh "cd cov && tar czf cbts_pystart_report_${arch}.tar.gz cbts_touchmap.sqlite"
                         def primary = llmArtifactsPrimary()

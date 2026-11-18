@@ -82,11 +82,40 @@ def enumerate_defs(source_root: str) -> tuple[set[str], set[tuple[str, str]]]:
             if patterns and not any(fnmatchcase(rel, pattern) for pattern in patterns):
                 continue
             try:
-                tree = ast.parse(open(full, encoding="utf-8").read())
+                with open(full, encoding="utf-8") as source:
+                    tree = ast.parse(source.read())
             except (OSError, SyntaxError):
                 continue
             _collect_defs(tree, "", rel, funcs)
     return {f for f, _q in funcs}, funcs
+
+
+def write_source_inventory(
+    con: sqlite3.Connection, functions: set[tuple[str, str]], revision: str, input_count: int
+) -> None:
+    """Persist the source denominator alongside an early architecture DB.
+
+    The publisher compares inventories before computing rates on the union of
+    architecture touch rows. Per-architecture percentages are never averaged.
+    """
+    if not functions or not revision:
+        raise ValueError("coverage inventory requires nonempty definitions and a source revision")
+    rows = sorted(functions)
+    digest = hashlib.sha256(json.dumps(rows, separators=(",", ":")).encode()).hexdigest()
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS coverage_source ("
+        "file TEXT NOT NULL, qualname TEXT NOT NULL, PRIMARY KEY(file, qualname))"
+    )
+    con.execute("DELETE FROM coverage_source")
+    con.executemany("INSERT INTO coverage_source VALUES (?, ?)", rows)
+    con.executemany(
+        "INSERT OR REPLACE INTO meta VALUES (?, ?)",
+        [
+            ("coverage_source_revision", revision),
+            ("coverage_inventory_sha256", digest),
+            ("coverage_input_count", str(input_count)),
+        ],
+    )
 
 
 _CSS = (
@@ -234,8 +263,15 @@ def write_json(con: sqlite3.Connection, out_path: str) -> None:
     default=None,
     help="source tree; when given, compute file/function coverage rate",
 )
-def main(glob_pattern, out_sqlite, out_dir, out_json, source_root):
+@click.option(
+    "--source-revision",
+    default=None,
+    help="immutable source commit; persist source definitions in the output DB",
+)
+def main(glob_pattern, out_sqlite, out_dir, out_json, source_root, source_revision=None):
     """Merge compact CBTS coverage databases into a compact touch DB and reports."""
+    if source_revision and not source_root:
+        raise click.UsageError("--source-revision requires --source-root")
     # Merge into a SQLite DB (bounded memory): --out-sqlite directly, else a unique per-invocation temp file.
     keep = out_sqlite is not None
     if keep:
@@ -279,6 +315,8 @@ def main(glob_pattern, out_sqlite, out_dir, out_json, source_root):
     rate_line = ""
     if source_root:
         coverable_files, all_funcs = enumerate_defs(source_root)
+        if source_revision:
+            write_source_inventory(con, all_funcs, source_revision, n_data_files)
         touched_files = {
             r[0] for r in con.execute("SELECT DISTINCT file FROM touch_rows WHERE test != ''")
         } & coverable_files
