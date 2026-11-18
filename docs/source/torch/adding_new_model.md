@@ -143,7 +143,10 @@ the shared execution path. If the enabled encoders change the answer (for
 example, an audio encoder that supports only `dp`), override
 `get_supported_encoder_parallel_modes(model_config)`. The loader checks the
 declaration before constructing weights. See [multimodal encoder parallelism](../features/parallel-strategy.md#multimodal-encoders)
-for the configuration.
+for the configuration. A model with its own `forward` gets encoder DP only if
+it encodes through `_run_multimodal_encoder`, as the shared
+`prepare_multimodal_inputs` path does; otherwise every replica encodes the
+whole batch.
 
 `supports_mm_encoder_item_scheduling` describes the separate item scheduling
 contract. Shared encoder TP across attention-DP ranks requires it. Validate

@@ -2311,3 +2311,15 @@ def test_qwen_encoder_backend_declarations_preserve_fixed_hf_encoder() -> None:
             Qwen2VLModel,
             MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("distributes_items", [False, True])
+def test_qwen2vl_encoder_forward_fn_follows_encoder_data_parallelism(distributes_items: bool):
+    # Qwen2-VL, Qwen2.5-VL and EXAONE 4.5 share this entry. Encoder DP needs the shared one.
+    model = object.__new__(modeling_qwen2vl.Qwen2VLModelBase)
+    model.mm_encoder = SimpleNamespace(forward=MagicMock())
+    model.__dict__["encoder_parallel_layout"] = SimpleNamespace(distributes_items=distributes_items)
+
+    expected = model._run_multimodal_encoder if distributes_items else model.mm_encoder.forward
+    assert model._encoder_forward_fn == expected

@@ -256,7 +256,6 @@ def encode_multimodal_by_groups(
     contract lives in one place.
     """
     per_modality_embeds: Dict[str, torch.Tensor] = {}
-    per_modality_lengths: Dict[str, List[int]] = {}
     item_layouts = [mp.get_item_layout() for mp in multimodal_params]
     for group in mm_encoder_groups:
         group_params = []
@@ -278,33 +277,31 @@ def encode_multimodal_by_groups(
             total = sum(lengths[m])
             per_modality_embeds[m] = out[cursor : cursor + total]
             cursor += total
-        per_modality_lengths.update(lengths)
-    return _reorder_embeds_by_manifest(item_layouts, per_modality_embeds, per_modality_lengths)
+    return reorder_multimodal_embeddings_by_modality(
+        multimodal_params, tuple(per_modality_embeds), tuple(per_modality_embeds.values())
+    )
 
 
 def reorder_multimodal_embeddings_by_modality(
-    multimodal_params: List[MultimodalParams],
+    multimodal_params: Sequence[MultimodalParams],
     modalities: Tuple[str, ...],
     embeddings: Sequence[torch.Tensor],
 ) -> torch.Tensor:
-    """Reorder modality-grouped encoder outputs into request/prompt order."""
+    """Reorder modality-grouped encoder outputs into request/prompt order.
+
+    ``embeddings[i]`` holds the rows of every ``modalities[i]`` item, in
+    request order. This is the one prompt-order reorder: grouped encoding
+    (``encode_multimodal_by_groups``) ends with it too.
+    """
     if len(embeddings) != len(modalities):
         raise ValueError(
             f"Expected {len(modalities)} multimodal encoder outputs, got {len(embeddings)}."
         )
-    item_layouts = []
-    for param in multimodal_params:
-        item_metadata = param.item_metadata
-        if item_metadata is None or item_metadata.output_embedding_lengths is None:
-            # Encoder memory profiling intentionally omits request layout metadata.
-            return torch.cat(list(embeddings), dim=0)
-        item_layouts.append((item_metadata.item_refs, item_metadata.output_embedding_lengths))
-    per_modality_embeds = dict(zip(modalities, embeddings, strict=True))
-    per_modality_lengths = _lengths_by_modality(item_layouts, modalities)
+    item_layouts = [param.get_item_layout() for param in multimodal_params]
     return _reorder_embeds_by_manifest(
         item_layouts,
-        per_modality_embeds,
-        per_modality_lengths,
+        dict(zip(modalities, embeddings, strict=True)),
+        _lengths_by_modality(item_layouts, modalities),
     )
 
 

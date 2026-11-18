@@ -817,6 +817,22 @@ def test_reorder_modality_grouped_embeddings_restores_prompt_order():
 
 
 @pytest.mark.cpu_only
+def test_reorder_modality_grouped_embeddings_needs_output_lengths():
+    # Item refs without output lengths are an error, not a silent modality-order result.
+    params = [
+        MultimodalParams(
+            multimodal_data={
+                "image": {"pixel_values": torch.empty(1, 1)},
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata([("image", 0)]),
+            },
+        )
+    ]
+
+    with pytest.raises(ValueError, match="output embedding lengths"):
+        reorder_multimodal_embeddings_by_modality(params, ("image",), (torch.ones(2, 1),))
+
+
+@pytest.mark.cpu_only
 def test_cast_multimodal_encoder_dtype_keeps_meta_tensors_meta():
     module = torch.nn.Linear(4, 4, device="meta")
 
