@@ -2616,8 +2616,10 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             "moe_expert_parallel_size": 2,
             "max_batch_size": 16,
             "cache_transceiver_config": cache_transceiver_config,
+            # The SM103 modeling_v2 context target accepts the backend literal
+            # but honors no tactic.
             "moe_config": {
-                "tactic": "trtllm_gen"
+                "backend": "TRTLLM"
             },
             "kv_cache_config": kv_cache_config,
         }

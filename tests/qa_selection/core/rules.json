@@ -79,7 +79,8 @@
     {
       "decorator": "skip_no_sm120",
       "reason": "This test is for SM120",
-      "skip_when": {"sm": {"ne": 120}}
+      "note": "Covers the cards below the SM120 family only: every operator must hold, so an upper-bound skip is left to runtime pytest.",
+      "skip_when": {"sm": {"lt": 120}}
     },
     {
       "decorator": "skip_device_contain_gb200",
