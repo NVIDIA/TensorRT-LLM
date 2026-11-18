@@ -36,13 +36,17 @@ class PromptEmbeds:
         positions: ``[K]`` int64 CPU tensor of strictly increasing prompt
             positions.
         hidden_size: ``H``.
+        row_digests: ``K`` concatenated 32-byte SHA-256 digests, one per row,
+            over the identity version, dtype and row bytes. Block reuse keys
+            each embedding position by its row digest.
         digest: Hex SHA-256 over the identity version, dtype, shape, positions
-            and row bytes.
+            and row digests.
     """
 
     embeds: Optional[torch.Tensor]
     positions: torch.Tensor
     hidden_size: int
+    row_digests: bytes
     digest: str
 
     @property
@@ -69,20 +73,43 @@ class PromptEmbeds:
         lo, hi = self.chunk_rows(position, position + 1)
         return hi > lo
 
+    def row_digest(self, row: int) -> bytes:
+        """Return the 32-byte digest of row ``row``."""
+        return self.row_digests[row * _ROW_DIGEST_LEN : (row + 1) * _ROW_DIGEST_LEN]
+
     def identity_only(self) -> "PromptEmbeds":
         """Return a copy that keeps the identity but drops the row values."""
         return PromptEmbeds(
-            embeds=None, positions=self.positions, hidden_size=self.hidden_size, digest=self.digest
+            embeds=None,
+            positions=self.positions,
+            hidden_size=self.hidden_size,
+            row_digests=self.row_digests,
+            digest=self.digest,
         )
 
 
-def _digest(embeds: torch.Tensor, positions: torch.Tensor) -> str:
+_ROW_DIGEST_LEN = 32
+
+
+def _row_digests(embeds: torch.Tensor) -> bytes:
+    """Hash each row of an owned embedding snapshot."""
+    prefix = f"prompt_embeds.v{PROMPT_EMBEDS_IDENTITY_VERSION}|{embeds.dtype}|{embeds.shape[1]}|"
+    # Reinterpret as bytes so bfloat16 (no numpy dtype) hashes the same way.
+    rows = embeds.view(torch.uint8).numpy()
+    out = bytearray()
+    for row in rows:
+        h = hashlib.sha256(prefix.encode())
+        h.update(row.tobytes())
+        out += h.digest()
+    return bytes(out)
+
+
+def _digest(embeds: torch.Tensor, positions: torch.Tensor, row_digests: bytes) -> str:
     """Hash the canonical identity of an owned embedding snapshot."""
     h = hashlib.sha256()
     h.update(f"v{PROMPT_EMBEDS_IDENTITY_VERSION}|{embeds.dtype}|{tuple(embeds.shape)}|".encode())
     h.update(positions.numpy().tobytes())
-    # Reinterpret as bytes so bfloat16 (no numpy dtype) hashes the same way.
-    h.update(embeds.view(torch.uint8).numpy().tobytes())
+    h.update(row_digests)
     return h.hexdigest()
 
 
@@ -179,11 +206,13 @@ def build_prompt_embeds(
     embeds = prompt_embeds.detach().to("cpu", copy=True).contiguous()
     if not bool(torch.isfinite(embeds).all()):
         raise ValueError("prompt_embeds contains non-finite values")
+    row_digests = _row_digests(embeds)
     snapshot = PromptEmbeds(
         embeds=embeds,
         positions=positions.contiguous(),
         hidden_size=int(hidden_size),
-        digest=_digest(embeds, positions),
+        row_digests=row_digests,
+        digest=_digest(embeds, positions, row_digests),
     )
     return prompt_token_ids, snapshot
 
@@ -191,9 +220,10 @@ def build_prompt_embeds(
 def prompt_embeds_cache_salt(user_salt: Optional[str], digest: str) -> str:
     """Return the KV cache salt that scopes reuse to identical embeddings.
 
-    Requests with the same ids, embeddings and user salt share KV blocks; any
-    other request, including a plain-token request with the same placeholder
-    ids, never matches.
+    For KV cache managers that key blocks by token ids alone: requests with the
+    same ids, embeddings and user salt share KV blocks; any other request,
+    including a plain-token request with the same placeholder ids, never
+    matches.
     """
     h = hashlib.sha256()
     h.update(digest.encode())

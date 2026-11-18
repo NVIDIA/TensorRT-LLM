@@ -40,6 +40,7 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..bindings.BuildInfo import check_cuda_architecture_supported
+from ..inputs.prompt_embeds import prompt_embeds_cache_salt
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -405,6 +406,27 @@ class BaseWorker(GenerationExecutor):
                     self._lora_adapter_identities.setdefault(
                         adapter_id, identity)
 
+    def _effective_cache_salt(self,
+                              request: GenerationRequest) -> Optional[str]:
+        """Return the cache salt the KV cache manager scopes reuse with.
+
+        KVCacheManagerV2 keys each embedding position by its row digest, so
+        blocks before the first embedding row stay shared with plain prompts.
+        Other managers key blocks by token ids alone, so the embedding identity
+        joins the salt and the whole prompt is scoped to identical embeddings.
+        """
+        if request.prompt_embeds is None or self._kv_cache_keys_prompt_embeds():
+            return request.cache_salt
+        return prompt_embeds_cache_salt(request.cache_salt,
+                                        request.prompt_embeds.digest)
+
+    def _kv_cache_keys_prompt_embeds(self) -> bool:
+        """Return whether the KV cache manager keys blocks by embedding rows."""
+        from .._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+            KVCacheManagerV2
+        return isinstance(getattr(self.engine, "kv_cache_manager", None),
+                          KVCacheManagerV2)
+
     def _check_prompt_embeds(self, request: GenerationRequest) -> None:
         """Reject prompt embeddings this engine cannot place correctly."""
         prompt_embeds = request.prompt_embeds
@@ -450,12 +472,9 @@ class BaseWorker(GenerationExecutor):
                 "prompt_embeds positions exceed the prompt length.")
         if request.disaggregated_params is not None and (
                 request.disaggregated_params.request_type == "context_only"):
-            from .._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
-                KVCacheManagerV2
-
             # The V1 transceiver looks up transferred blocks without the
             # request salt that carries the embedding identity.
-            if not isinstance(self.engine.kv_cache_manager, KVCacheManagerV2):
+            if not self._kv_cache_keys_prompt_embeds():
                 raise RequestError(
                     "prompt_embeds with disaggregated serving requires "
                     "kv_cache_config.use_kv_cache_manager_v2=True.")
@@ -618,7 +637,7 @@ class BaseWorker(GenerationExecutor):
                 encoder_input_token_ids=request.encoder_input_token_ids,
                 type=request_type,
                 disagg_request_id=disagg_request_id,
-                cache_salt=request.cache_salt,
+                cache_salt=self._effective_cache_salt(request),
                 priority=request.priority)
             if request.multimodal_params is not None:
                 # Resolve worker-handoff handles before constructing the input envelope.
@@ -654,10 +673,7 @@ class BaseWorker(GenerationExecutor):
                     arrival_time=request.arrival_time,
                     watermarking=request.sampling_params.watermarking,
                     prompt_trimmed_prefix=trimmed_prefix,
-                    prompt_embeds=(request.prompt_embeds
-                                   if request.prompt_embeds is not None
-                                   and request.prompt_embeds.embeds is not None
-                                   else None),
+                    prompt_embeds=request.prompt_embeds,
                 ),
             )
 

@@ -171,6 +171,7 @@ from .sparse_offload_memory import (
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
     from .remote_donor import RemoteMemDonor
@@ -1565,6 +1566,25 @@ def _augment_tokens_with_mm_run_metadata(
             )
         )
 
+    return result
+
+
+def _augment_tokens_with_prompt_embeds(
+    result: list[TokenIdExt],
+    prompt_embeds: "PromptEmbeds",
+    chunk_start: int,
+    chunk_end: int,
+) -> list[TokenIdExt]:
+    """Replace prompt-embedding positions in ``result`` with their row digests.
+
+    ``result`` holds the keys of prompt positions ``[chunk_start, chunk_end)``.
+    Each row is keyed by its own digest, so a block matches only when every
+    embedding row in it is identical; the radix tree chains earlier blocks.
+    """
+    lo, hi = prompt_embeds.chunk_rows(chunk_start, chunk_end)
+    for row in range(lo, hi):
+        position = int(prompt_embeds.positions[row])
+        result[position - chunk_start] = prompt_embeds.row_digest(row)
     return result
 
 
@@ -8049,10 +8069,25 @@ class KVCacheManagerV2(BaseResourceManager):
         `tokens[start:end]` is materialized and returned. This avoids
         re-augmenting the full prompt on every chunk during chunked prefill.
 
+        Prompt-embedding positions (``req.py_prompt_embeds``) likewise become
+        their row digest, so blocks before the first embedding row stay shared
+        with plain-token prompts and later blocks match only identical rows.
+
         For text-only requests this is a no-op.
         """
         if end is None:
             end = len(tokens)
+        prompt_embeds = getattr(req, "py_prompt_embeds", None)
+        tokens = self._augment_multimodal_tokens(tokens, req, start, end)
+        if prompt_embeds is None:
+            return tokens
+        result = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+        return _augment_tokens_with_prompt_embeds(result, prompt_embeds, start, end)
+
+    def _augment_multimodal_tokens(
+        self, tokens: Sequence[int], req: LlmRequest, start: int, end: int
+    ) -> Sequence[TokenIdExt]:
+        """Return ``tokens[start:end]`` with multimodal regions keyed by content."""
         chunk_start = start
         chunk_end = end
         is_sliced = chunk_start != 0 or chunk_end != len(tokens)

@@ -136,7 +136,38 @@ def test_identity_only() -> None:
     ident = pe.identity_only()
     assert ident.embeds is None
     assert ident.digest == pe.digest
+    assert ident.row_digests == pe.row_digests
     assert torch.equal(ident.positions, pe.positions)
+
+
+def test_row_digests() -> None:
+    rows = _rows(3)
+    _, pe = build_prompt_embeds([1, 2, 3, 4], rows, [True, True, False, True])
+    assert len(pe.row_digests) == 3 * 32
+    # A row's key depends on its values and dtype only; the block chain
+    # carries its position.
+    _, same = build_prompt_embeds([9, 9], rows[1:])
+    assert same.row_digest(0) == pe.row_digest(1)
+    assert same.row_digest(1) == pe.row_digest(2)
+    assert len({pe.row_digest(i) for i in range(3)}) == 3
+    _, bf16 = build_prompt_embeds([9], rows[:1].to(torch.bfloat16))
+    assert bf16.row_digest(0) != pe.row_digest(0)
+
+
+@pytest.mark.parametrize("start, end", [(0, 6), (0, 3), (2, 5), (4, 6)])
+def test_block_reuse_keys(start: int, end: int) -> None:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+        _augment_tokens_with_prompt_embeds,
+    )
+
+    ids = [10, 11, 12, 13, 14, 15]
+    mask = [False, True, False, True, True, False]
+    _, pe = build_prompt_embeds(ids, _rows(3), mask)
+    keys = _augment_tokens_with_prompt_embeds(list(ids[start:end]), pe, start, end)
+    expected = []
+    for p in range(start, end):
+        expected.append(pe.row_digest(sum(mask[:p])) if mask[p] else ids[p])
+    assert keys == expected
 
 
 def test_pickle_round_trip() -> None:

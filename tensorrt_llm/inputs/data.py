@@ -99,8 +99,11 @@ class TokensPrompt(TypedDict):
     token embedding of one prompt position and must equal what the model's
     input embedding module would produce there, including any scaling it
     applies. The ids at those positions are placeholders: they still feed
-    repetition penalties, prompt logprobs and KV cache events. KV blocks are
-    shared only between requests with identical ids and rows. Supported on
+    repetition penalties, prompt logprobs and KV cache events. A KV block is
+    reused only by requests with identical ids and rows up to its end, so with
+    the V2 KV cache manager blocks before the first embedding row are shared
+    with plain-token prompts (other managers scope the whole prompt to
+    identical embeddings). Supported on
     decoder models whose ``prompt_embeds_unsupported_reason`` returns None, on
     the PyTorch backend, without speculative decoding, attention data parallelism or
     context parallelism. With disaggregated serving the

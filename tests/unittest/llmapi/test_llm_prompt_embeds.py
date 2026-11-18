@@ -9,6 +9,7 @@ output of the equivalent token prompt exactly, whichever positions carry them.
 import os
 import pickle
 import uuid
+from types import SimpleNamespace
 from typing import Iterator, List, Optional
 
 import pytest
@@ -17,6 +18,7 @@ from safetensors import safe_open
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import RequestError
+from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds, prompt_embeds_cache_salt
 from tensorrt_llm.llmapi import KvCacheConfig
@@ -100,19 +102,21 @@ def table(model_dir: str) -> torch.Tensor:
     return _embedding_table(model_dir)
 
 
-def test_request_salt_carries_identity() -> None:
-    # Direct executor callers get the same reuse scoping as LLM.generate.
+@pytest.mark.parametrize("keys_rows", [True, False], ids=["v2", "v1"])
+def test_worker_cache_salt(keys_rows: bool) -> None:
+    # Managers that key blocks by ids alone scope the whole prompt by salt.
     _, pe = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
-    _, other = build_prompt_embeds([1, 2, 3], torch.zeros(3, 4))
     params = SamplingParams(max_tokens=1)
+    worker = SimpleNamespace(_kv_cache_keys_prompt_embeds=lambda: keys_rows)
     plain = GenerationRequest([1, 2, 3], params, cache_salt="s")
-    a = GenerationRequest([1, 2, 3], params, cache_salt="s", prompt_embeds=pe)
-    b = GenerationRequest([1, 2, 3], params, cache_salt="s", prompt_embeds=other)
-    assert a.cache_salt == prompt_embeds_cache_salt("s", pe.digest)
-    assert len({plain.cache_salt, a.cache_salt, b.cache_salt}) == 3
-    restored = pickle.loads(pickle.dumps(a))
-    assert restored.cache_salt == a.cache_salt
+    embeds = GenerationRequest([1, 2, 3], params, cache_salt="s", prompt_embeds=pe)
+    assert embeds.cache_salt == "s"
+    assert BaseWorker._effective_cache_salt(worker, plain) == "s"
+    salt = BaseWorker._effective_cache_salt(worker, embeds)
+    assert salt == ("s" if keys_rows else prompt_embeds_cache_salt("s", pe.digest))
+    restored = pickle.loads(pickle.dumps(embeds))
     assert torch.equal(restored.prompt_embeds.embeds, pe.embeds)
+    assert restored.prompt_embeds.row_digests == pe.row_digests
 
 
 def test_whole_prompt_matches_tokens(llm: LLM, table: torch.Tensor) -> None:
@@ -188,6 +192,49 @@ def test_reuse_scoped_to_embeddings(llm: LLM, table: torch.Tensor) -> None:
     # The plain prompt still reuses its own blocks and is unaffected.
     plain = llm.generate([ids], _greedy(), cache_salt=salt)[0]
     assert list(plain.outputs[0].token_ids) == expected
+
+
+def test_reuse_shares_plain_prefix(llm: LLM, table: torch.Tensor) -> None:
+    # Blocks before the first embedding row are keyed by token ids alone, so
+    # they are shared with the plain prompt; later blocks still match only
+    # identical rows.
+    ids = _token_ids(llm, [LONG_PROMPT])[0]
+    salt = uuid.uuid4().hex
+    expected = _run(llm, [ids], salt)[0]
+    first_embed = len(ids) // 2
+    mask = [p >= first_embed for p in range(len(ids))]
+    request = {
+        "prompt_token_ids": [0 if m else t for t, m in zip(ids, mask)],
+        "prompt_embeds": table[torch.tensor(ids[first_embed:])],
+        "prompt_embeds_mask": mask,
+    }
+    shared = llm.generate([request], _greedy(), cache_salt=salt)[0]
+    assert list(shared.outputs[0].token_ids) == expected
+    assert 0 < shared.cached_tokens <= first_embed
+    again = llm.generate([request], _greedy(), cache_salt=salt)[0]
+    assert list(again.outputs[0].token_ids) == expected
+    assert again.cached_tokens > first_embed
+
+
+def test_v1_reuse_scoped_to_embeddings(model_dir: str, table: torch.Tensor) -> None:
+    # V1 keys blocks by ids alone; the embedding identity joins the salt.
+    with LLM(
+        model=model_dir,
+        kv_cache_config=KvCacheConfig(
+            free_gpu_memory_fraction=0.3, enable_block_reuse=True, use_kv_cache_manager_v2=False
+        ),
+        max_batch_size=4,
+    ) as v1:
+        ids = _token_ids(v1, [LONG_PROMPT])[0]
+        salt = uuid.uuid4().hex
+        expected = _run(v1, [ids], salt)[0]
+        request = {"prompt_token_ids": ids, "prompt_embeds": table[torch.tensor(ids)]}
+        first = v1.generate([request], _greedy(), cache_salt=salt)[0]
+        assert list(first.outputs[0].token_ids) == expected
+        assert first.cached_tokens == 0
+        second = v1.generate([request], _greedy(), cache_salt=salt)[0]
+        assert list(second.outputs[0].token_ids) == expected
+        assert second.cached_tokens > 0
 
 
 def test_reuse_with_embedding_final_token(llm: LLM, table: torch.Tensor) -> None:
