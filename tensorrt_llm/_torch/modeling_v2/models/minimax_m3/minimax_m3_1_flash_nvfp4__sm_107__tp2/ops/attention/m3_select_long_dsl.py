@@ -118,7 +118,7 @@ class M3SelectLongDsl(OpWrapper):
         trigger_phase: int = 0,
         fast_tail: bool = True,
     ) -> torch.Tensor:
-        from ...kernels.m3_select_long_dsl import select_long_dsl
+        from ....kernels.m3_select_long_dsl import select_long_dsl
 
         if scores.shape[1] > MAX_BLOCKS:
             raise RuntimeError(

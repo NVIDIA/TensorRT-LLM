@@ -3,12 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Vendored from vLLM (Apache-2.0):
 # https://github.com/vllm-project/vllm/blob/6f91edf96d3f3272945809c04702380053bff4de/vllm/models/minimax_m3/nvidia/ops/index_decode_score.py
-"""MiniMax-M3 index decode block scorer (CuTe DSL, Blackwell) with its pre-wait schedule: T2SC, this target's copy of
-the sm_107 TP2 / TP8 targets' scorer (``modeling.INDEX_SCORE_T2SC``). The sm_103-derived ``kernels/m3_index_score``
-stays the kill path.
+"""MiniMax-M3 index decode block scorer (CuTe DSL, Blackwell) with its pre-wait schedule: T2SC, the sm_107 tp2 and tp4
+targets' scorer (their ``modeling.INDEX_SCORE_T2SC``). The family ``kernels/m3_index_score`` stays their kill path.
 
 The kernel of ``tensorrt_llm/_torch/attention/kernels/blackwell/minimax_m3_index_decode_score.py`` (the same scores, bit
-for bit) with three schedule options this target compiles in:
+for bit) with the schedule options the targets compile in:
 
 * ``prefetch_old``: before the grid-dependency wait, the TMA warp L2-prefetches this CTA's index-K pages that hold only
   tokens older than this step (the producer ahead writes only this step's tokens), up to ``prefetch_depth`` blocks per
@@ -20,9 +19,13 @@ for bit) with three schedule options this target compiles in:
 * ``prestage_old`` (with ``early_issue``, ``modeling.INDEX_SCORE_T2SC_PRESTAGE_OLD``): when the CTA's first block holds
   only tokens older than this step (block < (seq_lens hint - decode query length) / 128), its K tile is TMA-loaded into
   its stage before the wait; Q (and a first block that is not all old) is still loaded after it.
+* ``qown`` (``IndexScoreRunner.QOWN``: the tp4 target's opt-in T2SC_QOWN switch; early schedule, FP8 index keys): Q
+  gets its own shared buffer and barrier, so the CTA's second block is TMA-issued right after the wait instead of after
+  Q has been consumed (``kernel_qown``). BF16 index keys keep the default kernel.
 
 Every kernel is compiled before the executor's warmup (``layers.prebuild_index_scorer_t2sc``) through
-``IndexScoreRunner`` and called through this target's ``m3_index_score_t2sc`` entry.
+``IndexScoreRunner`` and called through the target's ``m3_index_score_t2sc`` entry. ``IndexScoreRunner`` is the default
+runner (``QOWN`` off); a target that turns ``qown`` on subclasses it with its own ``kernel_cache``.
 """
 
 from pathlib import Path
@@ -30,7 +33,7 @@ from pathlib import Path
 import cutlass
 import torch
 from cuda.bindings.driver import CUstream
-from cutlass import Float8E4M3FN, Float16, Float32, Int32, Int64, Uint32, cute
+from cutlass import Float8E4M3FN, Float16, Float32, Int8, Int32, Int64, Uint32, cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import dsl_user_op
@@ -49,7 +52,7 @@ from tensorrt_llm._torch.kernels.blackwell.utils import (
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
-__all__ = ["IndexDecodeScoreKernel", "IndexScoreRunner"]
+__all__ = ["IndexDecodeScoreKernel", "IndexDecodeScoreKernelQown", "IndexScoreRunner"]
 
 
 @dsl_user_op
@@ -102,6 +105,7 @@ class IndexDecodeScoreKernel:
 
     BLOCK_K = 128  # capacity: fixed: the MSA block size of the checkpoint
     BAR_MMA = 1
+    QOWN_MIN_BLOCKS = 6  # capacity: fixed: kernel_qown launch bound: the deployed one-wave residency (6 CTAs / SM)
     num_stages = 2
 
     def __init__(
@@ -116,7 +120,14 @@ class IndexDecodeScoreKernel:
         prefetch_depth: int = 0,
         prestage_old: bool = False,
         early_trigger: bool = False,
+        qown: bool = False,
     ):
+        # qown (IndexScoreRunner.QOWN, the early schedule only): see the module docstring and kernel_qown, launched by
+        # IndexDecodeScoreKernelQown.
+        self.qown = qown
+        assert not self.qown or (early_issue and prestage_old), (
+            "qown needs the early, prestaged schedule"
+        )
         # prefetch_old: before the grid dependency wait, the TMA warp L2-prefetches this CTA's index-K pages that
         # hold only tokens older than this step (the predecessor writes only this step's tokens).
         self.prefetch_old = prefetch_old
@@ -133,7 +144,7 @@ class IndexDecodeScoreKernel:
         # tile is TMA-loaded into its stage BEFORE the grid dependency wait (the predecessor writes only this step's
         # tokens; the block table and the seq_lens hint are final before the grid starts). Q stays after the wait.
         self.prestage_old = prestage_old and early_issue
-        # early_trigger (on for this target): release the dependent selector right after this CTA's
+        # early_trigger (on for the targets): release the dependent selector right after this CTA's
         # setup, so its launch and residency overlap the scoring; it still waits for this whole grid.
         self.early_trigger = early_trigger
         self.dtype = dtype
@@ -577,6 +588,427 @@ class IndexDecodeScoreKernel:
                         cute.arch.mbarrier_wait(tma_full_mbar, 0)
                         cute.arch.mbarrier_wait(tma_full_mbar + 1 % num_stages, 0)
 
+    @cute.kernel
+    def kernel_qown(
+        self,
+        q_tma_atom: cute.CopyAtom,
+        q_tma_tensor: cute.Tensor,
+        k_tma_atom: cute.CopyAtom,
+        k_tma_tensor: cute.Tensor,
+        gK_cache: cute.Tensor,
+        block_table: cute.Tensor,
+        score: cute.Tensor,
+        seq_lens: cute.Tensor,
+        decode_query_len,
+    ):
+        """``qown`` (early issue + prestage, two K stages): Q has its own shared buffer and barrier, so the CTA's
+        second block (ring pass 1, stage 0) is TMA-issued right after the grid wait instead of after Q is consumed. Each
+        stage carries its block id in shared memory and a negative id ends the CTA's ring; the blocks are the deployed
+        ones (split_id + r * split_k), scored by the same per-block code. The kernel launches with the deployed
+        one-wave residency bound (QOWN_MIN_BLOCKS)."""
+        batch_id, split_id, _ = cute.arch.block_idx()
+        _, split_k, _ = cute.arch.grid_dim()
+        warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane_id = cute.arch.lane_idx()
+
+        NUM_HEADS = self.num_heads
+        MAX_DQL = self.max_decode_query_len
+        BLOCK_Q = NUM_HEADS * MAX_DQL
+        BLOCK_K = self.BLOCK_K
+        head_dim = self.head_dim
+        dtype = self.dtype
+        MMA_N = 8
+        Q_TILES = cute.ceil_div(BLOCK_Q, MMA_N)
+        EPI_Q = Q_TILES * MMA_N
+        KBYTES = BLOCK_K * head_dim * (dtype.width // 8)
+        QBYTES = BLOCK_Q * head_dim * (dtype.width // 8)
+
+        sq_layout = self._sq_layout()
+        sk_layout = self._sk_layout()
+
+        smem = SmemAllocator()
+        sK = smem.allocate_tensor(
+            dtype,
+            sk_layout.outer,
+            byte_alignment=1024,
+            swizzle=sk_layout.inner,
+        )[0, None, None, None]
+        sQ_own = smem.allocate_tensor(
+            dtype, sq_layout.outer, byte_alignment=1024, swizzle=sq_layout.inner
+        )
+        if cutlass.const_expr(EPI_Q > BLOCK_Q):
+            # the 8-row ldmatrix reads EPI_Q rows: pad the Q buffer to whole 8-row tiles
+            smem.allocate_array(Int8, (EPI_Q - BLOCK_Q) * head_dim * (dtype.width // 8))
+        sQ_tma = cute.make_tensor(sQ_own.iterator, layout=sq_layout.outer)
+        q_tma_elems = self._swizzle_elems()
+        sQ = cute.coalesce(
+            cute.group_modes(sQ_tma, 0, 2),
+            target_profile=(BLOCK_Q, (q_tma_elems, head_dim // q_tma_elems)),
+        )
+        epi_buffer = smem.allocate_tensor(Float32, cute.make_layout((EPI_Q, 4)))
+        stage_blk = smem.allocate_tensor(Int32, cute.make_layout(2))
+
+        tma_full_mbar = smem.allocate_array(Int64, 2)
+        tma_empty_mbar = smem.allocate_array(Int64, 2)
+        q_full_mbar = smem.allocate_array(Int64, 1)
+
+        if warp_id == 0:
+            with cute.arch.elect_one():
+                for i in cutlass.range_constexpr(2):
+                    cute.arch.mbarrier_init(tma_full_mbar + i, 1)
+                    cute.arch.mbarrier_init(tma_empty_mbar + i, 128)
+                cute.arch.mbarrier_init(q_full_mbar, 1)
+                cute.arch.mbarrier_init_fence()
+        elif warp_id == 1:
+            cpasync.prefetch_descriptor(q_tma_atom)
+            cpasync.prefetch_descriptor(k_tma_atom)
+        cute.arch.sync_threads()
+        if cutlass.const_expr(self.early_trigger):
+            griddepcontrol_launch_dependents()
+
+        # the deployed depth-1 pre-wait prefetch of the CTA's first (old) block
+        if warp_id == 4:
+            with cute.arch.elect_one():
+                seqlen0 = seq_lens[batch_id]
+                num_blocks0 = cute.ceil_div(seqlen0, BLOCK_K)
+                stable = (seqlen0 - decode_query_len) // BLOCK_K
+                if stable > num_blocks0:
+                    stable = num_blocks0
+                if stable > split_id + split_k:
+                    stable = split_id + split_k
+                for block_id in range(split_id, stable, split_k):
+                    page = block_table[batch_id, block_id]
+                    _l2_prefetch_bulk(
+                        gK_cache[page, None, None].iterator.toint().to(Int64),
+                        Int32(KBYTES),
+                    )
+
+        early_q = False
+        early_k = False
+        early_page = Int32(0)
+        if warp_id == 4:
+            seqlen_hint = seq_lens[batch_id]
+            hint_blocks = cute.ceil_div(seqlen_hint, BLOCK_K)
+            if hint_blocks > block_table.shape[1]:
+                hint_blocks = block_table.shape[1]
+            if split_id < hint_blocks:
+                early_q = True
+                early_page = block_table[batch_id, split_id]
+                if split_id < (seqlen_hint - decode_query_len) // BLOCK_K:
+                    early_k = True
+                    cute.arch.mbarrier_wait(tma_empty_mbar + 1, 1)
+                    with cute.arch.elect_one():
+                        stage_blk[1] = split_id
+                        cute.arch.mbarrier_arrive_and_expect_tx(tma_full_mbar + 1, KBYTES)
+                    simple_tma_copy(
+                        k_tma_atom,
+                        k_tma_tensor[early_page, None, None],
+                        sK[None, None, 1],
+                        tma_full_mbar + 1,
+                        cache_policy=EVICT_FIRST,
+                    )
+
+        griddepcontrol_wait()
+
+        if warp_id == 4:
+            if early_q:
+                gQ_early = cute.local_tile(
+                    cute.domain_offset((batch_id * decode_query_len, 0, 0), q_tma_tensor),
+                    tiler=(MAX_DQL, NUM_HEADS, head_dim),
+                    coord=(0, 0, 0),
+                )
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(q_full_mbar, QBYTES)
+                simple_tma_copy(q_tma_atom, gQ_early, sQ_tma, q_full_mbar)
+                if not early_k:
+                    cute.arch.mbarrier_wait(tma_empty_mbar + 1, 1)
+                    with cute.arch.elect_one():
+                        stage_blk[1] = split_id
+                        cute.arch.mbarrier_arrive_and_expect_tx(tma_full_mbar + 1, KBYTES)
+                    simple_tma_copy(
+                        k_tma_atom,
+                        k_tma_tensor[early_page, None, None],
+                        sK[None, None, 1],
+                        tma_full_mbar + 1,
+                        cache_policy=EVICT_FIRST,
+                    )
+
+        seqlen = seq_lens[batch_id]
+        num_blocks = cute.ceil_div(seqlen, BLOCK_K)
+
+        if split_id < num_blocks:
+            if warp_id == 4:
+                if not early_q:
+                    gQ_tile = cute.local_tile(
+                        cute.domain_offset((batch_id * decode_query_len, 0, 0), q_tma_tensor),
+                        tiler=(MAX_DQL, NUM_HEADS, head_dim),
+                        coord=(0, 0, 0),
+                    )
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(q_full_mbar, QBYTES)
+                    simple_tma_copy(q_tma_atom, gQ_tile, sQ_tma, q_full_mbar)
+                    page0 = block_table[batch_id, split_id]
+                    cute.arch.mbarrier_wait(tma_empty_mbar + 1, 1)
+                    with cute.arch.elect_one():
+                        stage_blk[1] = split_id
+                        cute.arch.mbarrier_arrive_and_expect_tx(tma_full_mbar + 1, KBYTES)
+                    simple_tma_copy(
+                        k_tma_atom,
+                        k_tma_tensor[page0, None, None],
+                        sK[None, None, 1],
+                        tma_full_mbar + 1,
+                        cache_policy=EVICT_FIRST,
+                    )
+                # ring pass 1 -> stage 0 (fresh), right away
+                b1 = split_id + split_k
+                if b1 < num_blocks:
+                    page1 = block_table[batch_id, b1]
+                    with cute.arch.elect_one():
+                        stage_blk[0] = b1
+                        cute.arch.mbarrier_arrive_and_expect_tx(tma_full_mbar, KBYTES)
+                    simple_tma_copy(
+                        k_tma_atom,
+                        k_tma_tensor[page1, None, None],
+                        sK[None, None, 0],
+                        tma_full_mbar,
+                        cache_policy=EVICT_FIRST,
+                    )
+                    # rounds >= 2 into the stage the MMA warps free next: 1, 0, 1, ...
+                    s = Int32(1)
+                    par1 = Int32(0)
+                    par0 = Int32(0)
+                    r = Int32(2)
+                    active = Int32(1)
+                    while active == 1:
+                        b = split_id + r * split_k
+                        par = par0
+                        if s == 1:
+                            par = par1
+                        cute.arch.mbarrier_wait(tma_empty_mbar + s, par)
+                        if b < num_blocks:
+                            pg = block_table[batch_id, b]
+                            with cute.arch.elect_one():
+                                stage_blk[s] = b
+                                cute.arch.mbarrier_arrive_and_expect_tx(tma_full_mbar + s, KBYTES)
+                            simple_tma_copy(
+                                k_tma_atom,
+                                k_tma_tensor[pg, None, None],
+                                sK[None, None, s],
+                                tma_full_mbar + s,
+                                cache_policy=EVICT_FIRST,
+                            )
+                        else:
+                            with cute.arch.elect_one():
+                                stage_blk[s] = Int32(-1)
+                                cute.arch.mbarrier_arrive(tma_full_mbar + s)
+                            active = Int32(0)
+                        if s == 1:
+                            par1 = par1 ^ 1
+                        else:
+                            par0 = par0 ^ 1
+                        s = 1 - s
+                        r = r + 1
+                else:
+                    with cute.arch.elect_one():
+                        stage_blk[0] = Int32(-1)
+                        cute.arch.mbarrier_arrive(tma_full_mbar)
+
+            else:
+                # MMA warps; each handles K[32, head_dim] @ Q[BLOCK_Q, head_dim].T
+                sK_warp = cute.local_tile(sK, (32, head_dim, 2), (warp_id, 0, 0))
+                q_start = seqlen - decode_query_len
+
+                elems = 128 // dtype.width  # 16B
+                MMA_K = 32 * 8 // dtype.width  # 32B
+
+                sK_ldsm = cute.zipped_divide(sK_warp, (16, cute.make_layout((elems, 2)), 1))
+                sQ_ldsm = cute.zipped_divide(sQ, (MMA_N, cute.make_layout((elems, 4))))
+                sK_ldsm = sK_ldsm[(lane_id % 16, (None, lane_id // 16), 0), None]
+                sQ_ldsm = sQ_ldsm[(lane_id % MMA_N, (None, lane_id // 8)), None]
+
+                ldsm_op = warp.LdMatrix8x8x16bOp(num_matrices=4)
+                ldsm_atom = cute.make_copy_atom(ldsm_op, dtype)
+
+                rQ = cute.make_rmem_tensor(
+                    ((elems // 2, 2), head_dim // (MMA_K * 2), Q_TILES), dtype
+                )
+                rK = cute.make_rmem_tensor((elems, 2, head_dim // MMA_K), dtype)
+                rC = cute.make_rmem_tensor((4, 2, Q_TILES), Float32)
+
+                if warp_id == 0:
+                    cute.arch.mbarrier_wait(q_full_mbar, 0)
+                cute.arch.barrier(barrier_id=self.BAR_MMA, number_of_threads=128)
+                for q in cutlass.range_constexpr(Q_TILES):
+                    cute.copy(ldsm_atom, sQ_ldsm[None, (q, None)], rQ[None, None, q])
+
+                if cutlass.const_expr(dtype is Float8E4M3FN):
+                    rQ_f16 = cute.make_rmem_tensor((4, head_dim // MMA_K, Q_TILES, 2), Float16)
+                    q_lower, q_upper = _fp8_to_f16_mma_fragments(rQ)
+                    rQ_f16[None, None, None, 0].store(q_lower.load())
+                    rQ_f16[None, None, None, 1].store(q_upper.load())
+
+                s = Int32(1)
+                par1 = Int32(0)
+                par0 = Int32(0)
+                active = Int32(1)
+                while active == 1:
+                    rC.fill(0.0)
+                    par = par0
+                    if s == 1:
+                        par = par1
+                    if warp_id == 0:
+                        cute.arch.mbarrier_wait(tma_full_mbar + s, par)
+                    cute.arch.barrier(barrier_id=self.BAR_MMA, number_of_threads=128)
+                    blk = stage_blk[s]
+                    if blk < 0:
+                        active = Int32(0)
+                    else:
+                        for k in cutlass.range_constexpr(head_dim // MMA_K):
+                            cute.copy(
+                                ldsm_atom,
+                                sK_ldsm[None, (None, k, s)],
+                                rK[None, None, k],
+                            )
+                            for m in cutlass.range_constexpr(2):
+                                if cutlass.const_expr(dtype is Float8E4M3FN):
+                                    rK_lower, rK_upper = _fp8_to_f16_mma_fragments(rK[None, m, k])
+                                    for n in cutlass.range_constexpr(Q_TILES):
+                                        rC[None, m, n] = mma_sync(
+                                            rK_lower,
+                                            rQ_f16[None, k, n, 0],
+                                            rC[None, m, n],
+                                        )
+                                        rC[None, m, n] = mma_sync(
+                                            rK_upper,
+                                            rQ_f16[None, k, n, 1],
+                                            rC[None, m, n],
+                                        )
+                                else:
+                                    for n in cutlass.range_constexpr(Q_TILES):
+                                        rC[None, m, n] = mma_sync(
+                                            rK[None, m, k],
+                                            rQ[(None, k % 2), k // 2, n],
+                                            rC[None, m, n],
+                                        )
+
+                        cute.arch.mbarrier_arrive(tma_empty_mbar + s)
+
+                        k_start = blk * BLOCK_K + warp_id * 32
+
+                        for q in cutlass.range_constexpr(Q_TILES):
+                            for i in cutlass.range_constexpr(4):
+                                for j in cutlass.range_constexpr(2):
+                                    col = q * 8 + (lane_id % 4) * 2 + j
+                                    q_local_pos = col % MAX_DQL
+                                    q_pos = q_start + q_local_pos
+                                    k_pos = k_start + i * 8 + lane_id // 4
+                                    rC[q * 8 + i * 2 + j] = (
+                                        rC[q * 8 + i * 2 + j] if q_pos >= k_pos else float("-inf")
+                                    )
+
+                        for q in cutlass.range_constexpr(Q_TILES):
+                            rScore = cute.make_rmem_tensor(2, Float32)
+                            rScore.fill(float("-inf"))
+                            for i in cutlass.range_constexpr(4):
+                                rScore[0] = cute.arch.fmax(rScore[0], rC[i * 2 + 0 + q * 8])
+                                rScore[1] = cute.arch.fmax(rScore[1], rC[i * 2 + 1 + q * 8])
+
+                            for i in cutlass.range_constexpr(3):
+                                offset = 4 << i
+                                other0 = cute.arch.shuffle_sync_bfly(
+                                    rScore[0], offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                other1 = cute.arch.shuffle_sync_bfly(
+                                    rScore[1], offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                rScore[0] = cute.arch.fmax(rScore[0], other0)
+                                rScore[1] = cute.arch.fmax(rScore[1], other1)
+
+                            if lane_id * 2 < MMA_N:
+                                epi_buffer[q * MMA_N + lane_id * 2 + 0, warp_id] = rScore[0]
+                                epi_buffer[q * MMA_N + lane_id * 2 + 1, warp_id] = rScore[1]
+                        cute.arch.barrier(barrier_id=self.BAR_MMA, number_of_threads=128)
+
+                        head_id = lane_id // MAX_DQL
+                        q_local_pos = lane_id - head_id * MAX_DQL
+                        valid_q = head_id < NUM_HEADS and q_local_pos < decode_query_len
+                        if lane_id < BLOCK_Q and valid_q:
+                            final_score = epi_buffer[lane_id, 0]
+                            for i in cutlass.range_constexpr(1, 4):
+                                final_score = cute.arch.fmax(final_score, epi_buffer[lane_id, i])
+
+                            t = batch_id * decode_query_len + q_local_pos
+                            score[head_id, t, blk] = final_score
+                    if s == 1:
+                        par1 = par1 ^ 1
+                    else:
+                        par0 = par0 ^ 1
+                    s = 1 - s
+        else:
+            if warp_id == 4:
+                if early_q:
+                    # Early tiles past the request's true length: let them land before the CTA exits.
+                    cute.arch.mbarrier_wait(q_full_mbar, 0)
+                    cute.arch.mbarrier_wait(tma_full_mbar + 1, 0)
+
+
+class IndexDecodeScoreKernelQown(IndexDecodeScoreKernel):
+    """``IndexDecodeScoreKernel`` with ``qown``: launches ``kernel_qown`` (the same call as the default kernel)."""
+
+    @cute.jit
+    def __call__(
+        self,
+        gQ: cute.Tensor,
+        gK_cache: cute.Tensor,
+        block_table: cute.Tensor,
+        score: cute.Tensor,
+        seq_lens: cute.Tensor,
+        stream: CUstream,
+    ):
+        num_heads = self.num_heads
+        head_dim = self.head_dim
+        MAX_DQL = self.max_decode_query_len
+        assert num_heads * MAX_DQL <= 32
+
+        batch = seq_lens.shape[0]
+        decode_query_len = gQ.shape[0] // batch
+        grid = (batch, self.split_k, 1)
+        block = (32 * 5, 1, 1)
+
+        tma_g2s = cpasync.CopyBulkTensorTileG2SOp()
+        elems = self._swizzle_elems()
+
+        q_tma_atom, q_tma_tensor = cpasync.make_tiled_tma_atom(
+            tma_g2s,
+            cute.logical_divide(gQ, (None, None, elems)),
+            self._sq_layout(),
+            (MAX_DQL, num_heads, head_dim),
+        )
+        k_tma_atom, k_tma_tensor = cpasync.make_tiled_tma_atom(
+            tma_g2s,
+            cute.logical_divide(gK_cache, (None, None, elems)),
+            self._sk_layout(),
+            (1, self.BLOCK_K, head_dim),
+        )
+
+        self.kernel_qown(
+            q_tma_atom,
+            q_tma_tensor,
+            k_tma_atom,
+            k_tma_tensor,
+            gK_cache,
+            block_table,
+            score,
+            seq_lens,
+            decode_query_len,
+        ).launch(
+            grid=grid,
+            block=block,
+            stream=stream,
+            min_blocks_per_mp=self.QOWN_MIN_BLOCKS,
+            use_pdl=TRTLLM_ENABLE_PDL,
+        )
+
 
 class IndexScoreRunner:
     """Compiled ``IndexDecodeScoreKernel`` variants, keyed by (index dtype, index heads, decode query length, head dim,
@@ -585,6 +1017,9 @@ class IndexScoreRunner:
     per CTA."""
 
     kernel_cache: dict = {}
+    #: Whether the early schedule of FP8 index keys compiles the qown kernel. A subclass that sets it also sets its own
+    #: ``kernel_cache``, whose keys do not carry it.
+    QOWN = False
     SUPPORTED_HEAD_DIM = 128  # capacity: fixed: the checkpoint's index head dim
     SUPPORTED_PAGE_SIZE = IndexDecodeScoreKernel.BLOCK_K
     # BLOCK_Q must fit one warp's worth of epilogue lanes.
@@ -623,13 +1058,26 @@ class IndexScoreRunner:
         split_k: int,
         early: bool,
     ) -> None:
-        from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import TORCH_TO_CUTE_DTYPE
-
         key = (q_dtype, num_heads, max_decode_query_len, head_dim, split_k, early)
         if key in cls.kernel_cache:
             return
+        # qown is built for FP8 index keys only (the deployed index cache; the BF16 build faults)
+        cls.kernel_cache[key] = cls.compile_schedule(
+            key, qown=cls.QOWN and early and q_dtype == torch.float8_e4m3fn
+        )
+
+    @classmethod
+    def compile_schedule(cls, key: tuple, *, qown: bool = False):
+        """The kernel of ``key`` with the qown schedule (the early one only) or the default, outside the cache (the
+        tests compare the schedules in one process)."""
+        from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import TORCH_TO_CUTE_DTYPE
+
+        q_dtype, num_heads, max_decode_query_len, head_dim, split_k, early = key
+        qown = qown and early
+        assert not qown or q_dtype == torch.float8_e4m3fn, "qown is built for FP8 index keys only"
         cute_dtype = TORCH_TO_CUTE_DTYPE[q_dtype]
         page_size = cls.SUPPORTED_PAGE_SIZE
+
         sym_total_tokens = cute.sym_int()
         sym_batch = cute.sym_int()
 
@@ -661,7 +1109,7 @@ class IndexScoreRunner:
             cutlass.Int32, (sym_batch,), stride_order=(0,)
         )
         fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = IndexDecodeScoreKernel(
+        kernel = (IndexDecodeScoreKernelQown if qown else IndexDecodeScoreKernel)(
             cute_dtype,
             num_heads,
             max_decode_query_len,
@@ -672,9 +1120,11 @@ class IndexScoreRunner:
             prefetch_depth=cls.EARLY_PREFETCH_DEPTH if early else 0,
             prestage_old=early,
             early_trigger=True,
+            qown=qown,
         )
-        cls.kernel_cache[key] = cute_aot.compile_or_load(
-            f"m3_index_score_t2sc {key}",
+        name = f"m3_index_score_t2sc {key}" + (" qown" if qown else "")
+        return cute_aot.compile_or_load(
+            name,
             lambda: cute.compile(
                 kernel,
                 q_fake,
@@ -693,6 +1143,6 @@ class IndexScoreRunner:
 def _aot_sources():
     """The ``sources`` of this module's shipped AOT objects: the Python files of the model family package (its
     targets and the family code they import) and of the shared Blackwell kernel helpers."""
-    family = Path(__file__).resolve().parents[2]
+    family = Path(__file__).resolve().parents[1]
     shared = cute_aot.BLACKWELL_DIR
     return cute_aot.py_files(str(family), str(shared))

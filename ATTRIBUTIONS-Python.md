@@ -64348,14 +64348,13 @@ Source files with NVIDIA modifications, in
 https://github.com/vllm-project/vllm at commit `6f91edf96d3f3272945809c04702380053bff4de`.
 Copyright contributors to the vLLM project. Each file and the upstream file it derives from:
 
+  - `kernels/m3_index_score_t2sc.py`: `vllm/models/minimax_m3/nvidia/ops/index_decode_score.py`
+  - `kernels/triton_sparse_decode.py`: `vllm/models/minimax_m3/common/ops/sparse_attn.py`
   - `minimax_m3_1_flash_nvfp4__sm_107__tp2/kernels/m3_index_score.py`: `vllm/models/minimax_m3/nvidia/ops/index_decode_score.py`
-  - `minimax_m3_1_flash_nvfp4__sm_107__tp2/kernels/m3_index_score_t2sc.py`: `vllm/models/minimax_m3/nvidia/ops/index_decode_score.py`
-  - `minimax_m3_1_flash_nvfp4__sm_107__tp2/kernels/triton_sparse_decode.py`: `vllm/models/minimax_m3/common/ops/sparse_attn.py`
   - `minimax_m3_1_flash_nvfp4__sm_107__tp2/ops/attention/m3_index_score.py`: `tests/kernels/attention/test_minimax_m3.py`
   - `minimax_m3_1_flash_nvfp4__sm_107__tp2/ops/attention/m3_index_score_t2sc.py`: `tests/kernels/attention/test_minimax_m3.py`
   - `minimax_m3_1_flash_nvfp4__sm_107__tp2/ops/gqamix_sparse_decode.py`: `vllm/models/minimax_m3/common/ops/sparse_attn.py`
   - `minimax_m3_1_flash_nvfp4__sm_107__tp8/kernels/m3_index_score.py`: `vllm/models/minimax_m3/nvidia/ops/index_decode_score.py`
-  - `minimax_m3_1_flash_nvfp4__sm_107__tp8/kernels/triton_sparse_decode.py`: `vllm/models/minimax_m3/common/ops/sparse_attn.py`
   - `minimax_m3_1_flash_nvfp4__sm_107__tp8/ops/attention/m3_index_score.py`: `tests/kernels/attention/test_minimax_m3.py`
   - `minimax_m3_1_flash_nvfp4__sm_107__tp8/ops/gqamix_sparse_decode.py`: `vllm/models/minimax_m3/common/ops/sparse_attn.py`
 

@@ -22,7 +22,7 @@ HEAD_DIM = 128
 def compiled_scorer(key: tuple):
     """The compiled kernel of ``key`` (dtype, heads, query length, head dim, split_k, early), compiling it on a miss
     (the target compiles every key it can take before warmup: ``layers.prebuild_index_scorer_t2sc``)."""
-    from ...kernels.m3_index_score_t2sc import IndexScoreRunner
+    from ....kernels.m3_index_score_t2sc import IndexScoreRunner
 
     if key not in IndexScoreRunner.kernel_cache:
         IndexScoreRunner._compile(*key)

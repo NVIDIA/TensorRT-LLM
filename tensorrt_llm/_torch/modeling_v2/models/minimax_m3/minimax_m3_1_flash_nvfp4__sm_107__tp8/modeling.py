@@ -2898,8 +2898,8 @@ class MiniMaxM3Tp8ModelingV2(DecoderModel):
         )
         if not self.mxfp8.quant_method.use_cutlass:
             raise ValueError("the MiniMax-M3 decode dispatch needs the CUTLASS MXFP8 GEMM")
+        from ..kernels import m3_select_long_dsl as _select_long_dsl_kernel
         from .kernels import m3_fullctx_decode as _fullctx_decode_kernel
-        from .kernels import m3_select_long_dsl as _select_long_dsl_kernel
         from .kernels import m3_tokmap_guard
 
         device = self.w["embed"].device
@@ -4481,7 +4481,7 @@ class DecodeTarget:
             if group > 1
             else max_score
         )
-        from .kernels import m3_select_long_dsl as _select_long_dsl_kernel
+        from ..kernels import m3_select_long_dsl as _select_long_dsl_kernel
 
         num_blocks = int(max_score_kv.shape[1])
         table = None

@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Top-16 block select for MiniMax-M3 decode rows of up to 9216 blocks, one row per 384-thread CTA (CuTe DSL).
 
-Bit for bit the selection of this target's ``m3_select_long`` (``torch.ops.trtllm.minimax_m3_sm107_tp4_select_long``,
-one 1024-thread CTA per row), from a CTA of 384 threads:
+Bit for bit the selection of the calling target's ``m3_select_long`` (one 1024-thread CTA per row), from a CTA of 384
+threads:
 
 * Every block's score is forced (the first ``init_blocks`` and the last ``local_blocks`` of the row's valid blocks) and
   mapped to an order key held in registers: thread t owns blocks t, t + 384, ... (4, 11 or 24 of them by the row's
@@ -21,8 +21,13 @@ The kernel waits on its grid dependency first; it releases the dependent sparse 
 (``early_trigger``), once every score of its row is loaded (trigger phase 1) or at its exit (phase 0). Kernels are
 compiled per (PDL launch, early trigger, trigger phase) with symbolic shapes and strides; ``prebuild`` compiles and
 loads them before the executor's warmup, so a decode step never compiles one.
+
+The module is traced per configuration (``kernel_module``): importing it gives the default configuration; a target
+that selects another one loads its own copy of this file with ``M3_CONFIG`` set, which has its own ``kernel_cache``.
 """
 
+import importlib.util
+import sys
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -38,7 +43,23 @@ from tensorrt_llm._torch.kernels.blackwell.utils import (
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import cute_aot
 
-SELECT_THREADS = 384
+# The configuration this copy is traced with (``kernel_module``); empty for the imported module.
+_CFG = globals().get("M3_CONFIG") or {}
+
+
+def _cfg(key: str, default):
+    return _CFG.get(key, default)
+
+
+# ``select_w512`` (the tp4 target's opt-in SELECT_W512 switch): 512 threads per row and finer keys-per-thread classes
+# (3, 5, 7, 10, 13, 18 keys), so a 600K-token row (4688 blocks) holds 10 keys per thread instead of 24. Block b is still
+# thread b % SELECT_THREADS, slot b // SELECT_THREADS, and the selection is the same, bit for bit (ties included).
+# ``select_k13`` (the tp4 target's opt-in SELECT_K13 switch; ``select_w512`` wins if both are set): the deployed 384
+# threads and classes plus a 13-key class for rows of 4225..4992 blocks (540K..639K tokens), which otherwise take the
+# 24-key class. Both default off.
+SELECT_W512 = bool(_cfg("select_w512", False))
+SELECT_K13 = bool(_cfg("select_k13", False)) and not SELECT_W512
+SELECT_THREADS = 512 if SELECT_W512 else 384
 SELECT_WARPS = SELECT_THREADS // 32
 # 1M tokens + draft tokens at 128 tokens per block.
 MAX_BLOCKS = 9216  # capacity: fixed: the kernel's built blocks per row
@@ -50,7 +71,13 @@ NEG_INF_KEY = 0x7F800000  # capacity: fixed: a key encoding, not a size
 INIT_SCORE = 1.0e30
 LOCAL_SCORE = 1.0e29
 # (keys per thread, rows up to this many valid blocks)
-ITEM_CLASSES = ((4, 4 * SELECT_THREADS), (11, 11 * SELECT_THREADS), (24, MAX_BLOCKS))
+if SELECT_W512:
+    ITEM_CLASSES = ((3, 1536), (5, 2560), (7, 3584), (10, 5120), (13, 6656), (18, MAX_BLOCKS))
+elif SELECT_K13:
+    ITEM_CLASSES = ((4, 1536), (11, 4224), (13, 4992), (24, MAX_BLOCKS))
+else:
+    ITEM_CLASSES = ((4, 4 * SELECT_THREADS), (11, 11 * SELECT_THREADS), (24, MAX_BLOCKS))
+assert ITEM_CLASSES[-1][1] == MAX_BLOCKS and all(k * SELECT_THREADS >= hi for k, hi in ITEM_CLASSES)
 
 # Shared memory of the phase, int32 words: candidates [MAX_CAND] int64 (key << 32 | block, so one signed compare
 # orders them by (key, block)), picked keys / blocks [TOPK] each, per-warp group minima [SELECT_WARPS][16], group
@@ -296,8 +323,11 @@ class _SelectLongDslKernel:
 # (MsaMetadata.msa_n_valid_blocks) is written only before the step's first layer, behind a plain launch
 # (attention/test_modeling_v2_m3_n_valid_contract.py).
 N_VALID_PREWAIT = True
-#: Compiled kernels by (PDL launch, early trigger, trigger phase, valid count read before the wait).
+#: Compiled kernels by (PDL launch, early trigger, trigger phase, valid count read before the wait), per module copy
+#: (one configuration each).
 kernel_cache: Dict[Tuple[bool, bool, int, bool], object] = {}
+#: The configuration in the compiled kernels' names: none for the default one, so its names are the plain keys.
+_NAME_SUFFIX = "".join(f" {k}={v!r}" for k, v in sorted(_CFG.items()))
 
 
 def kernel_key(
@@ -326,7 +356,7 @@ def _compile(key: Tuple[bool, bool, int, bool]):
             cutlass.Int32, (rows, heads, TOPK), stride=(cute.sym_int64(), cute.sym_int64(), 1)
         )
         kernel_cache[key] = cute_aot.compile_or_load(
-            f"m3_select_long_dsl {key}",
+            f"m3_select_long_dsl {key}" + _NAME_SUFFIX,
             lambda: cute.compile(
                 _SelectLongDslKernel(*key),
                 scores,
@@ -377,6 +407,33 @@ def prebuild(keys, device) -> list:
 def _aot_sources():
     """The ``sources`` of this module's shipped AOT objects: the Python files of the model family package (its
     targets and the family code they import) and of the shared Blackwell kernel helpers."""
-    family = Path(__file__).resolve().parents[2]
+    family = Path(__file__).resolve().parents[1]
     shared = cute_aot.BLACKWELL_DIR
     return cute_aot.py_files(str(family), str(shared))
+
+
+#: Module copies by configuration (``kernel_module``), each traced with its own ``M3_CONFIG``.
+_modules: Dict[Tuple[Tuple[str, bool], ...], object] = {}
+
+
+def kernel_module(*, select_w512: bool, select_k13: bool):
+    """This module traced with a target's configuration: the imported module for the default one (both off), else a
+    copy of this file loaded with ``M3_CONFIG``, once per configuration (its own constants and ``kernel_cache``)."""
+    config = {}
+    if select_w512:
+        config["select_w512"] = True
+    if select_k13:
+        config["select_k13"] = True
+    if not config:
+        return sys.modules[__name__]
+    key = tuple(sorted(config.items()))
+    mod = _modules.get(key)
+    if mod is None:
+        name = f"{__name__}_cfg_" + "_".join(k for k, _ in key)
+        spec = importlib.util.spec_from_file_location(name, __file__)
+        mod = importlib.util.module_from_spec(spec)
+        mod.M3_CONFIG = dict(config)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        _modules[key] = mod
+    return mod

@@ -175,7 +175,9 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .. import cute_aot, m31_capture_fork, m31_decode_fsel, runtime_hooks_compat
 from ..kernels import m3_index_score as _index_score_kernel
+from ..kernels import m3_index_score_t2sc as _index_score_t2sc_kernel
 from ..kernels import m3_nnt_fold, m3_spec_tail
+from ..kernels import m3_select_long_dsl as _select_long_dsl_kernel
 from ..kernels import msa_kv_update as _msa_kv_update_kernel
 from ..kernels.m3ll import die_local as _die_local
 from ..kernels.m3ll import tp4_moe_engine as _wc_moe_engine
@@ -229,9 +231,7 @@ from .kernels import m3_draft_lowm as _draft_lowm_kernel
 from .kernels import m3_draft_step as m3_draft_step_kernel
 from .kernels import m3_drafter_attn as _drafter_attn_kernel
 from .kernels import m3_fullctx_decode as _fullctx_decode_kernel
-from .kernels import m3_index_score_t2sc as _index_score_t2sc_kernel
 from .kernels import m3_sampled_accept as m3_sampled_accept_kernel
-from .kernels import m3_select_long_dsl as _select_long_dsl_kernel
 from .kernels import m3_shard_accept as m3_shard_accept_kernel
 from .kernels import m3_target_head as m3_target_head_kernel
 from .kernels import m3_tokmap_guard as _tokmap_guard
