@@ -418,17 +418,24 @@ FUSED_HIDDEN = 2560  # a multiple of 512, not of 1024: the 512-element pipeline 
 FUSED_SHARD = 5000
 
 
-@torch.inference_mode()
 def _fused_draft_head_check(rank, tp):
+    from unittest import mock
+
+    from tensorrt_llm._torch.modules import bf16_draft_head
+
+    # The test shard is far below the production minimum; restored however the check ends (the
+    # pooled MPI worker runs later tasks).
+    with mock.patch.object(bf16_draft_head, "MIN_SHARD_BYTES", 0):
+        _fused_draft_head_body(rank, tp)
+
+
+@torch.inference_mode()
+def _fused_draft_head_body(rank, tp):
     """The fused BF16 draft head (``trtllm::lm_head_argmax``) on a TP key-exchange channel shared
     with the GEMM + shard argmax path: the same greedy draft tokens as that path and as
     ``torch.argmax`` over the gathered logits (ties to the lowest global id), for 1..max rows,
     with d2t, a late rank, and under CUDA-graph replay; the fallbacks decline the head."""
     from tensorrt_llm._torch.distributed.ll_exchange import TPKeyExchange
-    from tensorrt_llm._torch.modules import bf16_draft_head
-
-    # The test shard is far below the production minimum.
-    bf16_draft_head.MIN_SHARD_BYTES = 0
 
     class _Worker(SpecWorkerBase):
         verifies_on_target_shard = True
