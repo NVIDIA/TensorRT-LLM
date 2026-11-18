@@ -11,7 +11,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 def test_pinned_flashinfer_is_verified_for_draft_front() -> None:
-    repo_root = Path(__file__).resolve().parents[6]
+    repo_root = Path(__file__).resolve().parents[7]
     match = re.search(
         r"(?m)^flashinfer-python==([^\s;#]+)", (repo_root / "requirements.txt").read_text()
     )

@@ -220,7 +220,7 @@ the gated version. Otherwise, flag it to the user.
 For `VERIFIED_FLASHINFER_VERSIONS`, a newer version is not automatically compatible.
 Before extending the list, re-check FlashInfer's CuTe RMSNorm path for bit-exact
 compatibility or re-run the draft-front bit-exactness check in
-`tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/test_draft_front.py` on SM103.
+`tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/test_draft_front.py` on SM103.
 The CPU test `test_draft_front_flashinfer_version.py` checks that the dependency pin
 is listed; it does not establish numerical compatibility.
 
