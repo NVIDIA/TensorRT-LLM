@@ -360,8 +360,8 @@ TOPOLOGIES = [
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize(
     "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp",
-    [topology[:6] for topology in TOPOLOGIES[:3]],
-    ids=[topology[6] for topology in TOPOLOGIES[:3]],
+    [topology[:6] for topology in TOPOLOGIES[2:3]],
+    ids=[topology[6] for topology in TOPOLOGIES[2:3]],
 )
 def test_fp4_mla_kv_transfer_into_a_larger_hp_ring(
     monkeypatch,

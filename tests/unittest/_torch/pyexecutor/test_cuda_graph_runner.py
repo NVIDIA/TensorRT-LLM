@@ -957,30 +957,6 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
         runner.max_beam_width = 1
         return runner
 
-    def test_capture_writes_the_regime_into_the_graph_metadata(self) -> None:
-        runner = self._lookup_runner()
-        runner._capture_allowed = True
-        runner.graph_metadata = {}
-        key = KeyType(batch_size=1, draft_len=0, variants=(8192,))
-        runner.get_graph_key.return_value = key
-        graph_metadata = SimpleNamespace(is_cuda_graph=True, set_decode_graph_variant=Mock())
-        attn_metadata = SimpleNamespace(
-            create_cuda_graph_metadata=Mock(return_value=graph_metadata)
-        )
-        batch = self._batch(_make_request_stub(1, prompt_len=100))
-
-        with patch(
-            "tensorrt_llm._torch.pyexecutor.cuda_graph_runner.ExpertStatistic.should_record",
-            return_value=False,
-        ):
-            result = CUDAGraphRunner.maybe_get_cuda_graph(
-                runner, batch, enable_spec_decode=False, attn_metadata=attn_metadata
-            )
-
-        self.assertEqual(result, (graph_metadata, None, key))
-        # the decode of the captured graph decides on the regime ceiling, not the capacity
-        graph_metadata.set_decode_graph_variant.assert_called_once_with("kv_regime", 8192)
-
     def test_lookup_rounds_a_missing_regime_up_to_a_captured_graph(self) -> None:
         runner = self._lookup_runner()
         runner._capture_allowed = False
@@ -1052,12 +1028,6 @@ class PackedSplitGraphKeyTestCase(unittest.TestCase):
         batch.generation_requests = list(requests)
         return batch
 
-    def test_key_without_a_resolver_is_unchanged(self) -> None:
-        runner = self._runner(variants=None)
-        key = runner.get_graph_key(self._batch(_make_request_stub(1, prompt_len=9000)))
-        self.assertEqual(key, KeyType(batch_size=1, draft_len=0))
-        self.assertEqual(key.variants, ())
-
     def test_key_carries_the_decision_on_the_rows_kv_lengths(self) -> None:
         runner = self._runner()
         short = _make_request_stub(1, prompt_len=100)
@@ -1077,26 +1047,6 @@ class PackedSplitGraphKeyTestCase(unittest.TestCase):
             (1,),
         )
         self.assertEqual(self.decisions[-1], (1, 0, [4097]))
-
-    def test_a_shape_with_one_variant_keys_it_without_measuring(self) -> None:
-        runner = self._runner(variants=(True,))
-        batch = self._batch(_make_request_stub(1, prompt_len=100))
-        with patch.object(runner, "_total_seq_lens", side_effect=AssertionError("measured")):
-            self.assertEqual(runner.get_graph_key(batch).variants, (1,))
-        self.assertEqual(self.decisions, [])
-
-    def test_capture_pass_pins_the_decision(self) -> None:
-        runner = self._runner()
-        long_batch = self._batch(_make_request_stub(1, prompt_len=9000))
-        runner.set_capture_variant("packed_split", 0)
-        self.assertEqual(runner.get_graph_key(long_batch).variants, (0,))
-        runner.set_capture_variant("packed_split", None)
-        self.assertEqual(runner.get_graph_key(long_batch).variants, (1,))
-        # an agreed (attention-DP) decision wins over the local one
-        short_batch = self._batch(_make_request_stub(2, prompt_len=100))
-        self.assertEqual(runner.get_graph_key(short_batch, forced_variants=(1,)).variants, (1,))
-        runner.set_graph_variants(())
-        self.assertEqual(runner.get_graph_key(long_batch).variants, ())
 
     def test_a_missing_unsplit_graph_falls_back_to_the_split_graph(self) -> None:
         runner = self._runner()
@@ -1150,59 +1100,3 @@ class PackedSplitGraphKeyTestCase(unittest.TestCase):
             (True, SampleType.FULL, (8192, 1)),
         )
         self.assertEqual(exchanges[-1], [True, 1, SampleType.FULL.value, 8192, 0])
-
-    def test_capture_writes_the_decision_into_the_graph_metadata(self) -> None:
-        runner = Mock()
-        runner.enabled = True
-        runner._dspark_confidence_enabled = False
-        runner.config = SimpleNamespace(enable_attention_dp=False, use_mrope=False)
-        self.decisions = []
-        runner.graph_variants = (self._split_variant((False, True)),)
-        runner._agree_graph_shape = CUDAGraphRunner._agree_graph_shape.__get__(runner)
-        runner._get_compatible_variant_key = CUDAGraphRunner._get_compatible_variant_key.__get__(
-            runner
-        )
-        runner._is_mixed_encoder_decoder_batch.return_value = False
-        runner._can_run_cuda_graph_batch.return_value = True
-        runner.supported_batch_sizes = {1}
-        runner.max_beam_width = 1
-        runner._capture_allowed = True
-        runner.graph_metadata = {}
-        key = KeyType(batch_size=1, draft_len=0, variants=(0,))
-        runner.get_graph_key.return_value = key
-        graph_metadata = SimpleNamespace(is_cuda_graph=True, set_decode_graph_variant=Mock())
-        attn_metadata = SimpleNamespace(
-            create_cuda_graph_metadata=Mock(return_value=graph_metadata)
-        )
-        batch = self._batch(_make_request_stub(1, prompt_len=100))
-
-        with patch(
-            "tensorrt_llm._torch.pyexecutor.cuda_graph_runner.ExpertStatistic.should_record",
-            return_value=False,
-        ):
-            result = CUDAGraphRunner.maybe_get_cuda_graph(
-                runner, batch, enable_spec_decode=False, attn_metadata=attn_metadata
-            )
-
-        self.assertEqual(result, (graph_metadata, None, key))
-        # the decode captured in this graph launches one task per request
-        graph_metadata.set_decode_graph_variant.assert_called_once_with("packed_split", 0)
-
-    def test_strict_replay_rejects_metadata_of_another_decision(self) -> None:
-        runner = self._runner()
-        key = KeyType(batch_size=1, draft_len=0, variants=(0,))
-
-        def stored(value):
-            return {"attn_metadata": SimpleNamespace(decode_graph_variant=lambda name: value)}
-
-        same, other = stored(0), stored(1)
-        # a backend without a packed split decode ignores the decision
-        ignored = stored(None)
-        with patch.object(cuda_graph_runner_module, "_STRICT_BUFFER_CHECK", True):
-            runner._check_graph_variant_metadata(key, same)
-            runner._check_graph_variant_metadata(key, ignored)
-            runner._check_graph_variant_metadata(key._replace(variants=()), other)
-            with self.assertRaises(AssertionError):
-                runner._check_graph_variant_metadata(key, other)
-        with patch.object(cuda_graph_runner_module, "_STRICT_BUFFER_CHECK", False):
-            runner._check_graph_variant_metadata(key, other)

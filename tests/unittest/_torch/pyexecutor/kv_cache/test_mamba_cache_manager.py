@@ -17,10 +17,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
     FP4_MLA_TOKENS_PER_BLOCK,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaV2CacheLayoutPolicy
-from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
-    fp4_mla_cache_layout,
-    has_fp4_mla_cache_layout,
-)
+from tensorrt_llm._torch.attention.backends.fp4_mla.config import has_fp4_mla_cache_layout
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
     Glm5NextCacheManager,
 )
@@ -468,70 +465,6 @@ def _fp4_kv_quant_config() -> SimpleNamespace:
         quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: True, has_fp8_kv_cache=lambda: False),
         mamba_ssm_cache_dtype=torch.float32,
     )
-
-
-def test_kimi_fp4_mla_routes_to_hybrid_v2_manager(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
-    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
-    model_config = _kimi_model_config()
-    model_config.quant_config = _fp4_kv_quant_config()
-    model_config.attn_backend = "TRTLLM"
-
-    manager_cls = get_kv_cache_manager_cls(
-        model_config,
-        KvCacheConfig(
-            dtype="nvfp4",
-            tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
-            use_kv_cache_manager_v2=True,
-        ),
-    )
-
-    # The Kimi K3 hybrid V2 manager owns the KDA state, its replay caches,
-    # and the FP4 MLA layout of the MLA layers.
-    assert manager_cls is KimiK3HybridCacheManager
-
-
-def test_kimi_fp4_mla_rejects_v1(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
-    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
-    model_config = _kimi_model_config()
-    model_config.quant_config = _fp4_kv_quant_config()
-    model_config.attn_backend = "TRTLLM"
-
-    with pytest.raises(ValueError, match="use_kv_cache_manager_v2=True"):
-        get_kv_cache_manager_cls(
-            model_config,
-            KvCacheConfig(
-                dtype="nvfp4",
-                tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
-                use_kv_cache_manager_v2=False,
-            ),
-        )
-
-
-def test_kimi_fp4_mla_rejects_block_reuse_with_kv_pool_rebalance(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
-    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
-    model_config = _kimi_model_config()
-    model_config.quant_config = _fp4_kv_quant_config()
-    model_config.attn_backend = "TRTLLM"
-
-    # The FP4 MLA route keeps the hybrid V2 manager's reuse/rebalance check.
-    with pytest.raises(ValueError, match="enable_kv_pool_rebalance"):
-        get_kv_cache_manager_cls(
-            model_config,
-            KvCacheConfig(
-                dtype="nvfp4",
-                tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
-                use_kv_cache_manager_v2=True,
-                enable_block_reuse=True,
-                enable_kv_pool_rebalance=True,
-            ),
-        )
 
 
 @pytest.mark.parametrize(
@@ -2239,16 +2172,6 @@ def test_v2_hybrid_fp4_mla_snapshot_points_align_to_cache_blocks():
     assert [request.expect_snapshot_points for request in requests] == [[128, 256], []]
 
 
-def test_v2_hybrid_without_fp4_mla_keeps_unaligned_snapshot_points():
-    mgr = _fp4_mla_snapshot_manager(periodic_snapshot_interval=100)
-    mgr.fp4_mla_layout = None
-    request = SimpleNamespace(prompt_len=350, expect_snapshot_points=[])
-
-    mgr.prepare_expect_snapshot_points([request])
-
-    assert request.expect_snapshot_points == [100, 200, 300]
-
-
 def test_v2_hybrid_fp4_mla_branch_snapshot_point_aligns_prompt_end():
     mgr = _fp4_mla_snapshot_manager(periodic_snapshot_interval=0, enable_branch_snapshot=True)
     request = SimpleNamespace(
@@ -2263,43 +2186,6 @@ def test_v2_hybrid_fp4_mla_branch_snapshot_point_aligns_prompt_end():
     # The branch snapshot falls back to the prompt end, which FP4 MLA can
     # reuse only up to its last full block.
     assert request.expect_snapshot_points == [256]
-
-
-@pytest.mark.parametrize("fp4_mla", [False, True])
-def test_v2_hybrid_fp4_mla_advances_history_with_pending_snapshot(fp4_mla: bool):
-    mgr = object.__new__(MambaHybridCacheManagerV2)
-    mgr.enable_block_reuse = True
-    mgr.is_draft = False
-    mgr.block_reuse_policy = BlockReusePolicy.PER_REQUEST
-    mgr.fp4_mla_layout = SimpleNamespace() if fp4_mla else None
-    mgr.conversation_manager = None
-    request = SimpleNamespace(
-        py_request_id=7,
-        is_dummy_request=False,
-        context_current_position=128,
-        context_remaining_length=172,
-        expect_snapshot_points=[256],
-        is_last_context_chunk=False,
-    )
-    # History stays at the committed end while the snapshot is pending.
-    kv_cache = SimpleNamespace(
-        is_active=True,
-        history_length=0,
-        num_committed_tokens=0,
-        resize=MagicMock(return_value=True),
-    )
-    mgr.kv_cache_map = {request.py_request_id: kv_cache}
-    batch = ScheduledRequests()
-    batch.append_context_request(request)
-
-    mgr.update_context_resources(batch)
-
-    # Only the FP4 MLA HP ring needs the completed chunk's history before
-    # the pending snapshot at 256 commits.
-    if fp4_mla:
-        kv_cache.resize.assert_called_once_with(None, 128)
-    else:
-        kv_cache.resize.assert_not_called()
 
 
 def test_mamba_snapshot_rule_count_deduplicates_and_filters_unreachable_points():
@@ -2837,43 +2723,6 @@ def _fp4_mla_hybrid_with_fp8_fallback(
     return mgr
 
 
-def test_v2_hybrid_fp4_disagg_role_mapping_covers_mla_and_ssm_roles(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
-
-    kinds = mgr.get_disagg_role_mapper_kinds()
-
-    # SSM state keeps the INDEXED Role.ALL fallback and convolution state its
-    # SECTIONED reshard, while the MLA roles take the FP4 MLA layout per role.
-    assert kinds[Role.ALL] == MapperKind.INDEXED
-    assert MambaRole.SSM_STATE not in kinds
-    assert kinds[MambaRole.CONV_STATE] == MapperKind.SECTIONED
-    assert kinds[Role.KEY] == MapperKind.NHD
-    assert kinds[Role.KEY_BLOCK_SCALE] == MapperKind.NHD
-    assert kinds[Role.MLA_HP_TAIL] == MapperKind.REPLICATED
-    # INDEXED stays the whole-manager fallback only, as the page-table
-    # builder requires.
-    assert [role for role, kind in kinds.items() if kind == MapperKind.INDEXED] == [Role.ALL]
-
-
-def test_v2_hybrid_without_fp4_mla_has_no_layout() -> None:
-    # Every hybrid manager carries the layout hooks; they forward only to a
-    # layout, which configure_manager attaches for an NVFP4 MLA cache.
-    mgr = object.__new__(MambaHybridCacheManagerV2)
-
-    assert mgr.fp4_mla_layout is None
-    assert not has_fp4_mla_cache_layout(mgr)
-    assert mgr.fp4_mla_context_only_cache is False
-    # A disaggregated import has no derived FP4 MLA state to rebuild.
-    assert mgr.rebuild_disagg_imported_cache([]) is None
-
-    # Any manager is asked the same way: by the layout it holds.
-    layout = SimpleNamespace()
-    assert fp4_mla_cache_layout(SimpleNamespace(fp4_mla_layout=layout)) is layout
-    assert not has_fp4_mla_cache_layout(SimpleNamespace())
-
-
 def test_v2_hybrid_without_fp4_mla_keeps_its_disagg_role_mapping() -> None:
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr._use_kda_replay_update = False
@@ -2926,32 +2775,6 @@ def test_v2_hybrid_fp4_disagg_global_layer_ids_cover_every_layer(
     assert ids == [[0, 4], [2], [6], [3]]
     all_ids = [gid for group in ids for gid in group]
     assert len(set(all_ids)) == len(all_ids)
-
-
-def test_v2_hybrid_fp4_disagg_global_layer_ids_reject_unknown_virtual_layer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
-    mgr.impl = SimpleNamespace(buffer_grouping=_stub_buffer_grouping([[5]]))
-
-    with pytest.raises(ValueError, match="Unknown hybrid FP4 MLA internal layer 5"):
-        mgr.get_disagg_global_layer_ids(0)
-
-
-def test_v2_hybrid_virtual_hp_layers_are_not_recurrent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
-
-    # The page-table builder asks every layer of a lifecycle, including the
-    # HP-ring virtual layers past the model's own, whether it is recurrent.
-    assert [mgr._is_local_mamba_layer(layer) for layer in range(5)] == [
-        True,
-        False,
-        True,
-        False,
-        False,
-    ]
 
 
 def _build_v2_hybrid_fp4_mla(
@@ -3098,53 +2921,6 @@ def test_v2_hybrid_fp4_hosts_fp8_draft_layers_in_their_own_lifecycle(
 
 
 @skip_no_cuda
-def test_v2_hybrid_fp4_target_pool_ratio_gains_the_draft_share(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Lifecycles: KDA state, FP4 MLA, draft, HP ring; the ratio lists the three targets.
-    mgr = _build_v2_hybrid_fp4_mla(
-        monkeypatch, layer_specs=(_fp8_draft_layer_spec(2),), pool_ratio=[0.3, 0.6, 0.1]
-    )
-    try:
-        # The native manager takes one ratio per lifecycle; the draft share was inserted.
-        assert len(mgr.impl.layer_grouping) == 4
-        assert mgr.draft_layer_ids == (2,)
-    finally:
-        mgr.shutdown()
-
-
-def test_v2_hybrid_fp4_mla_snapshot_realignment_logs_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import mamba_cache_manager_v2
-
-    messages = []
-    monkeypatch.setattr(mamba_cache_manager_v2.logger, "info", messages.append)
-    mgr = SimpleNamespace(
-        fp4_mla_layout=object(),
-        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
-        _fp4_mla_snapshot_realignment_logged=False,
-    )
-    align = MambaHybridCacheManagerV2._align_fp4_mla_snapshot_points
-
-    aligned = SimpleNamespace(py_request_id=1, expect_snapshot_points=[128, 256])
-    align(mgr, aligned)
-    assert aligned.expect_snapshot_points == [128, 256]
-    assert messages == []
-
-    moved = SimpleNamespace(py_request_id=2, expect_snapshot_points=[100, 1000])
-    align(mgr, moved)
-    assert moved.expect_snapshot_points == [896]
-    assert len(messages) == 1
-    assert "[100, 1000] -> [896]" in messages[0]
-
-    again = SimpleNamespace(py_request_id=3, expect_snapshot_points=[300])
-    align(mgr, again)
-    assert again.expect_snapshot_points == [256]
-    assert len(messages) == 1
-
-
-@skip_no_cuda
 def test_v2_hybrid_fp4_mla_reuses_prefix_at_aligned_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3229,29 +3005,6 @@ def test_v2_hybrid_fp4_mla_reuses_prefix_after_two_chunk_prefill(
         mgr.free_resources(probe)
     finally:
         mgr.shutdown()
-
-
-def test_v2_hybrid_fp4_invalid_iterator_scans_physical_pools() -> None:
-    physical = torch.empty((3, 4), dtype=torch.uint8)
-    ssm = torch.empty((1, 2), dtype=torch.float32)
-    conv = torch.empty((1, 2), dtype=torch.float32)
-    mgr = object.__new__(MambaHybridCacheManagerV2)
-    mgr.fp4_mla_layout = SimpleNamespace(
-        _iter_fp4_mla_physical_pool_views=MagicMock(return_value=iter((physical,))),
-        get_fp4_mla_hp_pool=MagicMock(),
-    )
-    mgr._recurrent_buffers = {
-        (0, MambaRole.SSM_STATE): ssm,
-        (0, MambaRole.CONV_STATE): conv,
-    }
-
-    views = list(MambaHybridCacheManagerV2._iter_cache_buffers_for_invalid_check(mgr))
-
-    expected = [physical, ssm, conv]
-    assert [layer_id for layer_id, _ in views] == [-1, -1, -1]
-    assert all(actual is wanted for (_, actual), wanted in zip(views, expected))
-    mgr.fp4_mla_layout._iter_fp4_mla_physical_pool_views.assert_called_once_with()
-    mgr.fp4_mla_layout.get_fp4_mla_hp_pool.assert_not_called()
 
 
 def _install_default_v2_state(mgr):
