@@ -2939,7 +2939,8 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
 
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
         self._update_config_for_quantization(llm_model_config)
-        # The LM's attention and Mamba layers register where the engine looks them up.
+        # Share the wrapper's dict, not a copy: the LM's attention and Mamba layers register
+        # in it as they are built, and the engine looks them up there.
         llm_model_config.extra_attrs = model_config.extra_attrs
 
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
