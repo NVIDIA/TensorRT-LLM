@@ -737,7 +737,7 @@ def _create_py_executor(
         llm_args, checkpoint_loader, is_generation = _load_config_and_create_checkpoint_loader(
             llm_args, checkpoint_dir)
 
-    if not llm_args.mm_encoder_only and not is_generation:
+    if not is_generation:
         return _create_scheduled_encoder_executor(llm_args, checkpoint_dir,
                                                   checkpoint_loader,
                                                   _startup_timer,

@@ -105,23 +105,24 @@ def test_scheduled_encoder_serves_tensor_parallel_rpc_workers():
 
 
 @pytest.mark.parametrize(
-    ("config", "model_kwargs", "is_generation"),
+    ("config", "args_kwargs", "is_generation"),
     [
-        (BertConfig(architectures=["BertForSequenceClassification"]), None, False),
-        (LlamaConfig(architectures=["LlamaForCausalLM"]), None, True),
+        (BertConfig(architectures=["BertForSequenceClassification"]), {}, False),
+        (LlamaConfig(architectures=["LlamaForCausalLM"]), {}, True),
         (
             LlamaConfig(architectures=["LlamaForCausalLM"]),
-            {"architectures": ["LlamaForTextEmbedding"]},
+            {"model_kwargs": {"architectures": ["LlamaForTextEmbedding"]}},
             False,
         ),
+        (LlamaConfig(architectures=["LlamaForCausalLM"]), {"mm_encoder_only": True}, False),
     ],
-    ids=["pooling", "generation", "overridden-to-pooling"],
+    ids=["pooling", "generation", "overridden-to-pooling", "mm-encoder-only"],
 )
 def test_dispatch_reads_the_architecture_model_loading_will_use(
-    tmp_path, config, model_kwargs, is_generation
+    tmp_path, config, args_kwargs, is_generation
 ):
     config.save_pretrained(tmp_path)
-    args = TorchLlmArgs(model=str(tmp_path), model_kwargs=model_kwargs)
+    args = TorchLlmArgs(model=str(tmp_path), **args_kwargs)
 
     _, loaded = ModelLoader.load_config_with_defaults(str(tmp_path), args, HfCheckpointLoader())
 

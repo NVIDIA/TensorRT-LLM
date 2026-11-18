@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor import _util
+from tensorrt_llm._torch.pyexecutor.encoder_completion import MultimodalEmbeddingCompletion
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequestState,
     PyResult,
@@ -159,7 +160,7 @@ class _FakePyResult:
         self.mm_embeddings = []
         self.mrope_position = None
 
-    def append_mm_embeddings(self, mm_embedding, mm_embedding_lengths):
+    def append_mm_embeddings(self, mm_embedding, mm_embedding_lengths, mm_embedding_metadata=None):
         self.mm_embeddings.append((mm_embedding, mm_embedding_lengths))
 
     def set_mrope_position(self, position_ids, position_deltas):
@@ -265,6 +266,36 @@ def test_mm_encoder_sampler_exports_results_only_on_response_ranks(mapping, expo
     assert request.finished_reason == (FinishReason.LENGTH, 0)
     assert bool(request.py_result.mm_embeddings) is exports_results
     assert (request.py_result.mrope_position is not None) is exports_results
+
+
+@pytest.mark.parametrize("exports", [True, False], ids=["response_rank", "follower_rank"])
+@pytest.mark.cpu_only
+def test_mm_embedding_completion_attaches_results_by_request_index(exports):
+    """A sparse batch's results reach their own requests, only on the rank that exports them."""
+    text_request = _FakeRequest()
+    mm_request = _FakeRequest(multimodal_lengths=[4])
+
+    MultimodalEmbeddingCompletion(exports=exports).store(
+        [text_request, mm_request],
+        {
+            "mm_embeddings": [torch.ones(4, 2)],
+            "mm_embedding_request_indices": [1],
+            "mm_embedding_lengths": [[4]],
+            "mrope_position_ids": ["mm-pos"],
+            "mrope_position_deltas": ["mm-delta"],
+        },
+    )
+
+    assert text_request.py_result.mm_embeddings == []
+    assert text_request.py_result.mrope_position is None
+    if exports:
+        [(mm_embedding, mm_embedding_lengths)] = mm_request.py_result.mm_embeddings
+        assert mm_embedding.shape == (4, 2)
+        assert mm_embedding_lengths == [4]
+        assert mm_request.py_result.mrope_position == ("mm-pos", "mm-delta")
+    else:
+        assert mm_request.py_result.mm_embeddings == []
+        assert mm_request.py_result.mrope_position is None
 
 
 @pytest.mark.cpu_only

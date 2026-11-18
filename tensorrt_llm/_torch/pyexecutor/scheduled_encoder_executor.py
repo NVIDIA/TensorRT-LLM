@@ -28,10 +28,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import host_profiler_context
 
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
-from .encoder_completion import Completion, PoolingCompletion
-from .engine.model_setup import build_encoder_runner
-from .engine.runners.encoder import EncoderRunner, resolve_scheduled_encoder_args
-from .engine.runners.interface import ScheduledInputs
+from .encoder_completion import Completion, MultimodalEmbeddingCompletion, PoolingCompletion
+from .engine.model_setup import build_encoder_runner, build_mm_encoder_runner
+from .engine.runners.encoder import resolve_scheduled_encoder_args
+from .engine.runners.interface import ScheduledInputs, ScheduledModelRunner
 from .error_classification import ErrorBudget
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .hang_detector import (
@@ -121,6 +121,9 @@ class ScheduledEncoderExecutor:
     are always empty. With ``print_iter_log`` rank 0 logs one line per batch: its requests
     and prompt tokens, the requests still waiting when it launched, the host time from
     taking the batch to publishing it, and the GPU time of the forward.
+
+    A pooling model's runner pairs with ``PoolingCompletion``, a multimodal encoder's
+    with ``MultimodalEmbeddingCompletion``.
     """
 
     is_generation_model = False
@@ -128,7 +131,7 @@ class ScheduledEncoderExecutor:
 
     def __init__(
         self,
-        runner: EncoderRunner,
+        runner: ScheduledModelRunner,
         *,
         completion: Completion,
         model_loader: ModelLoader,
@@ -220,6 +223,9 @@ class ScheduledEncoderExecutor:
     ) -> ScheduledEncoderExecutor:
         """Load and compile the model, build its runner, and warm it up on every rank.
 
+        With ``mm_encoder_only`` the checkpoint's vision encoder is built and rank 0 exports
+        its embeddings; otherwise the checkpoint's pooling model is built.
+
         Args:
             llm_args: The arguments; scheduled-encoder constraints are applied to them first.
             model_path: The checkpoint directory.
@@ -231,7 +237,14 @@ class ScheduledEncoderExecutor:
             The executor, warmed up; its loop starts with ``start_worker``.
         """
         llm_args = resolve_scheduled_encoder_args(llm_args)
-        with build_encoder_runner(
+        if llm_args.mm_encoder_only:
+            build = build_mm_encoder_runner
+            # Attention DP is rejected, so rank 0 alone answers the frontend.
+            completion = MultimodalEmbeddingCompletion(exports=dist.rank == 0)
+        else:
+            build = build_encoder_runner
+            completion = PoolingCompletion()
+        with build(
             llm_args,
             model_path=model_path,
             checkpoint_loader=checkpoint_loader,
@@ -244,7 +257,7 @@ class ScheduledEncoderExecutor:
                 )
             return cls(
                 built.runner,
-                completion=PoolingCompletion(),
+                completion=completion,
                 model_loader=built.model_loader,
                 llm_args=llm_args,
                 mapping=mapping,

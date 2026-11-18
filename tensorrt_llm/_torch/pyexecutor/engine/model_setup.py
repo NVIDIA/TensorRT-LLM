@@ -31,12 +31,19 @@ from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.nccl_window_tensor_scope import install_eager_nccl_window_tensor_scopes
 from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import plan_cuda_graphs
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
+from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
+    setup_mm_encoder_attn_metadata,
+    setup_mm_encoder_cuda_graphs,
+)
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledModelRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.utils import set_torch_compiling
 from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm.inputs.registry import InputProcessor, create_input_processor
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
     PrefillCudaGraphBackend,
@@ -455,6 +462,23 @@ def create_model_loader(
     )
 
 
+def create_engine_input_processor(model_path: str, llm_args: TorchLlmArgs) -> InputProcessor:
+    """Create the checkpoint's input processor with the multimodal options the engine applies."""
+    input_processor_kwargs = {}
+    video_pruning_rate = llm_args.multimodal_config.video_pruning_rate
+    if video_pruning_rate is not None:
+        input_processor_kwargs["video_pruning_rate"] = video_pruning_rate
+    if llm_args.multimodal_config.vision_gpu_normalize:
+        input_processor_kwargs["vision_gpu_normalize"] = True
+    return create_input_processor(
+        model_path,
+        tokenizer=None,
+        checkpoint_format=llm_args.checkpoint_format,
+        trust_remote_code=llm_args.trust_remote_code,
+        **input_processor_kwargs,
+    )
+
+
 def prepare_loaded_model(model: torch.nn.Module, llm_args: TorchLlmArgs) -> None:
     """Give the model its extra attributes and the requested NVTX markers."""
     # AutoModelForCausalLM sets extra_attrs; a model passed in through
@@ -492,12 +516,74 @@ def resolve_attention_backend(
 class EncoderBuild:
     """An encoder runner built from a checkpoint, with the loader that owns its weights."""
 
-    runner: EncoderRunner
+    runner: ScheduledModelRunner
     model_loader: ModelLoader
     model_config: ModelConfig
     max_batch_size: int
     max_num_tokens: int
     max_seq_len: int
+
+
+@dataclass(frozen=True)
+class _LoadedEncoder:
+    model: torch.nn.Module
+    model_loader: ModelLoader
+    max_beam_width: int
+    max_batch_size: int
+    max_num_tokens: int
+    max_seq_len: int
+    prefill_capture_num_tokens: list[int]
+
+
+@contextmanager
+def _load_encoder(
+    llm_args: TorchLlmArgs,
+    *,
+    model_path: str,
+    checkpoint_loader: BaseCheckpointLoader,
+    mapping: Mapping,
+    dist: Distributed,
+) -> Iterator[_LoadedEncoder]:
+    """Load the checkpoint's model and resolve its capacity; the loader is cleaned up on a raise."""
+    init_process_setup(mapping, dist)
+    configure_autotuner_nvmmh(llm_args)
+    max_beam_width, max_num_tokens, max_seq_len, max_batch_size = llm_args.get_runtime_sizes()
+    model_loader = create_model_loader(
+        llm_args,
+        mapping,
+        spec_config=None,
+        max_num_tokens=max_num_tokens,
+        max_seq_len=max_seq_len,
+    )
+    try:
+        # Encoder executors run without a MoE load balancer: encode_only has one rank,
+        # and scheduled encoders reject the setting.
+        model, _ = model_loader.load(checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
+        prepare_loaded_model(model, llm_args)
+        max_seq_len = resolve_max_seq_len(model, max_seq_len)
+        max_num_tokens = resolve_max_num_tokens(
+            max_num_tokens, max_seq_len=max_seq_len, max_batch_size=max_batch_size
+        )
+        plan = plan_cuda_graphs(
+            llm_args.cuda_graph_config,
+            llm_args.prefill_capture_num_tokens,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
+            decode_tokens_per_request=1,
+        )
+        yield _LoadedEncoder(
+            model=model,
+            model_loader=model_loader,
+            max_beam_width=max_beam_width,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
+            prefill_capture_num_tokens=plan.prefill_num_tokens,
+        )
+    except BaseException:
+        model_loader.cleanup()
+        raise
 
 
 @contextmanager
@@ -524,62 +610,101 @@ def build_encoder_runner(
     Yields:
         The runner with its loader, model config and resolved capacity.
     """
-    init_process_setup(mapping, dist)
-    configure_autotuner_nvmmh(llm_args)
-    max_beam_width, max_num_tokens, max_seq_len, max_batch_size = llm_args.get_runtime_sizes()
-    model_loader = create_model_loader(
+    with _load_encoder(
         llm_args,
-        mapping,
-        spec_config=None,
-        max_num_tokens=max_num_tokens,
-        max_seq_len=max_seq_len,
-    )
-    try:
-        # Encoder executors run without a MoE load balancer: encode_only has one rank,
-        # and scheduled pooling rejects the setting.
-        model, _ = model_loader.load(checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
-        prepare_loaded_model(model, llm_args)
-        max_seq_len = resolve_max_seq_len(model, max_seq_len)
-        max_num_tokens = resolve_max_num_tokens(
-            max_num_tokens, max_seq_len=max_seq_len, max_batch_size=max_batch_size
-        )
-        plan = plan_cuda_graphs(
-            llm_args.cuda_graph_config,
-            llm_args.prefill_capture_num_tokens,
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-            decode_tokens_per_request=1,
-        )
+        model_path=model_path,
+        checkpoint_loader=checkpoint_loader,
+        mapping=mapping,
+        dist=dist,
+    ) as loaded:
         compiled = compile_model(
-            model,
+            loaded.model,
             llm_args=llm_args,
             mapping=mapping,
             dist=dist,
-            max_num_tokens=max_num_tokens,
-            prefill_capture_num_tokens=plan.prefill_num_tokens,
+            max_num_tokens=loaded.max_num_tokens,
+            prefill_capture_num_tokens=loaded.prefill_capture_num_tokens,
         )
         runner = EncoderRunner.create(
             compiled.model,
             llm_args=llm_args,
             mapping=mapping,
             dist=dist,
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-            max_beam_width=max_beam_width,
+            max_batch_size=loaded.max_batch_size,
+            max_num_tokens=loaded.max_num_tokens,
+            max_seq_len=loaded.max_seq_len,
+            max_beam_width=loaded.max_beam_width,
             model_caller=compiled.caller,
             attention_backend=resolve_attention_backend(compiled.model, llm_args),
             attention_runtime_features=AttentionRuntimeFeatures(),
         )
         yield EncoderBuild(
             runner=runner,
-            model_loader=model_loader,
-            model_config=model.model_config,
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
+            model_loader=loaded.model_loader,
+            model_config=loaded.model.model_config,
+            max_batch_size=loaded.max_batch_size,
+            max_num_tokens=loaded.max_num_tokens,
+            max_seq_len=loaded.max_seq_len,
         )
-    except BaseException:
-        model_loader.cleanup()
-        raise
+
+
+@contextmanager
+def build_mm_encoder_runner(
+    llm_args: TorchLlmArgs,
+    *,
+    model_path: str,
+    checkpoint_loader: BaseCheckpointLoader,
+    mapping: Mapping,
+    dist: Distributed,
+) -> Iterator[EncoderBuild]:
+    """Load the checkpoint's vision encoder, set up its towers and build a multimodal encoder runner.
+
+    The towers size their attention metadata, then capture their block CUDA graphs after
+    compilation. The loader is cleaned up as in ``build_encoder_runner``.
+
+    Args:
+        llm_args: The resolved arguments, with ``mm_encoder_only`` set.
+        model_path: The checkpoint directory.
+        checkpoint_loader: The loader for the checkpoint's format.
+        mapping: The parallel mapping of this rank.
+        dist: The communicator across the model's ranks.
+
+    Yields:
+        The runner with its loader, model config and resolved capacity.
+    """
+    encoder_max_num_tokens = (
+        llm_args.encoder_max_num_tokens
+        if llm_args.encoder_max_num_tokens is not None
+        else llm_args.max_num_tokens
+    )
+    with _load_encoder(
+        llm_args,
+        model_path=model_path,
+        checkpoint_loader=checkpoint_loader,
+        mapping=mapping,
+        dist=dist,
+    ) as loaded:
+        input_processor = create_engine_input_processor(model_path, llm_args)
+        setup_mm_encoder_attn_metadata(loaded.model, input_processor, encoder_max_num_tokens, None)
+        compiled = compile_model(
+            loaded.model,
+            llm_args=llm_args,
+            mapping=mapping,
+            dist=dist,
+            max_num_tokens=loaded.max_num_tokens,
+            prefill_capture_num_tokens=loaded.prefill_capture_num_tokens,
+        )
+        mm_config = llm_args.multimodal_config
+        setup_mm_encoder_cuda_graphs(
+            compiled.model,
+            mm_config.encoder_cuda_graph if mm_config is not None else None,
+            max_num_tokens=encoder_max_num_tokens,
+        )
+        yield EncoderBuild(
+            runner=MultimodalEncoderRunner.create(compiled.model),
+            model_loader=loaded.model_loader,
+            model_config=loaded.model.model_config,
+            max_batch_size=loaded.max_batch_size,
+            max_num_tokens=loaded.max_num_tokens,
+            max_seq_len=loaded.max_seq_len,
+        )

@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scheduled encoder executor behaviour, driven through the members the worker calls.
 
-A fake runner answers each request with a row holding its request id. It writes into one
-reused output buffer, as a captured graph does, and can hold or fail a forward. The
-executor's queue, admission, batching, completion and delivery are real.
+A fake runner answers each request with a row holding its request id. As a pooling model it
+writes into one reused output buffer, as a captured graph does; as a multimodal encoder it
+returns one CPU embedding per request, which the completion exports through shared memory.
+It can hold or fail a forward. The executor's queue, admission, batching, completion and
+delivery are real.
 """
 
 import re
@@ -19,12 +21,16 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor import scheduled_encoder_executor
-from tensorrt_llm._torch.pyexecutor.encoder_completion import PoolingCompletion
+from tensorrt_llm._torch.pyexecutor.encoder_completion import (
+    MultimodalEmbeddingCompletion,
+    PoolingCompletion,
+)
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import (
     ScheduledEncoderExecutor,
     fit_batch,
 )
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings.executor import FinishReason, OutputConfig, Request, SamplingConfig
 from tensorrt_llm.executor.utils import is_context_length_exceeded_message
 from tensorrt_llm.mapping import Mapping
@@ -72,9 +78,10 @@ def test_fit_batch_charges_each_child_request_a_full_row():
 
 
 class _Runner:
-    """Answer each request with a row of its request id, through one reused output buffer."""
+    """Answer each request with a row of its request id."""
 
-    def __init__(self, max_batch_size: int):
+    def __init__(self, max_batch_size: int, multimodal: bool):
+        self.multimodal = multimodal
         self.output = torch.zeros(max_batch_size, WIDTH, device="cuda")
         self.batches: list[list[int]] = []
         self.errors: list[Exception] = []
@@ -115,6 +122,14 @@ class _Runner:
             self.staged.append(inputs.inputs_staged)
         if self.gpu_cycles:
             torch.cuda._sleep(self.gpu_cycles)
+        if self.multimodal:
+            return {
+                "mm_embeddings": [
+                    torch.full((1, WIDTH), float(request.py_request_id)) for request in requests
+                ],
+                "mm_embedding_request_indices": list(range(len(requests))),
+                "mm_embedding_lengths": [[1]] * len(requests),
+            }
         for row, request in enumerate(requests):
             self.output[row].fill_(request.py_request_id)
         return {"logits": self.output[: len(requests)]}
@@ -122,12 +137,21 @@ class _Runner:
 
 class _Harness:
     def __init__(
-        self, *, max_batch_size=4, max_num_tokens=64, max_seq_len=32, print_iter_log=False
+        self,
+        *,
+        completion="pooling",
+        max_batch_size=4,
+        max_num_tokens=64,
+        max_seq_len=32,
+        print_iter_log=False,
     ):
-        self.runner = _Runner(max_batch_size)
+        self.multimodal = multimodal = completion == "multimodal"
+        self.runner = _Runner(max_batch_size, multimodal)
         self.executor = ScheduledEncoderExecutor(
             self.runner,
-            completion=PoolingCompletion(),
+            completion=(
+                MultimodalEmbeddingCompletion(exports=True) if multimodal else PoolingCompletion()
+            ),
             model_loader=Mock(),
             llm_args=SimpleNamespace(
                 garbage_collection_gen0_threshold=20000,
@@ -148,7 +172,7 @@ class _Harness:
         self,
         num_tokens: int = 4,
         *,
-        context_logits: bool = True,
+        context_logits: bool | None = None,
         perf_metrics: bool = False,
         **attrs,
     ) -> int:
@@ -156,7 +180,9 @@ class _Harness:
             input_token_ids=list(range(1, num_tokens + 1)),
             max_tokens=1,
             output_config=OutputConfig(
-                return_context_logits=context_logits,
+                return_context_logits=(
+                    not self.multimodal if context_logits is None else context_logits
+                ),
                 exclude_input_from_output=True,
                 return_perf_metrics=perf_metrics,
             ),
@@ -194,8 +220,13 @@ def _harness(**kwargs):
         h.shutdown()
 
 
-def test_batches_follow_the_budget_in_arrival_order():
-    with _harness(max_batch_size=2, max_num_tokens=64, max_seq_len=64) as h:
+@pytest.fixture(params=["pooling", "multimodal"])
+def completion(request):
+    return request.param
+
+
+def test_batches_follow_the_budget_in_arrival_order(completion):
+    with _harness(completion=completion, max_batch_size=2, max_num_tokens=64, max_seq_len=64) as h:
         ids = [h.submit(), h.submit(), h.submit(61), h.submit()]
         h.executor.start_worker()
 
@@ -217,6 +248,20 @@ def test_results_are_pooled_rows_with_no_tokens_and_reason_length():
         assert torch.equal(first.context_logits.cpu(), torch.full((1, WIDTH), float(pooled)))
         assert second.context_logits is None
         for result in (first, second):
+            assert result.output_token_ids == [[]]
+            assert result.finish_reasons == [FinishReason.LENGTH]
+
+
+def test_multimodal_results_are_exported_embeddings_with_no_tokens_and_reason_length():
+    with _harness(completion="multimodal", max_batch_size=2) as h:
+        ids = [h.submit(py_multimodal_data={"image": {}}) for _ in range(3)]
+        h.executor.start_worker()
+
+        for request_id in ids:
+            result = h.result(request_id)
+            (handle,) = result.mm_embedding_handles
+            embedding = SharedTensorContainer.from_dict(handle).get_local_view()
+            assert torch.equal(embedding, torch.full((1, WIDTH), float(request_id)))
             assert result.output_token_ids == [[]]
             assert result.finish_reasons == [FinishReason.LENGTH]
 
@@ -307,8 +352,21 @@ def test_inadmissible_requests_fail_alone():
         assert h.runner.batches == [[fitting]]
 
 
-def test_cancelling_a_queued_request_finishes_it_once_as_cancelled():
-    with _harness(max_batch_size=1) as h:
+def test_a_multimodal_encoder_admits_multimodal_requests_and_fails_an_oversized_one_alone():
+    with _harness(completion="multimodal", max_seq_len=32, max_num_tokens=64) as h:
+        too_long = h.submit(33, py_multimodal_data={"image": {}})
+        fitting = h.submit(32, py_multimodal_data={"image": {}})
+        h.executor.start_worker()
+
+        (long_response,) = h.responses(too_long)
+        h.result(fitting)
+
+        assert is_context_length_exceeded_message(long_response.error_msg)
+        assert h.runner.batches == [[fitting]]
+
+
+def test_cancelling_a_queued_request_finishes_it_once_as_cancelled(completion):
+    with _harness(completion=completion, max_batch_size=1) as h:
         h.runner.hold()
         running, queued = h.submit(), h.submit()
         h.executor.start_worker()
@@ -330,8 +388,8 @@ def test_cancelling_a_queued_request_finishes_it_once_as_cancelled():
         assert h.runner.batches == [[running], [later]]
 
 
-def test_a_survivable_forward_error_fails_only_its_batch():
-    with _harness(max_batch_size=1) as h:
+def test_a_survivable_forward_error_fails_only_its_batch(completion):
+    with _harness(completion=completion, max_batch_size=1) as h:
         h.runner.errors.append(RuntimeError("bad batch"))
         failed, later = h.submit(), h.submit()
         h.executor.start_worker()
@@ -352,8 +410,8 @@ def test_a_failed_forward_answers_a_request_with_children_once():
         assert (error.request_id, error.error_msg) == (failed, "bad batch")
 
 
-def test_a_fatal_forward_error_fails_everything_queued_and_shuts_down():
-    with _harness(max_batch_size=1) as h:
+def test_a_fatal_forward_error_fails_everything_queued_and_shuts_down(completion):
+    with _harness(completion=completion, max_batch_size=1) as h:
         h.runner.hold()
         h.runner.errors.append(RuntimeError("an illegal memory access was encountered"))
         running, waiting = h.submit(), h.submit()
@@ -409,8 +467,8 @@ def test_print_iter_log_logs_each_batch_with_its_size_and_tokens(monkeypatch):
     assert "host_step_time = " in line and "device_step_time = " in line
 
 
-def test_shutdown_runs_queued_requests_first():
-    with _harness(max_batch_size=1) as h:
+def test_shutdown_runs_queued_requests_first(completion):
+    with _harness(completion=completion, max_batch_size=1) as h:
         h.runner.hold()
         ids = [h.submit(), h.submit(), h.submit()]
         h.executor.start_worker()

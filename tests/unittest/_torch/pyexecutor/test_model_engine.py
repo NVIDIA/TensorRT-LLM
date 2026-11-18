@@ -1218,33 +1218,6 @@ class TestWarmupCleanup(unittest.TestCase):
                         unused.assert_not_called()
 
     @pytest.mark.cpu_only
-    def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self) -> None:
-        """Verify a no-KV-cache runner rejects an allocated KV cache before warmup."""
-        model_engine = object.__new__(ModelEngine)
-        model_engine.llm_args = SimpleNamespace(enable_autotuner=False)
-        model_engine._metrics = {}
-        model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
-        model_engine.moe_load_balancer = None
-        model_engine._warmup_depth = 0
-        model_engine._runner = Mock(spec=MultimodalEncoderRunner)
-        runner = model_engine._runner
-        runner._validate_resources = MultimodalEncoderRunner._validate_resources.__get__(runner)
-        runner.warmup.side_effect = MultimodalEncoderRunner.warmup.__get__(runner)
-        resource_manager = Mock()
-        resource_manager.get_resource_manager.return_value = object()
-
-        with self.assertRaisesRegex(
-            AssertionError,
-            "no-KV-cache runner was initialized, but a KV cache manager was allocated",
-        ):
-            model_engine.warmup(resource_manager)
-
-        model_engine._runner.warmup.assert_called_once_with(resource_manager)
-        resource_manager.get_resource_manager.assert_called_once_with(
-            ResourceManagerType.KV_CACHE_MANAGER
-        )
-
-    @pytest.mark.cpu_only
     def test_warmup_total_timing_and_kv_cache_cleanup(self) -> None:
         model_engine = object.__new__(ModelEngine)
         model_engine._metrics = {}
