@@ -558,7 +558,7 @@ def test_item_encoder_classifies_output_count_contract_error() -> None:
             return [(encoder_input, [1], "image")]
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor]:
             return []
 
@@ -582,7 +582,7 @@ def test_item_encoder_drains_replayed_host_functions_first() -> None:
             return [(encoder_input, [1], "image")]
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor]:
             calls.append("encode")
             return []
@@ -621,7 +621,7 @@ def test_item_encoder_translates_model_contract_errors(
             return [(encoder_input, [1], "image")]
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor]:
             with encoder_dp_error_guard(_own_status) if collective else nullcontext():
                 raise MultimodalEncoderContractError("bad encoder output rows")
@@ -662,7 +662,7 @@ def test_item_encoder_does_not_translate_system_errors(
             return [(encoder_input, [1], "image")]
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor]:
             with encoder_dp_error_guard(_own_status) if collective else nullcontext():
                 with encoder_dp_error_guard(_own_status) if collective else nullcontext():
@@ -746,7 +746,7 @@ def test_item_encoder_closes_window_scope_before_request_errors(
             return [(encoder_input, [1], "image")]
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor]:
             with (
                 encoder_dp_error_guard(_own_status)
@@ -808,7 +808,7 @@ def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -
             return []
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor | None]:
             return outputs
 
@@ -869,7 +869,9 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
         embedding_dtype = torch.float32
 
         def forward_multimodal_encoder_items(
-            self, encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self,
+            encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
+            **limits: int | None,
         ) -> list[torch.Tensor]:
             return [
                 torch.full((embedding_length, 2), float(embedding_length))
@@ -1077,8 +1079,15 @@ def test_empty_rank_participates_in_collective_encoder_step(collective):
     scheduler = bare_mm_item_scheduler(model)
     scheduler.collective = collective
     scheduler.bytes_per_embedding = 4
+    scheduler.encoder_max_num_tokens, scheduler.encoder_batch_size = 64, 4
     scheduler.forward_items([], {})
     assert model.forward_multimodal_encoder_items.call_count == int(collective)
+    if collective:
+        # The shared pass groups the ranks' batches within one encoder step.
+        assert model.forward_multimodal_encoder_items.call_args.kwargs == {
+            "max_tokens": 64,
+            "max_items": 4,
+        }
     model.forward_multimodal_encoder_items.reset_mock()
     model.peer_has_inputs = 0
     scheduler.forward_items([], {})

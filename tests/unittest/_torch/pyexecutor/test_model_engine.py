@@ -1479,6 +1479,7 @@ def test_layerwise_nvtx_flag_controls_real_forward_markers(
     engine.is_spec_decode = False
     engine.input_processor = None
     engine.encoder_max_num_tokens = 16
+    engine.encoder_batch_size = 4
     engine.llm_args = TorchLlmArgs(
         model="dummy", disable_overlap_scheduler=True, enable_layerwise_nvtx_marker=enabled
     )

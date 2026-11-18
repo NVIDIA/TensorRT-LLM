@@ -343,6 +343,7 @@ class MultimodalItemScheduler:
         input_processor: BaseMultimodalDummyInputsBuilder | None = None,
         attention_metadata_capacity: dict[str, int] | None = None,
         encoder_max_num_tokens: int | None = None,
+        encoder_batch_size: int | None = None,
         output_budget_bytes: int | None = None,
         bytes_per_embedding: int | None = None,
         collective: bool = False,
@@ -351,6 +352,7 @@ class MultimodalItemScheduler:
         self.input_processor = input_processor
         self.attention_metadata_capacity = attention_metadata_capacity
         self.encoder_max_num_tokens = encoder_max_num_tokens
+        self.encoder_batch_size = encoder_batch_size
         self.output_budget_bytes = output_budget_bytes
         self.bytes_per_embedding = bytes_per_embedding
         # Read from the eager model: whole-model torch.compile wraps the engine's model later.
@@ -365,6 +367,7 @@ class MultimodalItemScheduler:
         model: nn.Module,
         input_processor: BaseMultimodalDummyInputsBuilder,
         encoder_max_num_tokens: int | None,
+        encoder_batch_size: int | None = None,
     ) -> "MultimodalItemScheduler | None":
         """Build the scheduler if this run engages item scheduling, else ``None``.
 
@@ -386,6 +389,7 @@ class MultimodalItemScheduler:
             input_processor=input_processor,
             encoder_max_num_tokens=encoder_max_num_tokens,
             configured_encoder_max_num_tokens=llm_args.encoder_max_num_tokens,
+            encoder_batch_size=encoder_batch_size,
         )
 
     @classmethod
@@ -396,6 +400,7 @@ class MultimodalItemScheduler:
         input_processor: BaseMultimodalDummyInputsBuilder,
         encoder_max_num_tokens: int | None,
         configured_encoder_max_num_tokens: int | None,
+        encoder_batch_size: int | None = None,
     ) -> "MultimodalItemScheduler":
         """Resolve the encoder budgets and build the scheduler.
 
@@ -476,6 +481,7 @@ class MultimodalItemScheduler:
             input_processor=input_processor,
             attention_metadata_capacity=attention_metadata_capacity,
             encoder_max_num_tokens=encoder_max_num_tokens,
+            encoder_batch_size=encoder_batch_size,
             output_budget_bytes=output_budget_bytes,
             bytes_per_embedding=bytes_per_embedding,
             collective=model.encoder_parallel_layout.collective,
@@ -605,7 +611,13 @@ class MultimodalItemScheduler:
         pending_error = request_error
         with discard_nccl_window_tensor_outputs(encoder_inputs):
             try:
-                outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
+                # A shared encoder TP pass groups the ranks' batches within
+                # the limits of one encoder step, which profiling covered.
+                outputs = self.model.forward_multimodal_encoder_items(
+                    encoder_inputs,
+                    max_tokens=self.encoder_max_num_tokens,
+                    max_items=self.encoder_batch_size,
+                )
             except Exception as error:
                 pending_error = self._to_request_error(error, producer_request_ids)
                 if pending_error is None:

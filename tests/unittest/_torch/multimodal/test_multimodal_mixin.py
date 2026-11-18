@@ -651,11 +651,156 @@ def test_shared_encoder_tp_frees_each_owner_before_the_next():
 
     # Owner 0's payload and output are gone before owner 1 (this rank) sends.
     assert alive_at_gather == [[], [False, False]]
-    # The full-prompt MRoPE positions are not sent.
-    assert sent_elements == [(torch.float32, rows * dim)] * 2
+    # One packed byte buffer per owner. The full-prompt MRoPE positions are not sent.
+    assert sent_elements == [(torch.uint8, payload_bytes)] * 2
     # One owner at a time: the sender's packed and received copies, or a
     # received payload and its output, never two owners at once.
     assert torch.cuda.max_memory_allocated() - base <= 2 * payload_bytes + (1 << 20)
+
+
+class _OwnerTaggedEncoderModel(_SharedEncoderTpModel):
+    """Shared encoder TP over ``tp_size`` ranks. Each output row holds its owner's tag.
+
+    The input of the owner tagged ``bad_tag`` breaks the output contract with one extra row.
+    """
+
+    def __init__(self, tp_size=2, rank=1, device="cpu", bad_tag=None):
+        super().__init__(rows=2, dim=2, device=device)
+        self.model_config = ModelConfig(
+            mapping=Mapping(
+                world_size=tp_size, rank=rank, tp_size=tp_size, enable_attention_dp=True
+            ),
+            multimodal_config=MultimodalConfig(
+                encoder_data_parallel_size=1, encoder_cache_max_bytes=0
+            ),
+        )
+        self.bad_tag = bad_tag
+        self.encoded_tags: list[list[int]] = []
+        self.status_exchanges = 0
+
+    def exchange_encoder_status(self, values):
+        self.status_exchanges += 1
+        rows = [[0] * len(values) for _ in range(self.model_config.mapping.tp_size)]
+        rows[self.model_config.mapping.tp_rank] = list(values)
+        return rows
+
+    def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs):
+        tags = [int(p.multimodal_data["image"]["pixel_values"][0, 0]) for p in multimodal_params]
+        self.encoded_tags.append(tags)
+        extra = int(self.bad_tag in tags)
+        rows = [torch.full((self.rows, self.dim), float(tag)) for tag in tags]
+        return torch.cat(rows + [torch.zeros(extra, self.dim)]).to(self.out_device)
+
+
+def _owner_tagged_input(tag: float, device: str = "cpu", extra_dtype: bool = False) -> list:
+    image = {"pixel_values": torch.full((2, 2), tag, device=device)}
+    if extra_dtype:
+        image["image_grid_thw"] = torch.ones(1, 3, dtype=torch.int64, device=device)
+    data = {
+        "image": image,
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("image", 0)], encoder_token_lengths=[4], output_embedding_lengths=[2]
+        ),
+    }
+    return [(MultimodalParams(multimodal_data=data), [2], "image")]
+
+
+class _EveryRankSendsATaggedBatch:
+    """Object allgather where every rank sent this rank's batch, tagged with its rank."""
+
+    @staticmethod
+    def get(mapping):
+        def tp_allgather(obj, **kwargs):
+            leaves, *rest = obj
+            return [
+                (
+                    [
+                        torch.full_like(leaf, rank) if isinstance(leaf, torch.Tensor) else leaf
+                        for leaf in leaves
+                    ],
+                    *rest,
+                )
+                for rank in range(mapping.tp_size)
+            ]
+
+        return SimpleNamespace(tp_allgather=tp_allgather)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "max_tokens,encoded_tags", [(None, [[0], [1]]), (8, [[0, 1]])], ids=["alone", "grouped"]
+)
+def test_shared_encoder_tp_groups_owners_that_fit_one_encoder_step(max_tokens, encoded_tags):
+    model = _OwnerTaggedEncoderModel()
+
+    with patch.object(dp_module, "Distributed", _EveryRankSendsATaggedBatch):
+        outputs = model.forward_multimodal_encoder_items(
+            _owner_tagged_input(1.0), max_tokens=max_tokens, max_items=2
+        )
+
+    # Each owner costs 4 tokens and 1 item, so both fit 8 tokens and 2 items.
+    assert model.encoded_tags == encoded_tags
+    torch.testing.assert_close(outputs, [torch.ones(2, 2)])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("bad_tag", [0, 1], ids=["peer_input_fails", "own_input_fails"])
+def test_shared_encoder_tp_group_error_fails_only_the_bad_owner(bad_tag):
+    model = _OwnerTaggedEncoderModel(bad_tag=bad_tag)
+
+    with patch.object(dp_module, "Distributed", _EveryRankSendsATaggedBatch):
+        if bad_tag == 1:
+            with pytest.raises(MultimodalEncoderContractError, match="does not match"):
+                model.forward_multimodal_encoder_items(
+                    _owner_tagged_input(1.0), max_tokens=8, max_items=2
+                )
+        else:
+            outputs = model.forward_multimodal_encoder_items(
+                _owner_tagged_input(1.0), max_tokens=8, max_items=2
+            )
+            torch.testing.assert_close(outputs, [torch.ones(2, 2)])
+
+    # The group fails, so every rank encodes each owner alone.
+    assert model.encoded_tags == [[0, 1], [0], [1]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize(
+    "max_tokens,status_exchanges,allgathers",
+    [(None, 1 + 8 * 2, 8), (32, 1 + 2, 1)],
+    ids=["one_owner_per_group", "one_group"],
+)
+def test_shared_encoder_tp_collectives_per_step(max_tokens, status_exchanges, allgathers):
+    # TP8 with attention DP, seen from rank 3. Every owner has 2 CUDA dtypes.
+    model = _OwnerTaggedEncoderModel(tp_size=8, rank=3, device="cuda")
+    object_gathers = []
+    sent = []
+
+    def allgather(payload, mapping, dim=0, sizes=None):
+        sent.append((payload.dtype, sizes))
+        # Zeros: the peers' tags read as 0.
+        return torch.zeros(sum(sizes), dtype=payload.dtype, device="cuda")
+
+    class _Gather(_EveryRankSendsATaggedBatch):
+        @staticmethod
+        def get(mapping):
+            gather = _EveryRankSendsATaggedBatch.get(mapping).tp_allgather
+            return SimpleNamespace(tp_allgather=lambda obj: object_gathers.append(1) or gather(obj))
+
+    with (
+        patch.object(dp_module, "Distributed", _Gather),
+        patch.object(dp_module, "allgather", allgather),
+    ):
+        model.forward_multimodal_encoder_items(
+            _owner_tagged_input(3.0, "cuda", extra_dtype=True), max_tokens=max_tokens, max_items=8
+        )
+
+    # One flatten status, then per group one pack status and one encoder
+    # status. One object gather and one packed byte allgather per group.
+    assert model.status_exchanges == status_exchanges
+    assert len(object_gathers) == 1
+    assert len(sent) == allgathers
+    assert {dtype for dtype, _ in sent} == {torch.uint8}
 
 
 @pytest.mark.cpu_only

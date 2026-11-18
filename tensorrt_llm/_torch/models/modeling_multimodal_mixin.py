@@ -693,12 +693,18 @@ class MultimodalModelMixin:
     def forward_multimodal_encoder_items(
         self,
         encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
+        *,
+        max_tokens: Optional[int] = None,
+        max_items: Optional[int] = None,
     ) -> list[torch.Tensor]:
         """Forward prepared MM encoder inputs in scheduler item order.
 
         Args:
             encoder_inputs: Tuples returned by `prepare_multimodal_encoder_inputs`. Consecutive
                 inputs with the same modality must be batch-compatible.
+            max_tokens: Encoder input tokens of one encoder step.
+            max_items: Items of one encoder step. With a shared encoder TP pass, the batches of
+                several ranks run as one encoder call while they fit both limits together.
 
         Returns:
             One encoder output tensor **per item** (not per input tuple). Each tensor has the
@@ -709,31 +715,73 @@ class MultimodalModelMixin:
 
         outputs: list[torch.Tensor] = []
         owner_error: MultimodalEncoderContractError | None = None
-        mapping = self.model_config.mapping
-        # Visit one owner's bounded batch at a time. Cache state and returned
-        # embeddings remain on the rank that owns the original requests.
-        for owner, shared_inputs in iter_encoder_rank_inputs(
+        # Visit one bounded group of owners' batches at a time. Cache state and
+        # returned embeddings remain on the rank that owns the original requests.
+        for group in iter_encoder_rank_inputs(
             encoder_inputs,
-            mapping=mapping,
+            mapping=self.model_config.mapping,
             exchange_status=self.exchange_encoder_status,
+            max_tokens=max_tokens,
+            max_items=max_items,
         ):
-            shared_outputs = None
             try:
-                with encoder_dp_error_guard(self.exchange_encoder_status):
-                    shared_outputs = self._forward_multimodal_encoder_items_local(shared_inputs)
+                group_outputs = self._forward_shared_encoder_group(group)
             except MultimodalEncoderContractError as error:
-                # Every rank gets the error. Only the owner's requests fail,
-                # and the other owners' batches still run.
-                if owner == mapping.tp_rank:
-                    owner_error = error
+                # Only this rank's requests fail; the later groups still run.
+                owner_error = error
             else:
-                if owner == mapping.tp_rank:
-                    outputs = shared_outputs
-            # Drop this owner's inputs and outputs before the next owner's are allocated.
-            del shared_inputs, shared_outputs
+                if group_outputs is not None:
+                    outputs = group_outputs
+                # This rank's outputs keep at most one group's outputs alive.
+                del group_outputs
+            # Drop this group's inputs before the next group's are allocated.
+            del group
         if owner_error is not None:
             raise owner_error
         return outputs
+
+    def _forward_shared_encoder_group(
+        self,
+        group: Sequence[tuple[int, Sequence[tuple[MultimodalParams, Sequence[int], str]]]],
+    ) -> Optional[list[torch.Tensor]]:
+        """Encode a group of owners' batches in one encoder call on every rank.
+
+        Returns this rank's outputs, or ``None`` when it owns no batch in the
+        group. A request error fails only the owner's requests: every rank
+        gets the error, and only the owner raises it. An error in a group of
+        several owners cannot be traced to one owner, so every rank then
+        encodes each owner alone.
+        """
+        tp_rank = self.model_config.mapping.tp_rank
+        try:
+            with encoder_dp_error_guard(self.exchange_encoder_status):
+                shared_outputs = self._forward_multimodal_encoder_items_local(
+                    [encoder_input for _, inputs in group for encoder_input in inputs]
+                )
+        except MultimodalEncoderContractError:
+            if len(group) == 1:
+                if group[0][0] == tp_rank:
+                    raise
+                return None
+            outputs, own_error = None, None
+            for entry in group:
+                try:
+                    entry_outputs = self._forward_shared_encoder_group([entry])
+                except MultimodalEncoderContractError as error:
+                    # Keep going: the other ranks still encode the later owners.
+                    own_error = error
+                else:
+                    outputs = entry_outputs if entry_outputs is not None else outputs
+            if own_error is not None:
+                raise own_error
+            return outputs
+        start = 0
+        for owner, inputs in group:
+            num_items = sum(len(lengths) for _, lengths, _ in inputs)
+            if owner == tp_rank:
+                return shared_outputs[start : start + num_items]
+            start += num_items
+        return None
 
     def _forward_multimodal_encoder_items_local(
         self,

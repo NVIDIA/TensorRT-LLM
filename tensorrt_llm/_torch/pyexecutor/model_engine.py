@@ -357,6 +357,7 @@ class ModelEngine:
             model=self.model,
             input_processor=self.input_processor,
             encoder_max_num_tokens=self.encoder_max_num_tokens,
+            encoder_batch_size=self.encoder_batch_size,
         )
         self._mm_item_scheduler = mm_item_scheduler
         # Read by py_executor.py and _util.py.

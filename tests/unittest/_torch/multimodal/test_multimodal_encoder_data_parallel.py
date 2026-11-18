@@ -31,6 +31,7 @@ from tensorrt_llm._torch.models.multimodal_encoder_data_parallel import (
     MultimodalEncoderContractError,
     encoder_dp_error_guard,
     execute_encoder_dp_items,
+    group_encoder_owners,
     plan_encoder_dp_items,
 )
 from tensorrt_llm.mapping import Mapping
@@ -57,6 +58,22 @@ def exchange_with_peer(peer_status: int, statuses: list[int] | None = None):
 
 def own_status(values):
     return [values]
+
+
+@pytest.mark.parametrize(
+    "costs,groups",
+    [
+        ([(4, 1), (0, 0), (4, 1), (8, 2)], [[0, 2], [3]]),  # skip owners without items
+        ([(4, 1), (4, 3), (4, 1)], [[0], [1], [2]]),  # the item limit closes a group
+        ([(None, 1), (4, 1), (4, 1)], [[0], [1, 2]]),  # an unknown cost runs alone
+        ([(12, 1), (4, 1)], [[0], [1]]),  # an owner larger than the step still runs
+    ],
+)
+def test_group_encoder_owners_fills_one_encoder_step(costs, groups):
+    assert group_encoder_owners(costs, max_tokens=8, max_items=3) == groups
+    # Without limits, every owner with items is a group alone.
+    alone = [[owner] for owner, (_, items) in enumerate(costs) if items]
+    assert group_encoder_owners(costs, None, None) == alone
 
 
 def test_plan_encoder_dp_items_accepts_an_empty_batch():

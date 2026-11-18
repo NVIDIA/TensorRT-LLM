@@ -118,9 +118,12 @@ With LLM TP, encoder DP distributes cache-miss items by physical encoder token
 cost and gathers their embeddings in prompt order. With LLM attention DP and a
 fully replicated encoder, each rank encodes only its own requests. With LLM
 attention DP and encoder TP, all ranks participate in a common item-encoding
-step, including ranks with only cache hits or no multimodal work. Prepared
-inputs are shared one request owner's scheduled batch at a time; CUDA payloads
-stay on the GPU, and only the owner keeps the returned embeddings in its cache.
+step, including ranks with only cache hits or no multimodal work. The ranks'
+scheduled batches run together while they fit one encoder step
+(`encoder_max_num_tokens` and `encoder_max_batch_size`), with one encoder call
+for each run of same-modality items; larger work runs in more calls. CUDA
+payloads stay on the GPU, and only the owner keeps the returned embeddings in
+its cache.
 
 Explicit encoder TP is supported by the native Qwen2.5-VL, Qwen3-VL, Mistral3,
 EXAONE 4.5, and Gemma4 vision integrations. Gemma4 audio, Hugging Face Qwen2-VL,

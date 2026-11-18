@@ -333,6 +333,9 @@ def _run_qwen_vision_parallel_rank(config):
     actual = torch.cat(model.forward_multimodal_encoder_items(prepared), dim=0)
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
     if attention_dp:
+        # Both owners' batches fit one encoder step, so they run as one encoder call.
+        grouped = model.forward_multimodal_encoder_items(prepared, max_tokens=256, max_items=8)
+        torch.testing.assert_close(torch.cat(grouped), expected, atol=2e-2, rtol=2e-2)
         outputs = model.forward_multimodal_encoder_items(prepared if rank == 0 else [])
         if rank == 0:
             torch.testing.assert_close(torch.cat(outputs), expected, atol=2e-2, rtol=2e-2)
@@ -353,6 +356,8 @@ def _run_qwen_vision_parallel_rank(config):
     model._multimodal_encoder_cache = TensorLRUCache(1 << 20)
     scheduler = MultimodalItemScheduler(
         model=model,
+        encoder_max_num_tokens=256,
+        encoder_batch_size=8,
         bytes_per_embedding=model.embedding_dim * model.embedding_dtype.itemsize,
         collective=model.encoder_parallel_layout.collective,
     )
