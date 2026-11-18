@@ -296,6 +296,18 @@ add_tllm_gtest(
   "unit;batch-manager;host")
 
 add_tllm_gtest(
+  kvCacheManagerV2SmallObjectPoolTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2SmallObjectPoolTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
   kvCacheManagerV2ReentrantSharedMutexTest
   OWNER
   batch-manager

@@ -40,6 +40,7 @@ timing and iteration log around the controller's windows.
 
 import functools
 import os
+import tempfile
 import threading
 import time
 import uuid
@@ -50,6 +51,8 @@ from typing import Callable, Dict, Iterator, List, Optional
 import torch
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.metrics.logging import LoggerExposure
+from tensorrt_llm.metrics.perf import PerfMetricsRecord
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import get_global_profiler
 
@@ -345,15 +348,7 @@ class ProfileController:
             activities = ["CPU", "GPU"]
 
         if output_dir is None:
-            # ``/tmp`` is the documented developer default for the
-            # profile trace directory (matches the server docs); the
-            # user-facing override is the
-            # ``TLLM_TORCH_PROFILER_DIR`` env var or the
-            # ``output_dir`` request body field.
-            output_dir = os.environ.get(
-                "TLLM_TORCH_PROFILER_DIR",
-                "/tmp",  # nosec B108
-            )
+            output_dir = os.environ.get("TLLM_TORCH_PROFILER_DIR")
 
         # Fail fast if the directory cannot be created. Returning
         # success here would schedule a profile window that later
@@ -364,11 +359,16 @@ class ProfileController:
         # plumbing as the "already in progress" guard above, so the
         # HTTP handler can map it to a 5xx with a meaningful body.
         try:
-            os.makedirs(output_dir, exist_ok=True)
+            if output_dir is None:
+                with tempfile.TemporaryDirectory(prefix="trtllm-profile-"):
+                    pass
+            else:
+                os.makedirs(output_dir, exist_ok=True)
         except OSError as e:
             from tensorrt_llm.executor.utils import RequestError
 
-            raise RequestError(f"Failed to create profile output_dir {output_dir}: {e}") from e
+            target = output_dir if output_dir is not None else "the system temporary directory"
+            raise RequestError(f"Failed to create profile output directory at {target}: {e}") from e
 
         # Include a unique profile id (monotonic timestamp + short
         # uuid fragment) so successive start/stop cycles under the
@@ -505,9 +505,11 @@ class ProfileController:
         rank 0 sees the same state and is a no-op.
         """
         activities = config.get("activities") or ["CPU", "GPU"]
-        # ``/tmp`` matches the documented developer default; see
-        # ``start_profile`` for the rationale.
-        output_dir = config.get("output_dir") or "/tmp"  # nosec B108
+        output_dir = config.get("output_dir")
+        if not output_dir:
+            # Maintain compatibility for callers constructing
+            # configs without output_dir.
+            output_dir = tempfile.mkdtemp(prefix="trtllm-profile-")
         profile_id = config.get("profile_id") or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
         # Prefer the legacy absolute ``start_iter`` form (older unit
         # tests and env-var driven paths set this directly). For the
@@ -843,6 +845,9 @@ class PyExecutorProfileManager:
 
     def __init__(self, executor: "PyExecutor") -> None:  # noqa: F821
         self._executor_ref = weakref.ref(executor)
+        self.metrics = executor._perf_metrics
+        self.metrics_logger = LoggerExposure(logger.info)
+        self._metrics_log_rank_enabled = False
 
     @property
     def _executor(self) -> "PyExecutor":  # noqa: F821
@@ -855,6 +860,11 @@ class PyExecutorProfileManager:
             )
         return ex
 
+    def expose_metrics(self, record: PerfMetricsRecord) -> None:
+        """Select executor-loop logging after collection and rank filtering."""
+        if self._executor.print_log and self._metrics_log_rank_enabled:
+            self.metrics_logger.emit(record)
+
     @contextmanager
     def profile_step(self):
         """Context manager driving per-iteration profile bookkeeping.
@@ -865,6 +875,7 @@ class PyExecutorProfileManager:
         executor = self._executor
         controller = executor._profile_controller
         it = -1
+        self.metrics_logger.reset()
         start_time = None
 
         # These events are used to record the time of the previous
@@ -887,13 +898,6 @@ class PyExecutorProfileManager:
         timing_stream = torch.cuda.Stream() if one_timing_event else None
         if one_timing_event:
             logger.info("[M3 host] iteration timing: one side-stream event per iteration boundary")
-        # Cumulative fetch counter as of the previous iter log line; the
-        # per-iteration ``num_fetched`` on the log line is the delta.
-        prev_fetch_requests_cur_rank = 0
-        # Last kv_cache_util printed and the iteration it was computed at.
-        kv_util_str = "N/A"
-        kv_reuse_str = ""
-        kv_util_iter = None
 
         log_ranks_str = os.environ.get(PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
         if log_ranks_str.strip().lower() == "all":
@@ -902,13 +906,13 @@ class PyExecutorProfileManager:
         else:
             log_all_ranks = False
             log_ranks = {int(r) for r in log_ranks_str.split(",")}
+        self._metrics_log_rank_enabled = log_all_ranks or executor.dist.rank in log_ranks
 
         def profile_step_fn():
             nonlocal it, start_time
             nonlocal start_event_1, end_event_1, start_event_2, end_event_2
-            nonlocal prev_device_step_time, prev_fetch_requests_cur_rank
+            nonlocal prev_device_step_time
             nonlocal boundary_count
-            nonlocal kv_util_str, kv_reuse_str, kv_util_iter
             controller.end_iteration()
 
             # Capture per-loop timing whenever stats or the iter log
@@ -948,72 +952,42 @@ class PyExecutorProfileManager:
                 executor._latest_host_step_time_ms = host_step_time
                 executor._latest_prev_device_step_time_ms = prev_device_step_time
 
-                # Sampled iteration statistics thin the log to the same iterations.
+                # Logger-only mode reads the KV cache on the collector's cadence;
+                # batch collection reuses its own rank snapshots instead.
+                read_kv_cache = None
                 if (
                     executor.print_log
-                    and (log_all_ranks or executor.dist.rank in log_ranks)
-                    and (
-                        not executor.enable_iter_perf_stats
-                        or executor.iter_counter % executor.iter_perf_stats_interval == 0
-                    )
+                    and not executor.enable_iter_perf_stats
+                    and self._metrics_log_rank_enabled
+                    and executor.kv_cache_manager is not None
                 ):
-                    if prev_device_step_time is None:
-                        prev_device_step_time_str = "N/A"  # first iteration
-                    else:
-                        prev_device_step_time_str = f"{prev_device_step_time}ms"
-                    if executor.kv_cache_manager is not None and (
-                        kv_util_iter is None or it - kv_util_iter >= ITER_LOG_KV_UTIL_REFRESH_ITERS
-                    ):
-                        kv_util_iter = it
-                        kv_util_str = "N/A"
-                        kv_reuse_str = ""
-                        kv_stats = executor.kv_cache_manager.get_kv_cache_stats()
-                        if kv_stats.max_num_blocks > 0:
-                            kv_util_str = (
-                                f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
-                            )
-                        # Cumulative (warmup-adjusted) block reuse counters;
-                        # kv_cache_util only shows blocks pinned by active
-                        # requests, so it says nothing about prefix reuse.
-                        kv_reuse_str = (
-                            f"kv_reused_blocks = {kv_stats.reused_blocks}, "
-                            f"kv_missed_blocks = {kv_stats.missed_blocks}, "
-                            f"kv_hit_rate = {kv_stats.cache_hit_rate:.3f}, "
-                        )
-                    import datetime
-
-                    formatted_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    # Per-rank routing/scheduling observability for
-                    # attention-DP load-imbalance diagnosis. ``num_fetched``
-                    # is the number of new requests the ADP router assigned
-                    # to this rank since the previous log line.
-                    # ``num_dummy`` / ``num_unscheduled`` are sampled at
-                    # schedule time, so here they lag one iteration (like
-                    # ``num_scheduled_requests``).
-                    num_fetched = (
-                        executor.num_fetch_requests_cur_rank - prev_fetch_requests_cur_rank
-                    )
-                    prev_fetch_requests_cur_rank = executor.num_fetch_requests_cur_rank
-                    logger.info(
-                        f"iter = {executor.iter_counter}, "
-                        f"global_rank = {executor.global_rank}, "
-                        f"rank = {executor.dist.rank}, "
-                        f"num_scheduled_requests = {executor.num_scheduled_requests}, "
-                        f"adp_dummy_ctx_tokens = {executor._iter_adp_dummy_ctx_tokens}, "
-                        f"adp_dummy_gen_tokens = {executor._iter_adp_dummy_gen_tokens}, "
-                        f"kv_cache_util = {kv_util_str}, "
-                        f"{kv_reuse_str}"
-                        f"currank_total_requests = {executor.num_fetch_requests_cur_rank}/"
-                        f"{executor.num_fetch_requests}, "
-                        f"host_step_time = {host_step_time}ms, "
-                        f"prev_device_step_time = {prev_device_step_time_str}, "
-                        f"timestamp = {formatted_timestamp}, "
-                        f"states = {executor.model_engine.iter_states}, "
-                        f"num_active = {len(executor.active_requests)}, "
-                        f"num_fetched = {num_fetched}, "
-                        f"num_dummy = {executor.num_dummy_requests}, "
-                        f"num_unscheduled = {executor.num_unscheduled_requests}"
-                    )
+                    read_kv_cache = executor.kv_cache_manager.get_kv_cache_stats
+                record = self.metrics.collect_loop(
+                    {
+                        "iter": executor.iter_counter,
+                        "globalRank": executor.global_rank,
+                        "rank": executor.dist.rank,
+                        "numScheduledRequests": executor.num_scheduled_requests,
+                        "adpDummyCtxTokens": executor._iter_adp_dummy_ctx_tokens,
+                        "adpDummyGenTokens": executor._iter_adp_dummy_gen_tokens,
+                        "numFetchedRequestsTotal": executor.num_fetch_requests_cur_rank,
+                        "numFetchedRequestsAllRanks": executor.num_fetch_requests,
+                        "hostStepTimeMS": host_step_time,
+                        "prevDeviceStepTimeMS": prev_device_step_time,
+                        "states": str(executor.model_engine.iter_states),
+                        "numActiveRequests": len(executor.active_requests),
+                        "numDummyRequests": executor.num_dummy_requests,
+                        "numUnscheduledRequests": executor.num_unscheduled_requests,
+                    },
+                    read_kv_cache=read_kv_cache,
+                    kv_refresh_interval=ITER_LOG_KV_UTIL_REFRESH_ITERS,
+                )
+                # Sampled iteration statistics thin the log to the same iterations.
+                if (
+                    not executor.enable_iter_perf_stats
+                    or executor.iter_counter % executor.iter_perf_stats_interval == 0
+                ):
+                    self.expose_metrics(record)
 
             # profile_step runs at the start of each executor loop after
             # logging the preceding loop. Clear the counters before the next

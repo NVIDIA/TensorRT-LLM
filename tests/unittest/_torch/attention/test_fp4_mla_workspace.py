@@ -50,50 +50,56 @@ class _FakePool:
         return best.buffer[:nbytes].view(dtype).view(list(shape))
 
 
-def _metadata(max_sequences: int = 128) -> SimpleNamespace:
+def _metadata(max_sequences: int = 128, *, pool=None) -> SimpleNamespace:
     return SimpleNamespace(
         fp4_mla_state=SimpleNamespace(workspaces={}),
         max_num_sequences=max_sequences,
         max_num_requests=max_sequences,
+        is_cuda_graph=True,
+        forward_scratch_buffers=pool,
+        get_empty=lambda buffers, shape, dtype, name, capture_graph: buffers.get_buffer(
+            shape, dtype, name, capture_graph
+        ),
     )
 
 
 @pytest.fixture
 def pool(monkeypatch):
     fake = _FakePool()
-    monkeypatch.setattr(layout, "_workspace_pool", lambda: fake)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     return fake
 
 
 def test_buckets_share_one_block(pool):
-    a, b = _metadata(), _metadata()
+    a, b = _metadata(pool=pool), _metadata(pool=pool)
     ta = layout._ensure_workspace_tensor(
-        a, "ws", (4, 8), dtype=torch.float32, device=CPU, capacity_numel=1000
+        a, "ws", (4, 8), dtype=torch.float32, device=CPU, capacity_numel=1000, shared=True
     )
     tb = layout._ensure_workspace_tensor(
-        b, "ws", (20, 10), dtype=torch.float32, device=CPU, capacity_numel=1000
+        b, "ws", (20, 10), dtype=torch.float32, device=CPU, capacity_numel=1000, shared=True
     )
     assert ta.shape == (4, 8) and tb.shape == (20, 10)
     assert ta.data_ptr() == tb.data_ptr()
     assert pool.allocations == 1
     (key,) = pool.buffers
-    assert key == "fp4_mla_ws:ws:cpu"
+    assert key == "fp4_mla_decodews"
     (block,) = pool.buffers[key]
     assert block.buffer.numel() == 1000 * 4 and block.is_reserved
     # the per-state entry serves repeat requests without going back to the pool
-    tc = layout._ensure_workspace_tensor(a, "ws", (2, 2), dtype=torch.float32, device=CPU)
+    tc = layout._ensure_workspace_tensor(
+        a, "ws", (2, 2), dtype=torch.float32, device=CPU, shared=True
+    )
     assert tc.data_ptr() == ta.data_ptr()
     assert pool.allocations == 1
 
 
 def test_growth_past_capacity_keeps_the_old_block(pool):
-    a, b = _metadata(), _metadata()
+    a, b = _metadata(pool=pool), _metadata(pool=pool)
     ta = layout._ensure_workspace_tensor(
-        a, "ws", (10,), dtype=torch.int32, device=CPU, capacity_numel=16
+        a, "ws", (10,), dtype=torch.int32, device=CPU, capacity_numel=16, shared=True
     )
     tb = layout._ensure_workspace_tensor(
-        b, "ws", (64,), dtype=torch.int32, device=CPU, capacity_numel=16
+        b, "ws", (64,), dtype=torch.int32, device=CPU, capacity_numel=16, shared=True
     )
     assert pool.allocations == 2
     (key,) = pool.buffers
@@ -104,7 +110,7 @@ def test_growth_past_capacity_keeps_the_old_block(pool):
 
 
 def test_unshared_workspace_stays_per_state(pool):
-    a, b = _metadata(), _metadata()
+    a, b = _metadata(pool=pool), _metadata(pool=pool)
     ta = layout._ensure_workspace_tensor(a, "vp", (8,), dtype=torch.uint8, device=CPU, shared=False)
     tb = layout._ensure_workspace_tensor(b, "vp", (8,), dtype=torch.uint8, device=CPU, shared=False)
     assert ta.data_ptr() != tb.data_ptr()
@@ -112,15 +118,19 @@ def test_unshared_workspace_stays_per_state(pool):
 
 
 def test_unbounded_caller_keeps_a_per_state_buffer(pool):
-    # Without a capacity bound a workspace is not shared: each state grows its own buffer,
+    # Explicitly unshared workspaces stay local: each state grows its own buffer,
     # and a growing request leaves no reserved block behind in the pool.
-    a, b = _metadata(), _metadata()
-    ta = layout._ensure_workspace_tensor(a, "p_buf", (4, 8), dtype=torch.float32, device=CPU)
-    tb = layout._ensure_workspace_tensor(b, "p_buf", (4, 8), dtype=torch.float32, device=CPU)
+    a, b = _metadata(pool=pool), _metadata(pool=pool)
+    ta = layout._ensure_workspace_tensor(
+        a, "p_buf", (4, 8), dtype=torch.float32, device=CPU, shared=False
+    )
+    tb = layout._ensure_workspace_tensor(
+        b, "p_buf", (4, 8), dtype=torch.float32, device=CPU, shared=False
+    )
     assert ta.data_ptr() != tb.data_ptr()
     for rows in (8, 16, 32):
         grown = layout._ensure_workspace_tensor(
-            a, "p_buf", (rows, 8), dtype=torch.float32, device=CPU
+            a, "p_buf", (rows, 8), dtype=torch.float32, device=CPU, shared=False
         )
         assert grown.shape == (rows, 8)
     assert pool.allocations == 0 and not pool.buffers
@@ -128,34 +138,44 @@ def test_unbounded_caller_keeps_a_per_state_buffer(pool):
 
 
 def test_capture_never_allocates(pool, monkeypatch):
-    a = _metadata()
+    a = _metadata(pool=pool)
     layout._ensure_workspace_tensor(
-        a, "ws", (8,), dtype=torch.float32, device=CPU, capacity_numel=32
+        a, "ws", (8,), dtype=torch.float32, device=CPU, capacity_numel=32, shared=True
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    b = _metadata()
+    b = _metadata(pool=pool)
     # a hit inside the existing block is fine, a miss raises
     layout._ensure_workspace_tensor(
-        b, "ws", (32,), dtype=torch.float32, device=CPU, capacity_numel=32
+        b, "ws", (32,), dtype=torch.float32, device=CPU, capacity_numel=32, shared=True
     )
     with pytest.raises(ValueError, match="capturing"):
         layout._ensure_workspace_tensor(
-            b, "ws", (33,), dtype=torch.float32, device=CPU, capacity_numel=32
+            b, "ws", (33,), dtype=torch.float32, device=CPU, capacity_numel=32, shared=True
         )
     with pytest.raises(ValueError, match="capturing"):
         layout._ensure_workspace_tensor(
-            b, "other", (1,), dtype=torch.float32, device=CPU, capacity_numel=1
+            b, "other", (1,), dtype=torch.float32, device=CPU, capacity_numel=1, shared=True
         )
     with pytest.raises(ValueError, match="capturing"):
-        layout._ensure_workspace_tensor(b, "unbounded", (1,), dtype=torch.float32, device=CPU)
+        layout._ensure_workspace_tensor(
+            b, "unbounded", (1,), dtype=torch.float32, device=CPU, shared=False
+        )
     with pytest.raises(ValueError, match="capturing"):
         layout._ensure_workspace_tensor(b, "vp", (1,), dtype=torch.uint8, device=CPU, shared=False)
     assert pool.allocations == 1
 
 
-def test_pool_key_names_device_and_workspace():
-    assert layout._workspace_pool_key("x", torch.device("cpu")) == "fp4_mla_ws:x:cpu"
-    assert layout._workspace_pool_key("x", torch.device("cuda", 3)) == "fp4_mla_ws:x:cuda3"
+def test_scratch_stays_with_its_runner(pool):
+    other = _FakePool()
+    a, b = _metadata(pool=pool), _metadata(pool=other)
+    ta = layout._ensure_workspace_tensor(
+        a, "ws", (8,), dtype=torch.float32, device=CPU, shared=True, capacity_numel=32
+    )
+    tb = layout._ensure_workspace_tensor(
+        b, "ws", (8,), dtype=torch.float32, device=CPU, shared=True, capacity_numel=32
+    )
+    assert ta.data_ptr() != tb.data_ptr()
+    assert pool.allocations == other.allocations == 1
 
 
 def test_max_sequences_prefers_sequences_then_requests():
@@ -205,20 +225,20 @@ def test_plan_4x_task_capacity_bound_is_the_max(pairs, max_requests):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_real_pool_shares_one_cuda_block():
-    """Two metadata objects (two CUDA-graph buckets) get views of one reserved block of the process pool."""
-    from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+    """Two metadata objects (two CUDA-graph buckets) get views of one reserved block of their runner pool."""
+    from tensorrt_llm._torch.memory_buffer_utils import Buffers
 
     device = torch.device("cuda", torch.cuda.current_device())
     name = "_test_fp4_mla_workspace_shared"
-    key = layout._workspace_pool_key(name, device)
-    pool = get_memory_buffers()
+    key = f"fp4_mla_decode{name}"
+    pool = Buffers()
     before = len(pool.buffers.get(key, []))
-    a, b = _metadata(), _metadata()
+    a, b = _metadata(pool=pool), _metadata(pool=pool)
     ta = layout._ensure_workspace_tensor(
-        a, name, (3, 64), dtype=torch.float32, device=device, capacity_numel=4096
+        a, name, (3, 64), dtype=torch.float32, device=device, capacity_numel=4096, shared=True
     )
     tb = layout._ensure_workspace_tensor(
-        b, name, (16, 256), dtype=torch.float32, device=device, capacity_numel=4096
+        b, name, (16, 256), dtype=torch.float32, device=device, capacity_numel=4096, shared=True
     )
     assert ta.data_ptr() == tb.data_ptr()
     assert ta.is_contiguous() and tb.is_contiguous()
@@ -231,21 +251,21 @@ def test_real_pool_shares_one_cuda_block():
 
 
 def test_bounded_caller_upgrades_a_request_sized_block(pool):
-    a, b, c = _metadata(), _metadata(), _metadata()
+    a, b, c = _metadata(pool=pool), _metadata(pool=pool), _metadata(pool=pool)
     ta = layout._ensure_workspace_tensor(
         a, "ws", (10,), dtype=torch.float32, device=CPU, shared=True
     )
     assert pool.allocations == 1
     # a caller that knows the capacity bound replaces the request-sized block once ...
     tb = layout._ensure_workspace_tensor(
-        b, "ws", (5,), dtype=torch.float32, device=CPU, capacity_numel=100
+        b, "ws", (5,), dtype=torch.float32, device=CPU, capacity_numel=100, shared=True
     )
     assert pool.allocations == 2 and tb.data_ptr() != ta.data_ptr()
     (key,) = pool.buffers
     assert sorted(block.buffer.numel() for block in pool.buffers[key]) == [10 * 4, 100 * 4]
     # ... and everybody after it fits in the capacity block
     tc = layout._ensure_workspace_tensor(
-        c, "ws", (64,), dtype=torch.float32, device=CPU, capacity_numel=100
+        c, "ws", (64,), dtype=torch.float32, device=CPU, capacity_numel=100, shared=True
     )
     assert pool.allocations == 2 and tc.data_ptr() == tb.data_ptr()
     assert layout._workspace_capacity_numel(c, "ws", torch.float32, CPU) == 100
@@ -253,39 +273,36 @@ def test_bounded_caller_upgrades_a_request_sized_block(pool):
 
 
 def test_capture_hit_ignores_a_larger_bound(pool, monkeypatch):
-    a, b = _metadata(), _metadata()
+    a, b = _metadata(pool=pool), _metadata(pool=pool)
     layout._ensure_workspace_tensor(
-        a, "ws", (8,), dtype=torch.float32, device=CPU, capacity_numel=8
+        a, "ws", (8,), dtype=torch.float32, device=CPU, capacity_numel=8, shared=True
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     # inside capture a request that fits is served from the existing block even if its bound is larger
     tb = layout._ensure_workspace_tensor(
-        b, "ws", (4,), dtype=torch.float32, device=CPU, capacity_numel=4096
+        b, "ws", (4,), dtype=torch.float32, device=CPU, capacity_numel=4096, shared=True
     )
     assert tb.shape == (4,) and pool.allocations == 1
 
 
 def test_latest_request_shape_is_cached_per_state(pool):
-    a = _metadata()
+    a = _metadata(pool=pool)
     big = layout._ensure_workspace_tensor(
-        a, "ws", (4, 8), dtype=torch.float32, device=CPU, capacity_numel=64
+        a, "ws", (4, 8), dtype=torch.float32, device=CPU, capacity_numel=64, shared=True
     )
     small = layout._ensure_workspace_tensor(
-        a, "ws", (2, 3), dtype=torch.float32, device=CPU, capacity_numel=64
+        a, "ws", (2, 3), dtype=torch.float32, device=CPU, capacity_numel=64, shared=True
     )
     assert small.shape == (2, 3) and small.data_ptr() == big.data_ptr()
-    assert a.fp4_mla_state.workspaces["ws"].shape == (
-        4,
-        8,
-    )  # the cached view keeps the larger request
+    assert a.fp4_mla_state.workspaces["ws"].numel() == 64
     again = layout._ensure_workspace_tensor(
-        a, "ws", (8, 8), dtype=torch.float32, device=CPU, capacity_numel=64
+        a, "ws", (8, 8), dtype=torch.float32, device=CPU, capacity_numel=64, shared=True
     )
     assert again.shape == (8, 8) and again.data_ptr() == big.data_ptr() and pool.allocations == 1
 
 
 def test_unshared_capacity_is_the_per_state_entry(pool):
-    a = _metadata()
+    a = _metadata(pool=pool)
     layout._ensure_workspace_tensor(a, "vp", (6, 7), dtype=torch.uint8, device=CPU, shared=False)
     assert layout._workspace_capacity_numel(a, "vp", torch.uint8, CPU) == 42
     assert layout._workspace_capacity_numel(a, "vp", torch.float32, CPU) == 0

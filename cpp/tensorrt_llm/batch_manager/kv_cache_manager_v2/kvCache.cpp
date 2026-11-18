@@ -263,8 +263,10 @@ void KvCache::_collectReuseCandidates()
             }
         }
         // OPTIONAL checks coverage at the REQUIRED endpoint without shortening it.
-        // Use the ordinary SWA live ranges, including sinks and multi-page windows.
-        if (attention && allowsCheckpoint(*attention) && end > 0 && end % mTokensPerBlock == 0 && attention->windowSize)
+        // Use the ordinary SWA live ranges, including sinks and multi-page windows. OPTIONAL needs a block-aligned
+        // endpoint; a SINK_REQUIRED_ONLY window may also end in a partial block, as a REQUIRED window does.
+        if (attention && allowsCheckpoint(*attention) && end > 0 && attention->windowSize
+            && (end % mTokensPerBlock == 0 || policy == ReusePolicy::SINK_REQUIRED_ONLY))
         {
             auto const stale = getStaleRange(lifeCycles[lc], end, mTokensPerBlock);
             auto& candidates = mOptionalCandidates[lc];
@@ -292,7 +294,7 @@ void KvCache::_collectReuseCandidates()
                 // SINK_REQUIRED_ONLY claimed its sinks with the prefix match; only its window is a candidate.
                 if (stale.beg > BlockOrdinal{0})
                 {
-                    status.coverage.emplace_back(0, stale.beg.value() * mTokensPerBlock);
+                    status.coverage.emplace_back(0, std::min(end, stale.beg.value() * mTokensPerBlock));
                 }
             }
             else
@@ -302,6 +304,31 @@ void KvCache::_collectReuseCandidates()
             if (status.complete)
             {
                 collectRange(stale.end, BlockOrdinal{end / mTokensPerBlock});
+            }
+            // A window that ends in a partial block also needs that block's tokens up to the endpoint. The first
+            // resume copies the block before the request appends to it.
+            BlockOrdinal const tail{end / mTokensPerBlock};
+            if (status.complete && end % mTokensPerBlock != 0 && tail >= stale.end)
+            {
+                auto const& block = mBlocks[tail].treeBlock;
+                auto* page = block && !block->isOrphan() ? block->getPage(lc) : nullptr;
+                if (page && page->numTokensInBlock >= end - tail.value() * mTokensPerBlock)
+                {
+                    candidates.emplace_back(tail, page->hold());
+                    // One window range up to the endpoint, as REQUIRED reports it.
+                    if (stale.end < tail)
+                    {
+                        status.coverage.back().second = end;
+                    }
+                    else
+                    {
+                        status.coverage.emplace_back(tail.value() * mTokensPerBlock, end);
+                    }
+                }
+                else
+                {
+                    status.complete = false;
+                }
             }
             if (!status.complete)
             {
@@ -1603,10 +1630,10 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm, 
     std::vector<LifeCycleId> attachedLcs;
     for (auto const& [lcIdx, attn] : mManager->lifeCycles().attentionLifeCycles())
     {
-        // REQUIRED attaches every partial block; SINK_REQUIRED_ONLY only a partial sink block.
-        bool const requiredSink
-            = attn->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY && ordinal < BlockOrdinal{attn->numSinkBlocks};
-        if (!requiresPrefixCoverage(*attn) && !requiredSink)
+        // REQUIRED and SINK_REQUIRED_ONLY attach every partial block. A later request claims a partial
+        // SINK_REQUIRED_ONLY sink block with the prefix, and can select a window that ends in a partial block.
+        bool const sinkRequiredOnly = attn->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY;
+        if (!requiresPrefixCoverage(*attn) && !sinkRequiredOnly)
         {
             continue;
         }
@@ -3173,6 +3200,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
 
     BlockOrdinal const numMatchedBlocks = matched.size();
     _resizePageIndexBuffers(numMatchedBlocks);
+    mBlocks.reserve(numMatchedBlocks);
 
     for (BlockOrdinal i{0}; i < numMatchedBlocks; ++i)
     {
@@ -3356,7 +3384,8 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
 std::vector<TokenIdExt> KvCache::_getMatchedTokens(BlockRadixTree::ReuseMatch const& match) const
 {
     std::vector<TokenIdExt> ret;
-    ret.reserve(static_cast<size_t>(match.numTokens));
+    // Room for the rest of the prompt, which commit() appends.
+    ret.reserve(static_cast<size_t>(std::max(match.numTokens, mExpectedPromptLength.value_or(0))));
     int remaining = match.numTokens;
     for (auto const* block : match.blocks)
     {

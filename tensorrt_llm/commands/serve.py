@@ -438,9 +438,8 @@ def _publish_bound_address(report_addr: Optional[str], host: str,
         host = resolved
     report_addr = os.path.abspath(report_addr)
     parent = os.path.dirname(report_addr)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=parent or None,
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=parent,
                                     prefix=os.path.basename(report_addr) + ".",
                                     suffix=".tmp")
     try:

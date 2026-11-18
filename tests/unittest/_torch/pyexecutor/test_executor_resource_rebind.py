@@ -22,6 +22,7 @@ from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler import AsyncWorkerMixin
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 
 pytestmark = pytest.mark.cpu_only
 
@@ -52,6 +53,7 @@ def executor(monkeypatch):
     )
     ex = object.__new__(PyExecutor)
     ex._closed = False
+    ex._perf_metrics = PerfMetricsCollector()
     ex.enable_attention_dp = False
     ex._kv_connector_failed = False
     ex._resources_released = False

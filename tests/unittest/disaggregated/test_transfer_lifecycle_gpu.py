@@ -439,6 +439,9 @@ def _worker(args: argparse.Namespace) -> None:
     from tensorrt_llm import Mapping
     from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
     from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import BindingsNixlTransferAgent
+    from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import (
+        AsyncTransferManager,
+    )
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
     from tensorrt_llm._torch.distributed.communicator import MPIDist
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -573,7 +576,8 @@ def _worker(args: argparse.Namespace) -> None:
     full_pool = _pool_state(manager)
     assert full_pool["total"] == initial_pool["total"]
     assert full_pool["free"] == full_pool["available"] == full_pool["evictable"] == 0
-    # No model, scheduler loop, response transport, or async-send manager is initialized.
+    # No model, scheduler loop, or response transport is initialized. Transfers
+    # are owned by native sessions, not admitted through the executor manager.
     executor = object.__new__(PyExecutor)
     executor.sampler = Mock(spec=["release_request"])
     executor.model_engine = None
@@ -581,6 +585,9 @@ def _worker(args: argparse.Namespace) -> None:
     executor.kv_cache_transceiver = transceiver
     executor.kv_cache_manager = manager
     executor.resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+    executor.async_transfer_manager = AsyncTransferManager(
+        executor.resource_manager, should_store_blocks=False
+    )
     executor.dist = transceiver._dist
     executor.enable_attention_dp = not context_first
     executor._is_kv_manager_v2 = True
@@ -819,6 +826,9 @@ def _exercise_live_session(
         )
 
     fatal_check.append(check_fatal)
+    cancel_before_retirement = (role == "ctx" and context_first) or (
+        role == "gen" and not context_first
+    )
 
     if case != "baseline":
         _wait(
@@ -853,7 +863,7 @@ def _exercise_live_session(
             # The other endpoint may already have sent cancellation after the gate.
             # Local cancellation must preserve that first drain, not restart grace.
             previous_drain = retirement._drain_started
-            assert executor._try_cancel_request(request) is (role == "gen" and not context_first)
+            assert executor._try_cancel_request(request) is cancel_before_retirement
             if role == "gen" and not context_first:
                 assert executor.disagg._retiring_gen_receives == {request.py_request_id: request}
                 executor._terminate_request(request)
@@ -883,9 +893,7 @@ def _exercise_live_session(
         drain_started = session._retirement._drain_started
         for _ in range(3):
             if case.startswith("cancel_"):
-                assert executor._try_cancel_request(request) is (
-                    role == "gen" and not context_first
-                )
+                assert executor._try_cancel_request(request) is cancel_before_retirement
                 if role == "gen" and not context_first:
                     executor._terminate_request(request)
                 assert session._retirement._drain_started == drain_started
