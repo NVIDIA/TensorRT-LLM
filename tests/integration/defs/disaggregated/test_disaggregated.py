@@ -52,11 +52,31 @@ from tensorrt_llm.logger import logger
 
 MAMBA_BS1_CONCURRENCY2_MODEL = "NVIDIA-Nemotron-Nano-9B-v2"
 
-# Readiness budget for the Qwen3-0.6B pipeline-parallel disaggregated tests.
-# With cold JIT caches every rank spends most of its startup in warmup (kernel
-# JIT and autotuning), so cluster readiness takes 350-650s on 4-8 Blackwell or
-# Rubin GPUs, past the 300s default.
+# Readiness budgets for setup_disagg_cluster when the caller passes none.
+# Pipeline parallelism on SM100/SM103/SM107 enables the CuTe DSL BF16 GEMM/BMM
+# (see TorchLlmArgs.validate_cute_dsl_bf16), whose autotuning JIT-compiles
+# kernels on every rank. With cold caches, readiness of the Qwen3-0.6B PP
+# configurations then takes 350-650s on 4-8 Blackwell or Rubin GPUs.
+DEFAULT_SERVER_START_TIMEOUT = 300
 PP_DISAGG_SERVER_START_TIMEOUT = 900
+
+
+def resolve_server_start_timeout(config: dict[str, Any],
+                                 server_start_timeout: int | None) -> int:
+    """Return the readiness budget for a disagg config.
+
+    An explicit ``server_start_timeout`` wins. Otherwise a config whose context
+    or generation servers use pipeline parallelism gets
+    ``PP_DISAGG_SERVER_START_TIMEOUT`` and any other config gets
+    ``DEFAULT_SERVER_START_TIMEOUT``.
+    """
+    if server_start_timeout is not None:
+        return server_start_timeout
+    uses_pp = any(
+        (config.get(servers) or {}).get("pipeline_parallel_size", 1) > 1
+        for servers in ("context_servers", "generation_servers"))
+    return (PP_DISAGG_SERVER_START_TIMEOUT
+            if uses_pp else DEFAULT_SERVER_START_TIMEOUT)
 
 
 @dataclass
@@ -793,7 +813,7 @@ def setup_disagg_cluster(
     model_name: str | None = None,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
-    server_start_timeout: int = 300,
+    server_start_timeout: int | None = None,
     schedule_style: str | None = None,
     save_log: bool = False,
     startup_callback=None,
@@ -814,7 +834,8 @@ def setup_disagg_cluster(
         config_file: Path to disaggregated server config YAML
         model_name: Model path override (defaults to config's 'model' field)
         env: Environment variables to pass to subprocess (workers and disagg server)
-        server_start_timeout: Timeout in seconds for server to become ready
+        server_start_timeout: Timeout in seconds for server to become ready;
+            None picks one from the config (see resolve_server_start_timeout)
         schedule_style: Disagg schedule style ('context_first' or 'generation_first')
         disagg_cluster_overrides: Entries merged over
             get_default_disagg_cluster_config(), e.g. PRODUCTION_CLUSTER_TIMINGS
@@ -839,6 +860,8 @@ def setup_disagg_cluster(
             config.setdefault(key, {}).update(value)
         else:
             config[key] = value
+    server_start_timeout = resolve_server_start_timeout(config,
+                                                        server_start_timeout)
 
     if perf_metrics_output_dir is not None:
         config["perf_metrics_output_dir"] = perf_metrics_output_dir
@@ -1193,7 +1216,7 @@ def run_disaggregated_test(example_dir,
                            ctx_env=None,
                            gen_env=None,
                            share_gpu=False,
-                           server_start_timeout=300,
+                           server_start_timeout=None,
                            assert_ctx_log_contains=None,
                            config_overrides=None):
     """Run disaggregated test using service discovery instead of MPI.
@@ -1237,6 +1260,8 @@ def run_disaggregated_test(example_dir,
                                  "overlap_transceiver_runtime_python_bounce"))
 
     server_host = config.get("hostname", "localhost")
+    server_start_timeout = resolve_server_start_timeout(config,
+                                                        server_start_timeout)
 
     success = False
     try:
@@ -1627,9 +1652,7 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
         model_path=qwen_model_root,
         cwd=llm_venv.get_working_directory(),
         disagg_schedule_style="generation_first",
-        post_client_test=post_client_test,
-        server_start_timeout=(PP_DISAGG_SERVER_START_TIMEOUT
-                              if ctx_pp > 1 else 300))
+        post_client_test=post_client_test)
 
 
 def test_disaggregated_overlap_transceiver_runtime_python(
@@ -1973,8 +1996,7 @@ def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
                            "ctxpp2_genpp2",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=PP_DISAGG_SERVER_START_TIMEOUT)
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(4)
@@ -2019,8 +2041,7 @@ def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
                            "ctxtp2pp2_gentp2pp2",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=PP_DISAGG_SERVER_START_TIMEOUT)
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)
@@ -2035,8 +2056,7 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=PP_DISAGG_SERVER_START_TIMEOUT)
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)
@@ -2051,8 +2071,7 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
                            "ctxpp4_gentp4",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=PP_DISAGG_SERVER_START_TIMEOUT)
+                           cwd=llm_venv.get_working_directory())
 
 
 @skip_no_hopper
