@@ -2287,3 +2287,164 @@ def test_conversation_map_count_tracks_namespaces_and_retained_plans():
     assert manager.num_conversations == 1
     manager.clear()
     assert manager.num_conversations == 0
+
+
+def _activity_request(
+    conversation_id="session", *, request_id=1, lora=None, salt=None, dummy=False
+):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        is_dummy_request=dummy,
+        py_request_id=request_id,
+        py_conversation_params=SimpleNamespace(conversation_id=conversation_id),
+        lora_task_id=lora,
+        cache_salt=salt,
+    )
+
+
+def _activity_manager(**limits):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
+
+    manager = ConversationManager(0, retention_enabled=False)
+    manager.enable_activity_tracking(now=0.0, **limits)
+    return manager
+
+
+def test_conversation_activity_refreshes_scoped_identities_and_survives_retention_clear():
+    manager = _activity_manager()
+    first = _activity_request(" session ")
+    manager.observe_admission(first, 1.0)
+    manager.observe_admission(_activity_request("session", request_id=2), 500.0)
+    manager.observe_admission(_activity_request(lora=1), 501.0)
+    manager.observe_admission(_activity_request(salt="other"), 502.0)
+    manager.observe_admission(_activity_request(" "), 503.0)
+    manager.observe_admission(_activity_request(dummy=True), 504.0)
+    no_params = _activity_request()
+    no_params.py_conversation_params = None
+    manager.observe_admission(no_params, 505.0)
+    manager.prepare_request(first)
+    assert manager.num_conversations == 0  # Activity alone does not enable retention.
+    manager.clear()
+    assert manager.snapshot_activity(600.0).unique_10m == 3
+    assert manager.snapshot_activity(600.0).complete_10m == 1
+    assert manager.snapshot_activity(600.0).complete_1h == 0
+    assert manager.snapshot_activity(1100.0).unique_10m == 2
+    assert manager.snapshot_activity(1102.0).unique_10m == 0
+    assert manager.snapshot_activity(3600.0).unique_1h == 3
+    assert manager.snapshot_activity(3600.0).complete_1h == 1
+    assert manager.snapshot_activity(4102.0).unique_1h == 0
+    assert manager._activity_entries == manager._activity_identity_bytes == 0
+    manager.observe_admission(first, 4103.0)
+    assert manager.snapshot_activity(4103.0).unique_10m == 1
+
+
+def test_conversation_activity_overflow_refresh_and_window_recovery():
+    manager = _activity_manager(max_entries=2)
+    manager.observe_admission(_activity_request("a"), 1.0)
+    manager.observe_admission(_activity_request("b"), 2.0)
+    manager.observe_admission(_activity_request("a"), 3.0)
+    initial = manager.snapshot_activity(600.0)
+    assert initial.unique_10m == initial.unique_1h == 1
+    assert initial.overflow_entries_10m == initial.overflow_entries_1h == 1
+    assert initial.complete_10m == 0
+    assert manager.snapshot_activity(602.0).complete_10m == 1
+    assert manager.snapshot_activity(3601.0).complete_1h == 0
+    assert manager.snapshot_activity(3602.0).complete_1h == 1
+    assert manager.snapshot_activity(3603.0).unique_1h == 0
+
+
+def test_conversation_activity_byte_limit_and_repeat_storage_are_bounded():
+    import sys
+
+    request = _activity_request("a")
+    key = ("a", None, None)
+    size = sys.getsizeof(key) + sum(sys.getsizeof(part) for part in key)
+    manager = _activity_manager(max_entries=10, max_identity_bytes=2 * size)
+    for now in range(1, 1000):
+        manager.observe_admission(request, float(now))
+    assert manager._activity_entries == 2
+    assert manager._activity_identity_bytes == 2 * size
+    manager.observe_admission(_activity_request("x" * 10000), 1000.0)
+    snapshot = manager.snapshot_activity(1000.0)
+    assert snapshot.unique_10m == snapshot.unique_1h == 1
+    assert snapshot.overflow_bytes_10m == snapshot.overflow_bytes_1h == 1
+    assert snapshot.complete_10m == 0
+    assert manager.snapshot_activity(1600.0).complete_10m == 1
+    assert manager._activity_entries == 1
+    assert manager.snapshot_activity(4600.0).complete_1h == 1
+    assert manager._activity_identity_bytes == 0
+
+
+def test_conversation_activity_disabled_and_restart_warmup():
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
+
+    manager = ConversationManager(2)
+    manager.observe_admission(_activity_request(), 1.0)
+    assert manager.snapshot_activity(3600.0) is None
+    manager.enable_activity_tracking(now=4000.0)
+    assert manager.snapshot_activity(4599.0).complete_10m == 0
+    assert manager.snapshot_activity(4600.0).complete_10m == 1
+    assert manager.snapshot_activity(7600.0).complete_1h == 1
+    assert _activity_manager().snapshot_activity(1.0).complete_10m == 0
+
+
+def test_conversation_activity_metrics_keep_source_rank_and_cumulative_overflows(collector):
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
+
+    snapshot = ConversationActivityStats(5, 1, 2, 3, 9, 0, 4, 5)
+    row = {"attentionDpRank": 3, "conversationActivity": snapshot.to_dict()}
+    collector.log_iteration_stats(row)
+    collector.log_iteration_stats(row)
+    labels = {**collector.labels, "dp_rank": "3", "window": "10m"}
+    assert collector.conversation_unique_seen.labels(**labels)._value.get() == 5
+    assert collector.conversation_unique_seen_complete.labels(**labels)._value.get() == 1
+    assert (
+        collector.conversation_tracking_overflow.labels(**labels, reason="entries")._value.get()
+        == 2
+    )
+    assert (
+        collector.conversation_tracking_overflow.labels(
+            **labels, reason="identity_bytes"
+        )._value.get()
+        == 3
+    )
+    assert {
+        s.labels["dp_rank"] for s in collector.conversation_unique_seen.collect()[0].samples
+    } == {"3"}
+    manager = _activity_manager()
+    collector.log_iteration_stats(
+        {"attentionDpRank": 3, "conversationActivity": manager.snapshot_activity(3600.0).to_dict()}
+    )
+    assert collector.conversation_unique_seen.labels(**labels)._value.get() == 0
+    assert collector.conversation_unique_seen_complete.labels(**labels)._value.get() == 1
+
+
+def test_conversation_activity_enablement_keeps_retention_independent(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+        ConversationManager,
+        KVCacheManagerV2,
+    )
+
+    monkeypatch.setenv("TRTLLM_CONVERSATION_ACTIVITY_MAX_ENTRIES", "2")
+    monkeypatch.setenv("TRTLLM_CONVERSATION_ACTIVITY_MAX_IDENTITY_BYTES", "4096")
+    owner = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    owner.conversation_manager = None
+    manager = owner.enable_conversation_activity()
+    assert manager.retention_enabled is False
+    now = 0.0
+    manager.observe_admission(_activity_request(), now)
+    assert owner.enable_conversation_activity() is manager
+    assert manager.snapshot_activity(now).unique_10m == 1
+    manager.prepare_request(_activity_request())
+    assert manager.num_conversations == 0
+    manager.clear()
+    assert manager.snapshot_activity(now).unique_10m == 1
+    owner.conversation_manager = ConversationManager(2)
+    assert owner.enable_conversation_activity().retention_enabled is True
+
+
+@pytest.mark.parametrize("limits", [{"max_entries": -1}, {"max_identity_bytes": -1}])
+def test_conversation_activity_rejects_negative_limits(limits):
+    with pytest.raises(ValueError, match="nonnegative"):
+        _activity_manager(**limits)

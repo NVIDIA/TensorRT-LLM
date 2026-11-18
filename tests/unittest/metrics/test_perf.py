@@ -337,3 +337,263 @@ def test_prometheus_missing_used_count_does_not_infer_utilization() -> None:
         )
     )
     assert prom.kv_cache_utilization.collect()[0].samples == []
+
+
+@pytest.mark.parametrize("include_load", [False, True])
+@pytest.mark.parametrize("include_snapshots", [False, True])
+@pytest.mark.parametrize("outcomes", [None, (2, 3, 4)])
+def test_conversation_activity_wire_roundtrip(include_load, include_snapshots, outcomes):
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import (
+        RankIterStatsPayload,
+        RankKvCacheStats,
+        RankSchedulingCounters,
+        RankState,
+    )
+
+    activity = ConversationActivityStats(3, 1, 0, 2, 9, 0, 1, 4)
+    payload = RankIterStatsPayload(
+        kv_cache_stats=RankKvCacheStats(20, 10, 10, 32, 8, 2, 4, 1, 0.8)
+        if include_snapshots
+        else None,
+        scheduling_counters=RankSchedulingCounters(num_deferred_gen_receives=3)
+        if include_snapshots
+        else None,
+        kv_transfer_outcomes=outcomes,
+        conversation_activity=activity,
+    )
+    state = RankState(rank=2, iter_stats=payload, num_connector_transfers=4)
+    assert RankState.deserialize(state.serialize(include_load)) == state
+    wire = payload.serialize(include_load)
+    assert RankIterStatsPayload.deserialize(wire) == payload
+    with pytest.raises(ValueError):
+        RankIterStatsPayload.deserialize(wire[:-1])
+    wire[-3] = 2  # The 1h completeness field must be boolean.
+    with pytest.raises(ValueError):
+        RankIterStatsPayload.deserialize(wire)
+    record = PerfMetricsCollector.collect_iteration({"conversationActivity": activity.to_dict()})
+    assert "conversationActivity" in record.per_rank
+    assert "conversationActivity" not in record.per_iter
+
+
+def test_conversation_activity_piggybacks_without_a_pending_iteration():
+    from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankIterStatsPayload
+
+    activity = ConversationActivityStats(1, 0, 0, 0, 1, 0, 0, 0)
+    buffer = ADPIterStatsBuffer(activity_snapshot=lambda: activity)
+    payload = buffer.next_payload()
+    assert not payload.has_iter_stats
+    assert payload.conversation_activity == activity
+    assert ADPIterStatsBuffer().next_payload() is None
+    pending = RankIterStatsPayload(has_iter_stats=1, iter_stats_iter=7)
+    buffer._payloads[7] = pending
+    buffer._oldest_iter = 7
+    assert buffer.next_payload().conversation_activity == activity
+    assert pending.conversation_activity is None
+    assert buffer.next_payload().iter_stats_iter == 7
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("max_stats_len", [0, 10])
+def test_conversation_activity_adp_publication_keeps_worker_identity(rank, max_stats_len):
+    import threading
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankIterStatsPayload, RankState
+    from tensorrt_llm.executor.base_worker import BaseWorker
+
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.dist = SimpleNamespace(rank=rank)
+    executor.enable_iter_perf_stats = True
+    executor.stats_lock = threading.Lock()
+    executor.stats = []
+    executor.max_stats_len = max_stats_len
+    executor._last_published_conversation_activity = {}
+    states = [
+        RankState(
+            rank=i,
+            iter_stats=RankIterStatsPayload(
+                conversation_activity=ConversationActivityStats(i, 1, i, 0, i + 2, 0, 0, 0)
+            ),
+        )
+        for i in range(3)
+    ]
+    executor._publish_conversation_activity(states)
+    executor._publish_conversation_activity(states)
+    rows = [json.loads(BaseWorker._stats_serializer(row)) for row in executor.stats]
+    assert len(rows) == ((1 if max_stats_len == 0 else 3) if rank == 0 else 0)
+    for index, row in enumerate(rows):
+        i = 2 if max_stats_len == 0 else index
+        assert row["attentionDpRank"] == i
+        assert row["conversationActivity"]["10m"]["unique"] == i
+
+
+@pytest.mark.parametrize("transfer_timeout", [None, 0.25])
+def test_conversation_activity_idle_poll_expires_without_new_arrivals(
+    monkeypatch, transfer_timeout
+):
+    import datetime
+    import threading
+    from contextlib import nullcontext
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    manager = ConversationManager(0, retention_enabled=False)
+    manager.enable_activity_tracking(now=0.0)
+    request = SimpleNamespace(
+        is_dummy_request=False,
+        py_conversation_params=SimpleNamespace(conversation_id="a"),
+        lora_task_id=None,
+        cache_salt=None,
+    )
+    manager.observe_admission(request, 1.0)
+    executor = PyExecutor.__new__(PyExecutor)
+    executor._conversation_manager = manager
+    executor._conversation_activity_capture_time = float("-inf")
+    executor._conversation_activity_cached = None
+    executor._last_published_conversation_activity = {}
+    executor.enable_iter_perf_stats = True
+    executor.enable_attention_dp = False
+    executor.dist = SimpleNamespace(rank=0)
+    executor.stats_lock = threading.Lock()
+    executor.stats = []
+    executor.max_stats_len = 10
+    executor._publish_transfer_outcomes = Mock()
+    executor.kv_connector_manager = None
+    executor.control_requests = []
+    executor.canceled_req_ids = set()
+    executor.is_shutdown = False
+    executor._has_pending_connector_transfers = Mock(return_value=False)
+    executor._has_pending_context_retirement = Mock(return_value=False)
+    executor._disagg_coordinator = SimpleNamespace(has_retiring_gen_receives=False)
+    executor._disable_mpi = False
+    executor.request_accumulated = []
+    executor.hang_detector = SimpleNamespace(pause=nullcontext)
+    executor._flush_staged_responses = Mock()
+    executor._idle_kv_transfer_poll_timeout = Mock(
+        return_value=None
+        if transfer_timeout is None
+        else datetime.timedelta(seconds=transfer_timeout)
+    )
+
+    class IdleWaitReached(Exception):
+        pass
+
+    def idle_wait(timeout, *, wait_for_batch, batch_wait_deadline):
+        assert timeout.total_seconds() == (1.0 if transfer_timeout is None else transfer_timeout)
+        assert wait_for_batch is True
+        assert batch_wait_deadline == 601.0 + (
+            1.0 if transfer_timeout is None else transfer_timeout
+        )
+        raise IdleWaitReached
+
+    executor.executor_request_queue = SimpleNamespace(get_from_request_queue=idle_wait)
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.time.monotonic", lambda: 601.0)
+    with pytest.raises(IdleWaitReached):
+        executor._fetch_and_enqueue_requests([], 0)
+    assert executor.stats[0][1]["conversationActivity"]["10m"] == {
+        "unique": 0,
+        "complete": 1,
+        "overflowEntries": 0,
+        "overflowIdentityBytes": 0,
+    }
+    assert executor.stats[0][1]["conversationActivity"]["1h"]["unique"] == 1
+
+
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_conversation_activity_observes_only_local_worker_admissions(monkeypatch, attention_dp):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankState
+
+    executor = PyExecutor.__new__(PyExecutor)
+    manager = ConversationManager(0, retention_enabled=False)
+    manager.enable_activity_tracking(now=0.0)
+    executor._conversation_manager = manager
+    converted = [
+        SimpleNamespace(
+            is_dummy_request=False,
+            is_child=False,
+            py_conversation_params=SimpleNamespace(conversation_id=name),
+            lora_task_id=None,
+            cache_salt=None,
+        )
+        for name in ("local", "peer")
+    ]
+    child = SimpleNamespace(is_child=True)
+    requests = [SimpleNamespace(id=i) for i in range(2)]
+    executor.enable_attention_dp = attention_dp
+    executor.enable_iter_perf_stats = True
+    executor._kv_load_tracker = Mock(enabled=False)
+    executor._kv_load_tracker.begin_step.return_value = None
+    executor._kv_cache_capacity = {}
+    executor.adp_router = Mock(exclude_retiring_requests=False, needs_prefix_matches=False)
+    executor.adp_router.route_requests.return_value = ({0: [requests[0]], 1: [requests[1]]}, 1)
+    executor._prefetched_rank_states = [RankState(rank=0), RankState(rank=1)]
+    executor._kv_connector_deadlines = {}
+    executor._fetch_hint_enabled = False
+    executor._publish_adp_iter_stats = Mock()
+    executor._fetch_and_enqueue_requests = Mock()
+    executor._cancel_queued_context_requests = Mock()
+    executor._pop_from_waiting_queue = Mock(return_value=(requests, {}))
+    executor._update_new_active_requests_queue_latency = Mock()
+    executor.num_fetch_requests = executor.num_fetch_requests_cur_rank = 0
+    executor.max_num_active_requests = 4
+    executor.request_broadcaster = Mock()
+    executor.dist = SimpleNamespace(rank=0, tp_rank=0, cp_config={}, cp_rank=0, cp_size=1)
+    executor._enable_non_overlap_adp_forward_intent = True
+    executor.kv_cache_transceiver = None
+    executor.track_unique_tokens = False
+    executor._should_exclude_last_generation_logits = Mock(return_value=False)
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.time.monotonic", lambda: 1.0)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
+        lambda requests, **kwargs: [converted[request.id] for request in requests] + [child],
+    )
+    admitted = executor._fetch_new_requests([], [])
+    assert admitted == ([converted[0], child] if attention_dp else [*converted, child])
+    assert manager.snapshot_activity(1.0).unique_10m == (1 if attention_dp else 2)
+    # A subsequent turn refreshes activity without adding another identity.
+    executor._prefetched_rank_states = [RankState(rank=0), RankState(rank=1)]
+    executor._fetch_new_requests([], [])
+    assert manager.snapshot_activity(1.0).unique_1h == (1 if attention_dp else 2)
+
+
+@pytest.mark.parametrize("arrives", [False, True])
+def test_conversation_activity_poll_preserves_batch_fill_within_deadline(monkeypatch, arrives):
+    import datetime
+    import queue
+
+    from tensorrt_llm._torch.pyexecutor.executor_request_queue import ExecutorRequestQueue
+
+    now = [0.0]
+    first, second = object(), object()
+    requests = ExecutorRequestQueue.__new__(ExecutorRequestQueue)
+    requests.request_queue = Mock()
+    requests.request_queue.empty.return_value = True
+    requests.batch_wait_timeout_ms = 5.0
+    requests.max_batch_size = 2
+
+    def get(*, timeout):
+        if not arrives:
+            now[0] = 1.0
+            raise queue.Empty
+        return first if requests.request_queue.get.call_count == 1 else second
+
+    requests.request_queue.get.side_effect = get
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.executor_request_queue.time.monotonic", lambda: now[0]
+    )
+    result = requests.get_from_request_queue(datetime.timedelta(seconds=1), batch_wait_deadline=1.0)
+    if arrives:
+        assert result == [first, second]
+        assert requests.request_queue.get.call_args_list[1].kwargs["timeout"] == pytest.approx(
+            0.005
+        )
+    else:
+        assert result == []
+        requests.request_queue.get.assert_called_once_with(timeout=1.0)

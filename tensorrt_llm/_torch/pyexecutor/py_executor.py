@@ -112,11 +112,12 @@ from .hang_detector import (HangDetector, all_ranks_crashed,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
 from .iteration_stats import IterationStatsRecord
-from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.kv_cache_manager_v2 import ConversationManager, KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
 from .kv_cache_load import KvLoadTracker, aggregate_load
-from .kv_cache_stats import append_kv_cache_iteration_stats
+from .kv_cache_stats import (ConversationActivityStats,
+                             append_kv_cache_iteration_stats)
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
                           MultimodalEncoderRequestError, get_draft_token_length,
@@ -1695,7 +1696,17 @@ class PyExecutor:
                 "KV cache iteration stats are reported every "
                 f"{math.lcm(self._kv_iter_stats_interval, self.iter_perf_stats_interval)} "
                 "iterations.")
-        self._adp_iter_stats = ADPIterStatsBuffer()
+        self._conversation_manager: Optional[ConversationManager] = (
+            self.kv_cache_manager.enable_conversation_activity()
+            if self._is_kv_manager_v2 and self.enable_iter_perf_stats else None)
+        self._conversation_activity_capture_time = float("-inf")
+        self._conversation_activity_cached: Optional[
+            ConversationActivityStats] = None
+        self._last_published_conversation_activity: Dict[
+            int, ConversationActivityStats] = {}
+        self._adp_iter_stats = ADPIterStatsBuffer(
+            activity_snapshot=self._snapshot_conversation_activity if self.
+            _conversation_manager is not None else None)
         # Per-loop CPU wall and GPU forward time captured by the profile_step
         # closure (see _profiler). Populated whenever enable_iter_perf_stats or
         # print_iter_log is on so the /metrics serializer can read them
@@ -8984,6 +8995,40 @@ class PyExecutor:
             if validate_mm is not None:
                 validate_mm(mm_data)
 
+    def _snapshot_conversation_activity(
+            self) -> Optional[ConversationActivityStats]:
+        """Capture at most once per second on the executor thread, including idle passes."""
+        manager = getattr(self, "_conversation_manager", None)
+        if manager is None or not self.enable_iter_perf_stats:
+            return None
+        now = time.monotonic()
+        if now - self._conversation_activity_capture_time >= 1.0:
+            self._conversation_activity_cached = manager.snapshot_activity(now)
+            self._conversation_activity_capture_time = now
+        return self._conversation_activity_cached
+
+    def _publish_conversation_activity(
+            self, rank_states: Optional[List[RankState]] = None) -> None:
+        """Publish source-rank activity without fabricating an iteration or copying peer counts."""
+        if self.dist.rank != 0 or not self.enable_iter_perf_stats:
+            return
+        snapshots = ((state.rank, state.iter_stats.conversation_activity)
+                     for state in rank_states) if rank_states is not None else (
+                         (0, self._snapshot_conversation_activity()), )
+        with self.stats_lock:
+            for rank, snapshot in snapshots:
+                if snapshot is None or self._last_published_conversation_activity.get(
+                        rank) == snapshot:
+                    continue
+                if not _stats_buffer_is_unbounded(self.max_stats_len) and len(
+                        self.stats) >= max(1, self.max_stats_len):
+                    self.stats.pop(0)
+                self.stats.append(("per_rank_dict", {
+                    "attentionDpRank": rank,
+                    "conversationActivity": snapshot.to_dict(),
+                }))
+                self._last_published_conversation_activity[rank] = snapshot
+
     def _publish_transfer_outcomes(self) -> None:
         """Publish changed terminal counts before an idle request wait."""
         if not self.enable_iter_perf_stats or self.enable_attention_dp:
@@ -9094,6 +9139,9 @@ class PyExecutor:
                 probe path unchanged.
         """
         self._publish_transfer_outcomes()
+        if not self.enable_attention_dp and getattr(
+                self, "_conversation_manager", None) is not None:
+            self._publish_conversation_activity()
         connector = self.kv_connector_manager
         control_pending = len(self.control_requests) != 0
         # Continue the existing broadcast slot for cancellations during drain.
@@ -9171,6 +9219,17 @@ class PyExecutor:
                 self.request_accumulated.clear()
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
+            activity_wait_kwargs = {}
+            if idle and getattr(
+                    self, "_conversation_manager",
+                    None) is not None and self.enable_iter_perf_stats:
+                wait_budget = min(1.0, poll_timeout.total_seconds()
+                                  ) if poll_timeout is not None else 1.0
+                activity_wait_kwargs["batch_wait_deadline"] = time.monotonic(
+                ) + wait_budget
+                activity_timeout = datetime.timedelta(seconds=1)
+                timeout = activity_timeout if timeout is None else min(
+                    timeout, activity_timeout)
             self._fetch_may_block = (timeout is None
                                      or timeout.total_seconds() > 0)
             try:
@@ -9181,7 +9240,8 @@ class PyExecutor:
                         self.executor_request_queue.get_from_request_queue(
                             timeout,
                             wait_for_batch=not (pending_retirement
-                                                or self.is_shutdown)))
+                                                or self.is_shutdown),
+                            **activity_wait_kwargs))
             finally:
                 self._fetch_may_block = False
 
@@ -9417,6 +9477,8 @@ class PyExecutor:
             idle_wait_follows: Whether the fleet has no live or waiting request.
         """
         while True:
+            if getattr(self, "_conversation_manager", None) is not None:
+                self._publish_conversation_activity(all_rank_states)
             rows = self._adp_iter_stats.finalize(
                 all_rank_states,
                 is_rank0=self.dist.rank == 0,
@@ -9615,14 +9677,22 @@ class PyExecutor:
         # 7. Merge requests
         if self._kv_load_tracker.enabled and new_requests:
             self._kv_load_tracker.idle_sampled = False
-        return merge_requests(new_requests,
-                              cp_config=self.dist.cp_config,
-                              cp_rank=self.dist.cp_rank,
-                              cp_size=self.dist.cp_size,
-                              exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits(),
-                              is_disagg=self.kv_cache_transceiver is not None,
-                              track_unique_tokens=self.track_unique_tokens)
+        admitted_requests = merge_requests(
+            new_requests,
+            cp_config=self.dist.cp_config,
+            cp_rank=self.dist.cp_rank,
+            cp_size=self.dist.cp_size,
+            exclude_last_generation_logits=self.
+            _should_exclude_last_generation_logits(),
+            is_disagg=self.kv_cache_transceiver is not None,
+            track_unique_tokens=self.track_unique_tokens)
+        conversation_manager = getattr(self, "_conversation_manager", None)
+        if conversation_manager is not None and admitted_requests and self.enable_iter_perf_stats:
+            now = time.monotonic()
+            for request in admitted_requests:
+                if not request.is_child:
+                    conversation_manager.observe_admission(request, now)
+        return admitted_requests
 
     def _cancel_queued_context_requests(self,
                                         waiting_queue: WaitingQueue) -> None:
