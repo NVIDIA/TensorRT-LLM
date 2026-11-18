@@ -1506,7 +1506,8 @@ leaves belong to different families. Name the technique to pin either.
 `CutlassFusedMoE`, `TRTLLMGenFusedMoE` and `MarlinFusedMoE` name a family's
 abstract root, the parent of every leaf (the B12x leaves also descend from
 `CutlassFusedMoE`); `CuteDslFusedMoE` names the root of the two grouped-GEMM
-leaves only, not of the `CUTEDSL` family, which also holds the B12x leaves;
+leaves only, not of the `CUTEDSL` family, which also holds the B12x leaves
+and the MXFP8 fused FC12 leaf;
 `CuteDslB12xFusedMoE` names the B12x mixin; `DeepGemmFusedMoE`,
 `DenseGEMMFusedMoE`, `CuteDslFc12FusedMoE`, `MegaMoEDeepGemm`,
 `MegaMoECuteDsl`, `CuteDslB12xNvfp4FusedMoE` and

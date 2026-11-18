@@ -14,9 +14,9 @@
 # limitations under the License.
 """``CuteDslFc12FusedMoE``: :class:`.cutedsl.TrtllmCutedslFusedFc12Nvfp4Impl`.
 
-The implementation lives in :mod:`.cutedsl.fused_fc12`. An alias rather than a
-base class: the ``moe_backend="CUTEDSL_FC12"`` call sites and the ``issubclass``
-dispatch in ``create_moe.py`` mean the leaf itself.
+The implementation lives in :mod:`.cutedsl.fused_fc12.nvfp4`. An alias rather
+than a base class: the ``moe_backend="CUTEDSL_FC12"`` call sites and the
+``issubclass`` dispatch in ``create_moe.py`` mean the leaf itself.
 """
 
 from .cutedsl import TrtllmCutedslFusedFc12Nvfp4Impl

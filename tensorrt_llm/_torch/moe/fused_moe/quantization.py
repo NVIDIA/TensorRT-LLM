@@ -7412,10 +7412,12 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
                              expert_id: int) -> bool:
         """Whether ``weights`` holds an FC1 block scale for ``expert_id``."""
         if module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-            return "gate_up_proj_weight_scale" in weights
-        return any(
-            self._get_scale_key(weights, expert_id, leaf) is not None
-            for leaf in ("w1", "w3"))
+            return weights.get("gate_up_proj_weight_scale") is not None
+        for leaf in ("w1", "w3"):
+            key = self._get_scale_key(weights, expert_id, leaf)
+            if key is not None and weights[key] is not None:
+                return True
+        return False
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
         interleaved = module._cute_dsl_mxfp8_w3_w1_scale_interleaved
