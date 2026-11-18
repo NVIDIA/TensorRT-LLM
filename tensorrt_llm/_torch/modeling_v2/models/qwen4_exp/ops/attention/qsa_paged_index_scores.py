@@ -12,6 +12,9 @@ import triton.language as tl
 # torch.ops boundary. The engine's own sparse hook (`select_qsa_paged_tokens`
 # in `_torch/attention/backends/sparse/qsa/module.py`) calls this same callable.
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
+from tensorrt_llm._torch.attention.backends.sparse.qsa.index_plane_layout import (
+    index_plane_anchor_row,
+)
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_paged_index_scores as _triton_qsa_paged_index_scores,
 )
@@ -80,6 +83,7 @@ def _qsa_index_scores_visible_split_kernel(
     BLOCK_N: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     USE_PDL: tl.constexpr,
+    INDEX_ROWS: tl.constexpr = 0,
 ):
     """Visible-only scores of one request's rows among ROWS_PER_TILE consecutive rows (in
     QUERY_TILE dot lanes). Program (t, g, s) takes the g-th distinct request of row tile t,
@@ -144,7 +148,9 @@ def _qsa_index_scores_visible_split_kernel(
         valid_blocks = block_columns < group_visible
         anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
         logical_pages = anchor_positions // TOKENS_PER_BLOCK
-        token_in_page = anchor_positions % TOKENS_PER_BLOCK
+        token_in_page = index_plane_anchor_row(
+            block_columns, TOKENS_PER_BLOCK, COMPRESS_RATIO, INDEX_ROWS
+        )
         physical_pages = tl.load(
             block_table
             + request * block_table_stride_request
@@ -292,6 +298,7 @@ def _qsa_index_scores_visible_split(
         # One row tile masks its rows by `num_rows` alone: compile it at the full tile so every
         # row count up to `query_tile` shares one variant.
         ROWS_PER_TILE=query_tile if row_tiles == 1 else rows_per_tile,
+        INDEX_ROWS=index_cache.shape[1],
         QUERY_TILE=query_tile,
         BLOCK_H=dot_width,
         BLOCK_N=block_n,
@@ -338,6 +345,7 @@ def _qsa_index_scores_group_kernel(
     BLOCK_N: tl.constexpr,
     TILES_PER_PROGRAM: tl.constexpr,
     USE_PDL: tl.constexpr,
+    INDEX_ROWS: tl.constexpr = 0,
 ):
     """The engine's row-wise kernel (visible blocks only) over a run of ``GROUP_ROWS``
     consecutive rows a program: when the run's rows name one request (a verify step's
@@ -386,7 +394,9 @@ def _qsa_index_scores_group_kernel(
         valid_blocks = (block_columns < MAX_COMPRESSED_BLOCKS) & (block_columns < max_visible)
         anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
         logical_pages = anchor_positions // TOKENS_PER_BLOCK
-        token_in_page = anchor_positions % TOKENS_PER_BLOCK
+        token_in_page = index_plane_anchor_row(
+            block_columns, TOKENS_PER_BLOCK, COMPRESS_RATIO, INDEX_ROWS
+        )
         if shared:
             physical_pages = tl.load(
                 block_table
@@ -558,6 +568,7 @@ def _qsa_index_scores_prefill_query_tile(
         BLOCK_N=_PREFILL_BLOCK_N,
         TILES_PER_PROGRAM=_PREFILL_TILES_PER_PROGRAM,
         ONLY_VISIBLE_BLOCKS=True,
+        INDEX_ROWS=index_cache.shape[1],
         num_warps=4,
     )
     return output
@@ -661,6 +672,7 @@ def _qsa_index_scores_request_groups(
         BLOCK_N=_GROUP_BLOCK_N,
         TILES_PER_PROGRAM=tiles,
         USE_PDL=use_pdl,
+        INDEX_ROWS=index_cache.shape[1],
         num_warps=4,
         launch_pdl=use_pdl,
     )
@@ -680,6 +692,7 @@ def _qsa_index_scores_request_groups(
             max_compressed_blocks,
             rows_per_request,
             use_pdl,
+            index_cache.shape[1],
         ),
         args,
         [{"TILES_PER_PROGRAM": t} for t in (1, 2, 4)],

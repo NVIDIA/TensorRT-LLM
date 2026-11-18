@@ -9,6 +9,9 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa.index_plane_layout import (
+    index_plane_anchor_row,
+)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
@@ -1232,6 +1235,7 @@ def _qsa_paged_index_scores_kernel(
     ONLY_VISIBLE_BLOCKS: tl.constexpr,
     USE_PDL: tl.constexpr = False,
     PREFETCH: tl.constexpr = False,
+    INDEX_ROWS: tl.constexpr = 0,
 ):
     if PREFETCH:
         # One tile a program: its pages and keys are read before the wait (see
@@ -1242,7 +1246,7 @@ def _qsa_paged_index_scores_kernel(
             q_stride_row, q_stride_head, q_stride_dim, cache_stride_page, cache_stride_token,
             cache_stride_dim, block_table_stride_request, block_table_stride_page,
             output_stride_row, output_stride_block, NUM_INDEX_HEADS, INDEX_HEAD_DIM, BLOCK_D,
-            TOKENS_PER_BLOCK, COMPRESS_RATIO, MAX_COMPRESSED_BLOCKS, BLOCK_H, BLOCK_N,
+            TOKENS_PER_BLOCK, COMPRESS_RATIO, MAX_COMPRESSED_BLOCKS, BLOCK_H, BLOCK_N, INDEX_ROWS,
         )  # fmt: skip
         return
     if USE_PDL:
@@ -1279,7 +1283,9 @@ def _qsa_paged_index_scores_kernel(
         valid_blocks = (block_columns < MAX_COMPRESSED_BLOCKS) & (block_columns < visible_blocks)
         anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
         logical_pages = anchor_positions // TOKENS_PER_BLOCK
-        token_in_page = anchor_positions % TOKENS_PER_BLOCK
+        token_in_page = index_plane_anchor_row(
+            block_columns, TOKENS_PER_BLOCK, COMPRESS_RATIO, INDEX_ROWS
+        )
         physical_pages = tl.load(
             block_table
             + request * block_table_stride_request
@@ -1343,6 +1349,7 @@ def _qsa_paged_index_scores_prefetch_tile(
     MAX_COMPRESSED_BLOCKS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    INDEX_ROWS: tl.constexpr = 0,
 ):
     """One generation row's tile of visible compressed blocks under PDL, its static
     operands read before ``gdc_wait``: the row's metadata, the tile's pages and every
@@ -1364,7 +1371,9 @@ def _qsa_paged_index_scores_prefetch_tile(
     valid_blocks = (block_columns < MAX_COMPRESSED_BLOCKS) & (block_columns < visible_blocks)
     anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
     logical_pages = anchor_positions // TOKENS_PER_BLOCK
-    token_in_page = anchor_positions % TOKENS_PER_BLOCK
+    token_in_page = index_plane_anchor_row(
+        block_columns, TOKENS_PER_BLOCK, COMPRESS_RATIO, INDEX_ROWS
+    )
     physical_pages = tl.load(
         block_table
         + request * block_table_stride_request
@@ -1440,6 +1449,7 @@ def _qsa_paged_index_scores_qtile_kernel(
     BLOCK_N: tl.constexpr,
     TILES_PER_PROGRAM: tl.constexpr,
     ONLY_VISIBLE_BLOCKS: tl.constexpr,
+    INDEX_ROWS: tl.constexpr = 0,
 ):
     row_base = tl.program_id(0) * QUERY_TILE
     first_tile = tl.program_id(1) * TILES_PER_PROGRAM
@@ -1508,7 +1518,9 @@ def _qsa_paged_index_scores_qtile_kernel(
             valid_blocks = (block_columns < MAX_COMPRESSED_BLOCKS) & (block_columns < group_visible)
             anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
             logical_pages = anchor_positions // TOKENS_PER_BLOCK
-            token_in_page = anchor_positions % TOKENS_PER_BLOCK
+            token_in_page = index_plane_anchor_row(
+                block_columns, TOKENS_PER_BLOCK, COMPRESS_RATIO, INDEX_ROWS
+            )
             physical_pages = tl.load(
                 block_table
                 + request * block_table_stride_request
@@ -1693,6 +1705,7 @@ def triton_qsa_paged_index_scores(
             BLOCK_N=block_n,
             TILES_PER_PROGRAM=tiles_per_program,
             ONLY_VISIBLE_BLOCKS=only_visible_blocks,
+            INDEX_ROWS=index_cache.shape[1],
             num_warps=4,
         )
         return output
@@ -1731,6 +1744,7 @@ def triton_qsa_paged_index_scores(
         ONLY_VISIBLE_BLOCKS=only_visible_blocks,
         USE_PDL=use_pdl,
         PREFETCH=prefetch and use_pdl and tiles_per_program == 1 and only_visible_blocks,
+        INDEX_ROWS=index_cache.shape[1],
         num_warps=2,
         launch_pdl=use_pdl,
     )

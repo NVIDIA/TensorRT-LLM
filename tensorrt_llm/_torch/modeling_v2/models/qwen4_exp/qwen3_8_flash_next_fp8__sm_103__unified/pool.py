@@ -46,6 +46,7 @@ from typing import NamedTuple
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa import index_plane_layout
 from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
 from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -98,6 +99,9 @@ class PoolGeometry(NamedTuple):
     kv_dtype: torch.dtype  # the paged K/V pool's dtype: bf16, e4m3 (FP8) or uint8 (NVFP4)
     kv_width: int  # its innermost extent: head_dim, or head_dim // 2 for NVFP4's e2m1 pairs
     qsa_side_planes: bool  # the index and position planes share one packed page per slot
+    # Rows of a QSA index page: tokens_per_block, or fewer on compact pages
+    # (`index_plane_layout`, packed side planes only); 0 means tokens_per_block.
+    index_rows: int = 0
 
     @property
     def conv_sections(self) -> tuple[int, int, int]:
@@ -113,7 +117,7 @@ class PoolGeometry(NamedTuple):
     @property
     def index_page_bytes(self) -> int:
         per_token = self.index_kv_heads * self.index_head_dim * _INDEX_ELEMENT_BYTES
-        return self.tokens_per_block * per_token
+        return (self.index_rows or self.tokens_per_block) * per_token
 
     @property
     def position_page_bytes(self) -> int:
@@ -204,6 +208,11 @@ def pool_geometry(
         index_page,
         position_page,
     )
+    index_rows = (
+        index_plane_layout.plane_rows(tokens_per_block, cfg.indexer_compress_ratio, compact=True)
+        if side_planes and index_plane_layout.compact_enabled()
+        else tokens_per_block
+    )
     return PoolGeometry(
         tokens_per_block=tokens_per_block,
         heads_kv=heads_kv,
@@ -227,6 +236,7 @@ def pool_geometry(
         kv_dtype=kv_dtype,
         kv_width=kv_width,
         qsa_side_planes=side_planes,
+        index_rows=index_rows,
     )
 
 
@@ -253,7 +263,7 @@ def check_position_plane(g: PoolGeometry, position) -> None:
 
 
 def check_attention_pools(g: PoolGeometry, layer: int, index_cache, pool) -> None:
-    index_shape = (g.tokens_per_block, g.index_kv_heads, g.index_head_dim)
+    index_shape = (g.index_rows or g.tokens_per_block, g.index_kv_heads, g.index_head_dim)
     _check_pool(index_cache, f"layer {layer}: QSA index plane", 1, index_shape, g.dtype)
     # The sparse path needs adjacent HND K/V role planes: [pages, 2, H, block, D].
     kv_shape = (g.heads_kv, g.tokens_per_block, g.kv_width)

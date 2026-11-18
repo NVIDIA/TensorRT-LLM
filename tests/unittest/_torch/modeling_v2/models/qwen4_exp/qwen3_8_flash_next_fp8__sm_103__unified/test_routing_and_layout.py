@@ -1558,6 +1558,8 @@ COMMON = dict(
     ple_state_len=(4 - 1) * 3,
     ngram_context_len=3 - 1,
     dtype=torch.bfloat16,
+    # Plain index pages (TRTLLM_QSA_INDEX_PLANE_COMPACT unset): a token row a page token.
+    index_rows=TOKENS_PER_BLOCK,
 )
 
 #: K/V storage per KV-cache algorithm: (pool dtype, innermost extent, whether the QSA index and
@@ -1715,6 +1717,47 @@ def test_each_rank_binds_the_pools_of_its_layout(member, rank, algo):
             P.take_draft_pools(wrong, g, MTP_LAYER, separate=sep)
         with pytest.raises(AssertionError, match="does not map"):
             P.take_draft_pools(trunk, g, MTP_LAYER, separate=sep)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("algo", [None, QuantAlgo.FP8], ids=["kv_bf16", "kv_fp8"])
+def test_compact_index_pages_shrink_the_packed_index_page_only(algo, monkeypatch):
+    """With TRTLLM_QSA_INDEX_PLANE_COMPACT=1 a packed side page (quantized K/V) holds the compact
+    index rows; a bf16 pool keeps its plain index pages."""
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import index_plane_layout
+
+    monkeypatch.setenv(index_plane_layout.COMPACT_ENV, "1")
+    g = _geometry("tep2", 0, algo)
+    want = (
+        index_plane_layout.plane_rows(
+            TOKENS_PER_BLOCK, _TEXT["indexer_compress_ratio"], compact=True
+        )
+        if KV_STORAGE[algo][2]
+        else TOKENS_PER_BLOCK
+    )
+    assert g.index_rows == want
+    assert g.index_page_bytes == want * g.index_kv_heads * g.index_head_dim * 2
+
+
+@pytest.mark.cpu_only
+def test_compact_index_pages_decline_a_verify_step_wider_than_a_group_plus_one(
+    on_sm103, monkeypatch
+):
+    """Compact pages keep a group's raw keys for `indexer_compress_ratio + 1` consecutive positions
+    of a request in a step: a quantized K/V pool on them runs max_draft_len 1..compress_ratio."""
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import index_plane_layout
+
+    cr = _TEXT["indexer_compress_ratio"]
+    fp8_kv = dict(kv_cache_config=KvCacheConfig(dtype="fp8"))
+    _admitted(_routed_config("tep4", _mtp(cr + 1)), **fp8_kv)
+    monkeypatch.setenv(index_plane_layout.COMPACT_ENV, "1")
+    config = _routed_config("tep4", _mtp(cr + 1))
+    assert modeling_v2_resolve(config, _llm_args("auto", **fp8_kv)) is None
+    with pytest.raises(ValueError, match=f"{index_plane_layout.COMPACT_ENV}=1 with max_draft_len"):
+        modeling_v2_resolve(config, _llm_args("require", **fp8_kv))
+    _admitted(_routed_config("tep4", _mtp(cr)), **fp8_kv)
+    # A bf16 pool has no packed side planes; the cache manager refuses the switch there.
+    _admitted(_routed_config("tep4", _mtp(cr + 1)))
 
 
 # ------------------------------------------------ the stock manager, on GPU ---

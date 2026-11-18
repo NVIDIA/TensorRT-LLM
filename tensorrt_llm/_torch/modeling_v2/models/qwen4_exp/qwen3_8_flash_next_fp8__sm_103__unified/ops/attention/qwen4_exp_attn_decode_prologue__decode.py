@@ -23,8 +23,10 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa.index_plane_layout import index_plane_row
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.jit_variants import warm_variants
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
 
@@ -117,7 +119,20 @@ def _compress_norm_rope(x, weight, cosine, sine, eps, HEAD_DIM: tl.constexpr, RO
     ).to(tl.bfloat16)
 
 
-@triton.jit(do_not_specialize=["num_tokens", "num_requests", "table_width", "num_pages"])
+# Everything that follows the step's row count or a slice offset is a runtime value Triton does
+# not specialize: the row count and the coordinates' axis stride (the transposed position ids'
+# row count), the table's extents, and the alignment of the scalar-read metadata (the position
+# ids and coordinates are offset views in a draft pass, the row mapping in a mixed step). The
+# variants left are the deployment's geometry and the three launch buckets (`_launch`), which
+# the first call of a geometry compiles (`warm_variants`).
+_UNSPECIALIZED_ARGS = ("num_tokens", "num_requests", "table_width", "num_pages", "s_c_axis")
+_UNALIGNED_ARGS = ("positions", "coords", "request_indices", "logical_positions")
+
+
+@triton.jit(
+    do_not_specialize=list(_UNSPECIALIZED_ARGS),
+    do_not_specialize_on_alignment=list(_UNALIGNED_ARGS),
+)
 def _attn_decode_prologue_kernel(
     proj,
     stride_proj,
@@ -175,6 +190,7 @@ def _attn_decode_prologue_kernel(
     MAIN_PROGRAMS: tl.constexpr,
     TPB: tl.constexpr,
     CR: tl.constexpr,
+    IDX_ROWS: tl.constexpr,
     ROTARY_PAIRS: tl.constexpr,
     IN_LAUNCH_GROUPS: tl.constexpr,
     IQ_ROW_MAP: tl.constexpr,
@@ -279,7 +295,7 @@ def _attn_decode_prologue_kernel(
         group = tl.load(
             index_cache
             + member_pages[:, None] * s_ic_page
-            + (tl.maximum(members, 0) % TPB)[:, None] * s_ic_slot
+            + index_plane_row(tl.maximum(members, 0), TPB, CR, IDX_ROWS)[:, None] * s_ic_slot
             + dims[None, :],
             mask=(earlier & ~in_launch)[:, None],
             other=0.0,
@@ -338,16 +354,35 @@ def _attn_decode_prologue_kernel(
                     ),
                     (ID,),
                 )
-            tl.store(index_cache + page * s_ic_page + slot * s_ic_slot + dims, stored_k)
+            index_row = index_plane_row(logical, TPB, CR, IDX_ROWS)
+            tl.store(index_cache + page * s_ic_page + index_row * s_ic_slot + dims, stored_k)
+
+
+#: `(heads a program, warps)` of `_launch`'s buckets, in row-count order.
+_LAUNCH_BUCKETS = ((1, 2), (2, 2), (8, 8))
+
+
+def _variant_key(args: tuple, constexprs: dict) -> tuple:
+    """What picks the kernel's variant besides the launch bucket: the constexprs, each
+    specialized integer's value (strides: one set a call site), each tensor's dtype and, where
+    Triton specializes it, its 16-byte alignment."""
+    key = [tuple(sorted(constexprs.items()))]
+    for name, arg in zip(_attn_decode_prologue_kernel.arg_names, args):
+        if isinstance(arg, torch.Tensor):
+            aligned = name in _UNALIGNED_ARGS or arg.data_ptr() % 16 == 0
+            key.append((arg.dtype, aligned))
+        elif name not in _UNSPECIALIZED_ARGS:
+            key.append(arg)
+    return tuple(key)
 
 
 def _launch(num_tokens: int) -> Tuple[int, int]:
     """Main-plane heads per program and warps per program, by row count."""
     if num_tokens <= 16:
-        return 1, 2
+        return _LAUNCH_BUCKETS[0]
     if num_tokens <= 64:
-        return 2, 2
-    return 8, 8
+        return _LAUNCH_BUCKETS[1]
+    return _LAUNCH_BUCKETS[2]
 
 
 #: Rank geometries: tp4 / tep4 6 q heads and 1 KV head; tp2 / tep2 12 and 1; dep4 / dep2 / tp1
@@ -489,7 +524,7 @@ class Qwen4ExpAttnDecodePrologue(OpWrapper):
         hpb, warps = _launch(num_tokens)
         main_programs = triton.cdiv(num_heads_q + num_heads_k, hpb)
         pdl = get_env_enable_pdl()
-        _attn_decode_prologue_kernel[(num_tokens, main_programs + 2 + num_heads_k)](
+        args = (
             proj,
             proj.stride(0),
             out,
@@ -533,6 +568,8 @@ class Qwen4ExpAttnDecodePrologue(OpWrapper):
             coords.stride(0),
             coords.stride(1),
             proj if index_q_rows is None else index_q_rows,
+        )
+        constexprs = dict(
             HQ=num_heads_q,
             HK=num_heads_k,
             D=head_dim,
@@ -542,16 +579,35 @@ class Qwen4ExpAttnDecodePrologue(OpWrapper):
             ROT=rotary_dim,
             S1=mrope_section1,
             S2=mrope_section2,
-            HPB=hpb,
-            MAIN_PROGRAMS=main_programs,
             TPB=tokens_per_block,
             CR=compress_ratio,
+            IDX_ROWS=index_cache.shape[1],
             ROTARY_PAIRS=cos_sin.shape[1] // 2,
             IN_LAUNCH_GROUPS=rows_per_request > 1,
             IQ_ROW_MAP=index_q_rows is not None,
             USE_PDL=pdl,
-            num_warps=warps,
             launch_pdl=pdl,
+        )
+        # Every launch bucket compiles at a geometry's first call (an eager warm-up forward), with
+        # this call's tensors, so a step whose row count first reaches another bucket inside timed
+        # traffic finds its variant compiled.
+        warm_variants(
+            _attn_decode_prologue_kernel,
+            _variant_key(args, constexprs),
+            args,
+            [
+                dict(HPB=h, MAIN_PROGRAMS=triton.cdiv(num_heads_q + num_heads_k, h), num_warps=w)
+                for h, w in _LAUNCH_BUCKETS
+            ],
+            **constexprs,
+        )
+        _attn_decode_prologue_kernel[(num_tokens, main_programs + 2 + num_heads_k)](
+            # The options in `warm_variants`' order: Triton's in-memory key is ordered.
+            *args,
+            **constexprs,
+            HPB=hpb,
+            MAIN_PROGRAMS=main_programs,
+            num_warps=warps,
         )
         return out, index_q
 

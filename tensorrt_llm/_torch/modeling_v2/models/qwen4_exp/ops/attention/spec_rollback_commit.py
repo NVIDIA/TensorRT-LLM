@@ -28,6 +28,7 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa.index_plane_layout import index_plane_row
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback_planes import ROW
 
@@ -85,7 +86,8 @@ def _stage_kernel(
         tl.store(stream + i * (CTX + P) + w, tl.where(w < CTX, hist, row), mask=w < CTX + P)
 
 
-@triton.jit
+# The index rows (requests x verify rows) follow the batch: a runtime value, one variant a geometry.
+@triton.jit(do_not_specialize=["rows"])
 def _commit_kernel(
     accepted,
     slots,
@@ -123,6 +125,9 @@ def _commit_kernel(
     BLOCK_C: tl.constexpr,
     ROW: tl.constexpr,
     PREV_IN_POOL: tl.constexpr = False,
+    TPB: tl.constexpr = 0,
+    CR: tl.constexpr = 0,
+    IROWS: tl.constexpr = 0,
 ):
     i = tl.program_id(0)
     cb = tl.program_id(1)
@@ -172,8 +177,13 @@ def _commit_kernel(
         vals = tl.load(
             index_old + (cb * rows + r[:, None]) * ROW + e[None, :], mask=rejected[:, None]
         )
+        if IROWS != 0:
+            # Compact index pages (`index_plane_layout`): the slot's row in the plane.
+            irow = index_plane_row(tok, TPB, CR, IROWS)
+        else:
+            irow = tok
         tl.store(
-            base + page[:, None] * stride + tok[:, None] * ROW + e[None, :],
+            base + page[:, None] * stride + irow[:, None] * ROW + e[None, :],
             vals,
             mask=rejected[:, None],
         )
@@ -348,7 +358,12 @@ class SpecRollbackCommit(OpWrapper):
         plane_ptrs,
         plane_strides,
         index_old,
+        tokens_per_block: int = 0,
+        compress_ratio: int = 0,
+        index_rows: int = 0,
     ) -> None:
+        """`index_rows`: the index planes' rows a page under the compact layout
+        (`index_plane_layout`), else 0 (a plane's row is the slot itself)."""
         n, p, channels = conv_x.shape
         state = conv_pool.shape[2]
         ctx = ngram_pool.shape[1]
@@ -396,6 +411,9 @@ class SpecRollbackCommit(OpWrapper):
             BLOCK_C=_BLOCK_C,
             ROW=ROW,
             PREV_IN_POOL=prev_in_pool,
+            TPB=tokens_per_block if index_rows else 0,
+            CR=compress_ratio if index_rows else 0,
+            IROWS=index_rows,
             num_warps=4,
         )
 
@@ -465,6 +483,9 @@ class SpecRollbackCommit(OpWrapper):
         plane_ptrs,
         plane_strides,
         index_old,
+        tokens_per_block: int = 0,
+        compress_ratio: int = 0,
+        index_rows: int = 0,
     ) -> None:
         # The kernel reads every staged tensor by raw offset in the layout its producer writes,
         # and the pools by their strides. A wrong shape is read short or past its end, and a
@@ -507,6 +528,14 @@ class SpecRollbackCommit(OpWrapper):
         assert plane_ptrs.numel() == plane_strides.numel() == index_old.shape[0], (
             f"the plane table holds {plane_ptrs.numel()} planes and index_old "
             f"{index_old.shape[0]}; the kernel restores index_old's count"
+        )
+        # Compact index pages: the kernel maps the in-page slot (`within`), which names the same
+        # row as the position only with an even number of compress groups a page.
+        assert index_rows == 0 or (
+            compress_ratio > 1 and tokens_per_block % (2 * compress_ratio) == 0
+        ), (
+            f"compact index rows ({index_rows}) need tokens_per_block ({tokens_per_block}) a "
+            f"multiple of twice the compress ratio ({compress_ratio})"
         )
 
 

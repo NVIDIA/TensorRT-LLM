@@ -71,10 +71,12 @@ def _fence_after(*, loc=None, ip=None):
 
 
 class _IndexScoresKernel:
-    def __init__(self, *, tokens_per_block, compress_ratio):
+    def __init__(self, *, tokens_per_block, compress_ratio, compact=False):
         assert tokens_per_block % compress_ratio == 0
         self.tpb = tokens_per_block
         self.cr = compress_ratio
+        # Compact index pages (`index_plane_layout`): a page's compressed keys are its first rows.
+        self.compact = compact
         self.kpp = tokens_per_block // compress_ratio  # keys a page
         assert BM % self.kpp == 0 and BM // self.kpp <= 32
         assert self.kpp == KEYS_PER_PAGE, "a thread's keys: two token rows of each page"
@@ -486,7 +488,12 @@ class _IndexScoresKernel:
         toff = []
         dbase = []
         for v in cutlass.range_constexpr(self.kpp // kstep):
-            toff.append(((kq + kstep * v) * self.cr + self.cr - 1) * cache_stride_token + chunk * 8)
+            if cutlass.const_expr(self.compact):
+                toff.append((kq + kstep * v) * cache_stride_token + chunk * 8)
+            else:
+                toff.append(
+                    ((kq + kstep * v) * self.cr + self.cr - 1) * cache_stride_token + chunk * 8
+                )
             # SW128 K-major: 16-byte chunk c of row m at chunk c ^ (m % 8) of its 128-byte row,
             # each 64-dim half a BM x 128-byte block.
             kr = kq + kstep * v
@@ -843,11 +850,11 @@ _SMS: dict = {}
 _INDEX = {torch.int32: Int32, torch.int64: Int64}
 
 
-def _compiled(tpb, cr, pos_dtype, req_dtype, out):
-    key = (tpb, cr, pos_dtype, req_dtype)
+def _compiled(tpb, cr, pos_dtype, req_dtype, out, compact=False):
+    key = (tpb, cr, pos_dtype, req_dtype, compact)
     fn = _COMPILED.get(key)
     if fn is None:
-        kernel = _IndexScoresKernel(tokens_per_block=tpb, compress_ratio=cr)
+        kernel = _IndexScoresKernel(tokens_per_block=tpb, compress_ratio=cr, compact=compact)
         gmem = cute.AddressSpace.gmem
 
         def fake(dtype, align):
@@ -924,6 +931,7 @@ def _qsa_index_scores_prefill(
         query_positions.dtype,
         request_indices.dtype,
         out,
+        compact=index_cache.shape[1] != tokens_per_block,
     )
     dev = q.device.index if q.device.index is not None else 0
     sms = _SMS.get(dev)
