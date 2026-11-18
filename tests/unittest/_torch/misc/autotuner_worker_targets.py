@@ -34,6 +34,18 @@ class RecordingRunner(TunableRunner):
         return inputs[0] * 2
 
 
+class FromShapesRunner(RecordingRunner):
+    """A RecordingRunner whose build needs only its inputs' shapes; it records the device and the
+    columns of the input it built on."""
+
+    builds_from_shapes = True
+
+    def build(self, inputs, *, tactic=-1, **kwargs) -> None:
+        name = f"m{inputs[0].shape[0]}-t{tactic}"
+        with open(os.path.join(self.directory, name), "a") as f:
+            f.write(f"{os.getpid()} {inputs[0].device.type} {inputs[0].shape[1]}\n")
+
+
 class PrebuiltRunner(TunableRunner):
     """A runner whose kernel ships prebuilt (as cuBLAS's): its build does nothing."""
 

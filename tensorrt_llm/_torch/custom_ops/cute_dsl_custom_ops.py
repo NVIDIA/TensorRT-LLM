@@ -3376,6 +3376,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         n = weight.size(1)
         return torch.empty(m, n, dtype=output_dtype, device=input.device)
 
+    # A build of the NVFP4 gather and finalize grouped GEMM fusions: one kernel's compile on GB300.
+    _GROUPED_GEMM_BUILD_S = 1.0
+
     class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
             TunableRunner):
         kernel_class = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
@@ -3529,7 +3532,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                               10, 0,
                                               helper.infer_shape_input5_rows)),
                         use_cold_l2_cache=True,
-                        build_strategy=BuildStrategy.PARALLEL)
+                        build_strategy=BuildStrategy.PARALLEL,
+                        build_in_workers=True,
+                        build_seconds=_GROUPED_GEMM_BUILD_S)
                     return self.__class__.tuning_config_cache[key]
                 self.__class__.tuning_config_cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
@@ -3546,6 +3551,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
                     use_cold_l2_cache=True,
                     build_strategy=BuildStrategy.PARALLEL,
+                    build_in_workers=True,
+                    build_seconds=_GROUPED_GEMM_BUILD_S,
                     # The dynamic dimension is input 0's (permuted) rows.
                     tune_max_num_tokens=helper.get_max_num_permuted_tokens(
                         self.weights_evict_first_max_tokens)
@@ -3553,8 +3560,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             return self.__class__.tuning_config_cache[key]
 
-        def forward(self, inputs: List[torch.Tensor],
-                    tactic: Optional[tuple]) -> torch.Tensor:
+        # The kernel takes the inputs' pointers and sizes: meta inputs compile it.
+        builds_from_shapes = True
+
+        def build(self,
+                  inputs: List[torch.Tensor],
+                  *,
+                  tactic=-1,
+                  **kwargs) -> None:
+            """Compile the kernel ``tactic`` runs on ``inputs``, without running it."""
+            self.forward(inputs, tactic, launch=False)
+
+        def forward(self,
+                    inputs: List[torch.Tensor],
+                    tactic: Optional[tuple],
+                    *,
+                    launch: bool = True) -> torch.Tensor:
             a, b, a_sf, b_sf, alpha, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
@@ -3727,6 +3748,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
+            if not launch:
+                return c
 
             exec_args = [
                 a_ptr,
@@ -4431,7 +4454,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         constraint_specs=(ConstraintSpec(
                             2, 0, helper.infer_shape_input0_rows), ),
                         use_cold_l2_cache=True,
-                        build_strategy=BuildStrategy.PARALLEL)
+                        build_strategy=BuildStrategy.PARALLEL,
+                        build_in_workers=True,
+                        build_seconds=_GROUPED_GEMM_BUILD_S)
                     return self.__class__.tuning_config_cache[key]
                 helper = GatherGroupedGemmInputsHelper(
                     self.num_experts,
@@ -4461,12 +4486,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs_pre_hook=helper.inputs_pre_hook,
                     use_cold_l2_cache=True,
                     build_strategy=BuildStrategy.PARALLEL,
+                    build_in_workers=True,
+                    build_seconds=_GROUPED_GEMM_BUILD_S,
                 )
             return self.__class__.tuning_config_cache[key]
 
-        def forward(self, inputs: List,
-                    tactic: Optional[tuple]) -> torch.Tensor:
-            """Forward pass.
+        # The kernel takes the inputs' pointers and sizes: meta inputs compile it.
+        builds_from_shapes = True
+
+        def build(self, inputs: List, *, tactic=-1, **kwargs) -> None:
+            """Compile the kernel ``tactic`` runs on ``inputs``, without running it."""
+            self.forward(inputs, tactic, launch=False)
+
+        def forward(self,
+                    inputs: List,
+                    tactic: Optional[tuple],
+                    *,
+                    launch: bool = True) -> torch.Tensor:
+            """Forward pass; ``launch=False`` only compiles the kernel.
 
             Input layout:
                 0: a                               - tensor
@@ -4687,6 +4724,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
+            if not launch:
+                return c, c_sf
 
             exec_args = [
                 a_ptr,
@@ -13085,6 +13124,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..attention.kernels.blackwell.mla.mla_helpers import \
         MAX_SPLITS as MLA_DECODE_MAX_SPLITS
 
+    def _compile_source(tensor):
+        """``tensor``, or for a meta tensor a CUDA tensor to compile from in its place: of its
+        dtype, with its dims in the same stride order, of at most 16 elements each. A layout
+        marked dynamic compiles alike whatever its extents and strides but the unit stride; 16
+        keeps the divisibility a compact dim declares."""
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "meta":
+            return tensor
+        order = tensor.dim_order()
+        extents = [min(n, 16) for n in tensor.shape]
+        stand_in = torch.empty([extents[d] for d in order],
+                               dtype=tensor.dtype,
+                               device="cuda")
+        return stand_in.permute([order.index(d) for d in range(tensor.dim())])
+
     class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
         """Generic TunableRunner for the Blackwell CuTe DSL MLA decode kernels.
 
@@ -13508,6 +13561,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                       stats_constraints),
                     inputs_pre_hook=self._tuning_inputs_pre_hook,
                     build_strategy=BuildStrategy.PARALLEL,
+                    build_in_workers=True,
+                    build_seconds=4.0,  # One kernel's compile on GB300.
                 )
             return cache[key]
 
@@ -13534,13 +13589,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 max_active_blocks)
             return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, False)
 
+        # The kernel depends on the inputs' shapes alone: meta inputs compile it, from CUDA
+        # stand-ins of their layouts (``_compile_source``).
+        builds_from_shapes = True
+
+        def build(self,
+                  inputs: List[torch.Tensor],
+                  *,
+                  tactic=-1,
+                  **kwargs) -> None:
+            """Compile the kernel ``tactic`` runs on ``inputs``, without running it."""
+            self.forward(inputs, tactic, launch=False, **kwargs)
+
         def forward(
             self,
             inputs: List[torch.Tensor],
             tactic,
+            *,
+            launch: bool = True,
             **kwargs,
         ) -> torch.Tensor:
-            """Run the CuTe DSL MLA decode kernel.
+            """Run the CuTe DSL MLA decode kernel; ``launch=False`` only compiles it.
 
             Args:
                 inputs (List[torch.Tensor]):
@@ -13771,46 +13840,53 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     emit_softmax_stats=self.emit_softmax_stats,
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
-                    q_latent,
+                    _compile_source(q_latent),
                     assumed_align=16).mark_layout_dynamic(leading_dim=1)
                 q_rope_ct = cute.runtime.from_dlpack(
-                    q_rope, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                    _compile_source(q_rope),
+                    assumed_align=16).mark_layout_dynamic(leading_dim=1)
                 c_latent_ct = cute.runtime.from_dlpack(
-                    c_latent,
+                    _compile_source(c_latent),
                     assumed_align=16).mark_layout_dynamic(leading_dim=1)
                 c_rope_ct = cute.runtime.from_dlpack(
-                    c_rope, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                    _compile_source(c_rope),
+                    assumed_align=16).mark_layout_dynamic(leading_dim=1)
                 page_table_ct = cute.runtime.from_dlpack(
-                    page_table,
+                    _compile_source(page_table),
                     assumed_align=16).mark_layout_dynamic(leading_dim=0)
                 o_ct = cute.runtime.from_dlpack(
-                    o, assumed_align=16).mark_layout_dynamic(
+                    _compile_source(o), assumed_align=16).mark_layout_dynamic(
                         leading_dim=1).mark_compact_shape_dynamic(
                             mode=1,
                             stride_order=(3, 2, 0, 1),
                             divisibility=(128 // out_dtype.width))
                 lse_ct = cute.runtime.from_dlpack(
-                    lse, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+                    _compile_source(lse),
+                    assumed_align=16).mark_layout_dynamic(leading_dim=0)
                 softmax_stats_ct = (cute.runtime.from_dlpack(
-                    softmax_stats_kernel, assumed_align=16).mark_layout_dynamic(
-                        leading_dim=3) if softmax_stats_kernel is not None else
-                                    None)
+                    _compile_source(softmax_stats_kernel),
+                    assumed_align=16).mark_layout_dynamic(leading_dim=3) if
+                                    softmax_stats_kernel is not None else None)
                 workspace_ct = (cute.runtime.from_dlpack(
-                    split_workspace, assumed_align=32).mark_layout_dynamic()
+                    _compile_source(split_workspace),
+                    assumed_align=32).mark_layout_dynamic()
                                 if use_workspace else None)
                 cache_seqs_ct = cute.runtime.from_dlpack(
-                    cache_seqs, assumed_align=16).mark_layout_dynamic()
+                    _compile_source(cache_seqs),
+                    assumed_align=16).mark_layout_dynamic()
                 kv_bounds_ct = (cute.runtime.from_dlpack(
-                    kv_bounds, assumed_align=4).mark_layout_dynamic()
+                    _compile_source(kv_bounds),
+                    assumed_align=4).mark_layout_dynamic()
                                 if kv_bounds is not None else None)
                 block_split_kvs_ct = (cute.runtime.from_dlpack(
-                    block_split_kvs, assumed_align=4).mark_layout_dynamic()
+                    _compile_source(block_split_kvs),
+                    assumed_align=4).mark_layout_dynamic()
                                       if is_var_split_kv else None)
                 if has_fp8_input:
                     softmax_scale_ct = cute.runtime.from_dlpack(
-                        softmax_scale).mark_layout_dynamic()
+                        _compile_source(softmax_scale)).mark_layout_dynamic()
                     output_scale_ct = cute.runtime.from_dlpack(
-                        output_scale).mark_layout_dynamic()
+                        _compile_source(output_scale)).mark_layout_dynamic()
                 else:
                     softmax_scale_ct = cutlass.Float32(softmax_scale)
                     output_scale_ct = cutlass.Float32(output_scale)
@@ -13845,6 +13921,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         *compile_args,
                         options="--opt-level 2",
                     ))
+            if not launch:
+                return o
 
             compiled_mla = CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[
                 cache_key]

@@ -589,6 +589,114 @@ def test_count_native_cutedsl_matches_legacy_sort_bitwise(tile_size: int):
     assert torch.equal(direct_output, count_native_output)
 
 
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
+def test_grouped_gemm_runners_build_from_shapes_the_kernels_they_run(monkeypatch):
+    """The gather (FC1) and finalize (FC2) runners compile from meta tensors of their inputs, as a
+    worker process builds them (``TunableRunner.builds_from_shapes``), the kernels their calls
+    run: the calls compile nothing, and their outputs are bitwise those of kernels compiled from
+    the inputs themselves."""
+    from tensorrt_llm._torch.autotuner import _TensorSpec
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+    )
+
+    torch.manual_seed(0)
+    tile_size, sf_vec_size, top_k, num_experts = 128, 16, 1, 8
+    num_tokens, hidden_size, interm_size = 256, 4096, 256
+    token_final_scales, token_selected_experts = torch.randn(
+        num_tokens, num_experts, device="cuda"
+    ).topk(top_k, dim=-1)
+    token_final_scales = token_final_scales.softmax(dim=-1)
+    tile_idx_to_group_idx, tile_idx_to_mn_limit, _, permuted_idx_to_expanded_idx, _, num_tiles = (
+        torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts.to(torch.int32),
+            token_final_scales=token_final_scales,
+            num_experts=num_experts,
+            top_k=top_k,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            tile_tokens_dim=tile_size,
+        )
+    )
+    routing = [tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_tiles]
+    rows = permuted_idx_to_expanded_idx.numel()
+    row_indices = torch.arange(rows, device="cuda")
+    valid_rows = row_indices < tile_idx_to_mn_limit[row_indices // tile_size]
+
+    # Small values (0, +-0.5, +-1 in e2m1) and unit scales keep every output finite.
+    codes = torch.tensor([0, 1, 2, 9, 10], dtype=torch.uint8, device="cuda")
+
+    def fp4(*shape):
+        nibbles = codes[torch.randint(0, len(codes), (*shape, 2), device="cuda")]
+        return (nibbles[..., 0] | nibbles[..., 1] << 4).view(torch.float4_e2m1fn_x2)
+
+    def sf(*shape):
+        return torch.full(shape, 0x38, dtype=torch.uint8, device="cuda")  # 1.0 in e4m3
+
+    alpha = torch.full((num_experts,), 1 / 64, device="cuda")
+    fc1_inputs = [
+        fp4(num_tokens, hidden_size // 2),
+        fp4(num_experts, 2 * interm_size, hidden_size // 2),
+        sf(num_tokens, hidden_size // sf_vec_size),
+        sf(num_experts, 2 * interm_size, hidden_size // sf_vec_size),
+        alpha,
+        *routing,
+        torch.ones(1, device="cuda"),
+    ]
+    fc2_weight = fp4(num_experts, hidden_size, interm_size // 2)
+    fc2_weight_sf = sf(num_experts, hidden_size, interm_size // sf_vec_size)
+    runner_args = dict(
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        scaling_vector_size=sf_vec_size,
+    )
+    fc1 = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(**runner_args)
+    fc2 = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+        output_dtype=torch.bfloat16, **runner_args
+    )
+
+    def fc2_inputs(c, c_sf, output):
+        return [c, fc2_weight, c_sf, fc2_weight_sf, alpha, output, *routing, token_final_scales]
+
+    def run():
+        c, c_sf = fc1.forward(fc1_inputs, tactic=None)
+        output = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+        fc2.forward(fc2_inputs(c, c_sf, output), tactic=None)
+        torch.cuda.synchronize()
+        return c.view(torch.uint8)[valid_rows], output
+
+    def kernels():
+        return [len(type(runner).kernel_cache) for runner in (fc1, fc2)]
+
+    def meta(tensor):
+        return _TensorSpec.make_meta(_TensorSpec.of(tensor, keep_values=False))
+
+    for runner in (fc1, fc2):
+        monkeypatch.setattr(type(runner), "kernel_cache", {})
+    fc1.build([meta(t) for t in fc1_inputs])
+    c = torch.empty(rows, interm_size // 2, dtype=torch.uint8, device="meta")
+    c_sf = torch.empty(rows * interm_size // sf_vec_size, dtype=torch.uint8, device="meta")
+    output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device="meta")
+    fc2_meta = fc2_inputs(c.view(torch.float4_e2m1fn_x2), c_sf, output)
+    fc2.build([meta(t) for t in fc2_meta])
+    assert kernels() == [1, 1]
+    built_from_shapes = run()
+    assert kernels() == [1, 1]
+
+    for runner in (fc1, fc2):
+        monkeypatch.setattr(type(runner), "kernel_cache", {})
+    compiled_here = run()
+    assert all(torch.equal(a, b) for a, b in zip(built_from_shapes, compiled_here))
+
+
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024])

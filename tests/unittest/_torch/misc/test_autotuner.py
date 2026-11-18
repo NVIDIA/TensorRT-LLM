@@ -3598,9 +3598,10 @@ def test_tune_mode_builds_every_tactic_in_worker_processes_before_profiling(
 @pytest.mark.parametrize("build_s, in_workers", [(0.0, False), (0.4, True)],
                          ids=["short", "long"])
 def test_tune_mode_measures_a_build_before_the_workers_take_any(
-        tune_mode_workers, tmp_path, build_s, in_workers):
+        tune_mode_workers, tmp_path, monkeypatch, build_s, in_workers):
     """Until an op's builds are measured, tune mode builds one itself, timed; the workers
-    build the others only if it took TLLM_KERNEL_BUILDER_MIN_BUILD_S seconds."""
+    build the others only if it took TLLM_KERNEL_BUILDER_MIN_BUILD_S seconds. Builds too short
+    for the workers cost the inputs of the profile measured only."""
     import autotuner_worker_targets as targets
 
     tune_mode_workers.min_build_s = 0.2
@@ -3612,9 +3613,19 @@ def test_tune_mode_measures_a_build_before_the_workers_take_any(
         build_in_workers=True,
     )
     x = torch.randn(4, 8, device="cuda")
+    made = []
+    tuning_tensors = AutoTuner._tuning_tensors
+
+    def record_inputs(self, profile, *args):
+        made.append(profile.get_opt_shapes())
+        return tuning_tensors(self, profile, *args)
+
+    monkeypatch.setattr(AutoTuner, "_tuning_tensors", record_inputs)
     with tune_mode_workers.pass_scope(), autotune():
         tuner.choose_one(f"test::measured_builds_{build_s}", [runner], config,
                          [x])
+    # The measured profile's, then each profile's for the workers.
+    assert len(made) == (1 + 3 if in_workers else 1)
     builders = {
         name: (tmp_path / name).read_text().split()
         for name in os.listdir(tmp_path)
@@ -3628,6 +3639,71 @@ def test_tune_mode_measures_a_build_before_the_workers_take_any(
         assert all(pids[-1] != here for pids in builders.values())
     else:
         assert builders == {measured[0]: [here]}
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("start_fraction, measured", [(0.0, "m1-t0"),
+                                                      (0.5, "m2-t1")])
+def test_ranks_that_share_builds_measure_different_kernels(
+        tune_mode_workers, tmp_path, monkeypatch, start_fraction, measured):
+    """With shared builds, a rank measures a build from its own place in the profiles and
+    tactics (``jit_share.start_fraction``): the ranks measure different kernels, rather than
+    wait for one of them to build the same."""
+    import autotuner_worker_targets as targets
+
+    tune_mode_workers.min_build_s = 0.2
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
+    monkeypatch.setattr(jit_share, "start_fraction", lambda: start_fraction)
+    (tmp_path / "share").mkdir()
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path / "share"))
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        build_strategy=BuildStrategy.PARALLEL,
+        build_in_workers=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    with tune_mode_workers.pass_scope(), autotune():
+        tuner.choose_one(f"test::shared_measure_{start_fraction}", [runner],
+                         config, [x])
+    # Too short for the workers: the measured build is the only one.
+    assert sorted(name for name in os.listdir(tmp_path)
+                  if name != "share") == [measured]
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("build_s, in_workers", [(0.1, False), (30.0, True)],
+                         ids=["short", "long"])
+def test_an_op_that_gives_its_build_time_is_not_measured(
+        tune_mode_workers, tmp_path, build_s, in_workers):
+    """An op whose TuningConfig gives ``build_seconds`` builds nothing here to measure: the time
+    it gives decides whether the workers build every (profile, tactic)."""
+    import autotuner_worker_targets as targets
+
+    tune_mode_workers.min_build_s = 5.0
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        build_in_workers=True,
+        build_seconds=build_s,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    with tune_mode_workers.pass_scope(), autotune():
+        tuner.choose_one(f"test::expected_build_{build_s}", [runner], config,
+                         [x])
+    builders = {
+        name: (tmp_path / name).read_text().split()
+        for name in os.listdir(tmp_path)
+    }
+    assert all(str(os.getpid()) not in pids for pids in builders.values())
+    assert sorted(builders) == (sorted(f"m{m}-t{t}" for m in (1, 2, 4)
+                                       for t in (0, 1)) if in_workers else [])
     tuner.clear_cache()
 
 
@@ -3662,6 +3738,34 @@ def test_each_runner_of_an_op_is_measured_on_its_own(tune_mode_workers,
     tuner.clear_cache()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_runner_that_builds_from_shapes_builds_on_meta_inputs_in_the_workers(
+        tune_mode_workers, tmp_path):
+    """A runner that ``builds_from_shapes`` builds every (profile, tactic) in the worker
+    processes on meta tensors of the profile's inputs."""
+    import autotuner_worker_targets as targets
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.FromShapesRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        build_in_workers=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    with tune_mode_workers.pass_scope(), autotune():
+        tuner.choose_one("test::builds_from_shapes", [runner], config, [x])
+    records = {
+        name: (tmp_path / name).read_text().split()
+        for name in os.listdir(tmp_path)
+    }
+    assert sorted(records) == sorted(f"m{m}-t{t}" for m in (1, 2, 4)
+                                     for t in (0, 1))
+    assert all(record[0] != str(os.getpid()) and record[1:] == ["meta", "8"]
+               for record in records.values())
+    tuner.clear_cache()
+
+
 def test_tensor_spec_remakes_the_storage_a_view_reads(monkeypatch):
     """A worker's input has the tensor's storage, padding included, and its view of it, as a
     TMA-aligned scale is a column-major view of a padded buffer, and a small tensor's values; a
@@ -3674,6 +3778,17 @@ def test_tensor_spec_remakes_the_storage_a_view_reads(monkeypatch):
     assert remade.untyped_storage().nbytes() == padded.untyped_storage().nbytes(
     )
     assert torch.equal(remade, scale)
+    # Without values, for a build from shapes: a meta tensor of the same view.
+    spec = autotuner._TensorSpec.of(scale, keep_values=False)
+    meta = autotuner._TensorSpec.make_meta(spec)
+    assert spec.values is None and meta.is_meta
+    assert (meta.shape, meta.stride(), meta.storage_offset(),
+            meta.dtype) == (scale.shape, scale.stride(), scale.storage_offset(),
+                            scale.dtype)
+    fp4 = torch.zeros(4, 8, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+    assert autotuner._TensorSpec.make_meta(
+        autotuner._TensorSpec.of(
+            fp4, keep_values=False)).dtype == torch.float4_e2m1fn_x2
 
     # A block scale keeps its values (powers of two, which a kernel decodes).
     sf = torch.tensor([[0.5, 2.0], [4.0, 1.0]])

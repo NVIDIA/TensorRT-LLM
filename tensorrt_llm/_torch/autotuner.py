@@ -192,10 +192,16 @@ class TuningConfig:
             on inputs of the profile's layout. For runners whose compiler cannot run on
             several threads (CuTe DSL), which ``parallel_jit_warmup`` cannot take, and whose
             builds are small: each worker allocates its build's inputs and outputs on the
-            rank's GPU. The runners and their tactics must pickle, and must not be collective.
+            rank's GPU, unless the runner compiles from shapes alone
+            (``TunableRunner.builds_from_shapes``), whose build gets meta tensors. The runners
+            and their tactics must pickle, and must not be collective.
             The workers take a runner's builds only when they take long enough to repay a
             worker (``BuildPool.worth_a_worker``): until a runner's builds are measured, tune
-            mode builds one of them itself, timed; shorter ones build as the op profiles.
+            mode builds one of them itself, timed, unless ``build_seconds`` gives their time;
+            shorter ones build as the op profiles.
+        build_seconds (Optional[float]): How long one build of the op's runners takes, until
+            their builds are measured (``build_in_workers``): it decides whether the workers take
+            them, and tune mode measures none itself.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -209,6 +215,7 @@ class TuningConfig:
     build_strategy: BuildStrategy = BuildStrategy.INDEPENDENT
     cold_l2_flush_bytes: int = 0
     build_in_workers: bool = False
+    build_seconds: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -282,6 +289,10 @@ class FakeTensor:
 
 
 class TunableRunner(ABC):
+
+    # Whether ``build`` compiles from its inputs' shapes, strides and dtypes alone: in a worker
+    # process (``TuningConfig.build_in_workers``) it then gets meta tensors of them.
+    builds_from_shapes: bool = False
 
     @abstractmethod
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -371,7 +382,8 @@ class TunableRunner(ABC):
         Tune mode calls it in the rank's worker processes before it profiles
         (``TuningConfig.build_in_workers``). This default runs the tactic
         once, which compiles what a first call compiles. A runner that ships
-        its kernels, or can compile without launching, overrides it.
+        its kernels, or can compile without launching, overrides it; one whose
+        build needs only the inputs' shapes sets ``builds_from_shapes``.
         """
         self(inputs, tactic=tactic, **kwargs)
 
@@ -409,8 +421,9 @@ class _TensorSpec:
     values: Optional[torch.Tensor] = None
 
     @classmethod
-    def of(cls, value: Any) -> Any:
-        """A spec of a tensor; any other value itself."""
+    def of(cls, value: Any, keep_values: bool = True) -> Any:
+        """A spec of a tensor, without its values unless ``keep_values``; any other value
+        itself."""
         if not isinstance(value, torch.Tensor):
             return value
         itemsize = value.element_size()
@@ -425,7 +438,7 @@ class _TensorSpec:
         else:
             base = 0
         values = None
-        if (value.dtype != torch.float4_e2m1fn_x2
+        if (keep_values and value.dtype != torch.float4_e2m1fn_x2
                 and numel <= _SPEC_VALUES_MAX_NUMEL):
             values = value.detach().as_strided((numel, ), (1, ),
                                                base).to("cpu", copy=True)
@@ -452,20 +465,34 @@ class _TensorSpec:
         return storage.as_strided(value.shape, value.stride,
                                   value.storage_offset)
 
+    @staticmethod
+    def make_meta(value: Any) -> Any:
+        """A meta tensor of the spec's storage and view; any other value itself."""
+        if not isinstance(value, _TensorSpec):
+            return value
+        storage = torch.empty(value.storage_numel * value.itemsize,
+                              dtype=torch.uint8,
+                              device="meta").view(value.dtype)
+        return storage.as_strided(value.shape, value.stride,
+                                  value.storage_offset)
+
 
 def _build_in_worker(runner: "TunableRunner", tactic: Any, specs: List[Any],
                      kwargs: Dict[str, Any], prepare: bool) -> None:
     """In a BuildPool worker process: build the kernels ``runner`` runs ``tactic`` on, on
-    inputs made from ``specs``, as tune mode's profiling would. CuTe DSL kernels the runner
-    keeps in its class's ``kernel_cache`` go to the rank's store, the others to their
-    compilers' disk caches; the rank's profiling loads them from there."""
+    inputs made from ``specs`` (meta tensors for a runner that ``builds_from_shapes``), as
+    tune mode's profiling would. CuTe DSL kernels the runner keeps in its class's
+    ``kernel_cache`` go to the rank's store, the others to their compilers' disk caches; the
+    rank's profiling loads them from there."""
     tuner = AutoTuner.get()
     tuner.is_tuning_mode = True  # Some runners compile only while tuning.
     jit_share.share_kernel_caches([runner])
+    make = (_TensorSpec.make_meta
+            if runner.builds_from_shapes else _TensorSpec.make)
     with (torch.inference_mode(), jit_share.sharing_kernels(),
           nccl_window_allocation_suppressed()):
-        tensors = [_TensorSpec.make(spec) for spec in specs]
-        made = {key: _TensorSpec.make(value) for key, value in kwargs.items()}
+        tensors = [make(spec) for spec in specs]
+        made = {key: make(value) for key, value in kwargs.items()}
         if prepare:
             runner(tensors, tactic=-1, do_preparation=True, **made)
         runner.build(tensors, tactic=tactic, **made)
@@ -1672,21 +1699,13 @@ class AutoTuner:
             len(r.get_valid_tactics(tensors, first, **kwargs))
             for r in runners) == 1
 
-    def _measure_build(self, family: str, runners: List[TunableRunner],
-                       pending: List[OptimizationProfile],
-                       inputs: List[torch.Tensor], tuning_config: TuningConfig,
-                       item: Tuple[int, int,
-                                   int], prepare: bool, **kwargs) -> bool:
-        """For a runner whose builds (``family``) are not measured yet: build ``item``
-        (profile, runner, tactic) here, timed, and tell whether its builds take long enough
-        for the rank's workers (``BuildPool.worth_a_worker``). A runner already measured as
-        too short builds nothing here: its profiling builds its kernels."""
+    def _measure_build(self, family: str, runner: TunableRunner,
+                       tensors: List[torch.Tensor], tactic: Any, prepare: bool,
+                       **kwargs) -> bool:
+        """For a runner whose builds (``family``) are not measured yet: build ``tactic`` on a
+        profile's ``tensors`` here, timed, and tell whether its builds take long enough for the
+        rank's workers (``BuildPool.worth_a_worker``)."""
         pool = BuildPool.get()
-        if pool.build_seconds(family) is not None:
-            return False
-        i, r, tactic = item
-        runner = runners[r]
-        tensors = self._tuning_tensors(pending[i], inputs, tuning_config)
         t0 = time.perf_counter()
         try:
             if prepare:
@@ -1724,16 +1743,71 @@ class AutoTuner:
         each builds the ones it claims; the profiling waits for the others.
         Returns False, before claiming any item, when the runners cannot go to a worker (they
         do not pickle) and when every runner's builds are too short for one
-        (:meth:`_measure_build`), and the caller builds as without workers. The items of a
-        runner whose builds are too short, and an item whose inputs cannot go to a worker, are
-        left to the profiling.
+        (:meth:`_measure_build`), and the caller builds as without workers; the decision takes
+        the inputs of one profile, not of every profile. The items of a runner whose builds are
+        too short, and an item whose inputs cannot go to a worker, are left to the profiling.
         """
         pending = [p for p in profiles if is_pending(p)]
+        if not pending:
+            return True
+        # Runners that build from shapes get meta tensors in the workers: no values to send.
+        keep_values = not all(r.builds_from_shapes for r in runners)
+        kwarg_specs = {
+            k: _TensorSpec.of(v, keep_values)
+            for k, v in kwargs.items()
+        }
+        pool = BuildPool.get()
+        if not all(pool.takes((runner, kwarg_specs)) for runner in runners):
+            logger.warning_once(
+                f"[Autotuner] {custom_op}: its runners do not go to worker "
+                "processes; its kernels build as it profiles.",
+                key=(custom_op, "builds_in_pool_refused"))
+            return False
+        prepares = [
+            "do_preparation" in inspect.signature(r.forward).parameters
+            for r in runners
+        ]
+        # Each runner's builds are measured, and go to the workers, on their own: a runner
+        # whose kernels ship prebuilt (cuBLAS) says nothing of a JIT runner's.
+        families = [
+            f"{custom_op}|{type(runner).__name__}" for runner in runners
+        ]
+        expected_s = tuning_config.build_seconds
+        in_workers = {
+            r
+            for r in range(len(runners))
+            if pool.worth_a_worker(families[r], expected_s)
+        }
+        unmeasured = [
+            r for r in range(len(runners))
+            if pool.unmeasured(families[r], expected_s)
+        ]
+        # An unmeasured runner builds a tactic of a profile here, timed. The ranks that share
+        # the builds start at different profiles and tactics, so that they measure different
+        # kernels rather than wait for one of them to build the same.
+        offset = jit_share.start_fraction() if share_builds else 0.0
+        first = int(offset * len(pending))
+        for p in pending[first:] + pending[:first]:
+            if not unmeasured:
+                break
+            tensors = self._tuning_tensors(p, inputs, tuning_config)
+            for r in list(unmeasured):
+                tactics = runners[r].get_valid_tactics(tensors, p, **kwargs)
+                if not tactics:
+                    continue
+                unmeasured.remove(r)
+                tactic = tactics[int(offset * len(tactics))]
+                if self._measure_build(families[r], runners[r], tensors, tactic,
+                                       prepares[r], **kwargs):
+                    in_workers.add(r)
+            del tensors
+        if not in_workers:
+            return False
         items = []
         specs: Dict[int, List[Any]] = {}
         for i, p in enumerate(pending):
             tensors = self._tuning_tensors(p, inputs, tuning_config)
-            specs[i] = [_TensorSpec.of(t) for t in tensors]
+            specs[i] = [_TensorSpec.of(t, keep_values) for t in tensors]
             for r, runner in enumerate(runners):
                 items.extend((i, r, tactic)
                              for tactic in runner.get_valid_tactics(
@@ -1746,35 +1820,7 @@ class AutoTuner:
                   items))) if share_builds else None)
         start = int(jit_share.start_fraction() *
                     len(items)) if share_builds else 0
-        kwarg_specs = {k: _TensorSpec.of(v) for k, v in kwargs.items()}
-        prepares = [
-            "do_preparation" in inspect.signature(r.forward).parameters
-            for r in runners
-        ]
-        pool = BuildPool.get()
-        if not all(pool.takes((runner, kwarg_specs)) for runner in runners):
-            logger.warning_once(
-                f"[Autotuner] {custom_op}: its runners do not go to worker "
-                "processes; its kernels build as it profiles.",
-                key=(custom_op, "builds_in_pool_refused"))
-            return False
         order = list(range(start, len(items))) + list(range(start))
-        # Each runner's builds are measured, and go to the workers, on their own: a runner
-        # whose kernels ship prebuilt (cuBLAS) says nothing of a JIT runner's.
-        families = [
-            f"{custom_op}|{type(runner).__name__}" for runner in runners
-        ]
-        in_workers = set()
-        for r in range(len(runners)):
-            first = next((k for k in order if items[k][1] == r), None)
-            if first is None:
-                continue
-            if pool.worth_a_worker(families[r]) or self._measure_build(
-                    families[r], runners, pending, inputs, tuning_config,
-                    items[first], prepares[r], **kwargs):
-                in_workers.add(r)
-        if not in_workers:
-            return False
         builds, claimed = [], []
         for k in order:
             i, r, tactic = items[k]
