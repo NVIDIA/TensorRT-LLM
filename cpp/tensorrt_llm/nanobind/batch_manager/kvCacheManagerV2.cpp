@@ -1718,7 +1718,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "What this pool's pages actually are. The same as the group's tier except for a sparse "
             "pool of the GPU tier, which is host-backed while the group still reports GPU_MEM. Ask "
             "per pool, not per group, when the medium of an address matters -- registering it for "
-            "transfer, or picking a copy implementation.");
+            "transfer, or picking a copy implementation.")
+        .def_prop_ro("mapped_ranges",
+            [](kv::PoolDesc const& self)
+            {
+                std::vector<std::pair<size_t, size_t>> ranges;
+                ranges.reserve(self.mappedRanges.size());
+                for (auto const& range : self.mappedRanges)
+                {
+                    ranges.emplace_back(range.beg, range.end);
+                }
+                return ranges;
+            });
 
     nb::class_<kv::PoolGroupDesc>(m, "PoolGroupDesc")
         .def_prop_ro("pool_group_index", [](kv::PoolGroupDesc const& self) { return self.poolGroupIndex.value(); })
@@ -1749,8 +1760,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__deepcopy__", [](cls const& self, nb::dict) { return cls(self); }, nb::arg("memo"))
 
     nb::class_<kv::GpuCacheTierConfig>(m, "GpuCacheTierConfig")
-        .def(nb::init<size_t>(), nb::arg("quota"))
+        .def(
+            "__init__",
+            [](kv::GpuCacheTierConfig* self, size_t quota, bool enableLocalityDomains) {
+                new (self) kv::GpuCacheTierConfig{quota, enableLocalityDomains};
+            },
+            nb::arg("quota"), nb::arg("enable_locality_domains") = false)
         .def_rw("quota", &kv::GpuCacheTierConfig::quota)
+        .def_rw("enable_locality_domains", &kv::GpuCacheTierConfig::enableLocalityDomains)
         .def_prop_ro("tier", &kv::GpuCacheTierConfig::tier)
         .def("validate", &kv::GpuCacheTierConfig::validate) DEF_COPY(kv::GpuCacheTierConfig);
 
@@ -2006,7 +2023,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
-                std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking)
+                std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking,
+                std::optional<kv::BatchDesc> coldTypicalStep)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -2035,6 +2053,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->hostSparsePoolQuota = hostSparsePoolQuota;
                 cfg->regions = std::move(regions);
                 cfg->hostMemBacking = std::move(hostMemBacking);
+                cfg->coldTypicalStep = std::move(coldTypicalStep);
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -2049,7 +2068,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority,
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
             nb::arg("regions") = std::vector<kv::RegionConfig>{},
-            nb::arg("host_mem_backing") = kv::HostMemBackingConfig{})
+            nb::arg("host_mem_backing") = kv::HostMemBackingConfig{},
+            nb::arg("cold_typical_step").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2062,6 +2082,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_partial_commit", &kv::KVCacheManagerConfig::enablePartialCommit)
         .def_rw("cold_tier_offload_min_priority", &kv::KVCacheManagerConfig::coldTierOffloadMinPriority)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
+        .def_rw("cold_typical_step", &kv::KVCacheManagerConfig::coldTypicalStep,
+            nb::for_setter(nb::arg("value").none()),
+            "Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's "
+            "per-layer-group slot-count proportions at cold page sizes.")
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("host_sparse_pool_quota", &kv::KVCacheManagerConfig::hostSparsePoolQuota,
             "Host bytes the GPU tier's host-backed pools may take. None has the storage manager set it "
@@ -2154,7 +2178,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "decoding give a request several and are out of scope; this is the guard.")
         .def(
             "commit",
-            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
+            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd,
+                bool ssmFromPending)
             {
                 // An empty token list with is_end=True must still stop committing, so we do not
                 // early-return on empty; commit() handles it. beam_search_indices is only
@@ -2173,12 +2198,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         TLLM_CHECK_WITH_INFO(!(self.textOnly() && !knownNoDigest),
                             "commit() received a digest token on a text_only sequence — hashing would be corrupted");
                         nb::gil_scoped_release release;
-                        self.commit(view, isEnd);
+                        self.commit(view, isEnd, ssmFromPending);
                     });
             },
             nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
-            nb::arg("is_end") = false)
+            nb::arg("is_end") = false, nb::arg("ssm_from_pending") = false)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "acquire_ssm_snapshot_slot", &kv::KvCache::acquireSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("pending_ssm_snapshot_slot", &kv::KvCache::pendingSsmSnapshotSlot)
+        .def(
+            "release_ssm_snapshot_slot", &kv::KvCache::releaseSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_base_page_indices",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx)
@@ -2310,6 +2340,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 return nb::bytes(reinterpret_cast<char const*>(key->data()), key->size());
             })
         .def_prop_ro("reuse_scope", &kv::KvCache::reuseScope)
+        .def_prop_ro("locality_domain_id",
+            [](kv::KvCache const& self)
+            {
+                auto const localityDomainId = self.localityDomainId();
+                return localityDomainId ? std::optional<int>{localityDomainId->value()} : std::nullopt;
+            })
         .def(
             "plan_committed_block_drop", [](kv::KvCache& self) { return self.planCommittedBlockDrop(); },
             nb::call_guard<nb::gil_scoped_release>())
@@ -2896,6 +2932,25 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return counters;
         },
         nb::arg("manager"));
+    mIntrospection.def(
+        "locality_domain_free_slots",
+        [](kv::KvCacheManager& manager)
+        {
+            auto const& storage = manager.storage();
+            std::vector<kv::SlotCount> freeSlots;
+            for (kv::LocalityDomainId localityDomainId{0}; localityDomainId < storage.numLocalityDomains();
+                 ++localityDomainId)
+            {
+                kv::SlotCount free = 0;
+                for (kv::PoolGroupIndex pgIdx{0}; pgIdx < storage.numPoolGroups(kv::kHotLevel); ++pgIdx)
+                {
+                    free += storage.getStatistics(kv::kHotLevel, pgIdx, localityDomainId).free;
+                }
+                freeSlots.push_back(free);
+            }
+            return freeSlots;
+        },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "grains_for_slots",
         [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity,
@@ -3558,15 +3613,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
                 std::optional<kv::RequestIdType> id, nb::object customPriorityCallback,
                 std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats,
-                std::optional<executor::KvCacheRetentionConfig> retentionConfig)
+                std::optional<executor::KvCacheRetentionConfig> retentionConfig, std::optional<int> localityDomainId)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
+                std::optional<kv::LocalityDomainId> const domain(localityDomainId);
                 if (inputTokens.is_none())
                 {
                     nb::gil_scoped_release release;
                     return self->createKvCache(std::move(reuseScope), kv::TokenSpan{}, id, std::move(priorityCb),
-                        expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig));
+                        expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig),
+                        /*inputKnownNoDigest=*/false, domain);
                 }
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
@@ -3583,13 +3640,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         }
                         nb::gil_scoped_release release;
                         return self->createKvCache(std::move(reuseScope), view, id, std::move(priorityCb), promptLen,
-                            textOnly, enableRequestStats, std::move(retentionConfig));
+                            textOnly, enableRequestStats, std::move(retentionConfig), knownNoDigest, domain);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt,
             nb::arg("text_only") = std::nullopt, nb::arg("enable_request_stats") = false,
-            nb::arg("kv_cache_retention_config") = std::nullopt)
+            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("locality_domain_id").none() = std::nullopt)
         .def(
             "probe_reuse",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
@@ -3608,6 +3665,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())
+        .def(
+            "probe_reuse_domains",
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
+            {
+                kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
+                return withTokens(inputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest)
+                    {
+                        nb::gil_scoped_release release;
+                        return self->probeReuseDomains(std::move(reuseScope), view, knownNoDigest);
+                    });
+            },
+            nb::arg("reuse_scope"), nb::arg("input_tokens"),
+            "GPU-resident pages of the reuse match for input_tokens, counted per locality domain.")
         .def(
             "probe_first_new_block_key",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens) -> nb::object
@@ -3806,6 +3877,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("is_stats_excluded", &kv::KvCacheManager::isStatsExcluded, nb::arg("kv_cache_id").none(),
             nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
+        .def_prop_ro("num_locality_domains", &kv::KvCacheManager::numLocalityDomains)
+        .def("get_mapped_buffer_views", &kv::KvCacheManager::getMappedBufferViews, nb::arg("layer_id"), nb::arg("role"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("event_manager",
             [](kv::KvCacheManager const& self)
             { return std::dynamic_pointer_cast<kv::EventManager>(self.eventSink()); })

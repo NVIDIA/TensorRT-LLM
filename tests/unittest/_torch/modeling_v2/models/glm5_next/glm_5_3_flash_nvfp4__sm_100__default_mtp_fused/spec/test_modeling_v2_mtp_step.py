@@ -15,7 +15,7 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_nvfp4__sm_100__default_mtp_fused.modeling import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_nvfp4__sm_100__default_mtp_fused.modeling import (  # noqa: E501
     Glm5NextMtpStep,
     _check_speculation,
 )
@@ -276,6 +276,33 @@ def test_step_matches_stock_worker(ctx_lens, accept_depths, draft_len, greedy):
         assert torch.equal(sa, fa) and torch.equal(si, fi)
 
 
+class _FailingCopy:
+    """A speculative packed mask whose copy runs out of memory, as one can during the engine's warmup."""
+
+    def __getitem__(self, index):
+        raise torch.OutOfMemoryError("simulated out-of-memory copy of the packed mask")
+
+
+def test_failed_metadata_save_leaves_no_saved_state():
+    """A save that fails after ``prepare_for_spec_dec`` restores the lengths, so the next step runs as usual."""
+    batch = _batch(11, (4,), 3, 3, (3, 0, 2))
+    reference = _run_fused(_copy(batch))
+    failing = _copy(batch)
+    metadata = failing["attn_metadata"]
+    metadata.spec_decoding_packed_mask = _FailingCopy()
+    # One step object across both calls, as the target keeps one.
+    step = Glm5NextMtpStep(Mapping(), _VOCAB)
+    with pytest.raises(torch.OutOfMemoryError):
+        step(**failing)
+    assert not metadata.has_spec_dec_saved_state
+    assert metadata.snapshot() == batch["attn_metadata"].snapshot()
+
+    metadata.spec_decoding_packed_mask = None
+    retried = step(**failing)
+    for key in ("new_tokens_lens", "next_draft_tokens", "next_new_tokens"):
+        assert torch.equal(reference[key], retried[key]), key
+
+
 def test_no_drafts_step_matches_stock_worker():
     batch = _batch(3, (4,), 3, 1, (1, 0, 1))
     stock_in, fused_in = _copy(batch), _copy(batch)
@@ -295,6 +322,8 @@ def test_no_drafts_step_matches_stock_worker():
         (dict(use_rejection_sampling=True), "rejection sampling"),
         (dict(use_relaxed_acceptance_for_thinking=True), "relaxed acceptance"),
         (dict(use_mtp_vanilla=True), "vanilla MTP"),
+        (dict(draft_lm_head_dtype="mxfp8"), "MXFP8 draft LM head"),
+        (dict(moe_backend="CUTLASS"), "draft MoE backend"),
     ],
 )
 def test_unsupported_speculation_is_refused(overrides, refused):

@@ -246,10 +246,10 @@ def _run_one_rank() -> int:
         device_id=torch.device("cuda", local_rank),
     )
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa import (  # noqa: E501
         _hist_topk,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa import (  # noqa: E501
         hist_topk as entry,
     )
     from tensorrt_llm.mapping import Mapping

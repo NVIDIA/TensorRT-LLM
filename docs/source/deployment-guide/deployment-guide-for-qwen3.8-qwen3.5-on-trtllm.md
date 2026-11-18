@@ -159,6 +159,10 @@ Tiling applies to preprocessing batches with at least 256 tokens, at least 3,072
 
 Tiling can change Q/K rounding. Changing batch size across a dispatch boundary can therefore change cached K values and generated tokens. Leave the flag unset when batch-invariant results are required.
 
+### Disabling Eager Fusions
+
+`TRTLLM_QWEN3_EAGER_FUSION_DISABLED=1` turns off the fused all-reduce and RMSNorm kernels and the FP8 copies that RMSNorm writes for static FP8 layers, which can help when bisecting a numerics issue.
+
 ### Launch the TensorRT LLM Server
 
 Below is an example command to launch the TensorRT LLM server from within the container with the checkpoint that matches the configuration file you selected above.

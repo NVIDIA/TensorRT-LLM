@@ -773,6 +773,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     supports_encoder_cache = True
     # The inner Qwen3.5 decoder implements them (see Qwen3NextForCausalLM).
     model_specific_llm_args = Qwen3NextForCausalLM.model_specific_llm_args
+    # The inner decoder's GDN layers read it.
+    mamba_metadata_cls = Qwen3NextForCausalLM.mamba_metadata_cls
 
     @classmethod
     def get_model_defaults(cls, llm_args):

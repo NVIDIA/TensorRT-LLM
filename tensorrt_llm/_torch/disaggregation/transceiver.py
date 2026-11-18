@@ -363,6 +363,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     # GEN idle-poll skip state; _init_gen_idle_poll sets the instance values.
     _gen_idle_poll_skip: bool = False
     _gen_idle_agreed: bool = False
+    # Helix GEN idle probe; _init_sync_policy sets the instance value.
+    _gen_idle_probe: bool = False
     _gen_deferred_receives: int = 0
     _pending_rank_info_admissions: Optional[dict[int, tuple[LlmRequest, Optional[str]]]] = None
     _rank_info_start_failures: Optional[dict[int, LlmRequest]] = None
@@ -642,6 +644,42 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._gen_need_sync = m.world_size > 1
             self._gen_allgather = self._dist.allgather
         self._init_gen_idle_poll(self._gen_idle_poll_skip_applies(m, self._gen_need_sync))
+        self._gen_idle_probe = self._gen_idle_probe_applies(m, self._gen_need_sync)
+
+    @staticmethod
+    def _gen_idle_probe_applies(mapping: Mapping, gen_need_sync: bool) -> bool:
+        """Whether an idle non-blocking status poll is decided by one int64 allgather.
+
+        For context parallelism (helix), where the idle-poll skip does not
+        apply: without attention DP and with one PP stage the status consensus
+        spans the world, which is the TP x CP group the int64 allgather spans,
+        so every rank takes the same branch. The probe is a collective every
+        round, so ranks one round apart never split on entering one.
+        """
+        return (
+            gen_need_sync
+            and not mapping.enable_attention_dp
+            and mapping.pp_size == 1
+            and mapping.cp_size > 1
+            and mapping.world_size == mapping.tp_size * mapping.cp_size
+        )
+
+    def _any_rank_has_recv_sessions(self) -> bool:
+        """Whether any rank of the group has a receive in progress.
+
+        Counts what the full consensus would act on, as the idle-poll skip does
+        (_consensus_outcome's local_session_count): sessions, receives admitted
+        but not started yet, RankInfo admissions that start their session only
+        inside _poll_rank_info_admissions, and coordinated start failures.
+        """
+        local = (
+            len(self._recv_sessions)
+            + self._gen_deferred_receives
+            + len(self._pending_rank_info_admissions or {})
+            + len(self._rank_info_start_failures or {})
+        )
+        counts = self._dist.tp_cp_allgather_int64([local])
+        return bool(counts.any())
 
     def _dp_group_allgather(self, obj):
         """Allgather over the CP ranks, then the PP ranks, of this DP group.
@@ -1868,6 +1906,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # since (that clears the flag on all ranks in the same iteration):
             # this round's consensus would be empty everywhere.
             return GenTransferStatus([], [], [])
+        if (
+            self._gen_idle_probe
+            and at_least_request_num == 0
+            and not self._any_rank_has_recv_sessions()
+        ):
+            # No receive session on any rank: the consensus would gather empty
+            # lists and return three empty lists without side effects. Only the
+            # non-blocking poll is short-circuited; blocking and at-least-N
+            # calls keep their pacing.
+            return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
         need_progress = wait_num > 0
@@ -2125,12 +2173,60 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session is None or session.status != SessionStatus.ERROR
         )
 
+    def supports_logical_context_cancellation(self, req: Optional[LlmRequest] = None) -> bool:
+        """Whether this request has independently retained context-transfer ownership.
+
+        Args:
+            req: The request to check, or None to check the runtime capability.
+
+        Returns:
+            True only for the qualified, immutable-ID context-first profile.
+        """
+        if getattr(self, "_context_first_ownership", False) is not True:
+            return False
+        if req is None:
+            return True
+        params = req.py_disaggregated_params
+        return (
+            req.is_context_only_request
+            and params is not None
+            and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+            and type(params.disagg_request_id) is int
+            and params.disagg_request_id >= 0
+        )
+
+    def request_logical_context_cancellation(self, req: LlmRequest) -> bool:
+        """Close context admission without releasing an outstanding transfer.
+
+        Args:
+            req: The exact context request to cancel.
+
+        Returns:
+            Whether cancellation was accepted. This does not authorize resource
+            release; the normal send reaper must still observe safe retirement.
+        """
+        if not self.supports_logical_context_cancellation(req):
+            return False
+        rid = get_unique_rid(req)
+        session = self._send_sessions.get(rid)
+        if session is None:
+            # No publication exists, or the previous session already retired.
+            # Do not let a later executor pass create another send for this ID.
+            req.py_kv_send_session_retired = True
+            return True
+        if not getattr(session, "_enforce_physical_ownership", False):
+            return False
+        session.cancel()
+        # Keep both the native session and its request root until every physical
+        # operation settles. Repeated cancellation joins the same drain window.
+        return True
+
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 
-        Returns False while a session or cancelled admission fence may access
-        request memory; caller must retry next iteration. Returns True only
-        after transfer and local CUDA claims settle, permitting resource release.
+        Returns False while physical access or qualified context group retirement
+        is pending; caller must keep progressing and retry. Returns True when
+        this transceiver no longer holds the request's resources.
         """
         rid = get_unique_rid(req)
 
@@ -2154,6 +2250,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # A pending admission has not published any destination.
         if self._pending_rank_info_admissions is not None:
             self._pending_rank_info_admissions.pop(rid, None)
+
+        if self.supports_logical_context_cancellation(req):
+            # Local quiescence cannot remove a TP participant's retirement vote.
+            # Keep the session until the normal send reaper agrees across ranks.
+            accepted = self.request_logical_context_cancellation(req)
+            return accepted and rid not in self._send_sessions
 
         # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)
