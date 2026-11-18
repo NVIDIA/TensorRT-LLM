@@ -1384,10 +1384,11 @@ def _tq_decode_kernel(
     RAW: tl.constexpr,
     RAW_BLOCK: tl.constexpr,
     HALVES: tl.constexpr,
+    HEAD_ROWS: tl.constexpr,
 ):
     # HALVES (an mse pass that decodes a single instance of 512 values): the instance's output
     # columns are accumulated in two halves, so that both accumulators fit tensor memory; each
-    # chunk of codes is still read once.
+    # chunk of codes is still read once. HEAD_ROWS: rows per KV head (fractional bits).
     tile_page = tl.program_id(0)
     buffer = tl.program_id(1)
     tile = tl.program_id(2)
@@ -1398,7 +1399,8 @@ def _tq_decode_kernel(
         rows = lane % ROWS_PAD
         row_mask = (rows < ROWS) & (page < num_pages)
     else:
-        # Fractional bits: a tile is one KV head of the Page, whose tokens share the channel split.
+        # Fractional bits: a tile is one KV head of the Page, whose tokens share the channel split,
+        # or a part of one (rows wider than 448, see kernel_constants).
         page = tile_page + lane * 0
         rows = tile * TILE_ROWS + lane
         row_mask = (lane < TILE_ROWS) & (rows < ROWS)
@@ -1429,7 +1431,8 @@ def _tq_decode_kernel(
     alpha_lo = alpha
     if MODE == 1:
         G: tl.constexpr = N // 2
-        mask_ptr = cold_ptr + tl.max(cold_rows, axis=0) + OFF_MASK + tile * (N // 8)
+        head = tile * TILE_ROWS // HEAD_ROWS
+        mask_ptr = cold_ptr + tl.max(cold_rows, axis=0) + OFF_MASK + head * (N // 8)
         pos0, before = _outlier_positions(_load_mask(mask_ptr, 0, P0), 0, 0, P0, G)
         if P1 > 0:
             pos1, before = _outlier_positions(_load_mask(mask_ptr, P0, P1), before, P0, P1, G)

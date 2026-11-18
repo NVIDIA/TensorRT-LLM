@@ -156,8 +156,22 @@ class _TurboQuantGeometry:
         pages_per_tile, rows_pad = 1, self.rows
         launch: dict[str, int] = {}
         if self.mode == "fractional":
+            # The tokens of one KV head share the channel split: an encode tile is one head.
             block_m = max(16, triton.next_power_of_2(self.tokens_per_page))
             tile_rows = self.tokens_per_page
+            # Encoding stages the head's widest piece (fp16) and a [piece, C] chunk of the
+            # rotation in shared memory (227 KiB per block on GB300): keep them within 192 KiB.
+            # C also lays out the codes, so encode and decode derive it from the head alone.
+            while chunk > 16 and 2 * max(pieces) * (block_m + chunk) > 192 * 1024:
+                chunk //= 2
+            if not encode and self.width > 448 and block_m > 32:
+                # Decoding accumulates every output value of the row, and tensor-core tiles of 64+
+                # rows accumulate in tensor memory (512 fp32 columns, shared with the staged
+                # operand): rows wider than 448 do not fit (on GB300 the decode faults with a
+                # misaligned address). Such heads decode in tiles of at most 32 rows, whose
+                # accumulators live in registers; a tile is a power of two dividing the head.
+                tile_rows = min(32, self.tokens_per_page & -self.tokens_per_page)
+                block_m = max(16, tile_rows)
         else:
             # Tensor-core tiles of 64+ rows accumulate in tensor memory: 512 fp32 columns shared
             # by the accumulators and the staged operand. Decoding accumulates a whole instance;
@@ -241,6 +255,8 @@ class _TurboQuantGeometry:
         )
         if not encode:
             constants["HALVES"] = halves
+            # Rows per KV head, for the fractional channel mask of a decode tile.
+            constants["HEAD_ROWS"] = self.tokens_per_page if self.mode == "fractional" else 1
         return constants
 
     def decode_passes(self, halves: bool) -> tuple[tuple[int, bool], ...]:
