@@ -400,6 +400,53 @@ def test_qwen3vl_breakable_inputs_text_clears_stale_visual_features(num_levels):
         )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("owner_cls", [Qwen2_5_VLModel, Qwen3VLModel])
+@pytest.mark.parametrize("num_generations", [0, 1, 3])
+def test_qwenvl_breakable_inputs_pad_mrope_generation_deltas(owner_cls, num_generations):
+    model = owner_cls.__new__(owner_cls)
+    torch.nn.Module.__init__(model)
+    model.deepstack_num_level = 0
+    num_tokens = 5
+    mrope_config = {"mrope_rotary_cos_sin": torch.randn(1, 20)}
+    deltas = torch.tensor([-3, 0, 7], dtype=torch.int32)[:num_generations].view(-1, 1)
+    if num_generations:
+        mrope_config["mrope_position_deltas"] = deltas
+    inputs = {"inputs_embeds": torch.randn(num_tokens, 4), "mrope_config": mrope_config}
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    # The deltas take the token count's shape, so one graph per token count serves every batch.
+    padded = prepared["mrope_config"]["mrope_position_deltas"]
+    assert padded.shape == (num_tokens, 1)
+    assert padded.dtype == torch.int32
+    # Generation kernels index the deltas from zero, without a context-request offset.
+    torch.testing.assert_close(padded[:num_generations], deltas, atol=0, rtol=0)
+    torch.testing.assert_close(
+        padded[num_generations:], torch.zeros(num_tokens - num_generations, 1, dtype=torch.int32)
+    )
+    assert prepared["mrope_config"] is not mrope_config
+    assert prepared["mrope_config"]["mrope_rotary_cos_sin"] is mrope_config["mrope_rotary_cos_sin"]
+    if num_generations:
+        assert mrope_config["mrope_position_deltas"] is deltas
+    else:
+        assert "mrope_position_deltas" not in mrope_config
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("owner_cls", [Qwen2_5_VLModel, Qwen3VLModel])
+@pytest.mark.parametrize("mrope_config", [None, {}])
+def test_qwenvl_breakable_inputs_leave_unfused_mrope_unchanged(owner_cls, mrope_config):
+    model = owner_cls.__new__(owner_cls)
+    torch.nn.Module.__init__(model)
+    model.deepstack_num_level = 0
+    inputs = {"inputs_embeds": torch.randn(3, 4), "mrope_config": mrope_config}
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    assert prepared["mrope_config"] is mrope_config
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     ("family", "num_levels"),

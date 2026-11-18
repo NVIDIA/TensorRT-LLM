@@ -224,36 +224,19 @@ def test_breakable_inputs_embed_through_text_embedding_hook(use_prepared_embeds)
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("num_generations", [0, 1, 3])
-def test_breakable_inputs_pad_mrope_generation_deltas_without_context_offset(num_generations):
-    model = DummyMultimodalModel(make_embedding(), torch.tensor([99]))
-    num_tokens = 5
-    mrope_config = {"mrope_rotary_cos_sin": torch.randn(1, 20)}
-    deltas = torch.tensor([-3, 0, 7], dtype=torch.int32)[:num_generations].view(-1, 1)
-    if num_generations:
-        mrope_config["mrope_position_deltas"] = deltas
-    inputs = {"inputs_embeds": torch.randn(num_tokens, 4), "mrope_config": mrope_config}
-
-    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
-
-    padded = prepared["mrope_config"]["mrope_position_deltas"]
-    assert padded.shape == (num_tokens, 1)
-    assert padded.dtype == torch.int32
-    torch.testing.assert_close(padded[:num_generations], deltas, atol=0, rtol=0)
-    torch.testing.assert_close(
-        padded[num_generations:], torch.zeros(num_tokens - num_generations, 1, dtype=torch.int32)
-    )
-    assert prepared["mrope_config"] is not mrope_config
-    assert prepared["mrope_config"]["mrope_rotary_cos_sin"] is mrope_config["mrope_rotary_cos_sin"]
-    if num_generations:
-        assert mrope_config["mrope_position_deltas"] is deltas
-    else:
-        assert "mrope_position_deltas" not in mrope_config
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("mrope_config", [None, {}])
-def test_breakable_inputs_leave_unfused_mrope_unchanged(mrope_config):
+@pytest.mark.parametrize(
+    "mrope_config",
+    [
+        None,
+        {},
+        {
+            "mrope_rotary_cos_sin": torch.randn(1, 20),
+            "mrope_position_deltas": torch.tensor([[2]], dtype=torch.int32),
+        },
+    ],
+)
+def test_breakable_inputs_leave_mrope_config_to_the_model(mrope_config):
+    # Model-specific inputs such as MRoPE are prepared by the model's override of the hook.
     model = DummyMultimodalModel(make_embedding(), torch.tensor([99]))
     inputs = {"inputs_embeds": torch.randn(3, 4), "mrope_config": mrope_config}
 

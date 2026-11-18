@@ -143,6 +143,32 @@ def _prepare_qwen_vl_mrope_config(
     return mrope_config
 
 
+def _pad_qwen_vl_mrope_deltas(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Pad the MRoPE generation deltas of breakable prefill graph inputs.
+
+    `_prepare_qwen_vl_mrope_config` gives one delta per generation request.
+    Pad them to the token count so their shape does not depend on the batch.
+    Updates and returns `inputs`.
+    """
+    mrope_config = inputs.get("mrope_config")
+    if mrope_config is None or "mrope_rotary_cos_sin" not in mrope_config:
+        return inputs
+    num_tokens = inputs["inputs_embeds"].shape[0]
+    padded_deltas = torch.zeros((num_tokens, 1),
+                                dtype=torch.int32,
+                                device=inputs["inputs_embeds"].device)
+    deltas = mrope_config.get("mrope_position_deltas")
+    if deltas is not None:
+        if deltas.numel() > num_tokens:
+            raise ValueError(
+                "MRoPE generation deltas exceed the prefill token count")
+        # Generation kernels index deltas from zero, without a context-request offset.
+        padded_deltas[:deltas.numel()].copy_(deltas.reshape(-1, 1))
+    inputs["mrope_config"] = dict(mrope_config,
+                                  mrope_position_deltas=padded_deltas)
+    return inputs
+
+
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
 
@@ -2468,6 +2494,11 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     @property
     def text_embedding_layer(self) -> nn.Module:
         return self.llm.model.embed_tokens
+
+    def prepare_breakable_cuda_graph_inputs(
+            self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        return _pad_qwen_vl_mrope_deltas(
+            super().prepare_breakable_cuda_graph_inputs(inputs))
 
     def encode_multimodal_inputs(self,
                                  multimodal_params: List[MultimodalParams],

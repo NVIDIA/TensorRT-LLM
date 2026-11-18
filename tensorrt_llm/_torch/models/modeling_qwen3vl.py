@@ -72,6 +72,7 @@ from .modeling_multimodal_mixin import (
 from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,
+    _pad_qwen_vl_mrope_deltas,
     _prepare_qwen_vl_mrope_config,
     _qwen_vision_item_partitions,
 )
@@ -1999,7 +2000,9 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         return fused_input_ids, inputs_embeds, tuple(deepstack_buffer.unbind(0))
 
     def prepare_breakable_cuda_graph_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        prepared_inputs = super().prepare_breakable_cuda_graph_inputs(inputs)
+        prepared_inputs = _pad_qwen_vl_mrope_deltas(
+            super().prepare_breakable_cuda_graph_inputs(inputs)
+        )
         if self.deepstack_num_level > 0 and not prepared_inputs.get("deepstack_embeds"):
             # Text batches replay the same body as image batches, with zero DeepStack rows.
             num_tokens = prepared_inputs["inputs_embeds"].shape[0]
