@@ -67,6 +67,7 @@ from .multimodal_encoder_data_parallel import (
     encoder_dp_error_guard,
     execute_encoder_dp_items,
     iter_encoder_rank_inputs,
+    release_error_frames,
 )
 
 
@@ -748,7 +749,8 @@ class MultimodalModelMixin:
                 group_outputs = self._forward_shared_encoder_group(group)
             except MultimodalEncoderContractError as error:
                 # Only this rank's requests fail; the later groups still run.
-                owner_error = error
+                # The error's frames must not keep this group's buffers alive.
+                owner_error = release_error_frames(error)
             else:
                 if group_outputs is not None:
                     outputs = group_outputs
@@ -788,6 +790,7 @@ class MultimodalModelMixin:
                 with encoder_dp_error_guard(self.exchange_encoder_status):
                     shared_outputs.extend(self._forward_multimodal_encoder_items_local(run))
         except MultimodalEncoderContractError:
+            shared_outputs.clear()
             if len(group) == 1:
                 if group[0][0] == tp_rank:
                     raise
@@ -798,7 +801,7 @@ class MultimodalModelMixin:
                     entry_outputs = self._forward_shared_encoder_group([entry])
                 except MultimodalEncoderContractError as error:
                     # Keep going: the other ranks still encode the later owners.
-                    own_error = error
+                    own_error = release_error_frames(error)
                 else:
                     outputs = entry_outputs if entry_outputs is not None else outputs
             if own_error is not None:
@@ -808,7 +811,12 @@ class MultimodalModelMixin:
         for owner, inputs in group:
             num_items = sum(len(lengths) for _, lengths, _ in inputs)
             if owner == tp_rank:
-                return shared_outputs[start : start + num_items]
+                own_outputs = shared_outputs[start : start + num_items]
+                if len(group) == 1:
+                    return own_outputs
+                # Copy this rank's rows out of the group's output, so the
+                # other owners' rows are freed before the next group runs.
+                return list(torch.cat(own_outputs).split([o.shape[0] for o in own_outputs]))
             start += num_items
         return None
 

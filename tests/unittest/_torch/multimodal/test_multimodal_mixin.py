@@ -857,6 +857,51 @@ def test_shared_encoder_tp_group_error_fails_only_the_bad_owner(bad_tag):
     assert model.encoded_tags == [[0, 1], [0], [1]]
 
 
+class _OutputTrackingEncoderModel(_OwnerTaggedEncoderModel):
+    """Records, at each encoder call, which earlier encoder outputs are still alive."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.output_refs: list[weakref.ref] = []
+        self.alive_at_encode: list[list[bool]] = []
+
+    def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs):
+        self.alive_at_encode.append([ref() is not None for ref in self.output_refs])
+        output = super().encode_multimodal_inputs(multimodal_params, **encoder_kwargs)
+        self.output_refs.append(weakref.ref(output))
+        return output
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("bad_tag", [None, 1], ids=["success", "own_input_fails"])
+def test_shared_encoder_tp_frees_each_group_before_the_next(bad_tag):
+    # TP4 seen from rank 1. Groups [0, 1] and [2, 3]: each owner costs 4 tokens and 1 item.
+    model = _OutputTrackingEncoderModel(tp_size=4, rank=1, bad_tag=bad_tag)
+
+    with patch.object(dp_module, "Distributed", _EveryRankSendsATaggedBatch):
+        if bad_tag is None:
+            outputs = model.forward_multimodal_encoder_items(
+                _owner_tagged_input(1.0), max_tokens=8, max_items=2
+            )
+        else:
+            with pytest.raises(MultimodalEncoderContractError, match="does not match"):
+                model.forward_multimodal_encoder_items(
+                    _owner_tagged_input(1.0), max_tokens=8, max_items=2
+                )
+
+    if bad_tag is None:
+        assert model.encoded_tags == [[0, 1], [2, 3]]
+        # This rank keeps a copy of its own rows, not the group's whole output.
+        torch.testing.assert_close(outputs, [torch.ones(2, 2)])
+        assert outputs[0].untyped_storage().nbytes() == outputs[0].nbytes
+    else:
+        # Group [0, 1] fails and is encoded again one owner at a time.
+        assert model.encoded_tags == [[0, 1], [0], [1], [2, 3]]
+    # Nothing from group [0, 1] is alive when group [2, 3] is encoded: not its
+    # output (success), and not the saved error's frames (failure).
+    assert not any(model.alive_at_encode[-1])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize(
     "max_tokens,status_exchanges,allgathers",

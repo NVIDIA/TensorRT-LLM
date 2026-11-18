@@ -23,6 +23,7 @@ tokens when item metadata provides them; output rows are tracked separately
 for reconstruction.
 """
 
+import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
@@ -138,6 +139,24 @@ def raise_shared_system_error(statuses: Sequence[int], local_error: Exception | 
     ]
     if failed:
         raise EncoderDpError(f"Multimodal encoder failed on TP rank(s) {failed}.") from local_error
+
+
+def release_error_frames(error: Exception) -> Exception:
+    """Clear the local variables that ``error`` and its causes keep alive, and return it.
+
+    An error kept until the end of an encoder step would otherwise keep its
+    failed batch's buffers alive while later batches run. Line numbers stay.
+    """
+    pending: list[BaseException | None] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        pending += (current.__cause__, current.__context__)
+    return error
 
 
 @contextmanager
