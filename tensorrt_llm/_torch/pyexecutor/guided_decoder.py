@@ -163,16 +163,13 @@ class GuidedRequests:
         return len(self.requests)
 
 
-def _build_threads(backend) -> int:
+def _build_threads() -> int:
     """Threads used to build the bitmask rows of one batch in parallel.
 
-    Only the XGrammar backend is parallelized: it releases the GIL while
-    filling a bitmask, and the matcher of one request is independent of the
-    others. 1 builds serially. ``TRTLLM_GUIDED_DECODING_BUILD_THREADS``
-    overrides the default.
+    Both backends release the GIL while filling a bitmask, and the matcher of
+    one request is independent of the others. 1 builds serially.
+    ``TRTLLM_GUIDED_DECODING_BUILD_THREADS`` overrides the default.
     """
-    if backend != GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR:
-        return 1
     default = min(16, os.cpu_count() or 1)
     try:
         return max(
@@ -184,8 +181,7 @@ def _build_threads(backend) -> int:
 class GuidedDecoder:
     bitmask_dtype = torch.int32
     token_mask_dtype = torch.int32
-    # Serial unless the backend allows a build pool; the pool itself is
-    # created by the first build of two or more requests.
+    # The build pool is created by the first build of two or more requests.
     _build_pool: Optional[ThreadPoolExecutor] = None
     _build_pool_size: int = 1
 
@@ -262,7 +258,7 @@ class GuidedDecoder:
         # request owns its matcher, its slot's counters and its own bitmask
         # rows. XGrammar releases the GIL while it fills, so the requests of a
         # batch are built on a small thread pool.
-        self._build_pool_size = _build_threads(self.guided_decoding_backend)
+        self._build_pool_size = _build_threads()
 
     @property
     def bitmask_size(self) -> int:

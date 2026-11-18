@@ -256,9 +256,35 @@ def test_build_dead_end_isolates_the_failing_request(monkeypatch):
     assert decoder.num_advanced_tokens[1] == 1
 
 
+def _byte_vocab_config(backend: str) -> GuidedDecodingConfig:
+    """A one-byte-per-token vocabulary (token id = byte value) plus an EOS token (256)."""
+    vocab = [bytes([i]) for i in range(256)] + [b"<EOS>"]
+    if backend == "xgrammar":
+        return GuidedDecodingConfig(
+            encoded_vocab=[v.decode("latin-1") for v in vocab], stop_token_ids=[256]
+        )
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers.models.gpt2.tokenization_gpt2 import bytes_to_unicode
+
+    byte_to_char = bytes_to_unicode()
+    token_vocab = {byte_to_char[i]: i for i in range(256)}
+    token_vocab["<EOS>"] = 256
+    tokenizer = Tokenizer(models.BPE(vocab=token_vocab, merges=[]))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = decoders.ByteLevel()
+    tokenizer.add_special_tokens(["<EOS>"])
+    return GuidedDecodingConfig(
+        backend=GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE,
+        encoded_vocab=[v.decode("latin-1") for v in vocab],
+        tokenizer_str=tokenizer.to_str(),
+        stop_token_ids=[256],
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_build_on_thread_pool_matches_serial_build(monkeypatch):
-    """The thread-pool build equals the serial build, with real xgrammar matchers.
+@pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+def test_build_on_thread_pool_matches_serial_build(monkeypatch, backend):
+    """The thread-pool build equals the serial build, with real matchers of each backend.
 
     A byte-level vocabulary and a real JSON-schema grammar drive real matchers:
     a context step creates them, then a generation step advances each through
@@ -290,9 +316,7 @@ def test_build_on_thread_pool_matches_serial_build(monkeypatch):
     def build(threads: int):
         monkeypatch.setenv("TRTLLM_GUIDED_DECODING_BUILD_THREADS", str(threads))
         decoder = GuidedDecoder(
-            GuidedDecodingConfig(
-                encoded_vocab=[v.decode("latin-1") for v in vocab], stop_token_ids=[256]
-            ),
+            _byte_vocab_config(backend),
             max_num_sequences=len(texts),
             vocab_size_padded=len(vocab),
             max_num_draft_tokens=num_draft,
