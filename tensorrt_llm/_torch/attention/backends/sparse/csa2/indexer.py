@@ -92,6 +92,16 @@ def _sparse_block(candidate_block_size: int) -> int:
     return next((block for block in (16, 8) if candidate_block_size % block == 0), 0)
 
 
+# (candidate source, decode rows, candidate columns) -> whether a consumer read the sparse logits
+# schedule there; False only while every consumer at that shape took the fused Reindex select.
+_SCHEDULE_NEEDED: dict = {}
+
+
+def _note_schedule_use(source: int, rows: int, width: int, needed: bool) -> None:
+    key = (int(source), int(rows), int(width))
+    _SCHEDULE_NEEDED[key] = bool(_SCHEDULE_NEEDED.get(key, False) or needed)
+
+
 def candidate_consumer_requirement(
     heads: int, head_dim: int, candidate_block_size: int
 ) -> str | None:
@@ -616,6 +626,67 @@ class CSA2Indexer(Indexer):
             state.cand_ctl[:rows, 1].masked_fill_(bad_rows[:rows], 1)
         if state.block_max is not None:
             state.block_max[:count].masked_fill_(mask, torch.inf)
+
+    def _fused_reindex_applies(
+        self,
+        count: int,
+        sparse_indices: torch.Tensor,
+        logical_positions: torch.Tensor,
+        output_indices: torch.Tensor,
+    ) -> bool:
+        from .reindex_select import reindex_select_applies
+
+        width = sparse_indices.shape[1] * self.sparse_block
+        return bool(
+            self.top_k.decode_implementation == TopKImplementation.CUTE_DSL_RADIX
+            and output_indices.shape[1] == self.top_k.top_k
+            and self.sparse_block == 8
+            and output_indices.is_contiguous()
+            and logical_positions.is_contiguous()
+            and logical_positions.shape[1] >= width
+            and logical_positions.data_ptr() % 16 == 0
+            and sparse_indices.stride(1) == 1
+            and reindex_select_applies(count, width, output_indices.shape[1])
+        )
+
+    def _fused_reindex_select(
+        self,
+        q_data: torch.Tensor,
+        q_scale: torch.Tensor,
+        weights: torch.Tensor,
+        sparse_indices: torch.Tensor,
+        logical_positions: torch.Tensor,
+        output_indices: torch.Tensor,
+        valid_counts: torch.Tensor,
+        paged: tuple[torch.Tensor, ...],
+    ) -> bool:
+        """``_sparse_candidate_logits`` + ``_select_mapped_logits`` of the decode rows in one launch
+        (``reindex_select.py``) where it reproduces them bit for bit; returns whether it ran."""
+        from .reindex_select import reindex_select_
+
+        count = q_data.shape[0]
+        pages, block_table, _, row_requests, _ = paged
+        if not (
+            self._fused_reindex_applies(count, sparse_indices, logical_positions, output_indices)
+            and pages.dim() == 4
+            and pages.shape[1] == 64
+            and pages.stride(1) == 68
+            and pages.stride(3) == 1
+            and block_table.stride(1) == 1
+        ):
+            return False
+        return reindex_select_(
+            q_data.contiguous(),
+            q_scale.contiguous().view(torch.int32).reshape(count, self.n_heads),
+            weights.to(torch.bfloat16).contiguous(),
+            pages,
+            block_table,
+            row_requests,
+            sparse_indices,
+            valid_counts,
+            logical_positions,
+            output_indices,
+        )
 
     def _select_mapped_logits(
         self,
@@ -1143,8 +1214,23 @@ class CSA2Indexer(Indexer):
         )
         sparse_descriptors = None
         if paged is not None and candidates is not None:
-            # Sparse paged logits read the native index pages in place
-            sparse_descriptors = metadata.prepare_sparse_indexer(self.layer_idx, self.sparse_block)
+            # Sparse paged logits read the native index pages in place. The fused Reindex select
+            # reads no DeepGEMM schedule: it neither builds nor waits for one.
+            fused = self._fused_reindex_applies(
+                count - decode_start,
+                sparse_blocks[decode_start:],
+                candidates[decode_start:],
+                logical[decode_start:],
+            )
+            _note_schedule_use(
+                layer.candidate_source,
+                count - decode_start,
+                int(sparse_blocks.shape[1]) * self.sparse_block,
+                needed=not fused,
+            )
+            sparse_descriptors = metadata.prepare_sparse_indexer(
+                self.layer_idx, self.sparse_block, build=not fused
+            )
             if sparse_descriptors is None:
                 paged = None
         if candidates is None:
@@ -1193,7 +1279,18 @@ class CSA2Indexer(Indexer):
                 logical,
             )
         if paged is not None:
-            if candidates is not None:
+            if candidates is not None and self._fused_reindex_select(
+                q_fp8[decode_start:],
+                q_scale[decode_start:],
+                weights[decode_start:],
+                sparse_blocks[decode_start:],
+                candidates[decode_start:],
+                logical[decode_start:],
+                sparse_counts[decode_start:],
+                sparse_descriptors,
+            ):
+                pass
+            elif candidates is not None:
                 # Score only the published candidate blocks straight from the index pages
                 scores = self._sparse_candidate_logits(
                     q_fp8[decode_start:],
@@ -1229,7 +1326,8 @@ class CSA2Indexer(Indexer):
             # This forward's candidate consumers share one sparse logits schedule over the
             # candidates just published: build it on the side stream now, not in the first
             # consumer's chain.
-            metadata.prebuild_sparse_schedule(self.layer_idx, self.sparse_block)
+            if not self._sparse_schedule_unused(metadata):
+                metadata.prebuild_sparse_schedule(self.layer_idx, self.sparse_block)
         if prior is not None:
             metadata.publish_indexer_prior(self.layer_idx, logical)
         return logical
@@ -1257,6 +1355,16 @@ class CSA2Indexer(Indexer):
         stream while it projects, and its indexer then finds them current."""
         if self._native_decode(metadata, count)[1]:
             metadata.prepare_indexer(self.layer_idx, batch_queries=self._batch_paged_queries())
+
+    def _sparse_schedule_unused(self, metadata: CSA2TrtllmMetadata) -> bool:
+        """Whether every consumer recorded at this decode shape took the fused Reindex select."""
+        blocks = metadata.csa2_candidate_blocks.get(self.layer_idx)
+        table = getattr(metadata, "csa2_indexer_block_table", None)
+        if blocks is None or table is None:
+            return False
+        rows = int(table.shape[0])
+        width = int(blocks.shape[1]) * self.sparse_block
+        return _SCHEDULE_NEEDED.get((self.layer_idx, rows, width)) is False
 
     def _feeds_sparse_consumers(self) -> bool:
         """Whether this candidate source's consumers score its published blocks with the paged

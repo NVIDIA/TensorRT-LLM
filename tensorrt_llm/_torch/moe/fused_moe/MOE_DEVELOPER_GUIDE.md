@@ -322,10 +322,11 @@ A family package has one layout, so a new leaf has an obvious place:
   the `quant` segment in `cutlass/` and `marlin/`, provider and `quant` in
   `trtllm_gen/` (`trtllm_nvfp4.py`, `trtllm_bf16.py`), and in `cutedsl/`,
   which holds several kernels, the kernel first (`grouped_gemm/nvfp4.py`,
-  `fused_fc12.py`).
+  `fused_fc12/nvfp4.py`).
 - Modules several leaves share, named for what they hold: a kernel ABI
   (`trtllm_gen/fp4_block_scale.py`), shared inputs (`kernel_inputs.py`),
-  autotune runners (`cutedsl/runners.py`).
+  autotune runners (`cutedsl/runners.py`), a mixin leaves of different kernels
+  take (`cutedsl/locality_domain.py`).
 
 The package's `__init__.py` imports every leaf module, which registers the
 leaves, and exports a lookup by format (`cutlass_leaf`, `trtllm_gen_leaf`,
@@ -408,7 +409,7 @@ how its package is built; which leaves it holds is the catalog's job.
 | `DEEPGEMM` | `fused_moe_deepgemm.py` (`DeepgemmCudaFp8BlockScalesImpl`, aliased as `DeepGemmFusedMoE`) | SM100/SM103/SM107 | FP8 Block Scales on Blackwell/Rubin | `EXTERNAL_COMM` |
 | `DENSEGEMM` | `cutedsl/dense_gemm.py` | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
 | `CUTEDSL` | `cutedsl/grouped_gemm/`, and the B12x leaves in `fused_moe_cute_dsl_b12x.py` | Grouped GEMM: SM100/SM103/SM107, NVFP4_PLUS and BF16 SM107 only. B12x: SM120/SM121 | High throughput NVFP4, generally faster than Cutlass; NVFP4_PLUS (MXFP4 checkpoints, UE5M3 scales) and unquantized BF16 SwiGLU on Rubin; B12x on RTX PRO 6000 and DGX Spark (see [CuteDSL leaves](#cutedsl-leaves-fused_moecutedsl)) | `EXTERNAL_COMM` |
-| `CUTEDSL_FC12` | `cutedsl/fused_fc12.py` | SM107 (Rubin) | NVFP4 fused FC1+FC2 in one persistent kernel (`cute_dsl_nvfp4_fc12_fused_rubin`) with a trace-time SwiGLU or SiTU epilogue, keeping the FC1→FC2 intermediate on-chip; shares the grouped-GEMM NVFP4 leaf's weight layout and autotune runner; needs `MoEDep.CUTEDSL_RUBIN`; non-uGPU | `EXTERNAL_COMM` |
+| `CUTEDSL_FC12` | `cutedsl/fused_fc12/nvfp4.py` | SM107 (Rubin) | NVFP4 fused FC1+FC2 in one persistent kernel (`cute_dsl_nvfp4_fc12_fused_rubin`) with a trace-time SwiGLU or SiTU epilogue, keeping the FC1→FC2 intermediate on-chip; shares the grouped-GEMM NVFP4 leaf's weight layout and autotune runner; needs `MoEDep.CUTEDSL_RUBIN`; non-uGPU | `EXTERNAL_COMM` |
 | `MEGAMOE_DEEPGEMM` | `mega_moe/mega_moe_deepgemm.py` | SM100/SM103/SM107 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `MEGAMOE_CUTEDSL` | `mega_moe/mega_moe_cute_dsl.py` | SM100/SM103/SM107 | NVFP4 fused dispatch+FC1+act+FC2+combine; internally selects one of its per-architecture kernel variants. Requires CUDA 13 Cutlass DSL and a symmetric-memory provider. Uses uniform activation constants and applies routing weights before FC2 quantization for DeepSeek-V4, after FC2 for other models | `FUSED_COMM` |
 | `MARLIN` | `marlin/` | SM89-SM99 | W4A16 NVFP4 on Ada/Hopper (BF16 activations + FP4 weights, single-launch `marlin_nvfp4_moe_gemm`); attention-DP + EP via external comm (plain BF16 dispatch payload); non-NVFP4 layers (e.g. unquantized MTP draft layers) degrade to Cutlass, recorded in the `MoEResolutionReport`; no dynamic EPLB | `EXTERNAL_COMM` |
@@ -420,8 +421,9 @@ how its package is built; which leaves it holds is the catalog's job.
 Everything CUTLASS lives in this package. `fused_moe_cutlass.py` above it
 defines the family name `CutlassFusedMoE` (the abstract `CutlassFusedMoEBase`,
 parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
-Every leaf but the Triton FP8 block-scale one runs the single
-`torch.ops.trtllm.fused_moe` call in `base.py` (`_run_fused_moe_op`), and only
+Every leaf but the two Triton FP8 block-scale ones runs the single
+`torch.ops.trtllm.fused_moe` call in `base.py` (`_run_fused_moe_op`); the SM90
+one runs it above its row threshold. Only
 the `none` and `fp8` leaves mix in routed-expert LoRA (`CutlassMoeLoraMixin`),
 the two the op can fuse it for. Most formats differ from the base only in how
 they quantize the input: a static per-tensor e4m3 one for `fp8` and
@@ -436,18 +438,28 @@ to 128 at construction, and `run_moe` pads the activation to match.
   copies `scheduler_kind`, `capabilities` and `input_requirement` off the
   descriptor, so the contract has one source, and nothing in the base branches
   on `quant_config`.
-- **FP8 block scales splits by SM.** Its two leaves carry the providers and
+- **FP8 block scales splits by SM.** Its three leaves carry the providers and
   techniques of the kernels they run: on SM90
   `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales`, where
-  `CutlassMoeFCRunner` hands FC1/FC2 to the vendored DeepGEMM; on SM120/121,
+  `CutlassMoeFCRunner` hands FC1/FC2 to the vendored DeepGEMM; also on SM90,
+  opt-in (`TLLM_MOE_ENABLE_SM90_TRITON_FP8_DECODE=1`, else it declines with
+  `PATH_NOT_ENABLED`), `trtllm.triton.fp8_act_grouped_gemm.fp8_block_scales`
+  (`fp8_block_scales_hopper_triton.py`), a subclass of the DeepGEMM leaf for
+  SwiGLU without expert bias. Its `run_moe` runs Triton FP8-activation GEMMs
+  (`run_triton_fp8_block_scale_moe_fp8_act`) when it receives at most
+  `TRITON_FP8_ACT_MAX_TOKENS` rows after dispatch, no `moe_output` buffer (so
+  never under NVLinkOneSided), BF16 input and a clamp uniform across experts
+  (`_takes_triton_path`), and the parent's fused op otherwise; on SM120/121,
   with BF16 activations, `trtllm.triton.grouped_gemm.fp8_block_scales`, a Triton
   grouped GEMM that never enters C++ (`issues_fused_moe_op = False`, so no build
   gate) and runs SwiGLU/GeGLU only, with no expert bias and no activation
-  constant but a uniform pre-SiLU SwiGLU clamp. Both stay in the family because
-  the `CUTLASS` literal serves FP8 block scales on SM90 and SM120/121.
+  constant but a uniform pre-SiLU SwiGLU clamp. All stay in the family because
+  the `CUTLASS` literal serves FP8 block scales on SM90 and SM120/121. The two
+  SM90 leaves overlap: the opt-in Triton FP8-activation leaf ranks first and
+  declines unless its `opt_in_flag` is set.
   `find_cutlass_leaf(quant_algo, *, sm=None)` (and `cutlass_leaf`, which
   raises instead of returning `None`) is a lookup, not an eligibility check, and
-  reads the SM only to choose between those two.
+  reads the SM, and a leaf's `opt_in_flag`, only to choose among those leaves.
 
 ### TRTLLM-Gen leaves (`fused_moe/trtllm_gen/`)
 
@@ -517,7 +529,9 @@ kernel segment says how much of the expert MLP one launch covers:
 `grouped_gemm` runs FC1 and FC2 as two grouped GEMMs, `fused_fc12` runs both in
 one persistent kernel, and `dense_gemm` packs every expert into one dense matrix
 for small token counts. Inheritance stays inside a kernel; kernels share only the
-package-level modules. `fused_moe_cute_dsl.py`, `fused_moe_cute_dsl_fc12.py` and
+package-level modules, which may include a mixin such as
+`CuteDslLocalityDomainMixin` that leaves of different kernels take (never a
+kernel root). `fused_moe_cute_dsl.py`, `fused_moe_cute_dsl_fc12.py` and
 `fused_moe_densegemm.py` above it hold no code: they define `CuteDslFusedMoE`,
 `CuteDslFc12FusedMoE` and `DenseGEMMFusedMoE`. The grouped-GEMM lookups,
 `cutedsl_grouped_gemm_leaf` / `find_cutedsl_grouped_gemm_leaf`, are exported by
@@ -1322,7 +1336,7 @@ implementation. The parent holds what they share, leaves at least
 because a descriptor is exactly one identity. How much else it implements
 follows how much the formats share: `TrtllmGenFusedMoEBase` implements none of
 the four (its formats differ in kernel ABI, so each leaf gets its methods
-through a per-ABI layer), `CuteDslFusedMoEBase` none either (its two formats
+through a per-ABI layer), `CuteDslFusedMoEBase` none either (its three formats
 share construction, the locality-domain plan and the weight lifecycle, but run
 different ops), `MarlinFusedMoEBase` three (one ABI serves both formats), and
 `CutlassFusedMoEBase` defaults for `quantize_input` and `run_moe` that most
@@ -1336,16 +1350,17 @@ keeps only flags read off the class at resolution (`supports_gptoss_style`,
 per-format kernel configuration as `FUSED_MOE_OP_FLAGS`, its padding as
 `pad_hidden_and_intermediate_to`, and its build requirements as
 `requires_oss_cutlass_build` / `uses_dynamic_fc2_scale`; `CuteDslFusedMoEBase`
-reaches what only one format needs through the `_init_format_state` and
-`_locality_domain_scale_shard` hooks and the leaf-declared
-`_locality_domain_full_scale_params`.
+reaches what only one format needs through its `_init_format_state` hook and,
+from `CuteDslLocalityDomainMixin`, the `_locality_domain_scale_shard` hook and
+the leaf-declared `_locality_domain_full_scale_params`.
 
 **Note on implementation class names:** the name is derived from the identity
 as `<Provider><Technique><Quant>Impl`. The kernel segment enters when two ids
 differ in that segment alone: the class that would otherwise collide spells it
 out between technique and quant, in id order
 (`DeepgemmCudaHopperFp8BlockScalesImpl` next to
-`DeepgemmCudaFp8BlockScalesImpl`). The `trtllm.cutedsl.*.nvfp4` ids
+`DeepgemmCudaFp8BlockScalesImpl`, `TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl`
+next to `TrtllmTritonFp8BlockScalesImpl`). The `trtllm.cutedsl.*.nvfp4` ids
 (`mega_moe`, `fused_fc12`, `dense_gemm`, `grouped_gemm`) differ in
 `kernel_name` alone, so their classes spell the kernel out;
 `TrtllmCutedslGroupedGemmBf16Impl` keeps it to match its NVFP4 sibling. Quant

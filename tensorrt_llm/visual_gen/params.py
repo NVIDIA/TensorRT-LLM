@@ -14,7 +14,7 @@
 # limitations under the License.
 import ast
 import base64
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from pydantic import Field, field_validator, model_validator
 from typing_extensions import Literal
@@ -83,6 +83,15 @@ class MediaRef(StrictBaseModel):
                 f"{type(self.content).__name__}."
             )
         return self
+
+    def __repr_args__(self) -> Iterator[Tuple[Optional[str], Any]]:
+        # A ``bytes`` payload (an upload or a ``path`` reference read by serve)
+        # is shown by size only. A ``url`` or ``base64`` reference is still its
+        # string here and is shown as is.
+        for name, value in super().__repr_args__():
+            if name == "content" and isinstance(value, bytes):
+                value = f"<{len(value)} bytes>"
+            yield name, value
 
 
 def _reject_bare_refs(value: Any) -> Any:
@@ -442,6 +451,10 @@ def _resolve_reference(content: Any, content_format: str) -> bytes:
         except Exception as exc:
             raise ValueError(f"reference URL could not be fetched: {exc}") from exc
     if content_format == "path":
+        # No directory check here on purpose: only the offline Python API
+        # reaches this branch, reading the caller's own files. Serve reads an
+        # HTTP request's path reference at its boundary, under the allowed
+        # directory, and hands the engine bytes.
         return _safe_read_local_file(content)
     if content_format == "base64":
         return _read_reference_payload(content)
@@ -482,11 +495,12 @@ def _validate_reference_payload(payload: bytes, *, modality: str) -> None:
 def prepare_reference_slots(params: Any) -> None:
     """Resolve every reference to raw bytes, in place.
 
-    The single reference choke point, used by the engine (``generate_async``)
-    so serve and the standalone Python API share one path. Dispatch is on each
-    reference's declared ``format``, never on the shape of its content: the
-    declared form is resolved to bytes, content-validated against the slot's
-    modality, and written back with ``format`` set to ``"bytes"``.
+    Used by the engine (``generate_async``) for every request. Serve reads
+    ``path`` references to bytes before this, so for serve it resolves only
+    ``url`` and ``base64``; for the Python API it resolves all three. Dispatch
+    is on each reference's declared ``format``, never on the shape of its
+    content: the declared form is resolved to bytes, content-validated against
+    the slot's modality, and written back with ``format`` set to ``"bytes"``.
 
     ``format`` is rewritten alongside ``content`` because the mutated params
     object is what gets broadcast to the workers; a stale format would tell a

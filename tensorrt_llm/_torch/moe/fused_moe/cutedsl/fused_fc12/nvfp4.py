@@ -30,17 +30,17 @@ import torch
 
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from ....autotuner import AutoTuner
-from ....model_config import ModelConfig
-from ....utils import ActivationType, AuxStreamType, EventType
-from ..activation import (
+from .....autotuner import AutoTuner
+from .....model_config import ModelConfig
+from .....utils import ActivationType, AuxStreamType, EventType
+from ...activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
     MoEActivation,
     MoEActivationSupport,
 )
-from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
-from ..impl_contract import (
+from ...impl_base import MoEImplBase, apply_moe_impl_construction_state
+from ...impl_contract import (
     MoEDeployment,
     MoEEligibility,
     MoEInputRequirement,
@@ -51,19 +51,19 @@ from ..impl_contract import (
     MoEStaticCapability,
     require_comm_plan,
 )
-from ..impl_environment import MoEDep
-from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
-from ..interface import MoESchedulerKind, _reject
-from ..quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
-from ..routing import BaseMoeRoutingMethod, DeepSeekV4MoeRoutingMethod
-from .identity import KERNEL_FUSED_FC12, PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL
-from .kernel_inputs import (
+from ...impl_environment import MoEDep
+from ...impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
+from ...interface import MoESchedulerKind, _reject
+from ...quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
+from ...routing import BaseMoeRoutingMethod, DeepSeekV4MoeRoutingMethod
+from ..identity import KERNEL_FUSED_FC12, PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL
+from ..kernel_inputs import (
     NvFp4WeightView,
     finalize_routing_scales,
     prequantized_nvfp4_input_scale,
     quantize_input_nvfp4,
 )
-from .runners import CuteDslFusedMoENvfp4Runner
+from ..runners import CuteDslFusedMoENvfp4Runner
 
 
 class CuteDslFc12FusedMoENvfp4Runner(CuteDslFusedMoENvfp4Runner):
@@ -280,15 +280,6 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         """``run_moe_nvfp4`` runs on the routing kernel's tables when they match
         the tuned tile; not with a slot remap."""
         return self.num_slots == self.num_experts
-
-    def load_weights(self, weights: list[dict], allow_partial_loading: bool = False) -> None:
-        super().load_weights(weights, allow_partial_loading=allow_partial_loading)
-        # DWDP registers the freshly loaded expert weights with its handle
-        # collector; same hook TrtllmCutedslGroupedGemmNvfp4Impl exposes
-        # (supports_dwdp=True).
-        dwdp_handle_collector = getattr(self, "dwdp_handle_collector", None)
-        if dwdp_handle_collector is not None:
-            dwdp_handle_collector.register_weights(self)
 
     def _build_local_weight_view(self) -> NvFp4WeightView:
         """Build the weight view from this backend's per-layer weights."""
