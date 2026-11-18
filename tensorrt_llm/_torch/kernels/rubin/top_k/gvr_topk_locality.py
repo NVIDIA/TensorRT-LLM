@@ -10,7 +10,8 @@ from math import gcd, lcm
 import torch
 from cuda.bindings import driver as cuda
 
-from . import gvr_topk_decode_self_sampling_host as gvr
+from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling_host as gvr
+
 from .gvr_topk_locality_policy import COSCHEDULED_SM_COUNT, choose_backfill, choose_locality
 
 

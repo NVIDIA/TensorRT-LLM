@@ -1,10 +1,35 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shape-based FP32 GVR dispatch for Rubin."""
+"""Shape-based FP32, FP16 and BF16 GVR tuning for Rubin."""
 
 import math
 from collections.abc import Callable
 from typing import NamedTuple
+
+
+class _LowpTuning(NamedTuple):
+    widen_crc: bool
+    cr2: bool
+    pcw_aligned: bool
+    sm_version: int = 100
+
+    def crc_geometry(self, block: int, vpt: int, cluster: int) -> tuple[int, int]:
+        if self.widen_crc and block == 512 and cluster == 16:
+            return 1024, vpt // 2
+        return block, vpt
+
+
+def select_lowp_tuning(
+    rows: int, n: int, npad: int, k: int, num_sms: int, sm_version: int
+) -> _LowpTuning | None:
+    """Select native low-precision host options without changing the device target."""
+    if sm_version != 107 or k not in (512, 1024, 2048):
+        return None
+    return _LowpTuning(
+        widen_crc=rows * 32 <= num_sms,
+        cr2=k != 2048 or rows > num_sms,
+        pcw_aligned=npad % 64 == 0 or (n > 2048 and npad % 8 == 0),
+    )
 
 
 class _Tuning(NamedTuple):
