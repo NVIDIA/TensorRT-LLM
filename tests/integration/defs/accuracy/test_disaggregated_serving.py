@@ -1231,6 +1231,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 gen_server_config,
                 f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
                 assert_worker_log_contains=context_only_log,
+                assert_worker_log_excludes=(
+                    "nvMatmulHeuristics cannot be imported", ),
         ) as llm:
             # The DuckLLM args do not carry the served quantization, so set
             # the specs the accuracy reference lookup matches on.
