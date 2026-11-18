@@ -192,6 +192,23 @@ modes.
     distribution, which leaves the sampled result unchanged but can lower the
     acceptance rate as the penalty grows.
 
+* An embedding bias (`embedding_bias`, or `logit_bias` of the OpenAI API) is added to the
+  logits before the penalties, and bad words (`bad`, `bad_token_ids`) are excluded from
+  sampling after them: a single-token bad word always, a longer one when the sequence
+  (prompt included) ends with all of its tokens but the last.
+
+  * With one-model speculative decoding both must be enabled at deploy time with
+    `enable_penalty: true` in the speculative decoding config, the flag that also enables
+    the occurrence penalties; while it is off, a request that sets either is rejected at
+    admission. A request may bias at most 1024 tokens and carry at most 256 bad words of
+    at most 16 tokens each; a request beyond these limits is rejected at admission.
+    Tree speculation (a dynamic tree), relaxed acceptance for thinking, vanilla MTP and
+    SA are not supported, and such requests are rejected even when the flag is on. Both
+    exact-match verification and rejection sampling verify against the edited target
+    distribution, so the sampled result is the one of non-speculative decoding. The
+    draft model proposes from its unedited distribution, which can lower the acceptance
+    rate: a draft token that is a bad word is never accepted.
+
 * If `no_repeat_ngram_size = n` is specified, any token that would recreate an `n`-gram already
   present in the sequence (prompt included) is excluded from sampling. `None` or `0` disables
   the restriction.
