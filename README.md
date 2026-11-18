@@ -22,14 +22,14 @@ TensorRT LLM
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
 
+* [11/17] NVFP4 MLA: Unified 4-bit KV Cache Storage and Attention Compute in TensorRT LLM
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog33_NVFP4_MLA_Unified_4bit_KV_Cache_Storage_and_Attention_Compute_in_TensorRT-LLM.md)
+
 * [11/11] Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.md)
 
 * [11/03] ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.md)
-
-* [10/26] NVFP4 MLA: Unified 4-bit KV Cache Storage and Attention Compute in TensorRT LLM
-✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog33_NVFP4_MLA_Unified_4bit_KV_Cache_Storage_and_Attention_Compute_in_TensorRT-LLM.md)
 
 * [10/14] KV Cache Compression in TensorRT LLM
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.md)
