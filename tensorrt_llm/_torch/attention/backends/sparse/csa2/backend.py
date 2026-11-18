@@ -118,20 +118,6 @@ def _csa2_parent_quant_config(quant_config, native_fp8: bool):
     return QuantConfig(**{**quant_config.model_dump(), "kv_cache_quant_algo": algo})
 
 
-def _prims_ts_takes_direct(attention: "CSA2TrtllmAttention", rows: int) -> bool:
-    """Whether a PrimTS layer's generation step of ``rows`` rows runs the direct decode
-    (``prims_ts_takes_direct_decode``, as the module routes it). A tile outside a model
-    layout has no layer mode and takes it whenever it fits."""
-    from .direct_decode import prims_ts_takes_direct_decode
-
-    layout = attention.sparse_params.layout
-    if layout is None or not 0 <= attention.layer_idx < len(layout.compress_ratios):
-        return True
-    return prims_ts_takes_direct_decode(
-        attention.num_heads, layout.layer(attention.layer_idx).mode, rows
-    )
-
-
 class CSA2TrtllmAttention(TrtllmAttention):
     """CSA2 sparse prediction with the inherited native trtllm-gen forward."""
 
@@ -458,7 +444,6 @@ class CSA2TrtllmAttention(TrtllmAttention):
                 or (
                     self.compute_backend == "prims_ts"
                     and self.swa_cache_format in ("swa", "swa_fp8")
-                    and _prims_ts_takes_direct(self, rows)
                 )
             )
             and not self.sparse_params.use_packed_sparse_attention

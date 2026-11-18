@@ -4183,11 +4183,7 @@ def test_prims_ts_decode_unit_scale_query_matches_bf16(monkeypatch, module_cache
         # Admitted to the direct decode, the same step attends with the BF16 query and no PrimTS
         # query quantization, whichever Q projection is asked for; it agrees to the E4M3
         # rounding of Q.
-        from tensorrt_llm._torch.attention.backends.sparse.csa2 import backend as csa2_backend
-
         monkeypatch.setattr(model.backend, "direct_decode_serves", serves_direct)
-        monkeypatch.setattr(csa2_backend, "_prims_ts_takes_direct", lambda attention, rows: True)
-        monkeypatch.setattr(model, "_prims_ts_routes_direct", lambda rows: True)
         for fp8_query in (False, True):
             calls.clear()
             direct = run(fp8_query)
@@ -4195,39 +4191,6 @@ def test_prims_ts_decode_unit_scale_query_matches_bf16(monkeypatch, module_cache
             error = (direct.float() - expected.float()).abs().mean() / expected.float().abs().mean()
             assert error < 0.05
     torch.cuda.synchronize()
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "compute_backend,heads,mode,rows,expected",
-    [
-        ("prims_ts", 8, CSA2Mode.SWA, 1, True),
-        ("prims_ts", 8, CSA2Mode.SWA, 12, True),
-        ("prims_ts", 8, CSA2Mode.REUSE, 1, True),
-        ("prims_ts", 8, CSA2Mode.REUSE, 7, True),
-        ("prims_ts", 8, CSA2Mode.REUSE, 8, False),
-        ("prims_ts", 8, CSA2Mode.FULL, 1, False),
-        ("prims_ts", 8, CSA2Mode.REINDEX, 6, False),
-        ("prims_ts", 16, CSA2Mode.SWA, 1, True),
-        ("prims_ts", 16, CSA2Mode.REUSE, 6, True),
-        ("prims_ts", 64, CSA2Mode.FULL, 4, True),
-        ("prims_ts", 64, CSA2Mode.REINDEX, 16, True),
-        ("trtllm", 8, CSA2Mode.SWA, 1, False),
-    ],
-)
-def test_prims_ts_routes_small_steps_to_direct_decode(
-    compute_backend: str, heads: int, mode: CSA2Mode, rows: int, expected: bool
-) -> None:
-    """At eight heads PrimTS hands SWA-only layers and short Reuse steps to the direct decode;
-    other head counts hand it every step the backend admits."""
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
-
-    module = SimpleNamespace(
-        backend=SimpleNamespace(compute_backend=compute_backend),
-        num_heads_tp=heads,
-        layer=SimpleNamespace(mode=mode),
-    )
-    assert DeepseekV41Attention._prims_ts_routes_direct(module, rows) is expected
 
 
 @skip_pre_blackwell

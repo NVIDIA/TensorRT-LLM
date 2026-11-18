@@ -2804,22 +2804,21 @@ def test_direct_decode_admission_by_swa_format_and_provider(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("heads", "mode", "rows", "expected"),
+    ("heads", "mode", "rows"),
     [
-        (8, "SWA", 12, True),
-        (8, "REUSE", 7, True),
-        (8, "REUSE", 8, False),
-        (8, "FULL", 1, False),
-        (8, "REINDEX", 6, False),
-        (16, "SWA", 1, True),
-        (64, "FULL", 4, True),
-        (64, "REINDEX", 16, True),
+        (8, "SWA", 12),
+        (8, "REUSE", 8),
+        (8, "FULL", 1),
+        (8, "REINDEX", 16),
+        (16, "SWA", 1),
+        (64, "FULL", 4),
+        (64, "REINDEX", 16),
     ],
 )
-def test_prims_ts_direct_decode_serves_follows_layer_mode(
-    monkeypatch: pytest.MonkeyPatch, heads: int, mode: str, rows: int, expected: bool
+def test_prims_ts_direct_decode_serves_every_layer_mode(
+    monkeypatch: pytest.MonkeyPatch, heads: int, mode: str, rows: int
 ) -> None:
-    """A PrimTS layer's generation step takes the direct decode exactly as the module routes it."""
+    """A PrimTS generation step the direct decode fits takes it whatever the layer's mode."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import direct_decode
@@ -2838,10 +2837,9 @@ def test_prims_ts_direct_decode_serves_follows_layer_mode(
         num_heads=heads,
         layer_idx=1,
     )
-    serves = CSA2TrtllmAttention.direct_decode_serves(attn, rows, 0, 512, torch.device("cpu"))
-    assert serves is expected
-    assert serves is direct_decode.prims_ts_takes_direct_decode(
-        heads, getattr(CSA2Mode, mode), rows
+    assert CSA2TrtllmAttention.direct_decode_serves(attn, rows, 0, 512, torch.device("cpu"))
+    assert not CSA2TrtllmAttention.direct_decode_serves(
+        attn, direct_decode.MAX_ROWS + 1, 0, 512, torch.device("cpu")
     )
 
 

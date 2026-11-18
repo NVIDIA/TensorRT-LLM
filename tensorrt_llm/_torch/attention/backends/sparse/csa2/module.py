@@ -973,16 +973,6 @@ class DeepseekV41Attention(nn.Module):
         """
         return positions.dtype == torch.int32
 
-    def _prims_ts_routes_direct(self, rows: int) -> bool:
-        """Whether a PrimTS layer's generation step of ``rows`` query rows runs the direct decode
-        (``prims_ts_takes_direct_decode``, which the backend's ``direct_decode_serves`` applies
-        too)."""
-        from .direct_decode import prims_ts_takes_direct_decode
-
-        return self.backend.compute_backend == "prims_ts" and prims_ts_takes_direct_decode(
-            self.num_heads_tp, self.layer.mode, rows
-        )
-
     def _rope_query(
         self, q: torch.Tensor, positions: torch.Tensor, amax: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, bool]:
@@ -1917,15 +1907,13 @@ class DeepseekV41Attention(nn.Module):
             and not torch.cuda.is_current_stream_capturing()
             and is_sm_100f()
         )
-        # A direct-decode forward leaves the query RoPE to its attention launch. The small PrimTS
-        # generation steps prims_ts_takes_direct_decode admits take it too: it attends the
-        # packed pools without compaction or a split-KV reduction.
+        # A direct-decode forward leaves the query RoPE to its attention launch. Native and PrimTS
+        # generation steps the backend admits take it: it attends the packed pools without
+        # staging, compaction or a split-KV reduction.
         extra_width = 0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk
         direct = (
             attn_metadata.num_ctx_tokens == 0
-            and (
-                self._compute_helper is None or self._prims_ts_routes_direct(hidden_states.shape[0])
-            )
+            and (self._compute_helper is None or self.backend.compute_backend == "prims_ts")
             and not self.rotary_emb.is_neox
             and self.qk_rope_head_dim == 64
             and self.backend.direct_decode_serves(
