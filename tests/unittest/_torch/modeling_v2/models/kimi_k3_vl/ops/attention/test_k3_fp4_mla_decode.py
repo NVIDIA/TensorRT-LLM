@@ -109,6 +109,8 @@ def _geometry_metadata(device, num_requests=4):
 @pytest.mark.cpu_only
 def test_plan_geometry_follows_the_page_plan(monkeypatch):
     dec, kernels = _stub_kernels(monkeypatch)
+    # The workspace helper asks whether a CUDA graph is being captured; CPU nodes have no device.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     device = torch.device("cpu")
     md = _geometry_metadata(device)
 

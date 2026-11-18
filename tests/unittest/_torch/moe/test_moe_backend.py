@@ -5060,6 +5060,7 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
         BlockPhase,
         map_phase_interleaved_fc12_work_id,
         resolve_phase_interleaved_fc1_claim_target,
+        resolve_phase_interleaved_stream_extent,
     )
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_scheduler import (
         PhaseInterleavedFc12Scheduler,
@@ -5133,6 +5134,8 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
             pipeline_init_wait(cluster_shape_mn=(1, 1))
             worker = self.scheduler._work_id_worker
             state = self.scheduler._task_mapping_state
+            # Mirror PhaseInterleavedFc12Scheduler.gen_next_work initialization.
+            state = resolve_phase_interleaved_stream_extent(state)
             _, fc1_valid, state = map_phase_interleaved_fc12_work_id(
                 Int32(0), Int32(BlockPhase.Linear1), (Int32(0), Int32(0), Int32(0)), state
             )
