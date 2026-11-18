@@ -37,6 +37,7 @@ def _piecewise_boundary_ops():
         "gdn_custom_op_inplace",
         "mamba2_custom_op_inplace",
         "minimax_m3_attn_custom_op_inplace",
+        "modeling_v2_m3_prefill_attention",
     ]
     return [
         op for op in (get_optional_trtllm_op(op_name) for op_name in op_names)

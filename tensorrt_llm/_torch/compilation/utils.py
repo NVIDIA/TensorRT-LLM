@@ -231,6 +231,9 @@ def inplace_info():
         "minimax_m3_attn_custom_op_inplace": {
             1: "output"
         },
+        "modeling_v2_m3_prefill_attention": {
+            1: "output"
+        },
         # The ordinary outputs are compact Q/index-Q; the next
         # three outputs of auto_functionalized are the mutated paged caches.
         "minimax_m3_fused_sparse_qkv_producer": {

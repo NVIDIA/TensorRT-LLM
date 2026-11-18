@@ -200,6 +200,10 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_force_vec imp
     m3_force_vec,
     m3_force_vec_req,
 )
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.prefill_attention import (
+    prefill_attention,
+    register_prefill_core,
+)
 from tensorrt_llm._torch.models.modeling_speculative import (
     _draft_loader_moe_kwargs as _draft_loader_moe_kwargs,
 )
@@ -1939,11 +1943,13 @@ def _sparse_qkv_producer(
             PRODUCER_EARLY_TRIGGER,
             PRODUCER_PREWAIT_STEP_INPUTS,
         )
-        taken(
-            PRODUCER.path,
-            rows,
-            f"early_trigger={PRODUCER_EARLY_TRIGGER}, prewait_step_inputs={PRODUCER_PREWAIT_STEP_INPUTS}",
-        )
+        if not torch.compiler.is_compiling():
+            phase = "decode" if rows <= DECODE_MAX_TOKENS else "prefill"
+            taken(
+                PRODUCER.path,
+                None,
+                f"{phase}, early_trigger={PRODUCER_EARLY_TRIGGER}, prewait_step_inputs={PRODUCER_PREWAIT_STEP_INPUTS}",
+            )
     else:
         if layer_uses_nvfp4 and covered:
             missed(
@@ -2920,6 +2926,9 @@ class PrefillTarget:
 
     def __init__(self, core: MiniMaxM3Tp2ModelingV2) -> None:
         self.core = core
+        self._compiled_attention_key = register_prefill_core(
+            core, _sparse_qkv_producer, _msa_attention_live
+        )
         self._bcg_key = f"m3_tp2_core_{id(core)}"
         _BCG_CORES[self._bcg_key] = core
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per forward.
@@ -3150,6 +3159,22 @@ class PrefillTarget:
                 )
             return self._unfused_sparse_attention(i, position_ids, hidden, step)
         packed, _ = _linear(core, hidden, f"l{i}_qkv_w", f"l{i}_qkv_s", True)
+        if is_torch_compiling():
+            output = packed.new_empty(
+                (packed.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16
+            )
+            prefill_attention(
+                packed,
+                position_ids,
+                None,
+                None,
+                None,
+                None,
+                output,
+                self._compiled_attention_key,
+                i,
+            )
+            return _linear(core, output, f"l{i}_o_w", f"l{i}_o_s", True)
         if not is_torch_compiling() and is_in_breakable_cuda_graph():
             output = packed.new_empty(
                 (packed.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16
@@ -3213,6 +3238,9 @@ class PrefillTarget:
         selection, the FMHA over the context rows and any generation rows beside them)."""
         core = self.core
         output = q.new_empty((q.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16)
+        if is_torch_compiling():
+            prefill_attention(None, None, q, k, v, idx_q, output, self._compiled_attention_key, i)
+            return output
         if not is_torch_compiling() and is_in_breakable_cuda_graph():
             # The live row count is a host value of the step: read at every replay inside the eager boundary.
             _prefill_attention_eager(None, None, q, k, v, idx_q, output, self._bcg_key, i)

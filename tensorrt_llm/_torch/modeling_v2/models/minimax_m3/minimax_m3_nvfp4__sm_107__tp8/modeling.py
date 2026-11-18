@@ -198,6 +198,10 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_force_vec imp
     m3_force_vec,
     m3_force_vec_req,
 )
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.prefill_attention import (
+    prefill_attention,
+    register_prefill_core,
+)
 from tensorrt_llm._torch.models.modeling_speculative import (
     _draft_loader_moe_kwargs as _draft_loader_moe_kwargs,
 )
@@ -1748,11 +1752,13 @@ def _sparse_qkv_producer(
             PRODUCER_EARLY_TRIGGER,
             PRODUCER_PREWAIT_STEP_INPUTS,
         )
-        taken(
-            PRODUCER.path,
-            rows,
-            f"early_trigger={PRODUCER_EARLY_TRIGGER}, prewait_step_inputs={PRODUCER_PREWAIT_STEP_INPUTS}",
-        )
+        if not torch.compiler.is_compiling():
+            phase = "decode" if rows <= DECODE_MAX_TOKENS else "prefill"
+            taken(
+                PRODUCER.path,
+                None,
+                f"{phase}, early_trigger={PRODUCER_EARLY_TRIGGER}, prewait_step_inputs={PRODUCER_PREWAIT_STEP_INPUTS}",
+            )
     else:
         if layer_uses_nvfp4 and covered:
             missed(
@@ -2707,12 +2713,46 @@ class MiniMaxM3Tp8ModelingV2(DecoderModel):
 # --------------------------------------------------------------------------------------------------------------------
 
 
+def _msa_attention_live(
+    core: MiniMaxM3Tp8ModelingV2,
+    i: int,
+    q: torch.Tensor,
+    k: torch.Tensor | None,
+    v: torch.Tensor | None,
+    idx_q: torch.Tensor | None,
+    md: AttentionMetadata,
+    output: torch.Tensor,
+) -> None:
+    """The MSA backend over a step's live rows (``md.num_tokens``; a padded step's pad rows of ``output`` are left as
+    allocated): the KV write unless a producer wrote the caches, the sparse layers' top-k block selection, the FMHA
+    over the context rows and any generation rows beside them."""
+    live = int(md.num_tokens)
+    sparse = i in core.sparse_layers
+    nvfp4 = core.main_kv_is_nvfp4
+    _record("m3_msa_attention", sparse, k is not None)
+    m3_msa_attention(
+        core.attn[i],
+        q[:live],
+        k[:live] if k is not None else None,
+        v[:live] if v is not None else None,
+        idx_q[:live] if idx_q is not None else None,
+        md,
+        output[:live],
+        sparse,
+        core.inv_kv_scales[i] if nvfp4 else None,
+        core.kv_scales[i] if nvfp4 else None,
+    )
+
+
 class PrefillTarget:
     """A step with context rows: prefill chunks, and the mixed steps that carry generation rows beside them. Every
     layer runs in its generic form; the attention core is the MSA backend's for every row."""
 
     def __init__(self, core: MiniMaxM3Tp8ModelingV2) -> None:
         self.core = core
+        self._compiled_attention_key = register_prefill_core(
+            core, _sparse_qkv_producer, _msa_attention_live
+        )
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per forward.
         self._contract_pending = step_contract_enabled()
 
@@ -2916,6 +2956,22 @@ class PrefillTarget:
         if not core.fused_projection:
             return self._unfused_sparse_attention(i, position_ids, hidden, step)
         packed, _ = _linear(core, hidden, f"l{i}_qkv_w", f"l{i}_qkv_s", True)
+        if is_torch_compiling():
+            output = packed.new_empty(
+                (packed.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16
+            )
+            prefill_attention(
+                packed,
+                position_ids,
+                None,
+                None,
+                None,
+                None,
+                output,
+                self._compiled_attention_key,
+                i,
+            )
+            return _linear(core, output, f"l{i}_o_w", f"l{i}_o_s", True)
         horizontal = _sparse_qkv_producer(
             core,
             i,
@@ -2971,26 +3027,10 @@ class PrefillTarget:
         selection, the FMHA over the context rows and any generation rows beside them)."""
         core = self.core
         output = q.new_empty((q.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16)
-        live = int(step["num_tokens"])
-        q_live, out_live = q[:live], output[:live]
-        k_live = k[:live] if k is not None else None
-        v_live = v[:live] if v is not None else None
-        idx_q_live = idx_q[:live] if idx_q is not None else None
-        sparse = i in core.sparse_layers
-        nvfp4 = core.main_kv_is_nvfp4
-        _record("m3_msa_attention", sparse, k_live is not None)
-        m3_msa_attention(
-            core.attn[i],
-            q_live,
-            k_live,
-            v_live,
-            idx_q_live,
-            step["metadata"],
-            out_live,
-            sparse,
-            core.inv_kv_scales[i] if nvfp4 else None,
-            core.kv_scales[i] if nvfp4 else None,
-        )
+        if is_torch_compiling():
+            prefill_attention(None, None, q, k, v, idx_q, output, self._compiled_attention_key, i)
+            return output
+        _msa_attention_live(core, i, q, k, v, idx_q, step["metadata"], output)
         return output
 
 
