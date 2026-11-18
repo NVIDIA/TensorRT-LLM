@@ -6172,6 +6172,7 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
                     "content": prompt
                 }],
                 tokenize=True,
+                return_dict=False,
                 add_generation_prompt=True,
                 enable_thinking=True,
             )
