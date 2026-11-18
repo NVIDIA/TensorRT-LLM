@@ -487,6 +487,7 @@ def test_qwen35_breakable_inputs_match_while_media_requests_decode(moe) -> None:
         ("qwen3", 0),
         ("qwen3", 2),
         ("qwen3_moe", 2),
+        ("cosmos3", 2),
         ("qwen3_5", 0),
         ("qwen3_5_moe", 0),
         ("cosmos3_edge", 0),
@@ -495,6 +496,14 @@ def test_qwen35_breakable_inputs_match_while_media_requests_decode(moe) -> None:
 )
 @torch.inference_mode()
 def test_qwenvl_opted_in_decoder_captures_and_refreshes(family, num_levels):
+    from _torch.helpers import (
+        check_breakable_prefill_startup,
+        check_stand_in_body_replay,
+        make_breakable_prefill_runner,
+        make_stand_in_multimodal_model,
+    )
+
+    from tensorrt_llm._torch.models.modeling_cosmos3 import Cosmos3Model
     from tensorrt_llm._torch.models.modeling_cosmos3_edge import (
         Cosmos3EdgeForCausalLM,
         Cosmos3EdgeModel,
@@ -511,9 +520,6 @@ def test_qwenvl_opted_in_decoder_captures_and_refreshes(family, num_levels):
         Qwen3_5VLModel,
     )
     from tensorrt_llm._torch.models.modeling_qwen3_moe import Qwen3MoeForCausalLM
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
-    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
-    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
     class Body(torch.nn.Module):
         def __init__(self):
@@ -532,74 +538,40 @@ def test_qwenvl_opted_in_decoder_captures_and_refreshes(family, num_levels):
         "qwen2": (Qwen2VLModel, Qwen2ForCausalLM),
         "qwen2.5": (Qwen2_5_VLModel, Qwen2ForCausalLM),
         "qwen3": (Qwen3VLModel, Qwen3ForCausalLM),
-        "qwen3_moe": (Qwen3VLModel, Qwen3MoeForCausalLM),
+        "qwen3_moe": (Qwen3MoeVLModel, Qwen3MoeForCausalLM),
+        "cosmos3": (Cosmos3Model, Qwen3ForCausalLM),
         "qwen3_5": (Qwen3_5VLModel, Qwen3_5ForCausalLM),
         "qwen3_5_moe": (Qwen3_5MoeVLModel, Qwen3_5MoeForCausalLM),
         "cosmos3_edge": (Cosmos3EdgeModel, Cosmos3EdgeForCausalLM),
         "exaone4_5": (Exaone4_5_ForConditionalGeneration, Exaone4ForCausalLM),
     }[family]
-    decoder = object.__new__(decoder_cls)
-    torch.nn.Module.__init__(decoder)
-    body = decoder.model = Body()
-    owner = object.__new__(owner_cls)
-    torch.nn.Module.__init__(owner)
-    owner.llm = decoder
-    owner.model_config = SimpleNamespace(disable_mm_encoder=False)
+    body = Body()
+    owner = make_stand_in_multimodal_model(owner_cls, decoder_cls, body)
     owner.deepstack_num_level = num_levels
     owner.deepstack_input_embeds = torch.zeros((num_levels, 4, 4), device="cuda")
-    # The engine's startup check accepts the wrapper only when its language model opts in.
-    model_engine = object.__new__(ModelEngine)
-    model_engine.model = owner
-    model_engine.mapping = SimpleNamespace(pp_size=1)
-    model_engine.llm_args = SimpleNamespace(
-        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE, disable_mm_encoder=False
-    )
-    model_engine._validate_breakable_cuda_graph_compatibility()
-    decoder_runner = object.__new__(DecoderRunner)
-    decoder_runner._model = owner
-    decoder_runner._config = SimpleNamespace(
-        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
-        prefill_cuda_graph_num_tokens=[4],
-        enable_attention_dp=False,
-    )
-    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
+    check_breakable_prefill_startup(owner)
+    runner = make_breakable_prefill_runner(owner, 4)
     assert runner.stages_inputs
-    inputs = {
-        "inputs_embeds": torch.zeros((4, 4), device="cuda"),
-        "deepstack_embeds": [torch.ones((4, 4), device="cuda") for _ in range(num_levels)],
-    }
 
-    def outer():
-        return body(**inputs)
-
-    def engine():
-        return runner.capture_model_body(outer) if runner.is_capturing else outer()
-
-    try:
-        runner.capture(4, engine)
-        assert runner.has_graph(4)
-        calls_after_capture = body.forward_calls
+    def image_step(inputs):
         inputs["inputs_embeds"] = torch.full((4, 4), 3.0, device="cuda")
         # As in `_fuse_multimodal_embeddings`, image rows are views of the wrapper's DeepStack
         # buffer, and the text batch below reuses that buffer.
         owner.deepstack_input_embeds.fill_(5.0)
         inputs["deepstack_embeds"] = list(owner.deepstack_input_embeds.unbind(0))
-        actual = runner.execute(4, engine)
-        torch.cuda.synchronize()
+        return torch.full((4, 4), 4.0 + 5 * num_levels, device="cuda")
 
-        torch.testing.assert_close(
-            actual, torch.full_like(actual, 4 + 5 * num_levels), rtol=0, atol=0
-        )
+    def text_step(inputs):
         # A text batch replays the same graph on the wrapper's token embeddings.
         input_ids = torch.tensor([1, 5, 2, 7], device="cuda")
         inputs.update(input_ids=input_ids, inputs_embeds=None, deepstack_embeds=[])
-        actual = runner.execute(4, engine)
-        torch.cuda.synchronize()
+        return body.embed_tokens(input_ids) + 1
 
-        torch.testing.assert_close(actual, body.embed_tokens(input_ids) + 1, rtol=0, atol=0)
-        assert body.forward_calls == calls_after_capture
-    finally:
-        runner.clear()
+    inputs = {
+        "inputs_embeds": torch.zeros((4, 4), device="cuda"),
+        "deepstack_embeds": [torch.ones((4, 4), device="cuda") for _ in range(num_levels)],
+    }
+    check_stand_in_body_replay(runner, body, inputs, [image_step, text_step], num_tokens=4)
 
 
 @pytest.mark.cpu_only

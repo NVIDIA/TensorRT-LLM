@@ -269,6 +269,84 @@ def create_mock_cuda_graph_runner(
     return CUDAGraphRunner(config)
 
 
+def make_stand_in_multimodal_model(owner_cls: type, decoder_cls: type,
+                                   body: torch.nn.Module) -> torch.nn.Module:
+    """A multimodal wrapper and language model of real classes around a stand-in body."""
+    decoder = object.__new__(decoder_cls)
+    torch.nn.Module.__init__(decoder)
+    decoder.model = body
+    model = object.__new__(owner_cls)
+    torch.nn.Module.__init__(model)
+    model.llm = decoder
+    model.model_config = SimpleNamespace(disable_mm_encoder=False)
+    return model
+
+
+def check_breakable_prefill_startup(model: torch.nn.Module) -> None:
+    """Run the engine's startup check, which accepts a multimodal model only when
+    its language model opts in."""
+    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
+    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+
+    engine = object.__new__(ModelEngine)
+    engine.model = model
+    engine.mapping = SimpleNamespace(pp_size=1)
+    engine.llm_args = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        disable_mm_encoder=False)
+    engine._validate_breakable_cuda_graph_compatibility()
+
+
+def make_breakable_prefill_runner(model: torch.nn.Module,
+                                  num_tokens: int,
+                                  *,
+                                  enable_attention_dp: bool = False,
+                                  tp_size: int = 1,
+                                  dist=None):
+    """The decoder runner's breakable prefill graph runner for ``model``."""
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import \
+        DecoderRunner
+    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+
+    decoder_runner = object.__new__(DecoderRunner)
+    decoder_runner._model = model
+    decoder_runner._dist = dist
+    decoder_runner._mapping = SimpleNamespace(tp_size=tp_size)
+    decoder_runner._config = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        prefill_cuda_graph_num_tokens=[num_tokens],
+        enable_attention_dp=enable_attention_dp)
+    return decoder_runner._initialize_breakable_cuda_graph_runner()
+
+
+def check_stand_in_body_replay(runner, body: torch.nn.Module, inputs: dict,
+                               steps: List[Callable[[dict], torch.Tensor]],
+                               num_tokens: int) -> None:
+    """Capture ``body(**inputs)`` for one bucket. Each step then changes ``inputs``
+    in place and returns the expected output; the replay must match it exactly
+    without running the body eagerly."""
+
+    def outer():
+        return body(**inputs)
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(outer)
+        return outer()
+
+    try:
+        assert runner.capture(num_tokens, engine_forward)
+        calls_after_capture = body.forward_calls
+        for step in steps:
+            expected = step(inputs)
+            actual = runner.execute(num_tokens, engine_forward)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert body.forward_calls == calls_after_capture
+    finally:
+        runner.clear()
+
+
 def check_breakable_prefill_replay(model: torch.nn.Module, extra_attrs: dict,
                                    forward: Callable[[dict], torch.Tensor],
                                    steps: List[dict], num_tokens: int) -> None:
@@ -279,27 +357,10 @@ def check_breakable_prefill_replay(model: torch.nn.Module, extra_attrs: dict,
     must change the eager output, and each replay must run the captured graph
     and match the eager output exactly.
     """
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import \
-        DecoderRunner
-    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
     from tensorrt_llm._torch.utils import model_extra_attrs
-    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
-    backend = PrefillCudaGraphBackend.BREAKABLE
-    # The engine's startup check accepts the model only when its language model opts in.
-    engine = object.__new__(ModelEngine)
-    engine.model = model
-    engine.mapping = SimpleNamespace(pp_size=1)
-    engine.llm_args = SimpleNamespace(prefill_cuda_graph_backend=backend,
-                                      disable_mm_encoder=False)
-    engine._validate_breakable_cuda_graph_compatibility()
-    decoder_runner = object.__new__(DecoderRunner)
-    decoder_runner._model = model
-    decoder_runner._config = SimpleNamespace(
-        prefill_cuda_graph_backend=backend,
-        prefill_cuda_graph_num_tokens=[num_tokens],
-        enable_attention_dp=False)
-    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
+    check_breakable_prefill_startup(model)
+    runner = make_breakable_prefill_runner(model, num_tokens)
     assert runner.stages_inputs
     replay_calls = []
     replay = runner.replay

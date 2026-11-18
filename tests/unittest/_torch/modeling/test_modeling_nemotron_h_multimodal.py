@@ -725,42 +725,27 @@ def test_nemotron_nano_breakable_inputs_embed_text_with_language_model_tokens():
     torch.testing.assert_close(prepared["inputs_embeds"], embedding(input_ids), atol=0, rtol=0)
 
 
-def _make_breakable_nano_wrapper(body: torch.nn.Module) -> NemotronHMultimodalModel:
-    """The VL wrapper around a real language model class whose body is a stand-in."""
-    decoder = object.__new__(NemotronHForCausalLM)
-    torch.nn.Module.__init__(decoder)
-    decoder.model = body
-    model = object.__new__(NemotronHMultimodalModel)
-    torch.nn.Module.__init__(model)
-    model.llm = decoder
-    model.model_config = SimpleNamespace(disable_mm_encoder=False)
-    return model
-
-
-def _validate_breakable_startup(model: NemotronHMultimodalModel) -> None:
-    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
-    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
-
-    model_engine = object.__new__(ModelEngine)
-    model_engine.model = model
-    model_engine.mapping = SimpleNamespace(pp_size=1)
-    model_engine.llm_args = SimpleNamespace(
-        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE, disable_mm_encoder=False
-    )
-    model_engine._validate_breakable_cuda_graph_compatibility()
-
-
 @pytest.mark.cpu_only
 def test_nemotron_nano_breakable_startup_accepts_language_model():
-    _validate_breakable_startup(_make_breakable_nano_wrapper(torch.nn.Module()))
+    from _torch.helpers import check_breakable_prefill_startup, make_stand_in_multimodal_model
+
+    check_breakable_prefill_startup(
+        make_stand_in_multimodal_model(
+            NemotronHMultimodalModel, NemotronHForCausalLM, torch.nn.Module()
+        )
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_nemotron_nano_opted_in_decoder_captures_and_refreshes():
     """Image and text prefill replay one captured body on staged embeddings."""
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
-    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+    from _torch.helpers import (
+        check_breakable_prefill_startup,
+        check_stand_in_body_replay,
+        make_breakable_prefill_runner,
+        make_stand_in_multimodal_model,
+    )
 
     class Body(torch.nn.Module):
         """Stand-in for NemotronHModel, with its forward signature."""
@@ -784,17 +769,21 @@ def test_nemotron_nano_opted_in_decoder_captures_and_refreshes():
             return inputs_embeds + 1
 
     body = Body()
-    model = _make_breakable_nano_wrapper(body)
-    _validate_breakable_startup(model)
-    decoder_runner = object.__new__(DecoderRunner)
-    decoder_runner._model = model
-    decoder_runner._config = SimpleNamespace(
-        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
-        prefill_cuda_graph_num_tokens=[4],
-        enable_attention_dp=False,
-    )
-    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
+    model = make_stand_in_multimodal_model(NemotronHMultimodalModel, NemotronHForCausalLM, body)
+    check_breakable_prefill_startup(model)
+    runner = make_breakable_prefill_runner(model, 4)
     assert runner.stages_inputs
+
+    def image_step(inputs):
+        inputs["inputs_embeds"] = torch.full((4, 4), 3.0, device="cuda")
+        return torch.full((4, 4), 4.0, device="cuda")
+
+    def text_step(inputs):
+        # A text batch replays the same graph on the language model's token embeddings.
+        input_ids = torch.tensor([1, 5, 2, 7], device="cuda")
+        inputs.update(input_ids=input_ids, inputs_embeds=None, orig_input_ids=input_ids)
+        return body.embed_tokens(input_ids) + 1
+
     # The wrapper passes fused embeddings plus the pre-fusion ids for the drafter.
     inputs = {
         "attn_metadata": None,
@@ -802,32 +791,7 @@ def test_nemotron_nano_opted_in_decoder_captures_and_refreshes():
         "inputs_embeds": torch.zeros((4, 4), device="cuda"),
         "orig_input_ids": torch.tensor([3, 6, 6, 4], device="cuda"),
     }
-
-    def outer():
-        return body(**inputs)
-
-    def engine():
-        return runner.capture_model_body(outer) if runner.is_capturing else outer()
-
-    try:
-        runner.capture(4, engine)
-        assert runner.has_graph(4)
-        calls_after_capture = body.forward_calls
-        inputs["inputs_embeds"] = torch.full((4, 4), 3.0, device="cuda")
-        actual = runner.execute(4, engine)
-        torch.cuda.synchronize()
-
-        torch.testing.assert_close(actual, torch.full_like(actual, 4), rtol=0, atol=0)
-        # A text batch replays the same graph on the language model's token embeddings.
-        input_ids = torch.tensor([1, 5, 2, 7], device="cuda")
-        inputs.update(input_ids=input_ids, inputs_embeds=None, orig_input_ids=input_ids)
-        actual = runner.execute(4, engine)
-        torch.cuda.synchronize()
-
-        torch.testing.assert_close(actual, body.embed_tokens(input_ids) + 1, rtol=0, atol=0)
-        assert body.forward_calls == calls_after_capture
-    finally:
-        runner.clear()
+    check_stand_in_body_replay(runner, body, inputs, [image_step, text_step], num_tokens=4)
 
 
 @pytest.mark.cpu_only

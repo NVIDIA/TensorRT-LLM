@@ -1119,17 +1119,14 @@ def test_decoder_runner_agrees_staged_replay_only_under_attention_dp(
     each rank's check with the same TP all-gather as the prefill graph vote. Otherwise
     there is no added all-gather, as in the decode graph agreement."""
     import numpy as np
+    from _torch.helpers import make_breakable_prefill_runner, make_stand_in_multimodal_model
 
     from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
     from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
 
-    decoder = object.__new__(Gemma4ForCausalLM)
-    nn.Module.__init__(decoder)
-    decoder.model = _PreparedBody()
-    owner = object.__new__(Gemma4ForConditionalGeneration)
-    nn.Module.__init__(owner)
-    owner.llm = decoder
-    owner.model_config = SimpleNamespace(disable_mm_encoder=False)
+    owner = make_stand_in_multimodal_model(
+        Gemma4ForConditionalGeneration, Gemma4ForCausalLM, _PreparedBody()
+    )
     sent = []
 
     def tp_allgather_int64(values):
@@ -1137,17 +1134,14 @@ def test_decoder_runner_agrees_staged_replay_only_under_attention_dp(
         sent.append(list(values))
         return np.asarray([list(values), [int(peer_replayable)]], dtype=np.int64)
 
-    decoder_runner = object.__new__(DecoderRunner)
-    # The text decoder alone keeps the unstaged text body.
-    decoder_runner._model = owner if stages_inputs else decoder
-    decoder_runner._dist = SimpleNamespace(tp_allgather_int64=tp_allgather_int64)
-    decoder_runner._mapping = SimpleNamespace(tp_size=tp_size)
-    decoder_runner._config = SimpleNamespace(
-        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
-        prefill_cuda_graph_num_tokens=[4],
+    runner = make_breakable_prefill_runner(
+        # The text decoder alone keeps the unstaged text body.
+        owner if stages_inputs else owner.llm,
+        4,
         enable_attention_dp=enable_attention_dp,
+        tp_size=tp_size,
+        dist=SimpleNamespace(tp_allgather_int64=tp_allgather_int64),
     )
-    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
     assert runner.stages_inputs is stages_inputs
     if not (stages_inputs and enable_attention_dp and tp_size > 1):
         assert runner._agree_replay is None
@@ -1302,45 +1296,24 @@ def test_gemma4_opted_in_decoder_captures_and_refreshes_ple_ids():
             self.forward_calls += 1
             return inputs_embeds + ple_input_ids[:, None]
 
-    decoder = object.__new__(Gemma4ForCausalLM)
-    nn.Module.__init__(decoder)
-    body = decoder.model = Body()
-    owner = object.__new__(Gemma4ForConditionalGeneration)
-    nn.Module.__init__(owner)
-    owner.llm = decoder
-    owner.model_config = SimpleNamespace(disable_mm_encoder=False)
-    decoder_runner = object.__new__(DecoderRunner)
-    decoder_runner._model = owner
-    decoder_runner._config = SimpleNamespace(
-        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
-        prefill_cuda_graph_num_tokens=[4],
-        enable_attention_dp=False,
+    from _torch.helpers import (
+        check_stand_in_body_replay,
+        make_breakable_prefill_runner,
+        make_stand_in_multimodal_model,
     )
-    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
+
+    body = Body()
+    owner = make_stand_in_multimodal_model(Gemma4ForConditionalGeneration, Gemma4ForCausalLM, body)
+    runner = make_breakable_prefill_runner(owner, 4)
     assert runner.stages_inputs
+
+    def multimodal_step(inputs):
+        inputs["input_ids"] = torch.arange(4, device="cuda")
+        inputs["inputs_embeds"] = torch.full((4, 4), 3.0, device="cuda")
+        return inputs["inputs_embeds"] + inputs["input_ids"][:, None]
+
     inputs = {
         "input_ids": torch.zeros(4, dtype=torch.long, device="cuda"),
         "inputs_embeds": torch.zeros((4, 4), device="cuda"),
     }
-
-    def outer():
-        return body(**inputs)
-
-    def engine():
-        return runner.capture_model_body(outer) if runner.is_capturing else outer()
-
-    try:
-        runner.capture(4, engine)
-        assert runner.has_graph(4)
-        calls_after_capture = body.forward_calls
-        inputs["input_ids"] = torch.arange(4, device="cuda")
-        inputs["inputs_embeds"] = torch.full((4, 4), 3.0, device="cuda")
-        actual = runner.execute(4, engine)
-        torch.cuda.synchronize()
-
-        torch.testing.assert_close(
-            actual, inputs["inputs_embeds"] + inputs["input_ids"][:, None], rtol=0, atol=0
-        )
-        assert body.forward_calls == calls_after_capture
-    finally:
-        runner.clear()
+    check_stand_in_body_replay(runner, body, inputs, [multimodal_step], num_tokens=4)
