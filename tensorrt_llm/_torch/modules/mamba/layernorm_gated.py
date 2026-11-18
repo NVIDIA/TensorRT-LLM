@@ -24,6 +24,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
+from tensorrt_llm.logger import logger
+
 from ...._utils import get_sm_version
 from ...utils import Fp4QuantizedTensor
 
@@ -321,6 +323,27 @@ _MULTIROW_GROUPS_MIN_ROWS = 1 << 16
 _multirow_variants_with_siblings = set()
 
 
+def _compile_multirow_siblings(args, kwargs, device_index, launched=None):
+    """Compile the multi-row kernel for args and kwargs (which fix GROUPS) with
+    every reachable pair of LAUNCH_WITH_PDL and EVEN but ``launched``."""
+    rows_per_program = _MULTIROW_ROWS * kwargs["GROUPS"]
+    # PDL runs only below one wave of programs, which the grids from
+    # _MULTIROW_GROUPS_MIN_ROWS rows may never be.
+    min_rows = 1 if kwargs["GROUPS"] == 1 else _MULTIROW_GROUPS_MIN_ROWS
+    min_grid = triton.cdiv(min_rows, rows_per_program)
+    for pdl in {False, _multirow_pdl(min_grid, device_index)}:
+        for even in (False, True):
+            if (pdl, even) != launched:
+                _multirow_variants_with_siblings.add(
+                    _rms_norm_gated_fwd_multirow_kernel.warmup(
+                        *args,
+                        grid=(1, ),
+                        LAUNCH_WITH_PDL=pdl,
+                        EVEN=even,
+                        launch_pdl=pdl,
+                        **kwargs))
+
+
 def _launch_multirow_kernel(x,
                             y,
                             weight,
@@ -348,6 +371,12 @@ def _launch_multirow_kernel(x,
     of these flags. GROUPS changes only from _MULTIROW_GROUPS_MIN_ROWS rows,
     which a warmup of the largest batch reaches. (Under torch.compile the
     launch is traced, not run, so there is no variant to pair.)
+
+    The row strides are compile keys too (== 1, % 16, and CONTIG), and a
+    one-token batch can change them: PyTorch gives a dimension of size 1 the
+    dense stride, so a gate viewed in a wider projection, or a column-sliced
+    x, arrives with other strides when it holds one token. Where those differ
+    from this launch's, the siblings include the one-token launches.
     """
     M, N = x.shape
     groups = (_MULTIROW_GROUPS
@@ -377,22 +406,26 @@ def _launch_multirow_kernel(x,
         if (torch.compiler.is_compiling()
                 or variant in _multirow_variants_with_siblings):
             return
+        heads = kwargs["HEADS_PER_TOK"]
+        logger.info(
+            f"Compiling the multi-row gated RMSNorm kernel's variants for "
+            f"N={N}, HEADS_PER_TOK={heads}, GROUPS={groups}, row strides "
+            f"{args[6:9]}")
         _multirow_variants_with_siblings.add(variant)
-        # PDL runs only below one wave of programs, which the grids from
-        # _MULTIROW_GROUPS_MIN_ROWS rows may never be.
-        min_rows = 1 if groups == 1 else _MULTIROW_GROUPS_MIN_ROWS
-        min_grid = triton.cdiv(min_rows, rows_per_program)
-        for pdl in {False, _multirow_pdl(min_grid, device_index)}:
-            for even_rows in (False, True):
-                if (pdl, even_rows) != (launch_with_pdl, even):
-                    _multirow_variants_with_siblings.add(
-                        _rms_norm_gated_fwd_multirow_kernel.warmup(
-                            *args,
-                            grid=grid,
-                            LAUNCH_WITH_PDL=pdl,
-                            EVEN=even_rows,
-                            launch_pdl=pdl,
-                            **kwargs))
+        _compile_multirow_siblings(args,
+                                   kwargs,
+                                   device_index,
+                                   launched=(launch_with_pdl, even))
+        # One token: `heads` rows, dense x and y rows when that is one row,
+        # and a dense gate. All four of its variants are compiled, so that
+        # every variant in the set has its siblings.
+        one_token = (N if heads == 1 else stride_x,
+                     N if heads == 1 else stride_y, heads * N)
+        if one_token != args[6:9]:
+            contig = one_token[:2] == (N, N)
+            _compile_multirow_siblings((*args[:6], *one_token, *args[9:]),
+                                       dict(kwargs, GROUPS=1, CONTIG=contig),
+                                       device_index)
 
 
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,

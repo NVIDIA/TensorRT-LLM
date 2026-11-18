@@ -8,6 +8,7 @@ import zlib
 
 import pytest
 import torch
+import triton
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.norm import (
@@ -167,6 +168,40 @@ def test_direct_launch_is_bitwise_the_registered_op(spec) -> None:
 
     assert torch.equal(op_module._direct_launch(x, z, weight, eps, act), expected)
     assert torch.equal(op(x, z, weight, eps, None, act, True), expected)
+
+
+@pytest.mark.parametrize(
+    "spec", [_FP8_TP2, op_module._TP4], ids=["24h-8240-fp8-tp2", "12h-4120-tp4"]
+)
+def test_direct_launch_reuses_the_compiled_variant_across_batches(spec) -> None:
+    """After one decode-sized batch, no token count `_direct_launch` takes compiles a new
+    variant of the multi-row kernel. One token included: its view gives `z` the dense token
+    stride (3072 or 1536), and 1536 is a multiple of 16 where the projection's 4120 is not."""
+    from _torch.helpers import triton_num_compiled
+
+    kernel = op_module._layernorm_gated._rms_norm_gated_fwd_multirow_kernel
+    while isinstance(kernel, triton.runtime.Heuristics):
+        kernel = kernel.fn  # the compiled variants live on the inner JITFunction
+    # Start from no compiled variants, as a server process does, so that those of earlier
+    # tests (such as the one-token cells) cannot stand in for the ones warmup compiles.
+    for cache in getattr(kernel, "device_caches", {}).values():
+        cache[0].clear()
+    op_module._layernorm_gated._multirow_variants_with_siblings.clear()
+
+    def check(tokens: int) -> None:
+        x, z, weight, eps, _, act, _ = _build(
+            dict(spec, tokens=tokens), seed=_seed(f"reuse {tokens}")
+        )
+        assert x.shape[0] < op_module._PREFILL_MIN_ROWS
+        out = op_module._direct_launch(x, z, weight, eps, act)
+        torch.testing.assert_close(out, op.reference(x, z, weight, eps, None, act))
+
+    check(32)
+    compiled = triton_num_compiled(kernel)
+    max_tokens = (op_module._PREFILL_MIN_ROWS - 1) // spec["heads"]
+    for tokens in (1, 2, 3, 4, 17, 128, 1000, max_tokens):
+        check(tokens)
+    assert triton_num_compiled(kernel) == compiled
 
 
 def test_guard_refuses_a_weight_of_the_wrong_length() -> None:
