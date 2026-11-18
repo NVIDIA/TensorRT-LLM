@@ -3109,7 +3109,7 @@ class PyExecutor:
     @property
     def should_stop_processing(self) -> bool:
         return self.is_shutdown and len(self.active_requests) == 0 and \
-            not (self.enable_attention_dp and self._fleet_has_live_requests) and \
+            not self._fleet_has_live_requests and \
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() and \
             not self.disagg.has_retiring_gen_receives and \
             not self._has_pending_context_retirement()
