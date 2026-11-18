@@ -608,6 +608,21 @@ def test_logprobs_against_logits(
                 )
 
 
+def _assert_raw_logprobs_match_model_logits(completion) -> None:
+    """Check that each raw logprob is the log-softmax of the model's logits for that step."""
+    expected = torch.log_softmax(completion.generation_logits.to(device="cuda"), dim=-1).cpu()
+    assert len(completion.logprobs) == len(completion.token_ids)
+    for step, token_logprobs in enumerate(completion.logprobs):
+        assert completion.token_ids[step] in token_logprobs
+        for token_id, logprob_obj in token_logprobs.items():
+            torch.testing.assert_close(
+                torch.tensor(logprob_obj.logprob, dtype=torch.float32),
+                expected[step, token_id],
+                msg=f"raw logprob {logprob_obj.logprob} of token {token_id} at step {step} "
+                f"does not match the model's {expected[step, token_id].item()}",
+            )
+
+
 @pytest.mark.parametrize(
     "logit_rewrite",
     [
@@ -632,17 +647,28 @@ def test_raw_logprobs_ignore_logit_rewrites(logit_rewrite: dict[str, Any], simpl
         **logit_rewrite,
     )
     for output in simple_llm.generate(["A B C A B C A B"], sampling_params=sampling_params):
-        completion = output.outputs[0]
-        expected = torch.log_softmax(completion.generation_logits.to(device="cuda"), dim=-1).cpu()
-        assert len(completion.logprobs) == len(completion.token_ids)
-        for step, token_logprobs in enumerate(completion.logprobs):
-            for token_id, logprob_obj in token_logprobs.items():
-                torch.testing.assert_close(
-                    torch.tensor(logprob_obj.logprob, dtype=torch.float32),
-                    expected[step, token_id],
-                    msg=f"raw logprob {logprob_obj.logprob} of token {token_id} at step {step} "
-                    f"does not match the model's {expected[step, token_id].item()}",
-                )
+        _assert_raw_logprobs_match_model_logits(output.outputs[0])
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_raw_logprobs_ignore_logit_rewrites_in_a_mixed_batch(simple_llm: LLM):
+    """In a batch, the logits of each raw-logprob request are kept and put back in its own rows.
+
+    A processed-logprob request with a penalty comes first, so the raw requests' rows do not
+    start at 0, and each request has its own prompt, so a row put back in the wrong place
+    would not match the model's logits.
+    """
+    common = dict(max_tokens=8, logprobs=3, return_generation_logits=True)
+    sampling_params = [
+        SamplingParams(logprobs_mode=LogprobMode.PROCESSED, repetition_penalty=1.3, **common),
+        SamplingParams(logprobs_mode=LogprobMode.RAW, repetition_penalty=1.3, **common),
+        SamplingParams(logprobs_mode=LogprobMode.RAW, **common),
+    ]
+    outputs = simple_llm.generate(
+        ["A B C A B C A B", "1 2 3 1 2 3 1 2", "x y z x y z x y"], sampling_params=sampling_params
+    )
+    for output in outputs[1:]:
+        _assert_raw_logprobs_match_model_logits(output.outputs[0])
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])

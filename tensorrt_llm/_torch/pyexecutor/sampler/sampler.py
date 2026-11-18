@@ -2833,16 +2833,28 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if return_log_probs:
             self._log_probs._prepare_log_probs(sampling_requests)
         # Raw logprobs come from the model's logits, but the embedding bias,
-        # penalties and token bans below rewrite logits_cuda in place. When a
-        # request that asks for raw logprobs uses one of them, read the raw
-        # logprobs from a copy of the logits taken before those steps.
-        raw_logprobs_logits_cuda = logits_cuda
-        if return_log_probs and any(
-            self._slot_params.need_raw_logprobs[cast(int, request.py_seq_slot)]
-            and self._request_rewrites_logits(request)
-            for request in sampling_requests
-        ):
-            raw_logprobs_logits_cuda = logits_cuda.clone()
+        # penalties and token bans below rewrite logits_cuda in place. Keep a
+        # copy of the rows of the requests that ask for raw logprobs and use one
+        # of them, and put those rows back before the logprobs are read.
+        raw_rows_index_cuda: Optional[torch.Tensor] = None
+        raw_rows_cuda: Optional[torch.Tensor] = None
+        if return_log_probs:
+            raw_rows = [
+                row
+                for request, offset, num_tokens in zip(
+                    sampling_requests,
+                    sampling_requests_metadata.req_offsets.tolist(),
+                    sampling_requests_metadata.req_num_generated_tokens.tolist(),
+                )
+                if self._slot_params.need_raw_logprobs[cast(int, request.py_seq_slot)]
+                and self._request_rewrites_logits(request)
+                for row in range(offset, offset + num_tokens)
+            ]
+            if raw_rows:
+                raw_rows_index_cuda = torch.tensor(
+                    raw_rows, dtype=torch.int64, pin_memory=prefer_pinned()
+                ).to(logits_cuda.device, non_blocking=True)
+                raw_rows_cuda = logits_cuda.index_select(0, raw_rows_index_cuda)
 
         seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in sampling_requests],
@@ -2994,9 +3006,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         if return_log_probs:
+            if raw_rows_cuda is not None:
+                logits_cuda.index_copy_(0, raw_rows_index_cuda, raw_rows_cuda)
             self._log_probs._process_logprobs(
                 batched_sampling_result,
-                logits_cuda=raw_logprobs_logits_cuda,
+                logits_cuda=logits_cuda,
                 # Drop the trailing scratch slot row (see dummy_slot_row): it
                 # belongs to no request, and the logprobs stores are sized by
                 # max_num_sequences, which also sets the flat gather stride
