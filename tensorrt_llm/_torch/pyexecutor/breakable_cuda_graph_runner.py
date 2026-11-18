@@ -38,38 +38,63 @@ class BreakableCUDAGraphRunnerState(Enum):
     REPLAY = "replay"
 
 
-def _copy_inputs(destination: Any, source: Any) -> bool:
-    """Refresh a captured input tree only when its execution layout matches."""
+def _find_input_mismatch(destination: Any, source: Any, path: str = "inputs") -> Optional[str]:
+    """Return the first input whose execution layout differs from the captured tree, or None.
+
+    Reads only, so every rank can decide before any rank copies (see _copy_inputs).
+    """
     if isinstance(destination, torch.Tensor):
         if not isinstance(source, torch.Tensor) or (
             destination.shape != source.shape
             or destination.dtype != source.dtype
             or destination.device != source.device
         ):
-            return False
-        if destination.device.type == "cpu":
-            # Host tensor values may have selected Python branches at capture.
-            return torch.equal(destination, source)
-        destination.copy_(source)
-        return True
+            return path
+        # Host tensor values may have selected Python branches at capture.
+        if destination.device.type == "cpu" and not torch.equal(destination, source):
+            return path
+        return None
     if type(destination) is not type(source):
-        return False
+        return path
     if isinstance(destination, dict):
-        return destination.keys() == source.keys() and all(
-            _copy_inputs(value, source[key]) for key, value in destination.items()
+        if destination.keys() != source.keys():
+            return path
+        children = ((f"{path}[{key!r}]", value, source[key]) for key, value in destination.items())
+    elif isinstance(destination, (tuple, list)):
+        if len(destination) != len(source):
+            return path
+        children = (
+            (f"{path}[{index}]", dst, src)
+            for index, (dst, src) in enumerate(zip(destination, source))
         )
-    if isinstance(destination, (tuple, list)):
-        return len(destination) == len(source) and all(
-            _copy_inputs(dst, src) for dst, src in zip(destination, source)
-        )
-    if isinstance(destination, (str, int, float, bool, type(None))):
-        return destination == source
-    # These engine-owned objects refresh their tensor state at the eager
-    # execution boundaries. Other mutable host objects can hide captured
-    # Python decisions and must use the eager body instead.
-    return isinstance(destination, (AttentionMetadata, SpecMetadata, ResourceManager)) and (
-        destination is source
-    )
+    elif isinstance(destination, (str, int, float, bool, type(None))):
+        return None if destination == source else path
+    elif isinstance(destination, (AttentionMetadata, SpecMetadata, ResourceManager)):
+        # These engine-owned objects refresh their tensor state at the eager
+        # execution boundaries.
+        return None if destination is source else path
+    else:
+        # Other mutable host objects can hide captured Python decisions and
+        # must use the eager body instead.
+        return path
+    for child_path, dst, src in children:
+        mismatch = _find_input_mismatch(dst, src, child_path)
+        if mismatch is not None:
+            return mismatch
+    return None
+
+
+def _copy_inputs(destination: Any, source: Any) -> None:
+    """Copy the device tensors of a matching input tree into the captured tree."""
+    if isinstance(destination, torch.Tensor):
+        if destination.device.type != "cpu":
+            destination.copy_(source)
+    elif isinstance(destination, dict):
+        for key, value in destination.items():
+            _copy_inputs(value, source[key])
+    elif isinstance(destination, (tuple, list)):
+        for dst, src in zip(destination, source):
+            _copy_inputs(dst, src)
 
 
 class BreakableCUDAGraphRunner:
@@ -85,6 +110,7 @@ class BreakableCUDAGraphRunner:
         layer_model: nn.Module,
         prepare_replay: Callable[[dict[str, Any]], None] | None = None,
         prepare_inputs: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        agree_replay: Callable[[bool], bool] | None = None,
     ) -> None:
         self.layer_model = layer_model
         # Refreshes state the captured body reads but computes outside capture, from the
@@ -93,6 +119,9 @@ class BreakableCUDAGraphRunner:
         # Normalizes the body's inputs; capture then stages their tensors in storage the
         # bucket graph owns, and replay copies the current values into it.
         self._prepare_inputs = prepare_inputs
+        # Under attention DP, turns this rank's staged-input match into the decision of
+        # all ranks, so they all replay or all run the body eagerly.
+        self._agree_replay = agree_replay
         self._input_signature = inspect.signature(layer_model.forward) if prepare_inputs else None
         self._inputs: dict[int, dict[str, Any]] = {}
         self._graphs: dict[int, BreakableCUDAGraph] = {}
@@ -389,10 +418,16 @@ class BreakableCUDAGraphRunner:
         def replay_forward(*args, **kwargs):
             if self._prepare_inputs is not None:
                 inputs = self._prepare_body_inputs(args, kwargs)
-                if not _copy_inputs(self._inputs[num_tokens], inputs):
+                static_inputs = self._inputs[num_tokens]
+                mismatch = _find_input_mismatch(static_inputs, inputs)
+                replayable = mismatch is None
+                if self._agree_replay is not None:
+                    replayable = self._agree_replay(replayable)
+                if not replayable:
                     logger.debug("BCG input layout changed; running the decoder body eagerly")
                     return original_forward(**inputs)
-                kwargs = self._inputs[num_tokens]
+                _copy_inputs(static_inputs, inputs)
+                kwargs = static_inputs
             del args
             if self._prepare_replay is not None:
                 # After the engine's in-place input corrections, as an eager body sees them.
