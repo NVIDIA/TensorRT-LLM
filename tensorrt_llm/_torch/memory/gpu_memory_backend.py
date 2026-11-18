@@ -359,6 +359,7 @@ class GMSBackend:
 
         Raises:
             RuntimeError: If `connect()` has not been called yet.
+            ValueError: If an untracked CUDA parameter has zero-byte storage.
         """
         # TODO(GMS-API): Clean up once the stable GMS API becomes available.
         if self._client is None:
@@ -369,11 +370,11 @@ class GMSBackend:
 
         gms_client = self._client
         device_index = self._device_index
-        # One byte tensor per migrated storage preserves both shared storage
+        # One mapping per migrated storage preserves both shared storage
         # identity and bytes outside the first parameter's view.
-        storage_to_gms: dict[int, torch.Tensor] = {}
+        storage_to_gms: dict[int, torch.UntypedStorage] = {}
 
-        for _name, tensor, tensor_type in _iter_module_tensors(model):
+        for name, tensor, tensor_type in _iter_module_tensors(model):
             if tensor_type != "parameter" or tensor is None or not tensor.is_cuda:
                 continue
 
@@ -386,21 +387,20 @@ class GMSBackend:
             if mapped_storage is None:
                 nbytes = _storage_nbytes(tensor)
                 if nbytes == 0:
-                    continue
+                    raise ValueError(
+                        f"GMS cannot register CUDA parameter {name!r} with zero-byte storage"
+                    )
                 base_va = gms_client.create_mapping(size=nbytes, tag=self._tag)
                 mapped_storage = _tensor_from_pointer(
                     int(base_va), [nbytes], [1], torch.uint8, device_index
-                )
-                source_storage = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
-                    storage, 0, (nbytes,), (1,)
-                )
-                mapped_storage.copy_(source_storage)
+                ).untyped_storage()
+                mapped_storage.copy_(storage)
                 storage_to_gms[storage_base_ptr] = mapped_storage
 
             # set_ interprets the offset and strides in the parameter's dtype,
             # while keeping the whole shared storage available for other views.
             replacement = torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(
-                mapped_storage.untyped_storage(),
+                mapped_storage,
                 tensor.storage_offset(),
                 tensor.shape,
                 tensor.stride(),
