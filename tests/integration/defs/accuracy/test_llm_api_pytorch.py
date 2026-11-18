@@ -30,6 +30,7 @@ from pytest_mock import MockerFixture
 from test_common.moe_tactics import (fp8_block_scales_moe_config,
                                      fp8_block_scales_moe_tactic,
                                      skip_unless_moe_tactic_runs_here,
+                                     sm100f_moe_tactic_or_auto,
                                      sm100f_moe_tactic_or_cutlass)
 
 from tensorrt_llm import LLM
@@ -3996,7 +3997,7 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False,
                                         dtype="fp8" if fp8kv else "auto")
 
-        moe_tactic = "trtllm_gen" if get_sm_version() in (100, 103) else None
+        moe_tactic = sm100f_moe_tactic_or_auto("trtllm_gen")
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  moe_config=MoeConfig(tactic=moe_tactic),
@@ -4022,7 +4023,7 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
                                         dtype="fp8",
                                         use_kv_cache_manager_v2=False)
 
-        moe_tactic = "trtllm_gen" if get_sm_version() in (100, 103) else None
+        moe_tactic = sm100f_moe_tactic_or_auto("trtllm_gen")
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  moe_config=MoeConfig(tactic=moe_tactic),
@@ -4059,7 +4060,7 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False,
                                         dtype="fp8" if fp8kv else "auto")
 
-        moe_tactic = "trtllm_gen" if get_sm_version() in (100, 103) else None
+        moe_tactic = sm100f_moe_tactic_or_auto("trtllm_gen")
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  moe_config=MoeConfig(tactic=moe_tactic),
@@ -5528,8 +5529,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         ids=["tp1", "tp2"],
     )
     def test_bf16(self, moe_tactic, tp_size, mocker):
-        if moe_tactic == "trtllm_gen" and get_sm_version() not in (100, 103):
-            pytest.skip(f"{moe_tactic} tactic supports SM 100 and 103 only")
+        skip_unless_moe_tactic_runs_here(moe_tactic)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
                                         enable_block_reuse=False)
@@ -5672,8 +5672,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             mamba_state_config=MambaStateConfig(
                 additional_snapshot_offsets_from_end=[0]),
         )
-        # Mirrors test_bf16: TRTLLM-Gen MoE is SM100/103 only, so pin CUTLASS,
-        # which is supported everywhere this test can run.
+        # Pin CUTLASS to cover this test on every supported GPU family.
         moe_config = MoeConfig(tactic="cutlass")
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=32)
