@@ -1632,3 +1632,85 @@ def test_close_out_under_attention_dp_waits_for_the_synchronized_flush() -> None
     executors[0]._terminate_request.assert_called_once_with(closed)
     executors[1]._terminate_request.assert_not_called()
     assert [executor.active_requests for executor in executors] == [[], [waiting]]
+
+
+_DRAFT_LEN = 3
+
+
+def _spec_executor(h: CoordinatorHarness, *, rejection: bool) -> PyExecutor:
+    """Receive-tail executor of a speculative-decoding generation server."""
+    executor = _executor_over(h.coordinator, [])
+    executor.enable_spec_decode = True
+    executor.model_engine = SimpleNamespace(
+        spec_config=SimpleNamespace(use_rejection_sampling=rejection),
+        max_total_draft_tokens=_DRAFT_LEN,
+    )
+    return executor
+
+
+def _handed_off(
+    h: CoordinatorHarness, ctx_draft_tokens, *, needs_onehot: bool = False
+) -> _GenRequest:
+    """A request whose receive ``h``'s coordinator started and completed."""
+    req = _GenRequest(
+        1,
+        context_phase_params=SimpleNamespace(first_gen_tokens=[41], draft_tokens=ctx_draft_tokens),
+        py_needs_onehot_draft_probs=needs_onehot,
+    )
+    _received(h, req)
+    return req
+
+
+@pytest.mark.parametrize("ctx_draft_tokens", [None, [], [0] * _DRAFT_LEN, [5, 6], [5, 6, 7]])
+def test_receive_tail_verifies_placeholders_against_one_hot_rows_under_rejection(
+    ctx_draft_tokens,
+) -> None:
+    """Under rejection sampling the handoff installs placeholders and requests
+    the one-hot row, whatever the context server sent."""
+    h = CoordinatorHarness()
+    req = _handed_off(h, ctx_draft_tokens)
+
+    _spec_executor(h, rejection=True)._prepare_disagg_gen_transmission_complete(_batch(req))
+
+    assert req.state == LlmRequestState.GENERATION_IN_PROGRESS
+    assert req.py_draft_tokens == [0] * _DRAFT_LEN
+    assert req.py_needs_onehot_draft_probs is True
+    assert req.new_tokens == [(41, 0)]
+
+
+@pytest.mark.parametrize(
+    "ctx_draft_tokens, expected",
+    [
+        (None, [0] * _DRAFT_LEN),
+        ([], [0] * _DRAFT_LEN),
+        ([0] * _DRAFT_LEN, [0] * _DRAFT_LEN),
+        ([5, 6], [5, 6, 0]),
+        ([5, 6, 7], [5, 6, 7]),
+    ],
+)
+def test_receive_tail_keeps_context_drafts_under_strict_acceptance(
+    ctx_draft_tokens, expected
+) -> None:
+    """Strict acceptance keeps the context drafts, padded to the draft width."""
+    h = CoordinatorHarness()
+    req = _handed_off(h, ctx_draft_tokens)
+
+    _spec_executor(h, rejection=False)._prepare_disagg_gen_transmission_complete(_batch(req))
+
+    assert req.py_draft_tokens == expected
+    assert req.py_needs_onehot_draft_probs is False
+
+
+@pytest.mark.parametrize("rejection, expected", [(True, [0] * _DRAFT_LEN), (False, [5, 6, 7])])
+def test_receive_tail_replaces_real_drafts_when_one_hot_row_is_already_requested(
+    rejection, expected
+) -> None:
+    """An already requested row does not make real drafts verifiable under
+    rejection sampling; strict acceptance keeps them."""
+    h = CoordinatorHarness()
+    req = _handed_off(h, [5, 6, 7], needs_onehot=True)
+
+    _spec_executor(h, rejection=rejection)._prepare_disagg_gen_transmission_complete(_batch(req))
+
+    assert req.py_draft_tokens == expected
+    assert req.py_needs_onehot_draft_probs is True

@@ -1129,6 +1129,35 @@ def resolve_draft_len(spec_config: Optional["DecodingBaseConfig"],
     return draft_len
 
 
+def disagg_gen_first_draft_tokens(
+        ctx_draft_tokens: Optional[list[int]],
+        spec_config: Optional["DecodingBaseConfig"], enable_spec_decode: bool,
+        max_total_draft_tokens: int) -> tuple[list[int], bool]:
+    """Drafts a disaggregated generation request verifies on its first step.
+
+    Missing or short context-server drafts are padded with placeholder zeros
+    to ``max_total_draft_tokens``. Under rejection sampling every draft becomes
+    a placeholder verified against the one-hot row at token 0: the context
+    server's proposal distribution is not transferred, so its drafts cannot be
+    verified exactly here. Rejection sampling stays exact with that row.
+
+    Returns:
+        ``(draft_tokens, needs_onehot_draft_probs)``.
+    """
+    if not enable_spec_decode:
+        return ([] if ctx_draft_tokens is None else ctx_draft_tokens), False
+    if not ctx_draft_tokens:
+        draft_tokens = [0] * max_total_draft_tokens
+    elif len(ctx_draft_tokens) < max_total_draft_tokens:
+        draft_tokens = list(ctx_draft_tokens) + [0] * (max_total_draft_tokens -
+                                                       len(ctx_draft_tokens))
+    else:
+        draft_tokens = ctx_draft_tokens
+    if getattr(spec_config, "use_rejection_sampling", False):
+        return [0] * len(draft_tokens), True
+    return draft_tokens, False
+
+
 def update_draft_len(model_engine: "ModelEngine",
                      scheduled_batch: "ScheduledRequests",
                      *,

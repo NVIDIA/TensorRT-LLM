@@ -90,7 +90,8 @@ from ..moe.fused_moe.moe_warmup_placement import \
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SpecSampler
 from ..speculative.speculation_gate import SpeculationGate
-from ..speculative.utils import get_static_draft_len, update_draft_len
+from ..speculative.utils import (disagg_gen_first_draft_tokens,
+                                 get_static_draft_len, update_draft_len)
 from .adp_iter_stats import ADPIterStatsBuffer
 from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -11628,23 +11629,16 @@ class PyExecutor:
             req.decoding_iter = 1
             req.py_decoding_iter = 1
             first_gen_tokens = req.context_phase_params.first_gen_tokens
-            ctx_draft_tokens = req.context_phase_params.draft_tokens
-            if not ctx_draft_tokens and self.enable_spec_decode:
-                # CTX has no speculative decoding — fill dummy draft tokens
-                # so model_engine builds the correct input shape (1 + draft_len
-                # tokens per gen request). Dummies will be rejected on verify,
-                # and the draft model will produce real tokens for next step.
-                ctx_draft_tokens = [0
-                                    ] * self.model_engine.max_total_draft_tokens
-            elif (self.enable_spec_decode and len(ctx_draft_tokens)
-                  < self.model_engine.max_total_draft_tokens):
-                # A CTX with a smaller max_draft_len than this GEN: pad to the
-                # GEN's draft width; like the dummies above, the padding is
-                # rejected on verify.
-                ctx_draft_tokens = list(ctx_draft_tokens) + [0] * (
-                    self.model_engine.max_total_draft_tokens -
-                    len(ctx_draft_tokens))
-            req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
+            # Request the one-hot row here: the scheduling path skips requests
+            # that already carry drafts, and the PP loop does not run it.
+            spec_config = getattr(self.model_engine, "spec_config", None)
+            max_draft_tokens = (self.model_engine.max_total_draft_tokens
+                                if self.enable_spec_decode else 0)
+            req.py_draft_tokens, needs_onehot = disagg_gen_first_draft_tokens(
+                req.context_phase_params.draft_tokens, spec_config,
+                self.enable_spec_decode, max_draft_tokens)
+            if needs_onehot:
+                req.py_needs_onehot_draft_probs = True
             beam_width = req.py_beam_width
             if not self._update_sampler_state_for_disagg_gen_request(
                     req, beam_width, first_gen_tokens):

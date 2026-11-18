@@ -1492,6 +1492,9 @@ class SpecMetadata:
         published in draft_probs_last_dim (what acceptance reads), so it is NOT
         overwritten here. No-op unless rejection is enabled and slots exist.
         Static shapes -> CUDA-graph safe.
+
+        Limitation: the row is at draft-vocab id 0, which is the placeholder
+        (target token 0) only if ``d2t[0] == 0``.
         """
         if (not padding_slot_ids
                 or not getattr(self, "use_rejection_sampling", False)
