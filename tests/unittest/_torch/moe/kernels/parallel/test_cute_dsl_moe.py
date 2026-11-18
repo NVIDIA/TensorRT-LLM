@@ -62,6 +62,29 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 
+def _nvfp4_quantize_fp32_ref(
+    x: torch.Tensor, inverse_global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize without the BF16 rounding absent from the fused FP32 epilogue."""
+    m, n = x.shape
+    blocks = x.reshape(m, n // 16, 16)
+    scales = (blocks.abs().amax(dim=-1) / 6 * inverse_global_scale).to(torch.float8_e4m3fn)
+    inverse_scales = (inverse_global_scale / scales.float()).clamp(
+        max=torch.finfo(torch.float32).max
+    )
+    normalized = (blocks * inverse_scales.unsqueeze(-1)).reshape(m, n)
+    magnitudes = normalized.abs().contiguous()
+    # E2M1 magnitudes are 0, 0.5, 1, 1.5, 2, 3, 4, 6. At midpoint ties,
+    # choose the even code, matching round-to-nearest-even conversion.
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    codes = torch.bucketize(magnitudes, midpoints)
+    for index in (1, 3, 5):
+        codes += (magnitudes == midpoints[index]).to(codes.dtype)
+    codes = codes.to(torch.uint8) | (torch.signbit(normalized).to(torch.uint8) << 3)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed, swizzle_sf(scales.view(torch.uint8), m, n)
+
+
 def swiglu_ref(x: torch.Tensor, swiglu_limit: float = float("inf")) -> torch.Tensor:
     x, gate = x.chunk(2, dim=-1)
     if swiglu_limit != float("inf"):
@@ -1052,6 +1075,81 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
+@pytest.mark.parametrize("top_k", [1, 2])
+@pytest.mark.parametrize("num_tokens", [7, 48 * 7, 4 * 52 * 7])
+def test_nvfp4_grouped_gemm_finalize_weights_evict_first_bitwise(num_tokens: int, top_k: int):
+    """The L2 evict_first policy on the FC2 weight loads leaves every output bit unchanged (top-k <= 2: the
+    finalize's scatter-add is order-independent)."""
+    sf_vec_size, tile_size = 16, 128
+    hidden_size, interm_size = 4096, 1024
+    num_experts, num_local_experts = 512, 128
+
+    torch.manual_seed(0)
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    # Token 0 picks local expert 0 first, so the output is never all zero (no local pick at all).
+    routing_logits[0, 0] = routing_logits.max() + 1
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        _,
+        permuted_idx_to_expanded_idx,
+        _,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+    a = torch.randn(permuted_idx_to_expanded_idx.size(0), interm_size, device="cuda").bfloat16()
+    b = torch.randn(num_local_experts, hidden_size, interm_size, device="cuda").bfloat16()
+    a_global_sf = a.abs().max().float() / (448 * 6)
+    b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
+    b_sf = b_sf.view(num_local_experts, hidden_size, interm_size // sf_vec_size)
+
+    def run(weights_evict_first):
+        out = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+            a.view(torch.float4_e2m1fn_x2),
+            b.view(torch.float4_e2m1fn_x2),
+            a_sf,
+            b_sf,
+            a_global_sf * b_global_sf,
+            out,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            token_final_scales,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=sf_vec_size,
+            weights_evict_first=weights_evict_first,
+        )
+        return out
+
+    expected = run(False)
+    assert expected.abs().sum().item() > 0
+    assert torch.equal(run(True).view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
@@ -1557,12 +1655,15 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         tile_idx_to_group_idx,
         num_non_exiting_tiles,
         tile_size=tile_size,
-        output_dtype=torch.bfloat16,
+        output_dtype=torch.float32 if activation_type == ActivationType.Relu2 else torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
     c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
-    c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
+    if activation_type == ActivationType.Relu2:
+        c_ref, c_sf_ref = _nvfp4_quantize_fp32_ref(c_ref, 1 / global_sf)
+    else:
+        c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
     # Call Rubin gather kernel
     c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
@@ -2084,12 +2185,13 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin_small_tokens(
     )
     num_valid_permuted_tokens = n_tiles * tile_size
     for i in range(min(num_valid_permuted_tokens, max_num_permuted_tokens)):
+        # Routing metadata defines valid rows; expanded index zero is valid.
+        if i >= tile_idx_to_mn_limit[i // tile_size].item():
+            continue
         expanded_idx = permuted_idx_to_expanded_idx[i].item()
-        if expanded_idx > 0 or i == 0:
-            token_id = expanded_idx // top_k
-            if token_id < num_tokens:
-                a_gathered[i] = a[token_id]
-                a_sf_gathered[i] = a_sf_unswizzled[token_id]
+        token_id = expanded_idx // top_k
+        a_gathered[i] = a[token_id]
+        a_sf_gathered[i] = a_sf_unswizzled[token_id]
 
     a_sf_gathered_swizzled = swizzle_sf(
         a_sf_gathered.view(max_num_permuted_tokens, hidden_size // sf_vec_size),
@@ -3172,6 +3274,9 @@ def test_cute_dsl_nvfp4_quantize_empty_input_rubin():
 
     assert x.shape == (0, hidden_size // 2)
     assert x_sf.shape == (0, hidden_size // scaling_vector_size)
+    # The empty input must not leave a pending CUDA error for the next launch.
+    torch.ones(1, device="cuda").add_(1)
+    torch.cuda.synchronize()
 
 
 def test_sm107_nvfp4_tile512_fallback_uses_two_cta_cluster():

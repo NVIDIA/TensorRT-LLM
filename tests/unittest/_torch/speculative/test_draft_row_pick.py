@@ -201,17 +201,29 @@ def _worker(is_mtp_eagle, fast_paths):
     w.mapping = None
     w.draft_head = None
     w._d2t = None
+    w._vocab_parallel_argmax = False
     w._draft_folds_kv_lens_increment = False
     w._step0_row_pick = DraftRowPick("test draft layer")
     w.draft_kv_cache_context = lambda md, mgr: contextlib.nullcontext(md)
-    w.sample_draft_tokens = (
-        lambda logits,
-        spec_metadata,
-        batch_size,
-        draft_step,
-        mapping_lm_head_tp=None: logits.argmax(-1).to(torch.int32)
-    )
+    w.sample_draft_tokens = _greedy_draft_tokens
     return w
+
+
+def _greedy_draft_tokens(
+    logits,
+    spec_metadata,
+    batch_size,
+    draft_step,
+    mapping_lm_head_tp=None,
+    out=None,
+    vocab_sharded=None,
+):
+    """Argmax tokens; written into ``out`` when given, like the real sampler."""
+    tokens = logits.argmax(-1).to(torch.int32)
+    if out is None:
+        return tokens
+    out.copy_(tokens)
+    return out
 
 
 def _run_loop(

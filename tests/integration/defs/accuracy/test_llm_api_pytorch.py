@@ -318,9 +318,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                     acceptance_length,
                 )
 
-    @skip_no_rubin
     @pytest.mark.skip_less_device_memory(60000)
-    def test_nvfp4_mla(self, monkeypatch):
+    @pytest.mark.parametrize("enable_chunked_prefill", [False, True],
+                             ids=["unchunked", "chunked"])
+    def test_nvfp4_mla(self, monkeypatch: pytest.MonkeyPatch,
+                       enable_chunked_prefill: bool) -> None:
+        from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+            _fp4_mla_attention_backend, fp4_mla_generation_backend_supported)
+        if not fp4_mla_generation_backend_supported(
+                get_sm_version(), _fp4_mla_attention_backend()):
+            pytest.skip("requires a supported FP4 MLA generation backend")
         from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import \
             Fp4MlaFmha
         from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import \
@@ -339,7 +346,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
                 attn_backend="TRTLLM",
                 kv_cache_config=kv_cache_config,
-                enable_chunked_prefill=False,
+                enable_chunked_prefill=enable_chunked_prefill,
+                cuda_graph_config=CudaGraphConfig(),
                 max_num_tokens=8192,
                 max_batch_size=1350,
         ) as llm:
@@ -364,6 +372,50 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 assert any(
                     isinstance(fmha, Fp4MlaFmha)
                     for fmha in layer._fmha_manager._cache.values())
+
+    @skip_no_rubin
+    @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("enable_block_reuse,enable_chunked_prefill,mtp_nextn",
+                          [(True, False, 0), (False, True, 0), (True, True, 0),
+                           (True, True, 3)])
+    def test_nvfp4_mla_cached_context(self, monkeypatch,
+                                      enable_block_reuse: bool,
+                                      enable_chunked_prefill: bool,
+                                      mtp_nextn: int):
+        """FP4 MLA context attention over a prefix already in the FP4 cache.
+
+        GSM8K prompts share their few-shot examples, so with block reuse most
+        requests reuse that prefix; a 512-token budget splits every prompt
+        into several chunked-prefill chunks.
+
+        Decode runs with the 4x path dispatcher on, so the decoder CUDA graphs
+        are keyed by KV regime. The 16 heads of DeepSeek-V3-Lite fill no
+        256-row 4x item, so every graph shape keeps one regime and the
+        dispatcher keeps the 2x kernel.
+        """
+        # env_overrides also sets it in this process; monkeypatch removes it
+        # from this process once the test ends.
+        env = {"TRTLLM_FP4_MLA_CUTEDSL_4X": "1"}
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        kv_cache_config = KvCacheConfig(dtype="nvfp4",
+                                        free_gpu_memory_fraction=0.75,
+                                        use_kv_cache_manager_v2=True,
+                                        enable_block_reuse=enable_block_reuse)
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                attn_backend="TRTLLM",
+                env_overrides=env,
+                kv_cache_config=kv_cache_config,
+                enable_chunked_prefill=enable_chunked_prefill,
+                max_num_tokens=512 if enable_chunked_prefill else 8192,
+                speculative_config=mtp_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
@@ -2565,6 +2617,57 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 f"TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp{tp_size}]",
                 acceptance_length)
 
+    @DEEPSEEKV4_PARALLELISM
+    def test_gsm8k_megamoe_deepgemm_draft_len_schedule(self, tp_size,
+                                                       attention_dp):
+        """GSM8K under a schedule that trims, then turns off, verified drafts.
+
+        The evaluation submits every sample up front, so each attention-DP
+        rank first runs full batches without speculation and then passes
+        through the shorter and the full draft length as it drains, out of
+        step with its peers.
+        """
+        _skip_unless_deepseekv4_4gpu_memory(
+            tp_size,
+            min_device_memory_for_4gpus=DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        schedule = {32: 5, 96: 3}
+        spec_config = DSparkDecodingConfig(max_draft_len=5,
+                                           draft_len_schedule=schedule,
+                                           speculative_model=self.MODEL_PATH)
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=tp_size,
+                 enable_attention_dp=attention_dp,
+                 moe_config=MoeConfig(backend="MEGAMOE_DEEPGEMM"),
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=True,
+                 custom_tokenizer="deepseek_v4",
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            # The schedule decides how many steps speculate, so the acceptance
+            # length has no fixed floor; this still requires that some did.
+            acceptance_length = compute_acceptance_length(llm)
+            print(f"[AL] draft_len_schedule[dp{tp_size}] "
+                  f"acceptance_length = {acceptance_length:.3f}")
+
     @pytest.mark.skip_less_device_memory(DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_gsm8k_dep4_megamoe_cutedsl(self):
@@ -3937,6 +4040,32 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
             task = LongBenchV1(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_acc_spec=f"target_sparsity={target_sparsity}")
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(140000)
+    def test_skip_softmax_attention_kv_cache_manager_v1(self):
+        """Skip Softmax on KVCacheManager V1, which the C++ transceiver needs."""
+        sparse_attention_config = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor={
+                "prefill": 18471.56,
+                "decode": 852.20,
+            })
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                        enable_block_reuse=False,
+                                        dtype="fp8",
+                                        use_kv_cache_manager_v2=False)
+
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 moe_config=MoeConfig(
+                     backend="TRTLLM" if get_sm_version() in (100,
+                                                              103) else "AUTO"),
+                 max_batch_size=256,
+                 max_num_tokens=100000,
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config) as llm:
+            task = LongBenchV1(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="target_sparsity=0.9")
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
@@ -5487,7 +5616,11 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                           extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def _run_bf16_mtp(self, mocker, acceptance_key):
+    def _run_bf16_mtp(self,
+                      mocker,
+                      acceptance_key,
+                      tp_size=1,
+                      attention_dp=False):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
@@ -5497,8 +5630,9 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
         with LLM(self.MODEL_PATH,
                  trust_remote_code=True,
-                 tensor_parallel_size=1,
+                 tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
+                 enable_attention_dp=attention_dp,
                  max_seq_len=4096,
                  max_batch_size=32,
                  enable_chunked_prefill=True,
@@ -5516,6 +5650,19 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
     def test_bf16_mtp(self, mocker):
         self._run_bf16_mtp(mocker, "TestQwen3_5_35B_A3B::test_bf16_mtp")
+
+    @pytest.mark.skip_less_device(2)
+    def test_bf16_mtp_adp2(self, mocker):
+        """MTP under attention DP across mixed and generation-only ranks.
+
+        One rank's new prompts meet the other's generation-only steps, and
+        both ranks' draft MoE collectives must agree on their sizes (rows
+        mixed up across ranks show as a lower acceptance length).
+        """
+        self._run_bf16_mtp(mocker,
+                           "TestQwen3_5_35B_A3B::test_bf16_mtp_adp2",
+                           tp_size=2,
+                           attention_dp=True)
 
     def test_bf16_mtp_flashinfer_ring_replay(self, mocker, monkeypatch):
         """Same as test_bf16_mtp with GDN replay on the FlashInfer ring kernel."""

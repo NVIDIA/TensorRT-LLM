@@ -69,7 +69,11 @@ from tensorrt_llm.inputs.multimodal import (
     check_mm_embed_cumsum_if_needed,
     strip_mm_data_for_generation,
 )
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    DSparkDecodingConfig,
+    PrefillCudaGraphBackend,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -104,6 +108,13 @@ def resolve_runtime_draft_len(
     if spec_config is not None and not spec_config.is_linear_tree:
         return get_static_draft_len(spec_config)
     return runtime_draft_len
+
+
+def dspark_schedules_draft_len(spec_config: DecodingBaseConfig | None) -> bool:
+    """Whether a DSpark draft length schedule can shorten a step's uniform verify window."""
+    return (
+        isinstance(spec_config, DSparkDecodingConfig) and spec_config.draft_len_schedule is not None
+    )
 
 
 def uses_full_generation_page_table(
@@ -595,6 +606,10 @@ class DecoderInputPreparer:
         ``spec_metadata.num_tokens``, ``num_generations`` and ``seq_lens`` for
         this batch before calling this. ``num_generations`` counts every
         generation request, CUDA-graph dummies included.
+
+        The step's draft length rides along: each rank picks it from its own
+        batch, and a drafter that crosses a cross-rank barrier has to know
+        whether any peer drafts this step.
         """
         if not self._config.enable_attention_dp:
             return None, None
@@ -602,6 +617,7 @@ class DecoderInputPreparer:
             spec_metadata.dp_num_tokens(),
             len(spec_metadata.seq_lens),
             spec_metadata.num_generations,
+            spec_metadata.runtime_draft_len,
         )
         if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
             # attn counts span TP only while spec counts span TP*CP; keep the
@@ -900,6 +916,9 @@ class DecoderInputPreparer:
             and self._steady_gen_cache_supported
             and not self.mapping.has_cp_helix()
         ):
+            stage_rng = False
+            if self.runtime_hooks.pack_spec_rng_uploads:
+                stage_rng = True
             self._steady_mtp = SteadyMtpPrepare(
                 max_batch_size=self._config.max_batch_size,
                 max_num_tokens=self._config.max_num_tokens,
@@ -908,6 +927,7 @@ class DecoderInputPreparer:
                 ),
                 use_mrope=self._config.use_mrope,
                 has_static_inputs=cuda_graph_runner is not None and cuda_graph_runner.enabled,
+                stage_rng=stage_rng,
             )
 
     def _can_use_steady_mtp_fast_prepare(
@@ -965,8 +985,32 @@ class DecoderInputPreparer:
         requests = scheduled_requests.generation_requests
         num_requests = len(requests)
         num_tokens = num_requests * record.tokens_per_step
+        rng_state = None
+        rng_rows = steady_mtp.rng_rows()
+        sampling_populated = False
+        if rng_rows is not None and scheduled_requests.num_context_requests == 0:
+            # Populate the sampling parameters before staging, so that the staging kernel writes this step's
+            # Philox state from the host's values instead of four uploads on the stream after it.
+            rng_state = spec_metadata.populate_sampling_params_for_one_model(
+                scheduled_requests.all_requests(), defer_rng_rows=rng_rows
+            )
+            sampling_populated = True
         num_cached_tokens_per_seq, kv_lens, static_inputs_staged = steady_mtp.stage(
-            requests, new_tensors_device, self._buffers, attn_metadata
+            requests,
+            new_tensors_device,
+            self._buffers,
+            attn_metadata,
+            rng_state=rng_state,
+            rng_buffers=(
+                (
+                    spec_metadata.request_seeds,
+                    spec_metadata.request_offsets,
+                    spec_metadata.seeds,
+                    spec_metadata.offsets,
+                )
+                if rng_state is not None
+                else None
+            ),
         )
 
         attn_metadata.beam_width = 1
@@ -996,7 +1040,8 @@ class DecoderInputPreparer:
         spec_metadata.gather_ids = self._buffers.gather_ids_cuda[:num_tokens]
         # The positions are written on the device only.
         spec_metadata.host_position_ids = None
-        spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
+        if not sampling_populated:
+            spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
         spec_metadata.prepare()
 
         inputs = self.model_inputs(attn_metadata, resource_manager, virtual_num_tokens, [])
@@ -1077,10 +1122,13 @@ class DecoderInputPreparer:
 
         # Must be before the update of py_batch_idx
         if self.guided_decoder is not None:
+            # Prefill CUDA graphs can also capture guided decoding.
             self.guided_decoder.add_batch(
                 scheduled_requests,
                 new_tokens=new_tokens_device,
                 runtime_draft_len=runtime_draft_len,
+                is_cuda_graph=maybe_graph
+                or self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED,
             )
 
         spec_config = self._config.spec_config if enable_spec_decode else None
@@ -2667,7 +2715,10 @@ class DecoderInputPreparer:
                 ),
             )
 
-        if self._dspark_trims_submitted_tokens:
+        # Attention sizes its generation rows by the static draft ceiling
+        # unless told the step's window, which both the confidence scheduler
+        # and a draft length schedule can shorten.
+        if self._dspark_trims_submitted_tokens or dspark_schedules_draft_len(spec_config):
             self._publish_gen_token_layout(
                 attn_metadata,
                 scheduled_requests.generation_requests,
