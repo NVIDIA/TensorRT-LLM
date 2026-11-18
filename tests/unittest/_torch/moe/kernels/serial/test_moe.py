@@ -2273,6 +2273,7 @@ def _run_moe_mxe2m1_weights(
     use_topk_as_input: bool,
     valid_hidden_size: int | None = None,
     valid_intermediate_size: int | None = None,
+    skip_dynamic_tuning_buckets: bool = False,
 ) -> None:
     """Run the MXFP4 direct op and its numerical reference on the same inputs."""
     torch.random.manual_seed(0)
@@ -2627,7 +2628,8 @@ def _run_moe_mxe2m1_weights(
     if test_invalid_topk_input:
         top_k = top_k + 1
     AutoTuner.get().clear_cache()
-    with autotune(use_autotune):
+    with autotune(use_autotune,
+                  skip_dynamic_tuning_buckets=skip_dynamic_tuning_buckets):
         if dtype_activation == "mxfp8":
             # Test fused unpadding by checking only half of the output.
             output = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(

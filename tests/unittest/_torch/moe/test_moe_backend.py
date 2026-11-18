@@ -7522,4 +7522,5 @@ def test_moe_mxe2m1_weights_valid_dimensions(
         use_topk_as_input=False,
         valid_hidden_size=valid_hidden_size,
         valid_intermediate_size=valid_intermediate_size,
+        skip_dynamic_tuning_buckets=True,
     )
