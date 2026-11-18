@@ -2435,7 +2435,6 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
 
     moe = SimpleNamespace(
         apply_router_weight_on_input=False,
-        enable_dummy_allreduce=False,
         mapping=SimpleNamespace(moe_ep_rank=0),
         layer_idx=7,
         num_experts=16,

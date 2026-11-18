@@ -220,12 +220,16 @@ A model that runs other work on a side stream while the routed experts run (e.g.
 
 No external `Communication.dispatch` / `.combine`. Zero-token chunks still launch the kernel so peer EP ranks can cross the in-kernel NVLink barrier.
 
-With `TRTLLM_ENABLE_DUMMY_ALLREDUCE=1`, the scheduler inserts a dummy all-reduce
-immediately before and after each `backend.run_moe`, including zero-token chunks.
-Set the variable consistently on all ranks before constructing the model. This
-profiling switch aligns ranks around the whole fused dispatch/compute/combine;
-it cannot isolate dispatch and combine inside the kernel. It is off by default
-and adds synchronization overhead when enabled.
+With `TRTLLM_ENABLE_DUMMY_ALLREDUCE=1`, `_run_chunks` inserts a dummy NCCL
+all-reduce before and after each chunk's `_forward_chunk` (routing, quantization
+and `backend.run_moe`), including zero-token chunks. It brackets the chunk, not
+`run_moe`, so a `_forward_chunk` override that launches the kernel itself (the
+GLM Rubin direct stage) issues the same collectives as its idle peers. Set the
+variable consistently on all ranks before constructing the model. This profiling
+switch aligns ranks around the whole fused dispatch/compute/combine; it cannot
+isolate dispatch and combine inside the kernel. It is off by default and adds
+synchronization overhead when enabled. The dummy all-reduce always uses NCCL,
+whatever `allreduce_strategy` the model sets.
 
 The DeepGEMM kernel's in-kernel barriers trap when a peer is late; their timeout is relaxed during warmup, see [Communication timeouts](#communication-timeouts).
 

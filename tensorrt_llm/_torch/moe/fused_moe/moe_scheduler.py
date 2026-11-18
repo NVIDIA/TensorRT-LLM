@@ -1687,6 +1687,10 @@ class FusedCommMoEScheduler(MoEScheduler):
                 [lst[idx_chunk] for lst in all_rank_chunk_size_list] if had_meta else None
             )
 
+            # Bracket the whole chunk, not ``run_moe``: overrides of ``_forward_chunk`` (e.g. the
+            # GLM Rubin direct stage) launch the kernel themselves on some ranks only.
+            if moe.enable_dummy_allreduce:
+                moe.dummy_allreduce()
             out_chunk = self._forward_chunk(
                 x_chunk,
                 rl_chunk,
@@ -1699,6 +1703,8 @@ class FusedCommMoEScheduler(MoEScheduler):
                 row_offset=row_offset,
                 routing_aux=routing_aux_chunk,
             )
+            if moe.enable_dummy_allreduce:
+                moe.dummy_allreduce()
             row_offset += x_chunk.shape[0]
             outputs.append(out_chunk)
         return outputs
@@ -1907,9 +1913,6 @@ class FusedCommMoEScheduler(MoEScheduler):
         # num_slots in quantization.py).
         # Fused-comm backends own the EP exchange, so there is no comm plan:
         # nothing outside the fused kernel decided anything about this forward.
-        # Synchronize even zero-token chunks: every EP rank launches the fused exchange.
-        if moe.enable_dummy_allreduce:
-            moe.dummy_allreduce()
         out = moe.backend.run_moe(
             MoERunContext(
                 token_selected_experts=token_selected_slots,
@@ -1920,8 +1923,6 @@ class FusedCommMoEScheduler(MoEScheduler):
                 replica_plan=replica_plan,
             )
         )
-        if moe.enable_dummy_allreduce:
-            moe.dummy_allreduce()
 
         # ----- EPLB: start/done CPU rebalance, AFTER run_moe -----
         # The external-comm path overlaps CPU stage with ``comm.combine``;
