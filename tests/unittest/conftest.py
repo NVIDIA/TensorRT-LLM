@@ -52,6 +52,7 @@ from integration.defs.utils import periodic_junit
 # is harmless.
 from test_common import s3_output
 from test_common import session_prefetcher_hooks as _prefetch_hooks
+from test_common.waive import waive_candidates
 
 
 def dump_threads(signum, frame):
@@ -343,28 +344,11 @@ def apply_waives_ut(waives_file, items: list[pytest.Item], config):
         else:
             filtered_dict[waiver] = test_name_to_marker_dict[waiver]
 
-    # Fuzzy match is supported in the following order:
-    # 1. exact match
-    # 2. remove parameterization part in square brackets and try again (function level)
-    # 3. remove the last part after '::' and try again, until no '::' left (file level)
-    # Note: directory level match is not supported.
-    def match_waiver(id: str):
-        if id in filtered_dict:
-            return filtered_dict[id]
-        if id.endswith("]"):
-            id = id.split("[")[0]
-            if id in filtered_dict:
-                return filtered_dict[id]
-        while "::" in id:
-            id = id.rsplit("::", 1)[0]
-            if id in filtered_dict:
-                return filtered_dict[id]
-
-        return None
-
     # For each item in the list, apply waives if a waive entry exists
     for item in items:
-        waiver = match_waiver(item.nodeid)
+        waiver = next((filtered_dict[name]
+                       for name in waive_candidates(item.nodeid)
+                       if name in filtered_dict), None)
         if waiver:
             marker, reason, _ = waiver
             if marker:
