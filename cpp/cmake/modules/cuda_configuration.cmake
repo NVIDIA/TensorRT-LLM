@@ -60,8 +60,8 @@ Functions
     Falls back to ``all`` if detection fails.
 
   ``all`` or unset
-    Resolves to architectures TensorRT-LLM is optimized for and the
-    compiler supports (80, 86, 89, 90, 100, 103, 107, 120 depending on CUDA version).
+    Resolves to all architectures TensorRT-LLM is optimized for, and the
+    current platform and compiler supports.
 
   ``all-major``
     Unsupported. Results in a fatal error.
@@ -84,6 +84,10 @@ Functions
 
   ``CMAKE_CUDA_ARCHITECTURES_FAMILIES``
     List of family architectures (e.g., ``100f``, ``120f``).
+
+  ``CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS``
+    Architectures TensorRT-LLM provides optimized kernels for, i.e. the values
+    ``CMAKE_CUDA_ARCHITECTURES`` may select from.
 
   ``CMAKE_CUDA_ARCHITECTURES_HAS_FAMILIES``
     Boolean indicating if family targets are supported.
@@ -322,11 +326,24 @@ function(setup_cuda_architectures)
         message(FATAL_ERROR "Including PTX in compiled binary is unsupported.")
       elseif(CUDA_ARCH MATCHES "^(([1-9])([0-9])+)a?(-real)?$")
         list(APPEND CMAKE_CUDA_ARCHITECTURES_CLEAN ${CMAKE_MATCH_1})
+        if(NOT CUDA_ARCH STREQUAL CMAKE_MATCH_1)
+          list(APPEND CMAKE_CUDA_ARCHITECTURES_SUFFIXED ${CUDA_ARCH})
+        endif()
       else()
         message(FATAL_ERROR "Unrecognized CUDA architecture: ${CUDA_ARCH}")
       endif()
     endforeach()
     list(REMOVE_DUPLICATES CMAKE_CUDA_ARCHITECTURES_CLEAN)
+    if(CMAKE_CUDA_ARCHITECTURES_SUFFIXED)
+      list(JOIN CMAKE_CUDA_ARCHITECTURES_SUFFIXED ";" _suffixed)
+      list(JOIN CMAKE_CUDA_ARCHITECTURES_CLEAN ";" _clean)
+      message(
+        WARNING
+          "CMAKE_CUDA_ARCHITECTURES entries \"${_suffixed}\" carry suffixes, "
+          "which are ignored. List plain architecture numbers instead, e.g. "
+          "\"${_clean}\": TensorRT LLM produces a build that's optimized for "
+          "every listed architecture using appropriate config for each kernel.")
+    endif()
     set(CMAKE_CUDA_ARCHITECTURES_RAW ${CMAKE_CUDA_ARCHITECTURES_CLEAN})
   endif()
 
@@ -340,11 +357,35 @@ function(setup_cuda_architectures)
     endif()
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
       list(APPEND CMAKE_CUDA_ARCHITECTURES_RAW 103)
+      if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        list(APPEND CMAKE_CUDA_ARCHITECTURES_RAW 121)
+      endif()
     endif()
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.4")
       list(APPEND CMAKE_CUDA_ARCHITECTURES_RAW 107)
     endif()
   endif()
+
+  # TensorRT-LLM only promises optimized kernels for these architectures.
+  set(ARCHITECTURES_WITH_KERNELS
+      80
+      86
+      89
+      90
+      100
+      103
+      107
+      120
+      121)
+  foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES_RAW)
+    if(NOT CUDA_ARCH IN_LIST ARCHITECTURES_WITH_KERNELS)
+      list(JOIN ARCHITECTURES_WITH_KERNELS ";" SUPPORTED_ARCHITECTURES)
+      message(
+        FATAL_ERROR
+          "CUDA architecture ${CUDA_ARCH} is not supported by TensorRT-LLM. "
+          "Supported architectures: ${SUPPORTED_ARCHITECTURES}.")
+    endif()
+  endforeach()
 
   # CMAKE_CUDA_ARCHITECTURES_ORIG contains all architectures enabled, without
   # automatically added -real or -a suffix.
@@ -427,15 +468,6 @@ function(setup_cuda_architectures)
     endif()
   endforeach()
 
-  set(ARCHITECTURES_WITH_KERNELS
-      80
-      86
-      89
-      90
-      100
-      103
-      107
-      120)
   foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
     if(NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       add_definitions("-DEXCLUDE_SM_${CUDA_ARCH}")
@@ -482,6 +514,9 @@ function(setup_cuda_architectures)
       PARENT_SCOPE)
   set(CMAKE_CUDA_ARCHITECTURES_FAMILIES
       ${CMAKE_CUDA_ARCHITECTURES_FAMILIES}
+      PARENT_SCOPE)
+  set(CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS
+      ${ARCHITECTURES_WITH_KERNELS}
       PARENT_SCOPE)
 endfunction()
 

@@ -69,6 +69,12 @@ _STAGE_RE = re.compile(
     r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"(?:,\s*(?:\d+|true|false))*\s*\]'
 )
 
+_STAGE_BUILDER_RE = re.compile(
+    r'\w+\s*\+=\s*buildStageConfigs\(\s*"(?P<stage>[^"]+)"\s*,'
+    r'\s*"[^"]+"\s*,\s*"(?P<yml>[^"]+)"\s*,'
+    r'\s*(?P<splits>\d+)\s*,\s*\d+\s*,\s*\d+'
+    r'(?:\s*,\s*(?:true|false|\d+))*\s*\)')
+
 
 def _extract_terms(entry):
     """Extract terms from either direct 'terms' or 'condition.terms'."""
@@ -92,15 +98,23 @@ class StageQuery:
         stage_to_yaml = {}
         yaml_to_stages = defaultdict(list)
         with open(path, 'r') as f:
-            for line in f:
-                if line.lstrip().startswith('//'):
-                    continue
+            source = '\n'.join(line for line in f
+                               if not line.lstrip().startswith('//'))
+            for line in source.splitlines():
                 m = _STAGE_RE.search(line)
                 if m:
                     stage = m.group('stage')
                     yml = m.group('yml') + '.yml'
                     stage_to_yaml[stage] = yml
                     yaml_to_stages[yml].append(stage)
+        for match in _STAGE_BUILDER_RE.finditer(source):
+            yml = match.group('yml') + '.yml'
+            for split_id in range(1, int(match.group('splits')) + 1):
+                prefix = match.group('stage')
+                stage = (prefix.replace('{split}', str(split_id))
+                         if '{split}' in prefix else f'{prefix}-{split_id}')
+                stage_to_yaml[stage] = yml
+                yaml_to_stages[yml].append(stage)
         return stage_to_yaml, yaml_to_stages
 
     def _parse_tests(self, db_dir):
@@ -127,7 +141,9 @@ class StageQuery:
                     backend = terms.get('backend', '')  # Default to empty
 
                     tests = entry.get('tests', [])
-                    yml = os.path.basename(path)
+                    # A stage names a test-db context (top-level key), and one
+                    # file may hold several, so key by context, not file name.
+                    yml = f'{key}.yml'
                     for t in tests:
                         test_map[t].append((yml, stage, backend))
                         yaml_stage_tests[yml][stage].append(t)

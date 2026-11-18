@@ -8,8 +8,8 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E501
     fp4_quantize as op,
 )
 
@@ -50,7 +50,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(16, 256), dtype=torch.bfloat16, vec=16, swizzled=True),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
         Cell(
             why="qwen3.8 decode: 1 token, hidden 2560, linear -- its routed-expert input",
             spec=dict(shape=(1, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
@@ -62,6 +62,28 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
         Cell(
             why="qwen3.8 prefill at max_num_tokens 8192, hidden 2560, linear",
             spec=dict(shape=(8192, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+    ),
+    "glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4": (
+        Cell(
+            why="glm-5.2 decode: 1 token, hidden 6144, linear",
+            spec=dict(shape=(1, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2, 64 rows: its own quantizer's ceiling",
+            spec=dict(shape=(64, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2, 65 rows: the first row count past its own quantizer",
+            spec=dict(shape=(65, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2 prefill chunk, 2048 rows at hidden 6144, linear",
+            spec=dict(shape=(2048, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2 at its MoE chunk bound, 8192 rows at hidden 6144",
+            spec=dict(shape=(8192, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
         ),
     ),
 }

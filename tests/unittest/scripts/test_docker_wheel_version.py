@@ -27,31 +27,20 @@ def wheel_command() -> str:
 
 
 @pytest.mark.parametrize(
-    "script,version,extra_args,expected",
+    "script,version,extra_args",
     [
-        ("build_wheel.py", "", "--clean", "1.4.0a0"),
-        ("build_wheel.py", "1.5.0", "--clean -G Ninja -j 2", "1.5.0"),
-        ("build_wheel.py", "1.4.0alpha0.dev202610190100", "", "1.4.0a0.dev202610190100"),
-        ("build_wheel.py", ".dev202610190100", "--clean", "1.4.0a0.dev202610190100"),
-        ("build_wheel.py", "+local", "--clean", "1.4.0a0+local"),
-        ("build_wheel.py", "1.5.0", "--version-override 1.3.0", "1.5.0"),
-        ("build_wheel.py", "", "--version-override 1.3.0", "1.3.0"),
-        ("get_wheel_from_package.py", "1.5.0", "--arch x86_64 --artifact_path artifacts", None),
+        ("build_wheel.py", "", "--clean"),
+        ("build_wheel.py", "1.5.0", "--clean -G Ninja -j 2"),
+        ("get_wheel_from_package.py", "1.5.0", "--arch x86_64 --artifact_path artifacts"),
         (
             "get_wheel_from_package.py",
             "1.5.0",
             "--arch sbsa --artifact_path artifacts --bolt-branch main --bolt-profile-ref pinned",
-            None,
         ),
     ],
 )
 def test_docker_wheel_arguments(
-    wheel_command: str,
-    tmp_path: Path,
-    script: str,
-    version: str,
-    extra_args: str,
-    expected: str | None,
+    wheel_command: str, tmp_path: Path, script: str, version: str, extra_args: str
 ) -> None:
     """Check Docker argument forwarding against the real builder and download parsers."""
     auth = tmp_path / "docker/common/github_auth.sh"
@@ -63,7 +52,7 @@ def test_docker_wheel_arguments(
             "sh",
             "-eu",
             "-c",
-            'python3() { printf "%s\\n" "$TRTLLM_BUILD_SOURCE_COMMIT" "$@"; }; ' + wheel_command,
+            'python3() { echo "${TRTLLM_BUILD_SOURCE_COMMIT:-}" "$@"; }; ' + wheel_command,
         ],
         cwd=tmp_path,
         env={
@@ -73,17 +62,20 @@ def test_docker_wheel_arguments(
             "TRT_LLM_VER": version,
             "GIT_COMMIT": commit,
             "GITHUB_MIRROR": "",
+            "LLM_ARTIFACTS_PRIMARY": "",
+            "ARTIFACTORY_CREDENTIAL_ID": "",
         },
         capture_output=True,
         text=True,
         check=True,
         timeout=60,
     )
-    source_commit, invoked_script, *arguments = result.stdout.splitlines()
-    assert source_commit == commit
-    assert invoked_script == f"scripts/{script}"
-    original = shlex.split(extra_args)
-    assert arguments[: len(original)] == original
+    calls = [line.split() for line in result.stdout.splitlines()]
+    # A source build sets its version to TRT_LLM_VER first.
+    if script == "build_wheel.py" and version:
+        assert calls.pop(0) == ["scripts/bump_version.py", version]
+    arguments = shlex.split(extra_args)
+    assert calls == [[commit, f"scripts/{script}", *arguments]]
 
     spec = importlib.util.spec_from_file_location(
         script.removesuffix(".py"), ROOT / "scripts" / script
@@ -92,12 +84,4 @@ def test_docker_wheel_arguments(
     spec.loader.exec_module(module)
     parser = ArgumentParser()
     module.add_arguments(parser)
-    parsed = parser.parse_args(arguments)
-    if expected is None:
-        assert arguments == original
-    else:
-        version_file = tmp_path / "tensorrt_llm/version.py"
-        version_file.parent.mkdir()
-        version_file.write_text('__version__ = "1.4.0a0"\n')
-        module.apply_version_override(tmp_path, parsed.version_override)
-        assert version_file.read_text() == f'__version__ = "{expected}"\n'
+    parser.parse_args(arguments)

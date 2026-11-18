@@ -62,6 +62,9 @@ def server(model_name: str, temp_extra_llm_api_options_file: str):
     elif model_name == "zai-org/GLM-5-FP8":
         model_path = get_model_path("GLM-5-FP8")
 
+    else:
+        raise ValueError(f"Unsupported model: {model_name}")
+
     args = [
         "--max_batch_size=8", "--max_seq_len=4096", "--max_num_tokens=4096",
         f"--extra_llm_api_options={temp_extra_llm_api_options_file}"

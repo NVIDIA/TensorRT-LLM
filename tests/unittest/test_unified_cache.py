@@ -129,6 +129,33 @@ def test_prepare_environment_configures_cache_first(monkeypatch: pytest.MonkeyPa
     assert calls == ["cache", "dll", "python", "triton"]
 
 
+def test_prepare_environment_keeps_inductor_compile_pool_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(_bootstrap._INDUCTOR_QUIESCE_POOL_ENV, raising=False)
+    for name in (
+        "_setup_unified_cache",
+        "_add_trt_llm_dll_directory",
+        "_preload_python_lib",
+        "_setup_vendored_triton_kernels",
+    ):
+        monkeypatch.setattr(_bootstrap, name, lambda: None)
+
+    _bootstrap._prepare_environment()
+
+    assert os.environ[_bootstrap._INDUCTOR_QUIESCE_POOL_ENV] == "0"
+
+
+def test_explicit_inductor_compile_pool_quiesce_setting_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_bootstrap._INDUCTOR_QUIESCE_POOL_ENV, "1")
+
+    _bootstrap._keep_inductor_compile_pool_alive()
+
+    assert os.environ[_bootstrap._INDUCTOR_QUIESCE_POOL_ENV] == "1"
+
+
 def test_mpi_pool_environment_forwards_unified_cache_variables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

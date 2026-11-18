@@ -15,12 +15,14 @@
 
 import weakref
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, ClassVar, Optional, final
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -37,14 +39,32 @@ class FmhaPhase(str, Enum):
     GENERATION = "generation"
 
 
+@dataclass(frozen=True)
+class FmhaPrewarmConfig:
+    """Resolved static inputs for optional FMHA module initialization."""
+
+    dtype: torch.dtype
+    kv_cache_dtype: DataType
+    tokens_per_block: int
+    extra_tokens_per_block: frozenset[int] = frozenset()
+    context: bool = True
+    generation: bool = True
+    helix: bool = False
+
+
 class Fmha(ABC):
     """Common runtime contract for TRT-LLM attention FMHA libraries."""
 
     supports_skip_correction: ClassVar[bool] = False
     supports_block_sparse_inputs: ClassVar[bool] = False
     supports_per_tensor_fp8: ClassVar[bool] = False
+    supports_vc_attention: ClassVar[bool] = False
     supports_workspace_reclamation: bool = False
     supports_fp4_mla: ClassVar[bool] = False
+    # Serves a generation call whose QK-norm / RoPE / KV-append prologue the attention module deferred to the
+    # library (``AttentionForwardArgs.kv_append.fold``): the query input is then the raw QKV projection.
+    supports_deferred_prologue: ClassVar[bool] = False
+    supports_variable_window: ClassVar[bool] = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
@@ -55,6 +75,14 @@ class Fmha(ABC):
         if attn is None:
             raise RuntimeError("The owning TrtllmAttention instance has been garbage collected.")
         return attn
+
+    def can_prewarm(self, config: FmhaPrewarmConfig) -> bool:
+        """Whether this layer can use the optional module built by ``prewarm``."""
+        return False
+
+    @staticmethod
+    def prewarm() -> None:
+        """Initialize a library-wide JIT module; libraries without one do nothing."""
 
     @classmethod
     @final
@@ -125,6 +153,23 @@ class Fmha(ABC):
             or getattr(forward_args, "v_fp8_per_tensor", False)
         ) and not self.supports_per_tensor_fp8:
             logger.debug(f"{type(self).__name__} does not support per-tensor FP8 recipes.")
+            return False
+        if (
+            forward_args.kv_append is not None
+            and forward_args.kv_append.fold is not None
+            and not self.supports_deferred_prologue
+        ):
+            logger.debug(f"{type(self).__name__} does not run a deferred attention prologue.")
+            return False
+        if getattr(forward_args, "vc_attention", False) and not self.supports_vc_attention:
+            logger.debug(f"{type(self).__name__} does not support VC-Attention.")
+            return False
+        has_variable_window = (
+            forward_args.variable_window_token_starts is not None
+            or forward_args.variable_window_token_ends is not None
+        )
+        if has_variable_window and not self.supports_variable_window:
+            logger.debug(f"{type(self).__name__} does not support variable-window attention.")
             return False
         return self._is_supported(q, k, v, metadata, forward_args, phase=phase)
 

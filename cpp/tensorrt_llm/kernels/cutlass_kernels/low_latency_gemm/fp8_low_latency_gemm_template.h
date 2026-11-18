@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -236,7 +236,7 @@ size_t genericFp8LowLatencyGemmKernelLauncherSm90(__nv_fp8_e4m3 const* A, __nv_f
 #else  // COMPILE_HOPPER_TMA_GEMMS
     throw std::runtime_error(
         "[TensorRT LLM Error][genericFp8LowLatencyGemmKernelLauncherSm90] Please recompile with support for hopper by "
-        "passing 90-real as an arch to build_wheel.py.");
+        "passing 90 as an arch to build_wheel.py.");
 #endif // COMPILE_HOPPER_TMA_GEMMS
 }
 

@@ -63,7 +63,7 @@ def test_fingerprint_keeps_only_last_definition_of_a_key(build_wheel):
 
 
 def test_fingerprint_changes_when_an_argument_changes(build_wheel):
-    base = ["-DCMAKE_CUDA_ARCHITECTURES=100-real"]
+    base = ["-DCMAKE_CUDA_ARCHITECTURES=100"]
     with_nvrtc = base + ["-DNVRTC_DYNAMIC_LINKING=ON"]
     assert build_wheel.configure_args_fingerprint(base) != build_wheel.configure_args_fingerprint(
         with_nvrtc

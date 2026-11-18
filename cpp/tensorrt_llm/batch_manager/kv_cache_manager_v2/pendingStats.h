@@ -307,7 +307,7 @@ public:
         }
         auto& count = mCachedTokensByLevel.at(level);
         TLLM_CHECK_DEBUG(maxTokens >= 0);
-        count = std::min(count, std::max(int64_t{0}, maxTokens));
+        count = std::min(count, maxTokens);
     }
 
     [[nodiscard]] CountsByLevel const& cachedTokensByLevel() const noexcept
@@ -337,7 +337,7 @@ private:
     static PendingStatsDelta allocationDelta(
         PendingAllocationSegment const& segment, BlockOrdinal blockBegin, BlockOrdinal blockEnd)
     {
-        int64_t const numBlocks = static_cast<int64_t>(std::max(0, blockEnd - blockBegin)) * segment.beamWidth;
+        int64_t const numBlocks = static_cast<int64_t>(blockEnd - blockBegin) * segment.beamWidth;
         int64_t const missedBlocks = segment.countAsMissed ? numBlocks : 0;
         int64_t const connectorReusedBlocks = segment.countAsConnectorReused ? numBlocks : 0;
         PendingStatsDelta delta;

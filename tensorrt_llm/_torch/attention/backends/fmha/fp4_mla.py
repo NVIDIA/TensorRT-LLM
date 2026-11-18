@@ -112,10 +112,16 @@ class Fp4MlaFmha(PhasedFmha):
         state = metadata.fp4_mla_state
         if state is None or state.hp_pool is None:
             raise RuntimeError("FP4 MLA requires prepared high-precision KV state.")
-        if state.v_scale_pool is None:
-            raise RuntimeError("FP4 MLA requires the V-scale pool.")
-
         attention_input_type = forward_args.attention_input_type
+        context_only_cache = (
+            getattr(metadata.kv_cache_manager, "fp4_mla_context_only_cache", False) is True
+        )
+        if state.v_scale_pool is None and not (
+            context_only_cache and attention_input_type == AttentionInputType.context_only
+        ):
+            # Only a disaggregated context worker omits the V scales, and it
+            # runs context attention only.
+            raise RuntimeError("FP4 MLA requires the V-scale pool.")
         if attention_input_type == AttentionInputType.context_only:
             if k is None or v is None:
                 raise RuntimeError("FP4 MLA context requires expanded K and V tensors.")
@@ -163,9 +169,14 @@ class Fp4MlaFmha(PhasedFmha):
             setattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, scratch)
         else:
             assert isinstance(scratch, _Fp8MlaContextScratch)
-            assert scratch.matches(metadata, device=q.device, head_dim=scratch_head_dim), (
-                "FP8 MLA context scratch geometry must be shared by all layers of its KV manager."
-            )
+            # The step's FP8 metadata view is built only after this check, so a
+            # view of this scratch means an earlier layer already passed it.
+            fp8_context_state = metadata.fp4_mla_state.fp8_context_state
+            if fp8_context_state is None or fp8_context_state[0] is not scratch:
+                assert scratch.matches(metadata, device=q.device, head_dim=scratch_head_dim), (
+                    "FP8 MLA context scratch geometry must be shared by all layers of its "
+                    "KV manager."
+                )
 
         fp8_attention = self._fp8_attention
         if fp8_attention is None:

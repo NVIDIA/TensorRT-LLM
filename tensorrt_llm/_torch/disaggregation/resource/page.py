@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import FrozenSet, List, Optional, Tuple
+from typing import FrozenSet, List, Literal, Optional, Tuple
 
 import numpy as np
 
@@ -89,11 +89,15 @@ class RoleLayout:
     ``section_bytes`` describes a SECTIONED role (one entry per section, in
     slot order); ``bytes_per_head`` describes an INDEXED role whose head
     count is not derivable from ``RankInfo.attention`` (recurrent SSM state).
-    Roles with neither need no geometry (REPLICATED, attention K/V).
+    ``ring_slot_bytes`` describes a REPLICATED role whose per-layer region is
+    a ring of token slots addressed by global token position modulo the slot
+    count (see :attr:`PoolView.ring_slot_bytes`). Roles with none of these need
+    no geometry (plain REPLICATED, attention K/V).
     """
 
     section_bytes: Optional[Tuple[int, ...]] = None
     bytes_per_head: Optional[int] = None
+    ring_slot_bytes: Optional[int] = None
 
 
 @dataclass
@@ -103,14 +107,19 @@ class PhysicalPool:
     ``slot_bytes`` spans all layers and roles coalesced into one slot.
     The slot address is ``base_address + slot * slot_stride_bytes``;
     per-layer and per-role offsets are carried by each PoolView.
+    ``memory_type`` describes the backing allocation, including the host hot
+    tier for sparse buffers, independently of the logical layer layout.
     """
 
     base_address: int  # uint64
     slot_bytes: int
     num_slots: int
     slot_stride_bytes: Optional[int] = None
+    memory_type: Literal["VRAM", "DRAM"] = "VRAM"
 
     def __post_init__(self) -> None:
+        if self.memory_type not in ("VRAM", "DRAM"):
+            raise ValueError(f"Unsupported KV pool memory type: {self.memory_type!r}")
         if self.slot_stride_bytes is None:
             self.slot_stride_bytes = self.slot_bytes
         if self.slot_stride_bytes < self.slot_bytes:
@@ -122,6 +131,7 @@ class PhysicalPool:
             "slot_bytes": int(self.slot_bytes),
             "num_slots": int(self.num_slots),
             "slot_stride_bytes": int(self.slot_stride_bytes),
+            "memory_type": self.memory_type,
         }
 
     @staticmethod
@@ -135,6 +145,7 @@ class PhysicalPool:
                 if data.get("slot_stride_bytes") is not None
                 else None
             ),
+            memory_type=data.get("memory_type", "VRAM"),
         )
 
 
@@ -201,7 +212,19 @@ class PoolView:
         bytes_per_head: INDEXED views whose head count is not derivable from
             ``RankInfo.attention`` (recurrent SSM state). ``bytes_per_layer //
             bytes_per_head`` is the per-rank head count. Attention K/V leaves
-            it ``None`` and uses ``kv_heads_per_rank`` instead.
+            it ``None``; its head count is ``num_kv_heads``.
+        num_kv_heads: Attention K/V views only. Per-rank KV-head count shared
+            by every layer of the view, so views of one rank (e.g. target and
+            draft layers) may shard or replicate heads differently. Required
+            for head-sharded attention views; ``None`` for replicated and
+            recurrent-state views, which do not use attention head counts.
+        ring_slot_bytes: REPLICATED views only. When set, each layer's region
+            is a ring of ``bytes_per_layer // ring_slot_bytes`` token slots,
+            and the token at global position ``p`` lives in slot
+            ``p % num_slots`` of the ring in the page that holds ``p``. The two
+            sides may size their rings differently, so the transfer moves the
+            positions both rings retain slot by slot instead of copying the
+            region verbatim.
     """
 
     pool_idx: int
@@ -211,6 +234,8 @@ class PoolView:
     bytes_per_layer: Optional[int] = None
     section_bytes: Optional[List[int]] = None
     bytes_per_head: Optional[int] = None
+    ring_slot_bytes: Optional[int] = None
+    num_kv_heads: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -226,6 +251,10 @@ class PoolView:
             ),
             "bytes_per_head": (
                 int(self.bytes_per_head) if self.bytes_per_head is not None else None
+            ),
+            "num_kv_heads": int(self.num_kv_heads) if self.num_kv_heads is not None else None,
+            "ring_slot_bytes": (
+                int(self.ring_slot_bytes) if self.ring_slot_bytes is not None else None
             ),
         }
 
@@ -252,6 +281,12 @@ class PoolView:
             ),
             bytes_per_head=(
                 int(data["bytes_per_head"]) if data.get("bytes_per_head") is not None else None
+            ),
+            num_kv_heads=(
+                int(data["num_kv_heads"]) if data.get("num_kv_heads") is not None else None
+            ),
+            ring_slot_bytes=(
+                int(data["ring_slot_bytes"]) if data.get("ring_slot_bytes") is not None else None
             ),
         )
 
@@ -370,6 +405,11 @@ class KVCachePageTable:
     tokens_per_block: int
     layer_groups: List[LayerGroup]
     pool_groups: List[PhysicalPoolGroup]  # indexed by LayerGroup.pool_group_idx
+
+    @property
+    def has_host_pools(self) -> bool:
+        """Whether any transferable allocation is backed by host memory."""
+        return any(pool.memory_type == "DRAM" for group in self.pool_groups for pool in group.pools)
 
     def to_dict(self) -> dict:
         return {
