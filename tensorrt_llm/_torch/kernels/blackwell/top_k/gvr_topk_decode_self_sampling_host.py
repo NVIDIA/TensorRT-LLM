@@ -2070,9 +2070,9 @@ def _varlen_cache_for(dtype: torch.dtype) -> dict:
     return _VARLEN_CACHE
 
 
-# With wide_cta_rows (caller opt-in), varlen decode batches of this many rows whose plan is the
-# non-split gvr_main with 512-thread CTAs (two per SM) run it as one 1,024-thread CTA per row: twice
-# the loads in flight per row, so the batch's longest rows finish sooner. Same exact Top-K.
+# With wide_cta_rows (caller opt-in), varlen decode batches of this many rows can run the
+# non-split gvr_main as one 1,024-thread CTA per row: twice the loads in flight per row.
+# Rubin's shorter envelopes retain the sampling slab. Same exact Top-K.
 _WIDE_CTA_ROWS = (149, 296)
 
 
@@ -3519,7 +3519,15 @@ def _varlen_launcher(
                 if 2048 < n4 <= 3072 or (num_rows <= 6 * num_sms and 1536 < n4 <= 2048):
                     tpl = (256, 4, 4, tpl[3], 2, False, False)
             wide_min, wide_max = _WIDE_CTA_ROWS
-            if wide_cta_rows and wide_min <= num_rows <= wide_max and tpl[0] < 1024 and not tpl[5]:
+            if (
+                wide_cta_rows
+                and wide_min <= num_rows <= wide_max
+                and tpl[0] < 1024
+                and not tpl[5]
+                # The 1,024-thread slab skips sampling up to 16K columns for K <= 1,024.
+                # Rubin keeps the sampling slab for those shorter envelopes.
+                and (sm_version != 107 or k > 1024 or n_kernel > 16384)
+            ):
                 kpt = 1 if k <= 1024 else (2 if k <= 2048 else (4 if k <= 4096 else 8))
                 tpl = (1024, tpl[1], 1, tpl[3], kpt, tpl[5], tpl[6])
             main_options.update(
@@ -4228,9 +4236,10 @@ def run_varlen(
     ``deterministic=True`` selects the deterministic kernels (fixed selected set — ties broken by the
     smaller index — and a fixed per-route output order); ``sorting="ascending"`` additionally sorts
     every row (requires deterministic). The default path is the original kernel, unchanged.
-    ``wide_cta_rows=True`` runs the non-split gvr_main plan of ``_WIDE_CTA_ROWS``-row batches with
-    1,024-thread CTAs. FP32 only: ``pdl`` (see ``_varlen_launcher``), ``r_cap`` (see ``route``) and
-    ``finalize`` (CSA2's paged finalize, run by a clus launch that then sets ``finalize["done"]``).
+    ``wide_cta_rows=True`` opts non-split gvr_main plans of ``_WIDE_CTA_ROWS``-row batches into
+    1,024-thread CTAs; Rubin retains the sampling slab for envelopes <= 16K at K <= 1,024.
+    FP32 only: ``pdl`` (see ``_varlen_launcher``), ``r_cap`` (see ``route``) and ``finalize``
+    (CSA2's paged finalize, run by a clus launch that then sets ``finalize["done"]``).
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
