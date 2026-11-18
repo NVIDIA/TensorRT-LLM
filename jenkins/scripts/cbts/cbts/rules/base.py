@@ -42,7 +42,7 @@ def format_reason(reason: object) -> str:
 
 @dataclass
 class PRInputs:
-    """PR data, with executable selection diffs and verified docstring facts.
+    """PR data, with executable diffs and verified docstring/formatting facts.
 
     ``raw_diffs`` preserves source reconstruction input. ``post_merge``
     reflects /bot run --post-merge.
@@ -55,6 +55,7 @@ class PRInputs:
     # Documentation contributions can coexist with executable edits in one file.
     docstring_files: set[str] = field(default_factory=set)
     docstring_only_files: set[str] = field(default_factory=set)
+    formatting_only_files: set[str] = field(default_factory=set)
 
 
 @dataclass

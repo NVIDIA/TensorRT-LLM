@@ -1,4 +1,6 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/94e1251131ca27260cb0e8938aeb7b4a4e630b19/python/sglang/srt/function_call/deepseekv3_detector.py
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import json
 import re
 from typing import List
@@ -126,8 +128,10 @@ class DeepSeekV3Parser(BaseToolParser):
 
         calls: list[ToolCallItem] = []
         try:
+            # Lazy groups keep the match within the first call of the buffer; a
+            # later call is matched once this one is reported and removed.
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
+                pattern=r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```.*",
                 string=current_text,
                 flags=re.DOTALL,
             )

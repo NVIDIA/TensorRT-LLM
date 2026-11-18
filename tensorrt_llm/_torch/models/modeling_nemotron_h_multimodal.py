@@ -667,6 +667,7 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         self.vision_model = RADIOVisionModel(
             vision_model_config,
             disable_quantization=True,
+            vision_attn_backend=model_config.get_encoder_attention_backend("vision", "FLASHINFER"),
             encoder_cuda_graph_config=encoder_cuda_graph_config,
         )
 
@@ -1151,6 +1152,13 @@ class NemotronHMultimodalInputProcessor(
     BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder
 ):
     supports_token_id_mm_expansion: ClassVar[bool] = True
+
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        modalities = super().supported_modalities
+        if getattr(self, "_audio_extractor", None) is None:
+            return modalities - {"audio"}
+        return modalities
 
     def get_mm_item_metadata(
         self,
@@ -2895,6 +2903,11 @@ _NEMOTRON_H_MM_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
     placeholder_metadata=_NEMOTRON_H_MM_PLACEHOLDER_METADATA,
 )
 class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedModel):
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"}),
+        "audio": frozenset(),  # Parakeet uses fixed relative-position SDPA.
+    }
+
     _supports_flash_attn = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
 

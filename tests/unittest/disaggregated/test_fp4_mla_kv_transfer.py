@@ -58,7 +58,14 @@ def _requires_fp4_mla_backend(backend: str) -> None:
         pytest.skip("The CuTeDSL FP4 MLA backend requires SM107 and nvidia-cutlass-dsl")
 
 
-def _create_managers(tp: int, pp: int, enable_dp: bool) -> list[Fp4MlaKVCacheManagerV2]:
+def _create_managers(
+    tp: int,
+    pp: int,
+    enable_dp: bool,
+    *,
+    speculative: bool = True,
+    max_draft_len: int = MAX_DRAFT_LEN,
+) -> list[Fp4MlaKVCacheManagerV2]:
     return [
         Fp4MlaKVCacheManagerV2(
             KvCacheConfig(
@@ -82,13 +89,29 @@ def _create_managers(tp: int, pp: int, enable_dp: bool) -> list[Fp4MlaKVCacheMan
                 enable_attention_dp=enable_dp,
             ),
             dtype=DataType.NVFP4,
-            spec_config=MTPDecodingConfig(max_draft_len=MAX_DRAFT_LEN),
+            spec_config=MTPDecodingConfig(max_draft_len=max_draft_len) if speculative else None,
             max_num_tokens=MAX_TOKENS,
             pretrained_config=SimpleNamespace(kv_lora_rank=KV_LORA_RANK),
             is_disagg=True,
         )
         for rank in range(tp * pp)
     ]
+
+
+def _context_without_speculation() -> transfer_harness.ManagerFactory:
+    """Build the context side without speculative decoding, the generation side with it.
+
+    The harness creates the context managers first. Without draft tokens the
+    context worker keeps a 16-slot HP ring, while the generation worker reserves
+    ``MAX_DRAFT_LEN`` more slots for rewind.
+    """
+    calls = []
+
+    def factory(tp: int, pp: int, enable_dp: bool) -> list[Fp4MlaKVCacheManagerV2]:
+        calls.append((tp, pp, enable_dp))
+        return _create_managers(tp, pp, enable_dp, speculative=len(calls) > 1)
+
+    return factory
 
 
 def _initialize_cache(
@@ -198,6 +221,9 @@ def _verify_cache(
 ) -> None:
     del ctx_pp, gen_pp
     torch.cuda.synchronize()
+    # A generation worker with MTP also caches the draft layers, which a
+    # context worker without speculation neither holds nor sends.
+    ctx_layers = {layer_idx for manager in ctx_managers for layer_idx in manager.pp_layers}
 
     # Transferred roles arrive byte-exact; derived sidecars stay local.
     for req_idx, prompt_len in enumerate(request_lengths):
@@ -206,6 +232,8 @@ def _verify_cache(
                 continue
             gen_hp_pages = _hp_pages(gen_manager, gen_request_ids[req_idx], prompt_len)
             for layer_idx in gen_manager.pp_layers:
+                if layer_idx not in ctx_layers:
+                    continue
                 ctx_manager = _find_ctx_manager(
                     ctx_managers,
                     ctx_tp=ctx_tp,
@@ -234,22 +262,39 @@ def _verify_cache(
                 ctx_hp_pages = _hp_pages(ctx_manager, ctx_request_ids[req_idx], prompt_len)
                 # The HP window always covers the last prompt block.
                 assert gen_hp_pages[-1] >= 0 and ctx_hp_pages[-1] >= 0
-                gen_hp = gen_manager.get_fp4_mla_hp_pool()
-                ctx_hp = ctx_manager.get_fp4_mla_hp_pool()
-                for gen_page, ctx_page in zip(gen_hp_pages, ctx_hp_pages):
-                    if gen_page < 0 or ctx_page < 0:
-                        continue
-                    assert torch.equal(
-                        gen_hp[gen_page, gen_layer].view(torch.uint8),
-                        ctx_hp[ctx_page, ctx_layer].view(torch.uint8),
-                    )
+                # Each ring holds global position p at slot p % ring_size of the
+                # page holding p; the two sides may size their rings
+                # differently, so compare the positions both retain.
+                gen_slots = gen_manager.fp4_mla_hp_pool_size
+                ctx_slots = ctx_manager.fp4_mla_hp_pool_size
+                gen_hp = gen_manager.get_fp4_mla_hp_pool().view(torch.uint8)
+                ctx_hp = ctx_manager.get_fp4_mla_hp_pool().view(torch.uint8)
+                gen_ring = gen_hp[gen_hp_pages[-1], gen_layer, 0].view(gen_slots, -1)
+                ctx_ring = ctx_hp[ctx_hp_pages[-1], ctx_layer, 0].view(ctx_slots, -1)
+                last_page_start = (prompt_len - 1) // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
+                retained = range(
+                    max(last_page_start, prompt_len - min(gen_slots, ctx_slots)), prompt_len
+                )
+                assert len(retained) > 0
+                assert torch.equal(
+                    gen_ring[[p % gen_slots for p in retained]],
+                    ctx_ring[[p % ctx_slots for p in retained]],
+                )
 
     # Rebuilding the sidecars from the imported K and K scales reproduces what
-    # the context side derives from its own cache.
+    # the context side derives from its own cache. A single-copy context
+    # cache keeps no sidecars, so only the generation side rebuilds them, from
+    # the canonical bytes checked above.
+    ctx_context_only = any(manager.fp4_mla_context_only_cache for manager in ctx_managers)
     for managers, tp, enable_dp, request_ids in (
         (ctx_managers, ctx_tp, ctx_enable_dp, ctx_request_ids),
         (gen_managers, gen_tp, gen_enable_dp, gen_request_ids),
     ):
+        if ctx_context_only and managers is ctx_managers:
+            for manager in managers:
+                assert manager.get_mla_v_scale_pool_base() is None
+                assert manager.get_mla_v_packed_pool_base() is None
+            continue
         for manager in managers:
             manager.get_mla_v_scale_pool_base().zero_()
             v_packed_base = manager.get_mla_v_packed_pool_base()
@@ -269,6 +314,8 @@ def _verify_cache(
             if not _handles_request(gen_manager, gen_tp, gen_enable_dp, req_idx):
                 continue
             for layer_idx in gen_manager.pp_layers:
+                if layer_idx not in ctx_layers:
+                    continue
                 ctx_manager = _find_ctx_manager(
                     ctx_managers,
                     ctx_tp=ctx_tp,
@@ -286,12 +333,15 @@ def _verify_cache(
                 ctx_layer = _compact_layer(ctx_manager, layer_idx)
                 gen_v_scale = _v_scale_pages(gen_manager, gen_layer, gen_pages)
                 assert gen_v_scale.any()
-                assert torch.equal(gen_v_scale, _v_scale_pages(ctx_manager, ctx_layer, ctx_pages))
                 gen_v_packed = _v_packed_pages(gen_manager, gen_layer, gen_pages)
+                if gen_v_packed is not None:
+                    assert gen_v_packed.any()
+                if ctx_context_only:
+                    continue
+                assert torch.equal(gen_v_scale, _v_scale_pages(ctx_manager, ctx_layer, ctx_pages))
                 ctx_v_packed = _v_packed_pages(ctx_manager, ctx_layer, ctx_pages)
                 assert (gen_v_packed is None) == (ctx_v_packed is None)
                 if gen_v_packed is not None:
-                    assert gen_v_packed.any()
                     assert torch.equal(gen_v_packed, ctx_v_packed)
 
 
@@ -305,6 +355,42 @@ TOPOLOGIES = [
     (1, 2, False, 1, 1, True, "tp1pp2_to_dep1"),
     (1, 1, True, 1, 2, False, "dep1_to_tp1pp2"),
 ]
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp",
+    [topology[:6] for topology in TOPOLOGIES[:3]],
+    ids=[topology[6] for topology in TOPOLOGIES[:3]],
+)
+def test_fp4_mla_kv_transfer_into_a_larger_hp_ring(
+    monkeypatch,
+    ctx_tp: int,
+    ctx_pp: int,
+    ctx_enable_dp: bool,
+    gen_tp: int,
+    gen_pp: int,
+    gen_enable_dp: bool,
+) -> None:
+    """A context worker without speculation feeds a generation worker with it.
+
+    The rings differ in size (16 vs ``16 + MAX_DRAFT_LEN`` slots), so the HP
+    tail has to move position by position instead of as one region.
+    """
+    _requires_fp4_mla_backend("triton")
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    transfer_harness.run_kv_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_enable_dp=gen_enable_dp,
+        update_before_transfer=True,
+        manager_factory=_context_without_speculation(),
+        init_fn=_initialize_cache,
+        verify_fn=_verify_cache,
+    )
 
 
 @pytest.mark.timeout(300)
@@ -344,3 +430,57 @@ def test_fp4_mla_kv_transfer(
         init_fn=_initialize_cache,
         verify_fn=_verify_cache,
     )
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("backend", ["triton", "cutedsl"])
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp",
+    [topology[:6] for topology in TOPOLOGIES],
+    ids=[topology[6] for topology in TOPOLOGIES],
+)
+def test_fp4_mla_kv_transfer_from_context_only_cache(
+    monkeypatch,
+    backend: str,
+    ctx_tp: int,
+    ctx_pp: int,
+    ctx_enable_dp: bool,
+    gen_tp: int,
+    gen_pp: int,
+    gen_enable_dp: bool,
+) -> None:
+    """A single-copy context cache with a one-token MTP drafter sends what a decoding cache sends.
+
+    A context worker drafts one token, so its drafter never decodes on the
+    single-copy cache. Its draft layer shares the one lifecycle of the target
+    layers, as on the generation worker, which drafts ``MAX_DRAFT_LEN``
+    tokens and so keeps a larger HP ring.
+    """
+    _requires_fp4_mla_backend(backend)
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
+    created_sides = []
+
+    def create_managers(tp: int, pp: int, enable_dp: bool) -> list[Fp4MlaKVCacheManagerV2]:
+        # The harness creates the context side first, then the generation side.
+        context_side = not created_sides
+        created_sides.append(context_side)
+        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context" if context_side else "generation")
+        managers = _create_managers(
+            tp, pp, enable_dp, max_draft_len=1 if context_side else MAX_DRAFT_LEN
+        )
+        assert all(manager.fp4_mla_context_only_cache == context_side for manager in managers)
+        return managers
+
+    transfer_harness.run_kv_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_enable_dp=gen_enable_dp,
+        update_before_transfer=True,
+        manager_factory=create_managers,
+        init_fn=_initialize_cache,
+        verify_fn=_verify_cache,
+    )
+    assert created_sides == [True, False]

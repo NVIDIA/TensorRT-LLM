@@ -36,16 +36,16 @@
 # Artifactory layout (override via env):
 #   <REPO>/<PREFIX>/<branch>/<triple>/bolt-profile-<ref>-<triple>.tar.gz
 #   <REPO>/<PREFIX>/<branch>/<triple>/latest.tar.gz
-# Defaults match the repo used by jenkins/Build.groovy (sw-tensorrt-generic).
+# Defaults match the BOLT profile store on urm.nvidia.com (sw-tensorrt-generic),
+# which jenkins/BoltProfileGen.groovy promotes to (PROFILE_PROMOTE_DIR).
 #
 # Auth:
 #   promote     -> `jf` (JFrog) CLI (write). If JF_URL + JF_ACCESS_TOKEN are set
 #                  this configures jf automatically; else assumes jf is
 #                  preconfigured. (The CI postmerge path in BoltProfileGen.groovy
 #                  instead uploads cluster-side via curl + urm-artifactory-creds.)
-#   pull-latest -> anonymous curl (read), matching Build.groovy's tarball
-#                  download from the same repo; needs no creds and no jf, so it
-#                  runs in the premerge build pod as-is.
+#   pull-latest -> anonymous curl or wget (read) from the profile store on urm;
+#                  needs no creds and no jf, so it runs in a build pod as-is.
 
 set -euo pipefail
 
@@ -185,9 +185,8 @@ cmd_pull_latest() {
     fi
     mkdir -p "$dest"
     log "Pulling $url -> $dest"
-    # Anonymous download (like jenkins/Build.groovy's tarball from the same
-    # sw-tensorrt-generic repo): the read path needs no creds, so this works in the
-    # build pod without a configured `jf`. Use curl if present, else fall back to
+    # Anonymous download: reading the profile store needs no creds, so this works in
+    # a build pod without a configured `jf`. Use curl if present, else fall back to
     # wget -- the image-overlay build pod (BuildDockerImage.overlayBoltBundle) has no
     # curl, so hard-requiring curl made the overlay fail (curl: command not found)
     # even though the bundle existed. --retry rides out flaky links; a missing object

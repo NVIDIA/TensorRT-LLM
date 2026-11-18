@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <map>
 #include <numeric>
+#include <ranges>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -80,13 +81,17 @@ template <typename T>
 
 // Extract an attribute from the first element and assert (debug) all elements agree.
 // Mirrors Python's get_uniform_attribute(_utils.py:202).
+//
+// Takes the range by forwarding reference so an adapted view may be passed: a
+// filter_view's begin() is not const-qualified, so a const reference to one cannot
+// be iterated.
 template <typename Range, typename Func>
-[[nodiscard]] auto getUniformAttribute(Range const& range, Func&& func) -> decltype(func(*range.begin()))
+[[nodiscard]] auto getUniformAttribute(Range&& range, Func&& func) -> decltype(func(*std::ranges::begin(range)))
 {
-    auto it = range.begin();
-    TLLM_CHECK_DEBUG(it != range.end());
+    auto it = std::ranges::begin(range);
+    TLLM_CHECK_DEBUG(it != std::ranges::end(range));
     auto result = func(*it);
-    TLLM_CHECK_DEBUG(std::all_of(range.begin(), range.end(), [&](auto const& item) { return func(item) == result; }));
+    TLLM_CHECK_DEBUG(std::ranges::all_of(range, [&](auto const& item) { return func(item) == result; }));
     return result;
 }
 

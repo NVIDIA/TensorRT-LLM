@@ -50,7 +50,7 @@ struct RefOutputs
 
 RefOutputs cpuReference(std::vector<int32_t> const& ranks, std::vector<int64_t> const& ptrs, int64_t input_base,
     int64_t lowrank_workspace, int64_t output_base, int64_t in_hidden_size, int64_t out_hidden_size,
-    int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices)
+    int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices, int64_t output_dtype_bytes)
 {
     int64_t const P = static_cast<int64_t>(ranks.size());
     RefOutputs r;
@@ -80,7 +80,7 @@ RefOutputs cpuReference(std::vector<int32_t> const& ranks, std::vector<int64_t> 
 
         int64_t const in_row_stride = in_hidden_size * dtype_bytes;
         int64_t const work_row_stride = max_lora_rank * dtype_bytes;
-        int64_t const out_row_stride = out_hidden_size * dtype_bytes;
+        int64_t const out_row_stride = out_hidden_size * output_dtype_bytes;
 
         r.a_ptrs_in[i] = input_base + i * in_row_stride;
         r.b_ptrs_in[i] = ptrs[2 * i + 0];
@@ -173,11 +173,12 @@ protected:
     // sentinel thread); the splitk_offsets comparison is then skipped.
     void runAndCompare(std::vector<int32_t> const& ranks, std::vector<int64_t> const& ptrs, int64_t input_base,
         int64_t lowrank_workspace, int64_t output_base, int64_t in_hidden_size, int64_t out_hidden_size,
-        int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices, bool with_splitk = true)
+        int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices, int64_t output_dtype_bytes,
+        bool with_splitk = true)
     {
         auto const P = static_cast<int64_t>(ranks.size());
         RefOutputs ref = cpuReference(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size,
-            out_hidden_size, max_lora_rank, dtype_bytes, splitk_slices);
+            out_hidden_size, max_lora_rank, dtype_bytes, splitk_slices, output_dtype_bytes);
 
         int32_t* ranks_dev = upload(ranks);
         int64_t* ptrs_dev = upload(ptrs);
@@ -201,7 +202,7 @@ protected:
 
         launchMoeLoraProblemBuilder(ranks_dev, ptrs_dev, reinterpret_cast<void const*>(input_base),
             reinterpret_cast<void*>(lowrank_workspace), reinterpret_cast<void*>(output_base), P, in_hidden_size,
-            out_hidden_size, max_lora_rank, dtype_bytes, splitk_slices, out, mStream);
+            out_hidden_size, max_lora_rank, dtype_bytes, splitk_slices, out, mStream, output_dtype_bytes);
         TLLM_CUDA_CHECK(cudaStreamSynchronize(mStream));
 
         // Compare device outputs to host reference.
@@ -280,7 +281,22 @@ TEST_F(MoeLoraProblemBuilderTest, Bf16Smoke)
     }
 
     runAndCompare(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size, out_hidden_size,
-        max_lora_rank, dtype_bytes, splitk_slices);
+        max_lora_rank, dtype_bytes, splitk_slices, dtype_bytes);
+}
+
+TEST_F(MoeLoraProblemBuilderTest, Fp8InputWithBf16OutputStrides)
+{
+    std::vector<int32_t> const ranks = {16, 0, 32};
+    std::vector<int64_t> ptrs;
+    for (int32_t i = 0; i < static_cast<int32_t>(ranks.size()); ++i)
+    {
+        ptrs.push_back(fakeAdapter(1, i, 0));
+        ptrs.push_back(fakeAdapter(1, i, 1));
+    }
+    // Input and low-rank rows are one byte per element; output rows are two.
+    runAndCompare(ranks, ptrs, 0x1'0000'0000LL, 0x2'0000'0000LL, 0x3'0000'0000LL,
+        /*in_hidden_size=*/128, /*out_hidden_size=*/256, /*max_lora_rank=*/32,
+        /*dtype_bytes=*/1, /*splitk_slices=*/1, /*output_dtype_bytes=*/2, /*with_splitk=*/false);
 }
 
 TEST_F(MoeLoraProblemBuilderTest, Fp32StrideBytes)
@@ -304,7 +320,7 @@ TEST_F(MoeLoraProblemBuilderTest, Fp32StrideBytes)
     }
 
     runAndCompare(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size, out_hidden_size,
-        max_lora_rank, dtype_bytes, splitk_slices);
+        max_lora_rank, dtype_bytes, splitk_slices, dtype_bytes);
 }
 
 // Cover an empty call (no-op) and a single-token call (smallest live case)
@@ -326,7 +342,7 @@ TEST_F(MoeLoraProblemBuilderTest, BoundaryCases)
         launchMoeLoraProblemBuilder(nullptr, nullptr, reinterpret_cast<void const*>(input_base),
             reinterpret_cast<void*>(lowrank_workspace), reinterpret_cast<void*>(output_base),
             /*num_permuted_tokens=*/0, in_hidden_size, out_hidden_size, max_lora_rank, dtype_bytes, splitk_slices,
-            empty, mStream);
+            empty, mStream, dtype_bytes);
         TLLM_CUDA_CHECK(cudaStreamSynchronize(mStream));
     }
 
@@ -335,7 +351,7 @@ TEST_F(MoeLoraProblemBuilderTest, BoundaryCases)
         std::vector<int32_t> ranks = {3};
         std::vector<int64_t> ptrs = {fakeAdapter(3, 0, 0), fakeAdapter(3, 0, 1)};
         runAndCompare(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size, out_hidden_size,
-            max_lora_rank, dtype_bytes, splitk_slices);
+            max_lora_rank, dtype_bytes, splitk_slices, dtype_bytes);
     }
 }
 
@@ -363,7 +379,7 @@ TEST_F(MoeLoraProblemBuilderTest, NullSplitkOffsets)
     }
 
     runAndCompare(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size, out_hidden_size,
-        max_lora_rank, dtype_bytes, splitk_slices, /*with_splitk=*/false);
+        max_lora_rank, dtype_bytes, splitk_slices, dtype_bytes, /*with_splitk=*/false);
 }
 
 } // namespace

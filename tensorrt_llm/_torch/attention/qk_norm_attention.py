@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -28,7 +29,11 @@ from ..modules.rms_norm import RMSNorm
 from .attention import Attention
 from .backends.interface import PositionalEmbeddingParams
 from .kernels.fused_qk_norm_rope_gate import (fused_qkv_gemma_rmsnorm_rope_gate,
+                                              fused_sigmoid_mul_fp8,
                                               fused_sigmoid_mul_inplace)
+
+_QKV_ROPE_TILING_ENABLED = os.environ.get("TRTLLM_ENABLE_QKV_ROPE_TILING",
+                                          "0") == "1"
 
 
 # Move out from this class
@@ -143,6 +148,9 @@ class QKNormRoPEAttention(Attention):
     It is a subclass of Attention, and overrides the apply_rope method to apply QK norm and RoPE.
     """
 
+    # Prefill output gates write o_proj's E4M3 input (_output_gate_fp8_scale).
+    fp8_output_gate: bool = False
+
     def __init__(
         self,
         *,
@@ -167,6 +175,11 @@ class QKNormRoPEAttention(Attention):
         rope_fusion: Optional[bool] = True,
         mapping_with_cp: Optional[Mapping] = None,
         head_dim: Optional[int] = None,
+        use_gqa_decode_fmha: bool = False,
+        cache_context_plan: bool = False,
+        fp8_output_gate: bool = False,
+        context_fmha_head_dim_per_stage_kv: int = 0,
+        context_last_rows_only: bool = False,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -176,6 +189,7 @@ class QKNormRoPEAttention(Attention):
         # qk_norm_rope kernel via the use_gemma flag threaded through below.
         self.use_gemma_rms_norm = use_gemma_rms_norm
         self._fuse_qk_norm_rope_gate = False
+        self.fp8_output_gate = fp8_output_gate
 
         # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb
         # will be skipped in the overridden apply_rope. rope_fusion=None lets
@@ -205,6 +219,11 @@ class QKNormRoPEAttention(Attention):
             reduce_output=reduce_output,
             mapping_with_cp=mapping_with_cp,
             head_dim=head_dim,
+            use_gqa_decode_fmha=use_gqa_decode_fmha,
+            cache_context_plan=cache_context_plan,
+            context_fmha_head_dim_per_stage_kv=
+            context_fmha_head_dim_per_stage_kv,
+            context_last_rows_only=context_last_rows_only,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
@@ -267,39 +286,95 @@ class QKNormRoPEAttention(Attention):
         return (rotary_dim == rope.dim and rotary_dim > 0
                 and rotary_dim <= self.head_dim and rotary_dim % 2 == 0)
 
-    def preprocess_qkv(self, qkv, position_ids):
+    def preprocess_qkv(self, qkv, position_ids, attn_metadata=None):
         """Fuse gate split + gemma QK norm + RoPE into a single Triton kernel
-        when supported; otherwise fall back to the generic unfused path."""
+        when supported; otherwise fall back to the generic unfused path.
+
+        With attn_metadata (a GQA decode layer) and a generation-only step the
+        GQA decode library takes, the kernel also writes the FP8 query and
+        appends FP8 K / V, or the library's split-KV decode kernel runs it.
+        """
         if not self._can_use_fused_qk_norm_rope_gate(qkv, position_ids):
-            return super().preprocess_qkv(qkv, position_ids)
+            return super().preprocess_qkv(qkv, position_ids, attn_metadata)
         use_mrope = position_ids.dim() == 3
-        positions = position_ids.reshape(
-            3, -1) if use_mrope else position_ids.reshape(-1)
+        positions = (position_ids.reshape(3, -1)
+                     if use_mrope else position_ids.reshape(-1)).contiguous()
+        mrope_section = (tuple(self.pos_embd_params.mrope_section)
+                         if use_mrope else None)
+        gqa_decode = (self.attn.gqa_decode_fmha
+                      if attn_metadata is not None else None)
+        if gqa_decode is not None and qkv.dtype == torch.bfloat16:
+            plan = gqa_decode.kv_append_plan(attn_metadata, qkv.shape[0])
+            # The split-KV decode kernel runs the prologue itself when it takes
+            # the call; it always applies the gate, so the gate is offered.
+            if (plan is not None and self.attn_output_gate
+                    and self.sparse_attn_hooks is None):
+                plan.fold = gqa_decode.fold_inputs(
+                    plan, qkv, self.q_norm.weight, self.k_norm.weight,
+                    self.rotary_emb.rotary_cos_sin,
+                    positions, self.q_norm.variance_epsilon,
+                    self._get_qk_norm_rotary_dim(), mrope_section)
+            if plan is not None and plan.fold is not None:
+                num_tokens = qkv.shape[0]
+                packed = (self.num_heads +
+                          2 * self.num_key_value_heads) * self.head_dim
+                # The prologue is deferred: q is the raw projection, which the
+                # FMHA manager hands only to libraries declaring
+                # supports_deferred_prologue. The gate is the raw gate columns,
+                # as the prologue would copy them.
+                gate = qkv[:, :2 * self.q_size].view(
+                    num_tokens, self.num_heads,
+                    2 * self.head_dim)[:, :, self.head_dim:]
+                return qkv[:, :packed], None, None, gate, plan
+            if plan is not None:
+                qkv, gate = gqa_decode.run_prologue(
+                    plan, qkv, self.q_norm.weight, self.k_norm.weight,
+                    self.rotary_emb.rotary_cos_sin,
+                    positions, self.q_norm.variance_epsilon,
+                    self._get_qk_norm_rotary_dim(), mrope_section)
+                return qkv, None, None, gate, plan
         qkv, gate = fused_qkv_gemma_rmsnorm_rope_gate(
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
             self.rotary_emb.rotary_cos_sin,
-            positions.contiguous(),
+            positions,
             self.q_norm.variance_epsilon,
             self.num_heads,
             self.num_key_value_heads,
             self.head_dim,
             self._get_qk_norm_rotary_dim(),
-            tuple(self.pos_embd_params.mrope_section) if use_mrope else None,
+            mrope_section,
+            enable_tiling=_QKV_ROPE_TILING_ENABLED,
         )
-        return qkv, None, None, gate
+        return qkv, None, None, gate, None
 
-    def apply_output_gate(self, attention_output, gate):
+    def apply_output_gate(self, attention_output: torch.Tensor,
+                          gate: torch.Tensor) -> torch.Tensor:
         if (self._fuse_qk_norm_rope_gate and torch.version.hip is None
                 and attention_output.device.type == "cuda"
                 and attention_output.dim() == 2
                 and attention_output.stride(-1) == 1 and gate.dim() in (2, 3)
                 and gate.stride(-1) == 1
                 and gate.numel() == attention_output.numel()):
+            fp8_scale = self._output_gate_fp8_scale(attention_output)
+            if fp8_scale is not None:
+                return fused_sigmoid_mul_fp8(attention_output, gate, fp8_scale)
             fused_sigmoid_mul_inplace(attention_output, gate)
             return attention_output
         return super().apply_output_gate(attention_output, gate)
+
+    # With fp8_output_gate, calls of at least this many rows (prefill-sized) have the gate kernel write o_proj's
+    # E4M3 input where o_proj takes one (Linear.static_fp8_input_scale); smaller calls keep the BF16 gate.
+    _OUTPUT_GATE_FP8_MIN_TOKENS = 1024
+
+    def _output_gate_fp8_scale(
+            self, attention_output: torch.Tensor) -> Optional[torch.Tensor]:
+        rows = attention_output.shape[0]
+        if (not self.fp8_output_gate or rows < self._OUTPUT_GATE_FP8_MIN_TOKENS
+                or attention_output.dtype != torch.bfloat16):
+            return None
+        return self.o_proj.static_fp8_input_scale(rows)
 
     def apply_qk_norm(self, q, k):
 

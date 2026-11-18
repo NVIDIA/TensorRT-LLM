@@ -25,6 +25,7 @@ import click
 import yaml
 
 import tensorrt_llm.usage as usage
+from tensorrt_llm._startup_errors import classify_startup_error, llm_initialized, log_startup_error
 from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
 from tensorrt_llm.usage.schema import TerminationComponent
 
@@ -202,6 +203,9 @@ def run_with_terminal_reporting(
             termination_kind = "clean"
         else:
             termination_kind = "exception"
+            cause = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+            if cause is not None and not llm_initialized():
+                usage.record_startup_error_category(classify_startup_error(cause).category)
         report(
             usage.TerminalOutcome(
                 termination_kind=termination_kind,
@@ -222,7 +226,10 @@ def run_with_terminal_reporting(
             )
         )
         raise
-    except Exception:
+    except Exception as exc:
+        if not llm_initialized():
+            info = log_startup_error(exc, "Command failed") or classify_startup_error(exc)
+            usage.record_startup_error_category(info.category)
         signal_number = usage.get_observed_signal()
         report(
             usage.TerminalOutcome(

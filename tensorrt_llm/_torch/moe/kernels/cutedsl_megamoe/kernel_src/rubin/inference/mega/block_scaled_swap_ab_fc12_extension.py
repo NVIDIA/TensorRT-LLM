@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Rubin block-scaled SwapAB adapter between FC12 scheduling and kernel tensor views."""
 
 import dataclasses
@@ -15,6 +12,7 @@ from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 from .....helpers.dsl_helpers import spin_peek, spin_wait
 from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo, peek_ready_bit
+
 
 TensorRole = Literal["a", "b", "sfa", "sfb", "c", "sfc", "topk"]
 
@@ -37,6 +35,11 @@ class BlockScaledSwapAbFc12Extension:
     # Which expert holds each slot the scheduler enumerates. Absent when the
     # scheduler walks experts directly, in which case a slot is an expert.
     expert_remap: Optional[cute.Tensor] = None
+    # n_split: expert e's weights and scales sit at half * E + e (half = tile_m_idx // half_cta_tiles of its phase).
+    n_split: bool = False
+    local_expert_count: int = 0
+    fc1_half_cta_tiles: int = 0
+    fc2_half_cta_tiles: int = 0
 
     def __post_init__(self) -> None:
         if self.sf_vec_size <= 0:
@@ -59,18 +62,14 @@ class BlockScaledSwapAbFc12Extension:
         def rebuild(field):
             nonlocal value_index
             field_value_count = len(extract_mlir_values(field))
-            result = new_from_mlir_values(
-                field, values[value_index : value_index + field_value_count]
-            )
+            result = new_from_mlir_values(field, values[value_index : value_index + field_value_count])
             value_index += field_value_count
             return result
 
         fc1_done_counter_pointer = rebuild(self.fc1_done_counter_pointer)
         fc2_spin_threshold = rebuild(self.fc2_spin_threshold)
         fc1_ready_counter_pointer = (
-            rebuild(self.fc1_ready_counter_pointer)
-            if self.fc1_ready_counter_pointer is not None
-            else None
+            rebuild(self.fc1_ready_counter_pointer) if self.fc1_ready_counter_pointer is not None else None
         )
         expert_remap = rebuild(self.expert_remap) if self.expert_remap is not None else None
         if value_index != len(values):
@@ -83,7 +82,34 @@ class BlockScaledSwapAbFc12Extension:
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=fc1_ready_counter_pointer,
             expert_remap=expert_remap,
+            n_split=self.n_split,
+            local_expert_count=self.local_expert_count,
+            fc1_half_cta_tiles=self.fc1_half_cta_tiles,
+            fc2_half_cta_tiles=self.fc2_half_cta_tiles,
         )
+
+    @cute.jit
+    def _half_cta_tiles(self, work_tile: SwapAbFc12WorkTileInfo) -> Int32:
+        half_cta_tiles = Int32(self.fc2_half_cta_tiles)
+        if work_tile.phase == Int32(BlockPhase.Linear1):
+            half_cta_tiles = Int32(self.fc1_half_cta_tiles)
+        return half_cta_tiles
+
+    @cute.jit
+    def weight_half(self, work_tile: SwapAbFc12WorkTileInfo) -> Int32:
+        """Die-major half (0 / 1) holding this tile's weight rows; 0 unless n_split."""
+        half = Int32(0)
+        if cutlass.const_expr(self.n_split):
+            half = work_tile.tile_m_idx // self._half_cta_tiles(work_tile)
+        return half
+
+    @cute.jit
+    def local_tile_m(self, work_tile: SwapAbFc12WorkTileInfo) -> Int32:
+        """Weight-row CTA tile index inside the die-major half (== tile_m_idx unless n_split)."""
+        local = work_tile.tile_m_idx
+        if cutlass.const_expr(self.n_split):
+            local = work_tile.tile_m_idx % self._half_cta_tiles(work_tile)
+        return local
 
     @cute.jit
     def prepare_work_tile(self, work_tile: SwapAbFc12WorkTileInfo) -> SwapAbFc12WorkTileInfo:
@@ -110,9 +136,7 @@ class BlockScaledSwapAbFc12Extension:
                 if is_fc1:
                     counter_pointer = self.fc1_ready_counter_pointer + counter_slot
                     peek_flag = Int32(0)
-                    if spin_peek(
-                        counter_pointer, lambda value: value >= work_tile.valid_tokens_in_cta_tile
-                    ):
+                    if spin_peek(counter_pointer, lambda value: value >= work_tile.valid_tokens_in_cta_tile):
                         peek_flag = Int32(peek_ready_bit)
                     phase_and_flags = work_tile.phase_and_flags | peek_flag
 
@@ -157,9 +181,12 @@ class BlockScaledSwapAbFc12Extension:
         shape = tensor.shape
         stride = tensor.stride
         singleton = Int32(1)
+        weight_expert = expert_idx
+        if cutlass.const_expr(self.n_split):
+            weight_expert = self.weight_half(work_tile) * Int32(self.local_expert_count) + expert_idx
 
         if cutlass.const_expr(tensor_name == "a"):
-            result = cute.domain_offset((0, 0, expert_idx), tensor)
+            result = cute.domain_offset((0, 0, weight_expert), tensor)
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
         if cutlass.const_expr(tensor_name == "b"):
@@ -167,22 +194,16 @@ class BlockScaledSwapAbFc12Extension:
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
         if cutlass.const_expr(tensor_name == "sfa"):
-            result = cute.domain_offset((0, 0, expert_idx), tensor)
+            result = cute.domain_offset((0, 0, weight_expert), tensor)
             per_expert_shape = (shape[0], shape[1], singleton)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
-            return (
-                cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)),
-                None,
-            )
+            return (cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)), None)
 
         if cutlass.const_expr(tensor_name in ("sfb", "sfc")):
             result = cute.domain_offset((sf_token_offset, 0, 0), tensor)
             per_expert_shape = (shape[0], shape[1], singleton)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
-            return (
-                cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)),
-                None,
-            )
+            return (cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)), None)
 
         if cutlass.const_expr(tensor_name == "c"):
             result = cute.domain_offset((data_token_offset, 0, 0), tensor)
