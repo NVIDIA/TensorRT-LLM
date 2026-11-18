@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+import tensorrt_llm._torch.models.modeling_multimodal_mixin as mixin_module
 import tensorrt_llm._torch.models.multimodal_encoder_data_parallel as dp_module
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
@@ -474,8 +475,7 @@ def test_encoder_dp_uses_the_model_item_slicer() -> None:
     torch.testing.assert_close(output, expected)
 
 
-@pytest.mark.cpu_only
-def test_encoder_dp_uses_modality_local_indices_in_prompt_order() -> None:
+def make_interleaved_encoder_dp_param() -> MultimodalParams:
     metadata = MultimodalItemMetadata(
         item_refs=[("image", 1), ("audio", 0), ("image", 0)],
         encoder_token_lengths=[1, 100, 1],
@@ -485,13 +485,19 @@ def test_encoder_dp_uses_modality_local_indices_in_prompt_order() -> None:
             "audio": {"input_features": MultimodalItemPartition()},
         },
     )
-    param = MultimodalParams(
+    return MultimodalParams(
         multimodal_data={
             "image": {"pixel_values": torch.tensor([30.0, 10.0]).reshape(2, 1, 1, 1)},
             "audio": {"input_features": torch.tensor([20.0]).reshape(1, 1, 1)},
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
         }
     )
+
+
+@pytest.mark.cpu_only
+def test_encoder_dp_uses_modality_local_indices_in_prompt_order() -> None:
+    param = make_interleaved_encoder_dp_param()
+    metadata = param.item_metadata
     model = DataParallelEncoderMultimodalModel(rank=0)
     model.peer_output = torch.tensor([10.0] * 4 + [30.0] * 3).unsqueeze(1).repeat(1, 2)
 
@@ -501,6 +507,93 @@ def test_encoder_dp_uses_modality_local_indices_in_prompt_order() -> None:
     assert param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] is metadata
     expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
     torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rank", [0, 1])
+def test_item_scheduled_encoder_dp_gathers_all_modality_runs_once(rank):
+    model = DataParallelEncoderMultimodalModel(rank=rank)
+    param = make_interleaved_encoder_dp_param()
+    image_rows = [10.0] * 4 + [30.0] * 3
+    peer_rows = image_rows if rank == 0 else [20.0]
+    model.peer_output = torch.tensor(peer_rows).unsqueeze(1).repeat(1, 2)
+    encoder_inputs = model.prepare_multimodal_encoder_inputs([(param, i) for i in range(3)])
+
+    with (
+        patch.object(
+            model, "encode_multimodal_inputs", wraps=model.encode_multimodal_inputs
+        ) as encode,
+        patch.object(model, "exchange_encoder_status", wraps=model.exchange_encoder_status) as vote,
+        patch.object(
+            model, "_allgather_encoder_dp_output", wraps=model._allgather_encoder_dp_output
+        ) as gather,
+    ):
+        outputs = model.forward_multimodal_encoder_items(encoder_inputs)
+
+    # Rank 1 has no audio items but must keep its two original image runs.
+    assert model.encoded_item_ids == ([20] if rank == 0 else [10, 30])
+    assert encode.call_count == (1 if rank == 0 else 2)
+    vote.assert_called_once_with([dp_module.EncoderDpStatus.OK])
+    assert gather.call_count == 1
+    assert gather.call_args.args[1] == [1, 7]
+    torch.testing.assert_close(
+        outputs, [torch.full((rows, 2), value) for rows, value in [(4, 10.0), (1, 20.0), (3, 30.0)]]
+    )
+
+
+@pytest.mark.cpu_only
+def test_item_scheduled_encoder_dp_stops_before_next_tp_run_on_replica_peer_error():
+    model = DataParallelEncoderMultimodalModel(rank=0)
+    model.model_config = ModelConfig(
+        mapping=Mapping(world_size=4, rank=2, tp_size=4),
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=2),
+    )
+    param = make_interleaved_encoder_dp_param()
+    encoder_inputs = model.prepare_multimodal_encoder_inputs([(param, i) for i in range(3)])
+
+    with (
+        patch.object(mixin_module, "Distributed") as distributed,
+        patch.object(
+            model, "exchange_encoder_status", side_effect=[[[0]] * 4, [[0], [0], [0], [1]]]
+        ) as vote,
+        patch.object(model, "_allgather_encoder_dp_output") as gather,
+    ):
+        replica = distributed.get.return_value
+        replica.tp_allgather_int64.return_value = [[0], [1]]
+        with pytest.raises(MultimodalEncoderContractError, match=r"rank\(s\) \[3\]"):
+            model.forward_multimodal_encoder_items(encoder_inputs)
+
+    assert model.encoded_item_ids == [10]
+    distributed.get.assert_called_once_with(model.encoder_parallel_layout.mapping)
+    replica.tp_allgather_int64.assert_called_once_with([0], prefer_cpu=True)
+    assert [call.args[0] for call in vote.call_args_list] == [[0], [0]]
+    gather.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_item_scheduled_hybrid_encoder_dp_keeps_run_guards_without_replica_host_group():
+    model = DataParallelEncoderMultimodalModel(rank=0)
+    model.model_config = ModelConfig(
+        mapping=Mapping(world_size=4, rank=0, tp_size=4),
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=2),
+    )
+    model.peer_output = torch.empty(0, 2)
+    param = make_interleaved_encoder_dp_param()
+    encoder_inputs = model.prepare_multimodal_encoder_inputs([(param, i) for i in range(3)])
+
+    with (
+        patch.object(mixin_module, "mpi_disabled", return_value=True),
+        patch.object(model, "exchange_encoder_status", wraps=model.exchange_encoder_status) as vote,
+        patch.object(
+            model, "_allgather_encoder_dp_output", wraps=model._allgather_encoder_dp_output
+        ) as gather,
+    ):
+        outputs = model.forward_multimodal_encoder_items(encoder_inputs)
+
+    assert model.encoded_item_ids == [10, 20, 30]
+    assert vote.call_count == 6
+    assert gather.call_count == 3
+    assert [output.shape[0] for output in outputs] == [4, 1, 3]
 
 
 @pytest.mark.cpu_only

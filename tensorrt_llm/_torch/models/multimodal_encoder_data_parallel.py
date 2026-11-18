@@ -186,21 +186,31 @@ def execute_encoder_dp_items(
     Every rank derives the same plan from ``costs`` (physical encoder input
     tokens). ``prepare_local`` gets the indices placed on this replica, in
     item order, and returns a function that encodes them into their output
-    rows. Every rank shares its preparation status before any rank encodes,
-    so no rank starts encoder TP work while a peer of its replica has failed.
+    rows. When replicas use TP, every rank shares its preparation status before
+    any rank encodes, so no rank starts encoder TP work while a replica peer
+    has failed.
     A replica with no items sends ``empty_output``, a ``[0, dim]`` tensor with
-    the output dtype and device. A second status exchange shares encoder
-    failures before the output gather. ``allgather`` concatenates the
+    the output dtype and device. One status exchange before the output gather
+    shares failures, including preparation failures for replicas without TP.
+    ``allgather`` concatenates the
     per-replica outputs in replica order using the given row counts,
     including zero rows.
 
     Returns one dense tensor with each item's ``row_counts`` rows, in item order.
     """
-    with encoder_dp_error_guard(exchange_status):
+
+    def prepare() -> tuple[tuple[int, ...], list[int], Callable[[], torch.Tensor] | None]:
         ranks = plan_encoder_dp_items(costs, layout.dp_size)
         local = [index for index, rank in enumerate(ranks) if rank == layout.dp_rank]
-        encode_local = prepare_local(local) if local else None
+        return ranks, local, prepare_local(local) if local else None
+
+    if layout.tp_size > 1:
+        with encoder_dp_error_guard(exchange_status):
+            ranks, local, encode_local = prepare()
+
     with encoder_dp_error_guard(exchange_status):
+        if layout.tp_size == 1:
+            ranks, local, encode_local = prepare()
         if encode_local is None:
             local_output = empty_output
         else:

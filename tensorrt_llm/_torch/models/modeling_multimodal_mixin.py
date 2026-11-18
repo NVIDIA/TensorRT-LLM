@@ -40,7 +40,7 @@ import torch
 from tensorrt_llm._torch.distributed import Distributed, allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import mpi_disabled, prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,
@@ -787,6 +787,21 @@ class MultimodalModelMixin:
         self,
         encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
     ) -> list[torch.Tensor]:
+        if not encoder_inputs:
+            return []
+        layout = self.encoder_parallel_layout
+        # TorchDist's device mesh has no host process group for a split TP replica.
+        if layout.distributes_items and (layout.tp_size == 1 or not mpi_disabled()):
+            param_runs = (
+                [param for param, _, _ in run]
+                for _, run in itertools.groupby(encoder_inputs, key=lambda entry: entry[2])
+            )
+            encoder_context = self._encoder_forward_context or contextlib.nullcontext
+            with encoder_context():
+                embeddings = self._encode_multimodal_input_runs_dp(param_runs)
+            lengths = [rows for _, item_rows, _ in encoder_inputs for rows in item_rows]
+            return list(torch.split(embeddings, lengths, dim=0))
+
         outputs: list[torch.Tensor] = []
         group_params: list[MultimodalParams] = []
         group_lengths: list[int] = []
@@ -927,15 +942,83 @@ class MultimodalModelMixin:
     ) -> torch.Tensor:
         """Run the model encoder, splitting items between encoder DP replicas."""
         params = list(multimodal_params)
-        layout = self.encoder_parallel_layout
-        if not layout.distributes_items:
+        if not self.encoder_parallel_layout.distributes_items:
             return self.encode_multimodal_inputs(params, **encoder_kwargs)
+        return self._encode_multimodal_input_runs_dp([params], **encoder_kwargs)
 
-        items, costs, row_counts = self._encoder_dp_items(params)
+    def _encode_multimodal_input_runs_dp(
+        self,
+        param_runs: Iterable[Sequence[MultimodalParams]],
+        **encoder_kwargs: Any,
+    ) -> torch.Tensor:
+        """Place every run in one step and gather their combined output once."""
+        items: list[tuple[MultimodalParams, int | None]] = []
+        costs: list[int] = []
+        row_counts: list[int] = []
+        run_ids: list[int] = []
+        for run_id, params in enumerate(param_runs):
+            run_items, run_costs, run_rows = self._encoder_dp_items(params)
+            items.extend(run_items)
+            costs.extend(run_costs)
+            row_counts.extend(run_rows)
+            run_ids.extend([run_id] * len(run_items))
+
+        layout = self.encoder_parallel_layout
+        width = self.embedding_dim
+        empty_output = torch.empty(
+            (0, width),
+            dtype=self.embedding_dtype,
+            device=self.text_embedding_layer.weight.device,
+        )
 
         def prepare_local(indices: list[int]) -> Callable[[], torch.Tensor]:
-            local_params = self._prepare_encoder_dp_inputs([items[index] for index in indices])
-            return lambda: self.encode_multimodal_inputs(local_params, **encoder_kwargs)
+            local_runs: list[tuple[list[MultimodalParams], int]] = []
+            # Preserve the original run boundaries even if a replica receives
+            # no items from a run between two runs of the same modality.
+            for _, run in itertools.groupby(indices, key=run_ids.__getitem__):
+                run_indices = list(run)
+                params = self._prepare_encoder_dp_inputs([items[index] for index in run_indices])
+                local_runs.append((params, sum(row_counts[index] for index in run_indices)))
+
+            if len(local_runs) == 1:
+                return lambda: self.encode_multimodal_inputs(local_runs[0][0], **encoder_kwargs)
+            output = empty_output.new_empty((sum(rows for _, rows in local_runs), width))
+            local_runs.reverse()
+
+            def encode_local() -> torch.Tensor:
+                start = 0
+                while local_runs:
+                    params, rows = local_runs.pop()
+                    has_next_tp_run = layout.tp_size > 1 and bool(local_runs)
+                    local_error = None
+                    try:
+                        embeddings = self.encode_multimodal_inputs(params, **encoder_kwargs)
+                        if embeddings.shape != (rows, width):
+                            raise MultimodalEncoderContractError(
+                                "Multimodal encoder output shape does not match its local DP assignment: "
+                                f"expected {(rows, width)}, got {tuple(embeddings.shape)}."
+                            )
+                        output[start : start + rows].copy_(embeddings)
+                        del embeddings
+                    except Exception as error:
+                        if not has_next_tp_run:
+                            raise
+                        local_error = error
+                    del params
+                    if has_next_tp_run:
+                        # Stop every replica peer before it can enter another TP forward.
+                        # Only the failed rank reports the error in the final step-wide vote.
+                        statuses = Distributed.get(layout.mapping).tp_allgather_int64(
+                            [int(local_error is not None)], prefer_cpu=True
+                        )
+                        if local_error is not None:
+                            raise local_error
+                        if any(row[0] for row in statuses):
+                            break
+                    start += rows
+                return output
+
+            return encode_local
 
         return execute_encoder_dp_items(
             costs,
@@ -944,11 +1027,7 @@ class MultimodalModelMixin:
             prepare_local=prepare_local,
             exchange_status=self.exchange_encoder_status,
             allgather=self._allgather_encoder_dp_output,
-            empty_output=torch.empty(
-                (0, self.embedding_dim),
-                dtype=self.embedding_dtype,
-                device=self.text_embedding_layer.weight.device,
-            ),
+            empty_output=empty_output,
         )
 
     @property

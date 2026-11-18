@@ -39,9 +39,12 @@ from tensorrt_llm.mapping import Mapping
 pytestmark = pytest.mark.cpu_only
 
 
-def layout(dp_rank: int, dp_size: int = 2) -> EncoderParallelLayout:
+def layout(dp_rank: int, dp_size: int = 2, tp_size: int = 1) -> EncoderParallelLayout:
     return EncoderParallelLayout(
-        Mapping(), dp_size=dp_size, dp_rank=dp_rank, distributes_items=True
+        Mapping(world_size=dp_size * tp_size, tp_size=tp_size, pp_size=dp_size),
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        distributes_items=True,
     )
 
 
@@ -141,7 +144,7 @@ def test_execute_encoder_dp_items_synchronizes_local_shape_failure():
             empty_output=torch.empty((0, 1)),
         )
 
-    assert statuses == [EncoderDpStatus.OK, EncoderDpStatus.REQUEST_ERROR]
+    assert statuses == [EncoderDpStatus.REQUEST_ERROR]
     assert collective_dtypes == []
 
 
@@ -167,8 +170,7 @@ def test_execute_encoder_dp_items_keeps_empty_rank_in_collectives():
     )
 
     torch.testing.assert_close(output, peer_contribution)
-    # One exchange after preparing and one after encoding.
-    assert statuses == [EncoderDpStatus.OK, EncoderDpStatus.OK]
+    assert statuses == [EncoderDpStatus.OK]
     assert collective_dtypes == [torch.float32]
 
 
@@ -190,7 +192,7 @@ def test_execute_encoder_dp_items_stops_before_encoding_on_peer_prepare_failure(
         execute_encoder_dp_items(
             [1],
             [1],
-            layout=layout(dp_rank=0),
+            layout=layout(dp_rank=0, tp_size=2),
             prepare_local=lambda _: encode,
             exchange_status=exchange_with_peer(peer_status),
             allgather=lambda *_: pytest.fail("Output collective must not run after a failure."),
