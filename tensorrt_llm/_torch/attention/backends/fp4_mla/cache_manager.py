@@ -106,11 +106,13 @@ class Fp4MlaV2CacheLayoutPolicy:
     therefore request-private: it does not constrain prefix matching, and the
     radix tree retains only the full-history FP4 pages.
 
-    Hybrid linear-attention managers compose the same policy with
-    their SSM lifecycle and forward only attention-layout operations here.
-    Such a manager keeps its own disaggregation declarations and merges the
+    The Kimi K3 hybrid linear-attention manager selects it for its MLA latent
+    cache (``configure_manager``) and composes it with its SSM lifecycle:
+    ``MambaHybridCacheManagerV2`` forwards only attention-layout operations
+    here, calling the generic methods below with itself. Such a manager keeps
+    its own disaggregation declarations and merges the
     policy's attention roles into them (``DISAGG_ROLE_MAPPER_KINDS``,
-    ``DISAGG_IGNORED_ROLES``, ``_fp4_mla_disagg_global_layer_id``), so the
+    ``DISAGG_IGNORED_ROLES``, ``disagg_global_layer_id``), so the
     recurrent-state roles keep their own transfer mappings.
     """
 
@@ -257,6 +259,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         max_rewind_len = int(spec_config.tokens_per_gen_step - 1) if spec_config else 0
         manager._fp4_mla_hp_pool_size = HP_BLOCK_SIZE + max_rewind_len
         manager._fp4_mla_view_cache = {}
+        manager._fp4_mla_snapshot_realignment_logged = False
         manager._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
         Fp4MlaV2CacheLayoutPolicy.install_manager_capabilities(manager)
         return kv_cache_config
@@ -325,6 +328,56 @@ class Fp4MlaV2CacheLayoutPolicy:
             with torch.cuda.stream(manager._stream):
                 v_scale_pool.zero_()
             manager._stream.synchronize()
+
+    # Attention-layout operations of a lifecycle manager that composes this
+    # policy (MambaHybridCacheManagerV2), which calls them with itself.
+
+    def virtual_layer_pool_roles(
+        self, layer_id: int
+    ) -> Optional[tuple[DataRole, Optional[DataRole]]]:
+        """Pool roles of a virtual layer this layout appended (an HP ring), else ``None``."""
+        if LayerId(layer_id) in self._hp_manager_layer_ids:
+            return Role.MLA_HP_TAIL, None
+        return None
+
+    def disagg_global_layer_id(self, internal_layer: int) -> Optional[int]:
+        """Transfer ID of an MLA cache or HP-ring layer (``_fp4_mla_disagg_global_layer_id``).
+
+        Model layer ``L`` takes ``2 * L`` and ``2 * L + 1``, so a lifecycle
+        manager gives its other layers ``2 * L`` to keep the IDs collision-free.
+        """
+        return self._fp4_mla_disagg_global_layer_id(internal_layer)
+
+    def disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
+        """Transfer geometry of the HP ring (``_fp4_mla_disagg_role_layouts``)."""
+        return self._fp4_mla_disagg_role_layouts()
+
+    def iter_physical_pool_views(self) -> Iterable[torch.Tensor]:
+        """Page-major views of each physical MLA pool (``_iter_fp4_mla_physical_pool_views``)."""
+        return self._iter_fp4_mla_physical_pool_views()
+
+    def align_snapshot_points(self, request: "LlmRequest") -> None:
+        """Move a hybrid manager's recurrent-state snapshots onto full cache blocks.
+
+        The FP4 MLA cache quantizes the latent cache in 16-token tiles and
+        disables partial-block reuse, so a reused prefix always ends on a
+        cache block. A snapshot inside a block would restore the recurrent
+        state of a later token than the reused prefix ends at; one below the
+        first block can never be reused. Snapshot points also end the
+        context chunks, which keeps every non-final chunk tile-aligned.
+        """
+        block = self.tokens_per_block
+        points = request.expect_snapshot_points
+        aligned = sorted({point // block * block for point in points if point >= block})
+        if aligned != sorted(set(points)) and not self._fp4_mla_snapshot_realignment_logged:
+            self._fp4_mla_snapshot_realignment_logged = True
+            logger.info(
+                "FP4 MLA moves Mamba snapshot points down to "
+                f"{block}-token cache blocks and drops points below the "
+                f"first block (logged once; request {request.py_request_id}: "
+                f"{sorted(set(points))} -> {aligned})."
+            )
+        request.expect_snapshot_points = aligned
 
     @property
     def fp4_mla_hp_pool_size(self) -> int:

@@ -4636,17 +4636,19 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024, sm_version=sm_version)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384, sm_version=sm_version)
     assert (len(decode), len(prefill)) == (decode_count, prefill_count)
-    assert all(len(t) == 11 for t in decode + prefill)
-    assert {t[-2] for t in decode} == {(1, 1)}
-    assert {t[-2] for t in prefill} == {(2, 4)}
-    assert {t[-1] for t in decode + prefill} == {"expert"}
+    assert all(len(t) == 12 for t in decode + prefill)
+    assert {t[-3] for t in decode} == {(1, 1)}
+    assert {t[-3] for t in prefill} == {(2, 4)}
+    assert {t[-2] for t in decode + prefill} == {"expert"}
+    assert {t[-1] for t in decode + prefill} == {False}
     for tactic in decode + prefill:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     default_tactics = [
         megamoe_op.default_megamoe_tactic(num_tokens) for num_tokens in (64, 4096, 16384)
     ]
-    assert all(len(tactic) == 11 for tactic in default_tactics)
-    assert {tactic[-1] for tactic in default_tactics} == {"expert"}
+    assert all(len(tactic) == 12 for tactic in default_tactics)
+    assert {tactic[-2] for tactic in default_tactics} == {"expert"}
+    assert {tactic[-1] for tactic in default_tactics} == {False}
     for tactic in default_tactics:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     if sm_version == 107:
@@ -4660,7 +4662,7 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
                 in_kernel_fc2_reduce=False,
                 combine_format="bf16",
             )
-            assert len(selected) == 11
+            assert len(selected) == 12
             assert selected == megamoe_op._unpack_tactic(tactic)
     invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
     invalid_tactic[3] = ("grouped", 0)
@@ -4669,9 +4671,10 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
     megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
     assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
-    v4 = megamoe_op.default_megamoe_tactic(64)[:-1]
-    megamoe_op.validate_megamoe_tactic(v4, sm_version=sm_version)
-    assert megamoe_op._unpack_tactic(v4) == megamoe_op.default_megamoe_tactic(64)
+    for legacy_len in (11, 10):  # v5 (no combine_dedup) and v4 (no READY granularity)
+        legacy = megamoe_op.default_megamoe_tactic(64)[:legacy_len]
+        megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
+        assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
 
 
 @pytest.mark.cpu_only
@@ -5060,6 +5063,7 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
         BlockPhase,
         map_phase_interleaved_fc12_work_id,
         resolve_phase_interleaved_fc1_claim_target,
+        resolve_phase_interleaved_stream_extent,
     )
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_scheduler import (
         PhaseInterleavedFc12Scheduler,
@@ -5133,6 +5137,8 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
             pipeline_init_wait(cluster_shape_mn=(1, 1))
             worker = self.scheduler._work_id_worker
             state = self.scheduler._task_mapping_state
+            # Mirror PhaseInterleavedFc12Scheduler.gen_next_work initialization.
+            state = resolve_phase_interleaved_stream_extent(state)
             _, fc1_valid, state = map_phase_interleaved_fc12_work_id(
                 Int32(0), Int32(BlockPhase.Linear1), (Int32(0), Int32(0), Int32(0)), state
             )
