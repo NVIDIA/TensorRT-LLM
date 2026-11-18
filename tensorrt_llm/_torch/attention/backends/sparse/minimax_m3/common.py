@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Tuple
 
+import numpy as np
 import torch
 
 from tensorrt_llm._utils import async_tensor_h2d, maybe_pin_memory
@@ -227,8 +228,8 @@ class MiniMaxM3SparseConfig:
 class PagedKvSlotMapping(NamedTuple):
     """One step's paged-cache slot mapping (see build_paged_kv_slot_mapping)."""
 
-    req_to_token: torch.Tensor
-    slot_ids: torch.Tensor
+    req_to_token: Optional[torch.Tensor]
+    slot_ids: Optional[torch.Tensor]
     out_cache_loc: torch.Tensor
     block_ids_cpu: torch.Tensor
 
@@ -240,6 +241,7 @@ def build_paged_kv_slot_mapping(
     qo_lens_cpu: torch.Tensor,
     qo_offset_cpu: torch.Tensor,
     device: torch.device,
+    device_tables: bool = True,
 ) -> PagedKvSlotMapping:
     """Build the backend-neutral paged-cache slot mapping.
 
@@ -262,6 +264,9 @@ def build_paged_kv_slot_mapping(
     staged with non-blocking copies, so this neither syncs the host nor reads
     device memory back. It still allocates per step, so call it from prepare(),
     never from the forward path.
+
+    With device_tables=False, req_to_token and slot_ids are not built (None) and out_cache_loc stays a pinned host
+    tensor, for callers that only stage out_cache_loc into their own persistent buffer.
     """
     tokens_per_block = int(kv_cache_manager.tokens_per_block)
     # block_ids_per_seq is a [batch, max_blocks_per_seq] tensor; row b holds the
@@ -273,38 +278,49 @@ def build_paged_kv_slot_mapping(
     max_blocks = int(block_ids.shape[1])
     max_kv_len = max_blocks * tokens_per_block
 
-    # Expand block ids -> per-token slot ids.
-    block_ids_dev = block_ids.to(device, non_blocking=True).to(torch.int64)
-    within_block = torch.arange(tokens_per_block, device=device, dtype=torch.int64)
-    # Outer product per batch entry: [batch, max_blocks, tokens_per_block]
-    slot_grid = block_ids_dev.unsqueeze(-1) * tokens_per_block + within_block
-    req_to_token = slot_grid.reshape(batch, max_kv_len).to(torch.int32)
-    slot_ids = torch.arange(batch, device=device, dtype=torch.int32)
+    req_to_token = slot_ids = None
+    if device_tables:
+        # Expand block ids -> per-token slot ids.
+        block_ids_dev = block_ids.to(device, non_blocking=True).to(torch.int64)
+        within_block = torch.arange(tokens_per_block, device=device, dtype=torch.int64)
+        # Outer product per batch entry: [batch, max_blocks, tokens_per_block]
+        slot_grid = block_ids_dev.unsqueeze(-1) * tokens_per_block + within_block
+        req_to_token = slot_grid.reshape(batch, max_kv_len).to(torch.int32)
+        slot_ids = torch.arange(batch, device=device, dtype=torch.int32)
 
     # out_cache_loc: per-new-token slot ids, in flattened query-token order.
     # Expanding the per-request lengths on the host reproduces the same slot
     # ids as indexing req_to_token, without copying that [batch, max_kv_len]
     # grid back from the device.
-    qo = qo_lens_cpu.to(torch.long)
+    # Host arithmetic on batch-sized vectors runs in numpy: on a few dozen
+    # elements, torch CPU ops cost far more in dispatch and OpenMP fork/join
+    # than the arithmetic itself, and this runs every step.
+    qo = qo_lens_cpu.numpy().astype(np.int64, copy=False)
     total_q = int(qo.sum())
     if total_q == 0:
         out_cache_loc_cpu = torch.empty(0, dtype=torch.int32)
     else:
-        row = torch.repeat_interleave(torch.arange(batch, dtype=torch.long), qo)
-        starts = torch.cumsum(qo, 0) - qo
-        pos = qo_offset_cpu.to(torch.long)[row] + (
-            torch.arange(total_q, dtype=torch.long) - starts[row]
+        row = np.repeat(np.arange(batch, dtype=np.int64), qo)
+        starts = np.cumsum(qo) - qo
+        pos = qo_offset_cpu.numpy().astype(np.int64, copy=False)[row] + (
+            np.arange(total_q, dtype=np.int64) - starts[row]
         )
         # A zero-length CUDA-graph padding row offsets to -1. Its slot is a
         # placeholder no forward reads, so keep it in the row instead of
         # indexing off the table.
-        pos.clamp_(min=0, max=max(max_kv_len - 1, 0))
-        block_col = torch.div(pos, tokens_per_block, rounding_mode="floor")
-        out_cache_loc_cpu = (
-            block_ids[row, block_col].to(torch.long) * tokens_per_block
-            + (pos - block_col * tokens_per_block)
-        ).to(torch.int32)
-    out_cache_loc = async_tensor_h2d(out_cache_loc_cpu, torch.int32, device)
+        np.clip(pos, 0, max(max_kv_len - 1, 0), out=pos)
+        block_col = pos // tokens_per_block
+        block_ids_np = block_ids.numpy()
+        out_cache_loc_cpu = torch.from_numpy(
+            (
+                block_ids_np[row, block_col].astype(np.int64) * tokens_per_block
+                + (pos - block_col * tokens_per_block)
+            ).astype(np.int32)
+        )
+    if device_tables:
+        out_cache_loc = async_tensor_h2d(out_cache_loc_cpu, torch.int32, device)
+    else:
+        out_cache_loc = maybe_pin_memory(out_cache_loc_cpu)
     return PagedKvSlotMapping(req_to_token, slot_ids, out_cache_loc, block_ids)
 
 

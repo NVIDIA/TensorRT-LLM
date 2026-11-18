@@ -49,7 +49,9 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.logger import logger
 
+from ..hostfunc import hostfuncs_pending
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
 from .modeling_multimodal_utils import (
     _store_chunked_prefill_embeddings,
     find_input_mm_embeds,
@@ -410,13 +412,17 @@ class MultimodalModelMixin:
 
     Current limitations:
 
-    * For the time being, the persistent multimodal encoder cache stores per-item embeddings for
-      single-modality `MultimodalParams` objects. Mixed-modality objects bypass the cache.
+    * The persistent multimodal encoder cache stores per-item embeddings for the items in the
+      common item record, across modalities. A `MultimodalParams` object carrying a modality
+      payload that the record does not list bypasses the cache.
     * A partially cached `MultimodalParams` is handled by encoding only its miss items
       and interleaving cached items back in original per-item order. The default
       `build_multimodal_encoder_input` selects fields declared by
       `get_multimodal_item_partitions`. Undeclared models retain legacy stacked/packed inference.
     """
+
+    supports_vision_gpu_normalize: ClassVar[bool] = False
+    """Whether the model accepts processor-described raw vision pixels."""
 
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
@@ -427,8 +433,15 @@ class MultimodalModelMixin:
     `BaseMultimodalInputProcessor.get_mm_item_metadata`. This is the executor-layer gate for
     item scheduling."""
 
+    # TODO: Move capability declarations into the planned single
+    # SupportsMultimodal Protocol; keep shared execution in this mixin
+    # and encoder attention-metadata setup in MultimodalEncoderMixin.
+    supported_encoder_attention_backends: ClassVar[dict[str, frozenset[str]]] = {}
+    """Public backends by logical encoder; an empty set marks fixed attention."""
+
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
+    _encoder_forward_context: Callable[[], contextlib.AbstractContextManager[None]] | None = None
 
     @classmethod
     def _cast_multimodal_encoder_dtype(
@@ -477,6 +490,16 @@ class MultimodalModelMixin:
         the bad one. Default: accept everything.
         """
         return None
+
+    def _run_multimodal_encoder(
+        self,
+        multimodal_params: Sequence[MultimodalParams],
+    ) -> torch.Tensor:
+        """Run encoder work with optional runtime instrumentation after H2D."""
+        if self._encoder_forward_context is None:
+            return self.encode_multimodal_inputs(multimodal_params)
+        with self._encoder_forward_context():
+            return self.encode_multimodal_inputs(multimodal_params)
 
     def prepare_multimodal_encoder_inputs(
         self,
@@ -595,7 +618,7 @@ class MultimodalModelMixin:
         def flush_group() -> None:
             if not group_params:
                 return
-            embeddings = self.encode_multimodal_inputs(group_params)
+            embeddings = self._run_multimodal_encoder(group_params)
             expected_length = sum(group_lengths)
             if embeddings.shape[0] != expected_length:
                 raise MultimodalEncoderContractError(
@@ -689,9 +712,24 @@ class MultimodalModelMixin:
         raise NotImplementedError
 
     @property
+    def runtime_hooks(self) -> RuntimeHooks:
+        """Return the inner language model's step-loop hooks."""
+        try:
+            language_model = self.language_model
+        except NotImplementedError:
+            return DEFAULT_RUNTIME_HOOKS
+        return runtime_hooks_of(language_model)
+
+    @property
     def vocab_size_padded(self) -> int:
         """Return the inner language model's padded vocabulary size."""
         return self.language_model.vocab_size_padded
+
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        """Whether the inner model's speculative worker samples greedy and temperature-only
+        target rows from vocabulary shards; wrappers of such a model override this."""
+        return False
 
     def infer_max_seq_len(self) -> int:
         """Return the inner language model's maximum sequence length."""
@@ -711,12 +749,16 @@ class MultimodalModelMixin:
     def get_language_model_extra_forward_kwargs(
         self,
         *,
+        attn_metadata: Any,
         raw_input_ids: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         mm_inputs: PreparedLlmInputs,
         **forward_kwargs: Any,
     ) -> dict[str, Any]:
-        """Return model-specific arguments for the inner language-model forward."""
+        """Return model-specific arguments for the inner language-model forward.
+
+        The attention metadata identifies context and generation requests in this batch.
+        """
         return {}
 
     def get_language_model_forward_kwargs(
@@ -741,6 +783,7 @@ class MultimodalModelMixin:
         }
         llm_kwargs.update(
             self.get_language_model_extra_forward_kwargs(
+                attn_metadata=attn_metadata,
                 raw_input_ids=raw_input_ids,
                 position_ids=position_ids,
                 mm_inputs=mm_inputs,
@@ -1115,7 +1158,7 @@ class MultimodalModelMixin:
             self._encode_with_partial_cache(partial_hits, encoder_cache)
 
         embeddings = get_multimodal_embeddings(
-            encoder_forward_fn=self.encode_multimodal_inputs,
+            encoder_forward_fn=self._run_multimodal_encoder,
             multimodal_params=list(multimodal_params),
         )
         if encoder_cache is not None:
@@ -1417,7 +1460,7 @@ class MultimodalModelMixin:
         )
         # Keep one call across requests and modalities so EncoderGroup can
         # batch modalities that share an encoder.
-        batched_output = self.encode_multimodal_inputs([param for param, _, _ in encoder_inputs])
+        batched_output = self._run_multimodal_encoder([param for param, _, _ in encoder_inputs])
         output_lengths = [length for _, lengths, _ in encoder_inputs for length in lengths]
         encoded_items = iter(torch.split(batched_output, output_lengths, dim=0))
 
@@ -1643,8 +1686,8 @@ def _dispatch_cross_iter_prefetch(
 ) -> None:
     """H2D-copy MM data, run the encoder, and cache embeddings on `aux_stream`.
 
-    Stamps a CUDA event on every candidate's `py_mm_encoder_event` so the
-    next iteration's consume site waits on it before reading cached tensors.
+    Stamps a CUDA event on every candidate's `py_mm_encoder_event` so input
+    preparation waits on it for the first chunk that reads staged tensors.
     The event covers all work queued in the aux-stream block, so the same
     event object is shared across all candidates.
     """
@@ -1667,8 +1710,8 @@ def _dispatch_cross_iter_prefetch(
     # this after the iteration's LLM kernels so aux-stream H2D copies and
     # encoder work can overlap them.
     #
-    # Request-local ordering is handled by `encoder_event`; the consume path also `record_stream`s
-    # attached embeddings before gathering them so post-prefill request cleanup cannot release
+    # Request-local ordering is handled by `encoder_event`; input preparation waits on it and
+    # `record_stream`s the request's CUDA tensors so post-prefill request cleanup cannot release
     # storage while main-stream work is pending. Persistent-cache clones use their own producer
     # events and consumer `record_stream` calls inside `TensorLRUCache`.
     encoder_event = None
@@ -1716,7 +1759,7 @@ def _dispatch_cross_iter_prefetch(
                 if partial_hits and encoder_cache is not None:
                     model._encode_with_partial_cache(partial_hits, encoder_cache)
                 if cache_misses:
-                    encoder_output = model.encode_multimodal_inputs(cache_misses).clone()
+                    encoder_output = model._run_multimodal_encoder(cache_misses).clone()
                     _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
                     if encoder_cache is not None:
                         for param in cache_misses:
@@ -1764,8 +1807,7 @@ def maybe_prefetch_mm_encoder_for_next_iter(
     `_prepare_inputs` picks them up via the standard cache path, and a CUDA event is stamped on
     `request.py_mm_encoder_event` for `_prepare_inputs` to transfer onto the new `MultimodalParams`.
 
-    The mixin consume sites (e.g. `get_multimodal_embeddings)` need to wait on the event before
-    reading the cached tensors.
+    `_prepare_inputs` waits on the event before the main stream reads the staged tensors.
 
     While the current iteration's LLM kernels run on the main stream, this queues encoder work for
     an "admit-likely context" request on the aux stream.
@@ -1791,6 +1833,10 @@ def maybe_prefetch_mm_encoder_for_next_iter(
     if max_prefetch_ahead is None:
         max_prefetch_ahead = 0
     if max_prefetch_ahead <= 0:
+        return 0
+    # The encoder can hold the GIL while it waits on the device. Until the host functions of a
+    # replayed graph have been drained, these requests are encoded when scheduled instead.
+    if hostfuncs_pending():
         return 0
 
     aux_stream = _get_mm_aux_stream(max_prefetch_ahead)

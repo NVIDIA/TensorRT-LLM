@@ -39,7 +39,7 @@ shared data contracts, process boundaries, and request ownership.
 
 [`ModelEngine`](../../../tensorrt_llm/_torch/pyexecutor/model_engine.py) loads the model, resolves capacity and execution settings, constructs a model runner, and coordinates its lifecycle.
 `PyExecutor` calls `ModelEngine.forward` with scheduled requests, runtime resources, and the current speculative decoding state; the engine builds `ScheduledInputs` and delegates to a `ScheduledModelRunner`.
-`EncoderExecutor` instead passes `PackedInputs` through the engine to a `PackedModelRunner`.
+`EncoderExecutor` does not use `ModelEngine`: it builds its own `EncoderRunner` from the same setup steps (in `engine/model_setup.py`) and calls it directly with `PackedInputs`.
 
 The concrete runner owns input preparation, model execution, CUDA graphs, metadata, and output processing.
 `EncoderDecoderRunner` combines decoder execution with a separate encoder stage, which `PyExecutor` schedules through explicit encoder entry points.

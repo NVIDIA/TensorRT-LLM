@@ -19,13 +19,18 @@ Stage 0 rollout: only fp32/fp32 + num_epi_subtiles=1 are active. Other
 dtype combinations and subtile values are list-commented for later stages.
 """
 
-from typing import Tuple
-
 import pytest
 import torch
 
 from tensorrt_llm import deep_gemm
+from tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend import DSAVanillaIndexer
 from tensorrt_llm._utils import get_sm_version
+
+# Support both pytest package imports and the standalone benchmark entry point.
+if __package__:
+    from ._indexer_reference import paged_mqa_logits
+else:
+    from _indexer_reference import paged_mqa_logits
 
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
@@ -49,89 +54,6 @@ def align(x: int, y: int) -> int:
 
 def ceil_div_tensor(x: torch.Tensor, y: int) -> torch.Tensor:
     return (x + y - 1) // y
-
-
-def ceil_to_ue8m0(x: torch.Tensor):
-    bits = x.abs().float().view(torch.int)
-    exp = ((bits >> 23) & 0xFF) + (bits & 0x7FFFFF).bool().int()
-    return (exp.clamp(1, 254) << 23).view(torch.float)
-
-
-def pack_ue8m0_to_int(x: torch.Tensor):
-    assert x.dtype == torch.float and x.size(-1) % 4 == 0
-    assert (x.view(torch.int) & ((1 << 23) - 1) == 0).all()
-    return (x.view(torch.int) >> 23).to(torch.uint8).view(torch.int)
-
-
-def unpack_ue8m0_from_int(packed_sf: torch.Tensor) -> torch.Tensor:
-    return (packed_sf.view(torch.uint8).to(torch.int) << 23).view(torch.float)
-
-
-def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
-    ax = x.abs().clamp_max(6.0)
-    # {0, 0.5, 1, 1.5, 2, 3, 4, 6}
-    # midpoints: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
-    boundaries = torch.tensor(
-        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device, dtype=ax.dtype
-    )
-    idx = torch.bucketize(ax, boundaries)
-    code = idx.to(torch.uint8)
-    sign = (x < 0) & (idx != 0)
-    code = code | (sign.to(torch.uint8) << 3)
-    return code.view(torch.int8)
-
-
-def _dequantize_from_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
-    fp4_values = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-        device=x.device,
-        dtype=torch.float,
-    )
-    sign, value_idx = (x & 0x08) != 0, (x & 0x07).to(torch.int)
-    value = fp4_values[value_idx]
-    return torch.where(sign & (value_idx != 0), -value, value)
-
-
-def per_token_cast_to_fp4(
-    x: torch.Tensor,
-    use_ue8m0: bool,
-    gran_k: int = 128,
-    use_packed_ue8m0: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    m, n = x.shape
-    assert n % 2 == 0
-    assert not use_packed_ue8m0 or use_ue8m0
-    padded_n = align(n, gran_k)
-    x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
-    x_padded[:, :n] = x
-    x_view = x_padded.view(m, -1, gran_k)
-    x_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-4)
-    sf = x_amax / 6.0
-    sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
-    x_scaled = x_view * (1.0 / sf.unsqueeze(2))
-    codes = _quantize_to_fp4_e2m1(x_scaled).view(m, padded_n)  # int8
-    codes2 = codes.view(m, padded_n // 2, 2)
-    packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)
-    return packed[:, : n // 2].contiguous(), pack_ue8m0_to_int(sf) if use_packed_ue8m0 else sf
-
-
-def cast_back_from_fp4(
-    packed: torch.Tensor,
-    sf: torch.Tensor,
-    gran_k: int = 128,
-    use_packed_ue8m0: bool = False,
-) -> torch.Tensor:
-    m, n2 = packed.shape
-    n = n2 * 2
-    if use_packed_ue8m0:
-        sf = unpack_ue8m0_from_int(sf)
-    unpacked = torch.zeros((m, n), dtype=torch.int8, device=packed.device)
-    unpacked[:, ::2] = packed & 0x0F
-    unpacked[:, 1::2] = (packed >> 4) & 0x0F
-    x_dequantized = _dequantize_from_fp4_e2m1(unpacked)
-    group_idx = torch.arange(n, device=packed.device) // gran_k
-    x_restored = x_dequantized * sf[:, group_idx]
-    return x_restored
 
 
 # ---------------------------------------------------------------------------
@@ -178,13 +100,13 @@ def kv_cache_cast_to_fp4(x: torch.Tensor, remove_online_sf_transpose: bool = Fal
         )
         remove_online_sf_transpose = False
 
-    x_scaled, sf = per_token_cast_to_fp4(
+    x_scaled, sf = DSAVanillaIndexer.quantize_fp4(
         x.view(-1, head_dim),
         use_ue8m0=True,
         gran_k=32,
         use_packed_ue8m0=True,
     )
-    x_cast_back = cast_back_from_fp4(
+    x_cast_back = DSAVanillaIndexer.dequantize_fp4(
         x_scaled,
         sf,
         gran_k=32,
@@ -225,58 +147,6 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor):
         return 0.0
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
-
-
-def _ref_paged_mqa_logits(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_tables: torch.Tensor,
-    max_model_len: int,
-):
-    """Pure PyTorch reference for paged MQA logits.
-
-    Inputs are already in the simulated dtype (after FP4 quant->dequant
-    cast back). Body mirrors DeepGEMM's ``ref_paged_mqa_logits``: per-batch
-    MQA matmul -> causal/context mask -> ReLU -> weighted sum across heads.
-    Returns logits in float32; the kernel output is cast to float for
-    comparison.
-    """
-    batch_size, next_n, _num_heads, dim = q.size()
-    _num_block, block_size, _, dim = kv_cache.size()
-    logits = torch.full(
-        [batch_size * next_n, max_model_len],
-        float("-inf"),
-        device=q.device,
-        dtype=torch.float32,
-    )
-    context_lens_list = context_lens.tolist()
-    for i in range(batch_size):
-        context_len = context_lens_list[i]
-        q_offsets = torch.arange(context_len - next_n, context_len, device=q.device)
-        weight_slice = weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
-
-        num_blocks = (context_len + block_size - 1) // block_size
-        block_idxs = block_tables[i][:num_blocks]
-        kv_slice = kv_cache[block_idxs]  # [num_blocks, block_size, 1, dim]
-        kx = kv_slice.permute(2, 3, 0, 1).reshape(
-            kv_slice.size(2), dim, -1
-        )  # [kv_heads, dim, total_tokens]
-        qx = q[i].transpose(0, 1)  # [num_heads, next_n, dim]
-        s = torch.matmul(qx, kx).to(logits.dtype)  # [num_heads, next_n, total_tokens]
-
-        total_len = num_blocks * block_size
-        k_offsets = torch.arange(0, total_len, device=q.device)
-        mask = (k_offsets[None, :] < context_len) & (k_offsets[None, :] <= q_offsets[:, None])
-        s = torch.where(mask[None, :, :], s, float("-inf"))
-        s = torch.relu(s) * weight_slice[..., None]
-        s = s.sum(dim=0)  # [next_n, total_tokens]
-        logits[i * next_n : (i + 1) * next_n, :total_len] = torch.where(
-            k_offsets[None, :] <= q_offsets[:, None], s, float("-inf")
-        )
-
-    return logits
 
 
 # Tolerance table keyed by (epi_dtype, output_dtype) -> (atol, rtol).
@@ -398,7 +268,7 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     )
 
     # Quantize Q to packed FP4 + UE8M0 SF.
-    q_packed, sf_q_packed = per_token_cast_to_fp4(
+    q_packed, sf_q_packed = DSAVanillaIndexer.quantize_fp4(
         q.view(-1, head_dim),
         use_ue8m0=True,
         gran_k=32,
@@ -407,7 +277,7 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
     sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
     q_simulated = (
-        cast_back_from_fp4(
+        DSAVanillaIndexer.dequantize_fp4(
             q_packed,
             sf_q_packed,
             gran_k=32,
@@ -442,13 +312,14 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     # bf16 path inside torch.matmul introduces ~1e-3 relative error per
     # multiply which compounds to ~0.3 max_abs for our 128-elem dot products,
     # masking the kernel's true precision.
-    ref = _ref_paged_mqa_logits(
+    ref = paged_mqa_logits(
         q_simulated.float(),
         kv_simulated.float(),
         weights,
         context_lens,
+        context_lens,
         block_table,
-        max_model_len=max_model_len,
+        max_model_len,
     )
 
     # Call the FP4 kernel.
@@ -592,14 +463,14 @@ def test_cute_dsl_fp4_paged_mqa_logits_kernel_split(
         (num_total_blocks, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16
     )
     weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
-    q_packed, sf_q_packed = per_token_cast_to_fp4(
+    q_packed, sf_q_packed = DSAVanillaIndexer.quantize_fp4(
         q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
     )
     q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
     sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
-    q_simulated = cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32, use_packed_ue8m0=True).view(
-        batch_size, next_n, num_heads, head_dim
-    )
+    q_simulated = DSAVanillaIndexer.dequantize_fp4(
+        q_packed, sf_q_packed, gran_k=32, use_packed_ue8m0=True
+    ).view(batch_size, next_n, num_heads, head_dim)
     kv_fused, kv_simulated = kv_cache_cast_to_fp4(kv_cache)
 
     offsets_t = torch.tensor(
@@ -608,13 +479,14 @@ def test_cute_dsl_fp4_paged_mqa_logits_kernel_split(
     atom_ctx = (context_lens.unsqueeze(1) - offsets_t).reshape(-1, 1)
     schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(atom_ctx, 64, deep_gemm.get_num_sms())
 
-    ref = _ref_paged_mqa_logits(
+    ref = paged_mqa_logits(
         q_simulated.float(),
         kv_simulated.float(),
         weights,
         context_lens,
+        context_lens,
         block_table,
-        max_model_len=max_model_len,
+        max_model_len,
     )
     logits = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
         q_fp4,
@@ -733,7 +605,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_block_meta(
     )
     weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
 
-    q_packed, sf_q_packed = per_token_cast_to_fp4(
+    q_packed, sf_q_packed = DSAVanillaIndexer.quantize_fp4(
         q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
     )
     q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
@@ -906,7 +778,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
     )
     weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
 
-    q_packed, sf_q_packed = per_token_cast_to_fp4(
+    q_packed, sf_q_packed = DSAVanillaIndexer.quantize_fp4(
         q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
     )
     q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
@@ -963,6 +835,8 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         seed_thr[row, 1] = torch.quantile(vals, 0.90)
         seed_thr[row, 2] = torch.quantile(vals, 0.998)
 
+    seed_row = None
+    seed_counts = None
     if packed:
         # Packed contract: one [rows, 8] fp32 seed row, lines at cols
         # 0..2, counts accumulate as fp32 at cols 3..5 (caller zeroes).
@@ -998,7 +872,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
     for row in range(num_rows):
         ctx = int(context_lens[row // next_n].item())
         torch.testing.assert_close(lf[row, :ctx], lf0[row, :ctx], atol=0.0, rtol=0.0)
-    if packed:
+    if seed_row is not None:
         assert torch.equal(seed_row[:, 0:3], seed_thr), "lines clobbered"
         # col 6 carries the adaptive-skip pass count (lane0-accumulated
         # diagnostic; the top-k consumer reads it when block_max rides
@@ -1061,7 +935,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand(
         (num_total_blocks, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16
     )
     weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
-    q_packed, sf_q_packed = per_token_cast_to_fp4(
+    q_packed, sf_q_packed = DSAVanillaIndexer.quantize_fp4(
         q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
     )
     q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
@@ -1304,7 +1178,7 @@ def _generate_bench_data(
     q_bf16 = torch.randn(
         batch_size, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
     )
-    q_packed, sf_q_packed = per_token_cast_to_fp4(
+    q_packed, sf_q_packed = DSAVanillaIndexer.quantize_fp4(
         q_bf16.view(-1, head_dim),
         use_ue8m0=True,
         gran_k=32,
@@ -1719,7 +1593,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
         (num_total_blocks, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16
     )
     weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
-    q_packed, sf_q_packed = per_token_cast_to_fp4(
+    q_packed, sf_q_packed = DSAVanillaIndexer.quantize_fp4(
         q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
     )
     q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
@@ -1848,3 +1722,155 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
             assert cap_mode == "tight", f"unexpected void {tag}"
     if cap_mode == "tight":
         assert int(cand_ctl[:, 1].sum()) > 0, "tight caps never voided"
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size, avg_ctx", [(1, 3001), (25, 6000)])
+def test_cute_dsl_fp4_paged_mqa_logits_split_rows_match_deepgemm(batch_size, avg_ctx):
+    """Six 32-head queries per request, run as three 64-head rows, give DeepGEMM's next_n=6 logits."""
+    page, next_n, heads = 64, 6, 32
+    gen = torch.Generator(device="cuda").manual_seed(batch_size)
+    context_lens = torch.randint(
+        int(0.85 * avg_ctx),
+        int(1.15 * avg_ctx),
+        (batch_size,),
+        generator=gen,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    blocks = ceil_div_tensor(context_lens, page)
+    total = int(blocks.sum().item()) + 2 * batch_size
+    block_table = torch.zeros(
+        (batch_size, int(blocks.max().item())), dtype=torch.int32, device="cuda"
+    )
+    pool = torch.randperm(total, generator=gen, device="cuda").to(torch.int32)
+    offset = 0
+    for i, n in enumerate(blocks.tolist()):
+        block_table[i, :n] = pool[offset : offset + n]
+        offset += n
+    # Every FP4 code and UE8M0 scales around 1.
+    data = torch.randint(
+        0, 256, (total, page * 64), generator=gen, device="cuda", dtype=torch.uint8
+    )
+    scales = torch.randint(
+        118, 137, (total, page * 4), generator=gen, device="cuda", dtype=torch.uint8
+    )
+    kv = torch.cat([data, scales], dim=1).view(total, page, 1, 68)
+    q = torch.randint(
+        0, 256, (batch_size, next_n, heads, 64), generator=gen, device="cuda", dtype=torch.uint8
+    )
+    sf_q = (
+        torch.randint(
+            118,
+            137,
+            (batch_size, next_n, heads, 4),
+            generator=gen,
+            device="cuda",
+            dtype=torch.uint8,
+        )
+        .view(torch.int32)
+        .view(batch_size, next_n, heads)
+    )
+    weights = torch.randn((batch_size * next_n, heads), generator=gen, device="cuda")
+    row_lens = torch.stack([context_lens - next_n + j + 1 for j in range(next_n)], dim=1).to(
+        torch.int32
+    )
+    max_ctx = int(context_lens.max().item())
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+    ref = deep_gemm.fp8_fp4_paged_mqa_logits(
+        (q.view(torch.int8), sf_q),
+        kv,
+        weights,
+        row_lens,
+        block_table,
+        deep_gemm.get_paged_mqa_logits_metadata(row_lens, page, num_sms),
+        max_ctx,
+    )
+    rows = next_n * heads // 64
+    # The CSA2 indexer passes each request's first-row page table: a strided view.
+    row_tables = block_table.unsqueeze(1).expand(-1, next_n, -1).contiguous()
+    got = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+        q.view(batch_size, rows, 64, 64),
+        sf_q.view(batch_size, rows, 64),
+        kv,
+        weights.view(batch_size * rows, 64),
+        context_lens,
+        row_tables[:, 0],
+        deep_gemm.get_paged_mqa_logits_metadata(context_lens.unsqueeze(-1), page, num_sms),
+        max_ctx,
+        row_heads=heads,
+    )
+    valid = torch.arange(max_ctx, device="cuda")[None, :] < row_lens.flatten()[:, None]
+    assert torch.equal(
+        got[:, :max_ctx][valid].view(torch.int32), ref[:, :max_ctx][valid].view(torch.int32)
+    )
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("context_len", [3, 129, 257])
+@pytest.mark.parametrize("phys_block_kv", [32, 128])
+def test_cute_dsl_fp4_paged_mqa_logits_short_context(context_len, phys_block_kv):
+    """Check causal valid logits for short contexts and partial KV tiles."""
+    torch.manual_seed(42)
+    batch_size, next_n, num_heads, head_dim = 2, 3, 64, 128
+    max_model_len = 2048
+    device = "cuda"
+    context_lens = torch.tensor([next_n, context_len], dtype=torch.int32, device=device)
+    blocks_per_seq = ceil_div(context_len, phys_block_kv)
+    num_blocks = batch_size * blocks_per_seq
+    block_table = torch.randperm(num_blocks, dtype=torch.int32, device=device).reshape(
+        batch_size, blocks_per_seq
+    )
+    query = torch.randn(
+        (batch_size, next_n, num_heads, head_dim), dtype=torch.bfloat16, device=device
+    )
+    kv_cache = torch.randn(
+        (num_blocks, phys_block_kv, 1, head_dim), dtype=torch.bfloat16, device=device
+    )
+    weights = torch.randn((batch_size * next_n, num_heads), device=device)
+    query_packed, query_scales = DSAVanillaIndexer.quantize_fp4(
+        query.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    query_dequantized = DSAVanillaIndexer.dequantize_fp4(
+        query_packed, query_scales, gran_k=32, use_packed_ue8m0=True
+    ).view(batch_size, next_n, num_heads, head_dim)
+    remove_online_sf_transpose = phys_block_kv == 128
+    kv_fused, kv_dequantized = kv_cache_cast_to_fp4(
+        kv_cache, remove_online_sf_transpose=remove_online_sf_transpose
+    )
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens.unsqueeze(-1), 64, deep_gemm.get_num_sms()
+    )
+    expected = paged_mqa_logits(
+        query_dequantized.float(),
+        kv_dequantized.float(),
+        weights,
+        context_lens,
+        context_lens,
+        block_table,
+        max_model_len,
+    )
+
+    logits = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+        query_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2),
+        query_scales.view(torch.int32).view(batch_size, next_n, num_heads),
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+        epi_dtype=torch.float32,
+        output_dtype=torch.float32,
+        remove_online_sf_transpose=remove_online_sf_transpose,
+    )
+
+    row_indices = torch.arange(batch_size * next_n, device=device)
+    causal_limits = context_lens[row_indices // next_n] - next_n + row_indices % next_n
+    valid = torch.arange(max_model_len, device=device).unsqueeze(0) <= causal_limits.unsqueeze(1)
+    assert logits.shape == expected.shape
+    assert logits.dtype == torch.float32
+    assert torch.isfinite(logits[valid]).all()
+    atol, rtol = ELEM_TOL[(torch.float32, torch.float32)]
+    torch.testing.assert_close(logits[valid], expected[valid], atol=atol, rtol=rtol)

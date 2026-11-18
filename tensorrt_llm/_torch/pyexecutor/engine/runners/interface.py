@@ -24,10 +24,14 @@ class PreparedInputs:
     """Wrap, rather than replace, the keyword arguments passed to a model.
 
     ``runtime_draft_len`` is the draft length the prepared step runs with.
+    ``static_inputs_staged`` is the number of tokens whose input ids and
+    positions the preparation already wrote to the CUDA graph's static inputs
+    (0: none).
     """
 
     kwargs: dict[str, Any]
     runtime_draft_len: int = 0
+    static_inputs_staged: int = 0
 
 
 @dataclass(frozen=True)
@@ -66,7 +70,7 @@ class ScheduledInputs:
 
 @dataclass(frozen=True)
 class RunnerConfig:
-    """Immutable settings shared by encoder, decoder, and no-KV-cache runners."""
+    """Immutable settings shared by encoder and decoder runners."""
 
     max_batch_size: int
     max_num_tokens: int
@@ -109,23 +113,3 @@ class ScheduledModelRunner(ModelRunner):
 
         ``is_dummy`` marks warmup and memory-profiling passes.
         """
-
-
-class PackedModelRunner(ModelRunner):
-    """Run a model family whose batch arrives already packed.
-
-    A runner implements this contract or ``ScheduledModelRunner``; the engine
-    resolves which one it holds at initialization. The packed batch carries its
-    own request boundaries and model-specific inputs, so none of the scheduling
-    collaborators apply.
-    """
-
-    def warmup(self) -> None:
-        """Prepare execution, including optional graph capture, when needed."""
-
-    @abstractmethod
-    def forward(
-        self,
-        inputs: PackedInputs,
-    ) -> dict[str, Any]:
-        """Validate and execute the packed inputs without silently ignoring them."""

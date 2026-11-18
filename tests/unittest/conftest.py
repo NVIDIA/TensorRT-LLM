@@ -42,6 +42,7 @@ from tensorrt_llm._utils import print_all_stacks
 # Bootstrap: makes common utilities under tests/ importable.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
+from integration.defs.utils import periodic_junit
 # Dispatched explicitly (not via pytest_plugins, which pytest forbids in a
 # non-top-level conftest: a repo-root invocation like `pytest tests` loads
 # this file as a NESTED conftest and would fail collection; and not via "-p"
@@ -67,6 +68,10 @@ def pytest_configure(config):
     # Dump all threads' stacks when SIGALRM is received
     signal.signal(signal.SIGALRM, dump_threads)
 
+    periodic = config.getoption("--periodic-junit", default=False)
+    if periodic:
+        periodic_junit.register_pytest_timeout_evidence(config)
+
     # xdist worker processes must not register PeriodicJUnitXML: all worker
     # reports are forwarded to the controller via xdist and processed there,
     # so registering on workers causes concurrent writers to the same
@@ -75,7 +80,6 @@ def pytest_configure(config):
         return
 
     # Register PeriodicJUnitXML when invoked from integration test_unittests.py
-    periodic = config.getoption("--periodic-junit", default=False)
     periodic_junit_xmlpath = config.getoption("--periodic-junit-xmlpath",
                                               default=None)
     if periodic and periodic_junit_xmlpath:
@@ -86,6 +90,8 @@ def pytest_configure(config):
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
             "--periodic-save-unfinished-test", default=False)
+        periodic_unfinished_test_path = config.getoption(
+            "--periodic-unfinished-test-path", default=None)
         periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
                                                    default=False)
         xml_dir = os.path.dirname(periodic_junit_xmlpath)
@@ -100,6 +106,7 @@ def pytest_configure(config):
                 'warning': print_warning
             },
             save_unfinished_test=periodic_save_unfinished_test,
+            unfinished_test_path=periodic_unfinished_test_path,
             dump_hang_traceback=periodic_hang_traceback,
         )
         config.pluginmanager.register(reporter, 'periodic_junit')
@@ -257,6 +264,13 @@ def pytest_addoption(parser):
         default=False,
         help=
         "Save unfinished test name to unfinished_test.txt. Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-unfinished-test-path",
+        action="store",
+        default=None,
+        help="Override the unfinished_test.txt location (default: alongside "
+        "--periodic-junit-xmlpath). Only used with --periodic-save-unfinished-test.",
     )
     parser.addoption(
         "--periodic-hang-traceback",

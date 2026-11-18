@@ -28,6 +28,5 @@
 # H100_PCIe-*
 # DGX_H100-*
 
-Reason: L40S-PyTorch-2 is temporarily paused due to Kubernetes agent provisioning and node issues.
-L40S-PyTorch-2
-L40S-PyTorch-2-cbts
+Reason: H100_PCIe-PyTorch-Perf-1 was retired from main; skip the legacy stage in older PR revisions.
+H100_PCIe-PyTorch-Perf-1

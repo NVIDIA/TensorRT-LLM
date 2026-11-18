@@ -1,11 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Small integer and layout helpers shared by workspace implementations."""
 
 from typing import Iterable, List, Tuple, Union
 
 import cutlass
+
 
 IntegerType = Union[int, cutlass.Int32, cutlass.Int64, cutlass.Uint32, cutlass.Uint64]
 
@@ -69,9 +67,7 @@ def strides_equal_ignoring_singletons(shape, lhs_stride, rhs_stride) -> bool:
     return shape == 1 or lhs_stride == rhs_stride
 
 
-def ordered_stride(
-    shape: Tuple[int, ...], mem_order: Tuple[int, ...]
-) -> Tuple[Tuple[int, ...], int]:
+def ordered_stride(shape: Tuple[int, ...], mem_order: Tuple[int, ...]) -> Tuple[Tuple[int, ...], int]:
     stride = [0] * len(shape)
     cosize = 1
     for mode in sorted(range(len(shape)), key=lambda index: mem_order[index]):

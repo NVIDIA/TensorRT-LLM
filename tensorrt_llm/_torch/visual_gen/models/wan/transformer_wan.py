@@ -39,6 +39,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
 )
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.token_order import TokenReorder, resolve_token_order
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -719,6 +720,7 @@ class WanBlock(nn.Module):
 class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
     _supports_token_sharded_tp = True
+    _supports_token_order = True
 
     def __init__(
         self,
@@ -813,6 +815,12 @@ class WanTransformer3DModel(BaseDiffusionModel):
         )
 
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, max_seq_len=1024)
+
+        # Optional Z-order token permutation around the block stack, for
+        # block-sparse attention (SolAttentionConfig.token_order="morton").
+        _attn_cfg = getattr(model_config, "attention", None)
+        _sa_cfg = getattr(_attn_cfg, "sparse_attention_config", None) if _attn_cfg else None
+        self._token_reorder = TokenReorder(resolve_token_order(_sa_cfg))
 
         # LayerNorm weights in fp32 (matches internal float32 normalization; avoids bf16/fp32 mismatch).
         self.norm_out = LayerNorm(
@@ -909,6 +917,13 @@ class WanTransformer3DModel(BaseDiffusionModel):
         # Patchify and flatten: [B, C, T, H, W] -> [B, S, hidden_size]
         x = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
 
+        # Reorder tokens and RoPE together; the inverse is applied after the
+        # block stack (no-op for the native order).
+        self._token_reorder.prepare((T // pt, H // ph, W // pw), x.device)
+        x = self._token_reorder.permute(x, dim=1)
+        freqs_cos = self._token_reorder.permute(freqs_cos, dim=1)
+        freqs_sin = self._token_reorder.permute(freqs_sin, dim=1)
+
         # Shard sequence + matching RoPE across ranks (no-op when sharder is inactive).
         seq_len = x.shape[1]
         x = self.sharder.shard(x, dim=1)
@@ -940,6 +955,12 @@ class WanTransformer3DModel(BaseDiffusionModel):
         if ts_seq_len is not None:
             # batch_size, seq_len, 6, hidden_size
             temb_proj = temb_proj.unflatten(2, (6, self.config.hidden_size))
+            if self._token_reorder.active and temb_proj.shape[1] != seq_len:
+                raise ValueError(
+                    f"token_order={self._token_reorder.order!r} needs one timestep per "
+                    f"token: got {temb_proj.shape[1]} timesteps for {seq_len} tokens."
+                )
+            temb_proj = self._token_reorder.permute(temb_proj, dim=1)
             # Shard per-patch temb_proj to match the local sequence chunk
             temb_proj = self.sharder.shard(temb_proj, dim=1, expected_seq_len=seq_len)
         else:
@@ -982,6 +1003,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
 
         # All-gather sequence from all ranks: [B, S/P] -> [B, S] (no-op when inactive).
         x = self.sharder.gather(x, dim=1)
+        x = self._token_reorder.restore(x, dim=1)
 
         # Output projection and unpatchify
         if temb.ndim == 3:

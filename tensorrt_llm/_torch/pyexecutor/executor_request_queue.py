@@ -9,6 +9,9 @@ import threading
 import time
 from typing import Iterable, List, Optional
 
+import numpy as np
+
+from tensorrt_llm.bindings.executor import Request
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
 from ..distributed import Distributed
@@ -42,6 +45,9 @@ class RequestQueueItem:
     _ = dataclasses.KW_ONLY
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
+    # A completed frontend result may no longer map its client identity to an
+    # engine request. Resolve this only against retained CTX transfers.
+    cancel_context_client_id: Optional[int] = None
     # Only meaningful for control requests. True = drain active/waiting
     # queues before firing the action. False = fire at the next scheduler
     # step boundary with in-flight requests still in the engine.
@@ -58,6 +64,18 @@ class RequestQueueItem:
     # original arrival on the same clock.
     admit_arrival: Optional[float] = None
     admit_orig_arrival: Optional[float] = None
+    # Waiting-queue passes that left this request queued because its rank was full.
+    admission_wait_iters: int = 0
+    # The number of input token ids ``request`` carries (without the prefix a prompt-tail
+    # transport left out), kept when it travels without them, and those ids on the rank
+    # that owns such a request (see RequestBroadcaster).
+    num_input_tokens: Optional[int] = None
+    prompt_token_ids: Optional[np.ndarray] = None
+
+    def __post_init__(self) -> None:
+        # Normalize bound inputs before any queue, ADP, or broadcast handoff.
+        if isinstance(self.request, Request):
+            self.request = ExecutorRequest.adapt(self.request)
 
     @property
     def is_shutdown_request(self):
@@ -249,9 +267,11 @@ class ExecutorRequestQueue:
                     self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)
 
-                item = RequestQueueItem(req_id,
-                                        request,
-                                        child_req_ids=child_req_ids)
+                item = RequestQueueItem(
+                    req_id,
+                    request,
+                    child_req_ids=child_req_ids,
+                    num_input_tokens=request.num_input_tokens)
                 if self._stamp_admission_times is not None:
                     self._stamp_admission_times(item, time.monotonic())
                 self.request_queue.put(item)
@@ -272,8 +292,24 @@ class ExecutorRequestQueue:
 
     def enqueue_cancel_request(self, req_id: int):
         with self.enqueue_lock:
+            if not self._can_enqueue_cancellation():
+                return
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
+
+    def enqueue_context_transfer_cancel(self, client_id: int) -> None:
+        """Queue a late CTX cancellation in the client-ID namespace.
+
+        Args:
+            client_id: Original frontend identity, not an executor request ID.
+        """
+        with self.enqueue_lock:
+            if not self._can_enqueue_cancellation():
+                return
+            self.request_queue.put(
+                RequestQueueItem(client_id,
+                                 is_canceled_request=True,
+                                 cancel_context_client_id=client_id))
 
     def pending_cancellation_ids(self) -> set[int]:
         """Inspect cancellation sentinels without consuming queued requests."""
@@ -281,6 +317,7 @@ class ExecutorRequestQueue:
             return {
                 item.id
                 for item in self.request_queue.queue if item.is_canceled_request
+                and item.cancel_context_client_id is None
             }
 
     def enqueue_control_request(self,
@@ -322,13 +359,27 @@ class ExecutorRequestQueue:
         with self.enqueue_lock:
             return self.active and self.dist.rank == 0
 
+    def _can_enqueue_cancellation(self) -> bool:
+        # The caller holds enqueue_lock, including the enqueue-time recheck.
+        return (self.active and self.dist.rank == 0
+                and self.admission_state in (RequestAdmissionState.RUNNING,
+                                             RequestAdmissionState.PARKING))
+
+    def can_enqueue_cancellation(self) -> bool:
+        """Allow cancellation of existing work while admission drains for sleep."""
+        with self.enqueue_lock:
+            return self._can_enqueue_cancellation()
+
     def get_from_request_queue(
             self,
-            timeout: Optional[datetime.timedelta]) -> List[RequestQueueItem]:
+            timeout: Optional[datetime.timedelta],
+            *,
+            wait_for_batch: bool = True) -> List[RequestQueueItem]:
         """Fetch requests from the queue with optional timeout.
 
         Args:
             timeout: Optional timeout for waiting on queue.
+            wait_for_batch: Whether to wait for additional items to fill a batch.
 
         Returns:
             List of RequestQueueItem fetched from the queue.
@@ -349,7 +400,7 @@ class ExecutorRequestQueue:
         except queue.Empty:
             pass
 
-        if self.batch_wait_timeout_ms == 0:
+        if not wait_for_batch or self.batch_wait_timeout_ms == 0:
             return items
 
         if len(items) >= self.max_batch_size:
