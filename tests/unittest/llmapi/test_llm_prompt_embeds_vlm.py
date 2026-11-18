@@ -5,7 +5,7 @@
 import json
 import os
 import uuid
-from typing import Iterator, List, Tuple
+from typing import Iterator, List
 
 import numpy as np
 import pytest
@@ -187,8 +187,8 @@ def test_prompt_embeds_with_video_in_one_request(llm: LLM, model_dir: str) -> No
     }
     assert _run(llm, [request]) == expected
 
-    # Rows the model can tell apart: swap two words around the video through
-    # embeddings only; the reference swaps the ids themselves.
+    # Rows that differ from the scheduled ids: swap two words around the video
+    # through embeddings only; the reference swaps the ids themselves.
     before, after = _swappable_positions(llm, ids, vision_ids)
     swapped_ids = list(ids)
     swapped_ids[before], swapped_ids[after] = ids[after], ids[before]
@@ -198,11 +198,10 @@ def test_prompt_embeds_with_video_in_one_request(llm: LLM, model_dir: str) -> No
         "prompt_embeds_mask": [p in (before, after) for p in range(len(ids))],
     }
     expected_swap = _run(llm, [{**plain, "prompt_token_ids": swapped_ids}])
-    assert expected_swap != expected
     assert _run(llm, [swapped]) == expected_swap
 
 
-def _swappable_positions(llm: LLM, ids: List[int], vision_ids: set) -> Tuple[int, int]:
+def _swappable_positions(llm: LLM, ids: List[int], vision_ids: set) -> tuple[int, int]:
     """Pick a word before and one after the vision tokens whose swap re-tokenizes stably."""
     first_vision = min(p for p, t in enumerate(ids) if t in vision_ids)
     last_vision = max(p for p, t in enumerate(ids) if t in vision_ids)

@@ -240,7 +240,7 @@ def remap_prompt_embeds(
     prompt_embeds: PromptEmbeds,
     original_ids: Sequence[int],
     expanded_ids: Sequence[int],
-    item_spans: Sequence[Tuple[int, int]],
+    item_spans: Sequence[tuple[int, int]],
 ) -> PromptEmbeds:
     """Move prompt-embedding positions through multimodal placeholder expansion.
 
@@ -265,7 +265,14 @@ def remap_prompt_embeds(
     """
     if prompt_embeds.embeds is None:
         raise ValueError("Remapping prompt_embeds needs the rows.")
-    mapping: List[int] = []
+    if list(original_ids) == list(expanded_ids):
+        # Already expanded (e.g. a disaggregated encoder handoff): positions
+        # stand, and none may fall inside a multimodal item.
+        for p in prompt_embeds.positions.tolist():
+            if any(start <= p < end for start, end in item_spans):
+                raise ValueError("prompt_embeds_mask selects a multimodal placeholder position.")
+        return prompt_embeds
+    mapping: list[int] = []
     placeholders = set()
     gap_start = 0
     for start, end in list(item_spans) + [(len(expanded_ids), len(expanded_ids))]:
@@ -310,7 +317,7 @@ def _raise_unaligned() -> None:
 
 def _align_gap(
     segment: Sequence[int], expanded_ids: Sequence[int], begin: int, end: int, framed: bool
-) -> List[int]:
+) -> list[int]:
     """Match ``segment`` in order within ``expanded_ids[begin:end]``.
 
     Args:
@@ -346,7 +353,7 @@ def _align_gap(
     return mapping
 
 
-def multimodal_item_spans(multimodal_input: "MultimodalInput") -> List[Tuple[int, int]]:
+def multimodal_item_spans(multimodal_input: "MultimodalInput") -> list[tuple[int, int]]:
     """Return each multimodal item's ``[first row, last row + 1)`` in prompt order.
 
     Args:

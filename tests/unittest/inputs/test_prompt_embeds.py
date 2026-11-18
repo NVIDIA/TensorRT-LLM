@@ -251,3 +251,47 @@ def test_remap_text_after_video_matching_timestamp() -> None:
     expanded = [1, 60, 50, 53, 53, 52, 61, 50, 53, 53, 52, 61, 2]
     _, pe = build_prompt_embeds(original, _rows(1), [False] * 4 + [True, False])
     assert remap_prompt_embeds(pe, original, expanded, [(3, 10)]).positions.tolist() == [11]
+
+
+def test_item_spans_from_runs_feed_remap() -> None:
+    from types import SimpleNamespace
+
+    from tensorrt_llm.inputs.prompt_embeds import multimodal_item_spans, remap_prompt_embeds
+
+    # Two videos, two frame runs each (rows 3-4, 8-9 and 14-15, 19-20).
+    runs = SimpleNamespace(
+        multimodal_item_run_cu_offsets=[0, 2, 4],
+        multimodal_run_positions=[3, 8, 14, 19],
+        multimodal_run_lengths=[2, 2, 2, 2],
+        multimodal_positions=[3, 14],
+        multimodal_lengths=[4, 4],
+    )
+    spans = multimodal_item_spans(runs)
+    assert spans == [(3, 10), (14, 21)]
+    original = [1, 50, 53, 52, 61, 50, 53, 52, 2]
+    expanded = [1, 60, 50, 53, 53, 52, 61, 50, 53, 53, 52, 61,
+                60, 50, 53, 53, 52, 61, 50, 53, 53, 52, 2]  # fmt: skip
+    _, pe = build_prompt_embeds(original, _rows(2), [True] + [False] * 3 + [True] + [False] * 4)
+    assert remap_prompt_embeds(pe, original, expanded, spans).positions.tolist() == [0, 11]
+
+    # Contiguous fallback: one image of three rows.
+    contiguous = SimpleNamespace(
+        multimodal_item_run_cu_offsets=None,
+        multimodal_run_positions=None,
+        multimodal_run_lengths=None,
+        multimodal_positions=[2],
+        multimodal_lengths=[3],
+    )
+    assert multimodal_item_spans(contiguous) == [(2, 5)]
+
+
+def test_remap_keeps_already_expanded_ids() -> None:
+    from tensorrt_llm.inputs.prompt_embeds import remap_prompt_embeds
+
+    # A disaggregated encoder handoff schedules the ids it received.
+    ids = [1, 50, 51, 51, 52, 2]
+    _, pe = build_prompt_embeds(ids, _rows(1), [False] * 5 + [True])
+    assert remap_prompt_embeds(pe, ids, list(ids), [(2, 4)]) is pe
+    _, on_image = build_prompt_embeds(ids, _rows(1), [False, False, False, True, False, False])
+    with pytest.raises(ValueError, match="multimodal placeholder"):
+        remap_prompt_embeds(on_image, ids, list(ids), [(2, 4)])
