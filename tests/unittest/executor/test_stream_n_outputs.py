@@ -50,15 +50,34 @@ class CharTokenizer:
         return (prev_text or "") + self.decode(token_ids), states
 
 
-class _Result(SimpleNamespace):
-    """Fields the handler reads that these tests do not set are absent (None)."""
-
-    def __getattr__(self, name):
-        return None
+# Every other field the handlers read, so a newly read field fails here instead of passing as None.
+_UNSET_RESULT_FIELDS = (
+    "_result",
+    "additional_context_outputs",
+    "additional_generation_outputs",
+    "avg_decoded_tokens_per_iter",
+    "cached_tokens",
+    "context_logits",
+    "context_phase_params",
+    "ctx_computed_tokens",
+    "ctx_first_begin",
+    "ctx_num_chunks",
+    "ctx_usage",
+    "decoding_iter",
+    "generation_logits",
+    "mm_embedding_handles",
+    "mrope_position_ids_handle",
+    "per_pos_accepted",
+    "per_pos_drafted",
+    "request_perf_metrics",
+    "spec_dec_totals",
+    "time_breakdown_metrics",
+)
 
 
 def _response(seq_idx, ids, finish_reason, is_final, cum_log_prob=None):
-    result = _Result(
+    result = SimpleNamespace(
+        **dict.fromkeys(_UNSET_RESULT_FIELDS),
         sequence_index=seq_idx,
         output_token_ids=[ids],
         finish_reasons=[finish_reason],
