@@ -14,6 +14,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import weakref
 from collections.abc import Sequence
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+import tensorrt_llm._torch.models.multimodal_encoder_data_parallel as dp_module
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
@@ -547,6 +549,106 @@ def test_attention_data_parallel_encodes_only_local_requests_without_collective(
 
     assert model.encoded_item_ids == [10, 20, 30]
     assert output.shape == (8, 2)
+
+
+class _SharedEncoderTpModel(torch.nn.Module, MultimodalModelMixin):
+    """TP2 with attention DP and encoder TP over both ranks, seen from rank 1."""
+
+    def __init__(self, rows: int, dim: int, device: str):
+        torch.nn.Module.__init__(self)
+        self.model_config = ModelConfig(
+            mapping=Mapping(world_size=2, rank=1, tp_size=2, enable_attention_dp=True),
+            multimodal_config=MultimodalConfig(
+                encoder_data_parallel_size=1, encoder_cache_max_bytes=0
+            ),
+        )
+        self.rows, self.dim, self.out_device = rows, dim, device
+        # Keep only keys and ids: holding the params would keep their buffers alive.
+        self.encoded_keys: list[set[str]] = []
+        self.encoded_ids: list[int] = []
+        self.outputs: list[weakref.ref] = []
+
+    def _any_encoder_dp_rank_failed(self, local_failed: bool) -> bool:
+        return local_failed
+
+    def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs) -> torch.Tensor:
+        self.encoded_keys.extend(set(param.multimodal_data) for param in multimodal_params)
+        self.encoded_ids.extend(id(param) for param in multimodal_params)
+        output = torch.empty(self.rows, self.dim, device=self.out_device)
+        self.outputs.append(weakref.ref(output))
+        return output
+
+
+def _shared_encoder_tp_input(rows: int, dim: int, device: str) -> list:
+    data = {
+        "image": {"pixel_values": torch.zeros(rows, dim, device=device)},
+        # Full-prompt LLM data that the encoder does not read.
+        "mrope_config": {"mrope_position_ids": torch.zeros(3, 1, 4096, device=device)},
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("image", 0)], output_embedding_lengths=[rows]
+        ),
+    }
+    return [(MultimodalParams(multimodal_data=data), [rows], "image")]
+
+
+class _SameBatchOnEveryRank:
+    """Object allgather where the peer owner sent the same batch as this rank."""
+
+    @staticmethod
+    def get(mapping):
+        return SimpleNamespace(tp_allgather=lambda obj, **kwargs: [obj, obj])
+
+
+@pytest.mark.cpu_only
+def test_shared_encoder_tp_sends_only_encoder_data_and_owner_uses_local_inputs():
+    model = _SharedEncoderTpModel(rows=4, dim=2, device="cpu")
+    encoder_inputs = _shared_encoder_tp_input(rows=4, dim=2, device="cpu")
+
+    with patch.object(dp_module, "Distributed", _SameBatchOnEveryRank):
+        outputs = model.forward_multimodal_encoder_items(encoder_inputs)
+
+    # Owner 0 (the peer) sends only the encoder's data; owner 1 (this rank)
+    # encodes its own local params.
+    assert model.encoded_keys[0] == {"image", MULTIMODAL_ENCODER_ITEM_METADATA_KEY}
+    assert model.encoded_ids[1] == id(encoder_inputs[0][0])
+    assert [output.shape for output in outputs] == [(4, 2)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_shared_encoder_tp_frees_each_owner_before_the_next():
+    rows, dim = 1024, 2048  # 8 MiB fp32 payload and output per owner
+    payload_bytes = rows * dim * 4
+    model = _SharedEncoderTpModel(rows, dim, device="cuda")
+    encoder_inputs = _shared_encoder_tp_input(rows, dim, device="cuda")
+    gathered: list[weakref.ref] = []
+    sent_elements = []
+    alive_at_gather: list[list[bool]] = []
+
+    def allgather(payload, mapping, dim=0, sizes=None):
+        # Like NCCL, allocate the full receive buffer on every rank.
+        sent_elements.append((payload.dtype, sum(sizes)))
+        alive_at_gather.append([ref() is not None for ref in gathered + model.outputs])
+        output = torch.empty(sum(sizes), dtype=payload.dtype, device="cuda")
+        gathered.append(weakref.ref(output))
+        return output
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    with (
+        patch.object(dp_module, "Distributed", _SameBatchOnEveryRank),
+        patch.object(dp_module, "allgather", allgather),
+    ):
+        model.forward_multimodal_encoder_items(encoder_inputs)
+    torch.cuda.synchronize()
+
+    # Owner 0's payload and output are gone before owner 1 (this rank) sends.
+    assert alive_at_gather == [[], [False, False]]
+    # The full-prompt MRoPE positions are not sent.
+    assert sent_elements == [(torch.float32, rows * dim)] * 2
+    # One owner at a time: the sender's packed and received copies, or a
+    # received payload and its output, never two owners at once.
+    assert torch.cuda.max_memory_allocated() - base <= 2 * payload_bytes + (1 << 20)
 
 
 @pytest.mark.cpu_only

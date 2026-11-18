@@ -725,6 +725,8 @@ class MultimodalModelMixin:
                 shared_outputs = self._forward_multimodal_encoder_items_local(shared_inputs)
             if owner == mapping.tp_rank:
                 outputs = shared_outputs
+            # Drop this owner's inputs and outputs before the next owner's are allocated.
+            del shared_inputs, shared_outputs
         return outputs
 
     def _forward_multimodal_encoder_items_local(

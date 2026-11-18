@@ -32,7 +32,7 @@ import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from tensorrt_llm._torch.distributed import Distributed, allgather
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
@@ -173,31 +173,75 @@ def execute_encoder_dp_items(
     return torch.cat(ordered_outputs, dim=0)
 
 
+def _owner_leaves(
+    owner: int,
+    owner_leaves: list,
+    owner_descriptors: list[tuple[int, tuple[int, ...], torch.dtype]],
+    local_cuda_leaves: dict[torch.dtype, list[torch.Tensor]],
+    mapping: Mapping,
+    any_rank_failed: Callable[[bool], bool],
+) -> list:
+    """Send or receive one owner's CUDA tensors, one allgather per dtype.
+
+    The owner only sends: it keeps its local tensors and frees the packed copy
+    right away. Other ranks get views into one received buffer per dtype.
+    """
+    leaves = list(owner_leaves)
+    by_dtype: dict[torch.dtype, list[tuple[int, tuple[int, ...]]]] = {}
+    for index, shape, dtype in owner_descriptors:
+        by_dtype.setdefault(dtype, []).append((index, shape))
+    for dtype, entries in by_dtype.items():
+        with encoder_dp_error_guard(any_rank_failed):
+            total_elements = sum(torch.Size(shape).numel() for _, shape in entries)
+            if mapping.tp_rank == owner:
+                payload = torch.cat([tensor.reshape(-1) for tensor in local_cuda_leaves[dtype]])
+            else:
+                payload = torch.empty(0, dtype=dtype, device="cuda")
+        if total_elements:
+            payload = allgather(
+                payload,
+                mapping,
+                dim=0,
+                sizes=[total_elements if rank == owner else 0 for rank in range(mapping.tp_size)],
+            )
+        if mapping.tp_rank == owner:
+            continue
+        offset = 0
+        for index, shape in entries:
+            numel = torch.Size(shape).numel()
+            leaves[index] = payload[offset : offset + numel].view(shape)
+            offset += numel
+    return leaves
+
+
 def iter_encoder_rank_inputs(
     encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
     *,
     mapping: Mapping,
     any_rank_failed: Callable[[bool], bool],
-) -> Iterator[tuple[int, list[tuple[MultimodalParams, Sequence[int], str]]]]:
+) -> Iterator[tuple[int, Sequence[tuple[MultimodalParams, Sequence[int], str]]]]:
     """Share one ADP owner's prepared encoder batch at a time for encoder TP.
 
-    Only CPU descriptors and metadata use object collectives. CUDA tensor
-    payloads stay on the GPU and use the existing variable-size allgather.
-    Processing owners in order bounds temporary GPU storage by one owner's
-    encoder budget, rather than the sum of all ranks' budgets.
+    Only what the encoder reads is shared: the modality payload, the item
+    metadata, the row counts and the modality. Other request data, such as
+    full-prompt MRoPE positions, stays on its owner. CPU values use one object
+    collective; CUDA tensors stay on the GPU and use the variable-size
+    allgather. The owner encodes its own local inputs. The caller must drop
+    each yielded batch before asking for the next one, so temporary GPU
+    storage stays bounded by one owner's encoder budget.
     """
     with encoder_dp_error_guard(any_rank_failed):
         leaves, spec = tree_flatten(
             [
-                (param.multimodal_data, lengths, modality)
+                (param.multimodal_data[modality], param.item_metadata, lengths, modality)
                 for param, lengths, modality in encoder_inputs
             ]
         )
-        gpu_leaves: dict[torch.dtype, list[tuple[int, torch.Tensor]]] = {}
+        local_cuda_leaves: dict[torch.dtype, list[torch.Tensor]] = {}
         descriptors = []
         for index, leaf in enumerate(leaves):
             if isinstance(leaf, torch.Tensor) and leaf.is_cuda:
-                gpu_leaves.setdefault(leaf.dtype, []).append((index, leaf))
+                local_cuda_leaves.setdefault(leaf.dtype, []).append(leaf)
                 descriptors.append((index, tuple(leaf.shape), leaf.dtype))
                 leaves[index] = None
     rank_metadata = Distributed.get(mapping).tp_allgather((leaves, spec, descriptors))
@@ -205,35 +249,26 @@ def iter_encoder_rank_inputs(
     for owner, (owner_leaves, owner_spec, owner_descriptors) in enumerate(rank_metadata):
         if not owner_descriptors and not tree_unflatten(owner_leaves, owner_spec):
             continue
-        shared_leaves = list(owner_leaves)
-        by_dtype: dict[torch.dtype, list[tuple[int, tuple[int, ...]]]] = {}
-        for index, shape, dtype in owner_descriptors:
-            by_dtype.setdefault(dtype, []).append((index, shape))
-        for dtype, entries in by_dtype.items():
-            with encoder_dp_error_guard(any_rank_failed):
-                total_elements = sum(torch.Size(shape).numel() for _, shape in entries)
-                if mapping.tp_rank == owner:
-                    payload = torch.cat([tensor.reshape(-1) for _, tensor in gpu_leaves[dtype]])
-                else:
-                    payload = torch.empty(0, dtype=dtype, device="cuda")
-            if total_elements:
-                payload = allgather(
-                    payload,
-                    mapping,
-                    dim=0,
-                    sizes=[
-                        total_elements if rank == owner else 0 for rank in range(mapping.tp_size)
-                    ],
-                )
-            offset = 0
-            for index, shape in entries:
-                numel = torch.Size(shape).numel()
-                shared_leaves[index] = payload[offset : offset + numel].view(shape)
-                offset += numel
-        yield (
-            owner,
-            [
-                (MultimodalParams(multimodal_data=data), lengths, modality)
-                for data, lengths, modality in tree_unflatten(shared_leaves, owner_spec)
-            ],
+        shared_leaves = _owner_leaves(
+            owner, owner_leaves, owner_descriptors, local_cuda_leaves, mapping, any_rank_failed
         )
+        if owner == mapping.tp_rank:
+            shared_inputs = encoder_inputs
+        else:
+            shared_inputs = [
+                (
+                    MultimodalParams(
+                        multimodal_data={
+                            modality: data,
+                            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+                        }
+                    ),
+                    lengths,
+                    modality,
+                )
+                for data, metadata, lengths, modality in tree_unflatten(shared_leaves, owner_spec)
+            ]
+        del shared_leaves
+        yield owner, shared_inputs
+        # Free this owner's buffers before the next owner's are allocated.
+        del shared_inputs
