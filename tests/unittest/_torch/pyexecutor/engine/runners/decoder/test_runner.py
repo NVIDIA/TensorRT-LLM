@@ -679,6 +679,39 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
             (True, 7, False),
         )
 
+    def test_logits_processor_runs_on_the_last_context_chunk_only(self) -> None:
+        # After a pause the prompt also holds the tokens generated so far, so
+        # get_tokens(0) is longer than the prompt on every chunk and only the
+        # chunk bookkeeping tells the final chunk apart.
+        engine, _, _, _, _ = _make_decoder_runner(None)
+        for last_chunk in (False, True):
+            with self.subTest(last_chunk=last_chunk):
+                calls = []
+
+                def processor(req_id, logits, token_ids, stream_ptr, client_id):
+                    calls.append(req_id)
+
+                request = SimpleNamespace(
+                    py_request_id=1,
+                    context_chunk_size=1,
+                    py_return_context_logits=False,
+                    py_logits_post_processors=[processor],
+                    is_last_context_chunk=last_chunk,
+                    py_orig_prompt_len=2,
+                    get_tokens=lambda beam: [1, 2, 3, 4],
+                )
+                batch = ScheduledRequests()
+                if last_chunk:
+                    batch.context_requests_last_chunk = [request]
+                else:
+                    batch.context_requests_chunking = [request]
+
+                DecoderRunner._execute_logit_post_processors(
+                    engine, batch, {"logits": torch.zeros(1, 4)}
+                )
+
+                self.assertEqual(calls, [1] if last_chunk else [])
+
 
 @pytest.mark.cpu_only
 class TestDecodeGraphMetadataPreparation(unittest.TestCase):
