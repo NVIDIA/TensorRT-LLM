@@ -1377,8 +1377,10 @@ class _ModalityTpModel(MultimodalModelMixin):
         self.group = group
         self.fail_after_image = fail_after_image
         self.forwards: list[str] = []
+        self.status_exchanges = 0
 
     def exchange_encoder_status(self, values: Sequence[int]) -> list[object]:
+        self.status_exchanges += 1
         rows = self.group.allgather(self.model_config.mapping.tp_rank, list(values))
         if not all(isinstance(row, list) for row in rows):
             raise _MismatchedCollective
@@ -1446,3 +1448,55 @@ def test_shared_encoder_tp_shares_failures_before_the_next_modality(failure: str
     assert outcomes[0] is error
     torch.testing.assert_close(outcomes[1], [torch.full((1, 2), 200.0)])
     assert [model.forwards for model in models] == [["image", "image", "video"]] * 2
+
+
+class _UndescribableParams(MultimodalParams):
+    """A batch whose item metadata cannot be read, so it cannot be sent to the other ranks."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(multimodal_data={"image": {"pixel_values": torch.zeros(1, 2)}})
+        self.error = error
+
+    @property
+    def item_metadata(self) -> MultimodalItemMetadata:
+        raise self.error
+
+
+@pytest.mark.parametrize("failure", ["system_error", "request_error"])
+def test_shared_encoder_tp_shares_the_batch_status_with_its_metadata(failure: str) -> None:
+    """Rank 0 cannot describe its batch, and rank 1 owns a video. The status
+    goes with the batch metadata, so no status exchange runs before it."""
+    group = _ThreadTpGroup(2)
+    error = {
+        "system_error": TypeError("unreadable item metadata on rank 0"),
+        "request_error": MultimodalEncoderContractError("bad request on rank 0"),
+    }[failure]
+    models = [_ModalityTpModel(0, group), _ModalityTpModel(1, group)]
+    inputs = [[(_UndescribableParams(error), [1], "image")], _modality_input("video", 200.0)]
+    outcomes: list[object] = [None, None]
+
+    def run(rank: int) -> None:
+        try:
+            outcomes[rank] = models[rank].forward_multimodal_encoder_items(
+                inputs[rank], max_tokens=8, max_items=2
+            )
+        except BaseException as caught:  # noqa: BLE001 - record every outcome
+            outcomes[rank] = caught
+
+    with patch.object(dp_module, "Distributed", group), ThreadPoolExecutor(2) as ranks:
+        list(ranks.map(run, range(2)))
+
+    if failure == "system_error":
+        # Every rank raises the same error right after the metadata gather.
+        assert all(isinstance(outcome, EncoderDpError) for outcome in outcomes)
+        assert str(outcomes[0]) == str(outcomes[1])
+        assert outcomes[0].__cause__ is error
+        assert [model.forwards for model in models] == [[], []]
+        assert [model.status_exchanges for model in models] == [0, 0]
+        return
+    # Rank 0 sends no batch and fails only its own request after the pass.
+    # Rank 1's video is encoded by both ranks, with one status exchange.
+    assert outcomes[0] is error
+    torch.testing.assert_close(outcomes[1], [torch.full((1, 2), 200.0)])
+    assert [model.forwards for model in models] == [["video"], ["video"]]
+    assert [model.status_exchanges for model in models] == [1, 1]

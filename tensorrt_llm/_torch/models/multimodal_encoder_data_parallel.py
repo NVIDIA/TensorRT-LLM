@@ -341,7 +341,7 @@ def _shared_owner_inputs(
     owner_metadata: tuple, buffer: torch.Tensor | None
 ) -> list[tuple[MultimodalParams, Sequence[int], str]]:
     """Rebuild a peer owner's encoder inputs from its gathered metadata and packed bytes."""
-    owner_leaves, owner_spec, owner_descriptors, _, _ = owner_metadata
+    owner_leaves, owner_spec, owner_descriptors, *_ = owner_metadata
     leaves = list(owner_leaves)
     if owner_descriptors:
         # Without a payload, every CUDA tensor of the group is empty.
@@ -373,8 +373,11 @@ def iter_encoder_rank_inputs(
 
     Only what the encoder reads is shared: the modality payload, the item
     metadata, the row counts and the modality. Other request data, such as
-    full-prompt MRoPE positions, stays on its owner. CPU values use one object
-    collective. Consecutive owners whose batches fit one encoder step
+    full-prompt MRoPE positions, stays on its owner. CPU values and this
+    rank's status use one object collective. A rank that cannot describe its
+    batch sends none: a system error makes every rank raise the same
+    ``EncoderDpError``, and a request error is raised on that rank after the
+    shared pass. Consecutive owners whose batches fit one encoder step
     together (see ``group_encoder_owners``) form a group. Each owner in a
     group packs its CUDA tensors into one byte buffer, so a group costs one
     status exchange and one variable-size allgather. The owner encodes its
@@ -384,16 +387,17 @@ def iter_encoder_rank_inputs(
     caller must drop each group before asking for the next, so temporary GPU
     storage stays bounded by one encoder step.
     """
-    with encoder_dp_error_guard(exchange_status):
+    local_error: Exception | None = None
+    local_cuda_leaves: list[torch.Tensor] = []
+    descriptors = []
+    num_bytes = 0
+    try:
         leaves, spec = tree_flatten(
             [
                 (param.multimodal_data[modality], param.item_metadata, lengths, modality)
                 for param, lengths, modality in encoder_inputs
             ]
         )
-        local_cuda_leaves: list[torch.Tensor] = []
-        descriptors = []
-        num_bytes = 0
         for index, leaf in enumerate(leaves):
             if isinstance(leaf, torch.Tensor) and leaf.is_cuda:
                 local_cuda_leaves.append(leaf)
@@ -403,9 +407,15 @@ def iter_encoder_rank_inputs(
                 )
                 leaves[index] = None
         cost = _encoder_cost(encoder_inputs)
+    except Exception as error:
+        # Send no batch; the status rides with the metadata.
+        local_error = release_error_frames(error)
+        (leaves, spec), cost = tree_flatten([]), (0, 0)
+        local_cuda_leaves, descriptors, num_bytes = [], [], 0
     rank_metadata = Distributed.get(mapping).tp_allgather(
-        (leaves, spec, descriptors, num_bytes, cost)
+        (leaves, spec, descriptors, num_bytes, cost, int(EncoderDpStatus.of(local_error)))
     )
+    raise_shared_system_error([metadata[5] for metadata in rank_metadata], local_error)
 
     for owners in group_encoder_owners(
         [metadata[4] for metadata in rank_metadata], max_tokens, max_items
@@ -439,3 +449,5 @@ def iter_encoder_rank_inputs(
         yield group
         # Free this group's buffers before the next group's are allocated.
         del group
+    if local_error is not None:
+        raise local_error

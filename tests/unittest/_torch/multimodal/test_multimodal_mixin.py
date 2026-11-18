@@ -896,7 +896,7 @@ def test_shared_encoder_tp_frees_each_group_before_the_next(bad_tag):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize(
     "max_tokens,status_exchanges,allgathers",
-    [(None, 1 + 8 * 2, 8), (32, 1 + 2, 1)],
+    [(None, 8 * 2, 8), (32, 2, 1)],
     ids=["one_owner_per_group", "one_group"],
 )
 def test_shared_encoder_tp_collectives_per_step(max_tokens, status_exchanges, allgathers):
@@ -924,8 +924,8 @@ def test_shared_encoder_tp_collectives_per_step(max_tokens, status_exchanges, al
             _owner_tagged_input(3.0, "cuda", extra_dtype=True), max_tokens=max_tokens, max_items=8
         )
 
-    # One flatten status, then per group one pack status and one encoder
-    # status. One object gather and one packed byte allgather per group.
+    # Per group one pack status and one encoder status; the batch status
+    # goes with the one object gather. One packed byte allgather per group.
     assert model.status_exchanges == status_exchanges
     assert len(object_gathers) == 1
     assert len(sent) == allgathers
