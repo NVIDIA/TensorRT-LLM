@@ -1680,6 +1680,126 @@ def test_prims_ts_precompiles_once_per_arena(monkeypatch: pytest.MonkeyPatch) ->
     assert records[3] is not records[2] and records[3]["arena"] is records[2]["arena"]
 
 
+@skip_prims_ts_unsupported
+@torch.inference_mode()
+def test_prims_ts_plans_ignore_main_ready_without_runahead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import CSA2PrimsTS
+
+    calls = []
+    monkeypatch.setattr(
+        packed,
+        "precompile_packed_sparse_mla",
+        lambda *args, **kwargs: calls.append((kwargs["inputs_final"], kwargs["main_ready"])) or 1,
+    )
+    monkeypatch.setattr(packed, "_compile_packed", lambda spec: spec)
+    monkeypatch.setattr(packed, "_get_compiled_mla_decode", lambda spec: spec)
+    monkeypatch.setattr(packed.UnitScaleQuery, "plan", lambda *_, **__: None)
+    q = torch.zeros((2, 3, 512), device="cuda", dtype=torch.bfloat16)
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 0, kv_input_mode="packed")
+    metadata._csa2_prims_ts_max_queries = 6
+    helper = CSA2PrimsTS(_backend(3, compute_backend="prims_ts"))
+
+    def plan(inputs_final: bool, main_ready: bool) -> dict:
+        return helper._get_plan(
+            q.flatten(1),
+            metadata,
+            "swa_fp8",
+            "main",
+            inputs_final=inputs_final,
+            main_ready=main_ready,
+        )
+
+    # Only a kernel that runs ahead of its preceding launch reads MAIN before the wait.
+    assert plan(False, False) is plan(False, True)
+    assert plan(True, False) is not plan(True, True)
+    assert calls == [(False, True), (True, False), (True, True)]
+
+
+class _Forgetful(dict):
+    """A memo that keeps nothing, so every lookup builds afresh."""
+
+    def __setitem__(self, key, value) -> None:
+        pass
+
+
+@skip_prims_ts_unsupported
+@pytest.mark.parametrize(
+    "heads,geometry",
+    [
+        # Context tiles: a decoded MAIN bank and a SWA-only layer storing the grouped MXFP8
+        # output, and NVFP4 MAIN records.
+        (
+            64,
+            dict(
+                max_extra_topk=512,
+                swa_cache_format="swa_fp8",
+                main_cache_format="main_fp8",
+                valid_prefix=True,
+                output_groups=8,
+            ),
+        ),
+        (64, dict(max_extra_topk=512, swa_cache_format="swa_fp8", valid_prefix=True)),
+        (
+            64,
+            dict(max_extra_topk=0, swa_cache_format="swa_fp8", valid_prefix=True, output_groups=8),
+        ),
+        # Split-KV producer plans, and runahead raw-selection plans that rotate Q.
+        (16, dict(max_extra_topk=512)),
+        (
+            16,
+            dict(
+                max_extra_topk=512,
+                swa_cache_format="swa_fp8",
+                raw_selections=True,
+                query_rope=True,
+                inputs_final=True,
+                main_ready=False,
+            ),
+        ),
+    ],
+)
+@torch.inference_mode()
+def test_prims_ts_launches_share_kernels_across_row_counts(
+    heads: int, geometry: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    capacity = packed._validate_geometry(1, heads, 128, geometry["max_extra_topk"])
+    row_counts = [*range(1, sm_count + 9), 1024, 4095, 4096, 16383, 32768]
+    if geometry.get("output_groups") is not None:
+        # Only single-split, single-V-CTA plans store the MXFP8 output.
+        row_counts = [
+            rows
+            for rows in row_counts
+            if packed._quantizes_output(
+                packed._select_packed_profile(rows, heads, capacity, sm_count)
+            )
+        ]
+    shared = [packed._resolve_launch(device, rows, heads, 128, **geometry) for rows in row_counts]
+    monkeypatch.setattr(packed, "_LAUNCH_KERNELS", _Forgetful())
+    fresh = [packed._resolve_launch(device, rows, heads, 128, **geometry) for rows in row_counts]
+    for rows, a, b in zip(row_counts, shared, fresh):
+        # A plan of shared kernels compiles, sizes and binds what one of its own would.
+        assert a.profile == b.profile, rows
+        assert a.signature == b.signature == b.kernel.compile_signature(), rows
+        assert (a.core_bytes, a.workspace_bytes, a.sections) == (
+            b.core_bytes,
+            b.workspace_bytes,
+            b.sections,
+        ), rows
+        for x, y in ((a.gather, b.gather), (a.nvfp4, b.nvfp4)):
+            assert (x is None) == (y is None), rows
+            if x is not None:
+                assert (x.profile, x.spec, x.core_bytes) == (y.profile, y.spec, y.core_bytes), rows
+    assert len({id(launch.kernel) for launch in shared}) < len(row_counts)
+
+
 def _packed_mla_reference(
     q, swa, indices, lengths, main, extra_indices, extra_lengths, scale, output_scale, sinks
 ):

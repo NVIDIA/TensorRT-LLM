@@ -290,6 +290,9 @@ class CSA2PrimsTS:
         rows = metadata.num_tokens
         heads = self.attention.num_heads
         width = metadata.num_sparse_topk
+        # A kernel that does not run ahead of its preceding launch reads its MAIN part
+        # after that launch whatever ``main_ready`` says: its plans are one plan.
+        main_ready = main_ready or not inputs_final
         key = (
             q.device,
             rows,

@@ -119,10 +119,28 @@ class _GatherLaunch:
 
 
 @dataclass(frozen=True)
+class _LaunchKernels:
+    """The kernels of a launch: the packed producer kernel with its batch-free compile
+    signature and split-KV scratch, and the native kernels sized for the same arena."""
+
+    kernel: ThroughputLatencyMlaDecodeTs
+    signature: tuple
+    core_bytes: int
+    gather: _GatherLaunch | None
+    nvfp4: _GatherLaunch | None
+
+
+# _LaunchKernels by everything that selects them (see _resolve_launch).
+_LAUNCH_KERNELS: dict[tuple, _LaunchKernels] = {}
+
+
+@dataclass(frozen=True)
 class _Launch:
     device: torch.device
     profile: SparseMlaProfile
     kernel: ThroughputLatencyMlaDecodeTs
+    # The packed producer kernel's batch-free compile signature.
+    signature: tuple
     sections: dict[str, _WorkspaceSection]
     workspace_bytes: int
     # Split-KV scratch of the packed producer kernel; "core" also fits the native kernels'.
@@ -644,11 +662,120 @@ def _resolve_launch(
         raise NotImplementedError("CSA2 packed PrimTS requires SM100, SM103 or SM107")
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     profile = _select_packed_profile(rows, heads, capacity, sm_count, inputs_final)
-    output_quant = None
-    if output_groups is not None:
-        if not _quantizes_output(profile):
-            raise ValueError("CSA2 PrimTS MXFP8 output needs a single-split, single-V-CTA plan")
-        output_quant = MXFP8OutputQuant(heads, output_groups)
+    if output_groups is not None and not _quantizes_output(profile):
+        raise ValueError("CSA2 PrimTS MXFP8 output needs a single-split, single-V-CTA plan")
+    main_after_wait = inputs_final and not main_ready
+    natives = (
+        _select_gather_profile(rows, heads, capacity, sm_count),
+        _select_nvfp4_profile(rows, heads, capacity, sm_count, _compute_capability(device))
+        if max_extra_topk
+        else None,
+    )
+    # Beyond the profiles that select them, the kernels depend on the row count only
+    # through their split-KV scratch, which single-split kernels do without: plans of
+    # such kernels share them across row counts, as they share compiled kernels.
+    split = any(p is not None and p.split_kv > 1 for p in (profile, *natives))
+    key = (
+        device.index,
+        rows if split else None,
+        heads,
+        capacity,
+        sm_count,
+        max_topk,
+        max_extra_topk,
+        swa_cache_format,
+        aligned_strides,
+        main_cache_format,
+        output_groups,
+        raw_selections,
+        query_rope,
+        main_after_wait,
+        profile,
+        natives,
+        get_env_enable_pdl(),
+    )
+    kernels = _LAUNCH_KERNELS.get(key)
+    if kernels is None:
+        kernels = _launch_kernels(
+            device,
+            rows,
+            heads,
+            capacity,
+            sm_count,
+            max_topk,
+            max_extra_topk,
+            swa_cache_format,
+            aligned_strides,
+            main_cache_format,
+            output_groups,
+            raw_selections,
+            query_rope,
+            main_after_wait,
+            profile,
+        )
+        _LAUNCH_KERNELS[key] = kernels
+    native_core = max(
+        (launch.core_bytes for launch in (kernels.gather, kernels.nvfp4) if launch is not None),
+        default=0,
+    )
+    sections = {}
+    byte_end = 0
+    for name, shape, dtype in (
+        ("core", (max(kernels.core_bytes, native_core),), torch.int8),
+        ("lse", (rows, 1, heads), torch.float32),
+        ("q8", (rows, 1, heads, _HEAD_DIM), torch.uint8),
+        # One record wide enough for either MAIN format, so both share an arena.
+        ("dummy_main", (1, main_row_bytes("main_fp8")), torch.uint8),
+        # The gather ABI always binds an extra list and sinks: SWA-only launches
+        # bind empty extra lists, and plans without sinks bind -inf logits.
+        ("dummy_extra", (2, rows), torch.int32),
+        ("no_sinks", (heads,), torch.float32),
+        # Raw-selection launches: both lists' constant live widths, and an INT32 stand-in
+        # for the page-offset operand the INT64 SWA slots cannot alias.
+        ("raw_lengths", (2, rows), torch.int32),
+        ("raw_offsets", (rows, max_topk), torch.int32),
+    ):
+        sections[name], byte_end = _append_workspace_section(byte_end, shape, dtype)
+    gather, nvfp4 = kernels.gather, kernels.nvfp4
+    if not (
+        valid_prefix and gathers_plain_rows(swa_cache_format, main_cache_format, max_extra_topk)
+    ):
+        gather = None
+    if not (valid_prefix and swa_cache_format == "swa_fp8" and main_cache_format == "main"):
+        nvfp4 = None
+    return _Launch(
+        device,
+        profile,
+        kernels.kernel,
+        kernels.signature,
+        sections,
+        byte_end,
+        kernels.core_bytes,
+        gather,
+        nvfp4,
+    )
+
+
+def _launch_kernels(
+    device: torch.device,
+    rows: int,
+    heads: int,
+    capacity: int,
+    sm_count: int,
+    max_topk: int,
+    max_extra_topk: int,
+    swa_cache_format: SwaCacheFormat,
+    aligned_strides: bool,
+    main_cache_format: PrimsTSMainFormat,
+    output_groups: int | None,
+    raw_selections: bool,
+    query_rope: bool,
+    main_after_wait: bool,
+    profile: SparseMlaProfile,
+) -> _LaunchKernels:
+    """Build the packed producer kernel of ``profile`` and the native kernels of the
+    geometry, which size one arena for every format, prefix promise and output."""
+    output_quant = None if output_groups is None else MXFP8OutputQuant(heads, output_groups)
     kernel_profile = MlaProfile(
         name="csa2_packed_e4m3_keep_v3",
         kernel_variant="keeps_mma_ab",
@@ -685,7 +812,7 @@ def _resolve_launch(
             main_cache_format=main_cache_format,
             raw_selections=raw_selections,
             query_rope=query_rope,
-            main_after_wait=inputs_final and not main_ready,
+            main_after_wait=main_after_wait,
         ),
         # Compile the planned SWA + MAIN capacity; live lengths still arrive
         # with the metadata on every launch.
@@ -699,8 +826,6 @@ def _resolve_launch(
         partial_o_dtype=cutlass.BFloat16,
         lse_dtype=cutlass.Float32,
     )
-    # Size the arena for every kernel whatever the formats, so one arena serves
-    # every format, prefix promise and output of the geometry.
     gather = _gather_launch(
         device, rows, heads, capacity, sm_count, max_topk, max_extra_topk, output_quant
     )
@@ -711,34 +836,7 @@ def _resolve_launch(
         if max_extra_topk
         else None
     )
-    native_core = max(
-        (launch.core_bytes for launch in (gather, nvfp4) if launch is not None), default=0
-    )
-    sections = {}
-    byte_end = 0
-    for name, shape, dtype in (
-        ("core", (max(core_bytes, native_core),), torch.int8),
-        ("lse", (rows, 1, heads), torch.float32),
-        ("q8", (rows, 1, heads, _HEAD_DIM), torch.uint8),
-        # One record wide enough for either MAIN format, so both share an arena.
-        ("dummy_main", (1, main_row_bytes("main_fp8")), torch.uint8),
-        # The gather ABI always binds an extra list and sinks: SWA-only launches
-        # bind empty extra lists, and plans without sinks bind -inf logits.
-        ("dummy_extra", (2, rows), torch.int32),
-        ("no_sinks", (heads,), torch.float32),
-        # Raw-selection launches: both lists' constant live widths, and an INT32 stand-in
-        # for the page-offset operand the INT64 SWA slots cannot alias.
-        ("raw_lengths", (2, rows), torch.int32),
-        ("raw_offsets", (rows, max_topk), torch.int32),
-    ):
-        sections[name], byte_end = _append_workspace_section(byte_end, shape, dtype)
-    if not (
-        valid_prefix and gathers_plain_rows(swa_cache_format, main_cache_format, max_extra_topk)
-    ):
-        gather = None
-    if not (valid_prefix and swa_cache_format == "swa_fp8" and main_cache_format == "main"):
-        nvfp4 = None
-    return _Launch(device, profile, kernel, sections, byte_end, core_bytes, gather, nvfp4)
+    return _LaunchKernels(kernel, kernel.compile_signature(), core_bytes, gather, nvfp4)
 
 
 def get_packed_sparse_mla_workspace_size(
@@ -790,7 +888,7 @@ def _compile_spec(
 ) -> _CompileSpec:
     return _CompileSpec(
         device_index=launch.device.index,
-        kernel_signature=launch.kernel.compile_signature(),
+        kernel_signature=launch.signature,
         heads=heads,
         max_topk=max_topk,
         max_extra_topk=max_extra_topk,
@@ -1281,7 +1379,7 @@ class PackedSparseMLA:
             kernel = _compile_packed(
                 replace(
                     state.spec,
-                    kernel_signature=launch.kernel.compile_signature(),
+                    kernel_signature=launch.signature,
                     kernel=launch.kernel,
                 )
             )

@@ -660,7 +660,10 @@ must be warmed before capture; a cold captured profile is rejected. The row
 count selects compile-time split-KV and reduction-topology kernel variants, so
 the first plan of each MAIN format (packed records or the context bank) in an
 arena compiles every variant up to the arena's query capacity; later row counts
-only plan. All profiles
+only plan. Plans of single-split schedules share their kernel objects across row
+counts (`_LAUNCH_KERNELS` in `_prims_ts_packed.py`) and lay out only their
+row-sized workspace, so a context chunk of a new length plans in well under a
+millisecond. All profiles
 of a selected width share one fixed-address metadata/scratch arena on that
 serialized stream. The owning tables exist before graph cloning and remain
 shared across graph metadata and target/draft cache-manager swaps. Each forward
