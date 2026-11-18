@@ -304,10 +304,12 @@ Each signed message also carries a per-socket sequence number. A receiver accept
 a message only when its number is higher than the last one it accepted from that
 socket, so a repeated message is dropped; so is a message that arrives after a
 later one, which can happen when a connection is re-established. A receiving
-socket keeps the last number of up to 4096 sending sockets in memory. A newly
-opened socket (each RankInfo exchange opens one) and a restarted worker start with
-none, so the first message they get from a sending socket is accepted with any
-number.
+socket keeps the last number of up to 4096 sending sockets in memory. Once it
+holds 4096 and accepts a message from one more sending socket, it forgets the
+number of the socket it has least recently accepted a message from, and the next
+message from that socket is accepted with any number. A newly opened socket (each
+RankInfo exchange opens one) and a restarted worker start with none, so the first
+message they get from a sending socket is accepted with any number.
 
 Upgrade communicating context and generation workers together before enabling
 native authentication. Existing deployments that already set
