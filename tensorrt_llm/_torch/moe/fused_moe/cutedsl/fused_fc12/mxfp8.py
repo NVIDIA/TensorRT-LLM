@@ -28,7 +28,7 @@ import torch
 
 from .....autotuner import AutoTuner
 from .....model_config import ModelConfig
-from .....utils import ActivationType, AuxStreamType, EventType
+from .....utils import ActivationType, AuxStreamType
 from ...activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
@@ -403,9 +403,11 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         )
 
         # The fused finalize scatter-adds into moe_output, so the rows this
-        # rank produces must be zero on entry. Overlap the sparse memset with
-        # the routing metadata on the aux stream when one is available.
-        memset_kwargs = dict(
+        # rank produces must be zero on entry. The memset reads moe_sort's
+        # outputs and the fused op needs it at once, so it runs inline: unlike
+        # the grouped-GEMM leaves, which hide it behind FC1, an aux-stream fork
+        # would have nothing to overlap with.
+        torch.ops.trtllm.moe_output_memset_inplace(
             input=moe_output,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
@@ -416,17 +418,6 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
             ep_size=self.mapping.moe_ep_size,
             enable_alltoall=enable_alltoall,
         )
-        if self._has_moe_output_memset_aux_stream():
-            memset_stream = self._moe_output_memset_run_stream()
-            self.event_dict[EventType.Main].record()
-            moe_output.record_stream(memset_stream)
-            with torch.cuda.stream(memset_stream):
-                self.event_dict[EventType.Main].wait()
-                torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
-                self.event_dict[EventType.MoeOutputMemset].record()
-            self.event_dict[EventType.MoeOutputMemset].wait()
-        else:
-            torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
 
         fc_alpha, fc1_norm_const = self._fused_fc12_constants(x.device)
         # The block scales are stored int32-packed (4 UE8M0 per int32 along
