@@ -388,13 +388,28 @@ void cublaslt_fp8_epilogue_gemm(Tensor& out, Tensor const& a, Tensor const& b, T
     cublasWrapper->setStream(stream);
     cublasWrapper->setWorkspace(workspace.data_ptr());
 
+    bool const gelu = epilogue == ScaledMmEpilogue::kGelu;
+    // The tuned LUT covers the default path's case (bf16 output, no GELU); look it up before the
+    // descriptors exist, as cublas_gemm_caller does. Gemm() checks the algorithm against them.
+    cublasLtMatmulAlgo_t algo;
+    bool hasAlgo = false;
+    if (!outFp8 && !gelu)
+    {
+#if CUDART_VERSION < 12080
+        hasAlgo = find_special_algo_deprecated(
+            algo, cublasWrapper, m, n, k, compType, scaleType, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, outType);
+#else
+        hasAlgo = find_special_algo(
+            algo, cublasWrapper, m, n, k, compType, scaleType, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, outType);
+#endif
+    }
+
     int32_t const lda = b.stride(1);
     int32_t const ldb = a.stride(0);
     int32_t const ldd = out.stride(0);
     // Row-major out = a @ b is column-major out^T = b^T (A, transposed) x a^T (B).
     cublasWrapper->createDescriptors(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, lda, ldb, ldd, /*fastAcc=*/1);
     cublasWrapper->setScaleDescriptors(scale_b.data_ptr(), scale_a.data_ptr());
-    bool const gelu = epilogue == ScaledMmEpilogue::kGelu;
     cublasLtEpilogue_t const epi = bias.has_value() ? (gelu ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS)
                                                     : (gelu ? CUBLASLT_EPILOGUE_GELU : CUBLASLT_EPILOGUE_DEFAULT);
     cublasWrapper->setEpilogueDescriptor(epi, bias.has_value() ? bias->data_ptr() : nullptr, biasType);
@@ -404,15 +419,6 @@ void cublaslt_fp8_epilogue_gemm(Tensor& out, Tensor const& a, Tensor const& b, T
         cublasWrapper->setDScaleDescriptor(d_scale->data_ptr());
     }
 
-    cublasLtMatmulAlgo_t algo;
-#if CUDART_VERSION < 12080
-    bool hasAlgo = find_special_algo_deprecated(
-        algo, cublasWrapper, m, n, k, compType, scaleType, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, outType);
-#else
-    bool hasAlgo
-        = find_special_algo(algo, cublasWrapper, m, n, k, compType, scaleType, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, outType);
-#endif
-    // Gemm() checks a LUT algorithm against these descriptors and falls back to the heuristic if it fails.
     if (!hasAlgo)
     {
         static std::mutex algoMutex;

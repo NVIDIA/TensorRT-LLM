@@ -51,6 +51,12 @@ CublasMMWrapper::CublasMMWrapper(CublasMMWrapper const& wrapper)
 void CublasMMWrapper::createDescriptors(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n,
     int const k, int const lda, int const ldb, int const ldc, int8_t fastAcc)
 {
+    // A D layout from an earlier call that did not reach destroyDescriptors() must not carry over.
+    if (mDDesc != NULL)
+    {
+        check_cuda_error(cublasLtMatrixLayoutDestroy(mDDesc));
+        mDDesc = NULL;
+    }
     // --------------------------------------
     // Create descriptors for the original matrices
     check_cuda_error(
