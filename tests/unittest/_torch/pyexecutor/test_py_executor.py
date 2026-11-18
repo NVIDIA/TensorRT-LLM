@@ -4794,6 +4794,7 @@ class TestOneModelMTPDraftTokenScheduling:
         ex._packed_sync_enabled = False
         ex._stage_timing = False
         ex.waiting_queue = []
+        ex.canceled_req_ids = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         ex._pad_attention_dp_dummy_request = Mock()

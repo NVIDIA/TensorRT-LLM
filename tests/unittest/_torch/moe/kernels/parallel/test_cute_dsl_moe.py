@@ -62,6 +62,29 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 
+def _nvfp4_quantize_fp32_ref(
+    x: torch.Tensor, inverse_global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize without the BF16 rounding absent from the fused FP32 epilogue."""
+    m, n = x.shape
+    blocks = x.reshape(m, n // 16, 16)
+    scales = (blocks.abs().amax(dim=-1) / 6 * inverse_global_scale).to(torch.float8_e4m3fn)
+    inverse_scales = (inverse_global_scale / scales.float()).clamp(
+        max=torch.finfo(torch.float32).max
+    )
+    normalized = (blocks * inverse_scales.unsqueeze(-1)).reshape(m, n)
+    magnitudes = normalized.abs().contiguous()
+    # E2M1 magnitudes are 0, 0.5, 1, 1.5, 2, 3, 4, 6. At midpoint ties,
+    # choose the even code, matching round-to-nearest-even conversion.
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    codes = torch.bucketize(magnitudes, midpoints)
+    for index in (1, 3, 5):
+        codes += (magnitudes == midpoints[index]).to(codes.dtype)
+    codes = codes.to(torch.uint8) | (torch.signbit(normalized).to(torch.uint8) << 3)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed, swizzle_sf(scales.view(torch.uint8), m, n)
+
+
 def swiglu_ref(x: torch.Tensor, swiglu_limit: float = float("inf")) -> torch.Tensor:
     x, gate = x.chunk(2, dim=-1)
     if swiglu_limit != float("inf"):
@@ -1632,12 +1655,15 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         tile_idx_to_group_idx,
         num_non_exiting_tiles,
         tile_size=tile_size,
-        output_dtype=torch.bfloat16,
+        output_dtype=torch.float32 if activation_type == ActivationType.Relu2 else torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
     c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
-    c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
+    if activation_type == ActivationType.Relu2:
+        c_ref, c_sf_ref = _nvfp4_quantize_fp32_ref(c_ref, 1 / global_sf)
+    else:
+        c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
     # Call Rubin gather kernel
     c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
@@ -2159,12 +2185,13 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin_small_tokens(
     )
     num_valid_permuted_tokens = n_tiles * tile_size
     for i in range(min(num_valid_permuted_tokens, max_num_permuted_tokens)):
+        # Routing metadata defines valid rows; expanded index zero is valid.
+        if i >= tile_idx_to_mn_limit[i // tile_size].item():
+            continue
         expanded_idx = permuted_idx_to_expanded_idx[i].item()
-        if expanded_idx > 0 or i == 0:
-            token_id = expanded_idx // top_k
-            if token_id < num_tokens:
-                a_gathered[i] = a[token_id]
-                a_sf_gathered[i] = a_sf_unswizzled[token_id]
+        token_id = expanded_idx // top_k
+        a_gathered[i] = a[token_id]
+        a_sf_gathered[i] = a_sf_unswizzled[token_id]
 
     a_sf_gathered_swizzled = swizzle_sf(
         a_sf_gathered.view(max_num_permuted_tokens, hidden_size // sf_vec_size),
@@ -2867,7 +2894,7 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
         ("cutedsl.runners", "CuteDslFusedMoEBF16Runner", 4, 3),
         # The subclass production instantiates for CUTEDSL_FC12. It overrides
         # _tile_sizes, so a green result on the parent is not evidence about it.
-        ("cutedsl.fused_fc12", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
+        ("cutedsl.fused_fc12.nvfp4", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
     ],
 )
 def test_workload_identity_alone_does_not_prime_inner_tactics(
@@ -3029,7 +3056,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
     """
     import inspect
 
-    from tensorrt_llm._torch.moe.fused_moe.cutedsl import fused_fc12 as fc12
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import nvfp4 as fc12
 
     captured = {}
 
@@ -3137,6 +3164,82 @@ def _cute_dsl_eligibility(activation: str = "Swiglu", **deployment_kwargs):
         **deployment_kwargs,
     )
     return TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(problem, deployment)
+
+
+@pytest.mark.parametrize(
+    ("intermediate_size_per_partition", "hidden_size", "enabled"),
+    [
+        pytest.param(768, 2048, True, id="halves-are-128-multiples"),
+        # Qwen3-235B-A22B / GLM-4.5 at moe_tp_size=8: 2 * 192 = 384 splits into 192.
+        pytest.param(192, 4096, False, id="fc1-half-not-128-multiple"),
+        # GPT-OSS-120B hidden size: FC2 halves of 1440.
+        pytest.param(2880, 2880, False, id="fc2-half-not-128-multiple"),
+    ],
+)
+def test_locality_domain_plan_vetoes_shards_the_kernels_cannot_tile(
+    intermediate_size_per_partition, hidden_size, enabled
+):
+    """The default split halves FC1 N and FC2 N; a half that is not a 128-row
+    multiple falls back to the full-GPU kernels instead of failing at warmup."""
+    from tensorrt_llm._torch.locality_domain.policy import PartitionPlan
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+
+    host = SimpleNamespace(
+        intermediate_size_per_partition=intermediate_size_per_partition,
+        hidden_size=hidden_size,
+    )
+    plan = PartitionPlan(enabled=True, num_partitions=2)
+    adjusted = CuteDslLocalityDomainMixin._adjust_locality_domain_plan(host, plan)
+    assert adjusted.enabled is enabled
+    if enabled:
+        assert adjusted is plan
+    else:
+        assert "multiple of 128" in adjusted.reason_if_disabled
+    disabled = PartitionPlan(enabled=False, reason_if_disabled="policy off")
+    assert CuteDslLocalityDomainMixin._adjust_locality_domain_plan(host, disabled) is disabled
+
+
+@pytest.mark.parametrize(
+    ("fc1_n", "fc2_n"),
+    [
+        pytest.param(384, 4096, id="fc1-half-odd-multiple-of-64"),
+        pytest.param(1536, 2880, id="fc2-half-not-128-multiple"),
+    ],
+)
+def test_locality_domain_split_rejects_shards_the_kernels_cannot_tile(fc1_n, fc2_n):
+    """The split checks the stored widths itself, so a weight padded past what
+    the plan veto saw fails at load instead of at warmup."""
+    from tensorrt_llm._torch.locality_domain.policy import PartitionPlan
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+
+    host = SimpleNamespace(
+        _locality_domain_plan=PartitionPlan(enabled=True, num_partitions=2),
+        w3_w1_weight=torch.empty(1, fc1_n, 8),
+        w2_weight=torch.empty(1, fc2_n, 8),
+    )
+    with pytest.raises(ValueError, match="multiple of 128"):
+        CuteDslLocalityDomainMixin._split_weights_for_locality_domain(host)
+
+
+def test_locality_domain_mixin_precedes_moe_impl_base():
+    """The mixin's lifecycle overrides chain to super(), so with the bases
+    swapped MoEImplBase's defaults would silently win; every host must list
+    the mixin first."""
+    import tensorrt_llm._torch.moe.fused_moe  # noqa: F401  (registers every leaf)
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+    from tensorrt_llm._torch.moe.fused_moe.impl_base import MoEImplBase
+
+    hosts = []
+    pending = list(CuteDslLocalityDomainMixin.__subclasses__())
+    while pending:
+        cls = pending.pop()
+        hosts.append(cls)
+        pending.extend(cls.__subclasses__())
+    assert hosts
+    for cls in hosts:
+        mro = cls.__mro__
+        if MoEImplBase in mro:
+            assert mro.index(CuteDslLocalityDomainMixin) < mro.index(MoEImplBase), cls
 
 
 def test_cute_dsl_locality_domain_rejects_eplb():
@@ -3247,6 +3350,9 @@ def test_cute_dsl_nvfp4_quantize_empty_input_rubin():
 
     assert x.shape == (0, hidden_size // 2)
     assert x_sf.shape == (0, hidden_size // scaling_vector_size)
+    # The empty input must not leave a pending CUDA error for the next launch.
+    torch.ones(1, device="cuda").add_(1)
+    torch.cuda.synchronize()
 
 
 def test_sm107_nvfp4_tile512_fallback_uses_two_cta_cluster():

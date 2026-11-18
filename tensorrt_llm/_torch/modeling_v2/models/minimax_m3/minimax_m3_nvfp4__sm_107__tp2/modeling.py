@@ -5846,7 +5846,12 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
         )
 
     def greedy_sample_draft_with_tp_gather(
-        self, logits: torch.Tensor, spec_metadata=None, mapping_lm_head_tp=None, tokens_out=None
+        self,
+        logits: torch.Tensor,
+        spec_metadata=None,
+        mapping_lm_head_tp=None,
+        tokens_out=None,
+        vocab_sharded=None,
     ) -> torch.Tensor:
         """W2b (``WIDE_SPEC_TAIL``): the in-tree draft loop's greedy top-1 over this rank's vocab shard of the drafter
         logits, from the fused shard argmax + cross-rank key exchange (ops/m3_shard_accept at draft length 0, at
@@ -5861,7 +5866,11 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
             and logits.dim() == 2
             and logits.dtype == torch.bfloat16
             and logits.stride(-1) == 1
-            and self._draft_logits_are_sharded(logits, spec_metadata)
+            and (
+                self._draft_logits_are_sharded(logits, spec_metadata)
+                if vocab_sharded is None
+                else vocab_sharded
+            )
         ):
             m = logits.shape[0]
             empty = torch.empty((m, 0), dtype=torch.int32, device=logits.device)
@@ -5878,7 +5887,11 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 _log_engaged("m3_draft_shard_top1", self.mapping)
         if tokens is None:
             return super().greedy_sample_draft_with_tp_gather(
-                logits, spec_metadata, mapping_lm_head_tp, tokens_out=tokens_out
+                logits,
+                spec_metadata,
+                mapping_lm_head_tp,
+                tokens_out=tokens_out,
+                vocab_sharded=vocab_sharded,
             )
         return self._tokens_into(tokens, tokens_out)
 
