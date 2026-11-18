@@ -95,6 +95,8 @@ class BatchInputs:
     spec: Optional[SpecStepInputs] = None
     # The runner's TRTLLM-Gen FMHA JIT warmup pass.
     trtllm_gen_jit_warmup: bool = False
+    # Step inputs of one attention backend, in the type its metadata define.
+    backend_inputs: Any = None
     # Device-side correction of the KV lengths: a device tensor added to the
     # extend rows when the step has any, otherwise to the generation rows
     # (indexed from 0 over those rows), plus a host scalar.
