@@ -102,6 +102,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_physical_pool,
     get_unique_pool_memory_descs,
 )
+from tensorrt_llm._torch.pyexecutor import hang_detector
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import CUASSERT, nvtx_range
@@ -777,6 +778,7 @@ class Sender(SenderBase):
         self._agent_operation_gate = _AgentOperationGate()
         self._agent_generation = 0
         self._agent_failed = False
+        self._retirement_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
         self._recover_agent: Optional[Callable[[int], None]] = None
         self._remote_agent_descriptors: dict[str, bytes] = {}
         self._unreleased_statuses: list[tuple[TransferStatus, SendTaskBase, threading.Event]] = []
@@ -1103,54 +1105,63 @@ class Sender(SenderBase):
                 return False, "transfer belongs to a retired NIXL agent generation"
             completed, detail = False, "NIXL agent recovery is pending"
             if not self._agent_failed:
-                completed, detail = True, None
-                for index, member in enumerate(requests):
-                    status = None
-                    retired = True
-                    with task.lock:
-                        task._native_inflight += 1
-                    try:
+                try:
+                    for member in requests:
                         if member.op == TransferOp.WRITE and not self._agent.check_remote_descs(
                             member.remote_name, member.dst_descs
                         ):
                             raise RuntimeError("NIXL WRITE remote descriptors unavailable")
-                        status = self._agent.submit_transfer_requests(member)
-                        if index == 0 and on_submitted is not None:
-                            with disagg_diagnostics.suppress_diagnostic_errors():
-                                on_submitted()
-                        # A failed sibling must be able to drain this gate before
-                        # rebuilding the agent, even if this handle stays IN_PROG.
-                        completed = status.wait(stop_requested=lambda: self._agent_failed)
+                except Exception as error:
+                    raise _TransferNotSubmittedError(
+                        "NIXL sender rejected transfer before backend submission"
+                    ) from error
+                # Reserve the whole operation: a sibling can fail this task
+                # between group members, while the next member can still submit.
+                with task.lock:
+                    task._native_inflight += 1
+                try:
+                    completed, detail = True, None
+                    for index, member in enumerate(requests):
+                        status = None
+                        retired = True
+                        try:
+                            status = self._agent.submit_transfer_requests(member)
+                            if index == 0 and on_submitted is not None:
+                                with disagg_diagnostics.suppress_diagnostic_errors():
+                                    on_submitted()
+                            completed = status.wait(stop_requested=lambda: self._agent_failed)
+                            if not completed:
+                                detail = status.last_status_str()
+                        except RuntimeError as error:
+                            completed, detail = False, str(error)
+                        finally:
+                            if status is not None:
+                                try:
+                                    retired = status.release()
+                                except RuntimeError:
+                                    retired = False
+                                # An interrupted wait is not a terminal backend result.
+                                if not completed and self._agent_failed:
+                                    retired = False
+                            if not retired:
+                                retirement_event = threading.Event()
+                                self._unreleased_statuses.append((status, task, retirement_event))
+                                completed, detail = False, "NIXL request awaits agent teardown"
+                            del status
                         if not completed:
-                            detail = getattr(status, "last_status_str", lambda: None)()
-                    except RuntimeError as error:
-                        completed, detail = False, str(error)
-                    finally:
-                        if status is not None:
-                            try:
-                                retired = status.release()
-                            except RuntimeError:
-                                retired = False
-                            # An interrupted wait is not a terminal backend result.
-                            if not completed and self._agent_failed:
-                                retired = False
-                        if not retired:
-                            retirement_event = threading.Event()
-                            self._unreleased_statuses.append((status, task, retirement_event))
-                            completed, detail = False, "NIXL request awaits agent teardown"
-                        if retired:
-                            with task.lock:
-                                task._native_inflight -= 1
-                        # Group members retire before the next member can submit.
-                        del status
-                    if not completed:
-                        self._agent_failed = True
-                        break
+                            self._agent_failed = True
+                            break
+                finally:
+                    if retirement_event is None:
+                        with task.lock:
+                            task._native_inflight -= 1
         if not completed:
             recover(generation)
-        if retirement_event is not None:
-            # FAILED permits destination reuse, so backend teardown must precede it.
-            retirement_event.wait()
+        if retirement_event is not None and not retirement_event.wait(self._retirement_timeout_s):
+            # Keep the handle and its memory rooted. Ordinary error cleanup
+            # cannot safely recycle these buffers after retirement times out.
+            hang_detector.propagate_hard_kill(diagnostics=False)
+            raise SystemExit("NIXL agent retirement timed out")
         return completed, detail
 
     def _submit_transfer(
@@ -5078,6 +5089,8 @@ class TransferWorker:
         sender = getattr(self, "_sender", None)
         if sender is not None:
             sender._shutdown_requested = True
+            if sender._recover_agent is not None and sender._agent_failed:
+                sender._recover_agent(sender._agent_generation)
         watchdog = getattr(self, "_retirement_watchdog", None)
         if watchdog is not None:
             watchdog.request_shutdown()
@@ -5210,6 +5223,12 @@ class TransferWorker:
                 and not use_pure_python_transfer_agent()
             ):
                 if getattr(self._agent, "supports_handle_retirement", False):
+                    timeout_s = self._config.tx_overall_timeout_s
+                    self._sender._retirement_timeout_s = (
+                        timeout_s
+                        if timeout_s is not None and timeout_s > 0
+                        else _FALLBACK_TX_OVERALL_TIMEOUT_S
+                    )
                     self._sender._recover_agent = self._request_agent_recovery
                 else:
                     logger.warning("NIXL agent recovery requires rebuilt request-release bindings")
@@ -5238,9 +5257,11 @@ class TransferWorker:
                 torch.cuda.set_device(self._config.device_id)
                 CUASSERT(cudart.cudaSetDevice(self._config.device_id))
                 while not self._agent_recovery_stop.is_set():
-                    self._recover_transfer_agent(self._sender._agent_generation)
+                    recovered = self._recover_transfer_agent(self._sender._agent_generation)
                     with self._agent_recovery_lock:
-                        if not self._sender._agent_failed:
+                        if not self._sender._agent_failed or (
+                            recovered and self._sender._shutdown_requested
+                        ):
                             self._agent_recovery_thread = None
                             return
                     self._agent_recovery_stop.wait(1.0)
@@ -5263,8 +5284,6 @@ class TransferWorker:
         with sender._loaded_remote_agents_lock, sender._agent_operation_gate.metadata():
             if failed_generation != sender._agent_generation or not sender._agent_failed:
                 return True
-            if sender._shutdown_requested:
-                return False
             with receiver._sessions_lock:
                 if receiver._sessions:
                     return False
@@ -5280,6 +5299,9 @@ class TransferWorker:
                             task._native_inflight -= 1
                         retired.set()
                     sender._unreleased_statuses.clear()
+                    if sender._shutdown_requested:
+                        self._registered_mem.clear()
+                        return True
                     mapping = self._config.kv_cache_manager.mapping
                     agent = _create_nixl_agent(
                         self._rank_info.instance_name + str(self._rank_info.instance_rank),

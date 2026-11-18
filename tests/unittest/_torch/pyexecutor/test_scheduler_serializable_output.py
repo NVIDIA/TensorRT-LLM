@@ -27,7 +27,7 @@ def _request_ids(requests):
 
 def test_serializable_scheduler_output_round_trip():
     # Create all requests and put them in a pool
-    request_pool = {idx: _make_request(idx) for idx in range(1, 8)}
+    request_pool = {idx: _make_request(idx) for idx in range(1, 9)}
 
     # Create scheduler result: scheduled_requests, fitting_disagg_gen_init_requests, num_fitting_requests
     scheduled_requests = ScheduledRequests()
@@ -37,7 +37,7 @@ def test_serializable_scheduler_output_round_trip():
     scheduled_requests.paused_requests = [request_pool[4]]
     scheduled_requests.scheduled_mm_encoder_items = {1: [0, 2], 7: [1]}
     scheduled_requests.recompute_paused_requests = [request_pool[7]]
-    scheduled_requests.failed_requests = [request_pool[4]]
+    scheduled_requests.failed_requests = [request_pool[8]]
     fitting_disagg_gen_init_requests = [request_pool[5], request_pool[6]]
     num_fitting_requests = 3
 
@@ -84,7 +84,7 @@ def test_serializable_scheduler_output_round_trip():
     assert _request_ids(restored_schedule.recompute_paused_requests) == _request_ids(
         scheduled_requests.recompute_paused_requests
     )
-    assert _request_ids(restored_schedule.failed_requests) == [4]
+    assert _request_ids(restored_schedule.failed_requests) == [8]
     assert _request_ids(restored_fitting) == _request_ids(fitting_disagg_gen_init_requests)
 
 
