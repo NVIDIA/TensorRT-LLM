@@ -656,9 +656,11 @@ class DecoderCudaGraphs:
             and not ced_enabled
             and self._config.max_beam_width == 1
             and self._context_promotion_supported
-            # PLE owns recurrent n-gram and convolution state. Promoting a
-            # fresh final-context row would skip its cache-slot reset.
+            # PLE owns recurrent n-gram and convolution state, and other models
+            # may declare state that only their context path resets. Promoting
+            # a fresh final-context row would skip its cache-slot reset.
             and not self._model_uses_ple_recurrent_state
+            and not self._model_resets_recurrent_state_in_context
             and self.mapping.cp_size == 1
         ):
             return scheduled_requests, frozenset()
@@ -685,6 +687,18 @@ class DecoderCudaGraphs:
         if not self._config.use_mrope or not _has_mm_payload_keys(multimodal_data):
             return True
         return CUDAGraphRunner._get_mrope_position_delta(request) is not None
+
+    @functools.cached_property
+    def _model_resets_recurrent_state_in_context(self) -> bool:
+        """Whether the causal LM declares state that only its context path resets.
+
+        Reads ``DecoderModelForCausalLM.resets_recurrent_state_in_context`` from
+        the causal LM the engine holds or, for a multimodal wrapper, from its
+        ``llm``.
+        """
+        model = getattr(self.model, "_orig_mod", self.model)
+        causal_lm = getattr(get_top_level_model(model), "llm", model)
+        return bool(getattr(causal_lm, "resets_recurrent_state_in_context", False))
 
     @functools.cached_property
     def _model_uses_ple_recurrent_state(self) -> bool:

@@ -64,7 +64,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     mixed = op(*args)
     assert mixed.shape == (cell.spec["rows"], cell.spec.get("hidden", 2560))
     # The answer came from the CuTe DSL kernel, JIT-compiled for this device.
-    assert (_BLOCK_H, args[3], mixed.shape[1], args[0].shape[1], False) in _COMPILED
+    assert (_BLOCK_H, args[3], mixed.shape[1], args[0].shape[1], False, False) in _COMPILED
     _compare(mixed, op.reference(*args))
 
 
@@ -90,3 +90,22 @@ def test_cuda_graph_capture_and_replay() -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(g_mixed, op(fresh[0], up, fresh[2], c))
+
+
+@pytest.mark.parametrize("rows", [1, 17, 96, 129, 192, 288, 384, 480])
+def test_wide_epilogue_is_bitwise_the_four_warp_one(rows) -> None:
+    """`wide=True` gives the four-warp epilogue's bits, eagerly and replayed from a CUDA graph."""
+    low, up, normed, hc = _build(dict(rows=rows), seed=4100 + rows)
+    four = op(low, up, normed, hc)
+    eight = op(low, up, normed, hc, wide=True)
+    torch.cuda.synchronize()
+    assert torch.equal(four, eight)
+    static = low.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(static, up, normed, hc, wide=True)
+    fresh, _, _, _ = _build(dict(rows=rows), seed=4200 + rows)
+    static.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, op(fresh, up, normed, hc))
