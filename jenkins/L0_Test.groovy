@@ -3909,6 +3909,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
     // Shared by result suppression and the retry decision for this attempt only.
     Map slurmRetryContext = [
       scope: InfraFailure.SLURM,
+      dispatcherNodeName: dispatcherNodeName,
       stageName: stageName,
       attempt: attempt,
       backoffMs: 60L * 1000L,
@@ -3995,6 +3996,12 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
       echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
 
       sleep(60)
+      // The dispatcher may have gone offline during cooldown.
+      if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+        echo "[INFRA-RETRY] ${stageName}: dispatcher is offline or unknown after cooldown; " +
+             "not starting another SLURM attempt."
+        throw e
+      }
     }
   }
 }
@@ -4385,6 +4392,12 @@ boolean retryContextAllowsRetry(def pipeline, Map retryContext, Throwable error,
     def classified = classifyFailure(pipeline, error, scope, retryContext)
     if (!(classified instanceof InfraFailure)) {
         return false
+    }
+    if (scope == InfraFailure.SLURM) {
+        String dispatcherNodeName = retryContext.dispatcherNodeName
+        if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+            return false
+        }
     }
     Long parsedAttempt = trtllm_utils.parseCiBudgetLong(retryContext.attempt)
     int attempt = parsedAttempt != null ? parsedAttempt as int : 1
