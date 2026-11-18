@@ -241,12 +241,22 @@ def test_a_delivery_check_runs_again_only_when_a_task_that_claims_it_lands(
 
 def test_a_claim_that_lands_while_its_check_runs_stays_owed(tmp_path):
     serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    state = {"tree": 1, "land": ""}  # land: where a task lands and claims the serve
     runs = []
 
+    def land(at):
+        if state["land"] == at:
+            state["land"], state["tree"] = "", state["tree"] + 1
+            orchestrator._claim([serve.key])
+
+    def marker():
+        tree = f"m{state['tree']}"
+        land("after the run read the target")
+        return tree
+
     def check(chk):
-        runs.append(chk.key)
-        if len(runs) == 1:
-            orchestrator._claim([chk.key])  # a task lands and claims it while this run measures
+        runs.append(f"m{state['tree']}")
+        land("while the check runs")
         return SimpleNamespace(name=chk.gate, member=chk.member, detail="", tree_state="",
                                passed=True)  # fmt: skip
 
@@ -255,15 +265,18 @@ def test_a_claim_that_lands_while_its_check_runs_stays_owed(tmp_path):
         work=lambda task: "UNIT_READY",
         check=check,
         free_gpus=lambda: 4,
-        marker=lambda: f"m{len(runs)}",
+        marker=marker,
     )
     status = c.ContractStatus.load(tmp_path)
     orchestrator = GraphOrchestrator(services, c.Contract(checks=(serve,)), status, tmp_path)
     orchestrator._claim([serve.key])
-    orchestrator._run_check_once(serve)
-    assert serve.key in orchestrator._owed
-    orchestrator._run_check_once(serve)
-    assert serve.key not in orchestrator._owed and runs == [serve.key, serve.key]
+    for land_at in ("while the check runs", "", "after the run read the target", ""):
+        state["land"] = land_at
+        orchestrator._run_check_once(serve)
+        # A claim that came after the run read the target is not answered by it.
+        assert (serve.key in orchestrator._owed) == bool(land_at)
+    # m1 and m2 were measured; the pass on m2 did not answer the claim m3 made.
+    assert runs == ["m1", "m2", "m3"]
 
 
 def test_a_failure_on_the_final_tree_reaches_the_planner(tmp_path):

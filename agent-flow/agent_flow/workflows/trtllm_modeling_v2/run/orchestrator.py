@@ -529,13 +529,16 @@ class GraphOrchestrator:
                 self._claims[key] = self._claims.get(key, 0) + 1
 
     def _run_check_once(self, check: contract_mod.Check) -> bool:
-        marker = self.s.marker()
+        # The claims are read before the target: one that lands after this read is not
+        # answered by a pass on the state read next, nor by the run that follows.
         with self._status_lock:
             claims = self._claims.get(check.key, 0)
+        marker = self.s.marker()
+        with self._status_lock:
             here = bool(marker) and contract_mod.passed_here(
                 self.contract, self.status, check, marker, self.s.holds
             )
-            if here:
+            if here and self._claims.get(check.key, 0) == claims:
                 self._owed.discard(check.key)
         if here:
             return True
