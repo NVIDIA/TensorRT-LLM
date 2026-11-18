@@ -17,6 +17,7 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa import index_plane_layout
 from tensorrt_llm._torch.attention.backends.sparse.qsa.constants import (
     QSA_INDEX_K_CACHE_DTYPE,
     QSA_POSITION_CACHE_DTYPE,
@@ -48,6 +49,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, Pag
 
 if TYPE_CHECKING:
     import transformers
+
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 # Storage-layout constants; model geometry comes from QSASparseParams.
 _IDENTITY_PAGE_INDEX_EXPANSION = 1
@@ -223,6 +226,10 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         self._ple_params = qwen4_exp_ple_cache_params
         self._pretrained_config = pretrained_config
         self.qsa_index_dim = self.qsa_index_kv_heads = 0
+        self.qsa_compress_ratio = 1
+        # Rows of one index page: tokens_per_block, or fewer under the compact layout
+        # (`index_plane_layout`); set when the side planes are registered.
+        self.qsa_index_rows: int | None = None
         self.qsa_sparse_layer_ids = []
         self.qsa_position_layer_id = None
         self.qsa_side_planes_size: int | None = None
@@ -239,7 +246,11 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
                 params.index_head_dim,
                 params.index_kv_heads,
             )
+            self.qsa_compress_ratio = params.compress_ratio
             self.qsa_sparse_layer_ids = [i for i, active in enumerate(layer_mask) if active]
+        # The compact index-page layout (`index_plane_layout`): packed side planes only, every
+        # reuse point on a compress-group edge (`prepare_expect_snapshot_points`).
+        self.qsa_index_compact = self._qsa_enabled and index_plane_layout.compact_enabled()
         self._is_ple_draft = kwargs.get("is_draft", False)
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, layer_mask=layer_mask, **kwargs)
@@ -280,6 +291,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         """
         if not self._qsa_enabled:
             return {}
+        self.qsa_index_rows = tokens_per_block
         index_size = (
             self.qsa_index_kv_heads * self.qsa_index_dim * _INDEX_K_ELEMENT_BYTES * tokens_per_block
         )
@@ -295,11 +307,26 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         position_local_idx = self.layer_offsets[self.qsa_position_layer_id]
         main_page_sizes = self._main_cache_page_sizes(tokens_per_block)
         if index_size in main_page_sizes or position_size in main_page_sizes:
+            if self.qsa_index_compact:
+                self.qsa_index_rows = index_plane_layout.plane_rows(
+                    tokens_per_block, self.qsa_compress_ratio, compact=True
+                )
+                index_size = (
+                    self.qsa_index_kv_heads
+                    * self.qsa_index_dim
+                    * _INDEX_K_ELEMENT_BYTES
+                    * self.qsa_index_rows
+                )
             packed_size = len(local_sparse_layers) * index_size + position_size
             while packed_size in main_page_sizes:
                 packed_size += _SIDE_PLANES_SIZE_STEP
             self.qsa_side_planes_size = packed_size
             return {position_local_idx: [BufferConfig(role=QSA_SIDE_PLANES, size=packed_size)]}
+        if self.qsa_index_compact:
+            raise ValueError(
+                f"{index_plane_layout.COMPACT_ENV}=1 needs packed QSA side planes (an FP8 or "
+                "NVFP4 KV cache)"
+            )
         result = {
             self.layer_offsets[layer_id]: [BufferConfig(role=Role.INDEX_KEY, size=index_size)]
             for layer_id in local_sparse_layers
@@ -324,18 +351,16 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             if layer_idx not in self.qsa_local_sparse_layer_ids:
                 return None
             ordinal = self.qsa_local_sparse_layer_ids.index(layer_idx)
+            rows = self.qsa_index_rows or self.tokens_per_block
             index_size = (
-                self.qsa_index_kv_heads
-                * self.qsa_index_dim
-                * _INDEX_K_ELEMENT_BYTES
-                * self.tokens_per_block
+                self.qsa_index_kv_heads * self.qsa_index_dim * _INDEX_K_ELEMENT_BYTES * rows
             )
             planes = self._side_planes()
             plane = planes[:, ordinal * index_size : (ordinal + 1) * index_size]
             if kv_layout == "NHD":
-                page_shape = [self.tokens_per_block, self.qsa_index_kv_heads, self.qsa_index_dim]
+                page_shape = [rows, self.qsa_index_kv_heads, self.qsa_index_dim]
             else:
-                page_shape = [self.qsa_index_kv_heads, self.tokens_per_block, self.qsa_index_dim]
+                page_shape = [self.qsa_index_kv_heads, rows, self.qsa_index_dim]
             return plane.view(QSA_INDEX_K_CACHE_DTYPE).view(planes.shape[0], *page_shape)
         return super().get_index_k_buffer(
             layer_idx,
@@ -483,7 +508,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
                 self.qsa_index_kv_heads
                 * self.qsa_index_dim
                 * _INDEX_K_ELEMENT_BYTES
-                * self.tokens_per_block
+                * (self.qsa_index_rows or self.tokens_per_block)
             )
             plane = planes[:, start : start + position_size]
             return plane.view(QSA_POSITION_CACHE_DTYPE).view(
@@ -545,6 +570,31 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
                 if page:
                     sizes.update(page // heads * h for h in range(1, total + 1))
         return sizes
+
+    @override
+    def prepare_expect_snapshot_points(self, requests: list[LlmRequest]) -> None:
+        """Under the compact index layout, move every recurrent-state snapshot point down to a
+        compress-group edge (dropping points below the first group): a reused prefix then never
+        ends inside a group, whose raw index keys a reused page may no longer hold."""
+        super().prepare_expect_snapshot_points(requests)
+        if not self.qsa_index_compact:
+            return
+        cr = self.qsa_compress_ratio
+        for request in requests:
+            points = request.expect_snapshot_points
+            if points:
+                request.expect_snapshot_points = sorted(
+                    {point // cr * cr for point in points if point >= cr}
+                )
+
+    @override
+    def _inforward_snapshot_max_tail(self) -> int:
+        """A from-end snapshot point moved down to a group edge leaves up to `cr - 1` more
+        tokens after it in the chunk that ends at the prompt end."""
+        tail = super()._inforward_snapshot_max_tail()
+        if tail and self.qsa_index_compact:
+            tail += self.qsa_compress_ratio - 1
+        return tail
 
     def _side_planes(self) -> torch.Tensor:
         """uint8 ``[slots, qsa_side_planes_size]`` over the packed side-plane pool."""
