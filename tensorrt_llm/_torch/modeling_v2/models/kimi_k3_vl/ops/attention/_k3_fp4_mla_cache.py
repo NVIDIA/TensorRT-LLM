@@ -42,6 +42,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     _fp4_mla_q1_kv_blocks_per_program,
     _fp4_mla_q1_prefix_blocks_per_program,
     _HPUpdatePhase,
+    fp4_mla_cache_layout,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
     _ensure_workspace_tensor,
@@ -156,20 +157,14 @@ def _prepare_fp4_mla_q_buffers(
     """
     if num_queries <= 0:
         raise ValueError(f"FP4 MLA Q buffer preparation needs queries, got {num_queries}.")
-    owner = getattr(metadata, "kv_cache_manager", None)
-    if owner is None:
-        raise RuntimeError("Fused FP4 MLA Q quantization requires a KV cache manager.")
+    cache_layout = fp4_mla_cache_layout(getattr(metadata, "kv_cache_manager", None))
+    if cache_layout is None:
+        raise RuntimeError(
+            "Fused FP4 MLA Q quantization requires a KV cache manager with the FP4 MLA cache layout."
+        )
     if num_heads <= 0 or num_heads > 128:
         raise ValueError(f"FP4 MLA Q buffers require 1-128 local heads, got {num_heads}.")
-    buffers = getattr(owner, "_fp4_mla_q_buffers", None)
-    if buffers is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "Cannot create FP4 MLA Q buffers while capturing a CUDA graph. "
-                "Run a warmup forward first."
-            )
-        buffers = {}
-        setattr(owner, "_fp4_mla_q_buffers", buffers)
+    buffers = cache_layout.get_or_create_fp4_mla_q_buffers()
 
     max_num_tokens = int(getattr(metadata, "max_num_tokens", num_queries) or num_queries)
     max_num_sequences = int(
@@ -510,7 +505,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     )
     _materialize_fp4_mla_device_page_table_for_forward(metadata, kv_lens_gen)
 
-    pool = getattr(metadata.fp4_mla_state, "hp_pool", None)
+    pool = metadata.fp4_mla_state.hp_pool
     if pool is None:
         raise RuntimeError("FP4 MLA 2D generation scatter requires the HP KV pool.")
     try:
@@ -987,7 +982,9 @@ def scatter_fp4_mla_kv_cache(
         direct_v_packed_write = direct_context_v_packed_write or direct_generation_v_packed_write
         if direct_v_packed_write:
             v_packed_base = _get_fp4_mla_v_packed_pool_base(metadata)
-            get_v_page_offset = getattr(kv_cache_manager, "get_mla_v_packed_page_offset", None)
+            get_v_page_offset = getattr(
+                fp4_mla_cache_layout(kv_cache_manager), "get_mla_v_packed_page_offset", None
+            )
             v_page_offset = (
                 int(get_v_page_offset(local_layer))
                 if callable(get_v_page_offset)
@@ -1292,15 +1289,15 @@ def _v_packed_shape(
 
 
 def _get_fp4_mla_v_packed_pool(metadata: Any, local_layer: int) -> Optional[torch.Tensor]:
-    return metadata.kv_cache_manager.get_mla_v_packed_pool(local_layer)
+    return metadata.kv_cache_manager.fp4_mla_layout.get_mla_v_packed_pool(local_layer)
 
 
 def _get_fp4_mla_v_packed_pool_base(metadata: Any) -> Optional[torch.Tensor]:
-    return metadata.kv_cache_manager.get_mla_v_packed_pool_base()
+    return metadata.kv_cache_manager.fp4_mla_layout.get_mla_v_packed_pool_base()
 
 
 def _get_fp4_mla_v_scale_pool_base(metadata: Any) -> Optional[torch.Tensor]:
-    return metadata.kv_cache_manager.get_mla_v_scale_pool_base()
+    return metadata.kv_cache_manager.fp4_mla_layout.get_mla_v_scale_pool_base()
 
 
 def _get_cutedsl_persistent_v_packed_cache(
@@ -1575,9 +1572,6 @@ def _maybe_update_triton_v_packed_cache(
 
 
 _FP8_CONTEXT_SUPPORTED_SMS = {90, 100, 103, 107, 120}
-
-
-_FP8_CONTEXT_SCRATCH_ATTR = "_fp4_mla_fp8_context_scratch"
 
 
 def require_fp4_mla_fp8_context_support() -> None:

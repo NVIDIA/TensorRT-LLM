@@ -30,6 +30,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
     _fp4_mla_packed_rows_per_seq,
+    fp4_mla_cache_layout,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
     _get_fp4_mla_global_scale,
@@ -528,7 +529,9 @@ def _scatter_generation_kv_only(
         )
         if direct_v_packed_write:
             v_packed_base = _get_fp4_mla_v_packed_pool_base(metadata)
-            get_v_page_offset = getattr(kv_cache_manager, "get_mla_v_packed_page_offset", None)
+            get_v_page_offset = getattr(
+                fp4_mla_cache_layout(kv_cache_manager), "get_mla_v_packed_page_offset", None
+            )
             v_page_offset = (
                 int(get_v_page_offset(local_layer))
                 if callable(get_v_page_offset)

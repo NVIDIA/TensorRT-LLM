@@ -168,12 +168,12 @@ def _fp4_case(n, kv, seed):
         pretrained_config=SimpleNamespace(kv_lora_rank=LORA),
     )
     mgr.add_dummy_requests(list(range(n)), seq_lens)
-    kv_cache, sf_cache = mgr.get_fp4_mla_cache_buffers(0)
+    kv_cache, sf_cache = mgr.fp4_mla_layout.get_fp4_mla_cache_buffers(0)
     kv_cache.zero_()
     sf_cache.zero_()
     request_ids = list(range(n))
     block_ids = mgr.get_batch_cache_indices(request_ids, layer_idx=0)
-    spec = mgr.get_fp4_mla_page_table_spec(0)
+    spec = mgr.fp4_mla_layout.get_fp4_mla_page_table_spec(0)
     hp_block_ids = mgr._get_batch_cache_indices_by_pool_id(
         request_ids, pool_id=spec.hp_pool_id, is_kv_aggregate=False
     )
@@ -188,9 +188,9 @@ def _fp4_case(n, kv, seed):
     hp_idx = torch.tensor(hp_rows, dtype=torch.int32, device=dev)
     indptr = torch.arange(n + 1, dtype=torch.int32, device=dev) * stride
     state = Fp4MlaState(
-        hp_pool=mgr.get_fp4_mla_hp_pool(),
+        hp_pool=mgr.fp4_mla_layout.get_fp4_mla_hp_pool(),
         hp_page_indices=hp_idx,
-        v_scale_pool=mgr.get_mla_v_scale_pool(),
+        v_scale_pool=mgr.fp4_mla_layout.get_mla_v_scale_pool(),
         q_global_scale=torch.tensor([FP4_MLA_Q_GLOBAL_SCALE], dtype=torch.float32, device=dev),
         kv_global_scale=torch.tensor([FP4_MLA_KV_GLOBAL_SCALE], dtype=torch.float32, device=dev),
         generation_kv_lens=torch.empty(n, dtype=torch.int32, device=dev),
@@ -222,7 +222,7 @@ def _fp4_case(n, kv, seed):
         is_cuda_graph=False,
         fp4_mla_state=state,
     )
-    v_packed = mgr.get_mla_v_packed_pool_base()
+    v_packed = mgr.fp4_mla_layout.get_mla_v_packed_pool_base()
     if v_packed is not None:
         v_packed.zero_()
     state.v_scale_pool.zero_()
@@ -264,9 +264,10 @@ def _fp4_case(n, kv, seed):
 
 
 def _pools(mgr):
-    kv, sf = mgr.get_fp4_mla_cache_buffers(0)
-    pools = [kv, sf, mgr.get_fp4_mla_hp_pool(), mgr.get_mla_v_scale_pool()]
-    v_packed = mgr.get_mla_v_packed_pool_base()
+    layout = mgr.fp4_mla_layout
+    kv, sf = layout.get_fp4_mla_cache_buffers(0)
+    pools = [kv, sf, layout.get_fp4_mla_hp_pool(), layout.get_mla_v_scale_pool()]
+    v_packed = layout.get_mla_v_packed_pool_base()
     return pools + ([v_packed] if v_packed is not None else [])
 
 
