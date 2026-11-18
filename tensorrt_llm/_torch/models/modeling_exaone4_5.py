@@ -223,11 +223,8 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
         if model_config.attn_backend != "TRTLLM":
             raise ValueError("Exaone4.5 only supports TRTLLM backend")
 
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.deepcopy_with_shared_extra_attrs()
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.text_config
-        # Share the wrapper's dict, not a copy: the LM's attention layers register in it as
-        # they are built, and the engine looks them up there (as in Qwen2VLModelBase).
-        llm_model_config.extra_attrs = model_config.extra_attrs
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         if not _is_mm_disagg():
