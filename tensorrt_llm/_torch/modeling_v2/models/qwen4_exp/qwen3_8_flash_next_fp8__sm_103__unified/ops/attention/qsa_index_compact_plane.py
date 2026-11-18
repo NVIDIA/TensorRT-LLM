@@ -30,8 +30,15 @@ import triton.language as tl
 from tensorrt_llm._torch.attention.backends.sparse.qsa.index_plane_layout import index_plane_row
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import _qsa_gemma_norm_rope
 
+# The row count, the table's extents and the coordinates' axis stride (the transposed position
+# ids' row count) are runtime values Triton does not specialize, nor the alignment of the
+# scalar-read metadata (offset views in a draft pass or a mixed step): the variants are the
+# deployment's geometry only, all compiled by the first step.
+_UNSPECIALIZED_ARGS = ["num_rows", "num_requests", "table_width", "num_pages", "s_c_axis"]
+_UNALIGNED_ARGS = ["coords", "request_indices", "logical_positions"]
 
-@triton.jit(do_not_specialize=["num_rows", "num_requests", "table_width", "num_pages"])
+
+@triton.jit(do_not_specialize=_UNSPECIALIZED_ARGS, do_not_specialize_on_alignment=_UNALIGNED_ARGS)
 def _compress_kernel(
     token_k,
     s_k_row,
@@ -158,7 +165,7 @@ def _compress_kernel(
             )
 
 
-@triton.jit(do_not_specialize=["num_rows", "num_requests", "table_width", "num_pages"])
+@triton.jit(do_not_specialize=_UNSPECIALIZED_ARGS, do_not_specialize_on_alignment=_UNALIGNED_ARGS)
 def _store_kernel(
     token_k,
     s_k_row,

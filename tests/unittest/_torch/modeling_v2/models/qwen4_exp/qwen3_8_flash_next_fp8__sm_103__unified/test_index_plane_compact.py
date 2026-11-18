@@ -73,6 +73,15 @@ def _run(seed):
         req_t = torch.tensor(req, dtype=torch.int32, device=DEV)
         log_t = torch.tensor(logical, dtype=torch.int64, device=DEV)
         coords = torch.stack([log_t, log_t, log_t], 1).contiguous()
+        if steps % 2:
+            # As the engine passes them: the transpose of a `[3, capacity]` position-id buffer,
+            # at an offset (aligned or not), the axis stride the capacity (a multiple of 16 or
+            # not).
+            offset = (steps // 2) % 4
+            capacity = -(-(rows + offset) // 16) * 16 if steps % 4 == 1 else rows + offset + 5
+            ids = torch.zeros(3, capacity, dtype=torch.int32, device=DEV)
+            ids[:, offset : offset + rows] = coords.transpose(0, 1)
+            coords = ids[:, offset : offset + rows].transpose(0, 1)
         keys = torch.randn(rows, 1, D, device=DEV).to(torch.bfloat16)
         store_mod.qsa_paged_index_store(keys, coords, plain, pos_p, req_t, log_t, table, TPB)
         qsa_prefill_compress(
@@ -87,6 +96,17 @@ def _run(seed):
             length[r] += n
         torch.cuda.synchronize()
         steps += 1
+        variants = tuple(
+            len(k.device_caches[torch.cuda.current_device()][0])
+            for k in (compact_mod._compress_kernel, compact_mod._store_kernel)
+        )
+        if steps == 2:
+            first_variants = variants
+        elif steps > 2 and variants != first_variants:
+            bad += 1
+            print(
+                f"step {steps}: {rows} rows compiled a new variant {first_variants} -> {variants}"
+            )
         # every completed group's compressed key
         for r in range(nreq):
             groups = length[r] // CR
