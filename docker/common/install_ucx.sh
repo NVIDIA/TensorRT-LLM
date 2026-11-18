@@ -21,7 +21,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
 
 UCX_VERSION="v1.23.x"
 UCX_COMMIT="65e342a82dd2609a28c8c2b8c45ed7fe2cb33fa0"
-# Backport the false UD timeout fix to pinned UCX 1.23.x to avoid upgrading to the 1.24 development line.
+# Backport the false UD timeout fix to pinned UCX 1.23.x to avoid the potentially unstable 1.24 development line.
 UCX_TIMER_FIX_COMMIT="62182080282372e27a5cad45f23b7ac424b7cd94"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
