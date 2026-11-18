@@ -157,6 +157,9 @@ class PrometheusExposure:
             trtllm_kv_cache_tier_moved_bytes_total
             trtllm_kv_cache_tier_migration_duration_seconds
             trtllm_kv_cache_migration_timing_skipped_total
+            trtllm_conversation_unique_seen
+            trtllm_conversation_unique_seen_complete
+            trtllm_conversation_tracking_overflow_total
             trtllm_num_context_requests
             trtllm_num_generation_requests
             trtllm_num_paused_requests
@@ -396,6 +399,24 @@ class PrometheusExposure:
             "Eligible timing samples skipped because the pending-event budget was full",
             labelnames=iteration_labelnames)
         self._prev_skipped_migration_timings: dict[str, int] = {}
+
+        activity_labelnames = (*iteration_labelnames, "window")
+        self.conversation_unique_seen = Gauge(
+            name=self.metric_prefix + "conversation_unique_seen",
+            documentation=
+            "Namespace-scoped conversations admitted by this worker in the rolling window; a lower bound when incomplete",
+            labelnames=activity_labelnames)
+        self.conversation_unique_seen_complete = Gauge(
+            name=self.metric_prefix + "conversation_unique_seen_complete",
+            documentation=
+            "Whether the full activity window was observed without skipped identities",
+            labelnames=activity_labelnames)
+        self.conversation_tracking_overflow = Counter(
+            name=self.metric_prefix + "conversation_tracking_overflow_total",
+            documentation=
+            "Admission observations skipped because conversation tracking storage was full",
+            labelnames=(*activity_labelnames, "reason"))
+        self._prev_conversation_overflow: dict[tuple[str, str, str], int] = {}
 
         self.kv_cache_num_conversations = Gauge(
             name=self.metric_prefix + "kv_cache_num_conversations",
@@ -1628,6 +1649,34 @@ class PrometheusExposure:
             rank: Normalized data-parallel rank label.
         """
         rank_labels = {self.labelname_dp_rank: rank}
+        activity = iteration_stats.get("conversationActivity", {})
+        for window in ("10m", "1h"):
+            observation = activity.get(window)
+            if observation is None:
+                continue
+            labels = {**rank_labels, "window": window}
+            for field, metric in (("unique", self.conversation_unique_seen),
+                                  ("complete",
+                                   self.conversation_unique_seen_complete)):
+                value = observation.get(field)
+                if isinstance(value, int) and not isinstance(
+                        value, bool) and value >= 0 and (field != "complete"
+                                                         or value in (0, 1)):
+                    self._log_gauge(metric, value, labels=labels)
+            for reason, field in (("entries", "overflowEntries"),
+                                  ("identity_bytes", "overflowIdentityBytes")):
+                value = observation.get(field)
+                if not isinstance(value, int) or isinstance(value,
+                                                            bool) or value < 0:
+                    continue
+                key = (rank, window, reason)
+                previous = self._prev_conversation_overflow.get(key, 0)
+                self._log_counter(
+                    self.conversation_tracking_overflow, {
+                        **labels, "reason": reason
+                    }, value - previous if value >= previous else value)
+                self._prev_conversation_overflow[key] = value
+
         conversations = iteration_stats.get("kvCacheNumConversations")
         if (isinstance(conversations, int)
                 and not isinstance(conversations, bool) and conversations >= 0):

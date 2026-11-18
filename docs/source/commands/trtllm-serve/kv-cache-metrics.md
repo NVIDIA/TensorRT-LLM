@@ -345,26 +345,63 @@ in Dynamo trace logs over a selectable window. That log-based count depends on
 trace coverage and Loki query limits; it does not measure this map or necessarily
 use the same identity namespace.
 
-A follow-up for unique sessions seen during a period as native metrics should:
+#### Rolling worker activity: 10 minutes and 1 hour
 
-1. Observe normalized, namespace-scoped identities at request admission, including
-   requests whose conversation entries are later removed. Count a request once;
-   retries and subsequent turns must deduplicate by identity.
-2. Choose fixed reporting windows (for example 5 minutes and 1 hour), and decide
-   whether exact counts or bounded-memory estimates are required. Exact sliding
-   windows need a last-seen map plus expiry and an explicit memory budget. A ring
-   of time-bucketed HyperLogLog sketches provides bounded-memory estimates; document
-   its cardinality error and bucket-boundary timing error. Recompute the union
-   across live buckets because sketches cannot subtract expired observations.
-3. Export only aggregate gauges with a bounded `window` label. Hash identities
-   internally with a deployment-consistent keyed hash; never expose identifiers
-   as labels. Define key rotation, missing-ID behavior and restart warm-up.
-4. For deployment-wide uniqueness, deduplicate before routing or union compatible
-   sketches centrally. Summing per-worker unique counts double-counts sessions
-   routed to multiple workers; Prometheus cannot union sketches from scalar gauges.
-5. Test repeated turns, namespace separation, expiry boundaries, long-idle sessions,
-   reappearance, restarts, cross-worker duplication and memory bounds. Measure
-   request-admission overhead before enabling this tracking by default.
+With KVCM2 and `enable_iter_perf_stats: true`, `ConversationManager` also owns
+bounded historical admission tracking, independently of retention policy.
+The executor observes requests after waiting-queue admission and ADP placement,
+after conversion to execution requests. Output children do not add admission
+observations. A later cancellation or execution failure does not undo
+an admission. Queued requests awaiting worker placement are excluded. Prefill
+and decode workers count their own admissions independently. Dummy requests and
+missing/empty conversation IDs are excluded. The namespace is the same tuple as
+the retention map; repeated turns refresh the last-seen timestamp.
 
-This windowed tracker is a proposed follow-up; the current gauge reuses the
-existing map without adding historical session storage.
+| Metric | Type | Meaning |
+|---|---|---|
+| `trtllm_conversation_unique_seen{window="10m/1h"}` | Gauge | Tracked distinct identities admitted in `(now - window, now]`; a lower bound while incomplete. |
+| `trtllm_conversation_unique_seen_complete{window="10m/1h"}` | Gauge | `1` when the full window was observed without capacity skips, otherwise `0`. |
+| `trtllm_conversation_tracking_overflow_total{window="10m/1h",reason="entries/identity_bytes"}` | Counter | Admission observations skipped at a storage limit, not distinct missing conversations. |
+
+The actual `window` labels are `10m` and `1h`; `reason` is `entries` or
+`identity_bytes`. Existing worker target labels and `dp_rank` identify the source.
+No identities are exposed. Summing workers can count the same conversation more
+than once and does not give deployment-wide uniqueness.
+
+Two ordered last-seen maps use a monotonic clock and share these limits, read
+when activity tracking is first enabled:
+
+- `TRTLLM_CONVERSATION_ACTIVITY_MAX_ENTRIES`: default `100000` entries across both
+  windows. An identity present in both windows consumes two entries.
+- `TRTLLM_CONVERSATION_ACTIVITY_MAX_IDENTITY_BYTES`: default `16777216` bytes of
+  accounted identity storage across both windows. Each entry is conservatively
+  charged for its key tuple and referenced strings/LoRA ID, including shared
+  Python objects. Entry capacity separately bounds timestamp/container metadata.
+  This is not a hard limit on total Python allocator or worker RSS usage.
+
+Both limits accept nonnegative integers; zero retains no identities. At
+capacity, live entries are preserved and refreshed, while new identities are
+skipped. Each affected window stays incomplete until a full window elapses after
+its most recent skip. Oversized identities count as `identity_bytes` skips and
+are not retained. After tracker creation, completeness remains zero until each
+window fills; cache clears preserve the activity history. A worker restart starts
+new history and process-local overflow counters.
+
+Snapshots refresh at most once per second on the executor thread. ADP transports
+source-rank snapshots on its existing rank-state exchange, without adding a
+collective. Queue waits and subsequent batch-fill waits share a one-second
+polling deadline while tracking is enabled. Configured batch-fill waits are
+preserved within that deadline; shorter transfer deadlines are preserved. Scrapes read published snapshots rather than touching manager
+state. Busy execution, stats transport and scrape intervals can add reporting
+lag. Activity tracking adds admission bookkeeping and idle wakeups. Expiration is
+amortized O(1) per retained entry, but a burst expiring the full tracker is
+O(entry limit) on the executor thread. Choose limits for the worker latency
+budget and measure workload overhead before increasing them.
+
+For a count restricted to complete observations:
+
+```promql
+trtllm_conversation_unique_seen{window="10m"}
+  and on(instance, model_name, dp_rank, window)
+    (trtllm_conversation_unique_seen_complete{window="10m"} == 1)
+```

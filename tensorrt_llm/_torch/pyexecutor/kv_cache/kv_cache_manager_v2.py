@@ -16,6 +16,7 @@ import functools
 import math
 import os
 import sys
+import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -129,6 +130,7 @@ from ..config_utils import get_layer_attention_window, uses_vswa_kv_cache_layout
 from ..connectors.kv_cache_connector import KvCacheConnectorManager
 from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from ..kv_cache_stats import (
+    ConversationActivityStats,
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
     KVCacheV2PoolGroupIterationStats,
@@ -549,12 +551,106 @@ class _ConversationState:
     prefix_hash: bytes | None = None
 
 
-class ConversationManager:
-    """Track the current request and drop plan for each conversation."""
+@dataclass(slots=True)
+class _ConversationActivityWindow:
+    seconds: int
+    incomplete_until: float
+    last_seen: OrderedDict[tuple[str, int | None, str | None], tuple[float, int]] = field(
+        default_factory=OrderedDict
+    )
+    overflow_entries: int = 0
+    overflow_bytes: int = 0
 
-    def __init__(self, max_num_turns: int) -> None:
+
+class ConversationManager:
+    """Own conversation retention state and bounded worker-admission activity."""
+
+    def __init__(self, max_num_turns: int, *, retention_enabled: bool = True) -> None:
+        self.retention_enabled = retention_enabled
+        self._activity_windows: tuple[_ConversationActivityWindow, ...] = ()
+        self._activity_entries = 0
+        self._activity_identity_bytes = 0
+        self._activity_max_entries = 0
+        self._activity_max_identity_bytes = 0
         self._max_num_turns = max_num_turns
         self._conversation_states: Dict[tuple[str, int | None, str | None], _ConversationState] = {}
+
+    def enable_activity_tracking(
+        self,
+        *,
+        max_entries: int = 100_000,
+        max_identity_bytes: int = 16 * 1024 * 1024,
+        now: float | None = None,
+    ) -> None:
+        """Start rolling activity tracking with shared entry and identity-storage limits."""
+        if max_entries < 0 or max_identity_bytes < 0:
+            raise ValueError("Conversation activity limits must be nonnegative")
+        if self._activity_windows:
+            return
+        now = time.monotonic() if now is None else now
+        self._activity_max_entries = max_entries
+        self._activity_max_identity_bytes = max_identity_bytes
+        self._activity_windows = tuple(
+            _ConversationActivityWindow(seconds, now + seconds) for seconds in (600, 3600)
+        )
+
+    def _expire_activity(self, now: float) -> None:
+        for window in self._activity_windows:
+            cutoff = now - window.seconds
+            while window.last_seen:
+                key = next(iter(window.last_seen))
+                last_seen, size = window.last_seen[key]
+                if last_seen > cutoff:
+                    break
+                window.last_seen.popitem(last=False)
+                self._activity_entries -= 1
+                self._activity_identity_bytes -= size
+
+    def observe_admission(self, request: LlmRequest, now: float) -> None:
+        """Refresh a worker admission, independently of retention and context preparation."""
+        if not self._activity_windows:
+            return
+        key = _request_conversation_key(request)
+        if key is None:
+            return
+        self._expire_activity(now)
+        # Charge each window for the tuple and its referenced objects, even when
+        # Python shares those objects. Entry limits separately bound container metadata.
+        size = sys.getsizeof(key) + sum(sys.getsizeof(part) for part in key)
+        for window in self._activity_windows:
+            # Oversized identities need not be hashed or retained at all.
+            if size <= self._activity_max_identity_bytes and key in window.last_seen:
+                _, retained_size = window.last_seen[key]
+                window.last_seen[key] = (now, retained_size)
+                window.last_seen.move_to_end(key)
+                continue
+            if self._activity_identity_bytes + size > self._activity_max_identity_bytes:
+                window.overflow_bytes += 1
+            elif self._activity_entries >= self._activity_max_entries:
+                window.overflow_entries += 1
+            else:
+                window.last_seen[key] = (now, size)
+                self._activity_entries += 1
+                self._activity_identity_bytes += size
+                continue
+            window.incomplete_until = now + window.seconds
+
+    def snapshot_activity(self, now: float) -> ConversationActivityStats | None:
+        """Expire idle identities and return counts, completeness and lifetime overflow totals."""
+        if not self._activity_windows:
+            return None
+        self._expire_activity(now)
+        values = []
+        for window in self._activity_windows:
+            values.extend(
+                (
+                    len(window.last_seen),
+                    int(now >= window.incomplete_until),
+                    window.overflow_entries,
+                    window.overflow_bytes,
+                )
+            )
+        return ConversationActivityStats(*values)
 
     @property
     def num_conversations(self) -> int:
@@ -563,6 +659,8 @@ class ConversationManager:
 
     def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
         """Save a completed context's drop plan and apply the preceding plan on success."""
+        if not self.retention_enabled:
+            return
         request_id = request.py_request_id
         conversation_key = _request_conversation_key(request)
         if conversation_key is None:
@@ -605,6 +703,8 @@ class ConversationManager:
 
     def prepare_request(self, request: LlmRequest) -> None:
         """Register a context request unless its conversation has another active one."""
+        if not self.retention_enabled:
+            return
         conversation_key = _request_conversation_key(request)
         if conversation_key is None:
             return
@@ -623,6 +723,8 @@ class ConversationManager:
 
     def finish_request(self, request: LlmRequest) -> None:
         """Clear a request as active while preserving any saved drop plan."""
+        if not self.retention_enabled:
+            return
         conversation_key = _request_conversation_key(request)
         if conversation_key is None:
             return
@@ -635,7 +737,7 @@ class ConversationManager:
             self._conversation_states.pop(conversation_key)
 
     def clear(self) -> None:
-        """Clear state after reusable KV-cache blocks have been cleared."""
+        """Clear retention state after a KV-cache clear, preserving admission history."""
         self._conversation_states.clear()
 
 
@@ -8986,6 +9088,7 @@ class KVCacheManagerV2(BaseResourceManager):
             num_conversations=(
                 self.conversation_manager.num_conversations
                 if self.conversation_manager is not None
+                and self.conversation_manager.retention_enabled
                 else None
             ),
             migration_timings=migration_timings,
@@ -9010,6 +9113,20 @@ class KVCacheManagerV2(BaseResourceManager):
                 connector_cached_tokens if self._connector_reports_cached_tokens() else None
             ),
         )
+
+    def enable_conversation_activity(self) -> ConversationManager:
+        """Enable executor-owned admission observations without enabling retention."""
+        if self.conversation_manager is None:
+            self.conversation_manager = ConversationManager(0, retention_enabled=False)
+        self.conversation_manager.enable_activity_tracking(
+            max_entries=int(os.environ.get("TRTLLM_CONVERSATION_ACTIVITY_MAX_ENTRIES", "100000")),
+            max_identity_bytes=int(
+                os.environ.get(
+                    "TRTLLM_CONVERSATION_ACTIVITY_MAX_IDENTITY_BYTES", str(16 * 1024 * 1024)
+                )
+            ),
+        )
+        return self.conversation_manager
 
     def _connector_reports_cached_tokens(self) -> bool:
         """Whether a KV connector can serve prompt tokens, so its cache tier is reported."""

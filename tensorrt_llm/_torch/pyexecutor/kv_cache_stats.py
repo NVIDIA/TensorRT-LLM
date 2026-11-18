@@ -14,7 +14,32 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
+
+
+class ConversationActivityStats(NamedTuple):
+    """Bounded-window activity snapshot; identity data stays in the owning manager."""
+
+    unique_10m: int
+    complete_10m: int
+    overflow_entries_10m: int
+    overflow_bytes_10m: int
+    unique_1h: int
+    complete_1h: int
+    overflow_entries_1h: int
+    overflow_bytes_1h: int
+
+    def to_dict(self) -> dict[str, dict[str, int]]:
+        return {
+            window: dict(
+                zip(
+                    ("unique", "complete", "overflowEntries", "overflowIdentityBytes"),
+                    self[offset : offset + 4],
+                )
+            )
+            for window, offset in (("10m", 0), ("1h", 4))
+        }
+
 
 KV_CACHE_ITERATION_STATS_REUSE_KEYS = (
     "iterReusedBlocks",

@@ -374,12 +374,15 @@ class ExecutorRequestQueue:
             self,
             timeout: Optional[datetime.timedelta],
             *,
-            wait_for_batch: bool = True) -> List[RequestQueueItem]:
+            wait_for_batch: bool = True,
+            batch_wait_deadline: Optional[float] = None
+    ) -> List[RequestQueueItem]:
         """Fetch requests from the queue with optional timeout.
 
         Args:
             timeout: Optional timeout for waiting on queue.
             wait_for_batch: Whether to wait for additional items to fill a batch.
+            batch_wait_deadline: Optional monotonic deadline limiting batch-fill waiting.
 
         Returns:
             List of RequestQueueItem fetched from the queue.
@@ -407,6 +410,8 @@ class ExecutorRequestQueue:
             return items
 
         deadline = time.monotonic() + self.batch_wait_timeout_ms / 1000.0
+        if batch_wait_deadline is not None:
+            deadline = min(deadline, batch_wait_deadline)
         while len(items) < self.max_batch_size:
             remaining_timeout = deadline - time.monotonic()
 

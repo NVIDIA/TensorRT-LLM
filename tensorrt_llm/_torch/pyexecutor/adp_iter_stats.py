@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
+from dataclasses import replace
 from typing import Dict, List, Optional, Set
 
 from tensorrt_llm.bindings.executor import (
@@ -18,6 +20,7 @@ from tensorrt_llm.bindings.executor import (
 from tensorrt_llm.logger import logger
 
 from .iteration_stats_json import iteration_stats_row
+from .kv_cache_stats import ConversationActivityStats
 from .scheduler.adp_router import RankIterStatsPayload, RankState
 from .scheduler.rank_state import RankKvCacheStats, RankSchedulingCounters, RankSpecDecodingStats
 
@@ -214,7 +217,10 @@ class ADPIterStatsBuffer:
     background request/stat threads without adding external synchronization.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, activity_snapshot: Callable[[], ConversationActivityStats | None] | None = None
+    ) -> None:
+        self._activity_snapshot = activity_snapshot
         # All ranks: local per-iteration payloads waiting to piggyback on the
         # next ADP rank-state allgather.
         self._payloads: Dict[int, RankIterStatsPayload] = {}
@@ -294,9 +300,13 @@ class ADPIterStatsBuffer:
 
     def next_payload(self) -> Optional[RankIterStatsPayload]:
         """Return the oldest pending stats payload to piggyback."""
-        if self._oldest_iter is None:
-            return None
-        return self._payloads[self._oldest_iter]
+        payload = self._payloads[self._oldest_iter] if self._oldest_iter is not None else None
+        if self._activity_snapshot is None:
+            return payload
+        activity = self._activity_snapshot()
+        if activity is None:
+            return payload
+        return replace(payload or RankIterStatsPayload(), conversation_activity=activity)
 
     @staticmethod
     def rank0_sent_payload(all_rank_states: List[RankState]) -> bool:

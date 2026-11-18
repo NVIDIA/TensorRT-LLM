@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import MISSING, dataclass, field, fields, replace
 from typing import ClassVar, NamedTuple
 
+from ..kv_cache_stats import ConversationActivityStats
+
 
 class RankKvCacheStats(NamedTuple):
     """Immutable rank-local KV snapshot containing only transportable scalars."""
@@ -129,6 +131,7 @@ class RankIterStatsPayload:
     _KV_LOAD_FIELD_COUNT: ClassVar[int] = 3
     _SNAPSHOT_WIRE_VERSION: ClassVar[int] = -3
     _TRANSFER_WIRE_VERSION: ClassVar[int] = -4
+    _ACTIVITY_WIRE_VERSION: ClassVar[int] = -5
     _SNAPSHOT_HEADER_SIZE: ClassVar[int] = 6
 
     has_iter_stats: int = 0
@@ -148,6 +151,7 @@ class RankIterStatsPayload:
     specdec_stats: RankSpecDecodingStats | None = None
     scheduling_counters: RankSchedulingCounters | None = None
     kv_transfer_outcomes: tuple[int, int, int] | None = None
+    conversation_activity: ConversationActivityStats | None = None
 
     def serialize(self, include_kv_cache_load: bool = False) -> list[int | float]:
         """Serialize to a flat list for allgather transport."""
@@ -179,15 +183,23 @@ class RankIterStatsPayload:
         if (
             any(snapshot is not None for snapshot in snapshots)
             or self.kv_transfer_outcomes is not None
+            or self.conversation_activity is not None
         ):
             # The negative version cannot be confused with has_iter_stats (0/1).
             # Presence flags frame the snapshots and the independent load fields.
             values = [
-                self._TRANSFER_WIRE_VERSION
+                self._ACTIVITY_WIRE_VERSION
+                if self.conversation_activity is not None
+                else self._TRANSFER_WIRE_VERSION
                 if self.kv_transfer_outcomes is not None
                 else self._SNAPSHOT_WIRE_VERSION,
                 int(include_kv_cache_load),
                 *(int(snapshot is not None) for snapshot in snapshots),
+                *(
+                    [int(self.kv_transfer_outcomes is not None)]
+                    if self.conversation_activity is not None
+                    else []
+                ),
                 *values,
             ]
             for snapshot in snapshots:
@@ -195,6 +207,8 @@ class RankIterStatsPayload:
                     values.extend(snapshot)
         if self.kv_transfer_outcomes is not None:
             values.extend(self.kv_transfer_outcomes)
+        if self.conversation_activity is not None:
+            values.extend(self.conversation_activity)
         return values
 
     @classmethod
@@ -210,20 +224,38 @@ class RankIterStatsPayload:
         Raises:
             ValueError: The header is incomplete or contains an unsupported version or flag.
         """
+        header_size = cls._SNAPSHOT_HEADER_SIZE + int(
+            bool(data) and data[0] == cls._ACTIVITY_WIRE_VERSION
+        )
         if (
-            len(data) < cls._SNAPSHOT_HEADER_SIZE
-            or data[0] not in (cls._SNAPSHOT_WIRE_VERSION, cls._TRANSFER_WIRE_VERSION)
-            or any(flag not in (0, 1) for flag in data[1 : cls._SNAPSHOT_HEADER_SIZE])
+            len(data) < header_size
+            or data[0]
+            not in (
+                cls._SNAPSHOT_WIRE_VERSION,
+                cls._TRANSFER_WIRE_VERSION,
+                cls._ACTIVITY_WIRE_VERSION,
+            )
+            or any(flag not in (0, 1) for flag in data[1:header_size])
         ):
             raise ValueError("Invalid snapshot payload header")
         return (
-            cls._SNAPSHOT_HEADER_SIZE
+            header_size
             + cls._ITER_STATS_FIELD_COUNT
             + int(data[1]) * cls._KV_LOAD_FIELD_COUNT
             + int(data[2] + data[3]) * RankKvCacheStats.wire_size()
             + int(data[4]) * RankSpecDecodingStats.wire_size()
             + int(data[5]) * RankSchedulingCounters.wire_size()
-            + (3 if data[0] == cls._TRANSFER_WIRE_VERSION else 0)
+            + (
+                3
+                if data[0] == cls._TRANSFER_WIRE_VERSION
+                or (data[0] == cls._ACTIVITY_WIRE_VERSION and data[6])
+                else 0
+            )
+            + (
+                len(ConversationActivityStats._fields)
+                if data[0] == cls._ACTIVITY_WIRE_VERSION
+                else 0
+            )
         )
 
     @classmethod
@@ -234,12 +266,13 @@ class RankIterStatsPayload:
             expected_size = cls.snapshot_payload_size(values)
             if len(values) != expected_size:
                 raise ValueError(f"Snapshot payload requires {expected_size} fields")
+            header_size = cls._SNAPSHOT_HEADER_SIZE + int(values[0] == cls._ACTIVITY_WIRE_VERSION)
             scalar_end = (
-                cls._SNAPSHOT_HEADER_SIZE
+                header_size
                 + cls._ITER_STATS_FIELD_COUNT
                 + int(values[1]) * cls._KV_LOAD_FIELD_COUNT
             )
-            result = cls(*values[cls._SNAPSHOT_HEADER_SIZE : scalar_end])
+            result = cls(*values[header_size:scalar_end])
             cursor = scalar_end
             if values[2]:
                 result.kv_cache_stats = RankKvCacheStats.deserialize(
@@ -260,11 +293,26 @@ class RankIterStatsPayload:
                 result.scheduling_counters = RankSchedulingCounters.deserialize(
                     values[cursor : cursor + RankSchedulingCounters.wire_size()]
                 )
-            if values[0] == cls._TRANSFER_WIRE_VERSION:
-                counts = values[-3:]
+                cursor += RankSchedulingCounters.wire_size()
+            if values[0] == cls._TRANSFER_WIRE_VERSION or (
+                values[0] == cls._ACTIVITY_WIRE_VERSION and values[6]
+            ):
+                counts = values[cursor : cursor + 3]
                 if any(value < 0 or value != int(value) for value in counts):
                     raise ValueError("Transfer outcome counters must be nonnegative integers")
                 result.kv_transfer_outcomes = tuple(int(value) for value in counts)
+                cursor += 3
+            if values[0] == cls._ACTIVITY_WIRE_VERSION:
+                activity = values[cursor:]
+                if any(value < 0 or value != int(value) for value in activity) or any(
+                    activity[index] not in (0, 1) for index in (1, 5)
+                ):
+                    raise ValueError(
+                        "Conversation activity requires nonnegative integers and boolean completeness"
+                    )
+                result.conversation_activity = ConversationActivityStats(
+                    *(int(value) for value in activity)
+                )
             return result
         scalar_field_count = cls._ITER_STATS_FIELD_COUNT + cls._KV_LOAD_FIELD_COUNT
         if len(values) > scalar_field_count:
