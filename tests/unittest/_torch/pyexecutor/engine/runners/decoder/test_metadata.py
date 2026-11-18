@@ -88,11 +88,13 @@ def test_set_spec_metadata_all_rank_counts_for_one_model() -> None:
         [8, 9],
         [2, 3],
         [1, 2],
+        [3, 0],
     )
 
     assert spec_metadata.all_rank_num_tokens == [8, 9]
     assert spec_metadata.all_rank_num_seqs == [2, 3]
     assert spec_metadata.all_rank_num_gens == [1, 2]
+    assert spec_metadata.all_rank_draft_lens == [3, 0]
     assert spec_metadata.subseq_all_rank_num_tokens == [2, 3]
 
 

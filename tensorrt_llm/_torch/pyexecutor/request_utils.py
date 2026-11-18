@@ -247,6 +247,7 @@ def merge_requests_to_llm_requests(
             exclude_last_generation_logits,
             input_token_ids=req_item.prompt_token_ids,
             track_unique_tokens=track_unique_tokens,
+            locality_domain_id=req_item.locality_domain_id,
         )
         req_with_children.append(req)
         if req.child_requests:
@@ -263,8 +264,9 @@ def merge_helix_requests(
 ) -> list[LlmRequest]:
     """Merge requests for Helix CP.
 
-    Note: Helix parallelism is a decode-only feature run with disaggregated serving.
-    This function gets called on gen server during initialization of a new request.
+    Called only for disaggregated Helix, on the generation server when a new
+    request is initialized; it slices the prompt across CP ranks. Aggregated
+    Helix keeps the full prompt on every rank (see ``merge_requests``).
 
     Args:
         new_requests: List of RequestQueueItem objects.
@@ -291,6 +293,7 @@ def merge_helix_requests(
             exclude_last_generation_logits=exclude_last_generation_logits,
             input_token_ids=input_ids_this_rank,
             position_ids=position_ids_this_rank,
+            locality_domain_id=req_item.locality_domain_id,
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)

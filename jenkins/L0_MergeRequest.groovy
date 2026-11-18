@@ -787,7 +787,8 @@ def mergeWaiveList(pipeline, globalVars)
 
     // Get TOT waive list
     LLM_TOT_ROOT = "llm-tot"
-    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+    // Post-merge runs set only gitlabBranch; GitHub PR runs leave it unset and use the bot's target_branch.
+    targetBranch = env.gitlabTargetBranch ?: (env.gitlabBranch ?: globalVars[TARGET_BRANCH])
     echo "Target branch: ${targetBranch}"
 
     def targetBranchTOTCommit = ""
