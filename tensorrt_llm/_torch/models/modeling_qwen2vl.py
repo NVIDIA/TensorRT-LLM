@@ -2483,14 +2483,6 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
-    @property
-    def language_model(self) -> nn.Module:
-        return self.llm
-
-    @property
-    def text_embedding_layer(self) -> nn.Module:
-        return self.llm.model.embed_tokens
-
     def prepare_breakable_cuda_graph_inputs(
             self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         return _pad_qwen_vl_mrope_deltas(

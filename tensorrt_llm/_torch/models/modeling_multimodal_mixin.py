@@ -651,8 +651,11 @@ class MultimodalModelMixin:
 
     @property
     def text_embedding_layer(self):
-        """Return the token embedding layer used by `fuse_input_embeds`."""
-        raise NotImplementedError
+        """Return the token embedding layer used by `fuse_input_embeds`.
+
+        Defaults to the language model's `model.embed_tokens`.
+        """
+        return self.language_model.model.embed_tokens
 
     def prepare_breakable_cuda_graph_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Normalize language-model body inputs for breakable prefill graph capture and replay.
@@ -724,8 +727,14 @@ class MultimodalModelMixin:
 
     @property
     def language_model(self) -> torch.nn.Module:
-        """Return the inner language model that receives prepared inputs."""
-        raise NotImplementedError
+        """Return the inner language model that receives prepared inputs.
+
+        Defaults to `self.llm`, where the multimodal wrappers build it.
+        """
+        try:
+            return self.llm
+        except AttributeError:
+            raise NotImplementedError from None
 
     @property
     def runtime_hooks(self) -> RuntimeHooks:

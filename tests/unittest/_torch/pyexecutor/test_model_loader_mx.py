@@ -1855,9 +1855,11 @@ class _TinyMultimodalModel(MultimodalModelMixin, _TinyModel):
 
 
 class _UnknownLanguageModelMultimodalModel(_TinyMultimodalModel):
-    """Registered multimodal root that keeps the mixin's raising `language_model`."""
+    """Registered multimodal root whose `language_model` raises, as the mixin's does without `llm`."""
 
-    language_model = MultimodalModelMixin.language_model
+    @property
+    def language_model(self) -> nn.Module:
+        raise NotImplementedError
 
 
 class _UnregisteredMultimodalModel(_TinyMultimodalModel):

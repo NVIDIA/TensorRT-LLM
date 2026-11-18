@@ -3026,17 +3026,6 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
             weights.mark_consumed("language_model")
 
     @property
-    def language_model(self) -> torch.nn.Module:
-        # `MultimodalModelMixin` routes `vocab_size_padded`,
-        # `infer_max_seq_len` and `set_guided_decoder` through this property,
-        # and its base implementation raises.
-        return self.llm
-
-    @property
-    def text_embedding_layer(self) -> torch.nn.Module:
-        return self.llm.model.embed_tokens
-
-    @property
     def draft_config(self) -> Optional[ModelConfig]:
         return self.llm.draft_config
 

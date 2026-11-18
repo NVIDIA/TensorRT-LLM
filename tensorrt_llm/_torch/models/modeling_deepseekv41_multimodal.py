@@ -73,10 +73,6 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
                 )
 
     @property
-    def language_model(self):
-        return self.llm
-
-    @property
     def samples_from_vocab_shards(self) -> bool:
         return self.llm.samples_from_vocab_shards
 
@@ -95,10 +91,6 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
     @property
     def draft_model(self):
         return self.llm.draft_model
-
-    @property
-    def text_embedding_layer(self):
-        return self.llm.model.embed_tokens
 
     @property
     def embedding_dim(self) -> int:

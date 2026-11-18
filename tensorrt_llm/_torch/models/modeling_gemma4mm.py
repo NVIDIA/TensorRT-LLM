@@ -50,7 +50,6 @@ from ...inputs import (
 from ...inputs.multimodal import MultimodalItemMetadata, MultimodalItemPartition, MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
-from ..modules.embedding import Embedding
 from ..modules.linear import Linear
 from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_gemma4 import Gemma4ForCausalLM
@@ -1290,10 +1289,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     def load_draft_weights(self, weights, weight_mapper=None):
         self.llm.load_draft_weights(weights, weight_mapper)
 
-    @property
-    def language_model(self) -> torch.nn.Module:
-        return self.llm
-
     def prepare_breakable_cuda_graph_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         prepared_inputs = super().prepare_breakable_cuda_graph_inputs(inputs)
         if (
@@ -1355,10 +1350,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     @property
     def multimodal_token_ids(self) -> torch.Tensor:
         return self._mm_token_ids
-
-    @property
-    def text_embedding_layer(self) -> Embedding:
-        return self.llm.model.embed_tokens
 
     @property
     def embedding_dim(self) -> int:

@@ -55,7 +55,6 @@ from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.backends.utils import get_attention_backend
 from ..attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
-from ..modules.embedding import Embedding
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
@@ -1804,10 +1803,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     def multimodal_token_ids(self) -> torch.Tensor:
         return self._mm_token_ids
 
-    @property
-    def language_model(self) -> torch.nn.Module:
-        return self.llm
-
     # Draft-model (two-model speculative decoding, e.g. DFlash / Eagle3)
     # delegation: `ModelLoader.load` reads `draft_config` / `draft_model` and
     # calls `load_draft_weights` on the *outer* model it resolved, but the
@@ -1827,10 +1822,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
 
     def load_draft_weights(self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None):
         return self.llm.load_draft_weights(weights, weight_mapper=weight_mapper)
-
-    @property
-    def text_embedding_layer(self) -> Embedding:
-        return self.llm.model.embed_tokens
 
     @property
     def embedding_dim(self) -> int:

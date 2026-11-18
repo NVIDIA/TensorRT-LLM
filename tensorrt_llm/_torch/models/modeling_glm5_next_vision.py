@@ -1091,10 +1091,6 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
     def multimodal_data_device_paths(self) -> List[str]:
         return ["image.pixel_values", "video.pixel_values_videos", "multimodal_embedding"]
 
-    @property
-    def language_model(self) -> torch.nn.Module:
-        return self.llm
-
     # Speculative decoding lives on the inner decoder (``SpecDecOneEngineForCausalLM``
     # via the deep-copied model_config), but ``ModelLoader.load`` reads the draft
     # state from the outer model it resolved for the checkpoint's architecture.
@@ -1133,10 +1129,6 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
             "resource_manager": resource_manager,
             "orig_input_ids": raw_input_ids,
         }
-
-    @property
-    def text_embedding_layer(self):
-        return self.llm.model.embed_tokens
 
     @property
     def embedding_dim(self) -> int:
