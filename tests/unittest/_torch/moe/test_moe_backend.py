@@ -595,7 +595,7 @@ def test_fused_comm_dummy_allreduce_covers_forward_chunk_override(
             events,
             prepare_direct_stage=prepare_direct_stage,
             route_and_quantize_into=lambda *args: stage,
-            quantize_input_into=lambda x, stage: events.append("quantize") or (x, None),
+            quantize_input_into=lambda x, stage: events.append("quantize_into") or (x, None),
             set_adaptive_launch_tokens=Mock(),
         )
         x, output = _run_dummy_allreduce_scheduler(
@@ -606,10 +606,79 @@ def test_fused_comm_dummy_allreduce_covers_forward_chunk_override(
         torch.testing.assert_close(output, x[:num_tokens] + 1, atol=0, rtol=0)
         rank_events.append(events)
 
-    chunk_events = ["quantize", "run_moe"]
-    if enabled:
-        chunk_events = ["allreduce", *chunk_events, "allreduce"]
-    assert rank_events == [chunk_events * num_chunks] * len(token_counts)
+    def expected(quantize: str) -> List[str]:
+        chunk_events = [quantize, "run_moe"]
+        if enabled:
+            chunk_events = ["allreduce", *chunk_events, "allreduce"]
+        return chunk_events * num_chunks
+
+    # Rank 0 runs the direct stage; the idle rank 1 falls back to the base path.
+    assert rank_events == [expected("quantize_into"), expected("quantize")]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_dummy_allreduce_uses_nccl_whatever_the_model_strategy(
+    monkeypatch: pytest.MonkeyPatch, attention_dp: bool
+) -> None:
+    """TWOSHOT at TP 2/4 rejects the 4-element dummy tensor, so the dummy sync has its own NCCL
+    reducer; under attention TP the layer's output reduction keeps the model's strategy."""
+    import tensorrt_llm._torch.distributed as distributed
+    from tensorrt_llm.functional import AllReduceStrategy
+
+    class RecordingAllReduce:
+        def __init__(self, *, mapping, strategy, dtype):
+            self.strategy = strategy
+            self.inputs = []
+
+        def __call__(self, x):
+            self.inputs.append(x)
+            return x
+
+    class ReducerTestMoE(MoE):
+        def create_weights(self):
+            raise NotImplementedError
+
+        def load_weights(self, weights, allow_partial_loading=False):
+            raise NotImplementedError
+
+        def quantize_input(self, x, **kwargs):
+            return x, None
+
+        def run_moe(self, ctx, *, workspace=None):
+            raise NotImplementedError
+
+    monkeypatch.setattr(distributed, "AllReduce", RecordingAllReduce)
+    monkeypatch.setenv("TRTLLM_ENABLE_DUMMY_ALLREDUCE", "1")
+    moe = ReducerTestMoE(
+        routing_method=DefaultMoeRoutingMethod(top_k=1),
+        num_experts=4,
+        hidden_size=8,
+        intermediate_size=16,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=ModelConfig(
+            mapping=Mapping(world_size=2, tp_size=2, rank=0, enable_attention_dp=attention_dp),
+            allreduce_strategy=AllReduceStrategy.TWOSHOT,
+        ),
+        init_load_balancer=False,
+    )
+
+    assert moe.dummy_all_reduce.strategy == AllReduceStrategy.NCCL
+    if attention_dp:
+        # No output reduction under attention DP: the layer keeps the NCCL reducer, as before.
+        assert moe.all_reduce is moe.dummy_all_reduce
+    else:
+        assert moe.all_reduce.strategy == AllReduceStrategy.TWOSHOT
+
+    zeros = torch.zeros
+    monkeypatch.setattr(torch, "zeros", lambda *args, device=None, **kwargs: zeros(*args, **kwargs))
+    moe.dummy_allreduce()
+
+    (dummy,) = moe.dummy_all_reduce.inputs
+    assert dummy.shape == (4,) and dummy.dtype == torch.float32
+    if not attention_dp:
+        assert moe.all_reduce.inputs == []
 
 
 @pytest.mark.cpu_only

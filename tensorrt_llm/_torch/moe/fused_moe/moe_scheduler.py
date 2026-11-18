@@ -1655,8 +1655,10 @@ class FusedCommMoEScheduler(MoEScheduler):
     ) -> List[torch.Tensor]:
         """Drive the per-chunk kernel launches, padding zero-token chunks.
 
-        EPLB stage hooks and statistics AllReduce only fire at the (first|last)
-        chunk of the (first|last) repeat, matching the external-comm path. The
+        Standard EPLB stage hooks and statistics AllReduce only fire at the
+        (first|last) chunk of the (first|last) repeat, matching the
+        external-comm path. A per-layer dynamic EPLB layer instead plans every
+        chunk and releases that chunk's replica plan after its kernel. The
         ``idx_chunk >= len(x_chunks)`` branch only triggers when
         ``real_local == 0`` (this rank has no tokens but peers do): class
         invariant 7 says launch every chunk on every EP rank so the in-kernel
