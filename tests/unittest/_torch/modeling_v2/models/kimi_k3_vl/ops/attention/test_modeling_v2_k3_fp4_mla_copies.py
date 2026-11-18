@@ -33,12 +33,7 @@ SOURCES = (
 )
 # Copied definitions whose source reads an environment override the K3 targets do not take; the copy keeps
 # the source's default path, so it is checked only for not reading the environment.
-ENV_FREE_DEFINITIONS = {
-    "_select_triton_block_v": "TRTLLM_FP4_MLA_BLOCK_V",
-    "_triton_prepack_v_enabled": "TRTLLM_FP4_MLA_PREPACK_V / TRTLLM_FP4_MLA_TRITON_PREPACK_V",
-    "_triton_v_packed_attr": "TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE",
-    "_set_triton_v_packed_cache_valid": "TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE",
-}
+ENV_FREE_DEFINITIONS = {}
 
 # The backend gained a shared context plan in #21313. K3's caller also owns its
 # context/generation fusion, so replacing that caller is not an AST-only move.
@@ -54,25 +49,13 @@ INTENTIONAL_DIVERGENCES = {
         "than adopting the backend's new shared-plan workflow wholesale."
     ),
 }
-# Definitions the K3 targets serve with that no backend module defines as the family does: the Triton
-# V-packed cache and its repack kernels, the device-side generation page count the repack reads under
-# CUDA graphs, the SM107-only Q-quant fusion gate, and the FP8 context SM check. The family owns them;
-# they are not compared, and none may match a definition of any backend module.
+# Definitions the K3 targets serve with that no backend module defines as the family does: the SM107-only
+# Q-quant fusion gate and the FP8 context SM check. The family owns them; they are not compared, and none
+# may match a definition of any backend module.
 FAMILY_OWNED = {
-    "_fp4_mla_generation_num_blocks_device",
     "can_fuse_fp4_mla_q_quant",
-    "_v_packed_cache_tag",
-    "_triton_can_prepack_v",
-    "_triton_shared_v_packed_valid_attr",
-    "_triton_v_packed_cache_tag",
-    "_update_triton_v_packed_cache",
-    "_maybe_update_triton_v_packed_cache",
     "_FP8_CONTEXT_SUPPORTED_SMS",
     "require_fp4_mla_fp8_context_support",
-    "_fp4_mla_attention_v_repack_kernel",
-    "_fp4_mla_attention_v_repack_pages_kernel",
-    "_fp4_mla_attention_v_repack_pages_dyn_kernel",
-    "fp4_mla_repack_v_cache",
 }
 WHOLE_COPIES = {
     "_k3_fp4_mla_v_repack": "fp4_mla_cutedsl_v_repack",
