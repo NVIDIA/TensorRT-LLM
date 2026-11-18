@@ -159,6 +159,7 @@ def build_feature_attention_metadata(
         LinearDraftMetadata,
         SharedKVCacheLinearDraftMetadata,
         SharedKVCacheStandaloneDSparkDraftMetadata,
+        StandaloneDSparkDraftMetadata,
         SuffixAutomatonDraftMetadata,
     )
     from tensorrt_llm._torch.attention.metadata.mla_context import MlaContextMetadata
@@ -229,15 +230,18 @@ def build_feature_attention_metadata(
             )
         elif spec_dec_mode.is_dspark() and spec_config.draft_is_embedded_in_target:
             metadata_types.append(EmbeddedDSparkDraftMetadata)
-        elif spec_dec_mode.is_dspark() and not has_separate_draft_cache:
-            metadata_types.append(SharedKVCacheStandaloneDSparkDraftMetadata)
+        elif spec_dec_mode.is_dspark():
+            metadata_types.append(
+                StandaloneDSparkDraftMetadata
+                if has_separate_draft_cache
+                else SharedKVCacheStandaloneDSparkDraftMetadata
+            )
         elif spec_dec_mode.is_sa():
             metadata_types.append(SuffixAutomatonDraftMetadata)
         else:
             raise UnsupportedMetadataConfiguration(
                 f"the speculative decoding mode {spec_dec_mode.name} (linear MTP-Eagle "
-                "one-model, DSpark and the suffix automaton are covered; standalone DSpark "
-                "with a separate draft KV cache is not)"
+                "one-model, DSpark and the suffix automaton are covered)"
             )
         max_draft_tokens = spec_config.max_draft_len
 
