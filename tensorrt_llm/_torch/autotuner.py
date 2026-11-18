@@ -411,7 +411,7 @@ _SPEC_STORAGE_SLACK_BYTES = 64 << 20
 class _TensorSpec:
     """A tensor's storage and its view of it, to make one like it from in a worker process. A
     large tensor gets values of its own, as the autotuner makes for a profile's inputs; a small
-    one keeps a CPU copy of its storage's values (see ``_SPEC_VALUES_MAX_NUMEL``)."""
+    one keeps a CPU copy of its storage's bytes (see ``_SPEC_VALUES_MAX_NUMEL``)."""
     shape: Tuple[int, ...]
     stride: Tuple[int, ...]
     storage_offset: int
@@ -439,10 +439,11 @@ class _TensorSpec:
         else:
             base = 0
         values = None
-        if (keep_values and value.dtype != torch.float4_e2m1fn_x2
-                and numel <= _SPEC_VALUES_MAX_NUMEL):
-            values = value.detach().as_strided((numel, ), (1, ),
-                                               base).to("cpu", copy=True)
+        if keep_values and numel <= _SPEC_VALUES_MAX_NUMEL:
+            # Bytes: a pickled CPU tensor of a float8 or float4 dtype does not load in
+            # another process.
+            values = value.detach().as_strided(
+                (numel, ), (1, ), base).view(torch.uint8).to("cpu", copy=True)
         return cls(tuple(value.shape), tuple(value.stride()), offset, numel,
                    value.dtype, itemsize, value.is_cuda, values)
 
@@ -455,7 +456,7 @@ class _TensorSpec:
         device = (torch.device("cuda", torch.cuda.current_device())
                   if value.on_cuda else torch.device("cpu"))
         if value.values is not None:
-            storage = value.values.to(device)
+            storage = value.values.to(device).view(value.dtype)
         elif value.dtype.is_floating_point:
             storage = (torch.rand(value.storage_numel, device=device) * 10 -
                        5).to(value.dtype)

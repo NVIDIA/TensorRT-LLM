@@ -3743,6 +3743,34 @@ def test_a_worker_frees_the_gpu_memory_of_a_build_once_it_ends(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_small_inputs_of_any_dtype_reach_a_worker_with_their_values(
+        tune_mode_workers, tmp_path):
+    """A worker's small inputs keep their values whatever their dtype, as a prequantized FP8
+    GEMM's activation at a small profile: a pickled CPU tensor of a float8 or float4 dtype does
+    not load in another process."""
+    import autotuner_worker_targets as targets
+
+    from tensorrt_llm._torch.build_pool import Build
+
+    tensors = [
+        torch.arange(32 * dtype.itemsize, dtype=torch.uint8,
+                     device="cuda").view(dtype).reshape(4, 8)
+        for dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu,
+                      torch.float4_e2m1fn_x2, torch.bfloat16)
+    ]
+    path = tmp_path / "made"
+    with tune_mode_workers.pass_scope():
+        [result] = tune_mode_workers.build([
+            Build(f"{targets.__name__}:record_made",
+                  (str(path), [autotuner._TensorSpec.of(t) for t in tensors]),
+                  "made")
+        ])
+    assert result.status == "built", result.error
+    assert path.read_bytes() == b"".join(
+        t.view(torch.uint8).cpu().numpy().tobytes() for t in tensors)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_each_runner_of_an_op_is_measured_on_its_own(tune_mode_workers,
                                                      tmp_path):
     """A runner whose kernels ship prebuilt, timed first, does not keep a JIT

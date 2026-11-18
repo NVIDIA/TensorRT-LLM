@@ -63,6 +63,18 @@ def record_reserved(path: str) -> None:
         f.write(str(torch.cuda.memory_reserved()))
 
 
+def record_made(path: str, specs) -> None:
+    """A build that makes the inputs of ``specs`` (the autotuner's ``_TensorSpec``) and records
+    their bytes."""
+    import torch
+
+    from tensorrt_llm._torch.autotuner import _TensorSpec
+
+    with open(path, "wb") as f:
+        for spec in specs:
+            f.write(_TensorSpec.make(spec).view(torch.uint8).cpu().numpy().tobytes())
+
+
 class PrebuiltRunner(TunableRunner):
     """A runner whose kernel ships prebuilt (as cuBLAS's): its build does nothing."""
 
