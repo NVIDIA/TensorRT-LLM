@@ -521,6 +521,11 @@ _INDEX_SCORES_PDL = get_env_enable_pdl()
 #: kernel (`qsa_index_scores_groups_cute__decode`) over the family's Triton one. It sums in another
 #: order (~7e-8 relative), so a row's top-k can differ only at a near-tie.
 _INDEX_SCORES_CUTE_MIN_GROUPS = 8
+#: Opt-in switch (`weights.switch`): steps of four rows a request (an MTP3 verify step and its
+#: draft-extend step) take that kernel too. Off by default: they stay on the family's kernel and
+#: the CuTe kernel scores two and three rows a request, since moving them changes their scores'
+#: summation order. Read once, when the target is built.
+INDEX_SCORES_CUTE_MTP3_ENV = "TRTLLM_MODELING_V2_INDEX_SCORES_CUTE_MTP3"
 _SOFTPLUS_THRESHOLD = 20.0
 _L2_NORM_EPS = 1e-6
 _PLE_CLAMP_MIN = 1e-6
@@ -3349,7 +3354,18 @@ def _index_split_plan(split, qsa, num_tokens: int, rows_per_seq: int):
 
 
 def _decode_index_selection(
-    core, split, q, qsa, num_tokens, p, device, index_cache, plan=None, q_permuted=False, order=None
+    core,
+    split,
+    q,
+    qsa,
+    num_tokens,
+    p,
+    device,
+    index_cache,
+    plan=None,
+    q_permuted=False,
+    order=None,
+    cute_mtp3=False,
 ):
     """A sparse decode layer's int32 `[num_tokens, token_topk + compress_ratio - 1]` selection.
 
@@ -3357,7 +3373,8 @@ def _decode_index_selection(
     over this rank's rows gathered in rank order. `qsa` is `(req_idx, logical, seq_lens_q,
     visible_blocks, topk_indices, topk_row_starts, block_table, tokens_per_block)`. With a `plan`,
     this rank takes its slice of the permuted order (`q_permuted`: `q` is in it already). `order`:
-    the step's `_RowOrder`, shared by its layers."""
+    the step's `_RowOrder`, shared by its layers. `cute_mtp3`: four rows a request take the CuTe
+    scoring kernel too (`INDEX_SCORES_CUTE_MTP3_ENV`)."""
     req_idx, logical, seq_lens_q, visible_blocks, topk_indices, topk_row_starts = qsa[:6]
     block_table, tokens_per_block = qsa[6], qsa[7]
     part = _index_split_rows(split, num_tokens, p)
@@ -3381,6 +3398,7 @@ def _decode_index_selection(
     rpr = _index_rows_per_request(rows, p)
     if (
         rpr > 1
+        and (rpr < 4 or cute_mtp3)
         and rows >= _INDEX_SCORES_CUTE_MIN_GROUPS * rpr
         and logical.dtype == torch.int64
         and req_idx.dtype == torch.int32
@@ -5786,6 +5804,7 @@ class DecodeTarget:
         self._layers = _layer_views(core)
         self._stack = _stack_views(core)
         self._index_split = _index_split_group(core)
+        self._index_cute_mtp3 = _weights.switch(INDEX_SCORES_CUTE_MTP3_ENV)
 
     def _check_step_contract(self, md) -> None:
         if not self._contract_pending:
@@ -5899,6 +5918,7 @@ class DecodeTarget:
                 plan,
                 q_permuted=prologue,
                 order=getattr(self, "_row_order", None),
+                cute_mtp3=getattr(self, "_index_cute_mtp3", False),
             )
             attn = _sparse_gqa(
                 core,
@@ -6455,6 +6475,7 @@ class DecodeTarget:
                     n // gen_seqs,
                     qkv.device,
                     draft.index_cache,
+                    cute_mtp3=getattr(self, "_index_cute_mtp3", False),
                 )  # fmt: skip
                 if share:
                     capture = self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)

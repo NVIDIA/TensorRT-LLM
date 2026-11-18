@@ -6,12 +6,12 @@ A CTA (4 warps) walks `TILES` tiles (`BN` keys each) of one request group with `
 flight: the program's page numbers are looked up once into shared memory, each tile's keys go to
 an XOR-swizzled shared ring with `cp.async` (four threads a key), and the scores come from
 `mma.sync` m16n8k16 with the group's query columns as the A fragments (rows 4 t + h: verify row t,
-index head h) and the keys as B. A key's score per row is the family's
-(`qsa_paged_index_scores` with `rows_per_request`): ReLU of each head's dot, summed
+index head h; four rows a request fill all 16) and the keys as B. A key's score per row is the
+family's (`qsa_paged_index_scores` with `rows_per_request`): ReLU of each head's dot, summed
 (h0 + h1) + (h2 + h3), times 128^-0.5. The dot's accumulation order differs from the family
 kernel's, so the scores differ in the last bits.
 
-Precondition (`serves`): verify rows, `rows_per_request` (2 or 3) consecutive rows of one request
+Precondition (`serves`): verify rows, `rows_per_request` (2, 3 or 4) consecutive rows of one request
 each, 4 bf16 index heads of 128; the index pool a `[pages, tokens, 1, 128]` view with token rows
 256 B apart. Columns at and past a row's window are left unwritten.
 """
@@ -97,7 +97,7 @@ class _IdxGroupsKernel:
     def __init__(
         self, *, rpr, tpb, cr, tiles, stages, bt_width, num_requests, pdl, bn=BN, compact=False
     ):
-        assert 2 <= rpr <= 3 and tpb % cr == 0 and bn in (64, 128)
+        assert 2 <= rpr <= 4 and tpb % cr == 0 and bn in (64, 128)
         self.T, self.tpb, self.cr = rpr, tpb, cr
         # Compact index pages (`index_plane_layout`): a page's compressed keys are its first rows.
         self.compact = compact
@@ -345,11 +345,11 @@ _COMPILED: dict = {}
 
 
 def serves(q: torch.Tensor, index_cache: torch.Tensor, rows_per_request: int) -> bool:
-    """Verify rows this kernel serves: 2 or 3 rows a request, 4 bf16 index heads of 128 with unit
+    """Verify rows this kernel serves: 2, 3 or 4 rows a request, 4 bf16 index heads of 128 with unit
     dim stride and 16-byte aligned rows, a `[pages, tokens, 1, 128]` bf16 pool view with token rows
     256 B apart and 16-byte aligned pages."""
     return (
-        rows_per_request in (2, 3)
+        rows_per_request in (2, 3, 4)
         and q.ndim == 3
         and q.shape[1] == HEADS
         and q.shape[2] == HEAD_DIM
