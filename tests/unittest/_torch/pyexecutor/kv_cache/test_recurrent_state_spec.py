@@ -26,8 +26,9 @@ from tensorrt_llm._torch.recurrent_state_spec import (
     LayerStateSpec,
     PlaneShard,
     StatePlaneSpec,
+    recurrent_state_spec_from_mamba_params,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -109,7 +110,7 @@ _MANAGER_LAYOUT = {
     "nemotron": (
         torch.bfloat16,
         torch.bfloat16,
-        {1: ((48, 3), (32, 8, 8), (4, 8, 8)), 2: ((24, 3), (16, 4, 4), (2, 8, 8))},
+        {1: ((64, 3), (32, 16, 16), (4, 8, 16)), 2: ((32, 3), (16, 8, 8), (2, 8, 16))},
     ),
     "gdn": (
         torch.bfloat16,
@@ -152,7 +153,7 @@ def _text_config(
     )
     if family == "nemotron":
         config.hybrid_override_pattern = "M*M*" if recurrent else "****"
-        config.ssm_state_size, config.conv_kernel = 8, 4
+        config.ssm_state_size, config.conv_kernel = 16, 4
         config.mamba_num_heads, config.n_groups, config.mamba_head_dim = 4, 1, 8
     elif family in ("gdn", "qwen4"):
         config.layer_types = (
@@ -274,6 +275,12 @@ def test_plane_splits_only_its_sharded_axis():
             ),
             "more than once",
         ),
+        (
+            lambda: recurrent_state_spec_from_mamba_params(
+                extract_mamba_kv_cache_params(_text_config("nemotron")), conv_sections="b_c_x"
+            ),
+            "Unsupported convolution section order",
+        ),
     ],
 )
 def test_malformed_declaration_is_rejected(build, message):
@@ -373,18 +380,6 @@ def test_qwen4_exp_declares_ple_state_on_its_ple_layer():
             use_separate_draft_kv_cache=False,
         )
     )
-
-
-@pytest.mark.parametrize("family", sorted(_TEXT_MODELS))
-def test_declaration_covers_target_layers_only(family):
-    config = _text_config(family)
-
-    with_draft_layers = resolve_recurrent_state_spec(
-        config, quant_config=QuantConfig(), spec_config=MTPDecodingConfig(max_draft_len=2)
-    )
-
-    assert with_draft_layers == resolve_recurrent_state_spec(config, quant_config=QuantConfig())
-    assert len(with_draft_layers.layers) == config.num_hidden_layers
 
 
 @pytest.mark.parametrize(

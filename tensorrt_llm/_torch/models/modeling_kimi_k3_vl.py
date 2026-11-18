@@ -37,7 +37,7 @@ reuses everything numerically identical from the K2.5 implementation:
 """
 
 import copy
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -473,12 +473,15 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
 
     @classmethod
     def get_recurrent_state_spec(
-        cls, pretrained_config, *, quant_config=None, spec_config=None
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
     ) -> "RecurrentStateSpec":
         """Return the text backbone's declaration, read from ``text_config``."""
         text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
         return KimiLinearForCausalLM.get_recurrent_state_spec(
-            text_config, quant_config=quant_config, spec_config=spec_config
+            text_config, quant_config=quant_config
         )
 
     def __init__(

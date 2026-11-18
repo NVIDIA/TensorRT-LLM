@@ -87,6 +87,7 @@ if TYPE_CHECKING:
         MultimodalEncoderCudaGraphConfig,
         TorchLlmArgs,
     )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
@@ -3078,13 +3079,14 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
 
     @classmethod
     def get_recurrent_state_spec(
-        cls, pretrained_config, *, quant_config=None, spec_config=None
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional["QuantConfig"] = None,
     ) -> "RecurrentStateSpec":
         """Return the NemotronH backbone's declaration, read from ``llm_config``."""
         llm_config = getattr(pretrained_config, "llm_config", None) or pretrained_config
-        return NemotronHForCausalLM.get_recurrent_state_spec(
-            llm_config, quant_config=quant_config, spec_config=spec_config
-        )
+        return NemotronHForCausalLM.get_recurrent_state_spec(llm_config, quant_config=quant_config)
 
     def post_config(self):
         # use llm.config as config for pytorch model engine

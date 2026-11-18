@@ -3728,14 +3728,15 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
 
     @classmethod
     def get_recurrent_state_spec(
-        cls, pretrained_config, *, quant_config=None, spec_config=None
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
     ) -> RecurrentStateSpec:
         """Declare the KDA state of the linear-attention layers."""
         from ..modules.kimi_kda.cache_manager import get_kimi_cache_params
 
-        params = get_kimi_cache_params(
-            pretrained_config, spec_config=spec_config, quant_config=quant_config
-        )
+        params = get_kimi_cache_params(pretrained_config, quant_config=quant_config)
         return recurrent_state_spec_from_mamba_params(params, conv_sections="q_k_v")
 
     # ------------------------------------------------------------------

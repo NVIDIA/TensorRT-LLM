@@ -15,7 +15,7 @@
 
 import re
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Dict, List, Literal
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 import torch
 from transformers import PretrainedConfig
@@ -799,13 +799,14 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
 
     @classmethod
     def get_recurrent_state_spec(
-        cls, pretrained_config, *, quant_config=None, spec_config=None
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
     ) -> "RecurrentStateSpec":
         """Return the hybrid text decoder's declaration, read from ``text_config``."""
         text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
-        return Qwen3NextForCausalLM.get_recurrent_state_spec(
-            text_config, quant_config=quant_config, spec_config=spec_config
-        )
+        return Qwen3NextForCausalLM.get_recurrent_state_spec(text_config, quant_config=quant_config)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel

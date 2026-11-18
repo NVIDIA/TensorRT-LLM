@@ -65,8 +65,9 @@ class PlaneShard:
     Attributes:
         axis: Axis of the per-slot shape split evenly across those ranks; ``None`` when every
             rank holds the whole plane.
-        sections: Sizes of the consecutive sections along ``axis``, each split evenly on its own.
-            Empty when the axis is one section.
+        sections: Sizes of the consecutive sections along ``axis``. A rank holds each section's
+            size divided by the number of ranks, rounded down. Empty when the axis is one
+            section.
     """
 
     axis: int | None = None
@@ -119,7 +120,11 @@ class StatePlaneSpec:
         return self.shape[:axis] + (size // num_shards,) + self.shape[axis + 1 :]
 
     def local_sections(self, num_shards: int) -> tuple[int, ...]:
-        """Return the section sizes on one of ``num_shards`` ranks sharing a request."""
+        """Return the section sizes on one of ``num_shards`` ranks sharing a request.
+
+        Each section is divided on its own and rounded down, so the sizes add up to the local
+        axis only when every section is a multiple of ``num_shards``.
+        """
         return tuple(section // num_shards for section in self.shard.sections)
 
 
@@ -180,6 +185,9 @@ def recurrent_state_spec_from_mamba_params(
 
     Returns:
         The declaration of the target-model layers.
+
+    Raises:
+        ValueError: If ``conv_sections`` is neither order.
     """
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import MambaRole
 
@@ -187,8 +195,10 @@ def recurrent_state_spec_from_mamba_params(
     grouped_dim = params.n_groups * params.state_size
     if conv_sections == "x_b_c":
         sections = (inner_dim, grouped_dim, grouped_dim)
-    else:
+    elif conv_sections == "q_k_v":
         sections = (grouped_dim, grouped_dim, inner_dim)
+    else:
+        raise ValueError(f"Unsupported convolution section order: {conv_sections!r}")
     conv_plane = StatePlaneSpec(
         role=MambaRole.CONV_STATE,
         shape=(inner_dim + 2 * grouped_dim, params.conv_kernel - 1),

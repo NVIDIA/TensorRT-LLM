@@ -22,7 +22,7 @@ model does *not* use mRoPE).
 """
 
 import dataclasses
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -922,13 +922,14 @@ class MiniCPMV4_6Model(PreTrainedModel):
 
     @classmethod
     def get_recurrent_state_spec(
-        cls, pretrained_config, *, quant_config=None, spec_config=None
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
     ) -> "RecurrentStateSpec | None":
         """Return the declaration of the language model that ``text_config`` selects."""
         text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
-        return resolve_recurrent_state_spec(
-            text_config, quant_config=quant_config, spec_config=spec_config
-        )
+        return resolve_recurrent_state_spec(text_config, quant_config=quant_config)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         config = model_config.pretrained_config

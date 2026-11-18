@@ -1084,11 +1084,14 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
 
     @classmethod
     def get_recurrent_state_spec(
-        cls, pretrained_config, *, quant_config=None, spec_config=None
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
     ) -> "RecurrentStateSpec":
         """Return the text decoder's declaration; it is built from the composite config too."""
         return Glm5NextForCausalLM.get_recurrent_state_spec(
-            pretrained_config, quant_config=quant_config, spec_config=spec_config
+            pretrained_config, quant_config=quant_config
         )
 
     @property

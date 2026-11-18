@@ -14,12 +14,13 @@
 # limitations under the License.
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from torch import nn
 from transformers import AutoConfig, NemotronHConfig, PretrainedConfig
@@ -951,16 +952,16 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         return "PYTHON"
 
     @classmethod
-    def get_recurrent_state_spec(cls,
-                                 pretrained_config,
-                                 *,
-                                 quant_config=None,
-                                 spec_config=None) -> RecurrentStateSpec:
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional["QuantConfig"] = None,
+    ) -> RecurrentStateSpec:
         """Declare the Mamba2 state of the ``M`` layers of the hybrid pattern."""
         from ..modules.mamba.cache_manager import get_nemotron_cache_params
 
         params = get_nemotron_cache_params(pretrained_config,
-                                           spec_config=spec_config,
                                            quant_config=quant_config)
         return recurrent_state_spec_from_mamba_params(params,
                                                       conv_sections="x_b_c")

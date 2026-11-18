@@ -43,7 +43,6 @@ from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
                           is_builtin_zoo_module)
 
 if TYPE_CHECKING:
-    from ...llmapi.llm_args import DecodingBaseConfig
     from ..recurrent_state_spec import RecurrentStateSpec
     # The checkpoints package imports this module, so import its loader base
     # classes for type checking only.
@@ -907,7 +906,6 @@ class DecoderModelForCausalLM(nn.Module,
         pretrained_config: Any,
         *,
         quant_config: Optional[QuantConfig] = None,
-        spec_config: Optional['DecodingBaseConfig'] = None,
     ) -> Optional['RecurrentStateSpec']:
         """Return the layer kinds and base recurrent state of the model.
 
@@ -919,7 +917,6 @@ class DecoderModelForCausalLM(nn.Module,
         Args:
             pretrained_config: The loaded Hugging Face config.
             quant_config: Quantization config; it can select a state dtype.
-            spec_config: Speculative decoding config.
 
         Returns:
             ``None`` for an architecture without recurrent layers. A recurrent
@@ -1378,7 +1375,6 @@ def resolve_recurrent_state_spec(
     pretrained_config: Any,
     *,
     quant_config: Optional[QuantConfig] = None,
-    spec_config: Optional['DecodingBaseConfig'] = None,
 ) -> Optional['RecurrentStateSpec']:
     """Return the recurrent-state declaration of the model class of a config.
 
@@ -1394,9 +1390,7 @@ def resolve_recurrent_state_spec(
     get_spec = getattr(model_cls, 'get_recurrent_state_spec', None)
     if get_spec is None:
         return None
-    return get_spec(pretrained_config,
-                    quant_config=quant_config,
-                    spec_config=spec_config)
+    return get_spec(pretrained_config, quant_config=quant_config)
 
 
 def is_model_arch_known(model_arch: str) -> bool:

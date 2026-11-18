@@ -15,13 +15,14 @@
 """TensorRT-LLM text implementation for Qwen3.8-Flash-Next checkpoints."""
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
+    from ...models.modeling_utils import QuantConfig
     from ..speculative.interface import SpecWorkerBase
 
 from ...inputs import (
@@ -1210,15 +1211,16 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
 
     @classmethod
     def get_recurrent_state_spec(
-        cls, pretrained_config, *, quant_config=None, spec_config=None
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional["QuantConfig"] = None,
     ) -> RecurrentStateSpec:
         """Declare the GDN state of the linear-attention layers and the PLE state.
 
         The PLE planes belong to the decoder layer that runs PLE; every rank holds them whole.
         """
-        params = get_gdn_cache_params(
-            pretrained_config, spec_config=spec_config, quant_config=quant_config
-        )
+        params = get_gdn_cache_params(pretrained_config, quant_config=quant_config)
         ple = extract_qwen4_exp_ple_cache_params(pretrained_config)
         ple_planes = (
             StatePlaneSpec(
@@ -1314,13 +1316,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLModelBase):
 
     @classmethod
     def get_recurrent_state_spec(
-        cls, pretrained_config, *, quant_config=None, spec_config=None
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional["QuantConfig"] = None,
     ) -> RecurrentStateSpec:
         """Return the text core's declaration, read from ``text_config``."""
         text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
-        return Qwen4ExpForCausalLM.get_recurrent_state_spec(
-            text_config, quant_config=quant_config, spec_config=spec_config
-        )
+        return Qwen4ExpForCausalLM.get_recurrent_state_spec(text_config, quant_config=quant_config)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs) -> None:
         kwargs["vision_model_class"] = Qwen3VisionModel

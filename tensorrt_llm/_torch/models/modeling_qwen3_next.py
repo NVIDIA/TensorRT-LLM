@@ -22,8 +22,8 @@
 
 import os
 from types import SimpleNamespace
-from typing import (TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional,
-                    Sequence, Tuple, Union)
+from typing import (TYPE_CHECKING, Any, Dict, List, Literal, NamedTuple,
+                    Optional, Sequence, Tuple, Union)
 
 import torch
 
@@ -2432,16 +2432,16 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         return "PYTHON"
 
     @classmethod
-    def get_recurrent_state_spec(cls,
-                                 pretrained_config,
-                                 *,
-                                 quant_config=None,
-                                 spec_config=None) -> RecurrentStateSpec:
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> RecurrentStateSpec:
         """Declare the GDN state of the linear-attention layers."""
         from ..modules.fla.cache_manager import get_gdn_cache_params
 
         params = get_gdn_cache_params(pretrained_config,
-                                      spec_config=spec_config,
                                       quant_config=quant_config)
         return recurrent_state_spec_from_mamba_params(params,
                                                       conv_sections="q_k_v")
