@@ -1074,7 +1074,7 @@ def _prepare_commit(args: argparse.Namespace, plan: Promotion, source: Path) -> 
     if result:
         raise ValueError("Vendor pin failed; worktree preserved for inspection.")
     _check_lock_only(worktree, before, plan)
-    _git(worktree, "add", "--", plan.lock)
+    _git(worktree, "add", "--", f":(literal){plan.lock}")
     print("Creating signed-off promotion commit...", flush=True)
     _git(worktree, "commit", "-s", "-F", "-", text=f"{plan.title}\n\n{_record_text(plan.record)}\n")
     if _git(worktree, "status", "--porcelain"):

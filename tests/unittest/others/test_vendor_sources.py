@@ -147,9 +147,17 @@ def _make_work_tree_consumer(tmp_path: Path) -> Path:
 
 
 def _discover_vendor(
-    consumer: Path, *arguments: str | Path, check: bool = True
+    consumer: Path,
+    *arguments: str | Path,
+    check: bool = True,
+    env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return _run([sys.executable, _VENDOR_SOURCES, *arguments], cwd=consumer, check=check)
+    return _run(
+        [sys.executable, _VENDOR_SOURCES, *arguments],
+        cwd=consumer,
+        check=check,
+        env_overrides=env_overrides,
+    )
 
 
 def _source_arguments(upstream: Path, commit: str) -> list[str | Path]:
@@ -2120,11 +2128,21 @@ def test_scoped_lock_lifecycle_in_discovery_mode(tmp_path: Path) -> None:
     assert repo_lock.read_bytes() == repo_lock_bytes
     assert scoped_lock.read_bytes() != scoped_lock_bytes
     assert b"+VALUE = 'scoped-v2'" in scoped_patch.read_bytes()
-    _discover_vendor(consumer, "check")
+    _discover_vendor(consumer, "check", "scoped-example", "--repo", upstream)
 
     _discover_vendor(consumer, "remove", "scoped-example")
     assert not (scope / "3rdparty").exists()
     assert scoped_kernel.read_text(encoding="utf-8") == "VALUE = 'scoped-v2'\n"
+    _assert_failure(
+        _discover_vendor(consumer, "check", check=False),
+        "is in the Git index but missing from the work tree",
+    )
+    # The pre-commit hook of `git commit -a` gets a temporary index with the deletion staged.
+    commit_index = {"GIT_INDEX_FILE": str(tmp_path / "commit-index")}
+    shutil.copyfile(consumer / ".git" / "index", commit_index["GIT_INDEX_FILE"])
+    _run(["git", "add", "-A"], cwd=consumer, env_overrides=commit_index)
+    _discover_vendor(consumer, "check", env_overrides=commit_index)
+    _git(consumer, "add", "-A")
     checked = _discover_vendor(consumer, "check")
     assert "PASS-OFFLINE repo-example" in checked.stdout
     assert "scoped-example" not in checked.stdout

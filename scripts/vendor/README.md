@@ -428,7 +428,7 @@ The JSON separates process liveness from work completion:
 | --- | --- |
 | `running`, `pid`, `publish` | Process lock held, recorded PID, and whether remote writes are enabled; not a health verdict |
 | `vendor`, `base_branch`, `canonical_repo`, `canonical_branch` | Cached monitor scope and publishing destination; verify these after a restart or migration |
-| `lock` | Vendor lock the workdir monitors; `null` before settings are saved |
+| `lock` | Vendor lock the workdir monitors; settings saved without a lock report the repository lock |
 | `refresh_branches`, `migration` | Explicit refresh-target policy and last verified canonical-branch migration; not authorization to publish to a refresh target |
 | `operation`, `progress_at` | Current phase/PR/start time and last worker checkpoint |
 | `counts` | Current poll's scanned records, tracked lock PRs, relevant vendor updates, processed PRs, author-blocked PRs, and errors |
@@ -458,8 +458,8 @@ authorizes publication; restart recovery still verifies Git/GitHub provenance.
 
 Git/GitHub are the source of truth; SQLite is not required to reconstruct a
 promotion. Stop the old process before replacing or discarding its database.
-Relaunch with the **same account, repositories, consumer base branch, canonical
-branch, and cutoff**, and re-supply any `--refresh-branch` policy.
+Relaunch with the **same account, repositories, vendor and `--lock`, consumer base
+branch, canonical branch, and cutoff**, and re-supply any `--refresh-branch` policy.
 The bot accepts an existing workdir containing only recognized bot artifacts
 even if SQLite is missing. It preserves those artifacts and refuses unrelated
 files and symlinks. A new empty workdir also works; existing registered Git
@@ -491,6 +491,9 @@ the base branch, so start a monitor after the vendor's lock entry has merged.
 Move a vendor to another lock only after its pending promotions have merged,
 then start a new workdir with the new `--lock` (see
 [Vendored Sources](../../3rdparty/vendor-sources.md#promotion-and-local-monitoring)).
+Open source-update PRs for the vendor conflict with the move. After they are
+rebased onto the new lock, the new monitor tracks them and takes over earlier
+bot reviews, which are keyed by vendor and base branch rather than by lock.
 `--consumer-repo`, `--base-branch`, and `--upstream-branch` also support consumers
 and upstreams whose default branch is not `main`. `--repo` selects a **trusted**
 local consumer checkout; no code or hooks from source forks are executed.

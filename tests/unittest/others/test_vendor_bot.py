@@ -3048,7 +3048,7 @@ def test_completed_promotion_clears_stale_problem_without_remote_writes(monitor:
 
 
 @pytest.mark.parametrize("monitor", [_SCOPED_LOCK], ids=["scoped-vendor-lock"], indirect=True)
-@pytest.mark.parametrize("status", ["added", "removed", "modified"])
+@pytest.mark.parametrize("status", ["added", "removed", "renamed", "modified"])
 def test_lock_creation_removal_is_not_a_promotion_but_other_404s_fail(
     monitor: b.Monitor,
     monkeypatch: pytest.MonkeyPatch,
@@ -3306,6 +3306,7 @@ def test_workdir_lock_defaults_to_repository_lock(monitor: b.Monitor) -> None:
     assert monitor.store.get("settings")["lock"] == p._LOCK
 
 
+@pytest.mark.parametrize("monitor", [_SCOPED_LOCK], ids=["scoped-vendor-lock"], indirect=True)
 @pytest.mark.parametrize("vendors", [{}, None], ids=["vendor-missing", "lock-deleted"])
 def test_vendor_missing_from_configured_lock_fails_poll(
     monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch, vendors: dict | None
@@ -3316,5 +3317,5 @@ def test_vendor_missing_from_configured_lock_fails_poll(
         monitor.poll()
     health = monitor.store.get("health")
     assert health["last_poll_summary"]["outcome"] == "failed"
-    assert f"'toy' is not in {p._LOCK} on main" in health["last_error"]["message"]
+    assert f"'toy' is not in {monitor.gh.lock} on main" in health["last_error"]["message"]
     assert monitor.gh.writes == []

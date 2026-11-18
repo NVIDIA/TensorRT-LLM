@@ -781,8 +781,13 @@ class Monitor:
 
     def _inputs(self, pr: dict) -> tuple[manage.Vendor, manage.Vendor] | None:
         for change in _pages(self.gh, f"{self.prefix}/pulls/{pr['number']}/files"):
-            if change["filename"] == self.gh.lock and change.get("status") in ("added", "removed"):
-                return None  # Creating/removing the entire lock is not a source update.
+            # Creating, moving, or removing the entire lock is not a source update.
+            if change["filename"] == self.gh.lock and change.get("status") in (
+                "added",
+                "removed",
+                "renamed",
+            ):
+                return None
         if pr.get("merged"):
             revision = promote._sha(pr["merge_commit_sha"])
             commit = self.gh.get(f"{self.prefix}/commits/{revision}")

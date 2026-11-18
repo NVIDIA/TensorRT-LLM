@@ -582,8 +582,9 @@ it separately as part of the reviewed migration that removes the vendor.
 
 Without `--lock`, removing the last vendor of a scoped vendor lock also deletes
 that lock and its empty `3rdparty/vendor_patches/` and `3rdparty/` directories;
-stage the deletion with `git add`. The repository lock is kept even when it
-becomes empty.
+stage the deletion with `git add`. Until then, commands without `--lock` fail,
+because the Git index still lists the deleted lock. The repository lock is kept
+even when it becomes empty.
 
 ## Source access and checks
 
@@ -663,7 +664,10 @@ A monitor tracks only PRs that change its `--lock`, and every poll first checks
 that its vendor is in that lock on the base branch. Start a monitor after its
 vendor's lock entry has merged. Move a vendor to another lock only after its
 pending promotions have merged, then start a new workdir with `--lock` naming
-the new lock; the old monitor's polls fail until it is stopped. A promotion
+the new lock; the old monitor's polls fail until it is stopped. Open
+source-update PRs for the vendor conflict with the move. After they are rebased
+onto the new lock, the new monitor tracks them and takes over earlier bot
+reviews, which are keyed by vendor and base branch rather than by lock. A promotion
 still pending at the move can no longer complete: close it, and repoint the
 moved entry at the canonical repository and branch in a reviewed lock-only
 `manage.py pin` change once the canonical branch contains the pinned commit.

@@ -397,11 +397,17 @@ class World(m.GitHub):
 @pytest.fixture
 def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> World:
     instance = World(tmp_path, getattr(request, "param", m._LOCK))
+
+    def github(*args, lock: str) -> World:
+        assert lock == instance.lock
+        return instance
+
     monkeypatch.setattr(m, "_git", instance.routed_git)
-    monkeypatch.setattr(m, "GitHub", lambda *args, lock: instance)
+    monkeypatch.setattr(m, "GitHub", github)
     return instance
 
 
+@pytest.mark.parametrize("world", [_SCOPED_LOCK], ids=["scoped-vendor-lock"], indirect=True)
 def test_dry_run_has_no_writes_and_pins_merged_not_live_head(
     world: World, capfd: pytest.CaptureFixture
 ) -> None:
@@ -423,6 +429,8 @@ def test_dry_run_has_no_writes_and_pins_merged_not_live_head(
                 "4829",
                 "--repo",
                 str(world.consumer),
+                "--lock",
+                world.lock,
             ]
         )
         == 0

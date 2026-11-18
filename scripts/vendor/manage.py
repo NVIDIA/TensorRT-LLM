@@ -523,9 +523,16 @@ def _work_tree(directory: Path) -> Path:
 
 
 def _discover_locks(work_tree: Path) -> list[Path]:
-    # _git_environment() sets GIT_LITERAL_PATHSPECS, so filter the index listing here
-    # instead of passing a glob pathspec.
-    output = _run_git(["ls-files", "-z", "--cached"], cwd=work_tree, capture_bytes=True)
+    # Read the index being committed: `git commit -a` gives the pre-commit hook a temporary
+    # index through GIT_INDEX_FILE. _git_environment() sets GIT_LITERAL_PATHSPECS, so filter
+    # the index listing here instead of passing a glob pathspec.
+    index_file = os.environ.get("GIT_INDEX_FILE")
+    output = _run_git(
+        ["ls-files", "-z", "--cached"],
+        cwd=work_tree,
+        capture_bytes=True,
+        index_file=os.path.abspath(index_file) if index_file else None,
+    )
     assert isinstance(output, bytes)
     locks: set[Path] = set()
     for entry in os.fsdecode(output).split("\0"):
@@ -540,8 +547,12 @@ def _discover_locks(work_tree: Path) -> list[Path]:
                 f"<scope>/{_CONTROL_DIRECTORY}/{_LOCK_FILENAME}."
             )
         path = _checked_root_path(work_tree, entry, f"Vendor lock {entry!r}")
-        if path.is_file():
-            locks.add(path)
+        if not path.is_file():
+            raise VendorError(
+                f"Vendor lock {entry!r} is in the Git index but missing from the work tree; "
+                "restore it, or stage its deletion with git add."
+            )
+        locks.add(path)
     return sorted(locks)
 
 
@@ -868,10 +879,14 @@ def _atomic_file_replacement(path: Path, content: bytes) -> Iterator[None]:
         raise
 
 
-def _git_environment(*, isolated: bool, repository_ceiling: Path | None = None) -> dict[str, str]:
+def _git_environment(
+    *, isolated: bool, repository_ceiling: Path | None = None, index_file: str | None = None
+) -> dict[str, str]:
     environment = os.environ.copy()
     for variable in _GIT_LOCAL_ENVIRONMENT_VARIABLES:
         environment.pop(variable, None)
+    if index_file is not None:
+        environment["GIT_INDEX_FILE"] = index_file
     environment.update(
         {
             "GIT_TERMINAL_PROMPT": "0",
@@ -903,6 +918,7 @@ def _run_git(
     isolated: bool = False,
     input_bytes: bytes | None = None,
     repository_ceiling: Path | None = None,
+    index_file: str | None = None,
 ) -> bytes | str:
     if input_bytes is not None and not capture_bytes:
         raise ValueError("Git commands with byte input must capture byte output.")
@@ -914,6 +930,7 @@ def _run_git(
             env=_git_environment(
                 isolated=isolated,
                 repository_ceiling=repository_ceiling,
+                index_file=index_file,
             ),
             check=True,
             capture_output=True,
@@ -1390,12 +1407,15 @@ def _command_create(args: argparse.Namespace) -> None:
                 vendor.patch_digest = _patch_digest(patch)
                 patch_transaction = _atomic_file_replacement(patch_path, patch)
     vendor.digest = _tree_digest(result_tree)
+    unstaged = args.lock_set is not None and args.lock not in _discover_locks(
+        args.lock_set.work_tree
+    )
     with contextlib.ExitStack() as transaction:
         transaction.enter_context(destination_transaction)
         transaction.enter_context(patch_transaction)
         _save_lock_checked(lock, f"lock state for new vendor {vendor.name!r}")
     print(f"Created {vendor.name} at {vendor.commit} ({'patched' if vendor.patch else 'exact'}).")
-    if args.lock_set is not None and args.lock not in _discover_locks(args.lock_set.work_tree):
+    if unstaged:
         print(
             f"Vendor lock {_display_lock(args.lock_set, lock)} is not staged; stage it with "
             "git add so that lock discovery finds it."
@@ -1727,7 +1747,7 @@ def _remove_empty_scoped_lock(lock: LockFile) -> None:
     lock.path.unlink()
     control_directory = lock.path.parent
     for directory in (control_directory / _PATCH_DIRECTORY.name, control_directory):
-        if directory.is_dir() and not any(directory.iterdir()):
+        if directory.is_dir() and not directory.is_symlink() and not any(directory.iterdir()):
             directory.rmdir()
 
 
