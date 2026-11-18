@@ -1487,6 +1487,21 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    def test_guided_decoding_breakable_prefill_cuda_graph(self, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend="xgrammar",
+                  kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.75),
+                  cuda_graph_config=CudaGraphConfig(enable_padding=True),
+                  enable_chunked_prefill=True,
+                  max_num_tokens=256,
+                  speculative_config=MTPDecodingConfig(max_draft_len=2),
+                  prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])
