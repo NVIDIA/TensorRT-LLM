@@ -2217,3 +2217,73 @@ class TestExecutorLoopObservability:
             for family in collector.loop_requests_fetched.collect()
             for sample in family.samples
         )
+
+
+@pytest.mark.parametrize("count", [None, 0, 7])
+def test_conversation_count_snapshot_and_gauge(collector, count):
+    report = KVCacheV2IterationStatsReport({}, {}, num_conversations=count)
+    row = {"attentionDpRank": 0}
+    append_kv_cache_iteration_stats(row, report)
+    collector.log_iteration_stats(row)
+    samples = collector.kv_cache_num_conversations.collect()[0].samples
+    if count is None:
+        assert "kvCacheNumConversations" not in row
+        assert samples == []
+    else:
+        assert row["kvCacheNumConversations"] == count
+        assert _get_gauge_value(collector, "kv_cache_num_conversations", 0) == count
+        collector.log_iteration_stats({"attentionDpRank": 0, "kvCacheNumConversations": 0})
+        assert _get_gauge_value(collector, "kv_cache_num_conversations", 0) == 0
+        assert all(sample.labels["dp_rank"] == "0" for sample in samples)
+
+
+@pytest.mark.parametrize("value", [-1, True, "3", 1.5])
+def test_conversation_count_rejects_invalid_measurements(collector, value):
+    collector.log_iteration_stats({"kvCacheNumConversations": value})
+    assert collector.kv_cache_num_conversations.collect()[0].samples == []
+
+
+def test_conversation_map_count_tracks_namespaces_and_retained_plans():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
+    from tensorrt_llm.conversation_params import ConversationParams
+
+    manager = ConversationManager(2)
+
+    def request(request_id, *, lora=None, salt=None, conversation_id="session"):
+        return SimpleNamespace(
+            py_request_id=request_id,
+            is_dummy_request=False,
+            py_conversation_params=ConversationParams(conversation_id=conversation_id),
+            lora_task_id=lora,
+            cache_salt=salt,
+        )
+
+    first = request(1)
+    manager.prepare_request(first)
+    manager.prepare_request(first)
+    assert manager.num_conversations == 1
+    manager.prepare_request(request(2))
+    assert manager.num_conversations == 1
+    manager.finish_request(request(2))
+    assert manager.num_conversations == 1
+    cache = Mock(num_committed_tokens=8, tokens_per_block=4)
+    cache._get_committed_prefix_key.return_value = b"prefix"
+    manager.save_drop_plan(first, cache)
+    assert manager.num_conversations == 1
+    next_turn = request(3)
+    manager.prepare_request(next_turn)
+    assert manager.num_conversations == 1
+    manager.finish_request(next_turn)
+    assert manager.num_conversations == 1
+    other_lora, other_salt = request(4, lora=1), request(5, salt="other")
+    manager.prepare_request(other_lora)
+    manager.prepare_request(other_salt)
+    assert manager.num_conversations == 3
+    manager.finish_request(other_lora)
+    manager.finish_request(other_salt)
+    assert manager.num_conversations == 1
+    manager.clear()
+    assert manager.num_conversations == 0

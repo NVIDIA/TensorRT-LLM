@@ -29,6 +29,7 @@ _RANK_FIELDS = frozenset(
     {
         "kvCacheStats",
         "kvTransferOutcomes",
+        "kvCacheNumConversations",
         "crossKvCacheStats",
         "kvCacheIterationStats",
         "kvCacheIterationStatsByLifecycle",

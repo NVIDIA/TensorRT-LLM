@@ -1850,6 +1850,8 @@ def test_transfer_failure_is_exported_before_idle_wait_without_another_batch() -
     executor.enable_iter_perf_stats = True
     executor.enable_attention_dp = False
     executor._disagg_coordinator = coordinator
+    executor.canceled_req_ids = set()
+    executor._flush_staged_responses = Mock()
     executor.stats_lock = threading.Lock()
     executor.stats = []
     executor.max_stats_len = 10
