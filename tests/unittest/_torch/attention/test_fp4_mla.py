@@ -1329,6 +1329,8 @@ def test_fp4_mla_chunked_prefill_attends_cached_partitions_then_current_chunk(
     monkeypatch.setattr(mla_module, "maybe_compiled_cat", torch.cat)
     tokens, cached, heads, nope, rope, rank, v_dim = 4, 6, 2, 8, 4, 16, 8
     calls = []
+    expected_is_lse = chunked_loop_num > 0
+    change_format = False
 
     def load_chunked_kv_cache_for_mla(**kwargs):
         calls.append(("load", kwargs["num_ctx_cached_tokens"]))
@@ -1341,10 +1343,16 @@ def test_fp4_mla_chunked_prefill_attends_cached_partitions_then_current_chunk(
         assert forward_args.latent_cache is None
         assert k.shape == (k.shape[0], heads * (nope + rope))
         assert v.shape == (k.shape[0], heads * v_dim)
+        forward_args.softmax_stats_is_lse = (
+            not expected_is_lse
+            if change_format and forward_args.attention_mask == PredefinedAttentionMask.CAUSAL
+            else expected_is_lse
+        )
         partition_keys.append(k)
         return forward_args.output
 
-    def merge(merged, temp, stats, temp_stats, merge_op, metadata):
+    def merge(merged, temp, stats, temp_stats, merge_op, metadata, *, is_lse=False):
+        assert is_lse == expected_is_lse
         calls.append(("merge", merge_op))
 
     partition_keys = []
@@ -1408,6 +1416,18 @@ def test_fp4_mla_chunked_prefill_attends_cached_partitions_then_current_chunk(
     current_k = partition_keys[-1].view(tokens, heads, nope + rope)
     for head in range(heads):
         torch.testing.assert_close(current_k[:, head, nope:], latent[:, 0, rank:])
+
+    if chunked_loop_num:
+        calls.clear()
+        change_format = True
+        with pytest.raises(RuntimeError, match="normalizer format changed between partitions"):
+            MLA.forward_context_with_chunked_prefill_fp4(
+                module, q, torch.zeros(tokens, rank), latent, metadata, output
+            )
+        # The causal partition must not reach merge after a format change.
+        assert [call for call in calls if call[0] == "merge"] == [
+            ("merge", f"op{i}") for i in range(chunked_loop_num)
+        ]
 
 
 def test_fp4_mla_v2_runtime_sizing_accounts_for_pipeline_slots() -> None:

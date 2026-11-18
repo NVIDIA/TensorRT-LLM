@@ -237,15 +237,15 @@ def test_prims_ts_mla_cached_and_partitioned_context_geometry(
             PredefinedAttentionMask.FULL,
             temp_stats,
         )
-        merged_lse = attn.merge_attention_for_mla(
+        is_lse = partition_lse
+        attn.merge_attention_for_mla(
             merged,
             historical,
             merged_stats,
             temp_stats,
             torch.tensor([2, 0, 2], dtype=torch.int64, device="cuda"),
             metadata,
-            previous_lse=None,
-            current_lse=partition_lse,
+            is_lse=is_lse,
         )
         # The empty historical request must remain untouched until the fresh partition copies it.
         empty_rows = slice(case.seq_lens[0], sum(case.seq_lens[:2]))
@@ -257,6 +257,7 @@ def test_prims_ts_mla_cached_and_partitioned_context_geometry(
         fresh = run_partition(
             fresh_k, fresh_v, case.seq_lens, PredefinedAttentionMask.CAUSAL, temp_stats
         )
+        assert partition_lse == is_lse
         attn.merge_attention_for_mla(
             merged,
             fresh,
@@ -264,8 +265,7 @@ def test_prims_ts_mla_cached_and_partitioned_context_geometry(
             temp_stats,
             torch.tensor([1, 2, 1], dtype=torch.int64, device="cuda"),
             metadata,
-            previous_lse=merged_lse,
-            current_lse=partition_lse,
+            is_lse=is_lse,
         )
         assert torch.isfinite(normalizer).all()
         torch.testing.assert_close(merged, reference, atol=atol, rtol=rtol)

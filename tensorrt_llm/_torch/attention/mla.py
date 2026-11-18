@@ -69,6 +69,13 @@ from .rotary_embedding import RotaryEmbedding
 _MIN_STRIDED_KV_EXPAND_TOKENS = 4096
 
 
+def _check_mla_merge_format(is_lse: bool | None, partition_is_lse: bool) -> bool:
+    """Keep the first partition's normalizer encoding for the entire accumulation."""
+    if is_lse is not None and is_lse != partition_is_lse:
+        raise RuntimeError("MLA chunked-prefill normalizer format changed between partitions.")
+    return partition_is_lse if is_lse is None else is_lse
+
+
 def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
     """Drop CUDA-graph padding by slicing hidden_states to num_tokens rows.
 
@@ -1409,7 +1416,7 @@ class MLA(nn.Module):
             device=q.device,
         )
         self.temp_softmax_stats_tensor = torch.empty_like(self.softmax_stats_tensor)
-        merged_lse = None
+        is_lse = None
         attn_output = output
         temp_attn_output = q.new_empty(
             (q.size(0), self.num_context_heads * self.v_head_dim),
@@ -1484,15 +1491,15 @@ class MLA(nn.Module):
                 kv_lens_cuda=attn_metadata.chunked_seq_len[loop_idx],
                 kv_lens_cpu=attn_metadata.host_chunked_seq_len[loop_idx],
             )
-            merged_lse = trtllm_attention.merge_attention_for_mla(
+            is_lse = _check_mla_merge_format(is_lse, forward_args.softmax_stats_is_lse)
+            trtllm_attention.merge_attention_for_mla(
                 attn_output,
                 temp_attn_output,
                 self.softmax_stats_tensor,
                 self.temp_softmax_stats_tensor,
                 attn_metadata.merge_op_tensor[loop_idx],
                 attn_metadata,
-                previous_lse=merged_lse,
-                current_lse=forward_args.softmax_stats_is_lse,
+                is_lse=is_lse,
             )
 
         current_k, current_v = expand_kv(compressed_kv, current_k_pe)
@@ -1506,6 +1513,7 @@ class MLA(nn.Module):
             kv_lens_cuda=attn_metadata.prompt_lens_cuda_runtime,
             kv_lens_cpu=attn_metadata.prompt_lens_cpu_runtime,
         )
+        is_lse = _check_mla_merge_format(is_lse, forward_args.softmax_stats_is_lse)
         trtllm_attention.merge_attention_for_mla(
             attn_output,
             temp_attn_output,
@@ -1513,8 +1521,7 @@ class MLA(nn.Module):
             self.temp_softmax_stats_tensor,
             attn_metadata.merge_op_tensor[attn_metadata.chunked_loop_num],
             attn_metadata,
-            previous_lse=merged_lse,
-            current_lse=forward_args.softmax_stats_is_lse,
+            is_lse=is_lse,
         )
         return attn_output
 
@@ -1545,7 +1552,7 @@ class MLA(nn.Module):
             dtype=torch.float,
             device="cuda",
         )
-        merged_lse = None
+        is_lse = None
 
         attn_output = output
         temp_attn_output = q.new_empty(
@@ -1608,15 +1615,15 @@ class MLA(nn.Module):
             )
             # merge attn result
             temp_merge_op = attn_metadata.merge_op_tensor[loop_idx]
-            merged_lse = trtllm_attention.merge_attention_for_mla(
+            is_lse = _check_mla_merge_format(is_lse, forward_args.softmax_stats_is_lse)
+            trtllm_attention.merge_attention_for_mla(
                 attn_output,
                 temp_attn_output,
                 self.softmax_stats_tensor,
                 self.temp_softmax_stats_tensor,
                 temp_merge_op,
                 attn_metadata,
-                previous_lse=merged_lse,
-                current_lse=forward_args.softmax_stats_is_lse,
+                is_lse=is_lse,
             )
 
         # The current chunk's cache already contains rotated K positions.
@@ -1644,6 +1651,7 @@ class MLA(nn.Module):
         )
         temp_attn_output = self.mha.forward(q, k, v, attn_metadata, forward_args=forward_args)
         temp_merge_op = attn_metadata.merge_op_tensor[chunked_loop_num]
+        is_lse = _check_mla_merge_format(is_lse, forward_args.softmax_stats_is_lse)
         trtllm_attention.merge_attention_for_mla(
             attn_output,
             temp_attn_output,
@@ -1651,8 +1659,7 @@ class MLA(nn.Module):
             self.temp_softmax_stats_tensor,
             temp_merge_op,
             attn_metadata,
-            previous_lse=merged_lse,
-            current_lse=forward_args.softmax_stats_is_lse,
+            is_lse=is_lse,
         )
         # copy back kv_lens_runtime and kv_lens_cuda_runtime
         attn_metadata.kv_lens_runtime = origin_kv_lens_runtime

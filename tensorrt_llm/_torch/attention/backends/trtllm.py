@@ -4945,15 +4945,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         temp_softmax_stats: torch.Tensor,
         merge_op: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
-        previous_lse: Optional[bool] = False,
-        current_lse: bool = False,
-    ) -> bool:
-        """Merge a partition, returning the fixed accumulator normalizer format."""
+        is_lse: bool = False,
+    ) -> None:
+        """Merge a partition using one fixed normalizer format for both inputs."""
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
-        if previous_lse is None:
-            previous_lse = current_lse
-
         torch.ops.trtllm.merge_chunked_attention_for_mla(
             merged_attn,
             temp_attn,
@@ -4965,10 +4961,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             merge_op,
             self.num_heads,
             self.mla_params.v_head_dim,
-            previous_lse,
-            current_lse,
+            is_lse=is_lse,
         )
-        return previous_lse
 
     def sparse_kv_predict(
         self,

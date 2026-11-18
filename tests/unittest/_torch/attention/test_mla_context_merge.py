@@ -31,8 +31,7 @@ def _reference_merge(
     current_stats: torch.Tensor,
     offsets: list[int],
     operations: list[int],
-    previous_lse: bool = False,
-    current_lse: bool = False,
+    is_lse: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge normalized partial outputs using float64 log-partition weights."""
     expected = previous.clone()
@@ -41,12 +40,12 @@ def _reference_merge(
         rows = slice(offsets[request], offsets[request + 1])
         if operation == 0:
             continue
-        if operation == 2 and not (previous_lse or current_lse):
+        if operation == 2 and not is_lse:
             expected[rows] = current[rows]
             expected_stats[rows] = current_stats[rows]
             continue
 
-        def as_pair(stats: torch.Tensor, is_lse: bool) -> torch.Tensor:
+        def as_pair(stats: torch.Tensor) -> torch.Tensor:
             if not is_lse:
                 return stats.double()
             anchor = stats[..., 0].double() * math.log(2)
@@ -54,8 +53,8 @@ def _reference_merge(
 
         stats = torch.stack(
             (
-                as_pair(previous_stats[rows], previous_lse),
-                as_pair(current_stats[rows], current_lse),
+                as_pair(previous_stats[rows]),
+                as_pair(current_stats[rows]),
             ),
             dim=-1,
         )
@@ -76,27 +75,25 @@ def _reference_merge(
         merged_sum = (log_partition - merged_max).exp().nan_to_num()
         expected_stats[rows] = (
             (log_partition / math.log(2)).unsqueeze(-1)
-            if previous_lse
+            if is_lse
             else torch.stack((merged_max, merged_sum), dim=-1)
         ).float()
     return expected, expected_stats
 
 
 @pytest.mark.parametrize(
-    "dtype,head_size,previous_lse,current_lse",
+    "dtype,head_size,is_lse",
     [
-        (torch.float16, 128, False, False),
-        (torch.bfloat16, 128, False, False),
-        (torch.float32, 128, False, False),
-        (torch.float16, 256, False, False),
-        (torch.bfloat16, 256, False, False),
-        (torch.bfloat16, 128, True, True),
-        (torch.bfloat16, 128, True, False),
-        (torch.bfloat16, 128, False, True),
+        (torch.float16, 128, False),
+        (torch.bfloat16, 128, False),
+        (torch.float32, 128, False),
+        (torch.float16, 256, False),
+        (torch.bfloat16, 256, False),
+        (torch.bfloat16, 128, True),
     ],
 )
 def test_mla_context_merge_ragged_in_place(
-    dtype: torch.dtype, head_size: int, previous_lse: bool, current_lse: bool
+    dtype: torch.dtype, head_size: int, is_lse: bool
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(42)
     lengths = [5, 0, 17, 9, 1]
@@ -111,14 +108,12 @@ def test_mla_context_merge_ragged_in_place(
     output_storage = torch.full(
         (shape[0] + 2, num_heads, head_size), -7.0, dtype=dtype, device="cuda"
     )
-    stats_storage = torch.full(
-        (shape[0] + 2, num_heads, 1 if previous_lse else 2), -11.0, device="cuda"
-    )
+    stats_storage = torch.full((shape[0] + 2, num_heads, 1 if is_lse else 2), -11.0, device="cuda")
     merged = output_storage[1:-1]
     merged_stats = stats_storage[1:-1]
     merged.copy_(torch.randn(shape, generator=generator, device="cuda"))
     merged_stats[..., 0] = torch.linspace(-80, 80, shape[0], device="cuda").unsqueeze(-1)
-    if not previous_lse:
+    if not is_lse:
         merged_stats[..., 1] = torch.rand(shape[:2], generator=generator, device="cuda") + 1
     for request, operation in enumerate(operations_by_partition[0]):
         if operation == 2:
@@ -134,20 +129,16 @@ def test_mla_context_merge_ragged_in_place(
         current_stats[..., 0] = torch.linspace(80, -80, shape[0], device="cuda").unsqueeze(-1)
         current_stats[..., 0] *= (-1) ** partition
         current_stats[..., 1] = torch.rand(shape[:2], generator=generator, device="cuda") * 7 + 1
-        if current_lse:
+        if is_lse:
             current_stats = (
                 (current_stats[..., 0] + current_stats[..., 1].log()) / math.log(2)
             ).unsqueeze(-1)
-        if previous_lse or current_lse:
+        if is_lse:
             # Empty previous/current/both rows, including poisoned outputs.
             merged_stats[22:24, :, 0] = -torch.inf
             merged[22:24] = torch.nan
             current_stats[23:25, :, 0] = -torch.inf
             current[23:25] = torch.nan
-            if not previous_lse:
-                merged_stats[22:24, :, 1] = 0
-            if not current_lse:
-                current_stats[23:25, :, 1] = 0
         previous, previous_stats = merged.clone(), merged_stats.clone()
         current_before, current_stats_before = current.clone(), current_stats.clone()
         expected, expected_stats = _reference_merge(
@@ -157,8 +148,7 @@ def test_mla_context_merge_ragged_in_place(
             current_stats,
             offsets,
             operations,
-            previous_lse,
-            current_lse,
+            is_lse,
         )
 
         # The native binding aliases both destination tensors with its previous-partition inputs.
@@ -173,8 +163,7 @@ def test_mla_context_merge_ragged_in_place(
             torch.tensor(operations, dtype=torch.int64, device="cuda"),
             num_heads,
             head_size,
-            previous_lse,
-            current_lse,
+            **({"is_lse": True} if is_lse else {}),
         )
 
         torch.testing.assert_close(
@@ -185,7 +174,7 @@ def test_mla_context_merge_ragged_in_place(
         torch.testing.assert_close(current_stats, current_stats_before, atol=0, rtol=0)
         for request, operation in enumerate(operations):
             rows = slice(offsets[request], offsets[request + 1])
-            if operation == 0 or (operation == 2 and not (previous_lse or current_lse)):
+            if operation == 0 or (operation == 2 and not is_lse):
                 torch.testing.assert_close(
                     merged[rows], expected[rows], atol=0, rtol=0, equal_nan=True
                 )
