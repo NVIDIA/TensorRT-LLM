@@ -2159,10 +2159,6 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     # fallback (_util.py's _validate_or_fallback_kv_cache_manager_v2).
     MODEL_NAME = "Qwen/Qwen3.5-4B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3.5-4B-FP8"
-    # Evaluate GSM8K like the aggregate runs that set the gsm8k.yaml
-    # reference; on raw completion prompts this checkpoint scores several
-    # points lower.
-    GSM8K_EVALUATOR_KWARGS = QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS
 
     @pytest.mark.skip_less_device(2)
     def test_mismatched_block_reuse(self, mocker):
@@ -2206,10 +2202,11 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             # reference for this quant_algo differs from the unquantized one.
             llm.args.quant_config.quant_algo = "FP8_BLOCK_SCALES"
             llm.args.quant_config.kv_cache_quant_algo = "FP8"
-            run_accuracy_test(
-                llm,
-                self.MODEL_NAME, [GSM8K],
-                extra_evaluator_kwargs={GSM8K: self.GSM8K_EVALUATOR_KWARGS})
+            run_accuracy_test(llm,
+                              self.MODEL_NAME, [GSM8K],
+                              extra_evaluator_kwargs={
+                                  GSM8K: QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS
+                              })
 
     @pytest.mark.skip_less_device(4)
     def test_ctx_pp_gen_tp_asymmetric(self, mocker):
@@ -2238,7 +2235,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             # Other Qwen3.5-4B tests cap this at 32
             # (see test_llm_api_pytorch.py).
             max_batch_size=32,
-            extra_evaluator_kwargs={GSM8K: self.GSM8K_EVALUATOR_KWARGS})
+            extra_evaluator_kwargs={GSM8K: QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS})
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
