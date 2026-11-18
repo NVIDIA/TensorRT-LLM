@@ -135,6 +135,12 @@ trtllm-eval --model /path/to/video-model video_generation_eval \
   --output-dir results
 ```
 
+Generation defaults to seed `42` when `generation_params.seed` is omitted or null;
+an explicitly configured seed is preserved and used for every prompt.
+Produce baselines with the same seed and generation parameters (including resolution,
+frame count, and inference steps); matching the seed alone does not ensure comparable outputs.
+The effective generation parameters, including the seed, are recorded in `results.json`.
+
 To score existing videos using the YAML above:
 
 ```bash

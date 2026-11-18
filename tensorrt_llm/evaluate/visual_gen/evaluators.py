@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from dataclasses import fields, replace
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import click
 
 from .config import load_yaml_mapping
 from .qwen_image_bench import QwenImageBenchEvaluator, QwenImageBenchEvaluatorArgs
+
+if TYPE_CHECKING:
+    from .lpips import LPIPSNet
+
 
 _FORBIDDEN_EVALUATOR_CONFIG_KEYS = ("model", "type", "backend")
 
@@ -61,7 +65,7 @@ class VideoEvaluator(Protocol):
 class LPIPSVideoEvaluator:
     """Mean framewise LPIPS with bounded device memory and strict frame pairing."""
 
-    def __init__(self, references: dict[str, Path], net: str, device: str) -> None:
+    def __init__(self, references: dict[str, Path], net: LPIPSNet, device: str) -> None:
         from .lpips import make_lpips_model
 
         self.references = references

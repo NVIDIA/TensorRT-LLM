@@ -6,14 +6,17 @@ from __future__ import annotations
 
 import math
 import pathlib
-from typing import Any
+from typing import Callable, Literal
 
 import numpy as np
 import torch
 from PIL import Image
 
+LPIPSModel = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+LPIPSNet = Literal["alex", "vgg", "squeeze"]
 
-def _to_lpips_tensor(image: Any, device: str) -> torch.Tensor:
+
+def _to_lpips_tensor(image: Image.Image | np.ndarray | torch.Tensor, device: str) -> torch.Tensor:
     """Convert an RGB image-like object to LPIPS input: NCHW float in [-1, 1]."""
     if isinstance(image, Image.Image):
         tensor = torch.from_numpy(np.array(image.convert("RGB")))
@@ -43,8 +46,8 @@ def _to_lpips_tensor(image: Any, device: str) -> torch.Tensor:
 
 
 def score_images(
-    lpips_model: Any,
-    generated_image: Any,
+    lpips_model: LPIPSModel,
+    generated_image: Image.Image | np.ndarray | torch.Tensor,
     reference_image: Image.Image,
     device: str,
 ) -> float:
@@ -96,7 +99,7 @@ def _validate_paired_video_shapes(generated: torch.Tensor, reference: torch.Tens
 
 
 def score_video_files(
-    lpips_model: Any,
+    lpips_model: LPIPSModel,
     generated_video_path: pathlib.Path,
     reference_video_path: pathlib.Path,
     device: str,
@@ -121,7 +124,7 @@ def score_video_files(
     return _mean_lpips(lpips_model, generated, reference)
 
 
-def make_lpips_model(net: str, device: str) -> Any:
+def make_lpips_model(net: LPIPSNet, device: str) -> torch.nn.Module:
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"LPIPS device is {device}, but CUDA is not available.")
     import lpips
@@ -136,13 +139,13 @@ def _video_frames_to_tensor(frames: list[np.ndarray], device: str) -> torch.Tens
     return batch.to(device=device, dtype=torch.float32) * 2.0 - 1.0
 
 
-def _mean_lpips(model: Any, generated: torch.Tensor, reference: torch.Tensor) -> float:
+def _mean_lpips(model: LPIPSModel, generated: torch.Tensor, reference: torch.Tensor) -> float:
     with torch.no_grad():
         return float(model(generated, reference).reshape(-1).mean().item())
 
 
 def _score_video_strict(
-    model: Any, generated_path: pathlib.Path, reference_path: pathlib.Path, device: str
+    model: LPIPSModel, generated_path: pathlib.Path, reference_path: pathlib.Path, device: str
 ) -> float:
     import cv2
 
@@ -151,19 +154,28 @@ def _score_video_strict(
     total = 0.0
     count = 0
     try:
-        if not generated.isOpened() or not reference.isOpened():
-            raise ValueError(f"Cannot decode video pair: {generated_path}, {reference_path}")
+        if not generated.isOpened():
+            raise ValueError(f"Cannot open generated video: {generated_path}")
+        if not reference.isOpened():
+            raise ValueError(f"Cannot open reference video: {reference_path}")
         generated_fps = generated.get(cv2.CAP_PROP_FPS)
         reference_fps = reference.get(cv2.CAP_PROP_FPS)
         if not (generated_fps > 0 and reference_fps > 0) or not math.isclose(
             generated_fps, reference_fps, rel_tol=1e-6
         ):
-            raise ValueError("Frame rate mismatch or invalid frame rate")
+            raise ValueError(
+                f"Frame rate mismatch or invalid frame rate: generated {generated_fps:g} fps "
+                f"vs reference {reference_fps:g} fps"
+            )
         while True:
             has_generated, frame = generated.read()
             has_reference, baseline = reference.read()
             if has_generated != has_reference:
-                raise ValueError("Frame count mismatch")
+                raise ValueError(
+                    f"Frame count mismatch after {count} paired frames: "
+                    f"generated frame available={has_generated}, "
+                    f"reference frame available={has_reference}"
+                )
             if not has_generated:
                 break
             pair = [
@@ -173,12 +185,16 @@ def _score_video_strict(
             _validate_paired_video_shapes(*pair)
             score = _mean_lpips(model, *pair)
             if not math.isfinite(score):
-                raise ValueError("Non-finite LPIPS score")
+                raise ValueError(f"Non-finite LPIPS score: {score}")
             total += score
             count += 1
         if not count:
             raise ValueError("Empty video pair")
         return total / count
+    except ValueError as exc:
+        raise ValueError(
+            f"{exc}; generated={generated_path}, reference={reference_path}, frame_index={count}"
+        ) from exc
     finally:
         generated.release()
         reference.release()

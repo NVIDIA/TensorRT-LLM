@@ -86,30 +86,43 @@ class VideoGenerationEval:
         )
         generator = None
         results = []
+        generation_params = None
         try:
             if not existing:
                 generator, params = build_visual_generator(root["model"], generator_config)
+                if params.seed is None:
+                    params.seed = 42
+                generation_params = params.model_dump(mode="json", exclude_none=True)
                 media.mkdir(parents=True, exist_ok=True)
             output.mkdir(parents=True, exist_ok=True)
             (output / "results.json").unlink(missing_ok=True)
             with (output / "results.jsonl").open("w", encoding="utf-8") as stream:
-                for prompt_id, prompt, path in zip(ids, texts, paths, strict=True):
-                    if not existing:
-                        generated = generator.generate(inputs=[prompt], params=params)
-                        if len(generated) != 1:
-                            raise ValueError("Expected one generated video per prompt")
-                        item = generated[0]
-                        if item.error or item.video is None:
-                            raise ValueError(item.error or "Generator returned no video")
-                        item.save(path)
-                    results.append(
-                        {
-                            "id": prompt_id,
-                            "prompt": prompt,
-                            "video_path": str(path) if existing else str(path.relative_to(output)),
-                            "scores": metric.evaluate(prompt_id, prompt, path),
-                        }
-                    )
+                for index, (prompt_id, prompt, path) in enumerate(
+                    zip(ids, texts, paths, strict=True)
+                ):
+                    try:
+                        if not existing:
+                            generated = generator.generate(inputs=[prompt], params=params)
+                            if len(generated) != 1:
+                                raise ValueError("Expected one generated video per prompt")
+                            item = generated[0]
+                            if item.error or item.video is None:
+                                raise ValueError(item.error or "Generator returned no video")
+                            item.save(path)
+                        results.append(
+                            {
+                                "id": prompt_id,
+                                "prompt": prompt,
+                                "video_path": str(path)
+                                if existing
+                                else str(path.relative_to(output)),
+                                "scores": metric.evaluate(prompt_id, prompt, path),
+                            }
+                        )
+                    except (ValueError, RuntimeError, OSError) as exc:
+                        raise click.ClickException(
+                            f"Prompt index {index} (id={prompt_id!r}): {exc}"
+                        ) from exc
                     stream.write(json.dumps(results[-1]) + "\n")
                     stream.flush()
             aggregate = {
@@ -120,6 +133,7 @@ class VideoGenerationEval:
                 "evaluator": evaluator,
                 "evaluator_options": evaluator_options,
                 "generator_model": None if existing else root["model"],
+                "generation_params": generation_params,
                 "aggregation": "mean",
                 "aggregate_scores": aggregate,
                 "results": results,

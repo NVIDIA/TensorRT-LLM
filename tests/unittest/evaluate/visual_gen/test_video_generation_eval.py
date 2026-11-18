@@ -53,7 +53,11 @@ def test_invalid_reference_config_fails_before_loading_model(
         evaluators.build_video_evaluator("lpips", config, tmp_path, ids)
 
 
-def test_cli_generates_scores_and_closes_runtimes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("seed", [None, 0, 123])
+def test_cli_generates_scores_and_closes_runtimes(tmp_path, monkeypatch, seed):
+    from tensorrt_llm.visual_gen import VisualGenParams
+
+    params = VisualGenParams(seed=seed)
     prompts = tmp_path / "prompts.json"
     prompts.write_text(json.dumps([{"id": "fox", "prompt": "A fox"}]))
     options = tmp_path / "lpips.yaml"
@@ -64,10 +68,13 @@ def test_cli_generates_scores_and_closes_runtimes(tmp_path, monkeypatch):
     )
     item = SimpleNamespace(error=None, video=True, save=lambda path: path.write_bytes(b"video"))
     generator = SimpleNamespace(
-        generate=lambda **kwargs: [item], close=lambda: closed.append("generator")
+        generate=lambda **kwargs: [item]
+        if kwargs["params"].seed == (42 if seed is None else seed)
+        else [],
+        close=lambda: closed.append("generator"),
     )
     monkeypatch.setattr(cli, "build_video_evaluator", lambda *args, **kwargs: metric)
-    monkeypatch.setattr(cli, "build_visual_generator", lambda *args: (generator, None))
+    monkeypatch.setattr(cli, "build_visual_generator", lambda *args: (generator, params))
     result = CliRunner().invoke(
         cli.VideoGenerationEval.command,
         [
@@ -83,6 +90,8 @@ def test_cli_generates_scores_and_closes_runtimes(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     payload = json.loads((tmp_path / "out/results.json").read_text())
     assert payload["aggregate_scores"] == {"lpips": 0.1}
+    assert params.seed == (42 if seed is None else seed)
+    assert payload["generation_params"]["seed"] == params.seed
     assert payload["results"][0]["id"] == "fox"
     assert closed == ["generator", "metric"]
     assert (tmp_path / "out/generated_videos/0000.mp4").read_bytes() == b"video"
@@ -100,7 +109,10 @@ def test_video_subcommand_does_not_construct_text_llm(monkeypatch):
     assert "--evaluator-options" in result.output
 
 
-@pytest.mark.parametrize("failure", [None, "frames", "shape", "fps", "empty"])
+@pytest.mark.parametrize(
+    "failure",
+    [None, "frames", "shape", "fps", "empty", "nonfinite", "generated_open", "reference_open"],
+)
 def test_lpips_frame_pairing(tmp_path, monkeypatch, failure):
     import sys
 
@@ -123,7 +135,9 @@ def test_lpips_frame_pairing(tmp_path, monkeypatch, failure):
             self.frames = iter(baseline if self.reference else frames)
 
         def isOpened(self):
-            return True
+            return not (
+                failure == "reference_open" if self.reference else failure == "generated_open"
+            )
 
         def get(self, key):
             return 30 if self.reference and failure == "fps" else 24
@@ -148,10 +162,28 @@ def test_lpips_frame_pairing(tmp_path, monkeypatch, failure):
     metric = evaluators.LPIPSVideoEvaluator.__new__(evaluators.LPIPSVideoEvaluator)
     metric.references = {"fox": tmp_path / "reference.mp4"}
     metric.device = "cpu"
-    metric.model = lambda actual, expected: torch.mean((actual - expected) ** 2)
+    metric.model = lambda actual, expected: (
+        torch.tensor(float("nan"))
+        if failure == "nonfinite"
+        else torch.mean((actual - expected) ** 2)
+    )
     if failure:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError) as raised:
             metric.evaluate("fox", "A fox", tmp_path / "generated.mp4")
+        message = str(raised.value)
+        assert str(tmp_path / "generated.mp4") in message
+        assert str(tmp_path / "reference.mp4") in message
+        assert "frame_index=" in message
+        expected = {
+            "frames": "after 1 paired frames",
+            "shape": "(3, 8, 8) vs (3, 9, 8)",
+            "fps": "generated 24 fps vs reference 30 fps",
+            "empty": "Empty video pair",
+            "nonfinite": "Non-finite LPIPS score: nan",
+            "generated_open": "Cannot open generated video",
+            "reference_open": "Cannot open reference video",
+        }
+        assert expected[failure] in message
     else:
         assert metric.evaluate("fox", "A fox", tmp_path / "generated.mp4") == {"lpips": 0.0}
     assert len(released) == 2
@@ -524,7 +556,7 @@ def test_partial_scores_survive_later_failure(tmp_path, monkeypatch):
         obj={"model": "unused"},
     )
     assert result.exit_code != 0
-    assert str(result.exception) == "second video failed"
+    assert "Prompt index 1 (id='1'): second video failed" in result.output
     rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
     assert len(rows) == 1 and rows[0]["scores"] == {"lpips": 0.1}
     assert not (output / "results.json").exists()
@@ -556,7 +588,9 @@ def test_generator_config_is_read_once_and_telemetry_is_consumed(tmp_path, monke
     monkeypatch.setattr(builtins, "open", open_once)
     saved = []
     item = SimpleNamespace(error=None, video=True, save=lambda path: saved.append(path))
-    params = type("Params", (), {"model_fields": {"seed": object()}})()
+    from tensorrt_llm.visual_gen import VisualGenParams
+
+    params = VisualGenParams()
     generator = SimpleNamespace(
         default_params=params, generate=lambda **kwargs: [item], close=lambda: None
     )
