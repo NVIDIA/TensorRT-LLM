@@ -47,7 +47,7 @@ from _torch.moe.moe_test_utils import (
 )
 from _torch.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
-from utils.util import check_accuracy, skip_pre_blackwell
+from utils.util import check_accuracy, getSMVersion, skip_pre_blackwell
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
@@ -7483,3 +7483,41 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(
         if bias:
             torch.testing.assert_close(restored.w3_w1_bias, module.w3_w1_bias)
             torch.testing.assert_close(restored.w2_bias, module.w2_bias)
+
+
+@pytest.mark.skipif(
+    not (100 <= getSMVersion() < 110),
+    reason="The kernel requires Blackwell.",
+)
+@pytest.mark.parametrize(
+    "valid_hidden_size,valid_intermediate_size",
+    [(512, 352), (352, 512), (2880, 2880)],
+    ids=["h512_i352", "h352_i512", "h2880_i2880"],
+)
+def test_moe_mxe2m1_weights_valid_dimensions(valid_hidden_size, valid_intermediate_size):
+    """Exercise C++ TMA alignment with lean sizes and zero-padded weights."""
+    from _torch.moe.kernels.serial.test_moe import test_moe_mxe2m1_weights as run_direct_case
+
+    from tensorrt_llm.quantization.utils.fp4_utils import pad_up
+
+    # Reuse the numerical reference without enabling the deprecated test matrix.
+    run_direct_case(
+        num_tokens=16,
+        hidden_size=pad_up(valid_hidden_size, 128),
+        intermediate_size=pad_up(valid_intermediate_size, 128),
+        routing_info={
+            "num_experts": 16,
+            "top_k": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RenormalizeMoeRoutingMethod(top_k=8).routing_method_type,
+        },
+        dtype_activation="fp8",
+        act_type_str="SwiGlu",
+        use_autotune=True,
+        use_topk_as_input=False,
+        valid_hidden_size=valid_hidden_size,
+        valid_intermediate_size=valid_intermediate_size,
+    )

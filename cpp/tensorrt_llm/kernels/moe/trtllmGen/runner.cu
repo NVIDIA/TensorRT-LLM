@@ -480,11 +480,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype d
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim, ActType actType,
     bool useFineGrained)
-    : mDtypeAct(dtypeAct)
-    , mDtypeWeights(dtypeWeights)
-    , mTileTokensDim(tileTokensDim)
+    : mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, actType, useFineGrained)))
+          getOptions(dtypeAct, dtypeWeights, mTileTokensDim, useDeepSeekFp8, actType, useFineGrained)))
     , mActType(actType)
 {
 }
@@ -580,10 +578,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype d
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, bool useDeepSeekFp8,
     int tileTokensDim, bool useFineGrained)
-    : mDtypeAct(dtypeAct)
-    , mDtypeWeights(dtypeWeights)
-    , mDtypeOut(dtypeOut)
-    , mTileTokensDim(tileTokensDim)
+    : mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
           getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8, useFineGrained)))
 {

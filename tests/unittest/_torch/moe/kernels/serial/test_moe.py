@@ -2739,41 +2739,6 @@ def test_moe_mxe2m1_weights(num_tokens,
 
 @pytest.mark.skipif(
     not (100 <= getSMVersion() < 110),
-    reason="The kernel requires Blackwell.",
-)
-@pytest.mark.parametrize(
-    "valid_hidden_size,valid_intermediate_size",
-    [(512, 352), (352, 512), (2880, 2880)],
-    ids=["h512_i352", "h352_i512", "h2880_i2880"],
-)
-def test_moe_mxe2m1_weights_valid_dimensions(valid_hidden_size,
-                                             valid_intermediate_size):
-    """Exercise C++ TMA alignment with lean sizes and zero-padded weights."""
-    # Reuse the direct-op reference without enabling the deprecated test matrix.
-    test_moe_mxe2m1_weights(
-        num_tokens=16,
-        hidden_size=((valid_hidden_size + 127) // 128) * 128,
-        intermediate_size=((valid_intermediate_size + 127) // 128) * 128,
-        routing_info={
-            "num_experts": 16,
-            "top_k": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": False,
-            "routing_method_type": RoutingMethodType.Renormalize,
-        },
-        dtype_activation="fp8",
-        act_type_str="SwiGlu",
-        use_autotune=True,
-        use_topk_as_input=False,
-        valid_hidden_size=valid_hidden_size,
-        valid_intermediate_size=valid_intermediate_size,
-    )
-
-
-@pytest.mark.skipif(
-    not (100 <= getSMVersion() < 110),
     reason="The SiTu kernels are sm_100f (SM100 family). Current SM is %d." %
     getSMVersion(),
 )

@@ -113,31 +113,41 @@ static inline bool skipQuirks(BatchedGemmConfig const& config)
     return hang_c2x1_bM || hang_schedS_tmaOob_tileN64;
 }
 
-// Dynamic MoE weights are physically zero-padded. Only the packed operand's K
-// extent needs the 16U4 TMA alignment; keep its outer extent lean for OOB fill.
-static int32_t getAlignedMoeValidK(BatchedGemmConfig const& config, int32_t validK)
+namespace
+{
+// Dynamic MoE weights are physically zero-padded. Keep the outer extent lean,
+// apart from the row-shuffle granularity, and align K for the selected TMA format.
+void alignMoeValidDimensions(BatchedGemmConfig const& config, BatchedGemmData& gemmData)
 {
     auto const& options = config.mOptions;
     auto const dtypeWeights = options.mTransposeMmaOutput ? options.mDtypeA : options.mDtypeB;
     auto const dtypeAct = options.mTransposeMmaOutput ? options.mDtypeB : options.mDtypeA;
     if (options.mIsStaticBatch || dtypeWeights != Dtype::MxE2m1)
     {
-        return validK;
+        return;
     }
 
+    auto& dims = gemmData.mProblemDimensions;
     bool const isSparseA = isSparse(options.mSparsityA);
     if (dtypeNeedsPadding(dtypeWeights, options.mMmaKind, options.mMmaK, isSparseA))
     {
-        validK = tensorrt_llm::common::roundUp(validK, 128);
+        dims.mValidK = tensorrt_llm::common::roundUp(dims.mValidK, 128);
     }
     if (dtypeAct == Dtype::MxE4m3 && !doesRouteImplUseNoRoute(options.mRouteImpl))
     {
         // FIXME: routeAct can read past the valid hidden extent for MxE4m3.
         // Keep in sync with MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment.
-        validK = tensorrt_llm::common::roundUp(validK, 512);
+        dims.mValidK = tensorrt_llm::common::roundUp(dims.mValidK, 512);
     }
-    return validK;
+    if (options.mUseShuffledMatrix)
+    {
+        auto const shuffleBlockSize = batchedGemm::gemm::getShuffleBlockSize(options.mEpilogueTileM);
+        auto const outerAlignment = (options.mFusedAct ? 2 : 1) * shuffleBlockSize;
+        auto& validOuter = options.mTransposeMmaOutput ? dims.mValidM : dims.mValidN;
+        validOuter = tensorrt_llm::common::roundUp(validOuter, outerAlignment);
+    }
 }
+} // namespace
 
 void setProblemDimensions(BatchedGemmData& gemmData, bool transposeMmaOutput, int32_t m, int32_t n, int32_t k,
     std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
@@ -443,7 +453,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
 
     // Dims
     setProblemDimensions(gemmData, transposeMmaOutput, m, n, k, batchedTokens, numTokens, numBatches,
-        maxNumCtasInBatchDim, validM, validN, getAlignedMoeValidK(config, validK));
+        maxNumCtasInBatchDim, validM, validN, validK);
+    alignMoeValidDimensions(config, gemmData);
 
     // Inputs
     gemmData.mInputBuffers.mPtrA = transposeMmaOutput ? b : a;
@@ -654,7 +665,8 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
     {
         auto const& config = configs[configIndex];
         setProblemDimensions(gemmData, config.mOptions.mTransposeMmaOutput, m, n, k, batchedTokens, numTokens,
-            numBatches, maxNumCtasInBatchDim, validM, validN, getAlignedMoeValidK(config, validK));
+            numBatches, maxNumCtasInBatchDim, validM, validN, validK);
+        alignMoeValidDimensions(config, gemmData);
         auto isValidConfig = bmm.isValidConfig(config, gemmData);
         if (isValidConfig)
         {
@@ -696,7 +708,8 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
     // Dims
     auto const& config = configs[configIndex];
     setProblemDimensions(gemmData, config.mOptions.mTransposeMmaOutput, m, n, k, batchedTokens, numTokens, numBatches,
-        maxNumCtasInBatchDim, validM, validN, getAlignedMoeValidK(config, validK));
+        maxNumCtasInBatchDim, validM, validN, validK);
+    alignMoeValidDimensions(config, gemmData);
 
     return bmm.isValidConfig(config, gemmData);
 }
