@@ -773,6 +773,7 @@ class PyExecutor:
     # Set on a rank that reports completions while requests its first-token
     # check finished, which run no batch, wait for an iteration-stats record.
     _has_close_outs_pending_iter_stats = False
+    _fleet_has_live_requests = False
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -1327,6 +1328,10 @@ class PyExecutor:
         self._remote_tail_phase = RemoteTailPhase.NONE
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
+        # Whether any attention-DP rank held a request to step or received one
+        # at the last routing allgather. An idle rank keeps stepping while it is
+        # set, so every rank leaves the executor loop on the same iteration.
+        self._fleet_has_live_requests = False
         # Buffer for responses staged by rank-divergent paths (disagg transfer
         # completion, ADP error handling). With ADP, _enqueue_responses does a
         # tp_gather collective; the owning DP rank has a response but the other
@@ -3191,6 +3196,7 @@ class PyExecutor:
     @property
     def should_stop_processing(self) -> bool:
         return self.is_shutdown and len(self.active_requests) == 0 and \
+            not self._fleet_has_live_requests and \
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() and \
             not self.disagg.has_retiring_gen_receives and \
             not self._has_pending_context_retirement()
@@ -6389,7 +6395,7 @@ class PyExecutor:
             request.decoding_iter = request.py_decoding_iter
             response = request.create_response()
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens = request.reported_cached_tokens
                 if self.enable_attention_dp:
                     # Owner-local completions cannot enter a response gather.
                     self._pending_transfer_responses.append(
@@ -9567,6 +9573,14 @@ class PyExecutor:
             all_new_flat = [
                 req for reqs in all_ranks_new_requests.values() for req in reqs
             ]
+            # Fleet-wide snapshot for should_stop_processing. A rank-local
+            # decision would let an idle rank stop while a peer still runs
+            # collectives. Requests still sending KV need no step, and the
+            # rank-local stop condition does not wait for them either.
+            num_requests_to_step = total_num_live_requests - sum(
+                s.num_in_transfer_requests for s in all_rank_states)
+            self._fleet_has_live_requests = (num_requests_to_step > 0
+                                             or len(all_new_flat) > 0)
             if not self._enable_non_overlap_adp_forward_intent:
                 self._update_adp_dummy_role(all_new_flat)
 
@@ -12585,7 +12599,7 @@ class PyExecutor:
                 self._start_connector_async_save(request)
             response = request.create_response()
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens = request.reported_cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
@@ -12667,7 +12681,7 @@ class PyExecutor:
             request.decoding_iter = request.py_decoding_iter
             response = request.create_response()
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens = request.reported_cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
@@ -13030,7 +13044,7 @@ class PyExecutor:
             response = request.create_response()
             if response is None:
                 continue
-            response.result.cached_tokens = request.cached_tokens
+            response.result.cached_tokens = request.reported_cached_tokens
             response.result.ctx_computed_tokens = getattr(
                 request, 'py_ctx_computed_tokens', 0)
             response.result.ctx_first_begin = getattr(request,
@@ -13077,7 +13091,7 @@ class PyExecutor:
                 [request], gpu_times_cache=gpu_times_cache)
         response = request.create_response()
         if response:
-            response.result.cached_tokens = request.cached_tokens
+            response.result.cached_tokens = request.reported_cached_tokens
             response.result.ctx_computed_tokens = getattr(
                 request, 'py_ctx_computed_tokens', 0)
             response.result.ctx_first_begin = getattr(request,

@@ -172,6 +172,7 @@ class TestKVCacheAwareADPRouter:
         states = router.gather_all_rank_states([req1, req2])
 
         assert states[0].num_active_requests == 2  # 1 routable + 1 in transfer
+        assert states[0].num_in_transfer_requests == 1
         assert states[0].num_retiring_requests == 1
         assert states[0].num_active_tokens == 170
 
