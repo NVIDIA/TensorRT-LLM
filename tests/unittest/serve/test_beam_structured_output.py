@@ -26,12 +26,51 @@ from tensorrt_llm.serve.openai_protocol import (
     _response_format_text_config_to_guided_decoding_params,
     _response_format_to_guided_decoding_params,
 )
-from tensorrt_llm.serve.serving_extensions import OutputMode, get_serving_extension
+from tensorrt_llm.serve.serving_extensions import (
+    OutputMode,
+    get_serving_extension,
+    validate_tools_for,
+)
 
 pytestmark = pytest.mark.cpu_only
 
 FINAL = "<|channel|>final<|message|>"
 SCHEMA = {"type": "object", "properties": {"answer": {"type": "integer"}}}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("endpoint", ["chat/completions", "responses"])
+@pytest.mark.threadleak(enabled=False)
+def test_beam_tools_rejected_before_generation(serve_env, endpoint: str, stream: bool) -> None:
+    from test_common.serve.app_factory import AggConfig
+
+    server = serve_env.build_openai_server(
+        AggConfig(model_type="beam", reasoning_parser="beam_harmony_text")
+    )
+    function = {"name": "get_weather", "parameters": {"type": "object", "properties": {}}}
+    payload = {"model": "fake-model", "stream": stream, "tool_choice": "auto"}
+    if endpoint == "chat/completions":
+        payload["messages"] = [{"role": "user", "content": "What is the weather?"}]
+        payload["tools"] = [{"type": "function", "function": function}]
+    else:
+        payload["input"] = "What is the weather?"
+        payload["tools"] = [{"type": "function", **function, "strict": False}]
+        payload["store"] = False
+    response = serve_env.client(server.app).post(f"/v1/{endpoint}", json=payload)
+    assert response.status_code == 400
+    assert "Tool calling is not supported" in response.json()["message"]
+    assert server.generator.generate_calls == []
+
+
+def test_tool_validation_is_scoped_to_beam_parser() -> None:
+    tools = [{"type": "function", "function": {"name": "get_weather"}}]
+    with pytest.raises(ValueError, match="Tool calling is not supported"):
+        validate_tools_for("beam_harmony_text", tools)
+    for empty in (None, []):
+        validate_tools_for("beam_harmony_text", empty)
+    for parser in (None, "deepseek-r1", "unregistered-parser"):
+        validate_tools_for(parser, tools)
+    get_serving_extension(None).validate_tools(tools)
 
 
 @pytest.mark.parametrize(

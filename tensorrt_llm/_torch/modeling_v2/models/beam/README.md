@@ -49,6 +49,11 @@ supports manual endpoint evaluation and resuming incomplete runs.
 
 ## Configuration and limits
 
+Tool calling is not supported with `reasoning_parser: beam_harmony_text`.
+Chat Completions and Responses requests with a nonempty `tools` list return
+HTTP 400 before generation, including streaming requests and `tool_choice: none`.
+Omit `tools` or pass an empty list for text-only requests.
+
 | Setting | Serving configuration |
 |---|---|
 | Hardware and layout | Four GB300 GPUs (SM103), attention TP4, MoE TP4/EP1, PP1 |

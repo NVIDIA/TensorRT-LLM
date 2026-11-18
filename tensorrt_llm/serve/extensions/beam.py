@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Structured-output placement for Beam's text channel format."""
+"""Request constraints and structured-output placement for Beam's text format."""
 
 from typing import Any
 
@@ -24,6 +24,13 @@ _FINAL_CHANNEL_START = "<|channel|>final<|message|>"
 @register_serving_extension(model_types=("beam",), reasoning_parsers=("beam_harmony_text",))
 class BeamServingExtension(ServingExtension):
     """Constrain the final answer while retaining Beam's text parser and chat template."""
+
+    def validate_tools(self, tools: list[Any] | None) -> None:
+        if tools:
+            raise ValueError(
+                "Tool calling is not supported with reasoning_parser='beam_harmony_text'. "
+                "Omit tools or pass an empty tools list."
+            )
 
     def structured_output_format(
         self, content: dict[str, Any], chat_template_kwargs: dict[str, Any] | None
