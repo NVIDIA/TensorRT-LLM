@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""One tp2 rank's MiniMax-M3.1 MoE layer operands (expert width 1536 per rank, the shared expert's too) for the
-decode-engine entries' tests.
+"""One MiniMax-M3.1-Flash sm_107 rank's MoE layer operands for the decode-engine entries' tests, at a target's
+expert width per rank (``inter``: 1536 on tp2, 768 on tp4, 384 on tp8; the shared expert's is the same).
 
 The routed experts are random checkpoint-format NVFP4 tensors ([w3 (up); w1 (gate)] rows, e4m3 block scales) put
 through TRT-LLM's own TRTLLM-Gen NVFP4 loader shuffle (``NVFP4TRTLLMGenFusedMoEMethod._shuffle_all_experts``), which
@@ -16,8 +16,7 @@ from types import SimpleNamespace
 
 import torch
 
-H, I_TP, NUM_EXPERTS, TOP_K = 6144, 1536, 128, 4
-SHARED_I = 1536
+H, NUM_EXPERTS, TOP_K = 6144, 128, 4
 SWIGLU_ALPHA, SWIGLU_LIMIT = 1.702, 7.0
 ROUTED_SCALING = 2.0
 MINIMAX2_ROUTING = 5  # RoutingMethodType.MiniMax2
@@ -34,8 +33,9 @@ def _rand_e4m3_scales(shape, gen) -> torch.Tensor:
 
 
 @functools.lru_cache(maxsize=None)
-def experts(seed: int = 20261013):
-    """The routed experts and the router of one MoE layer, in the layout and conventions of the TRTLLM-Gen loader.
+def experts(inter: int, seed: int = 20261013):
+    """The routed experts and the router of one MoE layer of width ``inter`` per rank, in the layout and conventions
+    of the TRTLLM-Gen loader.
 
     Returns a SimpleNamespace: ``tensors`` (the ten expert operands in ``M3MoeState.layer``'s order), ``bias``,
     ``router_weight``, ``fc31_input_scale`` and ``shared`` (gate_up, its scales, down, its scales).
@@ -45,11 +45,11 @@ def experts(seed: int = 20261013):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     e = NUM_EXPERTS
     w31 = torch.randint(
-        0, 256, (e, 2 * I_TP, H // 2), dtype=torch.uint8, device="cuda", generator=gen
+        0, 256, (e, 2 * inter, H // 2), dtype=torch.uint8, device="cuda", generator=gen
     )
-    w2 = torch.randint(0, 256, (e, H, I_TP // 2), dtype=torch.uint8, device="cuda", generator=gen)
-    w31s = _rand_e4m3_scales((e, 2 * I_TP, H // 16), gen)
-    w2s = _rand_e4m3_scales((e, H, I_TP // 16), gen)
+    w2 = torch.randint(0, 256, (e, H, inter // 2), dtype=torch.uint8, device="cuda", generator=gen)
+    w31s = _rand_e4m3_scales((e, 2 * inter, H // 16), gen)
+    w2s = _rand_e4m3_scales((e, H, inter // 16), gen)
     module = SimpleNamespace(
         w3_w1_weight=w31,
         w2_weight=w2,
@@ -66,7 +66,7 @@ def experts(seed: int = 20261013):
     base = 1.5 / (FC31_INPUT_SCALE * 2.93 * 1.3 * H**0.5)
     fc31_alpha = base * (0.8 + 0.4 * torch.rand(e, device="cuda", generator=gen))
     fc2_alpha = (0.8 + 0.4 * torch.rand(e, device="cuda", generator=gen)) / (
-        FC2_INPUT_SCALE * 2.93 * 1.3 * I_TP**0.5
+        FC2_INPUT_SCALE * 2.93 * 1.3 * inter**0.5
     )
     tensors = (
         w31,
@@ -84,11 +84,11 @@ def experts(seed: int = 20261013):
     router_weight = (torch.randn(e, H, device="cuda", generator=gen) / H**0.5).float().contiguous()
     fc31_input_scale = torch.tensor([FC31_INPUT_SCALE], dtype=torch.float32, device="cuda")
 
-    gu = (0.02 * torch.randn(2 * SHARED_I, H, device="cuda", generator=gen)).to(torch.bfloat16)
-    dn = (0.05 * torch.randn(H, SHARED_I, device="cuda", generator=gen)).to(torch.bfloat16)
+    gu = (0.02 * torch.randn(2 * inter, H, device="cuda", generator=gen)).to(torch.bfloat16)
+    dn = (0.05 * torch.randn(H, inter, device="cuda", generator=gen)).to(torch.bfloat16)
     gu_q, gu_sf = torch.ops.trtllm.mxfp8_quantize(gu, True)
     dn_q, dn_sf = torch.ops.trtllm.mxfp8_quantize(dn, True)
-    shared = (gu_q.view(2 * SHARED_I, H), gu_sf, dn_q.view(H, SHARED_I), dn_sf)
+    shared = (gu_q.view(2 * inter, H), gu_sf, dn_q.view(H, inter), dn_sf)
     return SimpleNamespace(
         tensors=tensors,
         bias=bias,
@@ -103,10 +103,10 @@ def experts(seed: int = 20261013):
 CONCENTRATED = (5, 40, 77, 126)
 
 
-def layer_for(state, case: str, shared: bool = True):
+def layer_for(state, inter: int, case: str, shared: bool = True):
     """One layer on ``state`` over :func:`experts` for a routing case. ``shared=False``: the shared expert's weights
     are zero, so the engine returns the routed part alone (bf16(0 + bf16(routed)))."""
-    ops = experts()
+    ops = experts(inter)
     bias = ops.bias.clone()
     if case == "concentrated":
         bias[list(CONCENTRATED)] += 1.0
@@ -124,20 +124,20 @@ def layer_for(state, case: str, shared: bool = True):
 
 
 def stock_routed(
-    hidden: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor
+    hidden: torch.Tensor, inter: int, topk_ids: torch.Tensor, topk_weights: torch.Tensor
 ) -> torch.Tensor:
     """The stock TRTLLM-Gen NVFP4 MoE (fp4_quantize, then fp4_block_scale_moe_runner with SwiGLU-OAI) on the given
     routing, over :func:`experts`: what the built-in MiniMaxM3MoE computes for the routed part."""
     import tensorrt_llm._torch.custom_ops  # noqa: F401 -- registers the stock ops
 
-    ops = experts()
+    ops = experts(inter)
     w31, w31s, w2, w2s, fc31_alpha, scale_c, act_alpha, act_beta, act_clamp, fc2_alpha = ops.tensors
     xq, xsf = torch.ops.trtllm.fp4_quantize(hidden, ops.fc31_input_scale, 16, False, False)
     out = torch.ops.trtllm.fp4_block_scale_moe_runner(
         None, None, xq, xsf.view(torch.float8_e4m3fn).flatten(),
         w31, w31s, None, act_alpha, act_beta, act_clamp, w2, w2s, None,
         scale_c, fc31_alpha, fc2_alpha,
-        NUM_EXPERTS, TOP_K, None, None, I_TP, 0, NUM_EXPERTS, ROUTED_SCALING, MINIMAX2_ROUTING, True, 0,
+        NUM_EXPERTS, TOP_K, None, None, inter, 0, NUM_EXPERTS, ROUTED_SCALING, MINIMAX2_ROUTING, True, 0,
         topk_weights=topk_weights.to(torch.bfloat16), topk_ids=topk_ids.to(torch.int32),
     )  # fmt: skip
     return out[0] if isinstance(out, (list, tuple)) else out
@@ -148,13 +148,13 @@ def hidden_states(m: int, seed: int) -> torch.Tensor:
     return torch.randn(m, H, device="cuda", generator=gen).to(torch.bfloat16)
 
 
-def check_routed_part(op, state, m: int, seed: int) -> None:
+def check_routed_part(op, state, inter: int, m: int, seed: int) -> None:
     """Exact, independent of the reference: the engine's routing (its route_dbg record: ids, then the bf16 weights'
     fp32 bits) is the reference routing bit for bit, and its routed part is the stock TRTLLM-Gen MoE's output on that
     routing bit for bit -- the claim the engines are built on."""
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.moe.m3_moe_engine import moe_route
 
-    layer = layer_for(state, "random", shared=False)
+    layer = layer_for(state, inter, "random", shared=False)
     hidden = hidden_states(m, seed=seed)
     out = op(hidden, layer)
     ids = state.route_dbg[:, :4].long()
@@ -163,7 +163,7 @@ def check_routed_part(op, state, m: int, seed: int) -> None:
     assert torch.equal(ids, ref_ids) and torch.equal(weights, ref_weights), (
         "routing differs from the reference"
     )
-    stock = stock_routed(hidden, ids, weights)
+    stock = stock_routed(hidden, inter, ids, weights)
     assert torch.equal(out.view(torch.int16), stock.view(torch.int16)), (
         "routed part differs from TRTLLM-Gen's"
     )

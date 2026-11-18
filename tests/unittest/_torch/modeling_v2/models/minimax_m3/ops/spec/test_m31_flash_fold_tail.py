@@ -1,24 +1,55 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the forward-tail spec fold (kernels/m3_fold_tail and M3SpecStepFold.in_forward).
+"""GPU test for the forward-tail spec fold (``m3_fold_tail`` and ``M3SpecStepFold`` in the forward) of the
+MiniMax-M3.1-Flash sm_107 tp4 target (the family kernels) and tp8 target (its own kernels).
 
 The tail must write exactly what the sampler's store (slot_scatter) and then the engine's next-step gathers
 (step_gather, rows = the stored rows in order, first previous row 0) write, for the rows the step armed, and nothing
 when the step was not armed.
 """
 
+import importlib
 import types
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels import m3_fold_tail, m3_spec_tail
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4 import (
-    modeling as spec_fold,
-)
+from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
-    pytest.skip("the sm_107 TP4 target runs on SM107 only", allow_module_level=True)
+    pytest.skip("the sm_107 targets run on SM107 only", allow_module_level=True)
+
+_PACKAGE = "tensorrt_llm._torch.modeling_v2.models.minimax_m3"
+TP4 = "minimax_m3_1_flash_nvfp4__sm_107__tp4"
+TP8 = "minimax_m3_1_flash_nvfp4__sm_107__tp8"
+# Target -> the package of the fold-tail kernel it runs, and the M3SpecStepFold arguments it builds. Both targets run
+# the family spec-tail kernels.
+_KERNELS = {TP4: f"{_PACKAGE}.kernels", TP8: f"{_PACKAGE}.{TP8}.kernels"}
+_FOLD_KWARGS = {TP4: {"in_forward": True}, TP8: {}}
+
+
+def _load(target: str):
+    try:
+        return types.SimpleNamespace(
+            modeling=importlib.import_module(f"{_PACKAGE}.{target}.modeling"),
+            m3_fold_tail=importlib.import_module(f"{_KERNELS[target]}.m3_fold_tail"),
+            m3_spec_tail=importlib.import_module(f"{_PACKAGE}.kernels.m3_spec_tail"),
+        )
+    except NoTarget:
+        return None
+
+
+TARGETS = {target: _load(target) for target in _KERNELS}
+
+
+def _targets(*names):
+    return [
+        pytest.param(t, id=t.rsplit("__", 1)[1])
+        if TARGETS[t] is not None
+        else pytest.param(t, marks=pytest.mark.skip(reason=f"{t} is not built"))
+        for t in names
+    ]
+
 
 VOCAB = 200064
 NUM_SLOTS = 9
@@ -75,9 +106,9 @@ def _engine(t):
     )
 
 
-def _reference(store, engine, slots, out, t):
+def _reference(k, store, engine, slots, out, t):
     """slot_scatter into the store, then step_gather of the next step's inputs from it."""
-    assert m3_spec_tail.slot_scatter(
+    assert k.m3_spec_tail.slot_scatter(
         slots,
         out["new_tokens"],
         store.new_tokens.squeeze(-1).T,
@@ -91,7 +122,7 @@ def _reference(store, engine, slots, out, t):
     p = slots.numel()
     ids, draft, pos_off, kv_off = engine
     slots32 = slots.to(torch.int32)
-    assert m3_spec_tail.step_gather(
+    assert k.m3_spec_tail.step_gather(
         store.next_new_tokens,
         store.next_draft_tokens,
         store.new_tokens_lens,
@@ -110,9 +141,9 @@ def _reference(store, engine, slots, out, t):
     )
 
 
-def _tail(store, engine, ctrl, slots_buf, out, t, rows, cpp=False):
+def _tail(k, store, engine, ctrl, slots_buf, out, t, rows, cpp=False):
     ids, draft, pos_off, kv_off = engine
-    assert m3_fold_tail.fold_tail(
+    assert k.m3_fold_tail.fold_tail(
         ctrl,
         slots_buf,
         rows,
@@ -136,7 +167,8 @@ def _tail(store, engine, ctrl, slots_buf, out, t, rows, cpp=False):
 @pytest.mark.parametrize("cpp", [False, True], ids=["triton", "cpp"])
 @pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize("widths", [(4, 4, 3), (8, 8, 7)], ids=["store=step", "store wider"])
-def test_tail_matches_scatter_then_gather(rows, widths, cpp) -> None:
+@pytest.mark.parametrize("target", _targets(TP4, TP8))
+def test_tail_matches_scatter_then_gather(target, rows, widths, cpp) -> None:
     """Store bit for bit; engine rows [0, P*T) / [0, P) bit for bit (the forward reads only those rows)."""
     t = 4
     g = torch.Generator(device="cuda").manual_seed(1000 * rows + widths[0])
@@ -145,11 +177,12 @@ def test_tail_matches_scatter_then_gather(rows, widths, cpp) -> None:
     slots = torch.randperm(NUM_SLOTS, generator=g, device="cuda")[:rows]
     ref_store, tail_store = _clone(store), _clone(store)
     ref_engine, tail_engine = _engine(t), _engine(t)
-    _reference(ref_store, ref_engine, slots, out, t)
+    k = TARGETS[target]
+    _reference(k, ref_store, ref_engine, slots, out, t)
     ctrl = torch.tensor([rows], dtype=torch.int32, device="cuda")
     slots_buf = torch.zeros(MAX_ROWS, dtype=torch.long, device="cuda")
     slots_buf[:rows] = slots
-    _tail(tail_store, tail_engine, ctrl, slots_buf, out, t, rows, cpp)
+    _tail(k, tail_store, tail_engine, ctrl, slots_buf, out, t, rows, cpp)
     torch.cuda.synchronize()
     for name in vars(store):
         assert torch.equal(getattr(ref_store, name), getattr(tail_store, name)), name
@@ -160,7 +193,8 @@ def test_tail_matches_scatter_then_gather(rows, widths, cpp) -> None:
 
 
 @pytest.mark.parametrize("cpp", [False, True], ids=["triton", "cpp"])
-def test_unarmed_tail_writes_nothing(cpp) -> None:
+@pytest.mark.parametrize("target", _targets(TP4, TP8))
+def test_unarmed_tail_writes_nothing(target, cpp) -> None:
     """ctrl[0] = 0 (the step was not armed): the store and the engine buffers are untouched."""
     t, rows = 4, 2
     g = torch.Generator(device="cuda").manual_seed(7)
@@ -169,7 +203,7 @@ def test_unarmed_tail_writes_nothing(cpp) -> None:
     before, engine = _clone(store), _engine(t)
     ctrl = torch.zeros(1, dtype=torch.int32, device="cuda")
     slots_buf = torch.arange(MAX_ROWS, dtype=torch.long, device="cuda")
-    _tail(store, engine, ctrl, slots_buf, out, t, rows, cpp)
+    _tail(TARGETS[target], store, engine, ctrl, slots_buf, out, t, rows, cpp)
     torch.cuda.synchronize()
     for name in vars(store):
         assert torch.equal(getattr(before, name), getattr(store, name)), name
@@ -177,8 +211,46 @@ def test_unarmed_tail_writes_nothing(cpp) -> None:
         assert torch.all(buf == STALE)
 
 
-def _fold():
-    fold = spec_fold.M3SpecStepFold(in_forward=True)
+@pytest.mark.parametrize("cpp", [False, True], ids=["triton", "cpp"])
+@pytest.mark.parametrize("target", _targets(TP8))
+def test_strided_slots_are_declined_without_writes(target, cpp) -> None:
+    """The kernels read ``slots[i]`` at unit stride: a strided view is declined and nothing is written."""
+    t, rows = 4, 2
+    g = torch.Generator(device="cuda").manual_seed(17)
+    store = _store((4, 4, 3), g)
+    out = _outputs(rows, t, g)
+    before, engine = _clone(store), _engine(t)
+    ctrl = torch.tensor([rows], dtype=torch.int32, device="cuda")
+    slots = torch.arange(2 * MAX_ROWS, dtype=torch.long, device="cuda")[::2]
+    ids, draft, pos_off, kv_off = engine
+    assert not TARGETS[target].m3_fold_tail.fold_tail(
+        ctrl,
+        slots,
+        rows,
+        out["new_tokens"],
+        store.new_tokens.squeeze(-1).T,
+        out["next_new_tokens"],
+        store.next_new_tokens.squeeze(-1).T,
+        out["next_draft_tokens"],
+        store.next_draft_tokens,
+        out["new_tokens_lens"],
+        store.new_tokens_lens,
+        ids,
+        draft,
+        pos_off,
+        kv_off,
+        t,
+        cpp=cpp,
+    )
+    torch.cuda.synchronize()
+    for name in vars(store):
+        assert torch.equal(getattr(before, name), getattr(store, name)), name
+    for buf in engine:
+        assert torch.all(buf == STALE)
+
+
+def _fold(target):
+    fold = TARGETS[target].modeling.M3SpecStepFold(**_FOLD_KWARGS[target])
     t = 4
     engine = _engine(t)
     fold.bind_engine_buffers(*engine, max_batch_size=MAX_ROWS)
@@ -187,10 +259,11 @@ def _fold():
     return fold, g, t
 
 
-def test_fold_handshake_stages_only_confirmed_rows() -> None:
+@pytest.mark.parametrize("target", _targets(TP4, TP8))
+def test_fold_handshake_stages_only_confirmed_rows(target) -> None:
     """begin_step arms; the sampler confirms only the armed rows from the tail's outputs; the next step is staged only
     for exactly those rows in that order."""
-    fold, g, t = _fold()
+    fold, g, t = _fold(target)
     assert fold.begin_step([3, 5], 2) is False  # nothing staged before the first forward
     out = _outputs(2, t, g)
     fold.store_in_forward(out)
@@ -204,11 +277,12 @@ def test_fold_handshake_stages_only_confirmed_rows() -> None:
     assert fold.begin_step([5, 3], 2) is False
 
 
-def test_a_padded_step_after_an_armed_one_writes_nothing() -> None:
-    """K3 #150 check #5: CUDA-graph padding rows carry no seq slot, so the engine passes rows=None for a padded step.
+@pytest.mark.parametrize("target", _targets(TP4))
+def test_a_padded_step_after_an_armed_one_writes_nothing(target) -> None:
+    """CUDA-graph padding rows carry no seq slot, so the engine passes rows=None for a padded step.
     Even right after an armed step, that step uploads ctrl 0 and its forward tail leaves the store and the engine
     buffers untouched (a dummy row never writes a live slot)."""
-    fold, g, t = _fold()
+    fold, g, t = _fold(target)
     fold.begin_step([2, 4], 2)
     fold.store_in_forward(_outputs(2, t, g))
     torch.cuda.synchronize()

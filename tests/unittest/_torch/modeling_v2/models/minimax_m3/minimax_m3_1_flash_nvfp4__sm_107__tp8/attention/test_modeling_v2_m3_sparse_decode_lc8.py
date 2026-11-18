@@ -21,14 +21,16 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
     m3_sparse_decode_lc8 as op,
 )
 
-__extra_import_path__ = ["../../../..", "."]
-from _m3_nvfp4_cache import build_step  # noqa: E402
+__extra_import_path__ = ["../../../..", "../../ops/attention"]
+import _m31_flash_nvfp4_cache as cache  # noqa: E402
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402, F401
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
     reason="the sm_107 TP8 target runs on SM107 only",
 )
+
+TARGET = "minimax_m3_1_flash_nvfp4__sm_107__tp8"
 
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
     pytest.skip("the sm_107 TP8 target runs on SM107 only", allow_module_level=True)
@@ -84,7 +86,9 @@ def _buffers(total_q, mxfp8):
 
 
 def _case(spec, seed):
-    return build_step(spec["seq_lens"], spec["decode_query_len"], identity=False, seed=seed)
+    return cache.build_step(
+        spec["seq_lens"], spec["decode_query_len"], identity=False, seed=seed, target=TARGET
+    )
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -122,7 +126,7 @@ def test_reference_dequant_matches_the_quantizer() -> None:
     """The reference reads the paged bytes through its own layout claims (K scales token-major, V scales in
     4x4 token quads). Hold them to the quantizer's own flat output: every slot was written in order, so slot
     ``s`` is page ``s // 128``, token ``s % 128``, and the flat scales are token-major by construction."""
-    case = build_step((3000,), 1, identity=False, seed=5)
+    case = cache.build_step((3000,), 1, identity=False, seed=5, target=TARGET)
     pages = torch.arange(case.k_paged.shape[0], device="cuda")
     views = ((case.k_paged, case.k_block_scale, False), (case.v_paged, case.v_block_scale, True))
     for role, (data, scale, quad) in enumerate(views):
@@ -148,7 +152,7 @@ def test_reference_dequant_matches_the_quantizer() -> None:
 def test_guard_refuses_a_block_past_the_request() -> None:
     """A selected id at or past the request's block count reads a page the token cannot attend; with every
     position masked the CTA's softmax is NaN."""
-    case = build_step((3000,), 1, identity=False, seed=4)
+    case = cache.build_step((3000,), 1, identity=False, seed=4, target=TARGET)
     case.topk[0, 0, 0] = 40
     out, q8, sf = _buffers(1, True)
     with pytest.raises(AssertionError, match="block count"):

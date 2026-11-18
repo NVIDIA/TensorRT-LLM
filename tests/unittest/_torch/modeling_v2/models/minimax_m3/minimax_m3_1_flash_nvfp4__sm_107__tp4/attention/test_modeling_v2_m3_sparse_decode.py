@@ -7,9 +7,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
-    minimax_m3_sparse_attn_decode as stock_decode,
-)
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels import (  # noqa: E501
     m3_attn_lc,
     m3_report,
@@ -18,18 +15,21 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
     m3_sparse_decode as op,
 )
 
-__extra_import_path__ = ["../../../..", "."]
-from _m3_nvfp4_cache import (  # noqa: E402 — needs the path declared above
-    HEAD_DIM,
-    NUM_HEADS,
-    build_step,
-)
+__extra_import_path__ = ["../../../..", "../../ops/attention"]
+import _m31_flash_nvfp4_cache as cache  # noqa: E402 — needs the path declared above
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402, F401
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
     reason="the sm_107 TP4 target runs on SM107 only",
 )
+
+
+TARGET = "minimax_m3_1_flash_nvfp4__sm_107__tp4"
+
+
+def _build_step(*args, **kwargs):
+    return cache.build_step(*args, target=TARGET, **kwargs)
 
 
 # Band, in BF16 ulps (2^-8) of each [16, 128] head row's largest magnitude, and of the relative RMS. Every route
@@ -40,61 +40,6 @@ pytestmark = pytest.mark.skipif(
 # 1.80 ulps per element and 0.20 ulps RMS.
 _ELEMENT_ULP = 2.0
 _RMS_ULP = 0.5
-
-
-def _call(case, output, identity):
-    return op(
-        case.q,
-        case.k_paged,
-        case.v_paged,
-        case.topk,
-        case.block_table,
-        case.seq_lens,
-        case.sm_scale,
-        output,
-        case.decode_query_len,
-        None,
-        case.k_block_scale,
-        case.v_block_scale,
-        case.k_global_scale,
-        case.v_global_scale,
-        None,
-        identity,
-    )
-
-
-def _stock(case, output):
-    stock_decode(
-        case.q,
-        case.k_paged,
-        case.v_paged,
-        case.topk,
-        case.block_table,
-        case.seq_lens,
-        sm_scale=case.sm_scale,
-        output=output,
-        decode_query_len=case.decode_query_len,
-        k_block_scale=case.k_block_scale,
-        v_block_scale=case.v_block_scale,
-        k_global_scale=case.k_global_scale,
-        v_global_scale=case.v_global_scale,
-    )
-
-
-def _identity_table(
-    seq_lens: torch.Tensor, decode_query_len: int, heads: int, lag: int = 0
-) -> torch.Tensor:
-    """The identity selection of every verify token, staged from lengths `lag` tokens behind seq_lens."""
-    seq = (seq_lens.cpu().to(torch.int64) - lag).clamp(min=0).repeat_interleave(decode_query_len)
-    intra = torch.arange(seq.shape[0]) % decode_query_len
-    n_valid = ((seq - decode_query_len + intra + 1).clamp(min=0) + 127) // 128
-    ar = torch.arange(16)
-    table = torch.where(ar[None, :] < n_valid[:, None], ar[None, :], -1).to(torch.int32)
-    return table.unsqueeze(0).expand(heads, -1, -1).contiguous().cuda()
-
-
-# Each crosses a 128-token edge within its four verify tokens or between the stale and the true lengths.
-_EDGE_LENS = (1284, 1287, 1281, 129, 132, 2048, 1028, 5, 643, 1920, 256, 1)
 
 
 def _triton_route(monkeypatch) -> None:
@@ -123,13 +68,11 @@ def test_short_table_stress_is_bitwise_the_stock_decode(requests, seed, monkeypa
     _triton_route(monkeypatch)
     g = torch.Generator().manual_seed(1000 * requests + seed)
     for identity in (True, False):
-        case = build_step(_short_lens(requests, g), 4, identity=identity, seed=7 * seed + requests)
-        target = torch.empty(
-            case.q.shape[0], NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
-        )
+        case = _build_step(_short_lens(requests, g), 4, identity=identity, seed=7 * seed + requests)
+        target = cache.empty_output(case)
         stock = torch.empty_like(target)
-        _call(case, target, identity)
-        _stock(case, stock)
+        op(*cache.sparse_decode_args(case, target, identity))
+        cache.stock(case, stock)
         torch.cuda.synchronize()
         assert torch.equal(target.view(torch.int16), stock.view(torch.int16)), (
             identity,
@@ -143,7 +86,7 @@ def test_invalid_slot_fails_closed(fault, monkeypatch) -> None:
     page outside the pool) is read as an absent block instead of a wild KV read: the rows equal the reference over the
     remaining blocks."""
     _triton_route(monkeypatch)
-    case = build_step((1500, 2048, 700), 4, identity=False, seed=303)
+    case = _build_step((1500, 2048, 700), 4, identity=False, seed=303)
     tok, slot = 5, 2
     if fault == "neg_in_window":
         case.topk[0, tok, slot] = -1
@@ -156,8 +99,8 @@ def test_invalid_slot_fails_closed(fault, monkeypatch) -> None:
         case.block_table[req, blk] = case.k_paged.shape[0] + 1000
         # Every token of the request that selected that block loses it.
         hits = (case.topk[:, req * 4 : req * 4 + 4] == blk).nonzero().tolist()
-    output = torch.empty(case.q.shape[0], NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    _call(case, output, False)
+    output = cache.empty_output(case)
+    op(*cache.sparse_decode_args(case, output, False))
     torch.cuda.synchronize()
     # The reference walks each token's first min(16, blocks) entries and drops -1: the corrupt slots as -1.
     ref_topk = case.topk.clone()
@@ -196,34 +139,27 @@ def test_lc_identity_route_reads_its_own_lengths_not_the_table(
     """An identity step runs the long-context kernel, which takes block i for CTA i from the kv lengths it reads.
     Whatever the staged table holds (lagging a verify step, garbage), the rows are the LC's on the true
     identity table (the selected-table route) bit for bit, and in the band of the float64 reference."""
-    lens = tuple(_EDGE_LENS[(requests * 5 + k) % len(_EDGE_LENS)] for k in range(requests))
-    case = build_step(lens, 4, identity=True, seed=700 + requests)
-    heads = case.topk.shape[0]
-    true_table = _identity_table(case.seq_lens, 4, heads)
-    if fault == "stale_one_step":
-        staged = _identity_table(case.seq_lens, 4, heads, lag=4)
-    else:
-        g = torch.Generator().manual_seed(requests)
-        staged = (
-            torch.randint(-1, case.block_table.shape[1], true_table.shape, generator=g)
-            .to(torch.int32)
-            .cuda()
-        )
+    lens = tuple(
+        cache.EDGE_LENS[(requests * 5 + k) % len(cache.EDGE_LENS)] for k in range(requests)
+    )
+    case = _build_step(lens, 4, identity=True, seed=700 + requests)
+    true_table = cache.identity_table(case.seq_lens, 4, case.topk.shape[0])
+    staged = cache.staged_table(case, fault, seed=requests)
     rows = case.q.shape[0]
-    target = torch.empty(rows, NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    target = cache.empty_output(case)
     selected = torch.empty_like(target)
     case_staged = SimpleNamespace(**{**vars(case), "topk": staged})
     case_true = SimpleNamespace(**{**vars(case), "topk": true_table})
     taken = []
     monkeypatch.setattr(m3_report, "taken", lambda path, rows, what="": taken.append(path))
-    _call(case_staged, target, True)
+    op(*cache.sparse_decode_args(case_staged, target, True))
     monkeypatch.undo()
     # The LC engagement, plus its one-division merge's at these rows (m3_attn_lc.one_div_applies).
     assert sorted(taken) == sorted(
         ["m3_sparse_decode_lc"]
         + (["sparse_decode_lc_one_div_merge"] if m3_attn_lc.one_div_applies(rows) else [])
     ), taken
-    _call(case_true, selected, False)
+    op(*cache.sparse_decode_args(case_true, selected, False))
     torch.cuda.synchronize()
     assert torch.equal(target.view(torch.int16), selected.view(torch.int16)), (
         fault,
@@ -260,7 +196,7 @@ def test_lc_fails_closed_on_ids_past_the_row(requests) -> None:
     )
 
     lens = (165521, 700, 3000)[:requests]
-    case = build_step(lens, 4, identity=False, seed=1300 + requests)
+    case = _build_step(lens, 4, identity=False, seed=1300 + requests)
     dql = case.decode_query_len
     good = case.topk.clone()
     bad = case.topk.clone()
@@ -278,8 +214,8 @@ def test_lc_fails_closed_on_ids_past_the_row(requests) -> None:
     assert not torch.equal(bad, good)
     outs = []
     for table in (bad, good):
-        out = torch.empty(case.q.shape[0], NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        _call(SimpleNamespace(**{**vars(case), "topk": table}), out, False)
+        out = cache.empty_output(case)
+        op(*cache.sparse_decode_args(case, out, False, topk=table))
         outs.append(out)
     m3_prequant.SLOT.clear()
     torch.cuda.synchronize()

@@ -5,11 +5,11 @@
 Each 768-column shard computed by ``mv2_minimax_m3::minimax_m31_fc_shard_gemm`` with the pinned algo equals the matching
 columns of ``torch.nn.functional.linear(x, w)``, for every shard, every row count up to MAX_ROWS, real-scale and
 2^+-12 block-scaled inputs, eager and in a CUDA graph; the shards gathered in rank order are the full fc. The wrapper
-takes a shard only for the fc it was built from and the checked row counts, and the DSpark drafter's
-project_target_hidden takes it only within those rows. Default on; TRTLLM_M31_DISABLE_FC_SHARD=1 turns it off."""
+takes a shard only for the fc it was built from and the checked row counts. Default on;
+TRTLLM_M31_DISABLE_FC_SHARD=1 turns it off."""
 
 import importlib
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -108,54 +108,6 @@ def test_a_non_applicable_fc_keeps_the_stock_path():
     fc = torch.nn.Linear(K, N, bias=True, device="cuda", dtype=torch.bfloat16)
     shard, why = m31_fc_shard.FcShard._check(fc, TP, 0, SimpleNamespace(tp_size=TP, tp_rank=0))
     assert shard is None and "do not apply" in why
-
-
-class _HalfShard:
-    """A stand-in shard: the fc as two column halves, concatenated (the all-gather of a 2-rank group)."""
-
-    def __init__(self, fc, rows):
-        self.fc, self.rows, self.calls = fc, rows, 0
-
-    def applies(self, fc, rows):
-        return fc is self.fc and 0 < rows <= self.rows
-
-    def __call__(self, x):
-        self.calls += 1
-        h = self.fc.weight.shape[0] // 2
-        return torch.cat([F.linear(x, self.fc.weight[:h]), F.linear(x, self.fc.weight[h:])], dim=-1)
-
-
-@pytest.mark.parametrize("rows", [1, 8, 9, 24])
-def test_project_target_hidden_takes_the_shard_within_its_rows(rows):
-    import inspect
-
-    from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
-
-    if "_dflash_fc_shard" not in inspect.getsource(DFlashForCausalLM):
-        # The target's prebuild sets the shard only on a drafter that declares the attribute.
-        pytest.skip(
-            "needs the DFlashForCausalLM._dflash_fc_shard engine hook (project_target_hidden taking the fc shard), "
-            "which this TensorRT-LLM does not have"
-        )
-    g = torch.Generator().manual_seed(11)
-    fc = torch.nn.Linear(96, 32, bias=False, dtype=torch.bfloat16)
-    norm = torch.nn.RMSNorm(32, eps=1e-6, dtype=torch.bfloat16)
-    with torch.no_grad():
-        fc.weight.copy_(torch.randn(32, 96, generator=g).bfloat16())
-        norm.weight.copy_((1 + 0.1 * torch.randn(32, generator=g)).bfloat16())
-    shard = _HalfShard(fc, 8)
-    model = SimpleNamespace(
-        fc=fc,
-        hidden_norm=norm,
-        _fc_input_slice=None,
-        _dflash_fc_split=None,
-        _dflash_fc_shard=shard,
-    )
-    model._project_features = MethodType(DFlashForCausalLM._project_features, model)
-    x = torch.randn(rows, 96, generator=g)
-    out = DFlashForCausalLM.project_target_hidden(model, x)
-    assert torch.equal(out, norm(fc(x.to(torch.bfloat16))))
-    assert shard.calls == (1 if rows <= 8 else 0)
 
 
 @pytest.mark.parametrize(

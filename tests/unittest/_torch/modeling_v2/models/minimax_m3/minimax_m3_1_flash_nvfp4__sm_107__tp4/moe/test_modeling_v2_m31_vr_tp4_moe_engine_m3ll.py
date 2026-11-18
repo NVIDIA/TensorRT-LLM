@@ -28,10 +28,9 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
 )
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.moe.m3_moe_engine import m3_moe_engine
 
-__extra_import_path__ = ["../../../..", "."]
-from _m3_moe_operands import (  # noqa: E402
+__extra_import_path__ = ["../../../..", "../../ops/moe"]
+from _m31_flash_moe_operands import (  # noqa: E402
     FC2_INPUT_SCALE,
-    I_TP,
     NUM_EXPERTS,
     SWIGLU_ALPHA,
     SWIGLU_LIMIT,
@@ -44,6 +43,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 H = 6144
+I_TP = moe_op.INTER
 EMPTY = -(2**31)
 ROUTES = json.loads((Path(__file__).resolve().parent / "_m31_tp4wc_routes.json").read_text())[
     "routes"
@@ -79,7 +79,7 @@ def _wide_operands(seed: int):
     per-expert alphas rescaled to keep the sums finite: the weight-side block-scale stress."""
     from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4TRTLLMGenFusedMoEMethod
 
-    base = experts()
+    base = experts(I_TP)
     gen = torch.Generator(device="cuda").manual_seed(seed)
     e = NUM_EXPERTS
     w31 = torch.randint(
@@ -126,7 +126,7 @@ _WIDE = {}
 
 def _operands(wide: bool):
     if not wide:
-        return experts()
+        return experts(I_TP)
     if "w" not in _WIDE:
         _WIDE["w"] = _wide_operands(20261101)
     return _WIDE["w"]

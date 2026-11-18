@@ -1,13 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the m3_msa_attention entry: one layer's MSA backend step against its float64 reference.
+"""GPU test for the m3_msa_attention entry of the MiniMax-M3.1-Flash sm_107 tp2 and tp8 targets: one layer's MSA
+backend step against the entry's float64 reference, at each target's per-rank geometry (tp2: 32 query heads over 2 KV
+heads and 2 index heads, query head h reading KV head h // 16, each KV head selecting its own top-k blocks from its own
+index head; tp8: 8 query heads over 1 KV head and 1 index head).
 
-Every cell runs on the runtime's own objects (``_m3_attn_runtime_tp8``): a hybrid NVFP4 ``MiniMaxM3KVCacheManagerV2``
-with the requests allocated in it, ``MiniMaxM3MsaSparseAttentionMetadata`` filled by its ``prepare()``, and the layer's
-``MiniMaxM3MsaSparseAttention`` built as the target builds it. Earlier rows (and, on a sparse layer, the step's own
-rows, which the target's producer writes before the call) go into the cache through the in-tree scatters, at the
-slots the manager assigned. The sparse layers' index-K rows are planted so every block's score is 1/8 or more apart
-from every other's: the top-k selection the reference recomputes is then unambiguous.
+Every cell runs on the runtime's own objects (the target's ``_m3_attn_runtime_<tp>`` beside its tests): a hybrid NVFP4
+``MiniMaxM3KVCacheManagerV2`` with the requests allocated in it, ``MiniMaxM3MsaSparseAttentionMetadata`` filled by its
+``prepare()``, and the layer's ``MiniMaxM3MsaSparseAttention`` built as the target builds it. Earlier rows (and, on a
+sparse layer, the step's own rows, which the target's producer writes before the call) go into the cache through the
+in-tree scatters, at the slots the manager assigned. The sparse layers' index-K rows are planted so every block's score
+is 1/8 or more apart from every other's: the top-k selection the reference recomputes is then unambiguous.
 
 The cells are the target's calls (``_attention_core`` in modeling.py): a dense layer with live bf16 K / V in a
 prefill chunk and live FP8 K / V in a decode step (the dense layers sit in the hybrid cache's FP8 half), a sparse
@@ -15,21 +18,55 @@ layer whose producer already wrote the caches (``k = v = None``) in a prefill ch
 step, both with the NVFP4 scales the target passes.
 """
 
+import importlib
+import importlib.util
 import zlib
+from pathlib import Path
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8.ops.attention.m3_msa_attention import (  # noqa: E501
-    m3_msa_attention as op,
-)
+from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
-__extra_import_path__ = ["../../../..", "."]
-import _m3_attn_runtime_tp8 as rt  # noqa: E402 — needs the path declared above
+__extra_import_path__ = ["../../../.."]
 from _validating import ULP, assert_within_ulp, certifying  # noqa: E402, F401
 
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
-    pytest.skip("the sm_107 TP8 target runs on SM107 only", allow_module_level=True)
+    pytest.skip("the sm_107 targets run on SM107 only", allow_module_level=True)
+
+_PACKAGE = "tensorrt_llm._torch.modeling_v2.models.minimax_m3"
+_TESTS = Path(__file__).resolve().parents[2]
+# Target -> its runtime helper's file name (in the target's attention test directory).
+_RUNTIMES = {
+    "minimax_m3_1_flash_nvfp4__sm_107__tp2": "_m3_attn_runtime_tp2.py",
+    "minimax_m3_1_flash_nvfp4__sm_107__tp8": "_m3_attn_runtime_tp8.py",
+}
+
+
+def _entry(target: str):
+    try:
+        return importlib.import_module(
+            f"{_PACKAGE}.{target}.ops.attention.m3_msa_attention"
+        ).m3_msa_attention
+    except NoTarget:
+        return None
+
+
+OPS = {target: _entry(target) for target in _RUNTIMES}
+_RT = {}
+
+
+def _rt(target: str):
+    """The target's runtime helper, loaded from its file under a name of its own (the MiniMax-M3 targets' helpers
+    share its module name)."""
+    if target not in _RT:
+        path = _TESTS / target / "attention" / _RUNTIMES[target]
+        spec = importlib.util.spec_from_file_location(f"_m31_flash_attn_runtime_{target}", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _RT[target] = module
+    return _RT[target]
+
 
 # Bands, in BF16 ulps (2^-8) of each token's [heads x 128] row's largest magnitude (element) and of the relative RMS,
 # per kernel the step reaches. The reference reads the same quantized cache rows (and casts Q to E4M3 where the FP8
@@ -43,6 +80,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7
 #   to 3e-2).
 # * the Triton NVFP4 sparse decode (sparse generation rows): 1.0 / 0.19 -- the band of its own entry
 #   (m3_sparse_decode): exact operands, FP16 probabilities, BF16 rounding.
+# These are tp8's figures; tp2's reach 10.1 / 6.1, 7.0 / 6.1, 34.4 / 11.8 (26.8 / 9.1 at 512) and 1.0 / 0.25.
 # Each band leaves about 1.5x the measured maximum; a shifted or wrongly selected reference is far outside them.
 _FP8_CONTEXT = dict(element_ulp=16.0, rms_ulp=9.0)
 _FP8_DECODE = dict(element_ulp=12.0, rms_ulp=9.0)
@@ -65,12 +103,16 @@ def _assert_in_bands(output, ref, bands, context_rows: int) -> None:
         assert_within_ulp(output[context_rows:], ref[context_rows:], **decode_band)
 
 
-# (request rows, cached tokens per request, new tokens per request, context rows) per cell.
+# (request rows, cached tokens per request, new tokens per request, context rows) per cell; the targets' dense
+# generation cells differ in their request count.
 _SHAPES = {
     ("dense", "context"): ((384,), (1024,), 1),
-    ("dense", "generation"): ((128, 2500), (1, 1), 0),
     ("sparse", "context"): ((0,), (4096,), 1),
     ("sparse", "mixed"): ((0, 2999, 4500), (512, 1, 1), 1),
+}
+_DENSE_GENERATION = {
+    "minimax_m3_1_flash_nvfp4__sm_107__tp2": ((127, 128, 1000, 2500), (1, 1, 1, 1), 0),
+    "minimax_m3_1_flash_nvfp4__sm_107__tp8": ((128, 2500), (1, 1), 0),
 }
 
 
@@ -88,9 +130,12 @@ def _shift(x: torch.Tensor) -> torch.Tensor:
     return x.view(torch.uint8).roll(1, 0).view(x.dtype) if x.element_size() == 1 else x.roll(1, 0)
 
 
-def _shape(cell):
+def _shape(target, cell):
     spec = cell.spec
-    cached, qlens, contexts = _SHAPES[spec["layer"], spec["phase"]]
+    key = spec["layer"], spec["phase"]
+    cached, qlens, contexts = (
+        _DENSE_GENERATION[target] if key == ("dense", "generation") else _SHAPES[key]
+    )
     if spec["phase"] == "context":
         assert sum(qlens) == spec["tokens"]
     elif spec["phase"] == "generation":
@@ -100,8 +145,8 @@ def _shape(cell):
     return cached, qlens, contexts
 
 
-def _run_dense(cell, gen, manager, backend, metadata):
-    cached, qlens, contexts = _shape(cell)
+def _run_dense(rt, target, cell, gen, manager, backend, metadata):
+    cached, qlens, contexts = _shape(target, cell)
     rids = list(range(len(qlens)))
     rt.allocate(manager, rids, qlens, cached)
     for rid, c in zip(rids, cached):
@@ -123,8 +168,8 @@ def _run_dense(cell, gen, manager, backend, metadata):
     return (q, k, v, None, inv, fwd), dict(rids=rids, cached=cached, qlens=qlens, contexts=contexts)
 
 
-def _run_sparse(cell, gen, manager, backend, metadata):
-    cached, qlens, contexts = _shape(cell)
+def _run_sparse(rt, target, cell, gen, manager, backend, metadata):
+    cached, qlens, contexts = _shape(target, cell)
     rids = list(range(len(qlens)))
     rt.allocate(manager, rids, qlens, cached)
     u0, u1 = rt.index_directions(gen)
@@ -166,8 +211,18 @@ def _run_sparse(cell, gen, manager, backend, metadata):
     )
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
+_CELLS = [
+    pytest.param(target, cell, id=f"{target.rsplit('__', 1)[1]}-{cell.why[:44]}")
+    if op is not None
+    else pytest.param(target, None, marks=pytest.mark.skip(reason=f"{target} is not built"))
+    for target, op in OPS.items()
+    for cell in (op.CELLS if op is not None else (None,))
+]
+
+
+@pytest.mark.parametrize("target,cell", _CELLS)
+def test_certified_cells(target, cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
+    op, rt = OPS[target], _rt(target)
     spec = cell.spec
     sparse = spec["layer"] == "sparse"
     gen = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
@@ -176,7 +231,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         backend = rt.make_msa_backend(rt.SPARSE if sparse else rt.DENSE)
         metadata = rt.make_msa_metadata(manager)
         run = _run_sparse if sparse else _run_dense
-        (q, k, v, idx_q, inv, fwd), step = run(cell, gen, manager, backend, metadata)
+        (q, k, v, idx_q, inv, fwd), step = run(rt, target, cell, gen, manager, backend, metadata)
         output = torch.full(
             (q.shape[0], rt.HEADS * rt.HEAD_DIM), float("nan"), dtype=torch.bfloat16, device="cuda"
         )

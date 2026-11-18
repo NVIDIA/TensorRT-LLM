@@ -17,8 +17,10 @@ l0_gr100:
   # MiniMax-M3 family code shared with MiniMax-M3.1-Flash.
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/dspark
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/gemm
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/moe
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/norm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_m31_flash_fold_tail.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_add_rmsnorm_gpu.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_native_swiglu_gpu.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_tp_gumbel_draft_gpu.py
@@ -78,7 +80,6 @@ l0_gr100:
   # MiniMax-M3.1-Flash sm_107 tp4 target: one entry per op directory plus its top-level GPU tests. Its helpers
   # share basenames with the MiniMax-M3 targets' (importlib import mode); its comm tests run 4 ranks.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/attention --import-mode=importlib
-  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/gemm --import-mode=importlib
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/moe --import-mode=importlib
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/spec --import-mode=importlib
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_m31_tp4_qkv_front_gpu.py --import-mode=importlib

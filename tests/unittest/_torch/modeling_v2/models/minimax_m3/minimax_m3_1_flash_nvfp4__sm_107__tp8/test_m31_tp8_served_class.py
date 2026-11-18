@@ -140,7 +140,7 @@ def _replay(run, change_inputs):
 
 @pytest.fixture(scope="module")
 def moe_operands():
-    path = Path(__file__).parent / "moe/_m3_moe_operands.py"
+    path = Path(__file__).parents[1] / "ops/moe/_m31_flash_moe_operands.py"
     spec = importlib.util.spec_from_file_location("_tp8_served_moe_operands", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -167,9 +167,9 @@ def test_imported_decode_moe_engine_native_and_graph(
         )
 
     baseline = state({"MOE_SFA_BULK", "MOE_K128"})
-    baseline_layer = moe_operands.layer_for(baseline, case)
+    baseline_layer = moe_operands.layer_for(baseline, moe.INTER, case)
     current = baseline if disabled else state(set())
-    layer = baseline_layer if disabled else moe_operands.layer_for(current, case)
+    layer = baseline_layer if disabled else moe_operands.layer_for(current, moe.INTER, case)
     assert current.config.get("sfa_bulk", 0) == int(not disabled)
     assert current.config.get("k128", 0) == int(not disabled)
     assert current.mod.SFA_BULK == (not disabled) and current.mod.K128 == (not disabled)
