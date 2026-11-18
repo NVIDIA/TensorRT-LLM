@@ -812,10 +812,12 @@ class _WarmupProfile:
         )
 
 
-def _warmup_profiles(profiles: list[_WarmupProfile], metadata: "TrtllmAttentionMetadata") -> None:
-    """Compile all layer profiles in one worker group, then load them locally."""
+def _warmup_profiles(
+    profiles: list[_WarmupProfile], metadata: "TrtllmAttentionMetadata", *, use_workers: bool = True
+) -> bool:
+    """Prepare the local plans and report whether any profiles were warmed."""
     if not profiles:
-        return
+        return False
     from . import prims_ts_precompile
 
     payloads = []
@@ -836,11 +838,12 @@ def _warmup_profiles(profiles: list[_WarmupProfile], metadata: "TrtllmAttentionM
             workspace_bytes = _workspace_size(profile.device, rows, heads, **kwargs)
             plans.append((workspace_bytes, profile, rows))
     if not payloads:
-        return
+        return False
     start = time.perf_counter()
-    prims_ts_precompile.precompile_payloads(
-        payloads, local_ranks=prims_ts_precompile.local_rank_count(metadata.mapping)
-    )
+    if use_workers:
+        prims_ts_precompile.precompile_payloads(
+            payloads, local_ranks=prims_ts_precompile.local_rank_count(metadata.mapping)
+        )
     # Allocate the largest workspace first so all profiles can share it. The
     # serving process must load every artifact even when the disk cache is warm.
     for _, profile, rows in sorted(plans, key=lambda plan: plan[0], reverse=True):
@@ -849,11 +852,15 @@ def _warmup_profiles(profiles: list[_WarmupProfile], metadata: "TrtllmAttentionM
         f"PrimTS sparse MLA warmup loaded {len(payloads)} variants across {len(seen)} profiles "
         f"in {time.perf_counter() - start:.1f} s"
     )
+    return True
 
 
 def warmup_prims_ts_sparse_mla(
-    model: torch.nn.Module, metadata: "DeepseekV4TrtllmAttentionMetadata"
-) -> None:
+    model: torch.nn.Module,
+    metadata: "DeepseekV4TrtllmAttentionMetadata",
+    *,
+    use_workers: bool = True,
+) -> bool:
     """Warm enabled DeepSeek-V4 generation profiles before the first model forward."""
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
         DeepseekV4TrtllmAttention,
@@ -893,7 +900,7 @@ def warmup_prims_ts_sparse_mla(
                         fused_groups=layer.n_local_groups if fused else None,
                     )
                 )
-    _warmup_profiles(profiles, metadata)
+    return _warmup_profiles(profiles, metadata, use_workers=use_workers)
 
 
 __all__ = [

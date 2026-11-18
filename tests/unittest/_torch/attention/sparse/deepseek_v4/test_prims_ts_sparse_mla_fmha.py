@@ -1097,7 +1097,9 @@ def test_warmup_collects_only_enabled_layer_profiles(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(mod.PrimsTSSparseMlaFmha, "_is_fp8_cache", staticmethod(lambda _: True))
     monkeypatch.setattr(module, "supports_dsv4_epilogue_fusion", lambda layer: layer.fused)
-    monkeypatch.setattr(mod, "_warmup_profiles", lambda profiles, meta: captured.extend(profiles))
+    monkeypatch.setattr(
+        mod, "_warmup_profiles", lambda profiles, meta, **kw: captured.extend(profiles)
+    )
     mod.warmup_prims_ts_sparse_mla(SimpleNamespace(modules=lambda: iter(layers)), metadata)
     assert [(p.extra, p.q_dtype, p.has_sinks, p.fused_groups) for p in captured] == [
         (512, torch.float8_e4m3fn, True, 8),
@@ -1288,25 +1290,17 @@ def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> No
     def fake_workers(payloads, workers):
         assert not planned  # Discovery must not compile serially in the parent.
         fanned.append((list(payloads), workers))
-        return True
 
     monkeypatch.setattr(pp, "run_precompile_workers", fake_workers)
     attn, profile, eager = _attn_and_profile()
     lib = PrimsTSSparseMlaFmha(attn)
-    with pp.precompile_session() as session:
-        # An early config without automatic sparse defaults must not suppress
-        # the first actual warmup's worker batch.
-        session.start(SimpleNamespace(attn_backend="TRTLLM", sparse_attention_config=None), None)
-        assert session.group is None and not session.consumed
-        mod._warmup_profiles([mod._WarmupProfile(lib, extra=32, **profile)], eager)
-        assert planned == [(20, 32), (15, 32), (7, 32)]
-        assert session.consumed and session.group is None
-        # Replacing profiling metadata must load parent plans again without
-        # another subprocess group, including newly encountered profiles.
-        planned.clear()
-        fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
-        mod._warmup_profiles([mod._WarmupProfile(lib, extra=64, **profile)], fresh)
-        assert planned == [(20, 64), (15, 64), (7, 64)]
+    mod._warmup_profiles([mod._WarmupProfile(lib, extra=32, **profile)], eager)
+    assert planned == [(20, 32), (15, 32), (7, 32)]
+    # Final metadata needs local plans, including profiles absent in the first pass.
+    planned.clear()
+    fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
+    mod._warmup_profiles([mod._WarmupProfile(lib, extra=64, **profile)], fresh, use_workers=False)
+    assert planned == [(20, 64), (15, 64), (7, 64)]
     assert mla_decode.BatchSparseMLADecodePagedTSWrapper.discovery_rows == list(range(1, 21)) * 2
     assert len(fanned) == 1
     payloads, workers = fanned[0]
@@ -1384,109 +1378,55 @@ def test_default_worker_count_is_capped_by_the_ranks_on_the_host(monkeypatch) ->
     assert pp.local_rank_count(None) == 4
 
 
-def test_precompile_workers_compile_disjoint_shards(monkeypatch) -> None:
-    """Workers use normal plan() and together handle every payload exactly once."""
+def test_precompile_worker_imports_vendor_without_runtime() -> None:
     import json
+    import subprocess
+    import sys
+    from pathlib import Path
 
-    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
+    from tensorrt_llm._torch.attention.backends.fmha import _prims_ts_worker
 
-    planned = []
-    mla_decode = _fake_sparse_plan(monkeypatch, planned)
-    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
-    payloads = [
-        pp.encode_payload(
-            0, rows, 16, dict(max_topk=128, max_extra_topk=512, q_dtype=torch.bfloat16)
-        )
-        for rows in (20, 15, 7, 3)
-    ]
-    assert pp._main(["worker", json.dumps(payloads), "1", "2"]) == 0
-    assert [r for r, _ in planned] == [15, 3]
-    assert pp._main(["worker", json.dumps(payloads), "0", "2"]) == 0
-    assert [r for r, _ in planned] == [15, 3, 20, 7]
-    assert pp._main(["worker", json.dumps(payloads), "5", "8"]) == 0
-    assert len(planned) == 4
-    assert not mla_decode.BatchSparseMLADecodePagedTSWrapper.discovery_rows
+    source = """
+import json, runpy, sys
+worker = runpy.run_path(sys.argv[1])
+worker["_init_worker"](json.load(sys.stdin))
+from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+assert mla_decode.BatchSparseMLADecodePagedTSWrapper.__module__ == mla_decode.__name__
+assert sys.modules["tensorrt_llm"].__spec__.origin is None
+assert "tensorrt_llm._bootstrap" not in sys.modules and "mpi4py.MPI" not in sys.modules
+print(mla_decode.__file__)
+"""
+    worker = Path(_prims_ts_worker.__file__)
+    result = subprocess.run(
+        [sys.executable, "-c", source, str(worker)],
+        input=json.dumps(sys.path),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert (
+        Path(result.stdout.splitlines()[-1]).resolve()
+        == worker.parents[1] / "prims_ts" / "mla_decode.py"
+    )
 
 
 def test_precompile_workers_get_a_clean_environment_and_bounded_wait(monkeypatch, tmp_path) -> None:
-    """The runner strips the MPI launcher environment, forwards sys.path and the
-    worker count 0, assigns one slot per worker, and kills workers on timeout."""
-    from pathlib import Path
-
-    import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
-
-    spawned = []
-
-    class _FakeProc:
-        def __init__(self, argv, env, stdout, returncode=0, text="", hang=False):
-            self.argv, self.env, self.returncode, self._hang = argv, env, returncode, hang
-            stdout.write(text)
-            self._done = False
-            self.stdin = SimpleNamespace(write=self.wake, close=self.close_stdin)
-
-        def wake(self, signal):
-            assert signal == b"\n"
-            with open(self.env["TLLM_PRIMTS_PRECOMPILE_PAYLOAD"]) as payload_file:
-                self.payload = payload_file.read()
-            return 1
-
-        def close_stdin(self):
-            if self._hang:
-                raise BrokenPipeError("worker stopped")
-
-        def wait(self, timeout=None):
-            if self._hang and not getattr(self, "killed", False):
-                raise subprocess.TimeoutExpired(self.argv, timeout)
-            self._done = True  # like Popen.wait() after kill()
-            return self.returncode
-
-        def poll(self):
-            return None if (self._hang and not self._done) else self.returncode
-
-        def kill(self):
-            self._done = True
-            self.killed = True
-
     import subprocess
 
-    def make_popen(**behaviour):
-        def fake_popen(argv, env, stdin, stdout, stderr, text, bufsize, pass_fds):
-            import os
-
-            assert text is False and bufsize == 0
-            os.write(pass_fds[0], b"1")
-            proc = _FakeProc(argv, env, stdout, **behaviour)
-            spawned.append(proc)
-            return proc
-
-        return fake_popen
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_precompile as pp
 
     monkeypatch.setenv("OMPI_COMM_WORLD_RANK", "2")
     monkeypatch.setenv("SLURM_PROCID", "2")
-    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "4")
-    monkeypatch.setattr(subprocess, "Popen", make_popen())
-    payloads = [{"rows": r} for r in (20, 15, 7)]
-    assert pp.run_precompile_workers(payloads, 2) is True
-    assert len(spawned) == 2
-    env = spawned[0].env
-    assert "OMPI_COMM_WORLD_RANK" not in env and "SLURM_PROCID" not in env
-    assert env["TLLM_PRIMTS_WARM_WORKERS"] == "0"
-    import json
-    import sys
-
-    assert json.loads(env["TLLM_PRIMTS_PRECOMPILE_SYS_PATH"]) == sys.path
-    assert [p.argv[-2:] for p in spawned] == [["0", "2"], ["1", "2"]]
-    assert spawned[0].argv[0] == sys.executable and spawned[0].argv[1] == "-c"
-    assert json.loads(spawned[0].payload) == payloads
-    assert not Path(env["TLLM_PRIMTS_PRECOMPILE_PAYLOAD"]).exists()
-
-    spawned.clear()
-    monkeypatch.setattr(subprocess, "Popen", make_popen(returncode=3, text="boom"))
-    assert pp.run_precompile_workers(payloads, 2) is False
-
-    spawned.clear()
-    monkeypatch.setenv("TLLM_PRIMTS_WARM_TIMEOUT", "0.01")
-    monkeypatch.setattr(subprocess, "Popen", make_popen(hang=True))
-    assert pp.run_precompile_workers(payloads, 2) is False
-    assert all(getattr(p, "killed", False) for p in spawned)  # nothing left running
-    assert pp.run_precompile_workers(payloads, 1) is False  # one worker: nothing to fan out
+    monkeypatch.setattr(pp, "__file__", str(tmp_path / "prims_ts_precompile.py"))
+    worker = tmp_path / "_prims_ts_worker.py"
+    worker.write_text(
+        "import json, os, sys, time\n"
+        "assert 'OMPI_COMM_WORLD_RANK' not in os.environ and 'SLURM_PROCID' not in os.environ\n"
+        "request = json.load(sys.stdin)\n"
+        "assert request['sys_path'] and sys.argv[1] == '2'\n"
+        "time.sleep(request['payloads'][0]['seconds'])\n"
+    )
+    pp.run_precompile_workers([{"seconds": 0}], 2)
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_TIMEOUT", "0.05")
+    with pytest.raises(subprocess.TimeoutExpired):
+        pp.run_precompile_workers([{"seconds": 60}], 2)

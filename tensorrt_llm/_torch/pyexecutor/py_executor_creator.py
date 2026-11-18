@@ -47,7 +47,6 @@ if TYPE_CHECKING:
 
     from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 
-from ..attention.backends.fmha.prims_ts_precompile import precompile_session
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
@@ -794,8 +793,7 @@ def _create_py_executor_impl(
         A fully initialized PyExecutor instance.
     """
     creation_metrics: dict[str, float] = {}
-    with precompile_session(), timing_metric(
-            "total_py_executor_creation_seconds", creation_metrics):
+    with timing_metric("total_py_executor_creation_seconds", creation_metrics):
         py_executor = _create_py_executor(
             llm_args=llm_args,
             _startup_timer=_startup_timer,
