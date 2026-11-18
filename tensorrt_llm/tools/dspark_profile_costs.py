@@ -19,6 +19,10 @@ other K entries are kept.
 
 Point ``speculative_config.confidence_cost_table_path`` at the output and set
 ``enable_confidence_scheduling: true`` to use it.
+
+A model that spans several nodes is profiled through ``trtllm-llmapi-launch``,
+like its server. Every rank then reads ``--workdir``, so put it on a
+filesystem all nodes share.
 """
 
 import argparse
@@ -112,6 +116,26 @@ def without_adp_balance(config: dict) -> dict:
     return dict(config, attention_dp_config=dict(adp_config, enable_balance=False))
 
 
+def with_profile_environment(config: dict, environ) -> dict:
+    """``config`` that hands the profiler's settings in ``environ`` to every rank.
+
+    Each rank's executor reads them from its own environment. Ranks started
+    before this process, as under ``trtllm-llmapi-launch``, do not inherit it.
+    """
+    from tensorrt_llm._torch.speculative.dspark_profile import (
+        PROFILE_HOLD_ENV,
+        PROFILE_OUTPUT_ENV,
+        PROFILE_WARMUP_ENV,
+    )
+
+    settings = {
+        name: environ[name]
+        for name in (PROFILE_OUTPUT_ENV, PROFILE_HOLD_ENV, PROFILE_WARMUP_ENV)
+        if name in environ
+    }
+    return dict(config, env_overrides={**(config.get("env_overrides") or {}), **settings})
+
+
 def short_cells(
     samples_path: Path, graph_batch_size: int, budgets, min_samples: int
 ) -> dict[int, int]:
@@ -193,6 +217,7 @@ def _profile_k(args) -> None:
     )
     config["speculative_config"] = spec
     config = without_adp_balance(config)
+    config = with_profile_environment(config, os.environ)
     if args.graph_batch_sizes:
         config = with_graph_ladder(config, ladder)
 
@@ -349,7 +374,11 @@ def _parse_args(argv=None):
         default=None,
         help="Optional trtllm-bench JSONL with input_ids to use as prompts.",
     )
-    parser.add_argument("--workdir", default=None, help="Scratch directory (default: temporary).")
+    parser.add_argument(
+        "--workdir",
+        default=None,
+        help="Scratch directory, read by every rank (default: a temporary directory of this node).",
+    )
     parser.add_argument("--worker-output", default=None, help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 

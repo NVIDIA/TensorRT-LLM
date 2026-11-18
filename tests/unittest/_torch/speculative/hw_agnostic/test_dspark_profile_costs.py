@@ -15,6 +15,7 @@ from tensorrt_llm.tools.dspark_profile_costs import (
     plan_grid,
     short_cells,
     with_graph_ladder,
+    with_profile_environment,
     without_adp_balance,
 )
 
@@ -193,6 +194,26 @@ def test_profiling_turns_off_attention_dp_balancing_only():
     assert profiled["max_batch_size"] == 64
     assert balanced["attention_dp_config"]["enable_balance"] is True
     assert without_adp_balance({"max_batch_size": 64}) == {"max_batch_size": 64}
+
+
+def test_profile_settings_reach_the_ranks_started_before_the_tool():
+    environ = {
+        "TLLM_DSPARK_PROFILE_COSTS": "/shared/samples-k7.json",
+        "TLLM_DSPARK_PROFILE_HOLD_STEPS": "16",
+        "TLLM_DSPARK_PROFILE_WARMUP_STEPS": "3",
+        "HOME": "/root",
+    }
+    config = {"max_batch_size": 16, "env_overrides": {"OMP_NUM_THREADS": "4"}}
+    profiled = with_profile_environment(config, environ)
+    assert profiled["env_overrides"] == {
+        "OMP_NUM_THREADS": "4",
+        "TLLM_DSPARK_PROFILE_COSTS": "/shared/samples-k7.json",
+        "TLLM_DSPARK_PROFILE_HOLD_STEPS": "16",
+        "TLLM_DSPARK_PROFILE_WARMUP_STEPS": "3",
+    }
+    assert profiled["max_batch_size"] == 16
+    assert config["env_overrides"] == {"OMP_NUM_THREADS": "4"}
+    assert with_profile_environment({}, {})["env_overrides"] == {}
 
 
 def test_graph_batch_size_override_captures_only_the_profiled_graphs():
