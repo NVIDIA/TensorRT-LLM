@@ -126,7 +126,7 @@ def _modules():
     from ..kernels.msa_utils import require_msa_module
 
     fmha = require_msa_module()
-    from ...kernels.msa_kernels.fmha_sm100 import api, jit
+    from fmha_sm100 import api, jit
 
     return fmha, jit, api
 

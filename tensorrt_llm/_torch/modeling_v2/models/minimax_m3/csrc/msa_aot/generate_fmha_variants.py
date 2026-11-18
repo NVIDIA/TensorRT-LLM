@@ -14,11 +14,11 @@
 # limitations under the License.
 """Render the MSA fmha_sm100 variant sources that the build compiles ahead of time.
 
-The minimax_m3 family's vendored MSA package (kernels/msa_kernels/fmha_sm100, see
-3rdparty/vendor_sources.lock.yaml) compiles each FMHA variant at run time from two jinja
+The MSA package fmha_sm100 (fetched and patched by CMake, see the msa entry of 3rdparty/fetch_content.json)
+compiles each FMHA variant at run time from two jinja
 templates. The opt-in ahead-of-time build compiles the variants the MiniMax-M3.1 targets call: this script
 renders those templates for the variants in VARIANTS into the output directory, with the parameters
-the vendored jit.py would use, and the CMake file in this directory runs it at configure time and
+the package's jit.py would use, and the CMake file in this directory runs it at configure time and
 compiles the rendered sources with jit.py's flags. Files are rewritten only when their content
 changes, so an unchanged render does not rebuild anything.
 """
@@ -29,10 +29,6 @@ import sys
 from pathlib import Path
 
 import jinja2
-
-_HERE = Path(__file__).resolve().parent
-# This directory is <family>/csrc/msa_aot; the vendored package is <family>/kernels/msa_kernels/fmha_sm100.
-_PACKAGE = _HERE.parents[1] / "kernels/msa_kernels/fmha_sm100"
 
 # The variant keys (jit.py's dispatch indices: dtype, qo tile, single warp group, sparse mode,
 # page size, split-KV, pack factor) the MiniMax-M3.1 targets reach: the OnlyScore proxy of the
@@ -52,8 +48,8 @@ _SHAPES = (
 VARIANTS = tuple(f"{dtype}_{shape}" for dtype in (0, 1) for shape in _SHAPES)
 
 
-def _load_jit():
-    spec = importlib.util.spec_from_file_location("_msa_fmha_jit", _PACKAGE / "jit.py")
+def _load_jit(package: Path):
+    spec = importlib.util.spec_from_file_location("_msa_fmha_jit", package / "jit.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -74,9 +70,9 @@ def _params(jit, variant: str) -> dict:
     return params
 
 
-def render() -> dict[str, str]:
-    jit = _load_jit()
-    csrc = _PACKAGE / "csrc"
+def render(package: Path) -> dict[str, str]:
+    jit = _load_jit(package)
+    csrc = package / "csrc"
     inst = jinja2.Template((csrc / "fmha_sm100_inst.jinja").read_text())
     run = jinja2.Template((csrc / "fmha_sm100_variant_run.cu.jinja").read_text())
     files = {}
@@ -96,9 +92,15 @@ def main() -> int:
     parser.add_argument(
         "--out", type=Path, required=True, help="directory to render the sources into"
     )
+    parser.add_argument(
+        "--package",
+        type=Path,
+        required=True,
+        help="the fmha_sm100 package directory to render from",
+    )
     args = parser.parse_args()
     out = args.out
-    files = render()
+    files = render(args.package)
     out.mkdir(parents=True, exist_ok=True)
     for path in out.iterdir():
         if path.is_file() and path.name not in files:

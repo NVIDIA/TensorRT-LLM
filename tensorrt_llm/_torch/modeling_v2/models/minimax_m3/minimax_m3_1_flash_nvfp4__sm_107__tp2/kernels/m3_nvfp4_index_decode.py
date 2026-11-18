@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """AGG_NVFP4_INDEXK decode reader: the pure-generation index scores of an NVFP4 index-K cache.
 
-The vendored Q8KV4 decode indexer (``fmha_sm100_q8kv8``: E4M3 index-Q x NVFP4 index-K, the CuTe DSL kernel at two
+The MSA Q8KV4 decode indexer (``fmha_sm100_q8kv8``: E4M3 index-Q x NVFP4 index-K, the CuTe DSL kernel at two
 index heads per rank) scores each request's history pages and writes them straight into the select layout
 [index heads, pages, tokens] (``run_scores_hpr``), the layout of the FP8 path's ``max_score``; the served selector
 then takes the top 16 exactly as on FP8 pages. The wrapper's ``plan()`` refuses CUDA graph capture, so its device
@@ -20,9 +20,7 @@ PAGE = 128
 
 
 def _interface():
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels.fmha_sm100_q8kv8 import (
-        q8_indexer_interface as qi,
-    )
+    from fmha_sm100_q8kv8 import q8_indexer_interface as qi
 
     return qi
 

@@ -64295,15 +64295,15 @@ SOFTWARE.
 
 ## MSA (MiniMax sparse attention)
 
-Source files with NVIDIA modifications, compiled at run time, in
-`tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/`:
+Source files with NVIDIA modifications, compiled at run time, fetched and patched at build time
+(`3rdparty/fetch_content.json`, `3rdparty/patches/`) and installed as the packages:
 
   - `fmha_sm100`: `python/fmha_sm100` of https://gitlab.com/nvidia/tensorrt-llm/oss-components/msa
     at commit `e2ebe7656649f619af0ad1d457b534283034655e`.
   - `fmha_sm100_q8kv8`: `python/fmha_sm100/cute` of https://github.com/vllm-project/MSA at commit
     `25c144700f727b638067e98066a60507081b63ad`.
-  - `prefill_bf16x`: `python/fmha_sm100/prefill_q8kv4` of https://github.com/vllm-project/MSA at commit
-    `25c144700f727b638067e98066a60507081b63ad`.
+  - `fmha_sm100_prefill_bf16x`: `python/fmha_sm100/prefill_q8kv4` of https://github.com/vllm-project/MSA
+    at commit `25c144700f727b638067e98066a60507081b63ad`.
 
 The `NOTICE` file of each tree lists the third-party code the sources derive from (NVIDIA CUTLASS,
 BSD-3-Clause; FlashInfer, Apache-2.0). `fmha_sm100_q8kv8/src/sm100/q8kv4_indexer_decode.py` is

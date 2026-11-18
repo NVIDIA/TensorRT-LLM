@@ -31,11 +31,8 @@ from tensorrt_llm.logger import logger
 from .m31_switches import m31_enabled
 
 IDX_SCORER = m31_enabled("TP2CTX_IDX_SCORER")
-# The vendored scorer's interface module (MSA names the path).
-SCORER_MODULE = (
-    "tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels."
-    "fmha_sm100_q8kv8.q8_indexer_interface"
-)
+# The scorer's interface module (MSA's Q8KV8 indexer package, fetched as the msa_vllm dependency).
+SCORER_MODULE = "fmha_sm100_q8kv8.q8_indexer_interface"
 PAGE = 128  # capacity: fixed: the index-K cache page size the scorer is built for
 HEAD_DIM = 128  # capacity: fixed: the index head size the scorer is built for
 
@@ -56,9 +53,7 @@ def _module():
     try:
         # The scorer is a CuTe DSL kernel: the image's cutlass DSL needs the MSA compatibility shim first.
         install_msa_cutlass_compatibility()
-        mod = importlib.import_module(
-            "tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels.fmha_sm100_q8kv8.q8_indexer_interface"
-        )
+        mod = importlib.import_module(SCORER_MODULE)
         prefill = mod.Q8KV8PrefillIndexerSm100
         if prefill.uses_sm107_fp8_mma((10, 7)) or prefill.mma_inst_k((10, 7)) != 32:
             _log_once(

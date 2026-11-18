@@ -14,9 +14,10 @@
 # the License.
 
 # Opt-in ahead-of-time build (BUILD_MSA_AOT=ON) of the MSA kernels (MiniMax
-# sparse attention) the family vendors in kernels/msa_kernels. By default the
-# vendored jit.py compiles each module on first use; these rules compile the
-# modules the MiniMax-M3.1 targets call, from the same sources with the same
+# sparse attention): the fmha_sm100 package (the msa dependency) and the BF16X
+# sparse prefill (the msa_vllm dependency), both fetched and patched by CMake.
+# By default each package compiles a module on first use; these rules compile
+# the modules the MiniMax-M3.1 targets call, from the same sources with the same
 # nvcc command, into the layout jit.py looks in first
 # (msa_fmha_sm100/<variant>/<variant>.so, plan/, reduction/, sparse_topk/, k2q/,
 # prefill_bf16x/). The variant list and the rendered variant sources come from
@@ -29,8 +30,10 @@ if(NOT MSA_ARCHS)
   return()
 endif()
 
-set(MSA_KERNELS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../kernels/msa_kernels)
-set(MSA_PACKAGE_DIR ${MSA_KERNELS_DIR}/fmha_sm100)
+if(NOT DEFINED msa_SOURCE_DIR)
+  message(FATAL_ERROR "MSA fmha_sm100: the msa dependency is not available")
+endif()
+set(MSA_PACKAGE_DIR ${msa_SOURCE_DIR}/python/fmha_sm100)
 set(MSA_CSRC ${MSA_PACKAGE_DIR}/csrc)
 set(MSA_GENERATED ${CMAKE_CURRENT_BINARY_DIR}/generated)
 set(MSA_OUT ${CMAKE_CURRENT_BINARY_DIR}/msa_fmha_sm100)
@@ -43,10 +46,11 @@ find_package(
   REQUIRED)
 
 # Render the variant sources and their list; re-run configure when the
-# generator, the vendored templates or the vendored dispatch tables change.
+# generator, the package's templates or its dispatch tables change.
 set(MSA_GENERATOR ${CMAKE_CURRENT_SOURCE_DIR}/generate_fmha_variants.py)
-execute_process(COMMAND ${Python3_EXECUTABLE} ${MSA_GENERATOR} --out
-                        ${MSA_GENERATED} RESULT_VARIABLE MSA_GENERATE_RESULT)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} ${MSA_GENERATOR} --out ${MSA_GENERATED}
+          --package ${MSA_PACKAGE_DIR} RESULT_VARIABLE MSA_GENERATE_RESULT)
 if(NOT MSA_GENERATE_RESULT EQUAL 0)
   message(FATAL_ERROR "MSA fmha_sm100: generate_fmha_variants.py failed")
 endif()
@@ -146,8 +150,8 @@ msa_module(${MSA_OUT}/sparse_topk/sparse_topk_select.so -O3
            ${MSA_CSRC}/sparse_topk_select.cu)
 
 # The q2k -> k2q CSR builder is a torch extension; build_k2q_extension.py runs
-# the build the vendored module's own cpp_extension.load runs, without loading
-# the library (torch_extension_aot.py): the wheel build host has no GPU driver.
+# the build the package's own cpp_extension.load runs, without loading the
+# library (torch_extension_aot.py): the wheel build host has no GPU driver.
 get_filename_component(MSA_CUDA_HOME ${CMAKE_CUDA_COMPILER} DIRECTORY)
 get_filename_component(MSA_CUDA_HOME ${MSA_CUDA_HOME} DIRECTORY)
 set(MSA_K2Q_SOURCE
@@ -166,13 +170,17 @@ set_property(
   GLOBAL APPEND PROPERTY MSA_FMHA_SM100_OUTPUTS
                          ${MSA_OUT}/k2q/sparse_build_k2q_csr_m31_ext.so)
 
-# The BF16X / E4M3X sparse-prefill forward (msa_kernels/prefill_bf16x) the
+# The BF16X / E4M3X sparse-prefill forward (fmha_sm100_prefill_bf16x) the
 # MiniMax-M3.1 context path serves needs CUTLASS 4.8's SM107 MMA atoms (the
 # cutlass_msa fetch, made available only with BUILD_MSA_AOT; the rest of
 # TensorRT-LLM keeps its CUTLASS) and CUDA 13.4. build_bf16x_extension.py runs
-# the vendored package's own cpp_extension.load build for the served spec,
-# without loading the library.
-set(MSA_BF16X_DIR ${MSA_KERNELS_DIR}/prefill_bf16x)
+# the package's own cpp_extension.load build for the served spec, without
+# loading the library.
+if(NOT DEFINED msa_vllm_SOURCE_DIR)
+  message(
+    FATAL_ERROR "MSA prefill_bf16x: the msa_vllm dependency is not available")
+endif()
+set(MSA_BF16X_DIR ${msa_vllm_SOURCE_DIR}/python/fmha_sm100/prefill_q8kv4)
 set(MSA_BF16X_MODULE _fmha_sm100_prefill_attention_bf16x_e4m3x_shift0_fp16_107a)
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.4
    AND DEFINED cutlass_msa_SOURCE_DIR)

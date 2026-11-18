@@ -1,243 +1,516 @@
-diff --git a/LICENSE b/LICENSE
+diff --git a/b/python/fmha_sm100/cute/__init__.py b/python/fmha_sm100/cute/__init__.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..132dd20ee3294d09a1c613a6bd4c8094c496fbf9
+index 0000000..71c4081
 --- /dev/null
-+++ b/LICENSE
-@@ -0,0 +1,21 @@
-+MIT License
++++ b/python/fmha_sm100/cute/__init__.py
+@@ -0,0 +1,12 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""The MSA Q8KV4 / Q8KV8 index scorers (CuTe DSL) from vllm-project/MSA python/fmha_sm100/cute.
 +
-+Copyright (c) 2026 MiniMax
++MIT, Copyright (c) 2026 MiniMax (see LICENSE and NOTICE); ``src/sm100/q8kv4_indexer_decode.py`` is
++Apache-2.0, Copyright contributors to the vLLM project. TensorRT-LLM fetches it (the msa_vllm entry of
++3rdparty/fetch_content.json) and installs it as ``fmha_sm100_q8kv8``; the entry's patch carries the
++MiniMax-M3.1 changes (the select-layout decode output, the prefill MMA K in the kernel key) and makes the
++package's imports relative.
++"""
 +
-+Permission is hereby granted, free of charge, to any person obtaining a copy
-+of this software and associated documentation files (the "Software"), to deal
-+in the Software without restriction, including without limitation the rights
-+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-+copies of the Software, and to permit persons to whom the Software is
-+furnished to do so, subject to the following conditions:
++from .src.sm100.q8kv8_indexer_prefill import MMA_K  # noqa: F401
+diff --git a/python/fmha_sm100/cute/q8_indexer_interface.py b/python/fmha_sm100/cute/q8_indexer_interface.py
+index ae42081..6c5792d 100644
+--- a/python/fmha_sm100/cute/q8_indexer_interface.py
++++ b/python/fmha_sm100/cute/q8_indexer_interface.py
+@@ -1,4 +1,5 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """Q8KV4/Q8KV8 paged sparse-attention indexers over the vLLM cache layout.
+@@ -39,11 +40,12 @@ import torch
+ from cutlass import Int32
+ from cutlass.cute.runtime import from_dlpack
+ 
+-from src.common.aot_cache import save_aot, try_load_aot
+-from src.sm100.q8kv4_indexer_decode import Q8KV4DecodeIndexerSm100
+-from src.sm100.q8kv8_indexer_decode import Q8KV8DecodeIndexerSm100
+-from src.sm100.q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
+-from src.sm100.q8kv8_indexer_prefill_plan import (
++from .src.common.aot_cache import save_aot, try_load_aot
++from .src.sm100.q8kv4_indexer_decode import Q8KV4DecodeIndexerSm100
++from .src.sm100.q8kv8_indexer_decode import Q8KV8DecodeIndexerSm100
++from .src.sm100.q8kv8_indexer_prefill import MMA_K as _PREFILL_MMA_K
++from .src.sm100.q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
++from .src.sm100.q8kv8_indexer_prefill_plan import (
+     Q8KV8PrefillIndexerPlanBuild,
+     Q8KV8PrefillIndexerPlanReset,
+ )
+@@ -161,12 +163,15 @@ def _compile_or_load(key: tuple[object, ...], compile_fn):
+ 
+ 
+ def _cute_kernel_key(name: str, capability: tuple[int, int], *static) -> tuple[object, ...]:
++    # MiniMax-M3.1 vendoring: the MMA K (the exact K32 vs the SM107 K64 instruction) is part of every key, in-process and
++    # AOT, so a K32 run never loads a K64 binary (an earlier key ignored it).
+     return (
+         name,
+         cutlass.__version__,
+         str(cutlass.CUDA_VERSION),
+         _kernel_source_digest(),
+         capability,
++        ("mma_k", _PREFILL_MMA_K),
+         *static,
+     )
+ 
+@@ -247,17 +252,17 @@ def _check_topk_output(
+         raise ValueError(f"out must have shape {list(expected)}, got {tuple(out.shape)}")
+ 
+ 
+-def _load_indexer_module_from_source_tree(name: str):
+-    from fmha_sm100.jit import get_indexer_module
+-
+-    return get_indexer_module(name)
++def _indexer_module_unavailable(name: str):
++    raise NotImplementedError(
++        f"The csrc indexer module {name!r} (one-head Q8KV4 decode and indexer_topk_select) is "
++        "not vendored with this package; only the CuTe DSL scorers are available. Bind a loader "
++        "with bind_indexer_module_loader() to use it."
++    )
+ 
+ 
+-# The csrc JIT lives in the parent package, whose import name depends on how
+-# fmha_sm100 is vendored (for example vllm.third_party.fmha_sm100), so the
+-# package's sparse.py binds its own loader. Direct imports of this module from
+-# the source tree or an installed fmha_sm100 use the fallback.
+-_indexer_module_loader = _load_indexer_module_from_source_tree
++# The csrc indexer JIT lives in upstream's parent fmha_sm100 package, which is
++# not vendored with this copy, so the csrc paths fail until a loader is bound.
++_indexer_module_loader = _indexer_module_unavailable
+ 
+ 
+ def bind_indexer_module_loader(loader) -> None:
+@@ -611,6 +616,16 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
+     _supports_query_len = True
+     _kernel_name = "q8kv4_indexer_decode_sm100"
+     _kernel_class = Q8KV4DecodeIndexerSm100
++    # MiniMax-M3.1 IDX-PDL: pages of the CTA's range the two- / four-head kernel L2-prefetches before its PDL wait
++    # (Q8KV4DecodeIndexerSm100's prewait_prefetch_pages; scores unchanged). 0 keeps the kernel and its compile key.
++    _prewait_prefetch_pages = 0
 +
-+The above copyright notice and this permission notice shall be included in all
-+copies or substantial portions of the Software.
++    def _kernel_static(self, *extra) -> tuple:
++        """The compile key's static tail and the kernel's keyword arguments for this wrapper's settings."""
++        pages = int(self._prewait_prefetch_pages)
++        static = (*extra, ("pwp", pages)) if pages else extra
++        kwargs = {"prewait_prefetch_pages": pages} if pages else {}
++        return static, kwargs
+ 
+     @staticmethod
+     def _module():
+@@ -639,9 +654,55 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
+     def _check_k_cache(self, k_cache: torch.Tensor, device: torch.device) -> None:
+         _check_paged_cache(k_cache, dtype=torch.uint8, page_width=_NVFP4_PAGE_WIDTH, device=device)
+ 
++    def run_scores_hpr(self, q: torch.Tensor, k_cache: torch.Tensor, kernel_out: torch.Tensor) -> None:
++        """MiniMax-M3.1: the scores of the planned step written straight into the select layout
++        (``q8kv4_hpr_buffer``'s ``kernel_out``; read them through its ``view``). Two or four heads (the CuTe DSL kernel)."""
++        if self._num_heads == 1 or self._scores is None:
++            raise RuntimeError("run_scores_hpr needs plan() and two or four heads")
++        device = q.device
++        _check_query(q, self._scores.shape[0] * self._query_len, self._num_heads, device)
++        self._check_k_cache(k_cache, device)
++        sm_count = _sm_count(device)
++        static, kwargs = self._kernel_static(("hpr", self._query_len))
++        key = _cute_kernel_key(
++            self._kernel_name, _require_supported_device(device), sm_count, self._num_heads, *static
++        )
++        metadata = (self._block_table, self._seq_lens, kernel_out, self._workspace)
++        compiled = _compile_or_load(
++            key,
++            lambda: cute.compile(
++                self._kernel_class(
++                    sm_count=sm_count, num_heads=self._num_heads, out_query_len=self._query_len, **kwargs
++                ),
++                *_cute_arguments((q, k_cache), metadata),
++                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
++                options="--enable-tvm-ffi --opt-level 2",
++            ),
++        )
++        compiled(q, k_cache, *metadata)
 +
-+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-+SOFTWARE.
-diff --git a/NOTICE b/NOTICE
-new file mode 100644
-index 0000000000000000000000000000000000000000..39212e2332b2c89dd175abaef1d9df407eb2ba16
---- /dev/null
-+++ b/NOTICE
-@@ -0,0 +1,203 @@
-+fmha_sm100
-+Copyright (c) 2026 MiniMax
+     def _launch_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> None:
+         if self._num_heads != 1:
+-            super()._launch_scores(q, k_cache)
++            if not self._prewait_prefetch_pages:
++                super()._launch_scores(q, k_cache)
++                return
++            device = q.device
++            sm_count = _sm_count(device)
++            static, kwargs = self._kernel_static()
++            key = _cute_kernel_key(
++                self._kernel_name, _require_supported_device(device), sm_count, self._num_heads, *static
++            )
++            metadata = (self._block_table, self._seq_lens, self._scores, self._workspace)
++            compiled = _compile_or_load(
++                key,
++                lambda: cute.compile(
++                    self._kernel_class(sm_count=sm_count, num_heads=self._num_heads, **kwargs),
++                    *_cute_arguments((q, k_cache), metadata),
++                    cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
++                    options="--enable-tvm-ffi --opt-level 2",
++                ),
++            )
++            compiled(q, k_cache, *metadata)
+             return
+         device = q.device
+         self._module().q8kv4_indexer_run(
+@@ -656,6 +717,17 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
+         )
+ 
+ 
++def q8kv4_hpr_buffer(batch_size: int, max_pages: int, num_heads: int, query_len: int, device) -> tuple:
++    """MiniMax-M3.1: the score buffer of ``BatchDecodeIndexerQ8KV4Wrapper.run_scores_hpr`` and its select view
++    [num_heads, max_pages, batch_size * query_len] (contiguous, at offset 8 - query_len of the buffer)."""
++    rows = batch_size * query_len
++    pad = _DECODE_QUERY_LENGTH - query_len
++    buf = torch.empty(num_heads * max_pages * rows + pad, dtype=torch.float32, device=device)
++    view = buf.as_strided((num_heads, max_pages, rows), (max_pages * rows, rows, 1), pad)
++    kernel_out = buf.as_strided((num_heads, max_pages, rows), (max_pages * rows, rows, 1), 0)
++    return buf, view, kernel_out
 +
-+This product includes software developed by third parties. See the
-+"Third-party licenses" section of README.md for the full list of bundled
-+and runtime-dependency components and license summaries. The
-+authoritative license text for each third-party component is shipped
-+with that component itself (vendored source headers, the LICENSE file
-+distributed with the pip-installed package, or the upstream project
-+repository).
 +
-+================================================================================
-+Bundled / derived source (shipped in this repository)
-+================================================================================
+ @dataclass(frozen=True, slots=True)
+ class _PrefillPlanState:
+     cu_seqlens_q: torch.Tensor
+@@ -938,6 +1010,7 @@ class BatchPrefillIndexerQ8KV8Wrapper:
+ 
+ 
+ __all__ = [
++    "q8kv4_hpr_buffer",
+     "BatchDecodeIndexerQ8KV4Wrapper",
+     "BatchDecodeIndexerQ8KV8Wrapper",
+     "BatchPrefillIndexerQ8KV8Wrapper",
+diff --git a/python/fmha_sm100/cute/src/__init__.py b/python/fmha_sm100/cute/src/__init__.py
+index 15dfab1..2f188f6 100644
+--- a/python/fmha_sm100/cute/src/__init__.py
++++ b/python/fmha_sm100/cute/src/__init__.py
+@@ -1,3 +1,4 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+-
++# MiniMax-M3.1 vendoring (fmha_sm100_q8kv8): package marker.
+diff --git a/python/fmha_sm100/cute/src/common/aot_cache.py b/python/fmha_sm100/cute/src/common/aot_cache.py
+index 722a553..0fe1c9c 100644
+--- a/python/fmha_sm100/cute/src/common/aot_cache.py
++++ b/python/fmha_sm100/cute/src/common/aot_cache.py
+@@ -1,4 +1,5 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """Persistent AOT cache for CuTe DSL compiled kernels.
+@@ -58,13 +59,18 @@ def _toolchain_manifest():
+ 
+ 
+ _MANIFEST = _toolchain_manifest()
++_TOOLCHAIN = hashlib.sha256(json.dumps(_MANIFEST, sort_keys=True).encode()).hexdigest()[:16]
 +
-+This project bundles or derives from the following third-party components.
-+Each retains its original license and copyright. In compliance with the
-+BSD-3-Clause §2 and Apache-2.0 §4 redistribution clauses, the original
-+copyright notices and license terms are reproduced below (and are also
-+preserved at the top of every vendored source file via the
-+SPDX-License-Identifier header).
 +
-+--------------------------------------------------------------------------------
-+NVIDIA CUTLASS — BSD-3-Clause
-+--------------------------------------------------------------------------------
++# TensorRT-LLM: this copy keeps its own cache directory, apart from any other copy of these sources.
+ _AOT_CACHE_DIR = os.path.join(
+     os.environ.get(
+         "MM_SPARSE_ATTN_AOT_CACHE",
+         os.path.expanduser("~/.cache/minfer/mm_sparse_attn"),
+     ),
++    "fmha_sm100_q8kv8_m31",
+     f"v{_SCHEMA}",
+-    hashlib.sha256(json.dumps(_MANIFEST, sort_keys=True).encode()).hexdigest()[:16],
++    _TOOLCHAIN,
+ )
+ 
+ _loaded_modules: dict[str, object] = {}
+diff --git a/python/fmha_sm100/cute/src/sm100/__init__.py b/python/fmha_sm100/cute/src/sm100/__init__.py
+index f23267f..aecd1d1 100644
+--- a/python/fmha_sm100/cute/src/sm100/__init__.py
++++ b/python/fmha_sm100/cute/src/sm100/__init__.py
+@@ -1,4 +1,6 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """SM100 sparse attention kernels."""
++# MiniMax-M3.1 vendoring (fmha_sm100_q8kv8): package marker.
+diff --git a/python/fmha_sm100/cute/src/sm100/q8kv4_indexer_decode.py b/python/fmha_sm100/cute/src/sm100/q8kv4_indexer_decode.py
+index 409b457..c60ea68 100644
+--- a/python/fmha_sm100/cute/src/sm100/q8kv4_indexer_decode.py
++++ b/python/fmha_sm100/cute/src/sm100/q8kv4_indexer_decode.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ 
+ """CuTe DSL Q8KV4 paged decode indexer proxy scores for two or four index heads.
+ 
+@@ -26,7 +27,7 @@ from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
+ 
+ import cuda.bindings.driver as cuda
+ 
+-from src.common import utils as common_utils
++from ..common import utils as common_utils
+ 
+ # QMUL4 is public PTX from CUDA 13.4; older DSL backends and SM107, whose ptxas
+ # rejects it, take the exact FP16 path.
+@@ -180,6 +181,21 @@ def _e4m3x4_to_f16x4(word: Int32, *, loc=None, ip=None) -> tuple[Int32, Int32]:
+     )
+ 
+ 
++@dsl_user_op
++def _prefetch_l2_bulk(addr: Int64, nbytes: int, *, loc=None, ip=None) -> None:
++    """Non-binding L2 prefetch of ``nbytes`` (a multiple of 16) contiguous global bytes at ``addr`` (16-byte aligned)."""
 +
-+Copyright (c) 2017-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++    llvm.inline_asm(
++        None,
++        [Int64(addr).ir_value(loc=loc, ip=ip)],
++        f"cp.async.bulk.prefetch.L2.global [$0], {nbytes};",
++        "l",
++        has_side_effects=True,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++    )
 +
-+Redistribution and use in source and binary forms, with or without
-+modification, are permitted provided that the following conditions are met:
 +
-+  1. Redistributions of source code must retain the above copyright notice,
-+     this list of conditions and the following disclaimer.
-+  2. Redistributions in binary form must reproduce the above copyright notice,
-+     this list of conditions and the following disclaimer in the documentation
-+     and/or other materials provided with the distribution.
-+  3. Neither the name of the copyright holder nor the names of its
-+     contributors may be used to endorse or promote products derived from
-+     this software without specific prior written permission.
+ class _NamedBarrier(enum.IntEnum):
+     TmemPtr = enum.auto()
+     Score = enum.auto()
+@@ -257,7 +273,22 @@ class Q8KV4DecodeIndexerSm100:
+     k_per_tmem_col = e4m3_per_tmem_col
+     dequant_store_halves = 1
+ 
+-    def __init__(self, *, sm_count: int, num_heads: int) -> None:
++    def __init__(
++        self, *, sm_count: int, num_heads: int, out_query_len: int = 0, prewait_prefetch_pages: int = 0
++    ) -> None:
++        # MiniMax-M3.1: out_query_len > 0 writes the scores straight into the
++        # select's [heads, pages, rows] layout (rows = batch * out_query_len, the request's last out_query_len of the eight
++        # query slots), skipping the padded slots; 0 keeps the upstream [batch, 8 * heads, pages] layout. Same scores.
++        if not 0 <= out_query_len <= self.query_length:
++            raise ValueError(f"out_query_len must be in [0, {self.query_length}]")
++        self.out_query_len = out_query_len
++        # MiniMax-M3.1 IDX-PDL: prewait_prefetch_pages > 0 has one warp of every CTA issue L2 prefetches of the first
++        # pages of the CTA's page range before griddepcontrol.wait, while a predecessor that triggered early still runs.
++        # Prefetches are non-binding hints: every byte the kernel uses is still loaded after the wait, so the scores are
++        # unchanged. 0 keeps the kernel as it was.
++        if not 0 <= prewait_prefetch_pages <= self.threads_per_warp:
++            raise ValueError(f"prewait_prefetch_pages must be in [0, {self.threads_per_warp}]")
++        self.prewait_prefetch_pages = prewait_prefetch_pages
+         if sm_count <= 0:
+             raise ValueError("sm_count must be positive")
+         if num_heads not in self.supported_num_heads:
+@@ -374,10 +405,21 @@ class Q8KV4DecodeIndexerSm100:
+             mPageTable.iterator,
+             cute.select(mPageTable.layout, mode=[1, 0]),
+         )
+-        mOut_pqb = cute.make_tensor(
+-            mOut.iterator,
+-            cute.select(mOut.layout, mode=[2, 1, 0]),
+-        )
++        if cutlass.const_expr(self.out_query_len == 0):
++            mOut_pqb = cute.make_tensor(
++                mOut.iterator,
++                cute.select(mOut.layout, mode=[2, 1, 0]),
++            )
++        else:
++            # mOut = [heads, pages, rows] over a buffer whose select view starts (8 - out_query_len) elements later:
++            # query slot s of request b lands on row b * out_query_len + s - (8 - out_query_len) of that view.
++            mOut_pqb = cute.make_tensor(
++                mOut.iterator,
++                cute.make_layout(
++                    (mOut.shape[1], (self.num_heads, self.query_length), batch_size),
++                    stride=(mOut.stride[1], (mOut.stride[0], 1), self.out_query_len),
++                ),
++            )
+         mScheduler = cute.make_tensor(
+             cute.recast_ptr(mSchedulerStorage.iterator, dtype=Int32),
+             cute.make_layout(batch_size + 1),
+@@ -523,6 +565,8 @@ class Q8KV4DecodeIndexerSm100:
+             mSeqLens,
+             mOut_pqb,
+             mScheduler,
++            mKCache,
++            Int64(page_stride),
+             batch_size,
+             query_rows,
+             sPacked_layout,
+@@ -555,6 +599,8 @@ class Q8KV4DecodeIndexerSm100:
+         mSeqLens: cute.Tensor,
+         mOut_pqb: cute.Tensor,
+         mScheduler: cute.Tensor,
++        mKCache: cute.Tensor,
++        page_stride_bytes: Int64,
+         batch_size: Int32,
+         query_rows: Int32,
+         sPacked_layout: cute.ComposedLayout,
+@@ -694,6 +740,12 @@ class Q8KV4DecodeIndexerSm100:
+         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
+ 
+         pipeline.pipeline_init_wait()
++        if cutlass.const_expr(self.prewait_prefetch_pages > 0):
++            # IDX-PDL: a score warp (idle until the first accumulator) warms L2 with the CTA's first pages.
++            if warp_idx == Int32(self.score_warp_begin):
++                self._prefetch_pages_prewait(
++                    mKCache, page_stride_bytes, mPageTable_lb, mScheduler, batch_size, worker_idx, lane_idx
++                )
+         # PDL: the predecessor writes q and the current pages of the index cache.
+         cute.arch.griddepcontrol_wait()
+         # The plan writes the scheduler prefix sums just before this launch, so
+@@ -1034,7 +1086,12 @@ class Q8KV4DecodeIndexerSm100:
+                                 # waits for this grid, so it may start launching.
+                                 cute.arch.griddepcontrol_launch_dependents()
+                             if logical_page < local_block:
+-                                mOut_pqb[logical_page, query_idx, current_batch] = row_max
++                                if cutlass.const_expr(self.out_query_len == 0):
++                                    mOut_pqb[logical_page, query_idx, current_batch] = row_max
++                                elif query_idx >= Int32(
++                                    (self.query_length - self.out_query_len) * self.num_heads
++                                ):
++                                    mOut_pqb[logical_page, query_idx, current_batch] = row_max
+                         global_page += Int32(1)
+                         logical_page += Int32(1)
+                     pages_remaining -= segment_pages
+@@ -1056,6 +1113,71 @@ class Q8KV4DecodeIndexerSm100:
+         if cutlass.const_expr(self.split_tmem):
+             tmem_acc.free(acc_ptr)
+ 
++    @cute.jit
++    def _prefetch_pages_prewait(
++        self,
++        mKCache: cute.Tensor,
++        page_stride_bytes: Int64,
++        mPageTable_lb: cute.Tensor,
++        mScheduler: cute.Tensor,
++        batch_size: Int32,
++        worker_idx: Int32,
++        lane_idx: Int32,
++    ) -> None:
++        """L2 prefetch of the first ``prewait_prefetch_pages`` pages of this CTA's range, before griddepcontrol.wait.
 +
-+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-+POSSIBILITY OF SUCH DAMAGE.
++        Exact by construction: the only effect is cp.async.bulk.prefetch.L2 hints; nothing read here reaches the
++        scores. The scheduler and page table may still be in flight from a predecessor, so the values read here only
++        steer the hint addresses and are clamped into the tables and the page pool (no out-of-bounds access). Lane i
++        takes page (CTA's first page + i); the request owning it is found from one scheduler load per 32 requests.
++        """
++        int_max = Int32(0x7FFFFFFF)
++        total_pages = mScheduler[batch_size]
++        first_bound = int_max
++        if lane_idx < batch_size:
++            first_bound = mScheduler[lane_idx + Int32(1)]
++        if total_pages < Int32(0):  # noqa: PLR1730
++            total_pages = Int32(0)
++        pages_per_worker = (total_pages + Int32(self.grid_ctas - 1)) // Int32(self.grid_ctas)
++        page_begin = worker_idx * pages_per_worker
++        page_end = page_begin + pages_per_worker
++        if page_end > total_pages:  # noqa: PLR1730
++            page_end = total_pages
++        global_page = page_begin + lane_idx
++        # Requests b with scheduler[b + 1] <= page precede the page's request; the last such bound is its first page.
++        owner = Int32(0)
++        owner_first = Int32(0)
++        for chunk_begin in cutlass.range(0, batch_size, self.threads_per_warp, unroll=1):
++            bound = first_bound
++            if chunk_begin > Int32(0):
++                bound = int_max
++                if chunk_begin + lane_idx < batch_size:
++                    bound = mScheduler[chunk_begin + lane_idx + Int32(1)]
++            for src_lane in cutlass.range_constexpr(self.threads_per_warp):
++                lane_bound = cute.arch.shuffle_sync(bound, src_lane)
++                if lane_bound <= global_page:
++                    owner += Int32(1)
++                    owner_first = lane_bound
++        if lane_idx < Int32(self.prewait_prefetch_pages) and global_page < page_end and batch_size > Int32(0):
++            if owner > batch_size - Int32(1):  # noqa: PLR1730
++                owner = batch_size - Int32(1)
++            logical_page = global_page - owner_first
++            max_logical = mPageTable_lb.shape[0] - Int32(1)
++            if logical_page > max_logical:  # noqa: PLR1730
++                logical_page = max_logical
++            if logical_page < Int32(0):  # noqa: PLR1730
++                logical_page = Int32(0)
++            physical_page = mPageTable_lb[logical_page, owner]
++            max_physical = mKCache.shape[0] - Int32(1)
++            if physical_page > max_physical:  # noqa: PLR1730
++                physical_page = max_physical
++            if physical_page < Int32(0):  # noqa: PLR1730
++                physical_page = Int32(0)
++            _prefetch_l2_bulk(
++                mKCache.iterator.toint() + Int64(physical_page) * page_stride_bytes,
++                self.raw_page_bytes,
++            )
 +
-+Project:    https://github.com/NVIDIA/cutlass
-+Where:      python/fmha_sm100/cutlass/ (git submodule: include/ and
-+            tools/util/include/)
-+            plus BSD-3-tagged headers under python/fmha_sm100/csrc/include/.
-+            The SM100 MMA descriptor encodings in
-+            python/fmha_sm100/cute/src/common/mma_sm100_desc.py
-+            mirror NVIDIA CUTLASS hardware descriptors.
-+Full text:  python/fmha_sm100/cutlass/LICENSE.txt (submodule), or
-+            https://github.com/NVIDIA/cutlass/blob/main/LICENSE
+     @cute.jit
+     def _widen_q_stage(
+         self,
+diff --git a/python/fmha_sm100/cute/src/sm100/q8kv8_indexer_prefill.py b/python/fmha_sm100/cute/src/sm100/q8kv8_indexer_prefill.py
+index c0c3ff0..0980487 100644
+--- a/python/fmha_sm100/cute/src/sm100/q8kv8_indexer_prefill.py
++++ b/python/fmha_sm100/cute/src/sm100/q8kv8_indexer_prefill.py
+@@ -1,9 +1,11 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """CuTe DSL Q8KV8 paged prefill indexer proxy scores for SM100/SM103."""
+ 
+ import enum
++import os
+ 
+ import cutlass
+ import cutlass.cute as cute
+@@ -16,6 +18,13 @@ import cuda.bindings.driver as cuda
+ from quack import copy_utils
+ 
+ 
 +
-+--------------------------------------------------------------------------------
-+FlashInfer — Apache License 2.0
-+--------------------------------------------------------------------------------
++# MiniMax-M3.1 vendoring (fmha_sm100_q8kv8, MSA; CTX handoff HANDOFF_CTX_IDX_SCORER_M2_v1 6a964784): the MMA instruction K of
++# the SM107 FP8 path. 32 = EXACT mode (default): the generic F8F6F4 MMA, bitwise to the served fmha proxy scores. 64 = the
++# upstream SM107 FP8 instruction (upstream numerics: a different accumulation order), only with
++# TRTLLM_M31_IDX_SCORER_MMA_K=64 and behind MSA's parity gates. Read once, at import; part of every compile key.
++MMA_K = 64 if os.environ.get("TRTLLM_M31_IDX_SCORER_MMA_K", "32") == "64" else 32
 +
-+Copyright (c) 2023-2025 by FlashInfer team.
-+
-+Licensed under the Apache License, Version 2.0 (the "License");
-+you may not use this file except in compliance with the License.
-+You may obtain a copy of the License at
-+
-+    https://www.apache.org/licenses/LICENSE-2.0
-+
-+Unless required by applicable law or agreed to in writing, software
-+distributed under the License is distributed on an "AS IS" BASIS,
-+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+See the License for the specific language governing permissions and
-+limitations under the License.
-+
-+Project:    https://github.com/flashinfer-ai/flashinfer
-+Where:      Apache-2.0-tagged sources under python/fmha_sm100/csrc/
-+            and python/fmha_sm100/csrc/include/ (e.g. allocator.h,
-+            exception.h, utils.cuh, cutlass_utils.cuh,
-+            fmha_cutlass_sm100.cuh, sparse_topk_select.cuh, plan.cuh,
-+            sm100_fmha_reduction.hpp, tvm_ffi_utils.h).
-+Full text:  https://www.apache.org/licenses/LICENSE-2.0
-+
-+--------------------------------------------------------------------------------
-+Fireworks AI (minimax-kernels KV-outer) — Apache License 2.0
-+--------------------------------------------------------------------------------
-+
-+Copyright (c) 2026 Fireworks AI
-+
-+Licensed under the Apache License, Version 2.0 (the "License");
-+you may not use this file except in compliance with the License.
-+You may obtain a copy of the License at
-+
-+    https://www.apache.org/licenses/LICENSE-2.0
-+
-+Project:    https://github.com/fw-ai/minimax-kernels
-+Where:      python/fmha_sm100/kvouter/ and python/fmha_sm100/csrc/kvouter/
-+            (KV-outer sparse attention backend used by sparse_fmha_adapter.py).
-+Full text:  https://www.apache.org/licenses/LICENSE-2.0
-+
-+--------------------------------------------------------------------------------
-+NVIDIA TensorRT-LLM — Apache License 2.0
-+--------------------------------------------------------------------------------
-+
-+Copyright (c) 2019-2026 NVIDIA CORPORATION. All rights reserved.
-+
-+Licensed under the Apache License, Version 2.0 (the "License");
-+you may not use this file except in compliance with the License.
-+You may obtain a copy of the License at
-+
-+    https://www.apache.org/licenses/LICENSE-2.0
-+
-+Unless required by applicable law or agreed to in writing, software
-+distributed under the License is distributed on an "AS IS" BASIS,
-+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+See the License for the specific language governing permissions and
-+limitations under the License.
-+
-+Project:    https://github.com/NVIDIA/TensorRT-LLM
-+Where:      python/fmha_sm100/csrc/include/sparse_topk_select.cuh
-+            portions of the indexerTopK histogram-step + insertion-sort
-+            algorithm, derived from
-+            tensorrt_llm/cpp/tensorrt_llm/kernels/indexerTopK.cu.
-+Full text:  https://www.apache.org/licenses/LICENSE-2.0
-+
-+--------------------------------------------------------------------------------
-+NVIDIA indexer TopK — Apache License 2.0
-+--------------------------------------------------------------------------------
-+
-+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-+
-+Licensed under the Apache License, Version 2.0 (the "License");
-+you may not use this file except in compliance with the License.
-+You may obtain a copy of the License at
-+
-+    https://www.apache.org/licenses/LICENSE-2.0
-+
-+Unless required by applicable law or agreed to in writing, software
-+distributed under the License is distributed on an "AS IS" BASIS,
-+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+See the License for the specific language governing permissions and
-+limitations under the License.
-+
-+Where:      python/fmha_sm100/csrc/include/indexer_topk/ (forced-tail
-+            top-16 selection used by the Q8KV4/Q8KV8 paged indexers).
-+Full text:  https://www.apache.org/licenses/LICENSE-2.0
-+
-+--------------------------------------------------------------------------------
-+NAVER Corp. (CLOVA) — Apache License 2.0
-+--------------------------------------------------------------------------------
-+
-+Copyright (c) 2021 NAVER Corp.
-+Licensed under the Apache License, Version 2.0; you may not use this file
-+except in compliance with the License. You may obtain a copy of the
-+License at https://www.apache.org/licenses/LICENSE-2.0
-+
-+Project:    https://github.com/NAVER-CLOVA
-+Where:      Co-authored portions of
-+            python/fmha_sm100/csrc/include/sparse_topk_select.cuh
-+            (indexerTopK algorithm, alongside the NVIDIA copyright above).
-+Full text:  https://www.apache.org/licenses/LICENSE-2.0
-+
-+--------------------------------------------------------------------------------
-+Changes to bundled / derived source
-+--------------------------------------------------------------------------------
-+
-+This project does not modify the text of vendored third-party source files
-+beyond what is required to integrate them (path adjustments in
-+`#include` directives and minor macro renames to avoid collision with
-+project-local symbols; no semantic changes). All such integration
-+modifications are confined to `csrc/` and to the import shim under
-+`python/fmha_sm100/sparse.py`. The SM100 MMA descriptor encodings in
-+`python/fmha_sm100/cute/src/common/mma_sm100_desc.py` are
-+re-typed from the CUTLASS hardware descriptors — they are numerical
-+constants, not CUTLASS source code, but the original copyright is
-+attributed here for completeness.
-+
-+================================================================================
-+Runtime dependencies (installed via pip, not vendored)
-+================================================================================
-+
-+For runtime dependencies, the authoritative license text is distributed
-+with each installed package; consult `pip show <pkg>` for the license
-+metadata. The full list and license summaries are in the
-+"Third-party licenses" section of README.md.
-+
-+================================================================================
-+Trademarks
-+================================================================================
-+
-+NVIDIA, the NVIDIA logo, Blackwell, SM100, B200, B300, GB200, GB300,
-+TensorRT, TensorRT-LLM, cuDNN, cuBLAS, and CUDA are trademarks and/or
-+registered trademarks of NVIDIA Corporation. Apache, Apache TVM, and
-+Apache TVM FFI are trademarks of The Apache Software Foundation. All
-+other trademarks referenced in this project are the property of their
-+respective owners. The use of any trademark in this NOTICE or in
-+README.md is for identification purposes only and does not imply
-+endorsement.
-diff --git a/README.md b/README.md
-index 63b1593519f0c32cbbc4dbd57b57441b1944de26..7064df564003e649d98a88f561a7a978b7e0045b 100644
---- a/README.md
-+++ b/README.md
+ class NamedBarrierIndexerSm100(enum.IntEnum):
+     """Kernel-local named barriers."""
+ 
+@@ -60,7 +69,9 @@ class Q8KV8PrefillIndexerSm100:
+         compute_capability: tuple[int, int],
+         io_dtype=cutlass.Float8E4M3FN,
+     ) -> bool:
+-        return compute_capability == (10, 7) and io_dtype in cls.sm107_fp8_dtypes
++        # MiniMax-M3.1 vendoring (fmha_sm100_q8kv8): the exact mode (MMA_K == 32, the default) always takes the generic
++        # F8F6F4 instruction at K = 32, whose accumulation order is the served fmha proxy's (bitwise in CTX).
++        return MMA_K == 64 and compute_capability == (10, 7) and io_dtype in cls.sm107_fp8_dtypes
+ 
+     @classmethod
+     def uses_two_ctas_per_sm(cls, compute_capability: tuple[int, int]) -> bool:
+diff --git a/python/fmha_sm100/cute/src/sm100/q8kv8_indexer_prefill_plan.py b/python/fmha_sm100/cute/src/sm100/q8kv8_indexer_prefill_plan.py
+index 100ffc0..d60e87c 100644
+--- a/python/fmha_sm100/cute/src/sm100/q8kv8_indexer_prefill_plan.py
++++ b/python/fmha_sm100/cute/src/sm100/q8kv8_indexer_prefill_plan.py
+@@ -1,4 +1,5 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """Device-side varlen task planning for the Q8KV8 prefill indexer."""
+@@ -7,7 +8,7 @@ import cutlass
+ import cutlass.cute as cute
+ import cuda.bindings.driver as cuda
+ 
+-from src.sm100.q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
++from .q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
+ 
+ 
+ class Q8KV8PrefillIndexerPlanReset:
+diff --git a/python/fmha_sm100/prefill_q8kv4/README.md b/python/fmha_sm100/prefill_q8kv4/README.md
+index 63b1593..e077c78 100644
+--- a/python/fmha_sm100/prefill_q8kv4/README.md
++++ b/python/fmha_sm100/prefill_q8kv4/README.md
 @@ -18,15 +18,15 @@ sparse prefill.
    QMUL4 instruction where the toolchain accepts it for the target (SM100 and SM103; the JIT
    probes `nvcc` once per toolchain and architecture) and an exact packed-FP16 path otherwise
@@ -253,7 +526,7 @@ index 63b1593519f0c32cbbc4dbd57b57441b1944de26..7064df564003e649d98a88f561a7a978
 -  `FMHA_SM100_PREFILL_Q8KV4_ARCH` selects the target for offline builds without a device
 -  (`python -m fmha_sm100.prefill_q8kv4.build --arch 103a`).
 +  `FMHA_SM100_PREFILL_BF16X_ARCH` selects the target for offline builds without a device
-+  (`python -m tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels.prefill_bf16x.build --arch 103a`).
++  (`python -m fmha_sm100_prefill_bf16x.build --arch 103a`).
  
  ## Through `fmha_sm100`
  
@@ -262,7 +535,7 @@ index 63b1593519f0c32cbbc4dbd57b57441b1944de26..7064df564003e649d98a88f561a7a978
  
  ```python
 -from fmha_sm100.prefill_q8kv4 import BatchPrefillWithPagedKVCacheWrapper, interleave_v_scales
-+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels.prefill_bf16x import BatchPrefillWithPagedKVCacheWrapper, interleave_v_scales
++from fmha_sm100_prefill_bf16x import BatchPrefillWithPagedKVCacheWrapper, interleave_v_scales
  
  wrapper = BatchPrefillWithPagedKVCacheWrapper()
  wrapper.plan(topk_indices, cu_seqlens_q, cu_seqlens_k, kv_indices, kv_indptr=kv_indptr,
@@ -271,7 +544,7 @@ index 63b1593519f0c32cbbc4dbd57b57441b1944de26..7064df564003e649d98a88f561a7a978
  
  ```python
 -from fmha_sm100.prefill_q8kv4 import run_prefill
-+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels.prefill_bf16x import run_prefill
++from fmha_sm100_prefill_bf16x import run_prefill
  
  run_prefill(q_e4m3, (k_data, v_data), (k_sf, v_sf), kv_indices=block_table, kv_indptr=None,
              cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, k2q_row_ptr=k2q_row_ptr,
@@ -280,7 +553,7 @@ index 63b1593519f0c32cbbc4dbd57b57441b1944de26..7064df564003e649d98a88f561a7a978
  
  ```python
 -from fmha_sm100.prefill_q8kv4 import PrefillWorkspace
-+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels.prefill_bf16x import PrefillWorkspace
++from fmha_sm100_prefill_bf16x import PrefillWorkspace
  
  workspace = PrefillWorkspace(device)
  workspace = PrefillWorkspace(device, partial_bytes=workspace.required_bytes(topk, max_total_q, Hq))
@@ -293,11 +566,11 @@ index 63b1593519f0c32cbbc4dbd57b57441b1944de26..7064df564003e649d98a88f561a7a978
  comparisons). One workspace must not be used from two streams at once.
  
  ## Data contract
-diff --git a/_build_utils.py b/_build_utils.py
+diff --git a/b/python/fmha_sm100/prefill_q8kv4/_build_utils.py b/python/fmha_sm100/prefill_q8kv4/_build_utils.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2a5ba869823a608636e8ee09e890abad1371e86d
+index 0000000..2a5ba86
 --- /dev/null
-+++ b/_build_utils.py
++++ b/python/fmha_sm100/prefill_q8kv4/_build_utils.py
 @@ -0,0 +1,318 @@
 +# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -617,11 +890,11 @@ index 0000000000000000000000000000000000000000..2a5ba869823a608636e8ee09e890abad
 +    "require_cuda_version",
 +    "target_arch",
 +]
-diff --git a/_jit_cache.py b/_jit_cache.py
+diff --git a/b/python/fmha_sm100/prefill_q8kv4/_jit_cache.py b/python/fmha_sm100/prefill_q8kv4/_jit_cache.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..fc88195fc2e57ab23ab58efe857433d0e8be8fb9
+index 0000000..fc88195
 --- /dev/null
-+++ b/_jit_cache.py
++++ b/python/fmha_sm100/prefill_q8kv4/_jit_cache.py
 @@ -0,0 +1,312 @@
 +# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-License-Identifier: MIT
@@ -935,10 +1208,10 @@ index 0000000000000000000000000000000000000000..fc88195fc2e57ab23ab58efe857433d0
 +    if result.returncode != 0:
 +        raise RuntimeError(f"{label} compilation failed:\n"
 +                           f"stdout: {result.stdout}\nstderr: {result.stderr}")
-diff --git a/build.py b/build.py
-index 280ee6b8dd486a946e827771c324d4aeeb8efbbe..c2f283c4f44500364b6c246e002d9217de0482bd 100644
---- a/build.py
-+++ b/build.py
+diff --git a/python/fmha_sm100/prefill_q8kv4/build.py b/python/fmha_sm100/prefill_q8kv4/build.py
+index 280ee6b..c2f283c 100644
+--- a/python/fmha_sm100/prefill_q8kv4/build.py
++++ b/python/fmha_sm100/prefill_q8kv4/build.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1055,10 +1328,10 @@ index 280ee6b8dd486a946e827771c324d4aeeb8efbbe..c2f283c4f44500364b6c246e002d9217
  
 -__all__ = ["precompile"]
 +__all__ = ["build_aot", "precompile"]
-diff --git a/csrc/api/locality_domains.cu b/csrc/api/locality_domains.cu
-index 583c4ad51aa52aa7dabd6199ad160cc164267bf6..09dbefe9ab6f44b36573c884bf3effaa837f5697 100644
---- a/csrc/api/locality_domains.cu
-+++ b/csrc/api/locality_domains.cu
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/api/locality_domains.cu b/python/fmha_sm100/prefill_q8kv4/csrc/api/locality_domains.cu
+index 583c4ad..09dbefe 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/api/locality_domains.cu
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/api/locality_domains.cu
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1139,10 +1412,10 @@ index 583c4ad51aa52aa7dabd6199ad160cc164267bf6..09dbefe9ab6f44b36573c884bf3effaa
  
 -} // namespace fmha_sm100::prefill_q8kv4
 +} // namespace fmha_sm100::prefill_bf16x
-diff --git a/csrc/api/prefill_attention_api.cpp b/csrc/api/prefill_attention_api.cpp
-index e1f0a9fe05828351c0339ef93a4016233b81df98..4f7d6079217b1fcfd61432834a881e1973fd5239 100644
---- a/csrc/api/prefill_attention_api.cpp
-+++ b/csrc/api/prefill_attention_api.cpp
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_api.cpp b/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_api.cpp
+index e1f0a9f..4f7d607 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_api.cpp
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_api.cpp
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1227,10 +1500,10 @@ index e1f0a9fe05828351c0339ef93a4016233b81df98..4f7d6079217b1fcfd61432834a881e19
  
 -} // namespace fmha_sm100::prefill_q8kv4
 +} // namespace fmha_sm100::prefill_bf16x
-diff --git a/csrc/api/prefill_attention_api.hpp b/csrc/api/prefill_attention_api.hpp
-index b03cc68bdfa69cddd05949854f5dc78e9cd5029a..6a8c27fb171903de86de18a7b9d00ee0cc24baf1 100644
---- a/csrc/api/prefill_attention_api.hpp
-+++ b/csrc/api/prefill_attention_api.hpp
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_api.hpp b/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_api.hpp
+index b03cc68..6a8c27f 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_api.hpp
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_api.hpp
 @@ -1,11 +1,12 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1260,10 +1533,10 @@ index b03cc68bdfa69cddd05949854f5dc78e9cd5029a..6a8c27fb171903de86de18a7b9d00ee0
  
 -}  // namespace fmha_sm100::prefill_q8kv4
 +}  // namespace fmha_sm100::prefill_bf16x
-diff --git a/csrc/api/prefill_attention_binding.cpp b/csrc/api/prefill_attention_binding.cpp
-index 2057ad9bc3a70f23cd0d178f0df8da83e0c5eab0..7e3b8e83984af787001cd4bdcab3cf5016eef3a4 100644
---- a/csrc/api/prefill_attention_binding.cpp
-+++ b/csrc/api/prefill_attention_binding.cpp
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_binding.cpp b/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_binding.cpp
+index 2057ad9..7e3b8e8 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_binding.cpp
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/api/prefill_attention_binding.cpp
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1302,10 +1575,10 @@ index 2057ad9bc3a70f23cd0d178f0df8da83e0c5eab0..7e3b8e83984af787001cd4bdcab3cf50
               "Device buffer whose pages alternate between the locality domains",
               py::arg("bytes"), py::arg("device"));
  }
-diff --git a/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh b/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh
-index 37c003047aae67f2b73f940e6dd04ac287dbd2a1..3a1a343bccc8f398326b38654a54c0ea98bf2a98 100644
---- a/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh
-+++ b/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh
+index 37c0030..3a1a343 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/collective/sm100_prefill_attention_fp4_transform.cuh
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1524,10 +1797,10 @@ index 37c003047aae67f2b73f940e6dd04ac287dbd2a1..3a1a343bccc8f398326b38654a54c0ea
 +#endif  // FMHA_SM100_PREFILL_BF16X_DTYPE == 1
 +
 +}  // namespace fmha_sm100::prefill_bf16x::detail
-diff --git a/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh b/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh
-index a68d061e7633e05a6aed40c5e2c9886755a7cc24..3ca9ae07400edf28f4027cb320c105995fea37a4 100644
---- a/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh
-+++ b/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh
+index a68d061..3ca9ae0 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/collective/sm100_prefill_attention_mainloop.cuh
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1700,11 +1973,11 @@ index a68d061e7633e05a6aed40c5e2c9886755a7cc24..3ca9ae07400edf28f4027cb320c10599
  } // namespace detail
 -} // namespace fmha_sm100::prefill_q8kv4
 +} // namespace fmha_sm100::prefill_bf16x
-diff --git a/csrc/include/sm100/common/nvfp4_to_bf16.cuh b/csrc/include/sm100/common/nvfp4_to_bf16.cuh
+diff --git a/b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/nvfp4_to_bf16.cuh b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/nvfp4_to_bf16.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..a4ed8a986c9da54769fb832eb9020d88042c0fbc
+index 0000000..a4ed8a9
 --- /dev/null
-+++ b/csrc/include/sm100/common/nvfp4_to_bf16.cuh
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/nvfp4_to_bf16.cuh
 @@ -0,0 +1,118 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1824,10 +2097,10 @@ index 0000000000000000000000000000000000000000..a4ed8a986c9da54769fb832eb9020d88
 +}
 +
 +}  // namespace fmha_sm100::prefill_bf16x::sm100::common
-diff --git a/csrc/include/sm100/common/nvfp4_to_e4m3.cuh b/csrc/include/sm100/common/nvfp4_to_e4m3.cuh
-index 68da91a0074e8ca514647dea3d2b4280740c4c6c..e67261156edc64b42dfba85b6c772824ecbbceac 100644
---- a/csrc/include/sm100/common/nvfp4_to_e4m3.cuh
-+++ b/csrc/include/sm100/common/nvfp4_to_e4m3.cuh
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/nvfp4_to_e4m3.cuh b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/nvfp4_to_e4m3.cuh
+index 68da91a..e672611 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/nvfp4_to_e4m3.cuh
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/nvfp4_to_e4m3.cuh
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1935,10 +2208,10 @@ index 68da91a0074e8ca514647dea3d2b4280740c4c6c..e67261156edc64b42dfba85b6c772824
 +}
 +
 +}  // namespace fmha_sm100::prefill_bf16x::sm100::common
-diff --git a/csrc/include/sm100/common/prefill_attention_config.cuh b/csrc/include/sm100/common/prefill_attention_config.cuh
-index 5d55a306d3852d002eeb47d390675a59bf787dc1..734b54b2f1bbfab7f6a615b7977a3243bb49dbce 100644
---- a/csrc/include/sm100/common/prefill_attention_config.cuh
-+++ b/csrc/include/sm100/common/prefill_attention_config.cuh
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/prefill_attention_config.cuh b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/prefill_attention_config.cuh
+index 5d55a30..734b54b 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/prefill_attention_config.cuh
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/prefill_attention_config.cuh
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -2054,10 +2327,10 @@ index 5d55a306d3852d002eeb47d390675a59bf787dc1..734b54b2f1bbfab7f6a615b7977a3243
  
 -} // namespace fmha_sm100::prefill_q8kv4::detail
 +} // namespace fmha_sm100::prefill_bf16x::detail
-diff --git a/csrc/include/sm100/common/prefill_attention_math.cuh b/csrc/include/sm100/common/prefill_attention_math.cuh
-index a8785da9d22c6304e5ec9f0b1857d82eab5319ed..7dcbd2cd82df815f17a6a89e60d104acd364363f 100644
---- a/csrc/include/sm100/common/prefill_attention_math.cuh
-+++ b/csrc/include/sm100/common/prefill_attention_math.cuh
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/prefill_attention_math.cuh b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/prefill_attention_math.cuh
+index a8785da..7dcbd2c 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/prefill_attention_math.cuh
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/prefill_attention_math.cuh
 @@ -1,9 +1,13 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -2401,10 +2674,10 @@ index a8785da9d22c6304e5ec9f0b1857d82eab5319ed..7dcbd2cd82df815f17a6a89e60d104ac
  } // namespace detail
 -} // namespace fmha_sm100::prefill_q8kv4
 +} // namespace fmha_sm100::prefill_bf16x
-diff --git a/csrc/include/sm100/common/sm107_mma_ts.cuh b/csrc/include/sm100/common/sm107_mma_ts.cuh
-index fa5a400f26f315db6670cf685df5932d9bb5557a..ef53314e288f6b30b1121fc929d264b18c3a80fd 100644
---- a/csrc/include/sm100/common/sm107_mma_ts.cuh
-+++ b/csrc/include/sm100/common/sm107_mma_ts.cuh
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/sm107_mma_ts.cuh b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/sm107_mma_ts.cuh
+index fa5a400..ef53314 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/sm107_mma_ts.cuh
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/common/sm107_mma_ts.cuh
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -2563,10 +2836,10 @@ index fa5a400f26f315db6670cf685df5932d9bb5557a..ef53314e288f6b30b1121fc929d264b1
  
 -#endif // FMHA_SM100_PREFILL_Q8KV4_SM107
 +#endif // FMHA_SM100_PREFILL_BF16X_SM107
-diff --git a/csrc/include/sm100/device/prefill_attention.hpp b/csrc/include/sm100/device/prefill_attention.hpp
-index 25da849e9589e7fe1e64fb4d3cf8105bb5e4c95e..03b2b6a43699bd850667642e08c1bad289f78463 100644
---- a/csrc/include/sm100/device/prefill_attention.hpp
-+++ b/csrc/include/sm100/device/prefill_attention.hpp
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/device/prefill_attention.hpp b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/device/prefill_attention.hpp
+index 25da849..03b2b6a 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/device/prefill_attention.hpp
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/device/prefill_attention.hpp
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -2614,10 +2887,10 @@ index 25da849e9589e7fe1e64fb4d3cf8105bb5e4c95e..03b2b6a43699bd850667642e08c1bad2
  
 -} // namespace fmha_sm100::prefill_q8kv4
 +} // namespace fmha_sm100::prefill_bf16x
-diff --git a/csrc/include/sm100/device/prefill_attention_launch.cuh b/csrc/include/sm100/device/prefill_attention_launch.cuh
-index 3876fd82749ff756e04c417bb16e66cd4b5ceafc..9fd7031408f91801c859d99f0bd092f97b090040 100644
---- a/csrc/include/sm100/device/prefill_attention_launch.cuh
-+++ b/csrc/include/sm100/device/prefill_attention_launch.cuh
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/device/prefill_attention_launch.cuh b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/device/prefill_attention_launch.cuh
+index 3876fd8..9fd7031 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/device/prefill_attention_launch.cuh
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/device/prefill_attention_launch.cuh
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -2742,10 +3015,10 @@ index 3876fd82749ff756e04c417bb16e66cd4b5ceafc..9fd7031408f91801c859d99f0bd092f9
  
 -} // namespace fmha_sm100::prefill_q8kv4
 +} // namespace fmha_sm100::prefill_bf16x
-diff --git a/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh b/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh
-index b3aaafa7c79cce1fe89ad6f2edbc44ef96222a73..0b30f6594217b47cf6a57c1e9446cd6153496d07 100644
---- a/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh
-+++ b/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh
+index b3aaafa..0b30f65 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/kernel/sm100_prefill_attention_kernel.cuh
 @@ -1,11 +1,12 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -2766,10 +3039,10 @@ index b3aaafa7c79cce1fe89ad6f2edbc44ef96222a73..0b30f6594217b47cf6a57c1e9446cd61
  
 -}  // namespace fmha_sm100::prefill_q8kv4::detail
 +}  // namespace fmha_sm100::prefill_bf16x::detail
-diff --git a/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh b/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh
-index a466ab511134477fec7153e57f5b70dff13173b0..3abd742f74d9b59b295d46a03db3c964c505a772 100644
---- a/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh
-+++ b/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh
+index a466ab5..3abd742 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/include/sm100/kernel/sm100_prefill_attention_shared_storage.cuh
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -2800,10 +3073,10 @@ index a466ab511134477fec7153e57f5b70dff13173b0..3abd742f74d9b59b295d46a03db3c964
  
 -}  // namespace fmha_sm100::prefill_q8kv4::detail
 +}  // namespace fmha_sm100::prefill_bf16x::detail
-diff --git a/csrc/templates/prefill_attention_inst.cu.jinja b/csrc/templates/prefill_attention_inst.cu.jinja
-index cbfe28ac5fd1036ea07cbc042356f65c902f7c87..ec2e46f8256aa72e76e5e7b3fcd81832eb8e6335 100644
---- a/csrc/templates/prefill_attention_inst.cu.jinja
-+++ b/csrc/templates/prefill_attention_inst.cu.jinja
+diff --git a/python/fmha_sm100/prefill_q8kv4/csrc/templates/prefill_attention_inst.cu.jinja b/python/fmha_sm100/prefill_q8kv4/csrc/templates/prefill_attention_inst.cu.jinja
+index cbfe28a..ec2e46f 100644
+--- a/python/fmha_sm100/prefill_q8kv4/csrc/templates/prefill_attention_inst.cu.jinja
++++ b/python/fmha_sm100/prefill_q8kv4/csrc/templates/prefill_attention_inst.cu.jinja
 @@ -1,9 +1,10 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -2822,10 +3095,10 @@ index cbfe28ac5fd1036ea07cbc042356f65c902f7c87..ec2e46f8256aa72e76e5e7b3fcd81832
  
 -}  // namespace fmha_sm100::prefill_q8kv4
 +}  // namespace fmha_sm100::prefill_bf16x
-diff --git a/interface.py b/interface.py
-index bb5fa95636be775e0b86730335d37db5c58b0aea..f065fed6df8af0fb06692ea78372ea878483110b 100644
---- a/interface.py
-+++ b/interface.py
+diff --git a/python/fmha_sm100/prefill_q8kv4/interface.py b/python/fmha_sm100/prefill_q8kv4/interface.py
+index bb5fa95..c41c96e 100644
+--- a/python/fmha_sm100/prefill_q8kv4/interface.py
++++ b/python/fmha_sm100/prefill_q8kv4/interface.py
 @@ -1,10 +1,14 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -2883,8 +3156,8 @@ index bb5fa95636be775e0b86730335d37db5c58b0aea..f065fed6df8af0fb06692ea78372ea87
      """Return fmha_sm100's k2q CSR builder and split combine (the CuTe-DSL sparse stack)."""
 -    from .. import sparse  # noqa: F401  (puts the cute/ modules on sys.path)
 -    from src.sm100.fwd.combine import combine
-+    from ..fmha_sm100 import sparse
-+    from ..fmha_sm100.cute.src.sm100.fwd.combine import combine
++    from fmha_sm100 import sparse
++    from fmha_sm100.cute.src.sm100.fwd.combine import combine
  
      return sparse.build_k2q_csr, combine
  
@@ -2898,7 +3171,7 @@ index bb5fa95636be775e0b86730335d37db5c58b0aea..f065fed6df8af0fb06692ea78372ea87
  def _locality_hints_type():
 -    from .. import sparse  # noqa: F401  (puts the cute/ modules on sys.path)
 -    from src.sm100.fwd.combine import LocalityHints
-+    from ..fmha_sm100.cute.src.sm100.fwd.combine import LocalityHints
++    from fmha_sm100.cute.src.sm100.fwd.combine import LocalityHints
  
      return LocalityHints
  
@@ -3133,10 +3406,10 @@ index bb5fa95636be775e0b86730335d37db5c58b0aea..f065fed6df8af0fb06692ea78372ea87
          _check_same_device(topk_indices, page_table, name="page_table")
          batch = cu_seqlens_q.numel() - 1
          _check_page_table(page_table, kv_indptr, batch=batch)
-diff --git a/jit.py b/jit.py
-index e19e1676e9bbfb8c0fee215b8f2cbedf50a1cb63..695b20223f1aac9eec6770a0e0cbceb25714d5a9 100644
---- a/jit.py
-+++ b/jit.py
+diff --git a/python/fmha_sm100/prefill_q8kv4/jit.py b/python/fmha_sm100/prefill_q8kv4/jit.py
+index e19e167..e60f0a8 100644
+--- a/python/fmha_sm100/prefill_q8kv4/jit.py
++++ b/python/fmha_sm100/prefill_q8kv4/jit.py
 @@ -1,7 +1,8 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -3326,7 +3599,7 @@ index e19e1676e9bbfb8c0fee215b8f2cbedf50a1cb63..695b20223f1aac9eec6770a0e0cbceb2
          recipe = self.recipe()
          library = recipe.lookup()
          if library is not None:
-@@ -262,41 +305,127 @@ class JitSpec:
+@@ -262,41 +305,132 @@ class JitSpec:
          finally:
              cpp_extension.CUDA_HOME = previous_cuda_home
          logger.info(
@@ -3389,9 +3662,14 @@ index e19e1676e9bbfb8c0fee215b8f2cbedf50a1cb63..695b20223f1aac9eec6770a0e0cbceb2
 +
 +
 +def _aot_dir() -> Path:
-+    # This file is tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/prefill_bf16x/jit.py.
-+    default = Path(os.path.abspath(__file__)).parents[7] / "libs" / "msa_fmha_sm100" / "prefill_bf16x"
-+    return Path(os.environ.get(E4M3X_AOT_DIR_ENV) or default)
++    explicit = os.environ.get(E4M3X_AOT_DIR_ENV)
++    if explicit:
++        return Path(explicit)
++    # This package installs next to tensorrt_llm; the directory is looked up without importing tensorrt_llm.
++    spec = importlib.util.find_spec("tensorrt_llm")
++    if spec is None or spec.origin is None:
++        return Path(os.devnull)
++    return Path(spec.origin).resolve().parent / "libs" / "msa_fmha_sm100" / "prefill_bf16x"
 +
 +
 +def prebuilt_available(device=None, block_scale_shift: int = 0, data_path: str = E4M3_DATA_PATH) -> bool:

@@ -54,11 +54,8 @@ from .m31_switches import m31_disabled, m31_enabled
 IDX_SCORER = not m31_disabled("DEP2CTX_IDX_SCORER")
 # Not bitwise: an opt-in (see the header).
 IDX_SCORER_K64 = m31_enabled("DEP2CTX_IDX_SCORER_K64")
-# The vendored scorer's interface module (MSA names the path).
-SCORER_MODULE = (
-    "tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels."
-    "fmha_sm100_q8kv8.q8_indexer_interface"
-)
+# The scorer's interface module (MSA's Q8KV8 indexer package, fetched as the msa_vllm dependency).
+SCORER_MODULE = "fmha_sm100_q8kv8.q8_indexer_interface"
 PAGE = 128  # capacity: fixed: the index-K cache page size the scorer is built for
 HEAD_DIM = 128  # capacity: fixed: the index head size the scorer is built for
 MAX_PAGES = 8192  # capacity: fixed: the scorer's block-table width bound (it raises past it)
@@ -97,9 +94,7 @@ def _module():
     try:
         # The scorer is a CuTe DSL kernel: the image's cutlass DSL needs the MSA compatibility shim first.
         install_msa_cutlass_compatibility()
-        mod = importlib.import_module(
-            "tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels.fmha_sm100_q8kv8.q8_indexer_interface"
-        )
+        mod = importlib.import_module(SCORER_MODULE)
         prefill = mod.Q8KV8PrefillIndexerSm100
         mma_k = prefill.mma_inst_k((10, 7))
         exact = not prefill.uses_sm107_fp8_mma((10, 7)) and mma_k == 32

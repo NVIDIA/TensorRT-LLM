@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MSA (fmha_sm100) helpers of the family's MiniMax-M3.1 MSA backend: the vendored ``kernels/msa_kernels/fmha_sm100``
-module, paged-cache views and per-step host tables."""
+"""MSA (fmha_sm100) helpers of the family's MiniMax-M3.1 MSA backend: the packaged ``fmha_sm100`` module, paged-cache
+views and per-step host tables."""
 
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cach
 )
 from tensorrt_llm._utils import is_sm_100f, maybe_pin_memory
 
-# The MSA kernels (MiniMax fmha_sm100) vendored in-tree; see 3rdparty/vendor_sources.lock.yaml.
-MSA_MODULE = "tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels.fmha_sm100"
+# The MSA kernels (MiniMax fmha_sm100) packaged with TensorRT-LLM; see the msa entry of 3rdparty/fetch_content.json.
+MSA_MODULE = "fmha_sm100"
 
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
 # selects topk 16. Callers enforce these early so a misconfiguration fails
@@ -55,7 +55,7 @@ def is_msa_layer(attn) -> bool:
 
 
 def install_msa_cutlass_compatibility() -> None:
-    """Provide the legacy CuTe DSL names the vendored MSA sources still reference.
+    """Provide the legacy CuTe DSL names the MSA sources still reference.
 
     The MSA CuTe kernels annotate with ``cute.core.ThrMma`` / ``cute.core.ThrCopy``, which newer CUTLASS DSL releases
     only expose as ``cute.ThrMma`` / ``cute.ThrCopy``, and call ``cute.make_fragment``, now ``cute.make_rmem_tensor``.
@@ -84,7 +84,7 @@ def msa_package_available() -> bool:
     """
     _install_msa_cutlass_compatibility()
     try:
-        from ...kernels.msa_kernels import fmha_sm100  # noqa: F401
+        import fmha_sm100  # noqa: F401
     except ImportError:
         return False
     return True
@@ -99,7 +99,7 @@ def require_msa_module() -> types.ModuleType:
     """
     _install_msa_cutlass_compatibility()
     try:
-        from ...kernels.msa_kernels import fmha_sm100
+        import fmha_sm100
     except ImportError as exc:
         raise RuntimeError(
             "MiniMax-M3 MSA attention requires the fmha_sm100 kernels packaged "

@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Build the vendored MSA q2k -> k2q CSR builder (build_k2q_csr.cu) ahead of time.
+"""Build the MSA q2k -> k2q CSR builder (build_k2q_csr.cu) ahead of time.
 
-The vendored module compiles it on first import with torch.utils.cpp_extension.load; this runs
+The fmha_sm100 module compiles it on first import with torch.utils.cpp_extension.load; this runs
 the same build, with the same flags, at build time without loading the library
-(torch_extension_aot.py) and places the extension where the vendored module looks for an
+(torch_extension_aot.py) and places the extension where the module looks for an
 ahead-of-time build first.
 usage: build_k2q_extension.py <build_k2q_csr.cu> <output dir> <build dir>
 """
@@ -27,7 +27,7 @@ from pathlib import Path
 
 from torch_extension_aot import build_extension
 
-# The vendored module's _extra_cflags / _extra_cuda_cflags: keep in sync with
+# The module's _extra_cflags / _extra_cuda_cflags: keep in sync with
 # fmha_sm100/cute/src/sm100/build_k2q_csr/__init__.py.
 _EXTRA_CFLAGS = ["-O3"]
 _EXTRA_CUDA_CFLAGS = [

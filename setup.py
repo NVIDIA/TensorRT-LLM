@@ -213,20 +213,15 @@ package_data += [
     'grpc/openengine/proto/openengine/v1/*.proto',
 ]
 
-# Non-Python sources and notices of the MSA kernels the MiniMax-M3.1 targets compile at run time.
-_MSA_KERNELS = '_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels'
-package_data += [
-    f'{_MSA_KERNELS}/fmha_sm100/LICENSE',
-    f'{_MSA_KERNELS}/fmha_sm100/NOTICE',
-    f'{_MSA_KERNELS}/fmha_sm100/csrc/**/*',
-    f'{_MSA_KERNELS}/fmha_sm100/cute/src/**/*.cu',
-    f'{_MSA_KERNELS}/prefill_bf16x/LICENSE',
-    f'{_MSA_KERNELS}/prefill_bf16x/NOTICE',
-    f'{_MSA_KERNELS}/prefill_bf16x/README.md',
-    f'{_MSA_KERNELS}/prefill_bf16x/csrc/**/*',
-    f'{_MSA_KERNELS}/fmha_sm100_q8kv8/LICENSE',
-    f'{_MSA_KERNELS}/fmha_sm100_q8kv8/NOTICE',
-]
+# MSA packages staged under 3rdparty/ by scripts/build_wheel.py from the msa_vllm
+# FetchContent tree (the MiniMax-M3.1 Q8KV8 index scorer and BF16X sparse
+# prefill). Optional in precompiled installs: a wheel built before them lacks
+# them, and the MiniMax-M3.1 paths that use them then report them unavailable.
+MSA_VLLM_PACKAGES = {
+    "fmha_sm100_q8kv8": ['*.py', 'src/**/*', 'LICENSE', 'NOTICE'],
+    "fmha_sm100_prefill_bf16x":
+    ['*.py', 'csrc/**/*', 'LICENSE', 'NOTICE', 'README.md'],
+}
 
 
 def download_precompiled(workspace: str, version: str) -> str:
@@ -266,7 +261,6 @@ def should_skip_precompiled_package_data(filename: str) -> bool:
     return filename.startswith((
         "tensorrt_llm/grpc/openengine/_generated/",
         "tensorrt_llm/grpc/openengine/proto/",
-        "tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/",
     ))
 
 
@@ -478,6 +472,25 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                 shutil.rmtree(dst_fmha)
             shutil.copytree(source_fmha, dst_fmha)
 
+        for msa_package in MSA_VLLM_PACKAGES:
+            source_msa = os.path.join(precompiled_location, "3rdparty",
+                                      msa_package)
+            dst_msa = os.path.join("3rdparty", msa_package)
+            if os.path.islink(dst_msa):
+                os.unlink(dst_msa)
+            elif os.path.isdir(dst_msa):
+                shutil.rmtree(dst_msa)
+            if not os.path.isdir(source_msa):
+                continue
+            if link_artifacts:
+                print(f"Linking {msa_package} from local directory: "
+                      f"{source_msa}")
+                os.symlink(source_msa, dst_msa)
+            else:
+                print(f"Copying {msa_package} from local directory: "
+                      f"{source_msa}")
+                shutil.copytree(source_msa, dst_msa)
+
         source_nccl_extensions = os.path.join(precompiled_location, "3rdparty",
                                               "nccl_extensions")
         if os.path.isdir(source_nccl_extensions):
@@ -556,6 +569,12 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             os.unlink(dst_fmha)
         elif os.path.isdir(dst_fmha):
             shutil.rmtree(dst_fmha)
+        for msa_package in MSA_VLLM_PACKAGES:
+            dst_msa = os.path.join("3rdparty", msa_package)
+            if os.path.islink(dst_msa):
+                os.unlink(dst_msa)
+            elif os.path.isdir(dst_msa):
+                shutil.rmtree(dst_msa)
         dst_nccl_extensions = os.path.join("3rdparty", "nccl_extensions")
         if os.path.islink(dst_nccl_extensions):
             os.unlink(dst_nccl_extensions)
@@ -573,7 +592,9 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
 
             # Top-level MSA package in the wheel; stage under 3rdparty for
             # setuptools package_dir, matching scripts/build_wheel.py.
-            if file.filename.startswith("fmha_sm100/"):
+            if file.filename.startswith(
+                    tuple(f"{name}/"
+                          for name in ("fmha_sm100", *MSA_VLLM_PACKAGES))):
                 print(
                     f"Extracting and including {file.filename} from precompiled wheel."
                 )
@@ -643,6 +664,12 @@ packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 # CMake FetchContent tree (same packaging role as tensorrt_llm/deep_ep).
 package_dirs = {"fmha_sm100": "3rdparty/fmha_sm100"}
 packages += ["fmha_sm100"]
+msa_vllm_package_data = {}
+for msa_package, msa_package_patterns in MSA_VLLM_PACKAGES.items():
+    if Path("3rdparty", msa_package).is_dir():
+        package_dirs[msa_package] = f"3rdparty/{msa_package}"
+        packages += [msa_package]
+        msa_vllm_package_data[msa_package] = msa_package_patterns
 
 # NCCL-EP is staged from the source-built nccl-extensions wheel under
 # 3rdparty/. Its ``nccl`` package is a namespace shared with nccl4py, so
@@ -719,6 +746,8 @@ setup(
         package_data,
         'triton_kernels': ['LICENSE', 'VERSION', 'README.md'],
         'fmha_sm100': [
+            'LICENSE',
+            'NOTICE',
             '*.py',
             'csrc/**/*',
             'cute/**/*',
@@ -726,6 +755,7 @@ setup(
             'cutlass/tools/util/include/**/*',
             'cutlass/LICENSE.txt',
         ],
+        **msa_vllm_package_data,
         **nccl_extensions_package_data,
     },
     license_files=get_license(),

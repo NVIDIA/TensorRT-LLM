@@ -4852,7 +4852,7 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
             reader = Nvfp4IndexDecodeScorer(self.index_heads)
             if not reader.available():
                 raise RuntimeError(
-                    "indexer_kv_dtype='nvfp4' needs the vendored fmha_sm100_q8kv8 package with run_scores_hpr (v3h)"
+                    "indexer_kv_dtype='nvfp4' needs the fmha_sm100_q8kv8 package with run_scores_hpr (v3h)"
                 )
             times["nvfp4_reader_qlens"] = reader.prebuild(
                 self.w["embed"].device, self.decode_query_lens()

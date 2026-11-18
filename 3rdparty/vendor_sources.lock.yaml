@@ -23,64 +23,6 @@ vendors:
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:5e19fc304c3152e940fa1a6b29b4e6a2ca10c0a73770f2648fbdda7576a8a73c
     digest: sha256-tree-v1:61ef68ca3a7d0a4df92c4dd5146e6c26c0a3fffa1a6a0664c4d4e4a9a7cf6e0d
-  msa-m31-fmha-sm100:
-    url: https://gitlab.com/nvidia/tensorrt-llm/oss-components/msa.git
-    branch: main
-    commit: e2ebe7656649f619af0ad1d457b534283034655e
-    source: python/fmha_sm100
-    destination: tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100
-    include:
-    - LICENSE
-    - NOTICE
-    - __init__.py
-    - api.py
-    - jit.py
-    - sparse.py
-    - sparse_fmha_adapter.py
-    - csrc/**/*
-    - cute/__init__.py
-    - cute/fp4_indexer_interface.py
-    - cute/interface.py
-    - cute/quantize.py
-    - cute/sparse_index_utils.py
-    - cute/src/**/*
-    patch: 3rdparty/vendor_patches/msa-m31-fmha-sm100.patch
-    patch_digest: sha256:e3fff0eb3bc416ffdab5bdd41a1218c3c25a14bb42ba84fa02c0fe3a4ee491bd
-    digest: sha256-tree-v1:8ff7a3e1c209d4c2ec48cf80d6796ecf94c359c3ba93d1b2be6876f1b445b853
-  msa-m31-prefill-bf16x:
-    url: https://github.com/vllm-project/MSA.git
-    branch: dev
-    commit: 25c144700f727b638067e98066a60507081b63ad
-    source: python/fmha_sm100/prefill_q8kv4
-    destination: tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/prefill_bf16x
-    include:
-    - '**/*'
-    patch: 3rdparty/vendor_patches/msa-m31-prefill-bf16x.patch
-    patch_digest: sha256:a0ba7eba2198d3e5f4fb9f52b8d8b3be43ac990a10ec00a747196eb590469d8c
-    digest: sha256-tree-v1:88976bdd67858fce0bd5b1512f3780dfd9790f1e97be709fb981322c148a15b1
-  msa-m31-q8kv8-indexer:
-    url: https://github.com/vllm-project/MSA.git
-    branch: dev
-    commit: 25c144700f727b638067e98066a60507081b63ad
-    source: python/fmha_sm100/cute
-    destination: tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100_q8kv8
-    include:
-    - LICENSE
-    - NOTICE
-    - __init__.py
-    - q8_indexer_interface.py
-    - src/__init__.py
-    - src/common/__init__.py
-    - src/common/aot_cache.py
-    - src/common/utils.py
-    - src/sm100/__init__.py
-    - src/sm100/q8kv4_indexer_decode.py
-    - src/sm100/q8kv8_indexer_decode.py
-    - src/sm100/q8kv8_indexer_prefill.py
-    - src/sm100/q8kv8_indexer_prefill_plan.py
-    patch: 3rdparty/vendor_patches/msa-m31-q8kv8-indexer.patch
-    patch_digest: sha256:e1e0a81e85bc0c7590500a19edadb2b09af2525e779c439da877363eea95429e
-    digest: sha256-tree-v1:c7fac3cfa16767caa4bf273362411f2253407070c21565d0fa8a218a6d1514ba
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

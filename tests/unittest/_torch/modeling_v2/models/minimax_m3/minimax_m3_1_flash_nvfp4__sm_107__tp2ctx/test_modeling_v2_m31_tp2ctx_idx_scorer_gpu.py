@@ -4,7 +4,7 @@
 registered (``prefill_scorer_hook``, which the backend calls through ``select_prefill_hooked`` ahead of the proxy path)
 equal the tables of the fmha_sm100 proxy pass, on single and multi-request prefill steps, prefixes off the page grid
 and wide-range scales; the hook declines (the proxy runs) on BF16 operands and on rows not aligned bottom-right. GPU;
-needs the vendored scorer module and an MSA indexer with the hook, else skipped.
+needs the scorer module (fmha_sm100_q8kv8) and an MSA indexer with the hook, else skipped.
 """
 
 import functools

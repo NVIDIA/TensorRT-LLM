@@ -2721,8 +2721,6 @@ class MiniMaxM3Tp4ModelingV2(DecoderModel):
 
         # One MSA attention backend per layer (dense and sparse; the step metadata is the backend's).
         quant_config = model_config.get_quant_config()
-        # main's MSA classes run the family's vendored fmha_sm100 (msa.engine).
-        _msa_engine.route_stock_msa_to_vendored()
         self.attn: List[MiniMaxM3MsaSparseAttention] = []
         for i in range(self.num_layers):
             backend = create_attention(

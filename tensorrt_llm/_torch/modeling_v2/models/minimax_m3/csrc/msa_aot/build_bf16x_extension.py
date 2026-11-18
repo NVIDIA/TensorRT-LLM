@@ -12,12 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Build the vendored MSA BF16X / E4M3X sparse-prefill forward (msa_kernels/prefill_bf16x) ahead of time.
+"""Build the MSA BF16X / E4M3X sparse-prefill forward (fmha_sm100_prefill_bf16x) ahead of time.
 
-The vendored package compiles it on first use (prefill_bf16x/jit.py, JitSpec) with torch.utils.cpp_extension.load; this
+The package compiles it on first use (its jit.py, JitSpec) with torch.utils.cpp_extension.load; this
 runs the same build at build time, without loading the library (torch_extension_aot.py), for the one spec the
 MiniMax-M3.1 targets serve: the E4M3 data path as the E4M3X transcription, block-scale shift 0, the packed-FP16 dequant,
-sm_107a. The library lands where prefill_bf16x/jit.py's AOT loader looks for it.
+sm_107a. The library lands where the package's jit.py AOT loader looks for it.
 usage: build_bf16x_extension.py <prefill_bf16x dir> <CUTLASS root> <output dir> <build dir>
 """
 

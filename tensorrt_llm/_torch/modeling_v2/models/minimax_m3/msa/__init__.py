@@ -4,7 +4,7 @@
 
 * ``msa_backend``, ``msa_indexer``, ``msa_prefill``, ``msa_decode``: the family's MSA attention backend, its indexer
   and its context / generation FMHA libraries. Each class derives from main's MiniMax-M3 MSA class of the same role
-  and runs the family's paths (vendored ``kernels/msa_kernels/fmha_sm100``, lazy proxy and dense plans, NVFP4 readers,
+  and runs the family's paths (the packaged ``fmha_sm100``, lazy proxy and dense plans, NVFP4 readers,
   prefill scorer hook, split prefill workspace, k2q CSR schedule).
 * ``cache_manager``: main's MiniMax-M3 KV cache manager plus the NVFP4 index-K cache.
 * ``engine``: how the targets select these classes (``RuntimeHooks.sparse_attention``).

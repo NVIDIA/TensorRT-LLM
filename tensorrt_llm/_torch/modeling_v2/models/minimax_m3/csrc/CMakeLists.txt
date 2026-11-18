@@ -99,9 +99,8 @@ add_modeling_v2_target(
   ARCHS 100f 107a
   REQUIRES MULTI_DEVICE)
 
-# msa_aot/: the opt-in ahead-of-time build of the MSA kernels the family vendors
-# in kernels/msa_kernels (BUILD_MSA_AOT, off by default: they compile at run
-# time).
+# msa_aot/: the opt-in ahead-of-time build of the MSA kernels the MiniMax-M3.1
+# targets call (BUILD_MSA_AOT, off by default: they compile at run time).
 if(BUILD_MSA_AOT)
   add_subdirectory(msa_aot)
 endif()

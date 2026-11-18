@@ -14,7 +14,7 @@
 # limitations under the License.
 """Pack the MSA CuTe DSL objects a run compiled into an archive.
 
-The vendored MSA trees (msa_kernels/fmha_sm100, msa_kernels/fmha_sm100_q8kv8) export each CuTe DSL kernel they compile
+The MSA packages (fmha_sm100, fmha_sm100_q8kv8) export each CuTe DSL kernel they compile
 to their AOT cache (MM_SPARSE_ATTN_AOT_CACHE/<tree>/...). Pack a populated cache to carry it to other hosts of the
 same toolchain, and extract the archive into MM_SPARSE_ATTN_AOT_CACHE there; the caches read it before compiling.
 Objects are keyed by the toolchain and the kernel sources, so a stale one is never loaded. No archive ships with

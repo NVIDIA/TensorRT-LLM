@@ -196,16 +196,14 @@ def score_decode_rows(
     workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Index scores of decode rows straight from NVFP4 index-K pages, [heads, cols, rows * query_len] fp32 in the
-    selector's layout: the Q8KV4 decode reader (the vendored fmha_sm100_q8kv8; exact FP16 dequant, FP32 accumulation),
+    selector's layout: the Q8KV4 decode reader (fmha_sm100_q8kv8; exact FP16 dequant, FP32 accumulation),
     the reader every pure-decode step of the agg target uses. History pages are written; a row's local and later pages
     are left as allocated, which the selector never ranks (local blocks are forced).
 
     At query length 8 the reader writes its native layout [batch, 8 * heads, cols] (pages contiguous) and the result is
     a strided view of it (strides (cols, 1, heads * cols)): the same values as the hpr layout, which the selector reads
     with unit page stride. Other query lengths keep run_scores_hpr."""
-    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.msa_kernels.fmha_sm100_q8kv8 import (
-        q8_indexer_interface as qi,
-    )
+    from fmha_sm100_q8kv8 import q8_indexer_interface as qi
 
     batch, cols = int(block_table.shape[0]), int(block_table.shape[1])
     device = idx_q.device

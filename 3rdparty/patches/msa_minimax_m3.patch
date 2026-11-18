@@ -1,204 +1,7 @@
-diff --git a/LICENSE b/LICENSE
-new file mode 100644
-index 0000000000000000000000000000000000000000..132dd20ee3294d09a1c613a6bd4c8094c496fbf9
---- /dev/null
-+++ b/LICENSE
-@@ -0,0 +1,21 @@
-+MIT License
-+
-+Copyright (c) 2026 MiniMax
-+
-+Permission is hereby granted, free of charge, to any person obtaining a copy
-+of this software and associated documentation files (the "Software"), to deal
-+in the Software without restriction, including without limitation the rights
-+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-+copies of the Software, and to permit persons to whom the Software is
-+furnished to do so, subject to the following conditions:
-+
-+The above copyright notice and this permission notice shall be included in all
-+copies or substantial portions of the Software.
-+
-+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-+SOFTWARE.
-diff --git a/NOTICE b/NOTICE
-new file mode 100644
-index 0000000000000000000000000000000000000000..ed29295cd7c32f942a513bb8b0eedcbab15d7407
---- /dev/null
-+++ b/NOTICE
-@@ -0,0 +1,164 @@
-+fmha_sm100
-+Copyright (c) 2026 MiniMax
-+
-+This product includes software developed by third parties. See the
-+"Third-party licenses" section of README.md for the full list of bundled
-+and runtime-dependency components and license summaries. The
-+authoritative license text for each third-party component is shipped
-+with that component itself (vendored source headers, the LICENSE file
-+distributed with the pip-installed package, or the upstream project
-+repository).
-+
-+================================================================================
-+Bundled / derived source (shipped in this repository)
-+================================================================================
-+
-+This project bundles or derives from the following third-party components.
-+Each retains its original license and copyright. In compliance with the
-+BSD-3-Clause §2 and Apache-2.0 §4 redistribution clauses, the original
-+copyright notices and license terms are reproduced below (and are also
-+preserved at the top of every vendored source file via the
-+SPDX-License-Identifier header).
-+
-+--------------------------------------------------------------------------------
-+NVIDIA CUTLASS — BSD-3-Clause
-+--------------------------------------------------------------------------------
-+
-+Copyright (c) 2017-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-+
-+Redistribution and use in source and binary forms, with or without
-+modification, are permitted provided that the following conditions are met:
-+
-+  1. Redistributions of source code must retain the above copyright notice,
-+     this list of conditions and the following disclaimer.
-+  2. Redistributions in binary form must reproduce the above copyright notice,
-+     this list of conditions and the following disclaimer in the documentation
-+     and/or other materials provided with the distribution.
-+  3. Neither the name of the copyright holder nor the names of its
-+     contributors may be used to endorse or promote products derived from
-+     this software without specific prior written permission.
-+
-+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-+POSSIBILITY OF SUCH DAMAGE.
-+
-+Project:    https://github.com/NVIDIA/cutlass
-+Where:      python/fmha_sm100/cutlass/ (git submodule: include/ and
-+            tools/util/include/)
-+            plus BSD-3-tagged headers under python/fmha_sm100/csrc/include/.
-+            The SM100 MMA descriptor encodings in
-+            python/fmha_sm100/cute/src/common/mma_sm100_desc.py
-+            mirror NVIDIA CUTLASS hardware descriptors.
-+Full text:  python/fmha_sm100/cutlass/LICENSE.txt (submodule), or
-+            https://github.com/NVIDIA/cutlass/blob/main/LICENSE
-+
-+--------------------------------------------------------------------------------
-+FlashInfer — Apache License 2.0
-+--------------------------------------------------------------------------------
-+
-+Copyright (c) 2023-2025 by FlashInfer team.
-+
-+Licensed under the Apache License, Version 2.0 (the "License");
-+you may not use this file except in compliance with the License.
-+You may obtain a copy of the License at
-+
-+    https://www.apache.org/licenses/LICENSE-2.0
-+
-+Unless required by applicable law or agreed to in writing, software
-+distributed under the License is distributed on an "AS IS" BASIS,
-+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+See the License for the specific language governing permissions and
-+limitations under the License.
-+
-+Project:    https://github.com/flashinfer-ai/flashinfer
-+Where:      Apache-2.0-tagged sources under python/fmha_sm100/csrc/
-+            and python/fmha_sm100/csrc/include/ (e.g. allocator.h,
-+            exception.h, utils.cuh, cutlass_utils.cuh,
-+            fmha_cutlass_sm100.cuh, sparse_topk_select.cuh, plan.cuh,
-+            sm100_fmha_reduction.hpp, tvm_ffi_utils.h).
-+Full text:  https://www.apache.org/licenses/LICENSE-2.0
-+
-+--------------------------------------------------------------------------------
-+NVIDIA TensorRT-LLM — Apache License 2.0
-+--------------------------------------------------------------------------------
-+
-+Copyright (c) 2019-2026 NVIDIA CORPORATION. All rights reserved.
-+
-+Licensed under the Apache License, Version 2.0 (the "License");
-+you may not use this file except in compliance with the License.
-+You may obtain a copy of the License at
-+
-+    https://www.apache.org/licenses/LICENSE-2.0
-+
-+Unless required by applicable law or agreed to in writing, software
-+distributed under the License is distributed on an "AS IS" BASIS,
-+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+See the License for the specific language governing permissions and
-+limitations under the License.
-+
-+Project:    https://github.com/NVIDIA/TensorRT-LLM
-+Where:      python/fmha_sm100/csrc/include/sparse_topk_select.cuh
-+            portions of the indexerTopK histogram-step + insertion-sort
-+            algorithm, derived from
-+            tensorrt_llm/cpp/tensorrt_llm/kernels/indexerTopK.cu.
-+Full text:  https://www.apache.org/licenses/LICENSE-2.0
-+
-+--------------------------------------------------------------------------------
-+NAVER Corp. (CLOVA) — Apache License 2.0
-+--------------------------------------------------------------------------------
-+
-+Copyright (c) 2021 NAVER Corp.
-+Licensed under the Apache License, Version 2.0; you may not use this file
-+except in compliance with the License. You may obtain a copy of the
-+License at https://www.apache.org/licenses/LICENSE-2.0
-+
-+Project:    https://github.com/NAVER-CLOVA
-+Where:      Co-authored portions of
-+            python/fmha_sm100/csrc/include/sparse_topk_select.cuh
-+            (indexerTopK algorithm, alongside the NVIDIA copyright above).
-+Full text:  https://www.apache.org/licenses/LICENSE-2.0
-+
-+--------------------------------------------------------------------------------
-+Changes to bundled / derived source
-+--------------------------------------------------------------------------------
-+
-+This project does not modify the text of vendored third-party source files
-+beyond what is required to integrate them (path adjustments in
-+`#include` directives and minor macro renames to avoid collision with
-+project-local symbols; no semantic changes). All such integration
-+modifications are confined to `csrc/` and to the import shim under
-+`python/fmha_sm100/sparse.py`. The SM100 MMA descriptor encodings in
-+`python/fmha_sm100/cute/src/common/mma_sm100_desc.py` are
-+re-typed from the CUTLASS hardware descriptors — they are numerical
-+constants, not CUTLASS source code, but the original copyright is
-+attributed here for completeness.
-+
-+================================================================================
-+Runtime dependencies (installed via pip, not vendored)
-+================================================================================
-+
-+For runtime dependencies, the authoritative license text is distributed
-+with each installed package; consult `pip show <pkg>` for the license
-+metadata. The full list and license summaries are in the
-+"Third-party licenses" section of README.md.
-+
-+================================================================================
-+Trademarks
-+================================================================================
-+
-+NVIDIA, the NVIDIA logo, Blackwell, SM100, B200, B300, GB200, GB300,
-+TensorRT, TensorRT-LLM, cuDNN, cuBLAS, and CUDA are trademarks and/or
-+registered trademarks of NVIDIA Corporation. Apache, Apache TVM, and
-+Apache TVM FFI are trademarks of The Apache Software Foundation. All
-+other trademarks referenced in this project are the property of their
-+respective owners. The use of any trademark in this NOTICE or in
-+README.md is for identification purposes only and does not imply
-+endorsement.
-diff --git a/__init__.py b/__init__.py
-index 8b13a0d27e9aacd8dde1f494a63204c9a32d72eb..c808a65b8585573da3d12d485c0e923a88c93f39 100644
---- a/__init__.py
-+++ b/__init__.py
+diff --git a/python/fmha_sm100/__init__.py b/python/fmha_sm100/__init__.py
+index 8b13a0d..c808a65 100644
+--- a/python/fmha_sm100/__init__.py
++++ b/python/fmha_sm100/__init__.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -270,10 +73,10 @@ index 8b13a0d27e9aacd8dde1f494a63204c9a32d72eb..c808a65b8585573da3d12d485c0e923a
 -    pass
 +# TensorRT-LLM: this copy registers no global TVM-FFI functions. The packaged top-level fmha_sm100
 +# registers the minfer.ops.* names, and a second registration in the same process would fail.
-diff --git a/api.py b/api.py
-index b02f74736c63d58f6f29cc934027b34962e543cf..3be0aae0ddbec21f94f47281975fa3fbc66004f0 100644
---- a/api.py
-+++ b/api.py
+diff --git a/python/fmha_sm100/api.py b/python/fmha_sm100/api.py
+index b02f747..3be0aae 100644
+--- a/python/fmha_sm100/api.py
++++ b/python/fmha_sm100/api.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -897,10 +700,10 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..3be0aae0ddbec21f94f47281975fa3fb
              out.copy_(combined_out)
  
          # ---- Merge max_score ----
-diff --git a/csrc/fmha_sm100_inst.jinja b/csrc/fmha_sm100_inst.jinja
-index 69490350d3c11146c7800b4218612d5fff27d7b6..ec10e51cb5e8ce8d135269e9c8dc48b6d1ddc4d3 100644
---- a/csrc/fmha_sm100_inst.jinja
-+++ b/csrc/fmha_sm100_inst.jinja
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
+index 6949035..ec10e51 100644
+--- a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
++++ b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -946,10 +749,10 @@ index 69490350d3c11146c7800b4218612d5fff27d7b6..ec10e51cb5e8ce8d135269e9c8dc48b6
 +{% endif %}
 +  return run(cute::false_type{});
  }
-diff --git a/csrc/fmha_sm100_params.h b/csrc/fmha_sm100_params.h
-index 878a90c774900e961724a563ab75c6e72b448081..8972c64caf6d6e704a0ac7a907d1240ecadd3b0b 100644
---- a/csrc/fmha_sm100_params.h
-+++ b/csrc/fmha_sm100_params.h
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_params.h b/python/fmha_sm100/csrc/fmha_sm100_params.h
+index 878a90c..8972c64 100644
+--- a/python/fmha_sm100/csrc/fmha_sm100_params.h
++++ b/python/fmha_sm100/csrc/fmha_sm100_params.h
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -966,10 +769,10 @@ index 878a90c774900e961724a563ab75c6e72b448081..8972c64caf6d6e704a0ac7a907d1240e
    int pack_factor = 1;
    int h_r_original = 0;
    int q_stride_n_original = 0;
-diff --git a/csrc/fmha_sm100_variant_run.cu.jinja b/csrc/fmha_sm100_variant_run.cu.jinja
-index 7e21585130ae020ac88b04939126f0e2f5cbb827..ac0ac05eb179ddf92fbaa592840c98de00f5654d 100644
---- a/csrc/fmha_sm100_variant_run.cu.jinja
-+++ b/csrc/fmha_sm100_variant_run.cu.jinja
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
+index 7e21585..ac0ac05 100644
+--- a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
++++ b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
 @@ -1,9 +1,11 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1034,10 +837,10 @@ index 7e21585130ae020ac88b04939126f0e2f5cbb827..ac0ac05eb179ddf92fbaa592840c98de
    params.gmem_bounds.split_kv_size = maybe_kv_tile_begin_indices.has_value()
        ? static_cast<int>(maybe_kv_tile_begin_indices.value().size(0)) : 0;
    params.gmem_bounds.qo_offsets_size = maybe_qo_offsets.has_value()
-diff --git a/csrc/gmem_bounds_check.h b/csrc/gmem_bounds_check.h
-index 9d0e672bedbfa71f3334d271077ef3aa8c18d2b2..a2759e9149825307322ad6b36d6fc252cc457a4c 100644
---- a/csrc/gmem_bounds_check.h
-+++ b/csrc/gmem_bounds_check.h
+diff --git a/python/fmha_sm100/csrc/gmem_bounds_check.h b/python/fmha_sm100/csrc/gmem_bounds_check.h
+index 9d0e672..a2759e9 100644
+--- a/python/fmha_sm100/csrc/gmem_bounds_check.h
++++ b/python/fmha_sm100/csrc/gmem_bounds_check.h
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1089,10 +892,10 @@ index 9d0e672bedbfa71f3334d271077ef3aa8c18d2b2..a2759e9149825307322ad6b36d6fc252
 +#define KV_BLOCK_INDEX_LOAD(ptr, idx, sz) __ldg(&(ptr)[(idx)])
  
  #endif  // FMHA_GMEM_BOUNDS_CHECK
-diff --git a/csrc/include/fmha_cutlass_sm100.cuh b/csrc/include/fmha_cutlass_sm100.cuh
-index b11abe608c43c2ea02e989a0530193ad6de601a1..3633fa01da3d557714cf3d4be17af46022de2c86 100644
---- a/csrc/include/fmha_cutlass_sm100.cuh
-+++ b/csrc/include/fmha_cutlass_sm100.cuh
+diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
+index b11abe6..3633fa0 100644
+--- a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
++++ b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
 @@ -1,3 +1,4 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
  /*
@@ -1301,10 +1104,10 @@ index b11abe608c43c2ea02e989a0530193ad6de601a1..3633fa01da3d557714cf3d4be17af460
        pack_factor, q_stride_n_original, q_stride_h_original, h_r_original,
        pack_gqa, num_ctas);
  }
-diff --git a/csrc/include/gpu_trace.h b/csrc/include/gpu_trace.h
-index 696384f7f1f1e43300280a6ba5948331c4f7cf95..69854e653def7e6821885b7907710986fa872457 100644
---- a/csrc/include/gpu_trace.h
-+++ b/csrc/include/gpu_trace.h
+diff --git a/python/fmha_sm100/csrc/include/gpu_trace.h b/python/fmha_sm100/csrc/include/gpu_trace.h
+index 696384f..69854e6 100644
+--- a/python/fmha_sm100/csrc/include/gpu_trace.h
++++ b/python/fmha_sm100/csrc/include/gpu_trace.h
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -1320,10 +1123,10 @@ index 696384f7f1f1e43300280a6ba5948331c4f7cf95..69854e653def7e6821885b7907710986
  
  constexpr uint32_t hash(const char* s) {
      uint32_t h = 2166136261u;
-diff --git a/csrc/include/plan.cuh b/csrc/include/plan.cuh
-index cf8495732d2bda53a7893bc7f208dff12e7bf9dd..ab3e593ff06f9bde225cd54c9197e57c8817c50e 100644
---- a/csrc/include/plan.cuh
-+++ b/csrc/include/plan.cuh
+diff --git a/python/fmha_sm100/csrc/include/plan.cuh b/python/fmha_sm100/csrc/include/plan.cuh
+index cf84957..ab3e593 100644
+--- a/python/fmha_sm100/csrc/include/plan.cuh
++++ b/python/fmha_sm100/csrc/include/plan.cuh
 @@ -1,3 +1,4 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
  /*
@@ -1562,10 +1365,10 @@ index cf8495732d2bda53a7893bc7f208dff12e7bf9dd..ab3e593ff06f9bde225cd54c9197e57c
    FLASHINFER_CUDA_CALL(cudaGetLastError());
    return cudaSuccess;
  }
-diff --git a/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp b/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
-index 0e41ce01b2dcb770231e2877bd1a9e18aa2c7e06..09f3c80f0f300cfe2883ae3dcca2b470c367ac14 100644
---- a/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
-+++ b/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+index 0e41ce0..09f3c80 100644
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
 @@ -214,9 +214,9 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
    }
  
@@ -1579,10 +1382,10 @@ index 0e41ce01b2dcb770231e2877bd1a9e18aa2c7e06..09f3c80f0f300cfe2883ae3dcca2b470
  
      GPU_TRACE_INIT;
  
-diff --git a/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp b/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
-index 5a5d0f38887a6d7d5ebad00b9f6e7b599a1fedab..5c923c19be7ad32e08d88c76499e17cb94888409 100644
---- a/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
-+++ b/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+index 5a5d0f3..5c923c1 100644
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
 @@ -1,5 +1,5 @@
  /***************************************************************************************************
 - * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -1877,10 +1680,10 @@ index 5a5d0f38887a6d7d5ebad00b9f6e7b599a1fedab..5c923c19be7ad32e08d88c76499e17cb
      // do the final correction to O1
      // better to somehow special-case it in the loop above
      // doesn't matter for non-persistent code, but if it were
-diff --git a/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp b/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
-index 0fdcbfa097c4f4c1dbc53862b78b8afec3a6da82..d3d7c113ba13ad93ff32bf7f08482b1533bced0a 100644
---- a/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
-+++ b/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
+index 0fdcbfa..d3d7c11 100644
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
 @@ -1,5 +1,5 @@
  /***************************************************************************************************
 - * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -1982,10 +1785,10 @@ index 0fdcbfa097c4f4c1dbc53862b78b8afec3a6da82..d3d7c113ba13ad93ff32bf7f08482b15
                : -1;
            page_for_lookup = (sparse_idx >= 0) ? sparse_idx : 0;
          } else {
-diff --git a/csrc/include/utils.cuh b/csrc/include/utils.cuh
-index c7edf5ab57f56bb7302b7d4417496dbc8dfd3924..45bd67447f2e55c6a8f9389c5885e1bfe9fee420 100644
---- a/csrc/include/utils.cuh
-+++ b/csrc/include/utils.cuh
+diff --git a/python/fmha_sm100/csrc/include/utils.cuh b/python/fmha_sm100/csrc/include/utils.cuh
+index c7edf5a..45bd674 100644
+--- a/python/fmha_sm100/csrc/include/utils.cuh
++++ b/python/fmha_sm100/csrc/include/utils.cuh
 @@ -1,3 +1,4 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
  /*
@@ -2000,19 +1803,19 @@ index c7edf5ab57f56bb7302b7d4417496dbc8dfd3924..45bd67447f2e55c6a8f9389c5885e1bf
        return 64;
      }
    }
-diff --git a/cute/__init__.py b/cute/__init__.py
+diff --git a/b/python/fmha_sm100/cute/__init__.py b/python/fmha_sm100/cute/__init__.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..6bed8e30b87c9ab44e1c4c6cef810ecf0c6442cf
+index 0000000..6bed8e3
 --- /dev/null
-+++ b/cute/__init__.py
++++ b/python/fmha_sm100/cute/__init__.py
 @@ -0,0 +1,3 @@
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +# SPDX-License-Identifier: Apache-2.0
 +"""TensorRT-LLM: the MSA CuTe DSL sparse attention sources as a package, imported with relative imports."""
-diff --git a/cute/fp4_indexer_interface.py b/cute/fp4_indexer_interface.py
-index 1250e28f978c5d5e501e5e7b2d2db54862699713..182000bc7d8f632a178a3acd435c6f0e582e601d 100644
---- a/cute/fp4_indexer_interface.py
-+++ b/cute/fp4_indexer_interface.py
+diff --git a/python/fmha_sm100/cute/fp4_indexer_interface.py b/python/fmha_sm100/cute/fp4_indexer_interface.py
+index 1250e28..182000b 100644
+--- a/python/fmha_sm100/cute/fp4_indexer_interface.py
++++ b/python/fmha_sm100/cute/fp4_indexer_interface.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -2028,10 +1831,10 @@ index 1250e28f978c5d5e501e5e7b2d2db54862699713..182000bc7d8f632a178a3acd435c6f0e
      Fp4FormatSpec,
      Fp4IndexerDecodePackedQSm100,
      Fp4IndexerDecodeQPackSm100,
-diff --git a/cute/interface.py b/cute/interface.py
-index d72b17a36e2ad31ea31e858e0f970f13742e6932..52ce1b4f8e1be95aee28f711a21a3299ace9c0ea 100644
---- a/cute/interface.py
-+++ b/cute/interface.py
+diff --git a/python/fmha_sm100/cute/interface.py b/python/fmha_sm100/cute/interface.py
+index d72b17a..52ce1b4 100644
+--- a/python/fmha_sm100/cute/interface.py
++++ b/python/fmha_sm100/cute/interface.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -2743,10 +2546,10 @@ index d72b17a36e2ad31ea31e858e0f970f13742e6932..52ce1b4f8e1be95aee28f711a21a3299
 +            v_sf_head_stride,
          )
      return schedule
-diff --git a/cute/quantize.py b/cute/quantize.py
-index 4719a4854bc9388b2a866598f9e21c1f14921181..1fbb51455ce403492e7999869f6fddde962e09c1 100644
---- a/cute/quantize.py
-+++ b/cute/quantize.py
+diff --git a/python/fmha_sm100/cute/quantize.py b/python/fmha_sm100/cute/quantize.py
+index 4719a48..1fbb514 100644
+--- a/python/fmha_sm100/cute/quantize.py
++++ b/python/fmha_sm100/cute/quantize.py
 @@ -1,18 +1,69 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -3530,10 +3333,10 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..1fbb51455ce403492e7999869f6fddde
      print("V global scale:", tuple(v_q.global_scale.shape), v_q.global_scale.dtype)
  
  
-diff --git a/cute/sparse_index_utils.py b/cute/sparse_index_utils.py
-index a930025c51bcb9f352e186b40635c71a22cd03d8..24851950f1d2c70b6ba9b73b172aa62f8b1f5226 100644
---- a/cute/sparse_index_utils.py
-+++ b/cute/sparse_index_utils.py
+diff --git a/python/fmha_sm100/cute/sparse_index_utils.py b/python/fmha_sm100/cute/sparse_index_utils.py
+index a930025..2485195 100644
+--- a/python/fmha_sm100/cute/sparse_index_utils.py
++++ b/python/fmha_sm100/cute/sparse_index_utils.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -3563,10 +3366,10 @@ index a930025c51bcb9f352e186b40635c71a22cd03d8..24851950f1d2c70b6ba9b73b172aa62f
          return_schedule=return_schedule,
 +        schedule_order=schedule_order,
      )
-diff --git a/cute/src/common/aot_cache.py b/cute/src/common/aot_cache.py
-index 99fd0b4da4ddb6fba21bcb18c924f5e9e8b583e6..fd00dae6dd01eb72119c1e9943d3763d633dd52e 100644
---- a/cute/src/common/aot_cache.py
-+++ b/cute/src/common/aot_cache.py
+diff --git a/python/fmha_sm100/cute/src/common/aot_cache.py b/python/fmha_sm100/cute/src/common/aot_cache.py
+index 99fd0b4..fd00dae 100644
+--- a/python/fmha_sm100/cute/src/common/aot_cache.py
++++ b/python/fmha_sm100/cute/src/common/aot_cache.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -3663,10 +3466,10 @@ index 99fd0b4da4ddb6fba21bcb18c924f5e9e8b583e6..fd00dae6dd01eb72119c1e9943d3763d
      name = str(key[0]).replace("/", "_")
      return os.path.join(_AOT_CACHE_DIR, f"{name}_{h}")
  
-diff --git a/cute/src/common/block_info.py b/cute/src/common/block_info.py
-index 52e6a198a8fb8ed0a31d0910a1edf7590159dc01..ceef6a36e081c83bfdc42a6be303db77cc1a7d9a 100644
---- a/cute/src/common/block_info.py
-+++ b/cute/src/common/block_info.py
+diff --git a/python/fmha_sm100/cute/src/common/block_info.py b/python/fmha_sm100/cute/src/common/block_info.py
+index 52e6a19..ceef6a3 100644
+--- a/python/fmha_sm100/cute/src/common/block_info.py
++++ b/python/fmha_sm100/cute/src/common/block_info.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -3682,11 +3485,11 @@ index 52e6a198a8fb8ed0a31d0910a1edf7590159dc01..ceef6a36e081c83bfdc42a6be303db77
  
  
  @dataclass(frozen=True)
-diff --git a/cute/src/common/cuda_toolchain.py b/cute/src/common/cuda_toolchain.py
+diff --git a/b/python/fmha_sm100/cute/src/common/cuda_toolchain.py b/python/fmha_sm100/cute/src/common/cuda_toolchain.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..5c76253230c1eafd07792ec319aeee751a87aead
+index 0000000..5c76253
 --- /dev/null
-+++ b/cute/src/common/cuda_toolchain.py
++++ b/python/fmha_sm100/cute/src/common/cuda_toolchain.py
 @@ -0,0 +1,170 @@
 +# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -3858,10 +3661,10 @@ index 0000000000000000000000000000000000000000..5c76253230c1eafd07792ec319aeee75
 +    if isa_version is None:
 +        return None
 +    return _assemble(body, isa_version, target)
-diff --git a/cute/src/common/cute_dsl_utils.py b/cute/src/common/cute_dsl_utils.py
-index e3473fbbf77fa1261abfc8fd960102c70d3e64bd..48a87f3d68052f14b986b95345404f91a385042e 100644
---- a/cute/src/common/cute_dsl_utils.py
-+++ b/cute/src/common/cute_dsl_utils.py
+diff --git a/python/fmha_sm100/cute/src/common/cute_dsl_utils.py b/python/fmha_sm100/cute/src/common/cute_dsl_utils.py
+index e3473fb..48a87f3 100644
+--- a/python/fmha_sm100/cute/src/common/cute_dsl_utils.py
++++ b/python/fmha_sm100/cute/src/common/cute_dsl_utils.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -3881,10 +3684,10 @@ index e3473fbbf77fa1261abfc8fd960102c70d3e64bd..48a87f3d68052f14b986b95345404f91
  
  
  def assume_strides_aligned(t):
-diff --git a/cute/src/common/mask.py b/cute/src/common/mask.py
-index bfd2354484506517cabae105457e17b2b8e32c77..23236b8b556c0dcb92a4c504b54f486a045eb362 100644
---- a/cute/src/common/mask.py
-+++ b/cute/src/common/mask.py
+diff --git a/python/fmha_sm100/cute/src/common/mask.py b/python/fmha_sm100/cute/src/common/mask.py
+index bfd2354..23236b8 100644
+--- a/python/fmha_sm100/cute/src/common/mask.py
++++ b/python/fmha_sm100/cute/src/common/mask.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -3902,11 +3705,11 @@ index bfd2354484506517cabae105457e17b2b8e32c77..23236b8b556c0dcb92a4c504b54f486a
  
  MaskGenFn: TypeAlias = Callable[[int], Uint32]
  MASK_R2P_CHUNK_SIZE: int = 32
-diff --git a/cute/src/common/mxfp8_epi.py b/cute/src/common/mxfp8_epi.py
+diff --git a/b/python/fmha_sm100/cute/src/common/mxfp8_epi.py b/python/fmha_sm100/cute/src/common/mxfp8_epi.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..b771f5d22fe921d44798287e326d2298d02de467
+index 0000000..b771f5d
 --- /dev/null
-+++ b/cute/src/common/mxfp8_epi.py
++++ b/python/fmha_sm100/cute/src/common/mxfp8_epi.py
 @@ -0,0 +1,100 @@
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +# SPDX-License-Identifier: MIT
@@ -4008,10 +3811,10 @@ index 0000000000000000000000000000000000000000..b771f5d22fe921d44798287e326d2298
 +        + ((m_idx % 128) // 32) * 4
 +        + (k_idx % 4)
 +    )
-diff --git a/cute/src/common/tile_scheduler.py b/cute/src/common/tile_scheduler.py
-index f7aad9e212c87829bbe584e65f2419142ff0c3f8..24c19d4ab3ec41c87ea44ab2580d968fe54fea33 100644
---- a/cute/src/common/tile_scheduler.py
-+++ b/cute/src/common/tile_scheduler.py
+diff --git a/python/fmha_sm100/cute/src/common/tile_scheduler.py b/python/fmha_sm100/cute/src/common/tile_scheduler.py
+index f7aad9e..24c19d4 100644
+--- a/python/fmha_sm100/cute/src/common/tile_scheduler.py
++++ b/python/fmha_sm100/cute/src/common/tile_scheduler.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -4029,10 +3832,10 @@ index f7aad9e212c87829bbe584e65f2419142ff0c3f8..24c19d4ab3ec41c87ea44ab2580d968f
  
  
  class SchedulingMode(IntEnum):
-diff --git a/cute/src/common/tma_utils.py b/cute/src/common/tma_utils.py
-index 5bdc19a08eacf9a060f2c0a7a4d50a4adb735094..dd390a33f0004d164f0b30969ecccf27cef9eca9 100644
---- a/cute/src/common/tma_utils.py
-+++ b/cute/src/common/tma_utils.py
+diff --git a/python/fmha_sm100/cute/src/common/tma_utils.py b/python/fmha_sm100/cute/src/common/tma_utils.py
+index 5bdc19a..dd390a3 100644
+--- a/python/fmha_sm100/cute/src/common/tma_utils.py
++++ b/python/fmha_sm100/cute/src/common/tma_utils.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -4056,10 +3859,10 @@ index 5bdc19a08eacf9a060f2c0a7a4d50a4adb735094..dd390a33f0004d164f0b30969ecccf27
          128,
      )
      desc_ptr = cute_ir.inttoptr(ptr_ty, ptr_i64_align, loc=loc, ip=ip)
-diff --git a/cute/src/common/utils.py b/cute/src/common/utils.py
-index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..f12aed329822d155600f5e21cbc4182a075b1242 100644
---- a/cute/src/common/utils.py
-+++ b/cute/src/common/utils.py
+diff --git a/python/fmha_sm100/cute/src/common/utils.py b/python/fmha_sm100/cute/src/common/utils.py
+index 10b2b1f..f12aed3 100644
+--- a/python/fmha_sm100/cute/src/common/utils.py
++++ b/python/fmha_sm100/cute/src/common/utils.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -4332,10 +4135,10 @@ index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..f12aed329822d155600f5e21cbc4182a
  
  
  @dsl_user_op
-diff --git a/cute/src/sm100/build_k2q_csr/__init__.py b/cute/src/sm100/build_k2q_csr/__init__.py
-index 830343e2fab66e423105772322a82e05bd8b29ee..b931d9548e17aa34bad0cb81e96480028cf00473 100644
---- a/cute/src/sm100/build_k2q_csr/__init__.py
-+++ b/cute/src/sm100/build_k2q_csr/__init__.py
+diff --git a/python/fmha_sm100/cute/src/sm100/build_k2q_csr/__init__.py b/python/fmha_sm100/cute/src/sm100/build_k2q_csr/__init__.py
+index 830343e..cf49dc2 100644
+--- a/python/fmha_sm100/cute/src/sm100/build_k2q_csr/__init__.py
++++ b/python/fmha_sm100/cute/src/sm100/build_k2q_csr/__init__.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -4351,7 +4154,7 @@ index 830343e2fab66e423105772322a82e05bd8b29ee..b931d9548e17aa34bad0cb81e9648002
  import os
  
  import torch
-@@ -33,13 +36,27 @@ _extra_cuda_cflags = [
+@@ -33,13 +36,31 @@ _extra_cuda_cflags = [
      "-I/usr/local/cuda/include/cccl",
  ]
  
@@ -4361,16 +4164,19 @@ index 830343e2fab66e423105772322a82e05bd8b29ee..b931d9548e17aa34bad0cb81e9648002
 -    extra_cflags=_extra_cflags,
 -    extra_cuda_cflags=_extra_cuda_cflags,
 -    verbose=False,
--)
 +# TensorRT-LLM: the extension name differs from the packaged top-level fmha_sm100's, whose
 +# build_k2q_csr.cu differs from this copy's, so the two never share or evict one build cache entry.
 +# The opt-in ahead-of-time build (BUILD_MSA_AOT) builds it with the flags above into
 +# tensorrt_llm/libs/msa_fmha_sm100/k2q, and it loads from there when present; otherwise it compiles here.
-+# This directory is tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/
-+# fmha_sm100/cute/src/sm100/build_k2q_csr.
-+_PACKAGE_ROOT = os.path.abspath(os.path.join(_THIS_DIR, *[os.pardir] * 12))
-+_PREBUILT = os.path.join(_PACKAGE_ROOT, "libs", "msa_fmha_sm100", "k2q", "sparse_build_k2q_csr_m31_ext.so")
-+if os.path.isfile(_PREBUILT):
++# fmha_sm100 installs next to tensorrt_llm; the directory is looked up without importing tensorrt_llm.
++_TRTLLM_SPEC = importlib.util.find_spec("tensorrt_llm")
++_PREBUILT = (
++    os.path.join(os.path.dirname(os.path.abspath(_TRTLLM_SPEC.origin)), "libs", "msa_fmha_sm100", "k2q",
++                 "sparse_build_k2q_csr_m31_ext.so")
++    if _TRTLLM_SPEC is not None and _TRTLLM_SPEC.origin is not None
++    else ""
+ )
++if _PREBUILT and os.path.isfile(_PREBUILT):
 +    _loader = importlib.machinery.ExtensionFileLoader("sparse_build_k2q_csr_m31_ext", _PREBUILT)
 +    _ext = importlib.util.module_from_spec(
 +        importlib.util.spec_from_file_location("sparse_build_k2q_csr_m31_ext", _PREBUILT, loader=_loader))
@@ -4386,10 +4192,10 @@ index 830343e2fab66e423105772322a82e05bd8b29ee..b931d9548e17aa34bad0cb81e9648002
  
  
  def run_build_k2q_csr(
-diff --git a/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu b/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
-index 8ee5457c50cd4d0bab15c8f02b10210ec418d215..720fa4b5e65d935f286f965b059085f89c69200d 100644
---- a/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
-+++ b/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
+diff --git a/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu b/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
+index 8ee5457..720fa4b 100644
+--- a/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
++++ b/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
 @@ -1,4 +1,5 @@
  // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -4412,10 +4218,11 @@ index 8ee5457c50cd4d0bab15c8f02b10210ec418d215..720fa4b5e65d935f286f965b059085f8
  
  #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be CUDA")
  #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
-@@ -197,6 +203,79 @@ __global__ void k2q_hist_kernel(
+@@ -196,6 +202,79 @@ __global__ void k2q_hist_kernel(
+ // ---------------------------------------------------------------------------
  // PR: row prefix. One block per head.
  // ---------------------------------------------------------------------------
- template <int kThreads>
++template <int kThreads>
 +__global__ void k2q_row_prefix_agg_kernel(
 +    int const* __restrict__ row_counts,
 +    int* __restrict__ row_ptr,
@@ -4488,14 +4295,14 @@ index 8ee5457c50cd4d0bab15c8f02b10210ec418d215..720fa4b5e65d935f286f965b059085f8
 +    }
 +}
 +
-+template <int kThreads>
+ template <int kThreads>
  __global__ void k2q_row_prefix_kernel(
      int const* __restrict__ row_counts,
-     int* __restrict__ row_ptr,
-@@ -257,6 +336,194 @@ __global__ void k2q_row_prefix_kernel(
+@@ -256,6 +335,194 @@ __global__ void k2q_row_prefix_kernel(
+     }
  }
  
- // ---------------------------------------------------------------------------
++// ---------------------------------------------------------------------------
 +// MiniMax-M3 (MSA) edge-rank build (kill: FMHA_K2Q_EDGE_RANK=0): hist in the scatter's lane layout (lanes =
 +// (q pair, slot)); each edge's per-warp rank comes from __match_any_sync + popc (lane order = q order), not from
 +// the order of same-address atomics, which CUDA leaves unspecified (the stock scatter relies on it). Each edge keeps
@@ -4683,10 +4490,9 @@ index 8ee5457c50cd4d0bab15c8f02b10210ec418d215..720fa4b5e65d935f286f965b059085f8
 +    }
 +}
 +
-+// ---------------------------------------------------------------------------
+ // ---------------------------------------------------------------------------
  // PT_smem: SMEM-staged tile prefix scan.
  // Each block handles kRowsPerBlock rows for one head h. Cooperative load
- // of tile_counts[*, h, base_r..base_r+M) into SMEM (better coalescing
 @@ -521,6 +788,49 @@ __global__ void k2q_scatter_kernel(
  // Host orchestration
  // ===========================================================================
@@ -5680,10 +5486,10 @@ index 8ee5457c50cd4d0bab15c8f02b10210ec418d215..720fa4b5e65d935f286f965b059085f8
      m.def("run_build_k2q_csr", &run_build_k2q_csr,
            "q2k -> k2q CSR build (sorted within row)",
            pybind11::arg("q2k"),
-diff --git a/cute/src/sm100/decode_schedule.py b/cute/src/sm100/decode_schedule.py
-index 0201bf8a0ec2a07d6b4848bfe08299833726bc88..1ed7f3221735b3c750dc82f31951ea174f7717a8 100644
---- a/cute/src/sm100/decode_schedule.py
-+++ b/cute/src/sm100/decode_schedule.py
+diff --git a/python/fmha_sm100/cute/src/sm100/decode_schedule.py b/python/fmha_sm100/cute/src/sm100/decode_schedule.py
+index 0201bf8..1ed7f32 100644
+--- a/python/fmha_sm100/cute/src/sm100/decode_schedule.py
++++ b/python/fmha_sm100/cute/src/sm100/decode_schedule.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -5699,10 +5505,10 @@ index 0201bf8a0ec2a07d6b4848bfe08299833726bc88..1ed7f3221735b3c750dc82f31951ea17
  
      raw = build_decode_schedule(
          seqused_k,
-diff --git a/cute/src/sm100/fp4_indexer.py b/cute/src/sm100/fp4_indexer.py
-index 54a5cd64a2b941183f763b4dc0f20f37ef61ad42..5f555f6c5c34ec04d4d4d372cac75e28c8f17eff 100644
---- a/cute/src/sm100/fp4_indexer.py
-+++ b/cute/src/sm100/fp4_indexer.py
+diff --git a/python/fmha_sm100/cute/src/sm100/fp4_indexer.py b/python/fmha_sm100/cute/src/sm100/fp4_indexer.py
+index 54a5cd6..5f555f6 100644
+--- a/python/fmha_sm100/cute/src/sm100/fp4_indexer.py
++++ b/python/fmha_sm100/cute/src/sm100/fp4_indexer.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -5718,10 +5524,10 @@ index 54a5cd64a2b941183f763b4dc0f20f37ef61ad42..5f555f6c5c34ec04d4d4d372cac75e28
  
  
  FP4_FORMAT = Literal["mxfp4", "nvfp4"]
-diff --git a/cute/src/sm100/fwd/atten_fwd.py b/cute/src/sm100/fwd/atten_fwd.py
-index f5950f3c5552107dcf8d4223383f39811dbed851..9eecc964627078ba6b344faec43e136883f4e164 100644
---- a/cute/src/sm100/fwd/atten_fwd.py
-+++ b/cute/src/sm100/fwd/atten_fwd.py
+diff --git a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py
+index f5950f3..9eecc96 100644
+--- a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py
++++ b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -5769,10 +5575,10 @@ index f5950f3c5552107dcf8d4223383f39811dbed851..9eecc964627078ba6b344faec43e1368
          tStS: cute.Tensor,
          tOrP: cute.Tensor,
          sK: cute.Tensor,
-diff --git a/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py b/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
-index ba930a6db87fa6527b7216a522a7003bd809e8bb..545d13574813ec49fcea590fc4ad2e3071be93f4 100644
---- a/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
-+++ b/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
+diff --git a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
+index ba930a6..545d135 100644
+--- a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
++++ b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -6120,7 +5926,7 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..545d13574813ec49fcea590fc4ad2e30
              )
              dst_i32[word_idx * 2] = fp8_lo
              dst_i32[word_idx * 2 + 1] = fp8_hi
-@@ -1312,30 +1424,12 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1312,29 +1424,11 @@ class SparseAttentionForwardNvfp4KvSm100:
              fp8_lo, fp8_hi = utils.cvt_fp4x8_e2m1_scaled_e4m3x8(
                  src_words[word_idx + 2],
                  scale_e4m3_hi,
@@ -6129,7 +5935,7 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..545d13574813ec49fcea590fc4ad2e30
              dst_i32[word_idx * 2 + 4] = fp8_lo
              dst_i32[word_idx * 2 + 5] = fp8_hi
  
-     @cute.jit
+-    @cute.jit
 -    def _flat_kv_scale_row(
 -        self,
 -        token_idx: Int32,
@@ -6148,10 +5954,9 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..545d13574813ec49fcea590fc4ad2e30
 -    ) -> Int32:
 -        return (page_idx * num_heads_kv + head_kv_idx) * Int32(self.page_size) + token_idx
 -
--    @cute.jit
+     @cute.jit
      def _load_k_fp4_to_smem(
          self,
-         sKFp4: cute.Tensor,
 @@ -1350,11 +1444,37 @@ class SparseAttentionForwardNvfp4KvSm100:
          kv_block_idx: Int32,
          k_batch_offset: Int32,
@@ -6783,10 +6588,10 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..545d13574813ec49fcea590fc4ad2e30
                                  row_base_ptr = flat_row * Int64(self.head_dim)
                                  o0 = tOrO_mn[r, c_base]
                                  o1 = tOrO_mn[r, c_base + Int32(1)]
-diff --git a/cute/src/sm100/fwd/combine.py b/cute/src/sm100/fwd/combine.py
-index b9e6bbb7103237880ef9fb2957084869b06e85b9..97c6795cb92d0121babfcf367575a6e6dc194012 100644
---- a/cute/src/sm100/fwd/combine.py
-+++ b/cute/src/sm100/fwd/combine.py
+diff --git a/python/fmha_sm100/cute/src/sm100/fwd/combine.py b/python/fmha_sm100/cute/src/sm100/fwd/combine.py
+index b9e6bbb..97c6795 100644
+--- a/python/fmha_sm100/cute/src/sm100/fwd/combine.py
++++ b/python/fmha_sm100/cute/src/sm100/fwd/combine.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -8393,10 +8198,10 @@ index b9e6bbb7103237880ef9fb2957084869b06e85b9..97c6795cb92d0121babfcf367575a6e6
 +            o_fp8,
 +            sf_out,
          )
-diff --git a/cute/src/sm100/fwd_decode/atten_fwd.py b/cute/src/sm100/fwd_decode/atten_fwd.py
-index 8ccc2cbfea1389e14be20ece1ef654cdaced95ea..3267a41f7706592d63192290d9bba915ecc29be6 100644
---- a/cute/src/sm100/fwd_decode/atten_fwd.py
-+++ b/cute/src/sm100/fwd_decode/atten_fwd.py
+diff --git a/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py b/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py
+index 8ccc2cb..3267a41 100644
+--- a/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py
++++ b/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -8551,10 +8356,10 @@ index 8ccc2cbfea1389e14be20ece1ef654cdaced95ea..3267a41f7706592d63192290d9bba915
          pipeline_s_p_o: pipeline.PipelineAsync,
          pipeline_p_lastsplit: pipeline.PipelineAsync,
          pipeline_sm_stats: pipeline.PipelineAsync,
-diff --git a/cute/src/sm100/fwd_decode/combine.py b/cute/src/sm100/fwd_decode/combine.py
-index 9df4a6c003945efd9d91246a370b844205e97662..8c179cdebe4a88d2259f284614a15e800f459a98 100644
---- a/cute/src/sm100/fwd_decode/combine.py
-+++ b/cute/src/sm100/fwd_decode/combine.py
+diff --git a/python/fmha_sm100/cute/src/sm100/fwd_decode/combine.py b/python/fmha_sm100/cute/src/sm100/fwd_decode/combine.py
+index 9df4a6c..8c179cd 100644
+--- a/python/fmha_sm100/cute/src/sm100/fwd_decode/combine.py
++++ b/python/fmha_sm100/cute/src/sm100/fwd_decode/combine.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -8570,10 +8375,10 @@ index 9df4a6c003945efd9d91246a370b844205e97662..8c179cdebe4a88d2259f284614a15e80
  
  
  class SparseDecodeForwardCombine:
-diff --git a/cute/src/sm100/fwd_decode/tile_scheduler.py b/cute/src/sm100/fwd_decode/tile_scheduler.py
-index 599dacec76fe8780cafcd4003f41840747f23b50..8fda2feafba2baf7a325c9eaa10b5cef369eafe7 100644
---- a/cute/src/sm100/fwd_decode/tile_scheduler.py
-+++ b/cute/src/sm100/fwd_decode/tile_scheduler.py
+diff --git a/python/fmha_sm100/cute/src/sm100/fwd_decode/tile_scheduler.py b/python/fmha_sm100/cute/src/sm100/fwd_decode/tile_scheduler.py
+index 599dace..8fda2fe 100644
+--- a/python/fmha_sm100/cute/src/sm100/fwd_decode/tile_scheduler.py
++++ b/python/fmha_sm100/cute/src/sm100/fwd_decode/tile_scheduler.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -8611,10 +8416,10 @@ index 599dacec76fe8780cafcd4003f41840747f23b50..8fda2feafba2baf7a325c9eaa10b5cef
              with cute.arch.elect_one():
                  cute.arch.issue_clc_query(
                      mbarrier_addr, response_ptr, loc=loc, ip=ip)
-diff --git a/cute/src/sm100/prepare_k2q_csr.py b/cute/src/sm100/prepare_k2q_csr.py
-index e65c18944760294fda5a875ba71e14b27ec0319c..7ddd695d82eedfde833f46b8c89504fc628f6d04 100644
---- a/cute/src/sm100/prepare_k2q_csr.py
-+++ b/cute/src/sm100/prepare_k2q_csr.py
+diff --git a/python/fmha_sm100/cute/src/sm100/prepare_k2q_csr.py b/python/fmha_sm100/cute/src/sm100/prepare_k2q_csr.py
+index e65c189..7ddd695 100644
+--- a/python/fmha_sm100/cute/src/sm100/prepare_k2q_csr.py
++++ b/python/fmha_sm100/cute/src/sm100/prepare_k2q_csr.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -8841,10 +8646,10 @@ index e65c18944760294fda5a875ba71e14b27ec0319c..7ddd695d82eedfde833f46b8c89504fc
          if schedule is not None:
              return k2q_row_ptr, k2q_q_indices, schedule
          return k2q_row_ptr, k2q_q_indices
-diff --git a/cute/src/sm100/prepare_scheduler.py b/cute/src/sm100/prepare_scheduler.py
-index 6d13fa9804b58f797f8849784784bc91e9475e69..1d79fcbaa09bfb8e68dc3f8ce192ffd847a4fb8b 100644
---- a/cute/src/sm100/prepare_scheduler.py
-+++ b/cute/src/sm100/prepare_scheduler.py
+diff --git a/python/fmha_sm100/cute/src/sm100/prepare_scheduler.py b/python/fmha_sm100/cute/src/sm100/prepare_scheduler.py
+index 6d13fa9..1d79fcb 100644
+--- a/python/fmha_sm100/cute/src/sm100/prepare_scheduler.py
++++ b/python/fmha_sm100/cute/src/sm100/prepare_scheduler.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -8880,10 +8685,787 @@ index 6d13fa9804b58f797f8849784784bc91e9475e69..1d79fcbaa09bfb8e68dc3f8ce192ffd8
  
          loaded = try_load_aot(key)
          if loaded is not None:
-diff --git a/jit.py b/jit.py
-index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea348746181b6fa 100644
---- a/jit.py
-+++ b/jit.py
+diff --git a/python/fmha_sm100/cute/test_sparse_atten.py b/python/fmha_sm100/cute/test_sparse_atten.py
+index 21c777e..fa48c96 100644
+--- a/python/fmha_sm100/cute/test_sparse_atten.py
++++ b/python/fmha_sm100/cute/test_sparse_atten.py
+@@ -19,9 +19,11 @@ from __future__ import annotations
+ 
+ import argparse
+ import math
++import os
+ import sys
+ import types
+ from contextlib import contextmanager
++from pathlib import Path
+ from typing import Optional
+ 
+ import pytest
+@@ -61,6 +63,78 @@ DECODE_DIM = 128
+ DECODE_KV_TOKEN_SWEEP = tuple(2**exp for exp in range(3, 21))
+ 
+ 
++def test_prepare_paged_hnd_input_keeps_aligned_outer_page_stride() -> None:
++    pages, roles, heads, page_size, head_dim = 5, 3, 2, 128, 128
++    pool = torch.empty(
++        pages,
++        roles,
++        heads,
++        page_size,
++        head_dim,
++        dtype=torch.float8_e4m3fn,
++        device="cuda",
++    )
++    view = pool[:, 1]
++
++    assert not view.is_contiguous()
++    prepared = sparse_interface._prepare_paged_hnd_input(view, page_size)
++    assert prepared.data_ptr() == view.data_ptr()
++    assert prepared.stride() == view.stride()
++
++
++def test_prepare_paged_hnd_input_materializes_unpacked_tokens() -> None:
++    pages, heads, page_size, head_dim = 5, 2, 128, 128
++    storage = torch.arange(
++        pages * heads * page_size * 2 * head_dim,
++        dtype=torch.int32,
++        device="cuda",
++    ).remainder(16).to(torch.float8_e4m3fn).reshape(pages, heads, page_size * 2, head_dim)
++    view = storage[:, :, ::2, :]
++
++    prepared = sparse_interface._prepare_paged_hnd_input(view, page_size)
++    assert prepared.is_contiguous()
++    assert prepared.data_ptr() != view.data_ptr()
++    torch.testing.assert_close(prepared, view, rtol=0, atol=0)
++
++
++def test_prepare_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
++    pages, heads, page_size, head_dim = 5, 2, 128, 128
++    outer_stride = heads * page_size * head_dim + 1
++    storage = torch.arange(
++        pages * outer_stride,
++        dtype=torch.int32,
++        device="cuda",
++    ).remainder(16).to(torch.float8_e4m3fn)
++    view = storage.as_strided(
++        (pages, heads, page_size, head_dim),
++        (outer_stride, page_size * head_dim, head_dim, 1),
++    )
++
++    prepared = sparse_interface._prepare_paged_hnd_input(view, page_size)
++    assert prepared.is_contiguous()
++    assert prepared.data_ptr() != view.data_ptr()
++    torch.testing.assert_close(prepared, view, rtol=0, atol=0)
++
++
++def test_prepare_paged_hnd_input_defers_page_size_validation() -> None:
++    pages, roles, heads, page_size, head_dim = 5, 2, 2, 128, 128
++    pool = torch.empty(
++        pages,
++        roles,
++        heads,
++        page_size,
++        head_dim,
++        dtype=torch.float8_e4m3fn,
++        device="cuda",
++    )
++    view = pool[:, 0]
++
++    prepared = sparse_interface._prepare_paged_hnd_input(view, page_size // 2)
++    assert prepared.data_ptr() == view.data_ptr()
++    with pytest.raises(ValueError, match="page_size == blk_kv"):
++        sparse_interface._prepare_paged_kv_for_tma(prepared, prepared, page_size // 2)
++
++
+ @contextmanager
+ def _nvtx_range(message: str):
+     torch.cuda.nvtx.range_push(message)
+@@ -435,12 +509,116 @@ def _install_flash_attn3_stub_for_te_import() -> None:
+     sys.modules.setdefault("flash_attn_3.flash_attn_interface", interface)
+ 
+ 
++# The kernel reads exactly one scale-factor layout pair, unconditionally: K
++# linear (`t*S + s`) and V in the 4x4 token-quad swizzle
++# (`(t//4)*(4*S) + 4*s + (t%4)`).  There is no third option, no runtime flag and
++# no 128x4 path left anywhere in the branch.
++NVFP4_K_SCALE_LAYOUT = "linear"
++NVFP4_V_SCALE_LAYOUT = "swizzle4x4"
++
++
++def _pack_synthetic_nvfp4_scale(
++    logical: torch.Tensor,
++    *,
++    layout: str,
++) -> torch.Tensor:
++    """Pack a *logical* block-scale array into the bytes the kernel reads.
++
++    ``logical`` is indexed exactly like the interface's scale argument:
++    ``[num_pages, Hkv, page_size, S]`` when paged and ``[total_k, Hkv, S]``
++    when flat.  The result has the same shape and the same bytes, permuted
++    within each region.
++
++    Only the *within-region* permutation comes from
++    ``quantize.pack_nvfp4_scale``.  The region decomposition is re-derived here
++    from the kernel on purpose, so that a silent change of region on either
++    side surfaces as a failure rather than as agreement:
++
++      * paged -- a region is one ``(page, head)`` pair covering ``page_size``
++        tokens (``src/sm100/fwd/atten_fwd_nvfp4_kv.py::_scale_region_base``).
++      * flat -- a region is ``R`` consecutive global tokens of a single KV
++        head, laid out head-minor, with ``R = 1`` for ``"linear"`` and
++        ``R = 4`` for ``"swizzle4x4"``
++        (``..._scale_region_base_flat``).  ``R = 4`` requires
++        ``total_k % 4 == 0``.  Flat is a test-only geometry with no production
++        producer, so it is not an ABI.
++
++    ``"linear"`` is ``t*S + s``, i.e. plain row-major over ``[tokens, S]``, and
++    is therefore the identity for both geometries.
++    """
++
++    if layout == NVFP4_K_SCALE_LAYOUT:
++        return logical.contiguous()
++    if layout != NVFP4_V_SCALE_LAYOUT:
++        raise ValueError(f"unknown NVFP4 scale layout {layout!r}")
++
++    from quantize import pack_nvfp4_scale
++
++    if logical.ndim == 4:
++        num_pages, head_kv, page_size, scale_cols = (int(d) for d in logical.shape)
++        regions = logical.reshape(num_pages * head_kv, page_size, scale_cols)
++        packed = pack_nvfp4_scale(
++            regions.contiguous(),
++            page_size=page_size,
++            scale_cols=scale_cols,
++            layout=layout,
++        )
++        return packed.reshape(num_pages, head_kv, page_size, scale_cols).contiguous()
++
++    if logical.ndim != 3:
++        raise ValueError(
++            "logical NVFP4 scales must be rank-4 [num_pages, Hkv, page_size, S] "
++            f"or rank-3 [total_k, Hkv, S], got shape {tuple(logical.shape)}"
++        )
++    total_k, head_kv, scale_cols = (int(d) for d in logical.shape)
++    if total_k % 4 != 0:
++        raise ValueError(
++            "the flat V swizzle tiles tokens in quads, so total_k must be a "
++            f"multiple of 4, got {total_k}"
++        )
++    regions = (
++        logical.reshape(total_k // 4, 4, head_kv, scale_cols)
++        .permute(0, 2, 1, 3)
++        .reshape(total_k // 4 * head_kv, 4, scale_cols)
++        .contiguous()
++    )
++    packed = pack_nvfp4_scale(
++        regions,
++        page_size=4,
++        scale_cols=scale_cols,
++        layout=layout,
++    )
++    return packed.reshape(total_k, head_kv, scale_cols).contiguous()
++
++
+ def _make_synthetic_nvfp4_tensor(
+     shape: tuple[int, ...],
+     *,
++    layout: str,
+     global_scale_value: float = 1.0,
++    generator: Optional[torch.Generator] = None,
+ ) -> object:
+-    """Create deterministic packed NVFP4 data with unit block/global scales."""
++    """Create deterministic packed NVFP4 data with *varying* block scales.
++
++    The block scales must vary for these tests to mean anything: with every
++    scale byte set to the same value, permuting the whole scale array leaves
++    the dequantized result bit-identical, so a wrong scale-layout decode in the
++    kernel is undetectable. Varying scales make the layout observable.
++
++    Bytes 0x30..0x3E are positive E4M3 values in [0.5, 1.875] -- no NaN, zero
++    or denormal -- so the reference stays well conditioned.
++
++    The scales are drawn in *logical* ``[..., S]`` order and only then packed,
++    so the same seed produces the same logical scale for a given
++    ``(token, scale_col)`` under every layout.  Filling the *physical* array
++    with random bytes instead -- which is what the 128x4 version of this helper
++    did -- would make the logical scales a permutation of each other and no two
++    layouts would ever agree.
++
++    Pass ``generator=`` when the draw must be independent of how many global
++    RNG draws the surrounding input builder happened to make; the golden gate
++    below depends on that.
++    """
+ 
+     from quantize import Nvfp4QuantizedTensor
+ 
+@@ -448,21 +626,26 @@ def _make_synthetic_nvfp4_tensor(
+         raise ValueError("NVFP4 synthetic shape requires D divisible by 16")
+     rows = math.prod(int(dim) for dim in shape[:-1])
+     scale_cols = int(shape[-1]) // 16
+-    padded_rows = ((rows + 127) // 128) * 128
+-    padded_cols = ((scale_cols + 3) // 4) * 4
++    draw = {} if generator is None else {"generator": generator}
+     data = torch.randint(
+         0,
+         256,
+         (*shape[:-1], shape[-1] // 2),
+         device="cuda",
+         dtype=torch.uint8,
++        **draw,
+     )
+-    scale_128x4 = torch.full(
+-        (padded_rows, padded_cols),
+-        0x38,
++    # Drawn as rank-2 [rows, S] and reshaped, not drawn in the final rank: the
++    # golden capture script draws it that way, and only an identical draw makes
++    # the two comparable.
++    logical_scale = torch.randint(
++        0x30,
++        0x3F,
++        (rows, scale_cols),
+         device="cuda",
+         dtype=torch.uint8,
+-    )
++        **draw,
++    ).reshape(*shape[:-1], scale_cols)
+     global_scale = torch.full(
+         (1,),
+         float(global_scale_value),
+@@ -471,27 +654,62 @@ def _make_synthetic_nvfp4_tensor(
+     )
+     return Nvfp4QuantizedTensor(
+         data=data,
+-        scale_128x4=scale_128x4,
++        scale=_pack_synthetic_nvfp4_scale(logical_scale, layout=layout),
+         global_scale=global_scale,
+         logical_scale_shape=(rows, scale_cols),
+-        original_shape=shape,
++        original_shape=tuple(shape),
++        layout=layout,
+     )
+ 
+ 
+-def _quantize_bf16_to_nvfp4_or_skip(x: torch.Tensor) -> object:
++def _quantize_bf16_to_nvfp4_with_layout(x: torch.Tensor, layout: str) -> object:
++    """Quantize one tensor to NVFP4 under an explicitly chosen SF layout.
++
++    Used both for the correct layout and -- by the negative controls -- for the
++    wrong one.  The kernel has no layout flag, so packing on the host with the
++    wrong ``layout=`` is the only way to build a mismatched input.
++    """
++
+     _install_flash_attn3_stub_for_te_import()
+-    from quantize import quantize_bf16_to_nvfp4_128x4
++    from quantize import quantize_bf16_to_nvfp4
+ 
+-    try:
+-        return quantize_bf16_to_nvfp4_128x4(x)
+-    except RuntimeError as exc:
+-        pytest.skip(str(exc))
++    return quantize_bf16_to_nvfp4(x, layout=layout)
++
++
++def _quantize_kv_bf16_to_nvfp4(k: torch.Tensor, v: torch.Tensor) -> tuple[object, object]:
++    """Quantize a BF16 K/V pair for the NVFP4 KV path.
++
++    K is packed linear and V with the 4x4 token-quad swizzle, which is the one
++    layout pair the kernel reads.
++
++    This deliberately does not skip on error. It used to swallow any
++    ``RuntimeError`` from the quantizer and call ``pytest.skip``, which turned a
++    missing Transformer Engine into 141 green-looking skips and silently removed
++    *all* NVFP4 accuracy coverage on machines that have the hardware -- and would
++    equally have hidden a genuine quantizer bug. The quantizer now has a
++    dependency-free PyTorch backend, so there is nothing left to be unavailable
++    and a raised error here is a real defect.
++    """
++
++    _install_flash_attn3_stub_for_te_import()
++    from quantize import quantize_kv_bf16_to_nvfp4
++
++    return quantize_kv_bf16_to_nvfp4(k, v)
+ 
+ 
+ def _dequant_nvfp4_to_bf16(qx: object, *, include_global_scale: bool = True) -> torch.Tensor:
+-    from quantize import dequantize_nvfp4_128x4_to_bf16
++    """Reference dequantization.
++
++    Layout-independent by construction: it reads ``qx.layout`` and undoes
++    whatever packing produced ``qx.scale``, so the same logical block scales
++    give the same BF16 K/V no matter how the FP4 kernel addresses the bytes.
++    That is what lets the BF16 reference stand as an absolute gate across the
++    layout change.
++    """
++
++    from quantize import dequantize_nvfp4_to_bf16
+ 
+-    return dequantize_nvfp4_128x4_to_bf16(
++    return dequantize_nvfp4_to_bf16(
+         qx,
+         include_global_scale=include_global_scale,
+     )
+@@ -1130,7 +1348,16 @@ def _decode_paged_dense_reference(
+     inputs: dict[str, object],
+     *,
+     chunk_tokens: int = 8192,
++    p_dtype: torch.dtype | None = torch.float8_e4m3fn,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
++    """Reference decode attention.
++
++    ``p_dtype`` selects the rounding applied to unnormalized P.  The default
++    (e4m3) models the kernel.  ``p_dtype=None`` skips that rounding entirely
++    and yields the same reference with its own P-quantization noise removed;
++    ``_assert_fp8_forward_close`` uses the difference of the two as a measured
++    noise floor.  See the derivation in that function.
++    """
+     q = inputs["q"].float()
+     k_paged = inputs["k_paged"]
+     v_paged = inputs["v_paged"]
+@@ -1231,7 +1458,11 @@ def _decode_paged_dense_reference(
+                 # normalized probabilities here would model a different
+                 # rounding point and overstate the kernel error for short-KV
+                 # decode rows.
+-                p_unnorm = exp_scores.to(torch.float8_e4m3fn).float()
++                p_unnorm = (
++                    exp_scores
++                    if p_dtype is None
++                    else exp_scores.to(p_dtype).float()
++                )
+                 out_cur += torch.einsum("hst,td->shd", p_unnorm, v_chunk)
+             out_cur = out_cur / safe_row_sum.transpose(0, 1).unsqueeze(-1)
+ 
+@@ -1342,18 +1573,167 @@ def _assert_fp8_forward_close(
+     lse: torch.Tensor,
+     lse_ref: torch.Tensor,
+     partial_is_fp8: bool = False,
++    out_ref_unquantized_p: torch.Tensor | None = None,
+ ) -> None:
++    out_ref_f = out_ref.float()
+     out_ref_bf16 = out_ref.to(torch.bfloat16).float()
+-    bf16_floor = (out_ref_bf16 - out_ref.float()).abs().max().item()
+-    kernel_diff = (out.float() - out_ref_bf16).abs().max().item()
+-    # QK/LSE should be tight. O additionally includes P(e4m3) @ V(e4m3)
+-    # with hardware FP8 MMA accumulation, so allow the observed PV rounding
+-    # envelope up through topK=32 rather than a bf16-only floor.
+-    # With fp8 O_partial, each split additionally quantizes the partial output
+-    # to e4m3 before combine; this adds another ~6% relative error per split
+-    # and pushes the worst-case |diff| up to ~0.5 on the standard cases.
+-    floor = 5.0e-1 if partial_is_fp8 else 1.25e-1
+-    assert kernel_diff <= max(floor, 4.0 * bf16_floor)
++    bf16_err = out_ref_bf16 - out_ref_f
++    bf16_floor = bf16_err.abs().max().item()
++    bf16_rms_floor = bf16_err.pow(2).mean().sqrt().item()
++    diff = out.float() - out_ref_bf16
++    kernel_diff = diff.abs().max().item()
++    diff_rms = diff.pow(2).mean().sqrt().item()
++    out_scale = out_ref_bf16.abs().max().item()
++    out_rms = out_ref_bf16.pow(2).mean().sqrt().item()
++    # QK/LSE should be tight. O additionally includes P(e4m3) @ V(e4m3) with
++    # hardware FP8 MMA accumulation, so it needs a slacker bound -- but that
++    # bound has to be RELATIVE to |O|. It used to be the bare constant 0.125
++    # (0.5 with fp8 O_partial), which is not scale-invariant: it silently gets
++    # stricter as the data grows. Making the synthetic NVFP4 block scales vary
++    # over [0.5, 1.875] instead of being pinned at 1.0 raised max|O| by 1.75x
++    # and raised |diff| by the same factor at *constant* relative error
++    # (measured 1.4-1.9% of max|O| in every scale window from constant-0x38 to
++    # 0x30-0x3E), and that alone flipped the test to failing. A relative bound
++    # would not have moved.
++    #
++    # Error model for the constant. P is rounded to E4M3, which carries 3
++    # explicit mantissa bits, so its round-to-nearest relative error is at most
++    # 2**-4. The kernel and the reference arrive at P by different roundings,
++    # so any P entry may land one E4M3 step away; O = sum_j P_j V_j / sum_j P_j
++    # is a convex combination of V rows, so that carries into O as the same
++    # relative perturbation. With fp8 O_partial every split additionally
++    # re-quantizes the partial output to E4M3 before the combine, which
++    # empirically costs ~4x more (measured max 12.4% vs 4.3% relative) -- the
++    # same 4x the two old constants encoded, now expressed relatively.
++    #
++    # Calibration: 561 measurements over the fp8 and NVFP4 test set give a
++    # worst observed relative error of 4.35% (441 bf16-O_partial cases) and
++    # 12.38% (120 fp8-O_partial cases), i.e. 1.4x and 2.0x of headroom below
++    # the bounds used here. The 4 * bf16_floor term is the reference's own
++    # bf16 storage floor; bf16 keeps 8 significand bits, so it is bounded by
++    # 4 * 2**-8 * max|O| = 1.6% * max|O| and is scale-invariant too. The
++    # headroom figures above count only the rtol term, so they are lower
++    # bounds on the real margin.
++    #
++    # The rtol term above is *only* valid while the reference's own P entries
++    # stay inside E4M3's normal range.  They do not, for long-KV decode.  The
++    # reference normalizes P by the GLOBAL row max, so p_j = exp(s_j - max_j
++    # s_j) covers (0, 1]; as the KV length N grows the row max grows like
++    # sqrt(2 ln N) and an ever larger share of p_j falls below E4M3's smallest
++    # normal 2**-6, where the rounding error is an ABSOLUTE half-ulp of 2**-10
++    # rather than a relative 2**-4.  Measured on the decode sweep, the
++    # subnormal share of the reference's P goes 0.9% (N=8) -> 34% (N=8192) ->
++    # 74% (N=1048576).  Meanwhile max|O| shrinks like 1/sqrt(N) (O is a convex
++    # combination of random V rows), so that absolute noise shows up as a
++    # relative error that climbs with N -- entirely on the reference's side.
++    #
++    # The kernel does not have this problem: it normalizes P against a
++    # per-tile running max (`rescale_threshold = 4.0` in
++    # src/sm100/fwd_decode/atten_fwd.py), never against a 1M-token global max.
++    # Measured against the same reference evaluated with an *unquantized* P,
++    # rms|kernel - exact| / rms|exact| is FLAT at 2.7% over N = 8192 ..
++    # 1048576, while rms|ref - exact| / rms|exact| climbs 2.68% -> 3.79% and
++    # max|ref - exact| / max|O| climbs 3.97% -> 12.74%.  At N = 1048576 the
++    # kernel is closer to the unquantized answer (6.9%) than the reference is
++    # (12.7%).  A bound that charges the reference's own quantization noise to
++    # the kernel is mis-modelled, not a kernel defect.
++    #
++    # So: when the caller can supply the same reference computed without the
++    # E4M3 P rounding, subtract the two to get that noise directly and admit
++    # it into the tolerance.  This is measured from the *inputs*, not from the
++    # kernel, so it cannot be inflated by a broken kernel.  Callers that do
++    # not supply it (all prefill/NVFP4 sites) keep exactly the previous bound.
++    e4m3_relative_ulp = 2.0**-4
++    rtol = 4.0 * e4m3_relative_ulp if partial_is_fp8 else e4m3_relative_ulp
++    if out_ref_unquantized_p is None:
++        ref_noise_max = 0.0
++        ref_noise_rms = 0.0
++    else:
++        ref_noise = out_ref_f - out_ref_unquantized_p.float()
++        ref_noise_max = ref_noise.abs().max().item()
++        ref_noise_rms = ref_noise.pow(2).mean().sqrt().item()
++
++    # Triangle inequality through the unquantized-P reference:
++    #   |out - out_ref| <= |out - exact| + |exact - out_ref|.
++    # The second leg is ref_noise.  The first leg is the kernel's own E4M3 P
++    # rounding, which is of the same class and (per the measurements above)
++    # never coarser, so it is charged the same quantity -- hence the factor 2.
++    tol = 4.0 * bf16_floor + rtol * out_scale + 2.0 * ref_noise_max
++    assert kernel_diff <= tol, (
++        f"max|out - out_ref| = {kernel_diff:.6g} exceeds {tol:.6g} "
++        f"(= 4 * bf16_floor {bf16_floor:.6g} + rtol {rtol:.6g} "
++        f"* max|out_ref| {out_scale:.6g} + 2 * ref_quant_noise "
++        f"{ref_noise_max:.6g}); relative error "
++        f"{kernel_diff / max(out_scale, 1e-30):.4%}"
++    )
++
++    # The same model evaluated in RMS instead of at the single worst element.
++    # rms <= max elementwise, so the same relative constants are conservative
++    # here; this is the coarse net for "the kernel got noisier everywhere",
++    # which a max over millions of elements reports only weakly.
++    rms_tol = 4.0 * bf16_rms_floor + rtol * out_rms + 2.0 * ref_noise_rms
++    assert diff_rms <= rms_tol, (
++        f"rms(out - out_ref) = {diff_rms:.6g} exceeds {rms_tol:.6g} "
++        f"(= 4 * bf16_rms_floor {bf16_rms_floor:.6g} + rtol {rtol:.6g} "
++        f"* rms|out_ref| {out_rms:.6g} + 2 * ref_quant_noise_rms "
++        f"{ref_noise_rms:.6g}); ratio {diff_rms / max(out_rms, 1e-30):.4%}"
++    )
++
++    # Both bounds above are set by the quantization NOISE, which is a few
++    # percent for any E4M3 attention kernel and grows with N on the reference
++    # side.  On their own they would accept a several-percent systematic
++    # corruption at large N, i.e. they would be close to vacuous exactly where
++    # the old absolute constant already was.  The two projections below are
++    # what keep the criterion sharp: they are insensitive to zero-mean noise
++    # (it averages down by sqrt(n_elem)) but respond linearly to a systematic
++    # error.
++    #
++    #   gain_err = <out - out_ref, out_ref> / <out_ref, out_ref>
++    #
++    # is exactly eps for a corruption out -> (1 + eps) * out.  For a correct
++    # kernel it is not zero, because round-to-nearest on the E4M3 grid is only
++    # unbiased to FIRST order in the relative ulp; writing the residual as
++    # sum_j e_j p_j / sum_j p_j^2 with |e_j| <= rtol * p_j, the surviving
++    # systematic part is second order, O(rtol**2).  Measured: the kernel's own
++    # projection (against the unquantized-P reference) is flat at -6.2e-4 ..
++    # -7.2e-4 across N = 1024 .. 1048576 = 0.16 .. 0.18 * rtol**2, and over
++    # 141 prefill/NVFP4 measurements |gain_err| <= 9.7e-5 = 0.025 * rtol**2.
++    # The reference's own projection is what grows with N (+4.6e-5 at N=1024
++    # -> +9.1e-4 at N=1048576), so it enters through ref_noise like the terms
++    # above.  The 8 * (statistical null sd) term covers small tensors, where
++    # the projection of a genuinely zero-mean residual fluctuates.
++    n_elem = diff.numel()
++    ref_energy = (out_ref_bf16 * out_ref_bf16).sum().item()
++    gain_err = (diff * out_ref_bf16).sum().item() / ref_energy if ref_energy > 0 else 0.0
++    gain_null_sd = diff_rms / (math.sqrt(n_elem) * out_rms) if out_rms > 0 else 0.0
++    ref_gain_noise = 0.0
++    if out_ref_unquantized_p is not None and ref_energy > 0:
++        ref_gain_noise = abs(
++            (ref_noise * out_ref_bf16).sum().item() / ref_energy
++        )
++    gain_tol = rtol * rtol + 2.0 * ref_gain_noise + 8.0 * gain_null_sd
++    assert abs(gain_err) <= gain_tol, (
++        f"<out - out_ref, out_ref> / <out_ref, out_ref> = {gain_err:.6g} "
++        f"exceeds {gain_tol:.6g} (= rtol**2 {rtol * rtol:.6g} + 2 * "
++        f"ref_gain_noise {ref_gain_noise:.6g} + 8 * null_sd "
++        f"{gain_null_sd:.6g}); the kernel output is systematically scaled"
++    )
++
++    # Companion projection onto the constant vector: catches an additive
++    # offset, which the gain statistic cannot see when out_ref is zero-mean.
++    # Its null is diff_rms / sqrt(n_elem); over the 160 fp8/NVFP4 measurements
++    # the observed |mean| never exceeded 2.38 of those sd, so 8 is >3x the
++    # worst observation.  The gain_tol * |mean(out_ref)| term keeps the two
++    # checks from double-counting when out_ref does have a nonzero mean.
++    mean_err = diff.mean().item()
++    mean_ref = out_ref_bf16.mean().item()
++    mean_tol = 8.0 * diff_rms / math.sqrt(n_elem) + gain_tol * abs(mean_ref)
++    assert abs(mean_err) <= mean_tol, (
++        f"mean(out - out_ref) = {mean_err:.6g} exceeds {mean_tol:.6g} "
++        f"(= 8 * null_sd {diff_rms / math.sqrt(n_elem):.6g} + gain_tol "
++        f"{gain_tol:.6g} * |mean(out_ref)| {abs(mean_ref):.6g}); the kernel "
++        f"output carries a systematic offset"
++    )
+ 
+     finite = lse_ref.isfinite()
+     if finite.any():
+@@ -1786,6 +2166,74 @@ def test_sparse_page_atten(
+ 
+     _assert_forward_close(out, out_ref, out_pt.float(), lse, lse_ref)
+ 
++
++def test_sparse_page_atten_strided_outer_page_matches_packed() -> None:
++    inputs = _build_paged_inputs(
++        batch=1,
++        seqlen_q=2048,
++        seqlen_kv=2048,
++        head_kv=2,
++        qhead_per_kv=16,
++        dim=128,
++        topk=16,
++        blk_kv=128,
++        causal=True,
++        page_size=128,
++        seqused_trim=0,
++        dtype=torch.float8_e4m3fn,
++    )
++    k_packed = inputs["k_paged"].detach().clone()
++    v_packed = inputs["v_paged"].detach().clone()
++    pool = torch.empty(
++        k_packed.shape[0],
++        4,
++        *k_packed.shape[1:],
++        dtype=k_packed.dtype,
++        device=k_packed.device,
++    )
++    k_strided = pool[:, 1]
++    v_strided = pool[:, 3]
++    k_strided.copy_(k_packed)
++    v_strided.copy_(v_packed)
++
++    assert not k_strided.is_contiguous()
++    assert not v_strided.is_contiguous()
++    assert (
++        sparse_interface._prepare_paged_hnd_input(k_strided, inputs["blk_kv"]).data_ptr()
++        == k_strided.data_ptr()
++    )
++    assert (
++        sparse_interface._prepare_paged_hnd_input(v_strided, inputs["blk_kv"]).data_ptr()
++        == v_strided.data_ptr()
++    )
++
++    def run(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        return sparse_atten_func(
++            inputs["q"],
++            k,
++            v,
++            inputs["k2q_row_ptr"],
++            inputs["k2q_q_indices"],
++            16,
++            blk_kv=inputs["blk_kv"],
++            causal=True,
++            softmax_scale=inputs["softmax_scale"],
++            return_softmax_lse=True,
++            cu_seqlens_q=inputs["cu_seqlens_q"],
++            cu_seqlens_k=inputs["cu_seqlens_k"],
++            max_seqlen_q=inputs["max_seqlen_q"],
++            max_seqlen_k=inputs["max_seqlen_k"],
++            page_table=inputs["page_table"],
++            seqused_k=inputs["seqused_k"],
++            schedule=inputs["schedule"],
++        )
++
++    packed_out, packed_lse = run(k_packed, v_packed)
++    strided_out, strided_lse = run(k_strided, v_strided)
++    torch.testing.assert_close(strided_out, packed_out, rtol=0, atol=0)
++    torch.testing.assert_close(strided_lse, packed_lse, rtol=0, atol=0)
++
++
+ @pytest.mark.parametrize("paged", [False, True])
+ @pytest.mark.parametrize("causal", [True])
+ @pytest.mark.parametrize("batch", [3])
+@@ -1857,8 +2305,7 @@ def test_sparse_atten_nvfp4_kv_matches_dequantized_bf16(
+         k_source = inputs["k"]
+         v_source = inputs["v"]
+ 
+-    k_q = _quantize_bf16_to_nvfp4_or_skip(k_source)
+-    v_q = _quantize_bf16_to_nvfp4_or_skip(v_source)
++    k_q, v_q = _quantize_kv_bf16_to_nvfp4(k_source, v_source)
+     k_deq = _dequant_nvfp4_to_bf16(k_q)
+     v_deq = _dequant_nvfp4_to_bf16(v_q)
+ 
+@@ -1886,8 +2333,8 @@ def test_sparse_atten_nvfp4_kv_matches_dequantized_bf16(
+         inputs["q"],
+         k_q.data,
+         v_q.data,
+-        k_q.scale_128x4,
+-        v_q.scale_128x4,
++        k_q.scale,
++        v_q.scale,
+         k_q.global_scale,
+         v_q.global_scale,
+         inputs["k2q_row_ptr"],
+@@ -2184,8 +2631,7 @@ def test_sparse_atten_nvfp4_kv_te_quantized_flat_smoke() -> None:
+         dtype=torch.bfloat16,
+         q2k_pattern=Q2KPattern.UNIFORM,
+     )
+-    k_q = _quantize_bf16_to_nvfp4_or_skip(inputs["k"])
+-    v_q = _quantize_bf16_to_nvfp4_or_skip(inputs["v"])
++    k_q, v_q = _quantize_kv_bf16_to_nvfp4(inputs["k"], inputs["v"])
+     k_deq = _dequant_nvfp4_to_bf16(k_q)
+     v_deq = _dequant_nvfp4_to_bf16(v_q)
+ 
+@@ -2211,8 +2657,8 @@ def test_sparse_atten_nvfp4_kv_te_quantized_flat_smoke() -> None:
+         inputs["q"],
+         k_q.data,
+         v_q.data,
+-        k_q.scale_128x4,
+-        v_q.scale_128x4,
++        k_q.scale,
++        v_q.scale,
+         k_q.global_scale,
+         v_q.global_scale,
+         inputs["k2q_row_ptr"],
+@@ -2237,7 +2683,7 @@ def test_sparse_atten_nvfp4_kv_te_quantized_flat_smoke() -> None:
+ @pytest.mark.parametrize("paged", [False, True])
+ @pytest.mark.parametrize("qhead_per_kv", [1, 2, 4, 8, 16])
+ @pytest.mark.parametrize("topk", [4, 8])
+-def test_sparse_atten_nvfp4_kv_fp8_q_matches_block_scaled_fp8_reference(
++def test_sparse_atten_nvfp4_kv_fp8_q_matches_calibrated_fp8_reference(
+     topk: int,
+     qhead_per_kv: int,
+     paged: bool,
+@@ -2280,15 +2726,14 @@ def test_sparse_atten_nvfp4_kv_fp8_q_matches_block_scaled_fp8_reference(
+         v_source = inputs["v"]
+ 
+     q_fp8 = inputs["q"].to(torch.float8_e4m3fn)
+-    k_q = _quantize_bf16_to_nvfp4_or_skip(k_source)
+-    v_q = _quantize_bf16_to_nvfp4_or_skip(v_source)
++    k_q, v_q = _quantize_kv_bf16_to_nvfp4(k_source, v_source)
+     fp8_max = torch.finfo(torch.float8_e4m3fn).max
+-    k_stage = _dequant_nvfp4_to_bf16(k_q, include_global_scale=False)
+-    v_stage = _dequant_nvfp4_to_bf16(v_q, include_global_scale=False)
++    # The block-scaled FP4 product is exactly representable in BF16. Apply
++    # the global scale in FP32, avoiding an extra BF16 rounding before FP8.
++    k_stage = _dequant_nvfp4_to_bf16(k_q, include_global_scale=False).float() * k_q.global_scale
++    v_stage = _dequant_nvfp4_to_bf16(v_q, include_global_scale=False).float() * v_q.global_scale
+     k_stage = k_stage.float().clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn)
+     v_stage = v_stage.float().clamp(min=-fp8_max, max=fp8_max).to(torch.float8_e4m3fn)
+-    k_global = float(k_q.global_scale.reshape(-1)[0].item())
+-    v_global = float(v_q.global_scale.reshape(-1)[0].item())
+ 
+     if paged:
+         k_ref_chunks = []
+@@ -2315,20 +2760,19 @@ def test_sparse_atten_nvfp4_kv_fp8_q_matches_block_scaled_fp8_reference(
+         q_lens=inputs["q_lens"],
+         k_lens=inputs["k_lens"],
+         blk_kv=inputs["blk_kv"],
+-        softmax_scale=inputs["softmax_scale"] * k_global,
++        softmax_scale=inputs["softmax_scale"],
+         causal=causal,
+         upcast=True,
+         seqused_k=inputs["seqused_k"] if paged else None,
+         p_dtype=torch.float8_e4m3fn,
+     )
+-    out_ref = out_ref * v_global
+ 
+     out, lse = sparse_atten_nvfp4_kv_func(
+         q_fp8,
+         k_q.data,
+         v_q.data,
+-        k_q.scale_128x4,
+-        v_q.scale_128x4,
++        k_q.scale,
++        v_q.scale,
+         k_q.global_scale,
+         v_q.global_scale,
+         inputs["k2q_row_ptr"],
+@@ -2366,8 +2810,14 @@ def test_sparse_atten_nvfp4_kv_fp8_q_without_global_scale_matches_reference() ->
+         q2k_pattern=Q2KPattern.UNIFORM,
+     )
+     q_fp8 = inputs["q"].to(torch.float8_e4m3fn)
+-    k_q = _make_synthetic_nvfp4_tensor(tuple(inputs["k"].shape))
+-    v_q = _make_synthetic_nvfp4_tensor(tuple(inputs["v"].shape))
++    k_q = _make_synthetic_nvfp4_tensor(
++        tuple(inputs["k"].shape),
++        layout=NVFP4_K_SCALE_LAYOUT,
++    )
++    v_q = _make_synthetic_nvfp4_tensor(
++        tuple(inputs["v"].shape),
++        layout=NVFP4_V_SCALE_LAYOUT,
++    )
+     fp8_max = torch.finfo(torch.float8_e4m3fn).max
+     k_ref = _dequant_nvfp4_to_bf16(
+         k_q,
+@@ -2395,8 +2845,8 @@ def test_sparse_atten_nvfp4_kv_fp8_q_without_global_scale_matches_reference() ->
+         q_fp8,
+         k_q.data,
+         v_q.data,
+-        k_q.scale_128x4,
+-        v_q.scale_128x4,
++        k_q.scale,
++        v_q.scale,
+         None,
+         None,
+         inputs["k2q_row_ptr"],
+@@ -2560,10 +3010,13 @@ def test_sparse_decode_page_fp8_forward(kv_tokens: int) -> None:
+ 
+     out, lse = _run_sparse_decode_page_fp8(fn, inputs)
+     out_ref, lse_ref = _decode_paged_dense_reference(inputs)
++    out_ref_exact, _ = _decode_paged_dense_reference(inputs, p_dtype=None)
+     assert out.dtype == torch.bfloat16
+     assert out.shape == inputs["q"].shape
+     assert lse.shape == inputs["q"].shape[:2]
+-    _assert_fp8_forward_close(out, out_ref, lse, lse_ref)
++    _assert_fp8_forward_close(
++        out, out_ref, lse, lse_ref, out_ref_unquantized_p=out_ref_exact
++    )
+ 
+ 
+ def test_sparse_decode_page_fp8_forward_forced_split_kv_tile_aligned_partial() -> None:
+@@ -2596,7 +3049,10 @@ def test_sparse_decode_page_fp8_forward_forced_split_kv_tile_aligned_partial() -
+         return_softmax_lse=True,
+     )
+     out_ref, lse_ref = _decode_paged_dense_reference(inputs)
+-    _assert_fp8_forward_close(out, out_ref, lse, lse_ref)
++    out_ref_exact, _ = _decode_paged_dense_reference(inputs, p_dtype=None)
++    _assert_fp8_forward_close(
++        out, out_ref, lse, lse_ref, out_ref_unquantized_p=out_ref_exact
++    )
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -2943,10 +3399,12 @@ def _build_sparse_nvfp4_kv_benchmark_context(
+         raise ValueError(f"Unsupported NVFP4 KV benchmark Q dtype: {q_dtype}")
+     k_q = _make_synthetic_nvfp4_tensor(
+         tuple(k_source.shape),
++        layout=NVFP4_K_SCALE_LAYOUT,
+         global_scale_value=0.75,
+     )
+     v_q = _make_synthetic_nvfp4_tensor(
+         tuple(v_source.shape),
++        layout=NVFP4_V_SCALE_LAYOUT,
+         global_scale_value=1.25,
+     )
+     k_bf16 = _dequant_nvfp4_to_bf16(k_q)
+@@ -2990,8 +3448,8 @@ def _build_sparse_nvfp4_kv_benchmark_context(
+             q,
+             k_q.data,
+             v_q.data,
+-            k_q.scale_128x4,
+-            v_q.scale_128x4,
++            k_q.scale,
++            v_q.scale,
+             k_q.global_scale,
+             v_q.global_scale,
+             k2q_row_ptr,
+diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
+index fa63a02..8fd38fa 100644
+--- a/python/fmha_sm100/jit.py
++++ b/python/fmha_sm100/jit.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -8911,7 +9493,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
  import threading
  from pathlib import Path
  
-@@ -22,11 +26,115 @@ import jinja2
+@@ -22,11 +26,107 @@ import jinja2
  
  logger = logging.getLogger(__name__)
  
@@ -8919,9 +9501,9 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
 +# compilation works from both editable and wheel installs.
 +_PACKAGE_DIR = Path(__file__).resolve().parent
 +_FMHA_VARLEN_DIR = _PACKAGE_DIR / "csrc"
-+# TensorRT-LLM: this copy ships no CUTLASS headers. A run-time compile uses CUTLASS_ROOT, else the
-+# CUTLASS headers packaged with TensorRT-LLM's top-level fmha_sm100 (fmha_sm100/cutlass). Either must
-+# be the CUTLASS release this copy was validated with.
++# A run-time compile uses CUTLASS_ROOT when set, else the CUTLASS headers shipped in this package
++# (fmha_sm100/cutlass). Either must be the CUTLASS release this package was validated with.
++_CUTLASS_DIR = _PACKAGE_DIR / "cutlass"
 +_VALIDATED_CUTLASS_VERSION = (4, 4, 2)
 +_cutlass_dir_cache = None
 +
@@ -8947,21 +9529,13 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
 +    if _cutlass_dir_cache is not None:
 +        return _cutlass_dir_cache
 +    root = os.environ.get("CUTLASS_ROOT")
-+    if root:
-+        cutlass_dir = Path(root)
-+    else:
-+        spec = importlib.util.find_spec("fmha_sm100")
-+        if spec is None or spec.origin is None:
-+            raise RuntimeError(
-+                "fmha_sm100 (MiniMax-M3.1 copy): compiling a kernel needs CUTLASS headers; set CUTLASS_ROOT, "
-+                "or install TensorRT-LLM with its packaged fmha_sm100")
-+        cutlass_dir = Path(spec.origin).resolve().parent / "cutlass"
++    cutlass_dir = Path(root) if root else _CUTLASS_DIR
 +    version = _read_cutlass_version(cutlass_dir / "include" / "cutlass" / "version.h")
 +    if version != _VALIDATED_CUTLASS_VERSION:
 +        found = "an unreadable version" if version is None else ".".join(map(str, version))
 +        expected = ".".join(map(str, _VALIDATED_CUTLASS_VERSION))
 +        raise RuntimeError(
-+            f"fmha_sm100 (MiniMax-M3.1 copy): CUTLASS at {cutlass_dir} has {found}, but this copy was "
++            f"fmha_sm100: CUTLASS at {cutlass_dir} has {found}, but this package was "
 +            f"validated with CUTLASS {expected}; point CUTLASS_ROOT at a CUTLASS {expected} checkout")
 +    _cutlass_dir_cache = cutlass_dir
 +    return cutlass_dir
@@ -9030,7 +9604,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
      # Different build configs get separate cache dirs to avoid conflicts
      suffix = ""
      if os.environ.get("GPU_TRACE") is not None:
-@@ -35,12 +143,76 @@ def _compute_cache_base():
+@@ -35,12 +135,83 @@ def _compute_cache_base():
          suffix += "_sm_timing"
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          suffix += "_gmem_check"
@@ -9095,8 +9669,12 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
 +# MiniMax-M3.1 targets call into tensorrt_llm/libs/msa_fmha_sm100, in this cache's layout, for the SM107 OnlyScore
 +# proxy modes without diagnostics. They load from there when present; no such module ships by default, so anything
 +# else, and everything without that build, compiles at run time.
-+# This file is tensorrt_llm/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100/jit.py.
-+_PREBUILT_DIR = Path(os.path.abspath(__file__)).parents[7] / "libs" / "msa_fmha_sm100"
++# This package installs next to tensorrt_llm; the directory is looked up without importing tensorrt_llm.
++def _prebuilt_dir():
++    spec = importlib.util.find_spec("tensorrt_llm")
++    if spec is None or spec.origin is None:
++        return None
++    return Path(spec.origin).resolve().parent / "libs" / "msa_fmha_sm100"
 +
 +
 +def _prebuilt(relative: str):
@@ -9105,12 +9683,15 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
 +        return None
 +    if _proxy_modes() != (False, False):
 +        return None
-+    path = _PREBUILT_DIR / relative
++    prebuilt_dir = _prebuilt_dir()
++    if prebuilt_dir is None:
++        return None
++    path = prebuilt_dir / relative
 +    return path if path.is_file() else None
  
  
  def _acquire_file_lock(lock_path):
-@@ -55,13 +227,6 @@ def _release_file_lock(fd):
+@@ -55,13 +226,6 @@ def _release_file_lock(fd):
      os.close(fd)
  
  
@@ -9124,7 +9705,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
  
  _PACK_FACTORS = [1,2,4,6,8,16]
  # _PACK_FACTORS = [1, 6]
-@@ -187,18 +352,98 @@ def _get_cuda_home():
+@@ -187,18 +351,98 @@ def _get_cuda_home():
      raise RuntimeError("Cannot find CUDA toolkit. Set CUDA_HOME.")
  
  
@@ -9226,7 +9807,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
          "-static-global-template-stub=false",
          "-DFLASHINFER_ENABLE_BF16",
          "-DFLASHINFER_ENABLE_FP8_E4M3",
-@@ -225,7 +470,12 @@ def _get_nvcc_flags(cache_dir, fmha=True):
+@@ -225,7 +469,12 @@ def _get_nvcc_flags(cache_dir, fmha=True):
          nvcc_flags.append("-DSM_TIMING_ENABLED")
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          nvcc_flags.append("-DFMHA_GMEM_BOUNDS_CHECK")
@@ -9240,7 +9821,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
  
  class _VariantWrapper:
      """Wraps a TVM-FFI function to look like a module with .run()."""
-@@ -257,9 +507,10 @@ class FMHAVariantManager:
+@@ -257,9 +506,10 @@ class FMHAVariantManager:
      def _ensure_all_module(self):
          if not self._all_module_checked:
              self._all_module_checked = True
@@ -9253,7 +9834,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
  
      def get_variant(self, dtype_code, qo_tile_size, single_wg,
                      sparse_mode, page_size, split_kv, pack_factor):
-@@ -278,6 +529,12 @@ class FMHAVariantManager:
+@@ -278,6 +528,12 @@ class FMHAVariantManager:
  
              fn_name = f"run_{variant_name}"
  
@@ -9266,7 +9847,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
              # Try all_variants.so
              self._ensure_all_module()
              if self._all_module is not None:
-@@ -289,12 +546,12 @@ class FMHAVariantManager:
+@@ -289,12 +545,12 @@ class FMHAVariantManager:
                      pass
  
              # Try per-variant .so
@@ -9281,7 +9862,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
  
                  import tvm_ffi
                  module = tvm_ffi.load_module(str(so_path))
-@@ -304,9 +561,14 @@ class FMHAVariantManager:
+@@ -304,9 +560,14 @@ class FMHAVariantManager:
              self._loaded[variant_name] = _VariantWrapper(fn)
              return self._loaded[variant_name]
  
@@ -9299,7 +9880,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
          so_path = cache_dir / f"{variant_name}.so"
  
          if so_path.exists():
-@@ -362,8 +624,8 @@ build {so_path}: nvcc_link {inst_obj} {run_obj}
+@@ -362,8 +623,8 @@ build {so_path}: nvcc_link {inst_obj} {run_obj}
          (cache_dir / "build.ninja").write_text(ninja_content)
  
      def _run_ninja(self, cache_dir):
@@ -9310,7 +9891,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
              cwd=str(cache_dir),
              capture_output=True,
              text=True,
-@@ -395,9 +657,11 @@ _plan_module = None
+@@ -395,9 +656,11 @@ _plan_module = None
  _plan_lock = threading.Lock()
  
  
@@ -9325,7 +9906,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
      so_path = cache_dir / "fmha_sm100_plan.so"
  
      if so_path.exists():
-@@ -434,7 +698,7 @@ build {so_path}: nvcc_link {obj}
+@@ -434,7 +697,7 @@ build {so_path}: nvcc_link {obj}
  """
      (cache_dir / "build.ninja").write_text(ninja_content)
  
@@ -9334,7 +9915,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
          ["ninja", "-j1"],
          cwd=str(cache_dir),
          capture_output=True,
-@@ -455,11 +719,14 @@ def _compile_plan_only():
+@@ -455,11 +718,14 @@ def _compile_plan_only():
  
  def _compile_plan_module():
      """Compile and load plan kernel."""
@@ -9352,7 +9933,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
          return tvm_ffi.load_module(str(so_path))
      finally:
          _release_file_lock(lock_fd)
-@@ -474,6 +741,11 @@ def get_plan_fn():
+@@ -474,6 +740,11 @@ def get_plan_fn():
      with _plan_lock:
          if _plan_module is not None:
              return _plan_module
@@ -9364,7 +9945,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
          _plan_module = _compile_plan_module()
          return _plan_module
  
-@@ -486,8 +758,9 @@ _sparse_topk_module = None
+@@ -486,8 +757,9 @@ _sparse_topk_module = None
  _sparse_topk_lock = threading.Lock()
  
  
@@ -9376,7 +9957,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
      so_path = cache_dir / "sparse_topk_select.so"
  
      if so_path.exists():
-@@ -530,7 +803,7 @@ build {so_path}: nvcc_link {obj}
+@@ -530,7 +802,7 @@ build {so_path}: nvcc_link {obj}
  """
      (cache_dir / "build.ninja").write_text(ninja_content)
  
@@ -9385,7 +9966,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
          ["ninja", "-j1"],
          cwd=str(cache_dir),
          capture_output=True,
-@@ -553,11 +826,19 @@ def get_sparse_topk_module():
+@@ -553,11 +825,19 @@ def get_sparse_topk_module():
      with _sparse_topk_lock:
          if _sparse_topk_module is not None:
              return _sparse_topk_module
@@ -9408,7 +9989,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
              _sparse_topk_module = tvm_ffi.load_module(str(so_path))
          finally:
              _release_file_lock(lock_fd)
-@@ -572,8 +853,9 @@ _reduction_module = None
+@@ -572,8 +852,9 @@ _reduction_module = None
  _reduction_lock = threading.Lock()
  
  
@@ -9420,7 +10001,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
      so_path = cache_dir / "fmha_sm100_reduction.so"
  
      if so_path.exists():
-@@ -615,7 +897,7 @@ build {so_path}: nvcc_link {obj}
+@@ -615,7 +896,7 @@ build {so_path}: nvcc_link {obj}
  """
      (cache_dir / "build.ninja").write_text(ninja_content)
  
@@ -9429,7 +10010,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
          ["ninja", "-j1"],
          cwd=str(cache_dir),
          capture_output=True,
-@@ -638,11 +920,19 @@ def get_reduction_module():
+@@ -638,11 +919,19 @@ def get_reduction_module():
      with _reduction_lock:
          if _reduction_module is not None:
              return _reduction_module
@@ -9452,10 +10033,10 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea34874
              _reduction_module = tvm_ffi.load_module(str(so_path))
          finally:
              _release_file_lock(lock_fd)
-diff --git a/sparse.py b/sparse.py
-index 7006fcd90bfa7c3beb715dcf0465913f9e9d10ad..fb962d79f13249b0212db0245531099b4e6025b2 100644
---- a/sparse.py
-+++ b/sparse.py
+diff --git a/python/fmha_sm100/sparse.py b/python/fmha_sm100/sparse.py
+index 7006fcd..fb962d7 100644
+--- a/python/fmha_sm100/sparse.py
++++ b/python/fmha_sm100/sparse.py
 @@ -1,19 +1,13 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
@@ -9580,10 +10161,10 @@ index 7006fcd90bfa7c3beb715dcf0465913f9e9d10ad..fb962d79f13249b0212db0245531099b
 +    "nvfp4_scale_swizzle4x4_offset",
      "nvfp4_global_scale_from_amax",
  ]
-diff --git a/sparse_fmha_adapter.py b/sparse_fmha_adapter.py
-index 306b416b39e269cbcb86256958b53253534d1750..f6becc4272dfb414fb63c84274b61cca0b262efa 100644
---- a/sparse_fmha_adapter.py
-+++ b/sparse_fmha_adapter.py
+diff --git a/python/fmha_sm100/sparse_fmha_adapter.py b/python/fmha_sm100/sparse_fmha_adapter.py
+index 306b416..f6becc4 100644
+--- a/python/fmha_sm100/sparse_fmha_adapter.py
++++ b/python/fmha_sm100/sparse_fmha_adapter.py
 @@ -1,4 +1,5 @@
  # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES

@@ -170,7 +170,7 @@ def _msa_sparse_api():
     sparse = getattr(fmha_sm100, "sparse", None)
     if sparse is None:
         try:
-            from ..kernels.msa_kernels.fmha_sm100 import sparse
+            from fmha_sm100 import sparse
         except ImportError as exc:
             raise RuntimeError("MiniMax-M3 NVFP4 KV cache requires the Fan MSA sparse API") from exc
     if not hasattr(sparse, "build_k2q_csr") or not hasattr(sparse, "sparse_atten_nvfp4_kv_func"):
@@ -188,10 +188,10 @@ def _k2q_csr_parts():
     Internals of the packaged MSA builder, resolved once; a build that moves
     them leaves every call on build_k2q_csr itself.
     """
-    _msa_sparse_api()  # the vendored package and its CuTe DSL name shim
+    _msa_sparse_api()  # the fmha_sm100 package and its CuTe DSL name shim
     try:
-        from ..kernels.msa_kernels.fmha_sm100.cute.sparse_index_utils import _K2Q_CSR_BUILDER
-        from ..kernels.msa_kernels.fmha_sm100.cute.src.sm100.prepare_scheduler import (
+        from fmha_sm100.cute.sparse_index_utils import _K2Q_CSR_BUILDER
+        from fmha_sm100.cute.src.sm100.prepare_scheduler import (
             SPARSE_SCHEDULE_MODEL,
             SparseAttentionSchedule,
         )
@@ -211,9 +211,9 @@ def _k2q_lpt_parts():
 
     Internals of the packaged MSA builder (prepare_k2q_csr), resolved once; a build that moves them leaves every LPT
     call on build_k2q_csr itself."""
-    _msa_sparse_api()  # the vendored package and its CuTe DSL name shim
+    _msa_sparse_api()  # the fmha_sm100 package and its CuTe DSL name shim
     try:
-        from ..kernels.msa_kernels.fmha_sm100.cute.src.sm100 import prepare_k2q_csr
+        from fmha_sm100.cute.src.sm100 import prepare_k2q_csr
     except ImportError:
         return None
     parts = tuple(
@@ -367,9 +367,9 @@ def _nvfp4_attention_parts():
     Internals of the packaged MSA entry point, resolved once; a build that
     moves them leaves every call on sparse_atten_nvfp4_kv_func itself.
     """
-    _msa_sparse_api()  # the vendored package and its CuTe DSL name shim
+    _msa_sparse_api()  # the fmha_sm100 package and its CuTe DSL name shim
     try:
-        from ..kernels.msa_kernels.fmha_sm100.cute import interface
+        from fmha_sm100.cute import interface
     except ImportError:
         return None
     names = (
@@ -570,8 +570,8 @@ def _tp2ctx_bf16x_run():
             reason = "not_sm107"
         else:
             try:
-                from ..kernels.msa_kernels.prefill_bf16x import jit as _bf16x_jit
-                from ..kernels.msa_kernels.prefill_bf16x import run_prefill as run
+                from fmha_sm100_prefill_bf16x import jit as _bf16x_jit
+                from fmha_sm100_prefill_bf16x import run_prefill as run
 
                 if not _bf16x_jit.prebuilt_available():
                     run, reason = None, "no_prefill_bf16x_prebuilt"
@@ -602,7 +602,7 @@ def _tp2ctx_e4m3x_ok():
         return "e4m3x_disabled_by_env"
     if "e4m3x_build" not in _TP2CTX_BF16X_STATE:
         try:
-            from ..kernels.msa_kernels.prefill_bf16x import jit as _bf16x_jit
+            from fmha_sm100_prefill_bf16x import jit as _bf16x_jit
 
             _TP2CTX_BF16X_STATE["e4m3x_build"] = bool(getattr(_bf16x_jit, "_E4M3X", False))
         except ImportError:
@@ -683,7 +683,7 @@ def _prefill_split_workspace(device: torch.device):
         return None
     key = (device.index, torch.cuda.current_stream(device).cuda_stream)
     if key not in _PREFILL_WORKSPACES:
-        from ..kernels.msa_kernels.prefill_bf16x import PrefillWorkspace
+        from fmha_sm100_prefill_bf16x import PrefillWorkspace
 
         workspace = PrefillWorkspace(device)
         _PREFILL_WORKSPACES[key] = workspace if workspace.num_domains > 1 else None
