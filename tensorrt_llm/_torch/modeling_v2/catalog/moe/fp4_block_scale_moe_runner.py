@@ -160,7 +160,9 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
 
     `tune_max_num_tokens` is an autotuner bucket hint and was measured inert;
     it is not a token count. `T` is `hidden_states.shape[0]`, and 8192 is the
-    top of the certified column. A warm autotuner cache was measured bitwise
+    top of the certified column. At the R1 geometry over the 16- and 9-wide
+    windows of wide expert parallelism, calls up to 262144 rows are certified
+    as bitwise equal to the same rows run 8192 at a time. A warm autotuner cache was measured bitwise
     inert against a cold one at the R1 stack, its windows and the 512-expert
     stack; `local_num_experts` separates the tuner's cache entries, so each
     layout warms its own.

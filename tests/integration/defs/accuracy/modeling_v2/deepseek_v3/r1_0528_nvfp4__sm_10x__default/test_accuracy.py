@@ -26,18 +26,22 @@ than only on the one running the test body. The switch is an LLM API argument,
 so it reaches the ranks the way the rest of the arguments do.
 """
 
+import random
+
 import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 
 from .....conftest import llm_models_root
 from ....accuracy_core import (
     GSM8K,
     LlmapiAccuracyTestHarness,
     assert_acceptance_length,
+    assert_acceptance_length_for_llm,
     compute_acceptance_length,
 )
 from ..._env import scoped_env_overrides
@@ -98,12 +102,63 @@ _LAYOUTS = [
     _layout("dep8_moetp8", 8, 8, 1, True),
     _layout("dep8_moetp2_ep4", 8, 2, 4, True),
     _layout("dep16", 16, 1, 16, True),
+    _layout("dep32", 32, 1, 32, True),
 ]
 
 # The layouts routing admits MTP at: each residual-norm path (attention TP in
 # one tray and across trays, attention DP) and each expert split.
-_MTP_LAYOUT_IDS = ("dep4", "tp4", "tp4_ep4", "dep4_moetp4", "tp8_moetp2_ep4", "dep8")
+_MTP_LAYOUT_IDS = (
+    "dep4",
+    "tp4",
+    "tp4_ep4",
+    "dep4_moetp4",
+    "tp8_moetp2_ep4",
+    "dep8",
+    "dep16",
+    "dep32",
+    "dep36",
+)
 _MTP_LAYOUTS = [p for i in _MTP_LAYOUT_IDS for p in _LAYOUTS if p.id == i]
+
+
+# The layouts the target runs EPLB at: attention DP over ranks holding whole experts, from
+# dep16 on over the alltoall of wide expert parallelism. dep36 runs only as EPLB slots.
+_EPLB_LAYOUTS = [p for i in ("dep4", "dep8", "dep16", "dep32") for p in _LAYOUTS if p.id == i] + [
+    _layout("dep36", 36, 1, 36, True)
+]
+
+# Each EPLB layout without and with the MTP layer, where routing admits it.
+_EPLB_CASES = [
+    pytest.param(p.values[0], mtp, id=f"{p.id}-{'mtp3' if mtp else 'no_spec'}", marks=p.marks)
+    for p in _EPLB_LAYOUTS
+    for mtp in (False, True)
+    if not mtp or p.id in _MTP_LAYOUT_IDS
+]
+
+
+def _eplb_placement(layer: int, experts: int, slots: int, ep_size: int) -> list:
+    """A static EPLB placement unlike the built-in default, drawn per layer.
+
+    The experts shuffled by layer, each rank holding its share once; then each rank's
+    spare slots hold experts again: first one it already holds, then experts of the
+    ranks after it. A slot loaded with the wrong expert, or an id routed to a slot that
+    does not hold its expert, still produces fluent text, so only a placement this far
+    from the default shows up in the score.
+    """
+    order = list(range(experts))
+    random.Random(layer).shuffle(order)
+    # A rank's share of the experts is uneven when the EP size does not divide them, as 256
+    # over 36 ranks; its slots then hold one more or one fewer spare.
+    bounds = [rank * experts // ep_size for rank in range(ep_size + 1)]
+    per_rank = slots // ep_size
+    out = []
+    for rank in range(ep_size):
+        own = order[bounds[rank] : bounds[rank + 1]]
+        extra = [order[(bounds[rank + 1] + k) % experts] for k in range(per_rank - len(own))]
+        if extra:
+            extra[0] = own[0]
+        out += own + extra
+    return out
 
 
 class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
@@ -238,7 +293,8 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         # whose dispatch takes only NVFP4 uint8 hidden states, and the MTP layer
         # is bf16 because modelopt excludes model.layers.61* from quantization.
         # Disabling DeepEP moves stock off it; the modeling_v2 target builds its
-        # own allgather + reduce-scatter and never consults the factory. Set at
+        # own exchange (allgather + reduce-scatter, or from dep16 on its own
+        # one-sided alltoall) and never consults the factory. Set at
         # every layout, where it is inert under attention TP. It travels as
         # ``env_overrides`` because it is read on the ranks.
         rank_env = {MODELING_V2_VALIDATE_ENV: "1"}
@@ -297,3 +353,95 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         ):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_not_sm10x
+    @pytest.mark.parametrize("parallel, mtp", _EPLB_CASES)
+    def test_gsm8k_static_eplb(self, mocker, parallel, mtp):
+        """Static EPLB at a placement drawn per layer, the MTP layer included.
+
+        288 slots hold the 256 experts of every routed layer. Every layer registers
+        with the engine's load balancer, loads its experts by slot and routes the
+        router's ids to slots, so this is the whole EPLB path of the target against
+        the same GSM8K reference as the identity cases. With the MTP layer the acceptance
+        length is read against the target's MTP minimum too: EPLB changes no expert's math,
+        and a draft routed to the wrong slots would be rejected without moving the score.
+        """
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+        cfg_layers, first_moe, num_slots = 61, 3, 288
+        ep_size = parallel["moe_expert_parallel_size"]
+        assignments = {
+            i: _eplb_placement(i, 256, num_slots, ep_size)
+            for i in range(first_moe, cfg_layers + int(mtp))
+        }
+        load_balancer = MoeLoadBalancerConfig(
+            num_slots=num_slots, initial_global_assignments=assignments
+        )
+        spec = (
+            dict(
+                speculative_config=self.MTP3,
+                kv_cache_config=self.MTP3_KV,
+                cuda_graph_config=CudaGraphConfig(),
+                enable_iter_perf_stats=True,
+            )
+            if mtp
+            else {}
+        )
+
+        with (
+            scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                moe_config=MoeConfig(load_balancer=load_balancer),
+                modeling_v2="require",
+                env_overrides=rank_env,
+                **spec,
+                **parallel,
+            ) as llm,
+        ):
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            if mtp:
+                assert_acceptance_length_for_llm(self.ACCEPTANCE_KEY, llm)
+
+    @skip_not_sm10x
+    @pytest.mark.parametrize("parallel, mtp", _EPLB_CASES)
+    def test_gsm8k_online_eplb(self, mocker, parallel, mtp):
+        """Online EPLB from the built-in default placement, the MTP layer included.
+
+        Two layers are rebalanced per forward. Every routed layer hands the engine's load
+        balancer host copies of its share of the experts and binds its slot weights to it,
+        every forward records which experts its tokens chose, and between forwards the
+        balancer copies experts into slots and reroutes to them. An expert copied wrong, a
+        statistic that stalls the balancer or a view left on the storage the balancer no
+        longer writes shows up here, against the same GSM8K reference as the identity cases.
+        With the MTP layer the acceptance length is read against the target's MTP minimum
+        too: a draft routed to the wrong slots is rejected without moving the score.
+        """
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+        load_balancer = MoeLoadBalancerConfig(num_slots=288, layer_updates_per_iter=2)
+        spec = (
+            dict(
+                speculative_config=self.MTP3,
+                kv_cache_config=self.MTP3_KV,
+                cuda_graph_config=CudaGraphConfig(),
+                enable_iter_perf_stats=True,
+            )
+            if mtp
+            else {}
+        )
+
+        with (
+            scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                moe_config=MoeConfig(load_balancer=load_balancer),
+                modeling_v2="require",
+                env_overrides=rank_env,
+                **spec,
+                **parallel,
+            ) as llm,
+        ):
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            if mtp:
+                assert_acceptance_length_for_llm(self.ACCEPTANCE_KEY, llm)
