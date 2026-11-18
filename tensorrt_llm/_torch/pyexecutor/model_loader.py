@@ -642,11 +642,11 @@ def _weight_load_num_threads() -> Optional[int]:
     try:
         requested = int(value)
     except ValueError as error:
-        raise ValueError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
-                         f"integer, got {value!r}") from error
+        raise ConfigInputError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
+                               f"integer, got {value!r}") from error
     if requested <= 0:
-        raise ValueError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
-                         f"integer, got {value!r}")
+        raise ConfigInputError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
+                               f"integer, got {value!r}")
     try:
         available = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
@@ -655,12 +655,11 @@ def _weight_load_num_threads() -> Optional[int]:
 
 
 @contextmanager
-def _weight_load_threads() -> Iterator[None]:
-    """Run this thread's load on ``TLLM_WEIGHT_LOAD_THREADS`` torch threads.
+def _weight_load_threads(requested: Optional[int]) -> Iterator[None]:
+    """Run this thread's load on ``requested`` torch threads.
 
-    Unset keeps the process's count. Only raises; restores on exit and on error.
+    None keeps the process's count. Only raises; restores on exit and on error.
     """
-    requested = _weight_load_num_threads()
     previous = torch.get_num_threads()
     if requested is None or requested <= previous:
         yield
@@ -674,6 +673,8 @@ def _weight_load_threads() -> Iterator[None]:
     logger.info(f"Weight loading uses {requested} torch threads (was "
                 f"{previous}), as {_WEIGHT_LOAD_THREADS_ENV} asks")
     try:
+        # The first call also sizes torch's pthreadpool for good; keep its size.
+        torch.set_num_threads(previous)
         torch.set_num_threads(requested)
         # New threads start from torch's process-wide count; set it back from
         # another thread so this one keeps the raise and loader pools do not.
@@ -1206,6 +1207,7 @@ class ModelLoader:
         self.lora_config = lora_config
         self.model_weights_memory_tag = model_weights_memory_tag
         self.model_weights_restore_mode = model_weights_restore_mode
+        self._weight_load_num_threads = _weight_load_num_threads()
         self.weight_mapper = None
         self._weight_pool_proxy = None
         self._gms_backend = None
@@ -1509,7 +1511,7 @@ class ModelLoader:
                                          checkpoint_dir)
         if load_format == LoadFormat.AUTO:
             # read the checkpoint with the checkpoint loader, built-in or custom
-            with _weight_load_threads():
+            with _weight_load_threads(self._weight_load_num_threads):
                 self.weight_mapper, weights_preloaded = load_model_from_auto_load_format(
                     checkpoint_loader,
                     checkpoint_dir,
@@ -1684,11 +1686,12 @@ class ModelLoader:
         _check_compile_wrapper_before_reload(model)
         if not allow_partial_loading:
             model_hooks.reset_weights_transformed(model)
-        model_hooks.call_load_weights(
-            model.load_weights,
-            weights,
-            self.weight_mapper,
-            allow_partial_loading=allow_partial_loading)
+        with _weight_load_threads(self._weight_load_num_threads):
+            model_hooks.call_load_weights(
+                model.load_weights,
+                weights,
+                self.weight_mapper,
+                allow_partial_loading=allow_partial_loading)
         if torch.cuda.is_available():  # CPU guard
             torch.cuda.current_stream().synchronize()
 
