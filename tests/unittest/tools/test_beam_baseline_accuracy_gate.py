@@ -45,6 +45,7 @@ def test_gate_uses_baseline_and_propagates_public_verdict(
         call["concurrency"],
         call["time_budget_s"],
     ) == (100, 95, 1, budget)
+    assert call["chat_template_kwargs"] == {"reasoning_effort": 128}
     managed = call["managed"]
     assert managed.argv[:3] == ("trtllm-serve", str(root / "target"), "--config")
     config = yaml.safe_load(Path(managed.argv[-1]).read_text())

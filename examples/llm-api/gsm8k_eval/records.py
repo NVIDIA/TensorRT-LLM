@@ -316,7 +316,9 @@ class Ledger:
                 os.close(fd)
 
 
-def summarize(state: LedgerState, problems: Sequence[protocol.Problem]) -> dict[str, Any]:
+def summarize(
+    state: LedgerState, problems: Sequence[protocol.Problem], protocol_id: str
+) -> dict[str, Any]:
     """Per-question outcome and counts over exactly the selected questions."""
     per_question = []
     counts: collections.Counter[str] = collections.Counter()
@@ -350,7 +352,7 @@ def summarize(state: LedgerState, problems: Sequence[protocol.Problem]) -> dict[
         return [q["id"] for q in per_question if predicate(q)]
 
     return {
-        "protocol_id": protocol.PROTOCOL_ID,
+        "protocol_id": protocol_id,
         "expected": len(problems),
         "distinct_completed": len(completed),
         "status_counts": dict(sorted(counts.items())),

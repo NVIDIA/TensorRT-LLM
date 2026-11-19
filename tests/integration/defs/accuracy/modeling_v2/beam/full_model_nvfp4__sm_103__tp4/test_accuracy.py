@@ -17,7 +17,7 @@ import yaml
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[7] / "examples" / "llm-api"
 sys.path.insert(0, str(EXAMPLES_DIR))
-from gsm8k_eval import runner  # noqa: E402
+from gsm8k_eval import protocol, runner  # noqa: E402
 
 
 def _run_first100(models_root, output_dir, time_budget_s):
@@ -58,6 +58,7 @@ def _run_first100(models_root, output_dir, time_budget_s):
         time_budget_s=evaluation_budget_s,
         max_seq_len=config["max_seq_len"],
         min_correct=95,
+        chat_template_kwargs=protocol.BEAM_CHAT_TEMPLATE_KWARGS,
         managed=runner.ManagedServer(
             argv=("trtllm-serve", str(target), "--config", str(config_path)),
             env=dict(os.environ),

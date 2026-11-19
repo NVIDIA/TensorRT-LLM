@@ -119,8 +119,11 @@ def test_prompt_is_exemplars_then_question_in_one_message():
     )
 
 
-def test_request_sends_exactly_the_protocol_fields():
-    body = runner.PinnedChatCompletion(model="served").request_body("prompt text")
+@pytest.mark.parametrize("kwargs", [None, {"reasoning_effort": 128}, {"enable_thinking": False}])
+def test_request_sends_exactly_the_protocol_fields(kwargs):
+    body = runner.PinnedChatCompletion(model="served").request_body(
+        "prompt text", protocol.request_fields(kwargs)
+    )
     assert body == {
         "model": "served",
         "messages": [{"role": "user", "content": "prompt text"}],
@@ -130,7 +133,7 @@ def test_request_sends_exactly_the_protocol_fields():
         "max_tokens": 65536,
         "n": 1,
         "stream": False,
-        "chat_template_kwargs": {"reasoning_effort": 128},
+        **({"chat_template_kwargs": kwargs} if kwargs is not None else {}),
     }
     record = protocol.request_record(body)
     assert record.pop("messages") == [
@@ -446,7 +449,9 @@ def _record(problem, status=records.OK, content="The answer is 4.", identity="ru
         )
     return records.make_record(
         problem,
-        runner.PinnedChatCompletion(model="served").request_body(problem.prompt),
+        runner.PinnedChatCompletion(model="served").request_body(
+            problem.prompt, protocol.request_fields()
+        ),
         status,
         None if status in records.COMPLETED else "failed",
         fields,
@@ -589,6 +594,7 @@ def test_malformed_reply_is_recorded_and_next_question_continues(tmp_path, bad_r
         concurrency=1,
         deadline=60,
         request_timeout_s=None,
+        request_fields=protocol.request_fields(),
     )
     runner._ask(session, "http://unused", "served", SimpleNamespace(poll=lambda: None), deps)
     state = ledger.load()
@@ -601,7 +607,9 @@ def test_record_construction_contains_unserializable_endpoint_metadata(tmp_path)
     problem = _problem(0)
     record = records.make_record(
         problem,
-        runner.PinnedChatCompletion(model="served").request_body(problem.prompt),
+        runner.PinnedChatCompletion(model="served").request_body(
+            problem.prompt, protocol.request_fields()
+        ),
         records.OK,
         None,
         {"usage": {"bad": object()}},
@@ -728,6 +736,21 @@ def test_managed_environment_values_are_private_and_rotation_resumes(tmp_path, m
         == 1
     )
     first = json.loads((output / "run_manifest.json").read_text())
+    assert "chat_template_kwargs" not in first["identity"]["request_fields"]
+    assert (
+        eval_gsm8k.main(
+            common
+            + [
+                "--server-env",
+                "HF_TOKEN=fake-old-secret",
+                "--server-env",
+                "MODE=first",
+                "--chat-template-kwargs",
+                '{"reasoning_effort":128}',
+            ]
+        )
+        == 2
+    )
     # Reordering overrides and rotating their values preserve the resume identity.
     assert (
         eval_gsm8k.main(

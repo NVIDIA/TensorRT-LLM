@@ -18,12 +18,15 @@
 # limitations under the License.
 r"""Evaluate the first N questions of the pinned GSM8K test split over a chat endpoint.
 
-Existing endpoint (any OpenAI-compatible server: aggregated or disaggregated ``trtllm-serve``,
+Existing endpoint (a compatible chat server: aggregated or disaggregated ``trtllm-serve``,
 or a Dynamo frontend). Install ``lm_eval[api]==0.4.10``, ``requests`` and ``pyarrow``; the server is never started,
 stopped or signalled::
 
     python examples/llm-api/eval_gsm8k.py --endpoint http://HOST:PORT \
         --dataset-dir DATASET --num-questions 100 --output-dir RESULTS
+
+Requests use the model's chat-template defaults. To reproduce the Beam baseline, add
+``--chat-template-kwargs '{"reasoning_effort":128}'``.
 
 Managed server: launch ``trtllm-serve MODEL --config CONFIG`` on this machine, evaluate, and
 stop the processes this run started::
@@ -49,11 +52,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import math
 import os
 import signal
 import sys
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from gsm8k_eval import protocol, runner
 
@@ -92,6 +96,17 @@ def _positive_float(text: str) -> float:
     return value
 
 
+def _template_kwargs(text: str) -> dict[str, Any]:
+    try:
+        value = json.loads(text)
+        json.dumps(value, allow_nan=False)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {error}") from None
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return value
+
+
 def _env_assignment(text: str) -> tuple[str, str]:
     name, sep, value = text.partition("=")
     if not sep or not name:
@@ -112,6 +127,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--served-model-name",
         help="model id to request (default: the only one listed; required for endpoints "
         "returning HTTP 404 for /v1/models)",
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=_template_kwargs,
+        metavar="JSON",
+        help="optional JSON object sent to the model's chat template and recorded in the run identity",
     )
     parser.add_argument("--config", help="managed mode: the trtllm-serve --config YAML")
     parser.add_argument(
@@ -256,6 +277,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_seq_len=max_seq_len,
             min_correct=args.min_correct,
             request_timeout_s=args.request_timeout_s,
+            chat_template_kwargs=args.chat_template_kwargs,
             identity_extra=identity_extra,
             attempt_extra={"client_concurrency": concurrency},
         )

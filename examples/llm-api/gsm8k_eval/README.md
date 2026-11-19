@@ -29,7 +29,7 @@ so the gate can check the finish reason, token usage and final-answer channel be
 
 ## Commands
 
-Existing endpoint (an aggregated or disaggregated `trtllm-serve`, or any OpenAI-compatible
+Existing endpoint (an aggregated or disaggregated `trtllm-serve`, or a compatible
 frontend):
 
 ```bash
@@ -62,6 +62,7 @@ Arguments:
 | `--served-model-name NAME` | Model id to request; by default the only id listed by `/v1/models`. Required only when the endpoint returns HTTP 404 for `/v1/models`. |
 | `--config YAML` | Managed mode: the `trtllm-serve --config` file (required). |
 | `--chat-template FILE` | Managed mode: passed as `trtllm-serve --chat_template`. |
+| `--chat-template-kwargs JSON` | Optional JSON object passed to the model's chat template and recorded in the run identity. Omit it to use the template defaults. |
 | `--server-env NAME=VALUE` | Managed mode: extra server environment variable (repeatable). |
 | `--monitor-gpus 0,1,...` | Managed mode: GPU indices whose used memory is sampled every second. |
 | `--num-questions N` | Evaluate test rows `0..N-1` in split order, `1 <= N <= 1319` (default 100). |
@@ -97,7 +98,10 @@ not an accuracy result. Completed records are retained where storage permits.
 ## Protocol
 
 The Beam-specific protocol id is `beam-gsm8k-first100-public-v1`;
-`gsm8k_eval/manifest.json` freezes its settings, including `reasoning_effort: 128`.
+`gsm8k_eval/manifest.json` freezes its settings, including `reasoning_effort: 128`. To reproduce or resume a historical Beam run, pass
+`--chat-template-kwargs '{"reasoning_effort":128}'`. Beam CI supplies this explicitly.
+Other template settings, including the default with no kwargs, use `gsm8k-chat-v1`;
+changing the request fields requires a fresh output directory.
 
 - Selection: test rows `0..N-1` in the original split order; question ids are `test-0000` to
   `test-1318`. The first 100 rows, the ten exemplars and every prompt digest are pinned by the
@@ -108,7 +112,7 @@ The Beam-specific protocol id is `beam-gsm8k-first100-public-v1`;
   training split, as frozen in the manifest) followed by the question:
   `Question: <question>\nAnswer: <answer>\n\n` per exemplar, then `Question: <question>\nAnswer:`.
 - Request: `temperature 0`, `top_k 1`, `seed 42`, `max_tokens 65536`, `n 1`, `stream false`,
-  `chat_template_kwargs: {"reasoning_effort": 128}`, no stop strings. The server applies its own
+  no stop strings. Template kwargs are sent only when supplied. The server applies its own
   chat template, tokenizer and end-of-sequence handling and must return the reasoning in
   `reasoning_content` (for example through a reasoning parser); the evaluator never renders or
   tokenizes text itself.

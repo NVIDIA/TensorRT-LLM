@@ -263,11 +263,12 @@ class _Session:
     concurrency: int
     deadline: float
     request_timeout_s: Optional[float]
+    request_fields: dict[str, Any]
 
 
 class PinnedChatCompletion(LocalChatCompletion):
-    def request_body(self, prompt):
-        fields = protocol.SAMPLING_FIELDS.copy()
+    def request_body(self, prompt, request_fields):
+        fields = request_fields.copy()
         seed = fields.pop("seed")
         body = self._create_payload(
             [{"role": "user", "content": prompt}], gen_kwargs=dict(fields, until=[]), seed=seed
@@ -276,11 +277,15 @@ class PinnedChatCompletion(LocalChatCompletion):
         del body["stop"]
         return body
 
-    async def amodel_call(self, session, sem, messages, *, cache_keys, record_reply, **kwargs):
+    async def amodel_call(
+        self, session, sem, messages, *, cache_keys, record_reply, request_fields, **kwargs
+    ):
         # lm-eval batches one prompt per chat request. Its default parser drops finish_reason
         # and usage, which the gate needs to distinguish a complete answer from truncation.
         async with sem:
-            await record_reply(session, cache_keys[0], self.request_body(messages[0]))
+            await record_reply(
+                session, cache_keys[0], self.request_body(messages[0], request_fields)
+            )
 
 
 def _ask(session: _Session, base: str, model: str, process: Any, deps: RunDeps) -> dict[str, Any]:
@@ -341,7 +346,10 @@ def _ask(session: _Session, base: str, model: str, process: Any, deps: RunDeps) 
         )
         batch = asyncio.create_task(
             client.get_batched_requests(
-                [problem.prompt for problem in session.pending], session.pending, record_reply=ask
+                [problem.prompt for problem in session.pending],
+                session.pending,
+                record_reply=ask,
+                request_fields=session.request_fields,
             )
         )
         while not batch.done():
@@ -466,6 +474,7 @@ def run(
     max_seq_len: Optional[int] = None,
     min_correct: Optional[int] = None,
     request_timeout_s: Optional[float] = None,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
     identity_extra: Optional[Mapping[str, Any]] = None,
     attempt_extra: Optional[Mapping[str, Any]] = None,
     manifest_path: str | os.PathLike = protocol.MANIFEST_PATH,
@@ -513,11 +522,15 @@ def run(
         ) from error
 
     transport = "endpoint" if endpoint is not None else "managed"
+    request_fields = protocol.request_fields(chat_template_kwargs)
+    protocol_id = (
+        protocol.PROTOCOL_ID if request_fields == protocol.SAMPLING_FIELDS else "gsm8k-chat-v1"
+    )
     identity = {
-        "protocol_id": protocol.PROTOCOL_ID,
+        "protocol_id": protocol_id,
         "manifest_sha256": manifest_sha256,
         "selection": protocol.selection(num_questions),
-        "request_fields": protocol.SAMPLING_FIELDS,
+        "request_fields": request_fields,
         "transport": transport,
         "endpoint": endpoint.rstrip("/") if endpoint is not None else None,
         "served_model": served_model,
@@ -555,7 +568,7 @@ def run(
 
             if run_manifest is None:
                 run_manifest = {
-                    "protocol_id": protocol.PROTOCOL_ID,
+                    "protocol_id": protocol_id,
                     "identity_sha256": identity_sha256,
                     "identity": identity,
                     "attempts": [],
@@ -607,6 +620,7 @@ def run(
                 concurrency=concurrency,
                 deadline=deadline,
                 request_timeout_s=request_timeout_s,
+                request_fields=request_fields,
             )
             if managed is not None:
                 files = {
@@ -658,7 +672,7 @@ def run(
             raise RuntimeError(
                 f"cannot read evaluation results in {results_dir}: {error}"
             ) from error
-        summary = records.summarize(final_state, problems)
+        summary = records.summarize(final_state, problems, protocol_id)
         summary.update(
             transport=transport,
             served_model=next(iter(final_state.served_models()), None),

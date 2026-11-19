@@ -68,15 +68,27 @@ QUESTION_TEMPLATE = "Question: {question}\nAnswer:"
 MAX_TOKENS = 65536
 #: Every request field besides ``model`` and ``messages``. No stop strings are sent: the
 #: served recipe's own end-of-sequence handling ends a reply.
-SAMPLING_FIELDS = {
+BASE_SAMPLING_FIELDS: dict[str, Any] = {
     "temperature": 0,
     "top_k": 1,
     "seed": 42,
     "max_tokens": MAX_TOKENS,
     "n": 1,
     "stream": False,
-    "chat_template_kwargs": {"reasoning_effort": 128},
 }
+
+BEAM_CHAT_TEMPLATE_KWARGS = {"reasoning_effort": 128}
+
+
+def request_fields(chat_template_kwargs: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    fields = dict(BASE_SAMPLING_FIELDS)
+    if chat_template_kwargs is not None:
+        fields["chat_template_kwargs"] = copy.deepcopy(chat_template_kwargs)
+    return fields
+
+
+# Request fields frozen in the Beam baseline manifest.
+SAMPLING_FIELDS = request_fields(BEAM_CHAT_TEMPLATE_KWARGS)
 
 SCORER_ID = "final-content-last-number-v1"
 GOLD_DELIMITER = "####"
