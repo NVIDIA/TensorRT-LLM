@@ -149,9 +149,7 @@ def test_handoff_replays_variable_width_steps_with_bounded_payload(speculative_d
             relay = state.host.beam_relay
             assert relay.seq_lens == [length + step for length in prompt_lens]
             assert relay.beam_widths == [min(step + 2, 4), 3]
-            assert (
-                relay.predecessor_beams.numel() * relay.predecessor_beams.element_size() <= 32
-            )
+            assert relay.predecessor_beams.numel() * relay.predecessor_beams.element_size() <= 32
             relayed = SampleStateTorch(
                 requests=received_requests, host=pickle.loads(pickle.dumps(state.host))
             )

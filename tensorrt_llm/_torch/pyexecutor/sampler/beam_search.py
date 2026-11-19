@@ -342,8 +342,6 @@ class BeamSearchRelayState:
     """Final beams of the requests the step finishes, by request id. Filled in
     on the last rank, once the step's copies have completed, right before the
     PP relay."""
-    error: str | None = None
-    """A builder failure to raise inside every rank's request-update handler."""
 
 
 def _gather_beam_path(
@@ -1656,9 +1654,7 @@ class BeamSearchHandler:
             cum_log_probs=self._copy_to_host(store.cum_log_probs[seq_slots_cuda]),
         )
 
-    def apply_relay(
-        self, requests: list[LlmRequest], beam_relay: BeamSearchRelayState
-    ) -> None:
+    def apply_relay(self, requests: list[LlmRequest], beam_relay: BeamSearchRelayState) -> None:
         """Apply the sampling rank's beam-parent update to this rank's cache indirection.
 
         Token positions and output widths are captured before later request

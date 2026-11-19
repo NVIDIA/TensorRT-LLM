@@ -24,7 +24,6 @@ held here as a handler, driven through ``setup_sampler_step`` /
 """
 
 import sys
-import traceback
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
@@ -48,8 +47,8 @@ from .beam_search import (
     BeamHistory,
     BeamHistoryBuilder,
     BeamSearchHandler,
-    BeamSearchRelayState,
     BeamSearchParams,
+    BeamSearchRelayState,
     BeamSearchStep,
     BeamSearchStore,
     PendingBeamHistories,
@@ -292,9 +291,8 @@ class Sampler(ABC, Generic[GenericSampleState]):
         state reaches any ``update_requests``. Those ranks only receive
         ``state.host``.
 
-        This hook may run on the PP relay thread. Implementations must carry
-        preparation failures in the host state for ``update_requests`` to
-        report, so an exception does not terminate the relay thread.
+        This hook may run on the PP relay thread. The executor propagates
+        preparation errors to every pipeline rank.
 
         Args:
             state: A state this sampler's ``sample_async`` returned.
@@ -1528,6 +1526,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Args:
             scheduled_requests: The scheduled requests to set up the sampler step for.
         """
+        if self._track_pending_steps:
+            # A reused slot can have an unapplied step if its previous request failed.
+            # Disaggregated generation also admits slots here, before its first sample.
+            for request in scheduled_requests.context_requests:
+                assert request.py_seq_slot is not None
+                self._pending_steps[request.py_seq_slot] = 0
+
         new_requests = self._collect_new_requests_for_setup(scheduled_requests)
 
         if not new_requests:
@@ -1620,53 +1625,41 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         The builders stay on this rank, so the ranks that do not sample finalize
         those requests from the beams built here. ``update_requests`` uses them
         on this rank too, so every rank finalizes from the same beams.
-
-        This hook can run on the PP relay thread. Builder failures travel as
-        host state and are raised by ``update_requests`` on every rank, inside
-        the executor's request-error handler, rather than ending that thread.
         """
         host = state.host
         beam_history_builders = state.beam_history_builders
         if host is None or host.beam_relay is None or beam_history_builders is None:
             return
         beam_histories: dict[int, BeamHistory] = {}
-        try:
-            first_finish_reasons_host = host.first_finish_reasons
-            assert first_finish_reasons_host is not None, (
-                "Beam-search relay requires first finish reasons"
+        first_finish_reasons_host = host.first_finish_reasons
+        assert first_finish_reasons_host is not None, (
+            "Beam-search relay requires first finish reasons"
+        )
+        finished_beam_prefix_lengths = self._finished_beam_prefix_lengths(first_finish_reasons_host)
+        finishing = [
+            (req_idx, req)
+            for req_idx, req in enumerate(state.requests)
+            if self._finalizes_beam_history(req, finished_beam_prefix_lengths)
+        ]
+        batched_histories = None
+        if state.beam_histories_deferred and len(finishing) > 1:
+            batched_histories = self._beam_search.build_deferred_beam_histories(
+                [req for _, req in finishing]
             )
-            finished_beam_prefix_lengths = self._finished_beam_prefix_lengths(
-                first_finish_reasons_host
-            )
-            finishing = [
-                (req_idx, req)
-                for req_idx, req in enumerate(state.requests)
-                if self._finalizes_beam_history(req, finished_beam_prefix_lengths)
-            ]
-            batched_histories = None
-            if state.beam_histories_deferred and len(finishing) > 1:
-                batched_histories = self._beam_search.build_deferred_beam_histories(
-                    [req for _, req in finishing]
+        for row, (req_idx, req) in enumerate(finishing):
+            if batched_histories is not None:
+                beam_history = batched_histories[row]
+            else:
+                beam_history_builder = beam_history_builders[req_idx]
+                beam_history = beam_history_builder() if beam_history_builder is not None else None
+            if beam_history is None:
+                # Cancellation can finish the request while a deferred builder waits for copies.
+                if req.state == LlmRequestState.GENERATION_COMPLETE:
+                    continue
+                raise RuntimeError(
+                    f"Final beam builder returned no history for request {req.py_request_id}"
                 )
-            for row, (req_idx, req) in enumerate(finishing):
-                if batched_histories is not None:
-                    beam_history = batched_histories[row]
-                else:
-                    beam_history_builder = beam_history_builders[req_idx]
-                    beam_history = (
-                        beam_history_builder() if beam_history_builder is not None else None
-                    )
-                if beam_history is None:
-                    # Cancellation can finish the request while a deferred builder waits for copies.
-                    if req.state == LlmRequestState.GENERATION_COMPLETE:
-                        continue
-                    raise RuntimeError(
-                        f"Final beam builder returned no history for request {req.py_request_id}"
-                    )
-                beam_histories[req.py_request_id] = beam_history
-        except Exception as exception:
-            logger.error(traceback.format_exc())
-            host.beam_relay.error = f"{type(exception).__name__}: {exception}"
+            beam_histories[req.py_request_id] = beam_history
         host.beam_relay.beam_histories = beam_histories
 
     @override
@@ -1690,11 +1683,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     self._pending_steps[slot] -= 1
 
         assert state.host is not None
-        if state.host.beam_relay is not None and state.host.beam_relay.error is not None:
-            raise RuntimeError(
-                "Building final beams on the last pipeline-parallel rank failed: "
-                f"{state.host.beam_relay.error}"
-            )
         # Reuse sample_async's qualification instead of rechecking every
         # request after the asynchronous sample completes.
         if state.host.single_step_greedy:
@@ -1994,15 +1982,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # NB: There are 1 + get_draft_token_length(request) tokens per request.
         self.setup_sampler_step(scheduled_requests)
         new_tokens = self.store.new_tokens
-
-        if self._track_pending_steps:
-            # A context request claims a (possibly reused) slot: clear any
-            # counter leaked by a prior occupant that never got its final
-            # update_requests. Must happen before _process_requests, which
-            # reads the counters for bad-words staleness.
-            for r in scheduled_requests.context_requests:
-                assert r.py_seq_slot is not None
-                self._pending_steps[r.py_seq_slot] = 0
 
         # seq_slots_cuda / seq_lens_cuda are cast once inside
         # _process_requests and shared with the beam-search metadata builder.

@@ -555,6 +555,7 @@ class BatchState:
 @dataclasses.dataclass
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
+    relay_error: Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -4935,23 +4936,27 @@ class PyExecutor:
         if self.dist.is_last_pp_rank:
             # The other ranks only get the host part of the state; the sampler
             # completes it with what they need of the step before it leaves.
-            if self._beam_relay_stream is None:
-                self.sampler.prepare_pp_relay(sample_state)
-            else:
-                # The inline relay owns these in-flight request slots until
-                # their updates finish. Its fallback copies can overlap the
-                # next microbatch without waiting for that forward.
-                if sample_state.sampler_event is not None:
-                    sample_state.sampler_event.synchronize()
-                with torch.cuda.stream(self._beam_relay_stream):
+            stream = self._beam_relay_stream
+            if stream is not None and sample_state.sampler_event is not None:
+                sample_state.sampler_event.synchronize()
+            relay_context = torch.cuda.stream(
+                stream) if stream is not None else nullcontext()
+            with relay_context:
+                try:
                     self.sampler.prepare_pp_relay(sample_state)
+                except Exception as exc:
+                    logger.error(traceback.format_exc())
+                    executed_batch.relay_error = (
+                        "Preparing the sample-state relay on the last pipeline rank failed: "
+                        f"{type(exc).__name__}: {exc}")
         else:
             # Receive tokens from previous pp rank (w.r.t model forward direction)
             with nvtx_range("recv_sample_state"):
-                sample_state.host, py_result_diffs = self.dist.recv_object(
-                    src=self.dist.prev_pp_rank,
-                    tag=tag,
-                )
+                (sample_state.host, py_result_diffs,
+                 executed_batch.relay_error) = self.dist.recv_object(
+                     src=self.dist.prev_pp_rank,
+                     tag=tag,
+                 )
 
             for request, py_result_diff in zip(requests, py_result_diffs):
                 request.py_result.apply_diff(py_result_diff)
@@ -4962,14 +4967,17 @@ class PyExecutor:
         # Second last rank does not need to since last rank has original decoded tokens
         if not self.dist.is_second_last_pp_rank:
             py_result_diffs = []
-            for request in requests:
-                diff = request.py_result.get_diff()
-                py_result_diffs.append(diff)
-                request.py_result.reset_diff()
+            host = None
+            if executed_batch.relay_error is None:
+                host = sample_state.host
+                for request in requests:
+                    diff = request.py_result.get_diff()
+                    py_result_diffs.append(diff)
+                    request.py_result.reset_diff()
             self.wait_on_pp_send_handles(self.send_handles, microbatch_id)
             with nvtx_range("send_sample_state"):
                 self.send_handles[microbatch_id] = self.dist.isend_object(
-                    (sample_state.host, py_result_diffs),
+                    (host, py_result_diffs, executed_batch.relay_error),
                     dest=self.dist.next_pp_rank,
                     tag=tag,
                 )
@@ -5014,40 +5022,56 @@ class PyExecutor:
         finished_requests = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
-                self._update_requests(executed_batch.sample_state)
-                if self.speculation_gate is not None:
-                    self._update_batch_acceptance_rate(
-                        executed_batch.scheduled_requests,
-                        executed_batch.sample_state,
-                        iteration_id=self.iter_counter)
-
                 scheduled_requests = executed_batch.scheduled_requests
-                if self._is_kv_manager_v2:
-                    # Finalize V2 KV before transfer/response handling can
-                    # terminate the request.
-                    self._update_v2_context_resources(scheduled_requests)
-                    self._update_v2_generation_resources(scheduled_requests)
-                if self.kv_cache_transceiver:
-                    finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
-                    self._send_kv_async(finished_ctx_reqs)
+                if executed_batch.relay_error is not None:
+                    # A receiver can still have this microbatch's forward in flight.
+                    sampler_event = executed_batch.sample_state.sampler_event
+                    if sampler_event is not None:
+                        sampler_event.synchronize()
+                    batch_ids = {
+                        id(req)
+                        for req in scheduled_requests.all_requests()
+                    }
+                    active_batch = [
+                        req for req in self.active_requests
+                        if id(req) in batch_ids
+                    ]
+                    self._handle_errors(executed_batch.relay_error,
+                                        requests=active_batch)
+                    # The relay error supersedes guided failures for this batch.
+                    self._take_capturable_guided_failures(executed_batch)
+                else:
+                    self._update_requests(executed_batch.sample_state)
+                    if self.speculation_gate is not None:
+                        self._update_batch_acceptance_rate(
+                            executed_batch.scheduled_requests,
+                            executed_batch.sample_state,
+                            iteration_id=self.iter_counter)
+
+                    if self._is_kv_manager_v2:
+                        # Finalize V2 KV before transfer/response handling can
+                        # terminate the request.
+                        self._update_v2_context_resources(scheduled_requests)
+                        self._update_v2_generation_resources(scheduled_requests)
+                    if self.kv_cache_transceiver:
+                        self._send_kv_async(
+                            scheduled_requests.context_requests_last_chunk)
                 self._flush_pending_transfer_responses()
-                self._handle_capturable_guided_decoder_errors(
-                    scheduled_requests, executed_batch.guided_batch_id)
+                if executed_batch.relay_error is None:
+                    self._handle_capturable_guided_decoder_errors(
+                        scheduled_requests, executed_batch.guided_batch_id)
                 self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
                 # Complete ctx send sessions AFTER responses are created so
                 # _handle_responses sees the request before it is terminated.
                 self.disagg.reap_context_sends(0)
-                sample_state_scheduled_requests = executed_batch.scheduled_requests
-                attn_metadata = self.model_engine.attn_metadata
-                kv_cache_dtype_byte_size = (
-                    self.model_engine.kv_cache_dtype_byte_size)
-                self.resource_manager.update_resources(
-                    sample_state_scheduled_requests,
-                    attn_metadata,
-                    kv_cache_dtype_byte_size,
-                    skip_kv_cache_manager=self._is_kv_manager_v2)
+                if executed_batch.relay_error is None:
+                    self.resource_manager.update_resources(
+                        scheduled_requests,
+                        self.model_engine.attn_metadata,
+                        self.model_engine.kv_cache_dtype_byte_size,
+                        skip_kv_cache_manager=self._is_kv_manager_v2)
 
                 self._remove_inflight_ids(scheduled_requests)
 

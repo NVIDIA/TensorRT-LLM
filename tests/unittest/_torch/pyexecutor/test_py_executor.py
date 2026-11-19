@@ -53,6 +53,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
+    BatchStatePP,
     EncoderStepResult,
     PyExecutor,
     _ADPForwardIntent,
@@ -4966,6 +4967,37 @@ def _make_pp_relay_executor(*, pp_size: int, is_last_pp_rank: bool) -> PyExecuto
     return executor
 
 
+def test_sampler_error_reaches_each_pp_rank_without_partial_results():
+    payload = None
+    for rank in (2, 0, 1):
+        executor = _make_pp_relay_executor(pp_size=3, is_last_pp_rank=rank == 2)
+        executor.dist.is_second_last_pp_rank = rank == 1
+        executor.dist.recv_object.return_value = payload
+        executor._beam_relay_stream = None
+        executor.executed_batch_response_queue = Mock()
+        executor.sampler = Mock()
+        executor.sampler.prepare_pp_relay.side_effect = RuntimeError("relay probe")
+        request = Mock()
+        state = types.SimpleNamespace(requests=[request], host=object())
+        batch = BatchStatePP(
+            scheduled_requests=ScheduledRequests(), sample_state=state, microbatch_id=0
+        )
+
+        executor._ring_broadcast_sample_state(batch)
+
+        assert batch.relay_error == (
+            "Preparing the sample-state relay on the last pipeline rank failed: RuntimeError: relay probe"
+        )
+        executor.executed_batch_response_queue.put.assert_called_once_with(batch)
+        request.py_result.get_diff.assert_not_called()
+        request.py_result.apply_diff.assert_not_called()
+        if rank != 1:
+            payload = executor.dist.isend_object.call_args.args[0]
+            assert payload == (None, [], batch.relay_error)
+        else:
+            executor.dist.isend_object.assert_not_called()
+
+
 @pytest.mark.parametrize("pp_size", [3, 4, 5])
 def test_last_pp_rank_drains_only_the_relay_send_whose_recv_is_due(pp_size):
     """The first rank relays slot ``(m + 1 - pp_size) % n`` in iteration ``m``;
@@ -5035,9 +5067,7 @@ def test_v2_generation_update_runs_before_cancel_and_responses(loop):
         executor._commit_kv_cache_stats = Mock()
         executor._flush_iter_stats_synced = Mock()
         executor._disagg_pp_termination_handler = None
-        executor._handle_executed_batch(
-            types.SimpleNamespace(scheduled_requests=batch, sample_state=None, guided_batch_id=None)
-        )
+        executor._handle_executed_batch(BatchStatePP(scheduled_requests=batch, sample_state=None))
 
     assert events == ["target_update", "cancel", "responses", "other_updates"]
     executor.kv_cache_manager.update_resources.assert_called_once_with(batch, metadata, 2.0)

@@ -28,7 +28,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import BatchStatePP, PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
 _ERROR = "Guided decoding error: matcher compile error"
@@ -207,7 +207,7 @@ def _loop_executor(monkeypatch, decoder, batches, log):
     def update_requests(sample_state, *args):
         log.append(("synchronize", sample_state.batch_no))
 
-    def handle_errors(error_msg, *, requests, charge_budget):
+    def handle_errors(error_msg, *, requests, charge_budget=True):
         log.append(("fail", tuple(request.py_request_id for request in requests), charge_budget))
 
     def handle_responses(**kwargs):
@@ -313,24 +313,34 @@ def test_executor_loop_fails_the_request_once_its_batch_is_synchronized(monkeypa
     assert decoder.completed_batch_ids == [1, 2]
 
 
-def test_pp_executed_batch_fails_the_request_once_its_batch_is_synchronized(monkeypatch):
-    """With pipeline parallelism, the last rank handles an executed batch's
-    failure after synchronizing on that batch and before its responses."""
+@pytest.mark.parametrize("relay_error", [None, "sample-state relay failed"])
+def test_pp_executed_batch_fails_the_request_once_its_batch_is_synchronized(
+    monkeypatch, relay_error
+):
+    """A relay error fails the batch once, even when guided decoding also failed."""
     log = []
     decoder = _FakeCapturableDecoder({1: [(7, _ERROR)]})
     batch = _batch(_request(7), _request(8), batch_no=1)
     executor = _loop_executor(monkeypatch, decoder, [batch], log)
+    executor.active_requests = [*batch.all_requests(), _request(9)]
     executor._handle_responses = lambda **kwargs: log.append(("responses", 1)) or []
-    executed_batch = SimpleNamespace(
+    executed_batch = BatchStatePP(
         scheduled_requests=batch,
-        sample_state=SimpleNamespace(batch_no=1, device=None),
+        sample_state=SimpleNamespace(
+            batch_no=1,
+            device=None,
+            sampler_event=Mock(synchronize=lambda: log.append(("synchronize", 1))),
+        ),
         guided_batch_id=1,
         microbatch_id=0,
+        relay_error=relay_error,
     )
 
     PyExecutor._handle_executed_batch(executor, executed_batch)
 
-    _between(log, ("fail", (7,), False), after=("synchronize", 1), before=("responses", 1))
+    expected = ("fail", (7, 8), True) if relay_error else ("fail", (7,), False)
+    _between(log, expected, after=("synchronize", 1), before=("responses", 1))
+    assert [entry for entry in log if entry[0] == "fail"] == [expected]
     assert decoder.completed_batch_ids == [1]
 
 

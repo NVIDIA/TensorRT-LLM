@@ -2104,7 +2104,7 @@ def beam_relay_finishing_step(
 @pytest.mark.parametrize("batched", [False, True], ids=["single", "batched"])
 def test_beam_search_handoff_tolerates_cancellation_during_history_copy(
     beam_relay_finishing_step: tuple[TorchSampler, TorchSampler,
-                                       SampleStateTorch, list[LlmRequest]],
+                                     SampleStateTorch, list[LlmRequest]],
     batched: bool,
 ) -> None:
     sampling_rank, receiving_rank, state, received_requests = beam_relay_finishing_step
@@ -2166,14 +2166,14 @@ def test_beam_search_handoff_tolerates_cancellation_during_history_copy(
      (True, "Final beam builder returned no history")],
     ids=["exception", "missing_history"],
 )
-def test_beam_search_handoff_relays_builder_errors(
+def test_prepare_pp_relay_raises_builder_errors(
     beam_relay_finishing_step: tuple[TorchSampler, TorchSampler,
-                                       SampleStateTorch, list[LlmRequest]],
+                                     SampleStateTorch, list[LlmRequest]],
     missing_history: bool,
     error_message: str,
     batched: bool,
 ) -> None:
-    sampling_rank, receiving_rank, state, received_requests = beam_relay_finishing_step
+    sampling_rank, _, state, _ = beam_relay_finishing_step
     assert state.beam_history_builders is not None
 
     def fail_snapshot() -> BeamHistory | None:
@@ -2183,31 +2183,20 @@ def test_beam_search_handoff_relays_builder_errors(
 
     state.beam_history_builders[0] = fail_snapshot
     state.beam_histories_deferred = batched
-    if batched:
 
-        def fail_batch(_requests: list[LlmRequest]) -> list[BeamHistory | None]:
-            return [fail_snapshot(), None]
+    def fail_batch(_requests: list[LlmRequest]) -> list[BeamHistory | None]:
+        return [fail_snapshot(), None]
 
-        with patch.object(sampling_rank._beam_search,
-                          "build_deferred_beam_histories", fail_batch):
+    with patch.object(sampling_rank._beam_search,
+                      "build_deferred_beam_histories", fail_batch):
+        with pytest.raises(RuntimeError, match=error_message):
             sampling_rank.prepare_pp_relay(state)
-    else:
-        sampling_rank.prepare_pp_relay(state)
-    relayed = SampleStateTorch(requests=received_requests,
-                               host=pickle.loads(pickle.dumps(state.host)))
-    for sampler, sample_state in ((sampling_rank, state), (receiving_rank,
-                                                           relayed)):
-        with pytest.raises(
-                RuntimeError,
-                match="Building final beams on the last pipeline-parallel rank "
-                f"failed: .*{error_message}"):
-            sampler.update_requests(sample_state)
 
 
 @pytest.mark.threadleak(enabled=False)
 def test_beam_search_handoff_requires_final_history(
     beam_relay_finishing_step: tuple[TorchSampler, TorchSampler,
-                                       SampleStateTorch, list[LlmRequest]],
+                                     SampleStateTorch, list[LlmRequest]],
 ) -> None:
     sampling_rank, receiving_rank, state, received_requests = beam_relay_finishing_step
     sampling_rank.prepare_pp_relay(state)
@@ -2225,7 +2214,7 @@ def test_beam_search_handoff_requires_final_history(
 @pytest.mark.threadleak(enabled=False)
 def test_beam_search_handoff_requires_request_order(
     beam_relay_finishing_step: tuple[TorchSampler, TorchSampler,
-                                       SampleStateTorch, list[LlmRequest]],
+                                     SampleStateTorch, list[LlmRequest]],
 ) -> None:
     sampling_rank, receiving_rank, state, received_requests = beam_relay_finishing_step
     sampling_rank.prepare_pp_relay(state)
