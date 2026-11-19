@@ -25,6 +25,8 @@ from PIL import ImageOps
 from torch import Tensor, nn
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
+from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.visual_gen import prims_ts
 from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.predictor import (
     BLOCK_SIZE as SOL_BLOCK_SIZE,
 )
@@ -565,6 +567,9 @@ class Flux3Pipeline(BasePipeline):
         self._warmup_reference_keys = set()
         super().warmup()
         self._warmed_up_shapes |= self._warmup_reference_keys
+        # Runs without a capture pass have not read rank 0's Prims-TS tactics yet.
+        with prims_ts.autotune_context(self.device, load=True):
+            pass
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         """Warm text-to-image and a same-size single-reference edit at each warmup text window.
@@ -575,16 +580,28 @@ class Flux3Pipeline(BasePipeline):
         references, _, _ = self._prepare_references([reference], height, width)
         self._warmup_reference_keys.add(self._reference_cache_key(height, width, references))
         prompts = [self._warmup_prompt(window) for window in WARMUP_TEXT_WINDOWS]
-        for image in (None, references):
-            for prompt in prompts:
-                self.forward(
-                    prompt,
-                    height=height,
-                    width=width,
-                    num_inference_steps=steps,
-                    seed=42,
-                    image=image,
-                )
+
+        def run() -> None:
+            for image in (None, references):
+                for prompt in prompts:
+                    self.forward(
+                        prompt,
+                        height=height,
+                        width=width,
+                        num_inference_steps=steps,
+                        seed=42,
+                        image=image,
+                    )
+
+        if AutoTuner.get().is_tuning_mode:
+            # The base warmup's tuning pass: rank 0 tunes the Prims-TS GEMMs in the eager runs
+            # before any capture and saves them; the other ranks keep the defaults until then.
+            context = prims_ts.autotune_context(self.device, tune=self.rank == 0)
+        else:
+            # Later passes (and capture) read rank 0's tactics, so every rank uses the same ones.
+            context = prims_ts.autotune_context(self.device, load=True)
+        with context:
+            run()
 
     def _warmup_prompt(self, window: int) -> str:
         """The shortest prompt of repeated "warmup" words whose text window is ``window``."""
@@ -735,7 +752,10 @@ class Flux3Pipeline(BasePipeline):
         timer.mark_denoise_start()
         # Reference count and sizes set the sequence length, so edits run outside CUDA graphs
         # instead of retaining one graph per reference shape; torch.compile stays active.
-        with self._temporarily_disable_cuda_graphs(disable=references is not None):
+        with (
+            self._temporarily_disable_cuda_graphs(disable=references is not None),
+            prims_ts.autotune_context(self.device),
+        ):
             latents = self._denoise(
                 latents,
                 latent_ids,

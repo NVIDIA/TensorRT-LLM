@@ -12,11 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Availability, tile configurations and positions shared by the Prims-TS GEMM callers."""
+"""Availability, tile configurations, autotuning and positions for the Prims-TS GEMM callers."""
 
 from __future__ import annotations
 
+import hashlib
+import os
+from contextlib import AbstractContextManager, nullcontext
 from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
@@ -133,12 +137,63 @@ def config_for(
     n: int,
     head_dim: Optional[int] = None,
     qkv_scale: bool = False,
-) -> "PrimsTsGemmConfig":
-    """Tile configuration for an [m, k] x [n, k] GEMM on ``device``, keyed by its M bucket."""
+) -> Optional["PrimsTsGemmConfig"]:
+    """Tile configuration for an [m, k] x [n, k] GEMM on ``device``, keyed by its M bucket.
+
+    None under ``autotune_enabled()``, for FlashInfer's autotuner to pick, except for the NVFP4
+    Q/K/V planes: the tuner's configs write packed Q|K|V.
+    """
+    planes = epilogue == "qkv_qknorm_rope" and operand_format == "nvfp4_e2m1"
+    if autotune_enabled() and not planes:
+        return None
     major, minor = torch.cuda.get_device_capability(device)
     return _gemm_config(
         major * 10 + minor, operand_format, epilogue, m_bucket(m), k, n, head_dim, qkv_scale
     )
+
+
+def autotune_enabled() -> bool:
+    """Whether FlashInfer autotunes the Prims-TS GEMMs (``TRTLLM_FLUX3_PRIMS_TS_AUTOTUNE=1``)."""
+    return os.environ.get("TRTLLM_FLUX3_PRIMS_TS_AUTOTUNE", "0") == "1"
+
+
+def autotune_context(
+    device: torch.device, *, tune: bool = False, load: bool = False
+) -> AbstractContextManager:
+    """FlashInfer autotuning of the Prims-TS GEMMs; a no-op unless ``autotune_enabled()``.
+
+    ``tune`` profiles uncached shapes and saves the winners to one file per GPU name under
+    ``TRTLLM_FLUX3_PRIMS_TS_CACHE_DIR``; ``load`` reads that file first; otherwise tuned tactics
+    are only looked up. M rounds up to the tactic-table buckets, or to the comma-separated
+    ``TRTLLM_FLUX3_PRIMS_TS_TUNING_BUCKETS``.
+    """
+    if not autotune_enabled():
+        return nullcontext()
+    from flashinfer import autotune
+
+    raw = os.environ.get("TRTLLM_FLUX3_PRIMS_TS_TUNING_BUCKETS")
+    buckets = tuple(sorted({int(b) for b in raw.split(",")})) if raw else _M_BUCKETS
+    cache = str(_autotune_cache(device)) if tune or load else None
+    return autotune(tune, cache=cache, tuning_buckets=buckets, round_up=True)
+
+
+def _autotune_cache(device: torch.device) -> Path:
+    root = os.environ.get("TRTLLM_FLUX3_PRIMS_TS_CACHE_DIR", "~/.cache/tensorrt_llm/flux3_prims_ts")
+    folder = Path(root).expanduser() / torch.cuda.get_device_name(device).replace(" ", "_")
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"gemm-{_gemm_source_digest()}.json"
+
+
+@lru_cache(maxsize=None)
+def _gemm_source_digest() -> str:
+    """Digest of FlashInfer's Prims-TS GEMM sources, so a kernel change drops saved tactics."""
+    from flashinfer.prims_ts import gemm
+
+    digest = hashlib.sha256()
+    for source in sorted(Path(gemm.__file__).parent.glob("*.py")):
+        digest.update(source.name.encode())
+        digest.update(source.read_bytes())
+    return digest.hexdigest()[:16]
 
 
 # Never evicted: captured CUDA graphs keep reading these buffers by address.

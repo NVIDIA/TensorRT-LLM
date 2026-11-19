@@ -6,6 +6,7 @@
 CPU cases are cpu_only, the rest need a GPU.
 """
 
+import contextlib
 import json
 import math
 import re
@@ -998,6 +999,96 @@ def test_fused_blocks_compile_once(tmp_path, monkeypatch, variant):
             if index == 0:
                 first = counter.frame_count
     assert counter.frame_count == first
+
+
+@pytest.mark.cpu_only
+def test_prims_ts_autotune_is_opt_in(monkeypatch):
+    """Pinned tiles by default; TRTLLM_FLUX3_PRIMS_TS_AUTOTUNE=1 leaves the FP8 tiles to FlashInfer."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    monkeypatch.delenv("TRTLLM_FLUX3_PRIMS_TS_AUTOTUNE", raising=False)
+    device = torch.device("cuda")
+
+    def configs():
+        return (
+            prims_ts.config_for(device, "fp8_e4m3", "swiglu", 4096, 3072, 18432),
+            prims_ts.config_for(device, "fp8_e4m3", "qkv_qknorm_rope", 4096, 3072, 9216, 128),
+            prims_ts.config_for(
+                device, "nvfp4_e2m1", "qkv_qknorm_rope", 4096, 3072, 9216, 128, qkv_scale=True
+            ),
+        )
+
+    # The klein tables' 8192-token rows.
+    swiglu, qkv, planes = configs()
+    assert (swiglu.cluster_shape, swiglu.ab_stages, swiglu.use_tma_store) == ((4, 4, 1), 6, False)
+    assert qkv.cluster_shape == (2, 2, 1) and qkv.use_tma_store and not qkv.separate_qkv_output
+    assert planes.separate_qkv_output and planes.tmem_overlap and not planes.use_tma_store
+    assert isinstance(prims_ts.autotune_context(device, tune=True), contextlib.nullcontext)
+
+    monkeypatch.setenv("TRTLLM_FLUX3_PRIMS_TS_AUTOTUNE", "1")
+    # FlashInfer's tuned configs write packed Q|K|V, so the NVFP4 planes keep their tile.
+    assert configs() == (None, None, planes)
+
+
+@requires_prims_ts
+def test_prims_ts_autotune_tunes_fp8r_blocks_and_tracks_trtllm(tmp_path, monkeypatch):
+    """FP8R blocks tune, then load the saved tactics and replay them eagerly and in a graph.
+
+    The NVFP4 Q/K/V planes keep their pinned tile under the same contexts.
+    """
+    _assert_prims_ts_installed()
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.prims_ts.gemm.runner import PrimsTsGemmRunner
+
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("TRTLLM_FLUX3_PRIMS_TS_AUTOTUNE", "1")
+    monkeypatch.setenv("TRTLLM_FLUX3_PRIMS_TS_CACHE_DIR", str(cache))
+    # One bucket above the 96 test tokens and two candidates per GEMM keep compiles few.
+    monkeypatch.setenv("TRTLLM_FLUX3_PRIMS_TS_TUNING_BUCKETS", "128")
+    candidates = PrimsTsGemmRunner.get_valid_tactics
+    monkeypatch.setattr(PrimsTsGemmRunner, "get_valid_tactics", lambda *args: candidates(*args)[:2])
+    fp8r, _, _ = _variant_pipeline(tmp_path / "fp8r", monkeypatch, "fp8r")
+    trtllm = _trtllm_transformer(tmp_path / "fp8r", monkeypatch, "fp8r")
+    nvfp4, _, _ = _variant_pipeline(tmp_path / "nvfp4", monkeypatch, "nvfp4")
+    block = _blocks(fp8r.transformer, FP8RowwiseLinearMethod)[0]
+    trtllm_block = _blocks(trtllm, FP8RowwiseLinearMethod)[0]
+    attn = next(m for m in nvfp4.transformer.modules() if getattr(m, "prims_ts_qkv", None))
+    hidden, rope = _block_inputs(block.attn)
+    nvfp4_hidden, (cos, sin) = _block_inputs(attn)
+
+    def fused():
+        planes = attn.prims_ts_qkv(nvfp4_hidden, cos, sin)
+        return block.prims_ts_fp8(hidden, rope, None, None), *planes
+
+    tuner = AutoTuner.get()
+    choose_one, choices = tuner.choose_one, []
+
+    def record(op, *args, **kwargs):
+        runner, tactic = choose_one(op, *args, **kwargs)
+        choices.append((op, tactic))
+        return runner, tactic
+
+    monkeypatch.setattr(tuner, "choose_one", record)
+    with torch.inference_mode():
+        with prims_ts.autotune_context(hidden.device, tune=True):
+            fused()
+        choices.clear()
+        with prims_ts.autotune_context(hidden.device, load=True):
+            actual = assert_cuda_graph_replays(fused)
+        attended = trtllm_block.attn.attend(hidden, rope)
+        mlp = trtllm_block.ff(hidden.reshape(-1, hidden.shape[-1])).reshape_as(hidden)
+        expected = trtllm_block.attn.to_out[0](attended) + mlp
+        shape = (*nvfp4_hidden.shape[:2], attn.local_num_attention_heads, attn.head_dim)
+        q, k, v = (t.view(shape) for t in attn.get_qkv(nvfp4_hidden))
+        q, k = attn.apply_qk_norm(q, k)
+        expected_planes = (apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin), v)
+    # Every lookup hits a tuned tactic; the NVFP4 planes never reach the tuner.
+    assert {op for op, _ in choices} == {"prims_ts_fp8_swiglu", "prims_ts_fp8_qkv"}
+    assert all(tactic != -1 for _, tactic in choices)
+    (saved,) = cache.rglob("*.json")
+    assert "prims_ts_fp8_swiglu" in saved.read_text()
+    assert_parity(actual[0], expected, relative_l2=0.03, cosine=0.999)
+    for plane, reference in zip(actual[1:], expected_planes):
+        assert_parity(plane, reference.flatten(2).to(plane.dtype), relative_l2=0.02, cosine=0.9995)
 
 
 @pytest.mark.cpu_only

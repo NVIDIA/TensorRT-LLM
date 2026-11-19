@@ -224,6 +224,10 @@ are not supported. See the
   `modular_model_index.json`, `transformer/config.json`, `text_encoder/*`, `vae/*` and
   `variants/<variant>/*`, then pass the local directory.
 - Without tensor parallelism (`tp_size` 1), `nvfp4` and `fp8r` checkpoints run fused GEMM kernels automatically on supported Blackwell GPUs.
+  Set `TRTLLM_FLUX3_PRIMS_TS_AUTOTUNE=1` to autotune the fused `fp8r` GEMMs on SM100/SM103/SM107
+  in warmup's autotuning pass (`torch_compile_config.enable_autotune`); rank 0 tunes, every rank
+  uses its tactics, and they are cached under `TRTLLM_FLUX3_PRIMS_TS_CACHE_DIR`
+  (default `~/.cache/tensorrt_llm/flux3_prims_ts`).
 - SOL-Attn is recommended with `tau: 1.0` and `disabled_until_timestep: 0.96`.
 - The checkpoints ship only `modular_model_index.json`, so `trtllm-serve` needs
   `--visual_gen_args` or `--enable_visual_gen`.

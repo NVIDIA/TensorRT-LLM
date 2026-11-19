@@ -15,6 +15,8 @@
 """VisualGen glue for the FlashInfer Prims-TS dense GEMMs (``flashinfer.prims_ts.gemm``)."""
 
 from .common import (
+    autotune_context,
+    autotune_enabled,
     config_for,
     device_supported,
     fp8_gemm_available,
@@ -26,6 +28,8 @@ from .common import (
 from .fp8 import fp8_gemm_eligible, quantize_per_token
 
 __all__ = [
+    "autotune_context",
+    "autotune_enabled",
     "config_for",
     "device_supported",
     "fp8_gemm_available",
