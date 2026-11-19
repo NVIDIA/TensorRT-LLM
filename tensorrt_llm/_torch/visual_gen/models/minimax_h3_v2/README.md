@@ -93,7 +93,7 @@ Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.
 | [components/text_encoder.py](components/text_encoder.py) | Extract H3 conditioning from the required Qwen3-VL hidden layer. |
 | [components/vae.py](components/vae.py) | Prepare the video decoder and decode video and audio latents. |
 | [parallel/tp.py](parallel/tp.py) | Compute TP shard bounds and head partitions compatible with Ulysses. |
-| [parallel/sequence.py](parallel/sequence.py) | Pad, shard and gather packed rows, masks, RoPE and timestep metadata. |
+| [parallel/sequence_sharder.py](parallel/sequence_sharder.py) | Pad and shard refiner and DiT inputs, prepare padding masks, and gather and trim output rows. |
 | [parallel/ulysses.py](parallel/ulysses.py) | Compose head/sequence exchanges, projection ordering and CUDA stream synchronization. |
 | [parallel/vae.py](parallel/vae.py) | Partition video decode tiles across the participating VAE ranks and combine their results. |
 
