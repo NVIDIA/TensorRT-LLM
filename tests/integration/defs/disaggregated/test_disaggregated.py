@@ -2490,19 +2490,23 @@ def run_disaggregated_benchmark(example_dir,
                                 skip_warmup=False,
                                 model_path=None,
                                 cwd=None,
-                                server_start_timeout=300):
+                                server_start_timeout: int | None = None):
     """Run disaggregated test with given configuration."""
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
+    setup_kwargs = {}
+    if server_start_timeout is not None:
+        setup_kwargs["server_start_timeout"] = server_start_timeout
+
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file,
                              model_name=model_path,
                              env=run_env,
                              cwd=cwd,
-                             server_start_timeout=server_start_timeout)
+                             **setup_kwargs)
 
     server_host = config.get("hostname", "localhost")
 
