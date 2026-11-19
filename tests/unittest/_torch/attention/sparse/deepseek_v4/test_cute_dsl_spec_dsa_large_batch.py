@@ -478,7 +478,7 @@ def test_cuda_graph_replay():
         _check_rows(inp, bases, topk, out, "realistic")
 
 
-def _schedule_reference(ctx_lens, num_ctas, unit=256, cmin=128):
+def _even_schedule_reference(ctx_lens, num_ctas, unit=256, cmin=128):
     """Row r costs max(ceil(n_r / unit), cmin) units; CTA s starts at unit s * (T // G) + min(s, T % G)."""
     units = [-(-n // unit) for n in ctx_lens]
     cost = [max(u, cmin) for u in units]
@@ -499,11 +499,48 @@ def _schedule_reference(ctx_lens, num_ctas, unit=256, cmin=128):
     return rows
 
 
-@pytest.mark.parametrize("batch", [1, 7, 148, 256, 1024])
+def _schedule_reference(ctx_lens, num_ctas, unit=256, cmin=128, align_batch=80, slack_pct=3):
+    """The even split, or below align_batch rows the rows cut into the fewest equal pieces that fit one per CTA
+    (a row shorter than cmin units stays in one piece), when that has fewer pieces than the even split and costs
+    the busiest CTA at most slack_pct percent more stream work."""
+    even = _even_schedule_reference(ctx_lens, num_ctas, unit, cmin)
+    batch = len(ctx_lens)
+    if batch >= align_batch or batch > num_ctas:
+        return even
+    units = [-(-n // unit) for n in ctx_lens]
+
+    def pieces(size):
+        return [1 if u < cmin else -(-u // size) for u in units]
+
+    size = max([u for u in units if u < cmin], default=1)
+    while sum(pieces(size)) > num_ctas:
+        size += 1
+    aligned = []
+    for r, count in enumerate(pieces(size)):
+        base, rem = divmod(units[r], count)
+        aligned += [(r, j * base + min(j, rem)) for j in range(count)]
+    n_aligned = len(aligned)
+    aligned += [(batch, 0)] * (num_ctas + 1 - n_aligned)
+    # selection pieces of the even split: the rows it touches plus the rows it cuts in the middle
+    n_even = sum((b[0] - a[0]) + (b[1] > 0) for a, b in zip(even[:-1], even[1:]) if a != b)
+    prefix = [0]
+    for u in units:
+        prefix.append(prefix[-1] + u)
+
+    def busiest(sched):
+        return max(prefix[b[0]] + b[1] - prefix[a[0]] - a[1] for a, b in zip(sched[:-1], sched[1:]))
+
+    if n_aligned < n_even and busiest(aligned) * 100 <= busiest(even) * (100 + slack_pct):
+        return aligned
+    return even
+
+
+@pytest.mark.parametrize("batch", [1, 7, 48, 64, 79, 80, 127, 148, 256, 1024])
 def test_schedule_matches_reference(batch):
     op = _op()
     gen = torch.Generator().manual_seed(5 + batch)
-    for trial in range(4):
+    aligned = 0
+    for trial in range(6):
         if trial == 0:
             ns = [N_MAX] * batch
         elif trial == 1:
@@ -517,6 +554,9 @@ def test_schedule_matches_reference(batch):
             ]
         got = op._schedule(ns, NUM_SMS)
         assert got.tolist() == [list(r) for r in _schedule_reference(ns, NUM_SMS)]
+        aligned += got.tolist() != [list(r) for r in _even_schedule_reference(ns, NUM_SMS)]
+    if batch in (48, 64):
+        assert aligned > 0, "the aligned schedule never applied: the test does not exercise it"
 
 
 def test_rejects_unsupported_arguments():

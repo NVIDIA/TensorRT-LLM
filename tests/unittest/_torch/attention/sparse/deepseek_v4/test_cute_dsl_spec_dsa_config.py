@@ -46,7 +46,7 @@ def test_ds_v4_flash_values():
     assert (s.index_page_tokens, s.compress_ratio, s.topk, s.max_index_len) == (32, 4, 512, 1 << 18)
     assert (s.attn_heads, s.kv_dim, s.kv_format, s.kv_page_rows) == (64, 512, "v4_e4m3_rows", 32)
     assert (s.window, s.swa_page_rows, s.has_sink) == (128, 128, True)
-    assert (s.megakernel_max_batch, s.large_batch, s.max_batch) == (48, True, 1024)
+    assert (s.megakernel_max_batch, s.large_batch, s.max_batch) == (47, True, 1024)
     assert s.shape_key == (64, 128, 512, 4)
     assert (s.min_index_len, s.selected_rows, s.pages_per_tile) == (512, 640, 4)
     assert s.index_page_bytes == 32 * (128 + 4)
@@ -145,7 +145,7 @@ def test_supported_spec():
     for lower in (
         dataclasses.replace(FLASH, name="small", megakernel_max_batch=8, max_batch=64),
         dataclasses.replace(FLASH, megakernel_max_batch=0),
-        dataclasses.replace(FLASH, large_batch=False, max_batch=48),
+        dataclasses.replace(FLASH, large_batch=False, max_batch=47),
     ):
         assert C.supported_spec(lower) is lower
     for higher in (
@@ -181,8 +181,8 @@ def test_require_built_for():
 
 def test_op_routes_batch_sizes_by_spec():
     assert op.implementation_for(1) == "megakernel"
-    assert op.implementation_for(48) == "megakernel"
-    assert op.implementation_for(49) == "large_batch"
+    assert op.implementation_for(47) == "megakernel"
+    assert op.implementation_for(48) == "large_batch"
     assert op.implementation_for(1024) == "large_batch"
     for bad in (-1, 0, 1025):
         with pytest.raises(ValueError, match="batch size"):
@@ -196,11 +196,11 @@ def test_op_routes_batch_sizes_by_spec():
         op.implementation_for(1, dataclasses.replace(FLASH, megakernel_max_batch=0))
         == "large_batch"
     )
-    no_large = dataclasses.replace(FLASH, large_batch=False, max_batch=48)
-    assert op.implementation_for(48, no_large) == "megakernel"
-    with pytest.raises(ValueError, match="batch size 49"):
-        op.implementation_for(49, no_large)
-    assert list(megakernel_op.supported_batch_sizes()) == list(range(1, 49))
+    no_large = dataclasses.replace(FLASH, large_batch=False, max_batch=47)
+    assert op.implementation_for(47, no_large) == "megakernel"
+    with pytest.raises(ValueError, match="batch size 48"):
+        op.implementation_for(48, no_large)
+    assert list(megakernel_op.supported_batch_sizes()) == list(range(1, 48))
     assert list(megakernel_op.supported_batch_sizes(small)) == list(range(1, 9))
 
 
@@ -211,7 +211,7 @@ def test_unsupported_spec_is_refused_before_any_device_work():
     ok, why = megakernel_op.is_supported(config=dataclasses.replace(FLASH, megakernel_max_batch=0))
     assert not ok and "no megakernel" in why
     ok, why = large_batch_op.is_supported(
-        config=dataclasses.replace(FLASH, large_batch=False, max_batch=48)
+        config=dataclasses.replace(FLASH, large_batch=False, max_batch=47)
     )
     assert not ok and "no large-batch" in why
     i32 = torch.int32

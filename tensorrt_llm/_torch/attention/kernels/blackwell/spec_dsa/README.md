@@ -29,7 +29,7 @@ specs have kernels; the rest of this file says where the parts that differ betwe
 
 | Spec | Indexer (heads x dim, K dtype) | Top-K | Compression | KV rows | Megakernel | Large batch |
 | --- | --- | --- | --- | --- | --- | --- |
-| DS-V4-Flash | 64 x 128, fp8 | 512 | 4 | E4M3 rows, window 128, sink | 1 to 48 rows | 49 to 1,024 rows |
+| DS-V4-Flash | 64 x 128, fp8 | 512 | 4 | E4M3 rows, window 128, sink | 1 to 47 rows | 48 to 1,024 rows |
 
 `is_supported(device, config)` and `implementation_for(batch_size, config)` answer from this table. For a config that is
 not in it `is_supported` returns `(False, reason)` and `precompile`, `prepare` and `implementation_for` raise

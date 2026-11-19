@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""specDSA megakernel, host side: fused DeepSeek-V4-Flash decode for 1 to 48 rows on B200 (SM100, 148 SMs).
+"""specDSA megakernel, host side: fused DeepSeek-V4-Flash decode for 1 to 47 rows on B200 (SM100, 148 SMs).
 
 One cooperative launch streams each row's FP8 indexer K cache once, computes the indexer logits, selects the exact
 top-512 compressed positions (sampled threshold with a count certificate and exact fallbacks), maps them to
@@ -85,7 +85,7 @@ _BASE = dict(
     late_done=4,
 )
 # Each batch size extends the previous set. From 5 rows on, two teams of 8 CTAs serve the rows in turn while 132 CTAs
-# stream the indexer K cache; 9 to 48 rows add the ring of logits slots (ring).
+# stream the indexer K cache; 9 to 47 rows add the ring of logits slots (ring).
 _BS1 = dict(swag=True, nohoist=True, rs24=True, rs24_t4split=True, rs24_lsu=12)
 _BS2 = dict(_BS1, math_regs=216, kv_stages=3, wdelay=0, early=True, tearly=True)
 _BS4 = dict(
@@ -117,7 +117,7 @@ _CONFIGS: dict[int, dict] = {
     3: _BS4T,
     4: _BS4T,
     **{b: _BS8 for b in range(5, 9)},
-    **{b: _BS16 for b in range(9, 49)},
+    **{b: _BS16 for b in range(9, 48)},
 }
 
 # The knob sets of the megakernel per spec (kernel_key) and batch size: the base knobs plus the set of the batch size.

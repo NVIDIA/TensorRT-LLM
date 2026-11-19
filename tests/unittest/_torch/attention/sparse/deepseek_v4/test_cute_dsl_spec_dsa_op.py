@@ -81,7 +81,7 @@ def test_implementation_for():
 
 
 @pytest.mark.parametrize(
-    "batch", [1, 2, 3, 4, 5, 8, 9, 13, 16, 17, 24, 32, 33, 40, 48, 49, 64, 149, 1024]
+    "batch", [1, 2, 3, 4, 5, 8, 9, 13, 16, 17, 24, 32, 33, 40, 47, 48, 49, 64, 149, 1024]
 )
 def test_matches_reference(batch):
     op = _op()
@@ -96,7 +96,7 @@ def test_matches_reference(batch):
     H._check_rows(inp, bases, topk, out, "realistic")
 
 
-@pytest.mark.parametrize("batch", [4, 5, 24, 40, 48, 60])
+@pytest.mark.parametrize("batch", [4, 5, 24, 40, 47, 48, 60])
 def test_refresh_in_place_and_cuda_graph(batch):
     op = _op()
     ns = H.LENGTHS[:batch] if batch <= len(H.LENGTHS) else H.LENGTHS

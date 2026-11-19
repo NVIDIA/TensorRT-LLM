@@ -213,7 +213,8 @@ DS_V4_FLASH = SpecDsaConfig(
     window=128,
     swa_page_rows=128,
     has_sink=True,
-    megakernel_max_batch=48,
+    # the megakernel is built for up to 48 rows; at 48 the large-batch kernels are the faster ones
+    megakernel_max_batch=47,
     large_batch=True,
     max_batch=1024,
 )

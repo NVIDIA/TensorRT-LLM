@@ -64,6 +64,11 @@ ERR_SCHEDULE = 1
 # Schedule granule: a row costs ceil(n / SCHED_UNIT) units, at least SCHED_MIN_UNITS; the CTAs split the total evenly.
 SCHED_UNIT = 256
 SCHED_MIN_UNITS = 128
+# Below SCHED_ALIGN_BATCH rows the schedule aligns the rows to the CTAs instead (see ``_schedule``), when that costs
+# the busiest CTA at most SCHED_ALIGN_SLACK_PCT percent more stream work. It gains nothing measurable above that and
+# costs about 60 us of host time per call.
+SCHED_ALIGN_BATCH = 80
+SCHED_ALIGN_SLACK_PCT = 3
 SELECT_BINS = 512
 SEGMENT_WORDS = 520  # int64 words per CTA and slot of the selection scratch
 # int32 words per row of the ready queue; word AQ_ENTRY + k holds the k-th finished row.
@@ -200,6 +205,11 @@ def _schedule(ctx_lens: list[int], num_ctas: int) -> np.ndarray:
     Row ``r`` spans ``max(ceil(n_r / SCHED_UNIT), SCHED_MIN_UNITS)`` units; entry ``s`` is ``(row, unit offset in
     the row)`` of that start (offset 0 for rows with fewer than ``SCHED_MIN_UNITS`` real units, which are never
     split) and entry ``num_ctas`` is ``(batch_size, 0)``.
+
+    With fewer than ``SCHED_ALIGN_BATCH`` rows the even split cuts rows at arbitrary units, and every extra piece of
+    a row is one more candidate list for the last finisher of the row to merge. ``_aligned_schedule`` then cuts the
+    rows into fewer pieces, one per CTA, and is used when it has fewer pieces and costs the busiest CTA at most
+    ``SCHED_ALIGN_SLACK_PCT`` percent more stream work.
     """
     n = np.asarray(ctx_lens, dtype=np.int64)
     batch = n.size
@@ -213,8 +223,59 @@ def _schedule(ctx_lens: list[int], num_ctas: int) -> np.ndarray:
     inside = row < batch
     row_c = np.minimum(row, batch - 1)
     offset = np.where(inside & (units[row_c] >= SCHED_MIN_UNITS), start - prefix[row_c], 0)
-    sched = np.stack([np.where(inside, row, batch), offset], axis=1)
-    return sched.astype(np.int32)
+    sched = np.stack([np.where(inside, row, batch), offset], axis=1).astype(np.int32)
+    if batch >= SCHED_ALIGN_BATCH or batch > num_ctas:
+        return sched
+    aligned = _aligned_schedule(units, num_ctas)
+    pieces = int((aligned[:, 0] < batch).sum())
+    # selection pieces of the even split: the rows it touches plus the rows it cuts in the middle
+    first_row, first_off = sched[:-1, 0], sched[:-1, 1]
+    next_row, next_off = sched[1:, 0], sched[1:, 1]
+    moved = (next_row != first_row) | (next_off != first_off)
+    even_pieces = int(((next_row - first_row) + (next_off > 0))[moved].sum())
+    busiest_aligned = _busiest_cta_units(units, aligned)
+    busiest_even = _busiest_cta_units(units, sched)
+    if pieces < even_pieces and busiest_aligned * 100 <= busiest_even * (
+        100 + SCHED_ALIGN_SLACK_PCT
+    ):
+        return aligned
+    return sched
+
+
+def _busiest_cta_units(units: np.ndarray, sched: np.ndarray) -> int:
+    """Stream units (``SCHED_UNIT`` positions of the rows, without the minimum cost) of the busiest CTA of ``sched``."""
+    work = np.concatenate([[0], np.cumsum(units)])
+    return int(np.diff(work[sched[:, 0]] + sched[:, 1]).max())
+
+
+def _aligned_schedule(units: np.ndarray, num_ctas: int) -> np.ndarray:
+    """Cut every row of at least ``SCHED_MIN_UNITS`` units into the fewest equal pieces that fit one per CTA.
+
+    A smallest piece size is searched such that the pieces of all rows (a shorter row stays in one piece) number at
+    most ``num_ctas``; a row of ``u`` units is cut into ``ceil(u / size)`` pieces that differ by at most one unit.
+    Returns the entries of ``_schedule`` for one piece per CTA, the unused CTAs and the end entry being
+    ``(batch_size, 0)``.
+    """
+    batch = units.size
+    small = units < SCHED_MIN_UNITS
+    long_rows = units[~small]
+    lo = max(1, int(units[small].max()) if small.any() else 1)
+    hi = int(units.max())
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if batch - long_rows.size + int(((long_rows + (mid - 1)) // mid).sum()) <= num_ctas:
+            hi = mid
+        else:
+            lo = mid + 1
+    count = np.where(small, 1, (units + (lo - 1)) // lo)
+    row = np.repeat(np.arange(batch), count)
+    nth = np.arange(row.size) - (np.cumsum(count) - count)[row]  # index of the piece inside its row
+    base, extra = np.divmod(units, count)
+    entries = np.full((num_ctas + 1, 2), 0, dtype=np.int32)
+    entries[:, 0] = batch
+    entries[: row.size, 0] = row
+    entries[: row.size, 1] = nth * base[row] + np.minimum(nth, extra[row])
+    return entries
 
 
 def _host_ints(t: torch.Tensor, count: int, name: str) -> list[int]:

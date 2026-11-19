@@ -345,7 +345,7 @@ CASES = [  # (rows' compressed lengths, attention mode, extra case options)
     pytest.param(
         [262127 - 4099 * r for r in range(8)], "realistic", {"ties": {3: 31}}, id="b8-mixed-ties"
     ),
-    # batch sizes between the powers of two, and the ring of 9 to 48 rows
+    # batch sizes between the powers of two, and the ring of 9 to 47 rows
     pytest.param([131071, 98309, 50021], "gather_exact", {}, id="b3-mixed"),
     pytest.param([262127] * 5, "realistic", {}, id="b5-max"),
     pytest.param(
@@ -387,7 +387,7 @@ CASES = [  # (rows' compressed lengths, attention mode, extra case options)
         {"ties": {5: 3, 31: 77}, "flat": (18,)},
         id="b32-mixed-short-ties",
     ),
-    # 33 to 48 rows: the block-table slices of rows 32 and up reuse the entries of rows 0 and up
+    # 33 to 47 rows: the block-table slices of rows 32 and up reuse the entries of rows 0 and up
     pytest.param([262127 - 4999 * r for r in range(33)], "realistic", {}, id="b33-mixed"),
     pytest.param(
         [131071 - 2003 * r for r in range(37)],
@@ -402,12 +402,12 @@ CASES = [  # (rows' compressed lengths, attention mode, extra case options)
         {"ties": {0: 5, 32: 11, 44: 77}},
         id="b45-mixed-ties",
     ),
-    pytest.param([262127] * 48, "realistic", {}, id="b48-max"),
+    pytest.param([262127] * 47, "realistic", {}, id="b47-max"),
     pytest.param(
-        [262127 - 3989 * r if r % 3 else 700 + 17 * r for r in range(48)],
+        [262127 - 3989 * r if r % 3 else 700 + 17 * r for r in range(47)],
         "gather_exact",
-        {"ties": {5: 3, 31: 77, 47: 6000}, "flat": (18, 40)},
-        id="b48-mixed-short-ties",
+        {"ties": {5: 3, 31: 77, 46: 6000}, "flat": (18, 40)},
+        id="b47-mixed-short-ties",
     ),
 ]
 
