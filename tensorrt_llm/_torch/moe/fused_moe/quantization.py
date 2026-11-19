@@ -7202,19 +7202,21 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
     ``[up 0:64, gate 64:128, up 128:192, ...]``, i.e. the ``[w3, w1]`` halves
     interleaved.
 
-    Like the swizzle, the interleave is a non-involutive read-modify-write, so
-    it is staged per local slot and applied exactly once in
-    ``process_weights_after_loading``: RLHF partial refit streams weights
-    bucket by bucket and its finalize walk calls both post-load hooks. A refit
-    may also rewrite only one of the two projections of a slot, which the
-    parent writes into its half of the plain ``[w3, w1]`` layout; so before
-    one projection lands in a slot already in the kernel layout, that slot is
-    first returned to the parent's layout, and the interleave is reapplied to
-    the whole slot at the next finalize. When both projections arrive (always
-    the case for ``FUSED_GATE_UP_PROJ``) they overwrite the whole slot, so it
-    is not returned first, and its scales are interleaved while still raw and
-    then swizzled once, instead of swizzled, unswizzled and swizzled again.
-    Finalize runs every layout pass on contiguous slot runs.
+    The FC1 weight needs no pass of its own: each projection is copied
+    straight into its interleaved rows at load time, so a slot is always in
+    the kernel layout and a refit of one projection overwrites only its rows.
+
+    The block scales cannot be written that way because the parent swizzles
+    them in ``process_weights_after_loading``, and the interleave is a
+    non-involutive read-modify-write like the swizzle, so it is staged per
+    local slot and applied exactly once there: RLHF partial refit streams
+    weights bucket by bucket and its finalize walk calls both post-load hooks.
+    A slot whose two scale halves both arrive (always the case for
+    ``FUSED_GATE_UP_PROJ``) is interleaved while still raw and then swizzled
+    once. A refit of one projection's scales keeps the other half's bytes, so
+    a slot already in the kernel layout is first returned to the parent's
+    layout, and the interleave is reapplied to the whole slot at the next
+    finalize. Finalize runs every scale pass on contiguous slot runs.
     """
     # The fused kernel gathers per-token FC1 scales in 16-byte chunks, i.e.
     # 16 UE8M0 scales covering 16 * 32 = 512 K elements per row.
@@ -7246,11 +7248,7 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
 
     @staticmethod
     def _reset_interleave_state(module: torch.nn.Module) -> None:
-        # Local slots whose staged FC1 weight bytes still owe the gate/up
-        # interleave. Mirrors ``_mxfp8_w3_w1_sf_pending_slots`` in the parent.
-        module._cute_dsl_mxfp8_w3_w1_interleave_pending = set()
-        # Local slots whose FC1 weight / block scales are in the kernel layout.
-        module._cute_dsl_mxfp8_w3_w1_weight_interleaved = set()
+        # Local slots whose FC1 block scales are in the kernel layout.
         module._cute_dsl_mxfp8_w3_w1_scale_interleaved = set()
 
     def load_expert_w3_w1_weight(self,
@@ -7258,26 +7256,43 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
                                  dst_w3_w1_weight: torch.Tensor,
-                                 allow_partial_loading: bool = False,
-                                 expert_idx: int = -1) -> None:
-        # Stage the plain [w3, w1] concat; the interleave is deferred (see the
-        # class docstring). Arm the slot only when FC1 bytes actually arrive so
-        # a down_proj-only bucket cannot re-interleave a finalized slot.
-        arrives = (w1_weight is not None
-                   or w3_weight is not None) and expert_idx >= 0
-        # Both projections overwrite the whole slot, so its old layout is moot.
-        whole_slot = (w1_weight is not None and w1_weight.shape[0] != 0
-                      and w3_weight is not None and w3_weight.shape[0] != 0)
-        interleaved = module._cute_dsl_mxfp8_w3_w1_weight_interleaved
-        if arrives and expert_idx in interleaved:
-            if not whole_slot:
-                self._deinterleave_w3_w1_weight(dst_w3_w1_weight)
-            interleaved.discard(expert_idx)
-        super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
-                                         dst_w3_w1_weight,
-                                         allow_partial_loading)
-        if arrives:
-            module._cute_dsl_mxfp8_w3_w1_interleave_pending.add(expert_idx)
+                                 allow_partial_loading: bool = False) -> None:
+        """Copy w3 and w1 straight into their gate/up interleaved rows.
+
+        Seen through ``plain``, the interleaved ``[2N, K]`` slot is the
+        parent's ``[w3; w1]`` layout, so each projection lands in one strided
+        copy and the other projection's rows are left as they are.
+        """
+        device = dst_w3_w1_weight.device
+        if not allow_partial_loading:
+            assert w1_weight is not None and w3_weight is not None
+        group = self.INTERLEAVE_GROUP_SIZE
+        # [2N/(2g), 2, g, K] -> [2, N/g, g, K]: plain[0] = w3, plain[1] = w1.
+        plain = dst_w3_w1_weight.unflatten(0, (-1, 2, group)).transpose(0, 1)
+        for half, weight in ((1, w1_weight), (0, w3_weight)):
+            if weight is None:
+                continue
+            shard = load_weight_shard(weight,
+                                      module.tp_size,
+                                      module.tp_rank,
+                                      TensorParallelMode.COLUMN,
+                                      device=device)
+            if shard.shape[0] == 0:
+                continue
+            if shard.dtype != dst_w3_w1_weight.dtype:
+                shard = shard.contiguous().view(dst_w3_w1_weight.dtype)
+            if half == 1 and shard.shape[0] == dst_w3_w1_weight.shape[0]:
+                # A w1 without a gate (Nemotron-H) fills the whole slot.
+                plain.copy_(shard.unflatten(0, (2, -1, group)),
+                            non_blocking=True)
+            elif shard.shape[0] == plain.shape[1] * group:
+                plain[half].copy_(shard.unflatten(0, (-1, group)),
+                                  non_blocking=True)
+            else:
+                raise ValueError(
+                    f"Shape mismatch between {('w3', 'w1')[half]} shard "
+                    f"{tuple(shard.shape)} and the FC1 slot "
+                    f"{tuple(dst_w3_w1_weight.shape)}")
 
     def _w3_w1_scale_halves(self, module: torch.nn.Module, weights: Dict,
                             expert_id: int) -> set[str]:
@@ -7349,18 +7364,6 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
         if run_start is not None:
             yield run_start, prev + 1
 
-    @classmethod
-    def _interleave_w3_w1_weight(cls, dst_w3_w1_weight: torch.Tensor) -> None:
-        """Interleave one slot's [2N, K] e4m3 FC1 weight in place."""
-        w3_w1_u8 = dst_w3_w1_weight.view(torch.uint8)
-        w3_w1_u8.copy_(cls._interleave_w3_w1_rows(w3_w1_u8))
-
-    @classmethod
-    def _deinterleave_w3_w1_weight(cls, dst_w3_w1_weight: torch.Tensor) -> None:
-        """Return one slot's FC1 weight to the plain [w3, w1] layout in place."""
-        w3_w1_u8 = dst_w3_w1_weight.view(torch.uint8)
-        w3_w1_u8.copy_(cls._deinterleave_w3_w1_rows(w3_w1_u8))
-
     def _permute_w3_w1_weight_scale_rows(
             self, module: torch.nn.Module, block: torch.Tensor,
             permute: Callable[..., torch.Tensor]) -> None:
@@ -7426,34 +7429,20 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
             pending.difference_update(
                 (s, half) for s in whole_slots for half in ("w1", "w3"))
             for lo, hi in self._slot_batches(whole_slots, scale_data):
-                self._swizzle_raw_w3_w1_weight_scale(module,
-                                                     scale_data[lo:hi])
+                self._swizzle_raw_w3_w1_weight_scale(module, scale_data[lo:hi])
             module._cute_dsl_mxfp8_w3_w1_scale_interleaved.update(whole_slots)
         super().process_weights_after_loading(module)
-
-        weight_slots = module._cute_dsl_mxfp8_w3_w1_interleave_pending
-        if weight_slots:
-            weight_data = module.w3_w1_weight.data
-            for lo, hi in self._slot_batches(weight_slots, weight_data):
-                block = weight_data[lo:hi].view(torch.uint8)
-                block.copy_(self._interleave_w3_w1_rows(block, dim=1))
-            module._cute_dsl_mxfp8_w3_w1_weight_interleaved.update(weight_slots)
-            weight_slots.clear()
         if partial_slots:
             for lo, hi in self._slot_batches(partial_slots, scale_data):
                 self._permute_w3_w1_weight_scale_rows(
                     module, scale_data[lo:hi], self._interleave_w3_w1_rows)
-            module._cute_dsl_mxfp8_w3_w1_scale_interleaved.update(
-                partial_slots)
+            module._cute_dsl_mxfp8_w3_w1_scale_interleaved.update(partial_slots)
 
     def pre_reload_weights(self, module: torch.nn.Module) -> None:
         rebuilt = set(module.rebuild_tensor_metadata)
         super().pre_reload_weights(module)
-        # A recreated parameter holds no slot in either layout; one left in
-        # place keeps its slots' layout for a partial refit to build on.
-        if "w3_w1_weight" in rebuilt:
-            module._cute_dsl_mxfp8_w3_w1_interleave_pending.clear()
-            module._cute_dsl_mxfp8_w3_w1_weight_interleaved.clear()
+        # A recreated scale parameter holds no slot in either layout; one left
+        # in place keeps its slots' layout for a partial refit to build on.
         if "w3_w1_weight_scale" in rebuilt:
             module._cute_dsl_mxfp8_w3_w1_scale_interleaved.clear()
 

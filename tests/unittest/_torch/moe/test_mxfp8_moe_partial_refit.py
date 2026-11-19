@@ -89,7 +89,10 @@ def _skip_if_backend_unavailable(backend: str) -> None:
         )
 
 
-def _make_module(backend: str = "CUTLASS"):
+def _make_module(
+    backend: str = "CUTLASS",
+    weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
+):
     _skip_if_backend_unavailable(backend)
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = NUM_EXPERTS
@@ -106,7 +109,7 @@ def _make_module(backend: str = "CUTLASS"):
         routing_method=RenormalizeMoeRoutingMethod(top_k=TOP_K),
         reduce_results=True,
         model_config=model_config,
-        weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        weight_loading_mode=weight_loading_mode,
     )
     module.cuda()
     return module
@@ -213,6 +216,30 @@ def _mxfp8_expert_weights(generator: torch.Generator):
 
 def _split(weights, leaves):
     return {k: v for k, v in weights.items() if k.split(".")[1] in leaves}
+
+
+def _fused(weights, leaves=("w1", "w3", "w2")):
+    """The same weights in the FUSED_GATE_UP_PROJ checkpoint format.
+
+    ``gate_up_proj`` is ``[E, H, 2I]`` with the gate (w1) first and
+    ``down_proj`` is ``[E, I, H]``; their scales drop H (resp. I) by the block.
+    """
+
+    def stack(*parts_of, suffix):
+        def expert(e):
+            parts = [weights[f"{e}.{name}.{suffix}"].view(torch.uint8) for name in parts_of]
+            return torch.cat(parts, dim=0).t()
+
+        return torch.stack([expert(e) for e in range(NUM_EXPERTS)]).contiguous()
+
+    fused = {}
+    if "w1" in leaves:
+        fused["gate_up_proj"] = stack("w1", "w3", suffix="weight").view(torch.float8_e4m3fn)
+        fused["gate_up_proj_weight_scale"] = stack("w1", "w3", suffix="weight_scale_inv")
+    if "w2" in leaves:
+        fused["down_proj"] = stack("w2", suffix="weight").view(torch.float8_e4m3fn)
+        fused["down_proj_weight_scale"] = stack("w2", suffix="weight_scale_inv")
+    return fused
 
 
 @requires_mxfp8_moe
@@ -330,8 +357,10 @@ def test_mxfp8_single_projection_refit_after_finalize_matches_fresh_load(leaf, b
     """Refitting only w1 (or w3) of already-finalized slots must leave the
     other projection's swizzled scales untouched and match a fresh full load.
 
-    On CUTEDSL the finalized FC1 slots are gate/up interleaved, so the refit
-    has to undo the interleave before writing one half and redo it after."""
+    On CUTEDSL the finalized FC1 slots are gate/up interleaved: the weight
+    half lands in its interleaved rows directly, while the scales are returned
+    to the plain layout before one half is written and interleaved again
+    after."""
     torch.manual_seed(20260821)
     weights_a = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(1))
     weights_b = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(2))
@@ -348,11 +377,10 @@ def test_mxfp8_single_projection_refit_after_finalize_matches_fresh_load(leaf, b
 
 @requires_mxfp8_moe
 def test_mxfp8_cutedsl_whole_fc1_refit_skips_layout_round_trips(monkeypatch):
-    """When w1 and w3 arrive together they overwrite the whole slot, so a refit
-    must not first return finalized slots to the plain layout, and the scale
-    interleave must ride on the raw bytes ahead of the single swizzle rather
-    than unswizzle and swizzle each slot again. The result still has to match
-    a fresh load."""
+    """When w1 and w3 arrive together they overwrite the whole slot, so the
+    scale interleave must ride on the raw bytes ahead of the single swizzle
+    rather than unswizzle and swizzle each slot again. The result still has to
+    match a fresh load."""
     torch.manual_seed(20260821)
     weights_a = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(1))
     weights_b = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(2))
@@ -364,17 +392,16 @@ def test_mxfp8_cutedsl_whole_fc1_refit_skips_layout_round_trips(monkeypatch):
     quant_method = _backend(module).quant_method
     assert isinstance(quant_method, MXFP8CuteDslFusedMoEMethod)
     calls = []
-    for name in ("_deinterleave_w3_w1_weight", "_permute_w3_w1_weight_scale_rows"):
-        # Bound on the instance, so the shadowing wrapper takes no self.
-        original = getattr(quant_method, name)
+    # Bound on the instance, so the shadowing wrapper takes no self.
+    original = quant_method._permute_w3_w1_weight_scale_rows
 
-        def counted(*args, _name=name, _original=original, **kwargs):
-            calls.append(_name)
-            return _original(*args, **kwargs)
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
 
-        monkeypatch.setattr(quant_method, name, counted)
+    monkeypatch.setattr(quant_method, "_permute_w3_w1_weight_scale_rows", counted)
     _refit(module, [_split(weights_b, {"w1", "w3"}), _split(weights_b, {"w2"})])
-    assert not calls, f"whole-FC1 refit ran per-slot layout round trips: {sorted(set(calls))}"
+    assert not calls, f"whole-FC1 refit ran {len(calls)} scale layout round trips"
     _assert_matches(module, expected, "whole-FC1 refit after finalize")
 
 
@@ -425,26 +452,47 @@ def test_mxfp8_cutedsl_layout_is_single_interleave_of_cutlass_layout():
 
 
 @requires_mxfp8_moe
-def test_mxfp8_cutedsl_interleave_pending_slots_drained_after_finalize():
-    """White-box: staging FC1 weights arms the CuTe DSL interleave set for
-    exactly the touched slots; a w2-only bucket must not; finalize drains it."""
+def test_mxfp8_cutedsl_fc1_weight_is_in_kernel_layout_at_load():
+    """White-box: the CuTe DSL FC1 weight is written straight into the gate/up
+    interleaved rows while loading, so it already equals the interleave of the
+    Cutlass layout before any finalize, and neither a w2-only bucket nor the
+    finalize walk touches it again."""
     torch.manual_seed(20260907)
-    generator = torch.Generator(device="cuda").manual_seed(4321)
-    weights = _mxfp8_expert_weights(generator)
+    weights = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(4321))
+
+    cutlass = _backend(_make_module("CUTLASS"))
+    cutlass.load_weights([dict(weights)])
+    group = MXFP8CuteDslFusedMoEMethod.INTERLEAVE_GROUP_SIZE
+    expected = interleave_linear_and_gate(_bits(cutlass.w3_w1_weight.data), group_size=group, dim=1)
 
     module = _make_module("CUTEDSL")
     backend = _backend(module)
-    module.load_weights([_split(weights, {"w2"})], allow_partial_loading=True)
-    assert not backend._cute_dsl_mxfp8_w3_w1_interleave_pending, (
-        "a w2-only bucket must NOT arm the FC1 interleave set"
-    )
-
     module.load_weights([_split(weights, {"w1", "w3"})], allow_partial_loading=True)
-    assert backend._cute_dsl_mxfp8_w3_w1_interleave_pending == set(
-        range(backend.w3_w1_weight.shape[0])
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(backend.w3_w1_weight.data), expected), (
+        "FC1 weight is not in the kernel layout right after loading"
     )
-
+    module.load_weights([_split(weights, {"w2"})], allow_partial_loading=True)
     _rlhf_finalize(module)
     torch.cuda.synchronize()
-    assert not backend._cute_dsl_mxfp8_w3_w1_interleave_pending
+    assert torch.equal(_bits(backend.w3_w1_weight.data), expected), (
+        "a w2-only bucket or the finalize walk rewrote the FC1 weight"
+    )
     assert not backend._mxfp8_w3_w1_sf_pending_slots
+
+
+@requires_mxfp8_moe
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_mxfp8_fused_gate_up_proj_refit_matches_vanilla_load(backend):
+    """FUSED_GATE_UP_PROJ hands the loader transposed views of the stacked
+    checkpoint tensors; a full load and a bucketed refit from that format must
+    match a VANILLA load of the same weights bit for bit."""
+    torch.manual_seed(20260821)
+    weights_a = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(1))
+    weights_b = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(2))
+    expected_b = _fresh_load(_make_module(backend), weights_b)
+
+    module = _make_module(backend, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ)
+    _refit(module, [_fused(weights_a)])
+    _refit(module, [_fused(weights_b, {"w1", "w3"}), _fused(weights_b, {"w2"})])
+    _assert_matches(module, expected_b, "FUSED_GATE_UP_PROJ refit")
