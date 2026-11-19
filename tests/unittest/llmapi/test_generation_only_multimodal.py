@@ -8,7 +8,7 @@ import torch
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.llmapi.llm import BaseLLM
+from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
@@ -41,13 +41,60 @@ class VocabProcessor(Processor):
         return 100
 
 
+class RotaryTableProcessor(Processor):
+    """Checks mRoPE positions like the Qwen-VL processors, with a 16-row rotary table."""
+
+    config = SimpleNamespace(max_position_embeddings=16)
+
+    def check_mrope_positions(self, *args):
+        from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
+
+        return Qwen2VLInputProcessorBase.check_mrope_positions(self, *args)
+
+
+class Submitted(Exception):
+    pass
+
+
+class Executor:
+    """Records each request that reaches executor submission, then stops it."""
+
+    def __init__(self):
+        self.requests = []
+
+    def is_shutdown(self):
+        return False
+
+    def shutdown(self):
+        pass
+
+    def generate_async(self, prompt_token_ids, **kwargs):
+        self.requests.append(kwargs)
+        raise Submitted
+
+
 @pytest.fixture
 def llm():
     llm = BaseLLM.__new__(BaseLLM)
     llm.input_processor = Processor()
     llm.args = SimpleNamespace()
     llm._is_encoder_decoder_model = lambda: False
+    llm._encode_only = False
+    llm._executor = Executor()
+    llm._prepare_sampling_params = lambda sampling_params=None: sampling_params or SamplingParams()
+    llm._check_arguments = lambda *args, **kwargs: None
     return llm
+
+
+def submit(llm, inputs, disagg, max_tokens=4):
+    """Run generate_async up to the executor and return the multimodal params it got."""
+    vars(llm.args).setdefault("mm_encoder_only", False)
+    vars(llm.args).setdefault("return_perf_metrics", False)
+    with pytest.raises(Submitted):
+        llm.generate_async(
+            inputs, SamplingParams(max_tokens=max_tokens), disaggregated_params=disagg
+        )
+    return llm._executor.requests[-1]["multimodal_params"]
 
 
 def params(prompt_len=3):
@@ -95,7 +142,7 @@ def test_cuda_ipc_mrope_is_rejected(llm, processor):
     disagg = params()
     disagg.mrope_position_ids_handle = {"method_key": 1}
     with pytest.raises(ValueError, match="requires portable mRoPE"):
-        llm._preprocess({"prompt_token_ids": [1, 91, 2]}, SamplingParams(max_tokens=4), disagg)
+        submit(llm, {"prompt_token_ids": [1, 91, 2]}, disagg)
 
 
 @pytest.mark.parametrize("key", ["tensor_size", "dtype", "data"])
@@ -134,11 +181,8 @@ def test_media_tokens_above_vocab_are_detected(llm):
     llm.input_processor = VocabProcessor()
     disagg = DisaggregatedParams(request_type="generation_only")
     with pytest.raises(ValueError, match="requires portable mRoPE"):
-        llm._preprocess({"prompt_token_ids": [1, 101, 2]}, SamplingParams(max_tokens=4), disagg)
-    _, _, mm, _ = llm._preprocess(
-        {"prompt_token_ids": [1, 2, 99]}, SamplingParams(max_tokens=4), disagg
-    )
-    assert mm is None
+        submit(llm, {"prompt_token_ids": [1, 101, 2]}, disagg)
+    assert submit(llm, {"prompt_token_ids": [1, 2, 99]}, disagg) is None
 
 
 class NoFlagProcessor:
@@ -158,14 +202,15 @@ def test_input_processor_decides_if_mrope_is_required(llm, processor, required):
     # The config is not read: only the processor flag counts.
     llm.input_processor.config = SimpleNamespace(rope_scaling={"mrope_section": [1, 1, 1]})
     llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(enable_block_reuse=False))
-    request = ({"prompt_token_ids": [1, 91, 2]}, SamplingParams(max_tokens=4))
-    disagg = DisaggregatedParams(request_type="generation_only")
+    request = (
+        {"prompt_token_ids": [1, 91, 2]},
+        DisaggregatedParams(request_type="generation_only"),
+    )
     if required:
         with pytest.raises(ValueError, match="requires portable mRoPE"):
-            llm._preprocess(*request, disagg)
+            submit(llm, *request)
     else:
-        _, _, mm, _ = llm._preprocess(*request, disagg)
-        assert mm is None
+        assert submit(llm, *request) is None
 
 
 def test_every_mrope_model_has_a_processor_that_says_so():
@@ -192,6 +237,8 @@ def test_every_mrope_model_has_a_processor_that_says_so():
             reads.add(model.__name__)
         if getattr(processor, "uses_mrope", False):
             declares.add(model.__name__)
+            # So the frontend can check the handed-over positions.
+            assert callable(getattr(processor, "check_mrope_positions", None)), processor
     assert declares == reads
     assert {"Qwen2VLModel", "Qwen2_5_VLModel", "Qwen3VLModel", "Qwen3_5VLModel"} <= declares
     # EXAONE 4.5 reuses the Qwen2-VL processor but has plain RoPE.
@@ -304,22 +351,13 @@ def test_context_result_carries_cache_identity():
 
 def test_generation_only_cache_reuse_requires_multimodal_identity(llm):
     llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(enable_block_reuse=True))
+    request = {"prompt_token_ids": [1, 91, 2], "multi_modal_data": None}
     with pytest.raises(ValueError, match="KV reuse requires cache identity") as error:
-        llm._preprocess(
-            {"prompt_token_ids": [1, 91, 2], "multi_modal_data": None},
-            SamplingParams(max_tokens=4),
-            params(),
-        )
+        submit(llm, request, params())
     # The error names the setting that serves the request without an identity.
     assert "kv_cache_config.enable_block_reuse=False" in str(error.value)
     llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(enable_block_reuse=False))
-    ids, _, mm, _ = llm._preprocess(
-        {"prompt_token_ids": [1, 91, 2], "multi_modal_data": None},
-        SamplingParams(max_tokens=4),
-        params(),
-    )
-    assert ids == [1, 91, 2]
-    assert mm.multimodal_input is None
+    assert submit(llm, request, params()).multimodal_input is None
 
 
 def test_identity_spans_must_pair_up():
@@ -354,3 +392,86 @@ def test_invalid_multimodal_identity_is_rejected(llm, update, error):
     disagg.multimodal_input = {**asdict(identity), **update}
     with pytest.raises(ValueError, match=error):
         llm._preprocess({"prompt_token_ids": [1, 91, 2, 91]}, SamplingParams(max_tokens=4), disagg)
+
+
+@pytest.mark.parametrize(
+    "positions, delta, max_tokens, error",
+    [
+        ([0, 1, 1, 2], -1, 4, None),
+        ([-1, 0, 0, 1], -2, 4, "Qwen mRoPE positions exceed"),
+        ([0, 1, 1, 16], 13, 4, "Qwen mRoPE positions exceed"),
+        ([0, 1, 1, 2], -100, 4, "inconsistent"),
+        ([0, 1, 1, 10], 7, 6, "decode positions exceed"),
+    ],
+    ids=["valid", "negative", "past-table", "delta", "decode-past-table"],
+)
+def test_mrope_positions_must_fit_the_rotary_table(llm, positions, delta, max_tokens, error):
+    # The worker indexes its rotary table with these values: a bad one fails the request here.
+    llm.input_processor = RotaryTableProcessor()
+    disagg = DisaggregatedParams(
+        request_type="generation_only",
+        mrope_position_ids_handle=SharedTensorContainer.from_tensor_bytes(
+            torch.tensor(positions).expand(3, 1, 4)
+        ).dump_to_dict(),
+        mrope_position_deltas_handle=SharedTensorContainer.from_tensor_bytes(
+            torch.tensor([[delta]], dtype=torch.int32)
+        ).dump_to_dict(),
+    )
+    request = {"prompt_token_ids": [1, 91, 91, 2]}
+    if error is None:
+        mm = submit(llm, request, disagg, max_tokens=max_tokens)
+        assert mm.multimodal_data["mrope_config"]["mrope_position_ids"] is (
+            disagg.mrope_position_ids_handle
+        )
+        return
+    with pytest.raises(ValueError, match=error):
+        submit(llm, request, disagg, max_tokens=max_tokens)
+    assert llm._executor.requests == []
+
+
+@pytest.mark.parametrize(
+    "processor, disagg, error",
+    [
+        (Processor, params, "requires portable mRoPE"),
+        (PlainRopeProcessor, None, "KV reuse requires cache identity"),
+    ],
+    ids=["mrope", "identity"],
+)
+def test_prepared_inputs_without_handoff_state_are_not_submitted(llm, processor, disagg, error):
+    # preprocess() without disaggregated parameters, then a generation-only submission.
+    llm.input_processor = processor()
+    llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(enable_block_reuse=True))
+    prepared = llm.preprocess({"prompt_token_ids": [1, 91, 2]})
+    assert prepared.multimodal_params is None
+    disagg = disagg() if disagg else DisaggregatedParams(request_type="generation_only")
+    with pytest.raises(ValueError, match=error):
+        submit(llm, prepared, disagg)
+    assert llm._executor.requests == []
+
+
+def test_prepared_inputs_with_handoff_state_are_submitted(llm):
+    from dataclasses import asdict
+
+    from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
+
+    identity = MultimodalInput.from_components(
+        [[1, 2, 3, 4, 5, 6, 7, 8]], [1], [2], ["image-id"], [0, 2], [1, 3], [1, 1]
+    )
+    llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(enable_block_reuse=True))
+    # As trtllm-serve does: preprocess with the generation-only parameters, then submit.
+    disagg = params(4)
+    disagg.multimodal_input = asdict(identity)
+    prepared = llm.preprocess({"prompt_token_ids": [1, 91, 2, 91]}, disaggregated_params=disagg)
+    assert submit(llm, prepared, disagg) is prepared.multimodal_params
+    # Local state with no handles, like the gRPC prepared-decode path.
+    local = MultimodalParams(
+        multimodal_input=identity,
+        multimodal_data={
+            "mrope_config": {
+                "mrope_position_ids": torch.zeros(3, 1, 4, dtype=torch.long),
+                "mrope_position_deltas": torch.zeros(1, 1, dtype=torch.int32),
+            }
+        },
+    )
+    prepared = PreprocessedInputs(prompt_token_ids=[1, 91, 2, 91], multimodal_params=local)
+    assert submit(llm, prepared, DisaggregatedParams(request_type="generation_only")) is local
