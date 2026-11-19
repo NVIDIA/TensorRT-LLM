@@ -42,8 +42,9 @@ _KEY_VERSION = b"tllm-cute-dsl-file-cache-v1"
 _OPTION_PATHS = frozenset({"DumpDir"})
 # The CuTe DSL's own post-compile hook, which attaches the TVM-FFI wrapper.
 _TVM_FFI_HOOK = "CutlassBaseDSL.compile_and_cache.<locals>.post_compile_hook"
-# CuTe DSL settings under which KernelCache neither loads nor stores: compile outputs or no caching.
-_DSL_ENV_NO_REUSE = ("KEEP_", "DUMP_", "NO_CACHE", "DISABLE_FILE_CACHING")
+# CuTe DSL settings under which KernelCache neither loads nor stores: compile outputs (KEEP and
+# the deprecated KEEP_*, DUMP_DIR, PRINT_*, DRYRUN) or no caching.
+_DSL_ENV_NO_REUSE = ("KEEP", "DUMP_", "PRINT_", "DRYRUN", "NO_CACHE", "DISABLE_FILE_CACHING")
 
 _local = threading.local()
 _file_digests: dict[tuple[str, int, int], str] = {}
