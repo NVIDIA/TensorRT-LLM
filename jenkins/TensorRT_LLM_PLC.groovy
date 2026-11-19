@@ -449,8 +449,8 @@ LLM_ARTIFACTS_CREDENTIALS_ID = trtllm_utils.llmArtifactsLocation("aws").credenti
 IMAGE_KEY_TO_TAG_LOOKUP_MINUTES = 30
 
 // Returns the image-tag map that /tmp/get_image_key_to_tag.py prints for imageScriptArgs. The
-// script reads the map with /tmp/fetch_build_artifact.sh, which looks in the primary artifact
-// location first, by default artifactory.nvidia.com, and authenticates there with a netrc. The
+// script reads the map with /tmp/fetch_build_artifact.sh, which reads it from
+// artifactory.nvidia.com and authenticates there with a netrc. The
 // netrc is removed when the lookup ends. It is in the cpu container's /tmp, which the pod's other
 // containers do not mount, so call this inside container("cpu"), and only while nothing from
 // params.ref runs in that container: see lookUpImageKeyToTag. A lookup that is still running after

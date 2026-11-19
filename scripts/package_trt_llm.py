@@ -167,13 +167,7 @@ if __name__ == "__main__":
         'sm architecture for windows, required for download. default: %(default)s'
     )
 
-    parser.add_argument(
-        '--addr',
-        type=str,
-        help='artifacts url path. %(default)s',
-        default=
-        'https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/1379/'
-    )
+    parser.add_argument('--addr', type=str, help='artifacts url path')
 
     parser.add_argument(
         '--download',

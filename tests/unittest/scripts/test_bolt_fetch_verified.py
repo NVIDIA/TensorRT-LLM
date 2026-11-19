@@ -531,7 +531,7 @@ def test_long_scripts_are_not_sent_on_the_ssh_command_line() -> None:
     one word of the remote command, and a csh/tcsh login shell rejects a word that long with
     "Word too long". Every script that carries the library is long, and so are ``publish``, the
     script that publishes the BOLTed build, and ``promote``, the script that promotes the profile
-    bundle to each location.
+    bundle.
     """
     source = BOLT_PROFILE_GEN.read_text()
     carriers = re.findall(

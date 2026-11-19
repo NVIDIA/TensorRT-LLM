@@ -31,30 +31,11 @@ LLM_ROOT = "llm"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
-// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
-// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
-// selects it. Reads fall back to the other location only when a file is absent.
+// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to and read from
+// artifactory.nvidia.com alone, the location that the shared library names "aws".
 // The shared library holds the locations' settings: localRepo is the local repository that the
 // copy API works on, and credential is the identity that publishes to the location.
 LLM_ARTIFACTS_LOCATIONS = trtllm_utils.llmArtifactsLocations()
-
-// The primary location a parent pipeline passed in globalVars, which this job uses instead of its
-// own controller's LLM_ARTIFACTS_PRIMARY. Empty when the job was started on its own.
-LLM_ARTIFACTS_PRIMARY_FROM_PARENT = ""
-
-def llmArtifactsPrimary()
-{
-    def primary = LLM_ARTIFACTS_PRIMARY_FROM_PARENT ?: env.LLM_ARTIFACTS_PRIMARY ?: "aws"
-    if (!(primary in ["aws", "urm"])) {
-        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
-    }
-    return primary
-}
-
-def llmArtifactsSecondary(String primary)
-{
-    return primary == "aws" ? "urm" : "aws"
-}
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -198,8 +179,6 @@ def BOLT_PUBLISH_VARIANT_KEY = "bolt_publish_variant"
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 @Field
 def BOLT_CONSUME_TRIPLES_KEY = "bolt_consume_triples"
-@Field
-def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -217,9 +196,6 @@ def globalVars = [
     (BOLT_PUBLISH_VARIANT_KEY): false,
     (BOLT_PROFILE_BRANCH): "",
     (BOLT_CONSUME_TRIPLES_KEY): "",
-    // Pre-declared so updateMapWithJson() populates it from the parent (see
-    // LLM_ARTIFACTS_PRIMARY_FROM_PARENT).
-    (LLM_ARTIFACTS_PRIMARY_KEY): "",
 ]
 
 // TODO: Move common variables to an unified location
@@ -373,8 +349,8 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 }
 
 // Sends a HEAD or POST request and returns its HTTP status, or "000" when no response arrived.
-// curl takes the credentials for the request's host from netrcPath when one is given, and sends
-// none otherwise. HEAD asks Artifactory to answer itself rather than redirect to a CDN.
+// curl takes the credentials for the request's host from netrcPath. HEAD asks Artifactory to
+// answer itself rather than redirect to a CDN.
 def artifactoryRequestStatus(String method, String url, String netrcPath)
 {
     def status = ""
@@ -385,10 +361,7 @@ def artifactoryRequestStatus(String method, String url, String netrcPath)
     ]) {
         status = sh(label: "Artifactory ${method}", returnStdout: true, script: '''
             set +x
-            set -- -sS -o /dev/null -w '%{http_code}' --max-time 300
-            if [ -n "$ARTIFACTORY_REQUEST_NETRC" ]; then
-                set -- "$@" --netrc-file "$ARTIFACTORY_REQUEST_NETRC"
-            fi
+            set -- -sS -o /dev/null -w '%{http_code}' --max-time 300 --netrc-file "$ARTIFACTORY_REQUEST_NETRC"
             if [ "$ARTIFACTORY_REQUEST_METHOD" = HEAD ]; then
                 set -- "$@" --head -H 'X-JFrog-Download-Redirect-To: None'
             else
@@ -401,15 +374,12 @@ def artifactoryRequestStatus(String method, String url, String netrcPath)
 }
 
 // Describes a failed Artifactory request. status is the HTTP status, or "000" when no response
-// arrived. A 401 or 403 names the credential that was sent, if any, and the permission that the
-// request needs ("read" or "deploy").
-def artifactoryFailureMessage(String location, String path, String status, boolean sentCredentials, String permission)
+// arrived. A 401 or 403 names the credential that was sent and the permission that the request
+// needs ("read" or "deploy").
+def artifactoryFailureMessage(String location, String path, String status, String permission)
 {
     def host = trtllm_utils.llmArtifactsHost(location)
     if (status in ["401", "403"]) {
-        if (!sentCredentials) {
-            return "${host} rejected the anonymous request for ${path} (HTTP ${status})."
-        }
         def credential = LLM_ARTIFACTS_LOCATIONS[location].credential
         def localRepo = LLM_ARTIFACTS_LOCATIONS[location].localRepo
         return "${host} rejected the credentials for ${path} (HTTP ${status}): the Artifactory " +
@@ -421,14 +391,13 @@ def artifactoryFailureMessage(String location, String path, String status, boole
     return "${host} answered HTTP status ${status} for ${path}."
 }
 
-// Whether a file of an earlier build is on a location: true on HTTP 200, false on 404. Any other
-// answer raises an error. aws is read with the publishing credential in netrcPath, and urm
-// anonymously, as every other reader of urm does.
-def cachedArtifactExists(String location, String legacyPath, String netrcPath)
+// Whether a file of an earlier build is on artifactory.nvidia.com: true on HTTP 200, false on
+// 404. Any other answer raises an error. The request carries the publishing credential in
+// netrcPath.
+def cachedArtifactExists(String legacyPath, String netrcPath)
 {
-    def sendCredentials = (location == "aws")
-    def url = trtllm_utils.llmArtifactsUrl(location, legacyPath)
-    def status = artifactoryRequestStatus("HEAD", url, sendCredentials ? netrcPath : "")
+    def url = trtllm_utils.llmArtifactsUrl("aws", legacyPath)
+    def status = artifactoryRequestStatus("HEAD", url, netrcPath)
     echo "Cached artifact ${url}: HTTP status ${status}"
     if (status == "200") {
         return true
@@ -436,76 +405,56 @@ def cachedArtifactExists(String location, String legacyPath, String netrcPath)
     if (status == "404") {
         return false
     }
-    error(artifactoryFailureMessage(location, trtllm_utils.llmArtifactsRepoPath(location, legacyPath), status, sendCredentials, "read"))
+    error(artifactoryFailureMessage("aws", trtllm_utils.llmArtifactsRepoPath("aws", legacyPath), status, "read"))
 }
 
-// Copies an earlier build's packaged builds into this run's directory on the primary location,
-// with the copy API of that instance. When the primary lacks them and the secondary holds them,
-// the run rebuilds instead, because a copy cannot cross instances.
+// Copies an earlier build's packaged builds into this run's directory on artifactory.nvidia.com,
+// with the copy API of that instance. When one of them is absent there, the run rebuilds.
 def copyCachedArtifacts(stageName, reuseArtifactPath, artifacts)
 {
     def reused = false
     stage(stageName) {
-        def primary = llmArtifactsPrimary()
-        def secondary = llmArtifactsSecondary(primary)
         def sourceRoot = reuseArtifactPath
-        def sourceOnSecondary = false
         def netrcPath = ""
         try {
             catchError(
                 buildResult: 'SUCCESS',
                 stageResult: 'UNSTABLE',
                 catchInterruptions: false) {
-                sourceRoot = trtllm_utils.llmArtifactsLocalRepoPath(primary, reuseArtifactPath)
-                def targetRoot = trtllm_utils.llmArtifactsLocalRepoPath(primary, UPLOAD_PATH)
-                // The primary's credential copies.
+                sourceRoot = trtllm_utils.llmArtifactsLocalRepoPath("aws", reuseArtifactPath)
+                def targetRoot = trtllm_utils.llmArtifactsLocalRepoPath("aws", UPLOAD_PATH)
+                // The publishing credential copies.
                 netrcPath = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
-                trtllm_utils.writeArtifactoryNetrc(netrcPath, primary)
-                def missing = []
+                trtllm_utils.writeArtifactoryNetrc(netrcPath)
+                def absent = []
                 for (artifact in artifacts) {
                     def legacyPath = "${reuseArtifactPath}/${artifact.key}"
-                    if (!cachedArtifactExists(primary, legacyPath, netrcPath)) {
-                        missing.add(legacyPath)
+                    if (!cachedArtifactExists(legacyPath, netrcPath)) {
+                        absent.add(legacyPath)
                     }
                 }
-                if (missing) {
-                    // Reading aws as the secondary needs its credential too.
-                    if (secondary == "aws") {
-                        trtllm_utils.writeArtifactoryNetrc(netrcPath, "aws", true)
-                    }
-                    def absent = []
-                    for (legacyPath in missing) {
-                        if (!cachedArtifactExists(secondary, legacyPath, netrcPath)) {
-                            absent.add(legacyPath)
-                        }
-                    }
-                    if (absent) {
-                        error("Cached artifacts are on neither ${primary} nor ${secondary}: ${absent.join(', ')}")
-                    }
-                    sourceOnSecondary = true
-                } else {
-                    def copyApi = "${LLM_ARTIFACTS_LOCATIONS[primary].root}/api/copy"
-                    for (artifact in artifacts) {
-                        def sourcePath = "${sourceRoot}/${artifact.key}"
-                        def targetPath = "${targetRoot}/${artifact.key}"
-                        echo "Copying cached artifact ${sourcePath} to ${targetPath}"
-                        def status = artifactoryRequestStatus(
-                            "POST", "${copyApi}/${sourcePath}?to=/${targetPath}", netrcPath)
-                        if (!(status ==~ /2\d\d/)) {
-                            error(artifactoryFailureMessage(primary, targetPath, status, true, "deploy"))
-                        }
-                    }
-                    reused = true
+                if (absent) {
+                    error("Cached artifacts are not on aws: ${absent.join(', ')}")
                 }
+                def copyApi = "${LLM_ARTIFACTS_LOCATIONS.aws.root}/api/copy"
+                for (artifact in artifacts) {
+                    def sourcePath = "${sourceRoot}/${artifact.key}"
+                    def targetPath = "${targetRoot}/${artifact.key}"
+                    echo "Copying cached artifact ${sourcePath} to ${targetPath}"
+                    def status = artifactoryRequestStatus(
+                        "POST", "${copyApi}/${sourcePath}?to=/${targetPath}", netrcPath)
+                    if (!(status ==~ /2\d\d/)) {
+                        error(artifactoryFailureMessage("aws", targetPath, status, "deploy"))
+                    }
+                }
+                reused = true
             }
         } finally {
             if (netrcPath) {
                 sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}'")
             }
         }
-        if (sourceOnSecondary) {
-            echo "reuse source is on ${secondary}; rebuilding"
-        } else if (!reused) {
+        if (!reused) {
             echo "Failed to copy cached artifacts from ${sourceRoot}; need rebuild."
         }
     }
@@ -516,7 +465,7 @@ def copyCachedArtifacts(stageName, reuseArtifactPath, artifacts)
 // [path: <local path>, props: <"k=v;k=v" or null>] when the object needs
 // Artifactory properties attached. Properties are set in the same request as the
 // upload, so metadata and bytes cannot disagree.
-def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 'Artifactory')
+def uploadArtifacts(artifacts, prefix, retryTimes, serverId)
 {
     for (it in artifacts) {
         def uploadpath = it.key
@@ -541,16 +490,10 @@ def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 
     }
 }
 
-// Publishes the packaged builds to the primary location: UPLOAD_PATH through server
-// 'Artifactory' on urm, or the same layout path in sw-tensorrt-llm-generic-local through
-// 'ArtifactoryAws' on aws. Both servers must be defined first.
-def uploadToPrimary(artifacts)
+// Publishes the packaged builds to artifactory.nvidia.com: the layout path of UPLOAD_PATH in
+// sw-tensorrt-llm-generic-local, through server 'ArtifactoryAws', which must be defined first.
+def uploadPackagedBuilds(artifacts)
 {
-    def primary = llmArtifactsPrimary()
-    if (primary == "urm") {
-        uploadArtifacts(artifacts)
-        return
-    }
     try {
         uploadArtifacts(artifacts, trtllm_utils.llmArtifactsRepoPath("aws", UPLOAD_PATH), 2, 'ArtifactoryAws')
     } catch (InterruptedException e) {
@@ -583,23 +526,16 @@ def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, ru
             }
             stage("Upload") {
                 rtServer (
-                    id: 'Artifactory',
-                    url: 'https://urm.nvidia.com/artifactory',
-                    credentialsId: 'urm-artifactory-creds',
+                    id: 'ArtifactoryAws',
+                    url: 'https://artifactory.nvidia.com/artifactory',
+                    credentialsId: 'aws-artifactory-credentials',
                     // If Jenkins is configured to use an http proxy, you can bypass the proxy when using this Artifactory server:
                     bypassProxy: true,
                     // Configure the connection timeout (in seconds).
                     // The default value (if not configured) is 300 seconds:
                     timeout: 300
                 )
-                rtServer (
-                    id: 'ArtifactoryAws',
-                    url: 'https://artifactory.nvidia.com/artifactory',
-                    credentialsId: 'aws-artifactory-credentials',
-                    bypassProxy: true,
-                    timeout: 300
-                )
-                uploadToPrimary(artifacts)
+                uploadPackagedBuilds(artifacts)
             }
         }
     })
@@ -850,7 +786,6 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
         try {
             trtllm_utils.writeArtifactoryNetrc(netrcPath)
             withEnv([
-                "LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}",
                 "ARTIFACTORY_NETRC=${netrcPath}",
                 "ARTIFACTORY_NETRC_REMOVE_AFTER_READ=1",
                 "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_LOCATIONS.aws.credential}",
@@ -867,7 +802,7 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
         }
         def storeUnreadable = (rc == 4)
         if (storeUnreadable) {
-            echo "[bolt-consume] the BOLT profile store could not be read for ${branch}/${triple}: a location " +
+            echo "[bolt-consume] the BOLT profile store could not be read for ${branch}/${triple}: the store " +
                  "refused the request or the read failed. The messages above give the cause, and name the " +
                  "credential if it was rejected."
         }
@@ -997,10 +932,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         globalVars = trtllm_utils.updateMapWithJson(pipeline, globalVars, env.globalVars, "globalVars")
         globalVars = trtllm_utils.initializeCiBudget(pipeline, globalVars, 24, 'HOURS', "Build-${cpu_arch}")
         globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
-        if (globalVars[LLM_ARTIFACTS_PRIMARY_KEY]) {
-            LLM_ARTIFACTS_PRIMARY_FROM_PARENT = globalVars[LLM_ARTIFACTS_PRIMARY_KEY].toString()
-            echo "Build artifacts: primary location ${llmArtifactsPrimary()}, passed by the parent pipeline"
-        }
         // BOLT consume flag: source it from globalVars (set by L0_MergeRequest as
         // bolt_consume_build), which is reliably propagated. The standalone
         // boltConsume job parameter is NOT registered on the remote build jobs, so
@@ -1057,20 +988,13 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
     }
 
     rtServer (
-        id: 'Artifactory',
-        url: 'https://urm.nvidia.com/artifactory',
-        credentialsId: 'urm-artifactory-creds',
+        id: 'ArtifactoryAws',
+        url: 'https://artifactory.nvidia.com/artifactory',
+        credentialsId: 'aws-artifactory-credentials',
         // If Jenkins is configured to use an http proxy, you can bypass the proxy when using this Artifactory server:
         bypassProxy: true,
         // Configure the connection timeout (in seconds).
         // The default value (if not configured) is 300 seconds:
-        timeout: 300
-    )
-    rtServer (
-        id: 'ArtifactoryAws',
-        url: 'https://artifactory.nvidia.com/artifactory',
-        credentialsId: 'aws-artifactory-credentials',
-        bypassProxy: true,
         timeout: 300
     )
     def reuseArtifactPath = env.reuseArtifactPath

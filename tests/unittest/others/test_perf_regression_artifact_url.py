@@ -14,9 +14,8 @@
 # limitations under the License.
 """Tests for the test-results link that perf_regression_utils records with each perf result.
 
-``s_artifact_url`` names the run's ``test-results/`` folder on the location that the pipeline
-publishes test results to, which ``globalVars["llm_artifacts_primary"]`` holds: aws (the default)
-in the native browser of artifactory.nvidia.com, which signs people in, or urm directly.
+``s_artifact_url`` names the run's ``test-results/`` folder on artifactory.nvidia.com, which the
+pipeline publishes test results to, in that location's native browser, which signs people in.
 """
 
 import importlib.util
@@ -78,7 +77,6 @@ get_job_info = _load_perf_regression_utils().get_job_info
 _AWS_BASE = (
     "https://artifactory.nvidia.com/ui/native/sw-tensorrt-llm-generic-local/llm-artifacts/LLM/main"
 )
-_URM_BASE = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main"
 
 # Parent job URLs; only whether one names L0_PostMerge matters to get_job_info.
 _PRE_MERGE_JOB_URL = "https://ci.example.com/job/LLM/job/main/job/L0_MergeRequest_PR/1234/"
@@ -94,19 +92,12 @@ def _clean_ci_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def _job_info(monkeypatch, primary, job_url, build_number):
+def _job_info(monkeypatch, job_url, build_number):
     global_vars = {"action_info": {"parents": [{"url": job_url, "build_number": build_number}]}}
-    if primary is not None:
-        global_vars["llm_artifacts_primary"] = primary
     monkeypatch.setenv("globalVars", json.dumps(global_vars))
     return get_job_info()
 
 
-@pytest.mark.parametrize(
-    ("primary", "base"),
-    [("aws", _AWS_BASE), ("urm", _URM_BASE), (None, _AWS_BASE), ("", _AWS_BASE)],
-    ids=["aws", "urm", "unset", "empty"],
-)
 @pytest.mark.parametrize(
     ("job_url", "job_name", "build_number"),
     [
@@ -116,16 +107,15 @@ def _job_info(monkeypatch, primary, job_url, build_number):
     ids=["pre-merge", "post-merge"],
 )
 def test_artifact_url_names_the_runs_test_results_folder(
-    monkeypatch, primary, base, job_url, job_name, build_number
+    monkeypatch, job_url, job_name, build_number
 ):
-    info = _job_info(monkeypatch, primary, job_url, build_number)
+    info = _job_info(monkeypatch, job_url, build_number)
 
-    assert info["s_artifact_url"] == f"{base}/{job_name}/{build_number}/test-results/"
+    assert info["s_artifact_url"] == f"{_AWS_BASE}/{job_name}/{build_number}/test-results/"
 
 
-@pytest.mark.parametrize("primary", ["aws", "urm", None])
 @pytest.mark.parametrize("job_url", [_PRE_MERGE_JOB_URL, _POST_MERGE_JOB_URL])
-def test_artifact_url_is_empty_without_a_job_id(monkeypatch, primary, job_url):
-    info = _job_info(monkeypatch, primary, job_url, "")
+def test_artifact_url_is_empty_without_a_job_id(monkeypatch, job_url):
+    info = _job_info(monkeypatch, job_url, "")
 
     assert info["s_artifact_url"] == ""
