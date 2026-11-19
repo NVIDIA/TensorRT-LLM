@@ -641,7 +641,12 @@ def test_model_engine_cleanup_shuts_manager_after_graphs_while_model_is_alive():
             "_release_model_loader",
             "cleanup",
         },
-        {"release_gc": lambda: events.append("release_gc")},
+        {
+            "release_gc": lambda: events.append("release_gc"),
+            "release_localized_moe_weights": lambda _model: events.append(
+                "release_localized_moe_weights"
+            ),
+        },
     )
     engine = engine_cls()
     model = object()
@@ -668,6 +673,7 @@ def test_model_engine_cleanup_shuts_manager_after_graphs_while_model_is_alive():
     assert events == [
         "release_graphs",
         ("manager.shutdown", True),
+        "release_localized_moe_weights",
         "release_gc",
     ]
     assert engine.moe_load_balancer is None
@@ -686,7 +692,12 @@ def test_model_engine_prepare_failure_participates_in_unsafe_preflight():
             "_release_model_loader",
             "cleanup",
         },
-        {"release_gc": lambda: events.append("release_gc")},
+        {
+            "release_gc": lambda: events.append("release_gc"),
+            "release_localized_moe_weights": lambda _model: events.append(
+                "release_localized_moe_weights"
+            ),
+        },
     )
 
     class Manager:
