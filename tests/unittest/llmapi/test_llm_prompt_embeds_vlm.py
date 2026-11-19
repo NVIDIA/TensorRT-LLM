@@ -148,6 +148,8 @@ def _check_image_swap(llm: LLM, model_dir: str, reuse: bool) -> None:
         "prompt_embeds_mask": [p in (before, after) for p in range(len(ids))],
     }
     expected = _run(llm, [{**plain, "prompt_token_ids": swapped_ids}])
+    # Otherwise an ignored overlay would also match.
+    assert expected != _run(llm, [plain])
     salt = uuid.uuid4().hex
     for repeat in (False, True) if reuse else (False,):
         out = llm.generate([request], _greedy(), cache_salt=salt)[0]
@@ -219,6 +221,7 @@ def test_prompt_embeds_with_video_in_one_request(llm: LLM, model_dir: str) -> No
         "prompt_embeds_mask": [p in (before, after) for p in range(len(ids))],
     }
     expected_swap = _run(llm, [{**plain, "prompt_token_ids": swapped_ids}])
+    assert expected_swap != expected
     assert _run(llm, [swapped]) == expected_swap
 
 
