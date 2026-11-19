@@ -3465,9 +3465,9 @@ def test_prims_ts_context_reads_projected_unit_scale_query(monkeypatch, fused_co
         manager.layout, sparse_options={"compute_backend": "prims_ts"}
     )
     assert all(model.backend.compute_backend == "prims_ts" for model in layers)
-    # PrimTS attends these context tiles itself only without the fused context kernel.
-    for model in layers:
-        model.backend.fused_context = False
+    # PrimTS takes the fused context kernel on the fp8 KV cache only, so it attends these
+    # fp8_ds_mla context tiles itself.
+    assert not any(model.backend.fused_context for model in layers)
     hidden = torch.randn(
         sum(request.prompt_len for request in requests), 256, device="cuda", dtype=torch.bfloat16
     )
@@ -3533,13 +3533,13 @@ def test_prims_ts_context_reads_projected_unit_scale_query(monkeypatch, fused_co
     reason="CSA2 PrimTS requires SM100, SM103 or SM107",
 )
 @pytest.mark.parametrize(
-    "fused_context_cache", [2, pytest.param((2, "fp8"), id="2-fp8")], indirect=True
+    "fused_context_cache", [pytest.param((2, "fp8"), id="2-fp8")], indirect=True
 )
 @torch.inference_mode()
 def test_prims_ts_context_runs_fused_kernel(monkeypatch, fused_context_cache):
-    """A PrimTS prefill of SWA-only, Full and Reuse layers runs every layer's context tile on the
-    native fused context kernel, as the native provider does, and equals its outputs bit for bit;
-    PrimTS attends those tiles only without that kernel."""
+    """A PrimTS prefill of SWA-only, Full and Reuse layers on the fp8 KV cache runs every layer's
+    context tile on the native fused context kernel, as the native provider does, and equals its
+    outputs bit for bit; PrimTS attends those tiles only without that kernel."""
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import prims_ts
 
     manager, requests = fused_context_cache

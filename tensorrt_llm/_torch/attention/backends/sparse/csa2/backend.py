@@ -313,11 +313,13 @@ class CSA2TrtllmAttention(TrtllmAttention):
         self.local_layer_idx = 0  # one physical compute-pool slot in this view
         # FP8 context tiles that stage the shared E4M3 bank run one fused kernel
         # (``forward_fused_context``) instead of the trtllm-gen context FMHA. PrimTS leaves
-        # them to that kernel too: its context tiles that get a shared bank stage it in E4M3
+        # them to that kernel too on the unit-scale E4M3 SWA records of the ``fp8`` KV cache,
+        # the FP8 format it reads: its context tiles that get a shared bank stage it in E4M3
         # (``query_tile_metadata``), wherever native FP8 staging would.
         context_fp8 = native_fp8 or (
             self.compute_backend == "prims_ts"
             and fp8_requested
+            and self.swa_cache_format == "swa_fp8"
             and sparse_params.use_fp8_staging is not False
         )
         self.fused_context = (

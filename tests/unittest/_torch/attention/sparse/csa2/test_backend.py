@@ -395,9 +395,12 @@ def test_prims_ts_independent_generation_and_output(
     torch.manual_seed(490)
     count, heads, q_scaling = _prims_ts_query_count(query_band), 64, 1.7
     attn = _backend(heads, compute_backend="prims_ts", kv_cache_dtype=kv_dtype, q_scaling=q_scaling)
-    # Generation tiles stay packed; only context tiles with a shared bank take the fused kernel.
+    # Generation tiles stay packed; only context tiles with a shared bank of the fp8 KV cache
+    # take the fused kernel.
     assert attn.staging_dtype == torch.bfloat16 and attn.kv_input_mode == "packed"
-    assert attn.fused_context == _fused_context_supported(torch.cuda.current_device())
+    assert attn.fused_context == (
+        kv_dtype == "fp8" and _fused_context_supported(torch.cuda.current_device())
+    )
     q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
     swa = torch.randn(count, 128, 512, device="cuda", dtype=torch.bfloat16)
     main = torch.randn(count, 512, 512, device="cuda", dtype=torch.bfloat16)
