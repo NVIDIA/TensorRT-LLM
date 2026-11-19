@@ -177,6 +177,26 @@ def _red_global_add_f32(addr_i64, fval, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _st_global_f32_if(addr_i64, fval, flag, *, loc=None, ip=None):
+    """Store ``fval`` at ``addr_i64`` when ``flag`` is nonzero (no branch)."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int64(addr_i64).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(fval).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(flag).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $2, 0;\n\t@p st.global.f32 [$0], $1;\n\t}",
+        "l,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def pack_f16x2(
     a: Float16,
     b: Float16,
@@ -542,6 +562,7 @@ class FP4MQALogitsKernel:
         use_two_level_task_loop=None,
         use_relu_trick: bool = True,
         row_heads: int = 0,
+        emit_block_max: bool = False,
     ):
         # The epilogue FMA works on head groups of 4. The N tile itself only
         # needs the tcgen05 rule (8 <= N <= N_max, N % 8 == 0); the SF layouts
@@ -729,9 +750,21 @@ class FP4MQALogitsKernel:
         ):
             raise ValueError(
                 "Split query rows need FP32, one atom, one epilogue sub-tile, "
-                "batched stores and no emission"
+                "batched stores and no GVR emission"
             )
         self.out_rows = next_n * self.split_rows
+        # Maxima of every 32 consecutive visible positions of each logits row, the block
+        # selection's input; a warp's lanes hold consecutive positions of a tile.
+        if emit_block_max and (
+            num_next_n_atoms != 1
+            or self.uneven
+            or not use_batched_store
+            or output_dtype != cutlass.Float32
+        ):
+            raise ValueError("Block maxima need one atom, batched stores and FP32 logits")
+        self.emit_block_max = emit_block_max
+        # The emission keeps the epilogue fast with 4 fewer register-cached weights per token.
+        self.block_max_w_cut = 4 if emit_block_max else 0
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
         self.epi_bytes = 2 if epi_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
@@ -1067,6 +1100,23 @@ class FP4MQALogitsKernel:
         else:
             out_row = self._atom_out_row_base(q_idx) + t
             mLogits_2d[(out_row, kv_pos)] = self.output_dtype(result_t)
+
+    @cute.jit
+    def _emit_block_max(self, result_arr, kv_pos, q_idx, mBlockMax32, row_vis):
+        """Store the maximum of every 32 consecutive visible positions of this tile's logits rows (a
+        warp's lanes hold 32 consecutive positions; lane 0 stores)."""
+        lane = cute.arch.lane_idx()
+        row0 = cutlass.Int64(self._atom_out_row_base(q_idx))
+        base = cutlass.Int64(mBlockMax32.iterator.toint())
+        stride = cutlass.Int64(mBlockMax32.layout.stride[0])
+        column = cutlass.Int64(kv_pos // 32)
+        first = cutlass.Int32(lane == 0)
+        for r in cutlass.range_constexpr(self.next_n_atom * self.split_rows):
+            value = cutlass.Float32(float("-inf"))
+            if kv_pos < row_vis[r]:
+                value = cutlass.Float32(result_arr[r])
+            value = cute.arch.warp_redux_sync(value, "fmax")
+            _st_global_f32_if(base + ((row0 + r) * stride + column) * 4, value, first)
 
     @cute.jit
     def _flush_hit_agg(
@@ -1417,6 +1467,8 @@ class FP4MQALogitsKernel:
         cand_ctl: cute.Tensor = None,  # [num_rows, 2] int32 {claimed, void}, zeroed
         cand_idx_t: cute.Tensor = None,  # bucketed: [num_rows, 2*segA+capC] int32 SoA
         cand_cur: cute.Tensor = None,  # bucketed: [num_rows, 4] int32 cursors, zeroed
+        block_max32: cute.Tensor = None,  # [num_rows, >= aligned ctx / 32] fp32
+        row_visible: cute.Tensor = None,  # [num_rows] int32 visible lengths (emit_block_max)
     ):
         # Derive KV data and SF views from the fused uint8 buffer.
         # Fused layout per phys block: [data half_head_dim*phys_block_kv bytes]
@@ -1655,6 +1707,8 @@ class FP4MQALogitsKernel:
             cand_ctl,
             cand_idx_t,
             cand_cur,
+            block_max32,
+            row_visible,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -1708,6 +1762,8 @@ class FP4MQALogitsKernel:
         mCandCtl: cute.Tensor,  # [num_rows, 2] int32 {claimed, void} (or None)
         mCandIdx: cute.Tensor,  # bucketed: [num_rows, 2*segA+capC] int32 SoA (or None)
         mCandCur: cute.Tensor,  # bucketed: [num_rows, 4] int32 cursors (or None)
+        mBlockMax32: cute.Tensor,  # [num_rows, >= aligned ctx / 32] fp32 (or None)
+        mRowVisible: cute.Tensor,  # [num_rows] int32 visible lengths (or None)
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -2770,7 +2826,8 @@ class FP4MQALogitsKernel:
                 NUM_W_IN_REG = min(
                     _max_num_w_in_reg(self.epi_dtype, next_n, num_heads)
                     - (8 if self.emit_block_meta else 0)
-                    - (8 if self.emit_block_meta and self.emit_hit_stats else 0),
+                    - (8 if self.emit_block_meta and self.emit_hit_stats else 0)
+                    - self.block_max_w_cut,
                     num_heads,
                 )
                 w_cache = cute.make_rmem_tensor((NUM_W_IN_REG * next_n,), self.epi_dtype)
@@ -2784,6 +2841,9 @@ class FP4MQALogitsKernel:
                 else:
                     result_arr = None
                 q_stage_local = cutlass.Int32(0)
+                row_vis = None
+                if cutlass.const_expr(self.emit_block_max):
+                    row_vis = cute.make_rmem_tensor((self.out_rows,), cutlass.Int32)
 
                 # Flat logits view + carried row offset: the store address
                 # is base + out_row*stride0 + kv_pos, but out_row only
@@ -2868,6 +2928,9 @@ class FP4MQALogitsKernel:
                             q_cons_state.advance()
                         q_pipeline.consumer_wait(q_cons_state)
                         q_stage_local = q_cons_state.index
+                        if cutlass.const_expr(self.emit_block_max):
+                            for r_v in cutlass.range_constexpr(self.out_rows):
+                                row_vis[r_v] = mRowVisible[self._atom_out_row_base(q_idx) + r_v]
                         if cutlass.const_expr(self.use_flat_logits_view):
                             out_row_off = (
                                 cutlass.Int64(self._atom_out_row_base(q_idx)) * logits_stride0
@@ -3051,6 +3114,10 @@ class FP4MQALogitsKernel:
                         )
                         if cutlass.const_expr(not self.uneven):
                             self._epi_tokens(next_n, *ops)
+                            if cutlass.const_expr(self.emit_block_max):
+                                self._emit_block_max(
+                                    result_arr, kv_pos, q_idx, mBlockMax32, row_vis
+                                )
                             if cutlass.const_expr(self.emit_block_meta):
                                 # Meta pass over the batched results: same post-conversion
                                 # value the logits store wrote.
@@ -3575,7 +3642,8 @@ class FP4MQALogitsKernel:
                 NUM_W_IN_REG = min(
                     _max_num_w_in_reg(self.epi_dtype, next_n, num_heads)
                     - (8 if self.emit_block_meta else 0)
-                    - (8 if self.emit_block_meta and self.emit_hit_stats else 0),
+                    - (8 if self.emit_block_meta and self.emit_hit_stats else 0)
+                    - self.block_max_w_cut,
                     num_heads,
                 )
                 w_cache = cute.make_rmem_tensor((NUM_W_IN_REG * next_n,), self.epi_dtype)
@@ -3589,6 +3657,9 @@ class FP4MQALogitsKernel:
                 else:
                     result_arr = None
                 q_stage_local = cutlass.Int32(0)
+                row_vis = None
+                if cutlass.const_expr(self.emit_block_max):
+                    row_vis = cute.make_rmem_tensor((self.out_rows,), cutlass.Int32)
 
                 # Flat logits view + carried row offset: the store address
                 # is base + out_row*stride0 + kv_pos, but out_row only
@@ -3673,6 +3744,9 @@ class FP4MQALogitsKernel:
                             q_cons_state.advance()
                         q_pipeline.consumer_wait(q_cons_state)
                         q_stage_local = q_cons_state.index
+                        if cutlass.const_expr(self.emit_block_max):
+                            for r_v in cutlass.range_constexpr(self.out_rows):
+                                row_vis[r_v] = mRowVisible[self._atom_out_row_base(q_idx) + r_v]
                         if cutlass.const_expr(self.use_flat_logits_view):
                             out_row_off = (
                                 cutlass.Int64(self._atom_out_row_base(q_idx)) * logits_stride0
@@ -3848,6 +3922,10 @@ class FP4MQALogitsKernel:
                         )
                         if cutlass.const_expr(not self.uneven):
                             self._epi_tokens(next_n, *ops)
+                            if cutlass.const_expr(self.emit_block_max):
+                                self._emit_block_max(
+                                    result_arr, kv_pos, q_idx, mBlockMax32, row_vis
+                                )
                             if cutlass.const_expr(self.emit_block_meta):
                                 # Meta pass over the batched results: same post-conversion
                                 # value the logits store wrote.

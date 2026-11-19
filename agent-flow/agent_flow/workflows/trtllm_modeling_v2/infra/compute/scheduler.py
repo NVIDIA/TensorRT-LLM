@@ -76,7 +76,8 @@ HAND-OVER
 for a successor until an ack names one. An ack is keyed by the allocation it follows, so a later
 ack for the next allocation never replaces it. A ready successor also starts hand-over before
 the alert window, so long jobs can use a fresh allocation. The old watcher admits nothing more
-and exits when its existing jobs are done.
+and exits when its existing jobs are done. Every pass judges the successor again: one that
+stopped heart-beating is dropped, and the watcher stays and admits again as if none had come.
 
 ADMISSION
 =========
@@ -85,9 +86,7 @@ One priority queue per watcher, ordered by effective priority (``priority`` plus
 :data:`AGING_S` waited), then whole-node jobs before device-slot jobs, then submission order (the
 pending file's mtime), then name. A GPU job waiting for devices blocks every GPU job ranked below
 it, so a stream of single-device jobs never starves a whole-node or multi-device one; a job that
-holds no device never waits for one. A job of a negative priority is background work (the tune
-campaign's): it does not age, so every other job ranks ahead of it however long it has waited,
-and, ranked last, it holds none of them back.
+holds no device never waits for one.
 
 A GPU job starts only on devices whose memory has come back. An engine sizes its KV-cache and
 recurrent pools from the device memory it finds free, so one started beside memory a cancelled
@@ -928,9 +927,6 @@ class Scheduler:
     # ------------------------------------------------------------- admission
 
     def _effective_priority(self, spec: JobSpec, now: float) -> int:
-        if spec.priority < 0:
-            # Background work (the tune campaign's) never ages past anyone else's.
-            return spec.priority
         return spec.priority + int(max(0.0, now - spec.submitted) // AGING_S)
 
     def _rank_key(self, spec: JobSpec, now: float) -> tuple:
@@ -1203,7 +1199,7 @@ class Scheduler:
     # -------------------------------------------------------------- hand-over
 
     def _plan_handover(self, now: float) -> None:
-        """Drain when the allocation is ending or a later-ending successor is ready."""
+        """Drain when the allocation is ending or a later-ending successor is live, judged every pass."""
         ends_at = self.config.ends_at
         if ends_at is None:
             return
@@ -1213,6 +1209,11 @@ class Scheduler:
             if peer.get("watcher") != self.watcher_id and _ends_after(peer, ends_at)
         ]
         if ends_at - now > self.config.handover_lead_s and not peers:
+            if self.handover:
+                self.handover = {}
+                self._append_status(
+                    f"watcher: no live successor; out of hand-over at {utc_iso(now)}"
+                )
             return
         if not self.handover:
             self.handover["since"] = utc_iso(now)
@@ -1222,6 +1223,8 @@ class Scheduler:
             if self.handover.get("successor") != successor:
                 self._append_status(f"watcher: successor {successor} is up")
             self.handover["successor"] = successor
+        elif self.handover.pop("successor", None):
+            self._append_status(f"watcher: no live successor at {utc_iso(now)}")
 
     def _handover_hold(self, spec: JobSpec, now: float) -> "Hold | None":
         ends_at = self.config.ends_at

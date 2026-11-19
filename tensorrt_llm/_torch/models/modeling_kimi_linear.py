@@ -3213,7 +3213,7 @@ class KimiLinearModel(DecoderModel):
         if runtime.gate.logits_kernel:
             compiled += kimi_k3_router_logits.precompile()
         if runtime.routed_experts.sort_routing_applies:
-            compiled += kimi_k3_routing.precompile(self.num_experts)
+            compiled += kimi_k3_routing.precompile(runtime.num_experts)
         return compiled
 
     def prewarm_decode_kernels(self, max_num_tokens: int, verify_batches: bool) -> int:

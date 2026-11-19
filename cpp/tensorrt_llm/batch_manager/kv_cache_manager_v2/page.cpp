@@ -23,8 +23,6 @@
 
 #include "tensorrt_llm/common/assert.h"
 
-#include <unordered_set>
-
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
@@ -74,6 +72,11 @@ Page::~Page()
                 manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
             }
         });
+}
+
+std::optional<LocalityDomainId> Page::localityDomainId() const
+{
+    return hasValidSlot() ? manager->localityDomainOf(cacheLevel, lifeCycle, slotId()) : std::nullopt;
 }
 
 PageStatus Page::status() const noexcept
@@ -527,7 +530,7 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
     // Every page is locked at the hot level, whatever its pool group is made of. A sparse
     // life cycle's hot pages are host memory, but that is a property of the allocation
     // rather than of the level, so locking does not see it.
-    std::unordered_set<Page*> seen;
+    uint64_t const visit = storeMgr->nextVisitStamp();
     std::vector<SharedPtr<Page>> pages;
     pages.reserve(targets.size());
     for (auto const& target : targets)
@@ -535,8 +538,11 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
         auto const& page = target.page;
         if (page->status() == PageStatus::LOCKED && page->cacheLevel != kHotLevel)
             throw LogicError("Cannot migrate a page locked by another owner");
-        if (seen.insert(page.get()).second)
+        if (page->visitStamp != visit)
+        {
+            page->visitStamp = visit;
             pages.push_back(page);
+        }
     }
 
     // Protect every destination group while any group is allocating. On failure,
@@ -563,8 +569,9 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
         for (auto const& page : pages)
             if (page->cacheLevel != kHotLevel)
                 ++requirements[storeMgr->getPoolGroupIndex(kHotLevel, page->lifeCycle)];
-        storeMgr->prepareFreeSlots(kHotLevel, requirements, migrationRecorder, dropRecorder);
-        storeMgr->batchedMigrate(kHotLevel, pages, migrationRecorder);
+        storeMgr->prepareFreeSlots(
+            kHotLevel, requirements, migrationRecorder, dropRecorder, kvCache.localityDomainId());
+        storeMgr->batchedMigrate(kHotLevel, pages, migrationRecorder, kvCache.localityDomainId());
     }
 
     // Wait for all ready events on KvCache's stream (deduplicated).
