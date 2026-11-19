@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Cosmos3 checkpoint settings built by hand, for tests that run a pipeline or a
-resolver without a real checkpoint: either a :class:`Cosmos3Config` built in memory,
+resolver without a real checkpoint: either a :class:`Cosmos3CheckpointSettings` built in memory,
 or the checkpoint's JSON files written into a temporary directory."""
 
 import json
@@ -25,9 +25,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
     DEFAULT,
     VAE_FILE,
     Cosmos3ActionSettings,
-    Cosmos3ArchitectureSettings,
-    Cosmos3AudioSettings,
-    Cosmos3Config,
+    Cosmos3CheckpointSettings,
     Cosmos3PromptSettings,
     Cosmos3SamplingSettings,
     Cosmos3VAESettings,
@@ -61,24 +59,19 @@ def bare_config(
     use_system_prompt: bool = False,
     native_flow_schedule: bool = False,
     flow_shift: Optional[float] = None,
-) -> Cosmos3Config:
-    """A base-checkpoint :class:`Cosmos3Config` with the given facts overridden."""
+) -> Cosmos3CheckpointSettings:
+    """A base-checkpoint :class:`Cosmos3CheckpointSettings` with the given facts overridden."""
     settings = {
-        "architecture.position_embedding_type": "unified_3d_mrope",
-        "architecture.max_position_embeddings": 262144,
         "vae.temporal_compression": 4,
         "vae.spatial_compression": 16,
-        "audio.temporal_compression": 1,
         "sampling.fixed_sigmas": fixed_sigmas,
         "sampling.native_flow_schedule": native_flow_schedule,
         "sampling.flow_shift": flow_shift,
         "prompt.use_system_prompt": use_system_prompt,
         "action.policy": policy,
     }
-    return Cosmos3Config(
-        architecture=Cosmos3ArchitectureSettings("unified_3d_mrope", 262144),
+    return Cosmos3CheckpointSettings(
         vae=Cosmos3VAESettings(temporal_compression=4, spatial_compression=16),
-        audio=Cosmos3AudioSettings(temporal_compression=1),
         sampling=Cosmos3SamplingSettings(
             fixed_sigmas=fixed_sigmas,
             native_flow_schedule=native_flow_schedule,

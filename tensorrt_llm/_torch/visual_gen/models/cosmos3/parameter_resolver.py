@@ -20,7 +20,7 @@ orders them, and every resolved value remembers which one it came from.
 
 * at load, :func:`resolve_checkpoint` reads the checkpoint's files (``config.json``,
   ``model_index.json``, ``checkpoint.json``, the component configs) into a
-  :class:`Cosmos3Config`. A Cosmos3 export carries the same fact in several files
+  :class:`Cosmos3CheckpointSettings`. A Cosmos3 export carries the same fact in several files
   written by exporters that are not kept in sync, so each setting says which file
   wins and what a disagreement means;
 * per request, ``request()`` turns a :class:`RequestParameters` (the caller's values,
@@ -130,11 +130,7 @@ _MISSING = object()
 
 
 def _step(obj: Any, key: str) -> Any:
-    if isinstance(obj, Mapping):
-        return obj.get(key, _MISSING)
-    if obj is None or isinstance(obj, (str, int, float, bool, list, tuple)):
-        return _MISSING
-    return getattr(obj, key, _MISSING)  # a pretrained config object standing in for a file
+    return obj.get(key, _MISSING) if isinstance(obj, Mapping) else _MISSING
 
 
 def _walk(doc: Any, path: str) -> Any:
@@ -147,24 +143,19 @@ def _walk(doc: Any, path: str) -> Any:
 
 
 class CheckpointFiles:
-    """The checkpoint's files, read on demand. ``pretrained_config`` stands in for
-    ``transformer/config.json`` when given; ``checkpoint_dir`` may then be ``None``."""
+    """The checkpoint's JSON files, read on demand."""
 
-    def __init__(self, checkpoint_dir: Optional[str], pretrained_config: Any = None) -> None:
+    def __init__(self, checkpoint_dir: str) -> None:
         self._dir = checkpoint_dir
-        self._pretrained = pretrained_config
         self._docs: dict[str, Any] = {}
 
     def doc(self, file: str) -> Any:
-        if file == TRANSFORMER_FILE and self._pretrained is not None:
-            return self._pretrained
         if file not in self._docs:
             doc = None
-            if self._dir is not None:
-                path = os.path.join(self._dir, file)
-                if os.path.exists(path):
-                    with open(path) as f:
-                        doc = json.load(f)
+            path = os.path.join(self._dir, file)
+            if os.path.exists(path):
+                with open(path) as f:
+                    doc = json.load(f)
             self._docs[file] = doc
         return self._docs[file]
 
@@ -208,23 +199,12 @@ class CheckpointFiles:
 
 
 @dataclass(frozen=True)
-class Cosmos3ArchitectureSettings:
-    position_embedding_type: str
-    max_position_embeddings: int
-
-
-@dataclass(frozen=True)
 class Cosmos3VAESettings:
     temporal_compression: int
     """Pixel frames per latent frame after the first, which is encoded alone."""
     spatial_compression: Optional[int]
     """``None`` when the export ships no ``vae/config.json``; a pipeline that loads the
     VAE needs it, one that skips the VAE does not."""
-
-
-@dataclass(frozen=True)
-class Cosmos3AudioSettings:
-    temporal_compression: int
 
 
 @dataclass(frozen=True)
@@ -249,18 +229,13 @@ class Cosmos3ActionSettings:
 
 
 @dataclass(frozen=True)
-class Cosmos3Config:
-    architecture: Cosmos3ArchitectureSettings
+class Cosmos3CheckpointSettings:
     vae: Cosmos3VAESettings
-    audio: Cosmos3AudioSettings
     sampling: Cosmos3SamplingSettings
     prompt: Cosmos3PromptSettings
     action: Cosmos3ActionSettings
     resolved: Mapping[str, Resolved]
     """Every setting above by dotted name (``vae.temporal_compression``), with origin."""
-
-    def source_of(self, name: str) -> str:
-        return self.resolved[name].source
 
     def require_vae_compression(self, checkpoint_dir: str) -> None:
         """Raise unless ``vae/config.json`` declares both compression factors, as a
@@ -291,28 +266,23 @@ class Cosmos3Config:
         return "\n".join(lines)
 
 
-ARCHITECTURE_KEYS: dict[str, tuple[str, Any]] = {
-    "position_embedding_type": (f"{TRANSFORMER_FILE}:position_embedding_type", "unified_3d_mrope"),
-    "max_position_embeddings": (f"{TRANSFORMER_FILE}:max_position_embeddings", 262144),
-    "temporal_compression_factor": (f"{TRANSFORMER_FILE}:temporal_compression_factor", 4),
-    "temporal_compression_factor_sound": (
-        f"{TRANSFORMER_FILE}:temporal_compression_factor_sound",
-        1,
-    ),
+ARCHITECTURE_DEFAULTS: dict[str, Any] = {
+    "position_embedding_type": "unified_3d_mrope",
+    "max_position_embeddings": 262144,
+    "temporal_compression_factor": 4,
+    "temporal_compression_factor_sound": 1,
 }
-"""The ``pretrained_config`` attributes the transformer is built from: the key in
-``transformer/config.json`` and the value for exports that predate it."""
+"""The ``transformer/config.json`` keys the transformer is built from, with the value
+for exports that predate each key."""
 
 REQUIRED_SETTINGS = ("prompt.use_system_prompt",)
 """Settings some checkpoint file must declare; nothing stands in for them."""
 
 
-def resolve_checkpoint(
-    checkpoint_dir: Optional[str], pretrained_config: Any = None
-) -> Cosmos3Config:
-    """Read the checkpoint's files into a :class:`Cosmos3Config`. Raises on a required
+def resolve_checkpoint(checkpoint_dir: str) -> Cosmos3CheckpointSettings:
+    """Read the checkpoint's files into a :class:`Cosmos3CheckpointSettings`. Raises on a required
     setting no file declares, or on a disagreement between files that is an error."""
-    files = CheckpointFiles(checkpoint_dir, pretrained_config)
+    files = CheckpointFiles(checkpoint_dir)
     resolved: dict[str, Resolved] = {}
 
     def setting(
@@ -322,24 +292,14 @@ def resolve_checkpoint(
         if r is not None:
             resolved[name] = r
 
-    def transformer_setting(
-        name: str, attr: str, *before: str, conflict: Conflict = Conflict.IGNORE
-    ) -> None:
-        """A setting the transformer is built from: the files in ``before`` first, then
-        the transformer config, then the compatibility default."""
-        key, default = ARCHITECTURE_KEYS[attr]
-        setting(name, *before, key, conflict=conflict, default=default)
-
-    transformer_setting("architecture.position_embedding_type", "position_embedding_type")
-    transformer_setting("architecture.max_position_embeddings", "max_position_embeddings")
-    transformer_setting(
+    setting(
         "vae.temporal_compression",
-        "temporal_compression_factor",
         f"{VAE_FILE}:scale_factor_temporal",
+        f"{TRANSFORMER_FILE}:temporal_compression_factor",
         conflict=Conflict.ERROR,
+        default=ARCHITECTURE_DEFAULTS["temporal_compression_factor"],
     )
     setting("vae.spatial_compression", f"{VAE_FILE}:scale_factor_spatial")
-    transformer_setting("audio.temporal_compression", "temporal_compression_factor_sound")
     # The training config over the diffusers index; published exports do disagree.
     setting(
         "prompt.use_system_prompt",
@@ -384,16 +344,11 @@ def resolve_checkpoint(
             f"Cosmos3 config: {SCHEDULER_FILE}:flow_shift must be a positive finite number, "
             f"got {flow_shift!r}."
         )
-    return Cosmos3Config(
-        architecture=Cosmos3ArchitectureSettings(
-            position_embedding_type=str(get("architecture.position_embedding_type")),
-            max_position_embeddings=int(get("architecture.max_position_embeddings")),
-        ),
+    return Cosmos3CheckpointSettings(
         vae=Cosmos3VAESettings(
             temporal_compression=int(get("vae.temporal_compression")),
             spatial_compression=None if spatial is None else int(spatial),
         ),
-        audio=Cosmos3AudioSettings(temporal_compression=int(get("audio.temporal_compression"))),
         sampling=Cosmos3SamplingSettings(
             fixed_sigmas=None if not sigmas else tuple(float(s) for s in sigmas),
             native_flow_schedule=bool(get("sampling.native_flow_schedule")),
@@ -407,16 +362,10 @@ def resolve_checkpoint(
 
 def fill_pretrained_config(pretrained_config: PretrainedConfigT) -> PretrainedConfigT:
     """Set the transformer-construction attributes of ``pretrained_config`` that the
-    export omits (:data:`ARCHITECTURE_KEYS`). Idempotent; returns the config.
-
-    Runs before the pipeline loads its components, so only ``pretrained_config``
-    itself is consulted."""
-    files = CheckpointFiles(None, pretrained_config)
-    for attr, (key, default) in ARCHITECTURE_KEYS.items():
+    export omits to their :data:`ARCHITECTURE_DEFAULTS`. Idempotent; returns the config."""
+    for attr, default in ARCHITECTURE_DEFAULTS.items():
         if getattr(pretrained_config, attr, None) is None:
-            resolved = select(checkpoint=files.value(key), default=default)
-            assert resolved is not None  # every entry has a default
-            setattr(pretrained_config, attr, resolved.value)
+            setattr(pretrained_config, attr, default)
     return pretrained_config
 
 
@@ -530,7 +479,7 @@ def policy_domain(
 
 class ParameterResolver:
     """The settings of one Cosmos3 checkpoint, and the per-request resolution against
-    them. Build it with :meth:`from_checkpoint`, or from a :class:`Cosmos3Config`.
+    them. Build it with :meth:`from_checkpoint`, or from a :class:`Cosmos3CheckpointSettings`.
 
     Args:
         family: The transformer family, a key of ``COSMOS3_DEFAULTS``; it selects the
@@ -540,7 +489,7 @@ class ParameterResolver:
             warnings and origins of each resolved request.
     """
 
-    def __init__(self, family: str, config: Cosmos3Config, *, log: bool = True) -> None:
+    def __init__(self, family: str, config: Cosmos3CheckpointSettings, *, log: bool = True) -> None:
         self.family = family
         self._config = config
         self._log = log
@@ -554,18 +503,15 @@ class ParameterResolver:
 
     @classmethod
     def from_checkpoint(
-        cls, checkpoint_dir: str, family: str, pretrained_config: Any = None, *, log: bool = True
+        cls, checkpoint_dir: str, family: str, *, log: bool = True
     ) -> "ParameterResolver":
         """Read the checkpoint's files. Raises on a required setting nothing declares,
         or on a disagreement between files that is an error."""
-        return cls(family, resolve_checkpoint(checkpoint_dir, pretrained_config), log=log)
+        return cls(family, resolve_checkpoint(checkpoint_dir), log=log)
 
-    def config(self) -> Cosmos3Config:
+    def config(self) -> Cosmos3CheckpointSettings:
         """The checkpoint-level settings, defaults filled where the files are silent."""
         return self._config
-
-    def describe(self) -> str:
-        return self._config.describe()
 
     def override(
         self,

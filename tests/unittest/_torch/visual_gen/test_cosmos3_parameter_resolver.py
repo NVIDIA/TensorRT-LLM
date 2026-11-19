@@ -39,7 +39,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
     VAE_FILE,
     CheckpointFiles,
     Conflict,
-    Cosmos3Config,
+    Cosmos3CheckpointSettings,
     ParameterResolver,
     RequestParameters,
     fill_pretrained_config,
@@ -55,12 +55,12 @@ T_LIST = [1.0, 0.9375, 0.8333333333333334, 0.625]
 
 def _files_on_disk(tmp_path: Path, files: dict) -> CheckpointFiles:
     write_checkpoint_files(tmp_path, files)
-    return CheckpointFiles(str(tmp_path), files.get(TRANSFORMER_FILE, {}))
+    return CheckpointFiles(str(tmp_path))
 
 
-def _resolve(tmp_path: Path, files: dict) -> Cosmos3Config:
+def _resolve(tmp_path: Path, files: dict) -> Cosmos3CheckpointSettings:
     write_checkpoint_files(tmp_path, files)
-    return resolve_checkpoint(str(tmp_path), files.get(TRANSFORMER_FILE, {}))
+    return resolve_checkpoint(str(tmp_path))
 
 
 class TestSelect:
@@ -128,7 +128,7 @@ class TestCheckpoint:
     def test_training_config_beats_the_diffusers_index(self, tmp_path):
         cfg = _resolve(tmp_path, _files())
         assert cfg.prompt.use_system_prompt is False
-        assert cfg.source_of("prompt.use_system_prompt") == (
+        assert cfg.resolved["prompt.use_system_prompt"].source == (
             "checkpoint (config.json:model.config.vlm_config.use_system_prompt)"
         )
         assert cfg.resolved["prompt.use_system_prompt"].disagreeing == (
@@ -140,7 +140,7 @@ class TestCheckpoint:
         assert (cfg.vae.temporal_compression, cfg.vae.spatial_compression) == (4, 16)
         assert cfg.sampling.fixed_sigmas == tuple(T_LIST)
         assert cfg.sampling.native_flow_schedule is False
-        assert cfg.source_of("sampling.native_flow_schedule") == DEFAULT
+        assert cfg.resolved["sampling.native_flow_schedule"].source == DEFAULT
         assert cfg.action.policy is None
 
     def test_vae_compression_copies_must_agree(self, tmp_path):
@@ -230,7 +230,6 @@ def test_published_checkpoint_resolves(tmp_path, repo):
     assert cfg.sampling.native_flow_schedule is native
     assert (cfg.sampling.fixed_sigmas is not None) is distilled
     assert (cfg.vae.temporal_compression, cfg.vae.spatial_compression) == (4, 16)
-    assert cfg.architecture.position_embedding_type == "unified_3d_mrope"
     disagreeing = {name for name, r in cfg.resolved.items() if r.disagreeing}
     assert disagreeing == EXPECTED_DISAGREEMENTS.get(repo, set())
 
