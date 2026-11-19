@@ -47,8 +47,8 @@ from lm_eval.models.openai_completions import LocalChatCompletion
 
 from . import protocol, records, server
 
-#: Seconds between polls of the server and the in-flight requests.
-POLL_S = 5.0
+READINESS_POLL_S = 0.5
+REQUEST_POLL_S = 5.0
 CONNECT_TIMEOUT_S = 10.0
 #: Upper bound on managed-server startup (model load) inside the run's budget.
 STARTUP_LIMIT_S = 3600.0
@@ -248,7 +248,7 @@ def _wait_ready(
                 return resolve_model(base, requested, deps)
         except (_ModelListNotReady, requests.exceptions.RequestException):
             pass
-        deps.sleep(min(POLL_S, max(0.0, limit - deps.monotonic())))
+        deps.sleep(min(READINESS_POLL_S, max(0.0, limit - deps.monotonic())))
 
 
 @dataclasses.dataclass
@@ -357,7 +357,7 @@ def _ask(session: _Session, base: str, model: str, process: Any, deps: RunDeps) 
             if remaining <= 0 or process.poll() is not None:
                 # asyncio.run cancels and joins all pending requests before the ledger unlocks.
                 return
-            await asyncio.wait({batch}, timeout=min(remaining, POLL_S))
+            await asyncio.wait({batch}, timeout=min(remaining, REQUEST_POLL_S))
         await batch
 
     first = deps.monotonic()

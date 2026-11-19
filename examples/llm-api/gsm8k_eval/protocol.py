@@ -40,7 +40,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Iterator, Mapping, Optional, Sequence
 
 PROTOCOL_ID = "beam-gsm8k-first100-public-v1"
 
@@ -387,25 +387,27 @@ def _check_row(split: str, index: int, row: tuple[str, str], item: Mapping[str, 
         raise ValueError(f"{split} row {index} does not match the pinned manifest")
 
 
+def _inventory_with_prompts(
+    exemplars: Sequence[tuple[str, str]], test: Sequence[tuple[str, str]]
+) -> Iterator[tuple[dict[str, Any], str]]:
+    for index, (question, answer) in enumerate(test):
+        prompt = build_prompt(exemplars, question)
+        yield {
+            "index": index,
+            "id": question_id(index),
+            "question_sha256": sha256_text(question),
+            "answer_sha256": sha256_text(answer),
+            "prompt_sha256": sha256_text(prompt),
+            "prompt_chars": len(prompt),
+            "gold": extract_gold(answer),
+        }, prompt
+
+
 def inventory_rows(
     exemplars: Sequence[tuple[str, str]], test: Sequence[tuple[str, str]]
 ) -> list[dict[str, Any]]:
     """Every test row's identity: question, answer and prompt digests, prompt size and gold."""
-    rows = []
-    for index, (question, answer) in enumerate(test):
-        prompt = build_prompt(exemplars, question)
-        rows.append(
-            {
-                "index": index,
-                "id": question_id(index),
-                "question_sha256": sha256_text(question),
-                "answer_sha256": sha256_text(answer),
-                "prompt_sha256": sha256_text(prompt),
-                "prompt_chars": len(prompt),
-                "gold": extract_gold(answer),
-            }
-        )
-    return rows
+    return [row for row, _ in _inventory_with_prompts(exemplars, test)]
 
 
 def build_problems(
@@ -438,8 +440,13 @@ def build_problems(
         exemplars.append(train[item["index"]])
     for item in manifest["questions"]:
         _check_row("test", item["index"], test[item["index"]], item)
+    rows = []
+    selected_prompts = []
     try:
-        rows = inventory_rows(exemplars, test)
+        for row, prompt in _inventory_with_prompts(exemplars, test):
+            rows.append(row)
+            if row["index"] < count:
+                selected_prompts.append(prompt)
     except ValueError as error:
         raise ValueError(f"the test split does not match the pinned inventory: {error}") from error
     if sha256_text(canonical_json(rows)) != expected_rows_sha256:
@@ -460,7 +467,7 @@ def build_problems(
                 question=question,
                 answer=answer,
                 gold=row["gold"],
-                prompt=build_prompt(exemplars, question),
+                prompt=selected_prompts[index],
                 prompt_sha256=row["prompt_sha256"],
             )
         )
