@@ -32,6 +32,22 @@ Choose the boundary case by case. A target can specialize only the transformer a
 
 ## Where to put code
 
+### Choose the implementation layer
+
+Place a change according to the decision it makes. Then choose its [sharing scope](#choose-the-sharing-scope).
+
+| Layer | Decision it owns | H3 example |
+| --- | --- | --- |
+| Pipeline | How a request moves through conditioning, denoising and decoding, including which components run at each step. | The [family pipeline](pipeline.py) advances the joint audio/video denoising loop. The [FastH3 target](fasth3/pipeline.py) supplies its trained schedule. |
+| Component | How a model block computes its output. It composes operations and holds the parameters or other instance state that block needs. | [H3 attention](components/attention.py) owns its projections and normalization weights and chooses when to apply fused Q/K norm and RoPE. |
+| Parallel | How tensors and weights are partitioned across ranks, which process group participates, and when collectives run relative to model computation. | [H3 Ulysses](parallel/ulysses.py) schedules V, Q, K on the asynchronous path and waits for the transfers before attention. |
+| Operation | What one tensor computation or collective returns for explicit inputs, layouts and parameters. The call is stateless. It can select a compatible kernel or compose several calls that satisfy the same contract. | The [Q/K norm and RoPE op](ops/rope.py) takes packed QKV, norm weights and rotation tables. Its PyTorch reference defines the expected Q and K. |
+| Kernel | How the device executes the operation, including fusion, tiling, memory access and launch configuration. | The [fused Triton kernel](kernels/fused_rope.py) loads the Q/K head data, computes RMS normalization and rotates the leading channels in one launch. |
+
+Changing the fused RoPE tile size belongs in `kernels/`. Changing the rotation from the leading channels to the trailing channels changes the contract in `ops/` and its reference tests. In asynchronous Ulysses, [parallel/ulysses.py](parallel/ulysses.py) determines when the V/Q/K transfers run. [ops/ulysses.py](ops/ulysses.py) determines how the three received buffers map to the attention layout.
+
+### Choose the sharing scope
+
 **Only fully model-independent operations belong in a catalog.** Independent callers must be able to use the same implementation unchanged. Express the computation in terms of tensors, layouts and explicit operation parameters. Model wrappers belong in their family or target, even when several models call the same native kernel. They own checkpoint interpretation, model-specific packing, masks, gates and collective scheduling.
 
 | Scope of the change | Place it here | H3 example |
