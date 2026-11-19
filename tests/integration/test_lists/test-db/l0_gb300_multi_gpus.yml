@@ -112,9 +112,6 @@ l0_gb300_multi_gpus:
   # KDA runtime state-pool and mixed-batch core coverage.
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py
-  # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
-  # checkpoint; the case moved out of the skipped TestMoeFp4 class).
-  - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
   # Vocab-parallel token selection over TP2/TP4 vocab shards, MNNVL and
   # default all-reduce.
   - unittest/_torch/multi_gpu/test_vocab_parallel_selection.py
