@@ -3,10 +3,12 @@
 
 """Single-use admission tokens for native context cancellation.
 
-Only unsubmitted admissions occupy the pending table. Bounded replay metadata
-remains until signed authorization expiry. Admitted work carries its token in
-the existing executor request; its normal owner remains responsible for KV
-retirement. A cancellation receipt never reports physical settlement.
+Only unsubmitted admissions occupy the pending table. Replay metadata remains
+for a bounded monotonic window. A fixed signed-expiry floor prevents removed
+authorizations from reopening admission, including after a UTC rollback.
+Admitted work carries its token in the existing executor request; its normal
+owner remains responsible for KV retirement. A cancellation receipt never
+reports physical settlement.
 
 Protected control traffic requires a trusted or encrypted network segment.
 Message signatures authenticate intent; they do not encrypt tokens or payloads.
@@ -20,7 +22,6 @@ policy when access is still unproven; unused admission expires separately.
 """
 
 import hashlib
-import heapq
 import hmac
 import json
 import re
@@ -28,7 +29,7 @@ import secrets
 import time
 from collections import OrderedDict
 from threading import Lock
-from typing import Callable, Literal
+from typing import Callable, Literal, NamedTuple
 
 CancellationReceipt = Literal["not_submitted", "queued"]
 CONTEXT_RESERVATION_AUTH_LIFETIME_MS = 60_000
@@ -36,7 +37,17 @@ _MAX_AUTHORIZATION_HORIZON_MS = 120_000
 _PENDING_RESERVATION_LIMIT = 1024
 _RESERVATION_LIFETIME_SECONDS = 60.0
 _AUTHORIZATION_REPLAY_LIMIT = 65_536
+_AUTHORIZATION_RETENTION_SECONDS = 120.0
 _AUTHORIZATION_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+
+
+class _AcceptedAuthorization(NamedTuple):
+    """Worker-local replay record; redelivery never extends its lifetime."""
+
+    request_id: int
+    expires_at_ms: int
+    token: str
+    retain_until: float
 
 
 class ContextCancellationReservations:
@@ -48,11 +59,9 @@ class ContextCancellationReservations:
         self._lock = Lock()
         self._pending: OrderedDict[str, float] = OrderedDict()
         # All HTTP lanes share this worker-owned ledger. Consumed authorizations
-        # remain here until signed expiry; they do not occupy pending admission.
-        self._authorizations: dict[str, tuple[int, int, str]] = {}
-        self._authorization_expiries: list[tuple[int, str]] = []
-        self._authorization_epoch_ms = time.time_ns() // 1_000_000
-        self._authorization_origin = time.monotonic()
+        # do not occupy pending admission, but remain recognizable after UTC changes.
+        self._authorizations: OrderedDict[str, _AcceptedAuthorization] = OrderedDict()
+        self._pruned_authorization_expiry_ms = -1
 
     def reserve(
         self, request_id: int, authorization_id: str, authorization_expires_at_ms: int
@@ -81,20 +90,20 @@ class ContextCancellationReservations:
             raise ValueError("Invalid context reservation authorization")
         with self._lock:
             now = time.monotonic()
-            # Follow forward UTC corrections, but never roll replay time back.
-            # Expired nonces must stay invalid after their records are removed.
-            now_ms = self._authorization_epoch_ms + int((now - self._authorization_origin) * 1000)
-            wall_ms = time.time_ns() // 1_000_000
-            if wall_ms > now_ms:
-                now_ms = self._authorization_epoch_ms = wall_ms
-                self._authorization_origin = now
+            now_ms = time.time_ns() // 1_000_000
             if not now_ms < authorization_expires_at_ms <= now_ms + _MAX_AUTHORIZATION_HORIZON_MS:
                 raise ValueError("Context reservation authorization is outside its validity window")
-            # Validate expiry before lookup: removed, expired nonces cannot mint
-            # another token. A heap handles out-of-order signed expiries lazily.
-            while self._authorization_expiries and self._authorization_expiries[0][0] <= now_ms:
-                _, expired_id = heapq.heappop(self._authorization_expiries)
-                del self._authorizations[expired_id]
+            # UTC corrections cannot shorten nonce retention. Once a record is
+            # removed, its signed expiry stays at or below a fixed rejection floor.
+            # Equal retention intervals put records in monotonic deadline order.
+            while self._authorizations:
+                oldest = next(iter(self._authorizations.values()))
+                if oldest.retain_until > now:
+                    break
+                self._authorizations.popitem(last=False)
+                self._pruned_authorization_expiry_ms = max(
+                    self._pruned_authorization_expiry_ms, oldest.expires_at_ms
+                )
             # Fixed-duration reservations are inserted in deadline order.
             # Stop at the first live entry rather than scanning all pending work.
             while self._pending:
@@ -104,12 +113,19 @@ class ContextCancellationReservations:
                 self._pending.popitem(last=False)
             previous = self._authorizations.get(authorization_id)
             if previous is not None:
-                previous_id, previous_expiry, token = previous
-                if previous_id != request_id or previous_expiry != authorization_expires_at_ms:
+                if (
+                    previous.request_id != request_id
+                    or previous.expires_at_ms != authorization_expires_at_ms
+                ):
                     raise ValueError("Context reservation authorization identity mismatch")
-                if token not in self._pending:
+                if previous.token not in self._pending:
                     raise ValueError("Context cancellation admission is closed")
-                return token
+                return previous.token
+            # An unrecognized nonce may be a removed authorization. A large or
+            # delayed rollback can temporarily reject fresh admissions here;
+            # advancing UTC catches this fixed floor without a moving offset.
+            if authorization_expires_at_ms <= self._pruned_authorization_expiry_ms:
+                raise ValueError("Context reservation authorization is outside its validity window")
             if len(self._pending) >= _PENDING_RESERVATION_LIMIT:
                 raise RuntimeError("Context cancellation reservations are full")
             # Keep replay storage bounded independently of the 1,024 pending
@@ -123,13 +139,11 @@ class ContextCancellationReservations:
             signature = hmac.new(self._key, payload.encode(), hashlib.sha256).hexdigest()
             token = f"{payload}.{signature}"
             self._pending[token] = deadline
-            self._authorizations[authorization_id] = (
+            self._authorizations[authorization_id] = _AcceptedAuthorization(
                 request_id,
                 authorization_expires_at_ms,
                 token,
-            )
-            heapq.heappush(
-                self._authorization_expiries, (authorization_expires_at_ms, authorization_id)
+                now + _AUTHORIZATION_RETENTION_SECONDS,
             )
             return token
 

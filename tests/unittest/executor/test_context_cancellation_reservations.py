@@ -16,9 +16,7 @@ pytestmark = pytest.mark.cpu_only
 
 def _reserve(owner: ContextCancellationReservations, request_id: int) -> str:
     """Supply fresh authorization while existing tests control the admission clock."""
-    now_ms = owner._authorization_epoch_ms + int(
-        (context_cancellation.time.monotonic() - owner._authorization_origin) * 1000
-    )
+    now_ms = context_cancellation.time.time_ns() // 1_000_000
     return owner.reserve(request_id, secrets.token_hex(16), now_ms + 60_000)
 
 
@@ -240,7 +238,7 @@ def test_failed_cancel_enqueue_does_not_return_a_receipt() -> None:
 def test_forward_clock_correction_accepts_fresh_auth_but_rollback_cannot_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Corrected UTC can advance replay time, but cannot reopen removed nonces."""
+    """Fresh signed UTC authorizations work after rollback; consumed nonces do not."""
     wall_ms, monotonic = [1_000_000], [100.0]
     monkeypatch.setattr(context_cancellation.time, "time_ns", lambda: wall_ms[0] * 1_000_000)
     monkeypatch.setattr(context_cancellation.time, "monotonic", lambda: monotonic[0])
@@ -248,20 +246,57 @@ def test_forward_clock_correction_accepts_fresh_auth_but_rollback_cannot_replay(
     first = owner.reserve(17, "a" * 32, 1_060_000)
     owner.submit(first, 17, lambda: 17)
     wall_ms[0] += 90_000
-    fresh = owner.reserve(18, "b" * 32, wall_ms[0] + 60_000)
-    assert list(owner._pending) == [fresh]
-    assert "a" * 32 not in owner._authorizations
+    forward = owner.reserve(18, "b" * 32, wall_ms[0] + 60_000)
     wall_ms[0] -= 90_000
+    fresh = owner.reserve(19, "c" * 32, wall_ms[0] + 60_000)
+    with pytest.raises(ValueError, match="admission is closed"):
+        owner.reserve(17, "a" * 32, 1_060_000)
+    assert owner.submit(forward, 18, lambda: 18) == 18
+    assert owner.submit(fresh, 19, lambda: 19) == 19
+
+    # Normal elapsed time expires replay records, without creating a UTC offset.
+    monotonic[0] += 120
+    wall_ms[0] += 120_000
+    latest = owner.reserve(20, "d" * 32, wall_ms[0] + 60_000)
+    assert set(owner._authorizations) == {"d" * 32}
+    assert owner.submit(latest, 20, lambda: 20) == 20
+    cancel = Mock()
+    assert owner.cancel(first, cancel) == "queued"
+    cancel.assert_called_once_with(first)
+
+
+def test_rollback_after_replay_pruning_recovers_past_a_fixed_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forgotten nonces stay rejected, but elapsed monotonic time cannot move the floor."""
+    wall_ms, monotonic = [1_000_000], [100.0]
+    monkeypatch.setattr(context_cancellation.time, "time_ns", lambda: wall_ms[0] * 1_000_000)
+    monkeypatch.setattr(context_cancellation.time, "monotonic", lambda: monotonic[0])
+    owner = ContextCancellationReservations()
+    first = owner.reserve(17, "a" * 32, 1_060_000)
+    owner.submit(first, 17, lambda: 17)
+    monotonic[0] = 219.0
+    pending = owner.reserve(21, "e" * 32, 1_050_000)
+    monotonic[0], wall_ms[0] = 220.0, 1_120_000
+    live = owner.reserve(18, "b" * 32, 1_180_000)
+    wall_ms[0] = 990_000
+    assert owner.reserve(21, "e" * 32, 1_050_000) == pending
     with pytest.raises(ValueError, match="validity window"):
         owner.reserve(17, "a" * 32, 1_060_000)
-    assert owner.submit(fresh, 18, lambda: 18) == 18
-    # Frequent probes must not discard fractional monotonic progress.
-    for index in range(1, 2002):
-        monotonic[0] = 100.0 + index * 0.0005
-        with pytest.raises(ValueError, match="validity window"):
-            owner.reserve(19, "c" * 32, 1_000_000)
     with pytest.raises(ValueError, match="validity window"):
-        owner.reserve(19, "c" * 32, 1_091_000)
+        owner.reserve(19, "c" * 32, wall_ms[0] + 60_000)
+    monotonic[0] += 10
+    wall_ms[0] += 10_000
+    with pytest.raises(ValueError, match="validity window"):
+        owner.reserve(19, "c" * 32, wall_ms[0] + 60_000)
+    assert owner._pruned_authorization_expiry_ms == 1_060_000
+    monotonic[0] += 0.001
+    wall_ms[0] += 1
+    fresh = owner.reserve(19, "c" * 32, wall_ms[0] + 60_000)
+    assert owner.submit(fresh, 19, lambda: 19) == 19
+    assert owner.submit(live, 18, lambda: 18) == 18
+    with pytest.raises(ValueError, match="validity window"):
+        owner.reserve(17, "a" * 32, 1_060_000)
 
 
 @pytest.mark.parametrize("request_id", [True, 1.0, "1"])
@@ -368,43 +403,44 @@ def test_invalid_authorization_cannot_allocate_pending_or_replay_state(
         owner.reserve(17, nonce, expiry)
     assert not owner._pending
     assert not owner._authorizations
-    assert not owner._authorization_expiries
 
 
 def test_replay_ledger_capacity_is_separate_and_expiry_does_not_reopen_old_nonce(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Expiry order, overload and wall rollback cannot revive a consumed authorization."""
-    now = [100.0]
+    """Monotonic retention order differs from signed expiry and bounds replay storage."""
+    now, wall_ms = [100.0], [1_000_000]
     monkeypatch.setattr(context_cancellation.time, "monotonic", lambda: now[0])
-    monkeypatch.setattr(context_cancellation.time, "time_ns", lambda: 1_000_000_000_000)
+    monkeypatch.setattr(context_cancellation.time, "time_ns", lambda: wall_ms[0] * 1_000_000)
     monkeypatch.setattr(context_cancellation, "_PENDING_RESERVATION_LIMIT", 1)
     monkeypatch.setattr(context_cancellation, "_AUTHORIZATION_REPLAY_LIMIT", 2)
     owner = ContextCancellationReservations()
     first = owner.reserve(17, "a" * 32, 1_090_000)
     owner.submit(first, 17, lambda: 17)
+    now[0] = 110.0
     second = owner.reserve(18, "b" * 32, 1_030_000)
     owner.cancel(second, Mock())
     assert not owner._pending and len(owner._authorizations) == 2
     with pytest.raises(RuntimeError, match="replay accounting is full"):
         owner.reserve(19, "c" * 32, 1_060_000)
-    # The second nonce expires first. Pruning must not evict the first live one.
-    now[0] = 131.0
-    monkeypatch.setattr(context_cancellation.time, "time_ns", lambda: 900_000_000_000)
+
+    # The first record reaches its monotonic retention deadline first, even
+    # though the second authorization has the earlier signed UTC expiry.
+    now[0] = 220.0
     third = owner.reserve(19, "c" * 32, 1_091_000)
-    assert set(owner._authorizations) == {"a" * 32, "c" * 32}
+    assert set(owner._authorizations) == {"b" * 32, "c" * 32}
     assert list(owner._pending) == [third]
     with pytest.raises(ValueError, match="validity window"):
-        owner.reserve(18, "b" * 32, 1_030_000)
-    with pytest.raises(ValueError, match="admission is closed"):
         owner.reserve(17, "a" * 32, 1_090_000)
-    # Admission authorization expiry does not revoke cancellation of old work.
-    now[0] = 191.0
+    with pytest.raises(ValueError, match="admission is closed"):
+        owner.reserve(18, "b" * 32, 1_030_000)
+    owner.submit(third, 19, lambda: 19)
+    now[0] = 230.0
+    wall_ms[0] = 1_091_000
     fresh = owner.reserve(20, "d" * 32, 1_151_000)
     assert list(owner._pending) == [fresh]
-    assert set(owner._authorizations) == {"d" * 32}
+    assert set(owner._authorizations) == {"c" * 32, "d" * 32}
+    assert owner._pruned_authorization_expiry_ms == 1_090_000
     cancel = Mock()
     assert owner.cancel(first, cancel) == "queued"
     cancel.assert_called_once_with(first)
-    with pytest.raises(ValueError, match="validity window"):
-        owner.reserve(17, "a" * 32, 1_090_000)
