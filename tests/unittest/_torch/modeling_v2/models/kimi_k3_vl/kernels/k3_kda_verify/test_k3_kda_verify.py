@@ -18,7 +18,7 @@ of T = 1 + num_spec tokens, at the per-rank TP16 shape (6 heads, K = V = 128, co
 Two references, run over the same schedule of rounds from the same initial pools, with distinct slots and a pending
 (accepted-draft) count per request that changes every round:
 
-* main's path, as ``KimiDeltaAttention.forward_verify_fused`` calls it: f_b as a bf16 ``F.linear``, then
+* the built-in path, as ``KimiDeltaAttention.forward_verify_fused`` calls it: f_b as a bf16 ``F.linear``, then
   ``trtllm::kda_mtp_decode`` replaying each request's accepted drafts from its replay caches
   (``cu_seqlens[n] = n T - pending[n]``, ``num_accepted_tokens = pending``), then the gated RMSNorm
   (``rms_norm_gated_token_major``, sigmoid gate). The report says which ``kda_mtp_decode`` was loaded.
@@ -27,8 +27,9 @@ Two references, run over the same schedule of rounds from the same initial pools
   S <- S d + beta (v - (S d) k) k^T, o = S q, the gated RMSNorm.
 
 Checks per round: the outputs of every request against both references (fp32 tolerance), the committed pool state
-(after each golden token) against the history and main's chunked 3xTF32 recurrence; the conv caches against main's
-(raw inputs: bit-exact). The sequential FP32 and chunked tensor-core state updates have different rounding order.
+(after each golden token) against the history and the built-in path's chunked 3xTF32 recurrence; the conv caches
+against the built-in path's (raw inputs: bit-exact). The sequential FP32 and chunked tensor-core state updates have
+different rounding order.
 The drafts' records in ``state_tok`` are checked through the next round, which starts from the accepted ones.
 Also: requests isolated, each schedule twice bit-identical, CUDA-graph replays with rewritten inputs, the slots
 and the pending counts given as slices of longer index tensors at any element offset.
@@ -59,11 +60,11 @@ EPS = 1e-5
 SCALE = K**-0.5
 POOL = 11
 ROUNDS = 6
-TOL_OUT = 2e-2  # bf16 outputs; main rounds the core to bf16 before its norm
+TOL_OUT = 2e-2  # bf16 outputs; the built-in path rounds the core to bf16 before its norm
 # fp32 states against the fp32 history: approximate exp / rcp in the kernels, and the bf16 f_b gate (one bf16 ulp
-# moves a decay by up to ~1 %; main's kda_mtp_decode measures 2.05e-4 at 6x8)
+# moves a decay by up to ~1 %; the built-in kda_mtp_decode measures 2.05e-4 at 6x8)
 TOL_STATE = 1e-3
-TOL_STATE_MAIN = 1e-5
+TOL_STATE_BUILTIN = 1e-5
 
 SPLITS = [(r, t) for t in (8, 4, 2) for r in range(1, 9)]
 
@@ -83,15 +84,16 @@ def _ops():
     )
 
 
-def main_kda_variant() -> str:
-    """'main' when the loaded kda_mtp_decode has main's signature, else 'port' (a modified one)."""
+def builtin_kda_variant() -> str:
+    """'stock' when the loaded kda_mtp_decode has the stock signature, else 'accepted_by_slot' (a build whose
+    kda_mtp_decode takes that argument)."""
     _ops()
     from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops as mtp
 
     return (
-        "port"
+        "accepted_by_slot"
         if "accepted_by_slot" in inspect.signature(mtp.kda_mtp_decode_impl).parameters
-        else "main"
+        else "stock"
     )
 
 
@@ -150,8 +152,8 @@ def split_proj(proj: torch.Tensor):
     return t, x_q, x_k, x_v, og, f_a, beta
 
 
-class MainPath:
-    """main's verify (forward_verify_fused): its replay caches, a per-request pending count."""
+class BuiltinPath:
+    """The built-in verify (forward_verify_fused): its replay caches, a per-request pending count."""
 
     def __init__(self, wt, pools, slots, num_spec):
         self.wt, self.p, self.slots, self.num_spec = wt, pools, slots, num_spec
@@ -216,13 +218,13 @@ def rel(a: torch.Tensor, b: torch.Tensor) -> float:
 def run_schedule(
     num_requests, steps, fold=True, layout="dense", seed=0, rounds=ROUNDS, states=None
 ):
-    """Main's path, k3_kda_verify and the fp32 history over ``rounds`` rounds; per-round metrics."""
+    """The built-in path, k3_kda_verify and the fp32 history over ``rounds`` rounds; per-round metrics."""
     _ops()
     num_spec = steps - 1
     wt = make_weights(100 + seed)
     pools = make_pools(200 + seed, num_spec, layout)
     slots = make_slots(num_requests, 300 + seed)
-    main = MainPath(wt, clone_pools(pools), slots, num_spec)
+    builtin = BuiltinPath(wt, clone_pools(pools), slots, num_spec)
     k3 = K3Path(wt, clone_pools(pools), slots, num_spec)
     ref = kc.F64Verify(wt, dict(pools, ssm=pools["state"]), slots, num_spec)
     pending_req = torch.zeros(num_requests, dtype=torch.int32, device="cuda")
@@ -230,27 +232,27 @@ def run_schedule(
     rows, outs = [], []
     for rnd in range(rounds):
         proj = torch.randn(num_requests * steps, PROJ, generator=gen, device="cuda").bfloat16()
-        out_main, g = main(proj, pending_req)
+        out_builtin, g = builtin(proj, pending_req)
         out_k3 = k3(proj, None if fold else g.contiguous())
         out_ref = ref(proj)
         torch.cuda.synchronize()
         r = dict(round=rnd, pending=pending_req.tolist())
-        r["out_vs_main"] = rel(out_k3, out_main)
+        r["out_vs_builtin"] = rel(out_k3, out_builtin)
         r["out_vs_fp32"] = rel(out_k3, out_ref)
-        r["main_vs_fp32"] = rel(out_main, out_ref)
+        r["builtin_vs_fp32"] = rel(out_builtin, out_ref)
         # The pool state after the golden token (state_tok holds the drafts' compact records, which the next round's
         # outputs check against the history).
-        st_err, main_st_err, st_main_err = 0.0, 0.0, 0.0
+        st_err, builtin_st_err, st_builtin_err = 0.0, 0.0, 0.0
         for n, s in enumerate(slots.tolist()):
             states, _ = ref.last[n]
             st_err = max(st_err, rel(k3.p["state"][s], states[0]))
-            main_st_err = max(main_st_err, rel(main.p["state"][s], states[0]))
-            st_main_err = max(st_main_err, rel(k3.p["state"][s], main.p["state"][s]))
+            builtin_st_err = max(builtin_st_err, rel(builtin.p["state"][s], states[0]))
+            st_builtin_err = max(st_builtin_err, rel(k3.p["state"][s], builtin.p["state"][s]))
         r["state_vs_fp32"] = st_err
-        r["main_state_vs_fp32"] = main_st_err
-        r["state_vs_main"] = st_main_err
-        r["conv_bits_vs_main"] = all(
-            torch.equal(k3.p[c], main.p[c]) for c in ("cs_q", "cs_k", "cs_v")
+        r["builtin_state_vs_fp32"] = builtin_st_err
+        r["state_vs_builtin"] = st_builtin_err
+        r["conv_bits_vs_builtin"] = all(
+            torch.equal(k3.p[c], builtin.p[c]) for c in ("cs_q", "cs_k", "cs_v")
         )
         rows.append(r)
         outs.append(out_k3.clone())
@@ -264,10 +266,10 @@ def run_schedule(
 
 
 def round_ok(r, fold: bool) -> bool:
-    ok = (r["out_vs_main"] <= TOL_OUT and r["out_vs_fp32"] <= TOL_OUT and r["state_vs_fp32"] <= TOL_STATE
-          and r["conv_bits_vs_main"])  # fmt: skip
+    ok = (r["out_vs_builtin"] <= TOL_OUT and r["out_vs_fp32"] <= TOL_OUT and r["state_vs_fp32"] <= TOL_STATE
+          and r["conv_bits_vs_builtin"])  # fmt: skip
     if not fold:
-        ok &= r["state_vs_main"] <= TOL_STATE_MAIN and r["main_state_vs_fp32"] <= TOL_STATE
+        ok &= r["state_vs_builtin"] <= TOL_STATE_BUILTIN and r["builtin_state_vs_fp32"] <= TOL_STATE
     return ok
 
 
@@ -284,7 +286,8 @@ def test_split(num_requests, steps):
 @pytest.mark.parametrize("num_requests,steps", [(1, 8), (3, 4), (8, 8), (8, 2)])
 @pytest.mark.parametrize("layout", ["dense", "strided"])
 def test_g_ext(num_requests, steps, layout):
-    """An unfused gate matches main numerically and repeats bit-identically on the same implementation."""
+    """An unfused gate matches the built-in path numerically and repeats bit-identically on the same
+    implementation."""
     states, states2 = [], []
     with torch.inference_mode():
         rows, outs = run_schedule(
@@ -441,9 +444,10 @@ def test_index_offset(which, offset):
 
 def report() -> int:
     with torch.inference_mode():
-        print(f"{torch.cuda.get_device_name()}; kda_mtp_decode: {main_kda_variant()}")
-        print("| split | mode | layout | rounds | k3 vs main | k3 vs fp32 | main vs fp32 | state vs fp32 "
-              "| main state vs fp32 | state vs main | conv bits = main | deterministic | result |")  # fmt: skip
+        print(f"{torch.cuda.get_device_name()}; kda_mtp_decode: {builtin_kda_variant()}")
+        print("| split | mode | layout | rounds | k3 vs built-in | k3 vs fp32 | built-in vs fp32 "
+              "| state vs fp32 | built-in state vs fp32 | state vs built-in | conv bits = built-in "
+              "| deterministic | result |")  # fmt: skip
         print("| :-- | :-- | :-- | --: | --: | --: | --: | --: | --: | --: | :-- | :-- | :-- |")
         ok_all = True
         cases = [(r, t, True, "dense") for r, t in SPLITS]
@@ -464,10 +468,10 @@ def report() -> int:
             ok = all(round_ok(x, fold) for x in rows) and det
             ok_all &= ok
             print(f"| {r}x{t} | {'fold' if fold else 'g_ext'} | {layout} | {len(rows)} | "
-                  f"{max(x['out_vs_main'] for x in rows):.2e} | {max(x['out_vs_fp32'] for x in rows):.2e} | "
-                  f"{max(x['main_vs_fp32'] for x in rows):.2e} | {max(x['state_vs_fp32'] for x in rows):.2e} | "
-                  f"{max(x['main_state_vs_fp32'] for x in rows):.2e} | "
-                  f"{max(x['state_vs_main'] for x in rows):.2e} | {all(x['conv_bits_vs_main'] for x in rows)} | "
+                  f"{max(x['out_vs_builtin'] for x in rows):.2e} | {max(x['out_vs_fp32'] for x in rows):.2e} | "
+                  f"{max(x['builtin_vs_fp32'] for x in rows):.2e} | {max(x['state_vs_fp32'] for x in rows):.2e} | "
+                  f"{max(x['builtin_state_vs_fp32'] for x in rows):.2e} | "
+                  f"{max(x['state_vs_builtin'] for x in rows):.2e} | {all(x['conv_bits_vs_builtin'] for x in rows)} | "
                   f"{det} | {'PASS' if ok else 'FAIL'} |", flush=True)  # fmt: skip
     print("ALL PASS" if ok_all else "FAIL")
     return 0 if ok_all else 1
@@ -501,25 +505,28 @@ def time_graph(body, calls, replays=15):
 def timing(layers: int = 48) -> None:
     """Graphs of back-to-back calls over ``layers`` copies of the weights and pools (HBM-cold), steady pending."""
     _ops()
-    print(f"{torch.cuda.get_device_name()}; kda_mtp_decode: {main_kda_variant()}; graphs over {layers} layer copies, "
-          "15 replays: median (min-max) us per call")  # fmt: skip
-    print("| split | main: f_b + kda_mtp_decode + gated norm | k3_kda_verify |")
+    print(f"{torch.cuda.get_device_name()}; kda_mtp_decode: {builtin_kda_variant()}; "
+          f"graphs over {layers} layer copies, 15 replays: median (min-max) us per call")  # fmt: skip
+    print("| split | built-in: f_b + kda_mtp_decode + gated norm | k3_kda_verify |")
     print("| :-- | --: | --: |")
     with torch.inference_mode():
         for r, t in SPLITS:
             num_spec = t - 1
             slots = make_slots(r, 1)
-            mains, k3s = [], []
+            builtin_paths, k3s = [], []
             for i in range(layers):
                 wt = make_weights(1000 + i)
                 pools = make_pools(2000 + i, num_spec, "dense")
-                mains.append(MainPath(wt, clone_pools(pools), slots, num_spec))
+                builtin_paths.append(BuiltinPath(wt, clone_pools(pools), slots, num_spec))
                 k3s.append(K3Path(wt, pools, slots, num_spec))
             pend = torch.tensor(pending_schedule(r, num_spec, 2), dtype=torch.int32, device="cuda")
             for k3 in k3s:
                 k3.p["pending"][slots.long()] = pend
             proj = torch.randn(r * t, PROJ, device="cuda").bfloat16()
-            arms = [lambda i: mains[i % layers](proj, pend), lambda i: k3s[i % layers](proj)]
+            arms = [
+                lambda i: builtin_paths[i % layers](proj, pend),
+                lambda i: k3s[i % layers](proj),
+            ]
             res = [[], []]
             for rep in range(3):
                 for a in (0, 1) if rep % 2 == 0 else (1, 0):
@@ -531,7 +538,7 @@ def timing(layers: int = 48) -> None:
                     f"{meds[1]:.2f} ({min(x[1] for x in res[a]):.2f}-{max(x[2] for x in res[a]):.2f})"
                 )
             print(f"| {r}x{t} | " + " | ".join(cells) + " |", flush=True)
-            mains.clear()
+            builtin_paths.clear()
             k3s.clear()
             torch.cuda.empty_cache()
 
