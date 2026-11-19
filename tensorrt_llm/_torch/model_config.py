@@ -59,9 +59,9 @@ from tensorrt_llm.models.quant_config_utils import \
     update_quant_config_from_compressed_tensors
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
-    canonicalize_quant_algo, is_modelopt_quant_config,
-    read_modelopt_quant_config, reject_checkpoint_nvfp4_plus,
-    warn_if_inline_diverges)
+    canonicalize_quant_algo, is_foreign_hf_quant_config,
+    is_modelopt_quant_config, read_modelopt_quant_config,
+    reject_checkpoint_nvfp4_plus, warn_if_inline_diverges)
 from tensorrt_llm.quantization.utils.fp4_utils import (
     NVFP4_SF_VEC_SIZE, W4A16_NVFP4_LINEAR_SF_VEC_SIZES,
     nvfp4_scaling_vector_size)
@@ -2114,11 +2114,25 @@ class ModelConfig(Generic[TConfig]):
                                                    architecture)
         parse_request = MoESelection.of(moe_backend_hint, moe_tactic).request()
 
+        hf_quant_config_file = cached_file(checkpoint_dir,
+                                           'hf_quant_config.json')
+        hf_quant_config_raw = None
+        if hf_quant_config_file:
+            with open(hf_quant_config_file) as f:
+                hf_quant_config_raw = json.load(f)
+        if is_foreign_hf_quant_config(hf_quant_config_raw):
+            # The checkpoint's own format lists per-tensor precisions that its
+            # model implementation reads. The file is authoritative, so an
+            # inline ModelOpt quantization_config in config.json does not
+            # apply either, and no module-wide quantization is configured.
+            logger.info(
+                "hf_quant_config.json declares quant_method="
+                f"{hf_quant_config_raw['quant_method']!r}, which is not a "
+                "ModelOpt config; leaving the checkpoint's quantization to the "
+                "model implementation")
         # quantized ckpt in modelopt format
-        if quant_config_file := cached_file(checkpoint_dir,
-                                            'hf_quant_config.json'):
-            with open(quant_config_file) as f:
-                normalized = read_modelopt_quant_config(json.load(f))
+        elif quant_config_file := hf_quant_config_file:
+            normalized = read_modelopt_quant_config(hf_quant_config_raw)
             # The file is authoritative; warn if the inline copy disagrees.
             # Done before _build_modelopt_quant_config since the builder may
             # mutate ``normalized`` via ``.update`` from quant_cfg.json.

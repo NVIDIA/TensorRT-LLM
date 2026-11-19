@@ -292,3 +292,56 @@ def test_dtypes_json_quant_config_keeps_exclude_modules_in_checkpoint_order(tmp_
     )
 
     assert quant_config.exclude_modules == _HF_EXCLUDE_MODULES
+
+
+def _write_inkling2_checkpoint(path, hf_quant_config) -> None:
+    # Inkling 2's layout: a ModelOpt block inline in config.json, and the per-tensor
+    # precisions in an hf_quant_config.json of its own format.
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Inkling2ForConditionalGeneration"],
+                "model_type": "inkling2",
+                "text_config": {"num_hidden_layers": 2, "local_layer_ids": [0]},
+                "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+            }
+        )
+    )
+    (path / "hf_quant_config.json").write_text(json.dumps(hf_quant_config))
+
+
+def test_foreign_hf_quant_config_leaves_quantization_to_the_model(tmp_path) -> None:
+    _write_inkling2_checkpoint(
+        tmp_path, {"quant_method": "inkling2", "model": {"parameter_groups": []}}
+    )
+
+    config = ModelConfig.from_pretrained(str(tmp_path))
+
+    # Neither the file nor the inline ModelOpt block configures module-wide quantization.
+    assert config.quant_config.quant_algo is None
+    assert config.quant_config_dict is None
+
+
+def test_llm_api_loader_leaves_a_foreign_hf_quant_config_to_the_model(tmp_path) -> None:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_utils import ModelLoader
+
+    _write_inkling2_checkpoint(
+        tmp_path, {"quant_method": "inkling2", "model": {"parameter_groups": []}}
+    )
+    llm_args = TorchLlmArgs(model=str(tmp_path))
+
+    # Not pre-quantized in the ModelOpt sense: no module-wide algorithm, from the file or
+    # from the inline config.json block.
+    assert ModelLoader(llm_args)._update_from_hf_quant_config() is False
+    assert llm_args.quant_config.quant_algo is None
+
+
+@pytest.mark.parametrize("hf_quant_config", [{"model": {}}, ["inkling2"]])
+def test_unrecognized_hf_quant_config_still_fails(tmp_path, hf_quant_config) -> None:
+    # Without a quant_method, or not a mapping at all, the file is not recognized as a
+    # foreign format and the ModelOpt parser reports it as before.
+    _write_inkling2_checkpoint(tmp_path, hf_quant_config)
+
+    with pytest.raises(ValueError):
+        ModelConfig.from_pretrained(str(tmp_path))

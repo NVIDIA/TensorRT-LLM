@@ -33,6 +33,24 @@ def is_modelopt_quant_config(raw: Any) -> bool:
     return (raw.get("producer") or {}).get("name") == "modelopt"
 
 
+def is_foreign_hf_quant_config(raw: Any) -> bool:
+    """Whether an `hf_quant_config.json` payload uses a format other than ModelOpt's.
+
+    Some checkpoints use `hf_quant_config.json` for precision metadata of their own
+    (Inkling 2 declares `quant_method: inkling2` and lists per-tensor precisions),
+    which only their model implementation can read. Such a file is authoritative: neither
+    it nor an inline ModelOpt `quantization_config` in `config.json` configures
+    module-wide quantization. A payload that is not a dict or names no `quant_method` is
+    not recognized as such and keeps the ModelOpt parser's error.
+    """
+    return (
+        isinstance(raw, dict)
+        and "quantization" not in raw
+        and "quant_method" in raw
+        and not is_modelopt_quant_config(raw)
+    )
+
+
 # Modelopt 1.x supports the same KV-cache algos as 0.x (FP8/NVFP4/INT8),
 # but encodes ``kv_cache_scheme`` in two different shapes depending on the
 # algo:

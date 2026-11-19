@@ -32,6 +32,9 @@ from tensorrt_llm._torch.configs import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
     DeepseekV41VisionConfig,
+    Inkling2Config,
+    Inkling2TextConfig,
+    Inkling2VisionConfig,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -135,6 +138,34 @@ _DEEPSEEK_V41_MIN_CONFIG = {
 }
 
 
+# The layout of thinkingmachines/Inkling-2-Small's config.json, shrunk to 12 layers. Its
+# text_config carries no model_type, and the checkpoint ships no auto_map.
+_INKLING2_MIN_CONFIG = {
+    "architectures": ["Inkling2ForConditionalGeneration"],
+    "model_type": "inkling2",
+    "eos_token_id": 200006,
+    "text_config": {
+        "model_max_length": 1048576,
+        "torch_dtype": "bfloat16",
+        "hidden_size": 4608,
+        "num_hidden_layers": 12,
+        "vocab_size": 201024,
+        "num_attention_heads": 48,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "local_layer_ids": [0, 1, 2, 3, 4, 6, 7, 8, 9, 10],
+        "sliding_window_size": 1024,
+        "log_scaling_n_floor": 8192,
+        "n_routed_experts": 384,
+        "num_experts_per_tok": 8,
+        "intermediate_size": 2304,
+    },
+    "vision_config": {"hidden_size": 1024, "num_hidden_layers": 23, "native_patch_size": 20},
+    "mtp_config": {"num_hidden_layers": 5, "block_size": 8, "markov_head_type": "rnn_hidden"},
+    "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+}
+
+
 def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None:
     assert isinstance(cfg, config_cls)
     assert cfg.model_type == model_type
@@ -155,6 +186,17 @@ def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None
         assert cfg.vision_config.out_hidden_size == 2048
         assert cfg.vision_config.temporal_patch_size == 1
         assert cfg.vision_config.num_heads == 16
+    elif model_type == "inkling2":
+        assert isinstance(cfg.text_config, Inkling2TextConfig)
+        assert isinstance(cfg.vision_config, Inkling2VisionConfig)
+        assert cfg.text_config.global_layer_ids == [5, 11]
+        assert cfg.text_config.sliding_window == 1024
+        assert cfg.text_config.max_position_embeddings == 1048576
+        assert cfg.text_config.log_scaling_n_floor == 8192
+        assert cfg.vision_config.native_patch_size == 20
+        assert cfg.mtp_config["markov_head_type"] == "rnn_hidden"
+        assert cfg.eos_token_id == 200006
+        assert cfg.quantization_config["quant_algo"] == "NVFP4"
     elif model_type == "deepseek_v41":
         assert not isinstance(cfg.text_config, dict)
         assert not isinstance(cfg.vision_config, dict)
@@ -181,6 +223,8 @@ def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None
         # The composite is covered by from_pretrained below; check subtypes directly.
         ("deepseek_v41_text", DeepseekV41TextConfig),
         ("deepseek_v41_vision", DeepseekV41VisionConfig),
+        ("inkling2_text", Inkling2TextConfig),
+        ("inkling2_vision", Inkling2VisionConfig),
     ],
 )
 def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
@@ -198,6 +242,7 @@ def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
         ("deepseek_v32", DeepseekV3Config, _deepseek_min_config("deepseek_v32")),
         ("kimi_k2", DeepseekV3Config, _deepseek_min_config("kimi_k2")),
         ("deepseek_v41", DeepseekV41Config, _DEEPSEEK_V41_MIN_CONFIG),
+        ("inkling2", Inkling2Config, _INKLING2_MIN_CONFIG),
     ],
 )
 def test_autoconfig_from_pretrained_resolves_to_local_config(
@@ -216,6 +261,44 @@ def test_autoconfig_from_pretrained_resolves_to_local_config(
     _verify_autoconfig_from_pretrained(cfg, model_type, config_cls)
     if model_type in ("cosmos3", "cosmos3_edge"):
         assert cfg._name_or_path == str(model_dir)
+
+
+def test_inkling2_text_config_publishes_kv_cache_layout():
+    # The engine sizes sliding-window and full-attention KV pools from layer_types and
+    # sliding_window; Inkling 2 states the same layout as local_layer_ids.
+    from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
+
+    cfg = Inkling2Config(**_INKLING2_MIN_CONFIG)
+    text = cfg.text_config
+    assert text.layer_types == [
+        "full_attention" if i in (5, 11) else "sliding_attention" for i in range(12)
+    ]
+    assert [get_layer_attention_window(text, i) for i in range(12)] == [
+        None if i in (5, 11) else 1024 for i in range(12)
+    ]
+
+
+def test_inkling2_text_config_derives_layout_from_local_layer_ids():
+    # A stale serialized layout must not override local_layer_ids.
+    text = Inkling2TextConfig(
+        num_hidden_layers=4,
+        local_layer_ids=[0, 2],
+        layer_types=["full_attention"] * 4,
+        sliding_window=7,
+        sliding_window_size=512,
+    )
+    assert text.layer_types == [
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+    ]
+    assert text.sliding_window == 512
+    assert text.global_layer_ids == [1, 3]
+    # Without local_layer_ids, every sixth layer is global, as in the release.
+    assert Inkling2TextConfig(num_hidden_layers=12).global_layer_ids == [5, 11]
+    with pytest.raises(ValueError, match="outside the 4 decoder layers"):
+        Inkling2TextConfig(num_hidden_layers=4, local_layer_ids=[0, 4])
 
 
 def test_edge_text_config_keeps_legacy_torch_dtype():

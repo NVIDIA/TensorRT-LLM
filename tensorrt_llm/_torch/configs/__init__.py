@@ -39,6 +39,11 @@ from tensorrt_llm._torch.configs.glm5_next import (
     Glm5NextTextConfig,
     Glm5NextVisionConfig,
 )
+from tensorrt_llm._torch.configs.inkling2 import (
+    Inkling2Config,
+    Inkling2TextConfig,
+    Inkling2VisionConfig,
+)
 from tensorrt_llm._torch.configs.k3_dspark import K3DsparkConfig
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
@@ -95,6 +100,11 @@ def _register_custom_configs_with_transformers() -> None:
         "glm5_next_text": Glm5NextTextConfig,
         "glm5_next_vision": Glm5NextVisionConfig,
         "gemma4_assistant": Gemma4AssistantConfig,
+        # Inkling 2 composite config and its sub-configs. The checkpoint ships no
+        # auto_map, so AutoConfig cannot resolve model_type "inkling2" on its own.
+        "inkling2": Inkling2Config,
+        "inkling2_text": Inkling2TextConfig,
+        "inkling2_vision": Inkling2VisionConfig,
         # Kimi K3 composite multimodal config ("kimi_k3") and its text config
         # ("kimi_linear"). pyexecutor.config_utils.load_pretrained_config keeps
         # the composite KimiK3Config when the checkpoint ships text+vision
@@ -161,6 +171,9 @@ __all__ = [
     "Gemma4UnifiedConfig",
     "Gemma4UnifiedTextConfig",
     "Gemma4UnifiedVisionConfig",
+    "Inkling2Config",
+    "Inkling2TextConfig",
+    "Inkling2VisionConfig",
     "K3DsparkConfig",
     "KimiK3Config",
     "KimiK3VisionConfig",
