@@ -2912,9 +2912,11 @@ class SpecWorkerBase(nn.Module, ABC):
             if self._rejection_buffers_valid(draft_tokens, draft_len,
                                              stored_vocab, num_contexts,
                                              batch_size, logits, spec_metadata):
-                # The fused verify assumes draft_len + 1 target rows per
-                # request, so ragged verification keeps the reference path.
-                if (not spec_metadata.is_ragged_verify
+                # The fused verify runs the token-level ("standard") rule over
+                # draft_len + 1 target rows per request, so block verification
+                # and ragged verification keep the reference path.
+                if (spec_metadata.rejection_sample_method == "standard"
+                        and not spec_metadata.is_ragged_verify
                         and self._fast_rs_applies(spec_metadata, logits,
                                                   stored_vocab)):
                     # Fused kernels read the slot rows in place (no gather).
@@ -3982,7 +3984,8 @@ class SpecWorkerBase(nn.Module, ABC):
             # offset + 1 (see the Philox layout in fast_rejection_sampling).
             tokens = fast_rs_draft_block(
                 flat_view,
-                spec_metadata.request_temperatures[num_contexts:batch_size],
+                self._draft_sampling_params(spec_metadata, num_contexts,
+                                            batch_size)[0],
                 spec_metadata.batch_slot_ids[num_contexts:batch_size],
                 self._fast_rs_dummy_row(spec_metadata),
                 spec_metadata.draft_probs,

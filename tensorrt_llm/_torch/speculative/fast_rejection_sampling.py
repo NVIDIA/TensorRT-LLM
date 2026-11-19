@@ -106,25 +106,10 @@ def _row_max_sum(pmax_ptr, psum_ptr, row, num_chunks, NC_POW2: tl.constexpr):
 
 
 @triton.jit
-def _load_scaled(
-    logits_ptr,
-    row,
-    stride_row,
-    bias_ptr,
-    bias_row,
-    stride_bias,
-    offs,
-    mask,
-    inv_t,
-    is_pad,
-    HAS_BIAS: tl.constexpr,
-):
-    """``(logits + bias) / T`` for one chunk; padding requests read as zero logits (the reference
-    zeroes them, which gives a uniform, legal distribution)."""
+def _load_scaled(logits_ptr, row, stride_row, offs, mask, inv_t, is_pad):
+    """``logits / T`` for one chunk; padding requests read as zero logits (the reference zeroes
+    them, which gives a uniform, legal distribution)."""
     x = tl.load(logits_ptr + row * stride_row + offs, mask=mask, other=0.0)
-    if HAS_BIAS:
-        b = tl.load(bias_ptr + bias_row * stride_bias + offs, mask=mask, other=0.0)
-        x = x + b.to(tl.float32)
     return tl.where(is_pad, 0.0, x * inv_t)
 
 
@@ -132,8 +117,6 @@ def _load_scaled(
 def _rs_row_stats_kernel(
     logits_ptr,
     stride_row,
-    bias_ptr,
-    stride_bias,
     temps_ptr,
     slot_ptr,
     dummy_row,
@@ -144,7 +127,6 @@ def _rs_row_stats_kernel(
     vocab,
     num_chunks,
     CHUNK: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     ch = tl.program_id(1)
@@ -152,9 +134,7 @@ def _rs_row_stats_kernel(
     is_pad = tl.load(slot_ptr + row // rows_per_req) == dummy_row
     offs = ch * CHUNK + tl.arange(0, CHUNK)
     mask = offs < vocab
-    x = _load_scaled(
-        logits_ptr, row, stride_row, bias_ptr, row, stride_bias, offs, mask, inv_t, is_pad, HAS_BIAS
-    )
+    x = _load_scaled(logits_ptr, row, stride_row, offs, mask, inv_t, is_pad)
     x = tl.where(mask, x, float("-inf"))
     m = tl.max(x, 0)
     # All -inf (masked) chunk: m stays -inf and the chunk adds nothing (exp(-inf - 0) = 0).
@@ -168,13 +148,10 @@ def _rs_row_stats_kernel(
 def _rs_draft_write_kernel(
     logits_ptr,
     stride_row,
-    bias_ptr,
-    stride_bias,
     temps_ptr,
     slot_ptr,
     dummy_row,
     rows_per_req,
-    step0,
     pmax_ptr,
     psum_ptr,
     probs_ptr,
@@ -186,12 +163,11 @@ def _rs_draft_write_kernel(
     num_chunks,
     CHUNK: tl.constexpr,
     NC_POW2: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     ch = tl.program_id(1)
     req = row // rows_per_req
-    step = step0 + row % rows_per_req
+    step = row % rows_per_req
     big_m, big_s = _row_max_sum(pmax_ptr, psum_ptr, row, num_chunks, NC_POW2)
     inv_s = tl.math.div_rn(1.0, big_s)
     inv_t = _inv_temperature(tl.load(temps_ptr + req))
@@ -199,9 +175,7 @@ def _rs_draft_write_kernel(
     is_pad = slot == dummy_row
     offs = ch * CHUNK + tl.arange(0, CHUNK)
     mask = offs < vocab
-    x = _load_scaled(
-        logits_ptr, row, stride_row, bias_ptr, row, stride_bias, offs, mask, inv_t, is_pad, HAS_BIAS
-    )
+    x = _load_scaled(logits_ptr, row, stride_row, offs, mask, inv_t, is_pad)
     q = tl.exp(x - big_m) * inv_s
     q = tl.where(mask, q, 0.0)
     tl.store(probs_ptr + slot * stride_slot + step * stride_step + offs, q, mask=mask)
@@ -236,8 +210,6 @@ def _rs_draft_pick_kernel(
     stride_step,
     slot_ptr,
     rows_per_req,
-    step0,
-    steps_total,
     csum_ptr,
     clast_ptr,
     seed_ptr,
@@ -250,12 +222,11 @@ def _rs_draft_pick_kernel(
 ):
     row = tl.program_id(0).to(tl.int64)
     req = row // rows_per_req
-    step = step0 + row % rows_per_req
+    step = row % rows_per_req
     seed = tl.load(seed_ptr + req) ^ _DRAFT_KEY_XOR
     offset = tl.load(offset_ptr + req) + step_offset
-    # The block sampler's row (request-major, K per request) is the Philox subsequence; a
-    # per-step launch (Markov feedback chain) keeps the same stream for each draft position.
-    u = _curand_uniform(seed, offset, req * steps_total + step, 0)
+    # The block sampler's row (request-major, K per request) is the Philox subsequence.
+    u = _curand_uniform(seed, offset, row, 0)
     kstar, base, last = _pick_chunk(csum_ptr, clast_ptr, row, num_chunks, u)
     slot = tl.load(slot_ptr + req)
     kk = tl.maximum(kstar, 0)
@@ -271,34 +242,7 @@ def _rs_draft_pick_kernel(
     token = tl.where(first < 2147483647, first, chunk_last)
     token = tl.where(kstar >= 0, token, last)
     token = tl.where(token >= 0, token, 0)
-    tl.store(tokens_ptr + req * steps_total + step, token.to(tl.int32))
-
-
-@triton.jit
-def _markov_feedback_emb_kernel(
-    tokens_ptr,
-    steps_total,
-    step,
-    anchor_ptr,
-    w1_ptr,
-    emb_ptr,
-    vocab,
-    RANK: tl.constexpr,
-    BLOCK_R: tl.constexpr,
-):
-    """``markov_w1[prev]`` for draft position ``step``: prev is the anchor for position 0 and
-    the token drawn at position ``step - 1`` otherwise; out-of-vocab ids give a zero row (as
-    `markov_prev_embeddings`)."""
-    req = tl.program_id(0).to(tl.int64)
-    if step == 0:
-        prev = tl.load(anchor_ptr + req).to(tl.int64)
-    else:
-        prev = tl.load(tokens_ptr + req * steps_total + step - 1).to(tl.int64)
-    valid = (prev >= 0) & (prev < vocab)
-    offs_r = tl.arange(0, BLOCK_R)
-    mask_r = offs_r < RANK
-    w = tl.load(w1_ptr + tl.where(valid, prev, 0) * RANK + offs_r, mask=mask_r & valid, other=0.0)
-    tl.store(emb_ptr + req * RANK + offs_r, w, mask=mask_r)
+    tl.store(tokens_ptr + row, token.to(tl.int32))
 
 
 @triton.jit
@@ -547,7 +491,6 @@ def _row_stats(
     dummy_row: int,
     rows_per_req: int,
     tag: str,
-    bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     rows, vocab = logits.shape
     nc, _ = _num_chunks(vocab)
@@ -557,8 +500,6 @@ def _row_stats(
         _rs_row_stats_kernel[(rows, nc)](
             logits,
             logits.stride(0),
-            bias if bias is not None else logits,
-            bias.stride(0) if bias is not None else 0,
             temps,
             slot_ids,
             dummy_row,
@@ -569,88 +510,9 @@ def _row_stats(
             vocab,
             nc,
             CHUNK=_CHUNK,
-            HAS_BIAS=bias is not None,
             num_warps=_NUM_WARPS,
         )
     return pmax, psum
-
-
-def _draft_rows(
-    logits: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    temperatures: torch.Tensor,
-    slot_ids: torch.Tensor,
-    dummy_row: int,
-    draft_probs: torch.Tensor,
-    seed: torch.Tensor,
-    offset: torch.Tensor,
-    step_offset: int,
-    step0: int,
-    steps_total: int,
-    tokens: torch.Tensor,
-) -> None:
-    """Sample ``rows_per_req = rows / num_gens`` draft positions (from ``step0``) per request,
-    writing the proposals to ``draft_probs[slot, step]`` and the tokens to
-    ``tokens[req, step]`` (``tokens`` is ``[num_gens, steps_total]`` int32)."""
-    rows, vocab = logits.shape
-    num_gens = slot_ids.shape[0]
-    rows_per_req = rows // num_gens
-    _check_request_args(temperatures, slot_ids, seed, offset, num_gens, num_gens)
-    nc, nc_pow2 = _num_chunks(vocab)
-    # Per (row, chunk): online max and sum of exp(x / T - max).
-    pmax, psum = _row_stats(
-        logits, temperatures, rows_per_req, slot_ids, dummy_row, rows_per_req, "draft", bias
-    )
-    # Per-chunk mass and last nonzero index: [rows, num_chunks] fp32 and int32.
-    csum = _WORKSPACE.get("draft.csum", (rows, nc), torch.float32, logits.device)
-    clast = _WORKSPACE.get("draft.clast", (rows, nc), torch.int32, logits.device)
-    # Per (row, chunk): q = exp(x / T - M) * (1 / S), written straight into the slot-indexed
-    # draft_probs[slot, i, :] row (the reference scatters a temporary), plus csum and clast.
-    _rs_draft_write_kernel[(rows, nc)](
-        logits,
-        logits.stride(0),
-        bias if bias is not None else logits,
-        bias.stride(0) if bias is not None else 0,
-        temperatures,
-        slot_ids,
-        dummy_row,
-        rows_per_req,
-        step0,
-        pmax,
-        psum,
-        draft_probs,
-        draft_probs.stride(0),
-        draft_probs.stride(1),
-        csum,
-        clast,
-        vocab,
-        nc,
-        CHUNK=_CHUNK,
-        NC_POW2=nc_pow2,
-        HAS_BIAS=bias is not None,
-        num_warps=_NUM_WARPS,
-    )
-    # Per row: inverse-CDF draw, the first x with q(x) > 0 and cumsum(q)(x) > u (flashinfer's
-    # sampling_from_probs rule).
-    _rs_draft_pick_kernel[(rows,)](
-        draft_probs,
-        draft_probs.stride(0),
-        draft_probs.stride(1),
-        slot_ids,
-        rows_per_req,
-        step0,
-        steps_total,
-        csum,
-        clast,
-        seed,
-        offset,
-        step_offset,
-        tokens,
-        vocab,
-        nc,
-        CHUNK=_CHUNK,
-        num_warps=_NUM_WARPS,
-    )
 
 
 def _check_draft_args(logits: torch.Tensor, draft_probs: torch.Tensor) -> None:
@@ -701,7 +563,7 @@ def fast_rs_draft_block(
     Returns:
         ``[num_gens * K]`` int32 tokens, distributed as ``softmax(logits / T)``.
     """
-    rows, _ = logits.shape
+    rows, vocab = logits.shape
     num_gens = slot_ids.shape[0]
     tokens = torch.empty((rows,), dtype=torch.int32, device=logits.device)
     if rows == 0:
@@ -709,88 +571,54 @@ def fast_rs_draft_block(
     _check_draft_args(logits, draft_probs)
     k = rows // num_gens
     assert k * num_gens == rows and draft_probs.shape[1] >= k
-    _draft_rows(
+    _check_request_args(temperatures, slot_ids, seed, offset, num_gens, num_gens)
+    nc, nc_pow2 = _num_chunks(vocab)
+    # Per (row, chunk): online max and sum of exp(x / T - max).
+    pmax, psum = _row_stats(logits, temperatures, k, slot_ids, dummy_row, k, "draft")
+    # Per-chunk mass and last nonzero index: [rows, num_chunks] fp32 and int32.
+    csum = _WORKSPACE.get("draft.csum", (rows, nc), torch.float32, logits.device)
+    clast = _WORKSPACE.get("draft.clast", (rows, nc), torch.int32, logits.device)
+    # Per (row, chunk): q = exp(x / T - M) * (1 / S), written straight into the slot-indexed
+    # draft_probs[slot, i, :] row (the reference scatters a temporary), plus csum and clast.
+    _rs_draft_write_kernel[(rows, nc)](
         logits,
-        None,
+        logits.stride(0),
         temperatures,
         slot_ids,
         dummy_row,
+        k,
+        pmax,
+        psum,
         draft_probs,
+        draft_probs.stride(0),
+        draft_probs.stride(1),
+        csum,
+        clast,
+        vocab,
+        nc,
+        CHUNK=_CHUNK,
+        NC_POW2=nc_pow2,
+        num_warps=_NUM_WARPS,
+    )
+    # Per row: inverse-CDF draw, the first x with q(x) > 0 and cumsum(q)(x) > u (flashinfer's
+    # sampling_from_probs rule).
+    _rs_draft_pick_kernel[(rows,)](
+        draft_probs,
+        draft_probs.stride(0),
+        draft_probs.stride(1),
+        slot_ids,
+        k,
+        csum,
+        clast,
         seed,
         offset,
         step_offset,
-        0,
-        k,
         tokens,
+        vocab,
+        nc,
+        CHUNK=_CHUNK,
+        num_warps=_NUM_WARPS,
     )
-    return tokens
-
-
-def fast_rs_draft_markov_feedback(
-    base_logits: torch.Tensor,
-    anchor_tokens: torch.Tensor,
-    markov_w1: torch.Tensor,
-    markov_w2: torch.Tensor,
-    temperatures: torch.Tensor,
-    slot_ids: torch.Tensor,
-    dummy_row: int,
-    draft_probs: torch.Tensor,
-    seed: torch.Tensor,
-    offset: torch.Tensor,
-    step_offset: int,
-) -> torch.Tensor:
-    """DSpark vanilla-Markov block chain that feeds back the sampled token.
-
-    Position ``i`` proposes ``q_i = softmax((base_i + markov_w2 @ markov_w1[x_{i-1}]) / T)``
-    with ``x_{-1}`` the anchor and ``x_{i-1}`` the token drawn at position ``i - 1`` (SGLang's
-    DSpark draft chain). ``q_i`` is stored for verification, so rejection sampling stays
-    lossless; the bias GEMV is the reference ``F.linear`` (bit-identical bias).
-
-    Args:
-        base_logits: ``[num_gens, K, vocab]`` fp32 shared-lm_head block logits.
-        anchor_tokens: ``[num_gens]`` last accepted token per request.
-        markov_w1, markov_w2: ``[vocab, rank]`` Markov head weights.
-        Other arguments as in `fast_rs_draft_block`.
-    Returns:
-        ``[num_gens, K]`` int32 tokens.
-    """
-    num_gens, k, vocab = base_logits.shape
-    tokens = torch.empty((num_gens, k), dtype=torch.int32, device=base_logits.device)
-    if num_gens == 0 or k == 0:
-        return tokens
-    _check_draft_args(base_logits, draft_probs)
-    assert draft_probs.shape[1] >= k
-    rank = markov_w1.shape[1]
-    anchor = anchor_tokens.contiguous()
-    emb = _WORKSPACE.get("markov.emb", (num_gens, rank), markov_w1.dtype, base_logits.device)
-    for step in range(k):
-        _markov_feedback_emb_kernel[(num_gens,)](
-            tokens,
-            k,
-            step,
-            anchor,
-            markov_w1,
-            emb,
-            vocab,
-            RANK=rank,
-            BLOCK_R=triton.next_power_of_2(rank),
-            num_warps=4,
-        )
-        bias = torch.nn.functional.linear(emb, markov_w2)
-        _draft_rows(
-            base_logits[:, step],
-            bias,
-            temperatures,
-            slot_ids,
-            dummy_row,
-            draft_probs,
-            seed,
-            offset,
-            step_offset,
-            step,
-            k,
-            tokens,
-        )
     return tokens
 
 
