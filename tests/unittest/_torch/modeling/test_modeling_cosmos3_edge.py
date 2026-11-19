@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.cosmos3_edge_weight_mapper import
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 from tensorrt_llm._torch.models.modeling_cosmos3_edge import (
     Cosmos3EdgeAttention,
+    Cosmos3EdgeForCausalLM,
     Cosmos3EdgeImageProcessor,
     Cosmos3EdgeInputProcessor,
     Cosmos3EdgeModel,
@@ -310,6 +312,82 @@ def test_edge_yarn_fused_cache_matches_decoder():
         mrope_interleaved=attention.pos_embd_params.mrope_interleaved,
     )
     assert not torch.allclose(uncorrected.rotary_cos_sin.cuda().float(), fused_table.float())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_edge_decoder_replays_breakable_prefill_graph():
+    """A two-layer random-weight Edge decoder captures once, then replays new embeddings,
+    mRoPE positions and token ids exactly as eager runs them."""
+    from _torch.helpers import check_breakable_prefill_replay
+
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.configs.cosmos3_edge import Cosmos3EdgeTextConfig
+
+    text = Cosmos3EdgeTextConfig(
+        vocab_size=128,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=64,
+    )
+    model_config = ModelConfig(
+        pretrained_config=text, attn_backend="TRTLLM", max_num_tokens=4, max_seq_len=32
+    )
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(0)
+        with torch.device("cuda"):
+            llm = Cosmos3EdgeForCausalLM(model_config).eval()
+        for parameter in llm.parameters():
+            if parameter.ndim == 1:
+                parameter.fill_(1.0)
+            else:
+                parameter.normal_(mean=0.0, std=0.02)
+        embeds = torch.randn((2, 4, 256), device="cuda").bfloat16()
+    model = object.__new__(Cosmos3EdgeModel)
+    torch.nn.Module.__init__(model)
+    model.llm = llm
+    model.model_config = SimpleNamespace(disable_mm_encoder=False)
+    model.deepstack_num_level = 0
+    # The wrapper's mRoPE table and buffers, as Qwen3VLModelBase builds them.
+    Cosmos3EdgeModel.init_mrope_embedding(
+        model, SimpleNamespace(pretrained_config=SimpleNamespace(text_config=text))
+    )
+    rotary_dim = model.rotary_emb.rotary_cos_sin.shape[-1]
+    model.mrope_position_deltas_cache = torch.zeros(5, dtype=torch.int32, device="cuda")
+    model.mrope_rotary_cos_sin_workspace = torch.zeros((1, 4 * rotary_dim * 2), device="cuda")
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=1,
+        max_num_tokens=4,
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        num_contexts=1,
+        request_ids=[0],
+    )
+    metadata.max_seq_len = 32
+
+    def forward(inputs):
+        metadata.prepare()
+        mrope_config = model.prepare_mrope_config([], 0, inputs["position_ids"])
+        return llm(
+            attn_metadata=metadata, mrope_config=mrope_config, return_context_logits=True, **inputs
+        )
+
+    text_positions = torch.arange(4, dtype=torch.int32, device="cuda").repeat(3, 1, 1)
+    # Image rows share a time step and differ in height and width.
+    image_positions = torch.tensor(
+        [[[0, 30, 30, 30]], [[0, 30, 45, 60]], [[0, 60, 45, 30]]], dtype=torch.int32, device="cuda"
+    )
+    steps = [
+        {"inputs_embeds": embeds[0], "position_ids": text_positions},
+        {"inputs_embeds": embeds[1], "position_ids": text_positions},
+        {"inputs_embeds": embeds[1], "position_ids": image_positions},
+        # A text batch replays the same graph on the wrapper's token embeddings.
+        {"input_ids": text_positions[0, 0] + 3, "position_ids": text_positions},
+    ]
+    attrs = {**model_config.extra_attrs, "attention_metadata": weakref.ref(metadata)}
+    check_breakable_prefill_replay(model, attrs, forward, steps, num_tokens=4)
 
 
 @pytest.mark.cpu_only

@@ -3,12 +3,17 @@
 
 import bisect
 import contextlib
+import inspect
 from enum import Enum
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Container, Iterator, Mapping, Optional, Sequence
 
 import torch
 from torch import nn
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
+from tensorrt_llm.logger import logger
+
+from ..attention.backends.interface import AttentionMetadata
 from ..models.modeling_utils import timing_metric
 from ..nccl_window_graph import (
     abandon_nccl_window_graph_owner,
@@ -16,12 +21,14 @@ from ..nccl_window_graph import (
     release_nccl_window_graph_owner,
 )
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from ..speculative.interface import SpecMetadata
 from ..utils import make_weak_ref
 from .breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
     enable_breakable_cuda_graph,
 )
+from .resource_manager import ResourceManager
 
 
 class BreakableCUDAGraphRunnerState(Enum):
@@ -29,6 +36,121 @@ class BreakableCUDAGraphRunnerState(Enum):
     WARMUP = "warmup"
     CAPTURE = "capture"
     REPLAY = "replay"
+
+
+def _find_input_mismatch(
+    destination: Any,
+    source: Any,
+    path: str = "inputs",
+    buffer_inputs: Optional[Mapping[int, tuple[int, tuple[int, ...]]]] = None,
+) -> Optional[str]:
+    """Return the first input whose execution layout differs from the captured tree, or None.
+
+    Reads only, so every rank can decide before any rank copies (see _copy_inputs).
+    A captured model buffer view (its id in ``buffer_inputs``) needs the address and
+    strides it had at capture: the graph keeps that address even if the buffer moved.
+    """
+    if isinstance(destination, torch.Tensor):
+        if not isinstance(source, torch.Tensor) or (
+            destination.shape != source.shape
+            or destination.dtype != source.dtype
+            or destination.device != source.device
+        ):
+            return path
+        # Host tensor values may have selected Python branches at capture.
+        if destination.device.type == "cpu" and not torch.equal(destination, source):
+            return path
+        captured_layout = buffer_inputs.get(id(destination)) if buffer_inputs else None
+        if captured_layout is not None and captured_layout != (source.data_ptr(), source.stride()):
+            return path
+        return None
+    if type(destination) is not type(source):
+        return path
+    if isinstance(destination, dict):
+        if destination.keys() != source.keys():
+            return path
+        children = ((f"{path}[{key!r}]", value, source[key]) for key, value in destination.items())
+    elif isinstance(destination, (tuple, list)):
+        if len(destination) != len(source):
+            return path
+        children = (
+            (f"{path}[{index}]", dst, src)
+            for index, (dst, src) in enumerate(zip(destination, source))
+        )
+    elif isinstance(destination, (str, int, float, bool, type(None))):
+        return None if destination == source else path
+    elif isinstance(destination, (AttentionMetadata, SpecMetadata, ResourceManager)):
+        # These engine-owned objects refresh their tensor state at the eager
+        # execution boundaries.
+        return None if destination is source else path
+    else:
+        # Other mutable host objects can hide captured Python decisions and
+        # must use the eager body instead.
+        return path
+    for child_path, dst, src in children:
+        mismatch = _find_input_mismatch(dst, src, child_path, buffer_inputs)
+        if mismatch is not None:
+            return mismatch
+    return None
+
+
+def _views_buffer(value: Any, buffers: Container[int]) -> bool:
+    return isinstance(value, torch.Tensor) and value.untyped_storage().data_ptr() in buffers
+
+
+def _stage_inputs(inputs: Any, larger: Any, buffers: Container[int] = ()) -> Any:
+    """Copy the body's input tensors into storage that the bucket graph owns.
+
+    A device tensor takes the leading rows of the same input of ``larger``, a
+    larger bucket's staged inputs, when the rest of its shape matches, as bucket
+    outputs share the largest output. Only one bucket graph replays at a time and
+    each replay copies all of its inputs first, so buckets can share this storage.
+    Both must be contiguous, so the view keeps the layout a clone would have.
+    A view of a model buffer (storage address in ``buffers``) is kept as it is.
+    Other tensors get a clone.
+    """
+    values, spec = tree_flatten(inputs)
+    larger_values = [None] * len(values)
+    if larger is not None:
+        flat_larger, larger_spec = tree_flatten(larger)
+        if larger_spec == spec:
+            larger_values = flat_larger
+    staged = []
+    for value, larger_value in zip(values, larger_values):
+        if isinstance(value, torch.Tensor) and not _views_buffer(value, buffers):
+            if (
+                isinstance(larger_value, torch.Tensor)
+                and not _views_buffer(larger_value, buffers)
+                and value.device.type != "cpu"
+                and value.dim() > 0
+                and larger_value.dim() == value.dim()
+                and value.is_contiguous()
+                and larger_value.is_contiguous()
+                and larger_value.device == value.device
+                and larger_value.dtype == value.dtype
+                and larger_value.shape[1:] == value.shape[1:]
+                and larger_value.shape[0] >= value.shape[0]
+            ):
+                view = larger_value[: value.shape[0]]
+                view.copy_(value)
+                value = view
+            else:
+                value = value.clone()
+        staged.append(value)
+    return tree_unflatten(staged, spec)
+
+
+def _copy_inputs(destination: Any, source: Any, buffer_inputs: Container[int] = ()) -> None:
+    """Copy the device tensors of a matching input tree into the captured tree."""
+    if isinstance(destination, torch.Tensor):
+        if destination.device.type != "cpu" and id(destination) not in buffer_inputs:
+            destination.copy_(source)
+    elif isinstance(destination, dict):
+        for key, value in destination.items():
+            _copy_inputs(value, source[key], buffer_inputs)
+    elif isinstance(destination, (tuple, list)):
+        for dst, src in zip(destination, source):
+            _copy_inputs(dst, src, buffer_inputs)
 
 
 class BreakableCUDAGraphRunner:
@@ -43,11 +165,27 @@ class BreakableCUDAGraphRunner:
         self,
         layer_model: nn.Module,
         prepare_replay: Callable[[dict[str, Any]], None] | None = None,
+        prepare_inputs: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        agree_replay: Callable[[bool], bool] | None = None,
+        input_buffers: Callable[[], Sequence[torch.Tensor]] | None = None,
     ) -> None:
         self.layer_model = layer_model
         # Refreshes state the captured body reads but computes outside capture, from the
         # body's keyword inputs.
         self._prepare_replay = prepare_replay
+        # Normalizes the body's inputs; capture then stages their tensors in storage the
+        # bucket graph owns, and replay copies the current values into it.
+        self._prepare_inputs = prepare_inputs
+        # Under attention DP, turns this rank's staged-input match into the decision of
+        # all ranks, so they all replay or all run the body eagerly.
+        self._agree_replay = agree_replay
+        # Model buffers that the model writes before each body call; staged inputs that
+        # view them stay those views, so the graph reads them in place. Per bucket: the id
+        # of each such view -> its address and strides at capture.
+        self._input_buffers = input_buffers or (lambda: ())
+        self._buffer_inputs: dict[int, dict[int, tuple[int, tuple[int, ...]]]] = {}
+        self._input_signature = inspect.signature(layer_model.forward) if prepare_inputs else None
+        self._inputs: dict[int, dict[str, Any]] = {}
         self._graphs: dict[int, BreakableCUDAGraph] = {}
         self._captured_num_tokens: list[int] = []
         self._outputs: dict[int, torch.Tensor] = {}
@@ -63,6 +201,30 @@ class BreakableCUDAGraphRunner:
         self._active_graph: Optional[BreakableCUDAGraph] = None
         self._active_num_tokens: Optional[int] = None
         self._metrics: dict[str, float] = {}
+        # Executions whose staged inputs did not match the capture, so the body ran
+        # eagerly. The bucket graphs alone cannot tell a replay from this fallback.
+        self.num_eager_fallbacks = 0
+
+    def _prepare_body_inputs(self, args: tuple, kwargs: dict) -> dict[str, Any]:
+        assert self._input_signature is not None and self._prepare_inputs is not None
+        bound = self._input_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        inputs = {}
+        for name, value in bound.arguments.items():
+            kind = self._input_signature.parameters[name].kind
+            if kind == inspect.Parameter.VAR_KEYWORD:
+                inputs.update(value)
+            elif kind == inspect.Parameter.VAR_POSITIONAL:
+                if value:
+                    raise TypeError("Staged BCG body inputs require named parameters")
+            else:
+                inputs[name] = value
+        return self._prepare_inputs(inputs)
+
+    @property
+    def stages_inputs(self) -> bool:
+        """Whether replay refreshes the body's inputs from the current call."""
+        return self._prepare_inputs is not None
 
     @property
     def metrics(self) -> dict[str, float]:
@@ -118,12 +280,20 @@ class BreakableCUDAGraphRunner:
         if self._state != BreakableCUDAGraphRunnerState.IDLE:
             raise RuntimeError(f"Cannot warm up BCG while runner is {self._state.value}")
         self._state = BreakableCUDAGraphRunnerState.WARMUP
+        original_forward = self.layer_model.forward
+        if self._prepare_inputs is not None:
+            # Warm up the body on the inputs that capture and replay give it.
+            self.layer_model.forward = lambda *args, **kwargs: original_forward(
+                **self._prepare_body_inputs(args, kwargs)
+            )
         try:
             with enable_breakable_cuda_graph():
                 for _ in range(steps):
                     with discard_nccl_window_tensor_outputs(scope_inputs):
                         engine_forward()
         finally:
+            if self._prepare_inputs is not None:
+                self.layer_model.forward = original_forward
             self._state = BreakableCUDAGraphRunnerState.IDLE
 
     def capture(
@@ -187,6 +357,8 @@ class BreakableCUDAGraphRunner:
         except Exception:
             if graph is not None:
                 graph.reset()
+            self._inputs.pop(num_tokens, None)
+            self._buffer_inputs.pop(num_tokens, None)
             if created_memory_pool and not self._graphs:
                 # Capture failure can be rank-local; do not return this pool to reuse.
                 abandon_nccl_window_graph_owner(self._memory_pool)
@@ -246,6 +418,19 @@ class BreakableCUDAGraphRunner:
 
         def capture_forward(*args, **kwargs):
             nonlocal captured_output
+            if self._prepare_inputs is not None:
+                inputs = self._prepare_body_inputs(args, kwargs)
+                # Capture runs the largest bucket first (see capture_output).
+                largest = self._inputs[max(self._inputs)] if self._inputs else None
+                buffers = {buffer.untyped_storage().data_ptr() for buffer in self._input_buffers()}
+                static_inputs = _stage_inputs(inputs, largest, buffers)
+                self._inputs[self._active_num_tokens] = static_inputs
+                self._buffer_inputs[self._active_num_tokens] = {
+                    id(value): (value.data_ptr(), value.stride())
+                    for value in tree_flatten(static_inputs)[0]
+                    if _views_buffer(value, buffers)
+                }
+                args, kwargs = (), static_inputs
             with self.capture_context():
                 captured_output = self.capture_output(original_body_forward(*args, **kwargs))
             return captured_output
@@ -302,6 +487,29 @@ class BreakableCUDAGraphRunner:
         original_forward = self.layer_model.forward
 
         def replay_forward(*args, **kwargs):
+            if self._prepare_inputs is not None:
+                inputs = self._prepare_body_inputs(args, kwargs)
+                static_inputs = self._inputs[num_tokens]
+                buffer_inputs = self._buffer_inputs[num_tokens]
+                mismatch = _find_input_mismatch(static_inputs, inputs, buffer_inputs=buffer_inputs)
+                replayable = mismatch is None
+                if self._agree_replay is not None:
+                    replayable = self._agree_replay(replayable)
+                if not replayable:
+                    self.num_eager_fallbacks += 1
+                    reason = (
+                        f"{mismatch} differs from the capture"
+                        if mismatch is not None
+                        else "another attention DP rank's inputs differ from the capture"
+                    )
+                    logger.info_once(
+                        f"Breakable prefill CUDA graph: the {num_tokens}-token body runs "
+                        f"eagerly because {reason} (logged once per token bucket)",
+                        key=f"breakable_prefill_eager_fallback_{num_tokens}",
+                    )
+                    return original_forward(**inputs)
+                _copy_inputs(static_inputs, inputs, buffer_inputs)
+                kwargs = static_inputs
             del args
             if self._prepare_replay is not None:
                 # After the engine's in-place input corrections, as an eager body sees them.
@@ -327,6 +535,8 @@ class BreakableCUDAGraphRunner:
         self._graphs.clear()
         self._captured_num_tokens.clear()
         self._outputs.clear()
+        self._inputs.clear()
+        self._buffer_inputs.clear()
         self._shared_output = None
         self._memory_pool = None
         self._break_graph_pool = None

@@ -651,8 +651,32 @@ class MultimodalModelMixin:
 
     @property
     def text_embedding_layer(self):
-        """Return the token embedding layer used by `fuse_input_embeds`."""
-        raise NotImplementedError
+        """Return the token embedding layer used by `fuse_input_embeds`.
+
+        Defaults to the language model's `model.embed_tokens`.
+        """
+        return self.language_model.model.embed_tokens
+
+    def prepare_breakable_cuda_graph_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Normalize language-model body inputs for breakable prefill graph capture and replay.
+
+        Text and multimodal calls both pass `[num_tokens, hidden_size]` embeddings from
+        `text_embedding_layer`, so they share one captured body. Models with other per-step
+        body inputs extend this hook.
+        """
+        prepared_inputs = dict(inputs)
+        if prepared_inputs.get("inputs_embeds") is None:
+            input_ids = prepared_inputs.get("input_ids")
+            if input_ids is None:
+                raise ValueError("Breakable multimodal prefill requires token IDs or embeddings")
+            prepared_inputs["inputs_embeds"] = self.text_embedding_layer(input_ids)
+        prepared_inputs["input_ids"] = None
+        return prepared_inputs
+
+    def breakable_cuda_graph_input_buffers(self) -> tuple[torch.Tensor, ...]:
+        """Return buffers that prepared body inputs view and that the model writes before each
+        body call. Breakable prefill graphs read them in place instead of a staged copy."""
+        return ()
 
     @property
     def embedding_dim(self) -> int:
@@ -708,8 +732,14 @@ class MultimodalModelMixin:
 
     @property
     def language_model(self) -> torch.nn.Module:
-        """Return the inner language model that receives prepared inputs."""
-        raise NotImplementedError
+        """Return the inner language model that receives prepared inputs.
+
+        Defaults to `self.llm`, where the multimodal wrappers build it.
+        """
+        try:
+            return self.llm
+        except AttributeError:
+            raise NotImplementedError from None
 
     @property
     def runtime_hooks(self) -> RuntimeHooks:

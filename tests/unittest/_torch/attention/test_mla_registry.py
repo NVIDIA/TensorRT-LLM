@@ -194,6 +194,37 @@ def test_duplicate_layer_ids_preserve_all_mla_registrations() -> None:
     assert registry["0_1"]() is next_mla
 
 
+@pytest.mark.cpu_only
+def test_attention_register_to_config_false_skips_the_layer_registry() -> None:
+    """An encoder tower's Attention stays out of the registry the decoder's custom op reads."""
+    from tensorrt_llm._torch.attention.attention import Attention
+
+    config = ModelConfig(skip_create_weights_in_init=True)
+
+    def make(**kwargs) -> Attention:
+        return Attention(
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            max_position_embeddings=8,
+            bias=False,
+            layer_idx=0,
+            dtype=torch.bfloat16,
+            config=config,
+            **kwargs,
+        )
+
+    backend = Mock(**{"support_fused_qkv.return_value": True})
+    with patch("tensorrt_llm._torch.attention.attention.create_attention", return_value=backend):
+        decoder = make()
+        tower = make(register_to_config=False)
+
+    assert decoder.register_to_config and decoder.layer_idx_str == "0"
+    assert not tower.register_to_config and tower.layer_idx_str == "0"
+    registry = config.extra_attrs["attn_layers"]
+    assert list(registry) == ["0"] and registry["0"]() is decoder
+
+
 def _make_dsv4_epilogue_layer() -> SimpleNamespace:
     return SimpleNamespace(
         _disable_dsv4_epilogue_fusion=False,

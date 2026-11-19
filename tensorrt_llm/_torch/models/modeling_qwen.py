@@ -248,6 +248,8 @@ class QwenModel(DecoderModel):
 @register_auto_model("Qwen2ForCausalLM")
 class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
 
+    supports_multimodal_breakable_cuda_graph = True
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen2Config],

@@ -977,10 +977,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         )
 
     @property
-    def language_model(self) -> torch.nn.Module:
-        return self.llm
-
-    @property
     def lora_owner(self) -> DecoderLoraOwner:
         if not isinstance(self.llm, MistralForCausalLM):
             raise NotImplementedError(
@@ -991,10 +987,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     @property
     def multimodal_token_ids(self) -> torch.Tensor:
         return self._image_token_ids
-
-    @property
-    def text_embedding_layer(self) -> Embedding:
-        return self.llm.model.embed_tokens
 
     @property
     def embedding_dim(self) -> int:

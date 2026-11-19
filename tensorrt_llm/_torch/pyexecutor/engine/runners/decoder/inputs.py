@@ -3001,7 +3001,7 @@ class DecoderInputPreparer:
             ) and not getattr(layer_model, "disagg_context_only", False)
             breakable_eligible = (
                 replay_plan is None
-                and not host.lists.multimodal_params_list
+                and (not host.lists.multimodal_params_list or breakable_runner.stages_inputs)
                 and (
                     not host.remote_tail_modes
                     or (supports_mixed_breakable and host.remote_tail_modes == {"destination"})

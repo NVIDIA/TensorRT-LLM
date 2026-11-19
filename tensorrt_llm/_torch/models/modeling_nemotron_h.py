@@ -795,6 +795,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
     # replay kernel reads, whichever cache manager serves the model.
     mamba_metadata_cls = ReplayMamba2Metadata
 
+    supports_multimodal_breakable_cuda_graph = True
+
     def __init__(
         self,
         model_config: NemotronHModelConfig,

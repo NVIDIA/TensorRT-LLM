@@ -14,6 +14,7 @@ from torch import nn
 import tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph as bcg
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor import breakable_cuda_graph_runner as runner_module
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
@@ -797,3 +798,589 @@ def test_padded_context_replay_with_spec_worker_matches_eager():
     replayed = runner.execute(16, forward)
     torch.cuda.synchronize()
     torch.testing.assert_close(replayed, expected)
+
+
+class _PreparedBody(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+        self.fail_capture = lambda: False
+
+    def forward(self, value, config, optional=None, scale=1, owner=None, **kwargs):
+        self.forward_calls += 1
+        if self.fail_capture():
+            raise ValueError("prepared capture failed")
+        output = value + config["offset"][0]
+        for feature in config["features"]:
+            output = output + feature
+        if optional is not None:
+            output = output + optional
+        if owner is not None:
+            output = output + owner.offset
+        if kwargs.get("host_scale") is not None:
+            output = output * kwargs["host_scale"].item()
+        return (output + kwargs.get("extra", 0)) * scale
+
+
+def _prepared_runner(agree_replay=None):
+    body = _PreparedBody().cuda()
+    runner = BreakableCUDAGraphRunner(
+        body, prepare_inputs=lambda inputs: inputs, agree_replay=agree_replay
+    )
+    inputs = {
+        "value": torch.zeros((4, 4), device="cuda"),
+        "config": {
+            "features": [torch.ones((4, 4), device="cuda")],
+            "offset": (torch.full((4, 4), 2.0, device="cuda"),),
+        },
+        "owner": None,
+        "extra": torch.full((4, 4), 3.0, device="cuda"),
+        "host_scale": torch.tensor(1.0),
+    }
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(**inputs))
+        return body(**inputs)
+
+    return body, runner, inputs, engine_forward
+
+
+def test_runner_prepared_inputs_refresh_owned_nested_storage(monkeypatch):
+    body, runner, inputs, engine_forward = _prepared_runner()
+    assert runner.stages_inputs
+    source_ref = weakref.ref(inputs["value"])
+    source_ptr = inputs["value"].data_ptr()
+    runner.capture(4, engine_forward)
+    captured = runner._inputs[4]
+    captured_ptr = captured["value"].data_ptr()
+    assert captured_ptr != source_ptr
+    assert captured["config"]["features"][0] is not inputs["config"]["features"][0]
+    assert captured["config"]["offset"][0] is not inputs["config"]["offset"][0]
+
+    replay_calls = []
+    original_replay = runner.replay
+
+    def replay(num_tokens):
+        replay_calls.append(num_tokens)
+        return original_replay(num_tokens)
+
+    monkeypatch.setattr(runner, "replay", replay)
+    for value in (5, 11):
+        inputs["value"] = torch.full((4, 4), float(value), device="cuda")
+        inputs["config"] = {
+            "features": [torch.full((4, 4), float(value + 1), device="cuda")],
+            "offset": (torch.full((4, 4), float(value + 2), device="cuda"),),
+        }
+        inputs["extra"] = torch.full((4, 4), float(value + 3), device="cuda")
+        assert source_ref() is None
+        churn = [torch.full_like(inputs["value"], index) for index in range(8)]
+        assert all(tensor.data_ptr() != captured_ptr for tensor in churn)
+        expected = body(**inputs)
+        eager_calls = body.forward_calls
+
+        actual = runner.execute(4, engine_forward)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert body.forward_calls == eager_calls
+        assert captured["value"].data_ptr() == captured_ptr
+        for index, tensor in enumerate(churn):
+            torch.testing.assert_close(tensor, torch.full_like(tensor, index))
+    assert replay_calls == [4, 4]
+
+
+def test_runner_prepared_inputs_share_the_largest_bucket_storage(monkeypatch):
+    """A smaller bucket stages its token-major device inputs in the leading rows of the
+    largest bucket's; alternate replays still read only the current step's rows."""
+    body = _PreparedBody().cuda()
+    runner = BreakableCUDAGraphRunner(body, prepare_inputs=lambda inputs: inputs)
+    inputs = {}
+
+    def set_inputs(num_tokens, value):
+        rows = torch.arange(num_tokens, device="cuda", dtype=torch.float32)[:, None]
+
+        def full(offset):
+            return torch.full((num_tokens, 4), float(value + offset), device="cuda") + rows
+
+        inputs.update(value=full(0), config={"features": [full(1)], "offset": (full(2),)})
+        # A host tensor and a tensor whose other dimensions change with the bucket.
+        inputs.update(extra=full(3), host_scale=torch.tensor(1.0))
+        inputs.update(positions=torch.zeros((3, 1, num_tokens), device="cuda"))
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(**inputs))
+        return body(**inputs)
+
+    for num_tokens in (8, 4):
+        set_inputs(num_tokens, 0)
+        runner.capture(num_tokens, engine_forward)
+    largest, smaller = runner._inputs[8], runner._inputs[4]
+    for name in ("value", "extra"):
+        assert smaller[name].data_ptr() == largest[name].data_ptr()
+        assert smaller[name].shape == (4, 4)
+    assert (
+        smaller["config"]["features"][0].data_ptr() == largest["config"]["features"][0].data_ptr()
+    )
+    assert smaller["config"]["offset"][0].data_ptr() == largest["config"]["offset"][0].data_ptr()
+    for name in ("host_scale", "positions"):
+        assert smaller[name].untyped_storage().data_ptr() != (
+            largest[name].untyped_storage().data_ptr()
+        )
+    calls_after_capture = body.forward_calls
+    replay_calls = []
+    original_replay = runner.replay
+
+    def replay(num_tokens):
+        replay_calls.append(num_tokens)
+        return original_replay(num_tokens)
+
+    monkeypatch.setattr(runner, "replay", replay)
+    steps = [(8, 5), (4, 11), (8, 17), (4, 23)]
+    for num_tokens, value in steps:
+        set_inputs(num_tokens, value)
+        actual = runner.execute(num_tokens, engine_forward)
+        torch.cuda.synchronize()
+
+        # value + offset + feature + extra, each with its row index added.
+        rows = torch.arange(num_tokens, device="cuda", dtype=torch.float32)[:, None]
+        expected = torch.full((num_tokens, 4), 4.0 * value + 6, device="cuda") + 4 * rows
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert body.forward_calls == calls_after_capture
+    assert replay_calls == [num_tokens for num_tokens, _ in steps]
+
+
+def test_stage_inputs_share_only_views_with_the_layout_of_a_clone():
+    """A smaller bucket views the largest bucket's input only when both have the same
+    rank and are contiguous; a scalar or a transposed largest input is cloned instead."""
+    largest = runner_module._stage_inputs(
+        {
+            "rows": torch.zeros((8, 4), device="cuda"),
+            "scalar": torch.zeros((), device="cuda"),
+            "transposed": torch.zeros((4, 8), device="cuda").t(),
+        },
+        None,
+    )
+    inputs = {
+        "rows": torch.ones((4, 4), device="cuda"),
+        "scalar": torch.ones((4,), device="cuda"),
+        "transposed": torch.ones((4, 4), device="cuda"),
+    }
+    staged = runner_module._stage_inputs(inputs, largest)
+
+    assert staged["rows"].data_ptr() == largest["rows"].data_ptr()
+    for name in ("scalar", "transposed"):
+        assert (
+            staged[name].untyped_storage().data_ptr() != largest[name].untyped_storage().data_ptr()
+        )
+        assert staged[name].stride() == inputs[name].stride()
+    for name, value in inputs.items():
+        torch.testing.assert_close(staged[name], value, rtol=0, atol=0)
+
+
+def test_runner_prepared_inputs_read_model_buffers_in_place():
+    """Inputs that view a model buffer are not staged: each bucket graph reads the buffer, which
+    the model writes before every step. A step that passes other memory there runs eagerly."""
+    body = _PreparedBody().cuda()
+    buffer = torch.zeros((2, 8, 4), device="cuda")
+    votes = []
+    runner = BreakableCUDAGraphRunner(
+        body,
+        prepare_inputs=lambda inputs: inputs,
+        agree_replay=lambda replayable: votes.append(replayable) or replayable,
+        input_buffers=lambda: (buffer,),
+    )
+    inputs = {}
+
+    def set_inputs(num_tokens, value):
+        buffer.fill_(value)  # as the model does before the body call
+        rows = buffer[:, :num_tokens]
+        inputs.update(
+            value=torch.full((num_tokens, 4), float(value), device="cuda"),
+            config={"features": list(rows.unbind(0)), "offset": (rows[0],)},
+        )
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(**inputs))
+        return body(**inputs)
+
+    for num_tokens in (8, 4):
+        set_inputs(num_tokens, 0)
+        assert runner.capture(num_tokens, engine_forward)
+        staged = runner._inputs[num_tokens]["config"]
+        assert [feature.data_ptr() for feature in staged["features"]] == [
+            buffer[0].data_ptr(),
+            buffer[1].data_ptr(),
+        ]
+        assert staged["offset"][0].data_ptr() == buffer.data_ptr()
+    calls_after_capture = body.forward_calls
+    for num_tokens, value in [(8, 5), (4, 11), (8, 17)]:
+        set_inputs(num_tokens, value)
+        actual = runner.execute(num_tokens, engine_forward)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, torch.full_like(actual, 4.0 * value), rtol=0, atol=0)
+    assert body.forward_calls == calls_after_capture
+    assert votes == [True, True, True]
+
+    set_inputs(4, 23)
+    inputs["config"]["features"][0] = inputs["config"]["features"][0].clone()
+    buffer.zero_()
+    expected = body(**inputs)
+    actual = runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert votes[-1] is False and runner.num_eager_fallbacks == 1
+
+    # Growing the buffer's storage moves it and the captured views with it, while the graphs
+    # still read the old address.
+    buffer.untyped_storage().resize_(2 * buffer.untyped_storage().nbytes())
+    set_inputs(4, 29)
+    actual = runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, torch.full_like(actual, 4.0 * 29), rtol=0, atol=0)
+    assert votes[-1] is False and runner.num_eager_fallbacks == 2
+    runner.clear()
+
+
+@pytest.mark.parametrize(
+    "change, mismatch",
+    [
+        ("shape", "inputs['config']['features'][0]"),
+        ("dtype", "inputs['value']"),
+        ("optional", "inputs['optional']"),
+        ("list_length", "inputs['config']['features']"),
+        ("list_type", "inputs['config']['features']"),
+        ("scalar", "inputs['scale']"),
+        ("owner", "inputs['owner']"),
+    ],
+)
+def test_runner_prepared_inputs_incompatible_values_fall_back_eager(monkeypatch, change, mismatch):
+    body, runner, inputs, engine_forward = _prepared_runner()
+    runner.capture(4, engine_forward)
+    logged = []
+    monkeypatch.setattr(
+        runner_module.logger, "info_once", lambda message, key: logged.append((message, key))
+    )
+    original_forward = body.forward
+    if change == "shape":
+        inputs["config"]["features"][0] = torch.full((1, 4), 5.0, device="cuda")
+    elif change == "dtype":
+        inputs["value"] = inputs["value"].double()
+    elif change == "optional":
+        inputs["optional"] = torch.full_like(inputs["value"], 5)
+    elif change == "list_length":
+        inputs["config"]["features"].append(torch.full_like(inputs["value"], 5))
+    elif change == "list_type":
+        inputs["config"]["features"] = tuple(inputs["config"]["features"])
+    elif change == "scalar":
+        inputs["scale"] = 2
+    else:
+        inputs["owner"] = SimpleNamespace(offset=7.0)
+    expected = body(**inputs)
+    eager_calls = body.forward_calls
+
+    def unexpected_replay(_num_tokens):
+        pytest.fail("incompatible prepared inputs must not replay")
+
+    monkeypatch.setattr(runner, "replay", unexpected_replay)
+    for step in (1, 2):
+        actual = runner.execute(4, engine_forward)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert body.forward_calls == eager_calls + step
+        assert runner.num_eager_fallbacks == step
+    assert body.forward == original_forward
+    assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+    # One info-level key per bucket (the logger prints a key once), naming the input.
+    assert [key for _, key in logged] == ["breakable_prefill_eager_fallback_4"] * 2
+    assert f"{mismatch} differs from the capture" in logged[0][0]
+
+
+@pytest.mark.parametrize("late_input", ["extra", "optional"])
+@pytest.mark.parametrize("matches", [(True, True), (True, False), (False, True)])
+def test_runner_prepared_inputs_attention_dp_ranks_agree_before_copying(
+    monkeypatch, matches, late_input
+):
+    """Two attention DP ranks share their staged-input checks: both replay or both run eagerly.
+
+    The mismatching rank changes a late input, ``extra``'s shape or ``optional``, which
+    was None at capture, so a rank that copied while it checked would already have
+    written ``value`` into the graph's inputs.
+    """
+    ranks = []
+    for rank, rank_matches in enumerate(matches):
+        local_answers = []
+
+        def agree_replay(replayable, rank=rank, local_answers=local_answers):
+            local_answers.append(replayable)
+            # Stand-in for the all-gather: the other rank's answer is its scripted check.
+            return all(
+                replayable if peer == rank else peer_matches
+                for peer, peer_matches in enumerate(matches)
+            )
+
+        body, runner, inputs, engine_forward = _prepared_runner(agree_replay)
+        runner.capture(4, engine_forward)
+        ranks.append((body, runner, inputs, engine_forward, local_answers, rank_matches))
+
+    for body, runner, inputs, engine_forward, local_answers, rank_matches in ranks:
+        captured = runner._inputs[4]
+        inputs["value"] = torch.full((4, 4), 5.0, device="cuda")
+        if not rank_matches and late_input == "extra":
+            inputs["extra"] = torch.full((1, 4), 3.0, device="cuda")
+        elif not rank_matches:
+            inputs["optional"] = torch.ones((4, 4), device="cuda")
+        expected = body(**inputs)
+        eager_calls = body.forward_calls
+        replay_calls = []
+        original_replay = runner.replay
+
+        def replay(num_tokens, original_replay=original_replay, replay_calls=replay_calls):
+            replay_calls.append(num_tokens)
+            return original_replay(num_tokens)
+
+        monkeypatch.setattr(runner, "replay", replay)
+        logged = []
+        monkeypatch.setattr(
+            runner_module.logger, "info_once", lambda message, key: logged.append(message)
+        )
+        actual = runner.execute(4, engine_forward)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert local_answers == [rank_matches]
+        if all(matches):
+            assert replay_calls == [4]
+            assert body.forward_calls == eager_calls
+            assert runner.num_eager_fallbacks == 0 and logged == []
+            torch.testing.assert_close(captured["value"], inputs["value"], rtol=0, atol=0)
+        else:
+            assert replay_calls == []
+            assert body.forward_calls == eager_calls + 1
+            assert runner.num_eager_fallbacks == 1
+            reason = (
+                "another attention DP rank's inputs differ"
+                if rank_matches
+                else f"inputs['{late_input}'] differs"
+            )
+            assert len(logged) == 1 and reason in logged[0]
+            # Nothing was copied into the graph's inputs before the ranks agreed.
+            torch.testing.assert_close(
+                captured["value"], torch.zeros_like(captured["value"]), rtol=0, atol=0
+            )
+        assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+
+
+@pytest.mark.parametrize("stages_inputs", [False, True])
+@pytest.mark.parametrize("enable_attention_dp, tp_size", [(False, 2), (True, 1), (True, 2)])
+@pytest.mark.parametrize("peer_replayable", [True, False])
+def test_decoder_runner_agrees_staged_replay_only_under_attention_dp(
+    stages_inputs, enable_attention_dp, tp_size, peer_replayable
+):
+    """Under attention DP with more than one TP rank, a runner that stages inputs shares
+    each rank's check with the same TP all-gather as the prefill graph vote. Otherwise
+    there is no added all-gather, as in the decode graph agreement."""
+    import numpy as np
+    from _torch.helpers import make_breakable_prefill_runner, make_stand_in_multimodal_model
+
+    from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+    owner = make_stand_in_multimodal_model(
+        Gemma4ForConditionalGeneration, Gemma4ForCausalLM, _PreparedBody()
+    )
+    sent = []
+
+    def tp_allgather_int64(values):
+        # Rank 0 is this rank; rank 1 answers peer_replayable.
+        sent.append(list(values))
+        return np.asarray([list(values), [int(peer_replayable)]], dtype=np.int64)
+
+    runner = make_breakable_prefill_runner(
+        # The text decoder alone keeps the unstaged text body.
+        owner if stages_inputs else owner.llm,
+        4,
+        enable_attention_dp=enable_attention_dp,
+        tp_size=tp_size,
+        dist=SimpleNamespace(tp_allgather_int64=tp_allgather_int64),
+    )
+    assert runner.stages_inputs is stages_inputs
+    if not (stages_inputs and enable_attention_dp and tp_size > 1):
+        assert runner._agree_replay is None
+        return
+    assert runner._agree_replay(True) is peer_replayable
+    assert runner._agree_replay(False) is False
+    assert sent == [[1], [0]]
+
+
+@pytest.mark.parametrize("source_kind", ["mutable_owner", "cpu_tensor"])
+def test_runner_prepared_inputs_mutable_host_values_fall_back_eager(monkeypatch, source_kind):
+    body, runner, inputs, engine_forward = _prepared_runner()
+    if source_kind == "mutable_owner":
+        inputs["owner"] = SimpleNamespace(offset=0.5)
+    else:
+        inputs["host_scale"] = torch.tensor(1.0)
+    runner.capture(4, engine_forward)
+    if source_kind == "mutable_owner":
+        inputs["owner"].offset = 7.0
+    else:
+        inputs["host_scale"].fill_(7)
+    expected = body(**inputs)
+    eager_calls = body.forward_calls
+
+    def unexpected_replay(_num_tokens):
+        pytest.fail("changed mutable host values must not replay captured Python decisions")
+
+    monkeypatch.setattr(runner, "replay", unexpected_replay)
+    actual = runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert body.forward_calls == eager_calls + 1
+
+
+def test_runner_prepared_warmup_normalizes_positional_inputs_under_the_flag():
+    body = _PreparedBody().cuda()
+    normalization_calls = []
+
+    def prepare_inputs(inputs):
+        normalization_calls.append(
+            (inputs["optional"], inputs["scale"], is_in_breakable_cuda_graph())
+        )
+        inputs["value"] = inputs["value"] + 2
+        return inputs
+
+    runner = BreakableCUDAGraphRunner(body, prepare_inputs=prepare_inputs)
+    original_forward = body.forward
+    value = torch.zeros((4, 4), device="cuda")
+    config = {"offset": (torch.zeros_like(value),), "features": []}
+    outputs = []
+
+    runner.warmup(lambda: outputs.append(body(value, config)), steps=2)
+
+    assert normalization_calls == [(None, 1, True), (None, 1, True)]
+    assert body.forward_calls == 2
+    assert body.forward == original_forward
+    assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+    for output in outputs:
+        torch.testing.assert_close(output, torch.full_like(value, 2), rtol=0, atol=0)
+
+
+def test_runner_prepared_input_storage_is_released_on_clear_and_capture_failure():
+    body, runner, _inputs, engine_forward = _prepared_runner()
+    runner.capture(4, engine_forward)
+    staged_ref = weakref.ref(runner._inputs[4]["value"])
+    runner.clear()
+    assert runner._inputs == {}
+    assert staged_ref() is None
+
+    original_forward = body.forward
+    body.fail_capture = lambda: runner.is_capturing
+    with pytest.raises(ValueError, match="prepared capture failed"):
+        runner.capture(4, engine_forward)
+
+    assert runner._inputs == {}
+    assert not runner.has_graph(4)
+    assert runner._memory_pool is None
+    assert body.forward == original_forward
+    assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+
+
+def test_runner_prepared_inputs_follow_the_whole_forward_flag():
+    """Staged runners keep main's flag scope: outer code sees the flag in all three phases."""
+    body = _Body().cuda()
+    runner = BreakableCUDAGraphRunner(body, prepare_inputs=lambda inputs: inputs)
+    inputs = {"value": torch.zeros((4, 4), device="cuda")}
+    seen = []
+
+    def engine_forward():
+        seen.append(is_in_breakable_cuda_graph())
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(**inputs))
+        return body(**inputs)
+
+    runner.capture(4, engine_forward)
+    inputs["value"] = torch.full((4, 4), 5.0, device="cuda")
+    replayed = runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replayed, torch.full((4, 4), 6.0, device="cuda"), rtol=0, atol=0)
+    assert len(seen) == BreakableCUDAGraphRunner._WARMUP_STEPS + 2 and all(seen)
+    assert not is_in_breakable_cuda_graph()
+
+
+def test_runner_prepared_body_replays_after_an_encoder_cuda_graph():
+    """An encoder graph replayed in the outer forward feeds the staged body replay."""
+    encoder_input = torch.zeros((4, 4), device="cuda")
+    encoder_graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        encoder_output = encoder_input * 3  # warm up outside capture
+        with torch.cuda.graph(encoder_graph, stream=stream):
+            encoder_output = encoder_input * 3
+    torch.cuda.current_stream().wait_stream(stream)
+    body = _Body().cuda()
+    runner = BreakableCUDAGraphRunner(body, prepare_inputs=lambda inputs: inputs)
+
+    def outer():
+        encoder_graph.replay()
+        # Fusion makes a fresh tensor every step, as fuse_input_embeds does.
+        return body(value=encoder_output + 0)
+
+    def engine_forward():
+        return runner.capture_model_body(outer) if runner.is_capturing else outer()
+
+    runner.capture(4, engine_forward)
+    for value in (2.0, 7.0):
+        encoder_input.fill_(value)
+        replayed = runner.execute(4, engine_forward)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            replayed, torch.full_like(replayed, 3 * value + 1), rtol=0, atol=0
+        )
+    encoder_graph.reset()
+    runner.clear()
+
+
+@torch.inference_mode()
+def test_gemma4_opted_in_decoder_captures_and_refreshes_ple_ids():
+    from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+    class Body(nn.Module):
+        hidden_size_per_layer_input = 1
+
+        def __init__(self):
+            super().__init__()
+            self.forward_calls = 0
+
+        def forward(self, input_ids=None, inputs_embeds=None, ple_input_ids=None):
+            self.forward_calls += 1
+            return inputs_embeds + ple_input_ids[:, None]
+
+    from _torch.helpers import (
+        check_stand_in_body_replay,
+        make_breakable_prefill_runner,
+        make_stand_in_multimodal_model,
+    )
+
+    body = Body()
+    owner = make_stand_in_multimodal_model(Gemma4ForConditionalGeneration, Gemma4ForCausalLM, body)
+    runner = make_breakable_prefill_runner(owner, 4)
+    assert runner.stages_inputs
+
+    def multimodal_step(inputs):
+        inputs["input_ids"] = torch.arange(4, device="cuda")
+        inputs["inputs_embeds"] = torch.full((4, 4), 3.0, device="cuda")
+        return inputs["inputs_embeds"] + inputs["input_ids"][:, None]
+
+    inputs = {
+        "input_ids": torch.zeros(4, dtype=torch.long, device="cuda"),
+        "inputs_embeds": torch.zeros((4, 4), device="cuda"),
+    }
+    check_stand_in_body_replay(runner, body, inputs, [multimodal_step], num_tokens=4)

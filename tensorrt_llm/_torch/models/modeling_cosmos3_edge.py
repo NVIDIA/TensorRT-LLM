@@ -644,6 +644,8 @@ class Cosmos3EdgeDecoderModel(DecoderModel):
 
 @register_auto_model("Cosmos3EdgeForCausalLM")
 class Cosmos3EdgeForCausalLM(SpecDecOneEngineForCausalLM):
+    supports_multimodal_breakable_cuda_graph = True
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         self.mapping_with_cp = None
         if model_config.mapping.has_cp_helix():

@@ -551,6 +551,7 @@ class Attention(nn.Module):
         cache_context_plan: bool = False,
         context_fmha_head_dim_per_stage_kv: int = 0,
         context_last_rows_only: bool = False,
+        register_to_config: bool = True,
     ):
         """
         Initialize the Attention module.
@@ -577,6 +578,9 @@ class Attention(nn.Module):
             cache_context_plan (bool): Let the TRTLLM backend plan a context-only forward once for all layers.
             context_fmha_head_dim_per_stage_kv (int): See TrtllmAttention; 0 keeps the default context kernel.
             context_last_rows_only (bool): See TrtllmAttention; the layer reads only each context request's last row.
+            register_to_config (bool): Register the layer in ``config.extra_attrs["attn_layers"]``, which the custom-op
+                path (torch.compile, breakable CUDA graph) uses to find it with the decoder's metadata. Encoder towers
+                that run with their own metadata pass False.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -584,7 +588,7 @@ class Attention(nn.Module):
 
         self.register_to_config = False
         # We only register TRTLLM attention layers to config.
-        if config is not None:
+        if config is not None and register_to_config:
             if "attn_layers" not in config.extra_attrs:
                 config.extra_attrs["attn_layers"] = {}
             suffix = 0

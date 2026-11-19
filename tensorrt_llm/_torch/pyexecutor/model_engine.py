@@ -55,7 +55,9 @@ from .engine.model_setup import (
 )
 from .engine.multimodal import (
     MultimodalItemScheduler,
+    check_layer_registries_in_language_model,
     is_multimodal,
+    keeps_text_prefill_body,
     mm_encoder_cache_enabled,
     setup_mm_encoder_attn_metadata,
     setup_mm_encoder_cuda_graphs,
@@ -902,18 +904,31 @@ class ModelEngine:
         if self.llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
             return
 
-        if isinstance(self.model, DecoderModelForCausalLM):
+        if keeps_text_prefill_body(self.model, self.llm_args.disable_mm_encoder):
             return
-        decoder_model = getattr(self.model, "llm", None)
-        if (
-            self.llm_args.disable_mm_encoder
-            and isinstance(decoder_model, DecoderModelForCausalLM)
-            and getattr(self.model, "mm_encoder", None) is None
-        ):
+        if isinstance(self.model, MultimodalModelMixin):
+            try:
+                language_model = self.model.language_model
+            except NotImplementedError:
+                language_model = None
+            if not isinstance(language_model, DecoderModelForCausalLM):
+                raise ValueError(
+                    "breakable prefill CUDA graph supports multimodal models only with a "
+                    "DecoderModelForCausalLM language_model"
+                )
+            if self.mapping.pp_size > 1:
+                raise ValueError(
+                    "breakable prefill CUDA graph supports multimodal models only with a "
+                    "single pipeline stage"
+                )
+            if not language_model.supports_multimodal_breakable_cuda_graph:
+                raise ValueError(
+                    "breakable prefill CUDA graph does not support multimodal models on "
+                    f"{type(language_model).__name__}; use eager prefill"
+                )
+            check_layer_registries_in_language_model(self.model, language_model)
             return
-        if isinstance(self.model, MultimodalModelMixin) or isinstance(
-            self.input_processor, BaseMultimodalInputProcessor
-        ):
+        if isinstance(self.input_processor, BaseMultimodalInputProcessor):
             raise ValueError("breakable prefill CUDA graph does not support multimodal models")
 
     def forward_multimodal_encoder_items(

@@ -163,6 +163,10 @@ class Glm5NextVisionAttention(Attention):
                 not model_config.mapping.enable_attention_dp and model_config.mapping.tp_size > 1
             ),
             head_dim=config.hidden_size // config.num_heads,
+            # Vision attention runs from the outer VL wrapper, outside the
+            # compiled LM region. Unregistered, compiled LM attention lookups
+            # never resolve a vision layer (same as Qwen2_5_VLVisionAttention).
+            register_to_config=False,
         )
         # Backend resolution can substitute an implementation; require plain
         # TRTLLM metadata and full-attention semantics after construction too.
@@ -175,13 +179,6 @@ class Glm5NextVisionAttention(Attention):
         # Per-head Q/K RMSNorm over head_dim, weights replicated across TP.
         self.q_norm = RMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.k_norm = RMSNorm(hidden_size=self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
-        # Vision attention runs from the outer VL wrapper, outside the
-        # compiled LM region. Unregister from the shared attn-layer metadata
-        # map so compiled LM attention lookups never resolve a vision layer
-        # (same contract as Qwen2_5_VLVisionAttention).
-        if self.register_to_config:
-            model_config.extra_attrs.get("attn_layers", {}).pop(self.layer_idx_str, None)
-            self.register_to_config = False
 
     def forward(
         self,
@@ -1046,10 +1043,7 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
         super().__init__(config)
         self.model_config = model_config
 
-        llm_model_config = copy.deepcopy(model_config)
-        # Share the live extra_attrs dict: the LM attention layers register
-        # their per-layer metadata there and model_engine reads the same dict.
-        llm_model_config.extra_attrs = model_config.extra_attrs
+        llm_model_config = model_config.deepcopy_with_shared_extra_attrs()
         llm_model_config.pretrained_config.architectures = ["Glm5NextForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
@@ -1094,10 +1088,6 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
     def multimodal_data_device_paths(self) -> List[str]:
         return ["image.pixel_values", "video.pixel_values_videos", "multimodal_embedding"]
 
-    @property
-    def language_model(self) -> torch.nn.Module:
-        return self.llm
-
     # Speculative decoding lives on the inner decoder (``SpecDecOneEngineForCausalLM``
     # via the deep-copied model_config), but ``ModelLoader.load`` reads the draft
     # state from the outer model it resolved for the checkpoint's architecture.
@@ -1136,10 +1126,6 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
             "resource_manager": resource_manager,
             "orig_input_ids": raw_input_ids,
         }
-
-    @property
-    def text_embedding_layer(self):
-        return self.llm.model.embed_tokens
 
     @property
     def embedding_dim(self) -> int:

@@ -682,6 +682,116 @@ def test_nemotron_nano_v2_vl_set_guided_decoder_reaches_inner_lm():
 
 
 @pytest.mark.cpu_only
+def test_nemotron_nano_language_model_shares_attention_registry(monkeypatch):
+    """The language model registers its attention and Mamba layers where the engine looks them up."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    built = []
+
+    def from_config(config):
+        built.append(config)
+        return SimpleNamespace(config=config.pretrained_config)
+
+    monkeypatch.setattr(nemotron_h_multimodal.AutoModelForCausalLM, "from_config", from_config)
+    config = transformers.PretrainedConfig(
+        llm_config=transformers.PretrainedConfig(vocab_size=128),
+        img_context_token_id=20,
+        torch_dtype=torch.bfloat16,
+    )
+    model_config = ModelConfig(pretrained_config=config)
+
+    NemotronHMultimodalModel(model_config)
+
+    (llm_model_config,) = built
+    assert llm_model_config.extra_attrs is model_config.extra_attrs
+
+
+@pytest.mark.cpu_only
+def test_nemotron_nano_breakable_inputs_embed_text_with_language_model_tokens():
+    model = object.__new__(NemotronHMultimodalModel)
+    torch.nn.Module.__init__(model)
+    embedding = torch.nn.Embedding(16, 4)
+    model.llm = SimpleNamespace(model=SimpleNamespace(embed_tokens=embedding))
+    input_ids = torch.tensor([1, 7, 2])
+    inputs = {"input_ids": input_ids, "inputs_embeds": None, "orig_input_ids": input_ids}
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    assert prepared["input_ids"] is None
+    assert prepared["orig_input_ids"] is input_ids
+    torch.testing.assert_close(prepared["inputs_embeds"], embedding(input_ids), atol=0, rtol=0)
+
+
+@pytest.mark.cpu_only
+def test_nemotron_nano_breakable_startup_accepts_language_model():
+    from _torch.helpers import check_breakable_prefill_startup, make_stand_in_multimodal_model
+
+    check_breakable_prefill_startup(
+        make_stand_in_multimodal_model(
+            NemotronHMultimodalModel, NemotronHForCausalLM, torch.nn.Module()
+        )
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_nemotron_nano_opted_in_decoder_captures_and_refreshes():
+    """Image and text prefill replay one captured body on staged embeddings."""
+    from _torch.helpers import (
+        check_breakable_prefill_startup,
+        check_stand_in_body_replay,
+        make_breakable_prefill_runner,
+        make_stand_in_multimodal_model,
+    )
+
+    class Body(torch.nn.Module):
+        """Stand-in for NemotronHModel, with its forward signature."""
+
+        def __init__(self):
+            super().__init__()
+            self.forward_calls = 0
+            self.embed_tokens = torch.nn.Embedding(8, 4, device="cuda")
+
+        def forward(
+            self,
+            attn_metadata,
+            input_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            spec_metadata=None,
+            lora_params=None,
+            **kwargs,
+        ):
+            self.forward_calls += 1
+            return inputs_embeds + 1
+
+    body = Body()
+    model = make_stand_in_multimodal_model(NemotronHMultimodalModel, NemotronHForCausalLM, body)
+    check_breakable_prefill_startup(model)
+    runner = make_breakable_prefill_runner(model, 4)
+    assert runner.stages_inputs
+
+    def image_step(inputs):
+        inputs["inputs_embeds"] = torch.full((4, 4), 3.0, device="cuda")
+        return torch.full((4, 4), 4.0, device="cuda")
+
+    def text_step(inputs):
+        # A text batch replays the same graph on the language model's token embeddings.
+        input_ids = torch.tensor([1, 5, 2, 7], device="cuda")
+        inputs.update(input_ids=input_ids, inputs_embeds=None, orig_input_ids=input_ids)
+        return body.embed_tokens(input_ids) + 1
+
+    # The wrapper passes fused embeddings plus the pre-fusion ids for the drafter.
+    inputs = {
+        "attn_metadata": None,
+        "position_ids": torch.arange(4, device="cuda").view(1, -1),
+        "inputs_embeds": torch.zeros((4, 4), device="cuda"),
+        "orig_input_ids": torch.tensor([3, 6, 6, 4], device="cuda"),
+    }
+    check_stand_in_body_replay(runner, body, inputs, [image_step, text_step], num_tokens=4)
+
+
+@pytest.mark.cpu_only
 class TestSoundPlaceholderInjection:
     """Test the sound placeholder token's injection points.
 

@@ -2921,7 +2921,7 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         super().__init__(config)
 
         self.model_config = model_config
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.deepcopy_with_shared_extra_attrs()
         if hasattr(self, "llm"):
             return
 
@@ -3026,13 +3026,6 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         # Free LLM weights from the dict to release the backing mmap pages for shards 2-17.
         if hasattr(weights, "mark_consumed"):
             weights.mark_consumed("language_model")
-
-    @property
-    def language_model(self) -> torch.nn.Module:
-        # `MultimodalModelMixin` routes `vocab_size_padded`,
-        # `infer_max_seq_len` and `set_guided_decoder` through this property,
-        # and its base implementation raises.
-        return self.llm
 
     @property
     def draft_config(self) -> Optional[ModelConfig]:

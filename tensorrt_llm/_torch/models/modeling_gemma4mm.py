@@ -20,7 +20,6 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 ``AutoModel.from_config()`` HF fallback (requires transformers>=5.5.0).
 """
 
-import copy
 import dataclasses
 import math
 from collections.abc import Mapping
@@ -50,7 +49,6 @@ from ...inputs import (
 from ...inputs.multimodal import MultimodalItemMetadata, MultimodalItemPartition, MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
-from ..modules.embedding import Embedding
 from ..modules.linear import Linear
 from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_gemma4 import Gemma4ForCausalLM
@@ -1290,9 +1288,14 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     def load_draft_weights(self, weights, weight_mapper=None):
         self.llm.load_draft_weights(weights, weight_mapper)
 
-    @property
-    def language_model(self) -> torch.nn.Module:
-        return self.llm
+    def prepare_breakable_cuda_graph_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        prepared_inputs = super().prepare_breakable_cuda_graph_inputs(inputs)
+        if (
+            self.llm.model.hidden_size_per_layer_input
+            and prepared_inputs.get("ple_input_ids") is None
+        ):
+            prepared_inputs["ple_input_ids"] = inputs.get("input_ids")
+        return prepared_inputs
 
     def get_language_model_extra_forward_kwargs(
         self,
@@ -1346,10 +1349,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     @property
     def multimodal_token_ids(self) -> torch.Tensor:
         return self._mm_token_ids
-
-    @property
-    def text_embedding_layer(self) -> Embedding:
-        return self.llm.model.embed_tokens
 
     @property
     def embedding_dim(self) -> int:
@@ -1448,8 +1447,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
             _mm_ids.append(config.video_token_id)
         self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
 
-        model_config_cp = copy.deepcopy(model_config)
-        model_config_cp.extra_attrs = model_config.extra_attrs
+        model_config_cp = model_config.deepcopy_with_shared_extra_attrs()
         self.model_config = model_config_cp
 
         # --- Language model ---

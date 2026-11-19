@@ -244,6 +244,8 @@ class Exaone4Model(DecoderModel):
 @register_auto_model("Exaone4ForCausalLM")
 class Exaone4ForCausalLM(DecoderModelForCausalLM[Exaone4Model, Exaone4Config]):
 
+    supports_multimodal_breakable_cuda_graph = True
+
     def __init__(
         self,
         model_config: ModelConfig[Exaone4Config],

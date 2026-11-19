@@ -47,6 +47,10 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, Res
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
+from tensorrt_llm._torch.utils import (
+    get_per_request_prefill_cuda_graph_flag,
+    set_per_request_prefill_cuda_graph_flag,
+)
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -271,6 +275,61 @@ class TestCachedKvTokenLogging(unittest.TestCase):
         self.inputs.iter_states["cached_kv_tokens_per_req"] = [100]
         self.inputs.iter_states["cached_kv_tokens_cuda_graph_padding"] = 7
         self.check_counts([], (([], 1),), [], 0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("stages_inputs", [False, True])
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_breakable_prefill_replays_multimodal_batches_only_with_staged_inputs(
+    stages_inputs: bool, multimodal: bool
+) -> None:
+    """Multimodal batches replay a breakable prefill graph only when replay refreshes the
+    body inputs; a runner on the plain text body keeps them eager, as before."""
+    preparer = object.__new__(DecoderInputPreparer)
+    preparer._config = SimpleNamespace(
+        enable_attention_dp=False,
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        prefill_cuda_graph_num_tokens=[8],
+        use_mrope=False,
+    )
+    preparer.model = None
+    preparer.mapping = None
+    preparer.dist = None
+    preparer._buffers = SimpleNamespace(
+        input_ids_cuda=torch.ones(16, dtype=torch.int),
+        position_ids_cuda=torch.ones(16, dtype=torch.int),
+    )
+    preparer.breakable_cuda_graph_runner = SimpleNamespace(
+        is_capturing=False,
+        is_warming_up=False,
+        is_capturing_break_graphs=False,
+        captured_num_tokens=[8],
+        has_graph=lambda num_tokens: num_tokens == 8,
+        stages_inputs=stages_inputs,
+    )
+    host = SimpleNamespace(
+        total_num_tokens=5,
+        num_ctx_requests=1,
+        remote_tail_modes=set(),
+        lists=SimpleNamespace(multimodal_params_list=[object()] if multimodal else []),
+    )
+    attn_metadata = SimpleNamespace(padded_num_tokens=None)
+    incoming_flag = get_per_request_prefill_cuda_graph_flag()
+    try:
+        preparer._pad_inputs(
+            host,
+            SimpleNamespace(attention_dp_phase=None, context_requests=[]),
+            attn_metadata,
+            None,
+            False,
+            is_dummy=False,
+        )
+        replays = stages_inputs or not multimodal
+        assert host.virtual_num_tokens == (8 if replays else 5)
+        assert attn_metadata.padded_num_tokens == (8 if replays else None)
+        assert get_per_request_prefill_cuda_graph_flag() is replays
+    finally:
+        set_per_request_prefill_cuda_graph_flag(incoming_flag)
 
 
 @pytest.mark.cpu_only

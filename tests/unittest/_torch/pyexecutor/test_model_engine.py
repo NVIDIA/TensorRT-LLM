@@ -26,10 +26,12 @@ from _torch.pyexecutor.engine_test_utils import (
     create_model_engine_and_kvcache,
 )
 
+import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner as decoder_runner_module
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
 from tensorrt_llm._torch.distributed import ops as distributed_ops
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.engine import model_setup
@@ -690,6 +692,144 @@ def test_model_engine_resolves_multimodal_prefill_graphs_before_validation(
     assert engine.llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend(expected_backend)
     if mm_encoder_only:
         assert engine.llm_args.torch_compile_config is None
+
+
+class _BreakableTextDecoder(DecoderModelForCausalLM):
+    """A language model whose multimodal breakable replay nobody verified."""
+
+    def prepare_breakable_cuda_graph_replay(self, inputs: dict) -> None:
+        pass
+
+
+class _BreakableMultimodalDecoder(_BreakableTextDecoder):
+    supports_multimodal_breakable_cuda_graph = True
+
+
+class _BreakableMultimodalOwner(MultimodalModelMixin, torch.nn.Module):
+    """A wrapper that exposes its decoder through ``language_model`` only."""
+
+    def __init__(self, decoder: DecoderModelForCausalLM, disable_mm_encoder: bool) -> None:
+        torch.nn.Module.__init__(self)
+        self.model_config = SimpleNamespace(disable_mm_encoder=disable_mm_encoder)
+        # The encoder rule of the models that honor the flag (e.g. Qwen3-VL).
+        self.mm_encoder = None if _is_mm_disagg() or disable_mm_encoder else torch.nn.Identity()
+        self._decoder = decoder
+
+    @property
+    def language_model(self) -> DecoderModelForCausalLM:
+        return self._decoder
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("deployment", "verified", "pp_size", "expected"),
+    [
+        # A local encoder or an E/P embedding handoff stages the fused embeddings.
+        ("encoder", True, 1, "staged"),
+        ("encoder", False, 1, "_BreakableTextDecoder"),
+        ("encoder", True, 2, "single pipeline stage"),
+        ("handoff", True, 1, "staged"),
+        ("handoff", False, 1, "_BreakableTextDecoder"),
+        # disable_mm_encoder without an encoder keeps the text body, with or without E/P.
+        ("text_only", False, 1, "text"),
+        ("text_only", False, 2, "text"),
+        ("text_only_handoff", False, 1, "text"),
+        # Without an `llm` decoder that path does not apply; the opted-in wrapper stages.
+        ("text_only_language_model", True, 1, "staged"),
+    ],
+)
+def test_breakable_multimodal_gate_and_runner_agree(
+    monkeypatch: pytest.MonkeyPatch, deployment: str, verified: bool, pp_size: int, expected: str
+) -> None:
+    monkeypatch.setenv(
+        "TLLM_MULTIMODAL_DISAGGREGATED", "1" if deployment.endswith("handoff") else "0"
+    )
+    decoder = object.__new__(_BreakableMultimodalDecoder if verified else _BreakableTextDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder.model = torch.nn.Identity()
+    disable_mm_encoder = deployment.startswith("text_only")
+    owner = _BreakableMultimodalOwner(decoder, disable_mm_encoder)
+    assert (owner.mm_encoder is None) == (deployment != "encoder")
+    if deployment in ("text_only", "text_only_handoff"):
+        owner.llm = decoder
+    engine = object.__new__(ModelEngine)
+    engine.model = owner
+    engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+    engine.mapping = SimpleNamespace(pp_size=pp_size)
+    engine.llm_args = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        disable_mm_encoder=disable_mm_encoder,
+    )
+    if expected not in ("staged", "text"):
+        with pytest.raises(ValueError, match=expected):
+            engine._validate_breakable_cuda_graph_compatibility()
+        return
+    engine._validate_breakable_cuda_graph_compatibility()
+
+    monkeypatch.setattr(
+        decoder_runner_module, "BreakableCUDAGraphRunner", lambda *args: SimpleNamespace(args=args)
+    )
+    from _torch.helpers import make_breakable_prefill_runner
+
+    layer_model, prepare_replay, prepare_inputs, agree_replay, input_buffers = (
+        make_breakable_prefill_runner(owner, 4).args
+    )
+    assert layer_model is decoder.model
+    assert prepare_replay == decoder.prepare_breakable_cuda_graph_replay
+    assert agree_replay is None
+    if expected == "staged":
+        assert prepare_inputs == owner.prepare_breakable_cuda_graph_inputs
+        assert input_buffers == owner.breakable_cuda_graph_input_buffers
+    else:
+        assert prepare_inputs is None and input_buffers is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("registry", [None, "attn_layers", "mamba2_layers"])
+def test_breakable_multimodal_rejects_encoder_layers_in_the_registry(registry: str | None) -> None:
+    """Breakable prefill graphs run every registered layer with the decoder's metadata, so an
+    encoder layer in any layer registry must fail at startup, and the error names it."""
+    from _torch.helpers import check_breakable_prefill_startup
+
+    from tensorrt_llm._torch.attention.attention import Attention
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    config = ModelConfig(skip_create_weights_in_init=True)
+
+    def attention(**kwargs) -> Attention:
+        return Attention(
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            max_position_embeddings=8,
+            bias=False,
+            layer_idx=0,
+            dtype=torch.bfloat16,
+            config=config,
+            **kwargs,
+        )
+
+    decoder = object.__new__(_BreakableMultimodalDecoder)
+    torch.nn.Module.__init__(decoder)
+    backend = Mock(**{"support_fused_qkv.return_value": True})
+    with patch("tensorrt_llm._torch.attention.attention.create_attention", return_value=backend):
+        decoder.model = attention()
+        # The "attn_layers" case is an encoder tower that forgot register_to_config=False.
+        encoder = attention(register_to_config=registry == "attn_layers")
+    if registry == "mamba2_layers":
+        config.extra_attrs[registry] = {"0": weakref.ref(encoder)}
+    owner = _BreakableMultimodalOwner(decoder, disable_mm_encoder=False)
+    owner.mm_encoder = encoder
+    owner.model_config = config
+
+    if registry is None:
+        check_breakable_prefill_startup(owner)
+        return
+    key = "0_0" if registry == "attn_layers" else "0"
+    with pytest.raises(
+        ValueError, match=rf"extra_attrs\['{registry}'\].*'{key}' \(mm_encoder, Attention\)"
+    ):
+        check_breakable_prefill_startup(owner)
 
 
 class ModelEngineTestCase(unittest.TestCase):

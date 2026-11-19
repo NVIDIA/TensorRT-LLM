@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.hostfunc import drain_captured_hostfuncs
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_multimodal_utils import needs_multimodal_encoder
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.context_logits import context_logits_heads, context_logits_scope
@@ -84,7 +85,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
 from ...model_call import ModelCaller
-from ...multimodal import MultimodalItemScheduler
+from ...multimodal import MultimodalItemScheduler, keeps_text_prefill_body
 from ..common import make_scheduled_inputs
 from ..interface import ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
@@ -588,11 +589,20 @@ class DecoderRunner(ScheduledModelRunner):
         if self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
             return None
 
-        decoder_model = (
-            self._model
-            if isinstance(self._model, DecoderModelForCausalLM)
-            else getattr(self._model, "llm", None)
-        )
+        prepare_inputs = input_buffers = None
+        if isinstance(self._model, MultimodalModelMixin) and not keeps_text_prefill_body(
+            self._model, self._model.model_config.disable_mm_encoder
+        ):
+            # Fused embeddings are new tensors every step, so replay must refresh them.
+            decoder_model = self._model.language_model
+            prepare_inputs = self._model.prepare_breakable_cuda_graph_inputs
+            input_buffers = self._model.breakable_cuda_graph_input_buffers
+        else:
+            decoder_model = (
+                self._model
+                if isinstance(self._model, DecoderModelForCausalLM)
+                else getattr(self._model, "llm", None)
+            )
         if not isinstance(decoder_model, DecoderModelForCausalLM):
             raise ValueError("breakable prefill CUDA graph requires a decoder model body")
         logger.info(
@@ -602,7 +612,24 @@ class DecoderRunner(ScheduledModelRunner):
         return BreakableCUDAGraphRunner(
             decoder_model.model,
             getattr(decoder_model, "prepare_breakable_cuda_graph_replay", None),
+            prepare_inputs,
+            self._all_ranks_replay
+            if prepare_inputs is not None
+            and self._config.enable_attention_dp
+            and self._mapping.tp_size > 1
+            else None,
+            input_buffers,
         )
+
+    def _all_ranks_replay(self, replayable: bool) -> bool:
+        """Agree on a staged-input check across attention DP ranks, as the prefill graph vote does.
+
+        Each rank checks its staged inputs during the forward, after that vote
+        (DecoderInputPreparer), so every rank replays or every rank runs eagerly.
+        With one TP rank there is nothing to agree on, as in the decode graph
+        agreement (CUDAGraphRunner._agree_graph_shape).
+        """
+        return bool(self._dist.tp_allgather_int64([int(replayable)])[:, 0].all())
 
     @property
     def _use_beam_search(self) -> bool:

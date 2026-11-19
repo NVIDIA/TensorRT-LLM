@@ -143,6 +143,32 @@ def _prepare_qwen_vl_mrope_config(
     return mrope_config
 
 
+def _pad_qwen_vl_mrope_deltas(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Pad the MRoPE generation deltas of breakable prefill graph inputs.
+
+    `_prepare_qwen_vl_mrope_config` gives one delta per generation request.
+    Pad them to the token count so their shape does not depend on the batch.
+    Updates and returns `inputs`.
+    """
+    mrope_config = inputs.get("mrope_config")
+    if mrope_config is None or "mrope_rotary_cos_sin" not in mrope_config:
+        return inputs
+    num_tokens = inputs["inputs_embeds"].shape[0]
+    padded_deltas = torch.zeros((num_tokens, 1),
+                                dtype=torch.int32,
+                                device=inputs["inputs_embeds"].device)
+    deltas = mrope_config.get("mrope_position_deltas")
+    if deltas is not None:
+        if deltas.numel() > num_tokens:
+            raise ValueError(
+                "MRoPE generation deltas exceed the prefill token count")
+        # Generation kernels index deltas from zero, without a context-request offset.
+        padded_deltas[:deltas.numel()].copy_(deltas.reshape(-1, 1))
+    inputs["mrope_config"] = dict(mrope_config,
+                                  mrope_position_deltas=padded_deltas)
+    return inputs
+
+
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
 
@@ -1662,22 +1688,18 @@ class Qwen2_5_VLVisionAttention(Attention):
             # hidden_size; don't inherit head_dim mirrored from the text
             # sub-config onto the top-level pretrained_config.
             head_dim=config.hidden_size // config.num_heads,
+            # Vision attention runs from the outer VL wrapper (outside the
+            # compiled LM region). A registered layer would take
+            # `attn_custom_op_inplace` under torch.compile or a breakable
+            # CUDA graph, which looks `attention_metadata` up in the global
+            # `extra_attrs` -- the LM decoder's metadata, set by
+            # `DecoderRunner._model_forward` -- so vision FMHA would get the
+            # LM's S/num_contexts with vision's head_dim and dispatch fails
+            # (`FMHA kernels are not found ... D: <vision_head_dim>`).
+            # Unregistered, `forward_impl` takes the eager path that uses
+            # vision's own `attn_metadata`.
+            register_to_config=False,
         )
-        # Vision attention runs from the outer VL wrapper (outside the
-        # compiled LM region). When `set_torch_compiling(True)` is set
-        # for the LM, `forward_impl` would otherwise dispatch vision
-        # through `attn_custom_op_inplace`, which looks
-        # `attention_metadata` up in the global `extra_attrs` --
-        # that slot is populated by `DecoderRunner._model_forward` with
-        # the LM decoder's metadata, so vision FMHA receives the LM's
-        # S/num_contexts with vision's head_dim and dispatch fails
-        # (`FMHA kernels are not found ... D: <vision_head_dim>`).
-        # Unregister so `forward_impl` falls back to the eager path
-        # that uses vision's own `attn_metadata`.
-        if self.register_to_config:
-            model_config.extra_attrs.get("attn_layers",
-                                         {}).pop(self.layer_idx_str, None)
-            self.register_to_config = False
 
     def apply_rope(self,
                    q: torch.Tensor,
@@ -2385,24 +2407,13 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
                             device='cuda'),
                 persistent=False)
 
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.deepcopy_with_shared_extra_attrs()
         text_config = getattr(llm_model_config.pretrained_config, 'text_config',
                               None)
         if text_config is not None:
             llm_model_config.pretrained_config = text_config
         llm_model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
-        # The LM's attention modules look themselves up in the global
-        # `extra_attrs` that `DecoderRunner._model_forward` binds via
-        # `with_model_extra_attrs(self._model.extra_attrs)` -- the
-        # outer wrapper's dict. Without sharing, `llm_model_config`
-        # carries a deep-copied dict, so LM `attn_custom_op_inplace`
-        # (used under `set_torch_compiling(True)`) fails its layer
-        # lookup and the piecewise-CUDA-graph dynamo trace blows up
-        # at the LM's `o_proj` call. Vision attention unregisters
-        # itself from this dict in `Qwen2_5_VLVisionAttention.__init__`
-        # so it does not poison LM lookups.
-        llm_model_config.extra_attrs = model_config.extra_attrs
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         # Normal worker owns encoder. MM E/P prefill worker gets attached embeddings.
@@ -2460,6 +2471,16 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
+
+    def prepare_breakable_cuda_graph_inputs(
+            self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        return _pad_qwen_vl_mrope_deltas(
+            super().prepare_breakable_cuda_graph_inputs(inputs))
+
+    def breakable_cuda_graph_input_buffers(self) -> tuple[torch.Tensor, ...]:
+        if hasattr(self, 'mrope_rotary_cos_sin_workspace'):
+            return (self.mrope_rotary_cos_sin_workspace, )
+        return ()
 
     def encode_multimodal_inputs(self,
                                  multimodal_params: List[MultimodalParams],

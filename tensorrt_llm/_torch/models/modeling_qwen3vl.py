@@ -55,7 +55,6 @@ from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.backends.utils import get_attention_backend
 from ..attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
-from ..modules.embedding import Embedding
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
@@ -72,6 +71,7 @@ from .modeling_multimodal_mixin import (
 from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,
+    _pad_qwen_vl_mrope_deltas,
     _prepare_qwen_vl_mrope_config,
     _qwen_vision_item_partitions,
 )
@@ -1732,14 +1732,8 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         llm_arch = vlm_to_llm_arch.get(self.original_arch)
         if llm_arch is None:
             raise ValueError(f"Unsupported architecture: {self.original_arch}")
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.deepcopy_with_shared_extra_attrs()
         llm_model_config.pretrained_config = config.text_config
-        # The LM attention modules use extra_attrs through the outer wrapper.
-        # Share the dict after deepcopy so compiled LM attention lookups see
-        # the same per-layer metadata as DecoderRunner._model_forward.
-        # Vision attention unregisters itself from this dict during init,
-        # so it does not pollute LM lookups.
-        llm_model_config.extra_attrs = model_config.extra_attrs
         llm_model_config.pretrained_config.architectures = [llm_arch]
         # Qwen3ForCausalLM.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
@@ -1803,10 +1797,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     def multimodal_token_ids(self) -> torch.Tensor:
         return self._mm_token_ids
 
-    @property
-    def language_model(self) -> torch.nn.Module:
-        return self.llm
-
     # Draft-model (two-model speculative decoding, e.g. DFlash / Eagle3)
     # delegation: `ModelLoader.load` reads `draft_config` / `draft_model` and
     # calls `load_draft_weights` on the *outer* model it resolved, but the
@@ -1826,10 +1816,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
 
     def load_draft_weights(self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None):
         return self.llm.load_draft_weights(weights, weight_mapper=weight_mapper)
-
-    @property
-    def text_embedding_layer(self) -> Embedding:
-        return self.llm.model.embed_tokens
 
     @property
     def embedding_dim(self) -> int:
@@ -1997,6 +1983,26 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
             device=deepstack_buffer.device,
         )
         return fused_input_ids, inputs_embeds, tuple(deepstack_buffer.unbind(0))
+
+    def prepare_breakable_cuda_graph_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        prepared_inputs = _pad_qwen_vl_mrope_deltas(
+            super().prepare_breakable_cuda_graph_inputs(inputs)
+        )
+        if self.deepstack_num_level > 0 and not prepared_inputs.get("deepstack_embeds"):
+            # Text batches replay the same body as image batches, with zero DeepStack rows.
+            # Image batches scatter their rows into this same scratch buffer (see
+            # `_fuse_multimodal_embeddings`), so clear the last image batch's rows. The graph
+            # reads this buffer in place (see `breakable_cuda_graph_input_buffers`).
+            num_tokens = prepared_inputs["inputs_embeds"].shape[0]
+            deepstack_buffer = self.deepstack_input_embeds[:, :num_tokens, :]
+            deepstack_buffer.zero_()
+            prepared_inputs["deepstack_embeds"] = list(deepstack_buffer.unbind(0))
+        return prepared_inputs
+
+    def breakable_cuda_graph_input_buffers(self) -> tuple[torch.Tensor, ...]:
+        # DeepStack rows and the packed MRoPE cos/sin are written here before each body call.
+        names = ("deepstack_input_embeds", "mrope_rotary_cos_sin_workspace")
+        return tuple(getattr(self, name) for name in names if hasattr(self, name))
 
     def get_language_model_extra_forward_kwargs(
         self,

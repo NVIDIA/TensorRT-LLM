@@ -439,6 +439,8 @@ class Qwen3MoEModel(DecoderModel):
 class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
                                                       Qwen3MoeConfig]):
 
+    supports_multimodal_breakable_cuda_graph = True
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen3MoeConfig],

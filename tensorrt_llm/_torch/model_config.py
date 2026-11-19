@@ -579,6 +579,19 @@ class ModelConfig(Generic[TConfig]):
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
         super().__setattr__(key, value)
 
+    def deepcopy_with_shared_extra_attrs(self) -> "ModelConfig":
+        """A deep copy that shares this config's ``extra_attrs`` dict.
+
+        For a sub-model built inside another model, such as the language model of a
+        multimodal wrapper. Its attention layers register in ``extra_attrs`` as they
+        are built, and the custom-op path (torch.compile, breakable CUDA graph) looks
+        them up in the outer model's dict. Encoder towers stay out of it
+        (``Attention(register_to_config=False)``).
+        """
+        config = copy.deepcopy(self)
+        config.extra_attrs = self.extra_attrs
+        return config
+
     def copy_with(self, **changes: object) -> "ModelConfig":
         """A shallow copy with ``changes`` applied, frozen as this config is.
 
