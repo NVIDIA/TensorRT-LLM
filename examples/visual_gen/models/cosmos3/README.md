@@ -296,8 +296,8 @@ value, and T2V and I2V on Nano and Super always take the checkpoint's.
 | `sigma_grid` | Grid | `flow_shift` |
 |---|---|---|
 | `"karras"` | The checkpoint's Karras levels | Not used; an explicit value is rejected |
-| `"native"` | The Cosmos framework's shifted-linear flow grid | Used; mode default when omitted |
-| `"diffusers"` | The Diffusers UniPC shifted-linear flow grid | Used; mode default when omitted |
+| `"native"` | The Cosmos framework's shifted-linear flow grid | Used; resolved shift when omitted |
+| `"diffusers"` | The Diffusers UniPC shifted-linear flow grid | Used; resolved shift when omitted |
 
 Selecting a linear grid does not change the shift: pass `flow_shift` with it.
 A `flow_shift` so extreme that the grid's sigmas are not finite, strictly

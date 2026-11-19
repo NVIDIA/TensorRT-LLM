@@ -18,8 +18,8 @@ Exactly two recipes are supported, read from the checkpoint's
 ``scheduler/scheduler_config.json``:
 
 * ``UniPCMultistepScheduler`` without fixed sigmas — base checkpoints:
-  request tables drive steps/guidance, and the flow shift comes from the mode
-  table unless the request overrides it.
+  request tables drive steps/guidance, and the flow shift is the request's,
+  else an override for the kind of request, else the checkpoint scheduler's.
 * ``FlowMatchEulerDiscreteScheduler`` with ``stochastic_sampling`` enabled
   and a nonempty ``fixed_step_sampler_config.t_list`` — distilled
   checkpoints: the step count is locked to the schedule, classifier-free
