@@ -33,6 +33,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
+from tensorrt_llm._torch.mmap_utils import release_file_page_cache
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 
@@ -929,15 +930,7 @@ class KimiK3DefaultTextWeights:
                         split_file_jobs.append((job, files))
 
             def drop_file_pages(file_name: str):
-                path = os.path.join(ckpt_dir, file_name)
-                try:
-                    fd = os.open(path, os.O_RDONLY)
-                    try:
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                    finally:
-                        os.close(fd)
-                except OSError:
-                    pass
+                release_file_page_cache([os.path.join(ckpt_dir, file_name)])
 
             def load_expert_file(file_name: str, jobs: list):
                 if device.type == "cuda":

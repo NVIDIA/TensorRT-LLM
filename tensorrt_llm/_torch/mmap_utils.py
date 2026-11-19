@@ -281,15 +281,23 @@ _MEMINFO_PATH = "/proc/meminfo"
 _VMSTAT_PATH = "/proc/vmstat"
 
 
+# Checkpoint directories this process is reading ahead. Their pages are the
+# node's admitted share, which the node's other ranks may still be reading.
+READ_AHEAD_DIRS: set[str] = set()
+
+
 def release_file_page_cache(paths: Iterable[str]) -> int:
     """Advise the kernel to drop the page cache of ``paths`` (``POSIX_FADV_DONTNEED``).
 
     Returns the total size in bytes of the files advised, not the bytes
     dropped: the kernel keeps pages that are dirty or mapped by a process.
-    Files that cannot be opened or advised are skipped.
+    Files that cannot be opened or advised, or that are being read ahead
+    (``READ_AHEAD_DIRS``), are skipped.
     """
     advised_bytes = 0
     for path in paths:
+        if os.path.dirname(os.path.abspath(path)) in READ_AHEAD_DIRS:
+            continue
         try:
             fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
         except OSError:

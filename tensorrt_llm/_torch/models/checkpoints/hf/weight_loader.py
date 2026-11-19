@@ -33,7 +33,7 @@ import tqdm
 from mpi4py import MPI as _MPI
 
 from tensorrt_llm._errors import ModelLoadError
-from tensorrt_llm._torch.mmap_utils import populate_file_pages
+from tensorrt_llm._torch.mmap_utils import READ_AHEAD_DIRS, populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
@@ -689,6 +689,7 @@ class HfWeightLoader(BaseWeightLoader):
                 fail. When the with-block failed, its error is kept instead.
         """
         status = self._last_checkpoint_io_status
+        READ_AHEAD_DIRS.discard(getattr(self, "_read_ahead_dir", None))
         try:
             read_error = session.finish(body_error)
         except Exception as error:
@@ -936,10 +937,6 @@ class HfWeightLoader(BaseWeightLoader):
         eligibility_reason = None
         preflight_error = None
         try:
-            if self._requires_lazy_safetensors(checkpoint_dir):
-                eligibility_reason = (
-                    "the checkpoint requires model-specific lazy SafeTensors loading"
-                )
             weight_files = self._files_with_key_prefixes(
                 self._selected_safetensors_files(checkpoint_dir,
                                                  use_consolidated),
@@ -1073,6 +1070,8 @@ class HfWeightLoader(BaseWeightLoader):
 
         status = self._last_checkpoint_io_status
         status.activated = True
+        self._read_ahead_dir = os.path.abspath(checkpoint_dir)
+        READ_AHEAD_DIRS.add(self._read_ahead_dir)
         logger.info("Rank-striped checkpoint read-ahead activated: "
                     f"local_rank={local_rank}, local_size={local_size}, "
                     f"workers={plan.workers}, assigned_bytes="
@@ -1082,9 +1081,13 @@ class HfWeightLoader(BaseWeightLoader):
         weights = None
         mapping_error = None
         try:
-            weights = self._load_weights_in_parallel(
-                weight_files, self._load_safetensors_file,
-                "Mapping safetensors weights in parallel")
+            if self._requires_lazy_safetensors(checkpoint_dir):
+                weights = self._load_lazy_safetensors(checkpoint_dir,
+                                                      use_consolidated)
+            else:
+                weights = self._load_weights_in_parallel(
+                    weight_files, self._load_safetensors_file,
+                    "Mapping safetensors weights in parallel")
         except BaseException as error:
             mapping_error = error
         coordinated_mapping_error = coordinate_error(

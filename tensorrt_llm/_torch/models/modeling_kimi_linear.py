@@ -126,6 +126,7 @@ from ..distributed import (
 )
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
+from ..mmap_utils import release_file_page_cache
 from ..model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
 from ..modules.dwdp.dense.manager import get_global_dense_dwdp_manager
 from ..modules.gated_mlp import GatedMLP
@@ -4443,15 +4444,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         split_file_jobs.append((job, files))
 
             def drop_file_pages(file_name: str):
-                path = os.path.join(ckpt_dir, file_name)
-                try:
-                    fd = os.open(path, os.O_RDONLY)
-                    try:
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                    finally:
-                        os.close(fd)
-                except OSError:
-                    pass
+                release_file_page_cache([os.path.join(ckpt_dir, file_name)])
 
             def load_expert_file(file_name: str, jobs: list):
                 if device.type == "cuda":
