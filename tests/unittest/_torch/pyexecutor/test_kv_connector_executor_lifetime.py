@@ -834,15 +834,17 @@ def test_failed_connector_load_batch_preserves_cleanup_order(request_count: int)
     requests = [
         SimpleNamespace(request_id=i, py_connector_load_failed=False) for i in range(request_count)
     ]
-    calls: list[str] = []
+    calls: list[str | tuple[str, int]] = []
     executor.execution_stream = SimpleNamespace(synchronize=lambda: calls.append("fence"))
     executor.kv_connector_manager = SimpleNamespace(
         drop_bound_saves=Mock(side_effect=lambda reqs: calls.append("drop_saves"))
     )
     executor.kv_cache_manager = SimpleNamespace(
-        drop_context_allocation=lambda req: calls.append("drop_allocation")
+        drop_context_allocation=lambda req: calls.append(("drop_allocation", req.request_id))
     )
-    spec_manager = SimpleNamespace(free_resources=lambda req: calls.append("drop_spec"))
+    spec_manager = SimpleNamespace(
+        free_resources=lambda req: calls.append(("drop_spec", req.request_id))
+    )
     executor.resource_manager = SimpleNamespace(get_resource_manager=lambda kind: spec_manager)
 
     assert executor._restart_failed_connector_loads(requests) == list(range(request_count))
@@ -850,7 +852,12 @@ def test_failed_connector_load_batch_preserves_cleanup_order(request_count: int)
     assert all(req.py_connector_load_failed for req in requests)
     if request_count:
         executor.kv_connector_manager.drop_bound_saves.assert_called_once_with(requests)
-        assert calls == ["fence", "drop_saves"] + ["drop_allocation", "drop_spec"] * request_count
+        # Each request is released exactly once, in order.
+        assert calls == ["fence", "drop_saves"] + [
+            (operation, request_id)
+            for request_id in range(request_count)
+            for operation in ("drop_allocation", "drop_spec")
+        ]
     else:
         executor.kv_connector_manager.drop_bound_saves.assert_not_called()
         assert calls == []

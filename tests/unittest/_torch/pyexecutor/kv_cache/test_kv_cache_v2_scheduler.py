@@ -2901,6 +2901,26 @@ def test_a_disagg_generation_init_request_that_no_longer_fits_is_failed_alone() 
     assert scheduler.take_lost_kv_requests() == []
 
 
+def test_a_capacity_rejection_on_the_last_stalled_pass_is_failed_alone() -> None:
+    """A pass that queues a rejection counts as progress, so the executor can drain it."""
+
+    def prepare(req):
+        raise _too_large_for_the_cache(req.py_request_id)
+
+    manager = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare)
+    scheduler = make_scheduler(manager, max_num_tokens=1000, enable_recompute_pause=False)
+    scheduler._stalled_schedules = scheduler._DEADLOCK_STALL_ITERS - 1
+    rejected = make_disagg_request(0)
+
+    batch = scheduler.schedule_request([rejected], set())
+
+    assert ids(batch.fitting_disagg_gen_init_requests) == []
+    [(failed, message)] = scheduler.take_lost_kv_requests()
+    assert failed is rejected and "completion blocks" in message
+    assert scheduler.take_lost_kv_requests() == []
+    assert scheduler._stalled_schedules == 0
+
+
 def test_an_error_that_is_not_a_capacity_rejection_still_stops_scheduling() -> None:
     def prepare(req):
         raise ValueError("a bug, not a request problem")

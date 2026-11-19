@@ -1613,10 +1613,10 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             )
 
     @override
-    def revert_allocate_generation(self, request) -> None:
+    def _undo_generation_step(self, request) -> None:
         if self._kda_replay is not None:
             self._kda_replay.acceptance_pending.discard(request.py_request_id)
-        super().revert_allocate_generation(request)
+        super()._undo_generation_step(request)
 
     @override
     def free_resources(self, request, pin_on_release: bool = False) -> None:

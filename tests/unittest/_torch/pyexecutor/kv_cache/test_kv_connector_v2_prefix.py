@@ -607,6 +607,36 @@ class TestRetainedGenerationAllocation:
         assert manager._inflight_draft_lens == {}
 
 
+class TestSkippedGenerationStepUndo:
+    """Keeping and reverting a skipped step unwind a subclass's per-step state alike."""
+
+    @pytest.mark.parametrize("keep", [True, False])
+    def test_both_paths_run_the_undo_hook(self, keep):
+        manager, _ = TestRetainedGenerationAllocation.make(retained=1, draft_slots=1)
+        manager._retained_generation_allocations = {}
+        manager._allocated_draft_lens = {5: 1}
+        manager._inflight_draft_lens = {5: [1]}
+        manager._undo_generation_step = Mock()
+        req = SimpleNamespace(py_request_id=5, is_dummy_request=False)
+
+        if keep:
+            manager.keep_generation_allocation(req)
+        else:
+            manager.revert_allocate_generation(req)
+
+        manager._undo_generation_step.assert_called_once_with(req)
+
+    def test_kda_replay_drops_the_pending_acceptance(self):
+        from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+
+        manager = object.__new__(KimiK3HybridCacheManager)
+        manager._kda_replay = SimpleNamespace(acceptance_pending={5, 6})
+
+        manager._undo_generation_step(SimpleNamespace(py_request_id=5))
+
+        assert manager._kda_replay.acceptance_pending == {6}
+
+
 class TestUnchunkedIsPureShrink:
     """With chunking off, ``resize_context`` already covered the whole prompt.
 
