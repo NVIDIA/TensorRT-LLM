@@ -2836,6 +2836,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # penalties and token bans below rewrite logits_cuda in place. Keep a
         # copy of the rows of the requests that ask for raw logprobs and use one
         # of them, and put those rows back before the logprobs are read.
+        # Multi-beam requests are skipped, as in the raw-logit extraction of
+        # _sample_batched_by_strategy: their logprobs come from the beam history.
         raw_rows_index_cuda: Optional[torch.Tensor] = None
         raw_rows_cuda: Optional[torch.Tensor] = None
         if return_log_probs:
@@ -2847,6 +2849,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     sampling_requests_metadata.req_num_generated_tokens.tolist(),
                 )
                 if self._slot_params.need_raw_logprobs[cast(int, request.py_seq_slot)]
+                and not (self._use_beam_search and request.py_beam_width != 1)
                 and self._request_rewrites_logits(request)
                 for row in range(offset, offset + num_tokens)
             ]

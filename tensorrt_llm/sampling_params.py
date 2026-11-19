@@ -107,9 +107,10 @@ class LogprobMode(StrEnum):
     RAW = "raw"
     """
     Return the raw log probabilities, i.e., the log probabilities calculated directly from the model output logits.
-    They exclude the embedding bias, the repetition, presence and frequency penalties, the token bans (bad words,
-    no-repeat n-grams and min_length), temperature, and top-k/top-p. Guided decoding and logits processors still
-    apply.
+    For single-beam requests, they exclude the embedding bias, the repetition, presence and frequency penalties, the
+    token bans (bad words, no-repeat n-grams and min_length), temperature, and top-k/top-p. Guided decoding and
+    logits processors still apply. Requests with a beam width above 1 return the log probabilities recorded in
+    their beam search history, so these exclusions do not apply to them.
     """
     PROCESSED = "processed"
     """
