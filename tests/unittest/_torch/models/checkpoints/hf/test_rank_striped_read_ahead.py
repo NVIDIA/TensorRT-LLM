@@ -49,6 +49,11 @@ def _write_checkpoint(tmp_path: Path) -> tuple[Path, dict[str, torch.Tensor]]:
     expected = {
         "model.embed_tokens.weight": torch.arange(24, dtype=torch.float32).reshape(6, 4),
         "model.norm.weight": torch.linspace(0.0, 1.0, 4),
+        "model.layers.0.weight": torch.linspace(0.0, 1.0, 6, dtype=torch.bfloat16),
+        "model.layers.0.packed": torch.arange(3, dtype=torch.uint8),
+        "model.layers.0.scale": torch.tensor(7, dtype=torch.int64),
+        "model.layers.0.block_scale": torch.ones(4, dtype=torch.float8_e8m0fnu),
+        "model.layers.0.empty": torch.empty(0, 4),
     }
     save_file(expected, str(checkpoint_dir / "model.safetensors"))
     return checkpoint_dir, expected

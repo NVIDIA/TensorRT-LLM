@@ -1240,7 +1240,27 @@ class HfWeightLoader(BaseWeightLoader):
     @staticmethod
     def _load_safetensors_file(file: str) -> dict[str, torch.Tensor]:
         logger.info(f"Start to load safetensor file {file}")
-        return safetensors.torch.load_file(file)
+        # One mapping per file and a view per tensor: load_file builds every
+        # tensor separately, which costs tens of seconds per rank on
+        # checkpoints with ~100k tensors.
+        file_size, header_bytes, header = _read_safetensors_header(file)
+        dtypes = dict(getattr(safetensors.torch, "_TYPES", {}),
+                      F8_E8M0=torch.float8_e8m0fnu)
+        storage = torch.UntypedStorage.from_file(file,
+                                                 shared=False,
+                                                 nbytes=file_size)
+        try:
+            return {
+                name:
+                torch.empty(0, dtype=torch.uint8).set_(
+                    storage, 8 + header_bytes + begin, (end - begin, )).view(
+                        dtypes[info["dtype"]]).view(info["shape"])
+                for name, info in header.items() if name != "__metadata__"
+                for begin, end in [info["data_offsets"]]
+            }
+        # A dtype or tensor offset that a view cannot express.
+        except (KeyError, TypeError, RuntimeError):
+            return safetensors.torch.load_file(file)
 
     @staticmethod
     def _load_bin_or_path_file(file):
