@@ -1469,6 +1469,8 @@ def _adp_stats_rank(
     stats for ``pending_iters``; fanned-out rows reach ``_append_stats_rows``,
     a mock."""
     executor = object.__new__(PyExecutor)
+    executor.enable_iter_perf_stats = executor.enable_attention_dp = True
+
     executor.disable_overlap_scheduler = True
     executor.dist = group.rank(rank)
     executor.dist.has_cp_helix = helix_cp

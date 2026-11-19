@@ -131,6 +131,7 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
     monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
     engine = object.__new__(PyExecutor)
+    engine.enable_iter_perf_stats = False
     engine.active_requests = []
     engine.canceled_req_ids = []
     engine.waiting_queue = FCFSWaitingQueue()
@@ -1905,6 +1906,7 @@ def test_adp_receive_retirement_snapshot_keeps_empty_peer_live(
     engines = []
     for rank in ranks:
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine._disagg_coordinator = rank.coordinator
         engine.dist = rank.dist
         engine.enable_attention_dp = True
@@ -2012,6 +2014,7 @@ def test_legacy_tp_cancel_reaches_multimodal_model_generation_work(
     requests = []
     for rank in range(2):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         engine.is_encoder_decoder = encoder_decoder
@@ -2095,6 +2098,7 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
     requests = []
     for rank in range(tp_size):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         request = _request(1)
@@ -2177,6 +2181,7 @@ def test_legacy_tp_cancel_with_request_missing_on_peer(
     request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
     for rank in range(2):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         engine.active_requests = [request] if rank == 0 else []
@@ -2223,6 +2228,7 @@ def test_legacy_tp_cancel_propagates_to_peer_with_active_request(executor: PyExe
     requests = []
     for rank in range(2):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         request = _request(1)
@@ -2280,6 +2286,7 @@ def test_legacy_tp_cp_cancel_vote_covers_cp_ranks_with_missing_replica(
     ready[1] = False  # peer whose receive is not drained
     for rank in range(ranks):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         transceiver = object.__new__(KvCacheTransceiverV2)
@@ -2370,6 +2377,7 @@ def test_legacy_tp_cancel_with_capacity_connector_completes_consensus(
     ready[-1] = False
     for rank in range(tp_size):
         engine = object.__new__(PyExecutor)
+        engine.enable_iter_perf_stats = False
         engine.__dict__.update(executor.__dict__)
         engine.dist = group.rank(rank)
         transceiver = object.__new__(KvCacheTransceiverV2)

@@ -15,6 +15,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.bindings import LlmRequestState
 
 
 @pytest.fixture(params=["async", "sync"])
@@ -85,6 +86,8 @@ def _manager() -> Mock:
 def _request(manager: Mock, request_id: int = 1) -> SimpleNamespace:
     request = SimpleNamespace(
         py_request_id=request_id,
+        is_disagg_generation_transmission_complete=False,
+        state=LlmRequestState.DISAGG_GENERATION_INIT,
         prompt_len=128,
         py_draft_tokens=[],
         is_first_context_chunk=True,

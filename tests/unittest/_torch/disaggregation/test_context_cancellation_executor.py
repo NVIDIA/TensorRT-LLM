@@ -84,6 +84,7 @@ def _request(
 def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
     """Keep lifecycle methods real while replacing model, transport, and output effects."""
     engine = object.__new__(PyExecutor)
+    engine.enable_iter_perf_stats = False
     engine.active_requests = []
     engine.canceled_req_ids = []
     engine.waiting_queue = FCFSWaitingQueue()
