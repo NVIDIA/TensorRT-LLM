@@ -29,6 +29,7 @@ import sys
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -119,7 +120,7 @@ def test_prompt_is_exemplars_then_question_in_one_message():
 
 
 def test_request_sends_exactly_the_protocol_fields():
-    body = protocol.build_request("served", "prompt text")
+    body = runner.PinnedChatCompletion(model="served").request_body("prompt text")
     assert body == {
         "model": "served",
         "messages": [{"role": "user", "content": "prompt text"}],
@@ -445,7 +446,7 @@ def _record(problem, status=records.OK, content="The answer is 4.", identity="ru
         )
     return records.make_record(
         problem,
-        protocol.build_request("served", problem.prompt),
+        runner.PinnedChatCompletion(model="served").request_body(problem.prompt),
         status,
         None if status in records.COMPLETED else "failed",
         fields,
@@ -576,7 +577,7 @@ def test_malformed_reply_is_recorded_and_next_question_continues(tmp_path, bad_r
     ledger = _ledger(tmp_path / "results.jsonl", problems)
     replies = iter([bad_reply, _payload()])
     deps = runner.RunDeps(
-        post=lambda *args, **kwargs: SimpleNamespace(status_code=200, text=next(replies)),
+        post=AsyncMock(side_effect=lambda *args, **kwargs: (200, next(replies))),
         monotonic=lambda: 0,
     )
     session = runner._Session(
@@ -600,7 +601,7 @@ def test_record_construction_contains_unserializable_endpoint_metadata(tmp_path)
     problem = _problem(0)
     record = records.make_record(
         problem,
-        protocol.build_request("served", problem.prompt),
+        runner.PinnedChatCompletion(model="served").request_body(problem.prompt),
         records.OK,
         None,
         {"usage": {"bad": object()}},
@@ -693,9 +694,9 @@ def test_managed_environment_values_are_private_and_rotation_resumes(tmp_path, m
         launches.append(dict(env))
         yield SimpleNamespace(poll=lambda: None)
 
-    def post(url, *, json, timeout):
+    async def post(client, url, *, json, timeout):
         prompts.append(json["messages"])
-        return SimpleNamespace(status_code=next(replies), text=_payload())
+        return next(replies), _payload()
 
     deps = runner.RunDeps(
         launch=launch,
@@ -764,7 +765,7 @@ def test_gpu_cost_preserves_unknown_and_labels_monitored_estimate(tmp_path, monk
         get=lambda *args, **kwargs: SimpleNamespace(
             status_code=200, json=lambda: {"data": [{"id": "served"}]}
         ),
-        post=lambda *args, **kwargs: SimpleNamespace(status_code=200, text=_payload()),
+        post=AsyncMock(return_value=(200, _payload())),
     )
     managed = (
         None
@@ -856,7 +857,7 @@ with open(sys.argv[1], 'a') as lock:
         get=lambda *args, **kwargs: SimpleNamespace(
             status_code=200, json=lambda: {"data": [{"id": "served"}]}
         ),
-        post=lambda *args, **kwargs: SimpleNamespace(status_code=200, text=_payload()),
+        post=AsyncMock(return_value=(200, _payload())),
     )
     managed = runner.ManagedServer(argv=("trtllm-serve", "model"), env={})
     if interrupt:

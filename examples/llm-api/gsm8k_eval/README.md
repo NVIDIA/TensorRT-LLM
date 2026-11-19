@@ -5,9 +5,12 @@ split through an OpenAI-compatible `/v1/chat/completions` endpoint. One implemen
 question selection, prompt and request construction, answer extraction and scoring serves both
 manual use and the [Beam baseline accuracy gate](#beam-baseline-accuracy-gate).
 
+lm-eval schedules chat requests and limits concurrency. The evaluator records each raw reply
+so the gate can check the finish reason, token usage and final-answer channel before scoring.
+
 ## Requirements
 
-- Existing-endpoint mode: Python 3.10 or later with `requests` and `pyarrow`. It needs no GPU, no
+- Existing-endpoint mode: Python 3.10 or later with `lm_eval[api]==0.4.10`, `requests` and `pyarrow`. It needs no GPU, no
   model checkpoint and no TensorRT LLM installation, and it never starts, stops or signals the
   server.
 - Managed mode: a TensorRT LLM installation that provides `trtllm-serve`, the GPUs the serving

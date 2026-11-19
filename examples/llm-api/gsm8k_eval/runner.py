@@ -28,21 +28,22 @@ keep weights, server build and serving settings unchanged behind that name.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import fcntl
 import json
 import math
 import os
 import platform
-import queue
 import tempfile
-import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterator, Mapping, Optional
 
+import aiohttp
 import requests
+from lm_eval.models.openai_completions import LocalChatCompletion
 
 from . import protocol, records, server
 
@@ -82,6 +83,11 @@ class ManagedServer:
     settings: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
 
+async def _post(client, url, *, json, timeout):
+    async with client.post(url, json=json, timeout=timeout) as response:
+        return response.status, await response.text(errors="replace")
+
+
 @dataclasses.dataclass
 class RunDeps:
     """Process, HTTP and clock entry points of a run (fakes replace them in unit tests)."""
@@ -90,7 +96,7 @@ class RunDeps:
     wait_for_addr: Callable[..., tuple[str, int]] = server.wait_for_addr
     memory_poller: Callable[..., ContextManager[Any]] = server.gpu_memory_poller
     get: Callable[..., Any] = requests.get
-    post: Callable[..., Any] = requests.post
+    post: Callable[..., Any] = _post
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
 
@@ -259,99 +265,99 @@ class _Session:
     request_timeout_s: Optional[float]
 
 
+class PinnedChatCompletion(LocalChatCompletion):
+    def request_body(self, prompt):
+        fields = protocol.SAMPLING_FIELDS.copy()
+        seed = fields.pop("seed")
+        body = self._create_payload(
+            [{"role": "user", "content": prompt}], gen_kwargs=dict(fields, until=[]), seed=seed
+        )
+        # The pinned endpoint contract omits stop strings and uses the server's EOS.
+        del body["stop"]
+        return body
+
+    async def amodel_call(self, session, sem, messages, *, cache_keys, record_reply, **kwargs):
+        # lm-eval batches one prompt per chat request. Its default parser drops finish_reason
+        # and usage, which the gate needs to distinguish a complete answer from truncation.
+        async with sem:
+            await record_reply(session, cache_keys[0], self.request_body(messages[0]))
+
+
 def _ask(session: _Session, base: str, model: str, process: Any, deps: RunDeps) -> dict[str, Any]:
     """Ask every pending question; each reply is recorded before the next result is read."""
-    stop = threading.Event()
     url = f"{base}/v1/chat/completions"
+    asked_ids = set()
 
-    def ask(problem: protocol.Problem) -> Optional[dict[str, Any]]:
-        if stop.is_set() or deps.monotonic() >= session.deadline or process.poll() is not None:
-            return None
-        body = protocol.build_request(model, problem.prompt)
-        started_at = records.utc_now()
+    async def ask(client, problem, body):
         begin = deps.monotonic()
-        read_timeout = max(1.0, session.deadline - begin)
-        if session.request_timeout_s is not None:
-            read_timeout = min(read_timeout, session.request_timeout_s)
+        if begin >= session.deadline or process.poll() is not None:
+            return
+        started_at = records.utc_now()
+        remaining = session.deadline - begin
+        read_timeout = min(remaining, session.request_timeout_s or remaining)
+        timeout = aiohttp.ClientTimeout(
+            total=remaining, sock_connect=CONNECT_TIMEOUT_S, sock_read=read_timeout
+        )
         try:
-            reply = deps.post(url, json=body, timeout=(CONNECT_TIMEOUT_S, read_timeout))
+            http_status, text = await deps.post(client, url, json=body, timeout=timeout)
             status, error, fields = records.interpret_reply(
-                reply.status_code, reply.text, max_seq_len=session.max_seq_len
+                http_status, text, max_seq_len=session.max_seq_len
             )
-        except requests.exceptions.Timeout as exc:
+        except asyncio.CancelledError:
+            if deps.monotonic() < session.deadline:
+                raise
+            status, error, fields = records.TIMEOUT, "evaluation deadline reached", {}
+        except asyncio.TimeoutError as exc:
             status, error, fields = (
                 records.TIMEOUT,
                 f"no reply within {read_timeout:.0f} s: {exc}",
                 {},
             )
-        except requests.exceptions.RequestException as exc:
+        except aiohttp.ClientError as exc:
             status, error, fields = records.ERROR, f"request failed: {exc}", {}
-        record = records.make_record(
-            problem,
-            body,
-            status,
-            error,
-            fields,
-            identity=session.identity,
-            attempt=session.attempt,
-            started_at=started_at,
-            finished_at=records.utc_now(),
-            latency_s=deps.monotonic() - begin,
+        session.ledger.append(
+            records.make_record(
+                problem,
+                body,
+                status,
+                error,
+                fields,
+                identity=session.identity,
+                attempt=session.attempt,
+                started_at=started_at,
+                finished_at=records.utc_now(),
+                latency_s=deps.monotonic() - begin,
+            )
         )
-        session.ledger.append(record)
-        return record
+        asked_ids.add(problem.id)
 
-    # Daemon workers: an interruption leaves at once (the caller then stops an owned server);
-    # replies still in flight are not recorded and are asked again on resume.
-    todo: queue.SimpleQueue[protocol.Problem] = queue.SimpleQueue()
-    for problem in session.pending:
-        todo.put(problem)
-    asked: list[dict[str, Any]] = []
-    failures: list[BaseException] = []
-    lock = threading.Lock()
-    workers = min(session.concurrency, len(session.pending))
-    remaining = [workers]
-    all_done = threading.Event()
-
-    def worker() -> None:
-        try:
-            while not stop.is_set():
-                try:
-                    problem = todo.get_nowait()
-                except queue.Empty:
-                    return
-                record = ask(problem)
-                if record is None:
-                    return
-                with lock:
-                    asked.append(record)
-        except BaseException as error:  # noqa: BLE001 - re-raised in the asking thread
-            with lock:
-                failures.append(error)
-            stop.set()
-        finally:
-            with lock:
-                remaining[0] -= 1
-                if remaining[0] == 0:
-                    all_done.set()
+    async def dispatch():
+        client = PinnedChatCompletion(
+            model=model,
+            base_url=url,
+            num_concurrent=session.concurrency,
+            max_retries=1,
+            tokenizer_backend=None,
+        )
+        batch = asyncio.create_task(
+            client.get_batched_requests(
+                [problem.prompt for problem in session.pending], session.pending, record_reply=ask
+            )
+        )
+        while not batch.done():
+            remaining = session.deadline - deps.monotonic()
+            if remaining <= 0 or process.poll() is not None:
+                # asyncio.run cancels and joins all pending requests before the ledger unlocks.
+                return
+            await asyncio.wait({batch}, timeout=min(remaining, POLL_S))
+        await batch
 
     first = deps.monotonic()
-    if workers == 0:
-        all_done.set()
-    for number in range(workers):
-        threading.Thread(target=worker, name=f"gsm8k-eval-{number}", daemon=True).start()
-    try:
-        while not all_done.wait(timeout=POLL_S):
-            if process.poll() is not None or deps.monotonic() >= session.deadline:
-                stop.set()
-    finally:
-        stop.set()
-    if failures:
-        raise failures[0]
-    asked_ids = {record["id"] for record in asked}
+    if session.pending:
+        asyncio.run(dispatch())
     return {
         "evaluation_s": deps.monotonic() - first,
-        "asked": len(asked),
+        "asked": len(asked_ids),
         "not_asked": [p.id for p in session.pending if p.id not in asked_ids],
         "server_exit_code_during_evaluation": process.poll(),
     }

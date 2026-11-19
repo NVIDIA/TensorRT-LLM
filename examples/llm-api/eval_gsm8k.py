@@ -19,7 +19,7 @@
 r"""Evaluate the first N questions of the pinned GSM8K test split over a chat endpoint.
 
 Existing endpoint (any OpenAI-compatible server: aggregated or disaggregated ``trtllm-serve``,
-or a Dynamo frontend). Needs only ``requests`` and ``pyarrow``; the server is never started,
+or a Dynamo frontend). Install ``lm_eval[api]==0.4.10``, ``requests`` and ``pyarrow``; the server is never started,
 stopped or signalled::
 
     python examples/llm-api/eval_gsm8k.py --endpoint http://HOST:PORT \

@@ -206,13 +206,6 @@ def build_prompt(exemplars: Sequence[tuple[str, str]], question: str) -> str:
     return shots + QUESTION_TEMPLATE.format(question=question)
 
 
-def build_request(model: str, prompt: str) -> dict[str, Any]:
-    """The complete JSON body of one chat-completions request."""
-    body: dict[str, Any] = {"model": model, "messages": [{"role": "user", "content": prompt}]}
-    body.update(copy.deepcopy(SAMPLING_FIELDS))
-    return body
-
-
 def request_record(body: Mapping[str, Any]) -> dict[str, Any]:
     """Every sent field, with message text replaced by its SHA-256 and length."""
     record = {key: copy.deepcopy(value) for key, value in body.items() if key != "messages"}
