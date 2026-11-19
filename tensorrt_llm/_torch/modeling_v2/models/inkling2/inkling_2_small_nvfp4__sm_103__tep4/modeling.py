@@ -20,8 +20,9 @@ partial residual block (bf16 between layers) and `blocks` the normalized complet
     output             P'' = P' + m, rounded to bf16
 
 then the final mix over the 8 blocks and the last partial block through the final norm. The
-shell's vocab-parallel lm_head gives fp32 logits, which are soft-capped (30 tanh(x / 30)) and
-cut to the tokenizer's 200058 entries (the padded rows are set to -inf).
+shell's vocab-parallel lm_head GEMM writes bf16 logits, which the shell upcasts to fp32 (as the
+Hugging Face implementation does); they are soft-capped in fp32 (30 tanh(x / 30)) and cut to
+the tokenizer's 200058 entries (the padded rows are set to -inf).
 
 The KV cache is the engine's `KVCacheManagerV2` (BF16, 2 KV heads of 128 per rank, a 1024-token
 window on the 40 sliding layers) extended with each request's short-convolution windows
@@ -186,11 +187,12 @@ class Inkling2SmallCore(DecoderModel):
             tables = {layer: per_window[window[layer]] for layer in layers}
         else:
             tables = {layer: build(layer) for layer in layers}
+        # One upload per distinct table: the layers of a window share theirs.
         uploaded = {}
-        return {
-            layer: uploaded.setdefault(id(t), t.to(device, non_blocking=True))
-            for layer, t in tables.items()
-        }
+        for t in tables.values():
+            if id(t) not in uploaded:
+                uploaded[id(t)] = t.to(device, non_blocking=True)
+        return {layer: uploaded[id(t)] for layer, t in tables.items()}
 
     # ------------------------------------------------------------------------------- forward
 

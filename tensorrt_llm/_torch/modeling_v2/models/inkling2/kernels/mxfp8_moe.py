@@ -24,6 +24,8 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 BLOCK_M = 32
+#: The K tile of both GEMMs: the hidden and intermediate sizes must be multiples of it.
+K_TILE = 128
 
 
 def align_routes(
@@ -246,13 +248,19 @@ def grouped_mxfp8_moe(
     num_tokens, hidden = x_hat.shape
     local, rows, _ = w13.shape
     inter = rows // 2
+    if hidden % K_TILE or inter % K_TILE:
+        # Neither GEMM masks a partial K tile.
+        raise ValueError(
+            f"grouped MXFP8 MoE needs hidden ({hidden}) and intermediate ({inter}) sizes that are "
+            f"multiples of {K_TILE}"
+        )
     top_k = topk_ids.shape[1]
     out = torch.zeros(num_tokens, hidden, dtype=torch.float32, device=x_hat.device)
     if num_tokens == 0:
         return out
     route_of_row, expert_of_block, max_blocks = align_routes(topk_ids, local_expert_offset, local)
     h = torch.empty(max_blocks * BLOCK_M, inter, dtype=torch.bfloat16, device=x_hat.device)
-    block_n, block_k = 128, 128
+    block_n, block_k = 128, K_TILE
     _gemm1_kernel[(max_blocks, triton.cdiv(inter, block_n))](
         x_hat,
         w13,

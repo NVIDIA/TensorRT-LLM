@@ -88,8 +88,16 @@ def _check(
         "state must hold contiguous channels in x's dtype"
     )
     num_requests = slots.shape[0]
-    for name, t in (("slots", slots), ("query_start", query_start), ("has_state", has_state)):
+    metadata = (
+        ("slots", slots),
+        ("query_start", query_start),
+        ("has_state", has_state),
+        ("token_request", token_request),
+    )
+    for name, t in metadata:
         assert t.dtype == torch.int32 and t.dim() == 1, f"{name} must be a 1-D int32 tensor"
+        # The kernels index request metadata at unit stride.
+        assert t.is_contiguous(), f"{name} must be contiguous"
     assert query_start.shape[0] == num_requests + 1 and has_state.shape[0] == num_requests, (
         "query_start must be [R + 1] and has_state [R] for R = len(slots)"
     )

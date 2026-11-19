@@ -143,6 +143,7 @@ def test_negative_controls_are_visible(what) -> None:
         ("bf16_rel_logits", None),
         ("short_page_table", "page_table must cover"),
         ("wrong_tiles", "tile plan"),
+        ("strided_kv", "contiguous head dims"),
     ],
 )
 def test_guard_refuses_inputs_the_op_answers_wrongly(case, match) -> None:
@@ -151,6 +152,13 @@ def test_guard_refuses_inputs_the_op_answers_wrongly(case, match) -> None:
         args[11] = args[11].to(torch.bfloat16)
     elif case == "short_page_table":
         args[4] = args[4][:, :1]
+    elif case == "strided_kv":
+        # The same values every other element of a wider buffer: the kernels read unit stride.
+        for i in (1, 2):
+            t = args[i]
+            wide = torch.zeros(*t.shape[:2], 2 * t.shape[2], dtype=t.dtype, device=t.device)
+            wide[..., ::2] = t
+            args[i] = wide[..., ::2]
     else:
         args[9] = torch.zeros_like(args[9])
     with pytest.raises(AssertionError, match=match):

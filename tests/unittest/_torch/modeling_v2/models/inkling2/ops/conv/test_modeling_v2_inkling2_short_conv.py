@@ -102,10 +102,12 @@ def test_dynamic_certified_cells(cell, certifying) -> None:  # noqa: F811
     )
 
 
+@pytest.mark.parametrize("first", [1, 2, 21])
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
-def test_chunked_steps_equal_one_prefill(dynamic) -> None:
-    """A prefill of 21 tokens, then chunks of 2 and 1 and decodes, equals one 29-token prefill:
-    the window carries exactly the inputs a step needs from the steps before it."""
+def test_chunked_steps_equal_one_prefill(dynamic, first) -> None:
+    """A fresh prefill of `first` tokens over a stale window, then chunks and decodes, equals one
+    29-token prefill: the window carries exactly the inputs a step needs from the steps before it,
+    and a fresh request shorter than the window starts it with zeros, not the stale inputs."""
     channels, heads = 256, 2
     g = torch.Generator(device="cuda").manual_seed(5)
     total = 29
@@ -133,8 +135,11 @@ def test_chunked_steps_equal_one_prefill(dynamic) -> None:
     whole = run(0, total, torch.zeros(3, 3, channels, dtype=torch.bfloat16, device="cuda"), 0)
     state = torch.randn(3, 3, channels, device="cuda").to(torch.bfloat16)
     pieces, start = [], 0
-    for end in (21, 23, 24, 25, 26, 27, 28, 29):
+    for end in sorted({first, *(e for e in (21, 23, 24, 25, 26, 27, 28, 29) if e > first)}):
         pieces.append(run(start, end, state, int(start > 0)))
+        if start == 0 and end < 3:
+            zeros = torch.zeros(3 - end, channels, dtype=torch.bfloat16, device="cuda")
+            torch.testing.assert_close(state[1], torch.cat([zeros, x[:end]]), rtol=0, atol=0)
         start = end
     torch.testing.assert_close(torch.cat(pieces), whole, rtol=0, atol=0)
     torch.testing.assert_close(state[1], x[-3:], rtol=0, atol=0)
@@ -157,6 +162,7 @@ def test_dynamic_taps_are_per_head() -> None:
         ("duplicate_slot", "own slot"),
         ("bf16_taps", "lag-major fp32"),
         ("bad_token_request", "token_request"),
+        ("strided_slots", "slots must be contiguous"),
     ],
 )
 def test_guard_refuses_inputs_the_op_answers_wrongly(case, match) -> None:
@@ -166,6 +172,9 @@ def test_guard_refuses_inputs_the_op_answers_wrongly(case, match) -> None:
         slots = slots[:1].repeat(2)
     elif case == "bf16_taps":
         taps = taps.to(torch.bfloat16)
+    elif case == "strided_slots":
+        # The same slot values, as a view the kernels would index at unit stride.
+        slots = torch.stack([slots, slots + NUM_SLOTS], dim=1)[:, 0]
     else:
         token_request = torch.zeros_like(token_request)
     with pytest.raises(AssertionError, match=match):

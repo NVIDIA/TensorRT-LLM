@@ -26,7 +26,7 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
-from ...kernels.mxfp8_moe import grouped_mxfp8_moe
+from ...kernels.mxfp8_moe import K_TILE, grouped_mxfp8_moe
 
 #: Values per MXFP8 scale.
 BLOCK = 32
@@ -174,6 +174,9 @@ class Inkling2Mxfp8Experts(OpWrapper):
         assert w2_s.shape == (local, hidden, rows // 2 // BLOCK) and w2_s.dtype == torch.uint8
         assert x.dtype == torch.bfloat16 and x.shape[1] == hidden
         assert topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
+        assert hidden % K_TILE == 0 and (rows // 2) % K_TILE == 0, (
+            f"hidden and intermediate sizes must be multiples of the {K_TILE}-wide K tile"
+        )
 
 
 inkling2_mxfp8_experts = Inkling2Mxfp8Experts()

@@ -207,6 +207,7 @@ class Inkling2PagedAttention(OpWrapper):
         assert k.shape == v.shape == (num_tokens, num_kv_heads, head_dim), (
             "k and v must be [T, kv heads, head dim]"
         )
+        assert k.stride(2) == 1 and v.stride(2) == 1, "k and v must have contiguous head dims"
         assert k.dtype == v.dtype == q.dtype == kv_pool.dtype, "q, k, v and the pool share a dtype"
         assert rel_logits.dtype == torch.float32 and rel_logits.shape[:2] == (num_tokens, num_heads)
         assert rel_logits.stride(2) == 1, "rel_logits must be contiguous over distances"

@@ -62,6 +62,22 @@ def test_values_are_the_normalized_states() -> None:
     torch.testing.assert_close(op(*args), out, rtol=0, atol=0)
 
 
+def test_fp32_partial_block_keeps_its_low_bits() -> None:
+    """The decoder hands the partial block over in fp32; the mix must not round it to bf16."""
+    blocks, partial, queries, weights, eps = _build(dict(blocks=3, queries=2, tokens=5), 11)
+    g = torch.Generator(device="cuda").manual_seed(12)
+    partial = partial.float() + 1e-3 * torch.randn(partial.shape, generator=g, device="cuda")
+    rounded = partial.to(torch.bfloat16)
+    assert not torch.equal(partial, rounded.float()), "values bf16 cannot hold"
+    out = op(blocks, partial, queries, weights, eps)
+    ref = op.reference(blocks, partial, queries, weights, eps)
+    assert_within_ulp(
+        out.reshape(-1, HIDDEN), ref.reshape(-1, HIDDEN), element_ulp=1.0, rms_ulp=0.1
+    )
+    # Had the op rounded the partial block first, both inputs would give the same mix.
+    assert not torch.equal(out, op(blocks, rounded, queries, weights, eps))
+
+
 def test_guard_refuses_bf16_queries() -> None:
     blocks, partial, queries, weights, eps = _build(dict(blocks=2, queries=1, tokens=3), 3)
     with pytest.raises(AssertionError, match="fp32"):

@@ -163,9 +163,13 @@ def test_router_certified_cells(cell, certifying) -> None:  # noqa: F811
 
 def test_fc1_row_order_and_swizzle_round_trip() -> None:
     order = fc1_row_order(2304, torch.device("cpu"))
-    assert sorted(order.tolist()) == list(range(4608))
-    # Rows 0..63 of the kernel are up rows 1, 3, ..; rows 64..127 gate rows 0, 2, ..
-    assert order[:3].tolist() == [1, 3, 5] and order[64:67].tolist() == [0, 2, 4]
+    # The checkpoint interleaves gate (even) and up (odd) rows. Kernel group g (128 rows) holds the
+    # up rows of gate/up pairs 64 g .. 64 g + 63, then their gate rows: every group, in order.
+    expected = []
+    for group in range(2304 // 64):
+        pairs = range(64 * group, 64 * group + 64)
+        expected += [2 * p + 1 for p in pairs] + [2 * p for p in pairs]
+    assert order.tolist() == expected
     scales = torch.randint(0, 256, (3, 256, 288), dtype=torch.uint8)
     assert torch.equal(unswizzle_block_scales(swizzle_block_scales(scales)), scales)
 
@@ -194,13 +198,12 @@ def test_nvfp4_certified_cells(cell, certifying) -> None:  # noqa: F811
 
 
 def test_nvfp4_runs_under_inference_mode() -> None:
-    """The engine runs every forward under inference mode; the op gives the same answer there."""
+    """The engine runs every forward under inference mode, a layer's first call included."""
     args = _nvfp4_args(dict(inkling2_nvfp4_experts.CELLS[1].spec), 23)
-    expected = inkling2_nvfp4_experts(*args)
+    ref = inkling2_nvfp4_experts.reference(*args)
     with torch.inference_mode():
         out = inkling2_nvfp4_experts(*args)
-    # The experts' outputs meet in atomic adds, whose order changes the last bf16 bit.
-    assert _rel_rms(out, expected) < 1e-2, _rel_rms(out, expected)
+    assert _rel_rms(out, ref) < 0.02, _rel_rms(out, ref)
 
 
 def test_nvfp4_swapped_gate_and_up_is_visible() -> None:
@@ -241,6 +244,42 @@ def test_align_routes_puts_each_local_route_in_one_row_of_its_expert() -> None:
         assert all(flat[r] == experts[b] for r in routes)
         placed += routes
     assert sorted(placed) == sorted(local)
+
+
+def test_mxfp8_expert_with_more_routes_than_a_row_block() -> None:
+    """33 routes to one expert fill a 32-row block and spill into a second: both count."""
+    from tensorrt_llm._torch.modeling_v2.models.inkling2.kernels.mxfp8_moe import (
+        BLOCK_M,
+        align_routes,
+    )
+
+    tokens = BLOCK_M + 1
+    spec = dict(local=4, hidden=256, inter=256, rank=1, tokens=tokens, experts=16, top_k=2)
+    args = _mxfp8_args(spec, 31)
+    offset = args[7]
+    # Every token's first choice is local expert 2; its second is expert 0, on another rank.
+    args[1] = torch.tensor([[offset + 2, 0]] * tokens, dtype=torch.int32, device="cuda")
+    args[2] = torch.full((tokens, 2), 4.0, device="cuda")
+    route_of_row, expert_of_block, max_blocks = align_routes(args[1], offset, spec["local"])
+    rows = route_of_row.view(max_blocks, BLOCK_M).cpu()
+    blocks = [b for b in range(max_blocks) if int(expert_of_block[b]) == 2]
+    assert len(blocks) == 2
+    placed = sorted(r for b in blocks for r in rows[b].tolist() if r >= 0)
+    assert placed == [2 * t for t in range(tokens)], "each route exactly once"
+    out = inkling2_mxfp8_experts(*args)
+    ref = inkling2_mxfp8_experts.reference(*args)
+    assert _rel_rms(out, ref) < 2e-3, _rel_rms(out, ref)
+
+
+def test_mxfp8_refuses_a_partial_k_tile() -> None:
+    """Neither GEMM masks a partial 128-wide K tile, so such a size is refused before launch."""
+    spec = dict(local=2, hidden=256, inter=160, rank=0, tokens=4, experts=8, top_k=2)
+    args = _mxfp8_args(spec, 7)
+    with pytest.raises(ValueError, match="multiples of 128"):
+        inkling2_mxfp8_experts(*args)
+    with pytest.raises(AssertionError, match="128-wide K tile"):
+        with validating(inkling2_mxfp8_experts):
+            inkling2_mxfp8_experts(*args)
 
 
 def test_mxfp8_quantize_round_trip() -> None:
