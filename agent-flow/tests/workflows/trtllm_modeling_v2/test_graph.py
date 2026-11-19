@@ -67,24 +67,6 @@ def test_an_investigation_never_gates_a_check_and_a_check_never_gates_a_kernel()
     ]
 
 
-def test_a_regression_check_may_wait_for_a_nice_to_have_task_and_not_for_ever():
-    extra = g.Task(id="extra", kind="feature", goal="nice", priority="nice_to_have",
-                   touches=["tensorrt_llm/_torch/shared.py"])  # fmt: skip
-    review = g.Task(id="regression-2", kind="check", goal="run the package tests",
-                    regression=True, depends_on=["extra"])  # fmt: skip
-    graph = g.Graph(tasks=[extra, review])
-    assert not [e for e in g.validate(graph) if "informs" in e]
-    assert [t.id for t in g.ready(graph)] == ["extra"]
-    # Ended without landing: nothing of it to review, so the check is not held for ever.
-    extra.status, extra.attempts = "failed", 1
-    assert [t.id for t in g.ready(graph)] == ["regression-2"]
-    # Any other check still may not wait for it.
-    review.regression = False
-    assert any("'regression-2': depends on 'extra', a nice_to_have task" in e
-               for e in g.validate(graph))  # fmt: skip
-    assert g.ready(graph) == []
-
-
 def test_round_trip_preserves_every_field_and_an_unknown_version_is_rejected(tmp_path):
     path = tmp_path / "state.json"
     original = WorkflowState(

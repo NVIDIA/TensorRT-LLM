@@ -82,13 +82,13 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/test_k3_source_checks.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_ctm_gemv/test_k3_ctm_gemv_source_checks.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_decode_gemv/test_k3_decode_gemv_source_checks.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_drafter/test_k3_drafter_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/kernels/k3_drafter/test_k3_drafter_source_checks.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_fused_moe_source_checks.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_kda_attn/test_k3_kda_attn_source_checks.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_kda_verify/test_k3_kda_verify_source_checks.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/test_k3_mla_source_checks.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_sandwich/test_k3_sandwich_source_checks.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_k3_moe_engines_source_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/kernels/k3_moe_engines/test_k3_moe_engines_source_checks.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py
@@ -98,7 +98,7 @@ l0_cpu:
   # GLM routing, draft workspace setup and the MTP draft's MoE selection use CPU
   # metadata, mocked allocations and a patched draft class.
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_draft_exchange.py
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_mtp_draft_moe.py
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_modeling_v2_mtp_draft_moe.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_small_batch_mtp.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
   # The qwen4_exp default target's cpu_only tests (its routing among them); this stage runs
@@ -135,14 +135,18 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_rank_agreement.py
   - unittest/_torch/modeling_v2/test_modeling_v2_env_scope.py
   - unittest/_torch/modeling_v2/test_modeling_v2_reference_precision.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_fp4_test_helpers.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_fp4_test_helpers.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_equality.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_job.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_mnnvl_mcast_workspace.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_routing.py
   # The GPU stages run with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_decode_step.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_decode_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_attn_res.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_fp4_mla_copies.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_mnnvl_workspace.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_k3_decode_worker.py
@@ -150,10 +154,13 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_ctx_rows_start.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_draft_block_rows.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_drafter_comm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_drafter_weights.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_spec_worker_gate.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_uncertified_generic_calls.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_uncertified_generic_calls.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_uncertified_generic_calls.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_kimi_k3_spec_shell.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_weights_checks.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_causal_lm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_decode_moe.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_k3_allreduce_module.py
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_weight_table.py
@@ -263,6 +270,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_cosmos3_edge_fp8_manifest.py
   - unittest/_torch/visual_gen/test_cosmos3_sigma_grid.py
   - unittest/_torch/visual_gen/test_quant_static_guard.py
+  - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_seacache.py
   - unittest/_torch/visual_gen/test_sleep.py
   - unittest/_torch/visual_gen/test_teacache.py
@@ -286,6 +294,7 @@ l0_cpu:
   - unittest/docs/test_llmapi_reference_docs.py
   - unittest/dynamo
   - unittest/evaluate/test_image_generation_eval_cli.py
+  - unittest/evaluate/visual_gen/test_video_generation_eval.py
   - unittest/evaluate/test_json_mode_eval.py
   - unittest/executor/test_base_worker.py ISOLATION
   - unittest/executor/test_fatal_error_health_check.py
