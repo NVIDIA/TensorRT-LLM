@@ -85,7 +85,7 @@ def test_nixl_roundtrip_retains_tensors_metadata_and_mrope(pair):
     llm, seen = model()
     output, expected = native_result()
     ref = producer.publish(output, request(), llm)
-    assert ref.reference_format == transport.BACKEND
+    assert json.loads(ref.opaque_state)["format"] == transport.BACKEND
     assert "host" not in json.loads(ref.opaque_state)
     assert not output.disaggregated_params.multimodal_embedding_handles
     _, params = consumer.prepare(ref, request(), llm, None)
@@ -369,7 +369,7 @@ def test_reference_does_not_expose_source_addresses(pair):
     llm, _ = model()
     ref = producer.publish(native_result()[0], request(), llm)
     state = json.loads(ref.opaque_state)
-    assert set(state) == {"version", "id", "endpoint", "metadata"}
+    assert set(state) == {"format", "version", "id", "endpoint", "metadata"}
     assert "ptr" not in state["metadata"]
 
 
@@ -388,9 +388,7 @@ def test_receiver_quota_and_dtype_validation_precede_allocation(pair):
     ref = producer.publish(native_result()[0], request(), llm)
     state = json.loads(ref.opaque_state)
     state["metadata"]["tensors"][0]["shape"] = [2**30]
-    oversized = EncodedMediaRef(
-        reference_format=transport.BACKEND, opaque_state=json.dumps(state).encode()
-    )
+    oversized = EncodedMediaRef(opaque_state=json.dumps(state).encode())
     with pytest.raises(ValueError, match="memory limit"):
         consumer.prepare(oversized, request(), llm, None)
     assert _writes(producer) == 0
@@ -748,7 +746,6 @@ def test_discard_reclaims_only_unclaimed_nixl_exports(pair, monkeypatch):
     value = json.loads(ref.opaque_state)
     for key, replacement in (("endpoint", "wrong.example:1234"), ("metadata", {})):
         malformed = EncodedMediaRef(
-            reference_format=transport.BACKEND,
             opaque_state=json.dumps({**value, key: replacement}).encode(),
         )
         with pytest.raises(ValueError):
@@ -789,7 +786,6 @@ def test_discard_during_claim_prevents_rejected_transfer_from_restoring_export(p
         assert identity in producer._claims
         value = json.loads(reference.opaque_state)
         malformed = EncodedMediaRef(
-            reference_format=transport.BACKEND,
             opaque_state=json.dumps({**value, "metadata": {}}).encode(),
         )
         with pytest.raises(ValueError, match="metadata mismatch"):
@@ -928,3 +924,50 @@ def test_unreachable_peer_quarantines_only_its_receive_and_late_write_remains_sa
     consumer.close()
     assert pinned.registrations and not pinned.stopped
     assert consumer._used == pinned_bytes
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing_format", "wrong_format", "missing_version", "wrong_version", "oversized"]
+)
+def test_native_envelope_rejection_precedes_allocation_claim_and_release(
+    pair, monkeypatch, invalid
+):
+    producer, consumer = pair
+    llm, _ = model()
+    reference = producer.publish(native_result()[0], request(), llm)
+    value = json.loads(reference.opaque_state)
+    identity = value["id"]
+    if invalid.startswith("missing_"):
+        value.pop(invalid.removeprefix("missing_"))
+    elif invalid == "wrong_format":
+        value["format"] = "another-engine-output-v1"
+    else:
+        value["version"] = 2
+    payload = (
+        json.dumps(value).encode()
+        if invalid != "oversized"
+        else b"x" * (transport._MAX_REFERENCE_BYTES + 1)
+    )
+    malformed = EncodedMediaRef(payload)
+    destination = b"destination must not be parsed"
+    decode = transport._decode
+
+    def guarded_decode(data):
+        if data == destination:
+            pytest.fail("invalid reference reached receiver metadata parsing")
+        return decode(data)
+
+    monkeypatch.setattr(transport, "_decode", guarded_decode)
+    operations = (
+        lambda: consumer.prepare(malformed, request(), llm, None),
+        lambda: producer.discard(malformed),
+        lambda: producer.transfer(malformed, destination),
+    )
+    for operation in operations:
+        with pytest.raises(ValueError):
+            operation()
+        assert identity in producer._exports and not producer._claims
+        assert consumer._used == consumer._receive_slots == 0
+        assert not consumer.test_agents and _writes(producer) == 0
+    consumer.prepare(reference, request(), llm, None)
+    assert producer._used == consumer._used == 0

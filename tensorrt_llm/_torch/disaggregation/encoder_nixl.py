@@ -233,9 +233,15 @@ class NixlEncoderCache:
                 }
                 identity = uuid.uuid4().hex
                 state = _encode(
-                    {"version": 1, "endpoint": self.endpoint, "id": identity, "metadata": metadata}
+                    {
+                        "format": BACKEND,
+                        "version": 1,
+                        "endpoint": self.endpoint,
+                        "id": identity,
+                        "metadata": metadata,
+                    }
                 )
-                reference = EncodedMediaRef(reference_format=BACKEND, opaque_state=state)
+                reference = EncodedMediaRef(opaque_state=state)
                 with self._lock:
                     self._healthy()
                     self._exports[identity] = _Export(tensors, metadata, time.monotonic(), total)
@@ -250,9 +256,9 @@ class NixlEncoderCache:
 
     @staticmethod
     def _reference(reference):
-        if reference.reference_format != BACKEND:
-            raise ValueError("unsupported encoder transfer backend")
         value = _decode(reference.opaque_state)
+        if value.get("format") != BACKEND:
+            raise ValueError("unsupported encoder transfer format")
         identity = value.get("id")
         if (
             type(value.get("version")) is not int

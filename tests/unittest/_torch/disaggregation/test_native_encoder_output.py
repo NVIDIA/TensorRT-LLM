@@ -192,7 +192,7 @@ def test_expiry_wrong_inputs_and_cross_host_are_rejected(tmp_path):
     ref = cache.publish(result, request(), llm)
     value = json.loads(ref.opaque_state)
     value["host"] = "another-host"
-    bad = oe.EncodedMediaRef(reference_format=oe.BACKEND, opaque_state=json.dumps(value).encode())
+    bad = oe.EncodedMediaRef(opaque_state=json.dumps(value).encode())
     with pytest.raises(ValueError, match="same host"):
         cache.prepare(bad, request(), llm, None)
     wrong = replace(request(), prompt="Another image prompt")
@@ -320,7 +320,6 @@ def test_discard_rejects_foreign_and_malformed_references(tmp_path):
     value = json.loads(ref.opaque_state)
     for key, replacement in (("namespace", "foreign"), ("host", "foreign"), ("id", "../file")):
         malformed = oe.EncodedMediaRef(
-            reference_format=oe.BACKEND,
             opaque_state=json.dumps({**value, key: replacement}).encode(),
         )
         with pytest.raises(ValueError):
@@ -334,7 +333,7 @@ def test_recursive_decode_is_invalid_without_consuming_handoff(tmp_path, monkeyp
     cache = oe.EncoderCache(str(tmp_path))
     llm, _ = model()
     ref = cache.publish(native_result()[0], request(), llm)
-    malformed = oe.EncodedMediaRef(reference_format=oe.BACKEND, opaque_state=b"[" * 1024)
+    malformed = oe.EncodedMediaRef(opaque_state=b"[" * 1024)
 
     def fail_decode(_):
         raise RecursionError("maximum recursion depth exceeded while decoding JSON")
@@ -354,3 +353,30 @@ def test_recursive_decode_is_invalid_without_consuming_handoff(tmp_path, monkeyp
 def test_native_input_requires_exactly_one_context(prompt, token_ids):
     with pytest.raises(ValueError, match="prompt or token IDs"):
         oe.EncoderInput(prompt, token_ids, request().media)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing_format", "wrong_format", "missing_version", "wrong_version", "oversized"]
+)
+def test_native_envelope_rejection_preserves_unclaimed_output(tmp_path, invalid):
+    cache = oe.EncoderCache(str(tmp_path))
+    llm, _ = model()
+    reference = cache.publish(native_result()[0], request(), llm)
+    value = json.loads(reference.opaque_state)
+    if invalid.startswith("missing_"):
+        value.pop(invalid.removeprefix("missing_"))
+    elif invalid == "wrong_format":
+        value["format"] = "another-engine-output-v1"
+    else:
+        value["version"] = 2
+    payload = json.dumps(value).encode() if invalid != "oversized" else b"x" * 1025
+    malformed = oe.EncodedMediaRef(payload)
+    for operation in (
+        lambda: cache.prepare(malformed, request(), llm, None),
+        lambda: cache.discard(malformed),
+    ):
+        with pytest.raises(ValueError):
+            operation()
+        assert len(list(tmp_path.glob("*.safetensors"))) == 1
+    cache.prepare(reference, request(), llm, None)
+    assert not list(tmp_path.glob("*.safetensors"))

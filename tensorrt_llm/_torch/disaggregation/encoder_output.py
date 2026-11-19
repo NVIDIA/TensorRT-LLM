@@ -28,7 +28,6 @@ from tensorrt_llm.logger import logger
 class EncodedMediaRef:
     """Framework-owned transferable output reference, independent of serving RPCs."""
 
-    reference_format: str
     opaque_state: bytes
 
 
@@ -335,14 +334,19 @@ class EncoderCache:
                 temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
-        reference = {"version": 1, "namespace": self.namespace, "host": self.host, "id": identity}
+        reference = {
+            "format": BACKEND,
+            "version": 1,
+            "namespace": self.namespace,
+            "host": self.host,
+            "id": identity,
+        }
         return EncodedMediaRef(
-            reference_format=BACKEND,
             opaque_state=json.dumps(reference, separators=(",", ":")).encode(),
         )
 
     def _path(self, reference: Any) -> Path:
-        if reference.reference_format != BACKEND or len(reference.opaque_state) > 1024:
+        if len(reference.opaque_state) > 1024:
             raise ValueError("unsupported encoder handoff reference")
         try:
             value = json.loads(reference.opaque_state)
@@ -350,10 +354,11 @@ class EncoderCache:
             raise ValueError("invalid encoder handoff reference") from error
         if (
             not isinstance(value, dict)
+            or value.get("format") != BACKEND
             or type(value.get("version")) is not int
             or value["version"] != 1
         ):
-            raise ValueError("unsupported encoder handoff reference version")
+            raise ValueError("unsupported encoder handoff format or version")
         if value.get("namespace") != self.namespace or value.get("host") != self.host:
             raise ValueError(
                 "encoder and consumer require the same host and shared cache directory"
