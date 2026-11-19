@@ -101,13 +101,19 @@ class DeCoAttention(AttentionBackend):
                 f"this GPU, whose kernels take qk_dtype='nvfp4' with v_dtype in {pv_formats}."
             )
 
+        if attention_metadata_state is None:
+            raise ValueError(
+                "DeCoAttention requires `attention_metadata_state` from DiffusionModelConfig: "
+                "the layers of a model component share one workspace buffer."
+            )
+
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
         self.dtype = dtype
         self.quant_attention_config = quant_attention_config
-        self._state = attention_metadata_state if attention_metadata_state is not None else {}
+        self._state = attention_metadata_state
         self._preferred_layout = AttentionTensorLayout.NHD
         self._vanilla = VanillaAttention(
             layer_idx=layer_idx,

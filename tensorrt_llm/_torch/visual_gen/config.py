@@ -823,11 +823,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
             FP8RowwiseLinearMethod.use_tunable_quantize = True
 
-        quant_attention_cfg = attention_cfg.quant_attention_config
         attention_metadata_state = (
             create_attention_metadata_state()
-            if attention_cfg.backend in ("TRTLLM", "FLASHINFER")
-            or (quant_attention_cfg is not None and quant_attention_cfg.deco_attention)
+            if attention_cfg.backend in ("TRTLLM", "FLASHINFER", "CUTEDSL")
             else None
         )
 
