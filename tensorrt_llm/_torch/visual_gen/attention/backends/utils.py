@@ -25,7 +25,7 @@ from typing import Optional, Type
 import torch
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 from .interface import AttentionBackend
 
@@ -33,15 +33,19 @@ from .interface import AttentionBackend
 def get_visual_gen_attention_backend(
     backend_name: str,
     sparse_algorithm: Optional[str] = None,
+    quant_attention_config: Optional[QuantAttentionConfig] = None,
 ) -> Type[AttentionBackend]:
     """
-    Get diffusion attention backend class by name and sparse algorithm.
+    Get diffusion attention backend class by name, sparse algorithm and quantization recipe.
 
     Args:
         backend_name: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4")
         sparse_algorithm: ``algorithm`` of the sparse attention config, if any. VSA
             ("vsa") and SOL ("sol_attn") have their own TRTLLM and CUTEDSL classes;
             other algorithms, such as skip-softmax, run in the dense class.
+        quant_attention_config: The quantized attention config, if any. A recipe with
+            ``deco_attention`` has its own CUTEDSL class; the other recipes run in the class
+            of their backend.
 
     Returns:
         Diffusion attention backend class
@@ -55,12 +59,13 @@ def get_visual_gen_attention_backend(
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
         - "CUTEDSL": CuTe DSL kernels: dense/SkipSoftmax FMHA, VSA or SOL depending on
-                     ``sparse_algorithm``.
+                     ``sparse_algorithm``, or DeCo-Attention with ``deco_attention``.
         - "CUDNN": cuDNN fused SDPA. Unquantized by default; quant_attention_config
                    selects per-tensor FP8 or block-scaled MXFP8 (Blackwell).
     """
 
     backend_name = backend_name.upper()
+    is_deco = quant_attention_config is not None and quant_attention_config.deco_attention
 
     if sparse_algorithm == "vsa" and backend_name == "TRTLLM":
         from .sparse.vsa.backend import VSATrtllmAttention
@@ -78,6 +83,10 @@ def get_visual_gen_attention_backend(
         from .sparse.sol.backend import SOLCuTeDSLAttention
 
         return SOLCuTeDSLAttention
+    elif is_deco and backend_name == "CUTEDSL":
+        from .cute_dsl import DeCoAttention
+
+        return DeCoAttention
     elif backend_name == "VANILLA":
         from .vanilla import VanillaAttention
 
@@ -145,7 +154,8 @@ def create_attention(
             forward its quantization or sparsity configuration.
         attention_metadata_state: Optional per-component VisualGen attention state.
             It keeps shape-stable attention metadata alive across layers and
-            CUDA Graph captures. Required for TRTLLM and shared by FlashInfer layers.
+            CUDA Graph captures. Required for TRTLLM and shared by FlashInfer and
+            DeCo-Attention layers.
         **kwargs: Additional backend-specific arguments
 
     Returns:
@@ -158,8 +168,15 @@ def create_attention(
     is_vsa = sparse_algorithm == "vsa"
     is_sol = sparse_algorithm == "sol_attn"
 
+    quant_attention_config = (
+        attention_config.quant_attention_config if attention_config is not None else None
+    )
+    is_deco = quant_attention_config is not None and quant_attention_config.deco_attention
+
     backend_name = backend.upper()
-    attn_cls = get_visual_gen_attention_backend(backend_name, sparse_algorithm)
+    attn_cls = get_visual_gen_attention_backend(
+        backend_name, sparse_algorithm, quant_attention_config
+    )
 
     if is_vsa:
         sparse_params = kwargs.pop("sparse_params", None)
@@ -170,10 +187,10 @@ def create_attention(
         # construct a backend directly get the same lowering here.
         kwargs["sparse_params"] = sparse_config.to_sparse_params()
 
-    # Forward the validated quantization recipe to TRTLLM, cuDNN, FlashInfer, or the dense CuTe DSL
-    # FMHA backend.
-    if attention_config is not None and attention_config.quant_attention_config is not None:
-        kwargs["quant_attention_config"] = attention_config.quant_attention_config
+    # Forward the validated quantization recipe to TRTLLM, cuDNN, FlashInfer, the dense CuTe DSL
+    # FMHA backend, or DeCo-Attention.
+    if quant_attention_config is not None:
+        kwargs["quant_attention_config"] = quant_attention_config
     if backend_name == "TRTLLM":
         if attention_metadata_state is None:
             raise ValueError(
@@ -186,6 +203,13 @@ def create_attention(
             raise ValueError(
                 "FLASHINFER backend requires `attention_metadata_state` from "
                 "DiffusionModelConfig for shared workspace allocation."
+            )
+        kwargs["attention_metadata_state"] = attention_metadata_state
+    elif is_deco and backend_name == "CUTEDSL":
+        if attention_metadata_state is None:
+            raise ValueError(
+                "DeCo-Attention requires `attention_metadata_state` from "
+                "DiffusionModelConfig: its layers share one workspace buffer."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
     return attn_cls(

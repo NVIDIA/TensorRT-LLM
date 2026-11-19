@@ -514,8 +514,15 @@
     },
     "QuantAttentionConfig": {
       "additionalProperties": false,
-      "description": "Attention quantization recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends).\n\nSpecifies Q/K and V quantization formats and their optional block sizes.\n\nBare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is\nbackend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V\non SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. Unsupported recipes are rejected\nby AttentionConfig's validator with a ValueError.",
+      "description": "Attention quantization recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends).\n\nSpecifies Q/K and V quantization formats and their optional block sizes.\n\nBare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is\nbackend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V\non SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. CUTEDSL runs NVFP4 Q/K with FP8 V,\nor with NVFP4 V on SM120, as DeCo-Attention when deco_attention is set. Unsupported\nrecipes are rejected by AttentionConfig's validator with a ValueError.",
       "properties": {
+        "deco_attention": {
+          "default": false,
+          "description": "Run the recipe as DeCo-Attention on the CUTEDSL backend. nvfp4 Q/K are Hadamard-rotated and carry compensation channels for the first-order quantization error of the scores; V is smoothed over blocks of keys and quantized to fp8, or to nvfp4 on SM120. Self-attention with head dimension 128.",
+          "status": "prototype",
+          "title": "Deco Attention",
+          "type": "boolean"
+        },
         "k_block_size": {
           "default": 0,
           "description": "Number of K tokens per SageAttention quantization block; 0 otherwise.",
