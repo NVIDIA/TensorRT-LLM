@@ -562,6 +562,56 @@ def test_decoder_capture_and_replay_named_capacity(
     }
 
 
+@pytest.mark.parametrize("operation", ["capture", "replay"])
+def test_decoder_graph_metadata_distinguishes_kv_graph_families(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: str
+) -> None:
+    """Retain distinct identities for regime-only and split-only graph families."""
+    select_regions(monkeypatch, "workflow")
+    owner = SimpleNamespace(
+        padding_enabled=True,
+        is_warmup_only=False,
+        WARMUP_STEPS=1,
+        max_beam_width=1,
+        _get_num_tokens_for_key=lambda key: 4,
+    )
+    inputs = {"input_ids": torch.arange(4)}
+    keys = [
+        cuda_graph_runner.KeyType(4, 0),
+        cuda_graph_runner.KeyType(4, 0, kv_regime=1024),
+        cuda_graph_runner.KeyType(4, 0, kv_regime=2048),
+        cuda_graph_runner.KeyType(4, 0, packed_split=False),
+        cuda_graph_runner.KeyType(4, 0, packed_split=True),
+    ]
+    factory = getattr(cuda_graph_runner, f"_decoder_{operation}_workflow_metadata")
+    path = tmp_path / "graph-families.json"
+    with (
+        execution_trace_observer(path) as observer,
+        torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
+        ),
+    ):
+        for key in keys:
+            args = (
+                (owner, key, lambda inputs: None, inputs)
+                if operation == "capture"
+                else (owner, key, inputs)
+            )
+            with profiler.record_workflow_scope(
+                "decoder::family", metadata_factory=lambda: factory(*args)
+            ):
+                torch.ones(1)
+    fields = [
+        decode_node_metadata(node)[1]
+        for node in profiler_nodes(path)
+        if node["name"] == "decoder::family"
+    ]
+    assert [
+        (item["workflow.graph.key.kv_regime"], item["workflow.graph.key.packed_split"])
+        for item in fields
+    ] == [(None, None), (1024, None), (2048, None), (None, False), (None, True)]
+
+
 @pytest.mark.parametrize("kind", ["decoder", "encoder"])
 @pytest.mark.parametrize("operation", ["capture", "replay"])
 def test_graph_metadata_accepts_additive_call_keywords(kind: str, operation: str) -> None:

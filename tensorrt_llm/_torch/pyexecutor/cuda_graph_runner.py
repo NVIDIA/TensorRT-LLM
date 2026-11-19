@@ -244,6 +244,10 @@ def _decoder_graph_workflow_metadata(
         key.temperature_only,
         "workflow.graph.key.ragged_verify_bucket":
         key.ragged_verify_bucket,
+        "workflow.graph.key.kv_regime":
+        key.kv_regime,
+        "workflow.graph.key.packed_split":
+        key.packed_split,
     }
     for name, field_name in (("input_ids", "input_token_rows"),
                              ("encoder_hidden_states",
