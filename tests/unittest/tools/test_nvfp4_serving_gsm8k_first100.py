@@ -53,6 +53,9 @@ PROTOCOL_DEFINITION_SHA256 = "1b20973ebed2049625b91f48ef2b6ed7d2089a8787d3276573
         ("The answer is 42.", "42"),
         ("-7 degrees", "-7"),
         ("x = -5", "-5"),
+        ("x-5", "5"),
+        ("10 000", "0"),
+        ("−5", "5"),
         ("(+5)", "5"),
         ("pages 10-15", "15"),
         ("It costs $1,234.50 in total", "1234.5"),
@@ -83,6 +86,7 @@ def test_scorer_takes_the_last_normalized_number(content, parsed):
         ("", "empty_content"),
         (" \n", "empty_content"),
         ("no digits here", "no_number"),
+        (".5", "no_number"),
         ("version v1.2 and x2", "no_number"),
     ],
 )
@@ -465,6 +469,44 @@ def _record(problem, status=records.OK, content="The answer is 4.", identity="ru
 
 def _ledger(path, problems, identity="run"):
     return records.Ledger(path, identity, {p.id: (p.index, p.prompt_sha256) for p in problems})
+
+
+@pytest.mark.parametrize(
+    "status,field",
+    [
+        (None, "missing"),
+        (records.ERROR, "errors"),
+        (records.TIMEOUT, "timeouts"),
+        (records.TRUNCATED, "truncated"),
+    ],
+)
+def test_incomplete_run_fails_even_when_score_meets_threshold(tmp_path, status, field):
+    answered, affected = _problem(0), _problem(1)
+    problems = [answered, affected]
+    ledger = _ledger(tmp_path / "results.jsonl", problems)
+    ledger.append(_record(answered))
+    if status is not None:
+        ledger.append(_record(affected, status=status, content="7"))
+    summary = records.summarize(ledger.load(), problems, protocol.PROTOCOL_ID)
+    assert summary[field] == [affected.id]
+    assert summary["correct"] == 1
+    for minimum in (None, 1):
+        verdict = records.verdict(summary, min_correct=minimum)
+        assert not verdict["passed"]
+        assert affected.id in verdict["problems"][0]
+
+
+def test_completed_run_score_threshold(tmp_path):
+    problems = [_problem(0), _problem(1)]
+    ledger = _ledger(tmp_path / "results.jsonl", problems)
+    ledger.append(_record(problems[0]))
+    ledger.append(_record(problems[1], content="7"))
+    summary = records.summarize(ledger.load(), problems, protocol.PROTOCOL_ID)
+    assert summary["correct"] == 1
+    assert records.verdict(summary, min_correct=1)["passed"]
+    assert not records.verdict(summary, min_correct=2)["passed"]
+    with pytest.raises(ValueError, match="min_correct"):
+        records.verdict(summary, min_correct=3)
 
 
 def test_reasoning_only_reply_is_a_visible_parse_failure():
