@@ -245,31 +245,46 @@ def frame_strip(
     halos: tuple[int, ...] = (),
     labels_above: bool = False,
 ) -> None:
-    # The same contour and column numbers identify a strip in every buffer.
-    ridge = [0.22, 0.34, 0.71, 0.43, 0.31, 0.57, 0.77, 0.46, 0.26]
+    # An illustrative channel of the feature frame, indexed by row and global column.
+    pixels = (
+        (2, 4, 6, 8, 3, 5, 7, 9),
+        (3, 1, 4, 2, 7, 6, 5, 8),
+        (6, 5, 2, 4, 1, 3, 8, 7),
+    )
+    height = len(pixels) * step
     for i, j in enumerate(columns):
         left = x + i * step
-        if j in (-1, 8):
-            ax.add_patch(Rectangle((left, y), step, 0.85, facecolor=PALE_GREY, edgecolor="white"))
-            ax.text(left + step / 2, y + 0.425, "0", ha="center", va="center", color=GREY)
-            continue
+        padding = j < 0 or j >= len(pixels[0])
         fill, edge = (PALE_BLUE, BLUE) if j < 4 else (PALE_GREEN, GREEN)
-        ax.add_patch(Rectangle((left, y), step, 0.85, facecolor=fill, edgecolor="white"))
-        ax.fill_between(
-            [left, left + step],
-            y,
-            [y + ridge[j], y + ridge[j + 1]],
-            color=edge,
-            alpha=0.60,
-            linewidth=0,
-        )
+        for row, values in enumerate(pixels):
+            bottom = y + height - (row + 1) * step
+            ax.add_patch(
+                Rectangle(
+                    (left, bottom),
+                    step,
+                    step,
+                    facecolor=PALE_GREY if padding else fill,
+                    edgecolor="white",
+                )
+            )
+            ax.text(
+                left + step / 2,
+                bottom + step / 2,
+                str(0 if padding else values[j]),
+                ha="center",
+                va="center",
+                color=GREY if padding else DARK,
+                fontsize=12,
+            )
+        if padding:
+            continue
         if j in halos:
             ax.add_patch(
-                Rectangle((left, y), step, 0.85, fill=False, edgecolor=edge, ls="--", lw=1.4)
+                Rectangle((left, y), step, height, fill=False, edgecolor=edge, ls="--", lw=1.4)
             )
         ax.text(
             left + step / 2,
-            y + 0.94 if labels_above else y - 0.12,
+            y + height + 0.09 if labels_above else y - 0.12,
             str(j),
             ha="center",
             va="bottom" if labels_above else "top",
@@ -278,11 +293,11 @@ def frame_strip(
 
 
 def halo() -> None:
-    fig, ax = canvas(3.55)
+    fig, ax = canvas(4.45)
     step = 0.45
     origin = 1.75
-    for rank, first, last, y, halo_column in [(0, -1, 4, 2.35, 4), (1, 3, 8, 0.35, 3)]:
-        ax.text(0.78, y + 0.43, f"GPU {rank}", va="center", ha="right", fontsize=14)
+    for rank, first, last, y, halo_column in [(0, -1, 4, 2.72, 4), (1, 3, 8, 0.32, 3)]:
+        ax.text(0.78, y + 1.5 * step, f"GPU {rank}", va="center", ha="right", fontsize=14)
         frame_strip(
             ax,
             origin + first * step,
@@ -292,19 +307,22 @@ def halo() -> None:
             halos=(halo_column,),
             labels_above=rank == 0,
         )
-    for j, start, end, color in [(3, 2.35, 1.20, BLUE), (4, 1.20, 2.35, GREEN)]:
+    for j, start, end, color in [
+        (3, 2.72, 0.32 + 3 * step, BLUE),
+        (4, 0.32 + 3 * step, 2.72, GREEN),
+    ]:
         x = origin + (j + 0.5) * step
         arrow(ax, (x, start), (x, end), color)
     save(fig, "halo_exchange")
 
-    fig, ax = canvas(3.15)
+    fig, ax = canvas(3.70)
     step = 0.36
-    ax.text(1.82, 2.88, "Local strip", ha="center", fontsize=14)
-    ax.text(4.83, 2.88, "After all-gather", ha="center", fontsize=14)
-    for rank, y in [(0, 1.66), (1, 0.25)]:
-        ax.text(0.87, y + 0.43, f"GPU {rank}", va="center", ha="right", fontsize=14)
+    ax.text(1.82, 3.46, "Local strip", ha="center", fontsize=14)
+    ax.text(4.83, 3.46, "After all-gather", ha="center", fontsize=14)
+    for rank, y in [(0, 2.08), (1, 0.32)]:
+        ax.text(0.87, y + 1.5 * step, f"GPU {rank}", va="center", ha="right", fontsize=14)
         frame_strip(ax, 1.1, y, range(4 * rank, 4 * rank + 4), step)
-        arrow(ax, (2.62, y + 0.425), (3.28, y + 0.425))
+        arrow(ax, (2.62, y + 1.5 * step), (3.28, y + 1.5 * step))
         frame_strip(ax, 3.39, y, range(8), step)
     save(fig, "strip_allgather")
 

@@ -413,7 +413,7 @@ A spatial 3 × 3 convolution also needs one column from either neighboring strip
 
 </div>
 
-*Figure 11(a).* A width split of one feature frame. GPU 0 owns columns 0–3 (blue) and GPU 1 owns columns 4–7 (green). Each arrow follows one Fused GPUDirect P2P write into a dashed halo slot. The gray cells hold zero padding at the frame edges. With more than two GPUs, an interior strip exchanges a column with each neighbor.
+*Figure 11(a).* Each cell shows an example value at one pixel in one feature channel. GPU 0 owns columns 0–3 (blue) and GPU 1 owns columns 4–7 (green). Fused GPUDirect P2P copies column 3 (8, 2, 4) to GPU 1 and column 4 (3, 7, 1) to GPU 0. Dashed outlines mark the receiving slots. The gray cells hold zero padding at the frame edges. With more than two GPUs, an interior strip exchanges a column with each neighbor.
 
 <div align="center">
 
