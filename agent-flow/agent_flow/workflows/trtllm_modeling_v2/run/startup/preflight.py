@@ -45,6 +45,7 @@ from ...spec.task_schema import (
     derive_family,
     derive_slug,
     features_through,
+    gpus_per_node,
     members_for,
     parse_parallel_segment,
     resolve_per_unit,
@@ -505,12 +506,22 @@ def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list
     return notes
 
 
-def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
-    """The native test's per-node device request fits the allocation geometry."""
+def check_disagg_placement(task_data: Mapping[str, Any], world_size: int = 0) -> list[str]:
+    """The nodes a gate's job spans (a wide member, a deployment, a test) are one gates session's."""
     spec = disagg_checks.DisaggSpec.from_task(task_data)
-    if spec is None:
-        return []
-    if spec.nodes > 1:
+    members = {m for u in assembly_units(task_data) for m in members_for(task_data, u, world_size)}
+    per_node = gpus_per_node(task_data)
+    try:  # a member is one world, laid out as a deployment's server is
+        nodes = max(
+            spec.job_nodes() if spec else 1,
+            *(
+                disagg_checks.plan_layout([(m, parse_parallel_segment(m)[1])], per_node)[0]
+                for m in members
+            ),
+        )
+    except ValueError as exc:
+        raise PreflightError(str(exc)) from exc
+    if nodes > 1:
         environment = task_data.get("environment") or {}
         sessions = environment.get("sessions") or ()
         available = max(
@@ -521,12 +532,12 @@ def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
             ]
             or [1]
         )
-        if environment.get("kind") != "session_spool" or available < spec.nodes:
+        if environment.get("kind") != "session_spool" or available < nodes:
             raise PreflightError(
-                f"disagg needs {spec.nodes} nodes in one session_spool allocation; "
-                f"the declared gate sessions provide {available}"
+                f"a gate's job (a member wider than one node, or disagg) needs {nodes} nodes in "
+                f"one session_spool allocation; the declared gate sessions provide {available}"
             )
-    if not spec.devices or not spec.node_gpus:
+    if spec is None or not spec.devices or not spec.node_gpus:
         return []
     if spec.devices > spec.node_gpus:
         raise PreflightError(
@@ -875,7 +886,7 @@ def run_preflight(
     notes.extend(check_accuracy_anchors(task_data, units))
     notes.extend(check_variant_anchors(task_data, world_size))
     notes.extend(check_launch_settings(task_data))
-    notes.extend(check_disagg_placement(task_data))
+    notes.extend(check_disagg_placement(task_data, world_size))
     notes.extend(check_gate_budgets(task_data))
     notes.extend(check_speculation_support(task_data))
     notes.extend(check_capture_lists(task_data))

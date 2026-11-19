@@ -149,7 +149,8 @@ def rank(view: SpoolView) -> tuple:
 def assess(spool: str | Path, job: JobNeeds, *, stale_s: float, now: float) -> SpoolView:
     """What ``spool`` can do for ``job`` now: through its best live watcher, or why not."""
     root = Path(spool)
-    records = _sched.watcher_records(root)
+    # A lead holds no devices: `_judge` would find it free (0 of 0) whatever its nodes do.
+    records = [record for record in _sched.watcher_records(root) if not record.get("lead")]
     live = [record for record in records if now - float(record["alive_epoch"]) <= stale_s]
     if not live:
         if not records:

@@ -35,6 +35,7 @@ from ..operators import tree_anchors
 from .schema_keys import reject_unknown_keys
 from .task_schema import (
     DISAGG_FEATURE,
+    DISAGG_FILES,
     DISAGG_KEYS,
     FEATURE_FAMILIES,
     PARALLEL_PATTERN,
@@ -770,6 +771,9 @@ def _disagg(
     block = dict(defaults.get("disagg") or {})
     if block:
         note("accuracy.disagg", dict(block), "site")
+    if block.get(DISAGG_FILES[0]):
+        # A stated deployment: no test to size.
+        return block
     if "devices" not in block and "nodes" not in block and checkpoint is not None:
         from .sizing import checkpoint_weight_bytes
 

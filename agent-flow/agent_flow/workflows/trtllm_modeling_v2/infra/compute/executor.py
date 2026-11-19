@@ -96,6 +96,7 @@ class SpoolCommandExecutor(CommandExecutor):
         name_prefix: str = "gate",
         gpus: str = "all",
         nodes: int = 1,
+        lead: bool = False,
         priority: int = 0,
         tree: str | Path | None = None,
         pool: Sequence[str | Path] = (),
@@ -112,6 +113,8 @@ class SpoolCommandExecutor(CommandExecutor):
         if nodes < 1:
             raise ValueError("nodes must be positive")
         self.nodes = nodes
+        #: The session's lead runs the job once (its worlds are steps across the nodes).
+        self.lead = lead and nodes > 1
         #: The class each job queues at (:data:`ACCURACY`, :data:`FEATURE`, or 0).
         self.priority = priority
         #: The checkout a job runs against (its working directory and first ``PYTHONPATH``
@@ -202,6 +205,7 @@ class SpoolCommandExecutor(CommandExecutor):
         header = {
             "gpus": self.gpus,
             "nodes": self.nodes if self.nodes > 1 else None,
+            "lead": 1 if self.lead else None,
             "wall": int(spec.timeout_s) if spec.timeout_s and spec.timeout_s > 0 else None,
             "owner": self.name_prefix,
             "token": token,
@@ -278,6 +282,7 @@ def select_command_executor(
     tree: Path | str | None = None,
     gpus: str = "all",
     nodes: int = 1,
+    lead: bool = False,
     priority: int = 0,
     note: Callable[[str], None] | None = None,
 ) -> CommandExecutor:
@@ -287,7 +292,7 @@ def select_command_executor(
     ``PYTHONPATH`` entry, and ``gpus`` (a count, or ``all``) what each job asks for. The spools of
     every session whose role takes gate jobs (:data:`sessions.GATE_ROLES`) form a pool beside
     ``environment.spool``, and each command goes to the live one that would start it soonest.
-    A long wait on a job is said to ``note``.
+    A long wait on a job is said to ``note``. ``lead``: the session's lead runs the job.
     """
     if environment.kind == "session_spool" and environment.spool:
         pool = [session.spool for session in environment.sessions if session.role in GATE_ROLES]
@@ -297,6 +302,7 @@ def select_command_executor(
             tree=tree,
             gpus=gpus,
             nodes=nodes,
+            lead=lead,
             priority=priority,
             pool=pool,
             note=note,

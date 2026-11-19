@@ -254,19 +254,37 @@ launcher also passes `--server_role`). Then `trtllm-serve disaggregated -c
 disagg_config.yaml`, which lists the `context_servers` and
 `generation_servers` URLs.
 
-**Flow proof.** The `disagg` unit owes only its disaggregated-serving test
-(`checks/disagg.py`; `gate disagg --unit disagg --member <m>`): a test the run
+**Flow proof.** The `disagg` unit owes only its `disagg` check
+(`checks/disagg.py`; `gate disagg --unit disagg --member <m>`), and the run's
+`task.yaml` says which of two it is. Read `accuracy.disagg` before writing
+anything.
+
+*It states `config`, `context` and `generation`:* the tree's own three files
+(`examples/kimi_k3/disagg/`), and the flow serves that deployment itself. You
+write no test, launcher or server. Each side is one `trtllm-serve` per instance
+with `--server_role` and its side's file as `--config`, as it is but for the
+gate's `modeling_v2: require` (`gates/disagg/disagg.<unit>.<member>/options.<ctx|gen>.yaml`
+is what it ran; nothing of the unit's options is in it), behind
+`trtllm-serve disaggregated -c` with the stated `config`. The gate passes when
+every server and the proxy came up and the unit's benchmark through the proxy is at or
+above the unit's floor. Its verdict names the server that did not come up and
+its log, in the same directory. `gate disagg` submits the job, across nodes too.
+
+*It states `test`:* the proof is a test the run
 writes beside the tree's own in `accuracy/test_disaggregated_serving.py`
 (`launch_disaggregated_llm` starts both workers and `trtllm-serve
 disaggregated`), named by `accuracy.disagg.test`. The gate runs it from its
-pytest root as CI does, once, at the member the request validates fully, on one
-node: `launch_disaggregated_llm` starts every worker on one host. It gets two
-engines' devices at the member's width, at most a node's (`dep4` on a 4-GPU
-node: write the test for two engines of two; `accuracy.disagg.devices`
-overrides, never past a node), and passes only when every test the node id
-selects passed: a skip (too few devices, no `LLM_MODELS_ROOT`) fails it.
+pytest root as CI does, once, at the member the request validates fully. By
+default that is one pytest on one node, with two engines' devices at the
+member's width, at most a node's (`dep4` on a 4-GPU node: write the test for two
+engines of two; `accuracy.disagg.devices` overrides it, per node). When two
+engines do not fit a node, `accuracy.disagg.nodes: N` runs one pytest on each of
+N nodes of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), one
+engine's devices per node by default, so the gates session must hold N nodes.
+The gate passes only when every test the node id selects passed on every node:
+a skip (too few devices, no `LLM_MODELS_ROOT`) fails it.
 
-**Blind spots.** Boot and accuracy never cross the hop; only the test does, and
+**Blind spots.** Boot and accuracy never cross the hop; only the `disagg` check does, and
 it judges a benchmark score, not token identity with an aggregated engine. A
 hop that loses part of the state can still score within the floor on short
 answers. The transceiver backend and runtime the workers actually ran are not

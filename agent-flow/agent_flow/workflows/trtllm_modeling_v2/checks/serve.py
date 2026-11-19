@@ -23,8 +23,9 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
+from ..infra.compute import steps
 from ..infra.compute.commands import ended_early
-from ..infra.compute.environment import RunEnvironment
+from ..infra.compute.environment import LLMAPI_LAUNCH, RunEnvironment
 from ..spec.task_schema import TaskSchemaError, parse_parallel_segment
 from .boot import DEFAULT_BOOT_IMAGE_PROMPT, BootSpec, resolve_boot_spec
 from .check_config import check_configuration, order_members_by_cost
@@ -201,11 +202,32 @@ def serve_requests(
 
 
 def serve_command(environment: RunEnvironment, spec_path: str | Path) -> str:
-    """The driver's launch over ``spec_path``: one process, which creates the server's ranks itself."""
-    return environment.python_command(
-        f"{shlex.quote(str(SERVE_DRIVER))} --spec {shlex.quote(str(spec_path))}",
-        single_process=True,
+    """The driver's launch over ``spec_path``: one process, which creates the server's ranks itself.
+
+    Across nodes the server is one step and the driver its client (the spec's ``attach``).
+    """
+    driver = f"{shlex.quote(str(SERVE_DRIVER))} --spec {shlex.quote(str(spec_path))}"
+    if environment.nodes <= 1:
+        return environment.python_command(driver, single_process=True)
+    spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    address = spec["attach"]["address"]
+    server = [spec["model"], "--host", "0.0.0.0", "--port", "0", "--report_addr", address]  # nosec B104
+    world = steps.World(
+        name="server",
+        ranks=environment.ntasks,
+        node=0,
+        nodes=environment.nodes,
+        devices=tuple(range(environment.gpus_per_node or 0)),
+        argv=shlex.join([LLMAPI_LAUNCH, "trtllm-serve", *server, *spec["serve_args"]]),
     )
+    script = steps.servers_script(
+        environment.step,
+        [world],
+        directory=Path(address).parent,
+        nodes=environment.nodes,
+        client=f"{shlex.quote(environment.python)} {driver}",
+    )
+    return f"bash {shlex.quote(str(script))}"
 
 
 def judge(
@@ -304,6 +326,13 @@ def run_serve_gate(
         "request_timeout": REQUEST_TIMEOUT_S,
         "requests": requests,
     }
+    if env.nodes > 1:
+        at = directory / f"serve.{tag}.steps"
+        driver_spec["server_log"] = str(at / "server.log")
+        driver_spec["attach"] = {
+            "address": str(at / "address.server"),
+            "exit": str(at / "exit.server"),
+        }
     spec_path = directory / f"serve.{tag}.json"
     spec_path.write_text(json.dumps(driver_spec, indent=1, ensure_ascii=False), encoding="utf-8")
     command = serve_command(env, spec_path)
