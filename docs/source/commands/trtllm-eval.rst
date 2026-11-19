@@ -95,6 +95,9 @@ Here are some examples:
 
 The ``--model`` argument accepts either a Hugging Face model ID or a local checkpoint path.
 
+For image and video evaluation, including LPIPS dependencies and evaluator YAML examples,
+see the `visual generation evaluation guide <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/evaluate/visual_gen/README.md>`_.
+
 For more details, see ``trtllm-eval --help`` and ``trtllm-eval <task> --help``.
 
 .. include:: ../_includes/note_sections.rst

@@ -308,6 +308,12 @@ def _get_uncached_multimodal_params(
     return params_to_run
 
 
+def needs_multimodal_encoder(
+        multimodal_params: Optional[List[MultimodalParams]]) -> bool:
+    """Return True if any param has multimodal content but no embedding."""
+    return bool(_get_uncached_multimodal_params(multimodal_params or []))
+
+
 def _store_chunked_prefill_embeddings(
     multimodal_params: List[MultimodalParams],
     embeddings: List[torch.Tensor],
@@ -715,8 +721,7 @@ def fuse_input_embeds(
           explicit indices for the active MM token positions.
         - Sync-free contract: passing both ``text_token_indices`` and
           ``mm_token_indices`` skips the GPU ``torch.where`` host sync. The
-          executor (``DecoderInputPreparer.prepare_inputs`` /
-          ``NoKVCacheRunner._prepare_inputs``) precomputes them on a CPU
+          executor (``DecoderInputPreparer.prepare_inputs``) precomputes them on a CPU
           ``input_ids`` copy via ``runners.prepare_multimodal_indices`` (which uses
           ``filter_mm_token_from_input_ids`` against ``self.model.mm_token_ids``
           when present, else the OOV fallback ``>= vocab_size``) and ships

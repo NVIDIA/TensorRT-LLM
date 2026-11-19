@@ -198,6 +198,12 @@ class AttentionMetadata:
     # This buffer is currently only used for TrtllmAttentionMetadata.
     cache_indirection: Optional[torch.Tensor] = None
     cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
+    forward_scratch_buffers: Optional[Buffers] = None
+    """Runner-local storage shared across graphs within one forward, not persistent state.
+
+    Warmup registers capacity; capture must not grow it. CUDAGraphRunner.clear()
+    releases the pool, unlike the potentially process-wide cuda_graph_buffers.
+    """
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
@@ -360,13 +366,21 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
+    def support_steady_gen_step(self) -> bool:
+        """Whether ``prepare_steady_gen_step`` may advance this metadata."""
+        return False
+
     def _has_mixed_precision_staging(self) -> bool:
         """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
         # no mixed-precision layers.
-        high_layers = getattr(self.kv_cache_manager,
-                              "mixed_precision_high_layers", None)
-        return isinstance(high_layers, dict) and bool(high_layers)
+        manager = self.kv_cache_manager
+        high_layers = getattr(manager, "mixed_precision_high_layers", None)
+        # The cold-page window keeps the history at the high precision and reads
+        # the high rows through the page tables instead of a staging copy.
+        return (isinstance(high_layers, dict) and bool(high_layers)
+                and manager.mixed_precision_low_dtype
+                != manager.mixed_precision_high_dtype)
 
     def prepare_mixed_precision_kv(self, layout: str,
                                    tokens_per_block: int) -> None:
@@ -490,7 +504,8 @@ class AttentionMetadata:
 
         if self.mamba_metadata is None:
             if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
-                metadata_cls = self.mamba_metadata_cls
+                metadata_cls = self.mamba_metadata_cls or getattr(
+                    self.kv_cache_manager, "mamba_metadata_cls", None)
                 if metadata_cls is None:
                     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
                     metadata_cls = Mamba2Metadata
@@ -504,17 +519,25 @@ class AttentionMetadata:
 
         self.mamba_metadata.prepare(self)
 
-    def create_cuda_graph_metadata(self,
-                                   max_batch_size: int,
-                                   sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0,
-                                   buffers=None,
-                                   encode_only: bool = False) -> Self:
+    def create_cuda_graph_metadata(
+            self,
+            max_batch_size: int,
+            sub_cross_metadata: bool = False,
+            max_draft_tokens: int = 0,
+            buffers=None,
+            encode_only: bool = False,
+            *,
+            forward_scratch_buffers: Optional[Buffers] = None) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
         Please do not re-allocate any tensors stored inside AttentionMetadata
         after the initial warmup run when you're using CUDA graphs.
+
+        forward_scratch_buffers belongs to the caller's runner and is shared by
+        its graphs within one forward. Warmup must register capacity before
+        capture; persistent state must not use this pool. The runner releases
+        it in clear(), independently of cuda_graph_buffers.
 
         When encode_only is True, initialize seq_lens as ones(max_batch_size)
         and leave num_contexts at the caller's discretion.
@@ -525,9 +548,15 @@ class AttentionMetadata:
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.cuda_graph_buffers = buffers
+        cuda_graph_metadata.forward_scratch_buffers = forward_scratch_buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
-                max_batch_size, True, max_draft_tokens, buffers, encode_only)
+                max_batch_size,
+                True,
+                max_draft_tokens,
+                buffers,
+                encode_only,
+                forward_scratch_buffers=forward_scratch_buffers)
         if not sub_cross_metadata:
             # Set to None to force the cuda graph metadata to allocate a tensor
             # with the correct batch size. See seq_lens setter for how this works.
@@ -562,6 +591,41 @@ class AttentionMetadata:
             cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
+
+    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
+        """Bound the KV length the decode kernels choose their path on.
+
+        A CUDA graph runner that keys its decode graphs by KV regime passes
+        the regime ceiling of the graph this metadata serves, an upper bound
+        of the longest KV a replay reads.
+
+        Args:
+            kv_regime: The regime ceiling in tokens; None restores the
+                page-table capacity. Backends whose decode path does not
+                depend on the KV length ignore it.
+        """
+
+    @property
+    def decode_kv_regime(self) -> Optional[int]:
+        """The KV regime set by ``set_decode_kv_regime``; None when unset or ignored."""
+        return None
+
+    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
+        """Fix whether the decode launches its KV split budget.
+
+        A CUDA graph runner that keys its decode graphs by the split
+        decision passes the decision of the graph this metadata serves.
+
+        Args:
+            packed_split: True launches the split budget, False one task
+                per request; None restores the per-call decision. Backends
+                without a split decode ignore it.
+        """
+
+    @property
+    def decode_packed_split(self) -> Optional[bool]:
+        """The decision set by ``set_decode_packed_split``; None when unset or ignored."""
+        return None
 
     def prepare_for_spec_dec(self, *fields) -> None:
         assert len(self._saved_tensors) == 0, (
@@ -1050,6 +1114,10 @@ class AttentionForwardArgs:
     # consume the per-phase slice in ``FmhaParams.output``, not this full buffer.
     output: Optional[torch.Tensor] = None
     output_sf: Optional[torch.Tensor] = None
+    variable_window_token_starts: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
+    variable_window_token_ends: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
     kv_scale_orig_quant: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     kv_scale_quant_orig: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     out_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
@@ -1064,11 +1132,21 @@ class AttentionForwardArgs:
     cu_kv_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     fmha_scheduler_counter: Optional[torch.Tensor] = cpp_field(
         dtype=torch.uint32)
+    # Locality domain this call runs against; -1 means the whole batch.
+    locality_domain_id: int = -1
     mla_bmm1_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     mla_bmm2_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     quant_q_buffer: Optional[torch.Tensor] = None
     cross_kv: Optional[torch.Tensor] = None
     relative_attention_bias: Optional[torch.Tensor] = None
+    # Caller-quantized FP8 Q for the MLA FP8 context / fused generation paths;
+    # only meaningful together with `quant_q_buffer`. The fused paths that
+    # quantize into `quant_q_buffer` (DSv4 generation / context RoPE) read the
+    # value as the quant scale. The non-sparse FP8 context path reads only the
+    # presence: its FMHA dequantizes Q / K / V with the kv cache scale, so
+    # caller-quantized FP8 `k` / `v` and `quant_q_buffer` must have been
+    # quantized with `kv_scale_orig_quant`, and this tensor must carry that
+    # scale.
     quant_scale_qkv: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_field(
         dtype=torch.float32)
@@ -1116,6 +1194,11 @@ class AttentionForwardArgs:
     # the output sets output_gate_applied, and the caller applies the gate otherwise.
     output_gate: Optional[torch.Tensor] = None
     output_gate_applied: bool = False
+    # o_proj's static FP8 input scale offered together with output_gate: an FMHA library that applies the gate may
+    # also write the gated output as E4M3 at this scale, byte for byte as o_proj's own static quant would, into
+    # output_fp8 [num_tokens, num_heads * head_dim]; the caller then passes output_fp8 to o_proj (output unwritten).
+    gated_out_scale: Optional[torch.Tensor] = None
+    output_fp8: Optional[torch.Tensor] = None
     # Paged FP8 query / K / V the caller already wrote for this generation-only call (fmha/gqa_decode.py).
     kv_append: Optional["KvAppendPlan"] = None
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
@@ -1279,6 +1362,36 @@ class AttentionBackend(Generic[TMetadata]):
         that prefix.
         """
         return True
+
+    @classmethod
+    def runtime_workspace_min_tokens(
+        cls,
+        model_config: "ModelConfig",
+        mapping: Mapping,
+        *,
+        max_num_tokens: int,
+        runtime_features: AttentionRuntimeFeatures,
+    ) -> int:
+        """Minimum tokens priced at ``runtime_workspace_bytes_per_token``.
+
+        The estimator calls this only for a nonzero per-token workspace rate
+        with an admission cap. It subtracts staging actually covered by the
+        profiling peak before reserving additional memory. Backends whose
+        workspace is not chunk-bounded return zero, as does the default.
+        """
+        return 0
+
+    @classmethod
+    def runtime_workspace_profiled_tokens(
+        cls,
+        model_config: "ModelConfig",
+        *,
+        profiled_prompt_len: int,
+        max_num_tokens: int,
+        max_batch_size: int,
+    ) -> int:
+        """Workspace tokens actually staged by the fresh-prefill profiling path."""
+        return 0
 
     @classmethod
     def runtime_workspace_fixed_bytes(

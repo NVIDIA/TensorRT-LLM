@@ -24,7 +24,11 @@ import pytest
 import torch
 import yaml
 
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+    MiniMaxM3KVCacheManagerV2,
+)
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
@@ -50,6 +54,27 @@ def _model_config(*, kv_heads, head_dim, kv_quant_algo=None):
         num_key_value_heads=kv_heads,
         head_dim=head_dim,
         hidden_size=32 * head_dim,
+        torch_dtype=torch.bfloat16,
+    )
+    quant_mode = QuantMode.from_quant_algo(kv_cache_quant_algo=kv_quant_algo)
+    return SimpleNamespace(
+        pretrained_config=pretrained,
+        quant_config=SimpleNamespace(quant_mode=quant_mode),
+    )
+
+
+class _V1LikeManager:
+    """A non-V2 manager: predates the appended-draft layer specs."""
+
+
+def _mla_model_config(*, kv_quant_algo=None):
+    """An MLA target: one K-only head per rank holding the latent."""
+    pretrained = SimpleNamespace(
+        num_hidden_layers=2,
+        num_attention_heads=32,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        hidden_size=8192,
         torch_dtype=torch.bfloat16,
     )
     quant_mode = QuantMode.from_quant_algo(kv_cache_quant_algo=kv_quant_algo)
@@ -120,7 +145,9 @@ def test_dspark_checkpoint_width_reaches_shared_cache_cost_and_construction(
     )
     creator._speculative_config.max_draft_len = 7
     creator._speculative_config.draft_is_embedded_in_target = False
-    creator._model_engine.model.draft_model = SimpleNamespace(_dspark_shift_label=shift_label)
+    creator._model_engine.model.draft_model = SimpleNamespace(
+        shift_label=shift_label, reads_managed_ctx_pages=lambda tokens_per_block: True
+    )
     creator._kv_cache_config = KvCacheConfig()
     creator._tokens_per_block = 32
     creator._max_batch_size = 4
@@ -187,6 +214,49 @@ def test_fp8_target_with_bf16_draft_unifies(is_disagg: bool) -> None:
     assert [spec.dtype for spec in specs] == [DataType.FP8] * 2 + [DataType.BF16] * 2
 
 
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_non_v2_target_manager_keeps_separate_cache(is_disagg: bool) -> None:
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=8, head_dim=128)
+
+    creator = _creator(is_disagg=is_disagg, target=target, draft=draft)
+    creator._kv_cache_manager_cls = _V1LikeManager
+
+    assert not creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize(
+    "manager_cls", [KVCacheManagerV2, KimiK3HybridCacheManager], ids=["plain_v2", "mamba_hybrid"]
+)
+@pytest.mark.parametrize("target_is_mla", [True, False])
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_mismatched_draft_k_only_keeps_separate_cache(
+    is_disagg: bool, target_is_mla: bool, manager_cls: type
+) -> None:
+    """A k_only mismatch shares only where the storage can hold both shapes.
+
+    The plain manager pages each layer through that layer's kv_factor, so an
+    aggregated shared pool holds a K-only target and a drafter's K and V, or
+    the other way around; disaggregated serving still keeps separate pools, as
+    the transceiver registers one k_only per side. The hybrid manager's
+    appended draft layers must match its target cache type, so both mismatch
+    directions keep a separate draft KV cache instead of failing the
+    appended-layer validation at construction.
+    """
+    gqa = _model_config(kv_heads=1, head_dim=128)
+    if target_is_mla:
+        target, draft = _mla_model_config(), gqa
+    else:
+        target, draft = gqa, _mla_model_config()
+
+    creator = _creator(is_disagg=is_disagg, target=target, draft=draft)
+    creator._kv_cache_manager_cls = manager_cls
+
+    assert creator._should_unify_dflash_kv_cache() is (
+        manager_cls is KVCacheManagerV2 and not is_disagg
+    )
+
+
 def test_layout_compares_rank_local_heads():
     # 8 target heads and 2 draft heads differ per rank at every TP size; at
     # TP4 the draft is duplicated to 1 head per rank while the target has 2.
@@ -236,7 +306,10 @@ class _StopLauncher(Exception):
 
 
 def _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generation_servers):
-    """Run the real disaggregated_mpi_worker up to the rank-communicator split."""
+    """Run the real disaggregated_mpi_worker up to the rank-communicator split.
+
+    ``generation_servers=None`` writes a context-only config (no generation instances).
+    """
     from tensorrt_llm.commands import serve
 
     config = tmp_path / "disagg.yaml"
@@ -244,7 +317,11 @@ def _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generatio
         yaml.safe_dump(
             {
                 "context_servers": {"num_instances": 1, **context_servers},
-                "generation_servers": {"num_instances": 1, **generation_servers},
+                "generation_servers": (
+                    {"num_instances": 0}
+                    if generation_servers is None
+                    else {"num_instances": 1, **generation_servers}
+                ),
             }
         )
     )
@@ -276,6 +353,24 @@ def test_launcher_rejects_dflash_on_generation_worker_only(
         )
 
 
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_embedded_dspark_draft_keeps_its_own_window(is_disagg: bool) -> None:
+    """An embedded DSpark draft (DeepSeek-V4) is not a DFlashForCausalLM: the
+    gate reports why it keeps its own window instead of calling hooks it lacks."""
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=is_disagg, target=layout, draft=layout)
+    creator._speculative_config.spec_dec_mode = SimpleNamespace(
+        is_dflash=lambda: False, is_dspark=lambda: True, is_external_drafter=lambda: False
+    )
+    creator._speculative_config.draft_is_embedded_in_target = True
+    creator._model_engine.model.draft_model = object()
+
+    assert creator._loaded_standalone_dspark_drafter() is None
+    assert creator._dflash_unify_blocker() is not None
+    assert not creator._should_unify_dflash_kv_cache()
+    creator._check_shared_draft_kv_request()
+
+
 def test_disagg_without_shared_draft_kv_env_keeps_separate_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -289,7 +384,7 @@ def test_disagg_without_shared_draft_kv_env_keeps_separate_cache(
 
 def test_dflash_with_different_tp_keeps_separate_cache(monkeypatch, tmp_path):
     spec = {"decoding_type": "DFlash"}
-    with pytest.raises(click.UsageError, match="same tensor_parallel_size and enable_attention_dp"):
+    with pytest.raises(click.UsageError, match="same attention tensor parallelism"):
         _launch_from_disagg_config(
             monkeypatch,
             tmp_path,
@@ -336,9 +431,14 @@ def test_shared_cache_requested_with_unsupported_layout_fails_at_startup():
     "context_servers,generation_servers,match",
     [
         (
-            {"enable_attention_dp": True},
-            {"enable_attention_dp": False},
-            "same tensor_parallel_size and enable_attention_dp",
+            {"tensor_parallel_size": 4, "enable_attention_dp": True},
+            {"tensor_parallel_size": 4, "enable_attention_dp": False},
+            "same attention tensor parallelism",
+        ),
+        (
+            {},
+            {"context_parallel_size": 8},
+            "context_parallel_size 1",
         ),
         (
             {"speculative_config": {"decoding_type": "DFlash", "attention_backend": "VANILLA"}},
@@ -351,7 +451,12 @@ def test_shared_cache_requested_with_unsupported_layout_fails_at_startup():
             "attention_backend TRTLLM",
         ),
     ],
-    ids=["mismatched_attention_dp", "vanilla_dflash_backend", "default_dflash_backend"],
+    ids=[
+        "mismatched_attention_dp",
+        "helix_generation",
+        "vanilla_dflash_backend",
+        "default_dflash_backend",
+    ],
 )
 def test_launcher_rejects_shared_cache_for_ineligible_config(
     monkeypatch, tmp_path, context_servers, generation_servers, match
@@ -374,6 +479,39 @@ def test_launcher_accepts_eligible_shared_cache_config(monkeypatch, tmp_path):
             {"speculative_config": spec, "enable_attention_dp": True},
             {"speculative_config": spec, "enable_attention_dp": True},
         )
+
+
+def test_launcher_shares_attention_dp_mla_drafter_across_tp(monkeypatch, tmp_path):
+    # Kimi K3 dep16: one-GPU context workers and a DEP16 generation worker hold
+    # every KV head per rank, as does a TP1 context worker without attention DP.
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
+    spec = {"decoding_type": "DSpark", "attention_backend": "CUTEDSL"}
+
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(
+            monkeypatch,
+            tmp_path,
+            {"speculative_config": spec, "tensor_parallel_size": 1, "enable_attention_dp": True},
+            {"speculative_config": spec, "tensor_parallel_size": 16, "enable_attention_dp": True},
+        )
+
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "auto"
+
+
+def test_launcher_shares_the_cutedsl_drafter_with_helix_generation(monkeypatch, tmp_path):
+    # Kimi K3 helix8: one-GPU context workers, TP1 x CP8 generation.
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
+    spec = {"decoding_type": "DSpark", "attention_backend": "CUTEDSL"}
+
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(
+            monkeypatch,
+            tmp_path,
+            {"speculative_config": spec, "enable_attention_dp": True},
+            {"speculative_config": spec, "context_parallel_size": 8},
+        )
+
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "auto"
 
 
 @pytest.mark.parametrize(
@@ -621,3 +759,117 @@ def test_launcher_checks_all_peer_configs(
         draft=_model_config(kv_heads=8, head_dim=128),
     )
     assert creator._should_unify_dflash_kv_cache() is shared
+
+
+@pytest.mark.parametrize(
+    ("context_tokens_per_block", "generation_tokens_per_block", "shared"),
+    [(128, 128, True), (64, 128, False), (16, 64, True)],
+    ids=["equal-128", "mismatch-64-128", "mixed-16-64"],
+)
+def test_launcher_leaves_equal_page_sizes_to_the_worker_gates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    context_tokens_per_block: int,
+    generation_tokens_per_block: int,
+    shared: bool,
+) -> None:
+    """Equal pages reach both worker gates; different pages outside 16/32/64 keep separate pools.
+
+    A manager hosting draft layers reads 128-token pages, so the launcher does not refuse them.
+    """
+    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
+    servers = [
+        {"speculative_config": spec, "kv_cache_config": {"tokens_per_block": tokens_per_block}}
+        for tokens_per_block in (context_tokens_per_block, generation_tokens_per_block)
+    ]
+    if not shared:
+        with pytest.raises(click.UsageError, match="tokens_per_block to be equal"):
+            _launch_from_disagg_config(monkeypatch, tmp_path, *servers)
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(monkeypatch, tmp_path, *servers)
+
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == ("auto" if shared else "0")
+    if context_tokens_per_block == generation_tokens_per_block:
+        # A plain V2 manager refuses 128-token pages on both workers alike.
+        creator = _creator(
+            is_disagg=True,
+            target=_model_config(kv_heads=8, head_dim=128),
+            draft=_model_config(kv_heads=8, head_dim=128),
+        )
+        creator._tokens_per_block = context_tokens_per_block
+        assert "tokens_per_block=128" in creator._dflash_unify_blocker()
+        assert not creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("request_mode", [None, "auto"], ids=["unset", "auto"])
+def test_launcher_leaves_a_one_sided_config_to_the_worker_gates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request_mode: str | None
+) -> None:
+    """A context-only config (a DWDP context world) cannot see how generation is launched.
+
+    Unset, the switch stays unset so each worker decides as a separately launched generation
+    worker does; "auto" still resolves to "0".
+    """
+    if request_mode is None:
+        monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, request_mode)
+    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(monkeypatch, tmp_path, {"speculative_config": spec}, None)
+
+    assert os.environ.get(_SHARED_DRAFT_KV_ENV) == ("0" if request_mode else None)
+
+
+@pytest.mark.parametrize("request_mode", [None, "auto"], ids=["unset", "auto"])
+def test_launcher_leaves_tp_and_attention_dp_to_hosting_managers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request_mode: str | None
+) -> None:
+    """Peers differing only in TP or attention DP leave the switch unset unless it is "auto".
+
+    Unset, a manager hosting draft layers shares on both peers (its decision compares global KV
+    heads), and a plain V2 manager keeps the separate draft KV cache, as an explicit "0" would.
+    """
+    if request_mode is None:
+        monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    else:
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, request_mode)
+    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(
+            monkeypatch,
+            tmp_path,
+            {"speculative_config": spec, "tensor_parallel_size": 2},
+            {"speculative_config": spec, "tensor_parallel_size": 2, "enable_attention_dp": True},
+        )
+
+    assert os.environ.get(_SHARED_DRAFT_KV_ENV) == ("0" if request_mode else None)
+    layout = _model_config(kv_heads=8, head_dim=128)
+    for enable_attention_dp in (False, True):
+        plain = _creator(is_disagg=True, target=layout, draft=layout, tp_size=2)
+        plain._mapping.enable_attention_dp = enable_attention_dp
+        assert not plain._should_unify_dflash_kv_cache()
+        draft = _model_config(kv_heads=8, head_dim=128)
+        draft.pretrained_config.sliding_window = 128
+        hosting = _creator(
+            is_disagg=True, target=layout, draft=draft, tp_size=2, draft_windows=[128]
+        )
+        hosting._mapping.enable_attention_dp = enable_attention_dp
+        hosting._kv_cache_manager_cls = MiniMaxM3KVCacheManagerV2
+        hosting._sparse_attention_config = SimpleNamespace(implementation="msa")
+        assert hosting._should_unify_dflash_kv_cache() is (request_mode is None)
+
+
+@pytest.mark.parametrize(
+    "backend, tokens_per_block, reads",
+    [("TRTLLM", 32, True), ("TRTLLM", 64, True), ("TRTLLM", 128, False), ("FA4", 32, False)],
+)
+def test_dflash_drafter_reads_managed_pages_only_at_trtllm_gen_page_sizes(
+    backend: str, tokens_per_block: int, reads: bool
+) -> None:
+    from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
+
+    # GQA DSpark drafters inherit this; at 128-token pages they keep their own pool.
+    drafter = SimpleNamespace(dflash_attention_backend=backend)
+    assert DFlashForCausalLM.reads_managed_ctx_pages(drafter, tokens_per_block) is reads

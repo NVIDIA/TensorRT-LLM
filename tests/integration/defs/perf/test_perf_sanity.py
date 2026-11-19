@@ -22,6 +22,7 @@ import ipaddress
 import json
 import math
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -72,6 +73,13 @@ SUPPORTED_GPU_MAPPING = {
     "B300": "b300",
     "H200": "h200",
     "VR200": "vr200",
+}
+
+# Pre-production boards report the placeholder product name "NVIDIA Graphics
+# Device", so they are identified by (compute capability, host CPU) instead.
+PLACEHOLDER_GPU_NAME = "Graphics Device"
+PLACEHOLDER_GPU_MAPPING = {
+    ("10.7", "x86_64"): "gr100",
 }
 
 # benchmark_client value selecting the AgentX trace-replay client
@@ -271,19 +279,20 @@ PERF_METRIC_LOG_QUERIES = {
     "token_throughput": re.compile(r"Output token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     "total_token_throughput": re.compile(r"Total Token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     "user_throughput": re.compile(r"User throughput \(tok\/s\):\s+(-?[\d\.]+)"),
-    "mean_ttft": re.compile(r"Mean TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "median_ttft": re.compile(r"Median TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "p99_ttft": re.compile(r"P99 TTFT \(ms\):\s+(-?[\d\.]+)"),
-    "mean_itl": re.compile(r"Mean ITL \(ms\):\s+(-?[\d\.]+)"),
-    "median_itl": re.compile(r"Median ITL \(ms\):\s+(-?[\d\.]+)"),
-    "p99_itl": re.compile(r"P99 ITL \(ms\):\s+(-?[\d\.]+)"),
-    "mean_tpot": re.compile(r"Mean TPOT \(ms\):\s+(-?[\d\.]+)"),
-    "median_tpot": re.compile(r"Median TPOT \(ms\):\s+(-?[\d\.]+)"),
-    "p99_tpot": re.compile(r"P99 TPOT \(ms\):\s+(-?[\d\.]+)"),
+    "mean_ttft": re.compile(r"Mean TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_ttft": re.compile(r"Median TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_ttft": re.compile(r"P99 TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "mean_itl": re.compile(r"Mean ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_itl": re.compile(r"Median ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_itl": re.compile(r"P99 ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "mean_tpot": re.compile(r"Mean TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "median_tpot": re.compile(r"Median TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
+    "p99_tpot": re.compile(r"P99 TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     "mean_e2el": re.compile(r"Mean E2EL \(ms\):\s+(-?[\d\.]+)"),
     "median_e2el": re.compile(r"Median E2EL \(ms\):\s+(-?[\d\.]+)"),
     "p99_e2el": re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
 }
+
 
 # Spec-decoding-only metrics: parsed from benchmark output but only stored
 # (and regression-checked) when the test runs with speculative decoding.
@@ -964,7 +973,8 @@ def add_perf_metric_value(
 ) -> None:
     """Populate `new_data` with per-test perf metrics from `metrics`.
 
-    - Always copies every key in PERF_METRIC_LOG_QUERIES as `d_<name>`.
+    - Copies available values in PERF_METRIC_LOG_QUERIES as `d_<name>`;
+      explicit N/A measurements are omitted from upload and comparison.
     - Adds `d_al` only when spec_decoding=True *and* the value was parsed;
       non-spec rows omit it so OpenSearch baselines don't blend the two
       populations, and spec rows exempted from reporting it (AgentX) omit it
@@ -987,7 +997,9 @@ def add_perf_metric_value(
     whose mean is absent, before results are uploaded.
     """
     for metric_name in PERF_METRIC_LOG_QUERIES:
-        new_data[f"d_{metric_name}"] = metrics[metric_name]
+        value = metrics[metric_name]
+        if value is not None:
+            new_data[f"d_{metric_name}"] = value
     if spec_decoding:
         # 'al' is legitimately absent for AgentX lanes: aiperf does not propagate
         # TRT-LLM's non-standard avg_decoded_tokens_per_iter field. Omit the
@@ -1078,6 +1090,7 @@ STARTUP_METRIC_NAMES = (
     "draft_weight_population_seconds",
     "draft_checkpoint_finalization_seconds",
     "post_load_processing_seconds",
+    "checkpoint_page_cache_release_seconds",
 )
 CHECKPOINT_PIPELINE_PHASES = (
     "checkpoint_preparation_seconds",
@@ -1094,7 +1107,7 @@ CHECKPOINT_IO_POLICY_PATTERN = re.compile(
     r"selected=(?P<selected>[^,]+), activated=(?P<activated>True|False), "
     r"effective=(?P<effective>[^,]+), fallback_reason=(?P<fallback_reason>.*)\."
 )
-CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v4-postmerge-50-auto-50-native"
+CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v5-postmerge-50-auto-50-native"
 CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV = "TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY"
 CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT = 2
 CHECKPOINT_IO_EXPERIMENT_NATIVE_BUCKET = 0
@@ -1105,6 +1118,7 @@ STARTUP_METADATA_NAMES = (
     "checkpoint_weight_loader_kind",
     "checkpoint_source_kind",
     "load_format",
+    "checkpoint_io_policy_source",
 )
 
 
@@ -1276,6 +1290,42 @@ def parse_checkpoint_io_policies(log_paths: List[str]) -> List[dict]:
     return statuses
 
 
+def _normalize_checkpoint_io_policy(policy: object) -> Optional[dict]:
+    """Validate a finalized primary-model status without inferring activation.
+
+    Args:
+        policy: Structured policy from the primary model's startup metrics.
+
+    Returns:
+        A normalized policy with a bounded fallback reason, or None if invalid.
+    """
+    if not isinstance(policy, dict):
+        return None
+    policies = ("native", "rank_striped_read_ahead")
+    if (
+        policy.get("requested") not in (*policies, "auto")
+        or policy.get("selected") not in policies
+        or policy.get("effective") not in policies
+        or not isinstance(policy.get("activated"), bool)
+        or "fallback_reason" not in policy
+        or not isinstance(policy["fallback_reason"], (str, type(None)))
+    ):
+        return None
+    if (policy["activated"] and policy["selected"] != "rank_striped_read_ahead") or (
+        policy["effective"] == "rank_striped_read_ahead" and not policy["activated"]
+    ):
+        return None
+    reason = policy["fallback_reason"] or "none"
+    return {
+        "requested": policy["requested"],
+        "selected": policy["selected"],
+        "activated": policy["activated"],
+        "effective": policy["effective"],
+        "fallback_reason": _bounded_checkpoint_io_fallback_reason(reason),
+        "fallback_category": checkpoint_io_fallback_category(reason),
+    }
+
+
 def make_startup_observation(server_info: dict, log_paths: List[str], role: str) -> dict:
     """Normalize startup data from ``/server_info`` and server logs."""
     startup_metrics = server_info.get("startup_metrics", {})
@@ -1292,7 +1342,12 @@ def make_startup_observation(server_info: dict, log_paths: List[str], role: str)
             continue
         for metric_name in STARTUP_METRIC_NAMES:
             value = loader_metrics.get(metric_name)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value >= 0
+            ):
                 metrics[f"{metric_prefix}{metric_name}"] = float(value)
         for metadata_name in STARTUP_METADATA_NAMES:
             value = loader_metrics.get(metadata_name)
@@ -1308,11 +1363,23 @@ def make_startup_observation(server_info: dict, log_paths: List[str], role: str)
                 metrics[f"{metric_prefix}{name}"] for name in DRAFT_CHECKPOINT_PIPELINE_PHASES
             )
 
+    primary_loader = startup_metrics.get("model_loader", {})
+    if isinstance(primary_loader, dict) and "checkpoint_io_policy" in primary_loader:
+        # An explicit unknown status is authoritative. Do not substitute logs
+        # that could describe a draft load or a different initialization phase.
+        policy = _normalize_checkpoint_io_policy(primary_loader["checkpoint_io_policy"])
+        policies = [policy] if policy is not None else []
+        policy_source = "server_info"
+    else:
+        policies = parse_checkpoint_io_policies(log_paths)
+        policy_source = "legacy_logs" if policies else "unknown"
+    metadata["checkpoint_io_policy_source"] = policy_source
+
     return {
         "role": role,
         "metrics": metrics,
         "metadata": metadata,
-        "checkpoint_io_policies": parse_checkpoint_io_policies(log_paths),
+        "checkpoint_io_policies": policies,
     }
 
 
@@ -1507,6 +1574,24 @@ def add_startup_metric_values(
     )
 
     successful = [entry for entry in selected if not entry.get("error")]
+    collection_complete = (
+        expected_server_count > 0 and len(successful) == expected_server_count and not failed
+    )
+    required_timings = (*CHECKPOINT_PIPELINE_PHASES, "total_model_loading_seconds")
+    new_data[f"b_{field_prefix}startup_metrics_timing_complete"] = collection_complete and all(
+        isinstance(value := entry.get("metrics", {}).get(name), (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+        for entry in successful
+        for name in required_timings
+    )
+    new_data[f"b_{field_prefix}checkpoint_io_policy_complete"] = collection_complete and all(
+        entry.get("metadata", {}).get("checkpoint_io_policy_source") == "server_info"
+        and len(entry.get("checkpoint_io_policies", [])) == 1
+        and _normalize_checkpoint_io_policy(entry["checkpoint_io_policies"][0]) is not None
+        for entry in successful
+    )
     metric_names = {name for entry in successful for name in entry.get("metrics", {})}
     for metric_name in metric_names:
         values = [entry.get("metrics", {}).get(metric_name) for entry in successful]
@@ -1575,6 +1660,8 @@ def add_startup_metric_values(
     )
     new_data[f"s_{field_prefix}checkpoint_io_experiment_classification"] = (
         classify_checkpoint_io_experiment(assignment, policies)
+        if collection_complete and all(entry.get("checkpoint_io_policies") for entry in successful)
+        else "unknown"
     )
 
 
@@ -1609,6 +1696,48 @@ def to_env_dict(env_vars: str) -> Dict[str, str]:
             key, value = env_var.split("=", 1)
             env[key] = value
     return env
+
+
+RELEASE_CHECKPOINT_PAGE_CACHE_ENV = "TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE"
+# GPU types whose servers the release turns on for by default, on a node whose
+# Lustre client drops a file's cached pages once its lock has been idle for at
+# most RELEASE_CHECKPOINT_PAGE_CACHE_MAX_LOCK_AGE_MS: for a server started
+# shortly before, that drop, and the compaction of the freed memory, land in
+# its measurement.
+RELEASE_CHECKPOINT_PAGE_CACHE_GPU_TYPES = ("gb300",)
+RELEASE_CHECKPOINT_PAGE_CACHE_MAX_LOCK_AGE_MS = 10 * 60 * 1000
+
+
+def lustre_lock_max_age_ms() -> Optional[int]:
+    """The shortest lock lifetime (lru_max_age, ms) of this node's Lustre client.
+
+    None without a Lustre client.
+    """
+    ages = []
+    for path in glob.glob("/sys/fs/lustre/ldlm/namespaces/*/lru_max_age"):
+        try:
+            with open(path) as f:
+                ages.append(int(f.read().strip()))
+        except (OSError, ValueError):
+            continue
+    return min(ages) if ages else None
+
+
+def default_release_checkpoint_page_cache(gpu_type: str) -> Optional[str]:
+    """TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE for servers whose YAML does not set it.
+
+    The job's own value when it exports one, else "1" for the GPU types above on
+    a node whose Lustre client ages idle locks out within the limit above.
+    """
+    value = os.environ.get(RELEASE_CHECKPOINT_PAGE_CACHE_ENV)
+    if value is not None:
+        return value
+    if gpu_type not in RELEASE_CHECKPOINT_PAGE_CACHE_GPU_TYPES:
+        return None
+    max_age_ms = lustre_lock_max_age_ms()
+    if max_age_ms is None or max_age_ms > RELEASE_CHECKPOINT_PAGE_CACHE_MAX_LOCK_AGE_MS:
+        return None
+    return "1"
 
 
 # AgentX knobs a ctx_only lane overrides on top of the yaml's client_env_var.
@@ -2210,9 +2339,28 @@ class ServerConfig:
             config_data = {**external_config, **config_data}
         return config_data
 
-    def generate_extra_llm_api_config(self) -> str:
-        """Generate extra-llm-api-config.yml content."""
+    def generate_extra_llm_api_config(
+        self, page_cache_release_default: Optional[str] = None
+    ) -> str:
+        """Generate extra-llm-api-config.yml content.
+
+        ``page_cache_release_default`` is TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE
+        unless this server's env_vars set it.
+        """
         config_data = self.merged_llm_api_config_data()
+
+        # Drop the checkpoint's page cache during startup, so that neither the
+        # file system's delayed drop nor the kernel's compaction of the freed
+        # memory lands in a measurement. Set through env_overrides, which every
+        # rank applies before loading: the MPI ranks of a multi-node server do
+        # not inherit this process's environment.
+        release = to_env_dict(self.env_vars).get(
+            RELEASE_CHECKPOINT_PAGE_CACHE_ENV, page_cache_release_default
+        )
+        if release is not None:
+            env_overrides = dict(config_data.get("env_overrides") or {})
+            env_overrides.setdefault(RELEASE_CHECKPOINT_PAGE_CACHE_ENV, release)
+            config_data["env_overrides"] = env_overrides
 
         # Handle speculative_model path conversion
         if (
@@ -3050,11 +3198,13 @@ class DisaggTestCmds(NamedTuple):
 
         Reused across runs; slurm_launch_draft.sh clears it before each attempt.
         The step id is excluded so all roles (separate srun steps) agree on it.
-        A DWDP ctx task sees SLURM_JOB_ID only under DWDP_SAVED_ENV_PREFIX.
+        Every role reads SLURM_JOB_ID from its own pytest environment. The worker
+        launchers (trtllm-llmapi-launch, dwdp_ctx_rank.sh) hide it, and slurm_run.sh
+        unsets it for the disagg server and the benchmark, so all roles of a Slurm
+        run use "local". A DWDP ctx task must not take the copy that dwdp_ctx_rank.sh
+        saves, or its CTX files land where the disagg server never looks.
         """
-        run_id = os.environ.get(
-            "SLURM_JOB_ID", os.environ.get(f"{DWDP_SAVED_ENV_PREFIX}SLURM_JOB_ID", "local")
-        )
+        run_id = os.environ.get("SLURM_JOB_ID", "local")
         return os.path.join(self.test_output_dir, f"hostnames-{run_id}-{server_idx}")
 
     def _hostname_file(self, server_idx: int, worker_name: str = "") -> str:
@@ -3639,11 +3789,15 @@ class DisaggTestCmds(NamedTuple):
         urls = []
         for rank in range(world_size):
             path = os.path.join(reserved_dir, f"{rank}.txt")
-            urls.append(wait_for_reported_addr(path, max(1, int(deadline - time.time()))))
+            host, port = wait_for_reported_addr(path, max(1, int(deadline - time.time())))
+            urls.append(f"{host}:{port}")
 
         # Same LLM args a plain ctx server gets from its --config file, with
         # the speculative model / load balancer paths already resolved.
         # model_path is set by to_cmd(), which get_commands() runs first.
+        # Without the page-cache release default: each instance is a server
+        # of its own, so it would drop the checkpoint files that the other
+        # instances on its node are still reading.
         ctx_args = yaml.safe_load(ctx_cfg.generate_extra_llm_api_config()) or {}
         ctx_args["backend"] = ctx_cfg.backend
         worker_config = {
@@ -4529,6 +4683,19 @@ class PerfSanityTestConfig:
                     stderr=subprocess.DEVNULL,
                     text=True,
                 )
+                if PLACEHOLDER_GPU_NAME in output:
+                    compute_cap = (
+                        subprocess.check_output(
+                            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                        )
+                        .splitlines()[0]
+                        .strip()
+                    )
+                    return PLACEHOLDER_GPU_MAPPING.get(
+                        (compute_cap, platform.machine()), "unsupported"
+                    )
                 model = output.split()[-1]
                 return SUPPORTED_GPU_MAPPING.get(model, "unsupported")
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
@@ -4538,6 +4705,16 @@ class PerfSanityTestConfig:
             os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
         )
         self.gpu_type = get_gpu_type()
+        self.page_cache_release_default = default_release_checkpoint_page_cache(self.gpu_type)
+        if (
+            self.page_cache_release_default is not None
+            or self.gpu_type in RELEASE_CHECKPOINT_PAGE_CACHE_GPU_TYPES
+        ):
+            print_info(
+                f"{RELEASE_CHECKPOINT_PAGE_CACHE_ENV} for servers whose env_vars do not "
+                f"set it: {self.page_cache_release_default or 'unset'} (gpu {self.gpu_type}, "
+                f"Lustre lock lru_max_age {lustre_lock_max_age_ms()} ms)"
+            )
 
         # Parse test case name to get config_base_name, select_pattern, runtime,
         # benchmark_mode and the time_breakdown modifier
@@ -4675,6 +4852,7 @@ class PerfSanityTestConfig:
         model_name = metadata.get("model_name", "")
         assert model_name, "model_name is required in metadata section"
 
+        gen_server_config = None
         # Use self.benchmark_mode instead of reading from config file
         benchmark_mode = self.benchmark_mode
         # The mode segments of the test id, reused verbatim as the config name so
@@ -5028,7 +5206,9 @@ class PerfSanityTestConfig:
             server_cmd = server_config.to_cmd(test_output_dir)
 
             # Generate extra-llm-api-config.yml
-            config_content = server_config.generate_extra_llm_api_config()
+            config_content = server_config.generate_extra_llm_api_config(
+                self.page_cache_release_default
+            )
             config_filename = f"extra-llm-api-config.aggr.{server_config.name}.yml"
             config_path = os.path.join(test_output_dir, config_filename)
             with open(config_path, "w") as f:
@@ -5076,7 +5256,9 @@ class PerfSanityTestConfig:
             # Generate ctx server command
             ctx_cmd = ctx_config.to_cmd(test_output_dir, numa_bind, "CTX")
             if disagg_serving_type == "CTX_0":
-                config_content = ctx_config.generate_extra_llm_api_config()
+                config_content = ctx_config.generate_extra_llm_api_config(
+                    self.page_cache_release_default
+                )
                 config_path = os.path.join(
                     test_output_dir, f"extra-llm-api-config.ctx.{ctx_config.name}.yml"
                 )
@@ -5086,7 +5268,9 @@ class PerfSanityTestConfig:
             # Generate gen server command
             gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
             if disagg_serving_type == "GEN_0":
-                config_content = gen_config.generate_extra_llm_api_config()
+                config_content = gen_config.generate_extra_llm_api_config(
+                    self.page_cache_release_default
+                )
                 config_path = os.path.join(
                     test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
                 )
@@ -5154,7 +5338,9 @@ class PerfSanityTestConfig:
                 )
 
             gen_cmd = gen_config.to_cmd(test_output_dir, numa_bind, "GEN")
-            config_content = gen_config.generate_extra_llm_api_config()
+            config_content = gen_config.generate_extra_llm_api_config(
+                self.page_cache_release_default
+            )
             config_path = os.path.join(
                 test_output_dir, f"extra-llm-api-config.gen.{gen_config.name}.yml"
             )
@@ -5259,7 +5445,7 @@ class PerfSanityTestConfig:
     def get_perf_result(self, outputs: Dict[int, List[str]]):
         """Parse performance results from outputs."""
 
-        def parse_metrics_from_output(output: str) -> Optional[Dict[str, float]]:
+        def parse_metrics_from_output(output: str) -> dict[str, float | None]:
             """Parse all metrics from a single output string."""
             metrics = {}
             all_queries = {
@@ -5289,7 +5475,10 @@ class PerfSanityTestConfig:
                         continue
                     match = regex.search(line)
                     if match:
-                        metrics[metric_type] = float(match.group(1))
+                        # Preserve explicit N/A as a present key so validation
+                        # can distinguish it from missing or malformed output.
+                        value = match.group(1)
+                        metrics[metric_type] = None if value == "N/A" else float(value)
                         break
             return metrics
 

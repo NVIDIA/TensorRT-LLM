@@ -87,8 +87,8 @@ target_include_directories(
 target_link_libraries(
   tllm_kv_cache
   PUBLIC tllm::kv_cache_host_memory tllm::common_cuda tllm::executor_types
-         CUDA::cuda_driver
-  PRIVATE tllm::common_environment)
+         tllm::runtime_locality CUDA::cuda_driver
+  PRIVATE tllm::common_environment tllm::executor_transfer_agent)
 
 add_library(
   tllm_kv_cache_legacy STATIC

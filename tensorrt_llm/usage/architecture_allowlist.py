@@ -24,6 +24,8 @@ arbitrary user-supplied names.
 PUBLIC_MODEL_ARCHITECTURES = frozenset(
     {
         "AfmoeForCausalLM",
+        "Apertus1p5ForConditionalGeneration",
+        "ApertusForCausalLM",
         "BartForConditionalGeneration",
         "BertForSequenceClassification",
         "CLIPVisionModel",
@@ -86,6 +88,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "MistralLarge3ForCausalLM",
         "MixtralForCausalLM",
         "MllamaForConditionalGeneration",
+        "MuseSparkForConditionalGeneration",
         "NemotronForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
@@ -99,6 +102,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "Phi4MMForCausalLM",
         "PixtralForConditionalGeneration",
         "PixtralVisionModel",
+        "PplxDeciderForDecision",
         "Qwen2ForCausalLM",
         "Qwen2ForProcessRewardModel",
         "Qwen2ForRewardModel",
@@ -107,6 +111,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "Qwen2_5_VLForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen3ForTextEmbedding",
+        "Qwen3ForTextReranking",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3VLForConditionalGeneration",

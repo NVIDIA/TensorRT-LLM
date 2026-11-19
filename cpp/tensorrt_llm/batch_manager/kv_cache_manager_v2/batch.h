@@ -719,6 +719,7 @@ private:
         kPageTables = 0,
         kHistory,
         kCapacity,
+        kSparseClock,
         kLeases,
         kScratch,
         kCount
@@ -798,6 +799,9 @@ private:
 
     //! The same array where a kernel reads it, which is what the launches are handed.
     [[nodiscard]] SparseLeaseIndex const* _leaseMirror() const noexcept;
+
+    //! The staged eviction clock where a resolve reads it, for the same reason.
+    [[nodiscard]] int32_t const* _sparseStepAgeMirror() const noexcept;
 
     //! Bytes of the mirror: the staged block from the histories through the leases, which is
     //! everything a captured kernel reads. The page tables ahead of them are read from the
@@ -879,6 +883,19 @@ private:
     //! Cumulative fetch statistics, across every life cycle and step. Outside mStepScratch
     //! because the step's clear must not touch it.
     CudaUniqPtr<SparseHitMiss> mHitMiss;
+
+    //! The eviction clock every resolve of this Batch reads. Advanced in publish(), which
+    //! is the one place a step begins: a step resolves once per layer, so advancing per
+    //! resolve would age an entry by the layer count, and advancing from the watermarks
+    //! would quantise the clock by a life cycle's unit size.
+    //!
+    //! Shared by the life cycles. A single clock is what lets one Batch-wide advance serve
+    //! them, and nothing compares an entry of one against an entry of another.
+    //!
+    //! The host counter only; publish() stages it into BufName::kSparseClock, which is what
+    //! a resolve reads. See SparseResolveArgs::stepAge for why a kernel cannot take it by
+    //! value.
+    uint32_t mSparseStepAge = 0;
 
     //! Device storage behind every life cycle's per-BufferId copy descriptors.
     CudaUniqPtr<SparseCopyDesc> mCopyDesc;
