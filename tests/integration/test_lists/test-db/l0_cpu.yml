@@ -184,6 +184,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_weight_table.py
   - unittest/_torch/modeling_v2/models/inkling2/test_config.py
+  - unittest/_torch/modeling_v2/models/inkling2/test_routing.py
   - unittest/_torch/modeling_v2/models/inkling2/inkling_2_small_nvfp4__sm_103__tep4/test_cache.py
   - unittest/_torch/modeling_v2/models/inkling2/inkling_2_small_nvfp4__sm_103__tep4/test_modeling.py
   - unittest/_torch/modeling_v2/models/inkling2/inkling_2_small_nvfp4__sm_103__tep4/test_weights.py
