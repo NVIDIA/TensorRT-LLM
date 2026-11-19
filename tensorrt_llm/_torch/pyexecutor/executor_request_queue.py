@@ -7,7 +7,7 @@ import enum
 import queue
 import threading
 import time
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 import numpy as np
 
@@ -26,6 +26,8 @@ CONTROL_REQUEST_ID = -2
 PROFILE_START_REQUEST_ID = -3
 PROFILE_STOP_REQUEST_ID = -4
 PREFIX_LOAD_COMPLETION_REQUEST_ID = -5
+# Shortest wait between two idle_tick calls in get_from_request_queue.
+_MIN_IDLE_TICK_WAIT_S = 0.001
 
 
 class RequestAdmissionState(enum.Enum):
@@ -44,7 +46,11 @@ class RequestQueueItem:
     request: Optional[ExecutorRequest] = None
     _ = dataclasses.KW_ONLY
     child_req_ids: Optional[list] = None
+    locality_domain_id: Optional[int] = None
     is_canceled_request: bool = False
+    # A completed frontend result may no longer map its client identity to an
+    # engine request. Resolve this only against retained CTX transfers.
+    cancel_context_client_id: Optional[int] = None
     # Only meaningful for control requests. True = drain active/waiting
     # queues before firing the action. False = fire at the next scheduler
     # step boundary with in-flight requests still in the engine.
@@ -289,8 +295,24 @@ class ExecutorRequestQueue:
 
     def enqueue_cancel_request(self, req_id: int):
         with self.enqueue_lock:
+            if not self._can_enqueue_cancellation():
+                return
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
+
+    def enqueue_context_transfer_cancel(self, client_id: int) -> None:
+        """Queue a late CTX cancellation in the client-ID namespace.
+
+        Args:
+            client_id: Original frontend identity, not an executor request ID.
+        """
+        with self.enqueue_lock:
+            if not self._can_enqueue_cancellation():
+                return
+            self.request_queue.put(
+                RequestQueueItem(client_id,
+                                 is_canceled_request=True,
+                                 cancel_context_client_id=client_id))
 
     def pending_cancellation_ids(self) -> set[int]:
         """Inspect cancellation sentinels without consuming queued requests."""
@@ -298,6 +320,7 @@ class ExecutorRequestQueue:
             return {
                 item.id
                 for item in self.request_queue.queue if item.is_canceled_request
+                and item.cancel_context_client_id is None
             }
 
     def enqueue_control_request(self,
@@ -339,16 +362,34 @@ class ExecutorRequestQueue:
         with self.enqueue_lock:
             return self.active and self.dist.rank == 0
 
+    def _can_enqueue_cancellation(self) -> bool:
+        # The caller holds enqueue_lock, including the enqueue-time recheck.
+        return (self.active and self.dist.rank == 0
+                and self.admission_state in (RequestAdmissionState.RUNNING,
+                                             RequestAdmissionState.PARKING))
+
+    def can_enqueue_cancellation(self) -> bool:
+        """Allow cancellation of existing work while admission drains for sleep."""
+        with self.enqueue_lock:
+            return self._can_enqueue_cancellation()
+
     def get_from_request_queue(
-            self,
-            timeout: Optional[datetime.timedelta],
-            *,
-            wait_for_batch: bool = True) -> List[RequestQueueItem]:
+        self,
+        timeout: Optional[datetime.timedelta],
+        *,
+        wait_for_batch: bool = True,
+        idle_tick: Optional[Callable[[],
+                                     float]] = None) -> List[RequestQueueItem]:
         """Fetch requests from the queue with optional timeout.
 
         Args:
             timeout: Optional timeout for waiting on queue.
             wait_for_batch: Whether to wait for additional items to fill a batch.
+            idle_tick: Optional callback used while blocked on an empty queue.
+                It runs before each wait and returns the seconds until it
+                should run again, so the caller can do periodic local work
+                (idle heartbeats) without ending the wait. ``timeout`` still
+                bounds the whole wait.
 
         Returns:
             List of RequestQueueItem fetched from the queue.
@@ -360,7 +401,11 @@ class ExecutorRequestQueue:
             if self.request_queue.empty() and (timeout_secs is None
                                                or timeout_secs > 0):
                 # if queue is empty and want to wait, wait
-                items.append(self.request_queue.get(timeout=timeout_secs))
+                if idle_tick is None:
+                    items.append(self.request_queue.get(timeout=timeout_secs))
+                else:
+                    items.append(
+                        self._get_between_idle_ticks(timeout_secs, idle_tick))
             else:
                 # if not empty or don't want to wait, just return all items in queue
                 while True:
@@ -389,6 +434,29 @@ class ExecutorRequestQueue:
                 break
 
         return items
+
+    def _get_between_idle_ticks(
+            self, timeout_secs: Optional[float],
+            idle_tick: Callable[[], float]) -> RequestQueueItem:
+        """Block on the queue, running ``idle_tick`` between waits.
+
+        Raises:
+            queue.Empty: ``timeout_secs`` elapsed with no item, like get().
+        """
+        deadline = (None if timeout_secs is None else time.monotonic() +
+                    timeout_secs)
+        while True:
+            # The floor keeps a misbehaving callback from spinning this loop.
+            wait = max(idle_tick(), _MIN_IDLE_TICK_WAIT_S)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                wait = min(wait, remaining)
+            try:
+                return self.request_queue.get(timeout=wait)
+            except queue.Empty:
+                continue
 
     def get_request_queue_size(self) -> int:
         return self.request_queue.qsize()
