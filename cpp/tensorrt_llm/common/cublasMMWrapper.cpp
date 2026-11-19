@@ -493,12 +493,14 @@ bool CublasMMWrapper::checkTactic(cublasOperation_t transa, cublasOperation_t tr
 }
 
 std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasOperation_t transa,
-    cublasOperation_t transb, int const m, int const n, int const k, int const lda, int const ldb, int const ldc)
+    cublasOperation_t transb, int const m, int const n, int const k, int const lda, int const ldb, int const ldc,
+    int const maxAlgorithms)
 {
     TLLM_CHECK_WITH_INFO(
         descriptorsCreated(), "Descriptors are not created! Call createDescriptors before calling this function");
 
-    auto const heuristics = getTactics(getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc, mCDesc);
+    auto const heuristics
+        = getTactics(getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc, mCDesc, maxAlgorithms);
 
     sync_check_cuda_error(mStream);
 
@@ -507,13 +509,14 @@ std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasO
 
 std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasLtHandle_t lightHandle,
     cublasLtMatmulDesc_t computeDesc, cublasLtMatrixLayout_t Adesc, cublasLtMatrixLayout_t Bdesc,
-    cublasLtMatrixLayout_t Cdesc, cublasLtMatrixLayout_t Ddesc)
+    cublasLtMatrixLayout_t Cdesc, cublasLtMatrixLayout_t Ddesc, int const maxAlgorithms)
 {
 #if TLLM_CUBLAS_VER_LE(11, 4, 2)
     TLLM_CHECK_WITH_INFO(false, "CUBLAS version too low, must be > 11.4.2.");
     return {};
 #else
-    std::vector<cublasLtMatmulHeuristicResult_t> heuristics(200);
+    TLLM_CHECK_WITH_INFO(maxAlgorithms > 0, "Heuristic request count must be positive");
+    std::vector<cublasLtMatmulHeuristicResult_t> heuristics(maxAlgorithms);
     cublasLtMatmulPreference_t preference;
     check_cuda_error(cublasLtMatmulPreferenceCreate(&preference));
     check_cuda_error(cublasLtMatmulPreferenceInit(preference));
@@ -534,6 +537,7 @@ std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasL
     check_cuda_error(cublasLtMatmulAlgoGetHeuristic(lightHandle, computeDesc, Adesc, Bdesc, Cdesc, Ddesc, preference,
         heuristics.size(), heuristics.data(), &return_count));
     heuristics.resize(return_count);
+    check_cuda_error(cublasLtMatmulPreferenceDestroy(preference));
 
     return heuristics;
 #endif
