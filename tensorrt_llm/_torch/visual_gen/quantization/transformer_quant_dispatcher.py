@@ -228,8 +228,10 @@ def share_non_linear_parameters(source: nn.Module, target: nn.Module) -> None:
                 module.register_parameter(parameter_name, shared)
 
 
-def bind_model_weights(source: nn.Module, target: nn.Module) -> None:
-    """Bind a fully loaded model's tensors without repeating native weight transforms."""
+def bind_model_weights(
+    source: nn.Module, target: nn.Module, *, share_parameters: bool = True
+) -> None:
+    """Reuse loaded tensors, optionally with independent Parameter bindings."""
     with reuse_transformer_weights(source, target, require_dynamic_weights=False):
         originals = dict(source.named_modules())
         for name, module in target.named_modules():
@@ -246,3 +248,17 @@ def bind_model_weights(source: nn.Module, target: nn.Module) -> None:
                     buffer,
                     persistent=buffer_name not in original._non_persistent_buffers_set,
                 )
+    if not share_parameters:
+        parameters = {}
+        for module in target.modules():
+            for name, parameter in list(module._parameters.items()):
+                if parameter is None:
+                    continue
+                if id(parameter) not in parameters:
+                    parameters[id(parameter)] = nn.Parameter(
+                        parameter.detach(), requires_grad=parameter.requires_grad
+                    )
+                module.register_parameter(name, parameters[id(parameter)])
+                metadata = getattr(module, "rebuild_tensor_metadata", {})
+                if name in metadata:
+                    metadata[name]["param"] = getattr(module, name)

@@ -351,7 +351,7 @@ class BasePipeline(nn.Module):
                 setattr(self, name, model)
 
     def transformer_quant_models(
-        self, component: str | None = None
+        self, component: str | None = None, *, stage: str | None = None
     ) -> Iterator[tuple[str, nn.Module]]:
         """Visit every real model, including independent stage weight versions."""
         dispatchers = getattr(self, "_transformer_quant_dispatchers", {})
@@ -362,7 +362,7 @@ class BasePipeline(nn.Module):
             if dispatcher is None:
                 yield name, getattr(self, name)
             else:
-                for variant_name, model in dispatcher.models():
+                for variant_name, model in dispatcher.models(stage):
                     yield f"{name}_{variant_name}", model
 
     def deferred_transformer_quant_tensor_ids(self) -> set[int]:
@@ -492,7 +492,7 @@ class BasePipeline(nn.Module):
                     source = sources.get((name, effective[0]))
                     if source is None:
                         source = dispatcher.variants[dispatcher.variant_name("base", effective)]
-                        bind_model_weights(source, model)
+                        bind_model_weights(source, model, share_parameters=False)
                         prepare(model)
                         sources[name, effective[0]] = model
                     else:
