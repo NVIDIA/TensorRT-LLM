@@ -99,6 +99,20 @@ Model-free suffix-automaton (SA) drafting is also available; see the
 [speculative-decoding guide](../../docs/source/deployment-guide/deployment-guide-for-musespark-open-speculative-decoding-on-trtllm.md)
 for its configuration and measured trade-offs.
 
+## Agentic workloads
+
+For agentic traffic (long multi-turn sessions that resend their whole
+conversation, up to the full 1M-token context), two more curated recipes keep
+and reuse the KV cache of earlier turns:
+`examples/configs/curated/musespark-open-agentic-max-throughput.yaml`
+(48 concurrent sessions) and
+`examples/configs/curated/musespark-open-agentic-balanced.yaml` (24 sessions,
+faster output per session). Serve either one in place of the general recipe;
+their host-memory KV tier needs 640 GiB of host memory per node. The
+deployment guide's
+[Agentic Workloads](../../docs/source/deployment-guide/deployment-guide-for-musespark-open-on-trtllm.md#agentic-workloads)
+section has the measurements and the commands to reproduce them.
+
 ## Configuration notes
 
 - **FP8 KV cache is required on `SM103` with chunked prefill or block
