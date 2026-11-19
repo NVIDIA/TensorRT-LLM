@@ -109,6 +109,19 @@ def params(prompt_len=3):
     )
 
 
+def table_params(positions, delta):
+    """Generation-only parameters with byte handles for a 4-token prompt."""
+    return DisaggregatedParams(
+        request_type="generation_only",
+        mrope_position_ids_handle=SharedTensorContainer.from_tensor_bytes(
+            torch.tensor(positions).expand(3, 1, 4)
+        ).dump_to_dict(),
+        mrope_position_deltas_handle=SharedTensorContainer.from_tensor_bytes(
+            torch.tensor([[delta]], dtype=torch.int32)
+        ).dump_to_dict(),
+    )
+
+
 def test_expanded_tokens_skip_input_processor(llm):
     ids, prompt, mm, _ = llm._preprocess(
         {"prompt_token_ids": [1, 91, 2], "multi_modal_data": None},
@@ -402,21 +415,25 @@ def test_invalid_multimodal_identity_is_rejected(llm, update, error):
         ([0, 1, 1, 16], 13, 4, "Qwen mRoPE positions exceed"),
         ([0, 1, 1, 2], -100, 4, "inconsistent"),
         ([0, 1, 1, 10], 7, 6, "decode positions exceed"),
+        ([0, 1, 1, 2], -1, None, None),
+        ([0, 1, 1, 5], 2, None, "decode positions exceed"),
     ],
-    ids=["valid", "negative", "past-table", "delta", "decode-past-table"],
+    ids=[
+        "valid",
+        "negative",
+        "past-table",
+        "delta",
+        "decode-past-table",
+        "no-max-tokens",
+        "no-max-tokens-past-table",
+    ],
 )
 def test_mrope_positions_must_fit_the_rotary_table(llm, positions, delta, max_tokens, error):
     # The worker indexes its rotary table with these values: a bad one fails the request here.
     llm.input_processor = RotaryTableProcessor()
-    disagg = DisaggregatedParams(
-        request_type="generation_only",
-        mrope_position_ids_handle=SharedTensorContainer.from_tensor_bytes(
-            torch.tensor(positions).expand(3, 1, 4)
-        ).dump_to_dict(),
-        mrope_position_deltas_handle=SharedTensorContainer.from_tensor_bytes(
-            torch.tensor([[delta]], dtype=torch.int32)
-        ).dump_to_dict(),
-    )
+    # Above the 16-row table: the worker caps it, so the check must too.
+    llm.args.max_seq_len = 32
+    disagg = table_params(positions, delta)
     request = {"prompt_token_ids": [1, 91, 91, 2]}
     if error is None:
         mm = submit(llm, request, disagg, max_tokens=max_tokens)
@@ -457,19 +474,24 @@ def test_prepared_inputs_with_handoff_state_are_submitted(llm):
     identity = MultimodalInput.from_components(
         [[1, 2, 3, 4, 5, 6, 7, 8]], [1], [2], ["image-id"], [0, 2], [1, 3], [1, 1]
     )
+    llm.input_processor = RotaryTableProcessor()
     llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(enable_block_reuse=True))
-    # As trtllm-serve does: preprocess with the generation-only parameters, then submit.
-    disagg = params(4)
+    request = {"prompt_token_ids": [1, 91, 2, 91]}
+    sampling_params = SamplingParams(max_tokens=4)
+    # As trtllm-serve does: preprocess with the request's parameters, then submit.
+    with pytest.raises(ValueError, match="positions exceed"):
+        llm.preprocess(request, sampling_params, table_params([-1, 0, 0, 1], -2))
+    disagg = table_params([0, 1, 1, 2], -1)
     disagg.multimodal_input = asdict(identity)
-    prepared = llm.preprocess({"prompt_token_ids": [1, 91, 2, 91]}, disaggregated_params=disagg)
+    prepared = llm.preprocess(request, sampling_params, disagg)
     assert submit(llm, prepared, disagg) is prepared.multimodal_params
     # Local state with no handles, like the gRPC prepared-decode path.
     local = MultimodalParams(
         multimodal_input=identity,
         multimodal_data={
             "mrope_config": {
-                "mrope_position_ids": torch.zeros(3, 1, 4, dtype=torch.long),
-                "mrope_position_deltas": torch.zeros(1, 1, dtype=torch.int32),
+                "mrope_position_ids": torch.tensor([0, 1, 1, 2]).expand(3, 1, 4),
+                "mrope_position_deltas": torch.tensor([[-1]], dtype=torch.int32),
             }
         },
     )
