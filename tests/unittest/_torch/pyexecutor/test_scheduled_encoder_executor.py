@@ -22,13 +22,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor import scheduled_encoder_executor
-from tensorrt_llm._torch.pyexecutor.encoder_completion import (
-    MultimodalEmbeddingCompletion,
-    PoolingCompletion,
-)
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import (
+    MultimodalEmbeddingCompletion,
+    PoolingCompletion,
     ScheduledEncoderExecutor,
     fit_batch,
 )

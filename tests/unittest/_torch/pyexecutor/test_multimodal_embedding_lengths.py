@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.encoder_completion import MultimodalEmbeddingCompletion
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult, get_multimodal_embedding_lengths
+from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import MultimodalEmbeddingCompletion
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,

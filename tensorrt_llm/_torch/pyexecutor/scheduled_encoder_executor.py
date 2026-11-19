@@ -28,7 +28,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import host_profiler_context
 
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
-from .encoder_completion import Completion, MultimodalEmbeddingCompletion, PoolingCompletion
 from .engine.model_setup import build_encoder_runner, build_mm_encoder_runner
 from .engine.runners.encoder import resolve_scheduled_encoder_args
 from .engine.runners.interface import ScheduledInputs, ScheduledModelRunner
@@ -60,7 +59,13 @@ if TYPE_CHECKING:
     from .llm_request import ExecutorRequest
     from .model_loader import ModelLoader
 
-__all__ = ["ScheduledEncoderExecutor", "fit_batch", "prompt_cost"]
+__all__ = [
+    "MultimodalEmbeddingCompletion",
+    "PoolingCompletion",
+    "ScheduledEncoderExecutor",
+    "fit_batch",
+    "prompt_cost",
+]
 
 _MULTIMODAL_INPUT_ERROR = "Requests to a pooling model cannot carry multimodal inputs."
 
@@ -106,6 +111,62 @@ def fit_batch(
     return len(items)
 
 
+class PoolingCompletion:
+    """Store each request's pooled row as its context logits, when the request asked for them."""
+
+    accepts_multimodal_inputs = False
+
+    def store(self, requests: list[LlmRequest], outputs: dict[str, Any]) -> None:
+        for request, row in zip(requests, outputs["logits"]):
+            if request.py_return_context_logits:
+                request.py_result.append_context_logits(row.unsqueeze(0) if row.ndim == 1 else row)
+
+    def retire(self, requests: list[LlmRequest]) -> None:
+        for request in requests:
+            request.py_result.drop_context_logits()
+
+
+class MultimodalEmbeddingCompletion:
+    """Export each request's multimodal embeddings, and its MRoPE positions, as CUDA IPC handles.
+
+    A request without multimodal items in the batch completes without a result. Only the rank
+    whose responses reach the frontend exports: an exported allocation stays alive until a
+    consumer opens and releases its handle, or ``retire`` consumes it.
+    """
+
+    accepts_multimodal_inputs = True
+
+    def __init__(self, *, exports: bool) -> None:
+        self._exports = exports
+
+    def store(self, requests: list[LlmRequest], outputs: dict[str, Any]) -> None:
+        if not self._exports:
+            return
+        metadata = outputs.get("mm_embedding_metadata")
+        mrope_position_ids = outputs.get("mrope_position_ids")
+        mrope_position_deltas = outputs.get("mrope_position_deltas")
+        for result, (request_index, embeddings, lengths) in enumerate(
+            zip(
+                outputs["mm_embedding_request_indices"],
+                outputs["mm_embeddings"],
+                outputs["mm_embedding_lengths"],
+                strict=True,
+            )
+        ):
+            py_result = requests[request_index].py_result
+            py_result.append_mm_embeddings(
+                embeddings, lengths, None if metadata is None else metadata[result]
+            )
+            if mrope_position_ids is not None and mrope_position_deltas is not None:
+                py_result.set_mrope_position(
+                    mrope_position_ids[result], mrope_position_deltas[result]
+                )
+
+    def retire(self, requests: list[LlmRequest]) -> None:
+        for request in requests:
+            request.py_result.release_exports()
+
+
 class ScheduledEncoderExecutor:
     """Serve scheduled requests to a non-generation model: queue, admission, batching, one forward.
 
@@ -133,7 +194,7 @@ class ScheduledEncoderExecutor:
         self,
         runner: ScheduledModelRunner,
         *,
-        completion: Completion,
+        completion: PoolingCompletion | MultimodalEmbeddingCompletion,
         model_loader: ModelLoader,
         llm_args: TorchLlmArgs,
         mapping: Mapping,
@@ -147,6 +208,8 @@ class ScheduledEncoderExecutor:
         Args:
             runner: The model's runner; every forward goes through its scheduled entry point.
             completion: How a forward's outputs complete its requests; it fits the runner.
+                ``store`` attaches a forward's results before their responses are created;
+                ``retire`` withdraws them from requests that finish without their result.
             model_loader: The loader that loaded the model, cleaned up at shutdown.
             llm_args: The resolved arguments; the executor reads its timeouts, garbage
                 collection threshold and metrics switches.

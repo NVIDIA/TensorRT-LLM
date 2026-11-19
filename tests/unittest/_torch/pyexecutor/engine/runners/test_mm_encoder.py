@@ -10,11 +10,11 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from tensorrt_llm._torch.pyexecutor.encoder_completion import MultimodalEmbeddingCompletion
 from tensorrt_llm._torch.pyexecutor.engine.runners import mm_encoder as mm_encoder_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
+from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import MultimodalEmbeddingCompletion
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.utils import get_model_extra_attrs
