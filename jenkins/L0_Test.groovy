@@ -8160,16 +8160,16 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             false,
             'manylinux_2_39_x86_64',
         ],
-        "PY310-UB2204": [
-            LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
-            "A10",
-            X86_64_TRIPLE,
-            true,
-            false,
-            UBUNTU_22_04_IMAGE,
-            true, // Install the public PyTorch CUDA 13 build used by TensorRT LLM wheels.
-            'manylinux_2_28_x86_64',
-        ],
+        // "PY310-UB2204": [
+        //     LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
+        //     "A10",
+        //     X86_64_TRIPLE,
+        //     true,
+        //     false,
+        //     UBUNTU_22_04_IMAGE,
+        //     true, // Install the public PyTorch CUDA 13 build used by TensorRT LLM wheels.
+        //     'manylinux_2_28_x86_64',
+        // ],
         "PY312-UB2404": [
             LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
             "A100X",

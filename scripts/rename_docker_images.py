@@ -13,8 +13,6 @@ IMAGE_MAPPING = {
     "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:sbsa-__stage__-torch_skip",
     "LLM_SBSA_WHEEL_DOCKER_IMAGE":
     "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:sbsa-ubuntu24-torch_skip-py312",
-    "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE":
-    "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:x86_64-rockylinux8-torch_skip-py310",
     "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE":
     "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/__stage__:x86_64-rockylinux8-torch_skip-py312",
 }
