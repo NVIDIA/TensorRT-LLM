@@ -517,5 +517,14 @@ class _PreadSlice:
         dtype = self._reader._dtypes[self._info["dtype"]]
         row_bytes = math.prod(shape[1:]) * dtype.itemsize
         begin = self._info["data_offsets"][0] + rows[0] * row_bytes
-        out = self._reader._read(begin, (rows[1] - rows[0]) * row_bytes).view(dtype)
+        nbytes = (rows[1] - rows[0]) * row_bytes
+        out = self._reader._read(begin, nbytes).view(dtype)
+        if shape and 0 < rows[1] - rows[0] < shape[0]:
+            # One rank reads a part (expert or row parallel): drop its pages.
+            # Otherwise they fill the page cache, and under a cap on it (a Lustre
+            # client keeps about half of host memory) the read-ahead's pages that
+            # are not yet used get evicted instead and are read again.
+            os.posix_fadvise(
+                self._reader._fd, self._reader._data_start + begin, nbytes, os.POSIX_FADV_DONTNEED
+            )
         return out.reshape(([rows[1] - rows[0]] + shape[1:]) if shape else shape)

@@ -84,12 +84,12 @@ def build_local_plan(
     local_rank: int,
     local_size: int,
 ) -> ReadAheadPlan:
-    """Assign every checkpoint extent to exactly one node-local issuer."""
+    """Assign every checkpoint extent, in ``ranges`` order, to exactly one node-local issuer."""
     if not 0 <= local_rank < local_size:
         raise ValueError("local rank and size must describe a valid group")
 
     extents = []
-    for path, start, length in sorted(ranges):
+    for path, start, length in ranges:
         if length < 0:
             raise ValueError("checkpoint file sizes must be nonnegative")
         for offset in range(start, start + length, _CHUNK_SIZE):

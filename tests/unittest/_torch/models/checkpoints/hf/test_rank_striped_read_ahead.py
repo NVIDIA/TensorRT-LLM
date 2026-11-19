@@ -972,6 +972,8 @@ def test_native_and_rank_striped_outputs_match(tmp_path, monkeypatch):
         assert torch.equal(striped[name], expected_tensor)
 
     # The lazy loader's pread slices: whole tensors, row ranges and a column shard.
+    advised = []
+    monkeypatch.setattr(os, "posix_fadvise", lambda fd, *args: advised.append(args[1:]))
     lazy = native_loader._load_lazy_safetensors(str(checkpoint_dir))
     for name, expected_tensor in expected.items():
         rows = (slice(1, None),) if expected_tensor.dim() else ...
@@ -979,6 +981,12 @@ def test_native_and_rank_striped_outputs_match(tmp_path, monkeypatch):
         assert torch.equal(lazy[name][rows], expected_tensor[rows])
     embed = expected["model.embed_tokens.weight"]
     assert torch.equal(lazy["model.embed_tokens.weight"][:, 1:3], embed[:, 1:3])
+    # Only a read of part of the rows drops its own pages; other ranks may read whole tensors.
+    assert advised == [
+        (t[1:].numel() * t.element_size(), os.POSIX_FADV_DONTNEED)
+        for t in expected.values()
+        if t.dim() and t.shape[0] > 1
+    ]
 
 
 def test_loader_passes_full_checkpoint_bytes_to_reader(
@@ -1004,31 +1012,55 @@ def test_loader_passes_full_checkpoint_bytes_to_reader(
     assert session_factory.call_args.kwargs["checkpoint_bytes"] == checkpoint_bytes
 
 
+@pytest.mark.parametrize("peer_rank", [1, 3])
 @pytest.mark.parametrize("checkpoint_fits", [True, False])
 def test_read_ahead_reads_only_the_node_ranks_stages_and_experts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checkpoint_fits: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checkpoint_fits: bool, peer_rank: int
 ) -> None:
-    # PP2 x EP2: this node holds rank 0 (layers 0-1, experts 0-1) and rank 3 (layers 2-3, experts 2-3).
+    # PP2 x EP2: this node holds rank 0 (layers 0-1, experts 0-1) and a peer: rank 1 (layers 0-1,
+    # experts 2-3) or rank 3 (layers 2-3, experts 2-3). Shard names sort layer 2 before layer 0.
     checkpoint_dir = tmp_path / "checkpoint"
     checkpoint_dir.mkdir()
-    tensors = {"model.embed_tokens.weight": torch.ones(64)}
-    for layer in range(4):
-        tensors[f"model.layers.{layer}.input_layernorm.weight"] = torch.ones(64)
-        for expert in range(4):
-            tensors[f"model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"] = torch.ones(64)
-    path = str(checkpoint_dir / "model.safetensors")
-    save_file(tensors, path)
-    file_size, header_bytes, header = weight_loader_module._read_safetensors_header(path)
-    node_offsets = []  # the bytes of the tensors ranks 0 and 3 load
-    for name, info in header.items():
-        parts = name.split(".")
-        if name != "__metadata__" and (
-            "experts" not in parts or (parts[2] < "2") == (parts[5] < "2")
-        ):
-            node_offsets += range(*(8 + header_bytes + offset for offset in info["data_offsets"]))
-    assert len(node_offsets) < file_size
+    shards = {"model-1": [2, 3], "model-2": [0, 1]}
+    for shard, layers in shards.items():
+        tensors = {"model.embed_tokens.weight": torch.ones(64)} if 0 in layers else {}
+        for layer in layers:
+            tensors[f"model.layers.{layer}.input_layernorm.weight"] = torch.ones(64)
+            # Experts stacked on dim 0, and one tensor per expert.
+            tensors[f"model.layers.{layer}.mlp.experts.gate_up_proj"] = torch.ones(4, 16)
+            for expert in range(4):
+                tensors[f"model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"] = torch.ones(
+                    64
+                )
+        save_file(tensors, str(checkpoint_dir / f"{shard}.safetensors"))
 
-    config = SimpleNamespace(num_hidden_layers=4)
+    def loads(rank: int, layer: int | None, expert: int | None) -> bool:
+        stage, ep_rank = divmod(rank, 2)
+        return (layer is None or layer // 2 == stage) and (expert is None or expert // 2 == ep_rank)
+
+    whole, node_offsets = [], []  # every byte, and the bytes ranks 0 and the peer load
+    for shard in ["model-2", "model-1"]:  # layer order
+        path = str(checkpoint_dir / f"{shard}.safetensors")
+        file_size, header_bytes, header = weight_loader_module._read_safetensors_header(path)
+        whole += [(path, offset) for offset in range(file_size)]
+        offsets = []
+        for name, info in header.items():
+            if name == "__metadata__":
+                continue
+            start, end = (8 + header_bytes + offset for offset in info["data_offsets"])
+            parts = name.split(".")
+            layer = int(parts[2]) if parts[1] == "layers" else None
+            expert = int(parts[5]) if parts[4:5] == ["experts"] and parts[5].isdigit() else None
+            blocks = [(start, end, expert)]
+            if name.endswith("gate_up_proj"):
+                rows = (end - start) // 4
+                blocks = [(start + e * rows, start + (e + 1) * rows, e) for e in range(4)]
+            for begin, stop, expert in blocks:
+                if any(loads(rank, layer, expert) for rank in (0, peer_rank)):
+                    offsets += range(begin, stop)
+        node_offsets += [(path, offset) for offset in sorted(offsets)]
+
+    config = SimpleNamespace(num_hidden_layers=4, num_experts=4)
     model = SimpleNamespace(
         model_config=SimpleNamespace(pretrained_config=config, moe_load_balancer=None)
     )
@@ -1036,7 +1068,7 @@ def test_read_ahead_reads_only_the_node_ranks_stages_and_experts(
     def mapping(rank: int) -> Mapping:
         return Mapping(world_size=4, rank=rank, tp_size=2, pp_size=2, moe_ep_size=2)
 
-    peer = weight_loader_module._rank_read_set(mapping(3), model)
+    peer = weight_loader_module._rank_read_set(mapping(peer_rank), model)
     node_communicator = mock.Mock()
     node_communicator.Get_rank.return_value = 0
     node_communicator.Get_size.return_value = 2
@@ -1048,10 +1080,12 @@ def test_read_ahead_reads_only_the_node_ranks_stages_and_experts(
     monkeypatch.setattr(weight_loader_module, "ENABLE_MULTI_DEVICE", True)
     monkeypatch.setattr(weight_loader_module, "mpi_disabled", lambda: False)
     monkeypatch.setattr(weight_loader_module, "mpi_comm", lambda: active_communicator)
-    # Whole files when the checkpoint fits, else only the node's share.
-    read_offsets = range(file_size) if checkpoint_fits else node_offsets
-    available = len(read_offsets) + read_ahead._HOST_MEMORY_HEADROOM_BYTES
-    monkeypatch.setattr(weight_loader_module, "effective_available_host_memory", lambda: available)
+    available = len(whole if checkpoint_fits else node_offsets)
+    monkeypatch.setattr(
+        weight_loader_module,
+        "effective_available_host_memory",
+        lambda: available + read_ahead._HOST_MEMORY_HEADROOM_BYTES,
+    )
     plan_factory = mock.Mock(wraps=read_ahead.build_local_plan)
     monkeypatch.setattr(weight_loader_module, "build_local_plan", plan_factory)
 
@@ -1059,9 +1093,13 @@ def test_read_ahead_reads_only_the_node_ranks_stages_and_experts(
     with loader.open_weight_session(str(checkpoint_dir), mapping=mapping(0), model=model):
         pass
 
+    # Whole files when the checkpoint fits, unless the node reads only part of a stacked tensor
+    # (rank 3's node); otherwise only the node's bytes. Either way in layer order.
     assert loader.last_checkpoint_io_status.activated
-    read = [o for _, start, n in plan_factory.call_args.args[0] for o in range(start, start + n)]
-    assert sorted(read) == sorted(read_offsets)
+    read = [
+        (p, o) for p, start, n in plan_factory.call_args.args[0] for o in range(start, start + n)
+    ]
+    assert read == (whole if checkpoint_fits and peer_rank == 1 else node_offsets)
 
 
 def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
