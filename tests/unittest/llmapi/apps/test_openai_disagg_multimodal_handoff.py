@@ -17,8 +17,8 @@
 A context server, the disaggregated router and a generation server run in
 process and talk over their real wire format; only the engines are stubbed.
 The context engine returns what a context worker returns for one image. The
-generation engine runs the real generation-only checks of
-``BaseLLM._preprocess`` on what arrives.
+generation engine runs the real generation-only checks of ``BaseLLM`` on what
+arrives, in the order ``generate_async`` runs them.
 """
 
 import asyncio
@@ -164,6 +164,7 @@ def _generation_app(model_dir, uses_mrope: bool, reuse: bool, seen: dict) -> Fas
         prompt_token_ids, _, multimodal_params, _ = llm._preprocess(
             inputs, sampling_params, disaggregated_params
         )
+        llm._check_generation_only_inputs(prompt_token_ids, multimodal_params, disaggregated_params)
         seen.update(prompt_token_ids=prompt_token_ids, multimodal_params=multimodal_params)
         return SimpleNamespace(request_id=2, prompt_token_ids=prompt_token_ids, finished=True)
 
