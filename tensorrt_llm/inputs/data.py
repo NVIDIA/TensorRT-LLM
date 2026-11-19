@@ -101,7 +101,10 @@ class TokensPrompt(TypedDict):
     positions are placeholders that still feed repetition penalties, prompt
     logprobs and KV cache events. KV blocks are reused only across identical ids
     and rows; with the V2 KV cache manager blocks before the first row are
-    shared with plain-token prompts. Requires the PyTorch backend and a decoder
+    shared with plain-token prompts. Models that read ids after the embedding
+    still see the ids there (Gemma4 per-layer embeddings use the pad id instead;
+    DeepSeek-V4 and Qwen4-Exp use the placeholder), so their output can depend
+    on the placeholder choice. Requires the PyTorch backend and a decoder
     model whose ``prompt_embeds_unsupported_reason`` returns None; speculative
     decoding, attention data parallelism and context parallelism are rejected.
     Disaggregated serving needs the V2 manager, and the generation-only request
