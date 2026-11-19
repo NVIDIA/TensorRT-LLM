@@ -174,25 +174,52 @@ class BeamConfig(PretrainedConfig):
 
     def _validate(self) -> None:
         if len(self.layer_types) != self.num_hidden_layers:
-            raise ValueError("layer_types length must equal num_hidden_layers")
+            raise ValueError(
+                f"len(layer_types)={len(self.layer_types)} must equal "
+                f"num_hidden_layers={self.num_hidden_layers}"
+            )
         if len(self.mlp_layer_types) != self.num_hidden_layers:
-            raise ValueError("mlp_layer_types length must equal num_hidden_layers")
-        if set(self.layer_types) - set(BEAM_LAYER_TYPES):
-            raise ValueError(f"unsupported layer_types: {sorted(set(self.layer_types))}")
-        if set(self.mlp_layer_types) - set(BEAM_MLP_LAYER_TYPES):
-            raise ValueError(f"unsupported mlp_layer_types: {sorted(set(self.mlp_layer_types))}")
+            raise ValueError(
+                f"len(mlp_layer_types)={len(self.mlp_layer_types)} must equal "
+                f"num_hidden_layers={self.num_hidden_layers}"
+            )
+        unsupported = set(self.layer_types).difference(BEAM_LAYER_TYPES)
+        if unsupported:
+            raise ValueError(f"unsupported layer_types: {sorted(unsupported)}")
+        unsupported = set(self.mlp_layer_types).difference(BEAM_MLP_LAYER_TYPES)
+        if unsupported:
+            raise ValueError(f"unsupported mlp_layer_types: {sorted(unsupported)}")
         if self.hidden_act != "silu":
             raise ValueError(f"hidden_act must be 'silu': {self.hidden_act!r}")
-        if self.num_attention_heads % self.num_key_value_heads:
-            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
+        if self.num_key_value_heads == 0 or self.num_attention_heads % self.num_key_value_heads:
+            raise ValueError(
+                f"num_attention_heads={self.num_attention_heads} must be divisible by "
+                f"a nonzero num_key_value_heads, got {self.num_key_value_heads}"
+            )
         if "sliding_attention" in self.layer_types and not self.sliding_window:
-            raise ValueError("sliding_attention layers need a positive sliding_window")
+            raise ValueError(
+                f"sliding_attention layers need a positive sliding_window, got {self.sliding_window!r}"
+            )
         if "sparse" in self.mlp_layer_types:
-            if self.num_experts % self.n_group:
-                raise ValueError("num_experts must be divisible by n_group")
+            if self.n_group == 0 or self.num_experts % self.n_group:
+                raise ValueError(
+                    f"num_experts={self.num_experts} must be divisible by a nonzero "
+                    f"n_group, got {self.n_group}"
+                )
             if not 1 <= self.topk_group <= self.n_group:
-                raise ValueError("topk_group must be in [1, n_group]")
-            if self.num_experts // self.n_group < 2:
-                raise ValueError("Beam group scores sum the top-2 experts of each group")
-            if self.num_experts_per_tok > self.topk_group * (self.num_experts // self.n_group):
-                raise ValueError("num_experts_per_tok exceeds the experts of the selected groups")
+                raise ValueError(
+                    f"topk_group={self.topk_group} must be in [1, n_group={self.n_group}]"
+                )
+            experts_per_group = self.num_experts // self.n_group
+            if experts_per_group < 2:
+                raise ValueError(
+                    f"Beam group scores need at least 2 experts per group, got {experts_per_group} "
+                    f"(num_experts={self.num_experts}, n_group={self.n_group})"
+                )
+            selected_experts = self.topk_group * experts_per_group
+            if self.num_experts_per_tok > selected_experts:
+                raise ValueError(
+                    f"num_experts_per_tok={self.num_experts_per_tok} exceeds the {selected_experts} "
+                    f"available experts (topk_group={self.topk_group}, "
+                    f"num_experts={self.num_experts}, n_group={self.n_group})"
+                )

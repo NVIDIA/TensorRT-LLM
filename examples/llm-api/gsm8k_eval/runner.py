@@ -449,7 +449,7 @@ def _report(summary: Mapping[str, Any], timing: Mapping[str, Any]) -> str:
         f"{summary['verdict']['mode']} mode, {summary['transport']} transport): "
         f"{summary['correct']}/{summary['total']} correct",
         f"  served model: {summary['served_model']}",
-        f"  completed {summary['distinct_completed']}/{summary['expected']}; parse failures "
+        f"  completed {summary['distinct_completed']}/{summary['total']}; parse failures "
         f"{len(summary['parse_failures'])}; errors {len(summary['errors'])}; timeouts "
         f"{len(summary['timeouts'])}; truncations {len(summary['truncated'])}; missing "
         f"{len(summary['missing'])}",
@@ -509,6 +509,7 @@ def run(
         raise EvaluationError("give exactly one of an existing endpoint or a managed server")
     try:
         protocol.check_count(num_questions)
+        records.check_min_correct(min_correct, num_questions)
     except ValueError as error:
         raise EvaluationError(str(error)) from error
     if type(concurrency) is not int or concurrency < 1:
@@ -518,12 +519,6 @@ def run(
             continue
         if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
             raise EvaluationError(f"{name} must be finite and positive, got {value!r}")
-    if min_correct is not None and (
-        type(min_correct) is not int or not 0 <= min_correct <= num_questions
-    ):
-        raise EvaluationError(
-            f"min_correct must be an integer in 0..{num_questions}, got {min_correct!r}"
-        )
     check_max_seq_len(max_seq_len)
     deadline = started + float(time_budget_s)
     try:
@@ -688,7 +683,6 @@ def run(
         summary.update(
             transport=transport,
             served_model=next(iter(final_state.served_models()), None),
-            num_questions=num_questions,
             run_identity=identity_sha256,
             attempt=attempt,
             results_dir=str(results_dir),

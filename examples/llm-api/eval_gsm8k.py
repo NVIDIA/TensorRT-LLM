@@ -242,8 +242,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.error("--server-env and --monitor-gpus apply to managed mode (--model) only")
     elif not args.config:
         parser.error("managed mode (--model) needs --config")
-    if args.min_correct is not None and not 0 <= args.min_correct <= args.num_questions:
-        parser.error(f"--min-correct must be in 0..{args.num_questions}")
 
     managed = None
     concurrency = args.concurrency

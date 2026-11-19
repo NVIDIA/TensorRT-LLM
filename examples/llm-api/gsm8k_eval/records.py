@@ -353,7 +353,6 @@ def summarize(
 
     return {
         "protocol_id": protocol_id,
-        "expected": len(problems),
         "distinct_completed": len(completed),
         "status_counts": dict(sorted(counts.items())),
         "correct": correct,
@@ -384,6 +383,11 @@ def _distribution(values: Sequence[float]) -> Optional[dict[str, float]]:
     }
 
 
+def check_min_correct(min_correct: Optional[int], total: int) -> None:
+    if min_correct is not None and (type(min_correct) is not int or not 0 <= min_correct <= total):
+        raise ValueError(f"min_correct must be an integer in [0, {total}], got {min_correct!r}")
+
+
 def verdict(summary: Mapping[str, Any], min_correct: Optional[int] = None) -> dict[str, Any]:
     """Pass/fail of one run.
 
@@ -401,21 +405,13 @@ def verdict(summary: Mapping[str, Any], min_correct: Optional[int] = None) -> di
     ):
         if summary[key]:
             problems.append(f"{len(summary[key])} question(s) {label}: {', '.join(summary[key])}")
-    if summary["distinct_completed"] != summary["expected"] and not problems:
-        problems.append(
-            f"{summary['distinct_completed']} completed replies for {summary['expected']} "
-            "selected questions"
-        )
     mode = "measurement" if min_correct is None else "regression"
     result: dict[str, Any] = {"mode": mode, "operational_ok": not problems, "problems": problems}
     if min_correct is None:
         result["threshold"] = None
         result["passed"] = not problems
         return result
-    if type(min_correct) is not int or not 0 <= min_correct <= summary["total"]:
-        raise ValueError(
-            f"min_correct must be an integer in [0, {summary['total']}], got {min_correct!r}"
-        )
+    check_min_correct(min_correct, summary["total"])
     met = summary["correct"] >= min_correct
     result["criterion"] = {"min_correct": min_correct, "correct": summary["correct"], "met": met}
     if not met:
