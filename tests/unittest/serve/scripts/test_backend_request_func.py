@@ -99,6 +99,21 @@ async def test_error_event_after_first_token_fails_request(endpoint):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint", ENDPOINTS)
+async def test_error_event_before_any_token_fails_request(endpoint):
+    request_func, api_url, _ = ENDPOINTS[endpoint]
+    request = RequestFuncInput(
+        prompt="Hi", api_url=api_url, prompt_len=1, output_len=8, model="model"
+    )
+    output = await request_func(request, streaming=True, session=_FakeSession([ERROR_EVENT]))
+
+    assert not output.success
+    # The server's error is kept, not replaced by the client's own no-token error.
+    assert ERROR_MESSAGE in output.error
+    assert output.generated_text == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ENDPOINTS)
 async def test_stream_without_error_event_succeeds(endpoint):
     output = await _run(endpoint, [USAGE_EVENT])
 
