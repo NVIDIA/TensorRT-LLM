@@ -68,8 +68,11 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         ).read_text()
 
         self.assertIn('stageName.contains("-ModelExpress-")', sbatch)
+        launch_definition = 'mxServicesLaunch = """'
+        launch_start = sbatch.index(launch_definition) + len(launch_definition)
+        self.assertIn("mx_services_start", sbatch[launch_start : sbatch.index('"""', launch_start)])
         self.assertLess(
-            sbatch.index("mx_services_start"), sbatch.index("srun --kill-on-bad-exit=1")
+            sbatch.index("${mxServicesLaunch}"), sbatch.index("srun --kill-on-bad-exit=1")
         )
         self.assertIn("-name 'model_express*'", sbatch)
         self.assertIn("srun --overlap", services)

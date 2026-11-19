@@ -19,8 +19,11 @@
 # before the test step, then call `mx_services_start`.
 #
 # The two services run as `srun --overlap` steps beside the test step, from the same images as
-# the Kubernetes sidecars. A pyxis/enroot step shares the host network, so the ports are chosen
-# per job from a range and checked to be free instead of using the fixed sidecar ports.
+# the Kubernetes sidecars, and listen on loopback only. A pyxis/enroot step shares the host
+# network, so the ports are chosen per job from a range and checked to be free instead of using
+# the fixed sidecar ports. Jobs that share a host pick their ports and start their services in
+# turn, under a host-wide lock, and a service counts as ready only while its own step runs and,
+# where the host can tell, a process of this job listens on its port.
 #
 # Inputs (environment):
 #   jobWorkspace            job workspace on the shared filesystem; the logs go under it
@@ -36,15 +39,56 @@
 
 mxRedisPid=""
 mxServerPid=""
+mxPortLockFile=/tmp/trtllm-model-express-ports.lock
 
 # A connection to the port succeeds only while something listens on it.
 mx_port_is_free() {
     ! (echo > "/dev/tcp/127.0.0.1/$1") > /dev/null 2>&1
 }
 
+# Takes the host-wide lock that a job holds from picking its ports until its services listen on
+# them, so that two jobs on one host cannot both find a range free before either binds it. Best
+# effort: without the lock, the ports are still checked to be free.
+mx_port_lock() {
+    (umask 0 && : >> "$mxPortLockFile") 2> /dev/null || true
+    if exec 9>> "$mxPortLockFile"; then
+        flock -w 900 9 || echo "WARNING: could not take $mxPortLockFile; picking ports without it"
+    else
+        echo "WARNING: could not open $mxPortLockFile; picking ports without it"
+    fi
+}
+
+mx_port_unlock() {
+    flock -u 9 2> /dev/null || true
+    exec 9>&- || true
+}
+
+# Succeeds when a process of this Slurm job listens on the port, judged from the per-job cgroups
+# of the listening processes that `ss` names. Where the host cannot tell (no per-job cgroups, or
+# `ss` names no listener), it succeeds too, and mx_wait_for_port relies on the step check alone.
+mx_port_owned_by_job() {
+    local port=$1
+    local job="job_${SLURM_JOB_ID:-}/"
+    local pids pid
+    if [ -z "${SLURM_JOB_ID:-}" ] || ! grep -q "$job" /proc/self/cgroup 2> /dev/null; then
+        return 0
+    fi
+    pids=$(ss -Hltnp "sport = :$port" 2> /dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2) || true
+    if [ -z "$pids" ]; then
+        return 0
+    fi
+    for pid in $pids; do
+        if grep -q "$job" "/proc/$pid/cgroup" 2> /dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Reserves ten consecutive ports starting at a job-derived base: the Redis port, the server
 # port, and eight ports for the NIXL metadata bases (donor `base`, receiver `base + tp`, each
-# binding one port per rank). The range stays below the Linux ephemeral port range.
+# binding one port per rank). The range stays below the Linux ephemeral port range. Call it
+# under mx_port_lock: a range whose Redis and server ports another job holds is skipped.
 mx_pick_ports() {
     local attempt offset candidate ok
     for attempt in $(seq 0 49); do
@@ -123,15 +167,17 @@ mx_resolve_image() {
     echo "$sqsh"
 }
 
-# Waits until something listens on the port; fails when the step that should listen exits first
-# or the timeout passes.
+# Waits until the service of the given step listens on the port. Fails when the step exits
+# first, when the timeout passes, or when the step exits right after the port starts answering:
+# a service that cannot bind its port exits at startup, so the listener then belongs to another
+# process.
 mx_wait_for_port() {
     local name=$1
     local port=$2
     local pid=$3
     local logFile=$4
     local deadline=$((SECONDS + ${5:-300}))
-    while mx_port_is_free "$port"; do
+    while mx_port_is_free "$port" || ! mx_port_owned_by_job "$port"; do
         if ! kill -0 "$pid" 2> /dev/null; then
             echo "ERROR: the $name step exited before listening on port $port"
             tail -n 50 "$logFile" || true
@@ -144,6 +190,12 @@ mx_wait_for_port() {
         fi
         sleep 2
     done
+    sleep 5
+    if ! kill -0 "$pid" 2> /dev/null; then
+        echo "ERROR: the $name step exited although port $port answers; another process holds it"
+        tail -n 50 "$logFile" || true
+        return 1
+    fi
     echo "$name is listening on port $port"
 }
 
@@ -164,7 +216,6 @@ mx_services_start() {
     local redisImage serverImage
     mkdir -p "$logDir"
 
-    mx_pick_ports
     redisImage=$(mx_resolve_image "$MX_REDIS_IMAGE")
     serverImage=$(mx_resolve_image "$MX_SERVER_IMAGE")
     if [ "${MX_SERVICES_ENROOT:-0}" = "1" ]; then
@@ -173,22 +224,29 @@ mx_services_start() {
 
     trap mx_services_stop EXIT
 
-    echo "Starting Redis on port $mxRedisPort"
+    # The service steps close the lock's descriptor, so the lock ends with mx_port_unlock.
+    mx_port_lock
+    mx_pick_ports || { mx_port_unlock; return 1; }
+
+    echo "Starting Redis on 127.0.0.1:$mxRedisPort"
     env -u BASH_ENV srun --overlap --nodes=1 --ntasks=1 \
         --container-image="$redisImage" --no-container-mount-home \
         redis-server --bind 127.0.0.1 --port "$mxRedisPort" --save "" --appendonly no \
-        > "$logDir/redis.log" 2>&1 &
+        > "$logDir/redis.log" 2>&1 9>&- &
     mxRedisPid=$!
-    mx_wait_for_port redis "$mxRedisPort" "$mxRedisPid" "$logDir/redis.log"
+    mx_wait_for_port redis "$mxRedisPort" "$mxRedisPid" "$logDir/redis.log" \
+        || { mx_port_unlock; return 1; }
 
-    echo "Starting the ModelExpress server on port $mxServerPort"
+    echo "Starting the ModelExpress server on 127.0.0.1:$mxServerPort"
     env -u BASH_ENV srun --overlap --nodes=1 --ntasks=1 \
         --container-image="$serverImage" --container-workdir=/app --no-container-mount-home \
-        /bin/bash -c 'MX_METADATA_BACKEND=redis REDIS_URL="redis://127.0.0.1:$1" exec /app/modelexpress-server --port "$2"' \
+        /bin/bash -c 'MX_METADATA_BACKEND=redis REDIS_URL="redis://127.0.0.1:$1" exec /app/modelexpress-server --host 127.0.0.1 --port "$2"' \
         _ "$mxRedisPort" "$mxServerPort" \
-        > "$logDir/server.log" 2>&1 &
+        > "$logDir/server.log" 2>&1 9>&- &
     mxServerPid=$!
-    mx_wait_for_port model-express-server "$mxServerPort" "$mxServerPid" "$logDir/server.log"
+    mx_wait_for_port model-express-server "$mxServerPort" "$mxServerPid" "$logDir/server.log" \
+        || { mx_port_unlock; return 1; }
+    mx_port_unlock
 
     export MODEL_EXPRESS_URL="http://127.0.0.1:$mxServerPort"
     export TRTLLM_MX_E2E_REQUIRED=1

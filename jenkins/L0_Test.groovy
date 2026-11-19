@@ -1222,7 +1222,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             // S3 spool and anything holding credentials right away: the launch
             // script embeds HF/GitHub tokens and OpenSearch credentials, and the
             // netrc files hold the Artifactory credentials.
-            "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config ${jobWorkspace}/${jobUID}-slurm_launch.sh ${jobWorkspace}/artifactory-netrc ${jobWorkspace}/fat-artifactory-netrc || true",
+            "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config ${jobWorkspace}/mx-enroot-config ${jobWorkspace}/${jobUID}-slurm_launch.sh ${jobWorkspace}/artifactory-netrc ${jobWorkspace}/fat-artifactory-netrc || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
