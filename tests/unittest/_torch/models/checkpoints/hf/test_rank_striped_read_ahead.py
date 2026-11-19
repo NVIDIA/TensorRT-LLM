@@ -971,6 +971,15 @@ def test_native_and_rank_striped_outputs_match(tmp_path, monkeypatch):
         assert torch.equal(native[name], expected_tensor)
         assert torch.equal(striped[name], expected_tensor)
 
+    # The lazy loader's pread slices: whole tensors, row ranges and a column shard.
+    lazy = native_loader._load_lazy_safetensors(str(checkpoint_dir))
+    for name, expected_tensor in expected.items():
+        rows = (slice(1, None),) if expected_tensor.dim() else ...
+        assert torch.equal(lazy[name][...], expected_tensor)
+        assert torch.equal(lazy[name][rows], expected_tensor[rows])
+    embed = expected["model.embed_tokens.weight"]
+    assert torch.equal(lazy["model.embed_tokens.weight"][:, 1:3], embed[:, 1:3])
+
 
 def test_loader_passes_full_checkpoint_bytes_to_reader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import glob
 import json
 import multiprocessing
@@ -33,7 +34,8 @@ import tqdm
 from mpi4py import MPI as _MPI
 
 from tensorrt_llm._errors import ModelLoadError
-from tensorrt_llm._torch.mmap_utils import READ_AHEAD_DIRS, populate_file_pages
+from tensorrt_llm._torch.mmap_utils import (READ_AHEAD_DIRS, SafetensorsPreader,
+                                            populate_file_pages)
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
@@ -520,8 +522,8 @@ class HfWeightLoader(BaseWeightLoader):
             use_consolidated: bool = False) -> dict[str, Any]:
         """Return a dict of name -> lazy safetensors slices.
 
-        Values are ``safetensors`` PySafeSlice objects: ``v[:]`` (or any
-        indexing) materializes only the requested bytes from the mmapped
+        Values are PySafeSlice-like lazy slices (``SafetensorsPreader``):
+        ``v[:]`` (or any indexing) reads only the requested bytes of the
         file. This lets a model's ``load_weights`` stream a huge checkpoint
         and read only its rank-local shard (e.g. Kimi K3 expert-parallel
         expert slices) without ever holding the full checkpoint in RAM.
@@ -539,13 +541,20 @@ class HfWeightLoader(BaseWeightLoader):
             weight_files = filtered_weight_files
         weights: dict[str, Any] = {}
         handles = []
-        for file_name in weight_files:
-            handle = safetensors.safe_open(file_name,
-                                           framework="pt",
-                                           device="cpu")
-            handles.append(handle)
-            for name in handle.keys():
-                weights[name] = handle.get_slice(name)
+        # Pause the cyclic GC while the headers' ~1M entries are created: the
+        # collections their allocations trigger rescan the whole process heap
+        # (measured 9 s -> 3 s for Kimi K3's 96 shards).
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            for file_name in weight_files:
+                handle = SafetensorsPreader(file_name)
+                handles.append(handle)
+                for name in handle.keys():
+                    weights[name] = handle.get_slice(name)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
         logger.info(f"Lazily opened {len(weight_files)} safetensors files "
                     f"({len(weights)} tensors) from {checkpoint_dir}")
         # The slices need their file handles, but the checkpoint loader

@@ -27,10 +27,9 @@ from contextlib import ExitStack
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
-from safetensors import safe_open
 from torch import nn
 
-from tensorrt_llm._torch.mmap_utils import release_file_page_cache
+from tensorrt_llm._torch.mmap_utils import SafetensorsPreader, release_file_page_cache
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 
@@ -933,7 +932,7 @@ class KimiK3DefaultTextWeights:
                 if device.type == "cuda":
                     torch.cuda.set_device(device)
                 path = os.path.join(ckpt_dir, file_name)
-                with safe_open(path, framework="pt", device="cpu") as fh:
+                with SafetensorsPreader(path) as fh:
                     # A job lands here only when every key it needs -- optional
                     # ones included, see the grouping above -- is in this file,
                     # so presence in this file is the whole question.
@@ -951,7 +950,7 @@ class KimiK3DefaultTextWeights:
                                 else None
                             ),
                         )
-                # Handle closed -> pages unmapped -> the drop takes effect.
+                # Read with pread, not mapped: the drop takes effect at once.
                 drop_file_pages(file_name)
 
             def load_split_file_expert(job, files):
@@ -960,9 +959,7 @@ class KimiK3DefaultTextWeights:
                 with ExitStack() as stack:
                     handles = {
                         file_name: stack.enter_context(
-                            safe_open(
-                                os.path.join(ckpt_dir, file_name), framework="pt", device="cpu"
-                            )
+                            SafetensorsPreader(os.path.join(ckpt_dir, file_name))
                         )
                         for file_name in files
                     }

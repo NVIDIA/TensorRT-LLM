@@ -26,10 +26,15 @@ that a tensor is file-backed before using `advise_tensor_pageout`.
 
 import ctypes
 import errno as errno_codes
+import functools
+import json
+import math
 import mmap
 import os
+import struct
 import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 
 __all__ = [
     "madvise_range",
@@ -39,6 +44,7 @@ __all__ = [
     "release_file_page_cache",
     "page_cache_bytes",
     "wait_for_page_migration_to_settle",
+    "SafetensorsPreader",
 ]
 
 _MADV_DONTNEED = 4
@@ -373,3 +379,143 @@ def wait_for_page_migration_to_settle(
         previous, previous_time = current, now
         if now - quiet_since >= quiet_s or now - start >= max_wait_s:
             return now - start
+
+
+_PREAD_CHUNK_BYTES = 16 << 20
+
+
+@functools.cache
+def _pread_pool() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(8, thread_name_prefix="trtllm-pread")
+
+
+def _pread_into(fd: int, buf: memoryview, offset: int) -> None:
+    while buf:
+        got = os.preadv(fd, [buf], offset)
+        if got <= 0:
+            raise EOFError(f"pread at offset {offset} returned {got}")
+        buf, offset = buf[got:], offset + got
+
+
+class SafetensorsPreader:
+    """A ``safetensors.safe_open(path, framework="pt")`` handle that reads with ``pread``.
+
+    ``safe_open`` tensors are views of a file mapping, and copying one to the GPU
+    faults its pages in one by one: a few GB/s per rank when they are cached and
+    about 0.5 GB/s when they are not, since each fault then waits on its own small
+    read. ``pread`` fills ordinary host tensors at page-cache speed, or in large
+    reads when uncached. ``get_slice(name)[rows]`` reads only those rows; see
+    ``_PreadSlice.__getitem__`` for other indices (column shards).
+    """
+
+    def __init__(self, path: str):
+        import safetensors.torch
+        import torch
+
+        self.path, self._mapped = path, None
+        # One open per shard: on NFS each open is a round trip to the server.
+        self._fd = os.open(path, os.O_RDONLY)
+        header_bytes = struct.unpack("<Q", os.pread(self._fd, 8, 0))[0]
+        header = bytearray(header_bytes)
+        _pread_into(self._fd, memoryview(header), 8)
+        self._header = json.loads(header)
+        self._header.pop("__metadata__", None)
+        self._data_start = 8 + header_bytes
+        self._dtypes = dict(getattr(safetensors.torch, "_TYPES", {}), F8_E8M0=torch.float8_e8m0fnu)
+
+    def keys(self) -> list[str]:
+        return sorted(self._header)
+
+    def get_slice(self, name: str) -> "_PreadSlice":
+        return _PreadSlice(self, name)
+
+    def get_tensor(self, name: str):
+        return self.get_slice(name)[...]
+
+    def _read(self, offset: int, nbytes: int):
+        import torch
+
+        out = torch.empty(nbytes, dtype=torch.uint8)
+        buf = memoryview(out.numpy())
+        offset += self._data_start
+        starts = range(0, nbytes, _PREAD_CHUNK_BYTES)
+        if len(starts) < 2:
+            _pread_into(self._fd, buf, offset)
+            return out
+        # A single loader thread copying a large tensor would read at one
+        # thread's speed; split it across the shared pool.
+        list(
+            _pread_pool().map(
+                lambda s: _pread_into(self._fd, buf[s : s + _PREAD_CHUNK_BYTES], offset + s), starts
+            )
+        )
+        return out
+
+    def _mapped_slice(self, name: str):
+        if self._mapped is None:
+            import safetensors
+
+            self._mapped = safetensors.safe_open(self.path, framework="pt", device="cpu")
+        return self._mapped.get_slice(name)
+
+    def close(self) -> None:
+        if getattr(self, "_fd", -1) >= 0:
+            os.close(self._fd)
+            self._fd = -1
+        self._mapped = None
+
+    __del__ = close
+
+    def __enter__(self) -> "SafetensorsPreader":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+class _PreadSlice:
+    """The ``PySafeSlice`` interface (``get_shape``, ``get_dtype``, indexing) over ``pread``."""
+
+    __slots__ = ("_reader", "_name", "_info")
+
+    def __init__(self, reader: SafetensorsPreader, name: str):
+        self._reader, self._name = reader, name
+        self._info = reader._header[name]
+
+    def get_shape(self) -> list[int]:
+        return list(self._info["shape"])
+
+    def get_dtype(self) -> str:
+        return self._info["dtype"]
+
+    def _rows(self, index) -> tuple[int, int] | None:
+        """``index`` as a row range ``[start, stop)`` of whole rows, or None."""
+        shape = self.get_shape()
+        index = index if isinstance(index, tuple) else (index,)
+        if index and index[-1] is Ellipsis:
+            index = index[:-1]
+        if not index:
+            return (0, shape[0] if shape else 1)
+        if len(index) > len(shape) or not all(isinstance(i, slice) for i in index):
+            return None
+        bounds = [i.indices(n) for i, n in zip(index, shape)]
+        if bounds[0][2] != 1 or any(b != (0, n, 1) for b, n in zip(bounds[1:], shape[1:])):
+            return None
+        return bounds[0][0], max(bounds[0][0], bounds[0][1])
+
+    def __getitem__(self, index):
+        rows = self._rows(index)
+        if rows is None:
+            # A column shard. While the read-ahead fills the page cache, the
+            # mapping copies just the shard's bytes; without it, one pread of
+            # the whole tensor (which the node's TP ranks share through the
+            # page cache) beats faulting the shard in page by page.
+            if os.path.dirname(os.path.abspath(self._reader.path)) in READ_AHEAD_DIRS:
+                return self._reader._mapped_slice(self._name)[index]
+            return self[...][index]
+        shape = self.get_shape()
+        dtype = self._reader._dtypes[self._info["dtype"]]
+        row_bytes = math.prod(shape[1:]) * dtype.itemsize
+        begin = self._info["data_offsets"][0] + rows[0] * row_bytes
+        out = self._reader._read(begin, (rows[1] - rows[0]) * row_bytes).view(dtype)
+        return out.reshape(([rows[1] - rows[0]] + shape[1:]) if shape else shape)
