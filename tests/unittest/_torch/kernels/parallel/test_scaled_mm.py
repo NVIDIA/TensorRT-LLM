@@ -21,6 +21,8 @@ import torch
 import torch.nn.functional as F
 from utils.util import getSMVersion
 
+from tensorrt_llm._torch.modules.linear import ScaledMmEpilogue
+
 
 @pytest.mark.skipif(getSMVersion() != 103,
                     reason="the exact-m cuBLASLt configs are tuned for SM 10.3")
@@ -123,9 +125,6 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
             warn(RuntimeWarning("cutlass result is not correct: " + repr(e)))
 
 
-if __name__ == '__main__':
-    test_fp8_scaled_mm(torch.float16, 12, (8192, 10240))
-
 E4M3 = torch.float8_e4m3fn
 E4M3_MAX = 448.0
 _SM89_PLUS = pytest.mark.skipif(getSMVersion() < 89,
@@ -148,8 +147,8 @@ def _epilogue_operands(m, n, k, seed=0):
 
 @_SM89_PLUS
 @pytest.mark.parametrize("m,n,k", [(4097, 13824, 5120), (33, 3072, 3072)])
-# The two combinations callers use: bias into a BF16 output, and bias + GELU into an e4m3 output.
-@pytest.mark.parametrize("gelu,out_fp8", [(False, False), (True, True)])
+@pytest.mark.parametrize("gelu,out_fp8", [(False, False), (True, True),
+                                          (True, False), (False, True)])
 def test_fp8_scaled_mm_epilogue(m, n, k, gelu, out_fp8):
     """cublas_scaled_mm bias / GELU epilogues and e4m3 output against torch."""
     a8, w8, scale_a, scale_w, bias, ref = _epilogue_operands(m,
@@ -167,11 +166,22 @@ def test_fp8_scaled_mm_epilogue(m, n, k, gelu, out_fp8):
         scale_w,
         bias,
         E4M3 if out_fp8 else torch.bfloat16,
-        epilogue=1 if gelu else 0,
+        epilogue=ScaledMmEpilogue.GELU if gelu else ScaledMmEpilogue.DEFAULT,
         d_scale=d_scale,
     )
     assert out.shape == (m, n) and out.dtype == (E4M3
                                                  if out_fp8 else torch.bfloat16)
+    if out_fp8:
+        # The e4m3 codes match the quantized reference up to accumulation-order rounding; a
+        # dropped, doubled or misplaced bias changes far more of them.
+        ref_codes = (ref * d_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3)
+        torch.testing.assert_close(out.float(),
+                                   ref_codes.float(),
+                                   rtol=0.125,
+                                   atol=2**-6)
+        same = (out.view(torch.uint8) == ref_codes.view(torch.uint8)).float()
+        assert same.mean().item(
+        ) > 0.98, f"{same.mean().item():.4f} codes equal"
     result = out.float() / d_scale if out_fp8 else out.float()
     cosine = F.cosine_similarity(result.flatten(), ref.flatten(), dim=0).item()
     assert cosine > (0.998 if out_fp8 else 0.9999)
@@ -192,7 +202,7 @@ def test_fp8_scaled_mm_epilogue_rejects_bad_arguments():
                                           scale_w,
                                           bias,
                                           torch.bfloat16,
-                                          epilogue=2)
+                                          epilogue=len(ScaledMmEpilogue))
     with pytest.raises(RuntimeError, match="d_scale"):
         torch.ops.trtllm.cublas_scaled_mm(a8,
                                           w8.t(),
@@ -200,4 +210,8 @@ def test_fp8_scaled_mm_epilogue_rejects_bad_arguments():
                                           scale_w,
                                           bias,
                                           E4M3,
-                                          epilogue=1)
+                                          epilogue=ScaledMmEpilogue.GELU)
+
+
+if __name__ == '__main__':
+    test_fp8_scaled_mm(torch.float16, 12, (8192, 10240))

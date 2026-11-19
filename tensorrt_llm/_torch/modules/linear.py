@@ -112,6 +112,13 @@ class WeightsLoadingConfig:
     ignore_tensor_parallel: bool = False
 
 
+class ScaledMmEpilogue(enum.IntEnum):
+    """``epilogue`` of ``trtllm::cublas_scaled_mm`` (values match the C++ ScaledMmEpilogue)."""
+
+    DEFAULT = 0  # bias added when given
+    GELU = 1  # tanh GELU after the optional bias
+
+
 class TensorParallelMode(str, enum.Enum):
     COLUMN = 'column'
     ROW = 'row'
@@ -965,7 +972,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             scale_b=module.weight_scale,
             bias=module.bias,
             out_dtype=torch.float8_e4m3fn,
-            epilogue=1,
+            epilogue=ScaledMmEpilogue.GELU,
             d_scale=inv_out_scale.reshape(1),
         )
         if len(original_shape) > 2:
@@ -1052,7 +1059,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                  if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
                  and module.mapping is not None else None)
 
-        # These ops do not support bias.
+        # The CuTe DSL and CUDA-core GEMMs take no bias (it is added below); the cuBLAS GEMM takes
+        # it in its epilogue for layers with enable_fp8_bias_epilogue().
         if _fp8_per_tensor_uses_cute_dsl_sm107():
             output = torch.ops.trtllm.cute_dsl_fp8_per_tensor_gemm_rubin(
                 qinput,

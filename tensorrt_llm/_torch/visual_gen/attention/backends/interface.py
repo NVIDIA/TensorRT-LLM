@@ -129,6 +129,11 @@ class AttentionBackend(ABC):
         v: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attention output and its softmax log-sum-exp.
+
+        The LSE is float32 [B, H, S] in natural log, S being the query length; Attention2D and
+        Ring merge partial outputs with it.
+        """
         raise NotImplementedError(
             f"{type(self).__name__} does not support LSE output. "
             "Override forward_with_lse() or check support_lse() before calling."

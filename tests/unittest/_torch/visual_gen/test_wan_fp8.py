@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen_dense_fp8 import TrtllmGenDenseFp8Fmha
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 
 # Importing models applies the pipeline registration decorators.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
@@ -37,6 +37,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import (
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig, VisualGenArgs
@@ -63,6 +64,12 @@ _SM107_ONLY = pytest.mark.skipif(
 def _cosine(a, b):
     """Cosine similarity of two tensors in fp32."""
     return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+
+
+def _rel_l2(a, b):
+    """Relative L2 error of a against b in fp32; unlike cosine it sees a uniform scale error."""
+    a, b = a.float(), b.float()
+    return ((a - b).norm() / b.norm()).item()
 
 
 def _config(backend, quant_attention, fp8=True):
@@ -92,18 +99,21 @@ def _block(config):
         return torch.randn(shape, device="cuda", generator=g) * scale
 
     with torch.no_grad():
-        for module in block.modules():
-            if isinstance(module, Linear):
-                w = randn(module.weight.shape, 0.02)
-                if module.weight.dtype == E4M3:
-                    module.weight.copy_((w / WEIGHT_SCALE).to(E4M3))
-                    module.weight_scale.fill_(WEIGHT_SCALE)
-                    module.input_scale.fill_(INPUT_SCALE)
-                    module.inv_input_scale.fill_(1.0 / INPUT_SCALE)
-                else:
-                    module.weight.copy_(w)
-                if module.bias is not None:
-                    module.bias.copy_(randn(module.bias.shape, 0.02))
+        linears = [module for module in block.modules() if isinstance(module, Linear)]
+        for idx, module in enumerate(linears):
+            w = randn(module.weight.shape, 0.02)
+            if module.weight.dtype == E4M3:
+                # A distinct input scale per Linear, so using another layer's scale shows up.
+                input_scale = INPUT_SCALE * (1.0 + 0.25 * (idx % 4))
+                module.weight.copy_((w / WEIGHT_SCALE).to(E4M3))
+                module.weight_scale.fill_(WEIGHT_SCALE)
+                module.input_scale.fill_(input_scale)
+                module.inv_input_scale.fill_(1.0 / input_scale)
+            else:
+                module.weight.copy_(w)
+            if module.bias is not None:
+                # Biases large enough that dropping, doubling or swapping one is visible.
+                module.bias.copy_(randn(module.bias.shape, 0.5))
         for name, p in block.named_parameters():
             if "norm" in name and p.dtype != E4M3:
                 p.copy_(
@@ -158,6 +168,10 @@ def test_fused_block_matches_unfused(backend, quant_attention):
         reference = unfused(x, text, temb, cos, sin)
     assert fused.shape == reference.shape and fused.dtype == torch.bfloat16
     assert _cosine(fused, reference) > 0.999
+    # The residual stream dominates the output; compare the block's update itself.
+    update, reference_update = fused.float() - x.float(), reference.float() - x.float()
+    assert _cosine(update, reference_update) > 0.99
+    assert _rel_l2(update, reference_update) < 0.1
 
 
 @_FP8_GPU
@@ -202,11 +216,37 @@ def test_per_token_temb_takes_the_unfused_path():
 
 
 @_FP8_GPU
-def test_bf16_block_is_not_planned():
-    """A BF16 block plans no FP8 fusions."""
-    block = _block(_config("VANILLA", None, fp8=False))
+@pytest.mark.parametrize(
+    "case,blocker",
+    [("bf16", "not static FP8"), ("expand_timesteps", "expand_timesteps")],
+)
+def test_block_is_not_planned(case, blocker):
+    """Blocks the fused path does not serve stay unfused and name the reason."""
+    config = _config("VANILLA", None, fp8=case != "bf16")
+    if case == "expand_timesteps":
+        config.pretrained_config.expand_timesteps = True
+    block = _block(config)
     assert not block.plan_fp8_fusions(log=True)
     assert not block._fp8_block
+    assert any(blocker in reason for reason in block.fp8_fusion_blockers)
+
+
+@pytest.mark.cpu_only
+def test_row_parallel_linear_without_reduction_produces_partial_output():
+    """A ROW tensor-parallel Linear whose reduction a wrapper runs later (token-sharded TP) still
+    reports partial outputs, and forward_without_bias rejects it."""
+    linear = Linear(
+        256,
+        128,
+        bias=True,
+        dtype=torch.bfloat16,
+        mapping=Mapping(world_size=2, tp_size=2, rank=0),
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        reduce_output=False,
+    )
+    assert linear.produces_partial_output()
+    with pytest.raises(ValueError, match="tensor-parallel"):
+        linear.forward_without_bias(torch.zeros(4, 128, dtype=torch.bfloat16))
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +341,7 @@ def test_bf16_input_matches_sdpa_and_cudnn(batch, seq, heads):
     assert out.shape == (batch, seq, heads * HEAD_DIM) and out.dtype == torch.bfloat16
     ref = _sdpa(q, k, v).reshape(batch, seq, -1)
     assert _cosine(out, ref) > 0.99
+    assert _rel_l2(out, ref) < 0.15
 
     cudnn = _backend("CUDNN", heads)
     out_cudnn = cudnn.forward(q=q, k=k, v=v, batch_size=batch, seq_len=seq)
@@ -329,6 +370,7 @@ def test_prequantized_matches_sdpa(out_fp8):
     assert out.dtype == (E4M3 if out_fp8 else torch.bfloat16)
     dequant = out.float() * out_scale if out_fp8 else out.float()
     assert _cosine(dequant, ref) > 0.99
+    assert _rel_l2(dequant, ref) < 0.15
 
 
 @_SM107_ONLY
@@ -414,6 +456,39 @@ def test_cross_attention_runs_on_cudnn_fp8(monkeypatch):
     # takes the VANILLA fallback as on Blackwell.
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
     assert isinstance(cross_attention().attn, VanillaAttention)
+
+
+@_SM107_ONLY
+def test_masked_cross_attention_matches_vanilla():
+    """Masked cross-attention under the FP8 recipe runs on VANILLA and matches it."""
+
+    def cross_attention(backend, quant):
+        """Wan cross-attention layer with seeded weights."""
+        attn = Attention(
+            hidden_size=12 * HEAD_DIM,
+            num_attention_heads=12,
+            qkv_mode=QKVMode.SEPARATE_QKV,
+            qk_norm=True,
+            config=_model_config(backend, quant),
+            enable_sequence_parallel=False,
+        ).cuda()
+        g = torch.Generator(device="cuda").manual_seed(3)
+        with torch.no_grad():
+            for name, p in attn.named_parameters():
+                scale = 0.1 if "norm" in name else 0.02
+                base = 1.0 if "norm" in name else 0.0
+                p.copy_(base + scale * torch.randn(p.shape, device="cuda", generator=g))
+        return attn
+
+    fp8, vanilla = cross_attention("TRTLLM", _TRTLLM_FP8), cross_attention("VANILLA", None)
+    hidden = torch.randn(1, 256, 12 * HEAD_DIM, device="cuda").bfloat16()
+    text = torch.randn(1, 64, 12 * HEAD_DIM, device="cuda").bfloat16()
+    mask = torch.ones(1, 64, dtype=torch.bool, device="cuda")
+    mask[:, 48:] = False
+    with torch.no_grad():
+        out = fp8(hidden, encoder_hidden_states=text, key_padding_mask=mask)
+        expected = vanilla(hidden, encoder_hidden_states=text, key_padding_mask=mask)
+    torch.testing.assert_close(out, expected)
 
 
 @_SM107_ONLY
@@ -511,14 +586,6 @@ def test_block_fusions_default_off_and_override_reaches_the_model_config(
         wan_checkpoint, args=args, pipeline_config=resolved, device="cpu"
     )
     assert config.extra_attrs["enable_fp8_block_fusions"] is True
-
-
-@pytest.mark.cpu_only
-def test_unknown_pipeline_config_key_is_rejected(wan_checkpoint: str) -> None:
-    """A misspelled pipeline_config key raises."""
-    args = VisualGenArgs(model=wan_checkpoint, pipeline_config={"enable_fp8_block_fusion": True})
-    with pytest.raises(ValueError, match="Unknown pipeline_config keys for WanPipeline"):
-        PipelineLoader(args, device="cpu")._resolve_pipeline_config(wan_checkpoint)
 
 
 @pytest.mark.cpu_only

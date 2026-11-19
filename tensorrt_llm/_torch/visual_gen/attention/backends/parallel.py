@@ -1250,6 +1250,10 @@ class Attention2DAttention(AttentionBackend):
             # o_recv: [N, B, shard_seq, H, D] — already stacked by source rank
 
             # lse: [B, H, seq_row] → [N, B, H, shard_seq] (grouped by dest rank)
+            assert lse.shape == (B, H, seq_row), (
+                f"forward_with_lse must return LSE as [B, H, S] = {(B, H, seq_row)}, "
+                f"got {tuple(lse.shape)}"
+            )
             lse_send = lse.view(B, H, N, shard_seq).permute(2, 0, 1, 3).contiguous()
             lse_recv = torch.empty_like(lse_send)
             torch.distributed.all_to_all_single(lse_recv, lse_send, group=self.row_process_group)
@@ -1437,6 +1441,11 @@ class RingAttention(AttentionBackend):
             )
             output_dtype = block_out.dtype
             # Inner backend returns LSE as [B, H, S]; merge uses [B, S, H] with out [B, S, H, D].
+            expected = (block_out.shape[0], block_out.shape[2], block_out.shape[1])
+            assert block_lse_bh.shape == expected, (
+                f"forward_with_lse must return LSE as [B, H, S] = {expected}, "
+                f"got {tuple(block_lse_bh.shape)}"
+            )
             block_lse = block_lse_bh.transpose(1, 2).contiguous()
             if step == 0:
                 out.copy_(block_out)

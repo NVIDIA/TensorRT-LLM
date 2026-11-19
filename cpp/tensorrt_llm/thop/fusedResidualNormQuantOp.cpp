@@ -19,6 +19,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 #include <cstdint>
@@ -66,9 +67,10 @@ float const* fp32Rows(
 std::tuple<torch::Tensor, torch::Tensor> fused_residual_norm_quant(torch::Tensor const& x,
     c10::optional<torch::Tensor> const& y, c10::optional<torch::Tensor> const& y_bias,
     c10::optional<torch::Tensor> const& gate, int64_t mode, c10::optional<torch::Tensor> const& weight,
-    c10::optional<torch::Tensor> const& bias, int64_t rows_per_batch, double eps,
+    c10::optional<torch::Tensor> const& bias, c10::SymInt rows_per_batch_sym, double eps,
     c10::optional<torch::Tensor> const& inv_out_scale)
 {
+    int64_t const rows_per_batch = rows_per_batch_sym.guard_int(__FILE__, __LINE__);
     TORCH_CHECK(mode >= 0 && mode <= 2, "fused_residual_norm_quant: mode must be 0, 1 or 2");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
     checkContiguousAligned(x, "x", x.device());
@@ -85,6 +87,7 @@ std::tuple<torch::Tensor, torch::Tensor> fused_residual_norm_quant(torch::Tensor
     TORCH_CHECK(!y_bias.has_value() || y.has_value(), "y_bias needs y");
     TORCH_CHECK(!gate.has_value() || y.has_value(), "gate needs y");
 
+    c10::cuda::CUDAGuard const deviceGuard(x.device());
     tk::ResidualNormQuantParams p;
     p.x = x.data_ptr();
     if (y.has_value())
@@ -143,7 +146,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fused_residual_norm_quant(Tensor x, Tensor? y, Tensor? y_bias, Tensor? gate, int mode, Tensor? weight, "
-        "Tensor? bias, int rows_per_batch, float eps, Tensor? inv_out_scale) -> (Tensor, Tensor)");
+        "Tensor? bias, SymInt rows_per_batch, float eps, Tensor? inv_out_scale) -> (Tensor, Tensor)");
     m.def("fused_residual_norm_quant_supported(int hidden) -> bool");
 }
 

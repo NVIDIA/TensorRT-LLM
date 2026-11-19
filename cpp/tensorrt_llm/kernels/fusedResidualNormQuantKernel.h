@@ -63,7 +63,7 @@ struct ResidualNormQuantParams
 //! Gated residual update and LayerNorm / AdaLN + static per-tensor FP8 quantization of each row,
 //! in one pass (diffusion transformer blocks). The residual rounds y + y_bias to bf16 and then
 //! computes x + gate * y with separately rounded multiply and add; the normalized value is rounded
-//! to bf16 before the FP8 multiply, so results do not depend on fast-math flags.
+//! to bf16 before the FP8 multiply.
 void launchResidualNormQuant(ResidualNormQuantParams const& params, cudaStream_t stream);
 
 //! Whether launchResidualNormQuant has a kernel for this hidden size: a multiple of 1024 up to 8192.

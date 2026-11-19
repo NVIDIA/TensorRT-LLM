@@ -11,6 +11,7 @@ import torch
 from utils.util import skip_pre_hopper
 
 import tensorrt_llm  # noqa: F401  -- triggers libth_common.so load (registers trtllm ops)
+from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import ResidualNormMode as RNM
 
 pytestmark = skip_pre_hopper
 
@@ -198,13 +199,13 @@ def _rnq_reference(x, y, y_bias, gate, mode, weight, bias, inv_scale):
         y = y + y_bias if y_bias is not None else y  # bf16 add, as the kernel rounds y + y_bias
         prod = y.float() * gate[:, None, :] if gate is not None else y.float()
         x = (x.float() + prod).bfloat16()
-    if mode == 0:
+    if mode == RNM.RESIDUAL_ONLY:
         return x, None
     xf = x.float()
     mean = xf.mean(-1, keepdim=True)
     var = (xf * xf).mean(-1, keepdim=True) - mean * mean
     xn = (xf - mean) * torch.rsqrt(var.clamp_min(0) + EPS)
-    if mode == 1:
+    if mode == RNM.LAYER_NORM:
         out = xn * weight + bias
     else:
         out = xn * (1.0 + weight[:, None, :]) + bias[:, None, :]
@@ -229,7 +230,7 @@ def _rnq_run(x, y, y_bias, gate, mode, weight, bias, inv_scale, seq):
     )
     return (
         x_out.view(x.shape) if y is not None else None,
-        normed.view(x.shape) if mode != 0 else None,
+        normed.view(x.shape) if mode != RNM.RESIDUAL_ONLY else None,
     )
 
 
@@ -237,13 +238,13 @@ def _rnq_run(x, y, y_bias, gate, mode, weight, bias, inv_scale, seq):
     "hidden,batch,mode,has_y,has_gate,has_bias",
     [
         # Every mode with all inputs, across widths.
-        (3072, 1, 0, True, True, True),
-        (5120, 2, 1, True, True, True),
-        (4096, 2, 2, True, True, True),
+        (3072, 1, RNM.RESIDUAL_ONLY, True, True, True),
+        (5120, 2, RNM.LAYER_NORM, True, True, True),
+        (4096, 2, RNM.ADA_LAYER_NORM, True, True, True),
         # Optional inputs left out.
-        (3072, 1, 1, True, False, True),
-        (5120, 2, 2, True, True, False),
-        (5120, 2, 2, False, False, False),
+        (3072, 1, RNM.LAYER_NORM, True, False, True),
+        (5120, 2, RNM.ADA_LAYER_NORM, True, True, False),
+        (5120, 2, RNM.ADA_LAYER_NORM, False, False, False),
     ],
 )
 def test_residual_norm_quant_matches_reference(hidden, batch, mode, has_y, has_gate, has_bias):
@@ -254,11 +255,11 @@ def test_residual_norm_quant_matches_reference(hidden, batch, mode, has_y, has_g
     y_bias = t["y_bias"] if has_bias and has_y else None
     gate = t["gate"] if has_gate and has_y else None
     weight, bias = {
-        0: (None, None),
-        1: (t["ln_weight"], t["ln_bias"]),
-        2: (t["scale"], t["shift"]),
+        RNM.RESIDUAL_ONLY: (None, None),
+        RNM.LAYER_NORM: (t["ln_weight"], t["ln_bias"]),
+        RNM.ADA_LAYER_NORM: (t["scale"], t["shift"]),
     }[mode]
-    inv_scale = torch.tensor([E4M3_MAX / 6.0], device="cuda") if mode != 0 else None
+    inv_scale = torch.tensor([E4M3_MAX / 6.0], device="cuda") if mode != RNM.RESIDUAL_ONLY else None
 
     x_out, normed = _rnq_run(t["x"], y, y_bias, gate, mode, weight, bias, inv_scale, seq)
     ref_x, ref_normed = _rnq_reference(
@@ -268,7 +269,7 @@ def test_residual_norm_quant_matches_reference(hidden, batch, mode, has_y, has_g
         assert torch.equal(x_out, ref_x)
     else:
         assert x_out is None
-    if mode != 0:
+    if mode != RNM.RESIDUAL_ONLY:
         # Statistics accumulate in a different order; codes agree up to one e4m3 step.
         torch.testing.assert_close(normed.float(), ref_normed.float(), rtol=0.125, atol=2**-6)
         assert (normed.view(torch.uint8) == ref_normed.view(torch.uint8)).float().mean() > 0.995
@@ -286,7 +287,9 @@ def test_residual_norm_quant_rejects_cpu_inv_out_scale():
     t = _rnq_inputs(1, 64, 3072)
     inv_scale = torch.tensor([E4M3_MAX / 6.0])
     with pytest.raises(RuntimeError, match="inv_out_scale must be a CUDA tensor"):
-        _rnq_run(t["x"], None, None, None, 1, t["ln_weight"], t["ln_bias"], inv_scale, 64)
+        _rnq_run(
+            t["x"], None, None, None, RNM.LAYER_NORM, t["ln_weight"], t["ln_bias"], inv_scale, 64
+        )
 
 
 def test_residual_norm_quant_fake_under_compile():
@@ -295,7 +298,9 @@ def test_residual_norm_quant_fake_under_compile():
     inv_scale = torch.tensor([E4M3_MAX / 6.0], device="cuda")
 
     def fn(x, y):
-        return _rnq_run(x, y, t["y_bias"], t["gate"], 2, t["scale"], t["shift"], inv_scale, 64)
+        return _rnq_run(
+            x, y, t["y_bias"], t["gate"], RNM.ADA_LAYER_NORM, t["scale"], t["shift"], inv_scale, 64
+        )
 
     eager = fn(t["x"], t["y"])
     compiled = torch.compile(fn, fullgraph=True)(t["x"], t["y"])

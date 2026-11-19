@@ -53,9 +53,6 @@ with _disable_mpi():
         AttentionTensorLayout,
     )
     from tensorrt_llm._torch.visual_gen.attention.backends.parallel import Attention2DAttention
-    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
-        _flash_attn_combine as flash_attn_combine,
-    )
     from tensorrt_llm._torch.visual_gen.config import (
         DiffusionModelConfig,
         create_attention_metadata_state,
@@ -1115,7 +1112,6 @@ def test_ulysses_fp8_cuda_graph_replay():
     _run_fp8(2, _logic_ulysses_cuda_graph)
 
 
-@pytest.mark.skipif(flash_attn_combine is None, reason="Attention2D needs flash_attn_combine.")
 def test_attn2d_fp8_runs_on_cudnn():
     """Attention2D with the FP8 recipe on cuDNN FP8."""
     _run_fp8(4, _logic_attn2d_runs_on_cudnn_fp8)

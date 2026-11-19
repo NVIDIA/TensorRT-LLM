@@ -25,14 +25,17 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
-from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....attention.backends.fmha.interface import Fmha
-from ....attention.backends.fmha.trtllm_gen_dense_fp8 import is_per_tensor_fp8
+from ....attention.backends.fmha.trtllm_gen_dense_fp8 import (
+    TrtllmGenDenseFp8Fmha,
+    is_per_tensor_fp8,
+)
 
 if TYPE_CHECKING:
     from ....attention.backends.prims_ts.vc_attention.quantization import (
@@ -378,7 +381,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     - Metadata creation and preparation
     - No KV cache operation
     - SageAttention per-block QKV quantization (when a quant_attention_config is provided. requires unfused QKV)
-    - PrimTS per-tensor FP8 recipes (quant_attention_config with zero block sizes, requires unfused QKV)
+    - Per-tensor FP8 recipes (quant_attention_config with zero block sizes, requires unfused QKV) on
+      PrimTS, or on the trtllm-gen dense FP8 library on SM107
     - VC-Attention recipes (quant_attention_config with vc_attention, requires unfused QKV)
     - Separate-QKV forwarding for generic block-sparse attention and backends that reject fused QKV
     """
@@ -449,11 +453,20 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             and quant_attention_config.q_block_size == 0
             and not any(fmha.supports_per_tensor_fp8 for fmha in self._fmha_manager.fmha_libs)
         ):
+            sm = get_sm_version()
+            dense_fp8_serves = (
+                quant_attention_config.qk_dtype == "fp8"
+                and sm in TrtllmGenDenseFp8Fmha.SUPPORTED_SMS
+            )
+            library = (
+                "the trtllm-gen dense FP8 FMHA library (trtllm_gen_dense_fp8)"
+                if dense_fp8_serves
+                else "the PrimTS FMHA library (TLLM_FMHA_LIBS=+prims_ts)"
+            )
             raise RuntimeError(
-                "The per-tensor FP8 attention recipe needs the PrimTS FMHA library "
-                "(TLLM_FMHA_LIBS=+prims_ts) or the trtllm-gen dense FP8 FMHA library "
-                "(trtllm_gen_dense_fp8), and neither is enabled or available for this layer "
-                "on this platform."
+                f"The per-tensor {quant_attention_config.qk_dtype}/{quant_attention_config.v_dtype} "
+                f"attention recipe needs {library}, which is not enabled or available for this "
+                f"layer on SM{sm}. Debug-level logs give the reason the library declined."
             )
         # Compiled callers guard on this flag; testing layer_idx per call would specialize, and
         # recompile, the attention frames for every layer.
