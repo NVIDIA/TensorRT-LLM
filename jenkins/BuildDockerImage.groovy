@@ -838,11 +838,11 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         (stageNames.ciImageSBSA): [
             arch: "arm64",
         ],
-        (stageNames.ciImageRockyPy310): [
-            target: "rockylinux8",
-            args: "PYTHON_VERSION=3.10.12",
-            postTag: "-py310",
-        ],
+        // (stageNames.ciImageRockyPy310): [
+        //     target: "rockylinux8",
+        //     args: "PYTHON_VERSION=3.10.12",
+        //     postTag: "-py310",
+        // ],
         (stageNames.ciImageRockyPy312): [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.12.3",
@@ -906,7 +906,11 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
     }
     if (buildCiImage) {
-        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageSBSAUbuntu, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312]
+        enabledStages += [
+            stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageSBSAUbuntu,
+            // stageNames.ciImageRockyPy310,
+            stageNames.ciImageRockyPy312,
+        ]
     }
     if (buildNgcRelease) {
         enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]

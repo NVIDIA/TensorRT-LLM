@@ -739,7 +739,6 @@ setup(
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
-        "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.12",
     ],
     distclass=BinaryDistribution,
@@ -787,5 +786,5 @@ setup(
     install_requires=required_deps,
     dependency_links=
     extra_URLs,  # Warning: Dependency links support has been dropped by pip 19.0
-    python_requires=">=3.10, <4",
+    python_requires=">=3.12, <4",
     project_urls=get_project_urls())
