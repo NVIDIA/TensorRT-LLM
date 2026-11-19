@@ -1610,6 +1610,7 @@ class AwaitResponseHelper:
             elif _drop_refused_response(self.worker, response):
                 continue
             elif self.worker._has_background_error():
+                release_undelivered_response(response)
                 response = self.worker._create_error_response(response)
             elif response.has_error():
                 # Convert to ErrorResponse, because tllm.Response cannot be

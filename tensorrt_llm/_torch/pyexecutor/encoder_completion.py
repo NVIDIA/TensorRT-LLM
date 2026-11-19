@@ -23,7 +23,7 @@ class Completion(Protocol):
         """Attach one forward's results to its requests before their responses are created."""
 
     def retire(self, requests: list[LlmRequest]) -> None:
-        """Release what ``store`` exported for requests whose responses will not be published."""
+        """Withdraw what ``store`` attached, for requests that finish without their result."""
 
 
 class PoolingCompletion:
@@ -37,7 +37,8 @@ class PoolingCompletion:
                 request.py_result.append_context_logits(row.unsqueeze(0) if row.ndim == 1 else row)
 
     def retire(self, requests: list[LlmRequest]) -> None:
-        pass
+        for request in requests:
+            request.py_result.drop_context_logits()
 
 
 class MultimodalEmbeddingCompletion:

@@ -13,7 +13,7 @@ import gc
 import re
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.encoder_completion import (
     PoolingCompletion,
 )
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import (
     ScheduledEncoderExecutor,
     fit_batch,
@@ -409,9 +410,58 @@ def test_cancelling_a_launched_request_finishes_it_once_as_cancelled(completion)
         assert cancelled.result.is_final
         assert cancelled.result.finish_reasons == [FinishReason.CANCELLED]
         assert cancelled.result.mm_embedding_handles is None
+        assert cancelled.result.context_logits is None
         h.result(later)
         assert h.responses(launched, NO_WAIT) == []
         assert h.runner.batches == [[launched], [later]]
+
+
+@pytest.mark.parametrize("rank, exports", [(0, True), (1, False)], ids=["rank_0", "tp_follower"])
+def test_only_rank_0_of_a_multimodal_encoder_exports(monkeypatch, rank, exports):
+    """A follower's responses reach no client, so its exports would pin each batch's memory."""
+    built = SimpleNamespace(
+        runner=_Runner(1, multimodal=True),
+        model_config=SimpleNamespace(is_generation=False),
+        model_loader=Mock(),
+        max_batch_size=1,
+        max_num_tokens=64,
+        max_seq_len=32,
+    )
+    monkeypatch.setattr(
+        scheduled_encoder_executor, "resolve_scheduled_encoder_args", lambda llm_args: llm_args
+    )
+    monkeypatch.setattr(
+        scheduled_encoder_executor,
+        "build_mm_encoder_runner",
+        lambda *args, **kwargs: nullcontext(built),
+    )
+    executor = ScheduledEncoderExecutor.create(
+        SimpleNamespace(
+            mm_encoder_only=True,
+            garbage_collection_gen0_threshold=20000,
+            batch_wait_timeout_ms=0,
+            return_perf_metrics=False,
+            enable_iter_perf_stats=False,
+            print_iter_log=False,
+        ),
+        model_path="",
+        checkpoint_loader=Mock(),
+        mapping=Mapping(world_size=2, rank=rank, tp_size=2),
+        dist=SimpleNamespace(rank=rank, world_size=2, has_pp=False, barrier=lambda: None),
+    )
+    request = SimpleNamespace(py_result=PyResult(prompt_len=1, max_new_tokens=1))
+
+    executor._completion.store(
+        [request],
+        {
+            "mm_embeddings": [torch.ones(1, WIDTH)],
+            "mm_embedding_request_indices": [0],
+            "mm_embedding_lengths": [[1]],
+        },
+    )
+
+    assert (request.py_result.mm_embedding_handles is not None) is exports
+    request.py_result.release_exports()
 
 
 def _cuda_memory_allocated() -> int:

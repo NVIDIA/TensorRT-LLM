@@ -11,17 +11,23 @@ consumed.
 import base64
 import gc
 from pathlib import Path
-from types import SimpleNamespace
+from queue import Queue
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, LlmResult, PyResult
-from tensorrt_llm.executor.base_worker import _drop_refused_response
+from tensorrt_llm.executor.base_worker import (
+    AwaitResponseHelper,
+    BaseWorker,
+    _drop_refused_response,
+)
 from tensorrt_llm.executor.executor import GenerationExecutor
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.result import ResponseWrapper
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
+from tensorrt_llm.executor.utils import ErrorResponse
 
 pytestmark = pytest.mark.cpu_only
 
@@ -51,6 +57,24 @@ def _exporting_response() -> tuple[LlmResponse, set[Path]]:
 
 def _drop_at_worker(response):
     assert _drop_refused_response(SimpleNamespace(_refused_client_ids={CLIENT_ID}), response)
+
+
+def _replace_at_worker_on_background_error(response):
+    errors = Queue()
+    errors.put(RuntimeError("background error"))
+    sent = []
+    worker = SimpleNamespace(
+        enable_postprocess_parallel=False,
+        _refused_client_ids=set(),
+        _error_queue=errors,
+        frontend_result_queues=None,
+        result_queue=SimpleNamespace(put=sent.extend),
+        _pop_result=lambda client_id: None,
+    )
+    worker._has_background_error = MethodType(BaseWorker._has_background_error, worker)
+    worker._create_error_response = MethodType(BaseWorker._create_error_response, worker)
+    AwaitResponseHelper(worker).handle_for_ipc_batched([response])
+    assert sent == [ErrorResponse(CLIENT_ID, "background error", CLIENT_ID)]
 
 
 class _ResultQueue:
@@ -86,8 +110,8 @@ def _drop_at_rpc_proxy(response):
 
 @pytest.mark.parametrize(
     "drop",
-    [_drop_at_worker, _drop_at_proxy, _drop_at_rpc_proxy],
-    ids=["refused_at_worker", "late_at_proxy", "unknown_at_rpc_proxy"],
+    [_drop_at_worker, _replace_at_worker_on_background_error, _drop_at_proxy, _drop_at_rpc_proxy],
+    ids=["refused_at_worker", "errored_at_worker", "late_at_proxy", "unknown_at_rpc_proxy"],
 )
 def test_a_dropped_response_releases_its_exports(drop):
     response, files = _exporting_response()

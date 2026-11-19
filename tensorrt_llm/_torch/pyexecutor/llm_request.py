@@ -598,6 +598,11 @@ class PyResult:
         self.diff.mrope_position_ids = None
         self.diff.mrope_position_deltas = None
 
+    def drop_context_logits(self) -> None:
+        """Drop the stored context logits; no response will deliver them."""
+        self._context_logits = None
+        self.diff.context_logits_list = []
+
     def set_encoder_output(self, encoder_output: torch.Tensor):
         self._encoder_output = encoder_output
         self.diff.encoder_output = encoder_output
