@@ -714,7 +714,7 @@ def pack_routed_experts_tp16(
     w1, w3, w2, w1_sf, w3_sf, w2_sf, w1_scale2, w3_scale2, w2_scale2, fc1_input_scale,
     fc2_input_scale, *, publish: bool = True,
 ):  # fmt: skip
-    """One rank's TP16 routed experts in the layout of ``kernels/mr8/nv_experts``'
+    """One rank's TP16 routed experts in the layout of ``kernels/k3r_moe/ull/nv_experts``'
     ``RubinNvExpertsKernel`` / ``RubinNvGroupedExpertsKernel``.
 
     Inputs (the checkpoint's NVFP4 tensors of every expert, sliced for this rank; any device):
@@ -953,7 +953,7 @@ def load_chain_weights(
 
 
 def _runtime():
-    from ...kernels.vendor.vllm_mr8 import nv_experts_runtime
+    from ..moe import k3_ull_nv_experts_runtime as nv_experts_runtime
 
     return nv_experts_runtime
 
@@ -991,7 +991,7 @@ class NvScratch:
     """The MoE layers' shared experts workspace, route mailbox and plan buffer (one device)."""
 
     def __init__(self, device):
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.moe import experts as mr8_experts
+        from ...kernels.k3r_moe.ull import experts as mr8_experts
 
         rt = _runtime()
         self.device = torch.device(device)
@@ -1024,7 +1024,7 @@ class NvExperts:
     ):  # fmt: skip
         import cutlass
 
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.moe import experts_runtime
+        from ...kernels.k3r_moe.ull import experts_runtime
 
         self.rt = rt = _runtime()
         self.er = experts_runtime
@@ -1070,7 +1070,7 @@ class NvExperts:
     def _prepare(self, batch, out, publish, planned, twoshot):
         import cutlass
 
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.common import host
+        from ..common import k3_ull_cute_host as host
 
         rt = self.rt
         if not 1 <= batch <= 64:
@@ -1110,7 +1110,7 @@ class NvExperts:
     def run(self, x, ids, weights=None):
         import cutlass
 
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.common import host
+        from ..common import k3_ull_cute_host as host
 
         b = x.shape[0]
         if b not in self.prepared and b in self.deferred:
@@ -1310,25 +1310,27 @@ class _Kernels:
     """The MR8 modules the chain builds from (imported on first use: they need CUTLASS)."""
 
     def __init__(self):
-        from ...kernels.vendor.vllm_mr8 import _compat
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.attn_res import (
+        # isort: off
+        from ..common import k3_ull_compat as _compat
+        from ...kernels.k3r_attn_res.ull import (
             prepared as attn_res,
         )
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.common import twoshot
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.kda import head as kda_head
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.kda import (
+        from ...kernels.k3r_comm import ull_twoshot as twoshot
+        from ...kernels.k3r_kda.ull import head as kda_head
+        from ...kernels.k3r_kda.ull import (
             prepared as kda_prepared,
         )
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.moe import front as moe_front
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.moe import (
+        from ...kernels.k3r_moe.ull import front as moe_front
+        from ...kernels.k3r_moe.ull import (
             prepared as moe_prepared,
         )
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.moe import tail_runtime
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.moe.small_batch import (
+        from ...kernels.k3r_moe.ull import tail_runtime
+        from ...kernels.k3r_moe.ull.small_batch import (
             chain as small_batch,
         )
-        from ...kernels.vendor.vllm_mr8.specialized_decode.cutedsl.oproj import prepared as oproj
-        from ...kernels.vendor.vllm_mr8.specialized_decode.runtime import prefetch, providers
+        from ...kernels.k3r_oproj.ull import prepared as oproj
+        from . import k3_ull_prefetch as prefetch, k3_ull_providers as providers
+        # isort: on
 
         self.compat, self.attn_res, self.twoshot = _compat, attn_res, twoshot
         self.kda_head, self.kda_prepared = kda_head, kda_prepared

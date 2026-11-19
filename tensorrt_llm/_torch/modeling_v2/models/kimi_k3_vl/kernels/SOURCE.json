@@ -413,447 +413,647 @@
    "served_sha": "6904cd9672402ece66a0bca11abdd1830884123a",
    "served_root": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl",
    "mr8_root": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia",
-   "dir": "kernels/vendor/vllm_mr8",
-   "target_dir": "kernels/mr8",
    "files": {
-    "__init__.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/__init__.py",
-     "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
-     "import_edits": 0,
-     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
-    },
-    "ops/__init__.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/__init__.py",
-     "source_sha256": "b3acb180d92be9417ec5d3eb36f474aadd976a0642663b5bffdbbe5b715eb49f",
-     "import_edits": 0,
-     "sha256": "cdbba4afa56174a54a920fcbc47bc644b479278f69b58cdda361b910434cc881",
-     "local_edits": [
-      "Drop the unused stock AttnRes re-export."
-     ]
-    },
-    "ops/cute_dsl/__init__.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/__init__.py",
-     "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
-     "import_edits": 0,
-     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
-    },
-    "ops/cute_dsl/latent_moe_tail/__init__.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/__init__.py",
-     "source_sha256": "4bcaf876ba15075b72d507e57874afb0634334658908872c1fce9d0a705e00cb",
-     "import_edits": 0,
-     "sha256": "dea3c9fed099457bc28b1b3148980d57e9e2b296f364f59547856181a465b7ed",
-     "local_edits": [
-      "Remove unused re-exports; ULL imports primitives directly."
-     ]
-    },
-    "ops/cute_dsl/latent_moe_tail/primitives.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/primitives.py",
-     "source_sha256": "b3eb9c6e1f3e146c8d1ebe54d8b69d701bb95b00c21fff994e2cccf34db2c861",
-     "import_edits": 0,
-     "sha256": "b3eb9c6e1f3e146c8d1ebe54d8b69d701bb95b00c21fff994e2cccf34db2c861"
-    },
-    "specialized_decode/__init__.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/__init__.py",
-     "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
-     "import_edits": 0,
-     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
-    },
-    "specialized_decode/cutedsl/__init__.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/__init__.py",
-     "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
-     "import_edits": 0,
-     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
-    },
-    "specialized_decode/cutedsl/attn_res/__init__.py": {
+    "kernels/k3r_attn_res/ull/__init__.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/__init__.py",
      "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
      "import_edits": 0,
-     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
+     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/__init__.py"
     },
-    "specialized_decode/cutedsl/attn_res/kernel.py": {
+    "kernels/k3r_attn_res/ull/kernel.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/kernel.py",
      "source_sha256": "ed5c581604dad4f8d998216509cb97cd4c903eb4ae392e1dc743e79e06369497",
      "import_edits": 2,
-     "sha256": "eedfcdc82ac7009dec1ebef8237e989990cad8ffc9aa2021f775b3023aa2b7ed"
+     "sha256": "e54af843d8a5cbd8df17fc356f2af4806533068b93c4df55ef0867d032ad708a",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/kernel.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/attn_res/prepared.py": {
+    "kernels/k3r_attn_res/ull/prepared.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/prepared.py",
      "source_sha256": "a361c786fbb885ded05483fe54e48fe9b336878d8b944c5865a6783c8bd2105a",
      "import_edits": 0,
-     "sha256": "a361c786fbb885ded05483fe54e48fe9b336878d8b944c5865a6783c8bd2105a"
+     "sha256": "a88957c1c4556472e641d3ff986f5dde16afe41378b3606b841bc72c87ec2045",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/prepared.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/attn_res/rows.py": {
+    "kernels/k3r_attn_res/ull/rows.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/rows.py",
      "source_sha256": "a7022cc3c48895a23e1b988afb5e3cd94a2b6f47aca79c3b80f15758e2b72257",
      "import_edits": 0,
-     "sha256": "a7022cc3c48895a23e1b988afb5e3cd94a2b6f47aca79c3b80f15758e2b72257"
+     "sha256": "7514226c3d82223e13396444a66019ddc1b14b98779042a6616038212f712b47",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/rows.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/attn_res/sharded.py": {
+    "kernels/k3r_attn_res/ull/sharded.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/sharded.py",
      "source_sha256": "47cf2ef9d10e57ccb99efdb488248570f99e16cdc3351c9a9d676073ca8d1974",
      "import_edits": 0,
-     "sha256": "47cf2ef9d10e57ccb99efdb488248570f99e16cdc3351c9a9d676073ca8d1974"
+     "sha256": "839376dd0a6e0843cb584ec65ecc426f0b3d2c0fb22a187ff3ce680ed6cb3b7d",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/sharded.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/common/__init__.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/__init__.py",
-     "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
-     "import_edits": 0,
-     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
-    },
-    "specialized_decode/cutedsl/common/dies.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/dies.py",
-     "source_sha256": "6800a8e6c219a16e32596e3fc9139c10dce914a74e977d66e6d5e79e8900d857",
-     "import_edits": 0,
-     "sha256": "6800a8e6c219a16e32596e3fc9139c10dce914a74e977d66e6d5e79e8900d857"
-    },
-    "specialized_decode/cutedsl/common/host.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/host.py",
-     "source_sha256": "09223f516860b83c3bd1357879337f1c4593c00c61ff51231d5d8e69d5d038ac",
-     "import_edits": 1,
-     "sha256": "aa7c37f38db8f2fa6349e49d5ccad5e4ea21a73729793255c8ac12d7aa9b4b0e"
-    },
-    "specialized_decode/cutedsl/common/mailbox.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/mailbox.py",
-     "source_sha256": "0b74ad6c34109576e6b9814c40d3d8c52039aed3d82658a4dd81b1fd41d417e0",
-     "import_edits": 0,
-     "sha256": "0b74ad6c34109576e6b9814c40d3d8c52039aed3d82658a4dd81b1fd41d417e0"
-    },
-    "specialized_decode/cutedsl/common/policy.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/policy.py",
-     "source_sha256": "ea8aa4ff9e7af62aa9391f9fabf1ab989ba766d20c2424d95800adf922c92015",
-     "import_edits": 0,
-     "sha256": "ea8aa4ff9e7af62aa9391f9fabf1ab989ba766d20c2424d95800adf922c92015"
-    },
-    "specialized_decode/cutedsl/common/prefetch.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/prefetch.py",
-     "source_sha256": "1fc41d043e57bb462e60379f1d68c2a784ac5e7a1de73b64ac2fd29bd91799cd",
-     "import_edits": 0,
-     "sha256": "1fc41d043e57bb462e60379f1d68c2a784ac5e7a1de73b64ac2fd29bd91799cd"
-    },
-    "specialized_decode/cutedsl/common/primitives.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/primitives.py",
-     "source_sha256": "bb703eab616bc42462194c8a25a586e4e78540ce6909a4043a266bd76f955162",
-     "import_edits": 0,
-     "sha256": "bb703eab616bc42462194c8a25a586e4e78540ce6909a4043a266bd76f955162"
-    },
-    "specialized_decode/cutedsl/common/tensormap.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/tensormap.py",
-     "source_sha256": "251bc446045432d7a0912f12b923e189de0064a9d52fa8d8d8cdf9f31f6b7c6f",
-     "import_edits": 0,
-     "sha256": "251bc446045432d7a0912f12b923e189de0064a9d52fa8d8d8cdf9f31f6b7c6f"
-    },
-    "specialized_decode/cutedsl/common/twoshot.py": {
+    "kernels/k3r_comm/ull_twoshot.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/twoshot.py",
      "source_sha256": "a7025cfb3d78f7fb8e67ba95cdc1b858f3b0592cc7258d32f7b9a7bc047b076d",
      "import_edits": 0,
-     "sha256": "a7025cfb3d78f7fb8e67ba95cdc1b858f3b0592cc7258d32f7b9a7bc047b076d"
+     "sha256": "63a9a7e187c94fd755d5f50a4f08a180a6da7e35fb7864f1f8731cfcb7dbb508",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/twoshot.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/gemm/__init__.py": {
+    "kernels/k3r_common/ull/__init__.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/__init__.py",
+     "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+     "import_edits": 0,
+     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/__init__.py"
+    },
+    "kernels/k3r_common/ull/dies.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/dies.py",
+     "source_sha256": "6800a8e6c219a16e32596e3fc9139c10dce914a74e977d66e6d5e79e8900d857",
+     "import_edits": 0,
+     "sha256": "bca6cd85f11f2a8ea7428df51a21ff890d4cea2993e9b03b1a6be9cb2980d9be",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/dies.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_common/ull/mailbox.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/mailbox.py",
+     "source_sha256": "0b74ad6c34109576e6b9814c40d3d8c52039aed3d82658a4dd81b1fd41d417e0",
+     "import_edits": 0,
+     "sha256": "0b74ad6c34109576e6b9814c40d3d8c52039aed3d82658a4dd81b1fd41d417e0",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/mailbox.py"
+    },
+    "kernels/k3r_common/ull/policy.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/policy.py",
+     "source_sha256": "ea8aa4ff9e7af62aa9391f9fabf1ab989ba766d20c2424d95800adf922c92015",
+     "import_edits": 0,
+     "sha256": "ea8aa4ff9e7af62aa9391f9fabf1ab989ba766d20c2424d95800adf922c92015",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/policy.py"
+    },
+    "kernels/k3r_common/ull/prefetch.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/prefetch.py",
+     "source_sha256": "1fc41d043e57bb462e60379f1d68c2a784ac5e7a1de73b64ac2fd29bd91799cd",
+     "import_edits": 0,
+     "sha256": "508dfcd20659903b5d0d04ed2061e3c9a843b9965c25563a91f62114e8cf4e6f",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/prefetch.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_common/ull/primitives.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/primitives.py",
+     "source_sha256": "bb703eab616bc42462194c8a25a586e4e78540ce6909a4043a266bd76f955162",
+     "import_edits": 0,
+     "sha256": "bb703eab616bc42462194c8a25a586e4e78540ce6909a4043a266bd76f955162",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/primitives.py"
+    },
+    "kernels/k3r_common/ull/tensor_views.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/primitives.py",
+     "source_sha256": "b3eb9c6e1f3e146c8d1ebe54d8b69d701bb95b00c21fff994e2cccf34db2c861",
+     "import_edits": 0,
+     "sha256": "b3eb9c6e1f3e146c8d1ebe54d8b69d701bb95b00c21fff994e2cccf34db2c861",
+     "previous_path": "kernels/vendor/vllm_mr8/ops/cute_dsl/latent_moe_tail/primitives.py"
+    },
+    "kernels/k3r_common/ull/tensormap.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/tensormap.py",
+     "source_sha256": "251bc446045432d7a0912f12b923e189de0064a9d52fa8d8d8cdf9f31f6b7c6f",
+     "import_edits": 0,
+     "sha256": "251bc446045432d7a0912f12b923e189de0064a9d52fa8d8d8cdf9f31f6b7c6f",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/tensormap.py"
+    },
+    "kernels/k3r_gemm/ull/__init__.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/__init__.py",
      "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
      "import_edits": 0,
-     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
+     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/__init__.py"
     },
-    "specialized_decode/cutedsl/gemm/projection.py": {
+    "kernels/k3r_gemm/ull/projection.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/projection.py",
      "source_sha256": "2e44fe4af6adeb81a21cb524fccfb64983e8bc7f642ddf7ac96e6f3c075100f4",
      "import_edits": 0,
-     "sha256": "2e44fe4af6adeb81a21cb524fccfb64983e8bc7f642ddf7ac96e6f3c075100f4"
+     "sha256": "bf90de621db56926dd52731a34cbef6ca344203c219fee87a970ae0f95f32810",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/projection.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/gemm/splitk.py": {
+    "kernels/k3r_gemm/ull/splitk.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk.py",
      "source_sha256": "b4455dc9bb543dbdfb0dd6bd73e345681aaf733cce707fd966e0f52c6a2efae9",
      "import_edits": 0,
-     "sha256": "b4455dc9bb543dbdfb0dd6bd73e345681aaf733cce707fd966e0f52c6a2efae9"
+     "sha256": "b4455dc9bb543dbdfb0dd6bd73e345681aaf733cce707fd966e0f52c6a2efae9",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/splitk.py"
     },
-    "specialized_decode/cutedsl/gemm/splitk_situ.py": {
+    "kernels/k3r_gemm/ull/splitk_situ.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_situ.py",
      "source_sha256": "8c048c652e0cac406fd56a03bf97d154599ad8d6a99f2de517a2fbc5cd08ed93",
      "import_edits": 0,
-     "sha256": "8c048c652e0cac406fd56a03bf97d154599ad8d6a99f2de517a2fbc5cd08ed93"
+     "sha256": "c6ab41dcce42518d7bbafc48fb99c80e7fd8852c127cc47ab63f806aa8cb2a3a",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/splitk_situ.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/gemm/splitk_situ64.py": {
+    "kernels/k3r_gemm/ull/splitk_situ64.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_situ64.py",
      "source_sha256": "7c68b184b88a9e6126d286ec9b7c7db910410bd3992b5be249a6a4f7a45c4f0a",
      "import_edits": 0,
-     "sha256": "7c68b184b88a9e6126d286ec9b7c7db910410bd3992b5be249a6a4f7a45c4f0a"
+     "sha256": "8c25cee02047e6822a5fce4f74f0756865613f9756c5224cbb7573d9af765264",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/splitk_situ64.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/gemm/splitk_tmem.py": {
+    "kernels/k3r_gemm/ull/splitk_tmem.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_tmem.py",
      "source_sha256": "428aabc9eec23d3d4bd78b1940325c823c964e06b73790e1f24db90848a7c2cb",
      "import_edits": 0,
-     "sha256": "428aabc9eec23d3d4bd78b1940325c823c964e06b73790e1f24db90848a7c2cb"
+     "sha256": "b7619464d1741b3f3a40b35529c1b32712dff9816aae91f6e98ad97551c3bc43",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/splitk_tmem.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/gemm/splitk_tmem64.py": {
+    "kernels/k3r_gemm/ull/splitk_tmem64.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_tmem64.py",
      "source_sha256": "5d487cb3c4f493df36a9052c2170fa92a928cc1dd560acc3c0f764a33ee6fe01",
      "import_edits": 0,
-     "sha256": "5d487cb3c4f493df36a9052c2170fa92a928cc1dd560acc3c0f764a33ee6fe01"
+     "sha256": "0583e1b0a9df19163ba593298adc02a45b238740a29361614f6c4734e82d8e8f",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/splitk_tmem64.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/gemm/ws_gemm.py": {
+    "kernels/k3r_gemm/ull/ws_gemm.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/ws_gemm.py",
      "source_sha256": "5d04acca3647d033e738183e5adb01241c706e7d6e2f304869e53bb3a34f9c61",
      "import_edits": 0,
-     "sha256": "5d04acca3647d033e738183e5adb01241c706e7d6e2f304869e53bb3a34f9c61"
+     "sha256": "3d5f5de4cea08141c616c427c93adbd38e0fa14a7c56544278b15f898c2c94ea",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/ws_gemm.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/kda/__init__.py": {
+    "kernels/k3r_kda/ull/__init__.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/__init__.py",
      "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
      "import_edits": 0,
-     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
+     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/__init__.py"
     },
-    "specialized_decode/cutedsl/kda/head.py": {
+    "kernels/k3r_kda/ull/head.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head.py",
      "source_sha256": "889b9e91909aeeff292a65a6cfb33e69e5ab4b20f82e33fccac3bbf849b07687",
      "import_edits": 0,
-     "sha256": "558a537d7f850ff7fd021d84418c531393ebac8af945309719887113704ae09b",
-     "local_edits": "Comment only: POLLED_OUT's RouteSitu exception now holds by RouteSitu's own wait."
+     "sha256": "1556f1be1d5ebc391923777db00aa78b9360d1306d7d2223221d31d5fa9b8203",
+     "local_edits": [
+      "Comment only: POLLED_OUT's RouteSitu exception now holds by RouteSitu's own wait.",
+      "Updated import paths for the Kimi K3 family layout."
+     ],
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/head.py"
     },
-    "specialized_decode/cutedsl/kda/head_multi.py": {
+    "kernels/k3r_kda/ull/head_multi.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head_multi.py",
      "source_sha256": "b67db007a0fd78d8d3817912b824393c25b07a9d11b5f0900c84eb6d9b6866cf",
      "import_edits": 0,
-     "sha256": "b67db007a0fd78d8d3817912b824393c25b07a9d11b5f0900c84eb6d9b6866cf"
+     "sha256": "cc7b5cff15156703b5ad73e2738cf1ebf8fd38b4735b064fb5b186cb1f29c313",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/head_multi.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/kda/head_verify.py": {
+    "kernels/k3r_kda/ull/head_verify.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head_verify.py",
      "source_sha256": "d944619e7465a2249d8d04096d52cdaeb38d84acd68d66662a4b8255be785ea7",
      "import_edits": 0,
-     "sha256": "d944619e7465a2249d8d04096d52cdaeb38d84acd68d66662a4b8255be785ea7"
+     "sha256": "5c4c9c94cfb5277ba84bec91ea298256244718b71ed843c1a1826d6e5bf35215",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/head_verify.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/kda/inproj64.py": {
+    "kernels/k3r_kda/ull/inproj64.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/inproj64.py",
      "source_sha256": "c264ca68fe39093526b0e5be9dcc4f5403aab62c2665cb2f7b673cbb14de1fcc",
      "import_edits": 0,
-     "sha256": "c264ca68fe39093526b0e5be9dcc4f5403aab62c2665cb2f7b673cbb14de1fcc"
+     "sha256": "a9f3a397fdfc5605de2ea83fce0a416afec4b209a4b3900389c9132414167102",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/inproj64.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/kda/kernel.py": {
+    "kernels/k3r_kda/ull/kernel.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/kernel.py",
      "source_sha256": "323898118dec3e3603c14a82547cf6e32980be499af82468249933db8a1ad70d",
      "import_edits": 0,
-     "sha256": "323898118dec3e3603c14a82547cf6e32980be499af82468249933db8a1ad70d"
+     "sha256": "38a9319a55dc6e23c87d30ea95ed8b613e36d4c167ea28fd028cd4365c9b647c",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/kernel.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/kda/prepared.py": {
+    "kernels/k3r_kda/ull/prepared.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/prepared.py",
      "source_sha256": "c61491c3b9ea0af552ba3966340f4e87c8b6862cf0f90e18a0a1ade8dbafbf44",
      "import_edits": 0,
-     "sha256": "c61491c3b9ea0af552ba3966340f4e87c8b6862cf0f90e18a0a1ade8dbafbf44"
+     "sha256": "95f3e585a7e1caeceab8649dc6de01b421669f13bca5a4263e8e89cdd22bce94",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/prepared.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/kda/verify.py": {
+    "kernels/k3r_kda/ull/verify.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify.py",
      "source_sha256": "a2c43a2578df3c2afcf6fd079f89816ca297deaaa632506f856291c7f42134bd",
      "import_edits": 0,
-     "sha256": "a2c43a2578df3c2afcf6fd079f89816ca297deaaa632506f856291c7f42134bd"
+     "sha256": "8718e8eb0d5d792d0e209ab4ffb9de0067ba0b69313d00226643b7b77aa8fddd",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/kda/verify_stream.py": {
+    "kernels/k3r_kda/ull/verify_stream.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_stream.py",
      "source_sha256": "83625f8c24a3e24b501d5515d31375abb4580a0f7c6483f1351aa961a30a91d2",
      "import_edits": 0,
-     "sha256": "83625f8c24a3e24b501d5515d31375abb4580a0f7c6483f1351aa961a30a91d2"
+     "sha256": "06a44c5bd251e696e0546786df070643dceff838dbc530e2d895f9b640fb708d",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify_stream.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/kda/verify_stream3.py": {
+    "kernels/k3r_kda/ull/verify_stream3.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_stream3.py",
      "source_sha256": "572b6ffa88a4e5d006610041a6b35321a914c70cf488d9805dc23da12e8e2eff",
      "import_edits": 0,
-     "sha256": "572b6ffa88a4e5d006610041a6b35321a914c70cf488d9805dc23da12e8e2eff"
+     "sha256": "c5e8952840f70c22ec902964891f5b9a6474e600542a4eef7c0756226e32082a",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify_stream3.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/kda/verify_wide.py": {
+    "kernels/k3r_kda/ull/verify_wide.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_wide.py",
      "source_sha256": "fed84fd29d5bde5e71430ec94e651d04974cc5f68da40a611fb8f31444c4c6a5",
      "import_edits": 0,
-     "sha256": "fed84fd29d5bde5e71430ec94e651d04974cc5f68da40a611fb8f31444c4c6a5"
+     "sha256": "2299903b9a23a1ecf4995851893390eb80544b58a5252d9880065adbdfcb50e3",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify_wide.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/moe/__init__.py": {
+    "kernels/k3r_moe/ull/__init__.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/__init__.py",
      "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
      "import_edits": 0,
-     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
+     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/__init__.py"
     },
-    "specialized_decode/cutedsl/moe/experts.py": {
+    "kernels/k3r_moe/ull/experts.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts.py",
      "source_sha256": "c5633071d8864f274df9e84fca18154d8570bd4238366a12a23b82fca35606dd",
      "import_edits": 0,
-     "sha256": "c5633071d8864f274df9e84fca18154d8570bd4238366a12a23b82fca35606dd"
+     "sha256": "cf58687ba54edb2530d3944d6c280f9e5933cbb915c26cc27512ea664476f3a1",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/moe/experts_rubin.py": {
+    "kernels/k3r_moe/ull/experts_rubin.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_rubin.py",
      "source_sha256": "9754094753737e3765c2352c09e919c821e55595eff2f18f530fe393756eac07",
      "import_edits": 0,
-     "sha256": "9754094753737e3765c2352c09e919c821e55595eff2f18f530fe393756eac07"
+     "sha256": "62c49d0ecc55396d847d148ea7bf24fb6cacce491dfa3b1d858f88c0d08eea2f",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts_rubin.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/moe/experts_rubin64.py": {
+    "kernels/k3r_moe/ull/experts_rubin64.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_rubin64.py",
      "source_sha256": "724001f2ef8e2309d46e7fb630dbcd1bd4ea001640bb86944e3bb1cbada63f2d",
      "import_edits": 0,
-     "sha256": "724001f2ef8e2309d46e7fb630dbcd1bd4ea001640bb86944e3bb1cbada63f2d"
+     "sha256": "64822ef5bd06be0d1b22c7cca9b4e7689e123fcd53539a9bdb8778d0bba0c2c8",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts_rubin64.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/moe/experts_runtime.py": {
+    "kernels/k3r_moe/ull/experts_runtime.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_runtime.py",
      "source_sha256": "785570886994615d972c73ecf94c8407f638a2ec406c793f5f7f2b9de9296686",
      "import_edits": 1,
-     "sha256": "cff9df70db5d64f5f3cf3dbf498eade3660dbe34fc42fb148b10e58deae40131"
+     "sha256": "9ae953247df0c65b37383d614c94828244303b93b5d005a43880a2648da4e6e4",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts_runtime.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/moe/experts_vw.py": {
+    "kernels/k3r_moe/ull/experts_vw.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_vw.py",
      "source_sha256": "f49b69919c2fee94896fcaa24099a59a8fe69740bcb18e338a44efd0449d9eda",
      "import_edits": 0,
-     "sha256": "f49b69919c2fee94896fcaa24099a59a8fe69740bcb18e338a44efd0449d9eda"
+     "sha256": "f3f6d9988287fefd64dbe6258affed82fb50591daef166346f681f8141a3fd15",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts_vw.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/moe/experts_wide.py": {
+    "kernels/k3r_moe/ull/experts_wide.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_wide.py",
      "source_sha256": "6eb5f422884790837b4b38496b614ce19cc8688e779491b1214dd51be371b409",
      "import_edits": 0,
-     "sha256": "6eb5f422884790837b4b38496b614ce19cc8688e779491b1214dd51be371b409"
+     "sha256": "69292c8130a4bd42180dc6074a70ac4426c1ebd36ad285af73a7df174708000c",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts_wide.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "specialized_decode/cutedsl/moe/front.py": {
+    "kernels/k3r_moe/ull/front.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front.py",
      "source_sha256": "5cd0defdb24e685ddca87e0765056e69d4696a27f4583bc34ad2832c57f9a1f0",
      "import_edits": 0,
-     "sha256": "3f21c117ae7739d4612afd60f456ed01d2f42d8d5c13847a350e9aa4c808673e",
-     "local_edits": "RouteSitu: where no role waits (the lean polled route and the copy roles, 9-64 rows) one thread executes griddepcontrol.wait after the late launch_dependents, so the grid completes only after its predecessors (MR8's transitive-completion invariant: SharedDown's h, kda.head POLLED_OUT). Rows up to 8 unchanged (const_expr)."
+     "sha256": "4a6139626f5e9dff1af012f071131c28493ad57e4936c21fa1e8a93c4fcd1993",
+     "local_edits": [
+      "RouteSitu: where no role waits (the lean polled route and the copy roles, 9-64 rows) one thread executes griddepcontrol.wait after the late launch_dependents, so the grid completes only after its predecessors (MR8's transitive-completion invariant: SharedDown's h, kda.head POLLED_OUT). Rows up to 8 unchanged (const_expr).",
+      "Updated import paths for the Kimi K3 family layout."
+     ],
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/front.py"
     },
-    "specialized_decode/cutedsl/moe/front_tmem.py": {
+    "kernels/k3r_moe/ull/front_tmem.py": {
      "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front_tmem.py",
      "source_sha256": "b41985d96be58cd8bc94c79bc0622e1957f6baded98ed310295b97e0f8fb8b6c",
      "import_edits": 0,
-     "sha256": "b41985d96be58cd8bc94c79bc0622e1957f6baded98ed310295b97e0f8fb8b6c"
-    },
-    "specialized_decode/cutedsl/moe/prepared.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/prepared.py",
-     "source_sha256": "73e79e31838aed2b40c404e4812fcd40fc6ccdabf14a3e5f1a838445a9d5ee32",
-     "import_edits": 4,
-     "sha256": "9f3c3ea1696f1525603430abf470c02713fe3fca19d8fd04d192a8d7b046ecc9"
-    },
-    "specialized_decode/cutedsl/moe/routing.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/routing.py",
-     "source_sha256": "1e56ace96e3ed012032923e3c8e4b6ffec524f80fdbdfb6e95c9843f7c172ed1",
-     "import_edits": 0,
-     "sha256": "1e56ace96e3ed012032923e3c8e4b6ffec524f80fdbdfb6e95c9843f7c172ed1"
-    },
-    "specialized_decode/cutedsl/moe/shared.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/shared.py",
-     "source_sha256": "06fab77c585a9e99b67cd87b9d3b4578b89c532c6b52839c170917572726a6d5",
-     "import_edits": 0,
-     "sha256": "06fab77c585a9e99b67cd87b9d3b4578b89c532c6b52839c170917572726a6d5"
-    },
-    "specialized_decode/cutedsl/moe/small_batch/__init__.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/__init__.py",
-     "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
-     "import_edits": 0,
-     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
-    },
-    "specialized_decode/cutedsl/moe/small_batch/chain.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/chain.py",
-     "source_sha256": "6f16c87b43ebe88869c46f93a7ab972f3ea80effe1c0782b2847b03ab2eed83c",
-     "import_edits": 0,
-     "sha256": "6f16c87b43ebe88869c46f93a7ab972f3ea80effe1c0782b2847b03ab2eed83c"
-    },
-    "specialized_decode/cutedsl/moe/small_batch/experts.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/experts.py",
-     "source_sha256": "40ef681004a0295d4508b18d8aa46b6fa2c04f8da0ea9f054f3e67b1ca8fd8aa",
-     "import_edits": 0,
-     "sha256": "40ef681004a0295d4508b18d8aa46b6fa2c04f8da0ea9f054f3e67b1ca8fd8aa"
-    },
-    "specialized_decode/cutedsl/moe/small_batch/front_tp16.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/front_tp16.py",
-     "source_sha256": "b25ae13012fcd1a532ed6885ceefc353fd89604622769673876f886cca429eae",
-     "import_edits": 0,
-     "sha256": "b25ae13012fcd1a532ed6885ceefc353fd89604622769673876f886cca429eae"
-    },
-    "specialized_decode/cutedsl/moe/small_batch/front_tp8.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/front_tp8.py",
-     "source_sha256": "c9c1b5ba5dd3b4299494b45b47a23ec43ba3dca753d3c25fa88c502da523ef12",
-     "import_edits": 0,
-     "sha256": "c9c1b5ba5dd3b4299494b45b47a23ec43ba3dca753d3c25fa88c502da523ef12"
-    },
-    "specialized_decode/cutedsl/moe/tail.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail.py",
-     "source_sha256": "30afbbadcfad6c25113471444b36fa4779ec5dc3d4cf1ac215e2a6b48f36bc9f",
-     "import_edits": 0,
-     "sha256": "30afbbadcfad6c25113471444b36fa4779ec5dc3d4cf1ac215e2a6b48f36bc9f"
-    },
-    "specialized_decode/cutedsl/moe/tail_rows.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_rows.py",
-     "source_sha256": "b59f35946a7c399b3029df6e899f76ecbdec944140e32a457f90e55ecdc30666",
-     "import_edits": 1,
-     "sha256": "0649f91d754256b7497bcdd1cbaf4991e0f4b8b08242688980e554737fe40598"
-    },
-    "specialized_decode/cutedsl/moe/tail_runtime.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_runtime.py",
-     "source_sha256": "fcc62c8e1dc5dc1ac382162904812a7c538c306c4fd4ca9fb192c26409059c4e",
-     "import_edits": 0,
-     "sha256": "fcc62c8e1dc5dc1ac382162904812a7c538c306c4fd4ca9fb192c26409059c4e"
-    },
-    "specialized_decode/cutedsl/moe/up_tmem.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/up_tmem.py",
-     "source_sha256": "250ad2a736c8563661baabca7bdf8e212b35c125eb8f29ed9e2d31f7b5ee57e3",
-     "import_edits": 0,
-     "sha256": "250ad2a736c8563661baabca7bdf8e212b35c125eb8f29ed9e2d31f7b5ee57e3"
-    },
-    "specialized_decode/cutedsl/oproj/__init__.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/__init__.py",
-     "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
-     "import_edits": 0,
-     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
-    },
-    "specialized_decode/cutedsl/oproj/consumer.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/consumer.py",
-     "source_sha256": "c5cd8671f99151180ff983299ce000f22b7053546de650d0ce489aee5a33d22a",
-     "import_edits": 0,
-     "sha256": "c5cd8671f99151180ff983299ce000f22b7053546de650d0ce489aee5a33d22a"
-    },
-    "specialized_decode/cutedsl/oproj/prepared.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/prepared.py",
-     "source_sha256": "2c2522b427aa84b7bd8b9189e56989d5c76da022ad0951f9ba007e3e7c1faf18",
-     "import_edits": 0,
-     "sha256": "2c2522b427aa84b7bd8b9189e56989d5c76da022ad0951f9ba007e3e7c1faf18"
-    },
-    "specialized_decode/cutedsl/oproj/producer.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/producer.py",
-     "source_sha256": "8c8b690c41e27f0d8f3b672d225fd1661bcdb471db89ec31eba916925bfe86ec",
-     "import_edits": 0,
-     "sha256": "8c8b690c41e27f0d8f3b672d225fd1661bcdb471db89ec31eba916925bfe86ec"
-    },
-    "specialized_decode/runtime/__init__.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/__init__.py",
-     "source_sha256": "0efa0642e5fd047e06f3ecbb92c74b7385ab01badfe6c1ab9f9bdc309a4a4a34",
-     "import_edits": 4,
-     "sha256": "7877a63add298a12892c88f84712fbea1b28a27a1acf33cf2578477d78260f3f"
-    },
-    "specialized_decode/runtime/prefetch.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/prefetch.py",
-     "source_sha256": "5bbaabd605381ba1170e12ef2ca3f686ab5aae3a80dd5f64445f964e6102d9a1",
-     "import_edits": 0,
-     "sha256": "5bbaabd605381ba1170e12ef2ca3f686ab5aae3a80dd5f64445f964e6102d9a1"
-    },
-    "specialized_decode/runtime/providers.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/providers.py",
-     "source_sha256": "d5a4277af648c0892726f26e0295c430b9c3ff382507d620a8845e05cfd610cf",
-     "import_edits": 4,
-     "sha256": "0628903a6ab0fd68877116588d1657890188a3e42059a5eeba17e5c16f2903e2",
+     "sha256": "db94b7a61a72742d378fcfb0ef29a5f4e7b538eb8d6354319f6bd2f25b633fae",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/front_tmem.py",
      "local_edits": [
-      "Keep the ULL KDA provider and drop unreachable MLA and wide paths.",
-      "Move head_batches here verbatim from the same MR8 revision's specialized_decode/runtime/decode.py."
+      "Updated import paths for the Kimi K3 family layout."
      ]
     },
-    "specialized_decode/shapes.py": {
-     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/shapes.py",
-     "source_sha256": "2a2f98334bd3f69063f3bfa18f3f485ff9b3d727aadaecf67ce30e4dfb4dc899",
-     "import_edits": 0,
-     "sha256": "2a2f98334bd3f69063f3bfa18f3f485ff9b3d727aadaecf67ce30e4dfb4dc899"
-    },
-    "nv_experts.py": {
+    "kernels/k3r_moe/ull/nv_experts.py": {
      "source": "kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/nv_experts.py",
      "source_sha256": "1389a0d316df0938c6012fd9a1ee03b0d4dd399af870b1687bc02391348ad2e8",
      "import_edits": 11,
-     "sha256": "507394bc61c8fd03dd55724e56ab18e3e97ce26b4130a5655a1c6f9a0452b326"
+     "sha256": "7e7886e898337e6e9741bcc0be121b1d0d2d2ad171e965b20803b1716f34d229",
+     "previous_path": "kernels/vendor/vllm_mr8/nv_experts.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     },
-    "nv_experts_runtime.py": {
+    "kernels/k3r_moe/ull/prepared.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/prepared.py",
+     "source_sha256": "73e79e31838aed2b40c404e4812fcd40fc6ccdabf14a3e5f1a838445a9d5ee32",
+     "import_edits": 4,
+     "sha256": "e4c8505de5595d95b9b91b853e9df7a7c1621720c5f05665b7d53c4555a45a4e",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/prepared.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_moe/ull/routing.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/routing.py",
+     "source_sha256": "1e56ace96e3ed012032923e3c8e4b6ffec524f80fdbdfb6e95c9843f7c172ed1",
+     "import_edits": 0,
+     "sha256": "0af7235572d10ee77671b2f957355406c3a8ddc4a7112edd99afc1211ca21282",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/routing.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_moe/ull/shared.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/shared.py",
+     "source_sha256": "06fab77c585a9e99b67cd87b9d3b4578b89c532c6b52839c170917572726a6d5",
+     "import_edits": 0,
+     "sha256": "9b19528b66e095365219b63fa312e501185c04948863cd98591744a4b9be33fd",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/shared.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_moe/ull/small_batch/__init__.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/__init__.py",
+     "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+     "import_edits": 0,
+     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/small_batch/__init__.py"
+    },
+    "kernels/k3r_moe/ull/small_batch/chain.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/chain.py",
+     "source_sha256": "6f16c87b43ebe88869c46f93a7ab972f3ea80effe1c0782b2847b03ab2eed83c",
+     "import_edits": 0,
+     "sha256": "2858aec1522b6a6384a4726daa19d7c2ffd4d432aa297de4f3b84fe0abb089a7",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/small_batch/chain.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_moe/ull/small_batch/experts.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/experts.py",
+     "source_sha256": "40ef681004a0295d4508b18d8aa46b6fa2c04f8da0ea9f054f3e67b1ca8fd8aa",
+     "import_edits": 0,
+     "sha256": "a5429de8d7a97d6b62087b2a5ede678a93b6959a7edc2a5c856575f424d97f46",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/small_batch/experts.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_moe/ull/small_batch/front_tp16.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/front_tp16.py",
+     "source_sha256": "b25ae13012fcd1a532ed6885ceefc353fd89604622769673876f886cca429eae",
+     "import_edits": 0,
+     "sha256": "526bdd5c493f9a836f21c05a779af8b5d7c2856b5fa3d874aa486f9467083750",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/small_batch/front_tp16.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_moe/ull/small_batch/front_tp8.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/front_tp8.py",
+     "source_sha256": "c9c1b5ba5dd3b4299494b45b47a23ec43ba3dca753d3c25fa88c502da523ef12",
+     "import_edits": 0,
+     "sha256": "83257d5540801c839da6ff3293ef7f359bc1ac4905da34aced12f77e6628eb5f",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/small_batch/front_tp8.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_moe/ull/tail.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail.py",
+     "source_sha256": "30afbbadcfad6c25113471444b36fa4779ec5dc3d4cf1ac215e2a6b48f36bc9f",
+     "import_edits": 0,
+     "sha256": "ca5215d142588540f5bd5b9e1ff07380bba1ba5159f29fb000ac256f6d84337b",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/tail.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_moe/ull/tail_rows.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_rows.py",
+     "source_sha256": "b59f35946a7c399b3029df6e899f76ecbdec944140e32a457f90e55ecdc30666",
+     "import_edits": 1,
+     "sha256": "32d1239d225e673a96951d9a9577f1e0c092a71ec92cc9a13bb2fb1b0af4f0ee",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/tail_rows.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_moe/ull/tail_runtime.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_runtime.py",
+     "source_sha256": "fcc62c8e1dc5dc1ac382162904812a7c538c306c4fd4ca9fb192c26409059c4e",
+     "import_edits": 0,
+     "sha256": "ced8972425fe50e33615ac5defe2e08ce8d45fb1b22874d63a4906cdda4cded9",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/tail_runtime.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_moe/ull/up_tmem.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/up_tmem.py",
+     "source_sha256": "250ad2a736c8563661baabca7bdf8e212b35c125eb8f29ed9e2d31f7b5ee57e3",
+     "import_edits": 0,
+     "sha256": "ac5c64f81509e579974929cc0a3f0d90f3c7e9577d9bd00c17cc2c6c8b7aa345",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/up_tmem.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_oproj/ull/__init__.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/__init__.py",
+     "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+     "import_edits": 0,
+     "sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/oproj/__init__.py"
+    },
+    "kernels/k3r_oproj/ull/consumer.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/consumer.py",
+     "source_sha256": "c5cd8671f99151180ff983299ce000f22b7053546de650d0ce489aee5a33d22a",
+     "import_edits": 0,
+     "sha256": "0205e7bf4ba0944f544633466bd5c0223f2ba1db4001782ee99d54b595dafef9",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/oproj/consumer.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_oproj/ull/prepared.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/prepared.py",
+     "source_sha256": "2c2522b427aa84b7bd8b9189e56989d5c76da022ad0951f9ba007e3e7c1faf18",
+     "import_edits": 0,
+     "sha256": "7d2112104ab09c348d177605628c3ada8ac12e34432670c425f59a4f9650efab",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/oproj/prepared.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "kernels/k3r_oproj/ull/producer.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/producer.py",
+     "source_sha256": "8c8b690c41e27f0d8f3b672d225fd1661bcdb471db89ec31eba916925bfe86ec",
+     "import_edits": 0,
+     "sha256": "bc60495ff3d3449eb82e2ab76ed90813d6db811ebabe85b4c41ee877b9266cf3",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/oproj/producer.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "ops/chain/k3_ull_decode_config.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/__init__.py",
+     "source_sha256": "0efa0642e5fd047e06f3ecbb92c74b7385ab01badfe6c1ab9f9bdc309a4a4a34",
+     "import_edits": 4,
+     "sha256": "c1179d412612d614f7088b5858924b2923ffdd481b6cd87c6c4decb824453ce0",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/runtime/__init__.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "ops/chain/k3_ull_prefetch.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/prefetch.py",
+     "source_sha256": "5bbaabd605381ba1170e12ef2ca3f686ab5aae3a80dd5f64445f964e6102d9a1",
+     "import_edits": 0,
+     "sha256": "48358db5f99e02ab2812482edafdde5c4e405c365e7963dd6fdd7c3f42df6d44",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/runtime/prefetch.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "ops/chain/k3_ull_providers.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/providers.py",
+     "source_sha256": "d5a4277af648c0892726f26e0295c430b9c3ff382507d620a8845e05cfd610cf",
+     "import_edits": 4,
+     "sha256": "f7c480745f3a2bb4eac67fad3a14e30b839d127089dfe9c36ac7ebd1967c3544",
+     "local_edits": [
+      "Keep the ULL KDA provider and drop unreachable MLA and wide paths.",
+      "Move head_batches here verbatim from the same MR8 revision's specialized_decode/runtime/decode.py.",
+      "Updated import paths for the Kimi K3 family layout."
+     ],
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/runtime/providers.py"
+    },
+    "ops/common/k3_ull_compat.py": {
+     "source": "TensorRT-LLM compatibility module",
+     "previous_path": "kernels/vendor/vllm_mr8/_compat.py",
+     "sha256": "d15f027620b309a91e7f9f64c3d6f5b62510dc5fae43d4ef26b562530f481480"
+    },
+    "ops/common/k3_ull_compat_custom_ops.py": {
+     "source": "TensorRT-LLM compatibility module",
+     "previous_path": "kernels/vendor/vllm_mr8/_compat_custom_ops.py",
+     "sha256": "cb96de731060edbe143d25728a871167dac921b2ee001e16f60a0af5e8bc8c15"
+    },
+    "ops/common/k3_ull_compat_envs.py": {
+     "source": "TensorRT-LLM compatibility module",
+     "previous_path": "kernels/vendor/vllm_mr8/_compat_envs.py",
+     "sha256": "4284d71153ed23355a5f84575d359fcb9f1a34965af292b4c1c47d83c51c0514"
+    },
+    "ops/common/k3_ull_cute_host.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/host.py",
+     "source_sha256": "09223f516860b83c3bd1357879337f1c4593c00c61ff51231d5d8e69d5d038ac",
+     "import_edits": 1,
+     "sha256": "f175b3c8fbe63240bb3c17c6c022562e1649a70d61aaccaaf4c4087829105f7f",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/host.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "ops/common/k3_ull_decode_shapes.py": {
+     "source": "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/shapes.py",
+     "source_sha256": "2a2f98334bd3f69063f3bfa18f3f485ff9b3d727aadaecf67ce30e4dfb4dc899",
+     "import_edits": 0,
+     "sha256": "b1d2c211e125accb6169c38a51bf0aac7dbf011bd8a19b02cf89e7f5e25937a9",
+     "previous_path": "kernels/vendor/vllm_mr8/specialized_decode/shapes.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
+    },
+    "ops/moe/k3_ull_nv_experts_runtime.py": {
      "source": "kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/nv_experts_runtime.py",
      "source_sha256": "cf68509f9df4c5270904445389cdad2d9fcb5451ba96d8b0da17755d2f576419",
      "import_edits": 11,
-     "sha256": "b6f507606ce42e16c0c60506f2cdcc2c6cbcdfce218b6c3051dc0f596db1e25e"
+     "sha256": "1567cc628a63f3c22f801b0ef4dd484d575e3ff1bd2887f496d07e2524a80680",
+     "previous_path": "kernels/vendor/vllm_mr8/nv_experts_runtime.py",
+     "local_edits": [
+      "Updated import paths for the Kimi K3 family layout."
+     ]
     }
+   },
+   "path_base": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl",
+   "retired_package_files": {
+    "kernels/vendor/__init__.py": "e9ea355ea0537c8a4f3f97c65530a02efb7caf60a4e374b3e9fc7afefafcc6e5",
+    "kernels/vendor/vllm_mr8/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "kernels/vendor/vllm_mr8/ops/__init__.py": "cdbba4afa56174a54a920fcbc47bc644b479278f69b58cdda361b910434cc881",
+    "kernels/vendor/vllm_mr8/ops/cute_dsl/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "kernels/vendor/vllm_mr8/ops/cute_dsl/latent_moe_tail/__init__.py": "dea3c9fed099457bc28b1b3148980d57e9e2b296f364f59547856181a465b7ed",
+    "kernels/vendor/vllm_mr8/specialized_decode/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
    }
   }
  },

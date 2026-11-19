@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The MR8 decode kernel chain's per-layer entry points (``kernels/mr8``, through ``chain.K3UllChain``).
+"""The MR8 decode kernel chain's per-layer entry points (``kernels/k3r_*/ull/``, through ``chain.K3UllChain``).
 
 The chain is one persistent run of fixed-shape decode kernels per step over the target's layers:
 every KDA + MoE layer whole (in-projection, KDA verify, o-projection, MoE), the MoE of every MLA
