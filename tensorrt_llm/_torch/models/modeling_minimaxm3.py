@@ -2041,8 +2041,8 @@ class MiniMaxM3Attention(Attention):
                 v_padded = v_padded.repeat_interleave(group, dim=2)
             # Prefill: build [total_q, max_k] mask using q_positions / q_batch_row.
             # Prefill never runs inside the CUDA-graph capture window
-            # (capture is decode-only), so the per-batch Python loop and
-            # the ``.tolist()`` below are acceptable.
+            # (capture is decode-only), so the per-batch Python loop below
+            # is acceptable.
             assert m3_meta.q_batch_row is not None and m3_meta.q_positions is not None, (
                 "prefill metadata requires q_batch_row + q_positions; call .prepare()"
             )
@@ -2058,7 +2058,10 @@ class MiniMaxM3Attention(Attention):
             # Easiest path: SDPA expects [batch, num_heads, q_len, head_dim].
             # We process each batch row independently to keep the math straightforward.
             output_view = output.view(-1, self.num_heads, self.head_dim)
-            cu = m3_meta.cu_seqlens_q.to(torch.long).tolist()
+            # Rebuild cu_seqlens_q from its host source so the loop bounds need no GPU read.
+            cu = [0]
+            for ext in m3_meta.extend_seq_lens_cpu:
+                cu.append(cu[-1] + int(ext))
             for b in range(batch):
                 start, end = cu[b], cu[b + 1]
                 if end <= start:
