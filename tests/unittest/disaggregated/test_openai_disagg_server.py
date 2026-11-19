@@ -381,9 +381,12 @@ def streaming_server(tmp_path):
         yield server
 
 
-def _streaming_raw_request() -> Request:
+def _streaming_raw_request(disconnected: asyncio.Event | None = None) -> Request:
     async def receive() -> Message:
-        await asyncio.Future()
+        if disconnected is None:
+            await asyncio.Future()
+        else:
+            await disconnected.wait()
         return {"type": "http.disconnect"}
 
     request = Request({"type": "http", "headers": []}, receive=receive)
@@ -394,6 +397,7 @@ def _streaming_raw_request() -> Request:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel_task", [False, True])
 async def test_first_chunk_wait_cancels_and_closes_upstream(cancel_task: bool) -> None:
+    """A disconnect raises `_ClientDisconnected`; a cancelled handler stays cancelled."""
     started = asyncio.Event()
     closed = asyncio.Event()
     disconnected = asyncio.Event()
@@ -419,12 +423,49 @@ async def test_first_chunk_wait_cancels_and_closes_upstream(cancel_task: bool) -
     await asyncio.wait_for(started.wait(), timeout=1)
     if cancel_task:
         task.cancel()
+        expected_error = asyncio.CancelledError
     else:
         disconnected.set()
-    with pytest.raises(asyncio.CancelledError):
+        expected_error = openai_disagg_server._ClientDisconnected
+    with pytest.raises(expected_error):
         await asyncio.wait_for(task, timeout=1)
     assert closed.is_set()
     assert listener_closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_before_first_chunk_ends_request_quietly(streaming_server):
+    """An early disconnect returns a plain response instead of raising into the ASGI server."""
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    disconnected = asyncio.Event()
+
+    async def generation_stream():
+        try:
+            started.set()
+            await asyncio.Future()
+            yield b"unreachable"
+        finally:
+            closed.set()
+
+    async def entry_point(request, hooks):
+        return generation_stream()
+
+    metrics = streaming_server._perf_metrics_collector
+    wrapper = streaming_server._wrap_entry_point(entry_point, CompletionRequest)
+    task = asyncio.create_task(
+        wrapper(_stream_request("completion"), _streaming_raw_request(disconnected))
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    disconnected.set()
+    response = await asyncio.wait_for(task, timeout=1)
+
+    assert not isinstance(response, StreamingResponse)
+    assert response.status_code == 499
+    assert closed.is_set()
+    metrics.total_responses.inc.assert_not_called()
+    metrics.internal_errors.inc.assert_not_called()
+    metrics.http_exceptions.inc.assert_not_called()
 
 
 @pytest.mark.asyncio

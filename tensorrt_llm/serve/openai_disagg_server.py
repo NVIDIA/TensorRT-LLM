@@ -113,6 +113,16 @@ _CLOCK_SYNC_TOTAL_BUDGET_SECONDS = 15.0
 # strictly better than applying it.
 _CLOCK_SYNC_MAX_DELAY_SECONDS = 0.010
 
+# nginx's "client closed request" status, for a request whose client left
+# before its response started. No client reads it; it only labels the request
+# for middleware.
+_CLIENT_CLOSED_REQUEST_STATUS = 499
+
+
+class _ClientDisconnected(Exception):
+    """The client closed its connection before the response started."""
+
+
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, queue_latency_metric,
                  collect_perf_metrics: bool):
@@ -487,6 +497,10 @@ class OpenAIDisaggServer:
                 # by_alias: e.g. text.format.schema goes out under its wire name.
                 return JSONResponse(
                     content=response_or_generator.model_dump(by_alias=True))
+            except _ClientDisconnected:
+                # The upstream stream is already closed; end the request
+                # quietly instead of raising into the ASGI server.
+                return Response(status_code=_CLIENT_CLOSED_REQUEST_STATUS)
             except Exception as e:
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
@@ -511,6 +525,10 @@ class OpenAIDisaggServer:
         Returns:
             `stream` itself when it is already exhausted; otherwise a started
             relay that yields the first chunk and then the rest of `stream`.
+
+        Raises:
+            _ClientDisconnected: The client left before the first chunk;
+                `stream` is closed.
         """
         async def wait_for_disconnect() -> None:
             while True:
@@ -527,7 +545,7 @@ class OpenAIDisaggServer:
                 return_when=asyncio.FIRST_COMPLETED)
             if disconnect_task in done:
                 disconnect_task.result()
-                raise asyncio.CancelledError
+                raise _ClientDisconnected()
             try:
                 first_chunk = first_chunk_task.result()
             except StopAsyncIteration:
