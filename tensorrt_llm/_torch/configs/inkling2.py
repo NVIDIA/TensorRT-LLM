@@ -81,9 +81,15 @@ class Inkling2TextConfig(PretrainedConfig):
 
     def __setattr__(self, key, value):
         if key in _DERIVATION_SOURCES and "layer_types" in self.__dict__:
-            # Validate against the new value before anything changes, then keep the derived
+            fields = {**self.__dict__, key: value}
+            if key == "num_hidden_layers" and fields["local_layer_ids"] is not None:
+                # A smaller model (the `model_kwargs` shrink idiom) keeps the explicit
+                # sliding-window layers it still has; an explicit `local_layer_ids` outside the
+                # layers is still refused.
+                fields["local_layer_ids"] = [i for i in fields["local_layer_ids"] if int(i) < value]
+            # Validate against the new values before anything changes, then keep the derived
             # attributes in step with their sources.
-            derived = self._derived({**self.__dict__, key: value})
+            derived = self._derived(fields)
             super().__setattr__(key, value)
             self.__dict__.update(derived)
         else:

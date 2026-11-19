@@ -161,7 +161,9 @@ def check_architecture_registered(
     `model_kwargs["architectures"]`, when set, is checked instead of the checkpoint's,
     since it overrides the config the engine builds from. A custom `checkpoint_loader`
     is not checked: its `load_config()` decides the architecture. An architecture that
-    only Modeling V2 implements counts as registered unless `modeling_v2` is `off`.
+    only Modeling V2 implements counts as registered unless `modeling_v2` is `off`. The
+    model-zoo check accepts any entry of `architectures`, while the Modeling V2 check reads
+    only `architectures[0]`, the entry the router keys on.
 
     Args:
         llm_args: The resolved LLM arguments.
