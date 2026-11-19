@@ -555,7 +555,9 @@ def test_kimi_k3_moe_split_selection() -> None:
     assert KimiK3MoERuntime._select_moe_tp_ep(tep) == (4, 2)
 
 
-@pytest.mark.parametrize("backend", ["CUTLASS", "TRTLLM", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"])
+@pytest.mark.parametrize(
+    "backend", ["CUTLASS", "TRTLLM", "PRIMS_TS", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
+)
 def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
@@ -1392,7 +1394,7 @@ def test_tp16_nvfp4_padded_loaders_preserve_rank_ownership():
 #: importing ``cute_dsl_utils`` pulls in the DSL package, which appends its own
 #: directory to ``sys.path``, and this repository fails the whole pytest
 #: session when a test file does that at collection time.
-_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL", "CUTEDSL_FC12"]
+_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL", "CUTEDSL_FC12", "PRIMS_TS"]
 
 
 def _skip_if_backend_unavailable(moe_backend):
@@ -1403,6 +1405,21 @@ def _skip_if_backend_unavailable(moe_backend):
     early puts the wheel's package directory on ``sys.path`` for every other
     test file in the session.
     """
+    if moe_backend == "PRIMS_TS":
+        from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
+            MoEDep,
+            collect_moe_environment,
+        )
+
+        # The same machine gates the PrimsTS leaves apply.
+        env = collect_moe_environment()
+        if (
+            env.sm not in (100, 103, 107)
+            or not env.has_dep(MoEDep.PRIMS_TS.value)
+            or (env.sm == 107 and not env.has_dep(MoEDep.CUTEDSL_RUBIN.value))
+        ):
+            pytest.skip("PrimsTS MoE needs SM100/SM103/SM107 and the CuTe DSL task scheduling")
+        return
     if moe_backend == "CUTEDSL_FC12":
         from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
@@ -2127,6 +2144,72 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
         f"norm ratio away from 1.0 with cosine intact is a scaling fault, "
         f"which cosine alone cannot see. If both look right, the residual has "
         f"gained a quantization stage -- sqrt(4)*0.0950 is 0.190"
+    )
+
+
+@nvfp4_moe_supported
+@pytest.mark.parametrize("moe_backend", ["TRTLLM", "PRIMS_TS"])
+def test_nvfp4_situ_linear_softcap_binds(moe_backend: str) -> None:
+    """A linear soft-cap that saturates must reach the epilogue unscaled.
+
+    ``NVFP4TRTLLMGenFusedMoEBaseMethod`` divides ``act_beta`` by ``fc31_alpha``,
+    the accumulator units SwiGLU's additive beta needs, but SiTU caps the
+    dequantized half, so both backends built on that method put the cap back.
+    The test above cannot see a cap left divided: its cap of 25 sits far above
+    the activations (sigma ~1.5). A cap of 1.0 saturates them, while the same
+    cap divided by ``fc31_alpha`` (~1e-4 here) caps nothing: measured 0.175
+    relative L2 with the cap restored, 1.17 with it left divided.
+    """
+    _skip_if_backend_unavailable(moe_backend)
+    gate_softcap, linear_softcap = 4.0, 1.0
+    num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
+    gate = _make_test_gate(num_experts=num_experts)
+
+    torch.manual_seed(91)
+    x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+
+    def experts(rows: int, cols: int) -> list[torch.Tensor]:
+        return [
+            torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda") * 0.05
+            for _ in range(num_experts)
+        ]
+
+    w1, w3, w2 = experts(inter, hidden), experts(inter, hidden), experts(hidden, inter)
+    bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], 1.0) for e in range(num_experts)]
+    moe = _make_nvfp4_moe(
+        gate,
+        num_experts=num_experts,
+        moe_backend=moe_backend,
+        gate_softcap=gate_softcap,
+        linear_softcap=linear_softcap,
+    )
+    _load_nvfp4_bank_for(moe, bank, moe_backend)
+
+    router_logits = gate.compute_logits(x)
+    actual = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
+    dq = [_dequantize_expert_bank(b) for b in bank]
+    w1q, w2q, w3q = ([d[i] for d in dq] for i in range(3))
+    situ = _situ_reference_moe(
+        x,
+        router_logits,
+        gate.routing_method,
+        w1q,
+        w2q,
+        w3q,
+        beta=gate_softcap,
+        linear_beta=linear_softcap,
+    )
+    rel_l2 = (torch.linalg.vector_norm(actual - situ) / torch.linalg.vector_norm(situ)).item()
+    norm_ratio = (torch.linalg.vector_norm(actual) / torch.linalg.vector_norm(situ)).item()
+    print(
+        f"NVFP4[{moe_backend}] linear_softcap={linear_softcap}: rel_l2={rel_l2:.6f} "
+        f"|k|/|ref|={norm_ratio:.6f}"
+    )
+    assert rel_l2 < _SITU_NVFP4_REL_L2_MAX, (
+        f"the NVFP4 {moe_backend} kernel is {rel_l2:.6f} relative L2 from the SiTU "
+        f"reference with a saturating linear cap (|k|/|ref|={norm_ratio:.6f}); a "
+        f"norm ratio well above 1.0 means the cap reached the kernel divided by "
+        f"fc31_alpha"
     )
 
 

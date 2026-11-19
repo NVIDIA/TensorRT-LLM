@@ -53,6 +53,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import find_marlin_leaf, marlin_leaf
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_prims_ts import find_prims_ts_leaf, prims_ts_leaf
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     find_trtllm_gen_leaf,
     trtllm_gen_leaf,
@@ -94,6 +95,7 @@ class MoeBackendType(str, Enum):
     MEGAMOE_CUTEDSL = "MEGAMOE_CUTEDSL"
     CUTE_DSL_B12X = "CUTE_DSL_B12X"
     MARLIN = "MARLIN"
+    PRIMS_TS = "PRIMS_TS"
 
 
 def get_backend_class(
@@ -112,6 +114,7 @@ def get_backend_class(
             MoeBackendType.CUTLASS: cutlass_leaf,
             MoeBackendType.TRTLLM: trtllm_gen_leaf,
             MoeBackendType.MARLIN: marlin_leaf,
+            MoeBackendType.PRIMS_TS: prims_ts_leaf,
             MoeBackendType.CUTEDSL: cutedsl_grouped_gemm_leaf,
         }.get(backend_type)
         if raising_lookup is None:
@@ -127,7 +130,7 @@ def find_backend_class(
 ) -> type[MoE] | None:
     """The MoE backend class, or ``None`` if the family has no leaf for the format.
 
-    ``CUTLASS``, ``TRTLLM``, ``MARLIN``, ``CUTEDSL`` and ``CUTE_DSL_B12X`` are
+    ``CUTLASS``, ``TRTLLM``, ``MARLIN``, ``PRIMS_TS``, ``CUTEDSL`` and ``CUTE_DSL_B12X`` are
     not one class each but sets of leaves keyed by quant, so each needs
     ``quant_algo``. CUTLASS publishes ``fp8_block_scales`` twice, once per SM
     family, so for that format the leaf is the one this device runs.
@@ -144,6 +147,8 @@ def find_backend_class(
         return find_trtllm_gen_leaf(quant_algo)
     if backend_type is MoeBackendType.MARLIN:
         return find_marlin_leaf(quant_algo)
+    if backend_type is MoeBackendType.PRIMS_TS:
+        return find_prims_ts_leaf(quant_algo)
     if backend_type is MoeBackendType.CUTEDSL:
         return find_cutedsl_grouped_gemm_leaf(quant_algo)
     if backend_type is MoeBackendType.CUTE_DSL_B12X:
@@ -1428,8 +1433,8 @@ def should_skip_to_accelerate_ci(
     all combinations run (local exhaustive testing).
 
     Rules applied (in order):
-    0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16 and
-       locality domain CuteDSL BF16 coverage enabled.
+    0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16, PRIMS_TS
+       BF16 and locality domain CuteDSL BF16 coverage enabled.
     0a. MARLIN backend: only NVFP4 on Ada/Hopper (SM89-SM99); skip all other
         quant_algo / architecture combinations.
     1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
@@ -1459,10 +1464,10 @@ def should_skip_to_accelerate_ci(
         return None
 
     # --- Rule 0: Skip gated and unquantized (quant=None) for most backends ---
-    # Keep TRTLLM BF16, and CuteDSL BF16 with locality domain for the dedicated
-    # locality domain backend matrix.
+    # Keep TRTLLM BF16, PRIMS_TS BF16 (one of its three leaves), and CuteDSL BF16
+    # with locality domain for the dedicated locality domain backend matrix.
     keeps_unquantized_bf16_coverage = dtype == torch.bfloat16 and (
-        backend_type == MoeBackendType.TRTLLM
+        backend_type in (MoeBackendType.TRTLLM, MoeBackendType.PRIMS_TS)
         or (backend_type == MoeBackendType.CUTEDSL and enable_locality_domains)
     )
     if (

@@ -5503,6 +5503,11 @@ def run_backend_moe(
             args["token_selected_experts"] = None
             args["token_final_scales"] = None
         # else: use token_selected_experts and token_final_scales (already set)
+    elif backend_type == MoeBackendType.PRIMS_TS:
+        # The scheduler casts to the declared routing-scale dtype.
+        args["token_final_scales"] = token_final_scales.to(
+            backend.input_requirement.routing_scales_dtype
+        )
     elif backend_type == MoeBackendType.DEEPGEMM:
         import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 
@@ -5560,6 +5565,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.CUTE_DSL_B12X,
     MoeBackendType.MARLIN,
     MoeBackendType.CUTEDSL_FC12,
+    MoeBackendType.PRIMS_TS,
 ]
 
 # Data types to test

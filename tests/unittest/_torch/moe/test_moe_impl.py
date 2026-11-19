@@ -33,6 +33,7 @@ import torch
 from _torch.moe.moe_test_utils import MoeBackendType
 from pydantic import ValidationError
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.model_config import ModelConfig, MoESelection
 from tensorrt_llm._torch.moe.fused_moe import moe_resolution
 from tensorrt_llm._torch.moe.fused_moe.activation import (
@@ -89,6 +90,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_prims_ts import PrimsTsFusedMoE, find_prims_ts_leaf
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
@@ -132,6 +134,11 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     moe_impl_request,
     mxfp4_quant_algo,
     resolve_moe_impl,
+)
+from tensorrt_llm._torch.moe.fused_moe.prims_ts import (
+    FlashinferPrimsTsBf16Impl,
+    FlashinferPrimsTsNvfp4Impl,
+    FlashinferPrimsTsW4a8Mxfp4Mxfp8Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod, RoutingMethodType
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
@@ -1095,6 +1102,258 @@ def test_pinned_marlin_identity_resolves_to_its_leaf(quant_algo, impl_id):
         report = resolve_moe_impl(_marlin_model_config(quant_algo), impl_id=impl_id)
     assert impl_class_for(report).descriptor.identity.canonical() == impl_id
     assert report.selected_by == "pinned"
+
+
+# =====================================================================
+# PrimsTS: one leaf per format over one launch path
+# =====================================================================
+# The leaves share ``PrimsTsFusedMoEBase.run_moe``; each publishes the format
+# its TRTLLM-Gen weight method lays out and keeps the hidden size unpadded.
+
+# SiTU carries its two soft caps in the alpha/beta registers.
+_SITU_ACTIVATION = ActivationType.SiTu.name
+_SITU_CONSTANTS = frozenset({"alpha", "beta"})
+
+# Every PrimsTS leaf's declarations, written out by hand: the format, the
+# hidden-size and per-rank intermediate multiples its gates require, and the
+# activation kinds it reaches.
+_PRIMS_TS_DECLARATIONS = (
+    pytest.param(
+        FlashinferPrimsTsBf16Impl,
+        None,
+        "flashinfer.prims_ts.batched_gemm.none",
+        128,
+        128,
+        {ActivationType.Swiglu},
+        id="none",
+    ),
+    pytest.param(
+        FlashinferPrimsTsNvfp4Impl,
+        QuantAlgo.NVFP4,
+        "flashinfer.prims_ts.batched_gemm.nvfp4",
+        128,
+        16,
+        {ActivationType.Swiglu, ActivationType.SiTu},
+        id="nvfp4",
+    ),
+    pytest.param(
+        FlashinferPrimsTsW4a8Mxfp4Mxfp8Impl,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+        "flashinfer.prims_ts.batched_gemm.w4a8_mxfp4_mxfp8",
+        512,
+        32,
+        {ActivationType.Swiglu, ActivationType.SiTu},
+        id="w4a8_mxfp4_mxfp8",
+    ),
+)
+
+_PRIMS_TS_LEAVES = (
+    FlashinferPrimsTsBf16Impl,
+    FlashinferPrimsTsNvfp4Impl,
+    FlashinferPrimsTsW4a8Mxfp4Mxfp8Impl,
+)
+
+
+def _prims_ts_environment(
+    sm: int = 100, *, rubin: bool = True, prims_ts: bool = True
+) -> MoEEnvironment:
+    deps = []
+    if prims_ts:
+        deps.append(MoEDep.PRIMS_TS.value)
+    if rubin:
+        deps.append(MoEDep.CUTEDSL_RUBIN.value)
+    return MoEEnvironment(sm=sm, available_deps=tuple(deps))
+
+
+def _prims_ts_problem(leaf: type, hidden_size: int = 4096, **overrides: object) -> MoEProblem:
+    return MoEProblem(
+        quant=canonical_quant(_PRIMS_TS_QUANT[leaf]),
+        dtype_act=torch.bfloat16,
+        hidden_size=hidden_size,
+        intermediate_size=2048,
+        **overrides,
+    )
+
+
+_PRIMS_TS_QUANT = {
+    FlashinferPrimsTsBf16Impl: None,
+    FlashinferPrimsTsNvfp4Impl: QuantAlgo.NVFP4,
+    FlashinferPrimsTsW4a8Mxfp4Mxfp8Impl: QuantAlgo.W4A8_MXFP4_MXFP8,
+}
+
+
+def _prims_ts_model_config(quant_algo: QuantAlgo | None = QuantAlgo.NVFP4) -> ModelConfig:
+    cfg = ModelConfig()
+    cfg.moe_backend = "PRIMS_TS"
+    cfg.quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo else None
+    return cfg
+
+
+@pytest.mark.parametrize(
+    "leaf, quant_algo, impl_id, hidden_alignment, shard_alignment, kinds", _PRIMS_TS_DECLARATIONS
+)
+def test_prims_ts_leaf_declarations(
+    leaf: type,
+    quant_algo: QuantAlgo | None,
+    impl_id: str,
+    hidden_alignment: int,
+    shard_alignment: int,
+    kinds: set[ActivationType],
+) -> None:
+    assert "descriptor" in vars(leaf)
+    assert leaf.descriptor.identity.canonical() == impl_id
+    assert MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id)) is leaf
+    assert find_prims_ts_leaf(quant_algo) is leaf
+    assert not leaf.__abstractmethods__
+    assert issubclass(leaf, PrimsTsFusedMoE)
+    assert leaf.scheduler_kind is MoESchedulerKind.EXTERNAL_COMM
+    assert leaf.capabilities == MoEStaticCapability()
+    assert leaf.input_requirement.routing_scales_dtype is torch.bfloat16
+    assert leaf.hidden_size_alignment == hidden_alignment
+    assert leaf.intermediate_shard_alignment == shard_alignment
+    assert set(leaf.activation_support.kinds) == kinds
+    assert backend_family_of(leaf) == "PRIMS_TS"
+
+
+def test_prims_ts_registers_exactly_its_leaves() -> None:
+    registered = {
+        MOE_IMPL_REGISTRY.lookup(identity)
+        for identity in MOE_IMPL_REGISTRY.identities()
+        if identity.technique == "prims_ts"
+    }
+    assert registered == set(_PRIMS_TS_LEAVES) == BACKEND_FAMILY["PRIMS_TS"]
+
+
+def test_prims_ts_parent_is_abstract_and_unaddressable() -> None:
+    assert "descriptor" not in vars(PrimsTsFusedMoE)
+    assert "can_implement" not in vars(PrimsTsFusedMoE)
+    assert PrimsTsFusedMoE.__abstractmethods__
+
+
+@pytest.mark.parametrize("leaf", _PRIMS_TS_LEAVES)
+@pytest.mark.parametrize("sm", [100, 103, 107])
+def test_prims_ts_leaf_admits_its_format_on_the_sm100_family(leaf: type, sm: int) -> None:
+    verdict = leaf.can_implement(
+        _prims_ts_problem(leaf), _single_rank_deployment(_prims_ts_environment(sm))
+    )
+    assert verdict.eligible, verdict.detail
+
+
+@pytest.mark.parametrize(
+    "env, reason",
+    [
+        pytest.param(_prims_ts_environment(90), MoERejectReason.SM_UNSUPPORTED, id="sm90"),
+        pytest.param(_prims_ts_environment(120), MoERejectReason.SM_UNSUPPORTED, id="sm120"),
+        pytest.param(
+            _prims_ts_environment(100, prims_ts=False), MoERejectReason.DEP_MISSING, id="no_dsl"
+        ),
+        pytest.param(
+            _prims_ts_environment(107, rubin=False),
+            MoERejectReason.DEP_MISSING,
+            id="sm107_no_rubin",
+        ),
+    ],
+)
+@pytest.mark.parametrize("leaf", _PRIMS_TS_LEAVES)
+def test_prims_ts_leaf_declines_a_machine_it_cannot_run_on(
+    leaf: type, env: MoEEnvironment, reason: MoERejectReason
+) -> None:
+    verdict = leaf.can_implement(_prims_ts_problem(leaf), _single_rank_deployment(env))
+    assert not verdict.eligible
+    assert verdict.reject_reason is reason
+
+
+@pytest.mark.parametrize(
+    "problem_overrides, deployment_overrides, reason",
+    [
+        pytest.param({}, {"eplb_enabled": True}, MoERejectReason.EPLB_UNSUPPORTED, id="eplb"),
+        pytest.param({}, {"moe_lora_enabled": True}, MoERejectReason.LORA_UNSUPPORTED, id="lora"),
+        pytest.param({}, {"cluster_size": 2}, MoERejectReason.TOPOLOGY_UNSUPPORTED, id="cluster"),
+        pytest.param({"bias": True}, {}, MoERejectReason.ACTIVATION_UNSUPPORTED, id="bias"),
+        pytest.param(
+            {"dtype_act": torch.float16}, {}, MoERejectReason.DTYPE_UNSUPPORTED, id="fp16"
+        ),
+    ],
+)
+@pytest.mark.parametrize("leaf", _PRIMS_TS_LEAVES)
+def test_prims_ts_leaf_declines_what_its_kernels_do_not_run(
+    leaf: type,
+    problem_overrides: dict[str, object],
+    deployment_overrides: dict[str, object],
+    reason: MoERejectReason,
+) -> None:
+    problem = dataclasses.replace(_prims_ts_problem(leaf), **problem_overrides)
+    deployment = dataclasses.replace(
+        _single_rank_deployment(_prims_ts_environment()), **deployment_overrides
+    )
+    verdict = leaf.can_implement(problem, deployment)
+    assert not verdict.eligible
+    assert verdict.reject_reason is reason
+
+
+@pytest.mark.parametrize(
+    "leaf, hidden_size, eligible",
+    [
+        # The NVFP4 weight method pads a hidden size above 1024 to 256.
+        pytest.param(FlashinferPrimsTsNvfp4Impl, 896, True, id="nvfp4_896"),
+        pytest.param(FlashinferPrimsTsNvfp4Impl, 2176, False, id="nvfp4_2176"),
+        pytest.param(FlashinferPrimsTsNvfp4Impl, 3584, True, id="nvfp4_3584"),
+        # The MXFP4 weight method pads FC1's input to 512.
+        pytest.param(FlashinferPrimsTsW4a8Mxfp4Mxfp8Impl, 2304, False, id="mxfp4_2304"),
+        pytest.param(FlashinferPrimsTsW4a8Mxfp4Mxfp8Impl, 3584, True, id="mxfp4_3584"),
+        pytest.param(FlashinferPrimsTsBf16Impl, 2880, False, id="bf16_2880"),
+        pytest.param(FlashinferPrimsTsBf16Impl, 2048, True, id="bf16_2048"),
+    ],
+)
+def test_prims_ts_leaf_keeps_the_hidden_size_unpadded(
+    leaf: type, hidden_size: int, eligible: bool
+) -> None:
+    verdict = leaf.can_implement(
+        _prims_ts_problem(leaf, hidden_size=hidden_size),
+        _single_rank_deployment(_prims_ts_environment()),
+    )
+    assert verdict.eligible is eligible, verdict.detail
+    if not eligible:
+        assert verdict.reject_reason is MoERejectReason.SHAPE_UNALIGNED
+
+
+@pytest.mark.parametrize(
+    "leaf, eligible",
+    [
+        pytest.param(FlashinferPrimsTsBf16Impl, False, id="none"),
+        pytest.param(FlashinferPrimsTsNvfp4Impl, True, id="nvfp4"),
+        pytest.param(FlashinferPrimsTsW4a8Mxfp4Mxfp8Impl, True, id="w4a8_mxfp4_mxfp8"),
+    ],
+)
+def test_prims_ts_situ_only_on_the_quantized_leaves(leaf: type, eligible: bool) -> None:
+    problem = _prims_ts_problem(
+        leaf, activation=_SITU_ACTIVATION, activation_constants=_SITU_CONSTANTS
+    )
+    verdict = leaf.can_implement(problem, _single_rank_deployment(_prims_ts_environment()))
+    assert verdict.eligible is eligible, verdict.detail
+
+
+@pytest.mark.parametrize("leaf", _PRIMS_TS_LEAVES)
+def test_prims_ts_literal_picks_the_leaf_that_publishes_the_format(leaf: type) -> None:
+    """``moe_backend: PRIMS_TS`` names the family; the quant picks which leaf."""
+    with override_moe_environment(_prims_ts_environment()):
+        report = resolve_moe_impl(_prims_ts_model_config(_PRIMS_TS_QUANT[leaf]))
+    assert impl_class_for(report) is leaf
+
+
+def test_prims_ts_tactic_names_the_family_and_never_degrades() -> None:
+    request = moe_impl_request(tactic="prims_ts")
+    assert set(request.impls) == set(_PRIMS_TS_LEAVES)
+    assert request.backend_for(set()) == "PRIMS_TS"
+    # Without the CuTe DSL modules every PrimsTS leaf declines, and a pin
+    # fails rather than falling back to another family.
+    with override_moe_environment(_prims_ts_environment(prims_ts=False)):
+        report = resolve_moe_impl(
+            _prims_ts_model_config(), impl_id="flashinfer.prims_ts.batched_gemm.nvfp4"
+        )
+    assert report.winner is None
+    with pytest.raises(UnsupportedError, match="no MoE implementation can serve this layer"):
+        impl_class_for(report)
 
 
 # =====================================================================

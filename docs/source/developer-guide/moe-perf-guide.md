@@ -169,6 +169,7 @@ TensorRT-LLM provides many MoE implementations, differing in supported quantizat
 | `DENSEGEMM` | SM100 / SM103 | NVFP4 |
 | `MEGAMOE_CUTEDSL` | SM100 / SM103 / SM107 | NVFP4 |
 | `MEGAMOE_DEEPGEMM` | SM100 / SM103 | W4A8_MXFP4_MXFP8 |
+| `PRIMS_TS` | SM100 / SM103 / SM107 | NVFP4, W4A8_MXFP4_MXFP8, BF16 |
 | `MARLIN` | SM89 – SM99 | NVFP4, W4A16_NVFP4 (BF16 activations) |
 | `TRITON` (Deprecated) | SM90 (GPT-OSS) | BF16, FP8 QDQ, W4A16_MXFP4, W4A8_MXFP4_FP8 |
 
@@ -230,29 +231,29 @@ Every implementation a tactic can pin, generated from the implementation registr
 
 | Implementation id | Shortest tactic | `backend` family | Priority | Description |
 |---|---|---|---|---|
-| `trtllm.triton.fp8_act_grouped_gemm.fp8_block_scales` | `fp8_act_grouped_gemm` | `CUTLASS` | 20 | Triton FP8-activation grouped GEMM for decode-sized batches, the DeepGEMM grouped GEMM otherwise, SM90. |
-| `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales` | `hopper_grouped_gemm` | `CUTLASS` | 21 | DeepGEMM grouped GEMM over FP8 block scales, driven by CutlassMoeFCRunner, SM90. |
-| `trtllm.triton.grouped_gemm.fp8_block_scales` | `triton.grouped_gemm` | `CUTLASS` | 22 | Internal Triton FP8 block-scale grouped GEMM, SM120/121. |
-| `trtllm.cutlass.grouped_gemm.nvfp4` | `cutlass.nvfp4` | `CUTLASS` | 23 | CUTLASS grouped GEMM over NVFP4 weights and activations, Blackwell. |
-| `trtllm.cutlass.grouped_gemm.w4a16_nvfp4` | `trtllm.w4a16_nvfp4` | `CUTLASS` | 24 | NVFP4 weights dequantized to the activation dtype every forward, SM80+. |
-| `trtllm.cutlass.grouped_gemm.mxfp8` | `mxfp8` | `CUTLASS` | 25 | CUTLASS grouped GEMM over MXFP8 weights and dynamic MXFP8 activations. |
-| `trtllm.cutlass.grouped_gemm.w4a8_mxfp4_fp8` | `cutlass.w4a8_mxfp4_fp8` | `CUTLASS` | 26 | CUTLASS grouped GEMM over MXFP4 weights with static FP8 activations. |
-| `trtllm.cutlass.grouped_gemm.w4a8_mxfp4_mxfp8` | `cutlass.w4a8_mxfp4_mxfp8` | `CUTLASS` | 27 | CUTLASS grouped GEMM over MXFP4 weights with dynamic MXFP8 activations. |
-| `trtllm.cutlass.grouped_gemm.w4a16_mxfp4` | `cutlass.w4a16_mxfp4` | `CUTLASS` | 28 | CUTLASS grouped GEMM over MXFP4 weights with high-precision activations, SM90. |
-| `trtllm.cutlass.grouped_gemm.w4a8_awq` | `w4a8_awq` | `CUTLASS` | 29 | CUTLASS grouped GEMM over INT4 group-scaled weights with FP8 activations. |
-| `trtllm.cutlass.grouped_gemm.w8a16` | `w8a16` | `CUTLASS` | 30 | CUTLASS grouped GEMM over INT8 per-channel weight-only, SM80+. |
-| `trtllm.cutlass.grouped_gemm.fp8` | `fp8` | `CUTLASS` | 31 | CUTLASS grouped GEMM over per-tensor FP8 (qdq) weights, SM89+. |
-| `trtllm.cutlass.grouped_gemm.none` | `cutlass.none` | `CUTLASS` | 32 | CUTLASS grouped GEMM over unquantized fp16/bf16 weights, SM80+. |
-| `marlin.cuda.fused_moe.nvfp4` | `marlin.nvfp4` | `MARLIN` | 18 | Marlin fused W4A16 MoE GEMM over NVFP4 weights, SM89-SM99 (Ada/Hopper). |
-| `marlin.cuda.fused_moe.w4a16_nvfp4` | `marlin.w4a16_nvfp4` | `MARLIN` | 19 | Marlin fused W4A16 MoE GEMM over W4A16-NVFP4 weights, SM89-SM99 (Ada/Hopper). |
-| `flashinfer.cutedsl.b12x.nvfp4` | `flashinfer.nvfp4` | `CUTEDSL` | 1 | FlashInfer CuTe DSL SM12x fused MoE for decode, CUTLASS NVFP4 grouped GEMM for prefill; SM120/SM121. |
+| `trtllm.triton.fp8_act_grouped_gemm.fp8_block_scales` | `fp8_act_grouped_gemm` | `CUTLASS` | 23 | Triton FP8-activation grouped GEMM for decode-sized batches, the DeepGEMM grouped GEMM otherwise, SM90. |
+| `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales` | `hopper_grouped_gemm` | `CUTLASS` | 24 | DeepGEMM grouped GEMM over FP8 block scales, driven by CutlassMoeFCRunner, SM90. |
+| `trtllm.triton.grouped_gemm.fp8_block_scales` | `triton.grouped_gemm` | `CUTLASS` | 25 | Internal Triton FP8 block-scale grouped GEMM, SM120/121. |
+| `trtllm.cutlass.grouped_gemm.nvfp4` | `cutlass.nvfp4` | `CUTLASS` | 26 | CUTLASS grouped GEMM over NVFP4 weights and activations, Blackwell. |
+| `trtllm.cutlass.grouped_gemm.w4a16_nvfp4` | `trtllm.w4a16_nvfp4` | `CUTLASS` | 27 | NVFP4 weights dequantized to the activation dtype every forward, SM80+. |
+| `trtllm.cutlass.grouped_gemm.mxfp8` | `mxfp8` | `CUTLASS` | 28 | CUTLASS grouped GEMM over MXFP8 weights and dynamic MXFP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w4a8_mxfp4_fp8` | `cutlass.w4a8_mxfp4_fp8` | `CUTLASS` | 29 | CUTLASS grouped GEMM over MXFP4 weights with static FP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w4a8_mxfp4_mxfp8` | `cutlass.w4a8_mxfp4_mxfp8` | `CUTLASS` | 30 | CUTLASS grouped GEMM over MXFP4 weights with dynamic MXFP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w4a16_mxfp4` | `cutlass.w4a16_mxfp4` | `CUTLASS` | 31 | CUTLASS grouped GEMM over MXFP4 weights with high-precision activations, SM90. |
+| `trtllm.cutlass.grouped_gemm.w4a8_awq` | `w4a8_awq` | `CUTLASS` | 32 | CUTLASS grouped GEMM over INT4 group-scaled weights with FP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w8a16` | `w8a16` | `CUTLASS` | 33 | CUTLASS grouped GEMM over INT8 per-channel weight-only, SM80+. |
+| `trtllm.cutlass.grouped_gemm.fp8` | `fp8` | `CUTLASS` | 34 | CUTLASS grouped GEMM over per-tensor FP8 (qdq) weights, SM89+. |
+| `trtllm.cutlass.grouped_gemm.none` | `cutlass.none` | `CUTLASS` | 35 | CUTLASS grouped GEMM over unquantized fp16/bf16 weights, SM80+. |
+| `marlin.cuda.fused_moe.nvfp4` | `marlin.nvfp4` | `MARLIN` | 21 | Marlin fused W4A16 MoE GEMM over NVFP4 weights, SM89-SM99 (Ada/Hopper). |
+| `marlin.cuda.fused_moe.w4a16_nvfp4` | `marlin.w4a16_nvfp4` | `MARLIN` | 22 | Marlin fused W4A16 MoE GEMM over W4A16-NVFP4 weights, SM89-SM99 (Ada/Hopper). |
+| `flashinfer.cutedsl.b12x.nvfp4` | `b12x.nvfp4` | `CUTEDSL` | 1 | FlashInfer CuTe DSL SM12x fused MoE for decode, CUTLASS NVFP4 grouped GEMM for prefill; SM120/SM121. |
 | `flashinfer.cutedsl.b12x.w4a16_nvfp4` | `flashinfer.w4a16_nvfp4` | `CUTEDSL` | 2 | FlashInfer CuTe DSL SM12x fused MoE, BF16 activations and NVFP4 weights; SM120/SM121. |
 | `trtllm.cutedsl.grouped_gemm.nvfp4` | `cutedsl.grouped_gemm.nvfp4` | `CUTEDSL` | 5 | CuTe DSL NVFP4 grouped GEMM: gather + FC1 + fused activation, then FC2 + finalize; SM100/SM103/SM107. |
 | `trtllm.cutedsl.grouped_gemm.nvfp4_plus` | `nvfp4_plus` | `CUTEDSL` | 6 | CuTe DSL NVFP4_PLUS (E2M1 with UE5M3 scales per 32 values) grouped GEMM: gather + FC1 + fused SwiGLU, then FC2 + finalize; SM107. |
 | `trtllm.cutedsl.grouped_gemm.none` | `cutedsl.none` | `CUTEDSL` | 7 | CuTe DSL BF16 grouped GEMM on Rubin (SM107): gather + FC1 + fused SwiGLU, then FC2 + fused finalize. |
 | `trtllm.cutedsl.fused_fc12.nvfp4` | `fused_fc12` | `CUTEDSL_FC12` | 8 | Rubin (SM107) NVFP4 fused FC1 + SwiGLU/SiTU + FC2 + finalize persistent CuTe DSL grouped GEMM. |
-| `deepgemm.cuda.grouped_gemm.fp8_block_scales` | `deepgemm.grouped_gemm` | `DEEPGEMM` | 16 | DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107. |
-| `trtllm.cutedsl.dense_gemm.nvfp4` | `dense_gemm` | `DENSEGEMM` | 17 | CuTe DSL dense GEMM with fused SwiGLU over NVFP4, SM100/SM103 min-latency. |
+| `deepgemm.cuda.grouped_gemm.fp8_block_scales` | `deepgemm.grouped_gemm` | `DEEPGEMM` | 19 | DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107. |
+| `trtllm.cutedsl.dense_gemm.nvfp4` | `dense_gemm` | `DENSEGEMM` | 20 | CuTe DSL dense GEMM with fused SwiGLU over NVFP4, SM100/SM103 min-latency. |
 | `trtllm.trtllm_gen.fused_moe.none` | `trtllm_gen.none` | `TRTLLM` | 9 | TRTLLM-Gen batched-GEMM cubins, BF16 activations and weights, SM100 family. |
 | `trtllm.trtllm_gen.fused_moe.nvfp4` | `trtllm_gen.nvfp4` | `TRTLLM` | 10 | TRTLLM-Gen batched-GEMM cubins over NVFP4, SM100 family. |
 | `trtllm.trtllm_gen.fused_moe.fp8_block_scales` | `trtllm_gen.fp8_block_scales` | `TRTLLM` | 11 | TRTLLM-Gen batched-GEMM cubins over FP8 1x128 block scales, SM100 family. |
@@ -260,14 +261,17 @@ Every implementation a tactic can pin, generated from the implementation registr
 | `trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8` | `trtllm_gen.w4a8_mxfp4_mxfp8` | `TRTLLM` | 13 | TRTLLM-Gen batched-GEMM cubins over MXFP4 weights with MXFP8 activations. |
 | `trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8` | `w4a8_nvfp4_fp8` | `TRTLLM` | 14 | TRTLLM-Gen fp8_fp4 block-scale runner: NVFP4 weights, FP8 activations. |
 | `trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_fp8` | `trtllm_gen.w4a8_mxfp4_fp8` | `TRTLLM` | 15 | TRTLLM-Gen e4m3_mxe2m1 block-scale runner: MXFP4 weights, FP8 activations. |
+| `flashinfer.prims_ts.batched_gemm.nvfp4` | `prims_ts.nvfp4` | `PRIMS_TS` | 16 | FlashInfer PrimsTS FC1/FC2 batched GEMMs, NVFP4 weights and activations, SM100/SM103/SM107. |
+| `flashinfer.prims_ts.batched_gemm.w4a8_mxfp4_mxfp8` | `flashinfer.w4a8_mxfp4_mxfp8` | `PRIMS_TS` | 17 | FlashInfer PrimsTS FC1/FC2 batched GEMMs, MXFP4 weights and MXFP8 activations, SM100/SM103/SM107. |
+| `flashinfer.prims_ts.batched_gemm.none` | `flashinfer.none` | `PRIMS_TS` | 18 | FlashInfer PrimsTS FC1/FC2 batched GEMMs, BF16 activations and weights, SM100/SM103/SM107. |
 | `deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8` | `deepgemm.mega_moe` | `MEGAMOE_DEEPGEMM` | 3 | DeepGEMM fused fp8_fp4_mega_moe: MXFP4 weights, MXFP8 activations, SM100/SM103/SM107. |
 | `trtllm.cutedsl.mega_moe.nvfp4` | `trtllm.mega_moe` | `MEGAMOE_CUTEDSL` | 4 | MegaMoE CuteDSL fused NVFP4 kernels: NVFP4 weights and activations, SM100/103/107. |
 
 Segment values a tactic can use, by field:
 
 - `provider`: `deepgemm`, `flashinfer`, `marlin`, `trtllm`
-- `technique`: `cuda`, `cutedsl`, `cutlass`, `triton`, `trtllm_gen`
-- `kernel_name`: `b12x`, `dense_gemm`, `fp8_act_grouped_gemm`, `fused_fc12`, `fused_moe`, `grouped_gemm`, `hopper_grouped_gemm`, `mega_moe`
+- `technique`: `cuda`, `cutedsl`, `cutlass`, `prims_ts`, `triton`, `trtllm_gen`
+- `kernel_name`: `b12x`, `batched_gemm`, `dense_gemm`, `fp8_act_grouped_gemm`, `fused_fc12`, `fused_moe`, `grouped_gemm`, `hopper_grouped_gemm`, `mega_moe`
 - `quant`: `fp8`, `fp8_block_scales`, `mxfp8`, `none`, `nvfp4`, `nvfp4_plus`, `w4a16_mxfp4`, `w4a16_nvfp4`, `w4a8_awq`, `w4a8_mxfp4_fp8`, `w4a8_mxfp4_mxfp8`, `w4a8_nvfp4_fp8`, `w8a16`
 
 <!-- END GENERATED MOE IMPL CATALOG -->

@@ -986,6 +986,7 @@ BACKEND_TYPES = [
     MoeBackendType.MEGAMOE_CUTEDSL,
     MoeBackendType.CUTE_DSL_B12X,
     MoeBackendType.MARLIN,
+    MoeBackendType.PRIMS_TS,
 ]
 
 # Data types to test

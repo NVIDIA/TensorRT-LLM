@@ -317,6 +317,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_CUTEDSL"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
   - unittest/_torch/moe/test_moe_module.py::test_a_tactic_builds_the_implementation_it_names
+  - unittest/_torch/moe/test_prims_ts_moe.py
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
@@ -725,5 +726,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_CUTEDSL"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=PRIMS_TS-quant=None-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=PRIMS_TS-quant=NVFP4-routing=Renormalize]
   # ---- non-quantized (quant=None) moved to post-merge ----
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"

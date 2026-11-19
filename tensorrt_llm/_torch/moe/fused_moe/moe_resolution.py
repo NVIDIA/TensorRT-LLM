@@ -64,6 +64,11 @@ from .interface import MoE
 from .marlin import MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl
 from .mega_moe import DeepgemmCudaW4a8Mxfp4Mxfp8Impl, TrtllmCutedslMegaMoeNvfp4Impl
 from .moe_load_balancer import get_moe_load_balancer
+from .prims_ts import (
+    FlashinferPrimsTsBf16Impl,
+    FlashinferPrimsTsNvfp4Impl,
+    FlashinferPrimsTsW4a8Mxfp4Mxfp8Impl,
+)
 from .trtllm_gen import (
     TrtllmTrtllmGenBf16Impl,
     TrtllmTrtllmGenFp8BlockScalesImpl,
@@ -119,6 +124,10 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
     TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
     TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
+    # The PrimsTS leaves; their ``quant`` segments are disjoint as well.
+    FlashinferPrimsTsNvfp4Impl,
+    FlashinferPrimsTsW4a8Mxfp4Mxfp8Impl,
+    FlashinferPrimsTsBf16Impl,
     DeepgemmCudaFp8BlockScalesImpl,
     TrtllmCutedslDenseGemmNvfp4Impl,
     MarlinCudaNvfp4Impl,
@@ -161,6 +170,13 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
             TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
             TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
             TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
+        }
+    ),
+    "PRIMS_TS": frozenset(
+        {
+            FlashinferPrimsTsNvfp4Impl,
+            FlashinferPrimsTsW4a8Mxfp4Mxfp8Impl,
+            FlashinferPrimsTsBf16Impl,
         }
     ),
     "TRITON": frozenset({TritonFusedMoE}),

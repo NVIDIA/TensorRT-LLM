@@ -16,6 +16,7 @@ from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
+from .fused_moe_prims_ts import PrimsTsFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -147,6 +148,23 @@ def create_moe_backend(
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             bias=bias,
+            layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
+            activation=activation,
+        )
+
+    if issubclass(moe_cls, PrimsTsFusedMoE):
+        # No expert-bias flag: the capability check above rejects a True.
+        return moe_cls(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=reduce_results,
+            model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
+            weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             activation=activation,

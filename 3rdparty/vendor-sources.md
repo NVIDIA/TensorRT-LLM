@@ -630,3 +630,22 @@ Use the normal commands with `flashinfer-prims-ts`, for example:
 python scripts/vendor/manage.py status flashinfer-prims-ts
 python scripts/vendor/manage.py check flashinfer-prims-ts
 ```
+
+## PrimTS MoE
+
+The `flashinfer-prims-ts-moe` entry selects the batched-GEMM and MoE adapter
+modules under `flashinfer/prims_ts` and materializes them at
+`tensorrt_llm/_torch/moe/kernels/prims_ts`. The dense `gemm` package, FlashInfer's
+own MoE runner and the tuning tools are not selected: TensorRT-LLM launches the
+GEMMs from `tensorrt_llm/_torch/moe/custom_ops/prims_ts_moe.py` over its own
+routing, finalize and autotuner. Its persistent patch contains only
+TensorRT-LLM integration adaptations: NVIDIA headers, relative imports in place
+of `flashinfer.prims_ts`, no `gemm` re-export, and a compile-cache module name
+and source list that do not assume the tree sits inside the flashinfer package.
+The entry pins FlashInfer `main`; to move it forward, follow
+[Using an upstream-main pin](#using-an-upstream-main-pin).
+
+```bash
+python scripts/vendor/manage.py status flashinfer-prims-ts-moe
+python scripts/vendor/manage.py check flashinfer-prims-ts-moe
+```
