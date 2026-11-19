@@ -41,8 +41,9 @@ from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_pre_hopper)
 from defs.deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT
 from defs.trt_test_alternative import check_call, check_output, print_info
-from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
-                               run_disagg_server, run_gen_worker, terminate,
+from disagg_test_utils import (ProcessWrapper, resolve_server_start_timeout,
+                               run_ctx_worker, run_disagg_server,
+                               run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics,
@@ -788,7 +789,7 @@ def setup_disagg_cluster(
     model_name: str | None = None,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
-    server_start_timeout: int = 300,
+    server_start_timeout: int | None = None,
     schedule_style: str | None = None,
     save_log: bool = False,
     startup_callback=None,
@@ -809,7 +810,8 @@ def setup_disagg_cluster(
         config_file: Path to disaggregated server config YAML
         model_name: Model path override (defaults to config's 'model' field)
         env: Environment variables to pass to subprocess (workers and disagg server)
-        server_start_timeout: Timeout in seconds for server to become ready
+        server_start_timeout: Timeout in seconds for server to become ready;
+            None picks one from the config (see resolve_server_start_timeout)
         schedule_style: Disagg schedule style ('context_first' or 'generation_first')
         disagg_cluster_overrides: Entries merged over
             get_default_disagg_cluster_config(), e.g. PRODUCTION_CLUSTER_TIMINGS
@@ -834,6 +836,8 @@ def setup_disagg_cluster(
             config.setdefault(key, {}).update(value)
         else:
             config[key] = value
+    server_start_timeout = resolve_server_start_timeout(config,
+                                                        server_start_timeout)
 
     if perf_metrics_output_dir is not None:
         config["perf_metrics_output_dir"] = perf_metrics_output_dir
@@ -1188,7 +1192,7 @@ def run_disaggregated_test(example_dir,
                            ctx_env=None,
                            gen_env=None,
                            share_gpu=False,
-                           server_start_timeout=300,
+                           server_start_timeout=None,
                            assert_ctx_log_contains=None,
                            config_overrides=None):
     """Run disaggregated test using service discovery instead of MPI.
@@ -1232,6 +1236,10 @@ def run_disaggregated_test(example_dir,
                                  "overlap_transceiver_runtime_python_bounce"))
 
     server_host = config.get("hostname", "localhost")
+    # The client gets the same budget as the readiness wait in
+    # setup_disagg_cluster: both resolve it from this post-override config.
+    server_start_timeout = resolve_server_start_timeout(config,
+                                                        server_start_timeout)
 
     success = False
     try:
@@ -2022,14 +2030,11 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
         qwen_model_root
     ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
-    # Cold model initialization and JIT across eight Blackwell ranks took
-    # about 640s on B300; allow headroom for CI variability (NVBug 6771023).
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=900)
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)

@@ -1924,7 +1924,7 @@ def test_update_waiting_queue(mock_executor):
         RequestQueueItem(2, Mock()),
         RequestQueueItem(3, Mock()),
     ]
-    mock_executor.waiting_queue.extend(items)
+    mock_executor.waiting_queue.add_requests(items)
     mock_executor.canceled_req_ids = [2]
 
     mock_executor.update_waiting_queue()
@@ -1949,7 +1949,7 @@ def test_getter_methods(mock_executor):
     mock_executor.canceled_req_ids = [3, 4]
     mock_executor.expected_num_active_requests = 5
     mock_executor.new_active_requests_queue_latency_ms = 10.5
-    mock_executor.waiting_queue.append(RequestQueueItem(1, Mock()))
+    mock_executor.waiting_queue.add_request(RequestQueueItem(1, Mock()))
 
     assert mock_executor.get_canceled_req_ids_size() == 2
     assert mock_executor.get_canceled_req_ids() == [3, 4]

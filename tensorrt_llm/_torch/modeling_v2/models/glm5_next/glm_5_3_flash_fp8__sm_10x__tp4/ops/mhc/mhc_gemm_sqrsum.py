@@ -57,7 +57,7 @@ class MhcGemmSqrsum(OpWrapper):
         ``(mixes, sqrsum)``: new ``[M, 24]`` and ``[M]`` FP32 tensors.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     _GLM = dict(mult=MULT, hidden=HIDDEN)
     CELLS: tuple[Cell, ...] = (

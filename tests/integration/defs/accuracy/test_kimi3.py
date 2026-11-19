@@ -248,7 +248,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # Attention DP replicates every non-expert weight on each rank, so DEP8
     # holds far more weight per GPU than TEP8 does; only GB300-class memory
     # leaves room for the KV cache.
-    @pytest.mark.skip_less_device_memory(250000)
+    @pytest.mark.skip_less_device_memory(270000)
     def test_gsm8k_nvfp4_dep8(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Full GSM8K on the NVFP4 checkpoint with the aggregate DEP8 recipe.
 
@@ -259,7 +259,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.skip_less_device_memory(250000)
+    @pytest.mark.skip_less_device_memory(270000)
     def test_gsm8k_nvfp4_kv_dep8(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The DEP8 NVFP4 recipe on an NVFP4 KV cache, which selects FP4 MLA.
 
