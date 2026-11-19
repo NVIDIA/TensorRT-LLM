@@ -96,8 +96,10 @@ def test_every_test_config_follows_pp_rule():
         config = yaml.safe_load(path.read_text())
         if not isinstance(config, dict):
             continue
+        # A server section without its own pipeline_parallel_size inherits the top-level one.
+        top_level_pp = config.get("pipeline_parallel_size", 1)
         uses_pp = any(
-            (config.get(servers) or {}).get("pipeline_parallel_size", 1) > 1
+            (config.get(servers) or {}).get("pipeline_parallel_size", top_level_pp) > 1
             for servers in ("context_servers", "generation_servers")
         )
         num_pp += uses_pp
