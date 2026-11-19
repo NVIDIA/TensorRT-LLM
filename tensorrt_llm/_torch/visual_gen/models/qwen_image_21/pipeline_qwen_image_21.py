@@ -26,6 +26,7 @@ from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
 
 from ..qwen_image.pipeline_qwen_image import QwenImagePipeline
+from .config import DEFAULT_NUM_INFERENCE_STEPS
 from .ops import (
     QwenImage21FlowMatchEulerScheduler,
     append_target_slots,
@@ -39,7 +40,7 @@ from .transformer_qwen_image_21 import QwenImage21KVCache, QwenImage21Transforme
 _QWEN_IMAGE_21_DEFAULT_GENERATION_PARAMS = {
     "height": 1024,
     "width": 1024,
-    "num_inference_steps": 40,
+    "num_inference_steps": DEFAULT_NUM_INFERENCE_STEPS,
     "guidance_scale": 1.0,
     "max_sequence_length": 4096,
 }
@@ -90,7 +91,7 @@ class QwenImage21Pipeline(QwenImagePipeline):
     transformer_class = QwenImage21Transformer2DModel
     kv_cache_class = QwenImage21KVCache
     scheduler_class = QwenImage21FlowMatchEulerScheduler
-    default_num_inference_steps = 40
+    default_num_inference_steps = DEFAULT_NUM_INFERENCE_STEPS
     vae_scale_factor = 16
     latent_channels = 64
     supports_image_edit = True
@@ -542,7 +543,7 @@ class QwenImage21Pipeline(QwenImagePipeline):
         image: Any | None = None,
         height: int | None = 1024,
         width: int | None = 1024,
-        num_inference_steps: int = 40,
+        num_inference_steps: int = DEFAULT_NUM_INFERENCE_STEPS,
         negative_prompt_cfg_scale: float = 1.0,
         true_cfg_scale: Optional[float] = None,
         seed: int = 42,

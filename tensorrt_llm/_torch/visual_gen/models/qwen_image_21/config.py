@@ -14,10 +14,8 @@ from dataclasses import dataclass, field
 from typing import Mapping, MutableMapping, Sequence
 
 DEFAULT_HF_MODEL_ID = "Qwen/Qwen-Image-2.1"
-# The SDK contract requires a 30 step default when the frozen source/manifest
-# does not specify a denoising step count.  Candidate E2E entrypoints must still
-# prefer the frozen M5 manifest when it records a source-specific step count.
-DEFAULT_NUM_INFERENCE_STEPS = 30
+# Shared default for the pipeline and generation configuration.
+DEFAULT_NUM_INFERENCE_STEPS = 40
 DEFAULT_HEIGHT = 1024
 DEFAULT_WIDTH = 1024
 DEFAULT_VAE_SCALE_FACTOR = 16
@@ -94,7 +92,7 @@ class QwenImage21PipelineConfig:
         """Build config while honoring frozen-manifest step precedence.
 
         Explicit ``overrides`` win, followed by manifest keys, then environment
-        variables, and finally the SDK default of 30 steps.
+        variables, and finally the default of 40 steps.
         """
 
         manifest = manifest or {}
@@ -138,7 +136,7 @@ def resolve_num_inference_steps(
 
     The frozen reference/candidate manifest is authoritative when it carries an
     explicit step field.  Otherwise the SDK-launcher environment variables are
-    honored.  If neither exists, the contract default of 30 steps is returned.
+    honored.  If neither exists, the default of 40 steps is returned.
     """
 
     manifest = manifest or {}

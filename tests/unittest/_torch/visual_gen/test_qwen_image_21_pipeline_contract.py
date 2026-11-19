@@ -1,12 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import sys
 import types
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.visual_gen.models.qwen_image_21.config import (
+    DEFAULT_NUM_INFERENCE_STEPS,
+    QwenImage21PipelineConfig,
+)
 from tensorrt_llm._torch.visual_gen.models.qwen_image_21.pipeline_qwen_image_21 import (
     QwenImage21Pipeline,
     _resolve_qwen_image_21_vae_fallback,
@@ -26,6 +31,13 @@ def test_qwen_image_21_pipeline_runtime_contract_is_native_t2i_default():
 
     assert QwenImage21Pipeline.DEFAULT_GENERATION_PARAMS["guidance_scale"] == 1.0
     assert QwenImage21Pipeline.default_num_inference_steps == 40
+    assert DEFAULT_NUM_INFERENCE_STEPS == 40
+    assert QwenImage21PipelineConfig().num_inference_steps == 40
+    assert QwenImage21Pipeline.DEFAULT_GENERATION_PARAMS["num_inference_steps"] == 40
+    assert (
+        inspect.signature(QwenImage21Pipeline.forward).parameters["num_inference_steps"].default
+        == 40
+    )
     assert QwenImage21Pipeline.transformer_class is QwenImage21Transformer2DModel
     assert QwenImage21Pipeline.scheduler_class.__name__ == "QwenImage21FlowMatchEulerScheduler"
 

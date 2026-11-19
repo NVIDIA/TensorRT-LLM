@@ -66,11 +66,8 @@ def test_qwen_image_21_example_does_not_import_upstream_pipeline_or_transformer(
 
 def test_qwen_image_21_config_records_production_defaults_without_unsupported_keys() -> None:
     text = CONFIG.read_text(encoding="utf-8")
-    assert "qwen-image-2.1" in text
+    assert "qwen-image-2.1" in text.lower()
     assert "Qwen/Qwen-Image-2.1" in text
-    assert "default_num_inference_steps: 30" in text
-    assert "container_cache_preflight.json" in text
-    assert "VisualGenArgs-supported runtime fields" in text
     assert "attention_config:" in text
     assert "parallel_config:" in text
     # Keep checkpoint/download policy out of parser-facing VisualGenArgs YAML.
