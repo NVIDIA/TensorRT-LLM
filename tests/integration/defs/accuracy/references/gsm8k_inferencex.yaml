@@ -30,3 +30,9 @@ MiniMaxAI/MiniMax-M3.1-Flash:
     kv_cache_quant_algo: NVFP4
     spec_dec_algo: DSpark
     accuracy: 97.043
+
+thinkingmachines/Inkling-2-Small:
+  # The model's SGLang implementation (lmsysorg/sglang:dev-inkling-2-small, TP4/EP4) on one GB300
+  # tray, chat template with its default reasoning effort, full 1319-sample split, 2026-11-18.
+  # The Modeling V2 target (attention TP4 + MoE EP4, eager) measured 97.73 on the same tray.
+  - accuracy: 97.5
