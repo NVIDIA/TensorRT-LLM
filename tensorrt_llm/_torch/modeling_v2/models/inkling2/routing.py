@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 _SMS = frozenset({(10, 3)})
 #: Inkling-2-Small's text decoder: layers, hidden width, routed experts.
 _SMALL = (48, 4608, 384)
+_SHAPE_FIELDS = ("num_hidden_layers", "hidden_size", "n_routed_experts")
 #: The longest sequence the first target was gated on (the release supports 1M tokens).
 MAX_SEQ_LEN = 262144
 #: Inkling-2-Small's attention window per layer: 1024 tokens, full context on every sixth layer.
@@ -42,7 +43,8 @@ def _windows(model_config: ModelConfig, llm_args: TorchLlmArgs, text) -> tuple:
 
     try:
         dims = InklingDims.from_config(text)
-    except ValueError:
+    except (AttributeError, TypeError, ValueError):
+        # A config without Inkling 2's fields fails the shape and window facts instead.
         return None, None, None
     max_seq_len = llm_args.max_seq_len or MAX_SEQ_LEN
     layers = list(range(dims.num_layers))
@@ -72,9 +74,13 @@ def route(
     cfg = model_config.pretrained_config
     text = getattr(cfg, "text_config", None) or cfg
     mapping = model_config.mapping
-    shape = (text.num_hidden_layers, text.hidden_size, text.n_routed_experts)
+    # A config that lacks a field fails the shape fact rather than raising.
+    shape = tuple(getattr(text, name, None) for name in _SHAPE_FIELDS)
     layout = (mapping.world_size, mapping.tp_size, mapping.moe_ep_size, mapping.moe_tp_size)
     kv_cache_config = llm_args.kv_cache_config
+    # `is_disagg_enabled`'s test: the context rank would hand over KV pages without the windows.
+    transceiver = llm_args.cache_transceiver_config
+    disaggregated = transceiver is not None and transceiver.backend is not None
     model_windows, cache_windows, small_windows = _windows(model_config, llm_args, text)
     released_windows = small_windows is not None and model_windows == cache_windows == small_windows
     facts = {
@@ -85,11 +91,14 @@ def route(
         and mapping.cp_size == 1
         and not mapping.enable_attention_dp,
         "a BF16 KV cache": engine_kv_cache_quant_algo(model_config, llm_args) is None,
-        "KV cache manager V2": kv_cache_config.use_kv_cache_manager_v2 is True,
+        "KV cache manager V2 (use_kv_cache_manager_v2 true, not auto)": (
+            kv_cache_config.use_kv_cache_manager_v2 is True
+        ),
         "no KV cache block reuse (the convolution windows are not cached)": not kv_cache_config.enable_block_reuse,
         "no SWA scratch reuse (the page tables do not map scratch slots)": not kv_cache_config.enable_swa_scratch_reuse,
         "Inkling-2-Small's attention windows (1024 tokens; full context on layers 5, 11, ..., 47), "
         "the same in the model and in the KV cache": released_windows,
+        "no disaggregated serving (the convolution windows are not transferred)": not disaggregated,
         "no chunked prefill": not llm_args.enable_chunked_prefill,
         "no CUDA graphs (the forward runs eagerly)": llm_args.cuda_graph_config is None,
         "the overlap scheduler off": bool(llm_args.disable_overlap_scheduler),

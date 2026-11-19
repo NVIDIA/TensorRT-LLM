@@ -35,4 +35,6 @@ thinkingmachines/Inkling-2-Small:
   # The model's SGLang implementation (lmsysorg/sglang:dev-inkling-2-small, TP4/EP4) on one GB300
   # tray, chat template with its default reasoning effort, full 1319-sample split, 2026-11-18.
   # The Modeling V2 target (attention TP4 + MoE EP4, eager) measured 97.73 on the same tray.
+  # The floor is the one the harness computes for this row (sigma 50, alpha 0.05, 1319 samples).
   - accuracy: 97.5
+    threshold: 94.3

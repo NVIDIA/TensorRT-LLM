@@ -4,12 +4,14 @@
 refused with the condition it lacks."""
 
 import pytest
+from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.configs import Inkling2Config
 from tensorrt_llm._torch.model_config import ModelConfig, _mirror_text_subconfig_attrs
 from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.modeling_v2.models.inkling2 import routing
 from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
     CudaGraphConfig,
     KvCacheConfig,
     MTPDecodingConfig,
@@ -105,6 +107,18 @@ def test_admits_the_gated_deployment(max_seq_len):
             ),
             "KV cache manager V2",
         ),
+        (
+            dict(
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False, use_kv_cache_manager_v2="auto"
+                )
+            ),
+            "KV cache manager V2",
+        ),
+        (
+            dict(cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT")),
+            "no disaggregated serving",
+        ),
         (dict(enable_chunked_prefill=True), "no chunked prefill"),
         (dict(cuda_graph_config=CudaGraphConfig()), "no CUDA graphs"),
         (dict(disable_overlap_scheduler=False), "the overlap scheduler off"),
@@ -121,6 +135,8 @@ def test_admits_the_gated_deployment(max_seq_len):
         "swa_scratch_reuse",
         "fp8_kv_cache",
         "kv_cache_manager_v1",
+        "kv_cache_manager_auto",
+        "disaggregated_serving",
         "chunked_prefill",
         "cuda_graphs",
         "overlap_scheduler",
@@ -167,3 +183,10 @@ def test_refuses_a_window_the_kv_cache_does_not_keep():
 def test_refuses_windows_other_than_the_release(text_overrides):
     pretrained = _pretrained(**text_overrides)
     assert "attention windows" in _refusal(model_config=_model_config(pretrained))
+
+
+def test_refuses_a_config_without_the_fields_it_reads():
+    """A config that names the expert count otherwise fails the shape fact, not with an error."""
+    foreign = PretrainedConfig(num_hidden_layers=48, hidden_size=4608, num_experts=384)
+    message = _refusal(model_config=_model_config(foreign))
+    assert "Inkling-2-Small's shape" in message and "shape (48, 4608, None)" in message, message
