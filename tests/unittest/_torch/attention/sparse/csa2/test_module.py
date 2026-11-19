@@ -3370,8 +3370,9 @@ def _native_context_layers(layout, kv_cache_dtype="fp8_ds_mla", weights=None, sp
     return layers, checkpoints
 
 
-def _prefill_outputs(layers, manager, requests, hidden):
-    """One prefill forward through every layer on fresh metadata; returns each layer's output."""
+def _prefill(layers, manager, requests, hidden):
+    """One prefill forward through every layer on fresh metadata; returns each layer's output
+    and the metadata, which keeps the index Top-K selections (``csa2_indices``)."""
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
@@ -3385,7 +3386,12 @@ def _prefill_outputs(layers, manager, requests, hidden):
     )
     metadata.prepare()
     metadata.reset_routing()
-    return [model(hidden, metadata.csa2_positions, metadata) for model in layers]
+    return [model(hidden, metadata.csa2_positions, metadata) for model in layers], metadata
+
+
+def _prefill_outputs(layers, manager, requests, hidden):
+    """One prefill forward through every layer on fresh metadata; returns each layer's output."""
+    return _prefill(layers, manager, requests, hidden)[0]
 
 
 @skip_no_fused_context
@@ -3539,7 +3545,8 @@ def test_prims_ts_context_reads_projected_unit_scale_query(monkeypatch, fused_co
 def test_prims_ts_context_runs_fused_kernel(monkeypatch, fused_context_cache):
     """A PrimTS prefill of SWA-only, Full and Reuse layers on the fp8 KV cache runs every layer's
     context tile on the native fused context kernel, as the native provider does, and equals its
-    outputs bit for bit; PrimTS attends those tiles only without that kernel."""
+    outputs bit for bit on every row both select the same KV rows for; PrimTS attends those tiles
+    only without that kernel."""
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import prims_ts
 
     manager, requests = fused_context_cache
@@ -3571,14 +3578,21 @@ def test_prims_ts_context_runs_fused_kernel(monkeypatch, fused_context_cache):
         return forward(self, q, metadata, forward_args)
 
     monkeypatch.setattr(prims_ts.CSA2PrimsTS, "_forward_packed", record_prims_ts)
-    expected = _prefill_outputs(native, manager, requests, hidden)
+    expected, native_metadata = _prefill(native, manager, requests, hidden)
     assert calls == [hidden.shape[0]] * len(native)
     calls.clear()
-    actual = _prefill_outputs(layers, manager, requests, hidden)
+    actual, prims_metadata = _prefill(layers, manager, requests, hidden)
     assert calls == [hidden.shape[0]] * len(layers) and not attended
+    # The index Top-K may break an exact score tie for its last slot either way, in either
+    # prefill. Rows that select the same KV rows run the same kernel on the same inputs.
+    assert native_metadata.csa2_indices.keys() == prims_metadata.csa2_indices.keys()
+    tied = torch.zeros(hidden.shape[0], dtype=torch.bool, device=hidden.device)
+    for layer, indices in native_metadata.csa2_indices.items():
+        tied |= (indices != prims_metadata.csa2_indices[layer]).any(-1)
+    assert int(tied.sum()) * 100 <= hidden.shape[0]
     for value, reference in zip(actual, expected, strict=True):
         assert torch.isfinite(value).all()
-        torch.testing.assert_close(value, reference, atol=0, rtol=0)
+        torch.testing.assert_close(value[~tied], reference[~tied], atol=0, rtol=0)
     calls.clear()
     for model in layers:
         model.backend.fused_context = False
