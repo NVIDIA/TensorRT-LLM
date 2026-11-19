@@ -339,22 +339,16 @@ attention_config:
 ## Layer and step exclusions
 
 Use `ignore` for layer exclusions or `ignore_steps` for step exclusions under
-`quant_config` for Linear layers (including attention projections), and under
-`attention_config.quant_attention_config` for attention kernels. Nonempty `ignore`
-and `ignore_steps` lists are mutually exclusive across both configurations.
+`attention_config.quant_attention_config` to exclude attention kernels from quantization.
 Excluded attention uses the selected backend's native BF16/FP16 path.
+Nonempty layer and step exclusion lists are mutually exclusive across Linear and
+attention configurations. For Linear settings, see
+[Linear exclusions](../models/visual-generation.md#layer-and-step-exclusions).
 
 **By layer.** `ignore` accepts module paths, `*` wildcard patterns, or
 `re:`-prefixed regular expressions.
 
 ```yaml
-quant_config:
-  quant_algo: FP8_BLOCK_SCALES
-  dynamic: true
-  ignore:
-    - "transformer_blocks.0.*"
-    - "transformer_blocks.2.*"
-    - "transformer_blocks.4.*"
 attention_config:
   backend: CUTEDSL
   quant_attention_config:
@@ -366,18 +360,14 @@ attention_config:
       - "transformer_blocks.4.attn"
 ```
 
-**By step.** In this example, Linear layers use BF16 at steps 0 and 1, while
-attention uses the backend's native BF16/FP16 path at steps 0 and 2. Each component
-remains quantized at its other steps. Step 0 is the first denoising step.
+**By step.** In this example, attention uses the backend's native BF16/FP16 path
+at steps 0 and 2 and remains quantized at the other steps. Step 0 is the first
+denoising step.
 In two-stage generation, numbering continues across stages: with 8 steps in
 Stage 1, `ignore_steps: [9]` selects Stage 2's second step. Each new generation
 starts at 0; indices outside the actual total step count raise an error.
 
 ```yaml
-quant_config:
-  quant_algo: NVFP4
-  dynamic: true
-  ignore_steps: [0, 1]
 attention_config:
   backend: CUTEDSL
   quant_attention_config:
@@ -386,15 +376,8 @@ attention_config:
     ignore_steps: [0, 2]
 ```
 
-- Linear step exclusions require quantizing BF16/FP16 checkpoint weights at load
-  time; pre-quantized checkpoints are not supported. Set `dynamic: true` to enable
-  load-time quantization and retain the original weights for excluded steps.
-  Both weight formats remain in memory. Fixed Transformer paths retain their
-  original fusion eligibility. See [Linear exclusions](../models/visual-generation.md#layer-and-step-exclusions)
-  for the weight-memory tradeoff.
-- Step exclusions cannot be combined with diffusion caching; Linear step exclusions
-  also do not support runtime LoRA fusion.
-- Quantization exclusions preserve sparse-attention settings: an excluded step
+- Step exclusions cannot be combined with diffusion caching.
+- Attention exclusions preserve sparse-attention settings: an excluded step
   may still use BF16 sparse attention rather than dense attention.
 
 ## Interaction With Other Features

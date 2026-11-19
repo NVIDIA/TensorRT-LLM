@@ -260,6 +260,8 @@ Each new generation starts at 0; indices outside the actual total step count
 raise an error.
 
 Step exclusions require a BF16/FP16 checkpoint and load-time quantization (`dynamic: true`).
+Pre-quantized checkpoints are not supported. Step exclusions cannot be combined
+with diffusion caching or runtime LoRA fusion.
 With Python `LinearQuantConfig`, a nonempty `ignore_steps` list enables load-time
 quantization automatically; without it, typed configurations retain static loading.
 They retain both BF16 and quantized Linear weights: roughly 1.5 times the BF16
@@ -271,7 +273,7 @@ LTX-2 refinement follows its native LoRA precision policy: NVFP4 LoRA targets
 can use merged BF16 weights.
 
 Attention kernels use the same numbering with their own `ignore_steps` list;
-see the [combined Linear/attention example](../features/visualgen-quantized-attention.md#layer-and-step-exclusions).
+see [attention layer and step exclusions](../features/visualgen-quantized-attention.md#layer-and-step-exclusions).
 
 #### Wan VAE NVFP4
 
