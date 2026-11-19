@@ -18,8 +18,10 @@ from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -161,6 +163,42 @@ def test_fast_completion_of_an_active_request_stages_its_response_first() -> Non
     assert h.effects.terminated == []
     assert h.active == []
     assert not h.in_transfer(req)
+
+
+def test_fast_completion_publishes_current_sampler_counters() -> None:
+    h = _Harness()
+    request = LlmRequest(
+        request_id=1,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=SamplingConfig(1),
+        is_streaming=True,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+        context_phase_params=ContextPhaseParams([4], 1, None, None, None, None),
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    request.py_decoding_iter = 1
+    request.py_draft_tokens = [7, 8]
+    request.py_per_pos_drafted[0] = 2
+    request.py_per_pos_accepted[0] = 1
+    request.py_total_draft_tokens = 2
+    request.py_total_accepted_draft_tokens = 1
+    assert request.decoding_iter == 0
+    h.active.append(request)
+    h.send(request)
+    h.transceiver.finish_send(request)
+
+    h.coordinator.reap_context_sends(0)
+
+    ((request_id, response, terminate_after_publish),) = h.effects.staged_responses
+    assert request_id == request.py_request_id
+    assert terminate_after_publish is request
+    assert response.result.get_result().decoding_iter == 1
+    assert request.draft_tokens == [7, 8]
+    assert response.result.per_pos_drafted[0] == 2
+    assert response.result.per_pos_accepted[0] == 1
+    assert response.result.spec_dec_totals == (1, 2)
 
 
 def test_fast_completion_without_a_response_terminates_immediately() -> None:

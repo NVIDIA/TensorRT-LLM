@@ -1121,7 +1121,7 @@ class DisaggTransferCoordinator:
                 return
             # Create the response while the state is still TRANS_IN_PROGRESS
             # (required by C++ createResult).
-            response = prepare_response(request)
+            response = prepare_response(request, publish_metadata=True)
             released = self._transfers.end_transfer(request)
             if released:
                 self._registry.remove(request)

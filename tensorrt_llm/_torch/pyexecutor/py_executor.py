@@ -12887,9 +12887,8 @@ class PyExecutor:
                 # request has filled; give it the same finish handshake the
                 # post-batch cancellation path runs before pages are freed.
                 self._start_connector_async_save(request)
-            response = request.create_response()
+            response = prepare_response(request, publish_metadata=True)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
