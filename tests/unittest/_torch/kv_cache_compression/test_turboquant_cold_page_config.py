@@ -108,7 +108,7 @@ def test_defaults_and_dumps_keep_each_format_to_its_own_options() -> None:
     assert ColdPageQuantizationCompressionConfig.model_validate(nvfp4.model_dump()) == nvfp4
 
 
-@pytest.mark.parametrize("bits", _SUPPORTED_BITS)
+@pytest.mark.parametrize("bits", (*_SUPPORTED_BITS, 3.0))
 def test_supported_settings_parse_from_python_and_yaml_and_round_trip(bits) -> None:
     yaml_options = yaml.safe_load(f"""
 kv_cache_compression_config:
@@ -118,7 +118,7 @@ kv_cache_compression_config:
   turboquant_seed: 7
 """)
     section = yaml_options["kv_cache_compression_config"]
-    # YAML reads 3 as an int; ints and floats must both be accepted.
+    # YAML reads 3 as an int and 3.0 as a float (the form model_dump() writes); both are accepted.
     assert type(section["turboquant_bits"]) is type(bits)
     serve_args = update_llm_args_with_extra_dict({"model": "/tmp/dummy_model"}, yaml_options)
     configs = (
