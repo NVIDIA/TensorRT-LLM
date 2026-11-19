@@ -318,11 +318,10 @@ def _run_process_group() -> bool:
     try:
         group = dist.distributed_c10d._get_default_group().boxed()
         local = torch.full((2, 4), rank + 1.0, device="cuda")
-        expected = torch.cat([torch.ones_like(local), torch.full_like(local, 2)])
+        expected = torch.cat([torch.full_like(local, 11), torch.full_like(local, 12)])
 
         def before_run() -> None:
-            local.add_(10)
-            expected.add_(10)
+            local.fill_(rank + 11)
 
         fields = _profile(
             lambda: [torch.ops.trtllm.allgather_pg(local, None, [0, 1], group)],
