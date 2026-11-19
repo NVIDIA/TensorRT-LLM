@@ -19,6 +19,13 @@ limitations under the License.
 Scope: this directory and its descendants. Supplements the repository-root
 `AGENTS.md`.
 
+## CPU-only pytest thread budget
+
+Keep `TESTER_CPU_ONLY_CORES` as the single CPU-only worker budget: it controls
+both the test container's CPU requests/limits and the pytest process's
+`OMP_NUM_THREADS` / `MKL_NUM_THREADS`, inherited by unittest subprocesses.
+Apply these startup limits only to `CPU-` test stages, not GPU stages.
+
 ## Stage maintenance
 
 - Edit `jenkins/config/maintenance_stages.txt`. Blank lines and `#` comments

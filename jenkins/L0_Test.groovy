@@ -2093,6 +2093,10 @@ def getPytestBaseCommandLine(
 
     // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
     extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
+    if (stageName.startsWith("CPU-")) {
+        extraInternalEnv += " OMP_NUM_THREADS=${TESTER_CPU_ONLY_CORES}"
+        extraInternalEnv += " MKL_NUM_THREADS=${TESTER_CPU_ONLY_CORES}"
+    }
     // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
