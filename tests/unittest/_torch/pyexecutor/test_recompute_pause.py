@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _torch.pyexecutor.executor_test_utils import make_partial_executor
 from _torch.pyexecutor.multimodal_utils import make_mm_request
 
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import NoopDisaggCoordinator
@@ -75,8 +76,6 @@ def test_recompute_pause_keeps_multimodal_inputs_for_replay() -> None:
     """A recompute-paused request replays its prefill, so pausing must leave its
     multimodal payload and its encoder-cache references in place."""
     cache = TensorLRUCache(16)
-    executor = _make_executor(None)
-    executor.model_engine = types.SimpleNamespace(mm_encoder_cache=cache)
     request = make_mm_request(7, [4, 4], interleaved=True)
     state = request.py_mm_encoder_state
     cache_key = ("mm_transient", request.request_id, 1)
@@ -85,7 +84,10 @@ def test_recompute_pause_keeps_multimodal_inputs_for_replay() -> None:
     state.set_item_cache_key(1, cache_key, ready=True)
     # Paused after a first chunk that covered item 0.
     request.context_current_position = 2
-    executor.active_requests = [request]
+    executor = make_partial_executor(
+        model_engine=types.SimpleNamespace(mm_encoder_cache=cache),
+        active_requests=[request],
+    )
     scheduled_batch = ScheduledRequests()
     scheduled_batch.recompute_paused_requests = [request]
 

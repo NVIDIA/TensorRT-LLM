@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, Mock, patch
 import numpy as np
 import pytest
 import torch
+from _torch.pyexecutor.executor_test_utils import make_partial_executor
 from torch.multiprocessing.reductions import StorageWeakRef
 
 from tensorrt_llm._torch import models as torch_models
@@ -304,10 +305,12 @@ def test_validate_token_id_range_rejects_end_id(end_id) -> None:
 def test_validate_token_id_range_accepts_encoder_decoder_end_id(model_class_name, end_id) -> None:
     model = Mock(spec=getattr(torch_models, model_class_name))
     object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
-    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    executor = make_partial_executor(
+        is_encoder_decoder=True, model_engine=types.SimpleNamespace(model=model)
+    )
     request = types.SimpleNamespace(py_end_id=end_id)
 
-    PyExecutor._validate_token_id_range(executor, request)
+    executor._validate_token_id_range(request)
 
 
 @pytest.mark.parametrize(
@@ -322,11 +325,13 @@ def test_validate_token_id_range_accepts_encoder_decoder_end_id(model_class_name
 def test_validate_token_id_range_rejects_encoder_decoder_end_id(model_class_name, end_id) -> None:
     model = Mock(spec=getattr(torch_models, model_class_name))
     object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
-    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    executor = make_partial_executor(
+        is_encoder_decoder=True, model_engine=types.SimpleNamespace(model=model)
+    )
     request = types.SimpleNamespace(py_end_id=end_id)
 
     with pytest.raises(ValueError, match=rf"EndId \({end_id}\) is not within acceptable range"):
-        PyExecutor._validate_token_id_range(executor, request)
+        executor._validate_token_id_range(request)
 
 
 def _make_remote_tail_executor_and_request(
@@ -771,17 +776,22 @@ def test_encoder_input_above_max_num_tokens_fails_only_that_request() -> None:
     requests = [_make_admission_request(i) for i in range(3)]
     for request, encoder_output_len in zip(requests, (16, 17, None)):
         request.try_get_encoder_output_len = lambda length=encoder_output_len: length
-    executor = _make_admission_executor(None, requests)
-    executor.model_engine.max_num_tokens = 16
-    executor.model_engine.encoder_max_num_tokens = 16
-    executor.resource_manager = Mock(
-        get_request_kv_block_budgets=Mock(return_value=[]),
-        get_resource_manager=Mock(return_value=None),
+    executor = make_partial_executor(
+        is_encoder_decoder=True,
+        model_engine=types.SimpleNamespace(
+            model=None, max_num_tokens=16, encoder_max_num_tokens=16
+        ),
+        resource_manager=Mock(
+            get_request_kv_block_budgets=Mock(return_value=[]),
+            get_resource_manager=Mock(return_value=None),
+        ),
+        _fetch_new_requests=Mock(return_value=requests),
+        _configure_csa2_remote_tail=Mock(),
+        _validate_token_id_range=Mock(),
+        _handle_errors=Mock(),
     )
-    for name in ("_validate_request_budget", "_validate_encoder_output_len"):
-        setattr(executor, name, types.MethodType(getattr(PyExecutor, name), executor))
 
-    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+    admitted = executor._fetch_and_activate_new_requests()
 
     assert admitted == [requests[0], requests[2]]
     assert executor.active_requests == [requests[0], requests[2]]
@@ -1035,20 +1045,6 @@ def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fa
         executor._wait_for_model_engine_input_copy.assert_not_called()
 
 
-class _InflightRequestIds:
-    def __init__(self):
-        self.ids = set()
-
-    def insert(self, request_id):
-        self.ids.add(request_id)
-
-    def erase(self, request_id):
-        self.ids.discard(request_id)
-
-    def __contains__(self, request_id):
-        return request_id in self.ids
-
-
 class MockPyExecutor:
     """A mock PyExecutor class for testing request handling logic.
 
@@ -1131,16 +1127,14 @@ def mock_dist():
     return mock_dist
 
 
-def _make_async_encoder_executor(future):
-    executor = object.__new__(PyExecutor)
-    executor.dist = types.SimpleNamespace(tp_size=1)
-    executor.encoder_launch_executor = Mock()
-    executor.encoder_launch_executor.submit.return_value = future
-    executor.pending_encoder_steps = []
-    executor.inflight_req_ids = _InflightRequestIds()
-    executor._run_encoder_step_unchecked = Mock()
-    executor._publish_encoder_step = Mock()
-    executor._handle_errors = Mock()
+def _make_encoder_step_executor(tp_size=1):
+    executor = make_partial_executor(
+        is_encoder_decoder=True,
+        encoder_launch_executor=Mock(),
+        _run_encoder_step_unchecked=Mock(),
+        _handle_errors=Mock(),
+    )
+    executor.dist.tp_size = tp_size
     return executor
 
 
@@ -1153,72 +1147,22 @@ def _encoder_decoder_runner(batch_sizes, *, pad_to_limit):
     return runner
 
 
-def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8):
-    """Build a PyExecutor stub wired for token-path encoder batch-wait admission."""
-    executor = object.__new__(PyExecutor)
-    executor.max_batch_size = 32
-    batch_sizes = batch_sizes or [1, 2, 4, 8]
-    executor.llm_args = types.SimpleNamespace(
-        encoder_cuda_graph_config=types.SimpleNamespace(
-            batch_sizes=batch_sizes,
-            enable_padding=True,
-            num_tokens=[96],
-            seq_lens=[512],
-        ),
-        encoder_max_batch_size=encoder_max_batch_size,
-    )
-    executor.model_engine = object.__new__(ModelEngine)
-    executor.model_engine._cleanup_done = True
-    executor.model_engine._runner = _encoder_decoder_runner(batch_sizes, pad_to_limit=True)
-    executor.batch_wait_timeout_iters = 48
-    executor.encoder_batch_wait_iters_count = 0
-    return executor
-
-
-def _make_feature_encoder_batch_wait_executor(
-    runner_batch_sizes, encoder_max_batch_size=8, runner_enabled=True
+def _make_encoder_batch_wait_executor(
+    graph_config, runner_batch_sizes, *, pad_to_limit=False, encoder_max_batch_size=8
 ):
-    """Batch-wait executor whose encoder graph config is the feature variant.
-
-    A feature encoder leaves `num_tokens` / `seq_lens` unset and may have had
-    its `batch_sizes` derived rather than configured, so the resolved sizes come
-    from the encoder manager's resolved startup settings rather than the config.
-    """
-    executor = object.__new__(PyExecutor)
-    executor.max_batch_size = 32
-    executor.llm_args = types.SimpleNamespace(
-        encoder_cuda_graph_config=EncodeCudaGraphConfig(enable_padding=True),
-        encoder_max_batch_size=encoder_max_batch_size,
+    engine = object.__new__(ModelEngine)
+    engine._cleanup_done = True
+    engine._runner = _encoder_decoder_runner(runner_batch_sizes, pad_to_limit=pad_to_limit)
+    return make_partial_executor(
+        is_encoder_decoder=True,
+        llm_args=types.SimpleNamespace(
+            encoder_cuda_graph_config=graph_config,
+            encoder_max_batch_size=encoder_max_batch_size,
+        ),
+        model_engine=engine,
+        max_batch_size=32,
+        batch_wait_timeout_iters=48,
     )
-    executor.model_engine = object.__new__(ModelEngine)
-    executor.model_engine._cleanup_done = True
-    executor.model_engine._runner = _encoder_decoder_runner(
-        runner_batch_sizes if runner_enabled else (), pad_to_limit=False
-    )
-    executor.batch_wait_timeout_iters = 48
-    executor.encoder_batch_wait_iters_count = 0
-    return executor
-
-
-def _make_encoder_fallback_batch_wait_executor():
-    """Build a PyExecutor stub with no encoder graph config, for the fallback path."""
-    executor = object.__new__(PyExecutor)
-    executor.llm_args = types.SimpleNamespace(
-        encoder_cuda_graph_config=None,
-        encoder_max_batch_size=None,
-    )
-    executor.model_engine = object.__new__(ModelEngine)
-    executor.model_engine._cleanup_done = True
-    executor.model_engine._runner = None
-    executor.model_engine.encoder_batch_size = 8
-    executor.model_engine.encoder_max_num_tokens = 32
-    executor.batch_wait_timeout_iters = 48
-    executor.encoder_batch_wait_iters_count = 0
-    executor.batch_wait_max_tokens_ratio = 0.5
-    executor.max_num_tokens = 32
-    executor.active_requests = []
-    executor.inflight_req_ids = _InflightRequestIds()
-    return executor
 
 
 def _make_encoder_request(request_id):
@@ -1230,11 +1174,7 @@ def _make_encoder_request(request_id):
 
 
 def test_encoder_graph_warmup_uses_runtime_encoder_stream():
-    executor = object.__new__(PyExecutor)
-    executor.device_id = 3
-    executor.encoder_stream = Mock()
-    executor.resource_manager = object()
-    executor.model_engine = Mock()
+    executor = make_partial_executor(is_encoder_decoder=True, device_id=3, model_engine=Mock())
     stream_context = MagicMock()
 
     with (
@@ -1303,7 +1243,9 @@ def test_encoder_microbatch_admission_uses_resolved_feature_batch_sizes(
     runner_batch_sizes, config_batch_sizes, num_requests, expected
 ):
     """Feature admission targets the runner's resolved sizes, not the configured ones."""
-    executor = _make_feature_encoder_batch_wait_executor(runner_batch_sizes)
+    executor = _make_encoder_batch_wait_executor(
+        EncodeCudaGraphConfig(enable_padding=True), runner_batch_sizes
+    )
     if config_batch_sizes is not None:
         executor.llm_args.encoder_cuda_graph_config.batch_sizes = config_batch_sizes
     encoder_requests = [object() for _ in range(num_requests)]
@@ -1324,7 +1266,9 @@ def test_encoder_microbatch_admission_skips_uncaptured_padded_size():
     # bucket beyond the admission limit. Padding admission up to the limit
     # itself is a token-path move: a feature batch of 8 would have to pad to
     # the captured 16, which `pad_batch` refuses, so it must target 4 instead.
-    executor = _make_feature_encoder_batch_wait_executor([1, 2, 4, 16], encoder_max_batch_size=16)
+    executor = _make_encoder_batch_wait_executor(
+        EncodeCudaGraphConfig(enable_padding=True), [1, 2, 4, 16], encoder_max_batch_size=16
+    )
     executor.max_batch_size = 8
     encoder_requests = [object() for _ in range(12)]
 
@@ -1340,11 +1284,9 @@ def test_encoder_microbatch_admission_ignores_disabled_feature_runner():
     # was declined (TP > 1, or no bucket fits), so waiting on those shapes
     # would stall a batch that can only ever run eager. With no decoder work
     # the request must be released immediately instead.
-    executor = _make_feature_encoder_batch_wait_executor([1, 2, 4, 8], runner_enabled=False)
+    executor = _make_encoder_batch_wait_executor(EncodeCudaGraphConfig(enable_padding=True), ())
     executor.batch_wait_max_tokens_ratio = 0.5
     executor.max_num_tokens = 32
-    executor.active_requests = []
-    executor.inflight_req_ids = _InflightRequestIds()
     encoder_requests = [_make_encoder_request(0)]
 
     scheduled = executor._waiting_encoder_requests(encoder_requests, [], [])
@@ -1354,7 +1296,11 @@ def test_encoder_microbatch_admission_ignores_disabled_feature_runner():
 
 
 def test_encoder_microbatch_graph_admission_boundaries():
-    executor = _make_encoder_batch_wait_executor()
+    batch_sizes = [1, 2, 4, 8]
+    graph_config = types.SimpleNamespace(
+        batch_sizes=batch_sizes, enable_padding=True, num_tokens=[96], seq_lens=[512]
+    )
+    executor = _make_encoder_batch_wait_executor(graph_config, batch_sizes, pad_to_limit=True)
     encoder_requests = [object()] * 7
     scheduled = executor._waiting_encoder_requests(
         encoder_requests,
@@ -1364,7 +1310,7 @@ def test_encoder_microbatch_graph_admission_boundaries():
     assert scheduled == []
     assert executor.encoder_batch_wait_iters_count == 1
 
-    executor = _make_encoder_batch_wait_executor()
+    executor = _make_encoder_batch_wait_executor(graph_config, batch_sizes, pad_to_limit=True)
     encoder_requests = [object() for _ in range(12)]
     scheduled = executor._waiting_encoder_requests(
         encoder_requests,
@@ -1374,9 +1320,12 @@ def test_encoder_microbatch_graph_admission_boundaries():
     assert scheduled == encoder_requests[:8]
     assert executor.encoder_batch_wait_iters_count == 0
 
+    deadline_batch_sizes = [1, 3, 6]
+    deadline_graph_config = types.SimpleNamespace(
+        batch_sizes=deadline_batch_sizes, enable_padding=True, num_tokens=[96], seq_lens=[512]
+    )
     executor = _make_encoder_batch_wait_executor(
-        batch_sizes=[1, 3, 6],
-        encoder_max_batch_size=8,
+        deadline_graph_config, deadline_batch_sizes, pad_to_limit=True
     )
     executor.encoder_batch_wait_iters_count = executor.batch_wait_timeout_iters
     encoder_requests = [object() for _ in range(5)]
@@ -1388,7 +1337,7 @@ def test_encoder_microbatch_graph_admission_boundaries():
     assert scheduled == encoder_requests[:3]
     assert executor.encoder_batch_wait_iters_count == 0
 
-    executor = _make_encoder_batch_wait_executor()
+    executor = _make_encoder_batch_wait_executor(graph_config, batch_sizes, pad_to_limit=True)
     executor.encoder_batch_wait_iters_count = executor.batch_wait_timeout_iters
     encoder_requests = [object() for _ in range(8)]
     scheduled = executor._waiting_encoder_requests(
@@ -1410,7 +1359,19 @@ def test_encoder_microbatch_graph_admission_boundaries():
 
 
 def test_encoder_fallback_distinguishes_inflight_encoder_and_decoder_work():
-    executor = _make_encoder_fallback_batch_wait_executor()
+    engine = object.__new__(ModelEngine)
+    engine._cleanup_done = True
+    engine._runner = None
+    engine.encoder_batch_size = 8
+    engine.encoder_max_num_tokens = 32
+    executor = make_partial_executor(
+        is_encoder_decoder=True,
+        llm_args=types.SimpleNamespace(encoder_cuda_graph_config=None, encoder_max_batch_size=None),
+        model_engine=engine,
+        batch_wait_timeout_iters=48,
+        batch_wait_max_tokens_ratio=0.5,
+        max_num_tokens=32,
+    )
     encoder_requests = [_make_encoder_request(1)]
     inflight_encoder_request = _make_encoder_request(2)
     executor.active_requests.append(inflight_encoder_request)
@@ -1443,7 +1404,9 @@ def test_async_encoder_step_lifecycle():
     )
     future = Mock()
     future.result.return_value = result
-    executor = _make_async_encoder_executor(future)
+    executor = _make_encoder_step_executor()
+    executor.encoder_launch_executor.submit.return_value = future
+    executor._publish_encoder_step = Mock()
     active_request = types.SimpleNamespace(
         request_id=11,
         state=LlmRequestState.ENCODER_INIT,
@@ -1469,7 +1432,7 @@ def test_async_encoder_step_lifecycle():
     future.done.assert_not_called()
     ready_event.query.assert_not_called()
     executor._publish_encoder_step.assert_not_called()
-    assert executor.inflight_req_ids.ids == {11, 12}
+    assert set(executor.inflight_req_ids) == {11, 12}
     assert len(executor.pending_encoder_steps) == 1
     executor.encoder_launch_executor.submit.assert_called_once_with(
         executor._run_encoder_step_unchecked,
@@ -1480,14 +1443,14 @@ def test_async_encoder_step_lifecycle():
     future.result.assert_called_once_with()
     ready_event.query.assert_called_once_with()
     executor._publish_encoder_step.assert_not_called()
-    assert executor.inflight_req_ids.ids == {11, 12}
+    assert set(executor.inflight_req_ids) == {11, 12}
     assert len(executor.pending_encoder_steps) == 1
 
     executor._poll_encoder_steps()
     future.result.assert_called_once_with()
     assert ready_event.query.call_count == 2
     executor._publish_encoder_step.assert_called_once_with(requests, result)
-    assert executor.inflight_req_ids.ids == set()
+    assert set(executor.inflight_req_ids) == set()
     assert executor.pending_encoder_steps == []
     assert active_request.state == LlmRequestState.CONTEXT_INIT
     assert active_request.py_encoder_output_ready_event is ready_event
@@ -1495,7 +1458,6 @@ def test_async_encoder_step_lifecycle():
     assert completed_request.state == LlmRequestState.GENERATION_COMPLETE
     assert not hasattr(completed_request, "py_encoder_output")
 
-    executor.execution_stream = Mock()
     encoder_output = Mock()
     active_request.py_encoder_output = encoder_output
     scheduled_requests = types.SimpleNamespace(context_requests=[active_request])
@@ -1520,8 +1482,9 @@ def test_tp_encoder_step_synchronizes_and_publishes_inline():
     )
     future = Mock()
     future.result.side_effect = lambda: (call_order.append("result"), result)[1]
-    executor = _make_async_encoder_executor(future)
-    executor.dist.tp_size = 2
+    executor = _make_encoder_step_executor(tp_size=2)
+    executor.encoder_launch_executor.submit.return_value = future
+    executor._publish_encoder_step = Mock()
     executor.execution_stream = execution_stream
     executor.encoder_stream = encoder_stream
     executor._publish_encoder_step.side_effect = lambda requests, encoder_result: call_order.append(
@@ -1533,7 +1496,7 @@ def test_tp_encoder_step_synchronizes_and_publishes_inline():
 
     assert call_order == ["wait_stream", "result", "synchronize", "publish"]
     encoder_stream.wait_stream.assert_called_once_with(execution_stream)
-    assert executor.inflight_req_ids.ids == set()
+    assert set(executor.inflight_req_ids) == set()
     assert executor.pending_encoder_steps == []
 
 
@@ -1557,23 +1520,6 @@ def _make_encoder_decoder_request(request_id, encoder_input, encoder_len):
         is_streaming=False,
         **encoder_kwargs,
     )
-
-
-def _make_handoff_executor(tp_size=1):
-    """Async encoder executor that publishes through the real handoff methods."""
-    executor = _make_async_encoder_executor(future=None)
-    del executor._publish_encoder_step
-    executor.dist.tp_size = tp_size
-    executor.dist.rank = 0
-    executor.execution_stream = Mock()
-    executor.encoder_stream = Mock()
-    executor.max_input_len = 1024
-    executor.canceled_req_ids = []
-    executor.waiting_queue = FCFSWaitingQueue()
-    executor.active_requests = []
-    executor.enable_attention_dp = False
-    executor.kv_cache_transceiver = None
-    return executor
 
 
 def _run_encoder_step_and_poll(
@@ -1642,13 +1588,13 @@ def recorded_streams():
 )
 def test_published_output_is_consumed_once(encoder_input, tp_size, sync, recorded_streams):
     request = _make_encoder_decoder_request(1, encoder_input, 5)
-    executor = _make_handoff_executor(tp_size)
+    executor = _make_encoder_step_executor(tp_size)
 
     result = _run_encoder_step_and_poll(executor, [request], sync=sync)
 
     assert request.state == LlmRequestState.CONTEXT_INIT
     assert torch.equal(request.py_encoder_output, result.hidden_states)
-    assert executor.inflight_req_ids.ids == set()
+    assert set(executor.inflight_req_ids) == set()
     assert executor.pending_encoder_steps == []
     assert _cross_kv_reservation(request) == (True, 5)
 
@@ -1673,7 +1619,7 @@ def test_cancel_before_submission_leaves_the_encoder_window():
     scheduler.no_schedule_after_state = LlmRequestState.GENERATION_TO_COMPLETE
     assert scheduler.is_request_in_schedulable_state(request)
 
-    _cancel_requests(_make_handoff_executor(), [request])
+    _cancel_requests(_make_encoder_step_executor(), [request])
 
     assert request.is_finished
     assert not scheduler.is_request_in_schedulable_state(request)
@@ -1686,7 +1632,7 @@ def test_cancel_while_step_pending_is_not_revived(encoder_input):
         for i, length in ((1, 2), (2, 3), (3, 4))
     ]
     first, cancelled, last = requests
-    executor = _make_handoff_executor()
+    executor = _make_encoder_step_executor()
     future = Mock()
     executor.encoder_launch_executor.submit.return_value = future
     ready_event = Mock()
@@ -1698,12 +1644,12 @@ def test_cancel_while_step_pending_is_not_revived(encoder_input):
     _cancel_requests(executor, [cancelled])
     assert cancelled.is_finished
     executor._poll_encoder_steps()
-    assert executor.inflight_req_ids.ids == {1, 2, 3}
+    assert set(executor.inflight_req_ids) == {1, 2, 3}
 
     ready_event.query.return_value = True
     executor._poll_encoder_steps()
 
-    assert executor.inflight_req_ids.ids == set()
+    assert set(executor.inflight_req_ids) == set()
     assert executor.pending_encoder_steps == []
     assert torch.equal(first.py_encoder_output, hidden_states[0:2])
     assert torch.equal(last.py_encoder_output, hidden_states[5:9])
@@ -1722,7 +1668,7 @@ def test_encoder_failure_fails_only_unfinished_requests(tp_size, sync, failure):
         _make_encoder_decoder_request(1, "token", 2),
         _make_encoder_decoder_request(2, "token", 3),
     )
-    executor = _make_handoff_executor(tp_size)
+    executor = _make_encoder_step_executor(tp_size)
     _cancel_requests(executor, [cancelled])
 
     _run_encoder_step_and_poll(
@@ -1736,7 +1682,7 @@ def test_encoder_failure_fails_only_unfinished_requests(tp_size, sync, failure):
     executor._handle_errors.assert_called_once()
     failed = executor._handle_errors.call_args.kwargs["requests"]
     assert [request.py_request_id for request in failed] == [1]
-    assert executor.inflight_req_ids.ids == set()
+    assert set(executor.inflight_req_ids) == set()
     assert executor.pending_encoder_steps == []
     for request in (unfinished, cancelled):
         assert request.py_encoder_output is None
@@ -1747,7 +1693,7 @@ def test_encoder_failure_fails_only_unfinished_requests(tp_size, sync, failure):
 @pytest.mark.parametrize("pause", ["v1_pause", "v2_recompute"])
 def test_recompute_projects_cross_kv_once_per_cycle(encoder_input, pause, recorded_streams):
     request = _make_encoder_decoder_request(1, encoder_input, 5)
-    executor = _make_handoff_executor()
+    executor = _make_encoder_step_executor()
 
     for cycle in range(2):
         _run_encoder_step_and_poll(executor, [request])
@@ -1775,10 +1721,7 @@ def test_recompute_projects_cross_kv_once_per_cycle(encoder_input, pause, record
 
 
 def test_recompute_active_requests_rejects_encoder_decoder() -> None:
-    executor = _make_handoff_executor()
-    executor.is_encoder_decoder = True
-    executor.dist.pp_size = 1
-    executor.previous_batch = None
+    executor = _make_encoder_step_executor()
 
     with pytest.raises(NotImplementedError, match="encoder-decoder"):
         executor.recompute_active_requests()
@@ -1789,15 +1732,7 @@ def test_request_terminated_before_first_context_releases_packed_output(recorded
         _make_encoder_decoder_request(1, "token", 3),
         _make_encoder_decoder_request(2, "token", 5),
     )
-    executor = _make_handoff_executor()
-    executor.sampler = Mock()
-    executor.resource_manager = Mock()
-    executor._prefetched_request_ids = set()
-    executor._disagg_coordinator = Mock()
-    executor.model_engine = None
-    executor.draft_model_engine = None
-    executor.gather_all_responses = False
-    executor._response_channel = ResponseChannel()
+    executor = _make_encoder_step_executor()
     packed = StorageWeakRef(
         _run_encoder_step_and_poll(executor, [cancelled, sibling]).hidden_states.untyped_storage()
     )
