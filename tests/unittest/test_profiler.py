@@ -399,20 +399,28 @@ def test_metadata_failures_log_once_per_scope_at_warning_level(
     assert sum("another_scope" in record.getMessage() for record in records) == 1
 
 
-@pytest.mark.parametrize("boundary", ["import", "logging"])
+@pytest.mark.parametrize("boundary", ["import", "logging", "formatting", "logging-lookup"])
 def test_metadata_diagnostic_failures_preserve_workload_outcome(
     monkeypatch: pytest.MonkeyPatch, boundary: str
 ) -> None:
-    """Diagnostic import and emission failures remain observational too."""
+    """Diagnostic import, formatting, and emission failures remain observational too."""
     from tensorrt_llm.logger import logger
 
     select_regions(monkeypatch, "workflow")
     original = LookupError("workload failed")
 
+    class UnformattableMetadataError(TypeError):
+        def __str__(self) -> str:
+            raise KeyError("diagnostic formatting failed")
+
     def metadata() -> dict[str, profiler.MetadataValue]:
+        if boundary == "formatting":
+            raise UnformattableMetadataError()
         raise TypeError("unexpected metadata keyword")
 
     def fail_logging(*args: object, **kwargs: object) -> None:
+        if boundary == "logging-lookup":
+            raise KeyError("diagnostic logging failed")
         raise RuntimeError("diagnostic failed")
 
     real_import = builtins.__import__
@@ -423,9 +431,9 @@ def test_metadata_diagnostic_failures_preserve_workload_outcome(
             raise ImportError("diagnostic import failed")
         return real_import(name, *args, **kwargs)
 
-    if boundary == "logging":
+    if boundary in {"logging", "logging-lookup"}:
         monkeypatch.setattr(logger, "warning_once", fail_logging)
-    else:
+    elif boundary == "import":
         monkeypatch.setattr(builtins, "__import__", fail_logger_import)
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
         with profiler.record_function_metadata_scope("diagnostic_result", "workflow", metadata):

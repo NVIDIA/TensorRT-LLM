@@ -117,7 +117,7 @@ def warn_profiler_failure(name: str, region: ProfilerRegion, phase: str, error: 
             f"{error}. Check profiler metadata and configuration if events are missing.",
             key=("profiler_observation", region, name, phase),
         )
-    except (ImportError, AttributeError, TypeError, ValueError, RuntimeError, OSError):
+    except (ImportError, AttributeError, LookupError, TypeError, ValueError, RuntimeError, OSError):
         # Diagnostic delivery is observational too, including during imports.
         pass
 
