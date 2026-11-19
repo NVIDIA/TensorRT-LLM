@@ -1140,12 +1140,48 @@ def test_mistral_encoder_group_selected_items(indices, sizes_as_tensor):
     max_w = max(int(s[1]) for s in miss_sizes)
     miss_pixel = miss_pixel[..., :max_h, :max_w]
     pixels, sizes = _legacy_mistral_batch_pixel_values([miss_pixel], [torch.tensor(miss_sizes)])
+    # The selection is cropped on the host, before its copy to the GPU; the request keeps its
+    # payload.
+    assert selected.multimodal_data["image"]["pixel_values"].shape == miss_pixel.shape
+    assert original["pixel_values"].shape == (2, 3, 4, 4)
     expected = _MistralCpuEncoder()._get_image_features(pixels, sizes)
     assert torch.equal(encoder.encode_multimodal_inputs([selected]), expected)
     assert torch.equal(encoder.calls[0][0], pixels)
     assert selected.item_metadata.output_embedding_lengths == tuple(
         param.item_metadata.output_embedding_lengths[index] for index in indices
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mistral_selected_image_uploads_only_its_own_size(monkeypatch):
+    """Item scheduling picks the small image of a request that also has a large one: the staged
+    upload holds the selected size, not the request-wide padding, and the rows do not change."""
+    from tensorrt_llm._torch import host_staging
+
+    shapes = []
+    upload_pieces = host_staging.StagedUploader.upload_pieces
+
+    def recording_upload_pieces(self, shape, dtype, pieces, fill_value=None):
+        shapes.append(tuple(shape))
+        return upload_pieces(self, shape, dtype, pieces, fill_value)
+
+    monkeypatch.setattr(host_staging.StagedUploader, "upload_pieces", recording_upload_pieces)
+    large_and_small = _mistral_cpu_param([(32, 32), (2, 3)])
+    other = _mistral_cpu_param([(3, 2)], offset=1000)
+    encoder = _MistralCpuEncoder()
+    selected = encoder.build_multimodal_encoder_input(large_and_small, [1], "image")
+    modeling_mistral.Mistral3VLM._apply_metadata_slice(selected, large_and_small, [1])
+    params = [selected, other]
+    expected = _MistralCpuEncoder().encode_multimodal_inputs(params)
+
+    encoder.multimodal_data_device_paths = ["image.pixel_values", "multimodal_embedding"]
+    actual = encoder.encode_multimodal_inputs(params)
+
+    # Two images padded to the largest selected size (3, 3), not to the 32x32 peer.
+    assert shapes == [(2, 3, 3, 3)]
+    assert encoder.calls[0][0].is_cuda
+    assert large_and_small.multimodal_data["image"]["pixel_values"].shape == (2, 3, 32, 32)
+    assert torch.equal(actual.cpu(), expected)
 
 
 @pytest.mark.cpu_only

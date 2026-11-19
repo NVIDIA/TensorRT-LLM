@@ -1107,6 +1107,32 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
         return (EncoderGroup(("image", ), self._get_image_features), )
 
+    def build_multimodal_encoder_input(
+        self,
+        param: MultimodalParams,
+        local_item_indices: Sequence[int],
+        modality: Optional[str] = None,
+    ) -> MultimodalParams:
+        """Select images, then crop them on the host to the largest selected size.
+
+        The processor pads all images of a request to its largest one. Without
+        the crop, a small selected image would take that padding to the GPU.
+        """
+        selected = MultimodalModelMixin.build_multimodal_encoder_input(
+            self, param, local_item_indices, modality)
+        image = selected.multimodal_data.get("image")
+        if not isinstance(image, dict):
+            return selected
+        pixel_values = image.get("pixel_values")
+        image_sizes = image.get("image_sizes")
+        if (isinstance(pixel_values, torch.Tensor) and pixel_values.dim() >= 4
+                and image_sizes is not None and len(image_sizes) > 0):
+            # `image` is the selection's own dict; the request keeps its payload.
+            height = max(int(size[0]) for size in image_sizes)
+            width = max(int(size[1]) for size in image_sizes)
+            image["pixel_values"] = pixel_values[..., :height, :width]
+        return selected
+
     # Original implementation:
     # https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/mistral3/
     # modeling_mistral3.py#L341
