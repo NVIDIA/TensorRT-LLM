@@ -703,6 +703,7 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
 
 
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
+    "beam": "beam_harmony_text",
     "qwen3": "qwen3",
     "qwen3_moe": "qwen3",
     "qwen3_5": "qwen3",
