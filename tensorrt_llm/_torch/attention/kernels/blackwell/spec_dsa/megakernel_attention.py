@@ -2646,12 +2646,17 @@ def role_corr_epi_team(
 
 # ===================================================================== 2 row groups x 4 V groups, DSMEM merge
 RS24_O_COL = 384  # O accumulator: lane panel 1, columns 384-511 (N = 128); P_t at 128t + 32, t <= 2
+# team4 (wide_v): a CTA owns a 256-column V slice (vslices = 2 of the 4 KV slices of a tile) instead of 128: the PV MMA
+# is N = 256 and the O accumulator sits at columns 256-511; the pair merge (_merge_22) hands the partner the 128
+# columns it owns
+RS22_O_COL = 256
 RS24_DRY_MASK = 2047  # dry pass: every merge address wraps inside this CTA's 2 KB stat/fin scratch
+assert 3 * TILE_N // 4 <= RS22_O_COL and RS22_O_COL + 2 * SLICE <= TMEM_COLS
 
 
-def rs24_rx_bytes(f32x):
-    # partner push: nchunk x [128 threads][16 B] partial O, then [128 threads][8 B] (max, sum)
-    return (8 if f32x else 4) * 2048 + 1024
+def rs24_rx_bytes(f32x, wide_v=False):
+    # partner push: nchunk x [128 threads][16 B] partial O, then [128 threads][8 B] (max, sum); wide_v: twice the chunks
+    return (8 if f32x else 4) * (2 if wide_v else 1) * 2048 + 1024
 
 
 @_dsl_user_op
@@ -2681,10 +2686,20 @@ LSU_ARR = (
 
 @cute.jit
 def lsu_tile4(
-    tq, d, lsu_g: cutlass.Constexpr[int], s_kv_a, s_idx_a, kvf_a, kv_empty, pool: Int64, tr=None
+    tq,
+    d,
+    lsu_g: cutlass.Constexpr[int],
+    s_kv_a,
+    s_idx_a,
+    kvf_a,
+    kv_empty,
+    pool: Int64,
+    tr=None,
+    wide_v: cutlass.Constexpr[bool] = False,
 ):
     # LSU-assisted gather (g = 1 CTAs, tile 4 = local tile 1, slots 4-7): groups [32 - lsu_g, 32) of every slot via
     # cp.async (128 threads, 8 per 128 B row slice, SW128 swizzle by hand), then a noinc arrive per thread and slot
+    vslices: cutlass.Constexpr[int] = 2 if wide_v else 1
     k = d >> Int32(1)
     t = Int32(1)
     j = Int32(4)
@@ -2693,7 +2708,7 @@ def lsu_tile4(
     if cutlass.const_expr(tr is not None):
         _stamp(tr, Int32(53), tq == Int32(0))
     for step in cutlass.range(NSLICE, unroll=1):
-        sl = (k + Int32(1) + step) & Int32(3)
+        sl = k * Int32(vslices) + Int32(vslices) + step & Int32(3)
         slot = sbase + step
         _wait(kv_empty + slot, epar)
         for p in cutlass.range_constexpr(lsu_g // 4):
@@ -2732,8 +2747,10 @@ def role_gather_24(
     tr=None,
     above_ptr=None,
     lsu_g: cutlass.Constexpr[int] = 0,
+    wide_v: cutlass.Constexpr[bool] = False,
 ):
     # above_ptr (t4split): the last tile's rows below `above` (selection-certain) are gathered at the early release
+    vslices: cutlass.Constexpr[int] = 2 if wide_v else 1
     lane = cute.arch.lane_idx()
     k = d >> Int32(1)
     j0, cnt = rs24_tiles(d)
@@ -2771,7 +2788,7 @@ def role_gather_24(
         sbase = (t & Int32(1)) * Int32(4)
         epar = ((t >> Int32(1)) & Int32(1)) ^ Int32(1)
         for step in cutlass.range_constexpr(NSLICE):
-            sl = (k + Int32(1 + step)) & Int32(3)
+            sl = k * Int32(vslices) + Int32(vslices + step) & Int32(3)
             slot = sbase + Int32(step)
             _wait(kv_empty + slot, epar)
             if gw == Int32(0):
@@ -2797,7 +2814,7 @@ def role_gather_24(
             if j == Int32(ntiles - 1):
                 _wait(sel_ready, Int32(0))
                 for step in cutlass.range_constexpr(NSLICE):
-                    sl = (k + Int32(1 + step)) & Int32(3)
+                    sl = k * Int32(vslices) + Int32(vslices + step) & Int32(3)
                     slot = sbase + Int32(step)
                     if g >= hi_g and g < g_t:
                         r4 = L.lds_v4(
@@ -2832,13 +2849,15 @@ def _qk_24(
     qdesc,
     idesc_qk,
     pfence: cutlass.Constexpr[bool] = False,
+    wide_v: cutlass.Constexpr[bool] = False,
 ):
+    vslices: cutlass.Constexpr[int] = 2 if wide_v else 1
     prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
     s_addr = tmem + t * Int32(TILE_N)
     sbase = (t & Int32(1)) * Int32(4)
     fpar = (t >> Int32(1)) & Int32(1)
     for step in cutlass.range_constexpr(NSLICE):
-        c = (k + Int32(1 + step)) & Int32(3)
+        c = k * Int32(vslices) + Int32(vslices + step) & Int32(3)
         slot = sbase + Int32(step)
         _wait(kv_full + slot, fpar)
         if cutlass.const_expr(pfence):
@@ -2861,22 +2880,36 @@ def _qk_24(
                     idesc_qk,
                     Boolean(step > 0 or kb > 0),
                 )
-            if cutlass.const_expr(step < NSLICE - 1):
+            if cutlass.const_expr(step < NSLICE - vslices):
                 prims.tcgen05_commit(kv_empty + slot, group=prims.CTAGroup.CTA_1)
     if prims.elect_sync():
         prims.tcgen05_commit(s_full + t, group=prims.CTAGroup.CTA_1)
 
 
 @cute.jit
-def _pv_24(tmem, s_kv, s_ext, t, p_full, kv_empty, o_full, idesc_pv):
+def _pv_24(
+    tmem,
+    s_kv,
+    s_ext,
+    t,
+    p_full,
+    kv_empty,
+    o_full,
+    idesc_pv,
+    wide_v: cutlass.Constexpr[bool] = False,
+):
+    vslices: cutlass.Constexpr[int] = 2 if wide_v else 1
+    o_col: cutlass.Constexpr[int] = RS22_O_COL if wide_v else RS24_O_COL
     _wait(p_full + t, Int32(0))
     prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
     a_addr = tmem + t * Int32(TILE_N) + Int32(TILE_N // 4) + Int32(PANEL1)
-    slot = (t & Int32(1)) * Int32(4) + Int32(NSLICE - 1)
-    d_addr = tmem + Int32(RS24_O_COL) + Int32(PANEL1)
+    if cutlass.const_expr(wide_v):
+        a_addr = tmem + t * Int32(TILE_N // 4) + Int32(PANEL1)
+    slot = (t & Int32(1)) * Int32(4) + Int32(NSLICE - vslices)
+    d_addr = tmem + Int32(o_col) + Int32(PANEL1)
     vdesc = prims.Tcgen05SmemDesc.build(
         _slot_ptr(s_kv, s_ext, slot),
-        leading_byte_offset=0,
+        leading_byte_offset=SLOT_BYTES if wide_v else 0,
         stride_byte_offset=1024,
         layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
     )
@@ -2893,7 +2926,8 @@ def _pv_24(tmem, s_kv, s_ext, t, p_full, kv_empty, o_full, idesc_pv):
                 idesc_pv,
                 en,
             )
-        prims.tcgen05_commit(kv_empty + slot, group=prims.CTAGroup.CTA_1)
+        for v in cutlass.range_constexpr(vslices):
+            prims.tcgen05_commit(kv_empty + slot + Int32(v), group=prims.CTAGroup.CTA_1)
         prims.tcgen05_commit(o_full, group=prims.CTAGroup.CTA_1)
 
 
@@ -2913,12 +2947,19 @@ def role_mma_24(
     pv_last,
     tr=None,
     pfence: cutlass.Constexpr[bool] = False,
+    wide_v: cutlass.Constexpr[bool] = False,
 ):
     idesc_qk = prims.Tcgen05InstrDesc.build(
         c_dtype=Float32, a_dtype=E4M3, b_dtype=E4M3, n_dim=TILE_N, m_dim=HEADS
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
-        c_dtype=Float32, a_dtype=E4M3, b_dtype=E4M3, a_major=0, b_major=1, n_dim=128, m_dim=HEADS
+        c_dtype=Float32,
+        a_dtype=E4M3,
+        b_dtype=E4M3,
+        a_major=0,
+        b_major=1,
+        n_dim=256 if wide_v else 128,
+        m_dim=HEADS,
     )
     qdesc = prims.Tcgen05SmemDesc.build(
         s_q,
@@ -2934,15 +2975,17 @@ def role_mma_24(
     # tile's PV goes right after its QK (its P is ready long before tile 1 lands)
     pvn = Int32(0)
     for t in cutlass.range(cnt, unroll=1):
-        _qk_24(tmem, s_q, s_kv, s_ext, t, k, kv_full, kv_empty, s_full, qdesc, idesc_qk, pfence)
+        _qk_24(
+            tmem, s_q, s_kv, s_ext, t, k, kv_full, kv_empty, s_full, qdesc, idesc_qk, pfence, wide_v
+        )
         if cutlass.const_expr(tr is not None):
             _stamp(tr, Int32(TS_QK) + j0 + t, lane == Int32(0))
         if t == Int32(0) and j0 == Int32(0) or t > pvn:
-            _pv_24(tmem, s_kv, s_ext, pvn, p_full, kv_empty, o_full, idesc_pv)
+            _pv_24(tmem, s_kv, s_ext, pvn, p_full, kv_empty, o_full, idesc_pv, wide_v)
             if cutlass.const_expr(tr is not None):
                 _stamp(tr, Int32(TS_PV) + j0 + pvn, lane == Int32(0))
             pvn = pvn + Int32(1)
-    _pv_24(tmem, s_kv, s_ext, pvn, p_full, kv_empty, o_full, idesc_pv)
+    _pv_24(tmem, s_kv, s_ext, pvn, p_full, kv_empty, o_full, idesc_pv, wide_v)
     if cutlass.const_expr(tr is not None):
         _stamp(tr, Int32(TS_PV) + j0 + pvn, lane == Int32(0))
     if prims.elect_sync():
@@ -3219,6 +3262,102 @@ def _merge_24a(
 
 
 @cute.jit
+def _merge_22(
+    tmem, tq, d, m_me, l_me, sink_ptr, out_addr: Int64, rx_s, pvl_a, rx_a, pr_a, scale_log2: Float32
+):
+    # team4 pair merge (CTAs of the two row groups g = 0, 1 that share a V slice k): each CTA pushes the 128 columns of
+    # its 256-column O accumulator that the partner owns (BF16, st.async into the partner's rx buffer, completing its
+    # rx mbarrier) with its (max, sum), then combines its own columns with the partner's, applies the sink and the
+    # final normalisation, and writes its 128 columns of the output.
+    warp = tq >> Int32(5)
+    lane = tq & Int32(31)
+    head = warp * Int32(16) + (lane & Int32(15))
+    half = lane >> Int32(4)
+    lane_base = warp * Int32(32) << Int32(16)
+    g = d & Int32(1)
+    k = d >> Int32(1)
+    sink = Float32((sink_ptr + head).load())
+    L.wait_cl(pvl_a, Int32(0))
+    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+    cute.arch.cluster_wait()
+    L.wait_cl(pr_a, Int32(0))
+    peer = L.cluster_ctarank() ^ Int32(1)
+    rc = L.mapa_u32(rx_s, peer)
+    mc = L.mapa_u32(rx_a, peer)
+    o_base = tmem + lane_base + Int32(RS22_O_COL + PANEL1)
+    for ch in cutlass.range(2, unroll=1):
+        src = o_base + Int32(128) * (g ^ Int32(1)) + ch * Int32(64)
+        po = prims.tcgen05_ld(
+            prims.Tcgen05LdStShape.SHAPE_16X32BX2,
+            prims.make_tmem_ptr(src, Float32),
+            num=32,
+            offset=Int64(32),
+        )
+        prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+        for i in cutlass.range_constexpr(4):
+            dst = rc + (ch * Int32(512) + Int32(i * 128) + tq) * Int32(16)
+            L.st_async_v4(
+                dst,
+                mc,
+                _pack_bf16x2(Float32(po[8 * i]), Float32(po[8 * i + 1])),
+                _pack_bf16x2(Float32(po[8 * i + 2]), Float32(po[8 * i + 3])),
+                _pack_bf16x2(Float32(po[8 * i + 4]), Float32(po[8 * i + 5])),
+                _pack_bf16x2(Float32(po[8 * i + 6]), Float32(po[8 * i + 7])),
+            )
+    L.st_async_v2(rc + Int32(16384) + tq * Int32(8), mc, L.u32_of_f32(m_me), L.u32_of_f32(l_me))
+    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+    L.wait_cl(rx_a, Int32(0))
+    sa = rx_s + Int32(16384) + tq * Int32(8)
+    m_p = L.f32_of_u32(Uint32(L.lds_u32(sa)))
+    l_p = L.f32_of_u32(Uint32(L.lds_u32(sa + Int32(4))))
+    m = cute.math.max(m_me, m_p, ftz=True)
+    w_me = cute.math.exp2(scale_log2 * (m_me - m), fastmath=True)
+    w_p = cute.math.exp2(scale_log2 * (m_p - m), fastmath=True)
+    l_sum = w_me * l_me + w_p * l_p
+    norm = _final_norm(m, l_sum, sink, scale_log2)
+    for ch in cutlass.range(2, unroll=1):
+        src = o_base + g * Int32(128) + ch * Int32(64)
+        own = prims.tcgen05_ld(
+            prims.Tcgen05LdStShape.SHAPE_16X32BX2,
+            prims.make_tmem_ptr(src, Float32),
+            num=32,
+            offset=Int64(32),
+        )
+        prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+        xs = []
+        for i in cutlass.range_constexpr(4):
+            xs.append(L.lds_v4(rx_s + (ch * Int32(512) + Int32(i * 128) + tq) * Int32(16)))
+        acc = []
+        for i in cutlass.range_constexpr(32):
+            acc.append(w_me * Float32(own[i]))
+        for i in cutlass.range_constexpr(4):
+            for e in cutlass.range_constexpr(4):
+                wd = Uint32(xs[i][e])
+                acc[8 * i + 2 * e] = acc[8 * i + 2 * e] + w_p * L.f32_of_u32(wd << Uint32(16))
+                acc[8 * i + 2 * e + 1] = acc[8 * i + 2 * e + 1] + w_p * L.f32_of_u32(
+                    wd & Uint32(4294901760)
+                )
+        ob = []
+        for pi in cutlass.range_constexpr(16):
+            fp = cute.arch.mul_packed_f32x2(
+                (norm, norm), (acc[2 * pi], acc[2 * pi + 1]), ftz=False, rnd="rn"
+            )
+            ob.append(_pack_bf16x2(fp[0], fp[1]))
+        rowb = out_addr + Int64(
+            (
+                head * Int32(LATENT)
+                + k * Int32(256)
+                + g * Int32(128)
+                + ch * Int32(64)
+                + half * Int32(32)
+            )
+            * Int32(2)
+        )
+        for i in cutlass.range_constexpr(4):
+            L.st_g_v4(rowb + Int64(i * 16), ob[i * 4], ob[i * 4 + 1], ob[i * 4 + 2], ob[i * 4 + 3])
+
+
+@cute.jit
 def role_softmax_24(
     tmem,
     s_full,
@@ -3242,11 +3381,14 @@ def role_softmax_24(
     dry_merge: cutlass.Constexpr[bool] = True,
     f32x: cutlass.Constexpr[bool] = False,
     asym: cutlass.Constexpr[bool] = False,
+    wide_v: cutlass.Constexpr[bool] = False,
 ):
     # Softmax of this CTA's tiles, then the pair merge. With dry_merge the merge first runs dry at the same call site
     # in the idle window (g == 0: after the SWA tile; g == 1: before its first tile) so the real merge runs warm.
     half_n: cutlass.Constexpr[int] = TILE_N // 2
     npk: cutlass.Constexpr[int] = TILE_N // 8
+    o_col: cutlass.Constexpr[int] = RS22_O_COL if wide_v else RS24_O_COL
+    ochunks: cutlass.Constexpr[int] = 4 if wide_v else 2
     tid0 = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % Int32(4)) * Int32(
         32
     ) + cute.arch.lane_idx()
@@ -3344,6 +3486,8 @@ def role_softmax_24(
                 regs.append(_pack4_e4m3(p0, p1, p2, p3))
             local_sum = sm0 + sm1 + (sm2 + sm3)
             p_addr = s_addr + Int32(TILE_N // 4)
+            if cutlass.const_expr(wide_v):
+                p_addr = tmem + lane_base + t * Int32(TILE_N // 4)
             _tmem_st_p_fp8(p_addr + Int32(PANEL1), regs, npk)
             prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -3360,9 +3504,9 @@ def role_softmax_24(
                     cscale = cute.math.exp2(scale_log2 * (old_max - new_max), fastmath=True)
                 skip = prims.vote_sync(4294967295, ident, prims.VoteSync.ALL)
                 if not skip:
-                    for ch in cutlass.range_constexpr(2):
+                    for ch in cutlass.range_constexpr(ochunks):
                         ptr = prims.make_tmem_ptr(
-                            tmem + lane_base + Int32(RS24_O_COL + 64 * ch) + Int32(PANEL1), Float32
+                            tmem + lane_base + Int32(o_col + 64 * ch) + Int32(PANEL1), Float32
                         )
                         o = prims.tcgen05_ld(
                             prims.Tcgen05LdStShape.SHAPE_16X32BX2, ptr, num=32, offset=Int64(32)
@@ -3392,7 +3536,11 @@ def role_softmax_24(
             if cutlass.const_expr(tr is not None):
                 _stamp(tr, Int32(TS_SM) + j, warp == Int32(0) and lane == Int32(0))
         l_tot = l_run + _shfl_xor_f32(l_run, 16)
-        if cutlass.const_expr(asym):
+        if cutlass.const_expr(wide_v):
+            _merge_22(
+                tmem, tq, d, m_run, l_tot, sink_ptr, out_addr, rx_s, pvl_a, rx_a, pr_a, scale_log2
+            )
+        elif cutlass.const_expr(asym):
             _merge_24a(
                 tmem,
                 tq,

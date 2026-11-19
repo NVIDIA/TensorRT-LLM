@@ -333,6 +333,14 @@ CASES = [  # (rows' compressed lengths, attention mode, extra case options)
     pytest.param([262127] * 4, "realistic", {}, id="b4-max"),
     pytest.param([131071, 98309, 50021, 32771], "gather_exact", {}, id="b4-mixed"),
     pytest.param([512, 5632, 8192, 700], "gather_exact", {}, id="b4-short"),
+    # 3 and 4 rows run as one team of 4 CTAs per row (a single pass)
+    pytest.param([262127] * 3, "realistic", {}, id="b3-max"),
+    pytest.param(
+        [262127, 700, 98309, 32771],
+        "gather_exact",
+        {"ties": {1: 5, 3: 77}, "flat": (2,)},
+        id="b4-short-ties-flat",
+    ),
     pytest.param([262127] * 8, "gather_exact", {"flat": (6,)}, id="b8-flat"),
     pytest.param(
         [262127 - 4099 * r for r in range(8)], "realistic", {"ties": {3: 31}}, id="b8-mixed-ties"

@@ -33,6 +33,8 @@ Contract:
   tiles (``4 * ceil(n / 128)`` entries), the compressed-KV table covers ``ceil(n / 32)`` entries.
 - The kernel does not trap. It records per-row errors in its workspace (see ``error_bits``); a row with an error has
   undefined outputs.
+- Under ``compute-sanitizer --tool synccheck`` only 1 to 4 rows complete: from 5 rows on, every pass after the first
+  re-initializes its mbarriers without invalidating them (the 3 to 4-row teams run a single pass).
 """
 
 from __future__ import annotations
@@ -82,7 +84,7 @@ _BASE = dict(
     acqpoll=True,
     late_done=4,
 )
-# Each batch size extends the previous set. From 3 rows on, two teams of 8 CTAs serve the rows in turn while 132 CTAs
+# Each batch size extends the previous set. From 5 rows on, two teams of 8 CTAs serve the rows in turn while 132 CTAs
 # stream the indexer K cache; 9 to 48 rows add the ring of logits slots (ring).
 _BS1 = dict(swag=True, nohoist=True, rs24=True, rs24_t4split=True, rs24_lsu=12)
 _BS2 = dict(_BS1, math_regs=216, kv_stages=3, wdelay=0, early=True, tearly=True)
@@ -103,13 +105,17 @@ _BS4 = dict(
     tsz01=True,
     bpf=True,
 )
+# 3 and 4 rows: one team of 4 CTAs per row (two row groups x two V column halves of 256, one KV gather per tile), so
+# every row has its own team and the launch is a single pass. The candidate-row L2 prefetch (pref) is off: it measured
+# slower.
+_BS4T = dict(_BS2, team4=True, nteams=4, rs24_dry=False, pref=False)
 _BS8 = dict(_BS4, tszall=True, dpf=True, b1l=True, b1l_pub=True, b1l_upub=2)
 _BS16 = dict(_BS8, ring=True, ring_w12=True)
 _CONFIGS: dict[int, dict] = {
     1: _BS1,
     2: _BS2,
-    3: _BS4,
-    4: _BS4,
+    3: _BS4T,
+    4: _BS4T,
     **{b: _BS8 for b in range(5, 9)},
     **{b: _BS16 for b in range(9, 49)},
 }

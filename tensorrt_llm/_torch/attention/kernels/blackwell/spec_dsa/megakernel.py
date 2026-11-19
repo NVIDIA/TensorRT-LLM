@@ -1223,6 +1223,7 @@ class SpecDsaMegakernel:
         b1l_upub: int = 2,
         ring: bool = False,
         ring_w12: bool = False,
+        team4: bool = False,
         config: SpecDsaConfig | None = None,
     ):
         require_built_for(config, SPEC)
@@ -1250,17 +1251,29 @@ class SpecDsaMegakernel:
         ), "rs24_lsu: multiple of 4 in [4, 32], needs rs24"
         assert not (self.rs24_asym and self.rs24_f32), "rs24_asym pushes bf16"
         self.nrows = int(nrows)
+        # team4: teams of 4 CTAs (two row groups x two V column halves of 256, one KV gather per tile) instead of 8; one
+        # team per row for 3 to 4 rows (a single pass), a paired BF16 merge
+        self.team4 = bool(team4)
+        self.team_ctas = 4 if self.team4 else NTEAM
+        assert not self.team4 or (
+            3 <= self.nrows <= 24
+            and self.rs24
+            and (not self.rs24_dry)
+            and (not self.rs24_f32)
+            and (not self.rs24_asym)
+        ), "team4 uses paired BF16 merge for B3..24"
+        assert not self.team4 or T_OFF_LIST + A.rs24_rx_bytes(False, True) <= SMAP2_OFF
         assert 1 <= self.nrows <= (48 if ring else 8) and (self.nrows == 1 or self.rs24), (
             "multi-row needs rs24 (nrows > 8 needs ring)"
         )
         assert not self.rs24 or (
-            gjoin and (num_sms - NTEAM * (int(nteams) if nteams else self.nrows)) % 2 == 0
+            gjoin and (num_sms - self.team_ctas * (int(nteams) if nteams else self.nrows)) % 2 == 0
         ), "rs24 pairs team CTAs 2k, 2k+1 of the gjoin layout"
         self.num_sms = num_sms
         # teams of 8 CTAs; nteams < nrows shares them (team t serves rows t, t + nteams, ...)
         self.nteams = min(int(nteams), self.nrows) if nteams else self.nrows
         assert 1 <= self.nteams <= self.nrows
-        self.ns = num_sms - NTEAM * self.nteams
+        self.ns = num_sms - self.team_ctas * self.nteams
         self.npmax = (self.nrows + self.nteams - 1) // self.nteams
         assert self.npmax <= (MAXP if self.nrows <= 32 else MAXP48)  # pass entry words in T_OFF_PW
         assert self.ns * CAPR >= NB_INITIAL * BUCKET_CAP
@@ -1358,7 +1371,7 @@ class SpecDsaMegakernel:
         self.arena_bytes = ARENA
         if self.ring:
             assert (
-                self.nteams == 2
+                (self.nteams == 2 or (self.team4 and self.nteams == 4))
                 and self.npmax <= (MAXP if self.nrows <= 32 else MAXP48)
                 and not self.qdb
                 and self.tsz01
@@ -1366,7 +1379,7 @@ class SpecDsaMegakernel:
                 and self.tsz
                 and self.tszall
             ), (
-                "ring: 2 shared teams, stream T servers for every row (tsz01 / tsz2 / tsz / tszall), no "
+                "ring: 2 or 4 shared teams, stream T servers for every row (tsz01 / tsz2 / tsz / tszall), no "
                 "qdb"
             )
             if self.nrows <= 16:
@@ -1855,8 +1868,8 @@ class SpecDsaMegakernel:
                 )
             elif cutlass.const_expr(self.nteams < self.nrows):
                 # shared teams: team t = CTAs ns + 8t .. ns + 8t + 7 serves rows t, t + nteams, ...
-                tm_ = (bidx - Int32(self.ns)) // Int32(NTEAM)
-                cta_t = Int32(self.ns) + (bidx - Int32(self.ns)) % Int32(NTEAM)
+                tm_ = (bidx - Int32(self.ns)) // Int32(self.team_ctas)
+                cta_t = Int32(self.ns) + (bidx - Int32(self.ns)) % Int32(self.team_ctas)
                 self._team_cta_mr(
                     arena,
                     cta_t,
@@ -1889,8 +1902,8 @@ class SpecDsaMegakernel:
             else:
                 # team r = CTAs ns + 8r .. ns + 8r + 7, unchanged team code on row views
                 rs_ = self.row_sizes()
-                tr_ = (bidx - Int32(self.ns)) // Int32(NTEAM)
-                cta_t = Int32(self.ns) + (bidx - Int32(self.ns)) % Int32(NTEAM)
+                tr_ = (bidx - Int32(self.ns)) // Int32(self.team_ctas)
+                cta_t = Int32(self.ns) + (bidx - Int32(self.ns)) % Int32(self.team_ctas)
                 self._team_cta(
                     arena,
                     cta_t,
@@ -3342,7 +3355,7 @@ class SpecDsaMegakernel:
                                     srv_ = Int32(1)
                         if cutlass.const_expr(self.tsz01):
                             # CTA ns - 2 (empty ranges in rows 0-1) serves rows 0 and 1
-                            if r_ < Int32(2):
+                            if r_ < Int32(min(2, self.nrows - 2) if self.tsz2 else 2):
                                 if cta == Int32(self.ns - 2):
                                     srv_ = Int32(1)
                         if cutlass.const_expr(self.tszall):
@@ -3806,7 +3819,7 @@ class SpecDsaMegakernel:
     @cute.jit
     def _followers_ready(self, ws, t64):
         ready = Int32(1)
-        for fi in cutlass.range_constexpr(1, NTEAM):
+        for fi in cutlass.range_constexpr(1, self.team_ctas):
             f = L.ld_relaxed_u64(self._w(ws, W_FOL + fi))
             if f != t64:
                 ready = Int32(0)
@@ -4921,13 +4934,16 @@ class SpecDsaMegakernel:
                 if cutlass.const_expr(self.rs24):
                     prims.mbarrier_init(bars + B_RX, 1)
                     prims.mbarrier_init(bars + B_PR, 1)
-                    prims.mbarrier_init(bars + B_DRY, 1)
+                    if cutlass.const_expr(self.rs24_dry):
+                        prims.mbarrier_init(bars + B_DRY, 1)
                     prims.mbarrier_arrive_expect_tx(
-                        bars + B_RX, A.rs24_rx_bytes(self.rs24_f32 or self.rs24_asym)
+                        bars + B_RX, A.rs24_rx_bytes(self.rs24_f32 or self.rs24_asym, self.team4)
                     )
-                    prims.mbarrier_arrive_expect_tx(
-                        bars + B_DRY, A.rs24_rx_bytes(self.rs24_f32 or self.rs24_asym)
-                    )
+                    if cutlass.const_expr(self.rs24_dry):
+                        prims.mbarrier_arrive_expect_tx(
+                            bars + B_DRY,
+                            A.rs24_rx_bytes(self.rs24_f32 or self.rs24_asym, self.team4),
+                        )
         if warp == Int32(A.W_G0):
             if prims.elect_sync():
                 prims.prefetch_tensormap(tma_q.get_ptr())
@@ -4942,7 +4958,11 @@ class SpecDsaMegakernel:
         if cutlass.const_expr(self.rs24):
             # phase 0 of the cluster barrier: arrive now (the mbarrier inits are fenced above); every thread waits only
             # before its first remote operation (softmax WG: real merge; control WG: B_PR arrive; others: at exit)
-            cute.arch.cluster_arrive_relaxed()
+            if cutlass.const_expr(self.team4):
+                # team4 uses the releasing arrive
+                cute.arch.cluster_arrive()
+            else:
+                cute.arch.cluster_arrive_relaxed()
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         tmem = misc.load()
         scale_log2 = softmax_scale * Float32(A.LOG2_E)
@@ -5003,6 +5023,7 @@ class SpecDsaMegakernel:
                         dry_merge=self.rs24_dry,
                         f32x=self.rs24_f32,
                         asym=self.rs24_asym,
+                        wide_v=self.team4,
                     )
                 else:
                     A.role_softmax_team(
@@ -5099,6 +5120,7 @@ class SpecDsaMegakernel:
                             bars + B_KVE,
                             mCPool.iterator.toint(),
                             tr,
+                            wide_v=self.team4,
                         )
                         if cutlass.const_expr(self.stamps):
                             A._stamp(
@@ -5226,6 +5248,7 @@ class SpecDsaMegakernel:
                         bars + B_PVL,
                         tr,
                         pfence=self.rs24_lsu > 0,
+                        wide_v=self.team4,
                     )
                 else:
                     A.role_mma_ordered(
@@ -5322,6 +5345,7 @@ class SpecDsaMegakernel:
                     tr,
                     (misc + 16) if self.rs24_t4split else None,
                     lsu_g=self.rs24_lsu,
+                    wide_v=self.team4,
                 )
             else:
                 A.role_gather_team(
@@ -5515,13 +5539,17 @@ class SpecDsaMegakernel:
                         if cutlass.const_expr(self.rs24):
                             prims.mbarrier_init(bars + B_RX, 1)
                             prims.mbarrier_init(bars + B_PR, 1)
-                            prims.mbarrier_init(bars + B_DRY, 1)
+                            if cutlass.const_expr(self.rs24_dry):
+                                prims.mbarrier_init(bars + B_DRY, 1)
                             prims.mbarrier_arrive_expect_tx(
-                                bars + B_RX, A.rs24_rx_bytes(self.rs24_f32 or self.rs24_asym)
+                                bars + B_RX,
+                                A.rs24_rx_bytes(self.rs24_f32 or self.rs24_asym, self.team4),
                             )
-                            prims.mbarrier_arrive_expect_tx(
-                                bars + B_DRY, A.rs24_rx_bytes(self.rs24_f32 or self.rs24_asym)
-                            )
+                            if cutlass.const_expr(self.rs24_dry):
+                                prims.mbarrier_arrive_expect_tx(
+                                    bars + B_DRY,
+                                    A.rs24_rx_bytes(self.rs24_f32 or self.rs24_asym, self.team4),
+                                )
                 prims.fence_mbarrier_init()
                 prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 if cutlass.const_expr(self.pdec):
@@ -5550,7 +5578,10 @@ class SpecDsaMegakernel:
                     # waits only
                     # before its first remote operation (softmax WG: real merge; control WG: B_PR arrive; others: at
                     # exit)
-                    cute.arch.cluster_arrive_relaxed()
+                    if cutlass.const_expr(self.team4):
+                        cute.arch.cluster_arrive()
+                    else:
+                        cute.arch.cluster_arrive_relaxed()
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                 tmem = misc.load()
                 scale_log2 = softmax_scale * Float32(A.LOG2_E)
@@ -5809,6 +5840,7 @@ class SpecDsaMegakernel:
                             dry_merge=self.rs24_dry,
                             f32x=self.rs24_f32,
                             asym=self.rs24_asym,
+                            wide_v=self.team4,
                         )
                     else:
                         A.role_softmax_team(
@@ -5919,7 +5951,10 @@ class SpecDsaMegakernel:
                     # waits only
                     # before its first remote operation (softmax WG: real merge; control WG: B_PR arrive; others: at
                     # exit)
-                    cute.arch.cluster_arrive_relaxed()
+                    if cutlass.const_expr(self.team4):
+                        cute.arch.cluster_arrive()
+                    else:
+                        cute.arch.cluster_arrive_relaxed()
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                 tmem = misc.load()
                 scale_log2 = softmax_scale * Float32(A.LOG2_E)
@@ -6033,6 +6068,7 @@ class SpecDsaMegakernel:
                                         bars + B_KVE,
                                         mCPool.iterator.toint(),
                                         tr,
+                                        wide_v=self.team4,
                                     )
                                     if cutlass.const_expr(self.stamps):
                                         A._stamp(
@@ -6189,7 +6225,10 @@ class SpecDsaMegakernel:
                     # waits only
                     # before its first remote operation (softmax WG: real merge; control WG: B_PR arrive; others: at
                     # exit)
-                    cute.arch.cluster_arrive_relaxed()
+                    if cutlass.const_expr(self.team4):
+                        cute.arch.cluster_arrive()
+                    else:
+                        cute.arch.cluster_arrive_relaxed()
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                 tmem = misc.load()
                 scale_log2 = softmax_scale * Float32(A.LOG2_E)
@@ -6218,6 +6257,7 @@ class SpecDsaMegakernel:
                             bars + B_PVL,
                             tr,
                             pfence=self.rs24_lsu > 0,
+                            wide_v=self.team4,
                         )
                     else:
                         A.role_mma_ordered(
@@ -6354,7 +6394,10 @@ class SpecDsaMegakernel:
                     # waits only
                     # before its first remote operation (softmax WG: real merge; control WG: B_PR arrive; others: at
                     # exit)
-                    cute.arch.cluster_arrive_relaxed()
+                    if cutlass.const_expr(self.team4):
+                        cute.arch.cluster_arrive()
+                    else:
+                        cute.arch.cluster_arrive_relaxed()
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                 tmem = misc.load()
                 scale_log2 = softmax_scale * Float32(A.LOG2_E)
@@ -6442,6 +6485,7 @@ class SpecDsaMegakernel:
                         tr,
                         (misc + 16) if self.rs24_t4split else None,
                         lsu_g=self.rs24_lsu,
+                        wide_v=self.team4,
                     )
                 else:
                     A.role_gather_team(
