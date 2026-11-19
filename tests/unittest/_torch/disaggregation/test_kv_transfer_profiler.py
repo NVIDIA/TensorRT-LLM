@@ -494,16 +494,59 @@ def test_v2_send_cancellation_preserves_retirement_outcome(
     fatal.assert_not_called()
 
 
+@pytest.mark.parametrize("failed", [False, True], ids=["cancelled", "failed"])
+def test_v2_legacy_send_cancellation_preserves_retirement_outcome(
+    failed: bool, request: pytest.FixtureRequest
+) -> None:
+    """Retain native failure evidence when legacy cancellation replaces status."""
+    owner = _v2_owner()
+    req = _request()
+    sender = SimpleNamespace(
+        _enforce_physical_ownership=False,
+        _context_first_ownership=False,
+        _get_req_info=Mock(return_value=None),
+        setup_session=Mock(),
+        clear_session=Mock(),
+        send_cancel_to_receivers=Mock(),
+    )
+    session = TxSession(
+        req.request_id,
+        DisaggregatedParams(disagg_request_id=17, schedule_style=DisaggScheduleStyle.CONTEXT_FIRST),
+        sender,
+    )
+    request.addfinalizer(session.close)
+    assert session._retirement is None
+    owner._send_sessions = {17: session}
+    owner._send_reqs = {17: req}
+    owner.start_send_terminal_outcome_observation(req)
+    if failed:
+        session.set_exception("original send failure")
+        assert session.status is SessionStatus.ERROR
+
+    assert session.cancel()
+    assert session.status is SessionStatus.CANCELLED
+    assert (session.exception is not None) is failed
+    owner._retire_send_session(17, req, outcome="cancelled")
+
+    assert owner.get_send_terminal_outcome(req) == ("failed" if failed else "cancelled")
+    assert req.py_kv_send_session_retired
+    assert owner._send_sessions == {}
+    assert owner._send_reqs == {}
+    sender.clear_session.assert_called_once_with(17)
+    sender.send_cancel_to_receivers.assert_called_once_with(17)
+
+
+@pytest.mark.parametrize("accessor", ["status", "exception"])
 @pytest.mark.parametrize("observed", [False, True])
 def test_v2_send_retirement_status_read_is_opt_in_and_observational(
-    monkeypatch: pytest.MonkeyPatch, observed: bool
+    monkeypatch: pytest.MonkeyPatch, observed: bool, accessor: str
 ) -> None:
     """A failing status accessor cannot alter retirement or the unobserved path."""
     owner = _v2_owner()
     req = _request()
-    session = Mock(_enforce_physical_ownership=False)
+    session = Mock(_enforce_physical_ownership=False, status=SessionStatus.CANCELLED)
     status = PropertyMock(side_effect=RuntimeError("status evidence unavailable"))
-    monkeypatch.setattr(type(session), "status", status, raising=False)
+    monkeypatch.setattr(type(session), accessor, status, raising=False)
     owner._send_sessions = {17: session}
     owner._send_reqs = {17: req}
     warning = Mock()
@@ -1401,7 +1444,7 @@ def test_v2_outcome_observation_requires_opt_in_and_safe_close() -> None:
     """
     owner = _v2_owner()
     req = _request()
-    session = Mock()
+    session = Mock(exception=None)
     session._enforce_physical_ownership = True
     session.resources_drained.return_value = False
     owner._send_sessions = {17: session}
@@ -1441,7 +1484,7 @@ def test_v2_failed_close_reports_failure_not_cancellation() -> None:
 def test_v2_pipeline_retirement_is_visible_before_final_request_registration() -> None:
     owner = _v2_owner()
     req = _request()
-    session = Mock()
+    session = Mock(exception=None)
     session._enforce_physical_ownership = False
     owner._send_sessions = {17: session}
     owner._send_reqs = {}
@@ -1459,7 +1502,7 @@ def test_v2_actual_partial_send_admission_keeps_record_until_safe_retirement(
     owner = _v2_owner()
     req = _request()
     req.set_kv_cache_transfer_start = lambda value: None
-    session = Mock()
+    session = Mock(exception=None)
     session._enforce_physical_ownership = False
     owner._send_sessions = {}
     owner._send_reqs = {}

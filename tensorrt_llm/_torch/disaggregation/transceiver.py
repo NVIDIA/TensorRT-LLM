@@ -1253,8 +1253,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             observed_outcome: SendTerminalOutcome = "cancelled"
             if session is not None and rid in self._profile_send_observers:
                 try:
-                    # Retirement preserves an earlier failure even after cancel().
-                    if session.status == SessionStatus.ERROR:
+                    # Legacy cancellation can replace status while retaining the error.
+                    if session.status == SessionStatus.ERROR or session.exception is not None:
                         observed_outcome = "failed"
                 except (
                     AttributeError,
