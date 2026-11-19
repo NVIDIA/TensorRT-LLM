@@ -4,6 +4,7 @@
 input embedding treat an embedding row like one of their image positions."""
 
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 import torch
@@ -26,7 +27,7 @@ IDS = torch.tensor([11, 0, 0, 14, 0], dtype=torch.int32)
 ROWS = torch.tensor([1, 2, 4])
 
 
-def _gemma4(ple_dim: int, pad_token_id) -> SimpleNamespace:
+def _gemma4(ple_dim: int, pad_token_id: int | None) -> SimpleNamespace:
     return SimpleNamespace(
         model=SimpleNamespace(hidden_size_per_layer_input=ple_dim),
         config=SimpleNamespace(pad_token_id=pad_token_id),
@@ -44,7 +45,9 @@ def test_plain_default() -> None:
     [(32, 7, [11, 7, 7, 14, 7]), (0, None, None), (32, None, "refused")],
     ids=["ple_pads_embedding_rows", "no_ple", "ple_without_pad"],
 )
-def test_gemma4(ple_dim: int, pad_token_id, ple_ids) -> None:
+def test_gemma4(
+    ple_dim: int, pad_token_id: int | None, ple_ids: list[int] | Literal["refused"] | None
+) -> None:
     model = _gemma4(ple_dim, pad_token_id)
     reason = Gemma4ForCausalLM.prompt_embeds_unsupported_reason(model)
     if ple_ids == "refused":

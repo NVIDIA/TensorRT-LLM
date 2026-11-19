@@ -39,7 +39,12 @@ def _rows(n: int, dtype: torch.dtype = torch.float16) -> torch.Tensor:
     ],
     ids=["no_ids", "no_mask", "mask", "mask_tensor"],
 )
-def test_build_positions(ids, mask, scheduled, positions) -> None:
+def test_build_positions(
+    ids: list[int] | None,
+    mask: list[bool] | torch.Tensor | None,
+    scheduled: list[int],
+    positions: list[int],
+) -> None:
     out_ids, pe = build_prompt_embeds(ids, _rows(len(positions)), mask)
     assert out_ids == scheduled
     assert pe.positions.tolist() == positions
@@ -62,7 +67,12 @@ def test_build_positions(ids, mask, scheduled, positions) -> None:
         ([1, 2], _rows(2).index_fill(1, torch.tensor([3]), float("nan")), None, ValueError),
     ],
 )
-def test_rejects_malformed(ids, embeds, mask, error) -> None:
+def test_rejects_malformed(
+    ids: list[int] | None,
+    embeds: object,
+    mask: object,
+    error: type[Exception],
+) -> None:
     with pytest.raises(error):
         build_prompt_embeds(ids, embeds, mask)
 
