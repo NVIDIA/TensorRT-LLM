@@ -212,6 +212,7 @@ def remap_prompt_embeds(
     original_ids: Sequence[int],
     expanded_ids: Sequence[int],
     item_spans: Sequence[tuple[int, int]],
+    run_spans: Optional[Sequence[tuple[int, int]]] = None,
 ) -> PromptEmbeds:
     """Move prompt-embedding positions through multimodal placeholder expansion.
 
@@ -230,6 +231,8 @@ def remap_prompt_embeds(
         expanded_ids: Prompt ids the engine schedules.
         item_spans: ``[start, end)`` expanded rows of each multimodal item, in
             prompt order, from its first multimodal row to its last.
+        run_spans: ``[start, end)`` of each contiguous multimodal run (a video
+            frame); defaults to ``item_spans``.
 
     Returns:
         A snapshot with the same rows whose positions index ``expanded_ids``.
@@ -238,9 +241,10 @@ def remap_prompt_embeds(
         raise ValueError("Remapping prompt_embeds needs the rows.")
     if list(original_ids) == list(expanded_ids):
         # Already expanded (e.g. a disaggregated encoder handoff): positions
-        # stand, and none may fall inside a multimodal item.
+        # stand, and none may be a multimodal row (text between frames may).
+        runs = item_spans if run_spans is None else run_spans
         for p in prompt_embeds.positions.tolist():
-            if any(start <= p < end for start, end in item_spans):
+            if any(start <= p < end for start, end in runs):
                 raise ValueError("prompt_embeds_mask selects a multimodal placeholder position.")
         return prompt_embeds
     mapping: list[int] = []
@@ -337,6 +341,18 @@ def multimodal_item_spans(multimodal_input: "MultimodalInput") -> list[tuple[int
             )
         ]
     return sorted(spans)
+
+
+def multimodal_run_spans(multimodal_input: "MultimodalInput") -> list[tuple[int, int]]:
+    """Return each contiguous multimodal run's ``[start, end)`` in prompt order."""
+    if multimodal_input.multimodal_run_positions is None:
+        return multimodal_item_spans(multimodal_input)
+    return sorted(
+        (int(start), int(start) + int(length))
+        for start, length in zip(
+            multimodal_input.multimodal_run_positions, multimodal_input.multimodal_run_lengths
+        )
+    )
 
 
 def prompt_embeds_block_key(row_digest: bytes, placeholder_id: int) -> bytes:

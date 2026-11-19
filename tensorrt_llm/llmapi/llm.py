@@ -58,7 +58,8 @@ from ..inputs import (GenerationInputs, PromptInputs, TokensPrompt,
                       create_input_processor, create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..inputs.prompt_embeds import (PromptEmbeds, build_prompt_embeds,
-                                    multimodal_item_spans, remap_prompt_embeds)
+                                    multimodal_item_spans, multimodal_run_spans,
+                                    remap_prompt_embeds)
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -917,10 +918,12 @@ class BaseLLM:
         if prompt_embeds is not None:
             if multimodal_params is not None:
                 multimodal_input = multimodal_params.multimodal_input
-                prompt_embeds = remap_prompt_embeds(
-                    prompt_embeds, inputs["prompt_token_ids"], prompt_token_ids,
-                    multimodal_item_spans(multimodal_input)
-                    if multimodal_input is not None else [])
+                spans = ((multimodal_item_spans(multimodal_input),
+                          multimodal_run_spans(multimodal_input))
+                         if multimodal_input is not None else ([], []))
+                prompt_embeds = remap_prompt_embeds(prompt_embeds,
+                                                    inputs["prompt_token_ids"],
+                                                    prompt_token_ids, *spans)
 
         if (not self.args.mm_encoder_only and disaggregated_params is not None
                 and disaggregated_params.multimodal_input_layout is not None):

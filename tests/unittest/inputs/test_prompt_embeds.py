@@ -13,6 +13,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm.inputs.prompt_embeds import (
     build_prompt_embeds,
     multimodal_item_spans,
+    multimodal_run_spans,
     prompt_embeds_block_key,
     prompt_embeds_cache_salt,
     remap_prompt_embeds,
@@ -235,3 +236,17 @@ def test_remap_keeps_already_expanded_ids() -> None:
     _, on_image = build_prompt_embeds(ids, _rows(1), [False, False, False, True, False, False])
     with pytest.raises(ValueError, match="multimodal placeholder"):
         remap_prompt_embeds(on_image, ids, list(ids), [(2, 4)])
+
+    # Timestamp text between two frames of one video is not a multimodal row.
+    video = [1, 60, 50, 53, 53, 52, 61, 50, 53, 53, 52, 2]
+    runs = SimpleNamespace(
+        multimodal_item_run_cu_offsets=[0, 2],
+        multimodal_run_positions=[3, 8],
+        multimodal_run_lengths=[2, 2],
+    )
+    spans = (multimodal_item_spans(runs), multimodal_run_spans(runs))
+    _, between = build_prompt_embeds(video, _rows(1), [p == 6 for p in range(len(video))])
+    assert remap_prompt_embeds(between, video, list(video), *spans) is between
+    _, on_frame = build_prompt_embeds(video, _rows(1), [p == 8 for p in range(len(video))])
+    with pytest.raises(ValueError, match="multimodal placeholder"):
+        remap_prompt_embeds(on_frame, video, list(video), *spans)
