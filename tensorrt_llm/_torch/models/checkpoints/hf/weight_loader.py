@@ -126,21 +126,12 @@ def _rank_read_set(mapping: Mapping, model) -> tuple | None:
     ep_size = mapping.moe_ep_size if config.moe_load_balancer is None else 1
     if layers is None and ep_size == 1:
         return None
-    # Checkpoints may stack a layer's experts in one tensor (dim 0 = expert).
-    text_config = getattr(config.pretrained_config, "text_config",
-                          None) or config.pretrained_config
-    num_experts = next(
-        (getattr(text_config, name)
-         for name in ("n_routed_experts", "num_local_experts", "num_experts")
-         if isinstance(getattr(text_config, name, None), int)), None)
     return (layers, num_layers, mapping.is_last_pp_rank(), ep_size,
-            mapping.moe_ep_rank, num_experts)
+            mapping.moe_ep_rank)
 
 
-def _node_read_extents(stats,
-                       read_sets) -> tuple[list[tuple[str, int, int]], bool]:
-    """The (path, offset, length) ranges any of a node's ranks reads, and
-    whether the ranks read only part of a tensor of stacked experts."""
+def _node_read_extents(stats, read_sets) -> list[tuple[str, int, int]]:
+    """The (path, offset, length) ranges any of a node's ranks reads."""
     from tensorrt_llm._torch.moe.fused_moe.interface import \
         _compute_ep_partition
 
@@ -151,31 +142,20 @@ def _node_read_extents(stats,
 
     # Parse the headers directly: a validated checkpoint catalog of ~1M
     # tensors (Kimi K3) takes ~13 s per rank, the headers ~2 s.
-    stacked = read_sets[0][5]
-    tensors = []  # (path, start, end, layer, expert, in_stack)
+    tensors = []  # (path, start, end, layer, expert)
     for path, _ in stats:
         _, header_bytes, header = _read_safetensors_header(path)
         for name, info in header.items():
-            if name == "__metadata__":
-                continue
-            layer, expert = indices(name)
-            start, end = (8 + header_bytes + offset
-                          for offset in info["data_offsets"])
-            shape = info["shape"]
-            if (expert is None and ".experts." in name and len(shape) > 1
-                    and shape[0] == stacked):
-                # Experts stacked on dim 0: expert e is the e-th block of rows.
-                rows = (end - start) // stacked
-                tensors += [(path, start + e * rows, start + (e + 1) * rows,
-                             layer, e, True) for e in range(stacked)]
-            else:
-                tensors.append((path, start, end, layer, expert, False))
+            if name != "__metadata__":
+                begin, end = info["data_offsets"]
+                tensors.append((path, 8 + header_bytes + begin,
+                                8 + header_bytes + end, *indices(name)))
     tensors.sort(key=lambda tensor: tensor[:2])
     num_experts = 1 + max(
         (tensor[4] for tensor in tensors if tensor[4] is not None), default=-1)
 
     def is_read(layer, expert, read_set) -> bool:
-        layers, num_layers, is_last_stage, ep_size, ep_rank, _ = read_set
+        layers, num_layers, is_last_stage, ep_size, ep_rank = read_set
         if layers is not None and layer is not None:
             if layer < num_layers and layer not in layers:
                 return False
@@ -188,18 +168,14 @@ def _node_read_extents(stats,
         return True
 
     extents = []  # [path, start, end], coalesced in file order
-    split = False
-    for path, start, end, layer, expert, in_stack in tensors:
+    for path, start, end, layer, expert in tensors:
         if not any(is_read(layer, expert, s) for s in read_sets):
-            # Part of a stacked tensor of a layer the node loads.
-            split |= in_stack and any(
-                is_read(layer, None, s) for s in read_sets)
             continue
         if extents and extents[-1][0] == path and extents[-1][2] >= start:
             extents[-1][2] = end
         else:
             extents.append([path, start, end])
-    return [(path, start, end - start) for path, start, end in extents], split
+    return [(path, start, end - start) for path, start, end in extents]
 
 
 class _LazySafetensorsWeights(ConsumableWeightsDict):
@@ -1042,16 +1018,13 @@ class HfWeightLoader(BaseWeightLoader):
                                        for observation in observations)
                 read_sets = [observation[2] for observation in observations]
             extents = [(path, 0, stat.st_size) for path, stat in stats]
-            # Whole files stream fastest; narrow to the node's tensors when the
-            # checkpoint does not fit, or when the node reads only part of
-            # tensors of stacked experts (a few large ranges).
+            # Whole files stream fastest; narrow to the node's tensors only
+            # when the checkpoint does not fit.
             fits, _ = memory_admission(sum(s.st_size for _, s in stats),
                                        available_memory)
-            if eligibility_reason is None and None not in read_sets:
+            if eligibility_reason is None and None not in read_sets and not fits:
                 with _gc_paused():
-                    node_extents, split = _node_read_extents(stats, read_sets)
-                if split or not fits:
-                    extents = node_extents
+                    extents = _node_read_extents(stats, read_sets)
             # Models load layer by layer, but shard names sort layer 10 before
             # layer 2: read ahead in layer order so the pages a rank needs next
             # are the ones read first, and the oldest pages are the first evicted.

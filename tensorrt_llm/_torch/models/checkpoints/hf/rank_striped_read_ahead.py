@@ -100,15 +100,8 @@ def build_local_plan(
     if not extents or local_rank not in issuer_ranks:
         return ReadAheadPlan((), 0)
 
-    # Balance bytes rather than extent counts: node ranges leave many short
-    # extents, and a node finishes only when its most loaded issuer does.
-    loads = [0] * len(issuer_ranks)
-    owners = []
-    for extent in extents:
-        owners.append(loads.index(min(loads)))
-        loads[owners[-1]] += extent.length
     issuer_index = issuer_ranks.index(local_rank)
-    local_extents = tuple(e for e, owner in zip(extents, owners) if owner == issuer_index)
+    local_extents = tuple(extents[issuer_index :: len(issuer_ranks)])
     workers = min(worker_counts[local_rank], len(local_extents))
     return ReadAheadPlan(local_extents, workers)
 

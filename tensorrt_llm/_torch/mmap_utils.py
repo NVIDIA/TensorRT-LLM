@@ -418,12 +418,9 @@ def _pread_into(fd: int, buf: memoryview, offset: int) -> None:
 class SafetensorsPreader:
     """A ``safetensors.safe_open(path, framework="pt")`` handle that reads with ``pread``.
 
-    ``safe_open`` tensors are views of a file mapping, and copying one to the GPU
-    faults its pages in one by one: a few GB/s per rank when they are cached and
-    about 0.5 GB/s when they are not, since each fault then waits on its own small
-    read. ``pread`` fills ordinary host tensors at page-cache speed, or in large
-    reads when uncached. ``get_slice(name)[rows]`` reads only those rows; see
-    ``_PreadSlice.__getitem__`` for other indices (column shards).
+    Copying a ``safe_open`` view to the GPU faults its pages in one at a time;
+    ``pread`` fills ordinary host tensors at page-cache speed, or in large reads
+    when uncached.
     """
 
     def __init__(self, path: str):
@@ -431,8 +428,7 @@ class SafetensorsPreader:
         import torch
 
         self.path, self._mapped = path, None
-        # One open per shard: on NFS each open is a round trip to the server.
-        self._fd = os.open(path, os.O_RDONLY)
+        self._fd = os.open(path, os.O_RDONLY)  # one open per shard: a round trip on NFS
         header_bytes = struct.unpack("<Q", os.pread(self._fd, 8, 0))[0]
         header = bytearray(header_bytes)
         _pread_into(self._fd, memoryview(header), 8)
@@ -454,27 +450,18 @@ class SafetensorsPreader:
         import torch
 
         out = torch.empty(nbytes, dtype=torch.uint8)
-        buf = memoryview(out.numpy())
-        offset += self._data_start
+        buf, offset = memoryview(out.numpy()), offset + self._data_start
         starts = range(0, nbytes, _PREAD_CHUNK_BYTES)
         if len(starts) < 2:
             _pread_into(self._fd, buf, offset)
-            return out
-        # A single loader thread copying a large tensor would read at one
-        # thread's speed; split it across the shared pool.
-        list(
-            _pread_pool().map(
-                lambda s: _pread_into(self._fd, buf[s : s + _PREAD_CHUNK_BYTES], offset + s), starts
+        else:  # one loader thread would read a large tensor at one thread's speed
+            chunk = _PREAD_CHUNK_BYTES
+            list(
+                _pread_pool().map(
+                    lambda s: _pread_into(self._fd, buf[s : s + chunk], offset + s), starts
+                )
             )
-        )
         return out
-
-    def _mapped_slice(self, name: str):
-        if self._mapped is None:
-            import safetensors
-
-            self._mapped = safetensors.safe_open(self.path, framework="pt", device="cpu")
-        return self._mapped.get_slice(name)
 
     def close(self) -> None:
         if getattr(self, "_fd", -1) >= 0:
@@ -497,8 +484,7 @@ class _PreadSlice:
     __slots__ = ("_reader", "_name", "_info")
 
     def __init__(self, reader: SafetensorsPreader, name: str):
-        self._reader, self._name = reader, name
-        self._info = reader._header[name]
+        self._reader, self._name, self._info = reader, name, reader._header[name]
 
     def get_shape(self) -> list[int]:
         return list(self._info["shape"])
@@ -507,30 +493,34 @@ class _PreadSlice:
         return self._info["dtype"]
 
     def _rows(self, index) -> tuple[int, int] | None:
-        """``index`` as a row range ``[start, stop)`` of whole rows, or None."""
+        """``index`` as a range ``[start, stop)`` of whole rows, or None."""
         shape = self.get_shape()
         index = index if isinstance(index, tuple) else (index,)
-        if index and index[-1] is Ellipsis:
-            index = index[:-1]
+        index = index[:-1] if index and index[-1] is Ellipsis else index
         if not index:
-            return (0, shape[0] if shape else 1)
+            return 0, shape[0] if shape else 1
         if len(index) > len(shape) or not all(isinstance(i, slice) for i in index):
             return None
         bounds = [i.indices(n) for i, n in zip(index, shape)]
         if bounds[0][2] != 1 or any(b != (0, n, 1) for b, n in zip(bounds[1:], shape[1:])):
             return None
-        return bounds[0][0], max(bounds[0][0], bounds[0][1])
+        return bounds[0][0], max(bounds[0][:2])
 
     def __getitem__(self, index):
         rows = self._rows(index)
         if rows is None:
-            # A column shard. While the read-ahead fills the page cache, the
-            # mapping copies just the shard's bytes; without it, one pread of
-            # the whole tensor (which the node's TP ranks share through the
-            # page cache) beats faulting the shard in page by page.
-            if os.path.dirname(os.path.abspath(self._reader.path)) in READ_AHEAD_DIRS:
-                return self._reader._mapped_slice(self._name)[index]
-            return self[...][index]
+            # A column shard: while the read-ahead fills the page cache, the
+            # mapping copies just the shard's bytes; otherwise one pread of the
+            # whole tensor, which the node's TP ranks share through the page cache.
+            if os.path.dirname(os.path.abspath(self._reader.path)) not in READ_AHEAD_DIRS:
+                return self[...][index]
+            if self._reader._mapped is None:
+                import safetensors
+
+                self._reader._mapped = safetensors.safe_open(
+                    self._reader.path, framework="pt", device="cpu"
+                )
+            return self._reader._mapped.get_slice(self._name)[index]
         shape = self.get_shape()
         dtype = self._reader._dtypes[self._info["dtype"]]
         row_bytes = math.prod(shape[1:]) * dtype.itemsize
@@ -538,10 +528,8 @@ class _PreadSlice:
         nbytes = (rows[1] - rows[0]) * row_bytes
         out = self._reader._read(begin, nbytes).view(dtype)
         if shape and 0 < rows[1] - rows[0] < shape[0]:
-            # One rank reads a part (expert or row parallel): drop its pages.
-            # Otherwise they fill the page cache, and under a cap on it (a Lustre
-            # client keeps about half of host memory) the read-ahead's pages that
-            # are not yet used get evicted instead and are read again.
+            # Only this rank reads these rows (expert or row parallel): drop
+            # them, or under a page-cache cap they evict unread read-ahead pages.
             os.posix_fadvise(
                 self._reader._fd, self._reader._data_start + begin, nbytes, os.POSIX_FADV_DONTNEED
             )
