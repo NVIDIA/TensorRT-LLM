@@ -220,6 +220,11 @@ target's own kernels run the experts. A target that declares neither honors no
 tactic: under one, `modeling_v2="auto"` builds the built-in model instead and
 `"require"` fails. The [Kimi K3 targets](models/kimi_k3_vl/) declare both.
 
+Step targets also declare the engine features they serve, such as the prefill
+CUDA graph. [Engine features](FEATURES.md) describes the three kinds of feature
+and how each is checked once `route` has returned a target, and lists the
+features with what every target does with them.
+
 How the model loader resolves a target:
 
 ```text

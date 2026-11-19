@@ -1,0 +1,124 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+# Engine features in Modeling V2
+
+A target serves the engine features its deployment turns on, such as the decode
+CUDA graph, chunked prefill, speculative decoding or LoRA. `_features.py`
+records which step targets serve which features, and `modeling_v2_resolve`
+checks the record once `route` has returned a target. This page describes the
+three kinds of feature, lists the features each kind holds and is planned to
+hold, and records what every routed target does with them today.
+
+## Feature kinds
+
+A deployment's core hands each step to one of its step targets
+(`_select_target`): every step with context rows to `PrefillTarget`, every step
+without to `DecodeTarget`. A deployment class that declares features on its step
+targets names them in `step_targets`; one without it is its own step target.
+
+A feature is a class in `_features.py`. Its `from_args` reads the facts that
+decide support from `ModelConfig` and the LLM arguments, and returns None while
+the feature is off. A step target declares itself with the feature's class
+decorator; `when`, if given, sees the feature instance and limits the
+declaration to the settings it holds for.
+
+| Kind | A step target serves it | Declared with | When the route's target has a step target that does not serve it |
+|---|---|---|---|
+| `BasicFeature` | unless it declares otherwise | `@Feature.unsupported(when=...)` | `ValueError` in every mode |
+| `AdvancedFunctionalFeature` | only once it declares it | `@Feature.supported(when=...)` | the target is refused: `auto` builds Modeling V1, `require` raises |
+| `AdvancedPerfFeature` | only once it declares it | `@Feature.supported(when=...)` | the target is built, with a warning |
+
+- **Basic** features are the ones every model in Modeling V1 serves (see the
+  Model-Feature Support Matrix in
+  [supported models](../../../docs/source/models/supported-models.md)); a target
+  that does not is the exception and says so.
+- **Advanced functional** features change what the engine computes. A target
+  that ignores one returns wrong results, so only a target that declares it is
+  built.
+- **Advanced perf** features change only how fast the engine runs. A target that
+  does not declare one still computes the right result in principle, so it is
+  built and the gap is reported.
+
+A declaration describes the step target. It does not replace a check in
+`route`: when a feature setting makes a target fail (rather than run slower),
+`route` (or a `check_deployment` it calls) still raises `NoTarget` for it. The
+qwen4_exp target, for example, both declares the prefill CUDA graph settings it
+serves and refuses the others in `check_deployment`; the warning then fires only
+if a route misses one.
+
+`from_args` sees only the engine arguments, so a feature that a request turns on
+(multimodal input, per-request context logits) is checked through the engine
+argument that enables it, or not at all.
+
+## Feature list
+
+Status: **in code** features exist in `_features.py`; **planned** ones are
+proposed and not implemented yet; **to verify** ones need a look at the targets
+before they are classified.
+
+### Basic features
+
+| Feature | Turned on by | Status | Targets that do not serve it today |
+|---|---|---|---|
+| `DecodeCudaGraph` | `cuda_graph_config` | in code | none |
+| `ChunkedPrefill` | `enable_chunked_prefill` | in code | none |
+| `OverlapScheduler` | `disable_overlap_scheduler=False` | in code | none (GLM-5.2 sm103 tp8 fast paths fall back without it) |
+| `KvCacheBlockReuse` | `kv_cache_config.enable_block_reuse` | in code | Kimi K3 tp16 (both): asserted off at the first forward; should declare `unsupported` |
+| `GuidedDecoding` | `guided_decoding_backend` | planned | GLM-5.3-Flash mtp_fused (refused in `route`) |
+| `ReturnLogits` | `gather_generation_logits` | planned | GLM-5.3-Flash mtp_fused drops `return_context_logits` |
+| `LogitsPostProcessor` | `batched_logits_processor` | to verify | sampler side; check targets that fuse sampling into a draft loop |
+| `TextWatermarking` | `watermark_config` | to verify | as above |
+
+### Advanced functional features
+
+| Feature | Turned on by | Status | Today |
+|---|---|---|---|
+| `SpeculativeDecoding` | `speculative_config` | planned | Every target serves one mode, checked in `route`: one-model MTP-Eagle (DeepSeek R1, Qwen3.8-Flash-Next, the four GLM-5.2 targets, GLM-5.3-Flash mtp_fused), one-model Eagle3 (MiniMax-M3), SA/DFlash/DSpark (Kimi K3 moetp4ep4), MTP or SA (GLM-5.3-Flash default), none (GPT-OSS, Kimi K3 moetp16ep1). Dynamic trees, `draft_len_schedule` and two-model drafting are refused everywhere; GLM-5.2 sm103 tp8 requires MTP. The feature would carry the mode, linearity and draft length so targets state these limits with `when`. |
+| `LoRA` | `enable_lora` / `lora_config` | planned | No target serves it. Qwen3.8-Flash-Next asserts and MiniMax-M3 raises at runtime; DeepSeek R1, GPT-OSS and GLM-5.2 sm103 tep4 ignore `lora_params` without a check. |
+| `BeamSearch` | `max_beam_width > 1` | planned | No target serves it. Qwen3.8-Flash-Next asserts width 1; DeepSeek R1 and GLM-5.2 sm103 tep4 assume width 1 without a check. |
+| `ReturnRoutedExperts` | `enable_return_routed_experts` | to verify | |
+| `DisaggregatedServing` | `cache_transceiver_config` | to verify | KV transfer planners already declare the deployments they serve (`supports_deployment`) |
+| `KvConnector` | `kv_connector_config` | to verify | |
+| `KvCacheCompression` | `kv_cache_compression_config` | to verify | |
+
+### Advanced perf features
+
+| Feature | Turned on by | Status | Today |
+|---|---|---|---|
+| `PrefillCudaGraph` | `prefill_cuda_graph_backend` | in code | Declared by GLM-5.2 sm103 tp8 and sm107 low_latency (all backends), Kimi K3 tp16 (breakable), MiniMax-M3 sm107 tp2 (breakable; decode left uncompiled), Qwen3.8-Flash-Next (breakable under attention TP; decode left uncompiled). MiniMax-M3 sm103 tp4/tp8 and sm107 tp4/tp8 raise at runtime under any prefill CUDA graph and need a refusal in `route`. |
+| `TorchCompile` | `torch_compile_config` | planned | No target is written for torch.compile; targets that fail under it need a refusal in `route` as well. |
+| `MoeLoadBalancer` | `moe_config.load_balancer` | planned | Qwen3.8-Flash-Next (with expert parallelism) and GLM-5.2 sm107 high_throughput refuse it because it would do nothing; a warning fits. |
+| `MoeTactic` | `moe_config.tactic`, `speculative_config.moe_tactic` | planned | Refused today unless the target lists `moe_impls_honored` / `draft_moe_impls_honored`; only GLM-5.2 sm107 low_latency and Kimi K3 list trunk ids. |
+| `MoeBackend` | `moe_config.backend` | to verify | Qwen3.8-Flash-Next and GLM-5.2 sm107 high_throughput restrict it. |
+| `CudaGraphPadding`, `CudaGraphSamplingVariants`, `InGraphSampling` | `cuda_graph_config.enable_padding`, `cuda_graph_config.sampling_variants`, `enable_in_graph_sampling` | to verify | |
+| `AttentionDpBalance` | `attention_dp_config` | to verify | |
+| `UserBuffers`, `CuteDslBlockscaling`, `MinLatency` | `torch_compile_config.enable_userbuffers`, `use_cute_dsl_blockscaling_mm/bmm`, `enable_min_latency` | to verify | |
+| `AllReduceStrategy` | `allreduce_strategy` | to verify | Kimi K3 asserts AUTO or MNNVL; decide whether that limit is functional or perf. |
+
+### Kept in `route`
+
+These are not features: a target is named after them, or they are part of the
+numerics a checkpoint is served with. `route` keeps checking them.
+
+- Parallel layout: pipeline parallelism, context parallelism and helix,
+  attention DP, `enable_lm_head_tp_in_adp`, MoE TP×EP.
+- Numerics: KV cache dtype, `mamba_ssm_cache_dtype`, model dtype, quantization
+  format, `sparse_attention_config`.
+- Settings the engine handles without the model: scheduler policy,
+  `batch_wait_*`, `stream_interval`, statistics, tokenizer.
+
+## Known gaps
+
+Found while recording the targets above; each is a change of its own.
+
+- **Hard errors that `auto` cannot fall back from.** These are assertions or
+  `ValueError`s at construction, not `NoTarget` in `route`: Kimi K3 moetp16ep1
+  with any speculative decoding; Kimi K3 moetp4ep4 with MTP, Eagle3 or NGram;
+  Kimi K3 with a KV cache other than bf16; MiniMax-M3 sm107 with a sparse
+  attention or Eagle3 configuration it does not serve.
+- **Runtime failures under a perf feature.** MiniMax-M3 sm103 tp4/tp8 and sm107
+  tp4/tp8 under any prefill CUDA graph.
+- **Silent wrong results.** LoRA, beam search and context logits on the targets
+  listed above; the planned `LoRA`, `BeamSearch` and `ReturnLogits` features
+  close them.
