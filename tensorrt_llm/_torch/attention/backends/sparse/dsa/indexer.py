@@ -2020,6 +2020,10 @@ class Indexer(nn.Module):
         batch. Otherwise they contain only the selected context or generation
         phase. ``q_scale`` is only consumed by the FP4 dispatch.
 
+        ``decode_topk_start_event`` is waited on the current stream immediately
+        before decode Top-K, after logits computation. It does not delay prefill
+        Top-K, and its producer must enqueue the record before this call.
+
         """
         # DSACacheManager / DeepseekV4CacheManager force quant_block_size to
         # 128 (FP8 path) or 32 (MXFP4 path); both round-trip to the same

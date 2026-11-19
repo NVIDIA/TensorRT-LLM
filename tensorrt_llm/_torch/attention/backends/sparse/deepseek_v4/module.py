@@ -1460,8 +1460,8 @@ def forward_sparse_attn(
     indexer_ran = False
     if _v4_extra_overlap:
         if _use_indexer_overlap:
-            # Compressor and indexer prework are already in flight. Run Q after the
-            # compressor on the same stream, then synchronize both streams below.
+            # Issue Q first: decode Top-K waits on dsv4_compressor_event, so its
+            # record must be enqueued before the indexer consumes the event.
             self.dsv4_overlap_start_event.record()
 
             with torch.cuda.stream(self.compressor_stream):
