@@ -59,7 +59,7 @@ moe_config:
 #### `backend`
 
  - MoE backend type, defaults to `AUTO`, which selects a backend based on the model.
- - TensorRT LLM has multiple MoE backends that support wide EP: `CUTEDSL`, `CUTLASS`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `MEGAMOE_CUTEDSL` and `MEGAMOE_DEEPGEMM`. The remaining backends (`VANILLA`, `TRITON`, `MARLIN`) do not support the load balancer. The dedicated `WIDEEP` backend is deprecated and can no longer be selected; use `CUTEDSL` for large-EP NVFP4 deployments, or `DEEPGEMM` for FP8 block-scale checkpoints on Blackwell.
+ - TensorRT LLM has multiple MoE backends that support wide EP: `CUTEDSL`, `CUTLASS`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `MEGAMOE_CUTEDSL` and `MEGAMOE_DEEPGEMM`. The remaining backends (`VANILLA`, `TRITON`, `MARLIN`, `PRIMS_TS`) do not support the load balancer. The dedicated `WIDEEP` backend is deprecated and can no longer be selected; use `CUTEDSL` for large-EP NVFP4 deployments, or `DEEPGEMM` for FP8 block-scale checkpoints on Blackwell.
 
 #### `max_num_tokens`
 

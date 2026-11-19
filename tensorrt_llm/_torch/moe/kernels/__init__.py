@@ -18,8 +18,10 @@ Per-architecture kernels live under ``blackwell/`` and ``rubin/``, keyed below
 that by kernel family, so a submodule may host several related operators
 rather than exactly one. ``cutedsl_megamoe/`` keeps the MegaMoE kernels for
 both architectures in a self-contained tree behind its own ``KernelClass``
-entry points. Callers own the enablement checks and decide what to do when a
-kernel does not apply.
+entry points. ``prims_ts/`` is FlashInfer's PrimsTS batched-GEMM MoE, vendored
+through ``3rdparty/vendor_sources.lock.yaml``; edit it only with
+``scripts/vendor/manage.py``. Callers own the enablement checks and decide what
+to do when a kernel does not apply.
 
 Nothing is re-exported from this file on purpose: importing one kernel must
 not drag in the others, several of which are arch-gated.

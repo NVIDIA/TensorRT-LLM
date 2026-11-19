@@ -1418,6 +1418,7 @@ def _register_fake():
             local_expert_offset: int,
             local_num_experts: int,
             tile_tokens_dim: int,
+            return_token_map: bool = False,
         ) -> List[torch.Tensor]:
             helper = GroupedGemmInputsHelper(
                 num_experts=num_experts,
@@ -1440,8 +1441,11 @@ def _register_fake():
             expanded_idx_to_permuted_idx = torch.empty((num_tokens, top_k),
                                                        dtype=torch.int32,
                                                        device=device)
+            # A token map carries one extra element (getRouteMapAllocCount).
             permuted_idx_to_expanded_idx = torch.empty(
-                (max_num_permuted_tokens, ), dtype=torch.int32, device=device)
+                (max_num_permuted_tokens + int(return_token_map), ),
+                dtype=torch.int32,
+                device=device)
             total_num_padded_tokens = torch.empty((1, ),
                                                   dtype=torch.int32,
                                                   device=device)
