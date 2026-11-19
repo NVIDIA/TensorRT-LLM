@@ -106,6 +106,8 @@ def test_attached_model_loader_resolves_hub_on_nonzero_device(
     ("/abs/missing/dir", ("/abs/missing/dir", None)),
     ("./rel/missing/dir", ("./rel/missing/dir", None)),
     ("owner//repo", ("owner//repo", None)),
+    ("owner/repo/../other", ("owner/repo/../other", None)),
+    ("owner/repo/./dspark", ("owner/repo/./dspark", None)),
 ])
 def test_split_hf_repo_subfolder(model, expected):
     assert split_hf_repo_subfolder(model) == expected

@@ -237,7 +237,8 @@ def split_hf_repo_subfolder(model: str) -> Tuple[str, Optional[str]]:
     is not a relative path of at least three parts is returned unchanged.
     """
     parts = model.split("/")
-    if len(parts) < 3 or model.startswith((".", "/")) or not all(parts):
+    if (len(parts) < 3 or model.startswith((".", "/")) or not all(parts)
+            or any(part in (".", "..") for part in parts)):
         return model, None
     return "/".join(parts[:2]), "/".join(parts[2:])
 
