@@ -1206,6 +1206,31 @@ def test_inkling_reasoning_parser_stream_across_deltas():
     assert content == "ANS 5"
 
 
+@pytest.mark.parametrize(("deltas", "content", "reasoning"), [
+    ([f"{INK_CH}think a", " <|content_te"], "", "think a <|content_te"),
+    ([f"{INK_CT}answer", " <|content_te"], "answer <|content_te", ""),
+],
+                         ids=["in_thinking", "in_content"])
+def test_inkling_reasoning_parser_finish_releases_a_held_partial_marker(
+        deltas, content, reasoning):
+    """A stream that ends on a partial marker gets it back from finish(), in its channel.
+
+    The next stream on the same parser starts fresh: its plain text is visible content,
+    not routed by the channel the previous stream ended in.
+    """
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    results = [parser.parse_delta(d) for d in deltas]
+    # parse_delta holds the partial marker back; only finish() can tell it is text.
+    assert results[-1].content + results[-1].reasoning_content == " "
+    results.append(parser.finish())
+    assert "".join(r.content for r in results) == content
+    assert "".join(r.reasoning_content for r in results) == reasoning
+
+    second = [parser.parse_delta("next stream"), parser.finish()]
+    assert "".join(r.content for r in second) == "next stream"
+    assert "".join(r.reasoning_content for r in second) == ""
+
+
 # --- streaming == batch under any chunk boundary -----------------------------
 # The streamed result (deltas + finish) must equal the full parse for every chunk
 # boundary, including one that splits a control token mid-token.

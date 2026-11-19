@@ -40,6 +40,8 @@ from tensorrt_llm.llmapi.inkling_tokens import (
 from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam, FunctionDefinition
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 
+pytestmark = pytest.mark.cpu_only
+
 MM, IT, EM, CT = (
     INKLING_MESSAGE_MODEL,
     INKLING_INVOKE_TOOL_JSON,
@@ -208,6 +210,87 @@ def test_streaming_rejected_call_does_not_shift_the_next_one():
     assembled = _assembled(calls)
     assert [name for name, _ in assembled] == ["good"]
     assert json.loads(assembled[0][1]) == {"b": 2}
+
+
+@pytest.mark.parametrize("bad_first", [True, False], ids=["malformed_first", "malformed_between"])
+def test_batch_malformed_payload_keeps_the_other_calls(bad_first):
+    """A payload that is not JSON drops only its own invocation."""
+    tools = _tools("a", "b")
+    bad = f'{MM}a{IT}{{"name":"a","args":{{"x":}}{EM}'
+    good_a, good_b = _call("a", {"x": 1}), _call("b", {"y": 2})
+    text = bad + good_a + good_b if bad_first else good_a + bad + good_b
+    result = _parser().detect_and_parse(text, tools)
+    assert [(c.tool_index, c.name, json.loads(c.parameters)) for c in result.calls] == [
+        (0, "a", {"x": 1}),
+        (1, "b", {"y": 2}),
+    ]
+
+
+def test_streaming_rejected_payload_is_never_announced():
+    """A call whose arguments are not an object emits nothing, then the next call parses."""
+    tools = _tools("f", "g")
+    text = f'{MM}f{IT}{{"name":"f","args":[]}}{EM}' + _call("g", {"y": 2})
+    parser = _parser()
+    seen = []
+    for i in range(len(text)):
+        seen.extend(parser.parse_streaming_increment(text[i], tools).calls)
+    assert {c.name for c in seen if c.name} == {"g"}
+    assert _assembled(seen) == [("g", json.dumps({"y": 2}))]
+    assert [entry["name"] for entry in parser.prev_tool_call_arr] == ["g"]
+
+
+def test_streaming_rejected_call_keeps_the_rest_of_its_increment():
+    """One increment: a header/payload mismatch, then a valid call, then text."""
+    tools = _tools("good")
+    text = _call("real", {"a": 1}, header="other") + _call("good", {"b": 2}) + f"{CT}done"
+    result = _parser().parse_streaming_increment(text, tools)
+    assert _assembled(result.calls) == [("good", json.dumps({"b": 2}))]
+    assert result.normal_text == "done"
+
+
+def test_streaming_malformed_payload_keeps_the_next_call():
+    tools = _tools("a", "b")
+    text = f'{MM}a{IT}{{"name":"a","args":{{"x":}}{EM}' + _call("b", {"y": 2})
+    normal, calls = _stream(text, range(1, len(text)), tools)
+    assert _assembled(calls) == [("b", json.dumps({"y": 2}))]
+    assert "<|" not in normal
+
+
+def test_final_increment_with_two_calls_drains_exactly_once():
+    """Both calls of a last delta are reported once; finish() adds nothing."""
+    tools = _tools("a", "b")
+    parser = _parser()
+    first = parser.parse_streaming_increment(f"{CT}checking{EM}", tools)
+    last = parser.parse_streaming_increment(
+        _call("a", {"x": 1}) + _call("b", {"y": 2}) + f"{CT}ok", tools
+    )
+    tail = parser.finish(tools)
+    calls = first.calls + last.calls + tail.calls
+    assert [(c.tool_index, c.name) for c in calls if c.name] == [(0, "a"), (1, "b")]
+    assert _assembled(calls) == [("a", json.dumps({"x": 1})), ("b", json.dumps({"y": 2}))]
+    assert first.normal_text + last.normal_text + tail.normal_text == "checkingok"
+
+
+@pytest.mark.parametrize(
+    "held, expected",
+    [("answer <", "answer <"), ("answer <|", "answer <|"), (f"answer {MM}get_weather", "answer ")],
+    ids=["partial_token", "partial_token_bar", "tool_header"],
+)
+def test_finish_releases_held_text_but_not_a_tool_header(held, expected):
+    """A partial control token at the end of the stream is text; a dangling header is not."""
+    parser = _parser()
+    streamed = parser.parse_streaming_increment(held, _tools("get_weather"))
+    tail = parser.finish(_tools("get_weather"))
+    assert streamed.normal_text + tail.normal_text == expected
+    assert not streamed.calls and not tail.calls
+
+
+def test_finish_drops_an_unfinished_invocation():
+    parser = _parser()
+    streamed = parser.parse_streaming_increment(f'{MM}f{IT}{{"name":"f","ar', _tools("f"))
+    tail = parser.finish(_tools("f"))
+    assert streamed.normal_text + tail.normal_text == ""
+    assert not tail.calls
 
 
 def test_structure_info_round_trip():
