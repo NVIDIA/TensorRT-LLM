@@ -405,7 +405,10 @@ def test_completed_linear_storage_is_shared_and_survives_offload(share_parameter
         result.proj = Linear(8, 8, dtype=torch.bfloat16, bias=False, quant_config=QuantConfig())
         return result
 
-    source, target = model(), model()
+    source = model()
+    with torch.device("meta"):
+        target = model()
+    cached_projection = target.proj
     source.proj.weight.data.normal_()
     source.proj.post_load_weights()
     source.proj.rebuild_tensor_metadata = {
@@ -413,6 +416,7 @@ def test_completed_linear_storage_is_shared_and_survives_offload(share_parameter
     }
     expected = source.proj.weight.detach().clone()
     bind_model_weights(source, target, share_parameters=share_parameters)
+    assert target.proj is cached_projection
     assert (source.proj.weight is target.proj.weight) == share_parameters
     assert target.proj.rebuild_tensor_metadata["weight"]["param"] is target.proj.weight
     assert (

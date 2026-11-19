@@ -172,7 +172,9 @@ def _bind_linear(source: Linear, target: Linear) -> Linear:
     for name in target.__dict__:
         if "hook" in name:
             bound.__dict__[name] = target.__dict__[name]
-    return bound
+    # Model preprocessors may keep direct references to their Linear modules.
+    target.__dict__ = bound.__dict__
+    return target
 
 
 @contextmanager
@@ -190,10 +192,7 @@ def reuse_transformer_weights(
                 original = source_modules.get(name)
                 if not isinstance(original, Linear):
                     raise ValueError(f"Transformer path has no matching Linear {name!r}")
-                parent_name, _, child_name = name.rpartition(".")
-                parent = target.get_submodule(parent_name) if parent_name else target
                 bound = _bind_linear(original, module)
-                parent.add_module(child_name, bound)
                 reused.add(id(bound))
     reuse = TransformerWeightReuse(require_dynamic_weights, frozenset(reused))
     token = _weight_reuse.set({**_weight_reuse.get(), target.model_config.component_name: reuse})
