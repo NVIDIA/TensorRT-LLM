@@ -217,6 +217,7 @@ package_data += [
 # FetchContent tree (the MiniMax-M3.1 Q8KV8 index scorer and BF16X sparse
 # prefill). Optional in precompiled installs: a wheel built before them lacks
 # them, and the MiniMax-M3.1 paths that use them then report them unavailable.
+# extract_from_precompiled lists the same names locally.
 MSA_VLLM_PACKAGES = {
     "fmha_sm100_q8kv8": ['*.py', 'src/**/*', 'LICENSE', 'NOTICE'],
     "fmha_sm100_prefill_bf16x":
@@ -357,6 +358,10 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
 
     from setuptools.errors import SetupError
 
+    # The packages of MSA_VLLM_PACKAGES, listed here so this function stays
+    # self-contained (tests run it outside this module).
+    msa_vllm_packages = ("fmha_sm100_q8kv8", "fmha_sm100_prefill_bf16x")
+
     # Only a local directory can be linked; a wheel or a URL has no build tree
     # to point at.
     link_artifacts = os.getenv("TRTLLM_PRECOMPILED_LINK", "0") not in ("", "0")
@@ -472,7 +477,7 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                 shutil.rmtree(dst_fmha)
             shutil.copytree(source_fmha, dst_fmha)
 
-        for msa_package in MSA_VLLM_PACKAGES:
+        for msa_package in msa_vllm_packages:
             source_msa = os.path.join(precompiled_location, "3rdparty",
                                       msa_package)
             dst_msa = os.path.join("3rdparty", msa_package)
@@ -569,7 +574,7 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             os.unlink(dst_fmha)
         elif os.path.isdir(dst_fmha):
             shutil.rmtree(dst_fmha)
-        for msa_package in MSA_VLLM_PACKAGES:
+        for msa_package in msa_vllm_packages:
             dst_msa = os.path.join("3rdparty", msa_package)
             if os.path.islink(dst_msa):
                 os.unlink(dst_msa)
@@ -594,7 +599,7 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             # setuptools package_dir, matching scripts/build_wheel.py.
             if file.filename.startswith(
                     tuple(f"{name}/"
-                          for name in ("fmha_sm100", *MSA_VLLM_PACKAGES))):
+                          for name in ("fmha_sm100", *msa_vllm_packages))):
                 print(
                     f"Extracting and including {file.filename} from precompiled wheel."
                 )

@@ -94,7 +94,8 @@ def _module():
     try:
         # The scorer is a CuTe DSL kernel: the image's cutlass DSL needs the MSA compatibility shim first.
         install_msa_cutlass_compatibility()
-        mod = importlib.import_module(SCORER_MODULE)
+        # A literal name, so the CI test selection sees this import.
+        mod = importlib.import_module("fmha_sm100_q8kv8.q8_indexer_interface")
         prefill = mod.Q8KV8PrefillIndexerSm100
         mma_k = prefill.mma_inst_k((10, 7))
         exact = not prefill.uses_sm107_fp8_mma((10, 7)) and mma_k == 32
