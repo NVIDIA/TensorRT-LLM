@@ -28,15 +28,18 @@ other than the one the recorded replies were asked of is refused without asking 
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import json
 import math
 import os
 import platform
 import queue
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, ContextManager, Mapping, Optional
+from typing import Any, Callable, ContextManager, Iterator, Mapping, Optional
 
 import requests
 
@@ -95,10 +98,37 @@ class _ExternalEndpoint:
         return None
 
 
+@contextmanager
+def _output_lock(path: Path) -> Iterator[None]:
+    """Own an output directory until all server and result work has stopped."""
+    path.mkdir(parents=True, exist_ok=True)
+    with (path / ".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise EvaluationError(f"{path} is already in use by another evaluation") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def _write_json(path: Path, data: Any) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=1, sort_keys=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=path.name + ".",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        tmp = Path(stream.name)
+        try:
+            stream.write(json.dumps(data, indent=1, sort_keys=False) + "\n")
+            stream.close()
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def _read_json(path: Path) -> Optional[dict[str, Any]]:
@@ -291,6 +321,7 @@ def _serve_and_ask(
     refuses that model, if it does; the server is then stopped without asking.
     """
     timing: dict[str, Any] = {"startup_error": None}
+    files["addr"].unlink(missing_ok=True)
     argv = server.serve_argv(managed.argv, files["addr"])
     with deps.memory_poller(files["memory"], list(managed.gpu_ids)):
         launched = deps.monotonic()
@@ -429,149 +460,151 @@ def run(
     }
     identity_sha256 = protocol.sha256_text(protocol.canonical_json(identity))
     results_dir = Path(output_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    manifest_file = results_dir / "run_manifest.json"
-    run_manifest = _read_json(manifest_file)
-    if run_manifest and run_manifest["identity_sha256"] != identity_sha256:
-        raise EvaluationError(
-            f"{results_dir} holds a run with identity {run_manifest['identity_sha256']}, not "
-            f"{identity_sha256} (changed protocol, selection, endpoint, inputs or settings); "
-            "use a fresh output directory"
-        )
-    ledger = records.Ledger(
-        results_dir / "results.jsonl",
-        identity_sha256,
-        {problem.id: (problem.index, problem.prompt_sha256) for problem in problems},
-    )
-    try:
-        state = ledger.load()
-    except records.LedgerError as error:
-        raise EvaluationError(f"cannot resume {results_dir}: {error}") from error
-    asked_models = state.served_models()
-    if len(asked_models) > 1:
-        raise EvaluationError(
-            f"cannot resume {results_dir}: its replies were asked of more than one model "
-            f"({', '.join(map(repr, asked_models))}); use a fresh output directory"
-        )
-    pending = [problem for problem in problems if problem.id not in state.completed]
-
-    if run_manifest is None:
-        run_manifest = {
-            "protocol_id": protocol.PROTOCOL_ID,
-            "identity_sha256": identity_sha256,
-            "identity": identity,
-            "attempts": [],
-        }
-    attempt = len(run_manifest["attempts"]) + 1
-    attempt_info: dict[str, Any] = {
-        "attempt": attempt,
-        "transport": transport,
-        "started_at": started_at,
-        "time_budget_s": time_budget_s,
-        "concurrency": concurrency,
-        "request_timeout_s": request_timeout_s,
-        "min_correct": min_correct,
-        "dataset_files": dataset_files,
-        "python": platform.python_version(),
-        "already_completed": len(problems) - len(pending),
-        "pending": len(pending),
-        "quarantined_partial_writes": state.quarantined,
-        **(attempt_extra or {}),
-    }
-    if managed is not None:
-        attempt_info["server_command"] = list(
-            server.serve_argv(managed.argv, results_dir / f"server-attempt-{attempt}.addr")
-        )
-        attempt_info["server_settings"] = dict(managed.settings)
-    run_manifest["attempts"].append(attempt_info)
-    _write_json(manifest_file, run_manifest)
-
-    def admit(model: str) -> Optional[str]:
-        """Record the served model before the attempt's first request; why it is refused, if so."""
-        attempt_info["served_model"] = model
-        if asked_models and asked_models != [model]:
-            return (
-                f"{results_dir} holds replies of model {asked_models[0]!r}, but {model!r} is "
-                "served now; a run never mixes models: use a fresh output directory"
+    with _output_lock(results_dir):
+        manifest_file = results_dir / "run_manifest.json"
+        run_manifest = _read_json(manifest_file)
+        if run_manifest and run_manifest["identity_sha256"] != identity_sha256:
+            raise EvaluationError(
+                f"{results_dir} holds a run with identity {run_manifest['identity_sha256']}, not "
+                f"{identity_sha256} (changed protocol, selection, endpoint, inputs or settings); "
+                "use a fresh output directory"
             )
-        _write_json(manifest_file, run_manifest)
-        return None
-
-    timing: dict[str, Any] = {"verification_s": deps.monotonic() - started}
-    if pending:
-        session = _Session(
-            pending=pending,
-            ledger=ledger,
-            identity=identity_sha256,
-            attempt=attempt,
-            max_seq_len=max_seq_len,
-            concurrency=concurrency,
-            deadline=deadline,
-            request_timeout_s=request_timeout_s,
+        ledger = records.Ledger(
+            results_dir / "results.jsonl",
+            identity_sha256,
+            {problem.id: (problem.index, problem.prompt_sha256) for problem in problems},
         )
-        if managed is not None:
-            files = {
-                "addr": results_dir / f"server-attempt-{attempt}.addr",
-                "log": results_dir / f"server-attempt-{attempt}.log",
-                "memory": results_dir / f"gpu-memory-attempt-{attempt}.csv",
-            }
-            timing.update(_serve_and_ask(session, managed, served_model, files, admit, deps))
-            if files["memory"].exists():
-                timing["gpu_memory"] = records.gpu_memory_peaks(files["memory"].read_text())
-        else:
-            base = endpoint.rstrip("/")
-            try:
-                model, listed = resolve_model(base, served_model, deps)
-            except (ServerError, requests.exceptions.RequestException) as error:
-                timing["startup_error"] = f"{type(error).__name__}: {error}"
-            else:
-                timing["served_model"] = model
-                timing["served_model_listed"] = listed
-                refusal = admit(model)
-                if refusal is not None:
-                    timing["refused"] = refusal
-                else:
-                    timing.update(_ask(session, base, model, _ExternalEndpoint(), deps))
-    timing["total_s"] = deps.monotonic() - started
-    # Monitored devices may be a subset or superset of the server's devices.
-    timing.update(gpu_hours=None, server_gpu_hours=None, monitored_gpu_hours=None)
-    lifetime = timing.get("server_lifetime_s")
-    if managed is not None and managed.gpu_ids and lifetime is not None:
-        timing["monitored_gpu_hours"] = records.gpu_hours(len(set(managed.gpu_ids)), lifetime)
-    monitored_hours = [
-        a.get("timing", {}).get("monitored_gpu_hours") for a in run_manifest["attempts"][:-1]
-    ] + [timing["monitored_gpu_hours"]]
-    attempt_info.update(finished_at=records.utc_now(), timing=timing)
-    if "refused" in timing:
-        _write_json(manifest_file, run_manifest)
-        raise EvaluationError(timing["refused"])
+        try:
+            state = ledger.load()
+        except records.LedgerError as error:
+            raise EvaluationError(f"cannot resume {results_dir}: {error}") from error
+        asked_models = state.served_models()
+        if len(asked_models) > 1:
+            raise EvaluationError(
+                f"cannot resume {results_dir}: its replies were asked of more than one model "
+                f"({', '.join(map(repr, asked_models))}); use a fresh output directory"
+            )
+        pending = [problem for problem in problems if problem.id not in state.completed]
 
-    final_state = ledger.load()
-    summary = records.summarize(final_state, problems)
-    summary.update(
-        transport=transport,
-        served_model=next(iter(final_state.served_models()), None),
-        num_questions=num_questions,
-        run_identity=identity_sha256,
-        attempt=attempt,
-        results_dir=str(results_dir),
-        timing=timing,
-        cost={
-            "gpu_hours_all_attempts": None,
-            "server_gpu_hours_all_attempts": None,
-            "monitored_gpu_hours_all_attempts": round(sum(monitored_hours), 4)
-            if all(hours is not None for hours in monitored_hours)
-            else None,
-        },
-    )
-    summary["verdict"] = records.verdict(summary, min_correct)
-    if timing.get("startup_error"):
-        failed = "server startup failed" if managed is not None else "the endpoint is not usable"
-        summary["verdict"]["problems"].insert(0, f"{failed}: {timing['startup_error']}")
-        summary["verdict"]["passed"] = False
-        summary["verdict"]["operational_ok"] = False
-    attempt_info["verdict"] = summary["verdict"]
-    _write_json(manifest_file, run_manifest)
-    _write_json(results_dir / "summary.json", summary)
-    print_report(_report(summary, timing))
-    return summary
+        if run_manifest is None:
+            run_manifest = {
+                "protocol_id": protocol.PROTOCOL_ID,
+                "identity_sha256": identity_sha256,
+                "identity": identity,
+                "attempts": [],
+            }
+        attempt = len(run_manifest["attempts"]) + 1
+        attempt_info: dict[str, Any] = {
+            "attempt": attempt,
+            "transport": transport,
+            "started_at": started_at,
+            "time_budget_s": time_budget_s,
+            "concurrency": concurrency,
+            "request_timeout_s": request_timeout_s,
+            "min_correct": min_correct,
+            "dataset_files": dataset_files,
+            "python": platform.python_version(),
+            "already_completed": len(problems) - len(pending),
+            "pending": len(pending),
+            "quarantined_partial_writes": state.quarantined,
+            **(attempt_extra or {}),
+        }
+        if managed is not None:
+            attempt_info["server_command"] = list(
+                server.serve_argv(managed.argv, results_dir / f"server-attempt-{attempt}.addr")
+            )
+            attempt_info["server_settings"] = dict(managed.settings)
+        run_manifest["attempts"].append(attempt_info)
+        _write_json(manifest_file, run_manifest)
+
+        def admit(model: str) -> Optional[str]:
+            """Record the served model before the attempt's first request; why it is refused, if so."""
+            attempt_info["served_model"] = model
+            if asked_models and asked_models != [model]:
+                return (
+                    f"{results_dir} holds replies of model {asked_models[0]!r}, but {model!r} is "
+                    "served now; a run never mixes models: use a fresh output directory"
+                )
+            _write_json(manifest_file, run_manifest)
+            return None
+
+        timing: dict[str, Any] = {"verification_s": deps.monotonic() - started}
+        if pending:
+            session = _Session(
+                pending=pending,
+                ledger=ledger,
+                identity=identity_sha256,
+                attempt=attempt,
+                max_seq_len=max_seq_len,
+                concurrency=concurrency,
+                deadline=deadline,
+                request_timeout_s=request_timeout_s,
+            )
+            if managed is not None:
+                files = {
+                    "addr": results_dir / f"server-attempt-{attempt}.addr",
+                    "log": results_dir / f"server-attempt-{attempt}.log",
+                    "memory": results_dir / f"gpu-memory-attempt-{attempt}.csv",
+                }
+                timing.update(_serve_and_ask(session, managed, served_model, files, admit, deps))
+                if files["memory"].exists():
+                    timing["gpu_memory"] = records.gpu_memory_peaks(files["memory"].read_text())
+            else:
+                base = endpoint.rstrip("/")
+                try:
+                    model, listed = resolve_model(base, served_model, deps)
+                except (ServerError, requests.exceptions.RequestException) as error:
+                    timing["startup_error"] = f"{type(error).__name__}: {error}"
+                else:
+                    timing["served_model"] = model
+                    timing["served_model_listed"] = listed
+                    refusal = admit(model)
+                    if refusal is not None:
+                        timing["refused"] = refusal
+                    else:
+                        timing.update(_ask(session, base, model, _ExternalEndpoint(), deps))
+        timing["total_s"] = deps.monotonic() - started
+        # Monitored devices may be a subset or superset of the server's devices.
+        timing.update(gpu_hours=None, server_gpu_hours=None, monitored_gpu_hours=None)
+        lifetime = timing.get("server_lifetime_s")
+        if managed is not None and managed.gpu_ids and lifetime is not None:
+            timing["monitored_gpu_hours"] = records.gpu_hours(len(set(managed.gpu_ids)), lifetime)
+        monitored_hours = [
+            a.get("timing", {}).get("monitored_gpu_hours") for a in run_manifest["attempts"][:-1]
+        ] + [timing["monitored_gpu_hours"]]
+        attempt_info.update(finished_at=records.utc_now(), timing=timing)
+        if "refused" in timing:
+            _write_json(manifest_file, run_manifest)
+            raise EvaluationError(timing["refused"])
+
+        final_state = ledger.load()
+        summary = records.summarize(final_state, problems)
+        summary.update(
+            transport=transport,
+            served_model=next(iter(final_state.served_models()), None),
+            num_questions=num_questions,
+            run_identity=identity_sha256,
+            attempt=attempt,
+            results_dir=str(results_dir),
+            timing=timing,
+            cost={
+                "gpu_hours_all_attempts": None,
+                "server_gpu_hours_all_attempts": None,
+                "monitored_gpu_hours_all_attempts": round(sum(monitored_hours), 4)
+                if all(hours is not None for hours in monitored_hours)
+                else None,
+            },
+        )
+        summary["verdict"] = records.verdict(summary, min_correct)
+        if timing.get("startup_error"):
+            failed = (
+                "server startup failed" if managed is not None else "the endpoint is not usable"
+            )
+            summary["verdict"]["problems"].insert(0, f"{failed}: {timing['startup_error']}")
+            summary["verdict"]["passed"] = False
+            summary["verdict"]["operational_ok"] = False
+        attempt_info["verdict"] = summary["verdict"]
+        _write_json(manifest_file, run_manifest)
+        _write_json(results_dir / "summary.json", summary)
+        print_report(_report(summary, timing))
+        return summary

@@ -24,6 +24,7 @@ import dataclasses
 import errno
 import json
 import os
+import subprocess
 import sys
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -803,3 +804,89 @@ def test_gpu_cost_preserves_unknown_and_labels_monitored_estimate(tmp_path, monk
         resumed = runner.run(**kwargs)
         assert resumed["timing"]["monitored_gpu_hours"] == 2.0
         assert resumed["cost"]["monitored_gpu_hours_all_attempts"] is None
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_managed_run_owns_directory_and_removes_stale_address(tmp_path, monkeypatch, interrupt):
+    monkeypatch.setattr(protocol, "load_problems", lambda *args: ([_problem(0)], {}))
+    addr = tmp_path / "server-attempt-1.addr"
+    addr.write_text("localhost:9999")
+    options = dict(
+        dataset_dir=tmp_path,
+        output_dir=tmp_path,
+        num_questions=1,
+        concurrency=1,
+        time_budget_s=30,
+        print_report=lambda text: None,
+    )
+
+    @contextmanager
+    def launch(argv, env, log_path):
+        assert not addr.exists()
+        manifest = (tmp_path / "run_manifest.json").read_bytes()
+        # An independent process cannot acquire the lock while the server is alive.
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import fcntl, sys
+with open(sys.argv[1], 'a') as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(23)
+""",
+                str(tmp_path / ".lock"),
+            ],
+            check=False,
+        )
+        assert child.returncode == 23
+        with pytest.raises(runner.EvaluationError, match="already in use"):
+            runner.run(**options, endpoint="http://other-server")
+        assert (tmp_path / "run_manifest.json").read_bytes() == manifest
+        if interrupt:
+            raise KeyboardInterrupt
+        yield SimpleNamespace(poll=lambda: None)
+
+    deps = runner.RunDeps(
+        launch=launch,
+        wait_for_addr=lambda *args: ("localhost", 1234),
+        memory_poller=lambda *args: nullcontext(),
+        get=lambda *args, **kwargs: SimpleNamespace(
+            status_code=200, json=lambda: {"data": [{"id": "served"}]}
+        ),
+        post=lambda *args, **kwargs: SimpleNamespace(status_code=200, text=_payload()),
+    )
+    managed = runner.ManagedServer(argv=("trtllm-serve", "model"), env={})
+    if interrupt:
+        with pytest.raises(KeyboardInterrupt):
+            runner.run(**options, managed=managed, deps=deps)
+    else:
+        result = runner.run(**options, managed=managed, deps=deps)
+        assert result["verdict"]["passed"]
+    # Both normal exit and interruption release ownership without deleting the lock inode.
+    with runner._output_lock(tmp_path):
+        assert (tmp_path / ".lock").is_file()
+
+
+def test_json_replacement_uses_unique_temporary_files_and_cleans_up(tmp_path, monkeypatch):
+    target = tmp_path / "summary.json"
+    target.write_text('{"old": true}')
+    sources = []
+    replace = os.replace
+
+    def record_replace(src, dst):
+        sources.append(src)
+        assert src.parent == dst.parent
+        replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", record_replace)
+    runner._write_json(target, {"value": 1})
+    runner._write_json(target, {"value": 2})
+    assert len(set(sources)) == 2
+    assert json.loads(target.read_text()) == {"value": 2}
+    with pytest.raises(TypeError):
+        runner._write_json(target, object())
+    assert json.loads(target.read_text()) == {"value": 2}
+    assert list(tmp_path.glob("*.tmp")) == []
