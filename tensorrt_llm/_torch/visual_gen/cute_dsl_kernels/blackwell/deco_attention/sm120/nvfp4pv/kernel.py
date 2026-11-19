@@ -86,20 +86,6 @@ PART_BYTES = (
 assert SMEM_BYTES <= 99 * 1024
 
 
-class Slice:
-    """Elements off.. of a register tensor, indexed from 0."""
-
-    def __init__(self, t, off):
-        self.t = t
-        self.off = off
-
-    def __getitem__(self, i):
-        return self.t[self.off + i]
-
-    def __setitem__(self, i, v):
-        self.t[self.off + i] = v
-
-
 # ------------------------------------------------------------------------------------------------ tile ring
 @cute.jit
 def load_tile(st, kt, stage: cutlass.Constexpr, initial: cutlass.Constexpr):
@@ -127,12 +113,6 @@ def load_tile(st, kt, stage: cutlass.Constexpr, initial: cutlass.Constexpr):
         else:
             cute.arch.mbarrier_arrive_and_expect_tx(sptr(Int64, mb), IMG_NOVM)
             bulk_complete(dst, src, IMG_NOVM, mb)
-
-
-@cute.jit
-def wait_tile(st, stage: cutlass.Constexpr, phase):
-    """Waits until the tile of stage `stage` has landed (its full barrier, phase parity `phase`)."""
-    mbar_wait(st.bar + 8 * stage, Int32(phase))
 
 
 @cute.jit
@@ -308,7 +288,7 @@ def iter_step(
     """Iteration kt (its tile in stage `stage`, full-barrier phase parity `phase`): wait for its tile, take the turn of
     the warp pair, the burst [QK(kt), PV(kt - 1)], hand the turn over, release tile kt - 1, then the softmax of tile kt
     (while the partner warp runs its burst)."""
-    wait_tile(st, stage, phase)
+    mbar_wait(st.bar + 8 * stage, Int32(phase))
     pre = preload(st, True, True, stage)
     cute.arch.barrier(barrier_id=st.turn_wait, number_of_threads=64)
     Sacc = burst(st, masked, True, True, not cur_odd, False, pre)
@@ -331,7 +311,7 @@ def run_range(st, k0: cutlass.Constexpr, k1: cutlass.Constexpr, two_step: cutlas
                 load_tile(st, Int32(k0 + s), s, True)
     m0 = n == 1 and k1 == nT
     # iteration k0: the QK burst only (warp w takes the first turn)
-    wait_tile(st, 0, Int32(0))
+    mbar_wait(st.bar, Int32(0))
     pre0 = preload(st, True, False, 0)
     barrier_turn(st.turn_wait, st.isB, "sync")
     Sacc = burst(st, m0, True, False, False, False, pre0)
@@ -532,7 +512,6 @@ def attn_kernel(
         O=O,
         lsum=lsum,
         Pst=Pst,
-        Pst_hi=Slice(Pst, 10),
         Mlo=Mlo,
         thr=thr,
         safe=safe,

@@ -42,7 +42,7 @@ def split_plan(units, nT, nsm):
     SM count of the device) run as key-range pieces after all whole units."""
     parts = min(MAX_SPLIT, nT // 2)
     tail = min(units, units % nsm + nsm // 2)
-    if parts < 2 or tail == 0:
+    if parts < 2:
         return units, 0, 1
     return units - tail, tail, parts
 

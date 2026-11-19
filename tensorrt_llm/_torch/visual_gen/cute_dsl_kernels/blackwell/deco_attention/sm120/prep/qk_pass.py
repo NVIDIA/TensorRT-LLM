@@ -29,7 +29,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint8, Uint16, Uint32
 from cutlass.utils import SmemAllocator
 
-from ...common.expmath import bf16x2, f2u
+from ...common.expmath import bf16x2, f2u, round_m3, warp_max
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
 from ...constants import QPRE
 from ..ptx.shared import (
@@ -39,7 +39,6 @@ from ..ptx.shared import (
     mma_bf16,
     st_global_b32_v2_hint,
 )
-from .basis import warp_max_f32
 
 QK_THREADS = 256
 
@@ -50,14 +49,6 @@ SQ_STG = SQ_UTS + 8704  # per warp: codes 16 x 144 B, scales 16 x 24 B
 STG_W = 16 * 144 + 16 * 24  # 2688
 SQ_RED = SQ_STG + 8 * STG_W  # 64 floats + flag
 SQ_TOTAL = SQ_RED + 512
-
-
-def round_m3(x):
-    """x (FP32, >= 0) rounded to 3 mantissa bits, nearest even, at any exponent."""
-    b = x.bitcast(Uint32)
-    b = b + ((b >> Uint32(20)) & Uint32(1))
-    b = (b + Uint32(0x7FFFF)) & Uint32(0xFFF00000)
-    return b.bitcast(Float32)
 
 
 @cute.jit
@@ -393,7 +384,7 @@ def qk_kernel(
         cute.arch.sync_warp()
     # group maxima of this CTA
     for i in cutlass.range_constexpr(6):
-        mv = warp_max_f32(gm[i])
+        mv = warp_max(gm[i])
         if lane == 0:
             cute.arch.store(sptr(Float32, red + (warp * 8 + i) * 4), mv)
     cute.arch.sync_threads()

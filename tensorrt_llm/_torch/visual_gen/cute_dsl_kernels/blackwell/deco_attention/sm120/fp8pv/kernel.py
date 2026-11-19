@@ -322,12 +322,12 @@ def first_stages_part(st, t0, nK):
 
 
 @cute.jit
-def refill_if_last(st, old, stage, ktile, vtile, has_k, has_v, vma, vmb, nvm, vbuf):
-    """After softmax_tile counted this warp's release of stage `stage` (old: the counter before it): the eighth warp
-    refills the stage for the phase three steps on, with the tiles and v_mean rows issue_tile takes."""
+def refill_if_last(st, old, ktile, vtile, has_k, vma, vmb, nvm):
+    """After softmax_tile counted this warp's release of stage 0 (old: the counter before it): the eighth warp
+    refills the stage for phase 3, with the tiles and v_mean rows issue_tile takes (a V tile, pair buffer 1)."""
     if (old & 7) == 7:
         cute.arch.fence_proxy("async.shared", space="cta")
-        issue_tile(st, stage, ktile, vtile, has_k, has_v, vma, vmb, nvm, vbuf)
+        issue_tile(st, 0, ktile, vtile, has_k, Int32(1), vma, vmb, nvm, Int32(1))
 
 
 def refill_full0(st, old, rot, nT, vt2):
@@ -336,85 +336,70 @@ def refill_full0(st, old, rot, nT, vt2):
     refill_if_last(
         st,
         old,
-        0,
         step_tile(3, rot, nT),
         vt2,
         Int32(1 if 3 < nT else 0),
-        Int32(1),
         vt2,
         vt2,
         Int32(1 if nT == 3 else 0),
-        Int32(1),
     )
 
 
 @cute.jit
 def refill_loop_full(st, old, k, stage, rot, nT: cutlass.Constexpr):
-    """refill_if_last for loop phase k of the full body, the tiles of the refill computed by the refilling warp only:
-    K' of step k + 3, V of step k + 2 and, for odd k, the v_mean rows of the pair (k + 1, k + 2) (an unpaired last
-    step k + 2 = nT - 1 for even k)."""
-    if (old & 7) == 7:
-        kt = Int32(nT - 1)
-        if k + 3 < nT - 1:
-            kt = rot_tile(k + 3, rot, nT - 1)
-        vt = Int32(nT - 1)
-        if k + 2 < nT - 1:
-            vt = rot_tile(k + 2, rot, nT - 1)
-        hk = Int32(0)
-        if k + 3 < nT:
-            hk = Int32(1)
-        nvm = Int32(0)
-        vma = vt
-        if (k & 1) == 1:
-            nvm = Int32(2)
-            vma = rot_tile(k + 1, rot, nT - 1)
-        else:
-            if k + 2 == nT - 1:
-                nvm = Int32(1)
-        cute.arch.fence_proxy("async.shared", space="cta")
-        issue_tile(st, stage, kt, vt, hk, Int32(1), vma, vt, nvm, ((k + 2) >> 1) & 1)
+    """refill_if_last for a loop phase k of the full body with a phase k + 3 to load (k + 2 < nT), the tiles of the
+    refill computed by the refilling warp only: K' of step k + 3, V of step k + 2 and, for odd k, the v_mean rows of
+    the pair (k + 1, k + 2) (an unpaired last step k + 2 = nT - 1 for even k)."""
+    if k + 2 < nT:
+        if (old & 7) == 7:
+            kt = Int32(nT - 1)
+            if k + 3 < nT - 1:
+                kt = rot_tile(k + 3, rot, nT - 1)
+            vt = Int32(nT - 1)
+            if k + 2 < nT - 1:
+                vt = rot_tile(k + 2, rot, nT - 1)
+            hk = Int32(0)
+            if k + 3 < nT:
+                hk = Int32(1)
+            nvm = Int32(0)
+            vma = vt
+            if (k & 1) == 1:
+                nvm = Int32(2)
+                vma = rot_tile(k + 1, rot, nT - 1)
+            else:
+                if k + 2 == nT - 1:
+                    nvm = Int32(1)
+            cute.arch.fence_proxy("async.shared", space="cta")
+            issue_tile(st, stage, kt, vt, hk, Int32(1), vma, vt, nvm, ((k + 2) >> 1) & 1)
 
 
 @cute.jit
 def refill_loop_part(st, old, k, stage, t0, nK):
-    """refill_loop_full for the key-range pieces (tiles t0 + step)."""
-    if (old & 7) == 7:
-        hk = Int32(0)
-        if k + 3 < nK:
-            hk = Int32(1)
-        nvm = Int32(0)
-        if (k & 1) == 1:
-            nvm = Int32(2)
-        else:
-            if k + 2 == nK - 1:
-                nvm = Int32(1)
-        cute.arch.fence_proxy("async.shared", space="cta")
-        issue_tile(
-            st,
-            stage,
-            t0 + k + 3,
-            t0 + k + 2,
-            hk,
-            Int32(1),
-            t0 + k + 2 - (k & 1),
-            t0 + k + 2,
-            nvm,
-            ((k + 2) >> 1) & 1,
-        )
-
-
-@cute.jit
-def refill_loop_full_if(st, old, k, stage, rot, nT: cutlass.Constexpr):
-    """refill_loop_full for loop phases k with a phase k + 3 to load (k + 2 < nT)."""
-    if k + 2 < nT:
-        refill_loop_full(st, old, k, stage, rot, nT)
-
-
-@cute.jit
-def refill_loop_part_if(st, old, k, stage, t0, nK):
-    """refill_loop_part for the pieces' loop phases k with a phase k + 3 to load (k + 2 < nK)."""
+    """refill_loop_full for the key-range pieces (tiles t0 + step; a phase k + 3 to load: k + 2 < nK)."""
     if k + 2 < nK:
-        refill_loop_part(st, old, k, stage, t0, nK)
+        if (old & 7) == 7:
+            hk = Int32(0)
+            if k + 3 < nK:
+                hk = Int32(1)
+            nvm = Int32(0)
+            if (k & 1) == 1:
+                nvm = Int32(2)
+            else:
+                if k + 2 == nK - 1:
+                    nvm = Int32(1)
+            cute.arch.fence_proxy("async.shared", space="cta")
+            issue_tile(
+                st,
+                stage,
+                t0 + k + 3,
+                t0 + k + 2,
+                hk,
+                Int32(1),
+                t0 + k + 2 - (k & 1),
+                t0 + k + 2,
+                nvm,
+                ((k + 2) >> 1) & 1,
+            )
 
 
 @cute.jit
@@ -427,7 +412,7 @@ def refill_part0(st, old, t0, nK):
         nvm0 = Int32(0)
         if nK == 3:
             nvm0 = Int32(1)
-        refill_if_last(st, old, 0, t0 + 3, t0 + 2, hk0, Int32(1), t0 + 2, t0 + 2, nvm0, Int32(1))
+        refill_if_last(st, old, t0 + 3, t0 + 2, hk0, t0 + 2, t0 + 2, nvm0)
 
 
 # ------------------------------------------------------------------------------------------------ phases
@@ -445,7 +430,7 @@ def qk_phase(st, base, kwait, turn):
     return mma_phase(st.P, st.O, None, base, base + SF_OFF, *st.mma, kwait=kwait, turn=turn)
 
 
-def pv_qk_phase(st, base, swait, turn, means=None):
+def pv_qk_phase(st, base, swait, means=None):
     """The dense MMA phase [PV, means, QK] of this thread on the stage at shared address base: O += P V of the
     stage's V, the means MMAs of the pair buffer `means` (None: an odd phase, without), then the QK of the stage's K',
     returned as 16 x 4 accumulators. swait: the stage's (full barrier, parity), waited for before the first fragment
@@ -457,17 +442,11 @@ def pv_qk_phase(st, base, swait, turn, means=None):
         base,
         base + SF_OFF,
         *st.mma,
-        turn=turn,
+        turn=st.turn,
         swait=swait,
         vmoff=st.vmoff,
         means=means,
     )
-
-
-def pv_phase(st, base):
-    """The MMA phase [PV] of this thread on the stage at shared address base, for a warp that waited for the stage
-    and holds the turn: O += P V of the stage's V."""
-    mma_phase(st.P, st.O, base + V_OFF, None, None, *st.mma)
 
 
 def softmax_init():
@@ -510,9 +489,9 @@ def loop_phase(st, k, stage, ph, nzp, sm, refill):
         # the parity branch sits ahead of the stage wait and the turn; the even copy pipelines the pair's means
         # steps between its PV and QK steps
         if mpar == 0:
-            acc2 = pv_qk_phase(st, stk, sw, st.turn, mbase)
+            acc2 = pv_qk_phase(st, stk, sw, mbase)
         else:
-            acc2 = pv_qk_phase(st, stk, sw, st.turn)
+            acc2 = pv_qk_phase(st, stk, sw)
     else:
         # the nested branches write the QK accumulators to the register tensor A2, which holds them across the join
         A2 = cute.make_rmem_tensor(cute.make_layout(64), Float32)
@@ -547,7 +526,7 @@ def last_qk_phase_full(st, kl: cutlass.Constexpr, nzp, sm, lim: cutlass.Constexp
     pvn = packed_pv_needed(st.P, st.vnan)
     mbase3 = pair_buffer(st, kl)
     if pvn != 0:
-        acc3 = pv_qk_phase(st, stk, sw, st.turn, mbase3 if kl % 2 == 0 else None)
+        acc3 = pv_qk_phase(st, stk, sw, mbase3 if kl % 2 == 0 else None)
     else:
         take_turn(st, sw)
         if cutlass.const_expr(kl % 2 == 0):
@@ -573,9 +552,9 @@ def last_qk_phase_part(st, kl, nzp, sm, lim: cutlass.Constexpr, piece, split: cu
     mbase3 = pair_buffer(st, kl)
     if pvn != 0:
         if mpar3 == 0:
-            acc3 = pv_qk_phase(st, stk, sw, st.turn, mbase3)
+            acc3 = pv_qk_phase(st, stk, sw, mbase3)
         else:
-            acc3 = pv_qk_phase(st, stk, sw, st.turn)
+            acc3 = pv_qk_phase(st, stk, sw)
     else:
         take_turn(st, sw)
         means_pair_guarded(mcond3, P, O, mbase3, st.vmoff)
@@ -593,7 +572,8 @@ def last_pv_phase(st, n, nzp):
     take_turn(st, (st.fbar + (n % STAGES) * 8, (n // STAGES) & 1))
     pvl = packed_pv_needed(st.P, st.vnan)
     if pvl != 0:
-        pv_phase(st, st.smem + (n % STAGES) * STAGE_BYTES)
+        # the MMA phase [PV] on the stage: O += P V of its V
+        mma_phase(st.P, st.O, st.smem + (n % STAGES) * STAGE_BYTES + V_OFF, None, None, *st.mma)
     means_last(
         (n & 1) ^ 1,
         pvl,
@@ -667,14 +647,14 @@ def full_body(ops, vs_ptr, o_ptr, S: cutlass.Constexpr, H: cutlass.Constexpr, un
             st, acc, sm, KT, stage=0, refill=lambda old: refill_full0(st, old, rot, nT, vt2)
         )
     else:
-        # no phase 3: stage 0 is not refilled
-        sm = softmax_step(st, acc, sm, LIM if nT == 1 else KT)
+        # no phase 3: stage 0 is not refilled (a single key tile is a full one: launch.run sends S < KT to small.py)
+        sm = softmax_step(st, acc, sm, KT)
     sk_i = Int32(1)  # stage of step k (loop-carried: no modulo in the loop)
     ph = Int32(0)  # its full-barrier parity, (k // STAGES) & 1
     # ---- phases k = 1 .. nT - 2
     for k in cutlass.range(1, nT - 1, unroll=1):
         nzp, sm = loop_phase(
-            st, k, sk_i, ph, nzp, sm, lambda old: refill_loop_full_if(st, old, k, sk_i, rot, nT)
+            st, k, sk_i, ph, nzp, sm, lambda old: refill_loop_full(st, old, k, sk_i, rot, nT)
         )
         sk_i, ph = stage_next(sk_i, ph, STAGES)
     # ---- phase nT - 1: PV(nT - 2), means(nT - 2), QK(nT - 1) with the last tile's mask
@@ -743,7 +723,7 @@ def partial_body(
     # ---- phases k = 1 .. nK - 2
     for k in cutlass.range(1, nK - 1, unroll=1):
         nzp, sm = loop_phase(
-            st, k, sk_i, ph, nzp, sm, lambda old: refill_loop_part_if(st, old, k, sk_i, t0, nK)
+            st, k, sk_i, ph, nzp, sm, lambda old: refill_loop_part(st, old, k, sk_i, t0, nK)
         )
         sk_i, ph = stage_next(sk_i, ph, STAGES)
     # ---- phase nK - 1: PV(nK - 2), means(nK - 2), QK(nK - 1) with the last tile's mask

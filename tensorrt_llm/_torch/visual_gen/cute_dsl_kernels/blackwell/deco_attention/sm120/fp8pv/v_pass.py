@@ -28,9 +28,9 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.math import RoundingMode
 from cutlass.utils import SmemAllocator
 
-from ...common.expmath import bf16x2, e4m3x4, pow2_ceil, u2f
+from ...common.expmath import bf16x2, e4m3x4, pow2_ceil, u2f, warp_max
 from ...common.mem import gptr, load_vector, sptr, store_vector
-from ..prep.basis import EIG_THREADS, SM_RED, basis_cta, bf16_f32, group16, stage_rows, warp_max_f32
+from ..prep.basis import EIG_THREADS, SM_RED, basis_cta, bf16_f32, group16, stage_rows
 from ..ptx.fp8pv import st_global_cs_b32_pred, st_global_cs_b32_v2_pred
 from ..ptx.shared import ld_global_nc_b32_hint_pred
 
@@ -71,8 +71,8 @@ def tensor_scale(
         c = cute.arch.fmax(
             c, u2f(cute.arch.load(gptr(Uint32, vmax_p + Int64(i) * 8 + 4), Uint32, cop=cop))
         )
-    a = warp_max_f32(a)
-    c = warp_max_f32(c)
+    a = warp_max(a)
+    c = warp_max(c)
     if cutlass.const_expr(SYNC):
         cute.arch.sync_threads()
     if (tid & 31) == 0:
@@ -137,8 +137,8 @@ def _tile_fold(sums, vmx, vmn, cnt, mv, mx):
 @cute.jit
 def _store_slot(mv: Float32, mx: Float32, tid: Int32, sb: Int32, vmax_p: Int64, slot: Int32):
     """The block's max|v| and max|v - vbar| into V-scan slot `slot`."""
-    mv = warp_max_f32(mv)
-    mx = warp_max_f32(mx)
+    mv = warp_max(mv)
+    mx = warp_max(mx)
     red = sb + SM_RED
     if (tid & 31) == 0:
         cute.arch.store(sptr(Float32, red + (tid >> 5) * 4), mv)

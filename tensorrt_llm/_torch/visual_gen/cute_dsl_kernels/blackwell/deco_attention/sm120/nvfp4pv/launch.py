@@ -69,7 +69,7 @@ def split_plan(S, H, B, nsm):
     n = nT * H * B
     r = n % nsm
     kmid = 4 * ((nT + 4) // 8)
-    if r == 0 or nT < 24 or kmid <= 0 or kmid >= nT:
+    if r == 0 or nT < 24:
         return n, 0, 0
     return n - r, r, kmid
 

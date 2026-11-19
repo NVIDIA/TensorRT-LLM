@@ -99,14 +99,13 @@ def small_mma_phase(
     sfoff,
     voff,
     vsw,
-    dist,
     kwait=None,
     vmst=None,
     vmoff=None,
 ):
     """One MMA phase of a warp: O += P V of the tile (if vst is not None), then the means term O += S M (if vmst is
     not None: the tile's v_mean rows at vmst, its block sums in P[16..17]), then S = Q' K'^T (if kst is not None).
-    The fragments are loaded dist steps ahead of the MMAs that consume them (each step is one ldmatrix and two MMAs, a
+    The fragments are loaded DIST steps ahead of the MMAs that consume them (each step is one ldmatrix and two MMAs, a
     means step four)."""
     steps = []
     if vst is not None:
@@ -141,13 +140,13 @@ def small_mma_phase(
     frags = [None] * len(steps)
     if n_pv == 0 and kst is not None:
         w = k_ready()
-    for n in range(min(dist, len(steps))):
+    for n in range(DIST):
         frags[n] = load(steps[n])
     for n, st in enumerate(steps):
-        if n + dist == n_pv and kst is not None:
+        if n + DIST == n_pv and kst is not None:
             w = k_ready()
-        if n + dist < len(steps):
-            frags[n + dist] = load(steps[n + dist])
+        if n + DIST < len(steps):
+            frags[n + DIST] = load(steps[n + DIST])
         b = frags[n]
         frags[n] = None
         if st[0] == "pv":
@@ -189,21 +188,19 @@ def small_mma_phase(
 
 @cute.jit
 def small_softmax(acc, P, sc, q, lim: cutlass.Constexpr):
-    """Softmax of the single tile (rows g and g + 8 of the warp): tile max as the anchor (keys >= lim masked), P =
-    E4M3(2^(s - anchor + 4)) into P[4 i + r], the row sums of the quantized P and its block sums (P[16], P[17])."""
-    if cutlass.const_expr(lim < KT):
-        for nt in cutlass.range_constexpr(16):
-            s = nt % 4
-            i = nt // 4
-            for e in cutlass.range_constexpr(2):
-                kk = 32 * i + 8 * key_grp(s) + ((2 * q + e) ^ key_rot(s))
-                ok = Int32(1)
-                if kk >= lim:
-                    ok = Int32(0)
-                acc[nt][e] = Float32(cutlass.select_(ok != 0, acc[nt][e], Float32(-math.inf)))
-                acc[nt][2 + e] = Float32(
-                    cutlass.select_(ok != 0, acc[nt][2 + e], Float32(-math.inf))
-                )
+    """Softmax of the single tile (rows g and g + 8 of the warp): tile max as the anchor (keys >= lim masked, lim <
+    KT), P = E4M3(2^(s - anchor + 4)) into P[4 i + r], the row sums of the quantized P and its block sums (P[16],
+    P[17])."""
+    for nt in cutlass.range_constexpr(16):
+        s = nt % 4
+        i = nt // 4
+        for e in cutlass.range_constexpr(2):
+            kk = 32 * i + 8 * key_grp(s) + ((2 * q + e) ^ key_rot(s))
+            ok = Int32(1)
+            if kk >= lim:
+                ok = Int32(0)
+            acc[nt][e] = Float32(cutlass.select_(ok != 0, acc[nt][e], Float32(-math.inf)))
+            acc[nt][2 + e] = Float32(cutlass.select_(ok != 0, acc[nt][2 + e], Float32(-math.inf)))
     # the anchors of the rows: the tile max in log2 units
     na0, na1 = tile_max(acc, sc)
     s0 = Float32(0.0)
@@ -307,7 +304,6 @@ def small_kernel(
         sfoff,
         voff,
         vsw,
-        DIST,
         (fbar, Int32(0)),
     )
     cute.arch.barrier_arrive(barrier_id=bid_pass, number_of_threads=NTHR, aligned=False)
@@ -327,7 +323,6 @@ def small_kernel(
         sfoff,
         voff,
         vsw,
-        DIST,
         vmst=smem + SVM_OFF,
         vmoff=vmoff,
     )

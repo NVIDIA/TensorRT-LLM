@@ -46,19 +46,13 @@ def split_plan(s, h, b, sm_count):
     return n_units, n_full, n_parts
 
 
-def split_flag_count(s, h, b, sm_count):
-    """Ready flags of the split launch at this shape, one per (tail unit, KV piece, O tile) merge slot; 0 without a
-    split launch."""
-    n_units, n_full, n_parts = split_plan(s, h, b, sm_count)
-    return (n_units - n_full) * n_parts * 2
-
-
 def scratch(b, s, h, sm_count):
     """The merge scratch of the split launch at this shape on a device of sm_count SMs, name -> (dtype, shape): the
     unnormalized O rows and the (anchor, row sum) pairs of every merge slot, which the pieces write before they are
     read, and the slots' ready flags, which must be zero when the launch starts (the merging CTAs return them to
-    zero). Empty when the shape has no split launch."""
-    n_slots = split_flag_count(s, h, b, sm_count)
+    zero). A merge slot is a (tail unit, KV piece, O tile) triple. Empty when the shape has no split launch."""
+    n_units, n_full, n_parts = split_plan(s, h, b, sm_count)
+    n_slots = (n_units - n_full) * n_parts * 2
     if not n_slots:
         return {}
     return {

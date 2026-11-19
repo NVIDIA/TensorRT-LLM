@@ -14,9 +14,9 @@
 # limitations under the License.
 """Arithmetic of the softmax, the epilogues and the preparations in CuTe DSL operations: the exp2 landing on the
 f32 subnormal grid with its anchor bias and its multiplier, f16x2 / E4M3 and BF16 packing, the scaling of a BF16
-pair, the guarded reciprocal, the power-of-two ceiling of a scale, float bit casts, the pairwise summation tree,
-and the sum and the maximum over a warp. The arithmetic that is inline PTX is in the PTX modules of common/ and
-of the families."""
+pair, the guarded reciprocal, the power-of-two ceiling of a scale, the rounding of an NVFP4 block scale, float bit
+casts, the pairwise summation tree, the sum and the maximum over a warp, and the hashed start values of the
+eigensolvers. The arithmetic that is inline PTX is in the PTX modules of common/ and of the families."""
 
 import cutlass
 import cutlass.cute as cute
@@ -153,6 +153,13 @@ def pow2_ceil_448(m):
     return pow2_ceil(cute.math.div(m, Float32(448.0), rounding=cute.math.RoundingMode.NEAREST_EVEN))
 
 
+def round_m3(x):
+    """x (FP32, >= 0) rounded to 3 mantissa bits, nearest even, at any exponent."""
+    b = f2u(x)
+    b = b + Uint32(0x7FFFF) + ((b >> 20) & Uint32(1))
+    return u2f(b & Uint32(0xFFF00000))
+
+
 def scale_bf16x2(x, a):
     """i32 word x of two BF16, f32 a -> i32 word of the two halves times a, rounded back to BF16: each half in the
     high 16 bits of an f32, a multiply that keeps subnormal results (mul.rn.f32), then the packing of bf16x2."""
@@ -176,3 +183,13 @@ def warp_max(x):
     for o in (16, 8, 4, 2, 1):
         x = cute.arch.fmax(x, cute.arch.shuffle_sync_bfly(x, offset=Int32(o)))
     return x
+
+
+def hash01(i, key):
+    """A value in [-0.5, 0.5) from the integers i and key by integer avalanche mixing: the deterministic dense start
+    vectors of the eigensolvers."""
+    h = Uint32(i + 1) ^ (Uint32(key) * Uint32(0x9E3779B9))
+    h = (h ^ (h >> Uint32(16))) * Uint32(0x7FEB352D)
+    h = (h ^ (h >> Uint32(15))) * Uint32(0x846CA68B)
+    h = h ^ (h >> Uint32(16))
+    return Float32(h >> Uint32(8)) * Float32(1.0 / 16777216.0) - Float32(0.5)

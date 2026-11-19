@@ -21,7 +21,7 @@ of what the kernel's PV format casts (the maxima that set its tensor scale). Whe
 the scan CTAs then run the kernel's V pass on the tiles a counter hands out, joined by the eigensolver CTAs as
 basis_cta describes; the V pass is a launch of its own otherwise. The scan and the pass are those of the kernel
 package (<kernel package>/v_pass.py), whose basis kernel is basis_cta with them; the helpers both V passes share
-are here (bf16_f32, group16, stage_rows), with the warp maximum of the passes (warp_max_f32)."""
+are here (bf16_f32, group16, stage_rows)."""
 
 import cutlass
 import cutlass.cute as cute
@@ -29,7 +29,7 @@ from cutlass import Float32, Int16, Int32, Int64, Uint16, Uint32
 from cutlass.utils import SmemAllocator
 
 from ...common.dsl import MMALayout, ldmatrix, nanosleep
-from ...common.expmath import bf16x2, f2u, u2f, warp_sum
+from ...common.expmath import bf16x2, f2u, hash01, u2f, warp_max, warp_sum
 from ...common.mem import cp_async16, gptr, load_invariant, load_vector, sptr, store_vector
 from ...common.ptx import ld_global_acquire_b32, vote_ballot
 from ...common.state import State
@@ -73,30 +73,10 @@ def pow2_inv_of_max(a, b):
 
 
 @cute.jit
-def warp_max_f32(x: Float32) -> Float32:
-    """The maximum of the f32 x over the lanes of the warp, by five butterfly shuffles."""
-    x = cute.arch.fmax(x, cute.arch.shuffle_sync_bfly(x, offset=16))
-    x = cute.arch.fmax(x, cute.arch.shuffle_sync_bfly(x, offset=8))
-    x = cute.arch.fmax(x, cute.arch.shuffle_sync_bfly(x, offset=4))
-    x = cute.arch.fmax(x, cute.arch.shuffle_sync_bfly(x, offset=2))
-    x = cute.arch.fmax(x, cute.arch.shuffle_sync_bfly(x, offset=1))
-    return x
-
-
-@cute.jit
 def _uhh_off(k: Int32) -> Int32:
     a = k >> 2
     b = k & 3
     return 512 * a - 8 * a * (a - 1) + b * (128 - 4 * a)
-
-
-@cute.jit
-def _hash01(i: Int32, c: Int32) -> Float32:
-    h = Uint32(i + 1) ^ (Uint32(c + 7) * Uint32(0x9E3779B9))
-    h = (h ^ (h >> Uint32(16))) * Uint32(0x7FEB352D)
-    h = (h ^ (h >> Uint32(15))) * Uint32(0x846CA68B)
-    h = h ^ (h >> Uint32(16))
-    return Float32(h >> Uint32(8)) * Float32(1.0 / 16777216.0) - Float32(0.5)
 
 
 # ------------------------------------------------------------------------------------------------ eigensolver steps
@@ -452,8 +432,8 @@ def publish_bounds(st):
             sE2[0] = Float32(0.0)
         glo = di - ea - eb
         ghi = di + ea + eb
-        glo = -warp_max_f32(-glo)
-        ghi = warp_max_f32(ghi)
+        glo = -warp_max(-glo)
+        ghi = warp_max(ghi)
         if st.lane == 0:
             sRed[st.warp] = glo
             sRed[4 + st.warp] = ghi
@@ -547,7 +527,7 @@ def inverse_iteration(st, span):
         lam = st.sLam[c]
         pfl = span * Float32(1e-9) + Float32(1e-30)
         for i in cutlass.range(128, unroll=4):
-            sZ[i, c] = _hash01(i, c)
+            sZ[i, c] = hash01(i, c + 7)
         scale = Float32(1.0)
         for itv in cutlass.range_constexpr(NIT_INV):
             piv = sD[0] - lam

@@ -90,7 +90,7 @@ class DeCoAttention(AttentionBackend):
         # The V format of the recipe names the PV format of the kernel; Q/K are always NVFP4.
         try:
             pv_formats = deco_attention.pv_formats()
-        except deco_attention.target.NoKernelError as e:
+        except NotImplementedError as e:
             raise ValueError(
                 "DeCo-Attention has kernels for SM100, SM103, SM107 and SM120 GPUs only."
             ) from e

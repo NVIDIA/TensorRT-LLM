@@ -28,19 +28,10 @@ from cutlass.cute.typing import Float8E4M3FN
 from cutlass.utils import SmemAllocator
 
 from ...common.dsl import FPRoundingMode, SaturationMode, cvt_f32x2_to_f8x2
-from ...common.expmath import bf16x2, pow2_ceil, u2f
+from ...common.expmath import bf16x2, pow2_ceil, u2f, warp_max
 from ...common.mem import gptr, load_vector, sptr, store_vector
 from ...common.ptx import f32x8_to_e2m1x8
-from ..prep.basis import (
-    EIG_THREADS,
-    SM_RED,
-    SM_VSTG,
-    basis_cta,
-    bf16_f32,
-    group16,
-    stage_rows,
-    warp_max_f32,
-)
+from ..prep.basis import EIG_THREADS, SM_RED, SM_VSTG, basis_cta, bf16_f32, group16, stage_rows
 from ..ptx.nvfp4pv import e4m3_to_f32
 from ..ptx.shared import ld_global_nc_b32_hint_pred
 
@@ -65,7 +56,7 @@ def tensor_scale(
         c = cute.arch.fmax(
             c, u2f(cute.arch.load(gptr(Uint32, vmax_p + Int64(i) * 4), Uint32, cop=cop))
         )
-    c = warp_max_f32(c)
+    c = warp_max(c)
     if cutlass.const_expr(SYNC):
         cute.arch.sync_threads()
     if (tid & 31) == 0:
@@ -141,7 +132,7 @@ def _fold(sums, vmx, vmn, fc, any_, mx):
 @cute.jit
 def _store_slot(mx: Float32, tid: Int32, sb: Int32, vmax_p: Int64, slot: Int32):
     """The block's max|v - vbar| into V-scan slot `slot`."""
-    mx = warp_max_f32(mx)
+    mx = warp_max(mx)
     red = sb + SM_RED
     if (tid & 31) == 0:
         cute.arch.store(sptr(Float32, red + (tid >> 5) * 4), mx)
@@ -223,29 +214,7 @@ def _vscan_gs(
             v_p + ((Int64(bb) * Int64(S) + Int64(k0)) * Int64(H) + Int64(hh)) * 256 + Int64(cc * 16)
         )
         rstride = Int64(H) * 256
-        sums = [Float32(0.0)] * 8
-        vmx = [Float32(-3.0e38)] * 8
-        vmn = [Float32(3.0e38)] * 8
-        for kk in cutlass.range_constexpr(16):
-            w = ld_global_nc_b32_hint_pred(base + rstride * kk, Int32(kk < cnt), "evict_last", 4)
-            ok = Int32(kk < cnt)
-            for e in cutlass.range_constexpr(4):
-                lo_ = u2f(w[e] << Uint32(16))
-                hi_ = u2f(w[e] & Uint32(0xFFFF0000))
-                sums[2 * e] = sums[2 * e] + lo_
-                sums[2 * e + 1] = sums[2 * e + 1] + hi_
-                vmx[2 * e] = cute.arch.fmax(
-                    vmx[2 * e], Float32(cutlass.select_(ok != 0, lo_, Float32(-3.0e38)))
-                )
-                vmx[2 * e + 1] = cute.arch.fmax(
-                    vmx[2 * e + 1], Float32(cutlass.select_(ok != 0, hi_, Float32(-3.0e38)))
-                )
-                vmn[2 * e] = cute.arch.fmin(
-                    vmn[2 * e], Float32(cutlass.select_(ok != 0, lo_, Float32(3.0e38)))
-                )
-                vmn[2 * e + 1] = cute.arch.fmin(
-                    vmn[2 * e + 1], Float32(cutlass.select_(ok != 0, hi_, Float32(3.0e38)))
-                )
+        sums, vmx, vmn = group16(base, rstride, cnt)
         fc = Float32(cnt)
         for c in cutlass.range_constexpr(8):
             mb = u2f(

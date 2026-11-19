@@ -97,9 +97,10 @@ def emit_block_max(Sacc, masked):
     return bm
 
 
-def emit_p(st, Sacc, bm, ma_dst, two_step):
+def emit_p(st, Sacc, bm, ma_dst, ma_off, two_step):
     """NVFP4 P of the tile into st.Pst (codes [4 s + 2 h + rr], scale words [8 + s]), the block sums of the
-    unquantized P as the BF16 operand of the means MMA into ma_dst, and the row-sum update."""
+    unquantized P as the BF16 operand of the means MMA into ma_dst[ma_off] and ma_dst[ma_off + 1], and the row-sum
+    update."""
     par = st.par
     P = st.Pst
     lsum = st.lsum
@@ -160,8 +161,8 @@ def emit_p(st, Sacc, bm, ma_dst, two_step):
         xs.append(sums)
     lsum[0] = lsum[0] + (xs[0][0] + xs[1][0])
     lsum[1] = lsum[1] + (xs[0][1] + xs[1][1])
-    ma_dst[0] = Int32(bf16x2(xs[0][0], xs[1][0]))
-    ma_dst[1] = Int32(bf16x2(xs[0][1], xs[1][1]))
+    ma_dst[ma_off] = Int32(bf16x2(xs[0][0], xs[1][0]))
+    ma_dst[ma_off + 1] = Int32(bf16x2(xs[0][1], xs[1][1]))
     # P scale words (lanes 4g: row g, 4g + 1: row g + 8): blocks 4s + 2h from this pair, 4s + 2h + 1 from t ^ 2
     wa = e4[0] | (e4[1] << 16)
     wb = cute.arch.shuffle_sync_bfly(wa, offset=1)
@@ -206,6 +207,6 @@ def softmax_phase(
             Mlo[0] = scale_bf16x2(Mlo[0], f0)
             Mlo[1] = scale_bf16x2(Mlo[1], f1)
     if cutlass.const_expr(cur_odd):
-        emit_p(st, Sacc, bm, st.Pst_hi, two_step)
+        emit_p(st, Sacc, bm, st.Pst, 10, two_step)
     else:
-        emit_p(st, Sacc, bm, Mlo, two_step)
+        emit_p(st, Sacc, bm, Mlo, 0, two_step)
