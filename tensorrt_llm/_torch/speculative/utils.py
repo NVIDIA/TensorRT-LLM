@@ -361,6 +361,7 @@ def get_spec_metadata(spec_config,
         # dispatcher routes to a backend that takes no min_p argument -- so the filter is
         # dropped with nothing raised. One assignment here keeps them in step.
         metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
+        metadata.rejection_sample_method = spec_config.rejection_sample_method
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
         metadata.temperature_only_graphs = temperature_only_graphs
@@ -822,6 +823,10 @@ def get_spec_worker(spec_config,
     # slot convention on top of DFlashWorker.
     if spec_dec_mode.is_dspark():
         if spec_config.draft_is_embedded_in_target:
+            if spec_config.use_ancestral_draft_sampling:
+                raise ValueError(
+                    "use_ancestral_draft_sampling=True is not supported with a "
+                    "drafter embedded in the target checkpoint.")
             return DSv4DSparkWorker(spec_config, mapping,
                                     use_separate_draft_kv_cache)
         return DSparkWorker(spec_config, mapping, use_separate_draft_kv_cache)
@@ -964,7 +969,6 @@ def update_spec_config_from_model_config(spec_config,
         raise ValueError(
             "A replacement MTP checkpoint must contain at least one head")
     spec_config.num_nextn_predict_layers = num_nextn_predict_layers
-    spec_config._validate_moe_backend_compatibility(model_config_resolved=True)
     is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()
 
     # Resolve max_draft_len when the user didn't set it:

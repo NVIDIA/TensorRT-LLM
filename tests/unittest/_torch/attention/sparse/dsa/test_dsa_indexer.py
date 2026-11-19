@@ -670,6 +670,7 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_samp
     assert metadata.needs_gvr_prior == (not use_self_sampling)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "requested,cute_dsl_available,sm_100f,expected",
     [
@@ -766,6 +767,19 @@ def test_cute_dsl_paged_mqa_logits_default_is_aligned():
     [
         (dict(), True),
         (dict(sm_version=103, index_topk=2048, compress_ratio=4), True),
+        (dict(sm_version=107), False),
+        (dict(sm_version=107, is_prefill=False), False),
+        (dict(sm_version=107, is_prefill=True), True),
+        (dict(sm_version=107, is_prefill=True, index_topk=1024), True),
+        (dict(sm_version=107, is_prefill=True, index_topk=2048), True),
+        (dict(sm_version=107, is_prefill=True, index_topk=256), False),
+        (dict(sm_version=107, is_prefill=True, compress_ratio=2), False),
+        (dict(sm_version=107, is_prefill=True, is_cute_dsl_available=False), False),
+        (dict(sm_version=107, is_prefill=True, use_self_sampling_topk=False), False),
+        (dict(sm_version=107, is_prefill=True, enable_heuristic_topk=False), False),
+        (dict(sm_version=100, is_prefill=True), True),
+        (dict(sm_version=103, is_prefill=True), True),
+        (dict(sm_version=120, is_prefill=True), False),
         (dict(enable_heuristic_topk=False), False),
         (dict(use_self_sampling_topk=False), False),
         (dict(is_cute_dsl_available=False), False),
@@ -4559,6 +4573,7 @@ def test_indexer_decode_custom_vs_fallback(
     )
 
     # Test with indexer skip enabled
+    topk_indices_skip = None
     if enable_indexer_skip:
         metadata_skip = _create_mock_metadata(
             request_ids,
@@ -5161,6 +5176,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip, ds
     )
 
     # Test with indexer skip enabled
+    topk_indices_skip = None
     if enable_indexer_skip:
         metadata_skip = _create_mock_metadata(
             request_ids,

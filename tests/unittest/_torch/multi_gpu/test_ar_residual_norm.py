@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -167,7 +167,3 @@ def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fused_add_norm):
         )
         for r in results:
             assert r is True
-
-
-if __name__ == "__main__":
-    test_row_linear_residual_norm_fusion(256, True)

@@ -9,12 +9,20 @@
 
 TensorRT-LLM Coding Style can be found [in this document](CODING_GUIDELINES.md).
 
-We use `pre-commit` for automatic code formatting and validation. Install the `pre-commit` package in your local Python environment.
+We use `pre-commit` for automatic code formatting and validation. Create and activate a local Python environment:
 
 ```bash
-pip install pre-commit pyrefly
-pre-commit install
+python3 -m venv .venv-precommit
+source .venv-precommit/bin/activate
+python3 -m pip install pre-commit pyrefly==1.4.0 'tomli>=2; python_version < "3.11"'
+python3 -m pre_commit install
 ```
+
+The type-check hook uses `python3` from `PATH`, so keep this environment activated
+when committing or running `pre-commit`. Install these dependencies with
+`python3 -m pip` to use the same interpreter as the hook. On Python 3.10, the
+workflow helpers need `tomli` to read TOML; Python 3.11 and newer provide `tomllib`.
+This setup does not require installing all of `requirements-dev.txt`.
 
 `pre-commit` will be triggered in every commit.
 

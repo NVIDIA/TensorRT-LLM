@@ -532,6 +532,30 @@ std::string TrtllmGenBatchedGemmRunner::getKernelNameFromConfigIndex(int32_t con
     return configs[configIndex].mFunctionName;
 }
 
+std::map<std::string, std::string> TrtllmGenBatchedGemmRunner::getKernelOptionsFromConfigIndex(
+    int32_t configIndex) const
+{
+    auto const bmm = BatchedGemmInterface();
+    auto const configs = bmm.getBatchedGemmConfigs();
+    auto const& options = configs[configIndex].mOptions;
+    return {
+        {"dtypeA", dtypeToString(options.mDtypeA)},
+        {"dtypeB", dtypeToString(options.mDtypeB)},
+        {"dtypeC", dtypeToString(options.mDtypeC)},
+        {"dtypeAcc", dtypeToString(options.mDtypeAcc)},
+        {"tileM", std::to_string(options.mTileM)},
+        {"tileN", std::to_string(options.mTileN)},
+        {"tileK", std::to_string(options.mTileK)},
+        {"mmaM", std::to_string(options.mMmaM)},
+        {"mmaN", std::to_string(options.mMmaN)},
+        {"mmaK", std::to_string(options.mMmaK)},
+        {"clusterDimX", std::to_string(options.mClusterDimX)},
+        {"clusterDimY", std::to_string(options.mClusterDimY)},
+        {"clusterDimZ", std::to_string(options.mClusterDimZ)},
+        {"numSlicesForSplitK", std::to_string(options.mNumSlicesForSplitK)},
+    };
+}
+
 std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m, int32_t n, int32_t k,
     std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
     int32_t validM, int32_t validN, int32_t validK) const

@@ -21,6 +21,7 @@ import numpy as np
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 from .page import AttentionLayerGroup
 
@@ -127,17 +128,26 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
 
         V2 transfer groups are indexed by the native layer-group ID. OPTIONAL
         groups not selected at resume have incomplete status; PRIVATE groups
-        never supply a reusable prefix, even when REQUIRED groups hit.
+        never supply a reusable prefix, even when REQUIRED groups hit. A
+        SINK_REQUIRED_ONLY group without its window still holds the claimed sinks.
         """
         scalar = self._global_cached_token_count(req)
         if scalar == 0:
             return [0] * len(layer_groups)
         statuses = self._mgr.kv_cache_map[req.py_request_id].reuse_status
         tpb = self.tokens_per_block
-        return [
-            min(scalar, statuses[group].endpoint // tpb * tpb) if statuses[group].complete else 0
-            for group in range(len(layer_groups))
-        ]
+        cached = []
+        for group in range(len(layer_groups)):
+            status = statuses[group]
+            if status.complete:
+                cached.append(min(scalar, status.endpoint // tpb * tpb))
+            elif status.policy == ReusePolicy.SINK_REQUIRED_ONLY:
+                # The transfer must not write the shared sink pages, whole blocks of them.
+                sink_blocks = self._mgr._life_cycle_by_layer_group()[group].num_sink_blocks
+                cached.append(min(scalar, sink_blocks * tpb))
+            else:
+                cached.append(0)
+        return cached
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         # V2 already returns per-cache-level pool slot indices (not logical block
@@ -155,15 +165,29 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         # valid_only=False yields one entry per block ordinal, with -1
         # (BAD_PAGE_INDEX) for out-of-window (SWA-evicted) and unbound blocks.
         # Position is the index; no length arithmetic needed.
+        kv_cache = self._mgr.kv_cache_map[req.py_request_id]
+        ordinals = block_ordinals_from_base_indices(kv_cache, group_idx)
+        if ordinals is not None:
+            return ordinals
         return np.fromiter(
-            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
-                group_idx, valid_only=False
-            ),
+            kv_cache.get_aggregated_page_indices(group_idx, valid_only=False),
             dtype=np.int64,
         )
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         self._mgr.try_commit_blocks(req)
+
+
+def block_ordinals_from_base_indices(kv_cache, group_idx: int):
+    """``get_aggregated_page_indices(group_idx, valid_only=False)`` read zero-copy from an active
+    cache's base page indices, which equal it over ``num_blocks`` entries; None otherwise."""
+    if not kv_cache.is_active:
+        return None
+    num_blocks = kv_cache.num_blocks
+    base = kv_cache.get_base_page_indices(group_idx)
+    if len(base) < num_blocks:
+        return None
+    return np.array(base[:num_blocks], dtype=np.int64)
 
 
 def create_cache_reuse_adapter(

@@ -26,7 +26,9 @@ import torch
 from .utils import Fp4QuantizedTensor, MxFp8QuantizedTensor
 
 _SCOPED_MODULE_MARKER = "_trtllm_nccl_window_tensor_scoped"
+_TENSOR_CONTAINER_MARKER = "_trtllm_nccl_window_tensor_container"
 _ModuleType = TypeVar("_ModuleType", bound=type[torch.nn.Module])
+_TensorContainerType = TypeVar("_TensorContainerType", bound=type)
 
 
 def nccl_window_tensor_scoped_module(module_type: _ModuleType) -> _ModuleType:
@@ -41,6 +43,23 @@ def nccl_window_tensor_scoped_module(module_type: _ModuleType) -> _ModuleType:
 
 def is_nccl_window_tensor_scoped_module(module_type: type[torch.nn.Module]) -> bool:
     return getattr(module_type, _SCOPED_MODULE_MARKER, False)
+
+
+def nccl_window_tensor_container(container_type: _TensorContainerType) -> _TensorContainerType:
+    """Mark a dataclass type whose CUDA tensors are activation inputs.
+
+    Besides explicitly supported quantized tensor wrappers, eager input
+    collection treats unmarked dataclasses as shared per-forward metadata,
+    even inside marked containers. Each nested activation dataclass must opt
+    in independently to expose its tensors to the consuming scope.
+    """
+    setattr(container_type, _TENSOR_CONTAINER_MARKER, True)
+    return container_type
+
+
+def is_nccl_window_tensor_container(container_type: type) -> bool:
+    """Return whether a type opts into eager activation-input collection."""
+    return getattr(container_type, _TENSOR_CONTAINER_MARKER, False)
 
 
 # Exact built-in scalar types cannot contain tensors. Subclasses still take the
@@ -81,7 +100,7 @@ def _cuda_tensors(
         _cuda_tensors(value.fp8_tensor, tensors, visited, include_dataclasses)
         _cuda_tensors(value.scaling_factor, tensors, visited, include_dataclasses)
     elif is_dataclass(value) and not isinstance(value, type):
-        if not include_dataclasses:
+        if not include_dataclasses and not is_nccl_window_tensor_container(type(value)):
             return
         value_type = type(value)
         for name in _dataclass_field_names(value_type):
@@ -104,9 +123,11 @@ def _module_call_cuda_tensors(args: tuple, kwargs: dict[str, Any]) -> list[torch
     """Collect a module call's CUDA tensor inputs, excluding shared metadata.
 
     Equivalent to ``_cuda_tensors((args, kwargs), tensors, include_dataclasses=False)``
-    with direct tensor arguments handled without recursion. Shared per-forward
-    metadata belongs to the enclosing scope, including when nested inside
-    activation containers.
+    with direct tensor arguments handled without recursion. Dataclasses marked
+    by :func:`nccl_window_tensor_container` expose their activation tensors,
+    alongside explicitly supported quantized tensor wrappers. Other dataclasses
+    are shared per-forward metadata belonging to the enclosing scope, even when
+    nested inside marked activation containers.
     """
     tensors: list[torch.Tensor] = []
     visited: set[int] | None = None
