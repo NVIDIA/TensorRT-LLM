@@ -670,6 +670,8 @@ class DecoderModelForCausalLM(nn.Module,
         Models that read token ids after the input embedding must treat an
         embedding row like an image row (``prompt_embeds_model_inputs``) or refuse.
         """
+        if type(self).__module__.startswith("tensorrt_llm._torch.modeling_v2."):
+            return "modeling_v2 implementations do not take engine-supplied embeddings yet"
         return None
 
     def embed_prompt_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:

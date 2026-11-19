@@ -80,7 +80,13 @@ def test_deepseek_engram_refuses() -> None:
         Gemma4AssistantForCausalLM,
         MiniMaxM3VLForConditionalGeneration,
         Exaone4_5_ForConditionalGeneration,
+        # Any modeling_v2 target (their libraries build only for their own SMs).
+        type(
+            "ModelingV2Target",
+            (DecoderModelForCausalLM,),
+            {"__module__": "tensorrt_llm._torch.modeling_v2.models.family.target.modeling"},
+        ),
     ],
 )
 def test_refused_families(cls: type) -> None:
-    assert cls.prompt_embeds_unsupported_reason(SimpleNamespace())
+    assert cls.prompt_embeds_unsupported_reason(object.__new__(cls))
