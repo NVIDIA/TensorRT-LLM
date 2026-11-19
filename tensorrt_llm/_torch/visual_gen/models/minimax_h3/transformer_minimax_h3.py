@@ -110,6 +110,23 @@ def _dense_attention_model_config(model_config: DiffusionModelConfig) -> Diffusi
     return dense_config
 
 
+def _refiner_attention_model_config(model_config: DiffusionModelConfig) -> DiffusionModelConfig:
+    """Return the config of the text-only token refiner: dense, and under a DeCo-Attention
+    recipe unquantized on VANILLA. The recipe is for the packed sequence of the transformer
+    blocks, and its backend runs every other call on VANILLA."""
+
+    dense_config = _dense_attention_model_config(model_config)
+    quant_config = dense_config.attention.quant_attention_config
+    if quant_config is None or not quant_config.deco_attention:
+        return dense_config
+
+    refiner_config = dense_config.model_copy(deep=False)
+    refiner_config.attention = dense_config.attention.model_copy(deep=True)
+    refiner_config.attention.quant_attention_config = None
+    refiner_config.attention.backend = "VANILLA"
+    return refiner_config
+
+
 class MiniMaxH3RotaryPosEmbed(nn.Module):
     """Three-axis RoPE over packed ``(time, height, width)`` coordinates."""
 
@@ -235,6 +252,7 @@ class MiniMaxH3Attention(Attention):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         valid_seq_len: Optional[int] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_async_ulysses:
             return self.forward_async(
@@ -243,6 +261,7 @@ class MiniMaxH3Attention(Attention):
                 key_padding_mask=key_padding_mask,
                 timestep=timestep,
                 valid_seq_len=valid_seq_len,
+                token_tags=token_tags,
             )
         batch_size, sequence_length = hidden_states.shape[:2]
         if rotary_emb is not None and self._use_fused_qk_norm_rope(hidden_states, rotary_emb):
@@ -302,6 +321,7 @@ class MiniMaxH3Attention(Attention):
             discard_padded_queries=True,
             valid_seq_len=valid_seq_len,
             timestep=timestep,
+            token_tags=token_tags,
         )
         return self.to_out[0](hidden_states)
 
@@ -312,6 +332,7 @@ class MiniMaxH3Attention(Attention):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         valid_seq_len: Optional[int] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``forward`` with each projection pushed to the peers as soon as it is
         computed: V, then Q and K with their per-head norm and RoPE, run on the
@@ -345,6 +366,7 @@ class MiniMaxH3Attention(Attention):
             discard_padded_queries=True,
             valid_seq_len=valid_seq_len,
             timestep=timestep,
+            token_tags=token_tags,
         )
         batch_size, local_seq_len = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(batch_size, local_seq_len, -1))
@@ -482,7 +504,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
             qk_norm_eps=qk_norm_eps,
-            model_config=_dense_attention_model_config(model_config),
+            model_config=_refiner_attention_model_config(model_config),
             layer_idx=layer_idx,
             module_name=f"token_refiner.refiner_blocks.{layer_idx}.attn",
         )
@@ -667,6 +689,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         valid_seq_len: Optional[int] = None,
+        token_tags: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self._fused_adaln and hidden_states.dtype == torch.bfloat16:
             return self._forward_fused_adaln(
@@ -677,6 +700,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
                 key_padding_mask,
                 timestep,
                 valid_seq_len,
+                token_tags,
             )
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
 
@@ -691,6 +715,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             key_padding_mask,
             timestep,
             valid_seq_len,
+            token_tags,
         )
 
         residual = hidden_states
@@ -712,6 +737,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         key_padding_mask: Optional[torch.Tensor],
         timestep: Optional[torch.Tensor],
         valid_seq_len: Optional[int],
+        token_tags: Optional[torch.Tensor],
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
         mod = self.adaln_proj.table(temb)
@@ -719,7 +745,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
         )
         attn_output = self.attn(
-            norm_hidden_states, rotary_emb, key_padding_mask, timestep, valid_seq_len
+            norm_hidden_states, rotary_emb, key_padding_mask, timestep, valid_seq_len, token_tags
         )
         hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
             hidden_states,
@@ -1131,6 +1157,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 key_padding_mask,
                 timestep,
                 valid_seq_len=valid_seq_len,
+                # Each attention call sees the whole packed sequence, so the tags of the
+                # padded sequence describe its rows; a backend that samples tokens by
+                # modality reads them.
+                token_tags=token_tags_for_mask,
             )
 
         packed_hidden_states = self.norm_out(

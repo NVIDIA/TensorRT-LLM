@@ -103,6 +103,10 @@ class AttentionBackend(ABC):
           key row counts, padding included, as the Attention module derives them from
           the tensor shapes.
         * ``attention_mask``, ``key_padding_mask``: the mask, if the backend takes one.
+        * ``token_tags``: an integer tensor ``[S]`` with the modality of every row of a
+          packed multimodal sequence, padding included: 0 video or image, positive text
+          or audio, negative padding. Advisory: a backend that samples tokens by
+          modality reads it.
         * ``kv``: a ``ForwardPlan`` from a ``RolloutKVCacheInterface``; only backends
           whose ``support_kv_cache()`` is true accept it. ``k``/``v`` are then this
           call's new tokens, staged into the cache and attended together with what the

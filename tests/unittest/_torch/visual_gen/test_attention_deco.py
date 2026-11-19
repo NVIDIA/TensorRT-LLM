@@ -221,6 +221,44 @@ def test_deco_delegates_unsupported_calls() -> None:
     assert _relative_error(out, _sdpa(q, k, v)) < 2e-2
 
     assert "deco_workspace" not in attn._state
+    # The causal call has the shape of a self-attention call: the layer notes it once.
+    assert attn._noted_unquantized
+
+
+def test_deco_token_tags_draw_the_basis_rows_by_modality() -> None:
+    """With the token tags of a packed sequence the preparation takes half of its rows from the
+    text and audio tokens and none from the padding; the rows are drawn once per tags tensor."""
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
+
+    device = _require_deco_gpu()
+    batch_size, seq_len, num_heads = 1, 4096, 2
+    q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
+    token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
+    token_tags[:100] = 1  # text
+    token_tags[100:160] = 2  # audio
+    token_tags[-8:] = -1  # padding
+    state: dict = {}
+    attn = _backend(num_heads, state=state)
+
+    out = attn.forward(q, k, v, token_tags=token_tags)
+
+    ((kept_tags, rows),) = state["deco_tagged_rows"]
+    assert kept_tags is token_tags
+    drawn = token_tags[rows.long()]
+    assert (drawn >= 0).all()
+    assert int((drawn > 0).sum()) == rows.numel() // 2
+
+    # The kernels give the same output for these rows, and another one for their own draw.
+    num_bytes = deco_attention.workspace_size(batch_size, seq_len, num_heads, device, "fp8")
+    workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+    operands = deco_attention.prepare(q, k, v, workspace, "fp8", rows=rows)
+    assert torch.equal(out, deco_attention.attention(operands, torch.empty_like(q)))
+    assert not torch.equal(out, attn.forward(q, k, v))
+
+    assert torch.equal(attn.forward(q, k, v, token_tags=token_tags), out)
+    assert len(state["deco_tagged_rows"]) == 1
+    with pytest.raises(ValueError, match="token tags"):
+        attn.forward(q, k, v, token_tags=token_tags[:-1])
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
