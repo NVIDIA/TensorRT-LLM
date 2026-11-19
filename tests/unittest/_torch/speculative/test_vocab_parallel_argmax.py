@@ -707,12 +707,15 @@ def test_fused_draft_head_draft_lm_head_choice():
         pass
 
     class _NormalizesInput(DeepseekV3MTPHead):
+        plain_lm_head_projection = False
+
         def forward(self, hidden_states, lm_head, attn_metadata, return_context_logits=False):
             raise NotImplementedError
 
     plain = object.__new__(_InheritsForward)
     custom = object.__new__(_NormalizesInput)
     assert is_plain_mtp_shared_head(plain) and not is_plain_mtp_shared_head(custom)
+    assert not is_plain_mtp_shared_head(object())
 
     head = object()
 

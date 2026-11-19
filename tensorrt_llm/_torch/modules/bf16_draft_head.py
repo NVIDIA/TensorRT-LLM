@@ -67,11 +67,9 @@ def max_rows(hidden_size: int, device_index: int) -> int:
 
 def is_plain_mtp_shared_head(shared_head: torch.nn.Module) -> bool:
     """Whether ``shared_head(x, lm_head, attn_metadata, True)`` is just this rank's vocab shard of
-    ``lm_head(x)`` outside attention DP (``DeepseekV3MTPHead`` and subclasses that keep its forward;
-    heads that normalize or transform ``x`` do not qualify)."""
-    from ..models.modeling_deepseekv3 import DeepseekV3MTPHead
-
-    return type(shared_head).forward is DeepseekV3MTPHead.forward
+    ``lm_head(x)`` outside attention DP: the head declares it with ``plain_lm_head_projection``
+    (``DeepseekV3MTPHead``); heads without the attribute do not qualify."""
+    return getattr(shared_head, "plain_lm_head_projection", False)
 
 
 class BF16DraftHead:
