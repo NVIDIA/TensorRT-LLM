@@ -1206,11 +1206,12 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
 
     @property
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        # An item costs its own padded size: a frame its patch count, a clip its request's
+        # width (`_vision_item_lengths`, `_audio_item_lengths`). The towers run padded slots, so
+        # payloads of other sizes are encoded apart, never padded to each other.
         return (
-            EncoderGroup(("image",), self._encode_vision),
-            EncoderGroup(("video",), self._encode_vision),
-            # The audio tower runs every padded frame, and a clip costs its request's padded
-            # width (`_audio_item_lengths`), so requests of other widths are encoded apart.
+            EncoderGroup(("image",), self._encode_vision, pad_payloads=False),
+            EncoderGroup(("video",), self._encode_vision, pad_payloads=False),
             EncoderGroup(("audio",), self._get_audio_features, pad_payloads=False),
         )
 
@@ -1224,9 +1225,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     ) -> torch.Tensor:
         """Encode one group's batched image or video frames.
 
-        Frames with fewer patches than the batch arrive padded, with the -1 position sentinel
-        on the added patches (see `_gemma4_input_partitions`). ``num_frames`` is declared for
-        item scheduling and unused here.
+        Frames of one call have one patch count; a frame with fewer valid patches arrives
+        padded by its processor, with the -1 position sentinel on the added patches.
+        ``num_frames`` is declared for item scheduling and unused here.
         """
         if vision_normalization is not None:
             pixel_values = _normalize_vision_patches(

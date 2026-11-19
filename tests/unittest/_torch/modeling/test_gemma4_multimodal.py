@@ -2465,9 +2465,9 @@ def test_gemma4_vision_partitions_match_legacy_packing(split):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("unified", [False, True])
 @pytest.mark.parametrize("missing_positions", [False, True])
-def test_gemma4_ragged_vision_pads_positions_with_sentinels(
-    unified, missing_positions, record_property
-):
+def test_gemma4_ragged_vision_encodes_each_patch_count_apart(unified, missing_positions):
+    """Images of other patch counts from other requests: a frame costs its own patch count, so
+    each count takes its own call, never padded to the other, with the per-request rows."""
     params = [_vision_request("image", [36]), _vision_request("image", [9], seed=1)]
     second = params[1].multimodal_data["image"]
     second["pixel_values"] = second["pixel_values"][:, :9]
@@ -2496,17 +2496,18 @@ def test_gemma4_ragged_vision_pads_positions_with_sentinels(
                     [], {"image": param.multimodal_data["image"]}
                 )
             )
-    # The producer materializes implicit positions; batching pads them with -1.
+    # The producer materializes implicit positions.
     expected = torch.cat([_legacy_gemma4_encode(model, [param]) for param in params])
+    calls = []
+    get_image_features = model._get_image_features
+
+    def counted_image_features(**kwargs):
+        calls.append(tuple(kwargs["pixel_values"].shape[:2]))
+        return get_image_features(**kwargs)
+
+    model._get_image_features = counted_image_features
     actual = model.encode_multimodal_inputs(params)
-    if not unified:
-        # Changing projection GEMM from 4+1 rows to 5 changes fp32 accumulation order.
-        record_property("projection_max_absolute_error", float((actual - expected).abs().max()))
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-        # Remove the reduction to check padding and valid tower rows bitwise.
-        model.embed_vision.forward = lambda features: features
-        expected = torch.cat([_legacy_gemma4_encode(model, [param]) for param in params])
-        actual = model.encode_multimodal_inputs(params)
+    assert calls == [(1, 36), (1, 9)]
     assert torch.equal(actual, expected)
 
 
