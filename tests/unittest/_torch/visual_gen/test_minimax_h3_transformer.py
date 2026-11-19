@@ -38,7 +38,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, QuantAttentionConfig
 
 try:
     from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
@@ -487,6 +487,52 @@ def test_attention_dispatches_fused_qk_norm_rope_per_instance(monkeypatch):
 
 
 @requires_cuda
+@requires_cuda
+def test_deco_recipe_tags_the_joint_blocks_and_keeps_the_refiner_unquantized(monkeypatch):
+    """Under a DeCo-Attention recipe the transformer blocks hand the token tags of the packed
+    sequence to the DeCo backend, and the text-only token refiner runs unquantized on VANILLA."""
+    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention, VanillaAttention
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7), (12, 0)):
+        pytest.skip("DeCo-Attention kernels need an SM100, SM103, SM107 or SM120 GPU.")
+    config = _make_model_config(
+        num_layers=1, num_refiner_layers=1, attention_head_dim=128, rope_freq_dim=16
+    )
+    config.attention = AttentionConfig(
+        backend="CUTEDSL",
+        quant_attention_config=QuantAttentionConfig(
+            qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True
+        ),
+    )
+    config.attention_metadata_state = create_attention_metadata_state()
+    model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
+    _initialize_weights(model, scale=0.1)
+    model.requires_grad_(False)
+
+    backends = {
+        name: module.attn
+        for name, module in model.named_modules()
+        if isinstance(module, h3.MiniMaxH3Attention)
+    }
+    refiner = [b for name, b in backends.items() if "token_refiner" in name]
+    joint = [b for name, b in backends.items() if "token_refiner" not in name]
+    assert refiner and all(type(b) is VanillaAttention for b in refiner)
+    assert joint and all(type(b) is DeCoAttention for b in joint)
+
+    seen = []
+
+    def launch(self, q, k, v, token_tags=None):
+        seen.append(token_tags)
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(DeCoAttention, "_launch", launch)
+    inputs = _model_inputs("cuda")
+    with torch.inference_mode():
+        model(**inputs)
+    assert len(seen) == len(joint)
+    assert all(tags is not None and torch.equal(tags, inputs["token_tags"]) for tags in seen)
+
+
 @pytest.mark.parametrize("grad_input", ["hidden_states", "cos", "sin"])
 def test_rope_preserves_autograd_fallback(grad_input):
     hidden_states = torch.randn((1, 7, 2, 8), device="cuda", dtype=torch.bfloat16)
@@ -790,8 +836,9 @@ def test_forward_builds_timestep_modality_adaln_indices() -> None:
             key_padding_mask: torch.Tensor | None,
             timestep: torch.Tensor,
             valid_seq_len: int | None = None,
+            token_tags: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            del temb, rotary_emb, key_padding_mask
+            del temb, rotary_emb, key_padding_mask, token_tags
             self.adaln_indices = adaln_indices.clone()
             self.attention_timestep = timestep.clone()
             return hidden_states
@@ -1543,6 +1590,7 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
                 key_padding_mask,
                 timestep,
                 valid_seq_len=None,
+                token_tags=None,
             ):
                 torch.testing.assert_close(adaln_indices, full_indices.chunk(world_size)[rank])
                 for actual, expected_rope in zip(rotary_emb, full_rope):

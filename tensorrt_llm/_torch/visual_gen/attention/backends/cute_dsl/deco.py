@@ -25,15 +25,21 @@ functions that work in a workspace buffer this backend hands them.
 
 The preparation rotates Q and K, quantizes them to NVFP4 and appends compensation channels for
 the first-order quantization error of the scores; it smooths V over blocks of keys before
-quantizing it. The kernels take NHD layout ([B, S, H, D]) with D = 128, as many K/V heads as Q
-heads, queries and keys of one sequence, bfloat16 and no mask; other calls (cross-attention, a
-causal or key padding mask, another dtype) run on the VANILLA backend.
+quantizing it. It estimates the compensation channels from a sample of the tokens: a model
+whose sequence packs text or audio tokens with the video tokens passes ``token_tags``, and the
+sample then takes half of its rows from the text and audio tokens instead of a draw over the
+whole sequence, which leaves the few text and audio tokens almost unsampled.
+
+The kernels take NHD layout ([B, S, H, D]) with D = 128, as many K/V heads as Q heads, queries
+and keys of one sequence, bfloat16 and no mask; other calls (cross-attention, a causal or key
+padding mask, another dtype) run on the VANILLA backend.
 """
 
 from typing import Any
 
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from .....attention.backends.interface import PredefinedAttentionMask
@@ -46,6 +52,9 @@ try:
 except (ImportError, OSError) as e:
     deco_attention = None
     _deco_import_error = e
+
+# The token tags of this many recent requests are kept with their basis rows.
+_TAGGED_ROWS_KEPT = 4
 
 
 class DeCoAttention(AttentionBackend):
@@ -114,6 +123,7 @@ class DeCoAttention(AttentionBackend):
         self.dtype = dtype
         self.quant_attention_config = quant_attention_config
         self._state = attention_metadata_state
+        self._noted_unquantized = False
         self._preferred_layout = AttentionTensorLayout.NHD
         self._vanilla = VanillaAttention(
             layer_idx=layer_idx,
@@ -143,7 +153,7 @@ class DeCoAttention(AttentionBackend):
         """Run a call the kernels do not take on VANILLA, which works in HND ([B, H, S, D]).
 
         A model's cross-attention layers take this path on every call, inside the compiled
-        model, so it logs nothing.
+        model, so it logs nothing; ``forward`` warns once when a self-attention call takes it.
         """
         out = self._vanilla.forward(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **kwargs
@@ -175,13 +185,71 @@ class DeCoAttention(AttentionBackend):
             self._state["deco_workspace"] = workspace
         return workspace
 
+    def _basis_rows(
+        self, token_tags: torch.Tensor | None, seq_len: int, device: torch.device
+    ) -> torch.Tensor | None:
+        """The tokens the preparation estimates its basis from: None, its own draw over the
+        whole sequence, without token tags; with them, the draw by modality of the kernels'
+        ``sample_rows``, half of it from the text and audio tokens.
+
+        The draw by modality reads the token counts back to the host, so it runs once per tags
+        tensor and outside CUDA graph capture: every layer and step of a request passes the
+        same tensor, and the component state keeps it with its rows, so that no other tensor
+        takes its identity meanwhile.
+        """
+        if token_tags is None:
+            return None
+        if token_tags.numel() != seq_len:
+            raise ValueError(
+                f"DeCo-Attention got {token_tags.numel()} token tags for a sequence of "
+                f"{seq_len} tokens."
+            )
+        tagged_rows = self._state.setdefault("deco_tagged_rows", [])
+        for tags, rows in tagged_rows:
+            if tags is token_tags:
+                return rows
+        rows = deco_attention.sample_rows(seq_len, device, token_tags)
+        tagged_rows.insert(0, (token_tags, rows))
+        del tagged_rows[_TAGGED_ROWS_KEPT:]
+        return rows
+
     @torch.compiler.disable
-    def _launch(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def _launch(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        token_tags: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         batch_size, seq_len, num_heads, _ = q.shape
         pv = self.quant_attention_config.v_dtype
         num_bytes = deco_attention.workspace_size(batch_size, seq_len, num_heads, q.device, pv)
-        operands = deco_attention.prepare(q, k, v, self._workspace(num_bytes, q.device), pv)
+        rows = self._basis_rows(token_tags, seq_len, q.device)
+        operands = deco_attention.prepare(
+            q, k, v, self._workspace(num_bytes, q.device), pv, rows=rows
+        )
         return deco_attention.attention(operands, torch.empty_like(q))
+
+    @torch.compiler.disable
+    def _note_unquantized(self, q: torch.Tensor, **kwargs: Any) -> None:
+        """Warn, once per layer, that one of its self-attention calls is delegated."""
+        self._noted_unquantized = True
+        if kwargs.get("key_padding_mask") is not None:
+            reason = "a key padding mask"
+        elif kwargs.get("attention_mask", PredefinedAttentionMask.FULL) != (
+            PredefinedAttentionMask.FULL
+        ):
+            reason = "an attention mask"
+        elif q.dtype != torch.bfloat16:
+            reason = f"{q.dtype} inputs"
+        else:
+            reason = "inputs that are not on a CUDA device"
+        logger.warning_once(
+            f"DeCo-Attention runs self-attention unquantized on VANILLA because of {reason} "
+            f"(first seen in layer {self.layer_idx}); its kernels take bfloat16 inputs without "
+            "a mask.",
+            key=f"deco_attention_unquantized_{reason}",
+        )
 
     def forward(
         self,
@@ -190,10 +258,18 @@ class DeCoAttention(AttentionBackend):
         v: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        """Attention over q, k, v ``[B, S, H, D]``; returns ``[B, S, H, D]`` in q's dtype."""
+        """Attention over q, k, v ``[B, S, H, D]``; returns ``[B, S, H, D]`` in q's dtype.
+
+        ``token_tags`` (keyword, ``[S]``): the modality of every token of a packed multimodal
+        sequence (``AttentionBackend.forward``); the preparation then draws its basis rows by
+        modality.
+        """
         if not self._can_serve(q, k, v, **kwargs):
+            # A call of the kernels' shape that a mask or a dtype keeps from them.
+            if q.shape == k.shape and not self._noted_unquantized:
+                self._note_unquantized(q, **kwargs)
             return self._delegate(q, k, v, **kwargs)
-        return self._launch(*self._compact_qkv(q, k, v))
+        return self._launch(*self._compact_qkv(q, k, v), kwargs.get("token_tags"))
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
