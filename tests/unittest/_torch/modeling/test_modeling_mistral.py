@@ -1154,18 +1154,11 @@ def test_mistral_encoder_group_selected_items(indices, sizes_as_tensor):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mistral_selected_image_uploads_only_its_own_size(monkeypatch):
-    """Item scheduling picks the small image of a request that also has a large one: the staged
-    upload holds the selected size, not the request-wide padding, and the rows do not change."""
-    from tensorrt_llm._torch import host_staging
+    """Item scheduling picks the small image of a request that also has a large one: only the
+    selected size is copied to the GPU, not the request-wide padding, and the rows do not change.
+    This holds on both copy paths: staged, and per request under Confidential Compute."""
+    from tensorrt_llm.inputs import multimodal
 
-    shapes = []
-    upload_pieces = host_staging.StagedUploader.upload_pieces
-
-    def recording_upload_pieces(self, shape, dtype, pieces, fill_value=None):
-        shapes.append(tuple(shape))
-        return upload_pieces(self, shape, dtype, pieces, fill_value)
-
-    monkeypatch.setattr(host_staging.StagedUploader, "upload_pieces", recording_upload_pieces)
     large_and_small = _mistral_cpu_param([(32, 32), (2, 3)])
     other = _mistral_cpu_param([(3, 2)], offset=1000)
     encoder = _MistralCpuEncoder()
@@ -1174,11 +1167,21 @@ def test_mistral_selected_image_uploads_only_its_own_size(monkeypatch):
     params = [selected, other]
     expected = _MistralCpuEncoder().encode_multimodal_inputs(params)
 
+    copies = []
+    batch_to_device = multimodal._batch_to_device
+
+    def recording_batch_to_device(values, *args, **kwargs):
+        batched = batch_to_device(values, *args, **kwargs)
+        copies.append(([tuple(value.shape) for value in values], tuple(batched.shape)))
+        return batched
+
+    monkeypatch.setattr(multimodal, "_batch_to_device", recording_batch_to_device)
     encoder.multimodal_data_device_paths = ["image.pixel_values", "multimodal_embedding"]
     actual = encoder.encode_multimodal_inputs(params)
 
-    # Two images padded to the largest selected size (3, 3), not to the 32x32 peer.
-    assert shapes == [(2, 3, 3, 3)]
+    # The host copies hold each selected size; the GPU batch pads them to the largest (3, 3),
+    # not to the 32x32 peer.
+    assert copies == [([(1, 3, 2, 3), (1, 3, 3, 2)], (2, 3, 3, 3))]
     assert encoder.calls[0][0].is_cuda
     assert large_and_small.multimodal_data["image"]["pixel_values"].shape == (2, 3, 32, 32)
     assert torch.equal(actual.cpu(), expected)
