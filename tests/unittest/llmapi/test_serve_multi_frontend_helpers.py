@@ -480,7 +480,6 @@ def test_drain_kills_attached_frontends_at_the_graceful_shutdown_deadline(
         def __init__(self, exits_after_s: float | None) -> None:
             self.exits_after_s = exits_after_s
             self.terminated_at = self.killed_at = self.returncode = None
-            self.waits = 0
 
         def terminate(self) -> None:
             self.terminated_at = clock.now
@@ -497,11 +496,6 @@ def test_drain_kills_attached_frontends_at_the_graceful_shutdown_deadline(
                 and clock.now >= self.terminated_at + self.exits_after_s
             ):
                 self.returncode = 0
-            return self.returncode
-
-        def wait(self) -> int:
-            assert self.returncode is not None, "wait() blocks on a running process"
-            self.waits += 1
             return self.returncode
 
     monkeypatch.setattr(_frontend_processes, "time", SimpleNamespace(monotonic=lambda: clock.now))
@@ -522,7 +516,50 @@ def test_drain_kills_attached_frontends_at_the_graceful_shutdown_deadline(
     else:
         assert (slow.killed_at, slow.returncode) == (None, 0)
         assert clock.now >= 100.0 + slow_exit_s
-    assert exits.waits == slow.waits == 1
+
+
+def test_drain_reaps_killed_attached_frontends_off_the_event_loop() -> None:
+    """Check that the event loop keeps running while a killed frontend takes time to exit."""
+
+    class _SlowToDieFrontend:
+        """Ignores SIGTERM and exits 0.3 s after SIGKILL; wait() blocks until then."""
+
+        def __init__(self) -> None:
+            self.returncode = self.dies_at = None
+
+        def terminate(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            self.dies_at = time.monotonic() + 0.3
+
+        def poll(self) -> int | None:
+            if self.dies_at is not None and time.monotonic() >= self.dies_at:
+                self.returncode = -signal.SIGKILL
+            return self.returncode
+
+        def wait(self) -> int:
+            while self.poll() is None:
+                time.sleep(0.01)
+            return self.returncode
+
+    child = _SlowToDieFrontend()
+    ticks_while_dying = []
+
+    async def tick() -> None:
+        while child.returncode is None:
+            if child.dies_at is not None:
+                ticks_while_dying.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    async def main() -> None:
+        await asyncio.gather(
+            _frontend_processes._drain_attached_frontends([child], None, lambda: True), tick()
+        )
+
+    asyncio.run(main())
+    assert child.returncode == -signal.SIGKILL
+    assert ticks_while_dying, "the drain blocked the event loop while the frontend exited"
 
 
 def test_force_exit_kills_attached_frontends_that_still_drain() -> None:
