@@ -988,6 +988,27 @@ def build_row_mapping(
     return row_slots, intra_tokens, intra_valid
 
 
+def _or_prompt_bits(mask_row: torch.Tensor, ids: torch.Tensor, valid: torch.Tensor) -> None:
+    """OR one bit per valid id into ``mask_row``, a packed int32 bitmask row.
+
+    Bit ``i % 32`` of word ``i // 32`` stands for id ``i``. Several ids can share a
+    word and the same id can repeat, so the reduction has to be a bitwise OR, which
+    no scatter mode provides. Instead, a 0/1 presence entry is written for every bit
+    position (duplicates all write 1, so the order does not matter) and each group of
+    32 is folded into a word with a sum of disjoint powers of two. Dropped ids land
+    on a sink entry past the last bit. Shapes depend only on host-known sizes, so
+    nothing here waits for the device.
+    """
+    num_bits = mask_row.numel() * 32
+    present = torch.zeros(num_bits + 1, dtype=torch.int64, device=mask_row.device)
+    present.index_fill_(0, torch.where(valid, ids, num_bits), 1)
+    shifts = torch.arange(32, dtype=torch.int64, device=mask_row.device)
+    words = (present[:num_bits].view(-1, 32) << shifts).sum(-1)
+    # ``words`` is the unsigned 32-bit pattern; re-express bit 31 as the int32 sign.
+    words = words - ((words >> 31) << 32)
+    mask_row.bitwise_or_(words.to(torch.int32))
+
+
 def seed_prompt(
     spec_metadata: "SpecMetadataLike",
     slot: int,
@@ -1006,12 +1027,18 @@ def seed_prompt(
     multimodal models place placeholders above the vocab -- so they are dropped
     rather than allowed to index the workspace.
 
+    Runs once per new request on the executor thread, so it never synchronizes with
+    the device: every branch depends on host-known sizes only, the copy is
+    asynchronous (``prompt_tokens`` is expected in pinned memory), and dropped ids
+    are masked with a zero weight instead of being filtered out.
+
     No-op unless the penalty buffers exist (i.e. ``enable_penalty``).
     """
     if not getattr(spec_metadata, "enable_penalty", False):
         return
     state = spec_metadata.penalty_state
-    if state is None or prompt_tokens.numel() == 0:
+    num_tokens = prompt_tokens.numel()
+    if state is None or num_tokens == 0:
         return
     prompt_mask, counts = state.prompt_mask, state.counts
     # Live rows only. A negative index would wrap onto another request's row, and
@@ -1020,30 +1047,20 @@ def seed_prompt(
         return
 
     vocab_size = spec_metadata.vocab_size
-    tokens = prompt_tokens.to(device=prompt_mask.device, dtype=torch.int64)
-    ignore = max(0, min(prompt_ignore_length, tokens.numel()))
-    ignored, counted = tokens[:ignore], tokens[ignore:]
+    ignore = max(0, min(prompt_ignore_length, num_tokens))
+    tokens = prompt_tokens.to(device=prompt_mask.device, dtype=torch.int64, non_blocking=True)
+    # Out-of-vocab ids are clamped onto a real id and flagged invalid, so they can be
+    # given no effect without a data-dependent shape.
+    safe = tokens.clamp(0, vocab_size - 1)
+    valid = safe == tokens
 
-    ignored = ignored[(ignored >= 0) & (ignored < vocab_size)]
-    if ignored.numel():
-        # Deduplicate first: two ids in the same 32-id word must contribute both
-        # bits, so the reduction has to be a bitwise OR. scatter_reduce_ has no OR
-        # mode and 'amax' would keep only the larger bit; over unique ids the bits
-        # within a word are disjoint, so a plain sum IS their bitwise OR.
-        unique = torch.unique(ignored)
-        row = torch.zeros_like(prompt_mask[slot])
-        row.scatter_add_(
-            0,
-            unique // 32,
-            torch.ones_like(unique, dtype=torch.int32) << (unique % 32).to(torch.int32),
-        )
-        prompt_mask[slot] = prompt_mask[slot].bitwise_or(row)
+    if ignore > 0:
+        _or_prompt_bits(prompt_mask[slot], safe[:ignore], valid[:ignore])
 
-    counted = counted[(counted >= 0) & (counted < vocab_size)]
-    if counted.numel():
+    if ignore < num_tokens:
         # Counted like generated tokens: repeats must accumulate, so this is a real
-        # count rather than a bitmask.
-        counts[slot].scatter_add_(0, counted, torch.ones_like(counted, dtype=counts.dtype))
+        # count rather than a bitmask. Invalid ids add zero.
+        counts[slot].scatter_add_(0, safe[ignore:], valid[ignore:].to(counts.dtype))
 
 
 @torch.compile(dynamic=None, fullgraph=True)
