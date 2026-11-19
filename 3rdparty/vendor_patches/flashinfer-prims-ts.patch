@@ -333,7 +333,7 @@ index 1afff11570802991e7ffad85534341412fdb6d56..1ea64f1087440d6856be61bd430233b8
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/kernels/fmha_context/fmha_resources.py b/kernels/fmha_context/fmha_resources.py
-index 3ca191ca565336611cbf0a4f525b9457597426c3..5f0e2f50c3526d5b5a34e8ed588298cb21e76583 100644
+index c9811f30d5341adb16689ac4533147c36f75bbb9..ab6eb4052d28630329a0ec4a43577068543e0162 100644
 --- a/kernels/fmha_context/fmha_resources.py
 +++ b/kernels/fmha_context/fmha_resources.py
 @@ -1,3 +1,4 @@
@@ -341,7 +341,7 @@ index 3ca191ca565336611cbf0a4f525b9457597426c3..5f0e2f50c3526d5b5a34e8ed588298cb
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -1454,8 +1455,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1455,8 +1456,6 @@ class GmemQKVResource(MemoryResource):
                  if cutlass.const_expr(self.cfg.has_uniform_varlen):
                      seqlen_k = Int32(self.cfg.uniform_seq_len_k)
                  else:
@@ -350,7 +350,7 @@ index 3ca191ca565336611cbf0a4f525b9457597426c3..5f0e2f50c3526d5b5a34e8ed588298cb
                      seqlen_k = _load_runtime_seq_len_kv(
                          self.seqlens_kv, self.max_seq_len_kv, batch_coord
                      )
-@@ -1478,8 +1477,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1479,8 +1478,6 @@ class GmemQKVResource(MemoryResource):
                      kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
                      kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
                  else:
@@ -359,7 +359,7 @@ index 3ca191ca565336611cbf0a4f525b9457597426c3..5f0e2f50c3526d5b5a34e8ed588298cb
                      kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                          Int32(self.block_table_row_stride),
                          self.cfg,
-@@ -1566,13 +1563,9 @@ class GmemQKVResource(MemoryResource):
+@@ -1567,13 +1564,9 @@ class GmemQKVResource(MemoryResource):
              kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
              kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
          else:
@@ -373,7 +373,7 @@ index 3ca191ca565336611cbf0a4f525b9457597426c3..5f0e2f50c3526d5b5a34e8ed588298cb
              kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                  Int32(self.block_table_row_stride),
                  self.cfg,
-@@ -7848,3 +7841,13 @@ class GmemOResource(MemoryResource):
+@@ -7855,3 +7848,13 @@ class GmemOResource(MemoryResource):
                  prims.cp_async_bulk_commit_group()
                  if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
                      prims.cp_async_bulk_wait_group(0, read=True)
@@ -388,7 +388,7 @@ index 3ca191ca565336611cbf0a4f525b9457597426c3..5f0e2f50c3526d5b5a34e8ed588298cb
 +    _load_runtime_seq_len_kv,
 +)
 diff --git a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
-index 6787e8ab5b566849ccc5ba228da220ed55898ea7..c11e9d211020c646a5a71cd309074d6bb70da119 100644
+index 2b3c72a304d0494a49fe633bc0ab0d46b31da891..b108140a12abfdd882b96f96fcf9aea15b1959f2 100644
 --- a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 +++ b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 @@ -1,3 +1,4 @@
@@ -396,17 +396,17 @@ index 6787e8ab5b566849ccc5ba228da220ed55898ea7..c11e9d211020c646a5a71cd309074d6b
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -36,7 +37,7 @@ from cutlass.experimental.task_scheduling.resources import (
-     producer_work,
+@@ -37,7 +38,7 @@ from cutlass.experimental.task_scheduling.resources import (
  )
  
+ from ...task_compat import consumer_work_stage
 -from ......cute_dsl.availability import is_rubin_cute_dsl_available
 +from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
  from ..fmha_decode_config import FmhaDecodeConfig
  from .helpers_common import (
      _TASK_CACHE_TMEM_BASE_OFFSET,
 diff --git a/kernels/mla_decode/helpers/nvfp4_kv.py b/kernels/mla_decode/helpers/nvfp4_kv.py
-index 8b2e8a43e5553ed33b67603273e0cc1fbd3585ae..fd3f735ede1f723f66d76f45a6490921ca77d3c3 100644
+index a6a4261ca8ad3aecf065f8a4c36fca327f307dbc..7b553b20c6d9c924a08db08235b0dbc531a389d6 100644
 --- a/kernels/mla_decode/helpers/nvfp4_kv.py
 +++ b/kernels/mla_decode/helpers/nvfp4_kv.py
 @@ -28,7 +28,7 @@ from cutlass.base_dsl.arch import Arch

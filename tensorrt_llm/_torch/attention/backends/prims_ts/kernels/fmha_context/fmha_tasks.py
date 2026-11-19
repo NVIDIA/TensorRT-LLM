@@ -43,6 +43,8 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 from cutlass.experimental.task_scheduling.resources import MemoryResource, WorkQueue
 from cutlass.experimental.task_scheduling.task import Task
 
+from ..task_compat import TaskCacheStageInfoMixin
+
 from .fmha_resources import (
     FmhaConfig,
     GmemOResource,
@@ -62,6 +64,16 @@ from .fmha_resources import (
     TmemPPrefixReadyResource,
 )
 from .vc_attention.vc_resources import SmemMuResource
+
+
+class ContextTask(TaskCacheStageInfoMixin, Task):
+    """Default context task.
+
+    Resource work in HEAD/TAIL reads the K loop state from ``StageInfo``, which
+    tree-walking tasks leave unavailable outside the loop.
+    """
+
+    restore_loop_state_outside_loop = True
 
 
 @dataclass(kw_only=True)
@@ -213,7 +225,7 @@ def create_load_task(
     smem_k_or_kv: SmemKVResource,
     smem_v: SmemKVResource | None,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     smem_page_offsets_kv: SmemPageOffsetsKvResource | None = None,
     smem_page_offsets_v: SmemPageOffsetsKvResource | None = None,
     smem_mu: SmemMuResource | None = None,
@@ -980,7 +992,7 @@ def create_mma_task(
     tmem_vec_done_0: TmemStatsDoneResource,
     tmem_vec_done_1: TmemStatsDoneResource | None,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     tmem_p_prefix_ready_0: TmemPPrefixReadyResource | None = None,
     tmem_p_prefix_ready_1: TmemPPrefixReadyResource | None = None,
     smem_p0: SmemPResource | None = None,
@@ -1971,7 +1983,7 @@ def create_softmax_task(
     tmem_p: TmemPResource | None,
     s0s1_seq: S0S1SequenceResource | None,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     tmem_p_prefix_ready: TmemPPrefixReadyResource | None = None,
     smem_p: SmemPResource | None = None,
     smem_sage_k: SmemSageKScalesResource | None = None,
@@ -3165,7 +3177,7 @@ def create_correction_task(
     tmem_vec_done_0: TmemStatsDoneResource,
     tmem_vec_done_1: TmemStatsDoneResource | None,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     **task_kwargs: Any,
 ) -> Task:
     """Create the four-warp Correction task (warps 8-11)."""
@@ -3461,7 +3473,7 @@ def create_epilogue_task(
     gmem_o_0: GmemOResource,
     gmem_o_1: GmemOResource | None,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp Epilogue store task (warp 14)."""
@@ -3590,7 +3602,7 @@ def create_padding_task(
     num_warps: int = 1,
     num_registers: int = 32,
     name: str = "PaddingTask",
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp padding task (warp 15 in the D128 schedule).
@@ -3767,7 +3779,7 @@ def create_page_offsets_task(
     gmem_qkv: GmemQKVResource,
     smem_page_offsets_kv: SmemPageOffsetsKvResource,
     work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     num_registers: int = 32,
     smem_page_offsets_v: SmemPageOffsetsKvResource | None = None,
     **task_kwargs: Any,
@@ -3888,7 +3900,7 @@ def create_scheduler_task(
     work_queue: WorkQueue,
     warp_idx: int = 15,
     num_registers: int = 32,
-    task_class: type[Task] = Task,
+    task_class: type[Task] = ContextTask,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp CLC scheduler task (warp 15 in D128).
