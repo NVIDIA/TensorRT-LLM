@@ -36,7 +36,8 @@ from mpi4py import MPI as _MPI
 
 from tensorrt_llm._errors import ModelLoadError
 from tensorrt_llm._torch.mmap_utils import (READ_AHEAD_DIRS, SafetensorsPreader,
-                                            populate_file_pages)
+                                            populate_file_pages,
+                                            safetensors_layout_is_valid)
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
@@ -1108,8 +1109,6 @@ class HfWeightLoader(BaseWeightLoader):
 
         status = self._last_checkpoint_io_status
         status.activated = True
-        self._read_ahead_dir = os.path.abspath(checkpoint_dir)
-        READ_AHEAD_DIRS.add(self._read_ahead_dir)
         logger.info("Rank-striped checkpoint read-ahead activated: "
                     f"local_rank={local_rank}, local_size={local_size}, "
                     f"workers={plan.workers}, assigned_bytes="
@@ -1142,6 +1141,9 @@ class HfWeightLoader(BaseWeightLoader):
             self._log_checkpoint_io_status()
             raise coordinated_mapping_error
         assert weights is not None
+        # Registered only once mapped, so a failed mapping leaves no entry.
+        self._read_ahead_dir = os.path.abspath(checkpoint_dir)
+        READ_AHEAD_DIRS.add(self._read_ahead_dir)
         return weights, session
 
     def _load_weights_native(self,
@@ -1288,6 +1290,8 @@ class HfWeightLoader(BaseWeightLoader):
         # tensor separately, which costs tens of seconds per rank on
         # checkpoints with ~100k tensors.
         file_size, header_bytes, header = _read_safetensors_header(file)
+        if not safetensors_layout_is_valid(header, file_size - 8 - header_bytes):
+            return safetensors.torch.load_file(file)  # reports the bad layout
         dtypes = dict(getattr(safetensors.torch, "_TYPES", {}),
                       F8_E8M0=torch.float8_e8m0fnu)
         storage = torch.UntypedStorage.from_file(file,

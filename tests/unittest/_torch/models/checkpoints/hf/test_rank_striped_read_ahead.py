@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import io
+import json
 import os
 import pickle
 import sys
@@ -19,6 +20,7 @@ import torch
 from mpi4py import MPI
 from safetensors.torch import save_file
 
+from tensorrt_llm._torch import mmap_utils
 from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead as read_ahead
 from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as weight_loader_module
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
@@ -981,6 +983,14 @@ def test_native_and_rank_striped_outputs_match(tmp_path, monkeypatch):
     embed = expected["model.embed_tokens.weight"]
     assert torch.equal(lazy["model.embed_tokens.weight"][:, 1:3], embed[:, 1:3])
     assert advised == [t[1:].nbytes for t in expected.values() if t.dim() and len(t) > 1]
+
+    # Lazily loaded families are read ahead too, and their pages are kept while the session runs.
+    (checkpoint_dir / "config.json").write_text(json.dumps({"model_type": "kimi_linear"}))
+    shard = [str(checkpoint_dir / "model.safetensors")]
+    with _rank_striped_loader().open_weight_session(str(checkpoint_dir), mapping=Mapping()) as lazy:
+        assert torch.equal(lazy["model.norm.weight"][...], expected["model.norm.weight"])
+        assert mmap_utils.release_file_page_cache(shard) == 0
+    assert mmap_utils.release_file_page_cache(shard) > 0
 
 
 def test_loader_passes_full_checkpoint_bytes_to_reader(

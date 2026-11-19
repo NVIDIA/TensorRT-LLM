@@ -415,6 +415,18 @@ def _pread_into(fd: int, buf: memoryview, offset: int) -> None:
         buf, offset = buf[got:], offset + got
 
 
+def safetensors_layout_is_valid(header: dict, payload_bytes: int) -> bool:
+    """Whether the tensors' ``data_offsets`` tile ``[0, payload_bytes)`` exactly, as SafeTensors requires."""
+    end = 0
+    for begin, stop in sorted(
+        info["data_offsets"] for name, info in header.items() if name != "__metadata__"
+    ):
+        if begin != end or stop < begin:
+            return False
+        end = stop
+    return end == payload_bytes
+
+
 class SafetensorsPreader:
     """A ``safetensors.safe_open(path, framework="pt")`` handle that reads with ``pread``.
 
@@ -435,6 +447,10 @@ class SafetensorsPreader:
         self._header = json.loads(header)
         self._header.pop("__metadata__", None)
         self._data_start = 8 + header_bytes
+        if not safetensors_layout_is_valid(
+            self._header, os.fstat(self._fd).st_size - self._data_start
+        ):
+            raise ValueError(f"invalid SafeTensors tensor layout in {path}")
         self._dtypes = dict(getattr(safetensors.torch, "_TYPES", {}), F8_E8M0=torch.float8_e8m0fnu)
 
     def keys(self) -> list[str]:
