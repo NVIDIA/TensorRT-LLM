@@ -236,6 +236,7 @@ def run_first100(
             output_dir=results_dir,
             num_questions=protocol.NUM_QUESTIONS,
             concurrency=recipe["max_batch_size"],
+            chat_template_kwargs=protocol.BEAM_CHAT_TEMPLATE_KWARGS,
             time_budget_s=float(timeout_s) - TEARDOWN_RESERVE_S,
             managed=managed,
             max_seq_len=recipe["max_seq_len"],

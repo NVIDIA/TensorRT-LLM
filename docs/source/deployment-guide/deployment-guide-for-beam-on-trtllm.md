@@ -555,6 +555,7 @@ model:
 ```bash
 python examples/llm-api/eval_gsm8k.py \
   --endpoint http://<ROUTER_HOST>:8000 --served-model-name beam-nvfp4 \
+  --chat-template-kwargs '{"reasoning_effort":128}' \
   --dataset-dir <DATASET> --num-questions 100 --output-dir <RESULTS>
 ```
 
@@ -568,6 +569,7 @@ python examples/llm-api/eval_gsm8k.py \
   --server-env TRTLLM_SKIP_KV_CACHE_ESTIMATION=1 \
   --server-env TRTLLM_MODELING_V2_KV_CACHE_SCALES=<KV_SCALES> \
   --monitor-gpus 0,1,2,3 \
+  --chat-template-kwargs '{"reasoning_effort":128}' \
   --dataset-dir <DATASET> --num-questions 100 --output-dir <RESULTS>
 ```
 
