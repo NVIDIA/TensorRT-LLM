@@ -275,6 +275,7 @@ def make_ctx_request(
     req.lora_task_id = lora_task_id
     req.is_context_init_state = True
     req.is_generation_in_progress_state = False
+    req.is_context_only_request = False
     req.encoder_output_len = encoder_output_len
     req.py_encoder_output_ready_event = None
     req.py_skip_cross_kv_projection = False
@@ -531,6 +532,10 @@ def make_kv_cache_manager(
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req, reuse_limit=None: True)
     mgr.prepare_context_cache.side_effect = lambda req, reuse_limit=None: 0
+    # The real cap, so it follows _spec_recompute_tail (zero: no cap).
+    mgr.context_reuse_claim_limit.side_effect = lambda req: (
+        KVCacheManagerV2.context_reuse_claim_limit(mgr, req)
+    )
     # The backoff lives in KVCacheManagerV2; the scheduler only clips the two
     # already-backed-off probe depths against each other.
     mgr.reuse_match_backoff = 0
@@ -851,6 +856,7 @@ class TestInflightPrefixWait:
         req.cache_salt = None
         req.multimodal_hashes = None
         req.is_dummy_request = False
+        req.is_dummy = False
         return req
 
     @staticmethod
@@ -892,6 +898,18 @@ class TestInflightPrefixWait:
         assert ids(sched.schedule_request([owner], set()).context_requests) == [0]
         self.run_chunk(owner)
         return owner
+
+    @pytest.mark.parametrize("tail", [-1, PROMPT_LEN - TOKENS_PER_BLOCK])
+    def test_request_does_not_wait_for_a_prefix_its_recompute_tail_cannot_claim(self, tail):
+        """The spec recompute tail caps the claim, so the request would gain
+        nothing by waiting for the owner's prefill."""
+        mgr = self.make_manager()
+        mgr._spec_recompute_tail = tail
+        sched = make_scheduler(mgr, max_num_tokens=100000)
+        owner = self._owner_in_flight(sched)
+        out = sched.schedule_request([owner, self.make_request(1)], {owner.request_id})
+        assert ids(out.context_requests) == [1]
+        mgr.request_prefix_snapshot.assert_not_called()
 
     def test_pass_where_every_request_waits_is_a_bounded_stall(self):
         """A pass in which every pending request waits for a prefilling owner
@@ -1911,6 +1929,38 @@ class TestKVCacheFailuresCtx:
         mgr.note_context_fork.assert_called_once_with(req, draft_probe)
         draft_mgr.free_resources.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("tail", "probe", "expected"),
+        [
+            pytest.param(128, 509, 448, id="tail_binds"),
+            pytest.param(128, 253, 253, id="match_binds"),
+            pytest.param(-1, 509, 0, id="full_re_prefill"),
+            pytest.param(128, None, 448, id="no_probe"),
+        ],
+    )
+    def test_paired_claims_leave_the_spec_recompute_tail(
+        self, tail: int, probe: int | None, expected: int
+    ) -> None:
+        """A paired first chunk claims through prepare_context_cache directly,
+        so the pair's limit carries the target's recompute tail as well."""
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_joint_kv_cache_reuse=True)
+        mgr._spec_recompute_tail = tail
+        draft_mgr = make_kv_cache_manager(tokens_per_block=64)
+        draft_mgr.probe_context_reuse.side_effect = lambda req: probe
+        mgr.probe_context_reuse.side_effect = lambda req: probe
+        draft_mgr.prepare_context_cache.side_effect = [expected]
+        mgr.prepare_context_cache.side_effect = [expected]
+        req = make_ctx_request(0, context_remaining_length=600, prompt_len=600)
+        req.context_chunk_size = 600
+        req.is_dummy = False
+
+        sched = make_scheduler(mgr, max_num_tokens=2000, draft_kv_cache_manager=draft_mgr)
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert draft_mgr.prepare_context_cache.call_args_list == [call(req, expected)]
+        mgr.prepare_context_cache.assert_called_once_with(req, expected)
+
     def test_paired_reuse_falls_back_to_zero_when_pools_disagree(self):
         mgr = make_kv_cache_manager(
             tokens_per_block=32,
@@ -2547,6 +2597,24 @@ class TestContextPreemption:
 
         assert ids(out.recompute_paused_requests) == [99]
         assert ids(out.context_requests) == []
+
+    def test_preemption_victim_must_share_the_locality_domain(self):
+        """Pages are per domain: a victim elsewhere frees nothing for the request."""
+        mgr = make_kv_cache_manager(has_cache_tier_below_gpu=False)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        same = make_gen_request(1)
+        same.py_locality_domain_id = 0
+        # Newest, so it would be taken first without the domain filter.
+        other = make_gen_request(2)
+        other.py_locality_domain_id = 1
+        recompute_paused = []
+
+        assert sched._try_preempt_for_pages(
+            [same, other], set(), set(), recompute_paused, set(), 0, locality_domain_id=0
+        )
+
+        assert recompute_paused == [same]
+        mgr.preempt_request.assert_called_once_with(same)
 
     def test_a_failed_preemption_still_lets_the_pass_continue(self):
         """With nothing to give up there is no capacity to reserve."""
@@ -6174,6 +6242,20 @@ def test_shortest_first_reusable_prefix_is_probed_every_pass():
     assert sched._order_ctx_shortest_first([uncached, cached]) == [uncached, cached]
     mgr.prepare_context.assert_not_called()
     mgr.prepare_context_cache.assert_not_called()
+
+
+def test_shortest_first_counts_the_spec_recompute_tail_as_uncached() -> None:
+    """A cached prompt whose claim the recompute tail caps sorts by what it will compute."""
+    mgr = make_kv_cache_manager(tokens_per_block=64)
+    mgr.probe_context_reuse.side_effect = lambda req: {0: 0, 1: 9000}[req.py_request_id]
+    sched = _make_srpt_scheduler(mgr=mgr)
+    uncached, cached = _ctx_batch(0, [6000, 10000])
+    cached.is_dummy = False
+    assert sched._order_ctx_shortest_first([uncached, cached]) == [cached, uncached]
+    # A 7000-token tail caps the 9000-token claim at 2944: 7056 tokens to compute.
+    mgr._spec_recompute_tail = 7000
+    sched._reuse_probes.clear()
+    assert sched._order_ctx_shortest_first([uncached, cached]) == [uncached, cached]
 
 
 class TestShortestFirstStarvation:

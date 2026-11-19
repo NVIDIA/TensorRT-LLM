@@ -13,6 +13,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.custom_ops.mxfp8_gemm import MXFP8_DEFAULT_BACKENDS
 from tensorrt_llm._torch.distributed import AllReduceStrategy
 from tensorrt_llm._torch.modules.linear import (
     _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE,
@@ -339,6 +340,15 @@ class DeepseekV41Attention(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             allreduce_strategy=allreduce_strategy,
+            mxfp8_allowed_backends=(
+                [*MXFP8_DEFAULT_BACKENDS, "cutedsl_sm107"]
+                if projection_quantization == "mxfp8"
+                and get_sm_version() == 107
+                and mapping.tp_size == 1
+                and hidden_size == 5120
+                and num_groups * o_lora_rank == 8192
+                else None
+            ),
         )
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope, head_dim=rope_head_dim, is_neox=pos_embd_params.is_neox

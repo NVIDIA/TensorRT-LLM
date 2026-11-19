@@ -10,8 +10,8 @@ tree's interpreter to load a workload.
 
 RECORDS. A harness prints one line per result, ``<MARKER> <json>``, the JSON
 on one line with ASCII escapes. A gate reads ONLY those lines -- never the
-engine's log -- so a keyword cannot match ``CPUs 72-143`` in a log line, and
-a prefix added by ``srun -l`` or a logger does not hide a record.
+engine's log -- so a log line is never taken for generated text, and a prefix
+added by ``srun -l`` or a logger does not hide a record.
 
 DATASETS. A dataset is a local path (a file or a directory of files: JSON,
 JSON lines, YAML, Parquet or Arrow) or a Hugging Face dataset id, which is
@@ -21,7 +21,6 @@ resolves from the local cache or fails; nothing is downloaded.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -32,15 +31,9 @@ from typing import Any, Iterable, Mapping
 RECORD_MARKER = "MV2FLOW_RECORD"
 #: What the driver imported, once, before the engine starts.
 DRIVER_MARKER = "MV2FLOW_DRIVER"
-#: What the engine runs once it is up, once per engine a harness builds (see
-#: :mod:`.engine_facts`).
-ENGINE_MARKER = "MV2FLOW_ENGINE"
 #: What the engine reused from its KV cache over the workload, once per engine,
 #: after the workload (see :mod:`.reuse_probe`).
 REUSE_MARKER = "MV2FLOW_REUSE"
-#: What one rank's executor worker runs, printed by that worker as it sets its
-#: engine up, once per rank (see ``rankhook/sitecustomize.py``).
-RANK_ENGINE_MARKER = "MV2FLOW_RANK_ENGINE"
 
 #: Fields tried, in order, when a dataset does not say which one holds the prompt.
 TEXT_FIELDS: tuple[str, ...] = (
@@ -101,11 +94,6 @@ def parse_marked(output: str, marker: str) -> list[dict[str, Any]]:
         if isinstance(data, dict):
             records.append(data)
     return records
-
-
-def prompt_digest(text: str) -> str:
-    """A short, stable name for a prompt, for pairing records across runs."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 # ------------------------------------------------------------------- datasets
@@ -322,9 +310,7 @@ def normalize_file(source: str, target: str) -> None:
 __all__ = [
     "DRIVER_MARKER",
     "DatasetError",
-    "ENGINE_MARKER",
     "KNOWN_DATASETS",
-    "RANK_ENGINE_MARKER",
     "RECORD_MARKER",
     "REUSE_MARKER",
     "TEXT_FIELDS",
@@ -332,7 +318,6 @@ __all__ = [
     "is_lfs_pointer",
     "load_rows",
     "parse_marked",
-    "prompt_digest",
     "normalize_requests",
     "normalize_file",
     "select_prompts",

@@ -18,11 +18,13 @@ import ctypes
 import errno
 import os
 import signal
+import socket
 import sys
 import threading
 import time
 from collections.abc import Callable
 from functools import partial
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -32,7 +34,8 @@ import zmq
 from utils.spawn_process import SpawnProcessContext, spawn_process
 
 from tensorrt_llm._torch.visual_gen import executor as executor_module
-from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient
+from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient, run_diffusion_worker
+from tensorrt_llm.visual_gen.args import CompilationConfig, ParallelConfig, VisualGenArgs
 from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
 pytestmark = pytest.mark.cpu_only
@@ -150,6 +153,22 @@ def _lightweight_background(client: DiffusionRemoteClient) -> None:
     client.shutdown_event.wait()
 
 
+def _rendezvous_worker(**worker_kwargs) -> None:
+    pipeline = SimpleNamespace(
+        default_generation_params={},
+        extra_param_specs={},
+        supports_image_edit=False,
+        ref_slot_specs={},
+        cleanup=MagicMock(),
+    )
+    with (
+        patch.object(executor_module.torch.cuda, "is_available", return_value=False),
+        patch.object(executor_module, "PipelineLoader") as loader,
+    ):
+        loader.return_value.load.return_value = pipeline
+        run_diffusion_worker(**worker_kwargs)
+
+
 def _run_temporary_constructor_coordinator(
     lifecycle_context: SpawnProcessContext,
     worker_entrypoint: Callable[..., None] = _parent_bound_worker,
@@ -174,11 +193,10 @@ def _run_temporary_constructor_coordinator(
                 patch.object(
                     executor_module,
                     "find_free_port",
-                    # DiffusionRemoteClient requests the distributed master,
-                    # request ZMQ, and response ZMQ ports in this order. The
-                    # patched networking paths below never bind these ports;
-                    # fixed placeholders keep construction deterministic.
-                    side_effect=[29500, 29501, 29502],
+                    side_effect=[29501, 29502],
+                ),
+                patch.object(
+                    executor_module.dist, "TCPStore", return_value=SimpleNamespace(port=29500)
                 ),
                 patch.object(
                     executor_module,
@@ -679,6 +697,248 @@ def test_temporary_constructor_thread_does_not_kill_worker() -> None:
     _assert_temporary_constructor_worker_lifecycle()
 
 
+@pytest.mark.timeout(_COLD_SPAWN_TIMEOUT)
+@pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
+def test_local_rendezvous_port_is_owned_until_shutdown(tmp_path: Path) -> None:
+    context = executor_module._get_mp_context("spawn")
+    create_process = context.Process
+    master_ports = []
+    args = VisualGenArgs(
+        model=str(tmp_path),
+        parallel_config=ParallelConfig(ulysses_size=2),
+        compilation_config=CompilationConfig(skip_warmup=True),
+    )
+
+    def create_worker(*process_args, **process_kwargs) -> BaseProcess:
+        master_port = process_kwargs["kwargs"]["master_port"]
+        if not master_ports:
+            master_ports.append(master_port)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+                with pytest.raises(OSError) as bind_error:
+                    contender.bind(("127.0.0.1", master_port))
+                assert bind_error.value.errno == errno.EADDRINUSE
+        return create_process(*process_args, **process_kwargs)
+
+    with (
+        patch.object(executor_module, "_detect_external_launch", return_value=None),
+        patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
+        patch.object(
+            executor_module, "_get_mp_context", return_value=SimpleNamespace(Process=create_worker)
+        ),
+        patch.object(
+            executor_module,
+            "run_diffusion_worker",
+            _rendezvous_worker,
+        ),
+    ):
+        client = DiffusionRemoteClient(args=args)
+        try:
+            assert all(worker.is_alive() for worker in client.worker_processes)
+        finally:
+            client.shutdown()
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+        contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        contender.bind(("127.0.0.1", master_ports[0]))
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "error_type"),
+    [("address", OSError), ("port", KeyboardInterrupt), ("atexit", RuntimeError)],
+)
+def test_local_rendezvous_port_is_released_after_metadata_failure(
+    tmp_path: Path, failure_stage: str, error_type: type[BaseException]
+) -> None:
+    clients = []
+    master_ports = []
+    create_store = executor_module.dist.TCPStore
+    select_port = executor_module.find_free_port
+    startup_error = error_type("coordinator metadata failed")
+    args = VisualGenArgs(model=str(tmp_path))
+
+    class RetainedClient(DiffusionRemoteClient):
+        def __init__(self) -> None:
+            clients.append(self)
+            super().__init__(args=args)
+
+    def record_store(*store_args, **store_kwargs):
+        store = create_store(*store_args, **store_kwargs)
+        master_ports.append(store.port)
+        return store
+
+    def select_ipc_port():
+        if failure_stage == "port":
+            raise startup_error
+        return select_port()
+
+    try:
+        with (
+            patch.object(executor_module, "_detect_external_launch", return_value=None),
+            patch.object(
+                executor_module,
+                "get_ip_address",
+                return_value="127.0.0.1",
+                side_effect=startup_error if failure_stage == "address" else None,
+            ),
+            patch.object(executor_module.dist, "TCPStore", side_effect=record_store),
+            patch.object(executor_module, "find_free_port", side_effect=select_ipc_port),
+            patch.object(
+                executor_module,
+                "_register_atexit",
+                side_effect=startup_error if failure_stage == "atexit" else None,
+            ),
+            pytest.raises(error_type, match="coordinator metadata failed") as error,
+        ):
+            RetainedClient()
+
+        assert error.value is startup_error
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            contender.bind(("127.0.0.1", master_ports[0]))
+    finally:
+        for client in clients:
+            client._rendezvous_store = None
+
+
+@pytest.mark.parametrize("fail_at_event_loop", [True, False], ids=["event-loop", "workers"])
+def test_local_rendezvous_port_is_released_after_startup_failure(fail_at_event_loop: bool) -> None:
+    master_ports = []
+    args = SimpleNamespace(parallel_config=SimpleNamespace(n_workers=1))
+    create_store = executor_module.dist.TCPStore
+    error_type = KeyboardInterrupt if fail_at_event_loop else RuntimeError
+    event_loop_ready = MagicMock() if fail_at_event_loop else _THREADING_EVENT()
+    if fail_at_event_loop:
+        event_loop_ready.wait.side_effect = error_type("startup failed")
+
+    def record_store(*store_args, **store_kwargs) -> executor_module.dist.TCPStore:
+        store = create_store(*store_args, **store_kwargs)
+        master_ports.append(store.port)
+        return store
+
+    with (
+        patch.object(executor_module, "_detect_external_launch", return_value=None),
+        patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
+        patch.object(executor_module.dist, "TCPStore", side_effect=record_store),
+        patch.object(
+            executor_module,
+            "_Event",
+            side_effect=[_THREADING_EVENT(), event_loop_ready, _THREADING_EVENT()],
+        ),
+        patch.object(executor_module, "_get_mp_context"),
+        patch.object(executor_module, "_WorkerProcessSpawner"),
+        patch.object(
+            DiffusionRemoteClient, "_wait_ready", side_effect=error_type("startup failed")
+        ),
+        pytest.raises(error_type, match="startup failed"),
+    ):
+        DiffusionRemoteClient(args=args)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+        contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        contender.bind(("127.0.0.1", master_ports[0]))
+
+
+@pytest.mark.timeout(_COLD_SPAWN_TIMEOUT)
+@pytest.mark.parametrize("startup_state", ["not-started", "before-ident", "identified", "started"])
+def test_background_thread_start_failure_releases_rendezvous_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup_state: str
+) -> None:
+    create_thread = executor_module._Thread
+    clients = []
+    master_ports = []
+    threads = []
+    bootstrap_entered = _THREADING_EVENT()
+    resume_bootstrap = _THREADING_EVENT()
+    thread_finished = _THREADING_EVENT()
+    startup_error = KeyboardInterrupt("background startup failed")
+    args = VisualGenArgs(model=str(tmp_path))
+
+    def create_client_thread(*thread_args, **thread_kwargs):
+        target = thread_kwargs["target"]
+        if target.__func__ is not DiffusionRemoteClient._serve_forever_thread:
+            return create_thread(*thread_args, **thread_kwargs)
+
+        def run_client_thread() -> None:
+            try:
+                target()
+            finally:
+                thread_finished.set()
+
+        thread_kwargs["target"] = run_client_thread
+        thread = create_thread(*thread_args, **thread_kwargs)
+        client = target.__self__
+        clients.append(client)
+        master_ports.append(client.master_port)
+        start_thread = thread.start
+        wait_started = thread._started.wait
+        threads.append((thread, wait_started))
+        wait_ready = client.event_loop_ready.wait
+
+        def resume_and_wait_ready(timeout=None):
+            resume_bootstrap.set()
+            return wait_ready(timeout=timeout)
+
+        monkeypatch.setattr(client.event_loop_ready, "wait", resume_and_wait_ready)
+        if startup_state in ("before-ident", "identified"):
+            if startup_state == "before-ident":
+                publish_start = thread._bootstrap_inner
+                pause_target = thread
+                pause_method = "_bootstrap_inner"
+            else:
+                publish_start = thread._started.set
+                pause_target = thread._started
+                pause_method = "set"
+
+            def pause_bootstrap() -> None:
+                bootstrap_entered.set()
+                assert resume_bootstrap.wait(timeout=_COLD_SPAWN_TIMEOUT)
+                publish_start()
+
+            def interrupt_wait(timeout=None):
+                assert bootstrap_entered.wait(timeout=_COLD_SPAWN_TIMEOUT)
+                assert (thread.ident is None) == (startup_state == "before-ident")
+                assert not thread._started.is_set()
+                raise startup_error
+
+            monkeypatch.setattr(pause_target, pause_method, pause_bootstrap)
+            monkeypatch.setattr(thread._started, "wait", interrupt_wait)
+        else:
+
+            def interrupt_start() -> None:
+                if startup_state == "started":
+                    start_thread()
+                raise startup_error
+
+            monkeypatch.setattr(thread, "start", interrupt_start)
+        return thread
+
+    try:
+        with (
+            patch.object(executor_module, "_detect_external_launch", return_value=None),
+            patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
+            patch.object(executor_module, "_Thread", side_effect=create_client_thread),
+            patch.object(executor_module, "_register_atexit"),
+        ):
+            with pytest.raises(KeyboardInterrupt, match="background startup failed") as error:
+                DiffusionRemoteClient(args=args)
+
+        assert error.value is startup_error
+        assert thread_finished.is_set() == (startup_state != "not-started")
+        assert all(not thread.is_alive() for thread, _ in threads)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            contender.bind(("127.0.0.1", master_ports[0]))
+    finally:
+        resume_bootstrap.set()
+        if startup_state != "not-started":
+            for thread, wait_started in threads:
+                assert wait_started(timeout=_COLD_SPAWN_TIMEOUT)
+                thread.join(timeout=_COLD_SPAWN_TIMEOUT)
+                assert not thread.is_alive()
+        for client in clients:
+            client.shutdown()
+
+
 def test_cleanup_is_registered_before_waiting_for_ready() -> None:
     events = []
     process = MagicMock()
@@ -690,7 +950,8 @@ def test_cleanup_is_registered_before_waiting_for_ready() -> None:
 
     with (
         patch.object(executor_module, "_detect_external_launch", return_value=None),
-        patch.object(executor_module, "find_free_port", side_effect=[29500, 29501, 29502]),
+        patch.object(executor_module, "find_free_port", side_effect=[29501, 29502]),
+        patch.object(executor_module.dist, "TCPStore", return_value=SimpleNamespace(port=29500)),
         patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
         patch.object(executor_module, "_get_mp_context", return_value=context),
         patch.object(executor_module, "_Thread") as thread_class,
@@ -763,6 +1024,7 @@ def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = threading.Event()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -779,6 +1041,7 @@ def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
     allow_start_to_finish.set()
     shutdown_thread.join(timeout=10.0)
     assert not shutdown_thread.is_alive()
+    assert client._shutdown_error is None
     spawner._thread.join(timeout=10.0)
     assert not spawner._thread.is_alive()
 
@@ -812,6 +1075,7 @@ def test_shutdown_bounds_inflight_spawn_and_spawner_reaps_late_worker() -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = threading.Event()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -848,6 +1112,7 @@ def test_shutdown_skips_registered_process_that_never_started() -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = threading.Event()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -870,6 +1135,7 @@ def test_shutdown_waits_for_external_worker_teardown(finishes: bool) -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = threading.Event()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -1150,9 +1416,10 @@ def test_shutdown_is_idempotent() -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = threading.Event()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
-    client.background_thread.is_alive.return_value = False
+    client.background_thread.is_alive.side_effect = lambda: not client.background_thread.join.called
     worker = MagicMock()
     worker.pid = 123
     worker.is_alive.return_value = False
@@ -1190,9 +1457,10 @@ def test_concurrent_shutdown_waits_for_active_reap() -> None:
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
     client._shutdown_complete = TrackedEvent()
+    client.event_loop_ready = _pre_set_event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
-    client.background_thread.is_alive.return_value = False
+    client.background_thread.is_alive.side_effect = lambda: not client.background_thread.join.called
 
     def block_active_cleanup(*args, **kwargs) -> None:
         del args, kwargs
