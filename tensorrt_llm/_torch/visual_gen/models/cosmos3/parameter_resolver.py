@@ -50,6 +50,7 @@ from .defaults import (
     EMBODIMENT_TO_DOMAIN_ID,
     canonical_domain_preset_key,
     normalize_action_resolution,
+    normalize_domain_name,
     resolve_checkpoint_policy_defaults,
     resolve_raw_action_dim,
 )
@@ -474,9 +475,6 @@ OPTIONAL_FIELDS = ("guidance_interval", "flow_shift", "raw_action_dim")
 """Fields that may legitimately end up unset: a mode without a guidance window, a
 distilled checkpoint without a flow shift, an embodiment without a canonical action width."""
 
-ACTION_RESOLUTION_DEFAULT = 480
-"""The bucket the action models were trained at."""
-
 
 class Candidates(NamedTuple):
     """What one field may take, by origin. ``recommended`` and ``fallback`` are both
@@ -508,10 +506,8 @@ def policy_domain(
     warnings: list[str] = []
     if checkpoint_domain is None:
         return domain_name, False, warnings
-    checkpoint_domain = str(checkpoint_domain).strip().lower()
-    explicit = (
-        str(domain_name).strip().lower() if domain_name and str(domain_name).strip() else None
-    )
+    checkpoint_domain = normalize_domain_name(checkpoint_domain)
+    explicit = normalize_domain_name(domain_name)
     checkpoint_domain_id = EMBODIMENT_TO_DOMAIN_ID.get(checkpoint_domain)
     id_matches = domain_id is not None and checkpoint_domain_id == int(domain_id)
     if explicit is None and (domain_id is None or id_matches):
@@ -698,25 +694,25 @@ class ParameterResolver:
         if in_action:
             known_width = resolve_raw_action_dim(domain_name=p.domain_name, domain_id=p.domain_id)
             candidates["raw_action_dim"] = Candidates(
-                p.raw_action_dim, policy.get("raw_action_dim"), known_width
+                p.raw_action_dim, policy.get("raw_action_dim"), recommended=known_width
             )
             candidates["action_chunk_size"] = Candidates(
                 p.action_chunk_size,
                 policy.get("action_chunk_size"),
-                preset.get("action_chunk_size"),
-                tables("action_chunk_size"),
+                recommended=preset.get("action_chunk_size"),
+                fallback=tables("action_chunk_size"),
             )
             candidates["action_resolution"] = Candidates(
                 p.action_resolution,
                 policy.get("action_resolution"),
-                preset.get("action_resolution"),
-                ACTION_RESOLUTION_DEFAULT,
+                recommended=preset.get("action_resolution"),
+                fallback=tables("action_resolution"),
             )
             candidates["frame_rate"] = Candidates(
                 p.frame_rate,
                 policy.get("frame_rate"),
-                preset.get("frame_rate"),
-                tables("frame_rate"),
+                recommended=preset.get("frame_rate"),
+                fallback=tables("frame_rate"),
             )
             frame_rate = candidates["frame_rate"].pick()
             candidates["action_fps"] = Candidates(
@@ -774,7 +770,7 @@ class ParameterResolver:
                         f"Cosmos3 {name}={values[name]} differs from recommended "
                         f"{suggestion} for domain {label}."
                     )
-            domain_requested = bool(p.domain_name and str(p.domain_name).strip()) or (
+            domain_requested = normalize_domain_name(p.domain_name) is not None or (
                 p.domain_id is not None and str(p.domain_id).strip() not in {"", "0"}
             )
             if domain_requested and preset_key is None:

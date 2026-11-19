@@ -13,7 +13,7 @@ import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
-from .defaults import EMBODIMENT_TO_DOMAIN_ID, find_closest_target_size
+from .defaults import EMBODIMENT_TO_DOMAIN_ID, find_closest_target_size, normalize_domain_name
 
 ACTION_MODE_POLICY = "policy"
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
@@ -51,8 +51,8 @@ def resolve_domain_id(
         # domain_id wins so unlisted embodiments stay reachable, but a caller
         # that passes both and disagrees would otherwise silently get a
         # trajectory in a different robot's dialect.
-        if domain_name is not None and str(domain_name).strip():
-            key = str(domain_name).strip().lower()
+        key = normalize_domain_name(domain_name)
+        if key is not None:
             named_id = EMBODIMENT_TO_DOMAIN_ID.get(key)
             if named_id is not None and named_id != resolved:
                 raise ValueError(
@@ -61,14 +61,14 @@ def resolve_domain_id(
                 )
         return resolved
 
-    if domain_name is None or str(domain_name).strip() == "":
+    key = normalize_domain_name(domain_name)
+    if key is None:
         if require_explicit:
             raise ValueError(
                 "Cosmos3 action generation requires domain_id or non-empty domain_name."
             )
         return 0
 
-    key = str(domain_name).strip().lower()
     if key not in EMBODIMENT_TO_DOMAIN_ID:
         raise ValueError(
             f"Unknown Cosmos3 action domain_name={domain_name!r}; "

@@ -159,6 +159,14 @@ EMBODIMENT_TO_RAW_ACTION_DIM: dict[str, int] = {
 }
 
 
+def normalize_domain_name(domain_name: Any) -> str | None:
+    """The embodiment name as the tables key it (stripped, lower case); ``None`` when
+    unset or blank."""
+    if domain_name is None:
+        return None
+    return str(domain_name).strip().lower() or None
+
+
 def resolve_raw_action_dim(
     domain_name: Any = None,
     domain_id: Any = None,
@@ -168,8 +176,9 @@ def resolve_raw_action_dim(
     Resolves by name first.  A bare ``domain_id`` is only usable when every
     embodiment sharing that id agrees on a width (true for all current ids).
     """
-    if domain_name is not None and str(domain_name).strip():
-        return EMBODIMENT_TO_RAW_ACTION_DIM.get(str(domain_name).strip().lower())
+    name = normalize_domain_name(domain_name)
+    if name is not None:
+        return EMBODIMENT_TO_RAW_ACTION_DIM.get(name)
 
     if domain_id is None:
         return None
@@ -190,10 +199,12 @@ _DEFAULT_VIDEO_W, _DEFAULT_VIDEO_H = VIDEO_RES_SIZE_INFO["720"]["16,9"]
 # the Cosmos3 omni ``action_*.json`` inputs where those exist. The embodiment's
 # action width is not a default; it lives in ``EMBODIMENT_TO_RAW_ACTION_DIM``.
 _ACTION_DEFAULTS: dict[str, dict[str, Any]] = {
-    # The sampling recipe every action request shares; an embodiment's row supplies
-    # the canvas, clip length and frame rate.
+    # The sampling recipe every action request shares, and the resolution bucket the
+    # action models were trained at; an embodiment's row supplies the canvas, clip
+    # length and frame rate.
     "common": {
         "action_chunk_size": 16,
+        "action_resolution": 480,
         "num_inference_steps": 30,
         "guidance_scale": 1.0,
         "frame_rate": 24.0,
@@ -572,8 +583,8 @@ def resolve_checkpoint_policy_defaults(policy: Mapping[str, Any] | None) -> dict
     defaults: dict[str, Any] = {}
     domain_name = policy.get("domain_name")
     if domain_name is not None:
-        domain_name = str(domain_name).strip().lower()
-        if not domain_name:
+        domain_name = normalize_domain_name(domain_name)
+        if domain_name is None:
             raise ValueError("Cosmos3 checkpoint policy domain_name must not be empty.")
         defaults["domain_name"] = domain_name
         defaults.update(_POLICY_DEFAULTS.get(domain_name, {}))
@@ -645,8 +656,8 @@ def canonical_domain_preset_key(
     domain_name: str | None = None,
     domain_id: str | int | None = None,
 ) -> str | None:
-    if domain_name is not None and str(domain_name).strip():
-        key = str(domain_name).strip().lower()
+    key = normalize_domain_name(domain_name)
+    if key is not None:
         key = COSMOS3_DOMAIN_PRESET_ALIASES.get(key, key)
         if key in _ACTION_DEFAULTS and key != "common":
             return key
