@@ -1359,7 +1359,7 @@ def _stats_executor(coordinator: DisaggTransferCoordinator, active) -> PyExecuto
         get_request_queue=lambda: SimpleNamespace(queue=[])
     )
 
-    def update_iter_stats(stats, _iter_latency_ms, num_completed_requests, *_args):
+    def update_iter_stats(stats, _iter_latency_ms, num_completed_requests, *_args, **_kwargs):
         stats.num_completed_requests = num_completed_requests
         return stats
 

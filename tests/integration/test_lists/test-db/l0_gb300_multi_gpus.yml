@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 version: 0.0.1
 l0_gb300_multi_gpus:
 - condition:
@@ -17,7 +20,9 @@ l0_gb300_multi_gpus:
   tests:
   # MiniMax-M3 target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/comm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/ops/comm
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/comm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/ops/comm
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
   - accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_identity_vs_mtp3[dep4]
@@ -41,6 +46,9 @@ l0_gb300_multi_gpus:
   # FlashInfer's ring replay, NVFP4 KV at tep4 without block reuse -- and dep2 context and
   # generation engines on one node. tep4 over bf16 KV runs pre-merge (l0_gb300); mmmu runs in
   # QA (llm_function_core).
+  # GLM-5.3-Flash FP8 modeling_v2 target on a GB300 tray: GSM8K with MTP-3, its acceptance length and the metadata
+  # contract.
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/test_accuracy.py::TestModelingV2Glm53FlashFp8Sm10xTp4::test_gsm8k_mtp3
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_flashinfer_ring] TIMEOUT (60)
@@ -164,3 +172,5 @@ l0_gb300_multi_gpus:
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_pass_graph[world2]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_encoder_pass_graph[world2]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_breakable_prefill_cuda_graph TIMEOUT (60)
+  # NVFP4 DSpark attention-DP4 gate with FP8 Engram tables (pre-merge runs the MXFP4-table export).
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)

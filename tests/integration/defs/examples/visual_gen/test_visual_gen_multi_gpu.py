@@ -90,20 +90,8 @@ WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD = 0.30
 # trajectory), so this bound intentionally has large headroom and exists
 # only to catch outputs that are far from everything.
 WAN_MULTI_GPU_GOLDEN_BACKSTOP_LPIPS_THRESHOLD = 0.32
-# MiniMax-H3 Ulysses is in the REDUCTION-REORDERING class: unlike Wan, its
-# multi-GPU run is not bit-exact with the single-GPU run, and the 27-step
-# sampler amplifies the one-ULP seed to a saturation band instead of a fixed
-# value.  Same-seed draws of the 384x384 L0 case measured 0.1180, 0.1528 and
-# 0.1732 on two GPUs and 0.0926, 0.1528, 0.1732, 0.1858 and 0.2033 on four
-# (FA4 gives the same output on two and four GPUs); the fusion toggle alone
-# moves the video 0.1776 on one GPU.  That fusion (QK-norm + RoPE) is lossless
-# in accuracy but not in bits: it keeps FP32 and rounds to BF16 once where
-# eager rounds after each of five ops, so 39 % of its outputs differ from
-# eager by one BF16 ULP (rel. L2 3.5e-3; the torch.compile'd unfused path is
-# equally far from eager, 3.6e-3).  Any such whole-build rounding change
-# re-draws from the band, so a bound taken from one draw is not stable.
-# 0.30 keeps ~0.10 over the worst benign draw; broken output (other seed
-# 0.585, time-reversed video 0.459) lands above it.
+# MiniMax-H3 distributed reduction ordering can introduce numerical drift,
+# so multi-GPU parity is perceptual rather than bit-exact.
 MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLD = WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD
 WAN22_MULTI_GPU_LPIPS_ATTENTION_BACKEND = "FA4"
 WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO = "wan22_t2v_fa4_fully_eager_lpips_golden_video.mp4"
@@ -513,6 +501,7 @@ def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size,
     """Compare real Ulysses + tiled VAE collectives with a fresh one-GPU baseline."""
     from defs.examples.visual_gen.test_minimax_h3_e2e import (
         MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD,
+        MINIMAX_H3_NUM_INFERENCE_STEPS,
         _mean_lpips_distance,
         _minimax_h3_checkpoint_path,
         _multi_resolution_log_stft_distance,
@@ -538,7 +527,11 @@ def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size,
             output = engine.generate(
                 inputs=prompt,
                 params=VisualGenParams(
-                    height=384, width=384, num_frames=124, num_inference_steps=28, seed=42
+                    height=384,
+                    width=384,
+                    num_frames=124,
+                    num_inference_steps=MINIMAX_H3_NUM_INFERENCE_STEPS,
+                    seed=42,
                 ),
             )
             video = torch.as_tensor(output.video).cpu()
@@ -586,6 +579,7 @@ def test_minimax_h3_tp2_example_lpips(tmp_path):
     from defs.examples.visual_gen.test_minimax_h3_e2e import (
         MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD,
         MINIMAX_H3_LPIPS_THRESHOLD,
+        MINIMAX_H3_NUM_INFERENCE_STEPS,
         _mean_lpips_distance,
         _minimax_h3_checkpoint_path,
         _multi_resolution_log_stft_distance,
@@ -614,7 +608,11 @@ def test_minimax_h3_tp2_example_lpips(tmp_path):
             output = engine.generate(
                 inputs=prompt,
                 params=VisualGenParams(
-                    height=128, width=128, num_frames=124, num_inference_steps=28, seed=42
+                    height=128,
+                    width=128,
+                    num_frames=124,
+                    num_inference_steps=MINIMAX_H3_NUM_INFERENCE_STEPS,
+                    seed=42,
                 ),
             )
             video = torch.as_tensor(output.video).cpu()
