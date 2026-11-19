@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Beam decoder blocks 3-5 / sm_103 / tp1: one sparse (MoE) block, constructed directly.
 
-This TP1 component uses FlashInfer normalization/activation kernels; see ``../README.md``
-for its numerical differences from the TP4 serving model.
+This TP1 component shares attention, normalization and activation operators with serving;
+see ``../README.md`` for the remaining geometry and configuration differences.
 
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
@@ -12,8 +12,8 @@ A caller constructs it from the checkpoint's configuration for one of the sparse
 -- a context step after any cached prefix, or a one-token generation step -- with the
 attention batch state prepared on a ``KVCacheManagerV2`` that holds the block's logical
 layer. The forward is assembled from catalog entries, the attention sublayer
-shared with the dense block component (``../_attention.py``) and the MoE component
-(``../moe``); it does not call the built-in Beam modeling and owns no
+shared with the dense block and serving in the production family ``_attention.py``.
+Its MoE execution uses the checkout-only ``../moe`` helper; it does not call the built-in Beam modeling and owns no
 dense MLP.
 
 The block, with block 3's residual coefficients (block i's are in ``depth_scales``)::
@@ -58,6 +58,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 from tensorrt_llm._torch.modeling_v2.models.beam import _attention
 from tensorrt_llm._torch.modeling_v2.models.beam._constants import SM as _SM
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.norm.beam_rmsnorm_fp32 import beam_rmsnorm_fp32
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
     depth_scales,
@@ -248,6 +249,7 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
             head_dim=self.head_dim,
             device=self.input_layernorm.device,
             max_tokens=MAX_TOKENS,
+            attention_window=self.window,
         )
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
@@ -289,7 +291,7 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
         x = hidden_states.view(num_tokens, self.hidden_size)
         positions = position_ids.view(num_tokens)
 
-        h = flashinfer_rmsnorm(x, self.input_layernorm, self.eps)
+        h = beam_rmsnorm_fp32(x, self.input_layernorm, self.eps)
         h = self.attention(h, positions, step)
         h = flashinfer_rmsnorm(h, self.post_attention_layernorm, self.eps)
         x = beam_depth_residual(h, x, *self.attention_scales)

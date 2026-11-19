@@ -80,7 +80,10 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, LayerId, PageIndexMode
 
-from ..dense_block import block as dense_block
+__extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2/models/beam"]
+
+from _components.dense_block import block as dense_block
+
 from ..moe.moe import check_weights
 from ..moe.moe import weight_shapes as moe_weight_shapes
 from ..sparse_block import block as sparse_block
