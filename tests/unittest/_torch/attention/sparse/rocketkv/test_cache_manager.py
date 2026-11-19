@@ -236,6 +236,7 @@ def _rocket_llm_args(tmp_path, **kwargs):
         ("speculative_decoding", "speculative_config"),
         ("disaggregated_serving", "cache_transceiver_config"),
         ("kv_cache_compression", "kv_cache_compression_config"),
+        ("block_reuse", "enable_block_reuse"),
         ("swa_scratch_reuse", "enable_swa_scratch_reuse"),
         ("beam_search", "max_beam_width"),
     ],
@@ -259,6 +260,8 @@ def test_rocket_llm_args_reject_unsupported_features(tmp_path, feature: str, mat
                 calibration_path="/calib/test.pt"
             )
         ),
+        # Block reuse is enabled by default.
+        "block_reuse": dict(kv_cache_config=KvCacheConfig()),
         "swa_scratch_reuse": dict(
             kv_cache_config=KvCacheConfig(enable_block_reuse=False, enable_swa_scratch_reuse=True)
         ),
@@ -267,3 +270,16 @@ def test_rocket_llm_args_reject_unsupported_features(tmp_path, feature: str, mat
 
     with pytest.raises(ValueError, match=f"RocketKV sparse attention does not support .*{match}"):
         _rocket_llm_args(tmp_path, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kv_cache_kwargs", [{}, {"use_kv_cache_manager_v2": False}], ids=["default", "v1_manager"]
+)
+def test_rocket_llm_args_accept_supported_config(tmp_path, kv_cache_kwargs: dict) -> None:
+    from tensorrt_llm.llmapi import KvCacheConfig
+
+    llm_args = _rocket_llm_args(
+        tmp_path, kv_cache_config=KvCacheConfig(enable_block_reuse=False, **kv_cache_kwargs)
+    )
+
+    assert llm_args.sparse_attention_config.algorithm == "rocket"
