@@ -368,10 +368,10 @@ class TestRMSNormBasic:
 
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
-    @pytest.mark.parametrize("sliced", [False, True], ids=["aligned", "sliced"])
+    @pytest.mark.parametrize("layout", ["dense", "aligned", "sliced"])
     @pytest.mark.parametrize("heads", [1, 6])
     def test_multirow_kernel_reuses_the_compiled_variant_across_batches(
-        self, heads: int, sliced: bool
+        self, heads: int, layout: str
     ) -> None:
         """No row count compiles a new variant of the multi-row kernel after warmup.
 
@@ -381,21 +381,25 @@ class TestRMSNormBasic:
         heads=6 the token-major path (sigmoid gate), whose largest inputs run
         several row tiles per program.
 
-        The gate is a column slice of a wider projection. ``sliced`` makes its
-        row stride not a multiple of 16 and, on the module path, x a column
-        slice too, so a one-token batch, which PyTorch views with dense
-        strides, keys other variants.
+        ``layout`` gives the gate whole (dense) or as a column slice of a wider
+        projection whose row stride is a multiple of 16 (aligned) or not
+        (sliced). Sliced also makes x a column slice on the module path, so a
+        one-token batch, which PyTorch views with dense strides, keys other
+        variants.
         """
         from _torch.helpers import triton_num_compiled
 
         kernel = layernorm_gated._rms_norm_gated_fwd_multirow_kernel
         while isinstance(kernel, triton.runtime.Heuristics):
             kernel = kernel.fn  # the compiled variants live on the inner JITFunction
-        # Start from no compiled variants, as a server process does, so that
-        # those of earlier tests cannot stand in for the ones warmup compiles.
-        for cache in getattr(kernel, "device_caches", {}).values():
-            cache[0].clear()
-        layernorm_gated._multirow_variants_with_siblings.clear()
+
+        def clear_compiled() -> None:
+            # Start from no compiled variants, as a server process does, so that
+            # those of earlier runs cannot stand in for the ones warmup compiles.
+            for cache in getattr(kernel, "device_caches", {}).values():
+                cache[0].clear()
+            layernorm_gated._multirow_variants_with_siblings.clear()
+
         device = "cuda"
         dtype = torch.bfloat16
         N = 128
@@ -405,10 +409,10 @@ class TestRMSNormBasic:
         norm = RMSNorm(N, eps=eps).to(device=device, dtype=dtype)
         norm.weight.data.copy_(weight)
 
-        pad = 24 if sliced else 128
+        pad = {"dense": 0, "aligned": 128, "sliced": 24}[layout]
 
         def check(num_tokens: int) -> None:
-            if sliced and heads == 1:
+            if layout == "sliced" and heads == 1:
                 x = torch.randn(num_tokens, N + pad, device=device, dtype=dtype)[:, pad:]
             else:
                 x = torch.randn(num_tokens * heads, N, device=device, dtype=dtype)
@@ -426,23 +430,27 @@ class TestRMSNormBasic:
             ref = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * weight.float() * gate
             torch.testing.assert_close(out, ref.to(dtype), rtol=1e-2, atol=1e-2)
 
-        # Warmup: one batch per tile count, as a warmup's decode and largest
-        # prefill batches would run.
-        warmup = [4096]
+        # Warmups: one batch per tile count, as a warmup's decode and largest
+        # prefill batches would run, and where the largest prefill runs grouped
+        # tiles, that prefill alone, as for a model whose decode fuses the norm
+        # into another kernel.
+        warmups = [[4096]]
         grouped = []
         if heads > 1:
             min_tokens = triton.cdiv(layernorm_gated._MULTIROW_GROUPS_MIN_ROWS, heads)
-            warmup.append(min_tokens)
+            warmups = [[4096, min_tokens], [min_tokens]]
             grouped = [min_tokens + 1, min_tokens + 5]
-        for num_tokens in warmup:
-            check(num_tokens)
-        compiled = triton_num_compiled(kernel)
-        # Then one token, row counts that are multiples of 16 and of the tile
-        # or neither, grids below and above one wave of programs, and grouped
-        # tiles with and without a partial last group.
-        for num_tokens in (1, 2, 3, 16, 17, 64, 100, 333, 1000, 4095, *grouped):
-            check(num_tokens)
-        assert triton_num_compiled(kernel) == compiled
+        for warmup in warmups:
+            clear_compiled()
+            for num_tokens in warmup:
+                check(num_tokens)
+            compiled = triton_num_compiled(kernel)
+            # Then one token, row counts that are multiples of 16 and of the
+            # tile or neither, grids below and above one wave of programs, and
+            # grouped tiles with and without a partial last group.
+            for num_tokens in (1, 2, 3, 16, 17, 64, 100, 333, 1000, 4095, *grouped):
+                check(num_tokens)
+            assert triton_num_compiled(kernel) == compiled, f"warmup {warmup}"
 
 
 @skip_no_cuda

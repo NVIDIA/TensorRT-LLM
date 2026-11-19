@@ -369,8 +369,10 @@ def _launch_multirow_kernel(x,
     one of them, while every request in flight waits. So the first launch of a
     variant also compiles its siblings, the same call with the other values
     of these flags. GROUPS changes only from _MULTIROW_GROUPS_MIN_ROWS rows,
-    which a warmup of the largest batch reaches. (Under torch.compile the
-    launch is traced, not run, so there is no variant to pair.)
+    which a warmup of the largest batch reaches; the siblings of a grouped
+    launch include the same call with one tile per program, which smaller
+    batches run. (Under torch.compile the launch is traced, not run, so there
+    is no variant to pair.)
 
     The row strides are compile keys too (== 1, % 16, and CONTIG), and a
     one-token batch can change them: PyTorch gives a dimension of size 1 the
@@ -416,6 +418,10 @@ def _launch_multirow_kernel(x,
                                    kwargs,
                                    device_index,
                                    launched=(launch_with_pdl, even))
+        if groups != 1:
+            # Fewer rows run one tile per program.
+            one_tile = dict(kwargs, GROUPS=1)
+            _compile_multirow_siblings(args, one_tile, device_index)
         # One token: `heads` rows, dense x and y rows when that is one row,
         # and a dense gate. All four of its variants are compiled, so that
         # every variant in the set has its siblings.
