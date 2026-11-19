@@ -33,13 +33,11 @@ from .open_search_db_utils import add_id, get_history_data, post_new_perf_data
 POST_MERGE_THRESHOLD = 0.05
 PRE_MERGE_THRESHOLD = 0.1
 
-# Where people open a run's outputs, by the location that the pipeline publishes test results to
-# (globalVars["llm_artifacts_primary"], aws when unset). artifactory.nvidia.com is opened in its
-# native browser, which signs people in; urm serves direct links.
-_ARTIFACT_BASES = {
-    "aws": "https://artifactory.nvidia.com/ui/native/sw-tensorrt-llm-generic-local/llm-artifacts/LLM/main",
-    "urm": "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main",
-}
+# Where people open a run's outputs: the pipeline publishes test results to
+# artifactory.nvidia.com, which is opened in its native browser, which signs people in.
+_ARTIFACT_BASE = (
+    "https://artifactory.nvidia.com/ui/native/sw-tensorrt-llm-generic-local/llm-artifacts/LLM/main"
+)
 
 
 def get_job_info():
@@ -71,8 +69,6 @@ def get_job_info():
     raw_branch = global_vars.get("build_branch")
     branch = raw_branch if isinstance(raw_branch, str) else ""
     commit = os.getenv("gitlabCommit", "")
-    primary = global_vars.get("llm_artifacts_primary") or "aws"
-    artifact_base = _ARTIFACT_BASES.get(primary, _ARTIFACT_BASES["aws"])
     # Original OCI/base reference, not the derived Enroot artifact or dispatcher.
     runtime_image = os.getenv("TRTLLM_CI_RUNTIME_IMAGE", "").strip()
     digest_match = re.fullmatch(r"[^@\s]+@(sha256:[0-9a-f]{64})", runtime_image)
@@ -111,10 +107,10 @@ def get_job_info():
         # Set trigger_mr_commit to commit
         trigger_mr_commit = commit
         artifact_url = (
-            f"{artifact_base}/L0_MergeRequest_PR/{job_id}/test-results/" if job_id else ""
+            f"{_ARTIFACT_BASE}/L0_MergeRequest_PR/{job_id}/test-results/" if job_id else ""
         )
     else:
-        artifact_url = f"{artifact_base}/L0_PostMerge/{job_id}/test-results/" if job_id else ""
+        artifact_url = f"{_ARTIFACT_BASE}/L0_PostMerge/{job_id}/test-results/" if job_id else ""
 
     return {
         "b_is_baseline": False,

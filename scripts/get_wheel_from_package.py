@@ -129,10 +129,7 @@ _FETCH_TRANSFER_FAILED = 4
 
 
 def _rejected_message(package_path: str) -> str:
-    """Describe why the primary location refused to serve `package_path`."""
-    if (os.environ.get("LLM_ARTIFACTS_PRIMARY") or "aws") == "urm":
-        return ("The primary location (urm) rejected the anonymous request "
-                f"for {package_path}.")
+    """Describe why Artifactory refused to serve `package_path`."""
     credential = (os.environ.get("ARTIFACTORY_CREDENTIAL_ID")
                   or "<unset: ARTIFACTORY_CREDENTIAL_ID>")
     return (
@@ -146,22 +143,21 @@ def download_package(artifact_path: str, tarfile_name: str,
                      timeout: int) -> None:
     """Download a packaged build, polling until it has been published.
 
-    jenkins/scripts/fetch_build_artifact.sh reads the primary location
-    (LLM_ARTIFACTS_PRIMARY) first, falls back to the other location only when
-    the file is absent there, and logs which location served it. It writes to
-    a temporary file and renames it only after the SHA-1 matches, so a failed
-    attempt never leaves a partial `tarfile_name` for the extract to read.
+    jenkins/scripts/fetch_build_artifact.sh reads the package from
+    artifactory.nvidia.com. It writes to a temporary file and renames it only
+    after the SHA-1 matches, so a failed attempt never leaves a partial
+    `tarfile_name` for the extract to read.
 
     Args:
         artifact_path: The build's artifact directory in the legacy layout,
             a repository name followed by llm-artifacts/<job>/<build>. The
-            helper maps it to each location.
+            helper maps it to the repository on artifactory.nvidia.com.
         tarfile_name: File name of the packaged build, also used for the local
             copy.
         timeout: Maximum number of attempts, one minute apart.
 
     Raises:
-        PermissionError: The primary location rejected the request.
+        PermissionError: Artifactory rejected the credentials.
         RuntimeError: The helper failed for a reason other than the package
             being absent or a transfer failure, such as a usage error.
         TimeoutError: The package was not downloaded within `timeout`
@@ -171,7 +167,7 @@ def download_package(artifact_path: str, tarfile_name: str,
               "fetch_build_artifact.sh")
     package_path = f"{artifact_path}/{tarfile_name}"
     for attempt in range(1, timeout + 1):
-        # The environment carries ARTIFACTORY_NETRC, LLM_ARTIFACTS_PRIMARY and
+        # The environment carries ARTIFACTORY_NETRC and
         # ARTIFACTORY_CREDENTIAL_ID to the helper.
         rc = subprocess.run(
             ["bash", str(helper), package_path, tarfile_name],

@@ -33,23 +33,9 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
-// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
-// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
-// selects it. Reads fall back to the other location only when a file is absent. This job reads
-// packaged builds with jenkins/scripts/fetch_build_artifact.sh, which maps the legacy paths above.
-
-// The primary location a parent pipeline passed in globalVars, which this job uses instead of its
-// own controller's LLM_ARTIFACTS_PRIMARY. Empty when the job was started on its own.
-LLM_ARTIFACTS_PRIMARY_FROM_PARENT = ""
-
-def llmArtifactsPrimary()
-{
-    def primary = LLM_ARTIFACTS_PRIMARY_FROM_PARENT ?: env.LLM_ARTIFACTS_PRIMARY ?: "aws"
-    if (!(primary in ["aws", "urm"])) {
-        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
-    }
-    return primary
-}
+// Everything under llm-artifacts/ is published to and read from artifactory.nvidia.com alone, the
+// location that the shared library names "aws". This job reads packaged builds with
+// jenkins/scripts/fetch_build_artifact.sh, which maps the legacy paths above to that location.
 
 // Credential with which the read helper reads packaged builds on artifactory.nvidia.com: the
 // publishing credential, the one the pipelines publish build artifacts with and that
@@ -130,8 +116,6 @@ def BOLT_PROFILE_REF = "bolt_profile_ref"
 @Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 @Field
-def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
-@Field
 def TRTLLM_RELEASE_REPO = "TRTLLM_RELEASE_REPO"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
@@ -146,9 +130,6 @@ def globalVars = [
     // without saying so.
     (BOLT_PROFILE_REF): "",
     (BOLT_PROFILE_BRANCH): "",
-    // Pre-declared so updateMapWithJson() populates it from the parent (see
-    // LLM_ARTIFACTS_PRIMARY_FROM_PARENT).
-    (LLM_ARTIFACTS_PRIMARY_KEY): "",
     // Release scripts repository as [url: ..., commit: ...], resolved by L0_MergeRequest.
     (TRTLLM_RELEASE_REPO): null,
 ]
@@ -441,7 +422,6 @@ def overlayBoltBundle(pairs, arch, action) {
     try {
         trtllm_utils.writeArtifactoryNetrc(netrcPath)
         withEnv([
-            "LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}",
             "ARTIFACTORY_NETRC=${netrcPath}",
             "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
         ]) {
@@ -698,9 +678,8 @@ def buildImage(config, imageKeyToTag, versionOverride)
         def wheelNetrcPath = buildWheelArgs.trim() ? "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}" : ""
         try {
             if (wheelNetrcPath) {
-                def primary = llmArtifactsPrimary()
                 trtllm_utils.writeArtifactoryNetrc(wheelNetrcPath)
-                buildWheelArgs += " ARTIFACTORY_NETRC='${wheelNetrcPath}' LLM_ARTIFACTS_PRIMARY=${primary}" +
+                buildWheelArgs += " ARTIFACTORY_NETRC='${wheelNetrcPath}'" +
                     " ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}"
             }
             stage ("make ${target}_${action} (${arch})") {
@@ -1054,10 +1033,6 @@ pipeline {
                     sh "env | sort"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
-                    if (globalVars[LLM_ARTIFACTS_PRIMARY_KEY]) {
-                        LLM_ARTIFACTS_PRIMARY_FROM_PARENT = globalVars[LLM_ARTIFACTS_PRIMARY_KEY].toString()
-                        echo "Build artifacts: primary location ${llmArtifactsPrimary()}, passed by the parent pipeline"
-                    }
                 }
             }
         }
@@ -1075,7 +1050,7 @@ pipeline {
                     echo "imageKeyToTag is: ${imageKeyToTagJson}"
                     writeFile file: "imageKeyToTag.json", text: imageKeyToTagJson
                     archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
-                    trtllm_utils.uploadToTargets("imageKeyToTag.json", "${UPLOAD_PATH}/", trtllm_utils.llmArtifactsTargets(llmArtifactsPrimary()), true)
+                    trtllm_utils.uploadArtifacts("imageKeyToTag.json", trtllm_utils.llmArtifactsRepoPath("aws", "${UPLOAD_PATH}/"), "aws")
                 }
             }
         }
@@ -1092,12 +1067,11 @@ pipeline {
                             // git for checkoutFile, curl for jenkins/scripts/fetch_build_artifact.sh
                             trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get install -y wget git curl")
 
-                            // The read helper from this run's commit looks for each file on the
-                            // primary location first; it needs a netrc for artifactory.nvidia.com.
+                            // The read helper from this run's commit looks for each file on
+                            // artifactory.nvidia.com; it needs a netrc for that host.
                             def helperDir = "${pwd(tmp: true)}/fetch-build-artifact"
                             trtllm_utils.checkoutFile(LLM_REPO, LLM_COMMIT_OR_BRANCH, "jenkins/scripts/fetch_build_artifact.sh", helperDir)
                             def helperPath = "${helperDir}/fetch_build_artifact.sh"
-                            def primary = llmArtifactsPrimary()
 
                             // Poll for build artifacts
                             def requiredFiles = [
@@ -1117,7 +1091,6 @@ pipeline {
                             try {
                                 trtllm_utils.writeArtifactoryNetrc(netrcPath)
                                 withEnv([
-                                    "LLM_ARTIFACTS_PRIMARY=${primary}",
                                     "ARTIFACTORY_NETRC=${netrcPath}",
                                     "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
                                 ]) {
@@ -1135,9 +1108,7 @@ pipeline {
 
                                             if (exitCode == FETCH_REJECTED) {
                                                 // The helper has printed which request was rejected and why.
-                                                error(primary == "aws" ?
-                                                    "Credential '${LLM_ARTIFACTS_CREDENTIALS_ID}' was rejected while checking for ${file}: its Artifactory access token needs renewal or lacks read permission on sw-tensorrt-llm-generic-local" :
-                                                    "urm rejected the anonymous request while checking for ${file}")
+                                                error("Credential '${LLM_ARTIFACTS_CREDENTIALS_ID}' was rejected while checking for ${file}: its Artifactory access token needs renewal or lacks read permission on sw-tensorrt-llm-generic-local")
                                             }
                                             if (!(exitCode in [0, FETCH_ABSENT, FETCH_TRANSFER_FAILED])) {
                                                 error "fetch_build_artifact.sh exited with ${exitCode} while checking for ${file}"
@@ -1179,7 +1150,6 @@ pipeline {
                 script {
                     catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
-                        globalVars[LLM_ARTIFACTS_PRIMARY_KEY] = llmArtifactsPrimary()
                         String globalVarsJson = writeJSON returnText: true, json: globalVars
                         def parameters = getCommonParameters()
                         parameters += [

@@ -62,7 +62,6 @@ def test_docker_wheel_arguments(
             "TRT_LLM_VER": version,
             "GIT_COMMIT": commit,
             "GITHUB_MIRROR": "",
-            "LLM_ARTIFACTS_PRIMARY": "",
             "ARTIFACTORY_CREDENTIAL_ID": "",
         },
         capture_output=True,

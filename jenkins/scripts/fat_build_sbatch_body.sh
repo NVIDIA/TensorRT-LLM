@@ -13,7 +13,7 @@
 #   FAT_BUILD_SCRIPT_PATH   - path to fat_build_inline.sh on the SLURM node
 #   FAT_TAR_NAME            - tarball filename (e.g. TensorRT-LLM.tar.gz)
 #   FAT_FETCH_HELPER_PATH   - path to fetch_build_artifact.sh on the SLURM node
-#   LLM_ARTIFACTS_PRIMARY, ARTIFACTORY_NETRC, ARTIFACTORY_CREDENTIAL_ID
+#   ARTIFACTORY_NETRC, ARTIFACTORY_CREDENTIAL_ID
 #                           - read by fetch_build_artifact.sh; ARTIFACTORY_NETRC is deleted on exit
 
 set -euo pipefail

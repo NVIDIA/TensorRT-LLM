@@ -51,18 +51,10 @@ APPLY_LATEST_SH = BOLT_INTERNAL / "apply_latest.sh"
 BRANCH = "main"
 TRIPLE = "aarch64-linux-gnu"
 REF = "0a1b2c3d4e5f"
-# The legacy path that the reads give the helper, which maps it to each location.
+# The legacy path that the reads give the helper, which maps it to the store's repository.
 STORE_DIR = f"sw-tensorrt-generic/llm-artifacts/bolt-profiles/{BRANCH}/{TRIPLE}"
 LATEST_PATH = f"{STORE_DIR}/latest.tar.gz"
 PINNED_PATH = f"{STORE_DIR}/bolt-profile-{REF}-{TRIPLE}.tar.gz"
-# The hosts of the two locations, and what the helper's --exists prints when aws holds
-# latest.tar.gz for readers.
-AWS_HOST = "artifactory.test"
-URM_HOST = "urm.test"
-HELD_ON_AWS = (
-    f"https://{AWS_HOST}/artifactory/sw-tensorrt-llm-generic-local/"
-    f"{LATEST_PATH.split('/', 1)[1]} {'0' * 40}"
-)
 
 # The read helper's exit statuses other than success, and those of the store's readers.
 FETCH_ABSENT = 2
@@ -78,8 +70,9 @@ UNREADABLE = {
     "usage": FETCH_USAGE,
 }
 
-# What the helper reads from its caller's environment.
-HELPER_ENVIRONMENT = ("LLM_ARTIFACTS_PRIMARY", "ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
+# What the helper reads from its caller's environment: the variables through which a caller
+# hands it its credential.
+HELPER_ENVIRONMENT = ("ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
 CREDENTIAL_ID = "test-publishing-credential"
 # Settings that would change what the scripts under test ask for.
 REMOVE_AFTER_READ = "ARTIFACTORY_NETRC_REMOVE_AFTER_READ"
@@ -96,8 +89,7 @@ PROFILE_TEXT = "functions: []\n"
 
 # Stands in for fetch_build_artifact.sh. It records its arguments and the environment it sees, and
 # plays back the planned answers, one per call; the last one repeats. An answer is an exit status
-# and the file that a successful call copies to <dest-file>, the helper's last argument. For
-# --exists, which has no <dest-file>, the answer is the line that a successful call prints.
+# and the file that a successful call copies to <dest-file>, the helper's last argument.
 _HELPER_STUB = r"""
 import json
 import os
@@ -114,10 +106,7 @@ with open(log_path, encoding="utf-8") as log:
 answers = json.loads(os.environ["HELPER_STUB_ANSWERS"])
 status, payload = answers[min(call_index, len(answers) - 1)]
 if status == 0:
-    if "--exists" in sys.argv:
-        print(payload)
-    else:
-        shutil.copyfile(payload, sys.argv[-1])
+    shutil.copyfile(payload, sys.argv[-1])
 sys.exit(status)
 """
 
@@ -134,9 +123,6 @@ if [ "$ARTIFACTORY_STUB_STATUS" -eq 0 ]; then
 fi
 exit "$ARTIFACTORY_STUB_STATUS"
 """
-
-# The variables through which a caller hands the read helper its credential.
-CREDENTIAL_VARIABLES = ("ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
 
 # Stands in for stage_llvm_bolt.sh, which apply_latest.sh sources. It notes what it could reach
 # of the caller's credential, and whether the pull came first.
@@ -204,11 +190,11 @@ def _bundle(path: Path, manifest: dict[str, object] | None) -> Path:
     return path
 
 
-def _properties(path: Path, properties: dict[str, str], host: str = AWS_HOST) -> Path:
-    """Write a location's storage API answer for a file's properties, as Artifactory sends it."""
+def _properties(path: Path, properties: dict[str, str]) -> Path:
+    """Write the storage API's answer for a file's properties, as Artifactory sends it."""
     answer = {
         "properties": {name: [value] for name, value in properties.items()},
-        "uri": f"https://{host}/artifactory/api/storage/{LATEST_PATH}",
+        "uri": f"https://artifactory.test/artifactory/api/storage/{LATEST_PATH}",
     }
     path.write_text(json.dumps(answer, indent=2, separators=(",", " : ")) + "\n", encoding="utf-8")
     return path
@@ -265,7 +251,6 @@ class Tree:
         self.netrc.write_text("machine artifactory.test login ci password secret\n")
         self.netrc.chmod(0o600)
         self.helper_env = {
-            "LLM_ARTIFACTS_PRIMARY": "aws",
             "ARTIFACTORY_NETRC": str(self.netrc),
             "ARTIFACTORY_CREDENTIAL_ID": CREDENTIAL_ID,
         }
@@ -294,7 +279,7 @@ class Tree:
         self,
         script: Path,
         *args: str,
-        answers: list[tuple[int, Path | str | None]] | None = None,
+        answers: list[tuple[int, Path | None]] | None = None,
         **variables: str,
     ) -> Result:
         """Run a script of the tree, from outside it, with the helper's environment of a CI caller.
@@ -306,8 +291,7 @@ class Tree:
             script: The script to run with bash.
             *args: Its arguments.
             answers: The stub helper's answers, one per call: an exit status and, for a
-                successful call, the file to copy to its destination, or the line that --exists
-                prints.
+                successful call, the file to copy to its destination.
             **variables: Further environment variables; one of the helper's replaces its value.
         """
         helper_env = {name: variables.pop(name, value) for name, value in self.helper_env.items()}
@@ -438,38 +422,12 @@ def test_resolve_latest_prints_the_ref_property(
         {"bolt.branch": BRANCH, "bolt.ref": REF, "bolt.triple": TRIPLE},
     )
 
-    result = tree.run(
-        artifactory, "resolve-latest", BRANCH, TRIPLE, answers=[(0, HELD_ON_AWS), (0, properties)]
-    )
+    result = tree.run(artifactory, "resolve-latest", BRANCH, TRIPLE, answers=[(0, properties)])
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"{REF}\n"
-    # The properties of the copy that readers get answer: the bundle is not downloaded.
-    assert result.helper_args == [["--exists", LATEST_PATH], ["--properties", LATEST_PATH, ANY]]
-
-
-def test_resolve_latest_ignores_the_properties_of_the_other_location(
-    tree: Tree, artifactory: Path, bundle: Path, tmp_path: Path
-) -> None:
-    # aws holds an unlabelled latest.tar.gz, so the properties lookup went on to urm's copy.
-    properties = _properties(tmp_path / "properties.json", {"bolt.ref": "f" * 12}, host=URM_HOST)
-
-    result = tree.run(
-        artifactory,
-        "resolve-latest",
-        BRANCH,
-        TRIPLE,
-        answers=[(0, HELD_ON_AWS), (0, properties), (0, bundle)],
-    )
-
-    assert result.returncode == 0, result.stderr
-    # The ref is the one in the manifest of the bundle that readers get.
-    assert result.stdout == f"{REF}\n"
-    assert result.helper_args == [
-        ["--exists", LATEST_PATH],
-        ["--properties", LATEST_PATH, ANY],
-        [LATEST_PATH, ANY],
-    ]
+    # The property answers: the bundle is not downloaded.
+    assert result.helper_args == [["--properties", LATEST_PATH, ANY]]
 
 
 @pytest.mark.parametrize("has_properties", [True, False], ids=["other-properties", "no-properties"])
@@ -482,29 +440,27 @@ def test_resolve_latest_without_the_property_reads_the_manifest(
         properties = (0, _properties(tmp_path / "properties.json", {"build.name": "L0_PostMerge"}))
 
     result = tree.run(
-        artifactory,
-        "resolve-latest",
-        BRANCH,
-        TRIPLE,
-        answers=[(0, HELD_ON_AWS), properties, (0, bundle)],
+        artifactory, "resolve-latest", BRANCH, TRIPLE, answers=[properties, (0, bundle)]
     )
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"{REF}\n"
-    assert result.helper_args == [
-        ["--exists", LATEST_PATH],
-        ["--properties", LATEST_PATH, ANY],
-        [LATEST_PATH, ANY],
-    ]
+    assert result.helper_args == [["--properties", LATEST_PATH, ANY], [LATEST_PATH, ANY]]
 
 
 def test_resolve_latest_prints_nothing_when_latest_is_absent(tree: Tree, artifactory: Path) -> None:
-    result = tree.run(artifactory, "resolve-latest", BRANCH, TRIPLE, answers=[(FETCH_ABSENT, None)])
+    # The helper reports the properties of an absent file as absent, and then the file.
+    result = tree.run(
+        artifactory,
+        "resolve-latest",
+        BRANCH,
+        TRIPLE,
+        answers=[(FETCH_ABSENT, None), (FETCH_ABSENT, None)],
+    )
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
-    # One lookup tells that neither location holds the file.
-    assert result.helper_args == [["--exists", LATEST_PATH]]
+    assert result.helper_args == [["--properties", LATEST_PATH, ANY], [LATEST_PATH, ANY]]
 
 
 @pytest.mark.parametrize(
@@ -520,7 +476,7 @@ def test_resolve_latest_prints_nothing_when_the_bundle_names_no_ref(
         "resolve-latest",
         BRANCH,
         TRIPLE,
-        answers=[(0, HELD_ON_AWS), (FETCH_ABSENT, None), (0, unlabelled)],
+        answers=[(FETCH_ABSENT, None), (0, unlabelled)],
     )
 
     assert result.returncode == 0, result.stderr
@@ -528,14 +484,13 @@ def test_resolve_latest_prints_nothing_when_the_bundle_names_no_ref(
 
 
 @pytest.mark.parametrize("helper_status", UNREADABLE.values(), ids=UNREADABLE)
-@pytest.mark.parametrize("failed_read", ["lookup", "properties", "bundle"])
+@pytest.mark.parametrize("failed_read", ["properties", "bundle"])
 def test_resolve_latest_reports_an_unreadable_store(
     tree: Tree, artifactory: Path, failed_read: str, helper_status: int
 ) -> None:
-    earlier: dict[str, list[tuple[int, Path | str | None]]] = {
-        "lookup": [],
-        "properties": [(0, HELD_ON_AWS)],
-        "bundle": [(0, HELD_ON_AWS), (FETCH_ABSENT, None)],
+    earlier: dict[str, list[tuple[int, Path | None]]] = {
+        "properties": [],
+        "bundle": [(FETCH_ABSENT, None)],
     }
     answers = [*earlier[failed_read], (helper_status, None)]
 
@@ -547,13 +502,11 @@ def test_resolve_latest_reports_an_unreadable_store(
     assert "[artifactory][ERROR]" in result.stderr
 
 
-@pytest.mark.parametrize("primary", ["aws", "urm"])
 def test_reads_inherit_the_callers_environment(
-    tree: Tree, artifactory: Path, bundle: Path, tmp_path: Path, primary: str
+    tree: Tree, artifactory: Path, bundle: Path, tmp_path: Path
 ) -> None:
     netrc = tmp_path / "another-netrc"
     caller = {
-        "LLM_ARTIFACTS_PRIMARY": primary,
         "ARTIFACTORY_NETRC": str(netrc),
         "ARTIFACTORY_CREDENTIAL_ID": "another-credential",
     }
@@ -572,14 +525,14 @@ def test_reads_inherit_the_callers_environment(
         "resolve-latest",
         BRANCH,
         TRIPLE,
-        answers=[(0, HELD_ON_AWS), (FETCH_ABSENT, None), (0, bundle)],
+        answers=[(FETCH_ABSENT, None), (0, bundle)],
         **caller,
     )
 
     assert pulled.returncode == 0, pulled.stderr
     assert resolved.returncode == 0, resolved.stderr
     assert [call.env for call in pulled.helper_calls] == [caller]
-    assert [call.env for call in resolved.helper_calls] == [caller] * 3
+    assert [call.env for call in resolved.helper_calls] == [caller] * 2
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +607,7 @@ def _apply_latest(
         APPLY_STUB_STATUS=str(apply_status),
         STAGE_STUB_LOG=str(stage_view),
         APPLY_STUB_VIEW=str(apply_view),
-        CREDENTIAL_STUB_VARIABLES=json.dumps(CREDENTIAL_VARIABLES),
+        CREDENTIAL_STUB_VARIABLES=json.dumps(HELPER_ENVIRONMENT),
         # The netrc that the caller names, which is the tree's unless a test names another.
         CREDENTIAL_STUB_NETRC=variables.get("ARTIFACTORY_NETRC", str(tree.netrc)),
         **variables,
@@ -757,7 +710,7 @@ def test_apply_latest_removes_the_callers_netrc_before_it_stages_and_applies(
     assert len(applied.result.helper_calls) == (0 if pull == "stub" else 1)
     assert applied.stage_view == NO_CREDENTIAL_AT_STAGING
     assert applied.apply_view == {
-        "variables": dict.fromkeys(CREDENTIAL_VARIABLES),
+        "variables": dict.fromkeys(HELPER_ENVIRONMENT),
         "netrc_exists": False,
     }
     assert not tree.netrc.exists()
@@ -798,7 +751,7 @@ def test_apply_latest_keeps_a_netrc_that_it_was_not_told_to_remove(
     # The variables are gone all the same, so that nothing started after the pull inherits them.
     assert applied.stage_view == [*NO_CREDENTIAL_AT_STAGING[:2], "netrc=present", "pull=done"]
     assert applied.apply_view == {
-        "variables": dict.fromkeys(CREDENTIAL_VARIABLES),
+        "variables": dict.fromkeys(HELPER_ENVIRONMENT),
         "netrc_exists": True,
     }
     assert tree.netrc.exists()

@@ -62,9 +62,7 @@ GITHUB_CLONE_TOKEN ?=
 # jenkins/scripts/fetch_build_artifact.sh). Passed as a BuildKit secret, never as a
 # build arg, for the same reason as GITHUB_CLONE_TOKEN.
 ARTIFACTORY_NETRC  ?=
-# The location the packaged build is read from first (aws or urm; empty means aws),
-# and the name of the CI credential behind ARTIFACTORY_NETRC, used only in messages.
-LLM_ARTIFACTS_PRIMARY ?=
+# The name of the CI credential behind ARTIFACTORY_NETRC, used only in messages.
 ARTIFACTORY_CREDENTIAL_ID ?=
 COMMA              := ,
 GITHUB_SECRET_ARG  := $(if $(GITHUB_CLONE_TOKEN),--secret id=github_clone_token$(COMMA)env=GITHUB_CLONE_TOKEN)
@@ -115,7 +113,6 @@ base_pull:
 		$(if $(CUDA_COMPAT_TAG), --build-arg CUDA_COMPAT_TAG=$(CUDA_COMPAT_TAG)) \
 		$(if $(BUILD_WHEEL_ARGS), --build-arg BUILD_WHEEL_ARGS="$(BUILD_WHEEL_ARGS)") \
 		$(if $(BUILD_WHEEL_SCRIPT), --build-arg BUILD_WHEEL_SCRIPT="$(BUILD_WHEEL_SCRIPT)") \
-		$(if $(LLM_ARTIFACTS_PRIMARY), --build-arg LLM_ARTIFACTS_PRIMARY="$(LLM_ARTIFACTS_PRIMARY)") \
 		$(if $(ARTIFACTORY_CREDENTIAL_ID), --build-arg ARTIFACTORY_CREDENTIAL_ID="$(ARTIFACTORY_CREDENTIAL_ID)") \
 		$(if $(TORCH_INSTALL_TYPE), --build-arg TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \
 		$(if $(CUDA_VERSION), --build-arg CUDA_VER="$(CUDA_VERSION)") \

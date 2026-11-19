@@ -213,7 +213,7 @@ class CoverageArtifactTest(unittest.TestCase):
 
 
 # build_info.txt, the coverage archives, and the pins are read with
-# jenkins/scripts/fetch_build_artifact.sh, which applies the read rule and is tested in
+# jenkins/scripts/fetch_build_artifact.sh, which is tested in
 # tests/unittest/scripts/test_fetch_build_artifact.py. These tests check how artifact.py runs it
 # and what it makes of each exit status.
 def _build_info_path(build: int) -> str:
@@ -250,7 +250,7 @@ _PR_HEAD = "b" * 40
 _PIN_TARGET = f"{artifact.PIN_BASE}/{_PR_NUMBER}/{_PR_HEAD}/"
 _PIN_READ = (f"{_PIN_TARGET}{artifact.PIN_NAME}",)
 _CREDENTIAL_ID = "aws-artifactory-credentials"
-_HELPER_ENVIRONMENT = ("LLM_ARTIFACTS_PRIMARY", "ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
+_HELPER_ENVIRONMENT = ("ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
 _STUB_URL_BASE = "https://artifacts.example/artifactory"
 
 # Stands in for fetch_build_artifact.sh. It records its arguments and the environment it sees,
@@ -311,7 +311,6 @@ class _HelperStub:
         monkeypatch.setenv("HELPER_STUB_URL_BASE", _STUB_URL_BASE)
         monkeypatch.setenv("HELPER_STUB_STATUSES", "{}")
         monkeypatch.setenv("HELPER_STUB_FILES", "{}")
-        monkeypatch.setenv("LLM_ARTIFACTS_PRIMARY", "urm")
         monkeypatch.setenv("ARTIFACTORY_NETRC", str(tmp_path / "artifactory-netrc"))
         monkeypatch.setenv("ARTIFACTORY_CREDENTIAL_ID", _CREDENTIAL_ID)
         self._monkeypatch = monkeypatch
@@ -369,18 +368,17 @@ def test_build_commit_reads_build_info_through_the_helper(
     # A temporary file, removed once read.
     assert not Path(dest).parent.exists()
     assert call["env"] == {
-        "LLM_ARTIFACTS_PRIMARY": "urm",
         "ARTIFACTORY_NETRC": str(tmp_path / "artifactory-netrc"),
         "ARTIFACTORY_CREDENTIAL_ID": _CREDENTIAL_ID,
     }
     captured = capfd.readouterr()
     # stdout carries the command's JSON, so the helper's stdout is dropped; its stderr is the
-    # job log's record of which location served the file, or why it could not.
+    # job log's record that the file was served, or of why it could not be.
     assert captured.out == ""
     assert "helper stderr" in captured.err
 
 
-def test_build_commit_returns_none_when_neither_location_has_build_info(
+def test_build_commit_returns_none_when_build_info_is_absent(
     helper_stub: _HelperStub,
 ) -> None:
     helper_stub.exits_with(2)
@@ -487,7 +485,7 @@ _COVERAGE_ARCHIVE_READS = pytest.mark.parametrize(
 
 
 @_COVERAGE_ARCHIVE_READS
-def test_coverage_archive_reads_return_none_when_neither_location_has_the_archive(
+def test_coverage_archive_reads_return_none_when_the_archive_is_absent(
     helper_stub: _HelperStub, tmp_path: Path, read: Callable[[Path], object]
 ) -> None:
     helper_stub.exits_with(2)
@@ -661,7 +659,7 @@ def test_select_build_declines_when_an_archive_of_the_pinned_build_cannot_be_rea
     assert f"[artifact] pinned build {_BUILD}: {message}" in capfd.readouterr().err.splitlines()
 
 
-def test_select_build_raises_when_the_primary_location_rejects_an_archive_read(
+def test_select_build_raises_when_an_archive_read_is_rejected(
     helper_stub: _HelperStub,
 ) -> None:
     helper_stub.exits_with(3)
@@ -773,8 +771,7 @@ def test_probe_selects_an_older_build_when_an_archive_read_fails(
 def test_probe_reads_each_build_once_and_declines_while_every_transfer_fails(
     helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    # How an outage of artifactory.nvidia.com while it is the primary location (the default) looks
-    # to the probe: every read fails in transfer, whichever location holds the file.
+    # How an outage of artifactory.nvidia.com looks to the probe: every read fails in transfer.
     helper_stub.exits_with(4)
     _set_newest_build(monkeypatch, 3)
 
@@ -849,7 +846,7 @@ def test_probe_selects_an_older_build_when_one_transfer_fails(
     ),
     ids=("coverage-archive", "build-info"),
 )
-def test_probe_stops_when_the_primary_location_rejects_a_read(
+def test_probe_stops_when_a_read_is_rejected(
     helper_stub: _HelperStub,
     monkeypatch: pytest.MonkeyPatch,
     rejected: tuple[str, ...],
@@ -938,7 +935,7 @@ def test_resolve_pin_reuses_the_pin_read_through_the_helper(
 
 
 @pytest.mark.usefixtures("no_direct_requests")
-def test_resolve_pin_creates_file_for_jenkins_upload_when_neither_location_has_a_pin(
+def test_resolve_pin_creates_file_for_jenkins_upload_when_the_pin_is_absent(
     helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     helper_stub.exits_with(2, *_PIN_READ)
@@ -1057,8 +1054,8 @@ def _resolve_pin_on_the_command_line(pin_path: Path) -> Result:
     )
 
 
-# The pin's read is the command's first helper call. When neither location has a pin, the probe
-# of the recent builds follows it.
+# The pin's read is the command's first helper call. When the pin is absent, the probe of the
+# recent builds follows it.
 @pytest.mark.usefixtures("no_direct_requests")
 @pytest.mark.parametrize(
     ("pin_status", "reads"),
@@ -1068,7 +1065,7 @@ def _resolve_pin_on_the_command_line(pin_path: Path) -> Result:
     ),
     ids=("pin", "coverage-archive"),
 )
-def test_resolve_pin_exits_1_when_the_primary_location_rejects_a_read(
+def test_resolve_pin_exits_1_when_a_read_is_rejected(
     helper_stub: _HelperStub,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1362,44 +1359,32 @@ class _ArtifactServer(ThreadingHTTPServer):
 
 
 class _LoopbackArtifactory:
-    """The aws and urm locations, each a loopback Artifactory stand-in, as the real helper sees them."""
+    """A loopback Artifactory stand-in with the repository that the real helper reads."""
 
-    def __init__(self, aws: _ArtifactServer, urm: _ArtifactServer) -> None:
-        self._locations = {
-            "aws": (aws, "sw-tensorrt-llm-generic-local"),
-            "urm": (urm, "sw-tensorrt-generic"),
-        }
+    _REPO = "sw-tensorrt-llm-generic-local"
 
-    def publish(self, location: str, layout_path: str, content: bytes) -> None:
-        """Put a file on a location, with the SHA-1 that its storage API reports."""
-        server, repo = self._locations[location]
+    def __init__(self, server: _ArtifactServer) -> None:
+        self._server = server
+        self.base_url = server.base_url(self._REPO)
+
+    def publish(self, layout_path: str, content: bytes) -> None:
+        """Put a file in the repository, with the SHA-1 that its storage API reports."""
         sha1 = hashlib.sha1(content, usedforsecurity=False).hexdigest()
         storage_info = json.dumps({"checksums": {"sha1": sha1}}).encode()
-        server.routes[f"/artifactory/api/storage/{repo}/{layout_path}"] = storage_info
-        server.routes[f"/artifactory/{repo}/{layout_path}"] = content
+        self._server.routes[f"/artifactory/api/storage/{self._REPO}/{layout_path}"] = storage_info
+        self._server.routes[f"/artifactory/{self._REPO}/{layout_path}"] = content
 
-    def url(self, location: str, layout_path: str) -> str:
-        """The URL of a file on a location, which the helper prints for --exists."""
-        server, repo = self._locations[location]
-        return f"{server.base_url(repo)}/{layout_path}"
+    def url(self, layout_path: str) -> str:
+        """The URL of a file in the repository, which the helper prints for --exists."""
+        return f"{self.base_url}/{layout_path}"
 
 
 @pytest.fixture
 def loopback_artifactory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> Iterator[_LoopbackArtifactory]:
-    # curl matches netrc entries by host name, so each location has its own loopback address.
-    servers = []
-    try:
-        for host in ("127.0.0.1", "127.0.0.2"):
-            servers.append(_ArtifactServer(host, {}))
-    except OSError as error:
-        for server in servers:
-            server.server_close()
-        pytest.skip(f"cannot listen on the 127.0.0.0/8 loopback range: {error}")
-    aws, urm = servers
-    for server in servers:
-        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+    server = _ArtifactServer("127.0.0.1", {})
+    threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
     netrc = tmp_path / "artifactory-netrc"
     netrc.write_text("machine 127.0.0.1 login ci-reader password reader-token-value\n")
     netrc.chmod(0o600)
@@ -1412,33 +1397,31 @@ def loopback_artifactory(
         "ALL_PROXY",
     ):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv("LLM_ARTIFACTS_PRIMARY", raising=False)
-    monkeypatch.setenv("LLM_ARTIFACTS_AWS_URL", aws.base_url("sw-tensorrt-llm-generic-local"))
-    monkeypatch.setenv("LLM_ARTIFACTS_URM_URL", urm.base_url("sw-tensorrt-generic"))
+    artifactory = _LoopbackArtifactory(server)
+    monkeypatch.setenv("LLM_ARTIFACTS_AWS_URL", artifactory.base_url)
     monkeypatch.setenv("ARTIFACTORY_NETRC", str(netrc))
     monkeypatch.setenv("ARTIFACTORY_CREDENTIAL_ID", _CREDENTIAL_ID)
     try:
-        yield _LoopbackArtifactory(aws, urm)
+        yield artifactory
     finally:
-        for server in servers:
-            server.shutdown()
-            server.server_close()
+        server.shutdown()
+        server.server_close()
 
 
-def test_build_commit_with_the_real_helper_falls_back_to_urm(
+def test_build_commit_reads_build_info_with_the_real_helper(
     loopback_artifactory: _LoopbackArtifactory, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    loopback_artifactory.publish("urm", _LAYOUT_PATH, _BUILD_INFO.encode())
+    loopback_artifactory.publish(_LAYOUT_PATH, _BUILD_INFO.encode())
 
     assert artifact.build_commit(_BUILD) == _COMMIT
 
     captured = capfd.readouterr()
     assert captured.out == ""
-    assert f"fetch_build_artifact: served-by=urm path={_LAYOUT_PATH}" in captured.err
+    assert f"fetch_build_artifact: served-by=aws path={_LAYOUT_PATH}" in captured.err
     assert "reader-token-value" not in captured.err
 
 
-def test_prepare_with_the_real_helper_reads_an_archive_only_on_urm(
+def test_prepare_reads_both_archives_with_the_real_helper(
     loopback_artifactory: _LoopbackArtifactory,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1449,9 +1432,9 @@ def test_prepare_with_the_real_helper_reads_an_archive_only_on_urm(
         f"llm-artifacts/LLM/main/L0_PostMerge/{_BUILD}/cbts-coverage/{name}"
         for name in artifact.ARCH_TARBALL_NAMES
     )
-    loopback_artifactory.publish("aws", _LAYOUT_PATH, _BUILD_INFO.encode())
-    loopback_artifactory.publish("aws", x86_layout, archives[_X86_ARCHIVE].read_bytes())
-    loopback_artifactory.publish("urm", sbsa_layout, archives[_SBSA_ARCHIVE].read_bytes())
+    loopback_artifactory.publish(_LAYOUT_PATH, _BUILD_INFO.encode())
+    loopback_artifactory.publish(x86_layout, archives[_X86_ARCHIVE].read_bytes())
+    loopback_artifactory.publish(sbsa_layout, archives[_SBSA_ARCHIVE].read_bytes())
     _set_newest_build(monkeypatch, _BUILD)
     _measure_topology_offline(monkeypatch)
     _check_compatibility_offline(monkeypatch)
@@ -1462,14 +1445,14 @@ def test_prepare_with_the_real_helper_reads_an_archive_only_on_urm(
     assert _tests_in(ready["path"]) == _ARCHIVED_TESTS
     meta = json.loads(Path(ready["meta"]).read_text())
     assert meta["urls"] == [
-        loopback_artifactory.url("aws", x86_layout),
-        loopback_artifactory.url("urm", sbsa_layout),
+        loopback_artifactory.url(x86_layout),
+        loopback_artifactory.url(sbsa_layout),
     ]
     assert "paths" not in meta
     captured = capfd.readouterr()
     assert captured.out == ""
     assert f"fetch_build_artifact: served-by=aws path={x86_layout}" in captured.err
-    assert f"fetch_build_artifact: served-by=urm path={sbsa_layout}" in captured.err
+    assert f"fetch_build_artifact: served-by=aws path={sbsa_layout}" in captured.err
     assert "reader-token-value" not in captured.err
 
 

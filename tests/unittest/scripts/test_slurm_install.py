@@ -51,7 +51,7 @@ CREDENTIAL_ID = "test-reader-credential"
 NETRC_PASSWORD = "netrc-password-5d1e9c0a"
 PAYLOAD = "packaged build contents\n"
 # What the job script exports for the read helper.
-HELPER_ENVIRONMENT = ("LLM_ARTIFACTS_PRIMARY", "ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
+HELPER_ENVIRONMENT = ("ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
 
 # Stands in for fetch_build_artifact.sh. It records its arguments, the environment it sees, and
 # whether the netrc exists, and plays back the planned exit statuses, one per call; the last one
@@ -305,7 +305,6 @@ def _run_slurm_install(
             "SLURM_STEP_ID": "0",
             "SLURM_STEP_NUM_NODES": str(step_num_nodes),
             "SLURM_NODEID": "2",
-            "LLM_ARTIFACTS_PRIMARY": "aws",
             "ARTIFACTORY_NETRC": str(netrc),
             "ARTIFACTORY_CREDENTIAL_ID": CREDENTIAL_ID,
             "FETCH_STUB_LOG": str(fetch_log),
@@ -347,7 +346,6 @@ def _run_slurm_install(
         }
         assert call["args"][1] == expected_destinations[call["args"][0]]
         assert call["env"] == {
-            "LLM_ARTIFACTS_PRIMARY": "aws",
             "ARTIFACTORY_NETRC": str(netrc),
             "ARTIFACTORY_CREDENTIAL_ID": CREDENTIAL_ID,
         }
@@ -650,7 +648,7 @@ def _fetch_script(command: str, status_path: Path) -> str:
     return script.replace('\\"', '"').replace("\\$", "$")
 
 
-@pytest.mark.parametrize("status", (0, 2, 3, 4, 5, 64))
+@pytest.mark.parametrize("status", (0, 2, 3, 4, 64))
 def test_l0_fetch_repeats_only_a_failed_transfer(tmp_path: Path, status: int) -> None:
     status_path = tmp_path / "fetch-status"
     script = _fetch_script(f"sh -c 'exit {status}'", status_path)
@@ -739,8 +737,8 @@ def test_l0_slurm_job_gets_the_read_helper_and_its_netrc() -> None:
         body,
     )
 
-    # Every job gets the helper's netrc, since the helper on the node contacts
-    # artifactory.nvidia.com whenever aws is the primary, wherever the package is.
+    # Every job gets the helper's netrc, since the helper on the node reads the package from
+    # artifactory.nvidia.com.
     netrc_writes = [
         index
         for index, line in enumerate(body_lines)
@@ -779,7 +777,6 @@ def test_l0_slurm_job_gets_the_read_helper_and_its_netrc() -> None:
     exports = [line.strip() for line in body_lines if re.search(r"\bexport \w+=", line)]
     for name, value in (
         ("llmTarArtifactPath", "$llmTarArtifactPath"),
-        ("LLM_ARTIFACTS_PRIMARY", "${llmArtifactsPrimary()}"),
         ("ARTIFACTORY_NETRC", "$artifactoryNetrcPathNode"),
         ("ARTIFACTORY_CREDENTIAL_ID", "$LLM_ARTIFACTS_CREDENTIALS_ID"),
         ("llmTarfile", "$llmTarfile"),
@@ -787,6 +784,8 @@ def test_l0_slurm_job_gets_the_read_helper_and_its_netrc() -> None:
         assert [line for line in exports if re.search(rf"\bexport {name}=", line)] == [
             f"export {name}={value}"
         ]
+    # The helper takes no location from its environment, and the job script exports none.
+    assert "LLM_ARTIFACTS_PRIMARY" not in body
     assert "llmTarfileSha1" not in body
     assert "llmTarfileOnAws" not in body
 
@@ -837,31 +836,43 @@ def test_l0_reads_build_artifacts_and_pulls_images_with_separate_credential_sett
     assert _groovy_string("\n".join(lines), "ARTIFACTORY_CREDENTIALS_ID") != publishing
 
 
-def test_l0_deletes_checkpoints_with_each_locations_publishing_credential() -> None:
-    """A checkpoint delete sends each location's publishing credential through a netrc."""
+def test_l0_deletes_checkpoints_with_the_publishing_credential() -> None:
+    """A checkpoint delete sends the publishing credential through a netrc."""
     lines = _l0_test_code_lines()
     code = "\n".join(lines)
 
-    # The shared library writes each entry of the delete's netrc: it names its location's host and
-    # holds the identity that publishes to that location. This pipeline and Build.groovy take the
-    # locations from the library, so each location has the one credential in both.
+    # The shared library writes the delete's netrc: it names the location's host and holds the
+    # identity that publishes to that location. This pipeline and Build.groovy take the
+    # locations from the library, so the location has the one credential in both.
     assert _netrc_writers(lines) == []
     build = _groovy_code(BUILD_GROOVY)
-    for location in ("aws", "urm"):
-        assert _artifact_location_field(code, location, "credential") == _artifact_location_field(
-            build, location, "credential"
-        )
+    assert _artifact_location_field(code, "aws", "credential") == _artifact_location_field(
+        build, "aws", "credential"
+    )
 
-    # The delete sends the credentials only through that netrc, never on a command line.
+    # The delete goes to the location that the watcher uploads checkpoints to, and to no other.
     delete = _groovy_function_body(lines, "deleteProgressArtifact")
+    prepare = _groovy_function_body(lines, "prepareCheckpointWatcher")
+    for function in (delete, prepare):
+        assert _assignments(function, "location") == ['"aws"']
+    assert delete.count('artifactoryRequestStatus(pipeline, "DELETE",') == 1
+    # Both addresses are the location's root and the checkpoint's path in its repository.
+    assert (
+        "def deletePath = trtllm_utils.llmArtifactsLocalRepoPath(location, checkpointPath)"
+        in delete
+    )
+    assert '"${LLM_ARTIFACTS_LOCATIONS[location].root}/${deletePath}", netrcPath)' in delete
+    assert 'String path = testResultsDirTarget("test-results") + progressTar' in prepare
+    assert (
+        'watcherEnv << "CHECKPOINT_TARGETS=${location}=${LLM_ARTIFACTS_LOCATIONS[location].root}/${path}"'
+        in prepare
+    )
+
+    # It sends the credentials only through that netrc, never on a command line.
     assert "trtllm_utils.writeArtifactoryNetrc(netrcPath, location)" in delete
     request = _groovy_function_body(lines, "artifactoryRequestStatus")
     assert '--netrc-file "$ARTIFACTORY_REQUEST_NETRC"' in request
     assert not re.search(r"(?:^|\s)(?:-u|--user)\s", request)
-
-    # The pipeline does not record which locations received a checkpoint, so the delete goes to
-    # every target of the attempt.
-    assert "attemptTargets(stageName, postTag)" in delete
 
 
 # The command that runs a stage's tests in the step beside the checkpoint watcher, by the function
@@ -894,11 +905,10 @@ def test_l0_takes_checkpoints_from_a_watcher_beside_the_tests() -> None:
     netrc_wait = _groovy_function_body(lines, "checkpointNetrcWait")
     assert "rm -rf '${netrcDir}'" in netrc_wait
 
-    # The watcher's netrc is written by the library as the delete's is, as one file to which each
-    # target adds its entry, and no credential is bound in the step that runs the tests.
+    # The watcher's netrc is written by the library as the delete's is, for the one location
+    # that the watcher uploads to, and no credential is bound in the step that runs the tests.
     prepare = _groovy_function_body(lines, "prepareCheckpointWatcher")
-    assert "attemptTargets(stageName, postTag)" in prepare
-    assert "trtllm_utils.writeArtifactoryNetrc(netrcPath, location, true)" in prepare
+    assert "trtllm_utils.writeArtifactoryNetrc(netrcPath, location)" in prepare
     assert "withCredentials" not in prepare
 
     # A batch stage copies the job's last results back only once the watcher has stopped taking
@@ -914,31 +924,31 @@ def test_l0_takes_checkpoints_from_a_watcher_beside_the_tests() -> None:
         assert f'"{name}=${{WORKSPACE}}/${{stageName}}/results.xml",' in batch
 
 
-def test_l0_checkpoint_netrc_entries_stand_on_their_own() -> None:
-    """A location whose netrc entry cannot be written does not stop the other's checkpoints."""
+def test_l0_checkpoint_watcher_gets_its_target_only_with_its_netrc() -> None:
+    """A netrc that cannot be written leaves the watcher without a target, and the stage goes on."""
     prepare = _groovy_function_body(_l0_test_code_lines(), "prepareCheckpointWatcher")
 
-    # Each entry is written in a try block of its own, whose handler for an ordinary failure goes
-    # on to the next location, and a location becomes one of the watcher's targets only after its
-    # entry is written.
-    loop = prepare.index("for (location in locations) {")
-    entry = prepare.index("trtllm_utils.writeArtifactoryNetrc(netrcPath, location, true)", loop)
-    assert prepare[loop:entry].split() == ["for", "(location", "in", "locations)", "{", "try", "{"]
-    interrupted = prepare.index("catch (InterruptedException e) {", entry)
-    ordinary = prepare.index("catch (Exception e) {", interrupted)
-    left_out = prepare.index("continue", ordinary)
-    target = prepare.index('targets << "${location}=', left_out)
-    # Of that try block's handlers, only the one for an interruption rethrows.
-    assert prepare[interrupted:left_out].count("throw") == 1
-
-    # The watcher gets the netrc only together with a target. Without one, the else branch removes
-    # the netrc itself, ahead of the handlers that also remove it.
-    with_targets = prepare.index("if (targets) {", target)
-    netrc = prepare.index('watcherEnv << "CHECKPOINT_NETRC_FILE=${netrcPath}"', with_targets)
+    # The watcher has one target, which it gets together with the netrc and only after the netrc
+    # is written. Nothing between the target and the netrc can fail.
+    entry = prepare.index("trtllm_utils.writeArtifactoryNetrc(netrcPath, location)")
+    target = prepare.index('watcherEnv << "CHECKPOINT_TARGETS=${location}=', entry)
+    netrc = prepare.index('watcherEnv << "CHECKPOINT_NETRC_FILE=${netrcPath}"', target)
+    assert prepare.count("CHECKPOINT_TARGETS") == 1
     assert prepare.count("CHECKPOINT_NETRC_FILE") == 1
-    without_targets = prepare.index("} else {", netrc)
-    removed = prepare.index("removeCheckpointNetrc(pipeline, netrcDir)", without_targets)
-    assert "catch" not in prepare[without_targets:removed]
+    assert len(prepare[target:netrc].splitlines()) == 2
+
+    # Each handler of the try block that writes the netrc removes the netrc's directory. Only the
+    # one for an interruption throws; the one for an ordinary failure returns no directory, so
+    # the watcher prepares its checkpoints without uploading them.
+    interrupted = prepare.index("catch (InterruptedException e) {", netrc)
+    ordinary = prepare.index("catch (Exception e) {", interrupted)
+    on_interruption = prepare[interrupted:ordinary]
+    assert on_interruption.count("removeCheckpointNetrc(pipeline, netrcDir)") == 1
+    assert on_interruption.count("throw e") == 1
+    on_failure = prepare[ordinary:]
+    removed = on_failure.index("removeCheckpointNetrc(pipeline, netrcDir)")
+    on_failure.index('netrcDir = ""', removed)
+    assert "throw" not in on_failure
 
 
 def test_l0_wheel_sanity_tests_get_no_checkpoint_netrc() -> None:
@@ -980,8 +990,8 @@ def _assignments(code: str, name: str) -> list[str]:
     return re.findall(rf"^[ \t]*(?:def[ \t]+)?{name}[ \t]*=[ \t]*(.+?)[ \t]*$", code, re.M)
 
 
-# Each location's settings, as trtllm_utils.llmArtifactsLocations() of the shared library returns
-# them. The library's own tests hold them to the servers that its uploads use.
+# The aws location's settings, as trtllm_utils.llmArtifactsLocations() of the shared library
+# returns them. The library's own tests hold them to the server that its uploads use.
 _LIBRARY_LOCATIONS = {
     "aws": {
         "root": "https://artifactory.nvidia.com/artifactory",
@@ -989,13 +999,6 @@ _LIBRARY_LOCATIONS = {
         "browseRoot": "https://artifactory.nvidia.com/ui/native",
         "localRepo": "sw-tensorrt-llm-generic-local",
         "credential": "aws-artifactory-credentials",
-    },
-    "urm": {
-        "root": "https://urm.nvidia.com/artifactory",
-        "repo": "sw-tensorrt-generic",
-        "browseRoot": "https://urm.nvidia.com/artifactory",
-        "localRepo": "sw-tensorrt-generic-local",
-        "credential": "urm-artifactory-creds",
     },
 }
 
@@ -1017,8 +1020,6 @@ _LIBRARY_HELPERS = (
     "llmArtifactsUrl",
     "llmArtifactsHost",
     "llmArtifactsBrowseUrl",
-    "llmArtifactsTargets",
-    "uploadToTargets",
     "writeArtifactoryNetrc",
 )
 
@@ -1100,7 +1101,7 @@ def test_a_changed_locations_map_is_not_taken_for_the_shared_librarys(change: st
     code = (
         "LLM_ARTIFACTS_LOCATIONS = trtllm_utils.llmArtifactsLocations()\n"
         "def credential = LLM_ARTIFACTS_LOCATIONS.aws.credential\n"
-        'if (LLM_ARTIFACTS_LOCATIONS[primary].repo == "sw-tensorrt-generic") {\n'
+        'if (LLM_ARTIFACTS_LOCATIONS[location].repo == "sw-tensorrt-llm-generic-local") {\n'
     )
     assert _artifact_location_field(code, "aws", "credential") == "aws-artifactory-credentials"
     with pytest.raises(AssertionError, match="not the shared library's map, unchanged"):
