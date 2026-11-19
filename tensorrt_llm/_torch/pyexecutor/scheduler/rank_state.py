@@ -130,8 +130,7 @@ class RankIterStatsPayload:
     _ITER_STATS_FIELD_COUNT: ClassVar[int] = 9
     _KV_LOAD_FIELD_COUNT: ClassVar[int] = 3
     _SNAPSHOT_WIRE_VERSION: ClassVar[int] = -3
-    _TRANSFER_WIRE_VERSION: ClassVar[int] = -5
-    _ACTIVITY_WIRE_VERSION: ClassVar[int] = -6
+    _OBSERVATIONS_WIRE_VERSION: ClassVar[int] = -5
     _QUEUED_WIRE_VERSION: ClassVar[int] = -4
     _QUEUED_FIELDS: ClassVar[tuple[str, ...]] = (
         "num_queued_context_requests",
@@ -195,30 +194,20 @@ class RankIterStatsPayload:
             self.scheduling_counters,
         )
         queued_values = [getattr(self, name) for name in self._QUEUED_FIELDS]
-        has_extended_stats = (
-            any(queued_values)
-            or self.has_pending_work
-            or self.kv_transfer_outcomes is not None
-            or self.conversation_activity is not None
-        )
+        observations = (self.kv_transfer_outcomes, self.conversation_activity)
+        has_observations = any(value is not None for value in observations)
+        has_extended_stats = any(queued_values) or self.has_pending_work or has_observations
         if any(snapshot is not None for snapshot in snapshots) or has_extended_stats:
-            # The negative version cannot be confused with has_iter_stats (0/1).
-            # Presence flags frame the snapshots and the independent load fields.
+            version = self._SNAPSHOT_WIRE_VERSION
+            if has_observations:
+                version = self._OBSERVATIONS_WIRE_VERSION
+            elif has_extended_stats:
+                version = self._QUEUED_WIRE_VERSION
             values = [
-                self._ACTIVITY_WIRE_VERSION
-                if self.conversation_activity is not None
-                else self._TRANSFER_WIRE_VERSION
-                if self.kv_transfer_outcomes is not None
-                else self._QUEUED_WIRE_VERSION
-                if has_extended_stats
-                else self._SNAPSHOT_WIRE_VERSION,
+                version,
                 int(include_kv_cache_load),
                 *(int(snapshot is not None) for snapshot in snapshots),
-                *(
-                    [int(self.kv_transfer_outcomes is not None)]
-                    if self.conversation_activity is not None
-                    else []
-                ),
+                *(int(value is not None) for value in observations if has_observations),
                 *values,
             ]
             for snapshot in snapshots:
@@ -227,10 +216,9 @@ class RankIterStatsPayload:
         if has_extended_stats:
             values.extend(queued_values)
             values.append(int(self.has_pending_work))
-        if self.kv_transfer_outcomes is not None:
-            values.extend(self.kv_transfer_outcomes)
-        if self.conversation_activity is not None:
-            values.extend(self.conversation_activity)
+        for observation in observations:
+            if observation is not None:
+                values.extend(observation)
         return values
 
     @classmethod
@@ -246,17 +234,15 @@ class RankIterStatsPayload:
         Raises:
             ValueError: The header is incomplete or contains an unsupported version or flag.
         """
-        header_size = cls._SNAPSHOT_HEADER_SIZE + int(
-            bool(data) and data[0] == cls._ACTIVITY_WIRE_VERSION
-        )
+        has_observations = bool(data) and data[0] == cls._OBSERVATIONS_WIRE_VERSION
+        header_size = cls._SNAPSHOT_HEADER_SIZE + 2 * has_observations
         if (
             len(data) < header_size
             or data[0]
             not in (
                 cls._SNAPSHOT_WIRE_VERSION,
                 cls._QUEUED_WIRE_VERSION,
-                cls._TRANSFER_WIRE_VERSION,
-                cls._ACTIVITY_WIRE_VERSION,
+                cls._OBSERVATIONS_WIRE_VERSION,
             )
             or any(flag not in (0, 1) for flag in data[1:header_size])
         ):
@@ -269,14 +255,8 @@ class RankIterStatsPayload:
             + int(data[4]) * RankSpecDecodingStats.wire_size()
             + int(data[5]) * RankSchedulingCounters.wire_size()
             + (
-                3
-                if data[0] == cls._TRANSFER_WIRE_VERSION
-                or (data[0] == cls._ACTIVITY_WIRE_VERSION and data[6])
-                else 0
-            )
-            + (
-                len(ConversationActivityStats._fields)
-                if data[0] == cls._ACTIVITY_WIRE_VERSION
+                3 * int(data[6]) + len(ConversationActivityStats._fields) * int(data[7])
+                if has_observations
                 else 0
             )
             + (len(cls._QUEUED_FIELDS) + 1 if data[0] <= cls._QUEUED_WIRE_VERSION else 0)
@@ -290,7 +270,8 @@ class RankIterStatsPayload:
             expected_size = cls.snapshot_payload_size(values)
             if len(values) != expected_size:
                 raise ValueError(f"Snapshot payload requires {expected_size} fields")
-            header_size = cls._SNAPSHOT_HEADER_SIZE + int(values[0] == cls._ACTIVITY_WIRE_VERSION)
+            has_observations = values[0] == cls._OBSERVATIONS_WIRE_VERSION
+            header_size = cls._SNAPSHOT_HEADER_SIZE + 2 * has_observations
             scalar_end = (
                 header_size
                 + cls._ITER_STATS_FIELD_COUNT
@@ -324,15 +305,13 @@ class RankIterStatsPayload:
                     setattr(result, name, int(value))
                 result.has_pending_work = bool(values[queue_end])
                 cursor = queue_end + 1
-            if values[0] == cls._TRANSFER_WIRE_VERSION or (
-                values[0] == cls._ACTIVITY_WIRE_VERSION and values[6]
-            ):
+            if has_observations and values[6]:
                 counts = values[cursor : cursor + 3]
                 if any(value < 0 or value != int(value) for value in counts):
                     raise ValueError("Transfer outcome counters must be nonnegative integers")
                 result.kv_transfer_outcomes = tuple(int(value) for value in counts)
                 cursor += 3
-            if values[0] == cls._ACTIVITY_WIRE_VERSION:
+            if has_observations and values[7]:
                 activity = values[cursor:]
                 if any(value < 0 or value != int(value) for value in activity) or any(
                     activity[index] not in (0, 1) for index in (1, 5)

@@ -1079,7 +1079,8 @@ class DisaggTransferCoordinator:
         """Poll send-side transfers and release settled requests."""
         ctx_status = self._transceiver.check_context_transfer_status(at_least)
         failed_req_ids = set(ctx_status.error_request_ids)
-        completed_req_ids = set(ctx_status.completed_request_ids) | failed_req_ids
+        succeeded_ids = set(ctx_status.completed_request_ids)
+        completed_req_ids = succeeded_ids | failed_req_ids
         failed_req_ids -= self._context_cancellation_drains
 
         requests_in_transfer = self._transfers.requests_in_transfer()
@@ -1091,12 +1092,12 @@ class DisaggTransferCoordinator:
                     logger.warning(f"Request {request_id} not found in transfer manager")
                 continue
             request = requests_in_transfer[request_id]
-            self._record_transfer_outcome(
-                request, "error" if request_id in failed_req_ids else "success"
-            )
             if request_id in failed_req_ids:
+                self._record_transfer_outcome(request, "error")
                 # Past the context phase: writing the error state here is safe.
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            elif request_id in succeeded_ids:
+                self._record_transfer_outcome(request, "success")
             self.release_transfer(request)
 
         # Releases above may have changed the set of requests in transfer.

@@ -125,16 +125,20 @@ def test_send_skips_requests_that_must_not_send() -> None:
 # -- reaping context sends ---------------------------------------------------
 
 
-def test_completed_send_releases_blocks_and_terminates_a_departed_request() -> None:
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_settled_send_releases_blocks_and_terminates_a_departed_request(cancelled) -> None:
     """A request already out of active_requests (PP>1 early path) terminates
-    exactly once when its send completes."""
+    exactly once when its send settles."""
     h = _Harness()
     req = _Request(1)
     h.send(req)
-    h.transceiver.finish_send(req)
+    if cancelled:
+        h.coordinator._context_cancellation_drains.add(req.py_request_id)
+    h.transceiver.finish_send(req, outcome="error" if cancelled else "complete")
 
     h.coordinator.reap_context_sends(0)
 
+    assert h.coordinator.transfer_outcomes == (int(not cancelled), 0, 0)
     assert not h.in_transfer(req)
     h.kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(1)
     assert h.effects.terminated == [req]

@@ -70,115 +70,7 @@ class PrometheusExposure:
         distinguishing between multiple series of the same metric name. Example:
         {"model_name": "nemotron-nano-3", "engine_type": "trtllm"}
 
-    Created Prometheus metrics:
-        Per-request metrics:
-            trtllm_request_success_total
-            trtllm_e2e_request_latency_seconds
-            trtllm_time_to_first_token_seconds
-            trtllm_time_per_output_token_seconds
-            trtllm_request_queue_time_seconds
-            trtllm_request_prefill_time_seconds
-            trtllm_request_decode_time_seconds
-            trtllm_request_inference_time_seconds
-            trtllm_prompt_tokens_total
-            trtllm_generation_tokens_total
-            trtllm_prompt_cached_tokens_total
-            trtllm_prompt_cache_hit_tokens_total
-            trtllm_prompt_cached_tokens_per_request
-            trtllm_spec_decode_drafted_tokens_total
-            trtllm_spec_decode_accepted_tokens_total
-            trtllm_prefill_perplexity
-            trtllm_generation_perplexity
-            trtllm_request_error_total
-            trtllm_kv_cache_transfer_duration_seconds
-            trtllm_kv_cache_transfer_bytes_total
-            trtllm_input_processing_seconds
-            trtllm_input_processing_queue_seconds
-            trtllm_media_processing_seconds
-
-        Iteration-level metrics:
-            trtllm_kv_cache_transfer_requests_total
-            trtllm_kv_cache_allocated_blocks_total
-            trtllm_kv_cache_new_blocks_total
-            trtllm_kv_cache_evictable_blocks
-            trtllm_kv_cache_peak_used_blocks
-            trtllm_kv_cache_host_dropped_bytes_total
-            trtllm_kv_cache_requests_suspended_total
-            trtllm_kv_cache_requests_resumed_total
-            trtllm_context_kv_tokens
-            trtllm_generation_kv_tokens
-            trtllm_paused_kv_tokens
-            trtllm_kv_cache_hit_rate
-            trtllm_kv_cache_utilization
-            trtllm_kv_cache_host_utilization
-            trtllm_kv_cache_iter_reuse_rate
-            trtllm_kv_cache_reused_blocks_total
-            trtllm_kv_cache_missed_blocks_total
-            trtllm_kv_cache_iter_reused_blocks_total
-            trtllm_kv_cache_iter_full_reused_blocks_total
-            trtllm_kv_cache_iter_partial_reused_blocks_total
-            trtllm_kv_cache_iter_missed_blocks_total
-            trtllm_kv_cache_iter_connector_reused_blocks_total
-            trtllm_kv_cache_gen_alloc_blocks_total
-            trtllm_kv_cache_onboard_bytes_total
-            trtllm_kv_cache_offload_bytes_total
-            trtllm_kv_cache_disk_prefetch_blocks_total
-            trtllm_kv_cache_intra_device_copy_bytes_total
-            trtllm_loop_scheduled_requests
-            trtllm_loop_active_requests
-            trtllm_loop_unscheduled_requests
-            trtllm_loop_dummy_requests
-            trtllm_loop_adp_dummy_context_tokens
-            trtllm_loop_adp_dummy_generation_tokens
-            trtllm_loop_requests_fetched_total
-            trtllm_num_requests_running
-            trtllm_num_requests_waiting
-            trtllm_num_requests_completed_total
-            trtllm_max_num_active_requests
-            trtllm_iteration_latency_seconds
-            trtllm_host_step_time_seconds
-            trtllm_prev_device_step_time_seconds
-            trtllm_gpu_forward_time_seconds
-            trtllm_host_step_duration_seconds
-            trtllm_gpu_forward_duration_seconds
-            trtllm_gpu_memory_usage_bytes
-            trtllm_cpu_memory_usage_bytes
-            trtllm_pinned_memory_usage_bytes
-            trtllm_max_batch_size_static
-            trtllm_max_batch_size_runtime
-            trtllm_max_num_tokens_runtime
-            trtllm_kv_cache_max_blocks
-            trtllm_kv_cache_free_blocks
-            trtllm_kv_cache_used_blocks
-            trtllm_kv_cache_tokens_per_block
-            trtllm_kv_cache_tier_blocks
-            trtllm_kv_cache_tier_bytes
-            trtllm_kv_cache_tier_moved_blocks_total
-            trtllm_kv_cache_tier_moved_bytes_total
-            trtllm_kv_cache_tier_migration_duration_seconds
-            trtllm_kv_cache_migration_timing_skipped_total
-            trtllm_conversation_unique_seen
-            trtllm_conversation_unique_seen_complete
-            trtllm_conversation_tracking_overflow_total
-            trtllm_num_context_requests
-            trtllm_num_generation_requests
-            trtllm_num_paused_requests
-            trtllm_num_scheduled_requests
-            trtllm_total_context_tokens
-            trtllm_avg_decoded_tokens_per_iter
-            trtllm_spec_decode_num_draft_tokens_total
-            trtllm_spec_decode_num_accepted_tokens_total
-            trtllm_spec_decode_acceptance_length
-            trtllm_spec_decode_draft_overhead
-            trtllm_prefill_batch_occupancy
-            trtllm_prefill_batch_tokens
-            trtllm_multimodal_encoder_gpu_time_seconds
-
-        Config info metrics (logged once at startup via log_config_info):
-            trtllm_model_config_info
-            trtllm_parallel_config_info
-            trtllm_speculative_config_info
-            trtllm_kv_cache_config_info
+    See the Prometheus performance metrics guide for the metric reference.
     """
     labelname_finish_reason = FINISH_REASON_LABEL
     labelname_cache_level = "cache_level"
@@ -536,28 +428,34 @@ class PrometheusExposure:
             documentation=
             "Host KV-cache bytes discarded from reported iteration deltas",
             labelnames=iteration_labelnames)
-        self.kv_cache_requests_suspended = Counter(
-            name=self.metric_prefix + "kv_cache_requests_suspended_total",
-            documentation="Requests suspended by the KV-cache manager",
-            labelnames=iteration_labelnames)
-        self.kv_cache_requests_resumed = Counter(
-            name=self.metric_prefix + "kv_cache_requests_resumed_total",
-            documentation=
-            "Previously suspended requests resumed by the KV-cache manager",
-            labelnames=iteration_labelnames)
-        self.context_kv_tokens = Gauge(
-            name=self.metric_prefix + "context_kv_tokens",
-            documentation=
-            "Existing KV context tokens read by scheduled prefill requests",
-            labelnames=iteration_labelnames)
-        self.generation_kv_tokens = Gauge(
-            name=self.metric_prefix + "generation_kv_tokens",
-            documentation="KV context tokens of scheduled generation requests",
-            labelnames=iteration_labelnames)
-        self.paused_kv_tokens = Gauge(
-            name=self.metric_prefix + "paused_kv_tokens",
-            documentation="KV context tokens of paused requests",
-            labelnames=iteration_labelnames)
+        self._kv_request_counters = {
+            field:
+            Counter(self.metric_prefix + name,
+                    description,
+                    labelnames=iteration_labelnames)
+            for field, name, description in (
+                ("iterSuspendedRequests", "kv_cache_requests_suspended_total",
+                 "Requests suspended by the KV-cache manager"),
+                ("iterResumedRequests", "kv_cache_requests_resumed_total",
+                 "Previously suspended requests resumed by the KV-cache manager"
+                 ),
+            )
+        }
+        self._kv_token_gauges = {
+            field:
+            Gauge(self.metric_prefix + name,
+                  description,
+                  labelnames=iteration_labelnames)
+            for field, name, description in (
+                ("numCtxKvTokens", "context_kv_tokens",
+                 "Existing KV context tokens read by scheduled prefill requests"
+                 ),
+                ("numGenKvTokens", "generation_kv_tokens",
+                 "KV context tokens of scheduled generation requests"),
+                ("numPausedKvTokens", "paused_kv_tokens",
+                 "KV context tokens of paused requests"),
+            )
+        }
         self.histogram_kv_cache_transfer_duration = Histogram(
             name=self.metric_prefix + "kv_cache_transfer_duration_seconds",
             documentation=
@@ -1590,6 +1488,8 @@ class PrometheusExposure:
 
     def _log_iteration_timing(self, iteration_stats: dict) -> None:
         """Export rank-0 timing samples without treating lagged GPU time as CPU overhead."""
+        if iteration_stats.get("isQueueSnapshot"):
+            return
         mode = iteration_stats.get("schedulerMode")
         if mode not in ("overlap", "non_overlap"):
             mode = "unknown"
@@ -1697,10 +1597,7 @@ class PrometheusExposure:
                 }, value - previous)
             self._prev_transfer_outcomes[key] = value
 
-        for field, counter in (
-            ("iterSuspendedRequests", self.kv_cache_requests_suspended),
-            ("iterResumedRequests", self.kv_cache_requests_resumed),
-        ):
+        for field, counter in self._kv_request_counters.items():
             value = iteration_stats.get(field, 0)
             if value > 0:
                 self._log_counter(counter, rank_labels, value)
@@ -1780,11 +1677,7 @@ class PrometheusExposure:
 
         # Inflight batching stats
         if ifb_stats := iteration_stats.get("inflightBatchingStats"):
-            for field, gauge in (
-                ("numCtxKvTokens", self.context_kv_tokens),
-                ("numGenKvTokens", self.generation_kv_tokens),
-                ("numPausedKvTokens", self.paused_kv_tokens),
-            ):
+            for field, gauge in self._kv_token_gauges.items():
                 if field in ifb_stats:
                     self._log_gauge(gauge, ifb_stats[field], labels=rank_labels)
             if "numContextRequests" in ifb_stats:

@@ -1284,10 +1284,6 @@ class PyExecutor:
         # above: _append_iter_stats is reached from per-rank-divergent gates,
         # so its tp_allgather collective is lifted to _flush_iter_stats_synced.
         self._pending_iter_stats_dict: Optional[Dict] = None
-        self._last_published_transfer_outcomes: Optional[tuple[int, int,
-                                                               int]] = None
-        self._last_published_adp_transfer_outcomes: Dict[int, tuple[int, int,
-                                                                    int]] = {}
         # Legacy ADP dummy role for overlap and PP fallback paths. The generic
         # non-overlap path derives its role from fresh per-iteration intent.
         self._adp_dummy_is_gen: bool = True
@@ -1640,8 +1636,8 @@ class PyExecutor:
         self._conversation_activity_capture_time = float("-inf")
         self._conversation_activity_cached: Optional[
             ConversationActivityStats] = None
-        self._last_published_conversation_activity: Dict[
-            int, ConversationActivityStats] = {}
+        self._last_rank_observations: Dict[int, tuple[Optional[tuple[
+            int, int, int]], Optional[ConversationActivityStats]]] = {}
         self._adp_iter_stats = ADPIterStatsBuffer(
             activity_snapshot=self._snapshot_conversation_activity
             if self._conversation_manager is not None else None,
@@ -4178,13 +4174,10 @@ class PyExecutor:
                                         batch_state.scheduled_batch_stats,
                                         current_batch=current_batch)
         if self.enable_attention_dp:
-            coordinator = self.__dict__.get("_disagg_coordinator")
             self._adp_iter_stats.queue(
                 stats,
                 req_stats,
                 kv_iter_stats=self._latest_kv_iter_stats,
-                kv_transfer_outcomes=(coordinator.transfer_outcomes
-                                      if coordinator is not None else None),
                 is_rank0=self.dist.rank == 0,
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
@@ -9075,84 +9068,44 @@ class PyExecutor:
             self._conversation_activity_capture_time = now
         return self._conversation_activity_cached
 
-    def _publish_conversation_activity(
-            self, rank_states: Optional[List[RankState]] = None) -> None:
-        """Publish source-rank activity without fabricating an iteration or copying peer counts."""
-        if self.dist.rank != 0 or not self.enable_iter_perf_stats:
-            return
-        snapshots = ((state.rank, state.iter_stats.conversation_activity)
-                     for state in rank_states) if rank_states is not None else (
-                         (0, self._snapshot_conversation_activity()), )
-        with self.stats_lock:
-            for rank, snapshot in snapshots:
-                if snapshot is None or self._last_published_conversation_activity.get(
-                        rank) == snapshot:
-                    continue
-                if not _stats_buffer_is_unbounded(self.max_stats_len) and len(
-                        self.stats) >= max(1, self.max_stats_len):
-                    self.stats.pop(0)
-                self.stats.append(("per_rank_dict", {
-                    "attentionDpRank": rank,
-                    "conversationActivity": snapshot.to_dict(),
-                }))
-                self._last_published_conversation_activity[rank] = snapshot
-
     def _snapshot_transfer_outcomes(self) -> Optional[tuple[int, int, int]]:
         if not self.enable_iter_perf_stats:
             return None
         coordinator = self.__dict__.get("_disagg_coordinator")
         return coordinator.transfer_outcomes if coordinator is not None else None
 
-    def _publish_transfer_outcomes(self,
+    def _publish_rank_observations(self,
                                    rank_states: Optional[List[RankState]] = None
                                    ) -> None:
-        """Publish changed endpoint counters, including outcome-only idle exchanges."""
-        if not self.enable_iter_perf_stats:
+        """Publish changed endpoint observations independently of iterations."""
+        if not self.enable_iter_perf_stats or self.dist.rank != 0:
             return
-        if self.enable_attention_dp:
-            if rank_states is None or self.dist.rank != 0:
+        if rank_states is None:
+            if self.enable_attention_dp:
                 return
-            snapshots: Dict[int, tuple[int, int, int]] = {}
-            for state in rank_states:
-                outcomes = state.iter_stats.kv_transfer_outcomes
-                if outcomes is not None and self._last_published_adp_transfer_outcomes.get(
-                        state.rank) != outcomes:
-                    snapshots[state.rank] = outcomes
-            if not snapshots:
-                return
-            with self.stats_lock:
-                for rank, outcomes in snapshots.items():
-                    if not _stats_buffer_is_unbounded(
-                            self.max_stats_len) and len(self.stats) >= max(
-                                1, self.max_stats_len):
-                        self.stats.pop(0)
-                    self.stats.append(("per_rank_dict", {
-                        "attentionDpRank":
-                        rank,
-                        "kvTransferOutcomes":
-                        dict(zip(("success", "error", "timeout"), outcomes)),
-                    }))
-                    self._last_published_adp_transfer_outcomes[rank] = outcomes
-            return
-        coordinator = self.__dict__.get("_disagg_coordinator")
-        if coordinator is None:
-            return
-        outcomes = getattr(coordinator, "transfer_outcomes", None)
-        if outcomes is None or outcomes == getattr(
-                self, "_last_published_transfer_outcomes", None):
-            return
-        snapshot = {
-            "attentionDpRank":
-            0,
-            "kvTransferOutcomes":
-            dict(zip(("success", "error", "timeout"), outcomes))
-        }
+            snapshots = ((0, self._snapshot_transfer_outcomes(),
+                          self._snapshot_conversation_activity()), )
+        else:
+            snapshots = ((state.rank, state.iter_stats.kv_transfer_outcomes,
+                          state.iter_stats.conversation_activity)
+                         for state in rank_states)
         with self.stats_lock:
-            if (not _stats_buffer_is_unbounded(self.max_stats_len)
-                    and len(self.stats) > self.max_stats_len):
-                self.stats.pop(0)
-            self.stats.append(("per_rank_dict", snapshot))
-            self._last_published_transfer_outcomes = outcomes
+            for rank, outcomes, activity in snapshots:
+                snapshot = (outcomes, activity)
+                if snapshot == (None, None) or self._last_rank_observations.get(
+                        rank) == snapshot:
+                    continue
+                row = {"attentionDpRank": rank}
+                if outcomes is not None:
+                    row["kvTransferOutcomes"] = dict(
+                        zip(("success", "error", "timeout"), outcomes))
+                if activity is not None:
+                    row["conversationActivity"] = activity.to_dict()
+                if not _stats_buffer_is_unbounded(self.max_stats_len) and len(
+                        self.stats) >= max(1, self.max_stats_len):
+                    self.stats.pop(0)
+                self.stats.append(("per_rank_dict", row))
+                self._last_rank_observations[rank] = snapshot
 
     def _idle_kv_transfer_poll_timeout(self) -> Optional[datetime.timedelta]:
         """Idle request-queue wait bound while context KV transfers are tracked.
@@ -9239,10 +9192,7 @@ class PyExecutor:
                 None (attention DP off, PP/CP, or non-ADP callers) keeps the
                 probe path unchanged.
         """
-        self._publish_transfer_outcomes()
-        if not self.enable_attention_dp and getattr(
-                self, "_conversation_manager", None) is not None:
-            self._publish_conversation_activity()
+        self._publish_rank_observations()
         connector = self.kv_connector_manager
         control_pending = len(self.control_requests) != 0
         # Continue the existing broadcast slot for cancellations during drain.
@@ -9482,7 +9432,8 @@ class PyExecutor:
         if not self.enable_attention_dp:
             return timeout, self._idle_heartbeat_tick
         adp_stats = self._adp_iter_stats
-        if adp_stats.next_payload() is not None:
+        payload = adp_stats.next_payload()
+        if payload is not None and payload.has_iter_stats:
             # Ranks that are not aligned yet settle nothing; do not spin.
             return (immediately if adp_stats.last_finalize_settled else
                     at_most(period)), None
@@ -9823,9 +9774,7 @@ class PyExecutor:
             idle_wait_follows: Whether the fleet has no live or waiting request.
         """
         while True:
-            self._publish_transfer_outcomes(all_rank_states)
-            if getattr(self, "_conversation_manager", None) is not None:
-                self._publish_conversation_activity(all_rank_states)
+            self._publish_rank_observations(all_rank_states)
             self._export_adp_fanout(
                 self._adp_iter_stats.finalize(
                     all_rank_states,

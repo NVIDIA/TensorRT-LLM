@@ -274,7 +274,6 @@ class ADPIterStatsBuffer:
         host_step_time_ms: Optional[float] = None,
         prev_device_step_time_ms: Optional[float] = None,
         gpu_forward_time_ms: Optional[float] = None,
-        kv_transfer_outcomes: tuple[int, int, int] | None = None,
         is_queue_snapshot: bool = False,
         idle_heartbeat: bool = False,
     ) -> None:
@@ -293,7 +292,6 @@ class ADPIterStatsBuffer:
         # An idle heartbeat is always a queue snapshot.
         is_queue_snapshot = is_queue_snapshot or idle_heartbeat
         payload = self.make_payload(stats)
-        payload.kv_transfer_outcomes = kv_transfer_outcomes
         iter_id = payload.iter_stats_iter
         if idle_heartbeat:
             for pending_iter in list(self._idle_heartbeat_iters):

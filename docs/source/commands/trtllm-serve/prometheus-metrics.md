@@ -44,7 +44,7 @@ Rendering is offline; remove `--dry-run` to publish. See the
 for datasource/workload selection, API versus ConfigMap ownership, publication
 and recovery. Select one scrape path per engine to avoid duplicated observations.
 Optional panels remain hidden until native measurements arrive; dashboard setup
-does not enable instrumentation. See [tiered KV metrics](kv-cache-metrics.md)
+does not enable instrumentation. See [tiered KV metrics](#tiered-kv-cache)
 for occupancy, movement, sampled migration timing and conversation counts.
 
 ## Metric reference
@@ -224,4 +224,78 @@ must not be rescaled by the iteration interval.
 
 The exporter adds CPU and exposition work. Optional KV migration CUDA timing is
 disabled by default; its costs and interpretation are described in the
-[tiered KV guide](kv-cache-metrics.md#optional-sampled-migration-latency).
+[migration timing section](#sampled-migration-latency).
+
+## Tiered KV cache
+
+KVCacheManagerV2 reports storage metrics by `dp_rank`, `cache_level`, `cache_tier`, and
+`pool_group`. Pool groups are local to their level. With attention DP, detailed storage
+snapshots come from rank 0. Older native builds can omit unsupported fields.
+
+| Metric | Type | Additional labels and meaning |
+| --- | --- | --- |
+| `kv_cache_tier_blocks` | Gauge | `state`: disjoint free, evictable and unavailable physical slots. |
+| `kv_cache_tier_bytes` | Gauge | Same states multiplied by the pool's summed slot sizes; logical capacity, excluding allocator padding. |
+| `kv_cache_tier_moved_blocks_total` | Counter | `operation`: restore, evict, drop_capacity or drop_priority. |
+| `kv_cache_tier_moved_bytes_total` | Counter | Movement multiplied by the attributed pool's slot size, not wire traffic. |
+| `kv_cache_tier_migration_duration_seconds` | Histogram | Sampled restore/evict batches, with source/destination level and tier labels. |
+| `kv_cache_migration_timing_skipped_total` | Counter | Eligible timing samples skipped at the pending-event limit. |
+
+Free slots are unallocated. Evictable slots hold pages reclaimable by the eviction policy.
+The exported `unavailable = total - free - evictable` includes retained cold-tier copies,
+which can also be reclaimed and are excluded by native `StorageStatistics::unavailable()`.
+Resident occupancy is `(unavailable + evictable) / total`. Keep `pool_group` in the query
+to identify capacity pressure that a tier average can hide.
+
+Restore counts accepted movement toward a hotter level on the destination pool. Evict
+counts movement toward a colder level on the source pool. Capacity and priority drops are
+attributed to the last resident pool. Release, cache clear, and same-level copies are excluded.
+Counters measure accepted submissions. Async errors do not roll them back. Byte metrics
+use the attributed pool's logical slot size, which can differ from wire bytes.
+
+### Sampled migration latency
+
+Set `TRTLLM_KV_CACHE_TIMING_SAMPLE_INTERVAL=N` before creating the engine. Positive N samples
+the first and every Nth eligible batch per source/destination/pool path. Zero disables
+timing by default. With stats enabled, the manager polls up to 64 pending CUDA event pairs.
+Collection drains completed samples and counts samples skipped at capacity. A transfer
+that never completes occupies a slot until teardown.
+
+The histogram measures stream time for a migration batch, including codec and staging
+work on that path. Check sample coverage and skipped counts when interpreting percentiles.
+
+```promql
+histogram_quantile(0.95,
+  sum by (le, instance, source_cache_level, destination_cache_level) (
+    rate(trtllm_kv_cache_tier_migration_duration_seconds_bucket{operation="restore"}[5m])
+  )
+)
+```
+
+### Conversations
+
+`trtllm_kv_cache_num_conversations` counts retention-map entries, including retained drop
+plans. Entries can exist without resident KV blocks. The gauge is absent when retention
+tracking is disabled.
+
+With iteration stats enabled, workers separately track admissions by
+`(conversation_id, lora_task_id, cache_salt)` after request conversion and placement.
+They exclude output children, dummy requests, and blank IDs. Repeated turns refresh the
+last-seen time, and later cancellation leaves admission history intact. Worker counts
+can overlap. Identities stay in the worker.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `trtllm_conversation_unique_seen{window="10m/1h"}` | Gauge | Distinct tracked identities in `(now - window, now]`; lower bound while incomplete. |
+| `trtllm_conversation_unique_seen_complete{window="10m/1h"}` | Gauge | Full window observed without capacity skips. |
+| `trtllm_conversation_tracking_overflow_total{window="10m/1h",reason="entries/identity_bytes"}` | Counter | Skipped admission observations, not distinct missing identities. |
+
+The 10-minute and 1-hour windows share limits of 100,000 entries and 16 MiB of
+accounted identity storage. A key in both windows consumes two entries. Container and
+allocator overhead are outside the byte accounting. Known identities refresh at capacity.
+Startup and skipped observations leave a window incomplete until one full window has elapsed.
+Cache clears preserve activity history. Restart resets it.
+
+Snapshots refresh at most once a second and use the existing ADP exchange. Expiring many
+identities together costs up to one pass over the retained entries. Filter on
+`trtllm_conversation_unique_seen_complete == 1` when queries require exact counts.
