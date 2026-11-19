@@ -1444,6 +1444,48 @@ class ModelConfig(Generic[TConfig]):
                 quantization_config.get('quantized_layers', None) is not None)
 
     @staticmethod
+    def _mtp_moe_request(
+            spec_config, moe_request: Optional["MoEImplRequest"]
+    ) -> Optional["MoEImplRequest"]:
+        """The request the MXFP4 format of the MTP layers' routed experts is
+        picked for.
+
+        A target pinned by ``moe_config.tactic`` names implementations of its
+        own experts only. Its MTP layers then select their own, as
+        ``modeling_speculative._draft_moe_selection`` resolves them:
+        ``speculative_config.moe_tactic`` or ``moe_backend``, else AUTO (None,
+        not resolved yet). Without a tactic they share the target's request.
+        """
+        if moe_request is None or not moe_request.pinned:
+            return moe_request
+        moe_tactic = getattr(spec_config, "moe_tactic", None)
+        moe_backend = getattr(spec_config, "moe_backend", None)
+        if moe_tactic is None and moe_backend in (None, "AUTO"):
+            return None
+        return MoESelection.of(moe_backend, moe_tactic).request()
+
+    @staticmethod
+    def _without_mtp_layers(layer_quant_config: Optional[Dict[str,
+                                                              QuantConfig]],
+                            num_hidden_layers: int):
+        """``layer_quant_config`` without the modules of MoE layers numbered
+        from ``num_hidden_layers`` on, the MTP layers."""
+        if layer_quant_config is None:
+            return None
+
+        def is_mtp_module(name: str) -> bool:
+            parts = name.split(".")
+            return (len(parts) > 2 and parts[:2] == ["model", "layers"]
+                    and parts[2].isdigit()
+                    and int(parts[2]) >= num_hidden_layers)
+
+        return {
+            name: config
+            for name, config in layer_quant_config.items()
+            if not is_mtp_module(name)
+        }
+
+    @staticmethod
     def _set_deepseek_v4_routed_moe_quant_config(
             pretrained_config,
             checkpoint_dir: str,
@@ -1482,11 +1524,12 @@ class ModelConfig(Generic[TConfig]):
                     "for MXFP4 or U8 for NVFP4.")
             return layer_quant_config
 
-        def build_experts_quant_config(layout_name: str) -> QuantConfig:
+        def build_experts_quant_config(layout_name: str,
+                                       request) -> QuantConfig:
             experts_quant_config = QuantConfig()
             if layout_name == "mxfp4":
                 experts_quant_config.quant_algo = (
-                    ModelConfig._mxfp4_quant_algo_for(moe_request))
+                    ModelConfig._mxfp4_quant_algo_for(request))
                 experts_quant_config.group_size = 32
             else:
                 experts_quant_config.quant_algo = QuantAlgo.NVFP4
@@ -1497,7 +1540,9 @@ class ModelConfig(Generic[TConfig]):
             ]
             return experts_quant_config
 
-        experts_quant_configs = {layout: build_experts_quant_config(layout)}
+        experts_quant_configs = {
+            layout: build_experts_quant_config(layout, moe_request)
+        }
         logger.info(
             "Detected DeepSeek-V4 routed MoE %s checkpoint layout in layers.0; "
             "using %s for the routed experts of the %d body MoE layers.",
@@ -1513,6 +1558,11 @@ class ModelConfig(Generic[TConfig]):
             layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"] = (
                 experts_quant_configs[layout])
 
+        # The MTP layers make their own MoE selection, so the MXFP4 format of
+        # their experts follows it.
+        mtp_request = ModelConfig._mtp_moe_request(spec_config, moe_request)
+        mtp_quant_configs = (experts_quant_configs
+                             if mtp_request is moe_request else {})
         for mtp_idx, block in enumerate(mtp_blocks):
             layer_idx = pretrained_config.num_hidden_layers + mtp_idx
             header = expert_headers[block]
@@ -1532,17 +1582,17 @@ class ModelConfig(Generic[TConfig]):
                     message, layer_idx, layout.upper())
             # A checkpoint without the block keeps the layers.0 format.
             block_layout = block_layout or layout
-            if block_layout not in experts_quant_configs:
-                experts_quant_configs[block_layout] = (
-                    build_experts_quant_config(block_layout))
+            if block_layout not in mtp_quant_configs:
+                mtp_quant_configs[block_layout] = (build_experts_quant_config(
+                    block_layout, mtp_request))
             if block_layout != layout:
                 logger.info(
                     "DeepSeek-V4 routed MoE block %s has the %s checkpoint "
                     "layout; using %s for the routed experts of MoE layer %d.",
                     block, block_layout.upper(),
-                    experts_quant_configs[block_layout].quant_algo, layer_idx)
+                    mtp_quant_configs[block_layout].quant_algo, layer_idx)
             layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"] = (
-                experts_quant_configs[block_layout])
+                mtp_quant_configs[block_layout])
         return layer_quant_config
 
     @staticmethod
@@ -2325,9 +2375,16 @@ class ModelConfig(Generic[TConfig]):
             # The literal model code is built for, derived from the tactic
             # (see MoEImplRequest.backend_for). The Mistral config loader
             # (checkpoints/mistral/config_loader.py) repeats this derivation.
-            moe_backend = moe_selection.resolve_backend(architecture,
-                                                        quant_config,
-                                                        layer_quant_config)
+            tactic_layer_quant_config = layer_quant_config
+            if (architecture in _DEEPSEEK_V4_ARCHITECTURES
+                    or architecture in _DEEPSEEK_V41_ARCHITECTURES):
+                # The tactic names the target's implementations; the MTP
+                # layers select their own (_mtp_moe_request), so their
+                # experts do not narrow it.
+                tactic_layer_quant_config = cls._without_mtp_layers(
+                    layer_quant_config, pretrained_config.num_hidden_layers)
+            moe_backend = moe_selection.resolve_backend(
+                architecture, quant_config, tactic_layer_quant_config)
         kwargs['moe_backend'] = moe_backend
         kwargs['moe_backend_requested'] = requested_moe_backend
 
