@@ -729,7 +729,8 @@ private:
     // KvCache's memory. If `fromPending`, the source is the pending snapshot page,
     // which is moved into the tree; a pending page that the tree block does not take
     // (it already covers `numTokens`) stays pending.
-    void _snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, int numTokens,
+    //! Returns true when a snapshot page was installed on `treeBlock` for `ssmLcId`.
+    bool _snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, int numTokens,
         bool move = false, bool fromPending = false);
 
     // Snapshot a partial (non-full) final block at `ordinal` into the radix tree,

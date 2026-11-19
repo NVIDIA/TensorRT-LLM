@@ -1197,34 +1197,37 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__init__",
             [](kv::KVCacheEvent* self, int64_t eventId, nb::handle data, int windowSize,
                 std::optional<std::string> hashAlgo, std::optional<int> attentionDpRank,
-                kv::EventLayerGroupId layerGroupId)
+                kv::EventLayerGroupId layerGroupId, std::optional<std::string> layerGroupKind)
             {
-                new (self) kv::KVCacheEvent{
-                    eventId, castEventData(data), windowSize, std::move(hashAlgo), attentionDpRank, layerGroupId};
+                new (self) kv::KVCacheEvent{eventId, castEventData(data), windowSize, std::move(hashAlgo),
+                    attentionDpRank, layerGroupId, std::move(layerGroupKind)};
             },
             nb::arg("event_id"), nb::arg("data"), nb::arg("window_size"), nb::arg("hash_algo") = std::nullopt,
-            nb::arg("attention_dp_rank") = std::nullopt, nb::arg("layer_group_id") = std::nullopt)
+            nb::arg("attention_dp_rank") = std::nullopt, nb::arg("layer_group_id") = std::nullopt,
+            nb::arg("layer_group_kind") = std::nullopt)
         .def_ro("event_id", &kv::KVCacheEvent::eventId)
         .def_prop_ro("data", [](kv::KVCacheEvent const& self) { return castEventData(self.data); })
         .def_ro("window_size", &kv::KVCacheEvent::windowSize)
         .def_ro("hash_algo", &kv::KVCacheEvent::hashAlgo)
         .def_ro("attention_dp_rank", &kv::KVCacheEvent::attentionDpRank)
         .def_ro("layer_group_id", &kv::KVCacheEvent::layerGroupId)
+        .def_ro("layer_group_kind", &kv::KVCacheEvent::layerGroupKind)
         .def("__eq__", &kv::KVCacheEvent::operator==, nb::arg("other"))
         .def("__repr__",
             [](kv::KVCacheEvent const& self)
             {
-                return "KVCacheEvent(event_id=" + pythonRepr(self.eventId) + ", data="
-                    + pythonHandleRepr(castEventData(self.data)) + ", window_size=" + pythonRepr(self.windowSize)
-                    + ", hash_algo=" + pythonRepr(self.hashAlgo) + ", attention_dp_rank="
-                    + pythonRepr(self.attentionDpRank) + ", layer_group_id=" + pythonRepr(self.layerGroupId) + ")";
+                return "KVCacheEvent(event_id=" + pythonRepr(self.eventId)
+                    + ", data=" + pythonHandleRepr(castEventData(self.data))
+                    + ", window_size=" + pythonRepr(self.windowSize) + ", hash_algo=" + pythonRepr(self.hashAlgo)
+                    + ", attention_dp_rank=" + pythonRepr(self.attentionDpRank) + ", layer_group_id="
+                    + pythonRepr(self.layerGroupId) + ", layer_group_kind=" + pythonRepr(self.layerGroupKind) + ")";
             })
         .def("__reduce__",
             [](kv::KVCacheEvent const& self)
             {
                 return nb::make_tuple(nb::type<kv::KVCacheEvent>(),
                     nb::make_tuple(self.eventId, castEventData(self.data), self.windowSize, self.hashAlgo,
-                        self.attentionDpRank, self.layerGroupId));
+                        self.attentionDpRank, self.layerGroupId, self.layerGroupKind));
             });
 
     nb::class_<kv::EventSink>(m, "KVCacheEventSink");
@@ -1234,10 +1237,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("parent_block_hash", &kv::StreamingBlockStoredData::parentBlockHash)
         .def_ro("token_ids", &kv::StreamingBlockStoredData::tokenIds)
         .def_ro("lora_id", &kv::StreamingBlockStoredData::loraId)
+        .def_ro("group_idx", &kv::StreamingBlockStoredData::groupIdx)
+        .def_ro("kv_cache_spec_kind", &kv::StreamingBlockStoredData::kvCacheSpecKind)
         .def_prop_ro("mm_keys", [](kv::StreamingBlockStoredData const& self) { return castStreamingMmKeys(self); });
 
     nb::class_<kv::StreamingBlockRemovedData>(m, "StreamingBlockRemovedData")
-        .def_ro("block_hashes", &kv::StreamingBlockRemovedData::blockHashes);
+        .def_ro("block_hashes", &kv::StreamingBlockRemovedData::blockHashes)
+        .def_ro("group_idx", &kv::StreamingBlockRemovedData::groupIdx)
+        .def_ro("kv_cache_spec_kind", &kv::StreamingBlockRemovedData::kvCacheSpecKind);
 
     nb::class_<kv::StreamingAllBlocksClearedData>(m, "StreamingAllBlocksClearedData");
 
@@ -1246,7 +1253,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("removed_blocks", &kv::StreamingEventStats::removedBlocks)
         .def_ro("partial_blocks_suppressed", &kv::StreamingEventStats::partialBlocksSuppressed)
         .def_ro("non_target_life_cycles_ignored", &kv::StreamingEventStats::nonTargetLifeCyclesIgnored)
-        .def_ro("dropped_events", &kv::StreamingEventStats::droppedEvents);
+        .def_ro("dropped_events", &kv::StreamingEventStats::droppedEvents)
+        .def_ro("recurrent_checkpoints_stored", &kv::StreamingEventStats::recurrentCheckpointsStored)
+        .def_ro("recurrent_checkpoints_removed", &kv::StreamingEventStats::recurrentCheckpointsRemoved);
 
     nb::class_<kv::StreamingEventSink, kv::EventSink>(m, "StreamingEventSink")
         .def(nb::init<int, std::optional<int>>(), nb::arg("max_entries") = 50'000,
@@ -1256,6 +1265,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::StreamingEventSink& self, int lifeCycleId)
             { self.setTargetLifeCycle(kv::LifeCycleId{lifeCycleId}); },
             nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "set_recurrent_life_cycles",
+            [](kv::StreamingEventSink& self, std::vector<int> const& lifeCycleIds)
+            {
+                std::vector<kv::LifeCycleId> lifeCycles;
+                lifeCycles.reserve(lifeCycleIds.size());
+                for (int const lifeCycleId : lifeCycleIds)
+                {
+                    lifeCycles.emplace_back(lifeCycleId);
+                }
+                self.setRecurrentLifeCycles(std::move(lifeCycles));
+            },
+            nb::arg("life_cycle_ids"), nb::call_guard<nb::gil_scoped_release>())
         .def("drain_iteration_events", &kv::StreamingEventSink::drainIterationEvents,
             nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("stats", &kv::StreamingEventSink::getStats, nb::call_guard<nb::gil_scoped_release>());
@@ -1283,6 +1305,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("add_created_event", &kv::EventManager::addCreatedEvent, nb::arg("num_blocks_per_cache_level"),
             nb::arg("layer_group_ids") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("set_layer_group_window_sizes", &kv::EventManager::setLayerGroupWindowSizes, nb::arg("window_sizes"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("set_layer_group_kinds", &kv::EventManager::setLayerGroupKinds, nb::arg("kinds"),
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "add_stored_event",

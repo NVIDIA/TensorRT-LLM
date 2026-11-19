@@ -5964,6 +5964,17 @@ class KVEventsConfig(StrictBaseModel):
         default="",
         description="ZeroMQ subscription topic used for KV cache event batches."
     )
+    publish_recurrent_checkpoints: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Also publish the recurrent-state (Mamba/GDN/KDA) snapshots of hybrid models as "
+        "tagged BlockStored/BlockRemoved events (group_idx, kv_cache_spec_kind='mamba', "
+        "token_ids empty) under the block hash of the attention block they sit on, so a "
+        "KV-aware router knows at which blocks a worker can resume a cached prefix. "
+        "Attention events are unchanged. Needs kv_cache_config.enable_block_reuse and a "
+        "mamba_state_config snapshot policy; periodic_snapshot_interval should be a multiple "
+        "of tokens_per_block, since only full-block snapshots are published.")
 
     def model_post_init(self, __context) -> None:
         if self.publisher is None:

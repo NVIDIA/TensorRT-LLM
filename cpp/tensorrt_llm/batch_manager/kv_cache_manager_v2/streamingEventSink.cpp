@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/page.h"
 #include "tensorrt_llm/common/logger.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstddef>
 #include <iterator>
@@ -55,6 +56,41 @@ void StreamingEventSink::setTargetLifeCycle(LifeCycleId lifeCycle)
     mTargetLifeCycle = lifeCycle;
 }
 
+void StreamingEventSink::setRecurrentLifeCycles(std::vector<LifeCycleId> lifeCycles)
+{
+    for (auto const lifeCycle : lifeCycles)
+    {
+        if (lifeCycle.value() < 0)
+        {
+            throw std::invalid_argument("lifeCycle must be non-negative");
+        }
+    }
+    std::lock_guard<std::mutex> lock(mMutex);
+    if (mTargetLifeCycle.has_value())
+    {
+        for (auto const lifeCycle : lifeCycles)
+        {
+            if (lifeCycle == *mTargetLifeCycle)
+            {
+                throw std::invalid_argument("a recurrent life cycle cannot also be the attention target");
+            }
+        }
+    }
+    mRecurrentLifeCycles = std::move(lifeCycles);
+}
+
+std::optional<int> StreamingEventSink::recurrentGroupIdx(LifeCycleId lifeCycle) const
+{
+    for (size_t i = 0; i < mRecurrentLifeCycles.size(); ++i)
+    {
+        if (mRecurrentLifeCycles[i] == lifeCycle)
+        {
+            return static_cast<int>(i) + 1;
+        }
+    }
+    return std::nullopt;
+}
+
 std::vector<StreamingEventData> StreamingEventSink::drainIterationEvents()
 {
     std::lock_guard<std::mutex> lock(mMutex);
@@ -74,6 +110,16 @@ void StreamingEventSink::addStoredBlock(Block const& block)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     addStoredBlockUnlocked(block);
+    // A block announced with its snapshots already attached (partial-block commits, re-attached
+    // orphans) carries its checkpoints in the same announcement.
+    for (size_t i = 0; i < mRecurrentLifeCycles.size(); ++i)
+    {
+        auto const lifeCycle = mRecurrentLifeCycles[i];
+        if (lifeCycle < block.storage.size() && block.getPage(lifeCycle) != nullptr)
+        {
+            addRecurrentCheckpointUnlocked(block, lifeCycle, static_cast<int>(i) + 1);
+        }
+    }
 }
 
 void StreamingEventSink::addStoredLifeCycle(Block const& block, LifeCycleId lifeCycle)
@@ -83,12 +129,17 @@ void StreamingEventSink::addStoredLifeCycle(Block const& block, LifeCycleId life
     {
         return;
     }
-    if (lifeCycle != *mTargetLifeCycle)
+    if (lifeCycle == *mTargetLifeCycle)
     {
-        ++mStats.nonTargetLifeCyclesIgnored;
+        addStoredBlockUnlocked(block);
         return;
     }
-    addStoredBlockUnlocked(block);
+    if (auto const groupIdx = recurrentGroupIdx(lifeCycle))
+    {
+        addRecurrentCheckpointUnlocked(block, lifeCycle, *groupIdx);
+        return;
+    }
+    ++mStats.nonTargetLifeCyclesIgnored;
 }
 
 void StreamingEventSink::addRemovedBlock(Digest const& blockKey)
@@ -104,12 +155,31 @@ void StreamingEventSink::addRemovedLifeCycle(Digest const& blockKey, LifeCycleId
     {
         return;
     }
-    if (lifeCycle != *mTargetLifeCycle)
+    if (lifeCycle == *mTargetLifeCycle)
     {
-        ++mStats.nonTargetLifeCyclesIgnored;
+        addRemovedBlockUnlocked(blockKey);
         return;
     }
-    addRemovedBlockUnlocked(blockKey);
+    if (auto const groupIdx = recurrentGroupIdx(lifeCycle))
+    {
+        // The snapshot page was evicted on its own; the attention block stays published.
+        auto const stored = mStoredBlocks.find(blockKey);
+        if (stored == mStoredBlocks.end())
+        {
+            return;
+        }
+        auto& groups = stored->second.recurrentGroups;
+        auto const it = std::find(groups.begin(), groups.end(), *groupIdx);
+        if (it == groups.end())
+        {
+            return;
+        }
+        groups.erase(it);
+        addRemovedHashUnlocked(stored->second.blockHash, *groupIdx);
+        ++mStats.recurrentCheckpointsRemoved;
+        return;
+    }
+    ++mStats.nonTargetLifeCyclesIgnored;
 }
 
 void StreamingEventSink::addAllBlocksCleared()
@@ -182,7 +252,8 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
     if (!mPendingEvents.empty())
     {
         auto* stored = std::get_if<StreamingBlockStoredData>(&mPendingEvents.back());
-        if (stored != nullptr && !stored->blockHashes.empty() && parentHash.has_value()
+        // Never merge into a tagged checkpoint event: it shares hashes with attention blocks.
+        if (stored != nullptr && !stored->groupIdx.has_value() && !stored->blockHashes.empty() && parentHash.has_value()
             && stored->blockHashes.back() == *parentHash && stored->loraId == loraId)
         {
             stored->blockHashes.push_back(blockHash);
@@ -200,6 +271,70 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
     ++mStats.storedBlocks;
 }
 
+void StreamingEventSink::addRecurrentCheckpointUnlocked(Block const& block, LifeCycleId lifeCycle, int groupIdx)
+{
+    // The checkpoint is keyed by the attention block's hash, so the block must already be
+    // published; a partial block or an unpublished parent chain publishes no checkpoint either.
+    auto const stored = mStoredBlocks.find(block.key);
+    if (stored == mStoredBlocks.end())
+    {
+        return;
+    }
+    if (lifeCycle >= block.storage.size())
+    {
+        return;
+    }
+    auto const* page = block.getPage(lifeCycle);
+    if (page == nullptr)
+    {
+        return;
+    }
+    // A snapshot taken inside the block (unaligned snapshot point) is a valid resume point only
+    // at that token depth, which the wire format cannot express: publish full-block snapshots only.
+    if (!block.isFull() || page->numTokensInBlock < static_cast<int>(block.tokens.size()))
+    {
+        ++mStats.partialBlocksSuppressed;
+        return;
+    }
+    auto& groups = stored->second.recurrentGroups;
+    if (std::find(groups.begin(), groups.end(), groupIdx) != groups.end())
+    {
+        return;
+    }
+    std::optional<int64_t> parentHash;
+    if (block.prev != nullptr && block.prev->type() == NodeBase::Type::kBLOCK)
+    {
+        auto const& parent = *static_cast<Block const*>(block.prev);
+        auto const storedParent = mStoredBlocks.find(parent.key);
+        if (storedParent != mStoredBlocks.end())
+        {
+            parentHash = storedParent->second.blockHash;
+        }
+    }
+    if (!reserveEntryUnlocked())
+    {
+        return;
+    }
+    int64_t const blockHash = stored->second.blockHash;
+    auto const loraId = stored->second.loraId;
+    groups.push_back(groupIdx);
+    ++mStats.recurrentCheckpointsStored;
+    if (!mPendingEvents.empty())
+    {
+        auto* pending = std::get_if<StreamingBlockStoredData>(&mPendingEvents.back());
+        if (pending != nullptr && pending->groupIdx == groupIdx && !pending->blockHashes.empty()
+            && parentHash.has_value() && pending->blockHashes.back() == *parentHash && pending->loraId == loraId)
+        {
+            pending->blockHashes.push_back(blockHash);
+            pending->mmKeys.emplace_back();
+            return;
+        }
+    }
+    std::vector<std::vector<MmKey>> mmKeys(1);
+    mPendingEvents.emplace_back(StreamingBlockStoredData{
+        {blockHash}, parentHash, {}, std::move(mmKeys), loraId, groupIdx, std::string("mamba")});
+}
+
 void StreamingEventSink::addRemovedBlockUnlocked(Digest const& blockKey)
 {
     auto const stored = mStoredBlocks.find(blockKey);
@@ -208,21 +343,35 @@ void StreamingEventSink::addRemovedBlockUnlocked(Digest const& blockKey)
         return;
     }
     int64_t const blockHash = stored->second.blockHash;
+    auto const groups = std::move(stored->second.recurrentGroups);
     mStoredBlocks.erase(stored);
+    for (int const groupIdx : groups)
+    {
+        addRemovedHashUnlocked(blockHash, groupIdx);
+        ++mStats.recurrentCheckpointsRemoved;
+    }
     addRemovedHashUnlocked(blockHash);
 }
 
-void StreamingEventSink::addRemovedHashUnlocked(int64_t blockHash)
+void StreamingEventSink::addRemovedHashUnlocked(int64_t blockHash, std::optional<int> groupIdx)
 {
     if (!mPendingEvents.empty())
     {
         auto* removed = std::get_if<StreamingBlockRemovedData>(&mPendingEvents.back());
-        if (removed != nullptr)
+        if (removed != nullptr && removed->groupIdx == groupIdx)
         {
             removed->blockHashes.push_back(blockHash);
-            ++mStats.removedBlocks;
+            if (!groupIdx.has_value())
+            {
+                ++mStats.removedBlocks;
+            }
             return;
         }
+    }
+    if (groupIdx.has_value())
+    {
+        mPendingEvents.emplace_back(StreamingBlockRemovedData{{blockHash}, groupIdx, std::string("mamba")});
+        return;
     }
     mPendingEvents.emplace_back(StreamingBlockRemovedData{{blockHash}});
     ++mStats.removedBlocks;

@@ -3427,11 +3427,21 @@ class KVCacheManagerV2(BaseResourceManager):
                 "evicted pages a host tier."
             )
         if self.event_manager is not None:
+            is_streaming_events = isinstance(self.event_manager, StreamingKVCacheEventManager)
             self.event_manager.set_layer_group_window_sizes(
-                self._get_event_window_sizes_by_layer_group(
-                    attention_only=isinstance(self.event_manager, StreamingKVCacheEventManager)
-                )
+                self._get_event_window_sizes_by_layer_group(attention_only=is_streaming_events)
             )
+            self.event_manager.set_layer_group_kinds(self._get_event_kinds_by_layer_group())
+            if is_streaming_events and self.event_manager.publish_recurrent_checkpoints:
+                recurrent_groups = [
+                    layer_group_id
+                    for layer_group_id, kind in self._get_event_kinds_by_layer_group().items()
+                    if kind == "mamba"
+                ]
+                self._warn_recurrent_checkpoint_publishing(
+                    recurrent_groups, kv_cache_config, tokens_per_block
+                )
+                self.event_manager.set_recurrent_life_cycles(recurrent_groups)
             self.event_manager.add_created_event(
                 self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
                 self._get_event_layer_group_ids(),
@@ -4459,6 +4469,53 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             window_sizes[int(layer_group_id)] = get_event_window_size(layer_config)
         return window_sizes
+
+    def _get_event_kinds_by_layer_group(self) -> Dict[int, str]:
+        """Layer-group id -> what the group caches, as reported on KV cache events.
+
+        "attention" is full attention, "sliding_window" a windowed attention group and
+        "mamba" a recurrent-state (SSM/GDN/KDA) group whose committed pages are state
+        snapshots, so a block that carries one is a position where a hybrid model can
+        resume a cached prefix. Other groups report no kind.
+        """
+        kinds: Dict[int, str] = {}
+        for layer_group_id, layer_ids in enumerate(self._layer_ids_by_group):
+            layer_config = self.kv_cache_manager_py_config.layers[int(layer_ids[0])]
+            if isinstance(layer_config, SsmLayerConfig):
+                kinds[int(layer_group_id)] = "mamba"
+            elif isinstance(layer_config, AttentionLayerConfig):
+                kinds[int(layer_group_id)] = (
+                    "attention"
+                    if getattr(layer_config, "sliding_window_size", None) is None
+                    else "sliding_window"
+                )
+        return kinds
+
+    @staticmethod
+    def _warn_recurrent_checkpoint_publishing(
+        recurrent_groups: List[int], kv_cache_config: KvCacheConfig, tokens_per_block: int
+    ) -> None:
+        """Explain configurations under which no recurrent checkpoint can be published."""
+        if not recurrent_groups:
+            logger.warning(
+                "kv_events_config.publish_recurrent_checkpoints is set but the model has no "
+                "recurrent-state layer group; no checkpoint events will be published."
+            )
+            return
+        if not kv_cache_config.enable_block_reuse:
+            logger.warning(
+                "kv_events_config.publish_recurrent_checkpoints is set but block reuse is "
+                "disabled, so no recurrent-state snapshot is ever committed or published."
+            )
+            return
+        state_config = getattr(kv_cache_config, "mamba_state_config", None)
+        interval = int(getattr(state_config, "periodic_snapshot_interval", 0) or 0)
+        if interval > 0 and interval % tokens_per_block != 0:
+            logger.warning(
+                f"mamba_state_config.periodic_snapshot_interval={interval} is not a multiple of "
+                f"tokens_per_block={tokens_per_block}: periodic snapshots land inside a block "
+                "and only full-block snapshots are published as recurrent checkpoints."
+            )
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
         for pool_group in self.impl.pool_group_descs:

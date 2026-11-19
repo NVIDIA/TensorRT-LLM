@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -39,12 +40,19 @@ struct StreamingBlockStoredData
     //! One entry per blockHash. Empty block entries represent text-only blocks.
     std::vector<std::vector<MmKey>> mmKeys;
     std::optional<LoraTaskIdType> loraId;
+    //! Set for recurrent-state checkpoints: the group index (1-based over the declared recurrent
+    //! life cycles) and the kind "mamba". Attention events leave both unset.
+    std::optional<int> groupIdx;
+    std::optional<std::string> kvCacheSpecKind;
 };
 
 //! Semantic data for one wire-level BlockRemoved event.
 struct StreamingBlockRemovedData
 {
     std::vector<int64_t> blockHashes;
+    //! Set for recurrent-state checkpoint removals, as on StreamingBlockStoredData.
+    std::optional<int> groupIdx;
+    std::optional<std::string> kvCacheSpecKind;
 };
 
 //! Semantic data for one wire-level AllBlocksCleared event.
@@ -63,6 +71,9 @@ struct StreamingEventStats
     int64_t partialBlocksSuppressed = 0;
     int64_t nonTargetLifeCyclesIgnored = 0;
     int64_t droppedEvents = 0;
+    //! Recurrent-state checkpoints announced and withdrawn, when checkpoint publishing is on.
+    int64_t recurrentCheckpointsStored = 0;
+    int64_t recurrentCheckpointsRemoved = 0;
 };
 
 //! Captures streaming KV-cache lifecycle events without depending on Python or a transport.
@@ -77,6 +88,11 @@ public:
     }
 
     void setTargetLifeCycle(LifeCycleId lifeCycle);
+    //! Publish the recurrent-state (SSM) snapshots of these life cycles as tagged checkpoint events
+    //! (`groupIdx` = 1 + position in `lifeCycles`, `kvCacheSpecKind` = "mamba"). A checkpoint is
+    //! published for a block only after the block's attention page was published, under the same
+    //! block hash, so consumers can align it with the attention prefix. Empty disables publishing.
+    void setRecurrentLifeCycles(std::vector<LifeCycleId> lifeCycles);
     [[nodiscard]] std::vector<StreamingEventData> drainIterationEvents();
     [[nodiscard]] StreamingEventStats getStats() const;
 
@@ -93,11 +109,15 @@ private:
     {
         int64_t blockHash;
         std::optional<LoraTaskIdType> loraId;
+        //! Recurrent group indices whose checkpoint was published for this block.
+        std::vector<int> recurrentGroups;
     };
 
     void addStoredBlockUnlocked(Block const& block);
+    void addRecurrentCheckpointUnlocked(Block const& block, LifeCycleId lifeCycle, int groupIdx);
     void addRemovedBlockUnlocked(Digest const& blockKey);
-    void addRemovedHashUnlocked(int64_t blockHash);
+    void addRemovedHashUnlocked(int64_t blockHash, std::optional<int> groupIdx = std::nullopt);
+    [[nodiscard]] std::optional<int> recurrentGroupIdx(LifeCycleId lifeCycle) const;
     void recordDroppedEventUnlocked(char const* reason);
     [[nodiscard]] bool reserveEntryUnlocked();
     [[nodiscard]] static int64_t wireHash(Digest const& digest);
@@ -105,6 +125,7 @@ private:
     int mMaxEntries;
     std::optional<int> mMmTokenIdOffset;
     std::optional<LifeCycleId> mTargetLifeCycle;
+    std::vector<LifeCycleId> mRecurrentLifeCycles;
     int mPendingEntries = 0;
     std::unordered_map<Digest, StoredBlock> mStoredBlocks;
     std::vector<StreamingEventData> mPendingEvents;

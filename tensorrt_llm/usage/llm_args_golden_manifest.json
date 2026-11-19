@@ -870,6 +870,11 @@
       "path": "kv_cache_config.kv_events_config.max_queue_size"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.publish_recurrent_checkpoints"
+    },
+    {
       "allowed_values": [
         "null",
         "zmq"

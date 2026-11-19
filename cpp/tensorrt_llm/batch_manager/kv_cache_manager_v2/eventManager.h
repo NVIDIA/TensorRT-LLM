@@ -134,12 +134,15 @@ struct KVCacheEvent
     std::optional<std::string> hashAlgo;
     std::optional<int> attentionDpRank;
     EventLayerGroupId layerGroupId;
+    //! What the layer group caches: "attention", "sliding_window" or "mamba" (a recurrent-state
+    //! checkpoint). Unset when the owner did not declare kinds, so older consumers see no change.
+    std::optional<std::string> layerGroupKind;
 
     bool operator==(KVCacheEvent const& other) const
     {
         return eventId == other.eventId && data == other.data && windowSize == other.windowSize
             && hashAlgo == other.hashAlgo && attentionDpRank == other.attentionDpRank
-            && layerGroupId == other.layerGroupId;
+            && layerGroupId == other.layerGroupId && layerGroupKind == other.layerGroupKind;
     }
 };
 
@@ -163,6 +166,9 @@ public:
     void addCreatedEvent(
         std::vector<int> numBlocksPerCacheLevel, std::optional<std::vector<int>> layerGroupIds = std::nullopt);
     void setLayerGroupWindowSizes(std::map<int, int> windowSizes);
+    //! Declare each layer group's kind ("attention", "sliding_window", "mamba"); events of a
+    //! declared group carry it as `layerGroupKind`.
+    void setLayerGroupKinds(std::map<int, std::string> kinds);
     void addStoredEvent(KVCacheStoredData data, EventLayerGroupId layerGroupId = std::nullopt);
     void addRemovedEvent(std::vector<EventBlockHash> blockHashes, EventLayerGroupId layerGroupId = std::nullopt);
     void addUpdatedEvent(EventBlockHash blockHash, std::optional<KVCacheEventDiff> cacheLevel = std::nullopt,
@@ -231,11 +237,13 @@ private:
     std::vector<KVCacheEvent> drainPendingEventsUnlocked();
     void publishEventsUnlocked(std::vector<KVCacheEvent> events, std::optional<int> maxKvEventEntries = std::nullopt);
     int getWindowSize(EventLayerGroupId layerGroupId) const;
+    std::optional<std::string> getLayerGroupKind(EventLayerGroupId layerGroupId) const;
     void dropHashCache(Digest const& blockKey);
 
     int mMaxKvEventEntries;
     int mWindowSize;
     std::map<int, int> mWindowSizeByLayerGroup;
+    std::map<int, std::string> mKindByLayerGroup;
     std::optional<int> mAttentionDpRank;
     AttentionDpGatherFn mAttentionDpGather;
     HashAlgorithm mHashAlgo;

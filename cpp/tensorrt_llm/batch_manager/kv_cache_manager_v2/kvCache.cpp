@@ -1486,19 +1486,19 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
 // _snapshot_ssm_to_tree_block.
 // ---------------------------------------------------------------------------
 
-void KvCache::_snapshotSsmToTreeBlock(
+bool KvCache::_snapshotSsmToTreeBlock(
     SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, int numTokens, bool move, bool fromPending)
 {
     if (isPrivateLifeCycle(mManager->lifeCycles()[ssmLcId]))
     {
-        return;
+        return false;
     }
     int const numTokensInBlock = numTokens - treeBlock->ordinal().value() * mTokensPerBlock;
     TLLM_CHECK_DEBUG(0 < numTokensInBlock && numTokensInBlock <= mTokensPerBlock);
 
     if (treeBlock->pageCoverage(ssmLcId) >= numTokensInBlock)
     {
-        return;
+        return false;
     }
 
     if (fromPending)
@@ -1512,7 +1512,7 @@ void KvCache::_snapshotSsmToTreeBlock(
         // convertToCommitted() installs via replacePage(), dropping any shorter snapshot.
         auto committed = up->convertToCommitted(treeBlock, finishEvent(), numTokensInBlock);
         mManager->storage().scheduleForEviction(*committed);
-        return;
+        return true;
     }
 
     auto& ssmBlock = mSsmBlocks[kDefaultBeamIndex];
@@ -1528,10 +1528,10 @@ void KvCache::_snapshotSsmToTreeBlock(
         // convertToCommitted() installs via replacePage(), dropping any shorter snapshot.
         auto committed = up->convertToCommitted(treeBlock, finishEvent(), numTokensInBlock);
         mManager->storage().scheduleForEviction(*committed);
-        return;
+        return true;
     }
 
-    _copyPageToTreeBlock(treeBlock, ssmLcId, srcPage, numTokensInBlock);
+    return _copyPageToTreeBlock(treeBlock, ssmLcId, srcPage, numTokensInBlock) != nullptr;
 }
 
 void KvCache::_reattachOrphanTreeBlocks(BlockOrdinal lastOrdinal, RootBlock& root)
@@ -1651,20 +1651,27 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm, 
     if (commitSsm)
     {
         for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
-            _snapshotSsmToTreeBlock(treeBlock, lcId, start + numTokens, /*move=*/false, ssmFromPending);
+        {
+            if (_snapshotSsmToTreeBlock(treeBlock, lcId, start + numTokens, /*move=*/false, ssmFromPending))
+            {
+                attachedLcs.push_back(lcId);
+            }
+        }
     }
     if (treeBlock->eventSink)
     {
         if (isNew)
         {
+            // Announced after the snapshots above, so the recurrent-state life cycles that
+            // landed on this block are part of the announcement.
             treeBlock->eventSink->addStoredBlock(*treeBlock);
         }
         else
         {
             // The block was already announced, so report just the life cycles this snapshot
-            // added. The event manager itself drops the ones whose page does not span the
-            // whole block: the payload carries the block's full token list and cannot
-            // express a shorter valid prefix.
+            // added (attention pages and recurrent-state snapshots alike). The event manager
+            // itself drops the ones whose page does not span the whole block: the payload
+            // carries the block's full token list and cannot express a shorter valid prefix.
             for (auto lcIdx : attachedLcs)
             {
                 treeBlock->eventSink->addStoredLifeCycle(*treeBlock, lcIdx);
@@ -2647,8 +2654,19 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm, b
     if (didCommit && commitSsm)
     {
         for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
-            _snapshotSsmToTreeBlock(
+        {
+            bool const attached = _snapshotSsmToTreeBlock(
                 newBlock, lcId, start + static_cast<int>(tokenBlock.size()), moveSsm, ssmFromPending);
+            // The block itself was announced before the snapshot existed (addStoredBlock above
+            // only sees the pages present at that time), so the recurrent-state checkpoint is
+            // announced here. Without it the SSM life cycle never enters the event manager's
+            // stored set and its later eviction is dropped, and consumers cannot tell at which
+            // blocks a hybrid model can resume a cached prefix.
+            if (attached && newBlock->eventSink)
+            {
+                newBlock->eventSink->addStoredLifeCycle(*newBlock, lcId);
+            }
+        }
     }
 
     if (sb.isCommitted())
