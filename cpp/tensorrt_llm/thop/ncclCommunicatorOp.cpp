@@ -47,10 +47,6 @@ void addP2pMetadata(common::ProfilerMetadata& metadata, std::string_view operati
     metadata.add("nccl.logical_bytes", static_cast<std::int64_t>(bytes));
     cudaStreamCaptureStatus captureStatus{};
     auto const captureError = cudaStreamIsCapturing(stream, &captureStatus);
-    if (captureError != cudaSuccess)
-    {
-        static_cast<void>(cudaGetLastError());
-    }
     metadata.add("nccl.cuda_graph_state",
         captureError != cudaSuccess                        ? "unknown"
             : captureStatus == cudaStreamCaptureStatusNone ? "eager"
