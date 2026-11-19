@@ -1830,6 +1830,11 @@ class TestBenchmarkRequestStages:
             max_num_active_requests=16,
         )
         ex.previous_batch = None
+        # The broadcast delivers rank 0's vote request to the next call.
+        ex.executor_request_queue = Mock()
+        ex.executor_request_queue.enqueue_benchmark_stage_vote_request.side_effect = (
+            lambda: setattr(ex, "_benchmark_stage_vote_pending", True)
+        )
         ex._configure_benchmark_req_queues_size()
         return ex
 
@@ -1870,8 +1875,11 @@ class TestBenchmarkRequestStages:
         assert ex._benchmark_stage_index == 0
         ex.num_fetch_requests += 8
         ex._maybe_advance_benchmark_stage(0)
+        ex._allgather_model_parallel_status.assert_not_called()
+        ex._maybe_advance_benchmark_stage(0)
         assert ex._benchmark_stage_index == 0
         ex._allgather_model_parallel_status.return_value = [(1, False), (1, False)]
+        ex._maybe_advance_benchmark_stage(0)
         ex._maybe_advance_benchmark_stage(0)
         assert ex._benchmark_stage_index == 1
         assert ex.benchmark_req_queues_size == 4
@@ -1887,10 +1895,12 @@ class TestBenchmarkRequestStages:
         ex.num_fetch_requests += 4
         assert ex._check_benchmark_disagg_gate(ScheduledRequests(), False) == (True, False)
         ex._maybe_advance_benchmark_stage(0)
+        ex._maybe_advance_benchmark_stage(0)
         assert ex._benchmark_stage_index == 2
         assert ex.benchmark_req_queues_size == 8
         ex.num_fetch_requests += 8
         assert ex._check_benchmark_disagg_gate(ScheduledRequests(), True) == (True, False)
+        ex._maybe_advance_benchmark_stage(0)
         ex._maybe_advance_benchmark_stage(0)
         assert ex._benchmark_stage_index == 3
         assert not ex._benchmark_fill_phase_active
@@ -1907,12 +1917,12 @@ class TestBenchmarkRequestStages:
         ex.previous_batch = object() if blocker == "batch" else None
         ex.kv_cache_transceiver.check_gen_transfer_complete.return_value = blocker != "transfer"
         ex._allgather_model_parallel_status = Mock(side_effect=lambda status: [status])
+        ex._benchmark_stage_vote_pending = True
         ex._maybe_advance_benchmark_stage(1 if blocker == "live" else 0)
         assert ex._benchmark_stage_index == 0
-        if blocker == "fill":
-            ex._allgather_model_parallel_status.assert_not_called()
-        else:
-            ex._allgather_model_parallel_status.assert_called_once_with((0, 0))
+        ex._allgather_model_parallel_status.assert_called_once_with((0, 0))
+        ex._maybe_advance_benchmark_stage(1 if blocker == "live" else 0)
+        assert not ex._benchmark_stage_vote_pending
 
     def test_admission_stops_at_stage_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ex = TestBenchmarkFillAdmissionFlowControl._make_executor()
@@ -1923,8 +1933,11 @@ class TestBenchmarkRequestStages:
         ex._benchmark_fill_phase_active = False
         ex._benchmark_stage_base_fetch = 100
         ex.num_fetch_requests = 115
-        ex._pop_from_waiting_queue(Mock(), 0)
+        queue = Mock(**{"peek_request.return_value.child_req_ids": None})
+        ex._pop_from_waiting_queue(queue, 0)
         assert TestBenchmarkFillAdmissionFlowControl._admitted_cap(ex) == 1
         ex.num_fetch_requests = 116
-        ex._pop_from_waiting_queue(Mock(), 0)
+        ex._pop_from_waiting_queue(queue, 0)
         assert TestBenchmarkFillAdmissionFlowControl._admitted_cap(ex) == 0
+        with pytest.raises(ValueError, match="n=1"):
+            ex._pop_from_waiting_queue(Mock(), 0)

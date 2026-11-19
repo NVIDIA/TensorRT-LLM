@@ -9561,6 +9561,8 @@ class PyExecutor:
         self._benchmark_gate_rearm_pending = False
         self._benchmark_stage_draining = False
         self._benchmark_stage_idle_since: Optional[float] = None
+        self._benchmark_stage_vote_requested = False
+        self._benchmark_stage_vote_pending = False
         self.benchmark_req_queues_size = self._benchmark_stages[0].fill_target
         for index, (requested, effective) in enumerate(
                 zip(requested_stages, self._benchmark_stages)):
@@ -9579,9 +9581,10 @@ class PyExecutor:
                                        total_num_live_requests: int) -> None:
         """Advance to the next stage once all ranks have drained this one.
 
-        Only replicated state decides whether to vote, so all ranks enter the
-        allgather together. Without attention DP the live count is rank-local
-        (a timed-out transfer is retired per rank), so it is only voted on.
+        Rank 0 requests a vote once it has drained locally; the request
+        reaches every rank through the request broadcast in the same
+        iteration, so all ranks enter the allgather together and decode steps
+        pay no collective.
         """
         if not self._benchmark_sweep or self.is_warmup or not self.is_benchmark_disagg:
             return
@@ -9608,18 +9611,24 @@ class PyExecutor:
                     f"[BENCH-STAGE] index={self._benchmark_stage_index} "
                     f"stalled at {self._benchmark_stage_fetched()}/"
                     f"{stage.num_requests} requests")
-        if (not self._benchmark_stage_draining
-                or self._benchmark_fill_phase_active
-                or (self.enable_attention_dp and total_num_live_requests != 0)):
-            return
-
         local_drained = (
-            total_num_live_requests == 0 and self.previous_batch is None
+            self._benchmark_stage_draining
+            and not self._benchmark_fill_phase_active
+            and total_num_live_requests == 0 and self.previous_batch is None
             and self.kv_cache_transceiver.check_gen_transfer_complete())
+        if not self._benchmark_stage_vote_pending:
+            if (local_drained and self.dist.rank == 0
+                    and not self._benchmark_stage_vote_requested):
+                self._benchmark_stage_vote_requested = True
+                self.executor_request_queue.enqueue_benchmark_stage_vote_request(
+                )
+            if self._benchmark_stage_draining and total_num_live_requests == 0:
+                time.sleep(0.001)  # the draining fetch does not block
+            return
+        self._benchmark_stage_vote_pending = False
+        self._benchmark_stage_vote_requested = False
         status = self._allgather_model_parallel_status((int(local_drained), 0))
         if not all(item[0] for item in status):
-            if total_num_live_requests == 0:
-                time.sleep(0.001)  # the draining fetch does not block
             return
         self._log_benchmark_stage("drained")
         self._benchmark_stage_index += 1
@@ -9770,6 +9779,10 @@ class PyExecutor:
                 self._benchmark_stages[self._benchmark_stage_index].num_requests
                 - self._benchmark_stage_fetched())
             max_new_requests = min(max_new_requests, remaining)
+            if waiting_queue and waiting_queue.peek_request().child_req_ids:
+                raise ValueError(
+                    f"{BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME} schedules count "
+                    "requests and require n=1")
 
         if self.enable_attention_dp:
             # FIFO in warmup and the benchmark fill phase, where every request
@@ -10162,6 +10175,8 @@ class PyExecutor:
                 self._apply_profile_start_config(req_item.profile_config or {})
             elif req_item.is_profile_stop_request:
                 self._apply_profile_stop_config()
+            elif req_item.is_benchmark_stage_vote_request:
+                self._benchmark_stage_vote_pending = True
             else:
                 accepted_new_requests.append(req_item)
 
