@@ -208,7 +208,7 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     Not certified: the pre-routed path (`topk_ids` given), grouped routing (`n_group > 1`),
     other routing methods, bf16 logits or bias, `num_fused_shared_experts > 0`,
     expert-parallel windows, `output=`, a warm autotuner cache, CUDA-graph capture, other
-    geometries, sm_103.
+    geometries.
     """
 
     def __call__(

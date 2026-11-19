@@ -74,7 +74,7 @@ class KpoolScoreFp8(OpWrapper):
     The pools selected from these scores can therefore differ from those of the BF16 scores
     (`kpool_score`) where two pools score within that rounding of each other.
 
-    sm_100 only (DeepGEMM MQA logits). The target scores every packed context row here
+    sm_100 and sm_103 only (DeepGEMM MQA logits). The target scores every packed context row here
     (`MlaLayer.context_rows`); when this returns None the rows have no complete pool and
     attend their incomplete trailing pool only.
 

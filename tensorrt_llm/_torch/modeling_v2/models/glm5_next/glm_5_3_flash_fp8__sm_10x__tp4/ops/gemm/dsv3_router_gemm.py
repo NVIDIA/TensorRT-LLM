@@ -73,7 +73,7 @@ class Dsv3RouterGemm(OpWrapper):
 
     Not certified: a bias (it goes to the same cuBLASLt call as `cublas_mm`, whose hazards
     `is_valid` repeats), outputs other than FP32, operand dtypes other than BF16, router
-    shapes other than GLM-5.3-Flash's, CUDA-graph capture, sm_103.
+    shapes other than GLM-5.3-Flash's, CUDA-graph capture.
     """
 
     def __call__(

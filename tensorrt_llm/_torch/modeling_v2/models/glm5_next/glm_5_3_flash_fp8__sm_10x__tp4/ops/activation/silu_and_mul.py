@@ -68,7 +68,7 @@ class SiluAndMul(OpWrapper):
     no `scale`, at GLM's per-rank widths (2 x 512 and 2 x 3072) from 1 to 13,312 rows.
 
     Not certified: an fp8 output (`scale` + `dtype`), `swiglu_alpha` / `swiglu_beta`, other
-    input dtypes, CUDA-graph capture, sm_103.
+    input dtypes, CUDA-graph capture.
     """
 
     def __call__(

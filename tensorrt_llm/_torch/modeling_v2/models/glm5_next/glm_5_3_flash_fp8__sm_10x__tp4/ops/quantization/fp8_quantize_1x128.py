@@ -97,8 +97,9 @@ class Fp8Quantize1x128(OpWrapper):
 
     note = """
     Metadata consumed: none. The returned scale layout is chosen by an architecture query
-    (`isSM100Family()` in thop/fp8Quantize.cpp): off the sm_100 family the op returns a 1-D
-    padded buffer instead, which is why this entry is certified on sm_100 only.
+    (`isSM100Family()` in thop/fp8Quantize.cpp, sm_100 and sm_103 among the certified ones): off
+    that family the op returns a 1-D padded buffer instead, which is why this entry is certified
+    on sm_100 and sm_103 only.
 
     Preconditions, enforced loudly by the op: `input` bf16, 2-D (flatten `[B, S, K]` yourself),
     contiguous, CUDA, and `K % 16 == 0` -- the width, not the block count. A consumer needing
@@ -127,7 +128,7 @@ class Fp8Quantize1x128(OpWrapper):
 
     Not certified: `M == 0`, a short tail block (`K % 128 != 0`), all-zero blocks (the
     `AMAX_FLOOR` scale), inf / NaN inputs, `use_ue8m0=True`, the element-wise fallback kernel
-    (an input whose storage offset breaks 16-byte alignment), sm_103.
+    (an input whose storage offset breaks 16-byte alignment).
     """
 
     def __call__(

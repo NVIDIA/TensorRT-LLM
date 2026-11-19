@@ -105,7 +105,7 @@ class Fp8BlockwiseGemm(OpWrapper):
     captured and replayed). The other cells run the default tactic.
 
     Not certified: N or K not a multiple of 128 (the kernel needs K % 16 == 0 and N % 8 == 0
-    for its TMA alignment), sm_103.
+    for its TMA alignment).
     """
 
     def __call__(
