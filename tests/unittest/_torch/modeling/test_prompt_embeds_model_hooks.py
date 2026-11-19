@@ -10,6 +10,7 @@ import torch
 
 from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4ForCausalLM
 from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausalLM
+from tensorrt_llm._torch.models.modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
 from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4AssistantForCausalLM, Gemma4ForCausalLM
 from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3VLForConditionalGeneration
 from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpForCausalLM
@@ -78,6 +79,7 @@ def test_deepseek_engram_refuses() -> None:
         MistralLarge3EagleForCausalLM,
         Gemma4AssistantForCausalLM,
         MiniMaxM3VLForConditionalGeneration,
+        Exaone4_5_ForConditionalGeneration,
     ],
 )
 def test_refused_families(cls: type) -> None:
