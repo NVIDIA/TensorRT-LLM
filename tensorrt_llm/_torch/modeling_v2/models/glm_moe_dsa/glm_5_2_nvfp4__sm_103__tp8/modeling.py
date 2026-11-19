@@ -55,6 +55,7 @@ import torch
 from tensorrt_llm._torch.attention.attention import maybe_allgather_for_helix_cp
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._features import PrefillCudaGraph
 from tensorrt_llm._torch.modeling_v2._router_index import resolved_mode
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Model, GlmMoeDsaForCausalLM
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
@@ -151,6 +152,7 @@ class GlmMoeDsaModelingV2(DeepseekV3Model):
         )
 
 
+@PrefillCudaGraph.supported()
 class PrefillTarget:
     """The general case: context rows, and possibly generation rows beside them.
 
@@ -182,6 +184,7 @@ class PrefillTarget:
         )
 
 
+@PrefillCudaGraph.supported()
 class DecodeTarget:
     """The specialization: routed to only when there are no context rows.
 
@@ -247,6 +250,9 @@ class DecodeTarget:
 
 class ModelingV2Glm52Nvfp4Sm103Tp8(GlmMoeDsaForCausalLM):
     """GLM-5.2-NVFP4 on sm_103: the built-in causal LM with this target's core and dispatch."""
+
+    #: The step targets ``_select_target`` hands the steps to.
+    step_targets = (PrefillTarget, DecodeTarget)
 
     def __init__(self, model_config: ModelConfig):
         world_size = model_config.mapping.world_size

@@ -109,6 +109,7 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._features import PrefillCudaGraph
 from tensorrt_llm._torch.modeling_v2._router_index import (
     ANY_MOE_IMPL,
     ModelingV2Mode,
@@ -240,6 +241,7 @@ from tensorrt_llm._torch.speculative.interface import (
 from tensorrt_llm._torch.utils import ActType_TrtllmGen, get_model_extra_attrs
 from tensorrt_llm._utils import mpi_rank, prefer_pinned
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -2913,6 +2915,12 @@ def _draft_attention_boundary(qkv, output, draft_key: str) -> None:
 _draft_attention_eager = eager_on_graph(_draft_attention_boundary)
 
 
+def _breakable_prefill_cuda_graph(feature: PrefillCudaGraph) -> bool:
+    """The breakable prefill graph (`PrefillTarget`); the target does not run under torch.compile."""
+    return feature.backend == PrefillCudaGraphBackend.BREAKABLE
+
+
+@PrefillCudaGraph.supported(when=_breakable_prefill_cuda_graph)
 class PrefillTarget:
     """A step with context rows: prefill chunks, and the mixed steps that carry generation rows beside them. Every
     layer runs in its generic form; the attention core is the MSA backend's for every row.
@@ -3224,6 +3232,13 @@ class PrefillTarget:
         return output
 
 
+def _decode_left_uncompiled(feature: PrefillCudaGraph) -> bool:
+    """A prefill graph that leaves the steps without context rows uncompiled; the target does not run under
+    torch.compile."""
+    return not feature.compiles_decode
+
+
+@PrefillCudaGraph.supported(when=_decode_left_uncompiled)
 class DecodeTarget:
     """A pure generation step (no context rows), of any width.
 
@@ -6095,6 +6110,8 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp2(
     # selects the drafter as it does built-in. The trunk runs its own expert kernels, which no
     # moe_config.tactic names, so it declares no moe_impls_honored.
     draft_moe_impls_honored = frozenset({ANY_MOE_IMPL})
+    #: The step targets ``_select_target`` hands the steps to.
+    step_targets = (PrefillTarget, DecodeTarget)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         assert torch.cuda.get_device_capability() == _SM, (

@@ -93,6 +93,7 @@ from torch import nn
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._features import PrefillCudaGraph
 from tensorrt_llm._torch.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch.modeling_v2._router_index import ANY_MOE_IMPL
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
@@ -140,6 +141,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_
 from tensorrt_llm._torch.pyexecutor.config_utils import is_mla
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -3196,6 +3198,15 @@ def _check_construction(model_config: ModelConfig) -> None:
     )
 
 
+def _breakable_prefill_cuda_graph(feature: PrefillCudaGraph) -> bool:
+    """The breakable prefill graph, whose segments the KDA core runs eagerly between.
+
+    Nothing in the target is written for torch.compile, which the piecewise graph needs.
+    """
+    return feature.backend == PrefillCudaGraphBackend.BREAKABLE
+
+
+@PrefillCudaGraph.supported(when=_breakable_prefill_cuda_graph)
 class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
     """The class ``route`` returns: this target's text model (`KimiLinearModel` above) behind its checks.
 
