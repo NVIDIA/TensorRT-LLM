@@ -319,7 +319,10 @@ def test_public_api_post_merge_can_use_post_merge_validation() -> None:
             {"default_pipeline", "fasth3", "ops", "legacy"},
         ),
         ("tensorrt_llm/_torch/modeling_v2/catalog/attention/core.py", {"fasth3", "ops"}),
-        ("tensorrt_llm/_torch/modeling_v2/catalog/comm/ulysses.py", {"default_pipeline", "fasth3"}),
+        (
+            "tensorrt_llm/_torch/modeling_v2/catalog/gemm/cublas_mm.py",
+            {"default_pipeline", "fasth3"},
+        ),
         ("tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/ops/vsa.py", {"fasth3", "ops"}),
         (
             "tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/default_pipeline/pipeline.py",
@@ -341,13 +344,13 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
             "def route(config):\n    if config.fast:\n        return Fast\n    return Default\n"
         ),
         f"tensorrt_llm/_torch/visual_gen/models/{family}/default_pipeline/pipeline.py": (
-            "from ..parallel.ulysses import shard\nclass Default: pass"
+            "from ..components.linear import project\nclass Default: pass"
         ),
         f"tensorrt_llm/_torch/visual_gen/models/{family}/fasth3/pipeline.py": (
-            "from ..ops.vsa import sparse\nfrom ..parallel.ulysses import shard\nclass Fast: pass\n"
+            "from ..ops.vsa import sparse\nfrom ..components.linear import project\nclass Fast: pass\n"
         ),
-        f"tensorrt_llm/_torch/visual_gen/models/{family}/parallel/ulysses.py": (
-            "from tensorrt_llm._torch.modeling_v2.catalog.comm.ulysses import shard"
+        f"tensorrt_llm/_torch/visual_gen/models/{family}/components/linear.py": (
+            "from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as project"
         ),
         f"tensorrt_llm/_torch/visual_gen/models/{family}/ops/vsa.py": (
             "from tensorrt_llm._torch.modeling_v2.catalog.attention.adapter import sparse"
@@ -405,14 +408,19 @@ def test_h3_shared_quality_changes_select_v1_and_v2_entrypoints():
     } <= selected
 
 
-def test_visualgen_catalog_selects_block_sparse_attention_and_its_consumers():
+def _visualgen_selection(changed):
     index = YAMLIndex.load(REPO_ROOT / "tests/integration/test_lists/test-db")
     stages = parse_stages_from_groovy(REPO_ROOT / "jenkins/L0_Test.groovy")
     rule = VisualGenRule(index, stages, REPO_ROOT)
-    changed = "tensorrt_llm/_torch/visual_gen/catalog/attention/block_sparse_attention.py"
     result = rule.apply(PRInputs([changed], {}))
     assert result is not None and result.scope == "visualgenonly"
-    selected = {path for filters in result.block_filters.values() for path in filters}
+    return {path for filters in result.block_filters.values() for path in filters}
+
+
+def test_visualgen_catalog_selects_block_sparse_attention_and_its_consumers():
+    selected = _visualgen_selection(
+        "tensorrt_llm/_torch/visual_gen/catalog/attention/block_sparse_attention.py"
+    )
     assert {
         "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py",
         "unittest/_torch/visual_gen/catalog/attention/test_block_sparse_attention.py",
@@ -420,3 +428,16 @@ def test_visualgen_catalog_selects_block_sparse_attention_and_its_consumers():
         "unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_parity.py",
         "unittest/_torch/visual_gen/test_wan_vsa_pipeline.py",
     } <= selected
+
+
+def test_h3_ulysses_ops_select_the_family():
+    selected = _visualgen_selection(
+        "tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/ops/ulysses.py"
+    )
+    unit = "unittest/_torch/visual_gen/models/minimax_h3_v2"
+    assert {
+        f"{unit}/ops/test_ulysses.py",
+        f"{unit}/default_pipeline/test_minimax_h3_pipeline.py",
+        f"{unit}/fasth3/test_fasth3_pipeline.py",
+    } <= selected
+    assert all(path.startswith((unit + "/", "visual_gen/minimax_h3_v2/")) for path in selected)

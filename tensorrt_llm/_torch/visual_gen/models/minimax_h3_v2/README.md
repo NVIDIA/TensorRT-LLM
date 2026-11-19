@@ -35,14 +35,16 @@ Choose the boundary case by case. A target can specialize only the transformer a
 | Who consumes the change? | Place it here | H3 example |
 | --- | --- | --- |
 | One target | The target directory, including its local operations or kernels | Base Ref2VA conditioning and its TP text encoder, or FastH3's trained schedule |
-| Sibling H3 targets with the same contract | The H3 family | Packed rows, transformer blocks, attention modules and H3 parallel layouts. Targets import from the family and evolve independently of sibling targets. |
+| Sibling H3 targets with the same contract | The H3 family | Packed rows, transformer blocks, attention modules and H3 parallel layouts and the Ulysses Q/K/V operations. Targets import from the family and evolve independently of sibling targets. |
 | Multiple VisualGen families or backends consuming the same VisualGen-specific kernel contract | The [VisualGen catalog](../../catalog/) | H3 V2 and the existing VisualGen VSA backend share fine block-sparse attention over explicit KV tile indices. |
-| Domain-independent operations, including operations shared with LLM models | The [Modeling V2 catalog](../../../modeling_v2/catalog/) | Reuse existing attention and GEMM entries such as `thop_attention` and `cublas_mm`. |
+| Existing operations used by VisualGen and LLM callers | The [Modeling V2 catalog](../../../modeling_v2/catalog/) | Import common entries directly, such as `thop_attention` and `cublas_mm`. |
 | Runtime services | The existing VisualGen runtime | Checkpoint discovery, process groups, executor and lifecycle interfaces |
 
 **Attention.** Put a thin kernel entry in the VisualGen catalog when both callers can supply the same tensors, layout and explicit metadata. The [block-sparse attention op](../../catalog/attention/block_sparse_attention.py) takes head-major Q/K/V, selected KV tile indices, route counts, valid KV tile lengths and an optional scale. It returns attention output and logsumexp. [H3](ops/vsa.py) builds mixed-modality routes and applies its learned gate. The [VisualGen VSA backend](../../attention/backends/sparse/vsa/backend.py) supplies its predictor's routes and chooses its fallback. Both call the same CuTe kernel through the catalog. Keep whole attention modules, projections, checkpoint policy and model-specific masking in their families. Call a library operation such as PyTorch SDPA directly when it already provides the required interface.
 
-**Communication.** H3 orders its asynchronous Ulysses transfers V, Q, K and joins them before attention. The [communication ops](../../../modeling_v2/catalog/comm/ulysses.py) select a packed exchange with a fused layout kernel or the general collective path. A second family can reuse an operation while scheduling its projections differently. Both catalogs follow the same stateless `OpWrapper`, PyTorch reference and test-cell conventions. See the [LLM Modeling V2 guide](../../../modeling_v2/README.md).
+**Communication.** The base and FastH3 targets share the [H3 Ulysses ops](ops/ulysses.py). The synchronous op exchanges Q/K/V from sequence shards to head shards and returns the layout requested by H3 attention. The asynchronous op converts the three rank-major receive buffers to that layout. The [H3 parallel module](parallel/ulysses.py) owns the V, Q, K projection order, streams and barriers. Other families can call the same native kernels with their own tensor layouts and schedules.
+
+Promote a family op to the [VisualGen catalog](../../catalog/) when an independent VisualGen consumer needs the same inputs, outputs and layout guarantees. Keep one wrapper and one mirrored test suite for that shared contract. Import an existing cross-domain entry directly from its owning catalog. Family and catalog ops follow the same [Modeling V2 op contract](../../../modeling_v2/README.md).
 
 ## File map
 
@@ -79,6 +81,7 @@ Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.
 
 | Operations and kernels | Responsibility |
 | --- | --- |
+| [ops/ulysses.py](ops/ulysses.py) | Exchange Q/K/V for synchronous H3 attention and convert asynchronous receive buffers into its attention layout. |
 | [ops/activation.py](ops/activation.py) | Define the H3 SwiGLU operation. |
 | [ops/adaln.py](ops/adaln.py) | Define adaptive normalization/modulation and its gated residual variant. |
 | [ops/attention.py](ops/attention.py) | Select the H3 attention implementation and adapt dense attention inputs to its kernel runner. |

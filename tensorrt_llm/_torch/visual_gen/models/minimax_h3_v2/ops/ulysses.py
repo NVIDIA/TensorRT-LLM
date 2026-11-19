@@ -5,8 +5,7 @@ import torch
 import torch.distributed as dist
 
 from tensorrt_llm._torch.distributed import all_to_all_4d
-
-from .._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 
 def _fits_unscatter_kernel(heads: int, dim: int) -> bool:

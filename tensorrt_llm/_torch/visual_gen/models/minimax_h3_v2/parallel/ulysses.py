@@ -5,11 +5,9 @@ import torch
 import torch.distributed as dist
 
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
-from tensorrt_llm._torch.modeling_v2.catalog.comm.ulysses import (
-    ulysses_qkv_all_to_all,
-    ulysses_unscatter_qkv,
-)
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
+
+from ..ops.ulysses import ulysses_qkv_all_to_all, ulysses_unscatter_qkv
 
 
 class H3UlyssesAttention:

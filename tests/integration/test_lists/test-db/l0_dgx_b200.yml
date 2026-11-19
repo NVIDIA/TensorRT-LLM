@@ -45,7 +45,7 @@ l0_dgx_b200:
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[bf16-2gpu]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[bf16-2gpu]
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
-  - unittest/_torch/modeling_v2/comm/test_modeling_v2_ulysses.py
+  - unittest/_torch/visual_gen/models/minimax_h3_v2/ops/test_ulysses.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[TRTLLM-2-1]

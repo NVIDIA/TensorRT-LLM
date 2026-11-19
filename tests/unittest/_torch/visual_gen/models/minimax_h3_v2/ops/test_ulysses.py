@@ -12,7 +12,7 @@ import torch.multiprocessing as mp
 
 def _check_exchange(rank: int, init_method: str) -> None:
     torch.cuda.set_device(rank)
-    from tensorrt_llm._torch.modeling_v2.catalog.comm.ulysses import (
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.ops.ulysses import (
         ulysses_qkv_all_to_all,
         ulysses_unscatter_qkv,
     )
@@ -63,7 +63,9 @@ def test_ulysses_qkv_all_to_all(tmp_path, monkeypatch):
 
 
 def test_ulysses_unscatter_qkv():
-    from tensorrt_llm._torch.modeling_v2.catalog.comm.ulysses import ulysses_unscatter_qkv
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.ops.ulysses import (
+        ulysses_unscatter_qkv,
+    )
 
     for cell in ulysses_unscatter_qkv.CELLS:
         spec = cell.spec
@@ -89,7 +91,9 @@ def test_ulysses_unscatter_qkv():
 
 
 def test_ulysses_unscatter_misaligned_buffer():
-    from tensorrt_llm._torch.modeling_v2.catalog.comm.ulysses import ulysses_unscatter_qkv
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.ops.ulysses import (
+        ulysses_unscatter_qkv,
+    )
 
     x = torch.arange(17, device="cuda", dtype=torch.bfloat16)[1:].view(2, 1, 1, 1, 8)
     with patch.object(torch.ops.trtllm, "ulysses_post_unscatter_qkv") as fused:
