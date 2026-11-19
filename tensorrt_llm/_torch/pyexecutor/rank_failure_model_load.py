@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
+
 from ..moe.fused_moe.communication.execution_state import MoeExecutionState
 from ..moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from ..moe.fused_moe.ep_group_health import EPGroupHealth
@@ -31,9 +33,6 @@ from ..moe.fused_moe.interface import MoE
 
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
-
-# The alternative that each error about an unmet fault tolerance requirement offers.
-_TURN_FAULT_TOLERANCE_OFF = "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)"
 
 
 def prepare_model(model: torch.nn.Module) -> None:
@@ -74,7 +73,7 @@ def moe_comms(model: torch.nn.Module) -> list[NVLinkOneSided]:
                 f"MoE layer {name} ({type(layer).__name__}) uses {uses}, but Wide-EP fault "
                 "tolerance requires NVLinkOneSided, the only MoE communication that can leave "
                 f"out a failed rank. {_no_nvlink_one_sided_cause(layer.mapping)}; "
-                f"{_TURN_FAULT_TOLERANCE_OFF}."
+                f"{TURN_FAULT_TOLERANCE_OFF}."
             )
         if first is None:
             first = name, comm
@@ -84,12 +83,12 @@ def moe_comms(model: torch.nn.Module) -> list[NVLinkOneSided]:
                 f"MoE layer {name} communicates as EP rank {comm.ep_rank} of {comm.ep_size}, but "
                 f"MoE layer {first_name} as EP rank {first_comm.ep_rank} of {first_comm.ep_size}. "
                 "Wide-EP fault tolerance runs every MoE layer over one EP group; give the layers "
-                f"the same MoE parallelism or {_TURN_FAULT_TOLERANCE_OFF}."
+                f"the same MoE parallelism or {TURN_FAULT_TOLERANCE_OFF}."
             )
         comms[id(comm)] = comm
     if not comms:
         raise ValueError(
-            f"Wide-EP fault tolerance requires a model with MoE layers; {_TURN_FAULT_TOLERANCE_OFF}"
+            f"Wide-EP fault tolerance requires a model with MoE layers; {TURN_FAULT_TOLERANCE_OFF}"
         )
     return list(comms.values())
 

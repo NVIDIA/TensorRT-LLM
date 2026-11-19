@@ -111,8 +111,10 @@ add_tllm_gtest(
   SOURCES
   moeLoadBalancerTest.cpp
   ../../../tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.cpp
+  ../../../tensorrt_llm/runtime/moeLoadBalancer/unbackedSlotMemory.cpp
   LINK_LIBRARIES
   tllm::kernel_moe_load_balance
+  tllm::runtime_buffers
   tllm::runtime_host_accessible_memory
   LABELS
   "unit;runtime;gpu")

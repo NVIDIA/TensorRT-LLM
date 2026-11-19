@@ -15,6 +15,7 @@
 """``TrtllmCutedslGroupedGemmNvfp4Impl``: ``trtllm.cutedsl.grouped_gemm.nvfp4``."""
 
 import os
+from functools import cached_property, partial
 
 import torch
 
@@ -32,6 +33,7 @@ from ...impl_contract import (
     MoEFusedRouteQuant,
     MoEInputRequirement,
     MoEProblem,
+    MoERejectReason,
     MoERunContext,
     MoESortTables,
     MoEStaticCapability,
@@ -86,6 +88,9 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             supports_eplb=True,
             supports_apply_router_weight_on_input=True,
             supports_deep_ep_direct_metadata=True,
+            # Not on SM107 (see can_implement) or with locality domains, which
+            # decline EPLB.
+            supports_spare_slots=True,
         ),
         input_requirement=MoEInputRequirement(routing_scales_dtype=torch.float32),
         doc="CuTe DSL NVFP4 grouped GEMM: gather + FC1 + fused activation, "
@@ -93,6 +98,42 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
     )
     sm_support = SmSupport(allowed=frozenset({100, 103, 107}))
     _locality_domain_full_scale_params = ("w3_w1_weight_scale", "w2_weight_scale")
+
+    def create_weights(self) -> None:
+        if self._weights_created:
+            return
+        super().create_weights()
+        if self.uses_spare_slots:
+            # The GEMMs and their tuner profile only the active slots.
+            layout = self.tuner_layout_kwargs
+            self._fused_moe_runner = partial(CuteDslFusedMoENvfp4Runner, **layout)
+            self._gather_act_fusion_op = partial(
+                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell, **layout
+            )
+            self._finalize_inplace_op = partial(
+                torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell, **layout
+            )
+            self._grouped_gemm_op = partial(
+                torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell, **layout
+            )
+
+    # The runner and the Blackwell ops of the forward. A module with spare slots binds the tuner
+    # layout of its active slots to them in create_weights; the Rubin kernels take no spare slots.
+    @cached_property
+    def _fused_moe_runner(self):
+        return CuteDslFusedMoENvfp4Runner
+
+    @cached_property
+    def _gather_act_fusion_op(self):
+        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell
+
+    @cached_property
+    def _finalize_inplace_op(self):
+        return torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell
+
+    @cached_property
+    def _grouped_gemm_op(self):
+        return torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell
 
     # Kinds mirror the act-fusion kernels' own SUPPORTED_ACTIVATION_TYPES.
     # There are two of them and ``run_moe_nvfp4`` picks between them by SM:
@@ -110,10 +151,19 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        spare_slots = None
+        if d.spare_slots_enabled and d.env.sm == 107:
+            spare_slots = MoEEligibility.no(
+                MoERejectReason.SPARE_SLOTS_UNSUPPORTED,
+                f"Wide-EP fault tolerance: {cls.__name__} on SM107 does not support spare EPLB "
+                "slots, as it tunes every local slot",
+            )
         # process_weights_after_loading() unswizzles the FC1 block scales,
         # which asserts 128-row tiles; without this gate an unaligned shard
         # dies mid weight load with a bare swizzle error.
-        return check_grouped_gemm_leaf(cls, p, d, nvfp4_fc1_row_alignment_rejection(p, d))
+        return check_grouped_gemm_leaf(
+            cls, p, d, nvfp4_fc1_row_alignment_rejection(p, d), spare_slots
+        )
 
     def _init_format_state(self) -> None:
         # Opt-out for adapter-free DeepEP metadata; see
@@ -375,7 +425,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             ]
 
         tuner = AutoTuner.get()
-        runner = CuteDslFusedMoENvfp4Runner(
+        runner = self._fused_moe_runner(
             forward_impl=forward_impl,
             num_experts=self.num_slots,
             top_k=effective_top_k,
@@ -539,7 +589,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         gather_act_op = (
             torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin
             if use_rubin
-            else torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell
+            else self._gather_act_fusion_op
         )
 
         gather_act_kwargs = dict(
@@ -644,7 +694,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             finalize_inplace_op = (
                 torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin
                 if use_rubin
-                else torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell
+                else self._finalize_inplace_op
             )
 
             finalize_inplace_kwargs = dict(
@@ -700,7 +750,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                     "Basic grouped GEMM without finalize fusion is not yet "
                     "supported on Rubin."
                 )
-            x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
+            x = self._grouped_gemm_op(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),

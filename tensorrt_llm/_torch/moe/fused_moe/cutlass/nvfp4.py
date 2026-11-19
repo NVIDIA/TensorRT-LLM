@@ -46,6 +46,7 @@ class TrtllmCutlassNvfp4Impl(CutlassFusedMoEBase):
     descriptor = cutlass_descriptor(
         "nvfp4",
         "CUTLASS grouped GEMM over NVFP4 weights and activations, Blackwell.",
+        supports_spare_slots=True,
     )
     sm_support = SmSupport(allowed=frozenset({100, 103, 107, 120, 121}))
     supported_dtypes = HP_DTYPES_WITH_FP8
