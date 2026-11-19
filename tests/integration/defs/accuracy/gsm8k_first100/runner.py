@@ -234,7 +234,7 @@ def run_first100(
         summary = evaluator.run(
             dataset_dir=inputs.dataset_dir,
             output_dir=results_dir,
-            num_questions=protocol.NUM_QUESTIONS,
+            num_questions=protocol.MANIFEST_QUESTIONS,
             concurrency=recipe["max_batch_size"],
             chat_template_kwargs=protocol.BEAM_CHAT_TEMPLATE_KWARGS,
             time_budget_s=float(timeout_s) - TEARDOWN_RESERVE_S,

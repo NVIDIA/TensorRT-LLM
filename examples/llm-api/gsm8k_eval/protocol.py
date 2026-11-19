@@ -40,7 +40,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Iterator, Mapping, Optional, Sequence
 
 PROTOCOL_ID = "beam-gsm8k-first100-public-v1"
 
@@ -54,7 +54,9 @@ SPLIT_FILES = {
 }
 
 #: The first-100 selection frozen by ``manifest.json``.
-NUM_QUESTIONS = 100
+MANIFEST_QUESTIONS = 100
+#: Number selected when a caller omits the question count.
+DEFAULT_NUM_QUESTIONS = 100
 #: Rows of the pinned test split; the largest selectable question count.
 TEST_SPLIT_ROWS = 1319
 #: SHA-256 of ``canonical_json(inventory_rows(...))`` over the whole pinned test split.
@@ -137,7 +139,7 @@ def protocol_definition() -> dict[str, Any]:
         },
         "selection": {
             "split": "test",
-            "count": NUM_QUESTIONS,
+            "count": MANIFEST_QUESTIONS,
             "order": "original test-split order: row indices 0..99",
         },
         "exemplars": {
@@ -319,7 +321,7 @@ def build_manifest(
     indices = exemplar_indices(len(train))
     exemplars = [train[i] for i in indices]
     questions = []
-    for index in range(NUM_QUESTIONS):
+    for index in range(MANIFEST_QUESTIONS):
         question, answer = test[index]
         extract_gold(answer)
         questions.append(
@@ -368,9 +370,9 @@ def load_manifest(path: str | os.PathLike = MANIFEST_PATH) -> dict[str, Any]:
     if manifest.get("protocol") != protocol_definition():
         raise ValueError(f"{path}: the manifest's protocol differs from protocol_definition()")
     questions = manifest.get("questions", [])
-    if [q.get("index") for q in questions] != list(range(NUM_QUESTIONS)):
-        raise ValueError(f"{path}: questions must be test rows 0..{NUM_QUESTIONS - 1} in order")
-    if [q.get("id") for q in questions] != [question_id(i) for i in range(NUM_QUESTIONS)]:
+    if [q.get("index") for q in questions] != list(range(MANIFEST_QUESTIONS)):
+        raise ValueError(f"{path}: questions must be test rows 0..{MANIFEST_QUESTIONS - 1} in order")
+    if [q.get("id") for q in questions] != [question_id(i) for i in range(MANIFEST_QUESTIONS)]:
         raise ValueError(f"{path}: question ids do not follow the row indices")
     shots = [item.get("index") for item in manifest.get("exemplars", {}).get("items", [])]
     if len(shots) != NUM_SHOTS or len(set(shots)) != NUM_SHOTS:
@@ -387,32 +389,34 @@ def _check_row(split: str, index: int, row: tuple[str, str], item: Mapping[str, 
         raise ValueError(f"{split} row {index} does not match the pinned manifest")
 
 
+def _inventory_with_prompts(
+    exemplars: Sequence[tuple[str, str]], test: Sequence[tuple[str, str]]
+) -> Iterator[tuple[dict[str, Any], str]]:
+    for index, (question, answer) in enumerate(test):
+        prompt = build_prompt(exemplars, question)
+        yield {
+            "index": index,
+            "id": question_id(index),
+            "question_sha256": sha256_text(question),
+            "answer_sha256": sha256_text(answer),
+            "prompt_sha256": sha256_text(prompt),
+            "prompt_chars": len(prompt),
+            "gold": extract_gold(answer),
+        }, prompt
+
+
 def inventory_rows(
     exemplars: Sequence[tuple[str, str]], test: Sequence[tuple[str, str]]
 ) -> list[dict[str, Any]]:
     """Every test row's identity: question, answer and prompt digests, prompt size and gold."""
-    rows = []
-    for index, (question, answer) in enumerate(test):
-        prompt = build_prompt(exemplars, question)
-        rows.append(
-            {
-                "index": index,
-                "id": question_id(index),
-                "question_sha256": sha256_text(question),
-                "answer_sha256": sha256_text(answer),
-                "prompt_sha256": sha256_text(prompt),
-                "prompt_chars": len(prompt),
-                "gold": extract_gold(answer),
-            }
-        )
-    return rows
+    return [row for row, _ in _inventory_with_prompts(exemplars, test)]
 
 
 def build_problems(
     manifest: Mapping[str, Any],
     train: Sequence[tuple[str, str]],
     test: Sequence[tuple[str, str]],
-    count: int = NUM_QUESTIONS,
+    count: int = DEFAULT_NUM_QUESTIONS,
     *,
     test_rows_sha256: Optional[str] = None,
 ) -> list[Problem]:
@@ -438,8 +442,13 @@ def build_problems(
         exemplars.append(train[item["index"]])
     for item in manifest["questions"]:
         _check_row("test", item["index"], test[item["index"]], item)
+    rows = []
+    selected_prompts = []
     try:
-        rows = inventory_rows(exemplars, test)
+        for row, prompt in _inventory_with_prompts(exemplars, test):
+            rows.append(row)
+            if row["index"] < count:
+                selected_prompts.append(prompt)
     except ValueError as error:
         raise ValueError(f"the test split does not match the pinned inventory: {error}") from error
     if sha256_text(canonical_json(rows)) != expected_rows_sha256:
@@ -460,7 +469,7 @@ def build_problems(
                 question=question,
                 answer=answer,
                 gold=row["gold"],
-                prompt=build_prompt(exemplars, question),
+                prompt=selected_prompts[index],
                 prompt_sha256=row["prompt_sha256"],
             )
         )
@@ -468,7 +477,7 @@ def build_problems(
 
 
 def load_problems(
-    dataset_dir: str | os.PathLike, manifest: Mapping[str, Any], count: int = NUM_QUESTIONS
+    dataset_dir: str | os.PathLike, manifest: Mapping[str, Any], count: int = DEFAULT_NUM_QUESTIONS
 ) -> tuple[list[Problem], dict[str, Any]]:
     """Read the staged splits under ``dataset_dir`` and return the first ``count`` problems.
 

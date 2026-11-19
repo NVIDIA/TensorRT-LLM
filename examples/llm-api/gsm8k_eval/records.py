@@ -321,6 +321,7 @@ def summarize(
 ) -> dict[str, Any]:
     """Per-question outcome and counts over exactly the selected questions."""
     per_question = []
+    attempts = collections.Counter(record["id"] for record in state.records)
     counts: collections.Counter[str] = collections.Counter()
     for problem in problems:
         record = state.completed.get(problem.id) or state.latest.get(problem.id)
@@ -332,7 +333,7 @@ def summarize(
                 "index": problem.index,
                 "status": status,
                 "attempt": record["attempt"] if record else None,
-                "attempts": sum(1 for r in state.records if r["id"] == problem.id),
+                "attempts": attempts[problem.id],
                 "finish_reason": record["finish_reason"] if record else None,
                 "completion_tokens": record["completion_tokens"] if record else None,
                 "parse_status": record["parse_status"] if record else "no_response",

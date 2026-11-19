@@ -155,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num-questions",
         type=_count,
-        default=protocol.NUM_QUESTIONS,
+        default=protocol.DEFAULT_NUM_QUESTIONS,
         help=f"evaluate test rows 0..N-1, 1 <= N <= {protocol.TEST_SPLIT_ROWS} (default %(default)s)",
     )
     parser.add_argument("--output-dir", required=True, help="results directory (resumable)")

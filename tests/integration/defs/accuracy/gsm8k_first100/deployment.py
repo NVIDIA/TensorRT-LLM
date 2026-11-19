@@ -386,9 +386,9 @@ def load_criterion(
     if criterion.get("manifest_sha256") != manifest_sha256:
         raise CriterionError(f"{path.name} was set for a different item manifest")
     min_correct = criterion.get("min_correct")
-    if type(min_correct) is not int or not 0 <= min_correct <= protocol.NUM_QUESTIONS:
+    if type(min_correct) is not int or not 0 <= min_correct <= protocol.MANIFEST_QUESTIONS:
         raise CriterionError(
-            f"{path.name}: min_correct must be an integer in [0, {protocol.NUM_QUESTIONS}]"
+            f"{path.name}: min_correct must be an integer in [0, {protocol.MANIFEST_QUESTIONS}]"
         )
     required = criterion.get("required_identity", {})
     if not isinstance(required, dict):
