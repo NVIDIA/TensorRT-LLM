@@ -505,6 +505,7 @@ def h3_loader(monkeypatch: pytest.MonkeyPatch) -> tuple:
     pipeline.mapping = config.mapping
     pipeline._device = torch.device("cuda:0")
     pipeline._sleep_manager = None
+    pipeline._transformer_quant_dispatchers = torch.nn.ModuleDict()
     pipeline.transformer = None
     for name in (
         "load_weights",
@@ -732,6 +733,7 @@ def test_loader_uses_model_hook_without_h3_dependency(
 
     pipeline = OtherSleepPipeline.__new__(OtherSleepPipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline._transformer_quant_dispatchers = torch.nn.ModuleDict()
     for name in (
         "load_transformer_weights",
         "load_weights",
@@ -744,7 +746,9 @@ def test_loader_uses_model_hook_without_h3_dependency(
         setattr(pipeline, name, getattr(original, name))
     pipeline.transformer = None
     monkeypatch.setattr(loader_module.AutoPipeline, "from_config", lambda *args: pipeline)
-    loader._materialize_meta_tensors.side_effect = lambda *_args: events.append("materialize")
+    loader._materialize_meta_tensors.side_effect = lambda *_args, **_kwargs: events.append(
+        "materialize"
+    )
     pipeline.warmup.side_effect = lambda: events.append("warmup")
     assert loader.load(sleep_restore_mode="CPU") is pipeline
     assert events == ["enter", "materialize", "exit", "warmup"]
