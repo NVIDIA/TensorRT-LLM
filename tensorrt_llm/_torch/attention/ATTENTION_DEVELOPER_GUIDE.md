@@ -283,22 +283,6 @@ these hooks instead of adding algorithm-specific FMHA libraries.
 
 ### 2.3 Backend contract
 
-DeepSeek-V4's `PrimsTSSparseMlaFmha` compiles and loads its generation kernel
-variants in the decoder's explicit `prims_ts_sparse_mla` warmup phase, before
-the first model forward. Warmup collects the enabled layers' static profiles,
-including cache dtype, sinks, compressed capacity and fused output groups,
-and covers the generation row budget including speculative tokens. Public
-`plan(compile=False)` calls identify unique compile specs without building kernels;
-workspace sizes are cached in TRT-LLM through the public sparse MLA helper.
-When parallel precompilation is enabled, each warmup pass checks its
-distinct specializations with `is_kernel_cached()`. Two or more misses start a
-fresh pool for those variants. The rank handles zero or one miss locally.
-During memory profiling, workers exit before the rank sizes the final KV cache.
-On every pass, the rank prepares its own plans and shared workspace for the
-current metadata. It loads cached kernels and compiles any remaining misses
-locally. `forward()` only retrieves the
-current row count's plan; it does not launch precompile workers or scan variants.
-
 All backends implement the `AttentionBackend` interface.
 
 The core contract is:
