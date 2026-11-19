@@ -995,19 +995,26 @@ def test_prewarm_keeps_going_past_a_failed_bucket(monkeypatch: pytest.MonkeyPatc
 
 @_skip_no_lowm_fp8
 def test_cute_views_are_reused_per_tensor_storage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A base tensor's CuTe view is exported once and reused; new storage, a view, or a dead tensor
-    does not reuse it."""
-    monkeypatch.setattr(_mod, "_CUTE_VIEWS", {})
+    """A base tensor's CuTe view is exported once per host thread and reused by that thread; another
+    thread, new storage, a view, or a dead tensor does not reuse it."""
+    monkeypatch.setattr(_mod, "_CUTE_VIEWS", threading.local())
     t = torch.zeros(8, 64, device="cuda", dtype=torch.bfloat16)
     first = _mod._cute_view(t)
     assert _mod._cute_view(t) is first
+    other = []
+    worker = threading.Thread(
+        target=lambda u: other.extend((_mod._cute_view(u), _mod._cute_view(u))), args=(t,)
+    )
+    worker.start()
+    worker.join()
+    assert other[0] is other[1] and other[0] is not first
     t.data = torch.zeros(8, 64, device="cuda", dtype=torch.bfloat16)
     assert _mod._cute_view(t) is not first
     assert _mod._cute_view(t[:4]) is not _mod._cute_view(t[:4])
     key = id(t)
     del t
     gc.collect()
-    assert key not in _mod._CUTE_VIEWS
+    assert key not in _mod._views()
 
 
 # ---------------------------------------------------------------------------

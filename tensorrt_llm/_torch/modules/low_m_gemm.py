@@ -1294,24 +1294,35 @@ def _no_gamma(device) -> torch.Tensor:
     return torch.zeros((1, 8), dtype=torch.bfloat16, device=device)
 
 
-# CuTe views of the base tensors that launches pass call after call (weights, their scales, the
-# placeholder arguments): one DLPack export per tensor and layout, dropped with the tensor.
-_CUTE_VIEWS: Dict[int, Tuple[tuple, Any]] = {}
+# Per host thread: CuTe views of the base tensors that launches pass call after call (weights, their
+# scales, the placeholder arguments), one DLPack export per tensor and layout, dropped with the
+# tensor. A launch keeps its argument descriptors on the views it is given, so threads never share
+# a view.
+_CUTE_VIEWS = threading.local()
+
+
+def _views() -> Dict[int, Tuple[tuple, Any]]:
+    """The calling thread's cached CuTe views, by tensor ``id``."""
+    views = getattr(_CUTE_VIEWS, "views", None)
+    if views is None:
+        views = _CUTE_VIEWS.views = {}
+    return views
 
 
 def _cute_view(t: torch.Tensor, dtype: Optional[torch.dtype] = None) -> Any:
-    """``graph_safe_from_dlpack`` of ``t`` (as ``dtype``), reused while ``t`` keeps its storage and
-    layout. A view is exported anew on every call: views are made per call."""
+    """``graph_safe_from_dlpack`` of ``t`` (as ``dtype``), reused by the calling thread while ``t``
+    keeps its storage and layout. A view is exported anew on every call: views are made per call."""
     if t._base is not None:
         return graph_safe_from_dlpack(t if dtype is None else t.view(dtype))
+    views = _views()
     key = (t.data_ptr(), dtype, t.shape, t.stride())
-    entry = _CUTE_VIEWS.get(id(t))
+    entry = views.get(id(t))
     if entry is None:
-        weakref.finalize(t, _CUTE_VIEWS.pop, id(t), None)
+        weakref.finalize(t, views.pop, id(t), None)
     elif entry[0] == key:
         return entry[1]
     view = graph_safe_from_dlpack(t if dtype is None else t.view(dtype))
-    _CUTE_VIEWS[id(t)] = (key, view)
+    views[id(t)] = (key, view)
     return view
 
 
