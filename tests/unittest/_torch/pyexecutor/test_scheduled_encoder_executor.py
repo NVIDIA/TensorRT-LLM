@@ -438,6 +438,32 @@ def test_cancelling_a_launched_request_finishes_it_once_as_cancelled(completion)
         assert h.runner.batches == [[launched], [later]]
 
 
+def test_cancelling_a_launched_request_with_two_sequences_delivers_both_and_ends_with_the_last(
+    completion,
+):
+    with _harness(completion=completion) as h:
+        h.runner.hold()
+        launched = h.submit(sampling_config=SamplingConfig(num_return_sequences=2))
+        h.complete_after_the_loop_takes_the_cancellation(launched)
+        h.executor.start_worker()
+        assert h.runner.entered.wait(timeout=30)
+
+        h.executor.cancel_request(launched)
+        h.runner.release.set()
+
+        # The worker takes every response; a child's is stored under its own id.
+        responses = []
+        while len(responses) < 2 and (ready := h.executor.await_responses(timeout=WAIT)):
+            responses.extend(ready)
+        for response in responses:
+            response.result.deserialize()
+        assert [response.request_id for response in responses] == [launched, launched]
+        assert [response.result.sequence_index for response in responses] == [0, 1]
+        assert [response.result.is_final for response in responses] == [False, True]
+        for response in responses:
+            assert response.result.finish_reasons == [FinishReason.CANCELLED]
+
+
 @pytest.mark.parametrize("rank, exports", [(0, True), (1, False)], ids=["rank_0", "tp_follower"])
 def test_only_rank_0_of_a_multimodal_encoder_exports(monkeypatch, rank, exports):
     """A follower's responses reach no client, so its exports would pin each batch's memory."""
