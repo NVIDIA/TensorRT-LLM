@@ -156,11 +156,12 @@ after SIGTERM and another 10 after SIGKILL, then warns and continues saving resu
 Running again with the same output directory and the same settings resumes the run: completed
 replies are kept and never asked again, failed attempts stay recorded and their questions are
 asked again, and an interrupted last line is moved aside. A different protocol, selection,
-endpoint or configuration is refused; use a fresh output directory. Results recorded under
+endpoint URL or recorded managed-launch configuration is refused; use a fresh output
+directory. Results recorded under
 the previous `gsm8k-first100-public-v1` identifier must also use a fresh output directory
 with this version; the renamed protocol preserves the same prompts, requests and scoring.
 
-The replies of one run all come from one served model. Before its first request, each attempt
+The replies of one run must all use the same served model name. Before its first request, each attempt
 records the model it asks: the `--served-model-name`, or else the only model that `/v1/models`
 lists. If the recorded replies were asked of a different model, the attempt is refused before
 any question is asked. The refusal is recorded in `run_manifest.json`, and a managed
@@ -170,6 +171,15 @@ than one model is never resumed. A run whose selected questions all have complet
 nothing and contacts no server; its summary names the model those replies came from. The
 evaluator identifies a model only by its served name, so it cannot detect different weights
 served under an unchanged name.
+
+**Endpoint resume trusts the operator.** The evaluator does not fingerprint the
+server build, weights, tokenizer/chat template, precision or serving configuration.
+An unchanged URL and model name do not prove that these are unchanged. If the server
+is upgraded, reconfigured or restarted with different inputs, use a fresh output
+directory; otherwise a resumed score may combine incompatible runs. Resume after a
+restart only when you can establish that the model and evaluation-relevant settings
+are unchanged. Managed mode records its launch settings, but also cannot detect
+weights or a server installation replaced in place.
 
 ## Beam baseline accuracy gate
 

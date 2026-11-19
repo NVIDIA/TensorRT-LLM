@@ -36,7 +36,9 @@ stop the processes this run started::
 of ``openai/gsm8k`` at revision ``cc7b047b6e5bb11b4f1af84efc572db110a51b3c``. The output
 directory receives ``results.jsonl`` (one line per question attempt), ``run_manifest.json`` and
 ``summary.json``; running again with the same directory and settings resumes, provided the
-server still serves the model that the recorded replies came from. The exit status is 0 when
+operator keeps the model and serving configuration unchanged. Only the served model name
+is checked for an existing endpoint; use a fresh output directory after changing its build,
+weights or settings. The exit status is 0 when
 every selected question completed without error, timeout or truncation (and, with
 ``--min-correct``, enough answers are correct), 1 when the run finished but did not pass, and
 2 when it was refused before asking, and 3 for an unexpected execution or result-storage

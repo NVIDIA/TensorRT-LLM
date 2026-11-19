@@ -21,8 +21,9 @@ either an existing server (endpoint mode: never started, stopped or signalled he
 ``trtllm-serve`` process this run launches and owns (managed mode: always stopped on success,
 failure, timeout or interruption). Running again with the same output directory and run
 identity resumes; a different identity is refused. The replies of a run all come from one
-served model: before its first request an attempt records the model it resolved, and a model
-other than the one the recorded replies were asked of is refused without asking anything.
+served model name: before its first request an attempt records the name it resolved, and a
+different name is refused without asking anything. Endpoint resume trusts the operator to
+keep weights, server build and serving settings unchanged behind that name.
 """
 
 from __future__ import annotations
