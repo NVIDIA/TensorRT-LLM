@@ -45,6 +45,13 @@ _TVM_FFI_HOOK = "CutlassBaseDSL.compile_and_cache.<locals>.post_compile_hook"
 # CuTe DSL settings under which KernelCache neither loads nor stores: compile outputs (KEEP and
 # the deprecated KEEP_*, DUMP_DIR, PRINT_*, DRYRUN) or no caching.
 _DSL_ENV_NO_REUSE = ("KEEP", "DUMP_", "PRINT_", "DRYRUN", "NO_CACHE", "DISABLE_FILE_CACHING")
+# cute.compile options that write files beside the result; KernelCache keeps no key holding one.
+_OUTPUT_OPTIONS = (
+    "--keep-",
+    "--dump-dir",
+    "--remark-output",
+    "--flatten-locs-output-json-path",
+)
 
 _local = threading.local()
 _file_digests: dict[tuple[str, int, int], str] = {}
@@ -410,7 +417,8 @@ class KernelCache(dict):
 
     A lookup that misses loads the kernel a process stored for the key, so the caller neither
     traces nor compiles it; storing a kernel exports it. An entry is keyed on ``owner``, the
-    ``repr`` of the key (keys whose ``repr`` holds an object address are not kept), the
+    ``repr`` of the key (keys whose ``repr`` holds an object address or a compile option that
+    writes files, such as ``--keep-ptx`` in the caller's extra options, are not kept), the
     ``CUTE_DSL_*`` settings, the TensorRT-LLM and CuTe DSL versions, the GPU's compute capability
     and the ``.py`` files beside ``source_file``. It is used only once the cache is installed, in a
     directory only this user can write to. A load or export that fails leaves the caller compiling
@@ -427,6 +435,8 @@ class KernelCache(dict):
         env = _dsl_env()
         text = repr(key)
         if _kernel_root is None or env is None or " at 0x" in text:
+            return None
+        if any(option in text for option in _OUTPUT_OPTIONS):
             return None
         try:
             identity = (
