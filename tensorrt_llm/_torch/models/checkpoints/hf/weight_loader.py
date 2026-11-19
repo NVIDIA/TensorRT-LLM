@@ -84,8 +84,7 @@ _PREFETCH_LOG_INTERVAL_SEC = 60.0
 _PREFETCH_FALLBACK_LOGGED = threading.Event()
 _PREFETCH_FALLBACK_LOG_LOCK = threading.Lock()
 # Decoder layers only; other stacks (e.g. a vision encoder) are read everywhere.
-_LAYER_IN_NAME = re.compile(
-    r"^(?:model\.|language_model\.model\.)?layers\.(\d+)\.")
+_LAYER_IN_NAME = re.compile(r"^(?:(?:language_)?model\.){0,2}layers\.(\d+)\.")
 _EXPERT_IN_NAME = re.compile(r"\.experts\.(\d+)\.")
 
 
