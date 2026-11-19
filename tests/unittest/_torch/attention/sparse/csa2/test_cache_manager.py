@@ -804,7 +804,7 @@ def test_fresh_fill_uses_physical_roles_and_preserves_relocated_committed_pages(
 
 
 @pytest.mark.cpu_only
-def test_fresh_fill_preserves_deferred_generation_tokens(monkeypatch) -> None:
+def test_fresh_fill_preserves_deferred_generation_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = _declarative_manager(20)
     manager._fresh_page_fill = 0
     manager._fresh_fill_announced = True

@@ -2282,7 +2282,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # running __init__. Zero disables the spec recompute tail.
     _spec_recompute_tail: int = 0
     # request id -> (request, stable token count) whose generation commit is
-    # deferred; see try_commit_generation_blocks. Created on first use.
+    # deferred; see try_commit_generation_blocks. Created on first use. While an
+    # entry exists kv_cache.num_committed_tokens lags; read get_num_committed_tokens.
     _deferred_generation_commits: Optional[dict[int, tuple[LlmRequest, int]]] = None
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
@@ -3764,9 +3765,10 @@ class KVCacheManagerV2(BaseResourceManager):
         owner's keys and values, so a decode that reads past what its own
         request wrote sees a stranger's data. Filling on assignment turns such a
         read into the pattern instead. Only pages not yet given to the request
-        are written, and only beyond ``num_committed_tokens`` (rounded up, so a
-        partially reused block stays protected) -- overwriting the matched or
-        committed prefix would corrupt a correct answer.
+        are written, and only beyond ``get_num_committed_tokens``, which counts a
+        deferred generation commit (rounded up, so a partially reused block stays
+        protected) -- overwriting the matched or committed prefix would corrupt a
+        correct answer.
 
         ``TRTLLM_KV_FRESH_PAGE_FILL=zero`` fills zeros; ``nan`` poisons (any read
         of an unwritten slot fails visibly). Unset -- the default -- touches
@@ -3779,8 +3781,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None:
             return
-        committed = self._committed_token_bound(request_id, kv_cache)
-        protected = (committed + self.tokens_per_block - 1) // self.tokens_per_block
+        protected = self._num_protected_blocks(request_id)
         num_blocks = int(kv_cache.num_blocks)
         state = self._fresh_pages_filled.setdefault(request_id, {})
         filled = 0
@@ -7397,6 +7398,28 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return kv_cache.history_length
 
+    def get_num_committed_tokens(self, request_id: int) -> int:
+        """Return the tokens committed to the request's cache, or 0 if it has none.
+
+        Counts a generation commit that try_commit_generation_blocks deferred: during
+        decode ``kv_cache.num_committed_tokens`` lags this by up to
+        ``tokens_per_block - 1`` tokens until a block fills, so decode-time readers use
+        this instead.
+        """
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is None:
+            return 0
+        committed = kv_cache.num_committed_tokens
+        deferred = self._deferred_generation_commits
+        entry = deferred.get(request_id) if deferred else None
+        return max(committed, entry[1]) if entry else committed
+
+    def _num_protected_blocks(self, request_id: int) -> int:
+        """Blocks a fresh-page fill must keep: committed or deferred KV, a partial block included."""
+        return (self.get_num_committed_tokens(request_id) + self.tokens_per_block - 1) // (
+            self.tokens_per_block
+        )
+
     def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
         """Extend KV cache capacity for the CUDA-graph padding delta.
 
@@ -9452,7 +9475,7 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.commit(tokens)
         keep_committing = self._can_commit_generation_blocks(request)
         if request.context_remaining_length == 0 and not keep_committing:
-            kv_cache.stop_committing()
+            self._stop_committing(request.py_request_id, kv_cache)
 
     def _can_commit_generation_blocks(self, request: LlmRequest) -> bool:
         """Whether decode KV remains a valid reusable logical prefix."""
@@ -9492,14 +9515,18 @@ class KVCacheManagerV2(BaseResourceManager):
         start = kv_cache.num_committed_tokens
         if stable_token_count > start:
             tokens_per_block = self.tokens_per_block
+            deferred = self._deferred_generation_commits
             if not is_end and stable_token_count // tokens_per_block == start // tokens_per_block:
-                # Until a block fills, commit() only appends to the cache's token list.
-                # Defer it; _flush_deferred_generation_commit catches up before the tail matters.
-                deferred = self._deferred_generation_commits
+                # Within a block KvCache::_commit only appends tokens: commit_min_snapshot is off
+                # under ALL_REUSABLE and update_resources already advanced history_length. The
+                # call that fills the block commits them, or a flush before close/suspend does.
                 if deferred is None:
                     deferred = self._deferred_generation_commits = {}
                 deferred[request.py_request_id] = (request, stable_token_count)
                 return
+            if deferred:
+                # This commit covers the deferred tokens; an entry left behind would hold the request.
+                deferred.pop(request.py_request_id, None)
             self._commit_generation_tokens(request, kv_cache, start, stable_token_count, is_end)
         elif is_end:
             kv_cache.commit([], is_end=True)
@@ -9519,8 +9546,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def _flush_deferred_generation_commit(self, request_id: int) -> None:
         """Commit the partial-block tail try_commit_generation_blocks deferred.
 
-        Must run while the cache is active and before stop_committing() (close)
-        or suspend(), so the cache's committed tokens match a per-step commit.
+        Runs where a cache leaves the map (_remove_kv_cache, _defer_remove_kv_cache), stops
+        committing (_stop_committing) or suspends: close()'s stopCommitting() publishes the
+        committed tail as a partial block, and native commit() rejects a stopped or suspended
+        cache. The entry is dropped for an unmapped or suspended cache.
         """
         deferred = self._deferred_generation_commits
         entry = deferred.pop(request_id, None) if deferred else None
@@ -9528,18 +9557,20 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None or not kv_cache.is_active:
+            # Every unmap and suspend flushes first, so reaching this means a missed flush.
+            logger.debug(
+                f"KVCacheManagerV2: dropping the deferred generation commit of request {request_id}"
+            )
             return
         request, end = entry
         start = kv_cache.num_committed_tokens
         if end > start:
             self._commit_generation_tokens(request, kv_cache, start, end, is_end=False)
 
-    def _committed_token_bound(self, request_id: int, kv_cache: _KVCache) -> int:
-        """Committed tokens, counting a deferred generation commit as done."""
-        committed = int(getattr(kv_cache, "num_committed_tokens", 0) or 0)
-        deferred = self._deferred_generation_commits
-        entry = deferred.get(request_id) if deferred else None
-        return max(committed, entry[1]) if entry else committed
+    def _stop_committing(self, request_id: int, kv_cache: _KVCache) -> None:
+        """stop_committing() after flushing a deferred generation commit, which it would reject."""
+        self._flush_deferred_generation_commit(request_id)
+        kv_cache.stop_committing()
 
     def release_index_slot(self, request_id: int) -> None:
         """Release IndexMapper slot early while keeping KV cache blocks allocated.
@@ -9565,6 +9596,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """Forget a sequence made by `_create_kv_cache`: drop it from the map,
         close it, clear its stats exclusion and free its index slot. Calling
         this again for the same id does nothing."""
+        self._flush_deferred_generation_commit(request_id)
         kv_cache = self.kv_cache_map.pop(request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request_id)
@@ -9700,6 +9732,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None:
             return False
+        self._flush_deferred_generation_commit(request_id)
         if request_id not in self._early_freed_index_requests:
             self.release_index_slot(request_id)
         # Nothing of the id is left to free, so a new request with the same id takes the normal path.
@@ -9763,9 +9796,6 @@ class KVCacheManagerV2(BaseResourceManager):
         self._disagg_receive_ready.pop(request.py_request_id, None)
         self._on_allocation_stream.discard(request.py_request_id)
         self._allocation_ready.pop(request.py_request_id, None)
-        # Commit the deferred tail while the cache is still mapped; a deferred
-        # close below unmaps it before the actual close.
-        self._flush_deferred_generation_commit(request.py_request_id)
         # Dummies reuse request ids, so their closes stay immediate.
         if (
             self._defer_close_enabled
@@ -10180,8 +10210,9 @@ class KVCacheManagerV2(BaseResourceManager):
         # the caches it lent against are still alive.
         if self._sharing is not None:
             self._sharing._on_shutdown()
-        for request_id in list(self._deferred_generation_commits or ()):
-            self._flush_deferred_generation_commit(request_id)
+        # No flush: impl.shutdown() clears the reuse tree right after, and disposal has to
+        # succeed on a poisoned runtime, where commit() raises.
+        self._deferred_generation_commits = None
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()

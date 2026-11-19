@@ -1590,8 +1590,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         cache = self.kv_cache_map.get(request_id)
         if cache is None:
             return
-        committed = self._committed_token_bound(request_id, cache)
-        protected_blocks = (committed + self.tokens_per_block - 1) // self.tokens_per_block
+        protected_blocks = self._num_protected_blocks(request_id)
         state = self._fresh_pages_filled.setdefault(request_id, {})
         filled = 0
         for (physical_layer, data_role), (layer, _ratio, role) in self._physical_roles.items():
