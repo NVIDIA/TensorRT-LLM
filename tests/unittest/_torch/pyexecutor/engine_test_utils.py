@@ -141,6 +141,7 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
         py_multimodal_data=None,
         py_mm_encoder_event=None,
         py_mrope_position_delta=None,
+        py_prompt_embeds=None,
         py_return_context_logits=False,
         py_batch_idx=None,
         lora_task_id=None,
