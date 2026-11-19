@@ -201,11 +201,12 @@ accuracy. Private checkpoint identifiers, evaluation traces, and reference captu
 are not part of this source distribution.
 
 Portable generated-input tests cover the component implementations and their
-composition. The full-model directory contains CPU parser/routing/registration and
-recipe tests and GPU metadata/request-row and disaggregated-handoff tests:
+composition. CPU coverage includes parsing, routing, registration, recipes and sampler row selection.
+GPU tests cover attention metadata and disaggregated handoff:
 
 ```bash
 python -m pytest -m cpu_only \
+  tests/unittest/llmapi/test_beam_reasoning_parser.py \
   tests/unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_serving.py \
   tests/unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_serving_cli.py
 python -m pytest \
