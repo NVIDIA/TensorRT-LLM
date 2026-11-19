@@ -582,6 +582,8 @@ class DecoderWarmup:
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
+        with self._warmup_timer.phase("lowm_mma_row_buckets"):
+            self._prewarm_lowm_mma_row_buckets()
         with self._warmup_timer.phase("cuda_graph_capture"):
             # KV-cache estimation always uses both passes, so the KV-cache size ignores the switch.
             self._graphs.warmup_and_capture(
@@ -628,9 +630,6 @@ class DecoderWarmup:
                     )
                 self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
-
-        with self._warmup_timer.phase("lowm_mma_row_buckets"):
-            self._prewarm_lowm_mma_row_buckets()
 
         # Allocate the CUDA graph padding dummies now, while the KV cache is
         # empty. Waiting for the first padded step can race KV saturation:
@@ -958,13 +957,20 @@ class DecoderWarmup:
 
         Eager forwards run these GEMMs on their row count rounded up to a bucket
         (``low_m_gemm._MMA_ROW_BUCKETS``), and the warmup forwards reach only the buckets of their
-        own row counts. The TP group is held until its slowest rank has finished: the GEMMs a rank
-        ran eagerly, and so its compiles, can differ between ranks.
+        own row counts. Runs before CUDA graph capture, so that a capture outside the decode graphs
+        finds its buckets compiled. The TP group is held until its slowest rank has finished: the
+        GEMMs a rank ran eagerly, and so its compiles, can differ between ranks.
         """
         from tensorrt_llm._torch.modules.low_m_gemm import prewarm_mma_row_buckets
 
         start = time.perf_counter()
-        compiled = prewarm_mma_row_buckets()
+        compiled = gemms = 0
+        try:
+            compiled, gemms = prewarm_mma_row_buckets()
+        except Exception as e:
+            # A prewarm miss only defers a compile to the first call that needs it, so it must not
+            # fail startup; the rank still meets its peers below.
+            logger.warning(f"Low-M MMA GEMM row-bucket prewarm stopped. {type(e).__name__}: {e}")
         if self.dist is not None:
             if self.mapping.cp_size > 1:
                 self.dist.tp_cp_allgather(1)
@@ -972,7 +978,7 @@ class DecoderWarmup:
                 self.dist.tp_allgather(1)
         if compiled:
             logger.info(
-                f"Low-M MMA GEMM row-bucket prewarm complete ({compiled} kernels, "
+                f"Low-M MMA GEMM row-bucket prewarm complete ({compiled} kernels for {gemms} GEMMs, "
                 f"{time.perf_counter() - start:.1f} s)"
             )
 

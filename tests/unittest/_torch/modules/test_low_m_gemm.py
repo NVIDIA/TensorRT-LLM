@@ -6,8 +6,11 @@
 # invoke the kernel hardware rather than the Python dispatch logic.
 
 import dataclasses
+import functools
+import gc
 import sys
 import time
+from typing import Any, Callable
 from unittest.mock import MagicMock
 
 import pytest
@@ -760,7 +763,7 @@ def test_shared_expert_piece_stores_the_swiglu(m, monkeypatch):
         assert torch.equal(out, separate())
 
 
-def _lowm_call(variant: str, m: int):
+def _lowm_call(variant: str, m: int) -> Callable[[], Any]:
     """A small-M MMA GEMM call of ``variant`` on ``m`` rows, as a no-argument function. Calls
     with ``lowm_tiles`` tiles swap their MMA operands at <= 8 rows where the GPU does."""
     g = torch.Generator(device="cuda").manual_seed(m)
@@ -797,7 +800,7 @@ def _lowm_call(variant: str, m: int):
 
 
 @_skip_no_lowm_fp8
-@pytest.mark.parametrize("m", [5, 13, 17])
+@pytest.mark.parametrize("m", [3, 5, 13, 17, 40, 50])
 @pytest.mark.parametrize(
     "variant",
     [
@@ -810,53 +813,101 @@ def _lowm_call(variant: str, m: int):
         "bf16",
     ],
 )
-def test_eager_rows_run_the_row_bucket_kernel_bitwise(variant, m, monkeypatch):
-    """An eager call runs the kernel of its row bucket on zero-padded rows, and so does a CUDA
-    graph captured after it; a decode-graph call runs the kernel of its exact rows. The real rows
-    of all three results carry the same bits."""
-    compiled_rows = []
+def test_eager_rows_run_the_row_bucket_kernel_bitwise(
+    variant: str, m: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An eager call runs the kernel of its row bucket on rows padded with an earlier call's, and a
+    CUDA graph captured after it runs that kernel without compiling; a decode-graph call runs the
+    kernel of its exact rows, which later eager calls reuse. The real rows of all four results carry
+    the same bits."""
+    kernel_rows = []
+    mma_kernel = _mod._mma_kernel
     compiled_mma = _mod._compiled_mma
 
-    def record(rows, *args, **kwargs):
-        compiled_rows.append(rows)
-        return compiled_mma(rows, *args, **kwargs)
+    def record(m: int, *args: Any, **kwargs: Any) -> tuple[Any, int]:
+        fn, rows = mma_kernel(m, *args, **kwargs)
+        kernel_rows.append(rows)
+        return fn, rows
 
-    monkeypatch.setattr(_mod, "_compiled_mma", record)
     monkeypatch.setattr(_mod, "_MMA_SIGNATURES", {})
+    monkeypatch.setattr(_mod, "_MMA_BUILT", set())
+    monkeypatch.setattr(_mod, "_MMA_ROUTES", {})
+    bucket = {3: 3, 5: 5, 13: 16, 17: 32, 40: 48, 50: 64}[m]
+    if bucket > m:
+        # Leaves other rows in the staging rows this call pads with.
+        _lowm_call(variant, bucket - 1)()
+    monkeypatch.setattr(_mod, "_mma_kernel", record)
     call = _lowm_call(variant, m)
     eager = call()
-    with flashinfer_mxfp8_decode_graph_capture():
-        exact = call()
+    misses = compiled_mma.cache_info().misses
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = call()
+    assert compiled_mma.cache_info().misses == misses
     graph.replay()
     torch.cuda.synchronize()
-    bucket = {5: 8, 13: 16, 17: 32}[m]
-    assert compiled_rows == [bucket, m, bucket]
-    for e, x, c in zip(*(t if isinstance(t, tuple) else (t,) for t in (eager, exact, captured))):
-        assert e.shape[0] == m and e.is_contiguous()
-        assert torch.equal(e.view(torch.uint8), x.view(torch.uint8))
-        assert torch.equal(e.view(torch.uint8), c.view(torch.uint8))
+    with flashinfer_mxfp8_decode_graph_capture():
+        exact = call()
+    reused = call()
+    assert kernel_rows == [bucket, bucket, m, m]
+    results = [r if isinstance(r, tuple) else (r,) for r in (eager, captured, exact, reused)]
+    if variant == "split_n":
+        assert [t.shape for t in results[0]] == [(m, 128), (m, 384)]
+    assert len({len(r) for r in results}) == 1
+    for outputs in zip(*results):
+        for t in outputs:
+            assert t.shape == outputs[0].shape and t.shape[0] == m and t.is_contiguous()
+            assert torch.equal(t.view(torch.uint8), outputs[0].view(torch.uint8))
     assert len(_mod._MMA_SIGNATURES) == 1
 
 
 @_skip_no_lowm_fp8
-def test_prewarm_compiles_every_row_bucket_of_eager_calls_only(monkeypatch):
+def test_prewarm_compiles_every_row_bucket_of_eager_calls_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prewarm compiles the eleven buckets an eager call did not reach and none of a GEMM that
+    only a decode graph ran. Afterwards no eager row count compiles, and eager calls of the decode
+    graph's row count run its exact kernel."""
+    compiled_mma = functools.lru_cache(maxsize=None)(_mod._compiled_mma.__wrapped__)
+    monkeypatch.setattr(_mod, "_compiled_mma", compiled_mma)
     monkeypatch.setattr(_mod, "_MMA_SIGNATURES", {})
-    x = torch.randn(3, 512, device="cuda").to(torch.bfloat16)
+    monkeypatch.setattr(_mod, "_MMA_BUILT", set())
+    monkeypatch.setattr(_mod, "_MMA_ROUTES", {})
+
+    def rows(m: int) -> torch.Tensor:
+        return torch.zeros(m, 512, device="cuda", dtype=torch.bfloat16)
+
     eager_w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
     graph_w = torch.randn(72, 512, device="cuda").to(torch.bfloat16)
-    bf16_lowm_linear(x, eager_w)
+    bf16_lowm_linear(rows(3), eager_w)
     with flashinfer_mxfp8_decode_graph_capture():
-        bf16_lowm_linear(x, graph_w)
-    _mod.prewarm_mma_row_buckets()
-    misses = _mod._compiled_mma.cache_info().misses
+        bf16_lowm_linear(rows(3), graph_w)
+    assert compiled_mma.cache_info().misses == 2
+    assert _mod.prewarm_mma_row_buckets() == (11, 1)
+    assert compiled_mma.cache_info().misses == 13
     for m in range(1, 65):
-        bf16_lowm_linear(torch.zeros(m, 512, device="cuda", dtype=torch.bfloat16), eager_w)
-    assert _mod._compiled_mma.cache_info().misses == misses
-    bf16_lowm_linear(torch.zeros(13, 512, device="cuda", dtype=torch.bfloat16), graph_w)
-    assert _mod._compiled_mma.cache_info().misses == misses + 1
+        bf16_lowm_linear(rows(m), eager_w)
+    bf16_lowm_linear(rows(3), graph_w)
+    assert compiled_mma.cache_info().misses == 13
+    bf16_lowm_linear(rows(13), graph_w)
+    assert compiled_mma.cache_info().misses == 14
+
+
+@_skip_no_lowm_fp8
+def test_cute_views_are_reused_per_tensor_storage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A base tensor's CuTe view is exported once and reused; new storage, a view, or a dead tensor
+    does not reuse it."""
+    monkeypatch.setattr(_mod, "_CUTE_VIEWS", {})
+    t = torch.zeros(8, 64, device="cuda", dtype=torch.bfloat16)
+    first = _mod._cute_view(t)
+    assert _mod._cute_view(t) is first
+    t.data = torch.zeros(8, 64, device="cuda", dtype=torch.bfloat16)
+    assert _mod._cute_view(t) is not first
+    assert _mod._cute_view(t[:4]) is not _mod._cute_view(t[:4])
+    key = id(t)
+    del t
+    gc.collect()
+    assert key not in _mod._CUTE_VIEWS
 
 
 # ---------------------------------------------------------------------------

@@ -1075,6 +1075,26 @@ def test_decode_prewarm_failure_still_reaches_barrier() -> None:
     owner.dist.tp_allgather.assert_called_once_with(1)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cp_size,gather", [(1, "tp_allgather"), (2, "tp_cp_allgather")])
+@pytest.mark.parametrize("fails", [False, True])
+def test_lowm_row_bucket_prewarm_always_meets_its_peers(
+    cp_size: int, gather: str, fails: bool
+) -> None:
+    """A rank meets its TP (TP x CP) peers whether its prewarm compiled nothing or failed; a failure
+    is a warning, since it only defers the compiles to their first calls."""
+    owner = SimpleNamespace(mapping=SimpleNamespace(cp_size=cp_size, tp_size=2), dist=Mock())
+    prewarm = Mock(side_effect=RuntimeError("no compiler")) if fails else Mock(return_value=(0, 0))
+    with (
+        patch("tensorrt_llm._torch.modules.low_m_gemm.prewarm_mma_row_buckets", prewarm),
+        patch.object(decoder_warmup_module.logger, "warning") as warning,
+    ):
+        DecoderWarmup._prewarm_lowm_mma_row_buckets(owner)
+    prewarm.assert_called_once_with()
+    getattr(owner.dist, gather).assert_called_once_with(1)
+    assert warning.call_count == int(fails)
+
+
 class TestWarmupCleanup(unittest.TestCase):
     def test_empty_cache_fires_immediately_after_autotuner(self) -> None:
         """Change 1 placement: empty_cache must be the call right after
