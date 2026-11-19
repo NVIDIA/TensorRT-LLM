@@ -332,6 +332,18 @@ def test_attached_embeddings_reuse_only_identical_embeddings(
     assert first_again.cached_tokens >= reusable_tokens
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_attached_embedding_digest_does_not_depend_on_device(
+        dtype: torch.dtype) -> None:
+    """A CUDA embedding hashes through a host copy to the CPU digest."""
+    embedding = torch.arange(24, dtype=torch.float32).reshape(4, 6).to(dtype)
+
+    on_cuda = apply_mm_hashes({"image": [embedding.cuda()]}).hashes
+    on_cpu = apply_mm_hashes({"image": [embedding]}).hashes
+
+    assert on_cuda == on_cpu
+
+
 @pytest.fixture(
     scope="module",
     params=[

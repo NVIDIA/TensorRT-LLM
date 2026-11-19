@@ -12,6 +12,8 @@ import torch
 from blake3 import blake3
 from PIL import Image
 
+from tensorrt_llm._utils import prefer_pinned
+
 # Canonical media names for input metadata and I/O validation.
 MediaModality = Literal["image", "video", "audio"]
 MEDIA_MODALITIES: tuple[MediaModality, ...] = get_args(MediaModality)
@@ -89,6 +91,20 @@ def _numpy_has_dtype(dtype: torch.dtype) -> bool:
     return True
 
 
+def _to_host(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous host copy of ``tensor`` for hashing.
+
+    A CUDA tensor goes through pinned memory: a pageable destination of 32 MiB
+    or more is freshly mapped on every copy, so the copy page-faults.
+    """
+    tensor = tensor.detach()
+    if not tensor.is_cuda:
+        return tensor.contiguous()
+    host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=prefer_pinned())
+    host.copy_(tensor)
+    return host
+
+
 def _array_payload(array: np.ndarray) -> _Chunk:
     """Return the raw bytes of a C-contiguous array, as ``array.tobytes()``.
 
@@ -152,7 +168,7 @@ def _update_serialized_item(update: Callable[[_Chunk], None], obj: object) -> No
     if isinstance(obj, torch.Tensor) and not _numpy_has_dtype(obj.dtype):
         # NumPy has no such dtype (bfloat16, float8): key the torch dtype name,
         # the shape and the raw bytes instead.
-        tensor = obj.detach().contiguous().cpu()
+        tensor = _to_host(obj)
         raw = tensor.reshape(-1).view(torch.uint8).numpy()
         update(_u8(0x12))
         update(_len_prefixed(str(tensor.dtype).encode("utf-8")))
@@ -168,7 +184,7 @@ def _update_serialized_item(update: Callable[[_Chunk], None], obj: object) -> No
         # identity -- only dtype, shape, and raw bytes are. Normalize both to a
         # contiguous NumPy array so identical content hashes identically.
         if isinstance(obj, torch.Tensor):
-            obj = obj.detach().cpu().contiguous().numpy()
+            obj = _to_host(obj).numpy()
         array = np.ascontiguousarray(obj)
         update(_u8(0x11))
         update(_len_prefixed(array.dtype.str.encode("utf-8")))

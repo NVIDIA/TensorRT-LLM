@@ -11,6 +11,7 @@ Processor registration and encoder execution live outside this module.
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from functools import partial
 from itertools import accumulate
 from operator import itemgetter
 from typing import (Any, Container, Dict, Hashable, List, NamedTuple, Optional,
@@ -26,8 +27,9 @@ from tensorrt_llm.inputs.multimodal_data import (MEDIA_MODALITIES,
                                                  _hash_serialized_item)
 from tensorrt_llm.logger import logger
 
-# Default hasher
-default_hasher = blake3
+# Default hasher. BLAKE3 hashes large inputs on several threads; the digest
+# does not depend on the thread count.
+default_hasher = partial(blake3, max_threads=blake3.AUTO)
 _INT32_MAX = 2**31 - 1
 MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 
