@@ -259,7 +259,7 @@ Replace `engine-host` with an address Prometheus can reach. For remote scraping,
 
 - `trtllm_request_success_total` counts completed output candidates by finish reason. One successful request with `num_sequences=2` contributes two candidates.
 - `trtllm_prompt_tokens_total` counts the prompt once per request; `trtllm_generation_tokens_total` sums tokens across outputs.
-- `trtllm_openengine_rpc_outcomes_total{phase,outcome}` counts one outcome per `Generate` call, including rejection, cancellation, and engine errors. Use this to distinguish RPC outcomes from candidate completion. Completion means the server consumed the response stream, not that the client acknowledged receipt.
+- `trtllm_openengine_rpc_outcomes_total{phase,outcome}` counts one outcome per `Generate` or `Encode` call, including rejection, cancellation, and engine errors. Encode uses `phase="encode"` and does not record generated-token or candidate statistics. Completion means the handler produced its result, not that the client acknowledged receipt.
 - `trtllm_openengine_metrics_errors_total{source}` reports collection failures without failing inference.
 
 Request latency histograms measure this worker's execution phase. For separate prefill and decode workers, they do not measure the client's full request latency. Rejected or interrupted requests may have no candidate timing observations. Health probes are excluded from request metrics, but their engine work can appear in iteration statistics.
@@ -348,7 +348,7 @@ For disaggregated subagent context requests, configure `internal_request_auth_ke
 
 ## Image encoder handoff (experimental)
 
-Image E+PD and E+P+D use the `EncoderOptions` / `EncodeReady` contract proposed in
+Image E+PD and E+P+D use the unary `Inference.Encode` contract proposed in
 [OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), pinned to an
 immutable source revision in the vendor lock. Both client and server need the
 matching bindings; this proposal is not in a published BSR release or runtime.
@@ -366,7 +366,7 @@ For E+P+D, configure a compatible native `cache_transceiver_config` on both P an
 D, independently of the encoder transfer backend. The prefill request sets
 `extra.request_type = "context_only"` and consumes the encoder handoff. The decode
 request carries the resulting `kv.session`, preserves the original prompt/media
-identity, and omits `encoder.handoff`; an encoder reference must not be consumed
+identity, and omits `encoded_media`; an encoder reference must not be consumed
 twice. Decode reuses the expanded tokens and portable model state from prefill
 without fetching media or running the vision encoder.
 
@@ -375,21 +375,20 @@ capture hooks, missing state, or preparation metadata over the existing size bou
 the encoder-consuming prefill request to fail before language execution. These
 requirements do not change the ordinary PD preparation fallback or E+PD behavior.
 
-Image E+PD and E+P+D have been manually validated with Qwen3-VL-2B across GPU
-hosts using matching source overlays. Focused CPU checks cover the final rebased
-branch; GPU validation of that branch has not been repeated.
+`EncodeRequest` carries ordered media and optional prompt/token-ID context.
+Native TRT-LLM preparation requires that context; the portable API does not impose
+it on other frameworks. Encode returns one `EncodedMediaRef`, with a native
+`reference_format` and opaque bytes. The downstream Generate repeats the original
+context and media and supplies `encoded_media` to PD or P. The consumer does not
+fetch media or run its vision encoder. It reports the expanded prompt and
+generation usage. Text-only requests can bypass E.
 
-`ModelInfo.encoder` advertises the schema version, encoder-only or handoff-consumer
-role, supported transfer backends, typed abort cleanup support and mandatory-handoff
-policy. Producers report a singular `transfer_backend`; consumers list
-`supported_transfer_backends`. Encoder-only requests set the `encode_only`
-message in `EncoderOptions.mode` and terminate with `EncodeReady` without usage;
-the consumer reports the expanded prompt and generation usage. Encoding rejects
-nonempty sampling, stopping, guided-decoding and response options, and LoRA
-selection. The downstream request repeats the same prompt or ordered token IDs
-and field-equal ordered media items and supplies `encoder.handoff`
-to PD or P; it does not fetch the image or run its own vision encoder. Text-only
-requests can bypass the encoder.
+Dedicated E workers advertise `ENGINE_ROLE_ENCODER`. There is no encoder-specific
+capability negotiation: explicitly configure compatible E/P builds and validate
+their existing schema-release identity. `Control.ReleaseEncodedMedia` releases an
+unused output at E; `Control.Abort` cancels active Encode or Generate work.
+TRT-LLM owns reference validation, transfer and lifetime independently of the
+public protobuf adapter. Dynamo forwards the reference unchanged.
 
 For the optional shared-file backend, set `TRTLLM_OPENENGINE_ENCODER_CACHE_DIR`
 to the same private directory on the encoder and its consuming PD or P engine.
@@ -430,8 +429,8 @@ lock during network waits. Shutdown closes admission and drains active handoffs.
 Proven pre-WRITE rejections carry `INVALID_ARGUMENT` and trailing metadata
 `trtllm-encoder-write: not-started`; consumers release their receive buffers and
 report invalid input. Unmarked failures remain uncertain, including failures from
-older peers. Failed receiver setup preserves the source reference only after its
-request-owned agent has been retired.
+older peers. A claimed source reference remains consumed after failure. A fresh encoding
+is required to retry; a lost reply does not make the old reference reusable.
 
 Language engines release transport request references after native enqueue
 accepts ownership. Context-only KV transfers continue making progress while the
@@ -452,8 +451,7 @@ only that operation's registrations, buffers and agent until process exit; other
 receives can proceed within the memory quota and eight active-or-quarantined
 receive slots. Quarantined resources remain charged to both limits, including
 after shutdown, and require a process restart to reclaim. Exhausting the
-quarantine budget marks the cache unhealthy; a failed cache no longer advertises
-a transfer backend. A missing RPC reply does not establish that
+quarantine budget marks the cache unhealthy; subsequent operations fail. A missing RPC reply does not establish that
 a remote write stopped. Do not retry a consumed handoff.
 The cross-host GPU path requires the matching protocol and serving changes;
 a published runtime containing them is not yet available.

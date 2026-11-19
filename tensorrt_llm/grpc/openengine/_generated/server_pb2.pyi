@@ -17,10 +17,12 @@ class EngineRole(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     ENGINE_ROLE_AGGREGATED: _ClassVar[EngineRole]
     ENGINE_ROLE_PREFILL: _ClassVar[EngineRole]
     ENGINE_ROLE_DECODE: _ClassVar[EngineRole]
+    ENGINE_ROLE_ENCODER: _ClassVar[EngineRole]
 ENGINE_ROLE_UNSPECIFIED: EngineRole
 ENGINE_ROLE_AGGREGATED: EngineRole
 ENGINE_ROLE_PREFILL: EngineRole
 ENGINE_ROLE_DECODE: EngineRole
+ENGINE_ROLE_ENCODER: EngineRole
 
 class GetServerInfoRequest(_message.Message):
     __slots__ = ()

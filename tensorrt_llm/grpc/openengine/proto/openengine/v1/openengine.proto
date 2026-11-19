@@ -16,6 +16,7 @@ syntax = "proto3";
 
 package openengine.v1;
 
+import "openengine/v1/encoding.proto";
 import "openengine/v1/generation.proto";
 import "openengine/v1/kv.proto";
 import "openengine/v1/lifecycle.proto";
@@ -38,6 +39,8 @@ import "openengine/v1/server.proto";
 service Inference {
   // Core inference path.
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+  // Produce engine-owned media outputs; the endpoint's role is set at startup.
+  rpc Encode(EncodeRequest) returns (EncodeResponse);
 }
 
 service Control {
@@ -49,6 +52,8 @@ service Control {
   // Health and lifecycle.
   rpc Health(HealthRequest) returns (HealthResponse);
   rpc Abort(AbortRequest) returns (AbortResponse);
+  // Release a completed output at its producer; never cancels an active transfer.
+  rpc ReleaseEncodedMedia(ReleaseEncodedMediaRequest) returns (ReleaseEncodedMediaResponse);
   // Identity-fenced, idempotent shutdown of the entire engine serving group.
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 

@@ -13,40 +13,13 @@ from typing import Any
 import numpy as np
 from google.protobuf import struct_pb2
 
+from tensorrt_llm._torch.disaggregation.encoder_output import _config_digest
 from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.llmapi.llm import PreprocessedInputs
 
 _DECODE_PREPARATION_KEY = "trtllm_decode_preparation"
 _MAX_DECODE_PREPARATION_BYTES = 2 * 1024 * 1024
-
-
-def _input_digest(request: Any) -> str:
-    digest = hashlib.sha256()
-
-    def field(value: bytes) -> None:
-        digest.update(len(value).to_bytes(8, "big"))
-        digest.update(value)
-
-    # Hash field values, not protobuf encoding or unknown extension fields.
-    kind = request.WhichOneof("input")
-    if kind is None:
-        raise ValueError("encoder handoff requires prompt or token IDs")
-    field(kind.encode())
-    if kind == "prompt":
-        field(request.prompt.encode())
-    else:
-        field(np.asarray(request.token_ids.ids, dtype="<u4").tobytes())
-    digest.update(len(request.media).to_bytes(8, "big"))
-    for item in request.media:
-        digest.update(item.modality.to_bytes(4, "big", signed=True))
-        source = item.WhichOneof("source")
-        field((source or "").encode())
-        value = getattr(item, source) if source else b""
-        field(value if isinstance(value, bytes) else value.encode())
-        field(item.mime_type.encode())
-        field(item.uuid.encode())
-    return digest.hexdigest()
 
 
 def _decode_input_digest(request: Any) -> str:
@@ -58,20 +31,6 @@ def _decode_input_digest(request: Any) -> str:
         digest.update(len(part).to_bytes(8, "big"))
         digest.update(part)
     return digest.hexdigest()
-
-
-def _config_digest(llm: Any) -> str:
-    processor = llm.input_processor
-    config = processor.config.to_dict()
-    config.pop("_name_or_path", None)
-    image_processor = getattr(processor.processor, "image_processor", None)
-    identity = {
-        "model": config,
-        "processor_class": f"{type(processor).__module__}.{type(processor).__qualname__}",
-        "media_io": processor.get_preferred_media_io_kwargs(),
-        "image_processor": image_processor.to_dict() if image_processor is not None else None,
-    }
-    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _decode_preparation(

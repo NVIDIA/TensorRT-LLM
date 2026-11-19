@@ -3,6 +3,8 @@
 
 """Errors the OpenEngine adapter raises across its modules."""
 
+from tensorrt_llm._torch.disaggregation.encoder_output import EncoderTransferRejected
+
 
 class UnsupportedFeatureError(ValueError):
     """Raised when OpenEngine requests a feature this adapter cannot map."""
@@ -13,10 +15,6 @@ class MediaUnavailableError(RuntimeError):
 
 
 ENCODER_TRANSFER_REJECTED_METADATA = ("trtllm-encoder-write", "not-started")
-
-
-class EncoderTransferRejected(ValueError):
-    """Reject a transfer before WRITE; receiver buffers can be released."""
 
 
 class AbortFailedError(RuntimeError):

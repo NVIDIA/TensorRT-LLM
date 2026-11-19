@@ -9,6 +9,7 @@ import os
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from types import SimpleNamespace
 
 import grpc
@@ -23,10 +24,11 @@ from test_encoder import (
     request,
 )
 
+from tensorrt_llm._torch.disaggregation import encoder_nixl as transport
+from tensorrt_llm._torch.disaggregation.encoder_output import EncodedMediaRef
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.grpc.openengine import encoder_nixl as transport
+from tensorrt_llm.grpc.openengine import encoder_nixl as rpc
 from tensorrt_llm.grpc.openengine.bindings import encoder_transfer_pb2
-from tensorrt_llm.grpc.openengine.bindings import generation_pb2 as pb
 from tensorrt_llm.grpc.openengine.encoder_transfer import EncoderTransferServicer
 from tensorrt_llm.grpc.openengine.errors import (
     ENCODER_TRANSFER_REJECTED_METADATA,
@@ -134,7 +136,13 @@ def _cache(endpoint=""):
         agents.append(agent)
         return agent
 
-    cache = transport.NixlEncoderCache(endpoint, "a" * 40, device="cpu", agent_factory=factory)
+    cache = transport.NixlEncoderCache(
+        endpoint,
+        "a" * 40,
+        device="cpu",
+        agent_factory=factory,
+        request_transfer=rpc.request_transfer,
+    )
     agents.clear()
     cache.test_agents = agents
     return cache
@@ -180,15 +188,17 @@ def pair(monkeypatch):
 
         def Transfer(self, req, timeout):
             try:
-                producer.transfer(req.cache, req.destination)
+                producer.transfer(
+                    EncodedMediaRef(transport.BACKEND, req.reference), req.destination
+                )
             except transport.EncoderTransferRejected as error:
                 raise RpcFailure(
-                    str(error), metadata=(transport.ENCODER_TRANSFER_REJECTED_METADATA,)
+                    str(error), metadata=(ENCODER_TRANSFER_REJECTED_METADATA,)
                 ) from error
             return encoder_transfer_pb2.TransferEncoderCacheResponse()
 
-    monkeypatch.setattr(transport.grpc, "insecure_channel", lambda endpoint: Channel())
-    monkeypatch.setattr(transport.encoder_transfer_pb2_grpc, "EncoderTransferStub", Stub)
+    monkeypatch.setattr(rpc.grpc, "insecure_channel", lambda endpoint: Channel())
+    monkeypatch.setattr(rpc.encoder_transfer_pb2_grpc, "EncoderTransferStub", Stub)
     yield producer, consumer
     for cache in (consumer, producer):
         if not cache._closed:
@@ -200,7 +210,7 @@ def test_nixl_roundtrip_retains_tensors_metadata_and_mrope(pair):
     llm, seen = model()
     output, expected = native_result()
     ref = producer.publish(output, request(), llm)
-    assert ref.transfer_backend == transport.BACKEND
+    assert ref.reference_format == transport.BACKEND
     assert "host" not in json.loads(ref.opaque_state)
     assert not output.disaggregated_params.multimodal_embedding_handles
     _, params = consumer.prepare(ref, request(), llm, None)
@@ -353,8 +363,7 @@ def test_different_input_or_revision_is_rejected_before_transfer(pair):
     producer, consumer = pair
     llm, _ = model()
     ref = producer.publish(native_result()[0], request(), llm)
-    altered = request()
-    altered.prompt = "another prompt"
+    altered = replace(request(), prompt="another prompt")
     with pytest.raises(ValueError, match="request inputs"):
         consumer.prepare(ref, altered, llm, None)
     consumer.model_revision = "b" * 40
@@ -430,7 +439,7 @@ def test_unreachable_peer_quarantines_only_its_receive_and_late_write_remains_sa
 
     with monkeypatch.context() as patch:
         patch.setattr(
-            transport.encoder_transfer_pb2_grpc,
+            rpc.encoder_transfer_pb2_grpc,
             "EncoderTransferStub",
             lambda channel: SimpleNamespace(Transfer=fail_transfer),
         )
@@ -445,7 +454,9 @@ def test_unreachable_peer_quarantines_only_its_receive_and_late_write_remains_sa
     actual = _receive(consumer, fresh)
     assert _receiver(consumer) is not pinned and _receiver(consumer).stopped
     assert consumer._used == pinned_bytes and consumer._receive_slots == 1
-    producer.transfer(pending[0].cache, pending[0].destination)
+    producer.transfer(
+        EncodedMediaRef(transport.BACKEND, pending[0].reference), pending[0].destination
+    )
     assert torch.equal(actual[0], torch.arange(8, dtype=torch.float32).reshape(2, 4))
     consumer.close()
     assert pinned.registrations and not pinned.stopped
@@ -531,7 +542,7 @@ def test_exhausted_quarantine_budget_marks_cache_unhealthy_without_freeing_buffe
         raise RpcFailure("lost peer", grpc.StatusCode.UNAVAILABLE)
 
     monkeypatch.setattr(
-        transport.encoder_transfer_pb2_grpc,
+        rpc.encoder_transfer_pb2_grpc,
         "EncoderTransferStub",
         lambda channel: SimpleNamespace(Transfer=fail_transfer),
     )
@@ -556,7 +567,7 @@ def test_bad_destination_size_does_not_consume_export(pair):
 
 
 @pytest.mark.parametrize("invalid", ["address", "device"])
-def test_unregistered_destination_preserves_reference_for_retry(pair, monkeypatch, invalid):
+def test_unregistered_destination_consumes_claim_without_write(pair, monkeypatch, invalid):
     producer, consumer = pair
     llm, _ = model()
     reference = producer.publish(native_result()[0], request(), llm)
@@ -578,9 +589,12 @@ def test_unregistered_destination_preserves_reference_for_retry(pair, monkeypatc
             _receive(consumer, reference)
     assert not producer.failed and not consumer.failed
     assert _writes(producer) == 0
-    assert json.loads(reference.opaque_state)["id"] in producer._exports
+    assert json.loads(reference.opaque_state)["id"] not in producer._exports
     assert _sender(producer).stopped and not _sender(producer).registrations
     assert consumer._used == 0 and _receiver(consumer).stopped
+    with pytest.raises(EncoderTransferRejected, match="already consumed"):
+        _receive(consumer, reference)
+    reference = producer.publish(native_result()[0], request(), llm)
     actual = _receive(consumer, reference)
     assert torch.equal(actual[0], torch.arange(8, dtype=torch.float32).reshape(2, 4))
     assert producer._used == consumer._used == 0
@@ -610,8 +624,8 @@ def test_receiver_quota_and_dtype_validation_precede_allocation(pair):
     ref = producer.publish(native_result()[0], request(), llm)
     state = json.loads(ref.opaque_state)
     state["metadata"]["tensors"][0]["shape"] = [2**30]
-    oversized = pb.EncoderHandoffRef(
-        transfer_backend=transport.BACKEND, opaque_state=json.dumps(state).encode()
+    oversized = EncodedMediaRef(
+        reference_format=transport.BACKEND, opaque_state=json.dumps(state).encode()
     )
     with pytest.raises(ValueError, match="memory limit"):
         consumer.prepare(oversized, request(), llm, None)
@@ -677,12 +691,16 @@ def test_native_nixl_over_real_grpc_loopback():
 
     server = grpc.server(ThreadPoolExecutor(max_workers=2))
     port = server.add_insecure_port("127.0.0.1:0")
-    producer = transport.NixlEncoderCache(f"127.0.0.1:{port}", "a" * 40, device="cpu")
-    consumer = transport.NixlEncoderCache("", "a" * 40, device="cpu")
+    producer = transport.NixlEncoderCache(
+        f"127.0.0.1:{port}", "a" * 40, device="cpu", request_transfer=rpc.request_transfer
+    )
+    consumer = transport.NixlEncoderCache(
+        "", "a" * 40, device="cpu", request_transfer=rpc.request_transfer
+    )
 
     class Service(encoder_transfer_pb2_grpc.EncoderTransferServicer):
         def Transfer(self, req, context):
-            producer.transfer(req.cache, req.destination)
+            producer.transfer(EncodedMediaRef(transport.BACKEND, req.reference), req.destination)
             return encoder_transfer_pb2.TransferEncoderCacheResponse()
 
     encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(Service(), server)
@@ -712,11 +730,13 @@ def _native_encoder_producer(pipe):
 
     server = grpc.server(ThreadPoolExecutor(max_workers=2))
     port = server.add_insecure_port("127.0.0.1:0")
-    producer = transport.NixlEncoderCache(f"127.0.0.1:{port}", "a" * 40, device="cpu")
+    producer = transport.NixlEncoderCache(
+        f"127.0.0.1:{port}", "a" * 40, device="cpu", request_transfer=rpc.request_transfer
+    )
 
     class Service(encoder_transfer_pb2_grpc.EncoderTransferServicer):
         def Transfer(self, req, context):
-            producer.transfer(req.cache, req.destination)
+            producer.transfer(EncodedMediaRef(transport.BACKEND, req.reference), req.destination)
             return encoder_transfer_pb2.TransferEncoderCacheResponse()
 
     encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(Service(), server)
@@ -724,7 +744,7 @@ def _native_encoder_producer(pipe):
     try:
         llm, _ = model()
         ref = producer.publish(native_result()[0], request(), llm)
-        pipe.send((os.getpid(), ref.SerializeToString()))
+        pipe.send((os.getpid(), ref.opaque_state))
         assert pipe.recv() == "stop"
     finally:
         server.stop(0).wait()
@@ -749,9 +769,11 @@ def test_native_nixl_between_separate_processes():
         assert parent.poll(120), "encoder process did not become ready"
         producer_pid, wire = parent.recv()
         assert producer_pid != os.getpid()
-        consumer = transport.NixlEncoderCache("", "a" * 40, device="cpu")
+        consumer = transport.NixlEncoderCache(
+            "", "a" * 40, device="cpu", request_transfer=rpc.request_transfer
+        )
         llm, seen = model()
-        consumer.prepare(pb.EncoderHandoffRef.FromString(wire), request(), llm, None)
+        consumer.prepare(EncodedMediaRef(transport.BACKEND, wire), request(), llm, None)
         expected = [
             torch.arange(8, dtype=torch.float32).reshape(2, 4),
             torch.arange(6, dtype=torch.int64).reshape(3, 1, 2),
@@ -776,7 +798,7 @@ def _receive(cache, reference):
         return cache._receive(reference, cache._reference(reference))
 
 
-def test_preflight_rejection_restores_reference_and_receiver_is_reusable(pair, monkeypatch):
+def test_preflight_rejection_consumes_reference_and_receiver_is_reusable(pair, monkeypatch):
     producer, consumer = pair
     llm, _ = model()
     reference = producer.publish(native_result()[0], request(), llm)
@@ -794,21 +816,24 @@ def test_preflight_rejection_restores_reference_and_receiver_is_reusable(pair, m
     rejection = error.value.__cause__
     assert isinstance(rejection, grpc.RpcError)
     assert rejection.code() == grpc.StatusCode.INVALID_ARGUMENT
-    assert transport.ENCODER_TRANSFER_REJECTED_METADATA in rejection.trailing_metadata()
+    assert ENCODER_TRANSFER_REJECTED_METADATA in rejection.trailing_metadata()
     assert not producer.failed and not consumer.failed
-    assert json.loads(reference.opaque_state)["id"] in producer._exports
-    assert producer._used > 0 and _writes(producer) == 0
+    assert json.loads(reference.opaque_state)["id"] not in producer._exports
+    assert producer._used == 0 and _writes(producer) == 0
     assert _sender(producer).stopped and not _sender(producer).registrations
     assert not _sender(producer).loaded
     assert consumer._used == 0 and not _receiver(consumer).registrations
     assert _receiver(consumer).stopped
     monkeypatch.setattr(FakeAgent, "load_remote_agent", original)
+    with pytest.raises(transport.EncoderTransferRejected, match="already consumed"):
+        _receive(consumer, reference)
+    reference = producer.publish(native_result()[0], request(), llm)
     actual = _receive(consumer, reference)
     assert torch.equal(actual[0], torch.arange(8, dtype=torch.float32).reshape(2, 4))
     assert producer._used == consumer._used == 0
 
 
-def test_preflight_constructor_moves_descriptors_then_rejects_but_retry_succeeds(pair, monkeypatch):
+def test_preflight_constructor_failure_consumes_claim_and_new_output_succeeds(pair, monkeypatch):
     from tensorrt_llm._torch.disaggregation.base import agent
 
     producer, consumer = pair
@@ -831,6 +856,9 @@ def test_preflight_constructor_moves_descriptors_then_rejects_but_retry_succeeds
     with pytest.raises(transport.EncoderTransferRejected, match="taking descriptors"):
         _receive(consumer, reference)
     assert not producer.failed and not consumer.failed
+    with pytest.raises(transport.EncoderTransferRejected, match="already consumed"):
+        _receive(consumer, reference)
+    reference = producer.publish(native_result()[0], request(), llm)
     actual = _receive(consumer, reference)
     assert calls == 2 and _writes(producer) == 1
     assert torch.equal(actual[0], torch.arange(8, dtype=torch.float32).reshape(2, 4))
@@ -850,7 +878,7 @@ def test_unproven_rpc_failure_after_write_quarantines_receiver(pair, monkeypatch
         "marked-unavailable": RpcFailure(
             "reply failed after WRITE",
             grpc.StatusCode.UNAVAILABLE,
-            (transport.ENCODER_TRANSFER_REJECTED_METADATA,),
+            (ENCODER_TRANSFER_REJECTED_METADATA,),
         ),
     }
 
@@ -1135,16 +1163,18 @@ def test_real_grpc_marked_rejection_releases_receiver_and_allows_a_fresh_referen
     producer = _cache(f"127.0.0.1:{port}")
     consumer = _cache()
 
-    class Service(transport.encoder_transfer_pb2_grpc.EncoderTransferServicer):
+    class Service(rpc.encoder_transfer_pb2_grpc.EncoderTransferServicer):
         def Transfer(self, req, context):
             try:
-                producer.transfer(req.cache, req.destination)
+                producer.transfer(
+                    EncodedMediaRef(transport.BACKEND, req.reference), req.destination
+                )
             except transport.EncoderTransferRejected as error:
-                context.set_trailing_metadata((transport.ENCODER_TRANSFER_REJECTED_METADATA,))
+                context.set_trailing_metadata((ENCODER_TRANSFER_REJECTED_METADATA,))
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
             return encoder_transfer_pb2.TransferEncoderCacheResponse()
 
-    transport.encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(Service(), server)
+    rpc.encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(Service(), server)
     server.start()
     try:
         llm, _ = model()
@@ -1155,7 +1185,7 @@ def test_real_grpc_marked_rejection_releases_receiver_and_allows_a_fresh_referen
         rejection = error.value.__cause__
         assert isinstance(rejection, grpc.RpcError)
         assert rejection.code() == grpc.StatusCode.INVALID_ARGUMENT
-        assert transport.ENCODER_TRANSFER_REJECTED_METADATA in rejection.trailing_metadata()
+        assert ENCODER_TRANSFER_REJECTED_METADATA in rejection.trailing_metadata()
         assert not consumer.failed and not _receiver(consumer).registrations and consumer._used == 0
         second = producer.publish(native_result()[0], request(), llm)
         actual = _receive(consumer, second)
@@ -1213,7 +1243,7 @@ async def test_cancelled_encoder_transfer_keeps_native_work_alive():
 
     inference = SimpleNamespace(_encoder_cleanup_tasks=set())
     inference.encoder_role = "encode"
-    inference._encoder_cache = SimpleNamespace(transfer=transfer)
+    inference._encoder_cache = SimpleNamespace(transfer=transfer, backend=transport.BACKEND)
     transfer_service = EncoderTransferServicer(inference)
     task = asyncio.create_task(
         transfer_service.Transfer(
@@ -1243,7 +1273,7 @@ async def test_transfer_rejection_marker_requires_proven_prewrite_failure(reject
 
     inference = SimpleNamespace(_encoder_cleanup_tasks=set())
     inference.encoder_role = "encode"
-    inference._encoder_cache = SimpleNamespace(transfer=transfer)
+    inference._encoder_cache = SimpleNamespace(transfer=transfer, backend=transport.BACKEND)
     context = FakeServicerContext()
     with pytest.raises(AbortError):
         await EncoderTransferServicer(inference).Transfer(

@@ -75,9 +75,11 @@ class RpcOutcome(str, Enum):
 class RequestMetrics:
     """Own one RPC's classification and exactly-once outcome recording."""
 
-    def __init__(self, metrics: "OpenEngineMetrics") -> None:
+    def __init__(
+        self, metrics: "OpenEngineMetrics", *, phase: Literal["aggregated", "encode"] = "aggregated"
+    ) -> None:
         self._metrics = metrics
-        self._phase: Literal["aggregated", "prefill", "decode"] = "aggregated"
+        self._phase: Literal["aggregated", "prefill", "decode", "encode"] = phase
         self._finished = False
         self._outcome = RpcOutcome.REJECTED
 
@@ -138,6 +140,11 @@ class RequestMetrics:
         # Engine candidate accounting is independent of the RPC's outcome.
         self._metrics.record_result(result)
 
+    def complete_encoding(self) -> None:
+        """Encoding publishes a reference and has no generated-token accounting."""
+        if not self._finished:
+            self._outcome = RpcOutcome.COMPLETED
+
     def finish(self, status: grpc.StatusCode | None = None) -> None:
         """Record at most once, including when a suspended stream resumes later."""
         if self._finished:
@@ -184,7 +191,7 @@ class OpenEngineMetrics:
         )
         self._outcomes = Counter(
             "trtllm_openengine_rpc_outcomes_total",
-            "Generate RPC outcomes, independent of output-candidate completion metrics.",
+            "Inference RPC outcomes, independent of output-candidate completion metrics.",
             ["model_name", "phase", "outcome"],
             registry=registry,
         )

@@ -28,6 +28,7 @@ from .bindings import (
     MINIMUM_CLIENT_REVISION,
     SCHEMA_RELEASE,
     SCHEMA_REVISION,
+    encoding_pb2,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
@@ -37,6 +38,7 @@ from .bindings import (
 )
 from .capabilities import supported_guides, supports_image_routing
 from .coordinator import CoordinationError, FrontendClient, InvalidRequestIdError
+from .encoder import native_reference
 from .errors import AbortFailedError
 from .kv_events import data_parallel_size, events_config
 from .request_mapping import conversation_affinity_enabled, token_ids_input_supported
@@ -172,8 +174,12 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         info = server_pb2.ServerInfo(
             engine_name=_ENGINE_NAME,
             engine_version=str(trtllm_version),
-            # The same build serves either phase; the role is per request.
-            engine_role=server_pb2.ENGINE_ROLE_UNSPECIFIED,
+            # P/D phases remain per request; an encoder has a dedicated native role.
+            engine_role=(
+                server_pb2.ENGINE_ROLE_ENCODER
+                if getattr(self._inference, "encoder_role", "") == "encode"
+                else server_pb2.ENGINE_ROLE_UNSPECIFIED
+            ),
             instance_id=self._instance_id,
             supported_models=[self._model],
             schema_revision=SCHEMA_REVISION,
@@ -300,20 +306,6 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             reasoning_parser=str(self._llm.args.reasoning_parser or ""),
         )
         info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
-        role = getattr(self._inference, "encoder_role", "")
-        if role:
-            backend = self._inference._encoder_cache.backend
-            info.encoder.CopyFrom(
-                model_pb2.EncoderCapabilities(
-                    schema_version=1,
-                    encoder_only=role == "encode",
-                    accepts_handoff=role == "consume",
-                    supported_transfer_backends=[backend] if role == "consume" and backend else [],
-                    transfer_backend=backend if role == "encode" else None,
-                    supports_abort_cleanup=role == "encode",
-                    requires_handoff=role == "consume",
-                )
-            )
         if supports_image_routing(self._llm, media_modalities):
             info.extra.update({"trtllm_image_routing_version": 1})
 
@@ -328,7 +320,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         # discovery-becomes-a-per-request-failure case this service exists to
         # avoid. Unset means "unknown", which is the honest claim.
 
-        if role == "encode":
+        if getattr(self._inference, "encoder_role", "") == "encode":
             info.generation.CopyFrom(
                 model_pb2.GenerationCapabilities(
                     prompt_logprobs=model_pb2.LogprobCapabilities(supported=False),
@@ -573,49 +565,41 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             if reservation is not None:
                 await asyncio.shield(reservation.release())
 
+    async def ReleaseEncodedMedia(self, request, context):
+        cache = getattr(self._inference, "_encoder_cache", None)
+        discard = getattr(cache, "discard", None)
+        if not callable(discard) or getattr(self._inference, "encoder_role", "") != "encode":
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, "encoder release is not enabled")
+        if not request.HasField("encoded_media"):
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "encoded_media is required")
+        task = asyncio.create_task(
+            asyncio.to_thread(discard, native_reference(request.encoded_media))
+        )
+        tasks = self._inference._encoder_cleanup_tasks
+        tasks.add(task)
+
+        def completed(done):
+            tasks.discard(done)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(completed)
+        try:
+            await asyncio.shield(task)
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        except RuntimeError as error:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+        except OSError as error:
+            await context.abort(grpc.StatusCode.INTERNAL, str(error))
+        return encoding_pb2.ReleaseEncodedMediaResponse()
+
     async def Abort(
         self,
         request: lifecycle_pb2.AbortRequest,
         context: grpc.aio.ServicerContext,
     ) -> lifecycle_pb2.AbortResponse:
         target = request.WhichOneof("target")
-
-        if target == "encoder_handoff":
-            cache = getattr(self._inference, "_encoder_cache", None)
-            discard = getattr(cache, "discard", None)
-            if discard is None or getattr(self._inference, "encoder_role", "") != "encode":
-                await context.abort(grpc.StatusCode.UNIMPLEMENTED, "encoder release is not enabled")
-                return
-            task = asyncio.create_task(asyncio.to_thread(discard, request.encoder_handoff))
-            cleanup_tasks = getattr(self._inference, "_encoder_cleanup_tasks", None)
-            if cleanup_tasks is not None:
-                cleanup_tasks.add(task)
-
-            def completed(done):
-                if cleanup_tasks is not None:
-                    cleanup_tasks.discard(done)
-                if not done.cancelled():
-                    done.exception()
-
-            task.add_done_callback(completed)
-            try:
-                removed = await asyncio.shield(task)
-            except ValueError as error:
-                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
-                return
-            except RuntimeError as error:
-                await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
-                return
-            except OSError as error:
-                await context.abort(grpc.StatusCode.INTERNAL, str(error))
-                return
-            return lifecycle_pb2.AbortResponse(
-                status=(
-                    lifecycle_pb2.ABORT_STATUS_ABORTED
-                    if removed
-                    else lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED
-                )
-            )
 
         if self._frontend is not None and target in ("request_id", "all_requests"):
             fields = {"request_id": request.request_id} if target == "request_id" else {}

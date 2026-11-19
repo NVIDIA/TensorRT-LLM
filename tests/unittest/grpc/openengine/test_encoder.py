@@ -3,6 +3,7 @@
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,12 +11,12 @@ import pytest
 import torch
 from safetensors import safe_open
 
+from tensorrt_llm._torch.disaggregation import encoder_output as oe
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.grpc.openengine import encoder as oe
 from tensorrt_llm.grpc.openengine.bindings import generation_pb2 as pb
+from tensorrt_llm.grpc.openengine.encoder import encoder_input, validate_encoder
 from tensorrt_llm.grpc.openengine.errors import UnsupportedFeatureError
-from tensorrt_llm.grpc.openengine.preparation import _input_digest
 
 pytestmark = pytest.mark.cpu_only
 
@@ -48,6 +49,14 @@ def test_collection_tolerates_a_concurrently_removed_file(tmp_path, monkeypatch,
 
 
 def request():
+    return oe.EncoderInput(
+        prompt="Describe <image_1>",
+        token_ids=None,
+        media=(oe.EncoderMedia("image", "data_uri", "data:image/png;base64,aW1hZ2U="),),
+    )
+
+
+def wire_request():
     return pb.GenerateRequest(
         request_id="encode",
         model="qwen",
@@ -80,7 +89,7 @@ def model():
         ]
         return SimpleNamespace(multimodal_params=None)
 
-    return SimpleNamespace(input_processor=processor, preprocess=preprocess), seen
+    return SimpleNamespace(input_processor=processor, preprocess=preprocess, tokenizer=None), seen
 
 
 def native_result():
@@ -292,11 +301,10 @@ def test_expiry_wrong_inputs_and_cross_host_are_rejected(tmp_path):
     ref = cache.publish(result, request(), llm)
     value = json.loads(ref.opaque_state)
     value["host"] = "another-host"
-    bad = pb.EncoderHandoffRef(transfer_backend=oe.BACKEND, opaque_state=json.dumps(value).encode())
+    bad = oe.EncodedMediaRef(reference_format=oe.BACKEND, opaque_state=json.dumps(value).encode())
     with pytest.raises(ValueError, match="same host"):
         cache.prepare(bad, request(), llm, None)
-    wrong = request()
-    wrong.prompt = "Another image prompt"
+    wrong = replace(request(), prompt="Another image prompt")
     with pytest.raises(ValueError, match="does not match"):
         cache.prepare(ref, wrong, llm, None)
     cache.prepare(ref, request(), llm, None)
@@ -322,8 +330,7 @@ def test_lossy_prompt_decoding_preserves_the_handoff(tmp_path):
     llm.tokenizer = SimpleNamespace(
         decode=lambda ids, **kwargs: "decoded prompt", encode=lambda prompt, **kwargs: [9]
     )
-    req = request()
-    req.token_ids.ids.extend([1, 2])
+    req = replace(request(), prompt=None, token_ids=(1, 2))
     result, _ = native_result()
     ref = cache.publish(result, req, llm)
     with pytest.raises(ValueError, match="lossless prompt token decoding"):
@@ -391,60 +398,25 @@ def test_encoder_role_requires_a_validated_handoff_processor(role, model_type):
 
 
 def test_encoder_role_validation_fails_closed():
-    req = request()
-    req.encoder.SetInParent()
-    with pytest.raises(ValueError, match="exactly one"):
-        oe.validate_encoder(req, "encode")
-    req.encoder.encode_only.SetInParent()
-    assert oe.validate_encoder(req, "encode") == "encode"
+    req = wire_request()
+    with pytest.raises(UnsupportedFeatureError, match="Encode"):
+        validate_encoder(req, "encode")
     with pytest.raises(UnsupportedFeatureError):
-        oe.validate_encoder(req, "")
-    req.encoder.handoff.transfer_backend = oe.BACKEND
-    assert req.encoder.WhichOneof("mode") == "handoff"
-    assert oe.validate_encoder(req, "consume") == "consume"
-    with pytest.raises(UnsupportedFeatureError, match="role consume"):
-        oe.validate_encoder(req, "encode")
-    req.ClearField("encoder")
-    with pytest.raises(UnsupportedFeatureError, match="encoder handoff"):
-        oe.validate_encoder(req, "consume")
+        validate_encoder(req, "consume")
+    req.encoded_media.reference_format = oe.BACKEND
+    assert validate_encoder(req, "consume") == "consume"
+    with pytest.raises(UnsupportedFeatureError):
+        validate_encoder(req, "")
     req.kv.session.session_id = "prefilled"
-    assert oe.validate_encoder(req, "consume") == ""
-    req.encoder.handoff.transfer_backend = oe.BACKEND
-    with pytest.raises(UnsupportedFeatureError, match="must not consume an encoder handoff"):
-        oe.validate_encoder(req, "consume")
-
-
-@pytest.mark.parametrize(
-    "field, values",
-    [
-        ("sampling", {"temperature": 0.0}),
-        ("stopping", {"max_tokens": 1}),
-        ("guided", {"json_schema": "{}"}),
-        ("response", {"return_output_logprobs": False}),
-    ],
-)
-def test_encoder_only_rejects_language_options(field, values):
-    req = request()
-    req.encoder.encode_only.SetInParent()
-    getattr(req, field).SetInParent()
-    assert oe.validate_encoder(req, "encode") == "encode"
-    for name, value in values.items():
-        setattr(getattr(req, field), name, value)
-    with pytest.raises(UnsupportedFeatureError, match=field):
-        oe.validate_encoder(req, "encode")
-
-
-def test_encoder_only_rejects_lora_selection():
-    req = request()
-    req.encoder.encode_only.SetInParent()
-    req.lora_name = "adapter"
-    with pytest.raises(UnsupportedFeatureError, match="LoRA"):
-        oe.validate_encoder(req, "encode")
+    with pytest.raises(UnsupportedFeatureError):
+        validate_encoder(req, "consume")
+    req.ClearField("encoded_media")
+    assert validate_encoder(req, "consume") == ""
 
 
 @pytest.mark.parametrize("token_input", [False, True])
 def test_shared_handoff_accepts_field_equal_inputs_with_unknown_wire_fields(tmp_path, token_input):
-    req = request()
+    req = wire_request()
     if token_input:
         req.token_ids.ids.extend([1, 2])
     equivalent = pb.GenerateRequest.FromString(req.SerializeToString())
@@ -462,14 +434,14 @@ def test_shared_handoff_accepts_field_equal_inputs_with_unknown_wire_fields(tmp_
         decode=lambda ids, **kwargs: "Describe <image_1>",
         encode=lambda prompt, **kwargs: [1, 2],
     )
-    ref = cache.publish(native_result()[0], req, llm)
-    cache.prepare(ref, equivalent, llm, None)
+    ref = cache.publish(native_result()[0], encoder_input(req), llm)
+    cache.prepare(ref, encoder_input(equivalent), llm, None)
 
 
 def test_input_identity_preserves_order_source_and_all_media_fields():
-    req = request()
+    req = wire_request()
     req.media.add(modality=pb.MODALITY_IMAGE, raw_bytes=b"second")
-    original = _input_digest(req)
+    original = oe._input_digest(encoder_input(req))
     mutations = (
         lambda value: value.media.reverse(),
         lambda value: setattr(value.media[0], "url", value.media[0].data_uri),
@@ -482,11 +454,11 @@ def test_input_identity_preserves_order_source_and_all_media_fields():
     for mutate in mutations:
         changed = pb.GenerateRequest.FromString(req.SerializeToString())
         mutate(changed)
-        assert _input_digest(changed) != original
+        assert oe._input_digest(encoder_input(changed)) != original
     req.token_ids.ids.extend([1, 2])
-    original = _input_digest(req)
+    original = oe._input_digest(encoder_input(req))
     req.token_ids.ids.reverse()
-    assert _input_digest(req) != original
+    assert oe._input_digest(encoder_input(req)) != original
 
 
 def test_discard_is_idempotent_and_never_releases_a_claimed_handoff(tmp_path):
@@ -520,8 +492,8 @@ def test_discard_rejects_foreign_and_malformed_references(tmp_path):
     ref = cache.publish(native_result()[0], request(), llm)
     value = json.loads(ref.opaque_state)
     for key, replacement in (("namespace", "foreign"), ("host", "foreign"), ("id", "../file")):
-        malformed = pb.EncoderHandoffRef(
-            transfer_backend=oe.BACKEND,
+        malformed = oe.EncodedMediaRef(
+            reference_format=oe.BACKEND,
             opaque_state=json.dumps({**value, key: replacement}).encode(),
         )
         with pytest.raises(ValueError):
@@ -535,7 +507,7 @@ def test_recursive_decode_is_invalid_without_consuming_handoff(tmp_path, monkeyp
     cache = oe.EncoderCache(str(tmp_path))
     llm, _ = model()
     ref = cache.publish(native_result()[0], request(), llm)
-    malformed = pb.EncoderHandoffRef(transfer_backend=oe.BACKEND, opaque_state=b"[" * 1024)
+    malformed = oe.EncodedMediaRef(reference_format=oe.BACKEND, opaque_state=b"[" * 1024)
 
     def fail_decode(_):
         raise RecursionError("maximum recursion depth exceeded while decoding JSON")
@@ -549,3 +521,17 @@ def test_recursive_decode_is_invalid_without_consuming_handoff(tmp_path, monkeyp
                 cache.prepare(malformed, request(), llm, None)
     assert len(list(tmp_path.glob("*.safetensors"))) == 1
     assert cache.discard(ref)
+
+
+@pytest.mark.parametrize("prompt,token_ids", [(None, None), ("context", (1, 2))])
+def test_native_input_requires_exactly_one_context(prompt, token_ids):
+    with pytest.raises(ValueError, match="prompt or token IDs"):
+        oe.EncoderInput(prompt, token_ids, request().media)
+
+
+def test_native_reference_boundary_is_lossless():
+    from tensorrt_llm.grpc.openengine.encoder import native_reference, portable_reference
+
+    native = oe.EncodedMediaRef("framework-owned-v1", b"\x00\xffopaque")
+    assert native_reference(portable_reference(native)) == native
+    assert encoder_input(wire_request()) == request()

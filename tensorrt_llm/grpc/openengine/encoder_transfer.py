@@ -8,6 +8,8 @@ from typing import Any
 
 import grpc
 
+from tensorrt_llm._torch.disaggregation.encoder_output import EncodedMediaRef
+
 from .bindings import encoder_transfer_pb2, encoder_transfer_pb2_grpc
 from .errors import ENCODER_TRANSFER_REJECTED_METADATA, EncoderTransferRejected
 
@@ -23,7 +25,11 @@ class EncoderTransferServicer(encoder_transfer_pb2_grpc.EncoderTransferServicer)
             await context.abort(grpc.StatusCode.UNIMPLEMENTED, "encoder transfer is not enabled")
             return
         # Cancellation cannot release source buffers while a native WRITE may run.
-        task = asyncio.create_task(asyncio.to_thread(transfer, request.cache, request.destination))
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                transfer, EncodedMediaRef(cache.backend, request.reference), request.destination
+            )
+        )
         self._inference._encoder_cleanup_tasks.add(task)
 
         def completed(done):

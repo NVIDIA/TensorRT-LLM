@@ -35,8 +35,9 @@ from .disagg import disaggregated_params_from_request
 from .encoder import (
     EncoderCache,
     PrefillResultExports,
+    encoder_input,
     encoder_role,
-    release_encoder_result,
+    native_reference,
     validate_encoder,
 )
 from .errors import AbortFailedError, MediaUnavailableError, UnsupportedFeatureError
@@ -196,11 +197,12 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         if encoder_transport not in ("", "nixl"):
             raise ValueError("unsupported encoder transfer backend")
         if encoder_transport == "nixl":
-            from .encoder_nixl import NixlEncoderCache
+            from .encoder_nixl import NixlEncoderCache, request_transfer
 
             self._encoder_cache = NixlEncoderCache(
                 os.environ.get("TRTLLM_OPENENGINE_ENCODER_ENDPOINT", ""),
                 os.environ.get("TRTLLM_OPENENGINE_ENCODER_MODEL_REVISION", ""),
+                request_transfer=request_transfer,
             )
         self.encoder_role = encoder_role(llm, self._encoder_cache)
         if encoder_transport == "nixl" and (
@@ -303,6 +305,11 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             except AbortFailedError:
                 failed += 1
         return aborted, failed
+
+    async def Encode(self, request, context):
+        from .encoding import encode
+
+        return await encode(self, request, context)
 
     async def Generate(
         self,
@@ -515,8 +522,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                         def prepare_encoder_input() -> Any:
                             nonlocal disaggregated_params
                             inputs, disaggregated_params = self._encoder_cache.prepare(
-                                request.encoder.handoff,
-                                request,
+                                native_reference(request.encoded_media),
+                                encoder_input(request),
                                 self._llm,
                                 sampling_params,
                                 disaggregated_params,
@@ -650,22 +657,17 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             await context.abort(grpc.StatusCode.CANCELLED, "Request aborted before submission")
 
         try:
-            if encoder_action == "encode":
-                result_handle = self._llm.generate_async(
-                    inputs=inputs, sampling_params=sampling_params
-                )
-            else:
-                result_handle = self._llm.generate_async(
-                    inputs=inputs,
-                    sampling_params=sampling_params,
-                    streaming=True,
-                    trace_headers=trace_headers,
-                    scheduling_params=scheduling_params,
-                    conversation_params=conversation_params,
-                    cache_salt=cache_salt,
-                    priority=DEFAULT_REQUEST_PRIORITY,
-                    disaggregated_params=disaggregated_params,
-                )
+            result_handle = self._llm.generate_async(
+                inputs=inputs,
+                sampling_params=sampling_params,
+                streaming=True,
+                trace_headers=trace_headers,
+                conversation_params=conversation_params,
+                disaggregated_params=disaggregated_params,
+                scheduling_params=scheduling_params,
+                cache_salt=cache_salt,
+                priority=DEFAULT_REQUEST_PRIORITY,
+            )
         except ValueError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
             return
@@ -748,46 +750,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 if context.cancelled():
                     abort_request("RPC cancelled")
                     return
-                if encoder_action == "encode" and not result.error:
-                    responses = []
-                    if result.finished:
-                        await self._media_admission.acquire()
-                        lease = _PreparationLease(self._media_admission)
-
-                        def discard_publication(reference: Any) -> None:
-                            if reference is None:
-                                return
-                            try:
-                                self._encoder_cache.discard(reference)
-                            except Exception as error:
-                                self._encoder_cleanup_failed = True
-                                logger.error(f"Failed to reclaim abandoned encoder cache: {error}")
-
-                        publication = _PreprocessingWork(discard_publication)
-                        try:
-                            cache = await lease.run(
-                                self._input_executor,
-                                publication.run,
-                                partial(self._encoder_cache.publish, result, request, self._llm),
-                            )
-                            if (
-                                context.cancelled()
-                                or local_request.aborted
-                                or (reservation is not None and reservation.aborted)
-                            ):
-                                return
-                            responses.append(
-                                generation_pb2.GenerateResponse(
-                                    request_id=request_id,
-                                    encode_ready=generation_pb2.EncodeReady(handoff=cache),
-                                )
-                            )
-                            publication.transfer()
-                        finally:
-                            publication.abandon()
-                            lease.close()
-                else:
-                    responses = _format_result(result, format_state)
+                responses = _format_result(result, format_state)
                 for resp in responses or ():
                     if request_metrics is not None:
                         request_metrics.observe_response(resp)
@@ -848,22 +811,15 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             watchdog.close()
             if not engine_terminal:
                 abort_request("response stream closed")
-            if encoder_action == "encode" or (
-                prefill_exports is not None
-                and (
-                    (abort_requested and prefill_may_export)
-                    or prefill_exports.has_exports(result_handle)
-                )
+            if prefill_exports is not None and (
+                (abort_requested and prefill_may_export)
+                or prefill_exports.has_exports(result_handle)
             ):
 
                 async def reclaim_encoder(handle: Any) -> None:
                     try:
                         complete = getattr(handle, "aresult", None)
-                        if (
-                            abort_requested
-                            and complete is not None
-                            and (encoder_action == "encode" or prefill_may_export)
-                        ):
+                        if abort_requested and complete is not None and prefill_may_export:
                             await asyncio.wait_for(complete(), timeout=30)
                     except asyncio.TimeoutError:
                         logger.error("Native export cleanup timed out")
@@ -873,11 +829,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                         # Native abort completion may raise after updating the result.
                         pass
                     finally:
-                        if prefill_exports is None:
-                            if not await asyncio.to_thread(release_encoder_result, handle):
-                                self._encoder_cleanup_failed = True
-                        else:
-                            await release_prefill_result(handle)
+                        await release_prefill_result(handle)
 
                 await self._run_encoder_cleanup(reclaim_encoder(result_handle))
             registration.release()

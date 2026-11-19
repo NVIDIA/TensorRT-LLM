@@ -15,6 +15,7 @@ pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    encoding_pb2,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
@@ -945,14 +946,14 @@ async def test_subscribe_kv_events_is_unimplemented(enabled):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("role,has_discard", [("", True), ("consume", True), ("encode", False)])
-async def test_abort_encoder_cache_requires_encode_cleanup_support(role, has_discard):
+async def test_release_encoder_cache_requires_encode_cleanup_support(role, has_discard):
     inference = _inference()
     inference.encoder_role = role
     inference._encoder_cache = SimpleNamespace(**({"discard": Mock()} if has_discard else {}))
     context = FakeServicerContext()
     with pytest.raises(AbortError):
-        await _servicer(inference=inference).Abort(
-            lifecycle_pb2.AbortRequest(encoder_handoff={}), context
+        await _servicer(inference=inference).ReleaseEncodedMedia(
+            encoding_pb2.ReleaseEncodedMediaRequest(encoded_media={}), context
         )
     assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
     if has_discard:
@@ -960,8 +961,8 @@ async def test_abort_encoder_cache_requires_encode_cleanup_support(role, has_dis
 
 
 @pytest.mark.asyncio
-async def test_abort_encoder_cache_reports_release_and_idempotent_outcomes():
-    from tensorrt_llm.grpc.openengine.bindings import generation_pb2
+async def test_release_encoder_cache_reports_release_and_idempotent_outcomes():
+    from tensorrt_llm.grpc.openengine.bindings import encoded_media_pb2
 
     inference = _inference()
     inference.encoder_role = "encode"
@@ -969,21 +970,18 @@ async def test_abort_encoder_cache_reports_release_and_idempotent_outcomes():
 
     def discard(reference):
         nonlocal present
-        assert reference.transfer_backend == "test-encoder"
+        assert reference.reference_format == "test-encoder"
         removed, present = present, False
         return removed
 
     inference._encoder_cache = SimpleNamespace(discard=discard)
     control = _servicer(inference=inference)
-    req = lifecycle_pb2.AbortRequest(
-        encoder_handoff=generation_pb2.EncoderHandoffRef(transfer_backend="test-encoder")
+    req = encoding_pb2.ReleaseEncodedMediaRequest(
+        encoded_media=encoded_media_pb2.EncodedMediaRef(reference_format="test-encoder")
     )
-    for expected in (
-        lifecycle_pb2.ABORT_STATUS_ABORTED,
-        lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED,
-    ):
-        result = await control.Abort(req, FakeServicerContext())
-        assert result.status == expected
+    for _ in range(2):
+        result = await control.ReleaseEncodedMedia(req, FakeServicerContext())
+        assert isinstance(result, encoding_pb2.ReleaseEncodedMediaResponse)
     assert inference.active_request_count() == 0
 
 
@@ -996,7 +994,7 @@ async def test_abort_encoder_cache_reports_release_and_idempotent_outcomes():
         (OSError("cannot remove cached encoder output"), grpc.StatusCode.INTERNAL),
     ],
 )
-async def test_abort_encoder_cache_preserves_failures(failure, code):
+async def test_release_encoder_cache_preserves_failures(failure, code):
     inference = _inference()
     inference.encoder_role = "encode"
 
@@ -1006,18 +1004,18 @@ async def test_abort_encoder_cache_preserves_failures(failure, code):
     inference._encoder_cache = SimpleNamespace(discard=discard)
     context = FakeServicerContext()
     with pytest.raises(AbortError):
-        await _servicer(inference=inference).Abort(
-            lifecycle_pb2.AbortRequest(encoder_handoff={}), context
+        await _servicer(inference=inference).ReleaseEncodedMedia(
+            encoding_pb2.ReleaseEncodedMediaRequest(encoded_media={}), context
         )
     assert context.abort_code == code
 
 
 @pytest.mark.asyncio
-async def test_abort_encoder_cache_over_real_grpc(tmp_path):
+async def test_release_encoder_cache_over_real_grpc(tmp_path):
     from test_encoder import model, native_result, request
 
     from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc
-    from tensorrt_llm.grpc.openengine.encoder import EncoderCache
+    from tensorrt_llm.grpc.openengine.encoder import EncoderCache, portable_reference
 
     cache = EncoderCache(str(tmp_path))
     llm, _ = model()
@@ -1032,13 +1030,12 @@ async def test_abort_encoder_cache_over_real_grpc(tmp_path):
     try:
         async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
             stub = openengine_pb2_grpc.ControlStub(channel)
-            req = lifecycle_pb2.AbortRequest(encoder_handoff=reference)
-            for expected in (
-                lifecycle_pb2.ABORT_STATUS_ABORTED,
-                lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED,
-            ):
-                response = await stub.Abort(req, timeout=2)
-                assert response.status == expected
+            req = encoding_pb2.ReleaseEncodedMediaRequest(
+                encoded_media=portable_reference(reference)
+            )
+            for _ in range(2):
+                response = await stub.ReleaseEncodedMedia(req, timeout=2)
+                assert isinstance(response, encoding_pb2.ReleaseEncodedMediaResponse)
         assert not list(tmp_path.glob("*.safetensors"))
     finally:
         await server.stop(0)
@@ -1056,23 +1053,6 @@ async def test_encoder_cache_requirement_is_distinct_from_consumption_capability
         model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
     )
     assert control._engine_is_healthy() is not failed
-    assert info.HasField("encoder") is bool(role)
-    assert info.encoder.encoder_only is (role == "encode")
-    assert info.encoder.accepts_handoff is (role == "consume")
-    assert info.encoder.supports_abort_cleanup is (role == "encode")
-    assert info.encoder.requires_handoff is (role == "consume")
-    assert info.encoder.HasField("transfer_backend") is (role == "encode")
-    assert info.encoder.transfer_backend == ("test-encoder" if role == "encode" else "")
-    assert list(info.encoder.supported_transfer_backends) == (
-        ["test-encoder"] if role == "consume" else []
-    )
-    for name in (
-        "schema_version",
-        "encoder_only",
-        "accepts_handoff",
-        "supports_abort_cleanup",
-        "requires_handoff",
-    ):
-        assert info.encoder.HasField(name) is bool(role)
+    assert "encoder" not in info.DESCRIPTOR.fields_by_name
     assert "trtllm_encoder_cache_release" not in info.extra
     assert "trtllm_requires_encoder_cache" not in info.extra

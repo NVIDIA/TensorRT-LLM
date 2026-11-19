@@ -34,7 +34,6 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     SCHEMA_RELEASE,
     encoder_transfer_pb2,
     encoder_transfer_pb2_grpc,
-    generation_pb2,
     kv_pb2,
     openengine_pb2_grpc,
     server_pb2,
@@ -213,13 +212,13 @@ def test_openengine_server_serves_the_control_contract() -> None:
                 transfer=lambda cache, destination: transfers.append((cache, destination)),
                 close=lambda: None,
             )
-            reference = generation_pb2.EncoderHandoffRef(
-                transfer_backend="test-encoder", opaque_state=b"reference"
-            )
+            from tensorrt_llm._torch.disaggregation.encoder_output import EncodedMediaRef
+
+            reference = EncodedMediaRef("test-encoder", b"reference")
             peer = encoder_transfer_pb2_grpc.EncoderTransferStub(channel)
             await peer.Transfer(
                 encoder_transfer_pb2.TransferEncoderCacheRequest(
-                    cache=reference, destination=b"destination"
+                    reference=reference.opaque_state, destination=b"destination"
                 ),
                 timeout=5,
             )

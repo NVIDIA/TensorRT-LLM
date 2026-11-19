@@ -6,6 +6,7 @@
 import grpc
 import warnings
 
+from . import encoding_pb2 as openengine_dot_v1_dot_encoding__pb2
 from . import generation_pb2 as openengine_dot_v1_dot_generation__pb2
 from . import kv_pb2 as openengine_dot_v1_dot_kv__pb2
 from . import lifecycle_pb2 as openengine_dot_v1_dot_lifecycle__pb2
@@ -59,6 +60,11 @@ class InferenceStub(object):
                 request_serializer=openengine_dot_v1_dot_generation__pb2.GenerateRequest.SerializeToString,
                 response_deserializer=openengine_dot_v1_dot_generation__pb2.GenerateResponse.FromString,
                 _registered_method=True)
+        self.Encode = channel.unary_unary(
+                '/openengine.v1.Inference/Encode',
+                request_serializer=openengine_dot_v1_dot_encoding__pb2.EncodeRequest.SerializeToString,
+                response_deserializer=openengine_dot_v1_dot_encoding__pb2.EncodeResponse.FromString,
+                _registered_method=True)
 
 
 class InferenceServicer(object):
@@ -83,6 +89,13 @@ class InferenceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Encode(self, request, context):
+        """Produce engine-owned media outputs; the endpoint's role is set at startup.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_InferenceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -90,6 +103,11 @@ def add_InferenceServicer_to_server(servicer, server):
                     servicer.Generate,
                     request_deserializer=openengine_dot_v1_dot_generation__pb2.GenerateRequest.FromString,
                     response_serializer=openengine_dot_v1_dot_generation__pb2.GenerateResponse.SerializeToString,
+            ),
+            'Encode': grpc.unary_unary_rpc_method_handler(
+                    servicer.Encode,
+                    request_deserializer=openengine_dot_v1_dot_encoding__pb2.EncodeRequest.FromString,
+                    response_serializer=openengine_dot_v1_dot_encoding__pb2.EncodeResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -141,6 +159,33 @@ class Inference(object):
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def Encode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/openengine.v1.Inference/Encode',
+            openengine_dot_v1_dot_encoding__pb2.EncodeRequest.SerializeToString,
+            openengine_dot_v1_dot_encoding__pb2.EncodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class ControlStub(object):
     """Missing associated documentation comment in .proto file."""
@@ -175,6 +220,11 @@ class ControlStub(object):
                 '/openengine.v1.Control/Abort',
                 request_serializer=openengine_dot_v1_dot_lifecycle__pb2.AbortRequest.SerializeToString,
                 response_deserializer=openengine_dot_v1_dot_lifecycle__pb2.AbortResponse.FromString,
+                _registered_method=True)
+        self.ReleaseEncodedMedia = channel.unary_unary(
+                '/openengine.v1.Control/ReleaseEncodedMedia',
+                request_serializer=openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaRequest.SerializeToString,
+                response_deserializer=openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaResponse.FromString,
                 _registered_method=True)
         self.Shutdown = channel.unary_unary(
                 '/openengine.v1.Control/Shutdown',
@@ -239,6 +289,13 @@ class ControlServicer(object):
 
     def Abort(self, request, context):
         """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseEncodedMedia(self, request, context):
+        """Release a completed output at its producer; never cancels an active transfer.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -309,6 +366,11 @@ def add_ControlServicer_to_server(servicer, server):
                     servicer.Abort,
                     request_deserializer=openengine_dot_v1_dot_lifecycle__pb2.AbortRequest.FromString,
                     response_serializer=openengine_dot_v1_dot_lifecycle__pb2.AbortResponse.SerializeToString,
+            ),
+            'ReleaseEncodedMedia': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseEncodedMedia,
+                    request_deserializer=openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaRequest.FromString,
+                    response_serializer=openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaResponse.SerializeToString,
             ),
             'Shutdown': grpc.unary_unary_rpc_method_handler(
                     servicer.Shutdown,
@@ -476,6 +538,33 @@ class Control(object):
             '/openengine.v1.Control/Abort',
             openengine_dot_v1_dot_lifecycle__pb2.AbortRequest.SerializeToString,
             openengine_dot_v1_dot_lifecycle__pb2.AbortResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseEncodedMedia(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/openengine.v1.Control/ReleaseEncodedMedia',
+            openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaRequest.SerializeToString,
+            openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaResponse.FromString,
             options,
             channel_credentials,
             insecure,

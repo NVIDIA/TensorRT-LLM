@@ -5,8 +5,6 @@ syntax = "proto3";
 
 package trtllm.openengine.v1;
 
-import "openengine/v1/generation.proto";
-
 // TensorRT-LLM peer transfer; separate from the portable OpenEngine services.
 service EncoderTransfer {
   // Success means the native transfer completed. An uncertain outcome cannot
@@ -15,7 +13,7 @@ service EncoderTransfer {
 }
 
 message TransferEncoderCacheRequest {
-  .openengine.v1.EncoderHandoffRef cache = 1;
+  bytes reference = 1;
   bytes destination = 2;
 }
 

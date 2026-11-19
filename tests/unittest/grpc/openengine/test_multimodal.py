@@ -2662,15 +2662,20 @@ async def test_image_e_pd_over_grpc_uses_encoder_cache_without_downstream_fetch(
             media=[
                 generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
             ],
-            encoder=generation_pb2.EncoderOptions(encode_only=generation_pb2.EncodeOnly()),
         )
-        responses = [value async for value in clients[0].Generate(request, timeout=10)]
-        assert [value.WhichOneof("event") for value in responses] == ["encode_ready"]
-        assert not responses[0].HasField("usage")
+        from tensorrt_llm.grpc.openengine.bindings import encoding_pb2
+
+        encoded = await clients[0].Encode(
+            encoding_pb2.EncodeRequest(
+                request_id=request.request_id,
+                model=request.model,
+                prompt=request.prompt,
+                media=request.media,
+            ),
+            timeout=10,
+        )
         request.request_id = "pd"
-        request.encoder.CopyFrom(
-            generation_pb2.EncoderOptions(handoff=responses[0].encode_ready.handoff)
-        )
+        request.encoded_media.CopyFrom(encoded.encoded_media)
         if request_type:
             request.extra.update({"request_type": request_type})
         responses = [value async for value in clients[1].Generate(request, timeout=10)]
@@ -2679,7 +2684,7 @@ async def test_image_e_pd_over_grpc_uses_encoder_cache_without_downstream_fetch(
             session = responses[-1].prefill_ready.kv_session
             assert "trtllm_decode_preparation" in session.attributes_struct.fields
             request.request_id = "d"
-            request.ClearField("encoder")
+            request.ClearField("encoded_media")
             request.ClearField("extra")
             request.kv.session.CopyFrom(session)
             responses = [value async for value in clients[2].Generate(request, timeout=10)]
@@ -2748,11 +2753,7 @@ async def test_encoder_prefill_rejects_unusable_decode_state_and_reclaims_inputs
         media=[
             generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
         ],
-        encoder=generation_pb2.EncoderOptions(
-            handoff=generation_pb2.EncoderHandoffRef(
-                transfer_backend="unused", opaque_state=b"cache"
-            )
-        ),
+        encoded_media={"reference_format": "unused", "opaque_state": b"cache"},
         extra={"request_type": "context_only"},
     )
     context = FakeServicerContext()

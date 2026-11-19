@@ -15,6 +15,7 @@ enum EngineRole {
   ENGINE_ROLE_AGGREGATED = 1;
   ENGINE_ROLE_PREFILL = 2;
   ENGINE_ROLE_DECODE = 3;
+  ENGINE_ROLE_ENCODER = 4;
 }
 
 message GetServerInfoRequest {}

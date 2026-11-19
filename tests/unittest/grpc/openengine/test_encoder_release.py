@@ -15,9 +15,10 @@ from test_encoder import model, native_result, request
 from test_encoder_nixl import FakeAgent, _receive, _sender
 from test_encoder_nixl import pair as pair
 
-from tensorrt_llm.grpc.openengine import encoder_nixl as transport
-from tensorrt_llm.grpc.openengine.bindings import generation_pb2 as pb
-from tensorrt_llm.grpc.openengine.bindings import lifecycle_pb2
+from tensorrt_llm._torch.disaggregation import encoder_nixl as transport
+from tensorrt_llm._torch.disaggregation.encoder_output import EncodedMediaRef
+from tensorrt_llm.grpc.openengine.bindings import encoding_pb2
+from tensorrt_llm.grpc.openengine.encoder import portable_reference
 
 pytestmark = pytest.mark.cpu_only
 
@@ -29,8 +30,8 @@ def test_discard_reclaims_only_unclaimed_nixl_exports(pair, monkeypatch):
     assert producer._used > 0
     value = json.loads(ref.opaque_state)
     for key, replacement in (("endpoint", "wrong.example:1234"), ("metadata", {})):
-        malformed = pb.EncoderHandoffRef(
-            transfer_backend=transport.BACKEND,
+        malformed = EncodedMediaRef(
+            reference_format=transport.BACKEND,
             opaque_state=json.dumps({**value, key: replacement}).encode(),
         )
         with pytest.raises(ValueError):
@@ -70,13 +71,12 @@ def test_discard_during_claim_prevents_rejected_transfer_from_restoring_export(p
     def release_then_reject(agent, name, desc):
         assert identity in producer._claims
         value = json.loads(reference.opaque_state)
-        malformed = pb.EncoderHandoffRef(
-            transfer_backend=transport.BACKEND,
+        malformed = EncodedMediaRef(
+            reference_format=transport.BACKEND,
             opaque_state=json.dumps({**value, "metadata": {}}).encode(),
         )
         with pytest.raises(ValueError, match="metadata mismatch"):
             producer.discard(malformed)
-        assert not producer._claims[identity].discard_requested
         assert not producer.discard(reference)
         assert not producer.discard(reference)
         assert producer._used == reserved
@@ -94,7 +94,7 @@ def test_discard_during_claim_prevents_rejected_transfer_from_restoring_export(p
 
 
 @pytest.mark.asyncio
-async def test_abort_rejects_deeply_nested_reference_without_changing_exports(pair):
+async def test_release_rejects_deeply_nested_reference_without_changing_exports(pair):
     producer, _ = pair
     llm, _ = model()
     reference = producer.publish(native_result()[0], request(), llm)
@@ -102,14 +102,15 @@ async def test_abort_rejects_deeply_nested_reference_without_changing_exports(pa
     inference = _inference()
     inference.encoder_role = "encode"
     inference._encoder_cache = producer
-    malformed = pb.EncoderHandoffRef(
-        transfer_backend=transport.BACKEND,
+    malformed = EncodedMediaRef(
+        reference_format=transport.BACKEND,
         opaque_state=b"[" * 10000 + b"0" + b"]" * 10000,
     )
     context = FakeServicerContext()
     with pytest.raises(AbortError):
-        await _servicer(inference=inference).Abort(
-            lifecycle_pb2.AbortRequest(encoder_handoff=malformed), context
+        await _servicer(inference=inference).ReleaseEncodedMedia(
+            encoding_pb2.ReleaseEncodedMediaRequest(encoded_media=portable_reference(malformed)),
+            context,
         )
     assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
     assert producer._used == reserved and len(producer._exports) == 1
