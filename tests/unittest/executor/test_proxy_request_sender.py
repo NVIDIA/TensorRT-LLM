@@ -1225,6 +1225,63 @@ def test_probe_overlapping_the_worker_handshake_does_not_fail_the_engine(direct_
             _close_quietly(peer)
 
 
+_HTTP_PROBE = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+_TLS_PROBE = bytes.fromhex("16030100c4010000c00303") + b"\x00" * 190
+
+
+def _single_frontend_lanes():
+    proxy = _bare_proxy()
+    proxy._num_frontends = 1
+    proxy._error_queue = queue.Queue()
+    proxy.postproc_config = SimpleNamespace(enabled=False)
+    proxy._enable_resource_governor = False
+    addresses = proxy._setup_queues()
+    return proxy, addresses
+
+
+@pytest.mark.timeout(60, method="thread")
+@pytest.mark.parametrize("probe_open", [True, False])
+@pytest.mark.parametrize("payload", [_HTTP_PROBE, _TLS_PROBE], ids=["http", "tls"])
+@pytest.mark.parametrize("lane", ["request", "result"])
+def test_local_probe_before_the_worker_attaches_does_not_take_a_lane(lane, payload, probe_open):
+    # Regression: an HTTP/TLS probe or port scan of the loopback lane during
+    # model load attached as a ZMTP/1.0 peer, so the PAIR lane rejected rank 0
+    # when it connected after READY. Commands (or results) then went nowhere
+    # while the sender reported healthy.
+    proxy, addresses = _single_frontend_lanes()
+    address = addresses.request_queue_addr if lane == "request" else addresses.result_queue_addr
+    probe = socket.create_connection(("127.0.0.1", int(address[0].rsplit(":", 1)[1])))
+    worker = None
+    try:
+        probe.sendall(payload)
+        time.sleep(0.2)
+        if not probe_open:
+            probe.close()
+            time.sleep(0.5)
+        # Rank 0 connects after READY.
+        worker = IpcQueue(address, is_server=False, name="rank0")
+        worker.setup_lazily()
+        time.sleep(0.5)
+        if lane == "request":
+            proxy._request_sender.send(pickle.dumps("first"))
+            assert worker.poll(3), "a non-ZMTP probe took the command lane"
+            assert worker.get() == _payloads("first")
+            assert proxy._request_sender.available and proxy._error_queue.empty()
+        else:
+            worker.put("result")
+            lane_queue = proxy.result_queue.queue
+            assert lane_queue.poll(3), "a non-ZMTP probe took the result lane"
+            assert lane_queue.get() == "result"
+    finally:
+        probe.close()
+        proxy._request_sender.close(timeout=2)
+        if worker is not None:
+            worker.socket.setsockopt(zmq.LINGER, 0)
+            worker.close()
+        proxy.result_queue.close()
+        proxy.worker_init_status_queue.close()
+
+
 def test_command_connection_identifies_the_command_peer():
     from tensorrt_llm.executor.request_sender import _CommandConnection
 

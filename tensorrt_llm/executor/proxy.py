@@ -566,6 +566,17 @@ class GenerationExecutorProxy(GenerationExecutor):
             except Exception as exc:  # noqa: BLE001 - report, do not raise in a daemon thread
                 logger.error(f"Error monitor: pre_shutdown failed: {exc!r}")
 
+    # The single-frontend lanes are bound on loopback TCP from proxy start, so
+    # any local process can connect while the model loads. libzmq attaches a
+    # peer that does not speak ZMTP/3, such as an HTTP or TLS probe or a port
+    # scanner, as a ZMTP/1.0 peer, and a PAIR lane then rejects the worker:
+    # the engine received no commands while reporting healthy. With a ZAP
+    # domain set, libzmq rejects such peers during the handshake. Workers use
+    # the ZMTP/3 NULL mechanism and are still accepted, because no ZAP handler
+    # runs in these sockets' contexts and ZMQ_ZAP_ENFORCE_DOMAIN is off. This
+    # does not authenticate a deliberate ZMTP/3 peer.
+    _LOOPBACK_LANE_OPTIONS = {zmq.ZAP_DOMAIN: b"trtllm-executor-lane"}
+
     def _setup_queues(self) -> WorkerCommIpcAddrs:
         frontend_result_addrs = None
         if self._num_frontends > 1:
@@ -597,7 +608,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.request_queue = IpcQueue(
                 is_server=True,
                 name="proxy_request_queue",
-                send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+                send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES,
+                socket_options=self._LOOPBACK_LANE_OPTIONS)
             self._request_sender = _create_request_sender(
                 self.request_queue, self._error_queue,
                 weakref.WeakMethod(self._handle_command_failure))
@@ -609,13 +621,16 @@ class GenerationExecutorProxy(GenerationExecutor):
                 fuse_message=False,
                 socket_type=zmq.PULL
                 if self.enable_postprocess_parallel else zmq.PAIR,
-                name="proxy_result_queue")
+                name="proxy_result_queue",
+                socket_options=self._LOOPBACK_LANE_OPTIONS)
         self.worker_init_status_queue = IpcQueue(
             is_server=True,
             socket_type=zmq.ROUTER,
             name="worker_init_status_queue")
         self._resource_governor_queue = IpcQueue(
-            is_server=True, name="proxy_resource_governor_queue"
+            is_server=True,
+            name="proxy_resource_governor_queue",
+            socket_options=self._LOOPBACK_LANE_OPTIONS
         ) if self._enable_resource_governor else None
         # Worker -> proxy ack channel for synchronous control requests
         # (start_profile / stop_profile). Worker pushes a tuple
