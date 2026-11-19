@@ -54,6 +54,7 @@ from tensorrt_llm.logger import logger
 
 from .interface import Fmha
 from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha, get_prims_ts_toolchain_unsupported_reason
+from .registry import fmha_lib
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
@@ -185,6 +186,7 @@ def prims_ts_reads_nvfp4_mla_records(metadata, attn: Optional["TrtllmAttention"]
     return get_nvfp4_mla_record_reader_unsupported_reason() is None
 
 
+@fmha_lib("prims_ts_dsa_sparse_mla")
 class PrimsTSDsaSparseMlaFmha(Fmha):
     """DSA generation-phase sparse MLA on PrimTS, reading NVFP4 KV records in place."""
 

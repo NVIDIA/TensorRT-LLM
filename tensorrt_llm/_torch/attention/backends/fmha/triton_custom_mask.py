@@ -31,6 +31,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .registry import fmha_lib
 from .utils import (
     get_attention_chunk_size,
     get_bmm1_scale,
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
     )
 
 
+@fmha_lib("triton_custom_mask")
 class TritonCustomMaskFmha(PhasedFmha):
     """Run custom-mask context attention with Triton."""
 

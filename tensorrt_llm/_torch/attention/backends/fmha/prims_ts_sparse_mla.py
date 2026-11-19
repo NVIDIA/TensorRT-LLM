@@ -66,6 +66,7 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_sm_v
 from tensorrt_llm.logger import logger
 
 from .interface import Fmha
+from .registry import fmha_lib
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
@@ -133,6 +134,7 @@ class _SparsePlan:
     wrapper: "BatchSparseMLADecodePagedTSWrapper"
 
 
+@fmha_lib("prims_ts_sparse_mla")
 class PrimsTSSparseMlaFmha(Fmha):
     """DeepSeek-V4 generation-phase sparse MLA on the PrimTS Blackwell kernels."""
 

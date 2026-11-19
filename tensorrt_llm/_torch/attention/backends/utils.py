@@ -31,6 +31,7 @@ from .vanilla import VanillaAttention
 
 if TYPE_CHECKING:
     from .fmha.gqa_decode import GqaDecodeSetup
+    from .fmha.interface import Fmha
 
 
 def get_attention_backend(
@@ -89,6 +90,8 @@ def create_attention(
     cache_context_plan: bool = False,
     context_fmha_head_dim_per_stage_kv: int = 0,
     context_last_rows_only: bool = False,
+    fmha_libs: list[str | type["Fmha"]] | None = None,
+    use_fmha_libs_env: bool = True,
 ) -> AttentionBackend:
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -130,6 +133,13 @@ def create_attention(
         context_fmha_head_dim_per_stage_kv=context_fmha_head_dim_per_stage_kv,
         context_last_rows_only=context_last_rows_only,
     )
+    if fmha_libs is not None or not use_fmha_libs_env:
+        from .trtllm import TrtllmAttention
+
+        if not issubclass(attn_cls, TrtllmAttention):
+            raise ValueError(
+                "FMHA library selection requires a TRTLLM attention backend.")
+        kwargs.update(fmha_libs=fmha_libs, use_fmha_libs_env=use_fmha_libs_env)
 
     return attn_cls(
         layer_idx,

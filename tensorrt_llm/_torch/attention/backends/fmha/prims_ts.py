@@ -38,6 +38,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .registry import fmha_lib
 from .utils import get_kv_page_offset, get_multi_processor_count_for_device
 
 if TYPE_CHECKING:
@@ -153,6 +154,7 @@ def get_attention_feature_unsupported_reason(
     return None
 
 
+@fmha_lib("prims_ts")
 class PrimsTSFmha(PhasedFmha):
     """Task-scheduled paged context and decode FMHA library.
 

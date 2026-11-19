@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -102,7 +101,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         if self._uses_nvfp4_compress:
             # The base update builds FMHA libraries before the effective cache
             # mode is converted from NVFP4 storage to FP8 execution.
-            self._fmha_manager = FmhaManager(self)
+            self._rebuild_fmha_manager()
 
     def __init__(
         self,

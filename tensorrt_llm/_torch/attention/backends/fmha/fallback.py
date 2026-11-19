@@ -37,6 +37,7 @@ from tensorrt_llm.logger import logger
 from ..sparse.params import SparseRuntimeParams
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .registry import fmha_lib
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -78,6 +79,7 @@ def _legacy_forward_args(
     return AttentionForwardArgs(**values)
 
 
+@fmha_lib("fallback")
 class FallbackFmha(PhasedFmha):
     """Fallback FMHA implementation over the phased TRT-LLM thop ops."""
 

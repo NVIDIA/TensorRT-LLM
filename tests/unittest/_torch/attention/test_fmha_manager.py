@@ -1020,6 +1020,8 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
             super().__init__(attn, "new", events)
 
     attn = TrtllmAttention.__new__(TrtllmAttention)
+    attn._fmha_libs = None
+    attn._use_fmha_libs_env = False
     attn.is_mla_enable = False
     attn.skip_correction_threshold = 0.0
     metadata = _make_metadata(num_contexts=0, num_generations=1)

@@ -299,8 +299,6 @@ class _Fp8MlaContextScratch:
 
 def _build_fp8_mla_context_attn(attn: "TrtllmAttention") -> "TrtllmAttention":
     """Build a direct-attribute FP8 view without per-access Python forwarding."""
-    from ..fmha.manager import FmhaManager
-
     fp8_attn = copy.copy(attn)
     fp8_attn.quant_mode = int(QuantMode(0).set_fp8_kv_cache())
     fp8_attn.has_fp4_kv_cache = False
@@ -311,7 +309,7 @@ def _build_fp8_mla_context_attn(attn: "TrtllmAttention") -> "TrtllmAttention":
     fp8_attn.layer_idx = 0
     # Finalize the view before capability selection. FMHA instances must hold
     # weak references to this FP8 view, not to the original FP4 attention.
-    fp8_attn._fmha_manager = FmhaManager(fp8_attn)
+    fp8_attn._rebuild_fmha_manager()
     return fp8_attn
 
 
