@@ -5700,6 +5700,26 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast) {
     }
 }
 
+// IMPORTANT: Stage Configuration Syntax Requirement
+//
+// The test_to_stage_mapping.py script expects stage definitions in the following format:
+// "Stage-Name": ["platform", "yaml_file", splitId, split_count, gpu_count]
+//
+// Where:
+// - Stage-Name: Must be quoted string, used to identify the Jenkins stage
+// - platform: Hardware platform identifier (e.g., "a10", "h100-cr")
+// - yaml_file: Test database YAML filename without .yml extension (e.g., "l0_a10")
+// - splitId: Current split number (1-based)
+// - split_count: Total number of splits
+// - gpu_count: Number of GPUs required (optional, defaults to 1)
+//
+// This format is parsed by scripts/test_to_stage_mapping.py to provide bidirectional
+// mapping between test names and Jenkins stage names. Any changes to this syntax
+// may break the mapping functionality.
+//
+// The stage entries live in getX86TestConfigs(), getX86SlurmTestConfigs(),
+// getSBSASlurmTestConfigs() and getMultiNodesSBSAConfigs(), not in launchTestJobs().
+//
 // Kept out of launchTestJobs: its CPS method must stay under the JVM's 64 KB limit.
 def getX86TestConfigs()
 {
@@ -6130,22 +6150,6 @@ def getMultiNodesSBSAConfigs()
 def launchTestJobs(pipeline, testFilter, globalVars)
 {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
-    // IMPORTANT: Stage Configuration Syntax Requirement
-    //
-    // The test_to_stage_mapping.py script expects stage definitions in the following format:
-    // "Stage-Name": ["platform", "yaml_file", splitId, split_count, gpu_count]
-    //
-    // Where:
-    // - Stage-Name: Must be quoted string, used to identify the Jenkins stage
-    // - platform: Hardware platform identifier (e.g., "a10", "h100-cr")
-    // - yaml_file: Test database YAML filename without .yml extension (e.g., "l0_a10")
-    // - splitId: Current split number (1-based)
-    // - split_count: Total number of splits
-    // - gpu_count: Number of GPUs required (optional, defaults to 1)
-    //
-    // This format is parsed by scripts/test_to_stage_mapping.py to provide bidirectional
-    // mapping between test names and Jenkins stage names. Any changes to this syntax
-    // may break the mapping functionality.
 
     x86TestConfigs = getX86TestConfigs()
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)

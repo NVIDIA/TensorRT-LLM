@@ -206,7 +206,7 @@ Test lists are defined in `tests/integration/test_lists/test-db/`.
 
 ### Jenkins Pipeline Configuration
 
-Tests are defined in `jenkins/L0_Test.groovy` under the `launchTestJobs` function:
+Tests are defined in `jenkins/L0_Test.groovy` in the `getX86SlurmTestConfigs()`, `getSBSASlurmTestConfigs()` and `getMultiNodesSBSAConfigs()` functions:
 
 | Config Variable | Test Type |
 |-----------------|-----------|
@@ -381,7 +381,7 @@ Each disagg test line in the test-db file follows one of these formats:
 
 ### Step 5: Update `jenkins/L0_Test.groovy`
 
-Open `jenkins/L0_Test.groovy` and search for the `multiNodesSBSAConfigs` section inside `launchTestJobs()`. Disaggregated perf sanity stages are added via `buildStageConfigs()`:
+Open `jenkins/L0_Test.groovy` and search for the `multiNodesSBSAConfigs` section inside `getMultiNodesSBSAConfigs()`. Disaggregated perf sanity stages are added via `buildStageConfigs()`:
 
 ```groovy
 def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false)
