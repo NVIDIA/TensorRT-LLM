@@ -1435,3 +1435,26 @@ def test_shared_moe_matrix_variant_keeps_launcher_and_rank_body(tmp_path: Path) 
         f"{target_tests}/test_modeling_v2_{name}_op_matrix.py",
         f"{target_tests}/_{name}_op_matrix.py",
     )
+
+
+def test_dflash_keeps_the_speculative_config_its_options_declare(tmp_path):
+    task = _reuse_task(tmp_path, features=["dflash"])
+    drafter = {"decoding_type": "DFlash", "max_draft_len": 3, "speculative_model": "/drafter"}
+    Path(task["accuracy"]["llm_api_options"]["core"]).write_text(
+        yaml.safe_dump({**_OPTIONS, "speculative_config": drafter}), encoding="utf-8"
+    )
+    config = check_config.check_configuration(
+        task,
+        RunEnvironment(kind="local", python="/py", world_size=1, env={}),
+        unit="core",
+        features=["dflash"],
+        max_tokens=8,
+        member="tp1",
+    )
+    # Before, a dflash unit fell through to `speculative_config: None`: the engine ran with
+    # no drafter, and the acceptance gate measured nothing it asked for.
+    assert config["llm"]["speculative_config"] == drafter
+    assert check_config.speculation_flags(["dflash"], max_draft_len=3) == [
+        "--spec_decode_algo=DFlash",
+        "--spec_decode_max_draft_len=3",
+    ]
