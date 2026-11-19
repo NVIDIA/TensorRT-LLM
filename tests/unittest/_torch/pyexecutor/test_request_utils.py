@@ -2243,9 +2243,15 @@ def test_prepared_response_keeps_outputs_and_metadata_stable(
     assert response.result.ctx_first_begin == 0
     assert response.result.ctx_num_chunks == 2
 
-    request.py_result.set_log_probs(
-        [[{5: Logprob(-1.0)}] for _ in range(beam_width)], [-1.0] * beam_width
+    second_probs = [[{5: Logprob(-1.0)}] for _ in range(beam_width)]
+    request.py_result.append_log_probs(second_probs)
+    expected_history = (
+        [first + second for first, second in zip(first_probs, second_probs)]
+        if beam_width > 1
+        else second_probs
     )
+    assert request.py_result.log_probs == expected_history
+    assert request.py_result.cum_log_probs == [-1.5] * beam_width
     request.py_result.append_generation_logits(first_logits + 10)
     request.py_result.append_prompt_logprobs(torch.ones(1, 3, dtype=torch.float64))
     request.py_result.append_additional_context_outputs("hidden", torch.zeros(1, 2))
