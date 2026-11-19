@@ -212,6 +212,28 @@ def test_inactive_scopes_do_not_evaluate_metadata(
     assert calls == 0
 
 
+def test_compile_bypasses_metadata_under_active_profiler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Removing the compile guard must break full-graph capture or evaluate metadata."""
+    select_regions(monkeypatch, "workflow")
+    calls = 0
+
+    def forbidden() -> str:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("compiled metadata factory evaluated")
+
+    def operation(value: torch.Tensor) -> torch.Tensor:
+        with profiler.record_function_metadata_scope("compiled", "workflow", forbidden):
+            return value + 1
+
+    compiled = torch.compile(operation, backend="eager", fullgraph=True)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
+        assert torch.autograd._profiler_enabled()
+        result = compiled(torch.ones(2))
+    torch.testing.assert_close(result, torch.full((2,), 2.0))
+    assert calls == 0
+
+
 def test_none_selection_emits_no_custom_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Suppress custom events and metadata when no regions are selected."""
     select_regions(monkeypatch)
