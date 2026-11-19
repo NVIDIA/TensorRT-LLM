@@ -60,7 +60,7 @@ class KdaDecode(OpWrapper):
         ``output``.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # GLM-5.3-Flash's KDA at TP4 (16 of 64 heads). The op's own edges here; the decode steps the shipped target
     # runs are in this entry's test. On sm_100 with 16 heads the kernel follows B * H: B <= 2 takes the four-CTA
     # cluster kernel, 3 <= B <= 9 the legacy compact-heads one, 42 <= B <= 45 the legacy many-heads one,

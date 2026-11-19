@@ -14,6 +14,7 @@ import triton.language as tl
 from torch import nn
 
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream, private_stream
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_container
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._utils import is_blackwell_datacenter
 
@@ -33,6 +34,7 @@ def _collapse_kernel(x_ptr, pre_ptr, out_ptr, hidden, MULT: tl.constexpr, BLOCK:
     tl.store(out_ptr + row * hidden + cols, acc.to(out_ptr.dtype.element_ty), mask=mask)
 
 
+@nccl_window_tensor_container
 @dataclass
 class HCState:
     """Inter-layer mHC pipeline state.
@@ -47,9 +49,12 @@ class HCState:
       ``post_mapping``; the 4 tensors carry the inputs needed for the next
       layer to absorb it via ``fused_hc``.
 
-    Only ``modeling_deepseekv4.py`` depends on this shape — the kernel-level
-    ``mHC.fused_hc`` still returns a 4-tuple so low-level callers (tests,
-    benchmarks) stay unchanged.
+    Passing a state to a scoped decoder layer hands its NCCL-window tensors
+    to that layer. In eager mode, tensors not returned by the layer are released
+    when it exits, so callers must not read a consumed state afterwards.
+
+    The kernel-level ``mHC.fused_hc`` still returns a 4-tuple so low-level
+    callers (tests, benchmarks) stay unchanged.
     """
 
     residual: torch.Tensor

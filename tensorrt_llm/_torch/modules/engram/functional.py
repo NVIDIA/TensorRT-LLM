@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused DeepSeek-V4.1 Engram gating, after the separate WKV GEMM."""
+"""Fused DeepSeek-V4.1 Engram gating, after the separate WKV GEMM, and decode history scatter."""
 
 import torch
 import triton
@@ -109,7 +109,7 @@ def engram_gate(
         eps: The checkpoint's RMSNorm epsilon.
         add_residual: Add the residual in FP32 before casting; otherwise return the delta.
         norm_weight_product: Optional cached FP32 query/key product, shape ``[HC, D]``.
-            Refresh after weight changes. Used only for contiguous BF16 GB300 residuals.
+            Refresh after weight changes. Used only for contiguous BF16 SM103/SM107 residuals.
         out: Optional contiguous ``[T, HC, D]`` CUDA destination in the residual dtype, which
             may be ``hidden_states``: each program loads its whole row before it stores it.
 
@@ -177,10 +177,15 @@ def engram_gate(
         and hidden_states.is_contiguous()
         and kv.is_contiguous()
         and norm_weight_product.is_contiguous()
-        and torch.cuda.get_device_capability(hidden_states.device) == (10, 3)
+        and torch.cuda.get_device_capability(hidden_states.device) in ((10, 3), (10, 7))
+    )
+    # Keep SM107's original reduction layout when using the cached product.
+    use_four_warps = use_precomputed and torch.cuda.get_device_capability(hidden_states.device) == (
+        10,
+        3,
     )
     gate_weight = norm_weight_product if use_precomputed else query_weight
-    launch_options = {"maxnreg": 96} if use_precomputed else {}
+    launch_options = {"maxnreg": 96} if use_four_warps else {}
     _engram_gate_kernel[(tokens * hc,) if use_precomputed else (tokens, hc)](
         hidden_states,
         kv,
@@ -197,8 +202,81 @@ def engram_gate(
         BLOCK=triton.next_power_of_2(dim),
         ADD_RESIDUAL=add_residual,
         PRECOMPUTED_WEIGHT=use_precomputed,
-        num_warps=4 if use_precomputed or dim < 4096 else 8,
+        num_warps=4 if use_four_warps or dim < 4096 else 8,
         enable_fp_fusion=False,
         **launch_options,
     )
     return output
+
+
+@triton.jit(do_not_specialize=["num_tokens"])
+def _history_scatter_kernel(
+    ids_ptr,
+    positions_ptr,
+    rows_ptr,
+    mask_ptr,
+    lookup_ptr,
+    history_ptr,
+    history_stride,
+    history_columns,
+    num_tokens,
+    lookup_size,
+    DEAD: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    tokens = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = tokens < num_tokens
+    ids = tl.load(ids_ptr + tokens, live, 0).to(tl.int64)
+    ids = tl.minimum(tl.maximum(ids, 0), lookup_size - 1)
+    compressed = tl.load(lookup_ptr + ids, live, 0)
+    if HAS_MASK:
+        keep = tl.load(mask_ptr + tokens, live, 0) != 0
+        compressed = tl.where(keep, compressed, DEAD)
+    rows = tl.load(rows_ptr + tokens, live, 0).to(tl.int64)
+    positions = tl.load(positions_ptr + tokens, live, 0).to(tl.int64)
+    # Negative positions index from the end, as the Torch scatter does.
+    positions = tl.where(positions < 0, positions + history_columns, positions)
+    live = live & (positions >= 0) & (positions < history_columns)
+    tl.store(history_ptr + rows * history_stride + positions, compressed.to(tl.int32), live)
+
+
+def engram_history_scatter(
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    rows: torch.Tensor,
+    token_mask: torch.Tensor | None,
+    lookup_table: torch.Tensor,
+    history: torch.Tensor,
+    dead: int,
+) -> None:
+    """``history[rows, position_ids] = where(token_mask, lookup_table[clamp(input_ids)], dead)``
+    in one launch, as Torch's scatter: int32 truncation, indexing, unspecified collision winner."""
+    num_tokens = input_ids.numel()
+    if num_tokens == 0:
+        return
+    vectors = [input_ids, position_ids, rows] + ([token_mask] if token_mask is not None else [])
+    if (
+        history.dtype != torch.int32
+        or history.stride(1) != 1
+        or not lookup_table.is_contiguous()
+        or any(v.numel() != num_tokens or not v.is_contiguous() for v in vectors)
+    ):
+        raise ValueError("Engram history scatter takes contiguous token vectors and int32 history")
+    block = 128
+    _history_scatter_kernel[(triton.cdiv(num_tokens, block),)](
+        input_ids,
+        position_ids,
+        rows,
+        token_mask.view(torch.uint8) if token_mask is not None else input_ids,
+        lookup_table,
+        history,
+        history.stride(0),
+        history.shape[1],
+        num_tokens,
+        lookup_table.shape[0],
+        DEAD=dead,
+        HAS_MASK=token_mask is not None,
+        BLOCK=block,
+        num_warps=4,
+    )
