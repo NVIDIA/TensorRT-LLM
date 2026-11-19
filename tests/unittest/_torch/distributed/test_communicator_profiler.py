@@ -181,14 +181,20 @@ def test_payload_description_is_shallow(
     } == want
 
 
-def test_tensor_metadata_does_not_read_values(active: tuple[Mock, MagicMock, Mock]) -> None:
+def test_tensor_metadata_does_not_read_values(
+    active: tuple[Mock, MagicMock, Mock], monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Verify layout and payload descriptors for a noncontiguous tensor."""
     record, _, _ = active
     payload = torch.ones((3, 2)).transpose(0, 1)
+    forbidden = Mock(side_effect=RuntimeError("tensor values must not be inspected"))
+    for method in ("tolist", "cpu", "numpy", "to"):
+        monkeypatch.setattr(payload, method, forbidden)
     with communicator.record_mpi_function(
         "send", communicator="world", group=lambda: [3], rank=3, payload=payload
     ):
         pass
+    assert record.call_args.kwargs["args"] is not None, "tensor descriptor metadata was dropped"
     fields = _fields(record)
     assert {
         key.removeprefix("mpi.payload."): val
@@ -203,6 +209,7 @@ def test_tensor_metadata_does_not_read_values(active: tuple[Mock, MagicMock, Moc
         "numel": 6,
         "bytes": 24,
     }
+    forbidden.assert_not_called()
 
 
 def test_direct_mpi_scalars_normalize_without_schema_change(
