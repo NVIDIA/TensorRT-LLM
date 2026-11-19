@@ -19548,13 +19548,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # The FC1 SFA gather fetches 16-byte chunks of scales per row.
                 fc1_k_alignment = 16 * MXFP8_FUSED_FC12_SF_VEC_SIZE
 
-                def __init__(self,
-                             num_experts: int,
-                             top_k: int,
-                             num_local_experts: int,
-                             local_expert_offset: int,
-                             tile_size: int,
-                             swiglu_limit: float = float("inf")):
+                def __init__(
+                    self,
+                    num_experts: int,
+                    top_k: int,
+                    num_local_experts: int,
+                    local_expert_offset: int,
+                    tile_size: int,
+                    swiglu_limit: float = float("inf")) -> None:
                     super().__init__()
                     self.num_experts = num_experts
                     self.top_k = top_k
