@@ -490,6 +490,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._cancelled_receive_fences: Dict[int, tuple[torch.cuda.Event, RetirementDeadline]] = {}
         self._profile_send_outcomes: dict[int, SendTerminalOutcome] = {}
         self._profile_send_observers: set[int] = set()
+        self._profile_send_failures: set[int] = set()
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
         try:
@@ -778,6 +779,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._transfer_worker.shutdown()
         self._profile_send_outcomes.clear()
         self._profile_send_observers.clear()
+        self._profile_send_failures.clear()
         # Record completion only after every owner and worker has shut down.
         # A refusal leaves shutdown retryable after the physical operation drains.
         self._shutdown_complete = True
@@ -801,6 +803,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid, session in list(self._send_sessions.items()):
             self._close_session_or_raise(session, rid, "shutdown")
         self._send_sessions.clear()
+        self._profile_send_failures.clear()
         self._send_reqs.clear()
         self._recv_sessions.clear()
         self._recv_reqs.clear()
@@ -1242,6 +1245,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else:
                 session.close()
         self._send_sessions.pop(rid, None)
+        failed_before_cancel = rid in self._profile_send_failures
+        self._profile_send_failures.discard(rid)
         # Early teardown may occur before _send_reqs is populated.
         req = req if req is not None else self._send_reqs.get(rid)
         self._send_reqs.pop(rid, None)
@@ -1250,8 +1255,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if outcome == "completed":
             self._record_send_terminal_outcome(rid, "complete")
         elif outcome == "cancelled":
-            observed_outcome: SendTerminalOutcome = "cancelled"
-            if session is not None and rid in self._profile_send_observers:
+            observed_outcome: SendTerminalOutcome = (
+                "failed" if failed_before_cancel else "cancelled"
+            )
+            if (
+                observed_outcome != "failed"
+                and session is not None
+                and rid in self._profile_send_observers
+            ):
                 try:
                     # Legacy cancellation can replace status while retaining the error.
                     if session.status == SessionStatus.ERROR or session.exception is not None:
@@ -1274,11 +1285,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         rid = self.status_request_id(req)
         self._profile_send_observers.add(rid)
 
+    def _observe_send_failure_before_cancel(self, rid: int, session: TxSessionBase) -> None:
+        """Keep opt-in failure evidence private until the send safely retires."""
+        if rid not in self._profile_send_observers:
+            return
+        try:
+            # Legacy cancellation replaces ERROR even when only a task failed.
+            if session.status == SessionStatus.ERROR:
+                self._profile_send_failures.add(rid)
+        except (AttributeError, LookupError, TypeError, ValueError, RuntimeError, OSError) as error:
+            _profiler.warn_profiler_failure(
+                "trtllm::kv_transfer", "kv", "send cancellation outcome", error
+            )
+
     def stop_send_terminal_outcome_observation(self, req: LlmRequest) -> None:
         """Release a send's observation after terminal or rejected admission."""
         rid = self.status_request_id(req)
         self._profile_send_outcomes.pop(rid, None)
         self._profile_send_observers.discard(rid)
+        self._profile_send_failures.discard(rid)
 
     def get_send_terminal_outcome(self, req: LlmRequest) -> SendTerminalOutcome | None:
         """Read an opt-in outcome without polling or consuming retirement state."""
@@ -1286,6 +1311,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _record_send_terminal_outcome(self, rid: int, outcome: SendTerminalOutcome) -> None:
         """Retain terminal evidence only for a send with an active observer."""
+        self._profile_send_failures.discard(rid)
         if rid in self._profile_send_observers:
             self._profile_send_outcomes[rid] = outcome
 
@@ -2286,6 +2312,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return True
         if not getattr(session, "_enforce_physical_ownership", False):
             return False
+        self._observe_send_failure_before_cancel(rid, session)
         session.cancel()
         # Keep both the native session and its request root until every physical
         # operation settles. Repeated cancellation joins the same drain window.
@@ -2334,6 +2361,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         if rid in self._send_sessions:
             session = self._send_sessions[rid]
+            self._observe_send_failure_before_cancel(rid, session)
             session.cancel()
             if session.has_transferring_tasks():
                 has_transferring = True

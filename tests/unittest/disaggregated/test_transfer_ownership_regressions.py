@@ -936,6 +936,7 @@ def test_cancel_request_retains_session_when_close_refuses(direction: str) -> No
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._profile_send_outcomes = {}
     transceiver._profile_send_observers = set()
+    transceiver._profile_send_failures = set()
     transceiver._wait_reqs = {}
     transceiver._send_sessions = {rid: session} if direction == "send" else {}
     transceiver._send_reqs = {rid: request} if direction == "send" else {}
@@ -1020,6 +1021,7 @@ def test_send_terminal_session_is_retained_when_close_refuses(
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._profile_send_outcomes = {}
     transceiver._profile_send_observers = set()
+    transceiver._profile_send_failures = set()
     transceiver._ever_had_send_session = True
     transceiver._ctx_need_tp_sync = False
     transceiver._ctx_need_pp_sync = False
@@ -1172,6 +1174,7 @@ def test_shutdown_refuses_to_drop_active_receive_owner() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._profile_send_outcomes = {}
     transceiver._profile_send_observers = set()
+    transceiver._profile_send_failures = set()
     transceiver._shutdown_complete = False
     transceiver._wait_reqs = {}
     transceiver._send_sessions = {}
@@ -1210,6 +1213,7 @@ def test_shutdown_fails_stop_when_receive_close_refuses_after_preflight() -> Non
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._profile_send_outcomes = {}
     transceiver._profile_send_observers = set()
+    transceiver._profile_send_failures = set()
     transceiver._shutdown_complete = False
     transceiver._send_sessions = {rid + 1: send_session}
     transceiver._send_reqs = {rid + 1: object()}
@@ -1253,6 +1257,7 @@ def test_concurrent_shutdown_is_serialized() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._profile_send_outcomes = {}
     transceiver._profile_send_observers = set()
+    transceiver._profile_send_failures = set()
     transceiver._shutdown_complete = False
     transceiver._shutdown_lock = _TrackingLock(lock_events)
     transceiver._send_sessions = {}
@@ -1660,6 +1665,7 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._profile_send_outcomes = {}
     transceiver._profile_send_observers = set()
+    transceiver._profile_send_failures = set()
     transceiver._fp4_mla_bridge_enabled = True
     transceiver._enable_pipelined_transfer = False
     transceiver._ever_had_send_session = False

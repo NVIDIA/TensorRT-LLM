@@ -1258,6 +1258,7 @@ def _make_bare_transceiver() -> KvCacheTransceiverV2:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._profile_send_outcomes = {}
     transceiver._profile_send_observers = set()
+    transceiver._profile_send_failures = set()
     return transceiver
 
 

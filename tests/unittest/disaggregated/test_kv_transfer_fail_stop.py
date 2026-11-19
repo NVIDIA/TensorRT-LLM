@@ -565,6 +565,7 @@ def _shutdown_transceiver() -> tuple[KvCacheTransceiverV2, transfer_mod.RxSessio
     instance = KvCacheTransceiverV2.__new__(KvCacheTransceiverV2)
     instance._profile_send_outcomes = {}
     instance._profile_send_observers = set()
+    instance._profile_send_failures = set()
     instance._transfer_worker = worker
     instance._send_sessions = {}
     instance._send_reqs = {}
