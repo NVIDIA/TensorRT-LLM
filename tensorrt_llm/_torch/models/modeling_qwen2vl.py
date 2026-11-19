@@ -147,6 +147,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
 
     supports_tokenization_cache = True
+    uses_mrope = True
 
     def export_decode_state(
             self, multimodal_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:

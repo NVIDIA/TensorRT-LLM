@@ -75,11 +75,10 @@ class _StubModelConfig:
 
 
 class _GenerationProcessor:
-    """What the generation-only checks read: the media token and the rotary type."""
+    """What the generation-only checks read: the media token and the mRoPE flag."""
 
     def __init__(self, uses_mrope: bool):
-        rope = {"mrope_section": [1, 1, 1]} if uses_mrope else {"rope_type": "default"}
-        self.config = SimpleNamespace(text_config=SimpleNamespace(rope_scaling=rope))
+        self.uses_mrope = uses_mrope
 
     def get_mm_token_ids(self):
         return torch.tensor([IMAGE_TOKEN])

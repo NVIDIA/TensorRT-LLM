@@ -746,10 +746,13 @@ class MultimodalInput:
                 for digest in self.multimodal_hashes):
             raise ValueError(
                 "multimodal_hashes must hold eight int32 values per item")
-        spans = list(zip(self.multimodal_positions, self.multimodal_lengths))
+        spans = list(
+            zip(self.multimodal_positions, self.multimodal_lengths,
+                strict=True))
         if self.multimodal_run_positions is not None:
             spans += zip(self.multimodal_run_positions,
-                         self.multimodal_run_lengths)
+                         self.multimodal_run_lengths,
+                         strict=True)
         if any(position + length > prompt_len for position, length in spans):
             raise ValueError(
                 f"multimodal spans exceed the prompt of {prompt_len} tokens")

@@ -210,6 +210,13 @@ class BaseMultimodalInputProcessor(ABC):
     # tokens and tolerate splitting. Gemma4 sets True.
     mm_bidirectional_blocks: ClassVar[bool] = False
 
+    # Whether media prompts get mRoPE state from this processor
+    # (`multimodal_data["mrope_config"]`: position IDs and deltas). A
+    # generation-only worker cannot rebuild it from token IDs, so in
+    # disaggregated serving it must come from the context worker.
+    # Default False (plain RoPE); Qwen2VLInputProcessorBase sets True.
+    uses_mrope: ClassVar[bool] = False
+
     # Whether the subclass implements the tokenized+MM fast path — i.e. both
     # `get_text_with_mm_placeholders` and `expand_prompt_token_ids_for_mm`.
     # When True, `__call__` may route `prompt_token_ids + multi_modal_data`
