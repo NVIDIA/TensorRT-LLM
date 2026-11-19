@@ -805,6 +805,37 @@
       "title": "SeaCacheConfig",
       "type": "object"
     },
+    "SessionConfig": {
+      "additionalProperties": false,
+      "description": "Engine settings for streaming sessions (``VisualGen.open_session``).",
+      "properties": {
+        "delivery_slots": {
+          "default": 2,
+          "description": "Delivery slots per session: results the worker may hold for the client at once, each sized for the pipeline's largest result. 2 lets the worker produce the next result while the client uses the current one; more lets it run further ahead when inputs are already available.",
+          "minimum": 1,
+          "status": "prototype",
+          "title": "Delivery Slots",
+          "type": "integer"
+        },
+        "idle_timeout": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Seconds a session may wait for the client (no submit, no result request, no slot return) while only the client can make progress, before the executor closes it with a terminal error and frees the model instance. None disables the timeout.",
+          "status": "prototype",
+          "title": "Idle Timeout"
+        }
+      },
+      "title": "SessionConfig",
+      "type": "object"
+    },
     "SkipSoftmaxAttentionConfig": {
       "additionalProperties": false,
       "description": "SkipSoftmax sparse attention configuration for visual generation.\n\nThis class is only the Python/YAML user surface. Checkpoint calibration\ndata is passed to ``to_sparse_params()`` when SparseParams are created.",
@@ -1196,6 +1227,11 @@
       ],
       "default": null,
       "description": "Startup-preloaded LoRA adapter fused into VisualGen transformer weights.",
+      "status": "prototype"
+    },
+    "session_config": {
+      "$ref": "#/$defs/SessionConfig",
+      "description": "Streaming session settings: delivery slots per session and the idle timeout.",
       "status": "prototype"
     },
     "torch_compile_config": {
