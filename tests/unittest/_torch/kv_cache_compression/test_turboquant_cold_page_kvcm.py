@@ -275,9 +275,8 @@ def _assert_restored(provider, restored, original, max_nmse, rope_dim=0, num_tok
     [
         (4, True, 0.02),
         (3, False, 0.05),
-        (3.5, False, 0.03),
     ],
-    ids=["mse4-skip-rope", "mse3", "mse3.5"],
+    ids=["mse4-skip-rope", "mse3"],
 )
 def test_host_tier_round_trip(bits, skip_rope, max_nmse):
     provider = _provider(bits, skip_rope)

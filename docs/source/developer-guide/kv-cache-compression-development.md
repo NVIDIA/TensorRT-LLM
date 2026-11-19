@@ -345,8 +345,7 @@ for each quantized piece and in where it receives Page indices.
   including widths that are not a power of two, such as the 576-number MLA
   latent. With `true` the RoPE part is located by the same rules and the same
   `_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` as for NVFP4 and copied unchanged. The
-  codec refuses a piece whose length is not a multiple of 16 numbers, or of 32
-  with fractional bit widths.
+  codec refuses a piece whose length is not a multiple of 16 numbers.
 - DeepSeek-V4 compressed (CSA) rows follow `skip_rope_quantization` as for
   NVFP4: the whole 512-number row is quantized, or with `true` the 448 NoPE
   numbers, and the 64 RoPE numbers are copied unchanged. The indexer cache is
@@ -357,11 +356,9 @@ for each quantized piece and in where it receives Page indices.
 - Draft KVCMs ignore `skip_rope_quantization` and quantize whole vectors, as
   for NVFP4. Every KVCM still gets its own codec state; the seed-determined
   rotations and codebooks are shared by the KVCMs of one provider.
-- Each vector carries one BF16 scale per TurboQuant instance: one with 2, 3, or
-  4 bits, and two (one per channel half) with fractional bits. Fractional bits
-  also store one channel mask per Page, layer,
-  buffer, and KV head. All of it is computed while encoding, from the Page
-  itself: the format needs no calibration artifact or checkpoint metadata.
+- Each vector carries one BF16 scale per TurboQuant instance, computed while
+  encoding from the vector itself: the format needs no calibration artifact or
+  checkpoint metadata.
 - The provider reports `ColdPageIndexLocation.DEVICE`, so KVCM stages each
   batch's Page-index pairs in device memory and the kernels read them on the
   supplied stream; the NVFP4 provider uses `HOST`.
@@ -378,16 +375,14 @@ holds these regions, each padded to 16 bytes:
 
 | Region | Contents |
 |---|---|
-| Code planes | Codes of `b` bits split into 4-, 2- and 1-bit planes (3 bits = 2 + 1). Each plane is chunk-major, `[chunks of C coordinates][R rows][C * w / 8 bytes]`, so every tile of rows writes and reads contiguous bytes. Fractional bit widths have one set of planes per channel group. |
-| Scalars | BF16 per row: the least-squares scale of every instance; fractional bits store one scale per group. |
-| Channel masks | Fractional bits only: one `N`-bit outlier mask per KV head. |
+| Code planes | Codes of `b` bits split into 4-, 2- and 1-bit planes (3 bits = 2 + 1). Each plane is chunk-major, `[chunks of C coordinates][R rows][C * w / 8 bytes]`, so every tile of rows writes and reads contiguous bytes. |
+| Scalars | BF16 per row: the least-squares scale of every instance. |
 | Raw elements | The elements of each row outside the quantized range (RoPE), unchanged. |
 
 Rows whose width is not a power of two (448 = 256 + 128 + 64) are loaded as
 power-of-two pieces and rotated by one full `N x N` matrix: one TurboQuant
 instance per vector. Rows wider than 512 (the 576-value MLA latent) hold
-several instances (256 + 256 + 64; fractional bits keep their two halves,
-288 + 288, as the instances), because decoding
+several instances (256 + 256 + 64), because decoding
 accumulates every output value of an instance in tensor memory (512 fp32
 columns, shared with the staged operand); each instance decodes in its own
 launch over its own chunks of the code planes. A single 512-value instance
