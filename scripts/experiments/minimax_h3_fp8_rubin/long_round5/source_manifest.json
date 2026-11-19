@@ -1,0 +1,19 @@
+{
+  "version": "fp8-integration-current-Kanghwan-v1",
+  "GPU_qualification_pending": true,
+  "scope": "Retained runtime/kernel source pins; new-base GPU validation pending",
+  "files": {
+    "round5_cast_runtime.py": "7363016aa552dc12f6326347878fbdfc349024829ac7307ae79f46b3b6790a35",
+    "round5_kernels.py": "c2bd05aa25d1fc415c159f9111ccd58452582d5205c651ef5c76f936ff838118",
+    "round5_pdl_edges.py": "18708311a254d73201e9f885c5d89ff75188c316d931bfd45650236366957f5e",
+    "round5_quant_runtime.py": "5851bb73c7d23fe31fa7a5817164ada7ce8173bd71e7b7817cbb20b57db8b02d",
+    "round5_runtime.py": "6187f6300febf2be286d20138dc4ec2199c41eab37256a281a89aa42441e105d",
+    "round5_shared_forward.py": "0dd77881f32d6f295a6c8b41109cac9a02d5e5cd0b5e2cd4d8fe48401f3fbfcd",
+    "round5_shared_forward_proof.json": "72abdf245d84ce1e7e603bf2d291de5432d2069abc94651f0f53dcabdcb0eedc",
+    "round5_shared_runtime.py": "3784f13d193e6567085c262dc3dd2a87a3dc5264e67b19dcef78b127bd0f8626",
+    "sharedCast.cpp": "a458924b0b7281d77aed64b3ead376b5f21e5deba0d6f86ff158911bf19d6fc3",
+    "sharedCast.cu": "00139da11b25ebadc56260de59372eb396b4387606e3b98bd0e9e77287b623f2",
+    "staticQuant.cpp": "223f1385f132abe7d6b213407eca8ccc833bad3cdae0391a519f5250ca7a1443",
+    "staticQuant.cu": "58a60b38028e7c3d3dc40443efe695e28673e9cecab33ee0e068ab4d8e52c8f7"
+  }
+}
