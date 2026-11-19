@@ -377,7 +377,9 @@ def _policy(*, native_flow_schedule: bool = False) -> tuple[Cosmos3SamplingPolic
 
 def _distilled_policy() -> Cosmos3SamplingPolicy:
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(DISTILLED_CONFIG)
-    return Cosmos3SamplingPolicy.from_scheduler(scheduler)
+    return Cosmos3SamplingPolicy.from_scheduler(
+        scheduler, fixed_sigmas=tuple(DISTILLED_CONFIG["fixed_step_sampler_config"]["t_list"])
+    )
 
 
 def _resolve(policy, *, sigma_grid=None, flow_shift=None, mode_flow_shift=1.0, mode_karras=None):

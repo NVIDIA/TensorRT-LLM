@@ -869,8 +869,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         checkpoint_shift = getattr(self.sampling, "checkpoint_flow_shift", None)
         if checkpoint_shift is not None:
             shifts.add(float(checkpoint_shift))
-        rows = [*COSMOS3_DEFAULTS.get(self.resolver.family, {}).get("transfer", {}).values()]
-        for row in COSMOS3_OVERRIDES.get(self.resolver.family, {}).values():
+        rows = [*COSMOS3_DEFAULTS.get(self.family, {}).get("transfer", {}).values()]
+        for row in COSMOS3_OVERRIDES.get(self.family, {}).values():
             rows.append({name: override.value for name, override in row.items()})
         for row in rows:
             if row.get("flow_shift") is not None:

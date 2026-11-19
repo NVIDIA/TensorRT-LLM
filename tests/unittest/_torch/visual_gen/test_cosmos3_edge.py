@@ -35,6 +35,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_DEFAULTS,
     COSMOS3_EXTRA_SPECS,
 )
+from tensorrt_llm._torch.visual_gen.models.cosmos3.overrides import COSMOS3_OVERRIDES
 from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
     ParameterResolver,
     RequestParameters,
@@ -1169,14 +1170,22 @@ class TestSchedulerCacheBounds:
         return pipeline
 
     def test_every_cacheable_shift_source_contributes(self) -> None:
-        """The checkpoint's shift and every transfer hint preset; nothing else."""
+        """The checkpoint's shift, every transfer default and every override; nothing else."""
+        family = "nemotron_dense"
         hint_shifts = {
             float(defaults["flow_shift"])
-            for defaults in COSMOS3_DEFAULTS["qwen3"]["transfer"].values()
+            for defaults in COSMOS3_DEFAULTS[family]["transfer"].values()
             if "flow_shift" in defaults
         }
-        pipeline = self._pipeline(checkpoint_shift=2.75)
-        assert pipeline._cacheable_flow_shifts() == frozenset({2.75} | hint_shifts)
+        override_shifts = {
+            float(row["flow_shift"].value)
+            for row in COSMOS3_OVERRIDES[family].values()
+            if "flow_shift" in row
+        }
+        pipeline = self._pipeline(family, checkpoint_shift=2.75)
+        assert pipeline._cacheable_flow_shifts() == frozenset(
+            {2.75} | hint_shifts | override_shifts
+        )
 
     def test_arbitrary_shifts_never_enter_the_cache(self) -> None:
         pipeline = self._pipeline()
