@@ -40,7 +40,12 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
-from tensorrt_llm._torch.modeling_v2._features import PrefillCudaGraph
+from tensorrt_llm._torch.modeling_v2 import _router_index
+from tensorrt_llm._torch.modeling_v2._features import (
+    AdvancedFunctionalFeature,
+    BasicFeature,
+    PrefillCudaGraph,
+)
 from tensorrt_llm._torch.modeling_v2._router_index import (
     _RESOLVED_MODES,
     _ROUTES,
@@ -268,18 +273,34 @@ def test_a_set_mode_builds_a_target_disabled_by_default(monkeypatch, mode):
     assert modeling_v2_resolve(config, _llm_args(mode)) is _TargetDisabledByDefault
 
 
+def _warnings(monkeypatch):
+    """The modeling_v2 warnings logged from now on (constructing the engine arguments logs others)."""
+    warnings = []
+
+    def warning(message, *args, **kwargs):
+        if message.startswith("modeling_v2:"):
+            warnings.append(message)
+
+    monkeypatch.setattr(_router_index.logger, "warning", warning)
+    return warnings
+
+
 class _TargetWithoutPrefillCudaGraph:
     """A target that declares no feature."""
 
 
-def test_a_feature_the_target_does_not_declare_is_refused(monkeypatch):
-    config = _claimed_by(monkeypatch, _TargetWithoutPrefillCudaGraph)
-    assert modeling_v2_resolve(config, _llm_args("require")) is _TargetWithoutPrefillCudaGraph
-    _declined(
-        config,
-        dict(prefill_cuda_graph_backend="breakable"),
-        match="_TargetWithoutPrefillCudaGraph does not support prefill_cuda_graph_backend='breakable'$",
-    )
+def test_a_perf_feature_the_target_does_not_declare_warns(monkeypatch):
+    target = _TargetWithoutPrefillCudaGraph
+    config = _claimed_by(monkeypatch, target)
+    warnings = _warnings(monkeypatch)
+    assert modeling_v2_resolve(config, _llm_args("require")) is target
+    assert warnings == []
+    breakable = dict(prefill_cuda_graph_backend="breakable")
+    assert modeling_v2_resolve(config, _llm_args("auto", **breakable)) is target
+    assert warnings == [
+        "modeling_v2: _TargetWithoutPrefillCudaGraph does not support "
+        "prefill_cuda_graph_backend='breakable'; building it anyway"
+    ]
 
 
 @PrefillCudaGraph.supported()
@@ -298,18 +319,83 @@ class _TargetWithStepTargets:
     step_targets = (_PrefillTarget, _DecodeTarget)
 
 
-def test_every_step_target_must_serve_the_feature(monkeypatch):
+def test_every_step_target_must_declare_the_perf_feature(monkeypatch):
     """A breakable prefill graph leaves the decode steps uncompiled, so the decode step target
     serves it; a piecewise one torch.compiles them too unless ``compile_only_piecewise_graphs``
     keeps them eager."""
     target = _TargetWithStepTargets
     config = _claimed_by(monkeypatch, target)
-    breakable = dict(prefill_cuda_graph_backend="breakable")
-    assert modeling_v2_resolve(config, _llm_args("require", **breakable)) is target
+    warnings = _warnings(monkeypatch)
+    assert (
+        modeling_v2_resolve(config, _llm_args("require", prefill_cuda_graph_backend="breakable"))
+        is target
+    )
     piecewise = dict(prefill_cuda_graph_backend="piecewise")
-    _declined(config, piecewise, match="_TargetWithStepTargets's _DecodeTarget does not support")
     piecewise["torch_compile_config"] = TorchCompileConfig(compile_only_piecewise_graphs=True)
     assert modeling_v2_resolve(config, _llm_args("require", **piecewise)) is target
+    assert warnings == []
+    del piecewise["torch_compile_config"]
+    assert modeling_v2_resolve(config, _llm_args("require", **piecewise)) is target
+    assert len(warnings) == 1
+    assert warnings[0].startswith(
+        "modeling_v2: _TargetWithStepTargets's _DecodeTarget does not support"
+    )
+
+
+def test_a_basic_feature_the_target_declares_unsupported_is_an_error(monkeypatch):
+    """Every step target serves a basic feature until it says otherwise, and saying otherwise
+    fails the deployment in every mode rather than falling back."""
+    monkeypatch.setattr(BasicFeature, "_features", [])
+
+    class _Feature(BasicFeature):
+        @classmethod
+        def from_args(cls, model_config, llm_args):
+            return cls() if llm_args.enable_chunked_prefill else None
+
+        def __str__(self):
+            return "the feature"
+
+    @_Feature.unsupported()
+    class _Unsupporting:
+        pass
+
+    class _Target:
+        step_targets = (_PrefillTarget, _Unsupporting)
+
+    config = _claimed_by(monkeypatch, _Target)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is _Target
+    for mode in ("auto", "require"):
+        with pytest.raises(
+            ValueError, match="_Target's _Unsupporting does not support the feature$"
+        ):
+            modeling_v2_resolve(config, _llm_args(mode, enable_chunked_prefill=True))
+
+
+def test_a_functional_feature_the_target_does_not_declare_is_refused(monkeypatch):
+    monkeypatch.setattr(AdvancedFunctionalFeature, "_features", [])
+
+    class _Feature(AdvancedFunctionalFeature):
+        @classmethod
+        def from_args(cls, model_config, llm_args):
+            return cls() if llm_args.enable_chunked_prefill else None
+
+        def __str__(self):
+            return "the feature"
+
+    @_Feature.supported()
+    class _Supporting:
+        pass
+
+    class _Target:
+        step_targets = (_Supporting, _DecodeTarget)
+
+    config = _claimed_by(monkeypatch, _Target)
+    assert modeling_v2_resolve(config, _llm_args("require")) is _Target
+    _declined(
+        config,
+        dict(enable_chunked_prefill=True),
+        match="_Target's _DecodeTarget does not support the feature$",
+    )
 
 
 @pytest.mark.parametrize(

@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
-from ._features import feature_refusal
+from ._features import AdvancedFunctionalFeature, AdvancedPerfFeature, BasicFeature
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -314,11 +314,15 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     Returns the target class, or None for the built-in implementation:
     when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
     for the architecture, when that ``route`` raises ``NoTarget``, or when the
-    deployment turns on a feature that a step target of the returned class does
-    not declare (``_features``).
+    deployment turns on an advanced functional feature that a step target of the
+    returned class does not declare (``_features``).
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
     It also returns None for a ``@disable_v2_by_default`` target when
     ``modeling_v2`` was left at its default.
+    It raises ``ValueError`` in every mode when the deployment turns on a basic
+    feature that a step target of the returned class declares it does not serve,
+    and it warns when the target it builds does not declare an advanced perf
+    feature the deployment turns on.
 
     """
     mode = ModelingV2Mode.of(llm_args)
@@ -338,9 +342,14 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         target = route(config, llm_args, _device_compute_capability())
         if target is not None:
             _refuse_unhonored_moe_tactics(config, target, arch)
-            refusal = feature_refusal(target, config, llm_args)
-            if refusal is not None:
-                raise NoTarget(refusal)
+            unserved = BasicFeature.gaps(target, config, llm_args)
+            if unserved:
+                raise ValueError(
+                    f"modeling_v2: {arch!r} routes to {target.__name__}, but {'; '.join(unserved)}"
+                )
+            unserved = AdvancedFunctionalFeature.gaps(target, config, llm_args)
+            if unserved:
+                raise NoTarget("; ".join(unserved))
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
@@ -356,6 +365,8 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         return None
     if target is not None:
         _RESOLVED_MODES[target] = mode
+        for why in AdvancedPerfFeature.gaps(target, config, llm_args):
+            logger.warning(f"modeling_v2: {why}; building it anyway")
     return target
 
 

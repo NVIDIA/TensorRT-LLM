@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Engine features a step target must declare before a deployment that turns them on can build it.
+"""Engine features and the step targets that serve them.
 
 A deployment's core hands each step to one of its step targets (``_select_target``): every
 step with context rows to ``PrefillTarget``, every step without to ``DecodeTarget``. A
@@ -9,19 +9,22 @@ deployment class without it runs every step itself and is its own step target.
 
 Each feature is a class whose instance holds the facts that decide support, read from the
 engine arguments by :meth:`Feature.from_args`, which returns None while the feature is off.
-A step target declares support with the feature's class decorator::
+A step target declares itself with the feature's class decorator, optionally with ``when``,
+which sees only the feature instance and limits the declaration to the settings it holds
+for. A step target serves a feature when it runs correctly with the feature on, including
+when the feature leaves its steps alone: a ``DecodeTarget`` serves a breakable prefill CUDA
+graph, which captures only the steps with context rows.
 
-    @PrefillCudaGraph.supported(when=_prefill_cuda_graph_supported)
-    class PrefillTarget: ...
+Features come in three kinds, and ``modeling_v2_resolve`` treats a step target that does not
+serve one the deployment turns on by its kind:
 
-``when`` sees only the feature instance and returns whether the target serves it; without
-``when`` the target serves every setting of the feature. A step target serves a feature when
-it runs correctly with the feature on, including when the feature leaves its steps alone: a
-``DecodeTarget`` serves a breakable prefill CUDA graph, which captures only the steps with
-context rows. A step target that does not declare a feature does not serve it:
-``modeling_v2_resolve`` refuses every deployment one of whose step targets does not serve a
-feature it turns on, so a feature added here is refused everywhere until step targets
-declare it.
+- :class:`BasicFeature`: every step target serves it unless it declares otherwise with
+  ``@Feature.unsupported(when=...)``. The deployment is an error, in every mode.
+- :class:`AdvancedFunctionalFeature`: a step target serves it only once it declares
+  ``@Feature.supported(when=...)``. The route's target is refused: ``auto`` builds the
+  built-in implementation and ``require`` raises.
+- :class:`AdvancedPerfFeature`: declared like a functional feature, but the route's target
+  is built anyway, with a warning that it does not declare the feature.
 
 Picking a different step target when a feature is on is the core's decision, made with an
 ordinary branch on ``Feature.from_args`` in ``_select_target``.
@@ -42,20 +45,21 @@ def step_targets(deployment: type) -> Tuple[type, ...]:
     return getattr(deployment, "step_targets", None) or (deployment,)
 
 
-# Every feature class, filled as each is defined.
-_FEATURES: List[Type["Feature"]] = []
-
-
 class Feature:
-    """An engine feature a step target serves only once it declares it."""
+    """An engine feature; subclass one of its three kinds, not this class."""
 
     # step target class -> its ``when``, or None for every setting; one dict per feature class.
-    _supported_by: ClassVar[Dict[type, Optional[Callable[["Feature"], bool]]]]
+    _declared: ClassVar[Dict[type, Optional[Callable[["Feature"], bool]]]]
+    # The features of each kind, filled as each is defined.
+    _features: ClassVar[List[Type["Feature"]]]
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        cls._supported_by = {}
-        _FEATURES.append(cls)
+        cls._declared = {}
+        if Feature in cls.__bases__:
+            cls._features = []
+        else:
+            cls._features.append(cls)
 
     @classmethod
     def from_args(
@@ -65,47 +69,142 @@ class Feature:
         raise NotImplementedError
 
     @classmethod
-    def supported(cls, when: Optional[Callable[["Feature"], bool]] = None):
-        """Declare that the decorated step target serves this feature, where ``when`` holds if given."""
-
+    def _declare(cls, when: Optional[Callable[["Feature"], bool]]):
         def declare(target: type) -> type:
-            cls._supported_by[target] = when
+            cls._declared[target] = when
             return target
 
         return declare
 
     @classmethod
-    def refusal(
+    def _declares(cls, target: type, feature: "Feature") -> bool:
+        if target not in cls._declared:
+            return False
+        when = cls._declared[target]
+        return when is None or when(feature)
+
+    @classmethod
+    def _serves(cls, target: type, feature: "Feature") -> bool:
+        raise NotImplementedError
+
+    @classmethod
+    def gap(
         cls, deployment: type, model_config: "ModelConfig", llm_args: "TorchLlmArgs"
     ) -> Optional[str]:
-        """Why ``deployment`` cannot serve this feature as the deployment sets it, or None."""
+        """Which step target of ``deployment`` does not serve this feature as set, or None."""
         feature = cls.from_args(model_config, llm_args)
         if feature is None:
             return None
         for target in step_targets(deployment):
-            if target in cls._supported_by:
-                when = cls._supported_by[target]
-                if when is None or when(feature):
-                    continue
+            if cls._serves(target, feature):
+                continue
             name = deployment.__name__
             if target is not deployment:
                 name = f"{name}'s {target.__name__}"
             return f"{name} does not support {feature}"
         return None
 
+    @classmethod
+    def gaps(
+        cls, deployment: type, model_config: "ModelConfig", llm_args: "TorchLlmArgs"
+    ) -> List[str]:
+        """:meth:`gap` of every feature of this kind that ``deployment`` does not serve."""
+        return [
+            why
+            for feature in cls._features
+            if (why := feature.gap(deployment, model_config, llm_args))
+        ]
 
-def feature_refusal(
-    deployment: type, model_config: "ModelConfig", llm_args: "TorchLlmArgs"
-) -> Optional[str]:
-    """Why ``deployment`` cannot serve the features this deployment turns on, or None."""
-    refusals = [
-        why for feature in _FEATURES if (why := feature.refusal(deployment, model_config, llm_args))
-    ]
-    return "; ".join(refusals) or None
+
+class BasicFeature(Feature):
+    """A feature every step target serves unless it declares that it does not."""
+
+    @classmethod
+    def unsupported(cls, when: Optional[Callable[["Feature"], bool]] = None):
+        """Declare that the decorated step target does not serve this feature, where ``when`` holds if given."""
+        return cls._declare(when)
+
+    @classmethod
+    def _serves(cls, target: type, feature: Feature) -> bool:
+        return not cls._declares(target, feature)
+
+
+class AdvancedFunctionalFeature(Feature):
+    """A feature that changes what the engine computes; only the step targets that declare it serve it."""
+
+    @classmethod
+    def supported(cls, when: Optional[Callable[["Feature"], bool]] = None):
+        """Declare that the decorated step target serves this feature, where ``when`` holds if given."""
+        return cls._declare(when)
+
+    @classmethod
+    def _serves(cls, target: type, feature: Feature) -> bool:
+        return cls._declares(target, feature)
+
+
+class AdvancedPerfFeature(Feature):
+    """A feature that only changes how fast the engine runs; only the step targets that declare it serve it."""
+
+    @classmethod
+    def supported(cls, when: Optional[Callable[["Feature"], bool]] = None):
+        """Declare that the decorated step target serves this feature, where ``when`` holds if given."""
+        return cls._declare(when)
+
+    @classmethod
+    def _serves(cls, target: type, feature: Feature) -> bool:
+        return cls._declares(target, feature)
 
 
 @dataclass(frozen=True)
-class PrefillCudaGraph(Feature):
+class DecodeCudaGraph(BasicFeature):
+    """The decode CUDA graph (``cuda_graph_config`` set)."""
+
+    @classmethod
+    def from_args(cls, model_config, llm_args) -> Optional["DecodeCudaGraph"]:
+        return None if llm_args.cuda_graph_config is None else cls()
+
+    def __str__(self) -> str:
+        return "the decode CUDA graph (cuda_graph_config)"
+
+
+@dataclass(frozen=True)
+class ChunkedPrefill(BasicFeature):
+    """Chunked prefill (``enable_chunked_prefill``)."""
+
+    @classmethod
+    def from_args(cls, model_config, llm_args) -> Optional["ChunkedPrefill"]:
+        return cls() if llm_args.enable_chunked_prefill else None
+
+    def __str__(self) -> str:
+        return "enable_chunked_prefill"
+
+
+@dataclass(frozen=True)
+class OverlapScheduler(BasicFeature):
+    """The overlap scheduler (``disable_overlap_scheduler`` unset)."""
+
+    @classmethod
+    def from_args(cls, model_config, llm_args) -> Optional["OverlapScheduler"]:
+        return None if llm_args.disable_overlap_scheduler else cls()
+
+    def __str__(self) -> str:
+        return "the overlap scheduler (disable_overlap_scheduler=False)"
+
+
+@dataclass(frozen=True)
+class KvCacheBlockReuse(BasicFeature):
+    """KV cache block reuse (``kv_cache_config.enable_block_reuse``)."""
+
+    @classmethod
+    def from_args(cls, model_config, llm_args) -> Optional["KvCacheBlockReuse"]:
+        return cls() if llm_args.kv_cache_config.enable_block_reuse else None
+
+    def __str__(self) -> str:
+        return "kv_cache_config.enable_block_reuse"
+
+
+@dataclass(frozen=True)
+class PrefillCudaGraph(AdvancedPerfFeature):
     """A prefill CUDA graph (``prefill_cuda_graph_backend`` other than ``disabled``).
 
     The engine captures and replays it for steps with context rows only, but ``piecewise``
