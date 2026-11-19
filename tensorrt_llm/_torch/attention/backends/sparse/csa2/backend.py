@@ -312,9 +312,16 @@ class CSA2TrtllmAttention(TrtllmAttention):
         )
         self.local_layer_idx = 0  # one physical compute-pool slot in this view
         # FP8 context tiles that stage the shared E4M3 bank run one fused kernel
-        # (``forward_fused_context``) instead of the trtllm-gen context FMHA.
+        # (``forward_fused_context``) instead of the trtllm-gen context FMHA. PrimTS leaves
+        # them to that kernel too: its context tiles that get a shared bank stage it in E4M3
+        # (``query_tile_metadata``), wherever native FP8 staging would.
+        context_fp8 = native_fp8 or (
+            self.compute_backend == "prims_ts"
+            and fp8_requested
+            and sparse_params.use_fp8_staging is not False
+        )
         self.fused_context = (
-            self.native_fp8
+            context_fp8
             and num_heads == 64
             and _fused_context_supported(torch.cuda.current_device())
         )
@@ -355,6 +362,29 @@ class CSA2TrtllmAttention(TrtllmAttention):
         """Whether trtllm-gen consumes E4M3 staging, independently of persistent SWA."""
         return self.staging_dtype == torch.float8_e4m3fn
 
+    def query_tile_metadata(
+        self,
+        source: CSA2TrtllmMetadata,
+        q: torch.Tensor,
+        extra_width: int,
+        *,
+        query_start: int,
+        layer_idx: int,
+    ) -> CSA2TrtllmMetadata:
+        """``source``'s compute metadata of the module tile ``q`` ([rows, heads, 512]) from row
+        ``query_start``: staged in ``staging_dtype``, or packed for PrimTS. A PrimTS context tile
+        that the fused context kernel serves stages its shared E4M3 bank instead
+        (``runs_fused_context``)."""
+        return source.get_query_tile_metadata(
+            q,
+            extra_width,
+            query_start,
+            staging_dtype=self.staging_dtype,
+            layer_idx=layer_idx,
+            kv_input_mode=self.kv_input_mode,
+            stage_shared_context=self.kv_input_mode == "packed" and self.fused_context,
+        )
+
     def update_quant_config(self, new_quant_config):
         """Rebuild the shared dispatcher, then apply CSA2's provider policy."""
         from ...fmha.fallback import FallbackFmha
@@ -381,7 +411,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
         args = merge_attention_forward_args(forward_args, kwargs)
         if self.direct_decode_applies(q, metadata, args):
             return self._forward_direct(q, metadata, args)
-        if not self.native_fp8:
+        if not self.native_fp8 and not self.runs_fused_context(metadata):
             return super().forward(q, k, v, metadata, forward_args=forward_args, **kwargs)
         state = getattr(args.sparse_backend_args, "state", None)
         if state is not None and state.query_rope is not None:
@@ -400,8 +430,14 @@ class CSA2TrtllmAttention(TrtllmAttention):
         return super().forward(q, k, v, metadata, forward_args=args)
 
     def runs_fused_context(self, metadata: CSA2TrtllmMetadata) -> bool:
-        """Whether a context tile with this metadata runs ``forward_fused_context``."""
-        return self.native_fp8 and self.fused_context and metadata.shared_plan is not None
+        """Whether a context tile with this metadata runs ``forward_fused_context``: a tile that
+        stages the shared E4M3 bank, under either provider."""
+        return (
+            self.fused_context
+            and metadata.shared_plan is not None
+            and metadata.kv_input_mode == "staged"
+            and metadata.staging_dtype == torch.float8_e4m3fn
+        )
 
     def direct_decode_applies(self, q, metadata, forward_args) -> bool:
         """Whether this tile takes the direct sparse decode (``direct_decode.py``) instead of
@@ -674,7 +710,8 @@ class CSA2TrtllmAttention(TrtllmAttention):
         metadata: CSA2TrtllmMetadata,
         forward_args: AttentionForwardArgs,
     ) -> CSA2BackendForwardArgs:
-        if self.native_fp8 and (
+        fused_context = self.runs_fused_context(metadata)
+        if (self.native_fp8 or fused_context) and (
             forward_args.out_scale is not None
             or forward_args.out_scale_sf is not None
             or forward_args.output_sf is not None
@@ -682,9 +719,11 @@ class CSA2TrtllmAttention(TrtllmAttention):
             or (forward_args.output is not None and forward_args.output.dtype != torch.bfloat16)
         ):
             raise ValueError("CSA2 native FP8 attention requires unquantized BF16 output")
-        if metadata.kv_input_mode != self.kv_input_mode:
+        # PrimTS stages only the context tiles of the fused context kernel.
+        if metadata.kv_input_mode != self.kv_input_mode and not fused_context:
             raise ValueError("CSA2 tile KV input mode must match its attention backend")
-        if metadata.kv_input_mode == "staged" and metadata.swa_pool.dtype != self.staging_dtype:
+        staging_dtype = torch.float8_e4m3fn if fused_context else self.staging_dtype
+        if metadata.kv_input_mode == "staged" and metadata.swa_pool.dtype != staging_dtype:
             raise ValueError("CSA2 tile staging dtype must match its attention backend")
         count = metadata.num_tokens
         if (
@@ -908,7 +947,11 @@ class CSA2TrtllmAttention(TrtllmAttention):
 
     def sparse_attn_predict(self, q, k, metadata, forward_args, *, bank=False):
         """``bank``: stage for the ``gen_fmha`` generation core (``_forward_gen_fmha``)."""
-        if self.compute_backend != "trtllm" or self.sparse_params.use_packed_sparse_attention:
+        # PrimTS stages the context tiles of the fused context kernel as native FP8 staging does.
+        fused_context = self.runs_fused_context(metadata)
+        if (
+            self.compute_backend != "trtllm" and not fused_context
+        ) or self.sparse_params.use_packed_sparse_attention:
             raise ValueError("CSA2 Flash and packed attention require their explicit module helper")
         if (
             metadata.is_cuda_graph
@@ -920,7 +963,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
         ):
             raise RuntimeError("Warm up CSA2 metadata with forward before CUDA Graph capture")
         inputs = self.prepare_sparse_inputs(q, metadata, forward_args)
-        if self.native_fp8:
+        if self.native_fp8 or fused_context:
             generation = (
                 forward_args.attention_input_type == AttentionInputType.generation_only
                 and q.numel() > 0
@@ -1069,7 +1112,10 @@ class CSA2TrtllmAttention(TrtllmAttention):
                     forward_args.quant_q_buffer = quant_q
         else:
             metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices, dedup=True)
-        if not self.native_fp8 and forward_args.sparse_backend_args.query_ready is not None:
+        if (
+            not (self.native_fp8 or fused_context)
+            and forward_args.sparse_backend_args.query_ready is not None
+        ):
             forward_args.sparse_backend_args.query_ready.wait()
         sparse = forward_args.sparse_runtime_params
         sparse.sparse_attn_kv_lens = metadata.prepared_lens

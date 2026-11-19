@@ -1728,14 +1728,7 @@ class DeepseekV41Attention(nn.Module):
                 if start == end:
                     continue
                 tile = q[start:end]
-                metadata = attn_metadata.get_query_tile_metadata(
-                    tile,
-                    0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk,
-                    query_start=start,
-                    staging_dtype=self.backend.staging_dtype,
-                    layer_idx=layer_idx,
-                    kv_input_mode=self.backend.kv_input_mode,
-                )
+                metadata = self._tile_metadata(attn_metadata, tile, start)
                 args = AttentionForwardArgs(
                     attention_input_type=(
                         AttentionInputType.context_only
@@ -1750,7 +1743,9 @@ class DeepseekV41Attention(nn.Module):
                         query_start=start,
                     ),
                 )
-                if self._compute_helper is not None:
+                if self._compute_helper is not None and not self.backend.runs_fused_context(
+                    metadata
+                ):
                     compute = (
                         self._compute_helper.forward_context
                         if metadata.num_contexts
@@ -1761,6 +1756,19 @@ class DeepseekV41Attention(nn.Module):
                     self.backend.forward(tile.flatten(1), None, None, metadata, forward_args=args)
         if rows < output.shape[0]:
             output[rows:].zero_()
+
+    def _tile_metadata(
+        self, attn_metadata: CSA2TrtllmMetadata, tile: torch.Tensor, start: int
+    ) -> CSA2TrtllmMetadata:
+        """Compute metadata of this layer's query tile ``tile`` ([rows, heads, 512]) from row
+        ``start`` (``CSA2TrtllmAttention.query_tile_metadata``)."""
+        return self.backend.query_tile_metadata(
+            attn_metadata,
+            tile,
+            0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk,
+            query_start=start,
+            layer_idx=self.layer.layer_idx,
+        )
 
     def forward(
         self,
@@ -1941,6 +1949,22 @@ class DeepseekV41Attention(nn.Module):
         if publish_rows:
             # On this stream: a slot resolution it may launch precedes the side stream's fork.
             attn_metadata.enter_layer(self.layer)
+        # A context-only batch whose tile the fused context kernel serves, under either provider:
+        # it writes the grouped128 FP8 O-A input (``output_fp8``), never PrimTS's MXFP8 one.
+        rows = hidden_states.shape[0]
+        native_context = (
+            0 < attn_metadata.num_ctx_tokens == rows
+            and getattr(self.backend, "fused_context", False)
+            and self.backend.runs_fused_context(
+                self._tile_metadata(
+                    attn_metadata,
+                    _unwritten_rows(
+                        hidden_states.device, rows, self.num_heads_tp * self.qk_head_dim
+                    ).view(rows, self.num_heads_tp, self.qk_head_dim),
+                    0,
+                )
+            )
+        )
         quant_q = q_amax = None
         unit_q = touched = False
         if fused_query:
@@ -1952,18 +1976,7 @@ class DeepseekV41Attention(nn.Module):
             unit_q = (
                 getattr(self, "_unit_scale_context_query", False)
                 and attn_metadata.num_ctx_tokens == shape[0]
-                and (
-                    self.backend.compute_backend == "prims_ts"
-                    or self.backend.runs_fused_context(
-                        attn_metadata.get_query_tile_metadata(
-                            unwritten.view(shape[0], self.num_heads_tp, self.qk_head_dim),
-                            0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk,
-                            query_start=0,
-                            staging_dtype=self.backend.staging_dtype,
-                            layer_idx=self.layer.layer_idx,
-                        )
-                    )
-                )
+                and (self.backend.compute_backend == "prims_ts" or native_context)
             )
             q = (
                 unwritten
@@ -2090,11 +2103,10 @@ class DeepseekV41Attention(nn.Module):
         # projection input straight from that kernel (data, scale, positions, cos/sin).
         output_fp8 = None
         if (
-            getattr(self.backend, "fused_context", False)
+            native_context
             and self._o_a_fp8_block128
             and self.o_a_proj.dtype == torch.float8_e4m3fn
             and not self.inverse_rotary_emb.is_neox
-            and attn_metadata.num_ctx_tokens == q.shape[0]
         ):
             from tensorrt_llm._torch.attention.mla import _is_cute_dsl_fp8_bmm_available
 
@@ -2128,7 +2140,7 @@ class DeepseekV41Attention(nn.Module):
                 )
                 or (
                     (
-                        0 < attn_metadata.num_ctx_tokens == q.shape[0]
+                        (0 < attn_metadata.num_ctx_tokens == q.shape[0] and not native_context)
                         or (attn_metadata.num_ctx_tokens == 0 and positions.is_contiguous())
                     )
                     and self.backend.compute_backend == "prims_ts"
@@ -2175,7 +2187,7 @@ class DeepseekV41Attention(nn.Module):
             decode_start=self._prefetch_events[0] if prefetch_ctas else None,
             rows_published=publish_rows,
         )
-        if (unit_q and output_fp8 is not None) or (
+        if output_fp8 is not None or (
             output_mxfp8 is not None
             and self.backend.compute_backend == "prims_ts"
             and 0 < attn_metadata.num_ctx_tokens == q.shape[0]
@@ -2205,18 +2217,7 @@ class DeepseekV41Attention(nn.Module):
                 and not gen_fmha
                 and self.backend.fused_decode
             )
-            metadata = (
-                None
-                if fused
-                else attn_metadata.get_query_tile_metadata(
-                    tile,
-                    extra_width,
-                    query_start=start,
-                    staging_dtype=self.backend.staging_dtype,
-                    layer_idx=self.layer.layer_idx,
-                    kv_input_mode=self.backend.kv_input_mode,
-                )
-            )
+            metadata = None if fused else self._tile_metadata(attn_metadata, tile, start)
             args = AttentionForwardArgs(
                 attention_input_type=(
                     AttentionInputType.context_only
@@ -2254,7 +2255,12 @@ class DeepseekV41Attention(nn.Module):
                 self.backend.forward_fused_decode(tile, args)
             elif self.backend.sparse_params.use_packed_sparse_attention:
                 self.backend.forward_packed(tile.flatten(1), metadata, args)
-            elif self._compute_helper is not None and not direct:
+            elif (
+                self._compute_helper is not None
+                and not direct
+                # A context tile the fused context kernel serves runs it under PrimTS too.
+                and not self.backend.runs_fused_context(metadata)
+            ):
                 compute = (
                     self._compute_helper.forward_context
                     if metadata.num_contexts

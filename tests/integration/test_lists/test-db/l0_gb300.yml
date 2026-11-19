@@ -64,6 +64,7 @@ l0_gb300:
   # PrimTS small generation steps: raw selections and the kernel that runs ahead of its predecessor.
   - unittest/_torch/attention/sparse/csa2/test_backend.py::test_prims_ts_raw_selections_match_compacted
   - unittest/_torch/attention/sparse/csa2/test_backend.py::test_prims_ts_runahead_matches_ordered
+  - unittest/_torch/attention/sparse/csa2/test_module.py::test_prims_ts_context_runs_fused_kernel
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-cutlass-auto]

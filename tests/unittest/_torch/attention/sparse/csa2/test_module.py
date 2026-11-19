@@ -150,11 +150,20 @@ def test_module_sends_whole_context_and_generation_phases(
     )
 
     def phase_metadata(
-        query, extra_width, query_start, *, staging_dtype, layer_idx=None, kv_input_mode
+        query,
+        extra_width,
+        query_start,
+        *,
+        staging_dtype,
+        layer_idx=None,
+        kv_input_mode,
+        stage_shared_context,
     ):
         stop = query_start + query.shape[0]
         assert stop <= (contexts if query_start < contexts else count)
         assert kv_input_mode == ("packed" if implementation == "prims_ts" else "staged")
+        # Without the fused context kernel, PrimTS context tiles stay packed.
+        assert not stage_shared_context
         torch.testing.assert_close(query.flatten(1), hidden[query_start:stop], atol=0, rtol=0)
         return SimpleNamespace(
             num_contexts=int(query_start < contexts),
@@ -189,6 +198,7 @@ def test_module_sends_whole_context_and_generation_phases(
         staging_dtype=torch.bfloat16,
         kv_input_mode="packed" if implementation == "prims_ts" else "staged",
         native_fp8=False,
+        fused_context=False,
         fused_decode=False,
         gen_fmha_serves=lambda *args: False,
         direct_decode_applies=lambda *args: False,
@@ -198,6 +208,12 @@ def test_module_sends_whole_context_and_generation_phases(
     )
     backend._native_slot_mapping = lambda logical: CSA2TrtllmAttention._native_slot_mapping(
         backend, logical
+    )
+    backend.query_tile_metadata = lambda *args, **kwargs: (
+        CSA2TrtllmAttention.query_tile_metadata(backend, *args, **kwargs)
+    )
+    backend.runs_fused_context = lambda metadata: CSA2TrtllmAttention.runs_fused_context(
+        backend, metadata
     )
     backend.publish_layer_rows = lambda state, **kwargs: CSA2TrtllmAttention.publish_layer_rows(
         backend, state, **kwargs
@@ -3449,6 +3465,9 @@ def test_prims_ts_context_reads_projected_unit_scale_query(monkeypatch, fused_co
         manager.layout, sparse_options={"compute_backend": "prims_ts"}
     )
     assert all(model.backend.compute_backend == "prims_ts" for model in layers)
+    # PrimTS attends these context tiles itself only without the fused context kernel.
+    for model in layers:
+        model.backend.fused_context = False
     hidden = torch.randn(
         sum(request.prompt_len for request in requests), 256, device="cuda", dtype=torch.bfloat16
     )
@@ -3505,6 +3524,67 @@ def test_prims_ts_context_reads_projected_unit_scale_query(monkeypatch, fused_co
         assert torch.isfinite(actual).all()
         torch.testing.assert_close(actual, written, atol=0, rtol=0)
         torch.testing.assert_close(actual, quantized, atol=0, rtol=0)
+
+
+@skip_no_fused_context
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="CSA2 PrimTS requires SM100, SM103 or SM107",
+)
+@pytest.mark.parametrize(
+    "fused_context_cache", [2, pytest.param((2, "fp8"), id="2-fp8")], indirect=True
+)
+@torch.inference_mode()
+def test_prims_ts_context_runs_fused_kernel(monkeypatch, fused_context_cache):
+    """A PrimTS prefill of SWA-only, Full and Reuse layers runs every layer's context tile on the
+    native fused context kernel, as the native provider does, and equals its outputs bit for bit;
+    PrimTS attends those tiles only without that kernel."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import prims_ts
+
+    manager, requests = fused_context_cache
+    kv_cache_dtype = "fp8" if manager.swa_cache_format == "swa_fp8" else "fp8_ds_mla"
+    torch.manual_seed(89)
+    native, weights = _native_context_layers(manager.layout, kv_cache_dtype)
+    layers, _ = _native_context_layers(
+        manager.layout, kv_cache_dtype, weights, sparse_options={"compute_backend": "prims_ts"}
+    )
+    for model in layers:
+        assert model.backend.compute_backend == "prims_ts" and model.backend.fused_context
+        assert model.backend.kv_input_mode == "packed" and not model.backend.native_fp8
+    hidden = torch.randn(
+        sum(request.prompt_len for request in requests), 256, device="cuda", dtype=torch.bfloat16
+    )
+    op = torch.ops.trtllm.csa2_sparse_context
+    calls = []
+
+    def record(*args):
+        calls.append(args[1].shape[0])
+        return op(*args)
+
+    monkeypatch.setattr(torch.ops.trtllm, "csa2_sparse_context", record)
+    attended = []
+    forward = prims_ts.CSA2PrimsTS._forward_packed
+
+    def record_prims_ts(self, q, metadata, forward_args):
+        attended.append(q.shape[0])
+        return forward(self, q, metadata, forward_args)
+
+    monkeypatch.setattr(prims_ts.CSA2PrimsTS, "_forward_packed", record_prims_ts)
+    expected = _prefill_outputs(native, manager, requests, hidden)
+    assert calls == [hidden.shape[0]] * len(native)
+    calls.clear()
+    actual = _prefill_outputs(layers, manager, requests, hidden)
+    assert calls == [hidden.shape[0]] * len(layers) and not attended
+    for value, reference in zip(actual, expected, strict=True):
+        assert torch.isfinite(value).all()
+        torch.testing.assert_close(value, reference, atol=0, rtol=0)
+    calls.clear()
+    for model in layers:
+        model.backend.fused_context = False
+    own = _prefill_outputs(layers, manager, requests, hidden)
+    assert not calls and attended == [hidden.shape[0]] * len(layers)
+    assert all(torch.isfinite(value).all() for value in own)
 
 
 @skip_no_fused_context

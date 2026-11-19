@@ -851,8 +851,14 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         staging_dtype: torch.dtype = torch.bfloat16,
         layer_idx: int | None = None,
         kv_input_mode: Literal["staged", "packed"] = "staged",
+        stage_shared_context: bool = False,
     ) -> CSA2TrtllmMetadata:
-        """Retain query geometry, staging mode and graph-stable provider plans."""
+        """Retain query geometry, staging mode and graph-stable provider plans.
+
+        ``stage_shared_context``: a packed tile of an eager context phase that can share one
+        converted-KV bank (``shared_plan``) is staged instead, its bank in E4M3 for the fused
+        context kernel; the returned tile's ``kv_input_mode`` says which.
+        """
         # An eager forward asks for a layer's tile more than once. Until the next prepare, a
         # repeat reuses the first call's key, plan and groups while that key's cached tile is
         # unreserved: the full path would return that tile without evicting anything.
@@ -871,6 +877,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             staging_dtype,
             layer_idx,
             kv_input_mode,
+            stage_shared_context,
         )
         memo_key += (self.num_ctx_tokens,)
         resolved = None if memo is None else memo.get(memo_key)
@@ -880,7 +887,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             if metadata is not None and not metadata._csa2_graph_reserved:
                 metadata.shared_plan = shared_plan
                 metadata.is_cuda_graph = False
-                if context_lengths and kv_input_mode == "staged":
+                if context_lengths and metadata.kv_input_mode == "staged":
                     metadata._bind_context_tile(context_lengths)
                 return metadata
         context_lengths = []
@@ -903,9 +910,13 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             context_lengths = []
         shared_plan = (
             self._shared_context_plan(q, extra_width, layer_idx)
-            if kv_input_mode == "staged" and context_lengths and query_start == 0
+            if (kv_input_mode == "staged" or stage_shared_context)
+            and context_lengths
+            and query_start == 0
             else None
         )
+        if kv_input_mode == "packed" and shared_plan is not None:
+            kv_input_mode, staging_dtype = "staged", torch.float8_e4m3fn
         shared_rows = (
             None if shared_plan is None else 1 + shared_plan.swa_rows + shared_plan.main_rows
         )
