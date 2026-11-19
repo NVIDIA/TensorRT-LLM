@@ -10356,11 +10356,6 @@ class PyExecutor:
             req.py_request_id
             for req in scheduled_batch.failed_requests
         }
-        scheduled_ids = {
-            req.py_request_id
-            for req in scheduled_batch.all_requests()
-        }
-        self._scheduler_progress_since_vote |= bool(scheduled_ids - local_ids)
         rank_local = self.enable_attention_dp and self.dist.cp_size == 1 and self.dist.pp_size == 1
         if rank_local or (self.dist.tp_size == self.dist.cp_size ==
                           self.dist.pp_size == 1):
@@ -10368,7 +10363,8 @@ class PyExecutor:
             made_progress = self._scheduler_progress_since_vote
         else:
             pending = self._pending_scheduler_failures
-            pending.difference_update(scheduled_ids)
+            pending.difference_update(req.py_request_id
+                                      for req in scheduled_batch.all_requests())
             pending.update(local_ids)
             self._scheduler_failure_sync_tick += 1
             scheduled_batch.failed_requests = []
@@ -11856,6 +11852,13 @@ class PyExecutor:
 
             self._maybe_record_hang_diagnostic_phase("forward_complete",
                                                      scheduled_requests)
+            # Only executed work can clear a capacity stall. Admission votes
+            # may remove every locally scheduled row before forward runs.
+            if (self._is_kv_manager_v2 and not self.is_warmup
+                    and outputs is not None
+                    and any(not req.is_dummy
+                            for req in scheduled_requests.all_requests())):
+                self._scheduler_progress_since_vote = True
 
             return outputs
         except Exception as e:

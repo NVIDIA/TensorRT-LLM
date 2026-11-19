@@ -770,6 +770,7 @@ Rank-local attention-DP requests do not add a TP vote. Requests whose transfers
 still hold memory remain visible to the scheduler's capacity-stall hold probe.
 Each stall window selects one newest eligible KV holder (or one newest pending
 context if none holds KV), including starved contexts. After three agreed
-failure rounds without a successful scheduling pass, the executor escalates
+failure rounds without a successful model forward on a real request, the executor escalates
 through its existing event-loop failure containment instead of rejecting new
-requests indefinitely. A successful scheduling pass resets that round count.
+requests indefinitely. A successful real-request forward resets that round count;
+rejected candidates, empty batches, padding dummies and warmup do not.

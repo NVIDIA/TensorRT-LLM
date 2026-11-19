@@ -1264,3 +1264,34 @@ def test_engine_setup_enables_recovery_without_an_opt_in_flag(with_fatal_handler
     ):
         worker._setup_transfer_engine()
     assert (sender._recover_agent is not None) == with_fatal_handler
+
+
+def test_gen_terminal_sets_are_built_once_per_poll():
+    class CountedIds(list):
+        iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+
+    count = 1024  # Exposes per-candidate reconstruction without a timing assertion.
+    cancelled, failed, completed = CountedIds([0]), CountedIds([1]), CountedIds(range(2, count))
+    node = object.__new__(KvCacheTransceiverV2)
+    node._agent_recovery = True
+    node._gen_idle_poll_skip, node._gen_need_sync = False, False
+    node._recv_sessions = {rid: rid for rid in range(count + 2)}
+    node._failure_intents = Mock(return_value={count})
+    node._cancel_failed_transfers, node._gen_allgather = Mock(), Mock()
+    node._retirement_blocked = lambda session: session == 3
+    node._local_agent_ready = lambda: True
+    expected = [rid for rid in range(count + 1) if rid != 3]
+
+    def vote(
+        _candidates, _cancelled, _failed, _completed, _gather, _sync, retirable, *_args, **_kwargs
+    ):
+        assert retirable == expected
+        assert [ids.iterations for ids in (cancelled, failed, completed)] == [1, 1, 1]
+        return [], [], [], retirable, set(), {count}, True
+
+    node._consensus_outcome = vote
+    node._gen_consensus_outcome([], cancelled, failed, completed, [])

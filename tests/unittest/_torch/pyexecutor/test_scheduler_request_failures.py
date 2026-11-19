@@ -200,6 +200,8 @@ def test_persistent_admission_failures_escalate_only_without_progress(progress):
         batch = ScheduledRequests()
         batch.failed_requests = [failed]
         batch.generation_requests = [healthy] if progress else []
+        # The forward-success hook latches work executed since the last vote.
+        executor._scheduler_progress_since_vote = progress
         executor._scheduler_failure_sync_tick = 63
         if round_id == 2 and not progress:
             with pytest.raises(RuntimeError, match="three failure rounds"):
@@ -254,8 +256,11 @@ def test_mpi_scheduler_failure_consensus_spans_cp_and_pp():
             executor._scheduler_failure_sync_tick = 63
             batch = ScheduledRequests()
             batch.failed_requests = [failed] if rank == 3 else []
+            batch.generation_requests = [] if rank == 3 else [failed]
             if round_id < 2:
                 executor._fail_scheduler_requests(batch)
+                assert not batch.all_requests()
+                assert executor._scheduler_stall_rounds == round_id + 1
                 assert executor._handle_errors.call_args.kwargs["requests"] == [failed]
             else:
                 with pytest.raises(RuntimeError, match="three failure rounds"):
@@ -264,3 +269,58 @@ def test_mpi_scheduler_failure_consensus_spans_cp_and_pp():
     finally:
         cp.Free()
         pp.Free()
+
+
+@pytest.mark.parametrize("parallelism", ["tp", "cp", "pp"])
+def test_rejected_rows_never_reset_stall_rounds_without_execution(parallelism):
+    barrier = threading.Barrier(2, timeout=5)
+    votes = [None, None]
+
+    def gather(rank, vote):
+        votes[rank] = vote
+        barrier.wait()
+        result = list(votes)
+        barrier.wait()
+        return result
+
+    executors = []
+    for rank in range(2):
+        executor = object.__new__(PyExecutor)
+        executor._reset_scheduler_failure_state()
+        executor._is_kv_manager_v2, executor.enable_attention_dp = True, False
+        executor.dist = SimpleNamespace(
+            tp_size=2 if parallelism == "tp" else 1,
+            cp_size=2 if parallelism == "cp" else 1,
+            pp_size=2 if parallelism == "pp" else 1,
+        )
+        collective = {"tp": "tp_allgather", "cp": "tp_cp_allgather", "pp": "allgather"}[parallelism]
+        setattr(executor.dist, collective, lambda vote, rank=rank: gather(rank, vote))
+        executor._handle_errors = Mock()
+        executors.append(executor)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        # Each round is a new arrival, accepted by rank 0 and rejected by rank
+        # 1. Agreement leaves no executable rows on either rank.
+        for round_id in range(3):
+            request = SimpleNamespace(py_request_id=round_id)
+            batches = []
+            for rank, executor in enumerate(executors):
+                executor.active_requests = [request]
+                executor._scheduler_failure_sync_tick = 63
+                batch = ScheduledRequests()
+                batch.generation_requests = [request] if rank == 0 else []
+                batch.failed_requests = [request] if rank == 1 else []
+                batches.append(batch)
+            futures = [
+                pool.submit(ex._fail_scheduler_requests, batch)
+                for ex, batch in zip(executors, batches)
+            ]
+            for executor, batch, future in zip(executors, batches, futures):
+                if round_id == 2:
+                    with pytest.raises(RuntimeError, match="three failure rounds"):
+                        future.result(timeout=10)
+                else:
+                    future.result(timeout=10)
+                    assert not batch.all_requests()
+                assert executor._scheduler_stall_rounds == round_id + 1
+                assert not executor._scheduler_progress_since_vote
+    assert all(ex._handle_errors.call_count == 2 for ex in executors)

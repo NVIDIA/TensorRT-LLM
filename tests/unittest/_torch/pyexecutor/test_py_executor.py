@@ -266,6 +266,34 @@ def test_forward_step_keeps_draft_len_when_forward_fails():
     assert executor.runtime_draft_len == 2
 
 
+@pytest.mark.parametrize("case", ["real", "dummy", "empty", "failure", "no_outputs", "warmup"])
+def test_scheduler_progress_requires_a_successful_real_forward(case):
+    engine = Mock(route_capture=None)
+    engine.forward.return_value = None if case == "no_outputs" else {}
+    if case == "failure":
+        engine.forward.side_effect = RuntimeError("decoder failure")
+    executor = _forward_step_executor(engine)
+    executor._is_kv_manager_v2 = True
+    executor.is_warmup = case == "warmup"
+    executor._scheduler_progress_since_vote = False
+    executor._scheduler_stall_rounds = 2
+    executor._wait_for_model_engine_input_copy = Mock()
+    executor.dist = types.SimpleNamespace(tp_size=1, cp_size=1, pp_size=1)
+    batch = ScheduledRequests()
+    if case != "empty":
+        batch.generation_requests = [types.SimpleNamespace(is_dummy=case == "dummy")]
+    _run_forward_step(executor, batch)
+    assert executor._scheduler_progress_since_vote is (case == "real")
+    if case == "failure":
+        executor._handle_errors.assert_called_once()
+    else:
+        executor._handle_errors.assert_not_called()
+    # A completed forward clears the next stall vote even if its request has
+    # already left the scheduler's current batch.
+    PyExecutor._fail_scheduler_requests(executor, ScheduledRequests())
+    assert executor._scheduler_stall_rounds == (0 if case == "real" else 2)
+
+
 @pytest.mark.parametrize("end_id", [None, -1, 0, 127])
 def test_validate_token_id_range_accepts_end_id(end_id) -> None:
     model = Mock(spec=DecoderModelForCausalLM)
@@ -2665,6 +2693,7 @@ def test_each_pp_rank_schedules_once_per_iteration(
         pass
 
     executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
     executor._is_kv_manager_v2 = True
     executor._pp_rebalance_drain_iters = None
     executor._can_pause_for_rebalance = Mock(return_value=False)
@@ -2688,6 +2717,9 @@ def test_each_pp_rank_schedules_once_per_iteration(
     executor.inflight_req_ids = set()
     executor.kv_cache_manager = Mock()
     executor.scheduler = Mock()
+    executor.scheduler.schedule_request.return_value = types.SimpleNamespace(
+        failed_requests=[], fitting_disagg_gen_init_requests=[]
+    )
 
     def schedule_and_propagate(microbatch_id):
         if executor._pp_rank_schedules():
@@ -2716,7 +2748,11 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
         pass
 
     executor = object.__new__(PyExecutor)
-    executor.dist = Mock(pp_rank=1, rank=1, is_first_pp_rank=False)
+    executor._reset_scheduler_failure_state()
+    executor.enable_attention_dp = False
+    executor.dist = Mock(
+        pp_rank=1, rank=1, tp_size=1, cp_size=1, pp_size=2, world_size=2, is_first_pp_rank=False
+    )
     executor.device_id = 0
     profiler = MagicMock()
     profiler.__enter__.return_value = Mock()
@@ -2749,7 +2785,7 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
         return_value=(scheduled_batch, [canonical], 0, False)
     )
     executor.scheduler.schedule_request.return_value = types.SimpleNamespace(
-        fitting_disagg_gen_init_requests=[local_canonical, local_only]
+        fitting_disagg_gen_init_requests=[local_canonical, local_only], failed_requests=[]
     )
     # Gen-transfer polling and the receive start live in the coordinator, so
     # stub them there. Touch ``executor.disagg`` only after ``_is_kv_manager_v2``

@@ -1164,13 +1164,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         candidates = list(dict.fromkeys([*to_process, *sessions])) if recovery else to_process
         idle_skip = self._gen_idle_poll_skip
         intents = self._failure_intents(sessions, "gen") if recovery else None
+        terminal = None
         if recovery:
             self._cancel_failed_transfers(sessions, intents)
+            terminal = intents | set(cancelled) | set(failed) | set(completed)
         locally_retirable = [
             rid
             for rid in candidates
             if not self._retirement_blocked(sessions.get(rid))
-            and (not recovery or rid in (intents | set(cancelled) | set(failed) | set(completed)))
+            and (terminal is None or rid in terminal)
         ]
         outcome = self._consensus_outcome(
             candidates,
