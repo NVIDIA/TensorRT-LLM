@@ -750,10 +750,14 @@ def test_graph_capture_skips_only_profiler_serialization(
     with monkeypatch.context() as graph_patches:
         graph_patches.setattr(torch.Tensor, "cpu", forbidden)
         graph_patches.setattr(torch.Tensor, "tolist", forbidden)
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
             with torch.cuda.graph(graph, stream=stream):
                 assert torch.cuda.is_current_stream_capturing()
                 output = _external(moe, x, logits)
+        assert not any(
+            event.name in {"trtllm::moe_routing", "trtllm::moe_routing_ids"}
+            for event in trace.events()
+        )
         assert serialized == []
     logits.copy_(torch.tensor([[0.0, 4.0, 1.0, 3.0]], device="cuda"))
     x.fill_(2)
