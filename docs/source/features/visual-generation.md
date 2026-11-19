@@ -10,6 +10,7 @@ This section documents optimization features for VisualGen image and video gener
 For supported models and an overview of VisualGen, see the [model overview](../models/visual-generation.md). For usage examples, see [VisualGen Examples](https://nvidia.github.io/TensorRT-LLM/examples/visual_gen_examples.html).
 
 - [CUDA Graphs](visualgen-cuda-graph.md)
+- [Dynamic Batching](visualgen-dynamic-batching.md)
 - [Quantized Attention](visualgen-quantized-attention.md)
 - [Sparse Attention](visualgen-sparse-attention.md)
 
@@ -19,6 +20,7 @@ For supported models and an overview of VisualGen, see the [model overview](../m
 :maxdepth: 1
 
 CUDA Graphs <visualgen-cuda-graph>
+Dynamic Batching <visualgen-dynamic-batching>
 Quantized Attention <visualgen-quantized-attention>
 Sparse Attention <visualgen-sparse-attention>
 ```

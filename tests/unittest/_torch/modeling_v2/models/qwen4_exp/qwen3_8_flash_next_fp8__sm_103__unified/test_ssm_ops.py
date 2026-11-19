@@ -58,7 +58,7 @@ from tensorrt_llm._torch.modules.fla.cached_replay import (
 from tensorrt_llm._torch.modules.fla.cached_replay import (
     fused_recurrent_gated_delta_rule_cached_replay_update as stock_replay,
 )
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+from tensorrt_llm._torch.modules.mamba.replay_metadata import (
     REPLAY_WORK_ITEM_WIDTH,
     _build_replay_work_items_triton,
 )

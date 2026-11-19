@@ -16,7 +16,7 @@ transaction: the component is usable only after every rank loaded every selected
 
 Per call, rank r computes its 12 query heads / 2 kv heads, its dense or expert intermediate
 slice and its vocabulary rows; the enclosing method applies exactly one collective at each
-boundary, on the TRT-LLM NCCL all-reduce or all-gather::
+boundary, through the ModelingV2 catalog all-reduce or all-gather::
 
     embed          masked local lookup, one all-reduce (sum)
     attention      local q/k/v/gate, q/k norms, RoPE or NoPE scale, TRTLLM attention on the
@@ -37,17 +37,19 @@ import hashlib
 import json
 import os
 from collections import OrderedDict
+from functools import partial
 from typing import Any, Mapping, Optional, Sequence
 
 import torch
 from torch import nn
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.distributed import AllReduce, allgather
 from tensorrt_llm._torch.modeling_v2._router_index import (
     MODELING_V2_VALIDATE_ENV,
     step_contract_enabled,
 )
+from tensorrt_llm._torch.modeling_v2.catalog.comm.allgather import allgather
+from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import allreduce, allreduce_group_args
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (
@@ -62,7 +64,7 @@ from tensorrt_llm._torch.modeling_v2.models.beam.ops.residual.beam_depth_residua
     beam_depth_residual,
     depth_scales,
 )
-from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.functional import AllReduceFusionOp
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
 from .. import _attention, dispatch_combine
@@ -161,10 +163,27 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self.softcap = config["final_logit_softcapping"]
         self.vocab_interval = self.specs[EMBED].interval(self.rank)[1:]
         self._allocate_storage()
-        self._allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
+        self._init_collectives()
         self.usable = False
         self.load_record: Optional[dict] = None
         self._init_diagnostics()
+
+    def _init_collectives(self) -> None:
+        args = allreduce_group_args(self.mapping)
+        self._allreduce = partial(
+            allreduce,
+            residual=None,
+            norm_weight=None,
+            scale=None,
+            bias=None,
+            op=int(AllReduceFusionOp.NONE),
+            eps=0.0,
+            trigger_completion_at_end=False,
+            **args,
+        )
+        self._allgather = partial(
+            allgather, sizes=None, group=args["group"], process_group=args["process_group"]
+        )
 
     def _allocate_storage(self) -> None:
         #: Storage is always resolved from the currently registered parameters, never from
@@ -206,8 +225,8 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
 
     def _check_diagnostics_agree(self) -> None:
         """Raise on every rank unless all four ranks run the same diagnostic mode (collective)."""
-        flag = torch.tensor([1.0 if self.diagnostics else 0.0], device=self.device)
-        on = int(self._allreduce(flag).item())
+        flag = torch.tensor([int(self.diagnostics)], dtype=torch.int32, device=self.device)
+        on = int(self._allgather(flag).sum().item())
         if on not in (0, WORLD_SIZE):
             raise LoadError(
                 f"rank {self.rank}: diagnostic validation is on for {on} of {WORLD_SIZE} ranks; "
@@ -361,7 +380,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         return self.bank(f"layers.{layer}.experts.{which}")
 
     def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        """The one sum over the four ranks at a partial-result boundary (NCCL)."""
+        """The one sum over the four ranks at a partial-result boundary (catalog AUTO)."""
         return self._allreduce(tensor)
 
     def _digests_agree(self, tensors: Sequence[torch.Tensor]) -> list:
@@ -376,7 +395,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             h.update(memoryview(t.contiguous().cpu().view(torch.uint8).numpy().reshape(-1)))
             digests.append(h.digest())
         local = torch.frombuffer(bytearray(b"".join(digests)), dtype=torch.uint8).to(self.device)
-        gathered = allgather(local, self.mapping, dim=0).view(WORLD_SIZE, -1).cpu()
+        gathered = self._allgather(local).view(WORLD_SIZE, -1).cpu()
         if not all(torch.equal(gathered[0], gathered[r]) for r in range(1, WORLD_SIZE)):
             raise RuntimeError(
                 "replicated MoE routing differs between ranks (input, ids or weights)"
@@ -562,7 +581,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self._check_usable()
         _check_hidden(n, self.hidden, self.device, self.max_tokens)
         local = cublas_mm(n, self.tensor(HEAD).t())
-        gathered = allgather(local, self.mapping, dim=-1)
+        gathered = self._allgather(local.t().contiguous()).t().contiguous()
         logits = beam_logit_softcap(gathered, self.softcap)
         return logits
 
