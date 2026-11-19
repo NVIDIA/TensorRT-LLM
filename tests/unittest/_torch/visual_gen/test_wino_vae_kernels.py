@@ -24,6 +24,18 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kern
 # ---------------------------------------------------------------------------
 
 
+def _einsum_fp32(equation: str, *operands: torch.Tensor) -> torch.Tensor:
+    """torch.einsum in IEEE fp32. NGC PyTorch images set TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1,
+    which runs fp32 GEMMs with a 10-bit mantissa: too coarse for a reference that is compared
+    bitwise or within a few fp16 ulps."""
+    saved = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        return torch.einsum(equation, *operands)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = saved
+
+
 def rms_norm_silu_reference(
     x: torch.Tensor,
     gamma: torch.Tensor,
@@ -114,7 +126,7 @@ def wino_norm_silu_reference(
     f = torch.cat([hist, y], 0).float()  # frames -2 .. T-1
     bt = torch.tensor(TEMPORAL_WINO[order]["BT"], dtype=torch.float32, device=x.device)
     groups = f.unfold(0, order + 2, order)  # [groups, P, C, order+2]
-    d = torch.einsum("ki,gpci->kgpc", bt, groups).to(winograd_dtype)
+    d = _einsum_fp32("ki,gpci->kgpc", bt, groups).to(winograd_dtype)
     return s, y[-2:].contiguous(), [d[k] for k in range(order + 2)]
 
 
@@ -627,7 +639,7 @@ def test_wino_norm_inputs_reproduce_conv3d(order: int) -> None:
         ]
     )  # [comps, groups, Co, H, W]
     at = torch.tensor(TEMPORAL_WINO[order]["AT"], dtype=torch.float32, device="cuda")
-    y = torch.einsum("jk,kgchw->gjchw", at, m).reshape(T, Co, H, W)
+    y = _einsum_fp32("jk,kgchw->gjchw", at, m).reshape(T, Co, H, W)
     # direct conv of the normalized frames (bf16, as the kernel's ring holds them) with the cache
     y_norm = rms_norm_silu_reference(x.permute(0, 2, 1), gamma.reshape(1, -1, 1), 0.0, C**0.5)
     frames = torch.cat([cache.float(), y_norm.permute(0, 2, 1).float()], 0)  # [T+2, P, C]
@@ -827,7 +839,7 @@ def _ref_spatial_in(
     )  # [n, c*a*a, L]
     tiles = tiles.view(n, c, a, a, th, tw)[..., row0:row1, :].reshape(n, c, a, a, -1)
     bt = _SPATIAL_MATS[tile][0].to(frames.device)
-    v = torch.einsum("xa,ncabl,yb->nxylc", bt, tiles, bt)
+    v = _einsum_fp32("xa,ncabl,yb->nxylc", bt, tiles, bt)
     pairs = n // components
     return (
         v.reshape(components, pairs, a * a, -1, c)
@@ -847,7 +859,7 @@ def _ref_spatial_out(
     rows, tw = row1 - row0, -(-w // tile)
     mm = m.float().view(components, a, a, pairs, rows, tw, c)
     at = _SPATIAL_MATS[tile][1].to(m.device)
-    y = torch.einsum("rx,nxyphwc,sy->nphrwsc", at, mm, at)
+    y = _einsum_fp32("rx,nxyphwc,sy->nphrwsc", at, mm, at)
     return y.reshape(n, rows * tile, tw * tile, c)[:, : min(rows * tile, h - tile * row0), :w]
 
 
@@ -1136,7 +1148,7 @@ def _sm100_tile_v(x: torch.Tensor, n: int, th: int, tw: int, c0: int, c1: int) -
             if 0 <= hh < h and 0 <= ww < w:
                 d[a, b] = x[n, hh, ww, c0:c1].float()
     bt = torch.tensor(SPATIAL_WINO[4]["BT"], dtype=torch.float32, device=x.device)
-    return torch.einsum("ia,abc,jb->ijc", bt, d, bt).reshape(36, c1 - c0)
+    return _einsum_fp32("ia,abc,jb->ijc", bt, d, bt).reshape(36, c1 - c0)
 
 
 def test_spatial_winograd_sm100_in_xform_above_2_31_elements() -> None:
@@ -1208,7 +1220,7 @@ def test_spatial_winograd_sm100_out_xform_above_2_31_elements() -> None:
     for fn_, th_, tw_ in ((0, 0, 0), (2, th - 1, tw - 1), (2, 0, 0), (1, th // 2, tw // 2)):
         t = (fn_ * th + th_) * tw + tw_
         mt = m[:, t, :].float().view(6, 6, c)
-        ref = torch.einsum("ri,ijc,sj->rsc", at, mt, at)  # [4, 4, c]
+        ref = _einsum_fp32("ri,ijc,sj->rsc", at, mt, at)  # [4, 4, c]
         for r in range(4):
             if 4 * th_ + r < h:
                 got = y[fn_, 4 * th_ + r, 4 * tw_ : 4 * tw_ + 4, :].float()
