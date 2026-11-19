@@ -117,14 +117,6 @@ class TestCheckpointFiles:
         ignored = files.read("a", *keys)
         assert ignored.value == 1 and ignored.disagreeing == ("model_index.json:a=2",)
 
-    def test_float_lists_compare_within_tolerance(self, tmp_path):
-        files = _files_on_disk(
-            tmp_path,
-            {CONFIG_FILE: {"a": [0.5, 1 / 3]}, MODEL_INDEX_FILE: {"a": [0.5, 0.3333333333]}},
-        )
-        r = files.read("a", f"{CONFIG_FILE}:a", f"{MODEL_INDEX_FILE}:a", conflict=Conflict.ERROR)
-        assert r.disagreeing == ()
-
 
 def _files():
     """A distilled checkpoint whose training config and diffusers index disagree on

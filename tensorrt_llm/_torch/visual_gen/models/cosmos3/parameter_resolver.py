@@ -13,9 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Every Cosmos3 setting comes from one of four places, tried in this order: the
-request, an override (``overrides.py``), the checkpoint, a default. :func:`select` is
-the only thing that orders them, and every resolved value remembers which one it came
-from.
+request, an override (``overrides.py``), the checkpoint, a default. :func:`select`
+orders them, and every resolved value remembers which one it came from.
 
 :class:`ParameterResolver` owns one checkpoint's settings and serves two moments:
 
@@ -29,7 +28,8 @@ from.
   caller's value, else an override, else the checkpoint (the distilled schedule, the
   policy block), else the per-family tables and the embodiment presets.
 
-A setting nothing provides is an error, not a guess.
+A setting the mode needs and nothing provides is an error, not a guess; the optional
+ones (``OPTIONAL_FIELDS``) stay ``None``.
 """
 
 from __future__ import annotations
@@ -71,7 +71,8 @@ class Resolved:
     origin: str
     """``REQUEST``, ``OVERRIDE``, ``CHECKPOINT`` or ``DEFAULT``."""
     where: str = ""
-    """For checkpoint settings, the file and key that held the value."""
+    """For checkpoint settings, the file and key that held the value; for overrides,
+    the row of the overrides table."""
     disagreeing: tuple[str, ...] = ()
     """``file:key=value`` of the checkpoint files that held a different value."""
 
@@ -99,20 +100,6 @@ def select(
         if value is not None:
             return Resolved(value, origin)
     return None
-
-
-def same_value(a: Any, b: Any) -> bool:
-    """Whether two settings agree: bools by identity, numbers within 1e-8, lists and
-    mappings elementwise."""
-    if isinstance(a, bool) or isinstance(b, bool):
-        return a is b or a == b
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        return math.isclose(a, b, rel_tol=0.0, abs_tol=1e-8)
-    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        return len(a) == len(b) and all(same_value(x, y) for x, y in zip(a, b))
-    if isinstance(a, Mapping) and isinstance(b, Mapping):
-        return a.keys() == b.keys() and all(same_value(a[k], b[k]) for k in a)
-    return a == b
 
 
 # -------------------------------------------------------------------------- checkpoint
@@ -198,7 +185,7 @@ class CheckpointFiles:
             if winner is None:
                 winner = Resolved(value, CHECKPOINT, key)
                 continue
-            if not same_value(value, winner.value):
+            if value != winner.value:
                 disagreeing.append(f"{key}={value!r}")
             break
         if winner is None:
@@ -240,8 +227,8 @@ class Cosmos3SamplingSettings:
     """The distilled schedule (``t_list``); ``None`` on base checkpoints."""
     native_flow_schedule: bool
     flow_shift: Optional[float]
-    """The scheduler's flow shift; ``None`` on distilled checkpoints, whose fixed
-    schedule has no shift."""
+    """The scheduler config's ``flow_shift``; ``None`` when it declares none, as on
+    distilled checkpoints, whose fixed schedule has no shift."""
 
 
 @dataclass(frozen=True)
@@ -781,7 +768,7 @@ class ParameterResolver:
                 if (
                     suggestion is not None
                     and origins[name] == REQUEST
-                    and not same_value(values[name], suggestion)
+                    and values[name] != suggestion
                 ):
                     warnings.append(
                         f"Cosmos3 {name}={values[name]} differs from recommended "
