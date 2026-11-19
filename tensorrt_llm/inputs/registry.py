@@ -48,9 +48,9 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
-                         default_hasher, find_mm_token_lengths,
-                         get_multimodal_item_metadata, hexdigest_to_int32,
-                         validate_mm_inputs)
+                         attached_embedding_hasher, default_hasher,
+                         find_mm_token_lengths, get_multimodal_item_metadata,
+                         hexdigest_to_int32, validate_mm_inputs)
 # yapf: enable
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
 from .prefix_token_cache import (OffsetTokenizer, PrefixTokenCache,
@@ -428,7 +428,9 @@ class BaseMultimodalInputProcessor(ABC):
                                               strict=True),
                                           key=lambda item: item[0]):
             rows_by_modality.setdefault(modality, []).append(rows)
-        mm_hashes = apply_mm_hashes(rows_by_modality, multimodal_uuids)
+        mm_hashes = apply_mm_hashes(rows_by_modality,
+                                    multimodal_uuids,
+                                    hash_lib=attached_embedding_hasher)
         hashes = [mm_hashes.hashes[m][i] for m, i in item_refs]
         uuids = (None if mm_hashes.uuids is None else
                  [mm_hashes.uuids[m][i] for m, i in item_refs])

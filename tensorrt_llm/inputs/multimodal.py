@@ -27,9 +27,15 @@ from tensorrt_llm.inputs.multimodal_data import (MEDIA_MODALITIES,
                                                  _hash_serialized_item)
 from tensorrt_llm.logger import logger
 
-# Default hasher. BLAKE3 hashes large inputs on several threads; the digest
-# does not depend on the thread count.
-default_hasher = partial(blake3, max_threads=blake3.AUTO)
+# Default hasher
+default_hasher = blake3
+# Attached embeddings are MiB-sized, so each one is hashed on its own pool of a
+# few threads. A fixed thread count builds the pool per hasher; BLAKE3's AUTO
+# mode would share one global pool, which hangs a child forked after it started.
+# The digest does not depend on the thread count.
+_ATTACHED_EMBEDDING_HASH_THREADS = 4
+attached_embedding_hasher = partial(
+    blake3, max_threads=_ATTACHED_EMBEDDING_HASH_THREADS)
 _INT32_MAX = 2**31 - 1
 MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 
