@@ -319,7 +319,7 @@ Qwen/Qwen3.8-2.4T-A95B:
   - quant_algo: NVFP4
     accuracy: 93.80
   - quant_algo: NVFP4
-    spec_dec_algo: MTP  
+    spec_dec_algo: MTP
     accuracy: 93.80
 Qwen/Qwen3.8-Flash-Next:
   - accuracy: 95.72
