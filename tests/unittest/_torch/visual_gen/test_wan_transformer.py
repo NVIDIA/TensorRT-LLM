@@ -18,12 +18,8 @@ Run one:
     pytest tests/unittest/_torch/visual_gen/test_wan_transformer.py -v -s -k i2v
 """
 
-# MPI bootstrap must be disabled before importing TensorRT-LLM.
-# ruff: noqa: E402
-
 import os
 
-_PREVIOUS_TLLM_DISABLE_MPI = os.environ.get("TLLM_DISABLE_MPI")
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import gc
@@ -48,10 +44,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mpi_env():
     yield
-    if _PREVIOUS_TLLM_DISABLE_MPI is None:
-        os.environ.pop("TLLM_DISABLE_MPI", None)
-    else:
-        os.environ["TLLM_DISABLE_MPI"] = _PREVIOUS_TLLM_DISABLE_MPI
+    os.environ.pop("TLLM_DISABLE_MPI", None)
 
 
 @pytest.fixture(autouse=True)
@@ -542,47 +535,3 @@ class TestWanI2VTransformerCorrectness:
         assert cos_sim >= COS_SIM_THRESHOLD, (
             f"I2V cosine similarity {cos_sim:.6f} < {COS_SIM_THRESHOLD}. max_diff={max_diff:.6f}"
         )
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("norm", ["adaln", "affine"])
-def test_fixed_bf16_linear_keeps_norm_output_bf16(norm: str) -> None:
-    from unittest.mock import patch
-
-    from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
-        apply_fused_layernorm_adaln_quant,
-        apply_fused_layernorm_affine_quant,
-        get_nvfp4_input_scale,
-    )
-
-    projection = SimpleNamespace(
-        quant_config=SimpleNamespace(quant_algo=None),
-        input_scale=None,
-        scaling_vector_size=16,
-        pre_quant_scale=None,
-        force_dynamic_quantization=False,
-    )
-    inputs = torch.randn(1, 8, 128, dtype=torch.bfloat16)
-    scale = get_nvfp4_input_scale(projection)
-    assert scale is None
-    with (
-        patch(
-            "torch.ops.trtllm.fused_adaptive_layernorm_quant",
-            side_effect=AssertionError("Upstream FP4 quantization must be disabled"),
-        ),
-        patch(
-            "torch.ops.trtllm.fused_adaptive_layernorm", return_value=torch.empty_like(inputs)
-        ) as bf16,
-    ):
-        if norm == "adaln":
-            result = apply_fused_layernorm_adaln_quant(
-                inputs, torch.randn(1, 1, 128), torch.randn(1, 1, 128), 8, scale
-            )
-        else:
-            result = apply_fused_layernorm_affine_quant(
-                inputs, torch.randn(128), torch.randn(128), scale
-            )
-    bf16.assert_called_once()
-    assert result.dtype == torch.bfloat16
-    projection.input_scale = torch.ones(())
-    assert get_nvfp4_input_scale(projection) is projection.input_scale

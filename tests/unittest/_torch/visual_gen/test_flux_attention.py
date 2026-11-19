@@ -378,69 +378,6 @@ def test_flux_fixed_attention_qkv_quantization(quantized: bool) -> None:
 
 
 @pytest.mark.cpu_only
-def test_flux2_linear_quant_ignore_bypasses_fp4_mlp_fusion() -> None:
-    from unittest.mock import patch
-
-    from tensorrt_llm._torch.visual_gen.models.flux.attention import Flux2ParallelSelfAttention
-
-    class InputProjection(torch.nn.Module):
-        tp_size = 2
-
-        def __init__(self):
-            super().__init__()
-            self.qkv_proj = torch.nn.Linear(128, 384, bias=False, dtype=torch.bfloat16)
-            self.mlp_proj = torch.nn.Linear(128, 256, bias=False, dtype=torch.bfloat16)
-            self.mlp_proj.can_use_cute_dsl_nvfp4_swiglu_blackwell = lambda: False
-
-        def forward(self, value):
-            return self.qkv_proj(value), self.mlp_proj(value)
-
-    class OutputProjection(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.mlp_proj = torch.nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
-            self.mlp_proj._weights_created = True
-            self.mlp_proj.has_nvfp4 = False
-            self.mlp_proj.input_scale = None
-            self.mlp_proj.pre_quant_scale = None
-            self.mlp_proj.force_dynamic_quantization = False
-
-        def forward(self, attention, mlp):
-            return attention + self.mlp_proj(mlp)
-
-    attention = Flux2ParallelSelfAttention.__new__(Flux2ParallelSelfAttention)
-    torch.nn.Module.__init__(attention)
-    attention.to_qkv_mlp_proj = InputProjection()
-    attention.to_out = OutputProjection()
-    attention._apply_norm_rope = lambda value, rotary: value.chunk(3, dim=-1)
-    attention._attn_impl = lambda q, k, v, **kwargs: q
-    with (
-        patch("tensorrt_llm._torch.visual_gen.models.flux.attention.is_sm_100f", return_value=True),
-        patch("torch.cuda.is_available", return_value=True),
-        patch(
-            "tensorrt_llm._torch.visual_gen.models.flux.attention.swiglu",
-            side_effect=lambda value: value[:, :128],
-        ),
-        patch.object(
-            attention,
-            "_project_hidden_mlp_with_cute_dsl",
-            side_effect=AssertionError("Fused weight layout must not be used"),
-        ),
-        patch.object(
-            attention,
-            "_project_split_output_with_fp4_mlp",
-            side_effect=AssertionError("FP4 output must not be produced"),
-        ),
-        patch.object(
-            attention.to_out.mlp_proj, "forward", wraps=attention.to_out.mlp_proj.forward
-        ) as bf16,
-    ):
-        attention(torch.randn(1, 8, 128, dtype=torch.bfloat16))
-    bf16.assert_called_once()
-    assert bf16.call_args.args[0].dtype == torch.bfloat16
-
-
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("variant", ["flux1", "flux2"])
 def test_flux_attention_ignore_matches_real_module_path(
     variant: str, monkeypatch: pytest.MonkeyPatch

@@ -427,13 +427,13 @@ class PipelineLoader:
             pipeline.setup_parallel_vae()
 
         if hasattr(pipeline, "post_load_weights"):
-            pipeline.run_transformer_quant_hook("post_load_weights")
+            pipeline.post_load_weights()
         pipeline._setup_runtime_lora()
         pipeline.initialize_offload_pipeline()
 
         if config.torch_compile.enable:
             torch._dynamo.config.cache_size_limit = 128
-            pipeline.run_transformer_quant_hook("torch_compile")
+            pipeline.torch_compile()
         else:
             logger.info("torch.compile disabled by config")
 

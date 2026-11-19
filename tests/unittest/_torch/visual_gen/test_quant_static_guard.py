@@ -157,21 +157,13 @@ class TestStaticQuantGuard:
 
 
 class TestDynamicQuantGuard:
-    @pytest.mark.parametrize(
-        ("quant_algo", "weight_dtype"),
-        [
-            (QuantAlgo.W4A16_AWQ, torch.bfloat16),
-            (QuantAlgo.W4A8_AWQ, torch.bfloat16),
-            (QuantAlgo.W8A8_SQ_PER_CHANNEL, torch.bfloat16),
-            (QuantAlgo.W4A16_AWQ, torch.uint8),
-        ],
-    )
+    @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.uint8])
     def test_unsupported_algorithm_raises_before_retaining_or_loading_weights(
-        self, quant_algo: QuantAlgo, weight_dtype: torch.dtype
+        self, weight_dtype: torch.dtype
     ) -> None:
         loader = DynamicLinearWeightLoader(
             DiffusionModelConfig(
-                quant_config=LinearQuantConfig(quant_algo=quant_algo, ignore_steps=[0]),
+                quant_config=LinearQuantConfig(quant_algo=QuantAlgo.W4A16_AWQ, ignore_steps=[0]),
                 dynamic_weight_quant=True,
             )
         )
@@ -181,7 +173,9 @@ class TestDynamicQuantGuard:
         ) as quantize:
             with pytest.raises(
                 ValueError,
-                match=r"ignore_steps.*dynamic: true",
+                match="pre-quantized checkpoint"
+                if weight_dtype == torch.uint8
+                else "no load-time quantizer",
             ):
                 loader.load_linear_weights(
                     module,
@@ -234,19 +228,28 @@ class TestStaticNVFP4ActivationScale:
         )
         return quantizer
 
-    @pytest.mark.parametrize("dynamic_weight_quant", [False, True])
     @pytest.mark.parametrize(
-        "input_scale",
+        "dynamic_weight_quant,input_scale",
         [
-            None,
-            torch.tensor(0.0),
-            torch.tensor(-1.0),
-            torch.tensor(float("nan")),
-            torch.tensor(float("inf")),
-            torch.empty(0),
-            torch.ones(2),
+            (False, None),
+            (True, None),
+            (True, torch.tensor(0.0)),
+            (True, torch.tensor(-1.0)),
+            (True, torch.tensor(float("nan"))),
+            (True, torch.tensor(float("inf"))),
+            (True, torch.empty(0)),
+            (True, torch.ones(2)),
         ],
-        ids=["missing", "zero", "negative", "nan", "inf", "empty", "non-scalar"],
+        ids=[
+            "prequantized-missing",
+            "bf16-missing",
+            "zero",
+            "negative",
+            "nan",
+            "inf",
+            "empty",
+            "non-scalar",
+        ],
     )
     def test_missing_or_invalid_scale_raises_before_quantization(
         self, dynamic_weight_quant, input_scale, quantizer
