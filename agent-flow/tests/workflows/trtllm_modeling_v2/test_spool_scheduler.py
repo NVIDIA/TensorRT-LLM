@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import json
 import os
 import signal
@@ -483,7 +484,7 @@ def test_an_ending_session_is_handed_over_to_the_next_session_on_its_spool(tmp_p
 
 
 def test_a_successor_that_stops_heart_beating_is_dropped_and_jobs_start_again(
-    _spool_scheduler_spool, _spool_scheduler_clock
+    _spool_scheduler_spool, _spool_scheduler_clock, monkeypatch
 ):
     """The successor's allocation was cancelled a minute after its watcher started."""
     spool, clock = _spool_scheduler_spool, _spool_scheduler_clock
@@ -504,11 +505,18 @@ def test_a_successor_that_stops_heart_beating_is_dropped_and_jobs_start_again(
     assert old.pending_reasons["next"] == "this session is handing over to new"
 
     clock.advance(_spool_scheduler_scheduler.WATCHER_STALE_S + 1)
-    old.tick()
+
+    def full(line: str) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    # Even when the status line cannot be written, the gone successor is forgotten.
+    monkeypatch.setattr(old, "_append_status", full)
+    with pytest.raises(OSError):
+        old.tick()
+    monkeypatch.undo()
     assert old.handover == {}, "a successor that is gone is no reason to exit"
     _spool_scheduler_pump(old, lambda: _spool_scheduler_rc(spool, "next") is not None)
     assert _spool_scheduler_rc(spool, "next") == 0
-    assert "out of hand-over" in SpoolPaths(spool).status.read_text()
 
 
 def test_monitor_cli_tells_a_busy_orchestrator_from_one_that_has_exited(

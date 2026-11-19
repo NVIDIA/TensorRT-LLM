@@ -1210,10 +1210,10 @@ class Scheduler:
         ]
         if ends_at - now > self.config.handover_lead_s and not peers:
             if self.handover:
+                self.handover = {}
                 self._append_status(
                     f"watcher: no live successor; out of hand-over at {utc_iso(now)}"
                 )
-            self.handover = {}
             return
         if not self.handover:
             self.handover["since"] = utc_iso(now)
