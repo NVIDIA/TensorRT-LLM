@@ -119,36 +119,13 @@ These targets use their own copy of the MSA kernels, which compiles at run time 
 
 ### Speculative decoding with the DSpark drafter
 
-DSpark is a target-dependent block drafter: it reads hidden states from several target layers and proposes a block of up to 7 draft tokens per step, which the target verifies in one forward. Select it with `decoding_type: DSpark` and point `speculative_model` at the bundled drafter. The target attention backend must be `TRTLLM`. For example, on 4 GPUs with NVFP4 KV cache (set `max_seq_len` to the longest prompt plus output you serve):
+DSpark is a target-dependent block drafter: it reads hidden states from several target layers and proposes a block of up to 7 draft tokens per step, which the target verifies in one forward. Select it with `decoding_type: DSpark` and point `speculative_model` at the bundled drafter. The target attention backend must be `TRTLLM`. The drafter attends over a sliding window, so leave chunked prefill off unless a host KV cache is configured, and size `max_num_tokens` to the longest prompt. On 4 GPUs, the TP4 targets need `moe_expert_parallel_size: 1`, and the DEP4 target needs `enable_attention_dp: true` with `moe_expert_parallel_size: 4`. For example, the min-latency TP4 configuration (set `max_seq_len` to the longest prompt plus output you serve):
 
-```yaml
-tensor_parallel_size: 4
-moe_expert_parallel_size: 4
-trust_remote_code: true
-attn_backend: TRTLLM
-moe_config:
-  backend: TRTLLM
-max_batch_size: 8
-max_num_tokens: 16384
-max_seq_len: 32768
-enable_chunked_prefill: true
-cuda_graph_config:
-  enable_padding: true
-  max_batch_size: 8
-kv_cache_config:
-  dtype: nvfp4
-  enable_block_reuse: false
-  free_gpu_memory_fraction: 0.9
-sparse_attention_config:
-  algorithm: minimax_m3
-  implementation: msa
-  indexer_kv_dtype: fp8
-  fuse_qkv_index_projection: true
-speculative_config:
-  decoding_type: DSpark
-  max_draft_len: 7
-  speculative_model: /models/MiniMax-M3.1-Flash/dspark
+```{literalinclude} ../../../examples/configs/curated/minimax-m3.1-flash-latency.yaml
+:language: yaml
 ```
+
+For max throughput, [`minimax-m3.1-flash-throughput.yaml`](source:examples/configs/curated/minimax-m3.1-flash-throughput.yaml) runs the DEP4 target (attention data parallel, MegaMoE expert-parallel MoE) with the same drafter.
 
 `max_draft_len` is the number of draft tokens per step, up to the drafter's native block of 7. Launch the server with the same command as in [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server), pointing `$MODEL` at `/models/MiniMax-M3.1-Flash` and `--extra_llm_api_options` at this file.
 
