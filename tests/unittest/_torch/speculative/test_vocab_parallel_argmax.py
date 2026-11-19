@@ -987,27 +987,34 @@ def test_model_reports_the_temperature_variant():
 
 
 @pytest.mark.parametrize(
-    "cuda_graphs, worker, fast_paths, watermark, listed, captured",
+    "cuda_graphs, worker, fast_paths, excluded_by, listed, captured",
     [
-        (True, True, False, False, None, True),
-        (False, True, False, False, None, False),  # eager decoding keeps the gathered sampler
-        (True, False, False, False, None, False),
-        (True, False, True, False, None, False),  # fast paths alone: MTP-Eagle only (none here)
-        (True, True, False, True, None, False),  # the draw on the shard is not watermarked
-        (True, True, False, False, ["greedy", "advanced"], False),
+        (True, True, False, None, None, True),
+        (False, True, False, None, None, False),  # eager decoding keeps the gathered sampler
+        (True, False, False, None, None, False),
+        (True, False, True, None, None, False),  # fast paths alone: MTP-Eagle only (none here)
+        (True, True, False, "watermark", None, False),  # the draw on the shard is not watermarked
+        # No batch selects the variant (_temperature_only), so no warmup pass captures it.
+        (True, True, False, "use_rejection_sampling", None, False),
+        (True, True, False, "enable_penalty", None, False),
+        (True, True, False, None, ["greedy", "advanced"], False),
     ],
 )
 def test_temperature_graph_variant_follows_the_worker(
-    cuda_graphs, worker, fast_paths, watermark, listed, captured
+    cuda_graphs, worker, fast_paths, excluded_by, listed, captured
 ):
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import metadata
 
     config = SimpleNamespace(
-        spec_config=None,
+        spec_config=SimpleNamespace(
+            spec_dec_mode=SimpleNamespace(is_mtp_eagle_one_model=lambda: False),
+            use_rejection_sampling=excluded_by == "use_rejection_sampling",
+            enable_penalty=excluded_by == "enable_penalty",
+        ),
         cuda_graph_config=SimpleNamespace(sampling_variants=listed) if cuda_graphs else None,
         spec_decode_fast_paths=fast_paths,
         spec_samples_sharded_temperature=worker,
-        watermark_config=object() if watermark else None,
+        watermark_config=object() if excluded_by == "watermark" else None,
     )
     assert metadata.captures_temperature_only_graphs(config, None) is captured
 
