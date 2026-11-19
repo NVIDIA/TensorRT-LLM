@@ -23,12 +23,14 @@ The draft step and the verify step of one-model rejection sampling have two impl
 `SpecWorkerBase` takes the fused kernels wherever they cover the step. This script calls its two
 entry points on the same inputs, once held on the reference path and once on the fused path:
 
-- draft: ``sample_draft_tokens`` on block draft logits ``[B, K, V]``, as DSpark and DFlash call
-  it. It draws the draft tokens and stores their distributions in ``draft_probs``.
-- verify: ``_accept_draft_tokens`` on target logits ``[B * (K + 1), V]``.
+- draft: ``sample_draft_tokens`` on block draft logits ``[B, K, V]``, as DFlash and DSpark
+  without a Markov head call it. It draws the draft tokens and stores their distributions in
+  ``draft_probs``. A DSpark Markov head draws its drafts through ``markov_sampled_chain``
+  instead, so its draft step is not measured here.
+- verify: ``_accept_draft_tokens`` on target logits ``[B * (K + 1), V]``, for every drafter.
 
-The defaults are Kimi K3 with its DSpark drafter: a vocabulary of 163,840 tokens and fp32
-logits, in the temperature-only mode the fused kernels cover (``no_topk_no_topp``). The sweep
+The defaults are Kimi K3 shapes: a vocabulary of 163,840 tokens and fp32 logits, in the
+temperature-only mode the fused kernels cover (``no_topk_no_topp``). The sweep
 covers 1 to 512 generation requests per GPU, 1 to 16 draft tokens per request, temperatures 0.5,
 1 and 1.5, and four logit shapes.
 

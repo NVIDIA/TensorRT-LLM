@@ -531,7 +531,7 @@ def test_worker_paths_fast():
     """`SpecWorkerBase` entry points in ``NO_TOPK_NO_TOPP`` mode on the reference path and the fused
     path, on a mixed batch (2 context rows) and a padding request routed to the dummy slot: the
     fused path stores the reference's proposals, and its tokens and accept decisions match the
-    float64 model."""
+    float64 model. With block verification both workers run the reference verifier."""
     mbs, nctx, ngen, seed, offset = 16, 2, 9, 99, 13
     bsz = nctx + ngen
     slots = range(3, 3 + bsz)
@@ -551,13 +551,17 @@ def test_worker_paths_fast():
     gaps = _Gaps()
     _check_drafts(drafts[: ngen - 1].cpu().numpy(), q, [seed] * ngen, [offset] * ngen, K, gaps)
     out = {}
-    for fused in (False, True):
-        md = _worker_metadata(mbs, slots, seed, offset)
-        md.draft_probs.copy_(probs[True])
-        md.draft_tokens = drafts.reshape(-1)
-        acc, num = _worker(fused)._accept_draft_tokens(logits, drafts, nctx, bsz, md)
-        out[fused] = (acc.clone(), num.clone())
-    (a0, n0), (a1, n1) = out[False], out[True]
+    for method in ("standard", "block"):
+        for fused in (False, True):
+            md = _worker_metadata(mbs, slots, seed, offset)
+            md.rejection_sample_method = method
+            md.draft_probs.copy_(probs[True])
+            md.draft_tokens = drafts.reshape(-1)
+            acc, num = _worker(fused)._accept_draft_tokens(logits, drafts, nctx, bsz, md)
+            out[method, fused] = (acc.clone(), num.clone())
+    # Block verification accepts by its own rule, which the fused kernels do not implement.
+    assert all(torch.equal(x, y) for x, y in zip(out["block", False], out["block", True]))
+    (a0, n0), (a1, n1) = out["standard", False], out["standard", True]
     assert torch.equal(a0[:nctx, 0], a1[:nctx, 0])  # context rows: the same target sampler
     p = _softmax64(logits[nctx:], torch.ones(ngen * (K + 1), device=DEV)).reshape(ngen, K + 1, V)
     real_gens = slice(nctx, bsz - 1)
@@ -597,63 +601,6 @@ def test_guided_decoding_and_watermark_keep_reference():
     md.watermark = types.SimpleNamespace(ready=True)
     assert md.watermark_ready
     assert not worker._fast_rs_applies(md, logits, V)
-
-
-def test_markov_feedback_matches_float64_model():
-    """The Markov draft chain advances on the sampled token: position ``i`` samples from the logits
-    ``base_i + w2 @ w1[prev]`` with ``prev_0 = anchor``, using draw 0 of
-    ``(seed ^ DRAFT_KEY_XOR, subsequence b * K + i, offset + 1)`` for request ``b``. Every token must
-    match the float64 model up to `_CDF_TOL`, and every stored proposal row must be that position's
-    distribution."""
-    gen = torch.Generator(device=DEV).manual_seed(5)
-    num_gens, rank = 4, 256
-    checked = mism = 0
-    worst = 0.0
-    for trial in range(6):
-        base = peaked_logits(num_gens * K, V, gen).view(num_gens, K, V).contiguous()
-        w1 = (torch.randn(V, rank, generator=gen, device=DEV) * 0.2).to(torch.bfloat16)
-        w2 = (torch.randn(V, rank, generator=gen, device=DEV) * 0.2).to(torch.bfloat16)
-        anchor = torch.randint(0, V, (num_gens,), generator=gen, device=DEV)
-        seed, offset = 555 + trial, 6 * trial
-        buf = torch.zeros((8, K, V), dtype=torch.float32, device=DEV)
-        tok = frs.fast_rs_draft_markov_feedback(
-            base,
-            anchor,
-            w1,
-            w2,
-            torch.ones(num_gens, device=DEV),
-            torch.arange(num_gens, dtype=torch.int64, device=DEV),
-            -1,
-            buf,
-            torch.full((num_gens,), seed, dtype=torch.int64, device=DEV),
-            torch.full((num_gens,), offset, dtype=torch.int64, device=DEV),
-            1,
-        )
-        stored = buf.double().cpu().numpy()
-        # Same batched bias GEMM as the kernel path (F.linear of the [G, rank] embeddings).
-        prev = anchor.clone()
-        live = [True] * num_gens
-        for i in range(K):
-            bias = torch.nn.functional.linear(w1[prev], w2).float()
-            q = torch.softmax((base[:, i] + bias).double(), dim=-1).cpu().numpy()
-            nxt = prev.clone()
-            for b in range(num_gens):
-                if not live[b]:
-                    continue
-                # Request b's slot is b; its chain still conditions on the model's tokens here.
-                assert float(np.abs(stored[b, i] - q[b]).max()) < 1e-5
-                u = curand_uniform(_draft_key(seed), offset + 1, b * K + i, 0)
-                ref_tok = _inv_cdf(q[b], u)
-                checked += 1
-                if ref_tok != int(tok[b, i]):
-                    # The chains condition on different tokens from here on.
-                    worst = max(worst, _cdf_gap(q[b], u, ref_tok, int(tok[b, i])))
-                    mism += 1
-                    live[b] = False
-                nxt[b] = ref_tok
-            prev = nxt
-    print(f"markov feedback: {mism}/{checked} disagreements, worst CDF gap {worst:.2e}")
-    assert worst <= _CDF_TOL
 
 
 def _small_support_logits(rows, gen, support=96):
@@ -816,8 +763,8 @@ def _capture(fn):
 
 
 def test_cuda_graph_replay_matches_eager():
-    """Verify, draft block and the Markov chain captured in one CUDA graph replay what eager runs
-    compute, also with new logits and anchors written into the captured tensors."""
+    """Verify and draft block captured in one CUDA graph replay what eager runs compute, also with
+    new logits written into the captured tensors."""
     gen = torch.Generator(device=DEV).manual_seed(9)
     g = 8
     tgt, drf = _correlated_case(g, gen, 0.5)
@@ -827,20 +774,13 @@ def test_cuda_graph_replay_matches_eager():
     seeds = torch.full((g,), 5, dtype=torch.int64, device=DEV)
     offs = torch.full((g,), 12, dtype=torch.int64, device=DEV)
     s_tgt, s_drf = tgt.clone(), drf.clone().view(-1, V)
-    rank = 256
-    w1 = (torch.randn(V, rank, generator=gen, device=DEV) * 0.2).to(torch.bfloat16)
-    w2 = (torch.randn(V, rank, generator=gen, device=DEV) * 0.2).to(torch.bfloat16)
-    anchor = torch.randint(0, V, (g,), generator=gen, device=DEV)
     drafts = frs.fast_rs_draft_block(s_drf, temps_req, slots, -1, buf, seeds, offs, 1)
     drafts = drafts.view(g, K).contiguous()
 
     def step():
         acc, num = frs.fast_rs_verify(s_tgt, temps_tok, drafts, slots, -1, buf, seeds, offs)
         blk = frs.fast_rs_draft_block(s_drf, temps_req, slots, -1, buf, seeds, offs, 1)
-        fb = frs.fast_rs_draft_markov_feedback(
-            s_drf.view(g, K, V), anchor, w1, w2, temps_req, slots, -1, buf, seeds, offs, 1
-        )
-        return acc, num, blk, fb, buf.clone()
+        return acc, num, blk, buf.clone()
 
     snapshot = buf.clone()
     eager = [x.clone() for x in step()]
@@ -854,7 +794,6 @@ def test_cuda_graph_replay_matches_eager():
     tgt2, drf2 = _correlated_case(g, gen, 0.5)
     s_tgt.copy_(tgt2)
     s_drf.copy_(drf2.view(-1, V))
-    anchor.copy_(torch.randint(0, V, (g,), generator=gen, device=DEV))
     snapshot = buf.clone()
     graph.replay()
     torch.cuda.synchronize()
