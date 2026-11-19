@@ -371,9 +371,28 @@ def _ask(session: _Session, base: str, model: str, process: Any, deps: RunDeps) 
     }
 
 
+def _admit_and_ask(
+    session: _Session,
+    base: str,
+    model: str,
+    listed: bool,
+    process: Any,
+    admit: Callable[[str], Optional[str]],
+    deps: RunDeps,
+) -> dict[str, Any]:
+    timing = {"served_model": model, "served_model_listed": listed}
+    refusal = admit(model)
+    if refusal is not None:
+        timing["refused"] = refusal
+    else:
+        timing.update(_ask(session, base, model, process, deps))
+    return timing
+
+
 def _serve_and_ask(
     session: _Session,
     managed: ManagedServer,
+    argv: list[str],
     requested_model: Optional[str],
     files: Mapping[str, Path],
     admit: Callable[[str], Optional[str]],
@@ -386,7 +405,6 @@ def _serve_and_ask(
     """
     timing: dict[str, Any] = {"startup_error": None}
     files["addr"].unlink(missing_ok=True)
-    argv = server.serve_argv(managed.argv, files["addr"])
     with deps.memory_poller(files["memory"], list(managed.gpu_ids)):
         launched = deps.monotonic()
         stopping: Optional[float] = None
@@ -406,13 +424,9 @@ def _serve_and_ask(
                         timing["startup_error"] = f"{type(error).__name__}: {error}"
                     else:
                         timing["startup_s"] = deps.monotonic() - launched
-                        timing["served_model"] = model
-                        timing["served_model_listed"] = listed
-                        refusal = admit(model)
-                        if refusal is not None:
-                            timing["refused"] = refusal
-                        else:
-                            timing.update(_ask(session, base, model, process, deps))
+                        timing.update(
+                            _admit_and_ask(session, base, model, listed, process, admit, deps)
+                        )
                 finally:
                     stopping = deps.monotonic()
         finally:
@@ -590,9 +604,13 @@ def run(
                 **(attempt_extra or {}),
             }
             if managed is not None:
-                attempt_info["server_command"] = list(
-                    server.serve_argv(managed.argv, results_dir / f"server-attempt-{attempt}.addr")
-                )
+                files = {
+                    "addr": results_dir / f"server-attempt-{attempt}.addr",
+                    "log": results_dir / f"server-attempt-{attempt}.log",
+                    "memory": results_dir / f"gpu-memory-attempt-{attempt}.csv",
+                }
+                argv = server.serve_argv(managed.argv, files["addr"])
+                attempt_info["server_command"] = argv
                 attempt_info["server_settings"] = dict(managed.settings)
             run_manifest["attempts"].append(attempt_info)
             _write_json(manifest_file, run_manifest)
@@ -623,20 +641,18 @@ def run(
                 request_fields=request_fields,
             )
             if managed is not None:
-                files = {
-                    "addr": results_dir / f"server-attempt-{attempt}.addr",
-                    "log": results_dir / f"server-attempt-{attempt}.log",
-                    "memory": results_dir / f"gpu-memory-attempt-{attempt}.csv",
-                }
-                timing.update(_serve_and_ask(session, managed, served_model, files, admit, deps))
+                timing.update(
+                    _serve_and_ask(session, managed, argv, served_model, files, admit, deps)
+                )
                 if files["memory"].exists():
                     timing["gpu_memory"] = records.gpu_memory_peaks(files["memory"].read_text())
             else:
+                process = _ExternalEndpoint()
                 base = endpoint.rstrip("/")
                 try:
                     model, listed = _wait_ready(
                         base,
-                        _ExternalEndpoint(),
+                        process,
                         min(deadline, deps.monotonic() + STARTUP_LIMIT_S),
                         served_model,
                         deps,
@@ -645,13 +661,9 @@ def run(
                 except (ServerError, requests.exceptions.RequestException) as error:
                     timing["startup_error"] = f"{type(error).__name__}: {error}"
                 else:
-                    timing["served_model"] = model
-                    timing["served_model_listed"] = listed
-                    refusal = admit(model)
-                    if refusal is not None:
-                        timing["refused"] = refusal
-                    else:
-                        timing.update(_ask(session, base, model, _ExternalEndpoint(), deps))
+                    timing.update(
+                        _admit_and_ask(session, base, model, listed, process, admit, deps)
+                    )
         timing["total_s"] = deps.monotonic() - started
         # Monitored devices may be a subset or superset of the server's devices.
         timing.update(gpu_hours=None, server_gpu_hours=None, monitored_gpu_hours=None)
