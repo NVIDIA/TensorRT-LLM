@@ -102,11 +102,18 @@ def _probe_cutedsl_rubin() -> Tuple[bool, str]:
 
 
 def _probe_cutedsl_mxfp8_fused_fc12_rubin() -> Tuple[bool, str]:
+    # Import the op module first: it clears the flag if the vendored kernel
+    # fails to import with this CuTe DSL build.
+    from ...custom_ops import cute_dsl_custom_ops  # noqa: F401
     from ...cute_dsl_utils import IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE
 
     if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE:
         return True, ""
-    return False, "installed CuTe DSL lacks cutlass.memory / cutlass.tensor_utils"
+    return (
+        False,
+        "installed CuTe DSL lacks cutlass.memory / cutlass.tensor_utils or another "
+        "module the Rubin MXFP8 fused FC12 kernel imports",
+    )
 
 
 def _probe_locality_domain() -> Tuple[bool, str]:

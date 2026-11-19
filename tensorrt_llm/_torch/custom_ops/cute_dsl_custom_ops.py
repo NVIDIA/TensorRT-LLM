@@ -19444,16 +19444,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # requant + FC2 GEMM + top-k finalize in ONE persistent kernel.
         # ----------------------------------------------------------------
         # Gated separately from IS_CUTLASS_DSL_RUBIN_AVAILABLE: the vendored
-        # kernel needs a newer internal DSL build (see cute_dsl_utils.py).
+        # kernel needs a newer CuTe DSL build (see cute_dsl_utils.py).
         if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE:
-            from ..moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
-                Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel as \
-                Sm107Mxfp8BlockScaledContiguousGroupedGemmFusedFc12Kernel
-            from ..moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
-                validate_l2_atomic_descriptor_bounds as \
-                validate_mxfp8_fc12_l2_atomic_descriptor_bounds
-            from ..moe.kernels.rubin.utils import TRTLLM_ENABLE_PDL
+            # The flag only probes the submodules cute_dsl_utils knows about.
+            # A build that has them but lacks something else the vendored
+            # kernel imports disables this op instead of breaking the import of
+            # every CuTe DSL op; the MoEDep probe reads the cleared flag.
+            try:
+                from ..moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
+                    Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel as \
+                    Sm107Mxfp8BlockScaledContiguousGroupedGemmFusedFc12Kernel
+                from ..moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
+                    validate_l2_atomic_descriptor_bounds as \
+                    validate_mxfp8_fc12_l2_atomic_descriptor_bounds
+                from ..moe.kernels.rubin.utils import TRTLLM_ENABLE_PDL
+            except (ImportError, AttributeError) as e:
+                logger.warning(
+                    "The installed CuTe DSL cannot build the Rubin MXFP8 fused "
+                    f"FC12 MoE kernel ({e!r}); MXFP8 CuTe DSL MoE is disabled")
+                IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE = False
+                from .. import cute_dsl_utils
+                cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE = False
 
+        if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE:
             # MXFP8: E4M3 operands with UE8M0 scales over 32 elements.
             MXFP8_FUSED_FC12_SF_VEC_SIZE = 32
 
