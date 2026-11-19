@@ -22,7 +22,7 @@ FAMILY_DIR = (
 
 #: tensorrt_llm imports that compute nothing, so the generic path need not declare them: types and configs it
 #: reads, enums it passes, the metadata it is handed and the views it takes of it, the graph-capture context it
-#: asks about and its logger.
+#: asks about, the env switches it reads and its logger.
 _NON_COMPUTE_IMPORTS = frozenset(
     {
         "ANY_MOE_IMPL",
@@ -38,6 +38,7 @@ _NON_COMPUTE_IMPORTS = frozenset(
         "SiTuActivation",
         "is_in_breakable_cuda_graph",
         "k3_mla_decode_view",
+        "k3_router_gemm_bf16",
         "logger",
     }
 )

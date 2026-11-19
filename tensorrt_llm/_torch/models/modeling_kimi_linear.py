@@ -110,7 +110,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from ..._utils import get_sm_version, is_sm_100f
+from ..._utils import get_env_flag, get_sm_version, is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
@@ -155,6 +155,12 @@ from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
     os.environ.get("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
 )
+
+# A/B escape hatch (read once at import): TRTLLM_K3_LATENT_OVERLAP=0 runs the CuteDSL MoE latent
+# down-projection on the main stream after the router GEMM instead of beside the routing chain
+# on the MoeOutputMemset aux stream. ``KimiK3MoERuntime._front_plan`` needs that stream, so its
+# router-first and shared-first orders and the NVFP4 latent_down epilogue are off as well.
+_K3_LATENT_OVERLAP = get_env_flag("TRTLLM_K3_LATENT_OVERLAP", True)
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -1649,6 +1655,40 @@ def _is_helix_a2a(model_config: ModelConfig) -> bool:
     return mapping.enable_attention_dp and mapping.helix_repurposed_cp_size > 1
 
 
+_K3_ROUTER_BF16_ENV = "KIMI_K3_ROUTER_BF16"
+
+
+def k3_router_gemm_bf16(tp_group_shares_requests: bool) -> bool:
+    """Return whether the K3 MoE router gate GEMM takes bf16 inputs.
+
+    ``KIMI_K3_ROUTER_BF16`` takes the `get_env_flag` values or ``legacy``.
+    Unset, blank or on selects bf16 on every rank. Off selects the fp32 upcast
+    (TF32 cuBLAS) on every rank. ``legacy`` selects bf16 only where every rank
+    of the TP group serves the same requests, and the upcast elsewhere.
+
+    Args:
+        tp_group_shares_requests: ``Mapping.tp_group_shares_requests`` of this rank.
+
+    Raises:
+        ValueError: The variable holds any other value.
+    """
+    if os.environ.get(_K3_ROUTER_BF16_ENV, "").strip().lower() == "legacy":
+        return tp_group_shares_requests
+    try:
+        return get_env_flag(_K3_ROUTER_BF16_ENV, True)
+    except ValueError as error:
+        raise ValueError(f"{error}, or legacy") from None
+
+
+def _k3_latent_down_stream(aux_stream_dict, moe_backend: str):
+    """Return the aux stream for the MoE latent down-projection, or ``None`` for the main stream."""
+    # CuteDSL already quantizes the MoE input on the MoeOutputMemset stream; the latent
+    # down-projection runs there too, beside the routing chain.
+    if not _K3_LATENT_OVERLAP or moe_backend not in ("CUTEDSL", "CUTEDSL_FC12"):
+        return None
+    return aux_stream_dict.get(AuxStreamType.MoeOutputMemset)
+
+
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
@@ -1693,21 +1733,15 @@ class KimiK3MoERuntime(nn.Module):
         situ_beta, situ_linear_beta = _resolve_kimi_situ_betas(cfg)
         dtype = torch.bfloat16
 
-        # Routing scores stay fp32; with attention-DP off the gate GEMM runs
-        # bf16xbf16 with fp32 accumulate/output (checkpoint stores the gate
-        # weight in bf16; saves a per-layer input cast + fp32 splitK pair on
-        # the bs1 decode path). Under attention-DP the legacy upcast-to-fp32
-        # GEMM is kept: the bf16-input min-latency GEMM's different reduction
-        # order flips borderline top-16 picks (GSM8K 96.7 -> 96.1/96.4,
-        # 3-run bisect on 62b20dd868), and the bs1-latency win is irrelevant
-        # at DEP batch sizes. helix_a2a ranks share requests and keep bf16.
-        # KIMI_K3_ROUTER_BF16=1/0 forces either path.
-        _router_bf16_env = os.environ.get("KIMI_K3_ROUTER_BF16")
-        _router_bf16 = (
-            _router_bf16_env == "1"
-            if _router_bf16_env is not None
-            else model_config.mapping.tp_group_shares_requests
-        )
+        # Routing scores stay fp32. By default the gate GEMM multiplies the bf16
+        # hidden states by the bf16 checkpoint gate weight with fp32 accumulate
+        # and output, which saves a per-layer input cast and an fp32 split-K
+        # GEMM pair. The other path upcasts both inputs to fp32 (TF32 cuBLAS).
+        # Every product is exact in both paths, so they differ only in
+        # summation order, and the upcast is not more accurate.
+        # KIMI_K3_ROUTER_BF16=0 selects the upcast on every rank, and =legacy
+        # selects it only where the TP group does not share requests.
+        _router_bf16 = k3_router_gemm_bf16(model_config.mapping.tp_group_shares_requests)
         # The router-logits kernel serves the MoE blocks after KDA attention: there the earlier
         # routing shortens the MoE front, while after MLA attention it lands in the burst of
         # latent_down and the shared expert's first GEMM and the front gets longer.
@@ -1847,12 +1881,8 @@ class KimiK3MoERuntime(nn.Module):
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
         self.moe_routed_event = torch.cuda.Event() if self._defer_shared_allreduce else None
-        # CuteDSL already quantizes the MoE input on the MoeOutputMemset stream;
-        # the latent down-projection runs there too, beside the routing chain.
-        self.latent_down_stream = (
-            aux_stream_dict.get(AuxStreamType.MoeOutputMemset)
-            if routed_moe_model_config.moe_backend in ("CUTEDSL", "CUTEDSL_FC12")
-            else None
+        self.latent_down_stream = _k3_latent_down_stream(
+            aux_stream_dict, routed_moe_model_config.moe_backend
         )
         has_latent_stream = self.latent_down_stream is not None
         self.moe_latent_fork_event = torch.cuda.Event() if has_latent_stream else None
