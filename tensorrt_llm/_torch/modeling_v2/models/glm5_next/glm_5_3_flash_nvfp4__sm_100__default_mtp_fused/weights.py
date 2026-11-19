@@ -31,6 +31,16 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 if TYPE_CHECKING:
     from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 
+#: Stock code the loader runs outside the catalog (see ``UNCERTIFIED_GENERIC_CALLS`` in ``modeling.py``): the
+#: checkpoint's weight mapper and key-owner lookup, and the stock modules whose loaders it fills.
+UNCERTIFIED_GENERIC_CALLS = (
+    "tensorrt_llm._torch.models.checkpoints.base_weight_mapper.BaseWeightMapper",
+    "tensorrt_llm._torch.models.checkpoints.hf.glm5_next_weight_mapper.Glm5NextHfWeightMapper",
+    "tensorrt_llm._torch.models.checkpoints.hf.glm5_next_weight_mapper.glm5_next_weight_owner",
+    "tensorrt_llm._torch.modules.gated_mlp.GatedMLP",
+    "tensorrt_llm._torch.modules.linear.Linear",
+)
+
 #: Routed-expert destinations: consumed by the fused MoE layer's loader rather
 #: than placed by name.
 _FUSED_MOE_RE = re.compile(

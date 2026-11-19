@@ -20,11 +20,13 @@ from tensorrt_llm._torch.modules.low_m_gemm import (
     LOW_M_GEMM_OPT_IN_ATTR,
     LowMGemmDispatcher,
     _parse_enabled,
+    fp8_grouped_lowm,
     lowm_fp8_supported,
+    mxfp8_lowm_index_query,
     mxfp8_lowm_linear,
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
 
 # ---------------------------------------------------------------------------
 # Skip helpers — apply to tests that need hardware, not to mocked unit tests.
@@ -607,6 +609,152 @@ def test_fp8_lowm_rms_norm_matches_norm_then_gemm(m):
     torch.testing.assert_close(actual, ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
     separate = mxfp8_lowm_linear((normalized * gamma.float()).to(torch.bfloat16), w, s).float()
     torch.testing.assert_close(actual, separate, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
+    # Output RoPE rotates each pair with the row scale on both partners.
+    positions = torch.randint(0, 64, (m,), device="cuda", dtype=torch.int32, generator=g)
+    rope = (positions, torch.randn(64, 2, 32, device="cuda", generator=g), 128)
+    roped = mxfp8_lowm_linear(x, w, s, rms_norm=(gamma, eps), rope=rope).float()
+    separate = mxfp8_lowm_linear(
+        (normalized * gamma.float()).to(torch.bfloat16), w, s, rope=rope
+    ).float()
+    torch.testing.assert_close(roped, separate, rtol=1e-2, atol=1e-2 * separate.abs().max().item())
+
+
+@_skip_no_lowm_fp8
+@torch.inference_mode()
+@pytest.mark.parametrize("m", [1, 5, 8])
+def test_fp8_lowm_bf16_dequant_and_swap_ab_bitwise(m, monkeypatch):
+    """The BF16 weight conversion and, at <= 8 rows, two tiles per CTA with swapped MMA operands give
+    the plain kernel's bits (MXFP8 with and without the RMS norm, and the grouped FP8 GEMM)."""
+    g = torch.Generator(device="cuda").manual_seed(m)
+
+    def run(options, fn):
+        monkeypatch.setattr(_mod, "lowm_mma_options", lambda: options)
+        return fn()
+
+    def bits(y):
+        return y.view(torch.int16)
+
+    plain, dequant, both = (False, False), (True, False), (True, True)
+    n, k, edge = 4096, 1280, 64
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+    s = torch.randint(110, 125, (n, k // 32), device="cuda", dtype=torch.uint8, generator=g)
+    # The first output columns take the NaN codes and full-range scale bytes; the rest stay finite.
+    w.view(torch.uint8)[: edge // 2, ::97] = 0x7F
+    w.view(torch.uint8)[: edge // 4, 1::97] = 0xFF
+    s[edge // 2 : edge] = torch.randint(
+        0, 256, (edge // 2, k // 32), device="cuda", dtype=torch.uint8, generator=g
+    )
+    x = torch.randn(m, k, device="cuda", generator=g).to(torch.bfloat16)
+    gamma = (torch.rand(k, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
+    tiles = 2 if m <= 8 else 1
+    for norm in (None, (gamma, 1e-6)):
+        ref = run(plain, lambda: mxfp8_lowm_linear(x, w, s, rms_norm=norm))
+        assert torch.isfinite(ref[:, edge:]).all()
+        assert torch.equal(
+            bits(run(dequant, lambda: mxfp8_lowm_linear(x, w, s, rms_norm=norm))), bits(ref)
+        )
+        swapped = run(both, lambda: mxfp8_lowm_linear(x, w, s, rms_norm=norm, n_tiles=tiles))
+        assert torch.equal(bits(swapped), bits(ref))
+    # Split outputs whose boundary falls inside a CTA's two tiles.
+    split = run(both, lambda: torch.cat(mxfp8_lowm_linear(x, w, s, split_n=1032, n_tiles=tiles), 1))
+    assert torch.equal(bits(split), bits(run(plain, lambda: mxfp8_lowm_linear(x, w, s))))
+
+    groups, rank, head_dim, heads = 2, 1024, 512, 8
+    depth = heads * head_dim
+    wa = (torch.randn(groups * rank, depth, device="cuda", generator=g) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    sa = torch.exp2(
+        torch.randint(-12, -4, (groups * rank // 128, depth // 128), device="cuda", generator=g)
+    ).float()
+    sa[0, :4] = torch.tensor([0.3, 1.0 + 2**-9, 3e-3, 2.0**-130], device="cuda")
+    xa = torch.randn(m, groups * depth, device="cuda", generator=g).to(torch.bfloat16)
+    positions = torch.randint(0, 4096, (m,), device="cuda", dtype=torch.int32, generator=g)
+    cos_sin = torch.randn(4096, 2, 32, device="cuda", generator=g)
+    rope = (positions, cos_sin, head_dim)
+    ref = run(plain, lambda: fp8_grouped_lowm(xa, wa, sa, rank, inverse_rope=rope))
+    swapped = run(
+        both, lambda: fp8_grouped_lowm(xa, wa, sa, rank, inverse_rope=rope, n_tiles=tiles)
+    )
+    assert torch.equal(bits(swapped), bits(ref))
+
+
+@_skip_no_lowm_fp8
+@torch.inference_mode()
+@pytest.mark.parametrize("m", [1, 12])
+def test_fp8_lowm_index_query_matches_packed_rope_projection(m):
+    """The packed index queries are ``pack_index_queries_split`` of the RoPE'd projection, bit for
+    bit, with zero, tiny, huge, NaN and infinite rows."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
+        pack_index_queries_split,
+    )
+
+    n, k = 4096, 1280
+    g = torch.Generator(device="cuda").manual_seed(m)
+    w, s = torch.ops.trtllm.mxfp8_quantize(
+        (torch.randn(n, k, device="cuda", generator=g) * 0.05).to(torch.bfloat16), True
+    )
+    x = torch.randn(m, k, device="cuda", generator=g).to(torch.bfloat16)
+    for row, scale in zip(range(1, m), (0.0, 1e-30, 1e30, float("nan"), float("inf"))):
+        x[row] *= scale
+    positions = torch.randint(0, 64, (m,), device="cuda", dtype=torch.int32, generator=g)
+    cos_sin = torch.randn(64, 2, 32, device="cuda", generator=g)
+    query = mxfp8_lowm_linear(x, w, s, rope=(positions, cos_sin, 128), scale_swizzled=True)
+    expected = pack_index_queries_split(query.view(m, n // 128, 128))
+    for got, want in zip(mxfp8_lowm_index_query(x, w, s, positions, cos_sin), expected):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_blackwell_datacenter(),
+    reason="the shared expert stores the SwiGLU on SM100/SM103",
+)
+@torch.inference_mode()
+@pytest.mark.parametrize("m", [6])
+def test_shared_expert_piece_stores_the_swiglu(m, monkeypatch):
+    """The full-TP shared-expert piece's gate_up GEMM stores the clamped SwiGLU: the bits of the
+    GEMM, the separate SwiGLU launch and the down GEMM, eagerly and in graph replays."""
+    from tensorrt_llm._torch.models.modeling_deepseekv4 import full_tp_shared_expert_forward
+    from tensorrt_llm._torch.modules import swiglu as swiglu_module
+
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
+    limit, k, inter = 10.0, 5120, 320
+    g = torch.Generator(device="cuda").manual_seed(m * 1000 + inter)
+
+    def weight(n, kk):
+        w = (torch.randn(n, kk, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+        s = torch.randint(115, 128, (n, kk // 32), device="cuda", dtype=torch.uint8, generator=g)
+        return w, s
+
+    (w13, s13), (w2, s2) = weight(2 * inter, k), weight(k, inter)
+    x = torch.empty(m, k, device="cuda", dtype=torch.bfloat16)
+
+    def new_input(scale):
+        x.copy_(torch.randn(m, k, device="cuda", generator=g) * scale)
+        x[0] *= 16  # past the clamp limit
+
+    def separate():
+        gate_up = mxfp8_lowm_linear(x, w13, s13)
+        return mxfp8_lowm_linear(swiglu_module.swiglu(gate_up, swiglu_limit=limit), w2, s2)
+
+    def no_swiglu(*args, **kwargs):
+        raise AssertionError("the shared expert launched the separate SwiGLU")
+
+    def folded():
+        with monkeypatch.context() as patch:
+            patch.setattr(swiglu_module, "swiglu", no_swiglu)
+            return full_tp_shared_expert_forward(x, (w13, s13, w2, s2), limit)
+
+    new_input(2)
+    assert torch.equal(folded(), separate())
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = folded()
+    for scale in (1, 4, 8):
+        new_input(scale)
+        graph.replay()
+        assert torch.equal(out, separate())
 
 
 # ---------------------------------------------------------------------------

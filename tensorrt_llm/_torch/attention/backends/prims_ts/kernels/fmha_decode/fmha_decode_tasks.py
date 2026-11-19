@@ -53,7 +53,12 @@ from cutlass.experimental.task_scheduling.task import Task
 
 from ...sage.modes import SageScoreScaling
 from ..stage import FmhaStage
-from ..task_compat import task_context_kwargs
+from ..task_compat import (
+    TS_TREE_WALKING_TASK,
+    TaskCacheStageInfoMixin,
+    runtime_domain_end,
+    task_context_kwargs,
+)
 from .direct_sparse_metadata import DirectSparseMetadataView
 from .direct_sparse_metadata import HeadIndexedMetadataView
 from .fmha_decode_config import FmhaDecodeConfig
@@ -682,8 +687,11 @@ def _load_prepared_sparse_row_warp(
     return row_route_begin, route_count
 
 
-class DecodeGenTask(Task):
+class DecodeGenTask(TaskCacheStageInfoMixin, Task):
     """Decode-gen task with task-cached values used by hot resource paths."""
+
+    # HEAD/TAIL loads index K/V tiles from the resolved loop bounds.
+    restore_loop_state_outside_loop = True
 
     def __init__(self, **kwargs: TaskKwarg) -> None:
         """Capture decode-specific task config and initialize cache slots."""
@@ -767,11 +775,16 @@ class DecodeGenTask(Task):
     def _refresh_packed_q_bounds(self, work_tile: Any) -> None:
         """Attach one active CLC tile's packed Q bounds to its data resources."""
         assert self.cfg is not None
-        assert isinstance(self.work_queue, PackedDecodeWorkQueue)
+        work_queue = (
+            self._find_work_tile_loop().work_queue
+            if TS_TREE_WALKING_TASK
+            else self.work_queue
+        )
+        assert isinstance(work_queue, PackedDecodeWorkQueue)
         _, _, b_idx = work_tile.tile_idx
         q_token_offset, seq_len_q = _q_seq_bounds(
             self.cfg,
-            self.work_queue.cu_seqlens_q,
+            work_queue.cu_seqlens_q,
             cutlass.Int32(b_idx),
         )
         if cutlass.const_expr(self.seq_len_q is not None):
@@ -780,6 +793,76 @@ class DecodeGenTask(Task):
             if cutlass.const_expr(updates_q_token_offset):
                 resource.q_token_offset = q_token_offset
             resource.seq_len_q = seq_len_q
+
+    @cute.jit
+    def _q_group_has_tokens(self, work_tile: Any) -> Any:
+        """Return whether a packed-Q tile's Q group starts inside its sequence."""
+        assert self.cfg is not None
+        work_queue = (
+            self._find_work_tile_loop().work_queue
+            if TS_TREE_WALKING_TASK
+            else self.work_queue
+        )
+        assert isinstance(work_queue, PackedDecodeWorkQueue)
+        q_group_cta_idx, _, b_idx = work_tile.tile_idx
+        _, seq_len_q = _q_seq_bounds(
+            self.cfg,
+            work_queue.cu_seqlens_q,
+            cutlass.Int32(b_idx),
+        )
+        q_group_idx = cutlass.Int32(q_group_cta_idx)
+        return _q_group_token_base(self.cfg, q_group_idx) < seq_len_q
+
+    # Tree-walking hooks, called by ``TaskCacheStageInfoMixin`` and the tree
+    # walker. The pre-tree-walking overrides below (``_run_packed_skip_iteration``,
+    # ``_run_task_body_impl`` and ``_run_task_body_persistent``) are never called
+    # by the tree walker; it skips tiles through the schedule's ``skip_if`` /
+    # ``skippable()`` nodes, so these hooks restore their per-tile side effects.
+    def _initial_body_work_tile(self) -> Any:
+        """Map a compact split-KV launch's block coordinate to its task tile."""
+        work_tile = super()._initial_body_work_tile()
+        if cutlass.const_expr(self.cfg is not None and self.cfg.runtime_split_kv):
+            work_tile = WorkTileInfo(
+                split_kv_grid_coord(self.cfg, work_tile.tile_idx),
+                work_tile.is_valid_tile,
+            )
+        return work_tile
+
+    @cute.jit
+    def _begin_work_tile(self, work_tile: Any) -> None:
+        """Point the packed-Q resources at this persistent tile's batch."""
+        if cutlass.const_expr(
+            self.cfg is not None
+            and self.cfg.use_variable_seqlens_q
+            and self.cfg.use_persistent_scheduler
+        ):
+            self._refresh_packed_q_bounds(work_tile)
+
+    @cute.jit
+    def _end_work_tile(self, skip: Any, work_tile: Any) -> None:
+        """Keep persistent tasks on one logical tile until sink tails drain.
+
+        Attention sinks extend correction's tail beyond the ordinary task
+        graph, so every active tile ends with a barrier over the 16 task warps.
+        KV256's shared-KV alias instead uses a narrow Load/Correction credit in
+        the captured schedule. Tasks without ``skip_if`` also visit inactive
+        packed-Q tiles, so they test the Q group themselves to match the
+        arrivals of the tasks that skip those tiles.
+        """
+        if cutlass.const_expr(
+            self.cfg is not None
+            and self.cfg.use_persistent_scheduler
+            and self.cfg.use_attention_sinks
+        ):
+            if cutlass.const_expr(skip is None):
+                if cutlass.const_expr(self.cfg.use_variable_seqlens_q):
+                    if self._q_group_has_tokens(work_tile):
+                        prims.barrier_cta_sync(12, thread_count=16 * 32)
+                else:
+                    prims.barrier_cta_sync(12, thread_count=16 * 32)
+            else:
+                if not skip:
+                    prims.barrier_cta_sync(12, thread_count=16 * 32)
 
     @cute.jit
     def _run_packed_skip_iteration(
@@ -842,15 +925,7 @@ class DecodeGenTask(Task):
             if cutlass.const_expr(
                 self.cfg.use_variable_seqlens_q and self.cfg.use_persistent_scheduler
             ):
-                assert isinstance(self.work_queue, PackedDecodeWorkQueue)
-                q_group_cta_idx, _, b_idx = work_tile.tile_idx
-                _, seq_len_q = _q_seq_bounds(
-                    self.cfg,
-                    self.work_queue.cu_seqlens_q,
-                    cutlass.Int32(b_idx),
-                )
-                q_group_idx = cutlass.Int32(q_group_cta_idx)
-                if _q_group_token_base(self.cfg, q_group_idx) < seq_len_q:
+                if self._q_group_has_tokens(work_tile):
                     prims.barrier_cta_sync(12, thread_count=16 * 32)
             else:
                 prims.barrier_cta_sync(12, thread_count=16 * 32)
@@ -932,11 +1007,17 @@ class DecodeGenTask(Task):
 
     def get_domain(self, tile_coord: cute.Coord) -> cutlass.Int32 | int:
         """Return this task's loop domain for one static or persistent tile."""
+        return self._resolve_domain(tile_coord, self.domain)
+
+    def _resolve_domain(
+        self, tile_coord: cute.Coord, static_domain: cutlass.Int32 | int
+    ) -> cutlass.Int32 | int:
+        """Resolve one tile's loop domain, falling back to the schedule's ``static_domain``."""
         if self.cfg is None:
-            return self.domain
+            return static_domain
         if cutlass.const_expr(not self.cfg.fixed_seqlen and self.seq_len_q is None):
             # Padding and scheduler tasks do not consume request dimensions.
-            return self.domain
+            return static_domain
 
         # Sparse rows have a runtime-dependent number of prepared KV routes
         # even when sequence lengths are static. Load their compact header
@@ -949,7 +1030,7 @@ class DecodeGenTask(Task):
             row_route_offsets = self.sparse_row_route_offsets
             row_route_counts = self.sparse_row_route_counts
             if row_route_offsets is None or row_route_counts is None:
-                return self.domain
+                return static_domain
             if self.num_heads_kv is None:
                 raise ValueError(
                     "num_heads_kv is required to resolve block-sparse rows"
@@ -1027,7 +1108,7 @@ class DecodeGenTask(Task):
             and self.cfg.fixed_seqlen
             and not self.cfg.uses_runtime_q_kv_union
         ):
-            return self.domain
+            return static_domain
         tile_size_kv = cutlass.Int32(self.cfg.tile_size_kv)
 
         # Q-independent full-K nonsplit decode has no leading window skip.
@@ -1354,7 +1435,7 @@ def create_load_task(
             loop_labels = ("load_v0", "load_k0", "load_v1", "load_k1")
         else:
             loop_labels = ("load_k0", "load_v0", "load_k1", "load_v1")
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             # Generic V-first profiles consume their retained route before the
             # matching K label replaces it. Each route goes to its Softmax
             # consumer right after its own K issue instead of waiting for the
@@ -1507,7 +1588,7 @@ def create_page_offsets_task(
                 membership_lifetime.commit()
             # Preserve the runtime domain contract even though this fast path
             # needs no per-iteration page-window work.
-            with domain_loop(0, domain, 1, unroll=1):
+            with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
                 pass
             return
         # Page offsets are staged by a separate producer so the load warp can
@@ -1525,7 +1606,7 @@ def create_page_offsets_task(
             loop_labels = ("load_v0", "load_k0", "load_v1", "load_k1")
         else:
             loop_labels = ("load_k0", "load_v0", "load_k1", "load_v1")
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             for label in loop_labels:
                 _produce_staged_page_offsets(
                     smem_page_offsets, label, FmhaStage.Loop, cfg
@@ -1602,7 +1683,7 @@ def create_page_offsets_task_split_kv(
         _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
 
         # LOOP: mirror LoadTask's cross-resource consumption order exactly.
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
             _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Loop)
             _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
@@ -1686,14 +1767,14 @@ def create_page_offsets_task_one_inst_qkv(
                 membership_lifetime.commit()
             # Keep the task domain identical to the ordinary cadence even
             # though the held stage needs no per-iteration producer work.
-            with domain_loop(0, domain, 1, unroll=1):
+            with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
                 pass
             return
 
         _page_offsets_produce(smem_page_offsets, "load_k0", FmhaStage.Head)
         if membership_lifetime is not None:
             membership_lifetime.commit()
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             for label in ("load_k0", "load_v0"):
                 _page_offsets_produce(smem_page_offsets, label, FmhaStage.Loop)
         _page_offsets_produce(smem_page_offsets, "load_v0", FmhaStage.Tail)
@@ -1906,7 +1987,7 @@ def create_load_task_split_kv(
             if smem_k is not None
         }
 
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             # V consumes the retained route before the next K overwrites it.
             # Each route goes to its Softmax consumer right after its own K
             # issue instead of waiting for the other instance's loads.
@@ -2196,7 +2277,7 @@ def create_load_task_one_inst_qkv(
             _page_offsets_consume(smem_page_offsets)
         load_tile(smem_k, "load_k0", FmhaStage.Head)
 
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             load_tile(smem_k, "load_k0", FmhaStage.Loop)
             load_tile(smem_v, "load_v0", FmhaStage.Loop)
 
@@ -2405,7 +2486,7 @@ def create_mma_task_split_kv(
         # in registers: the next QK goes first and overlaps the exponentials
         # of this tile (``stages_q128_p_in_smem``).
         qk_before_pv = cfg.stages_q128_p_in_smem
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             for inst_idx, smem_k, smem_v, tmem_s, tmem_stats_done, smem_p in (
                 (KV_INST0, smem_k0, smem_v0, tmem_s0, tmem_stats_done0, smem_p0),
                 (KV_INST1, smem_k1, smem_v1, tmem_s1, tmem_stats_done1, smem_p1),
@@ -2724,7 +2805,7 @@ def create_mma_task_one_inst_qkv(
 
         qk_mma(q_desc, "qk_mma_head", FmhaStage.Head)
 
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             qk_mma(q_desc, "qk_mma_loop", FmhaStage.Loop)
             pv_mma("vp_mma_loop", FmhaStage.Loop)
 
@@ -2862,7 +2943,7 @@ def create_transform_kv_task(
         # Keep the transformed-K/V steady state as one compact runtime loop.
         # Static decode domains can be large, and the compiler default may
         # otherwise fully unroll this transform body once per K/V tile.
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             for label in loop_labels:
                 transform_one(label)
 
@@ -3004,7 +3085,7 @@ def create_mma_task(
         # overwrites its S columns. Full-SMEM P remains score-dependent during
         # Softmax replay, but owns independent storage once the replay commits
         # and releases S; that completed handoff enables the QK-before-PV cadence.
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             if cfg.uses_two_inst_tmem_p:
                 _consume_staged_pv_mma(
                     smem_kv,
@@ -3233,7 +3314,7 @@ def _softmax_schedule_body(
         (True, True): smem_p.compute_sage_proxy_route_p_fragments,
     }[(cfg.use_block_sparse_proxy_routes, use_sage)]
 
-    with domain_loop(0, domain, 1, unroll=1) as d:
+    with domain_loop(0, runtime_domain_end(domain), 1, unroll=1) as d:
         if use_sparse:
             # Consume the independent metadata stream first so its SMEM
             # loads and release can overlap the subsequent score wait.
@@ -3738,7 +3819,7 @@ def create_correction_task(
 
         # LOOP: each iteration corrects O0 and O1 before later BMM2 waves
         # accumulate into the same TMEM columns.
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             local0_state, tail_0, tail_1 = correct_o(
                 tmem_softmax_local0,
                 tmem_stats_done0,
@@ -4033,7 +4114,7 @@ def create_correction_task_one_inst_qkv(
         )
         # LOOP: each payload/O pair corresponds to a completed BMM2 wave whose
         # accumulator must be max-corrected before more V work accumulates.
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             local_state, tail_0, tail_1 = correct_o(local_state, tail_0, tail_1)
         # TAIL: the final payload carries sum/new max and the final O stage is
         # normalized/stored instead of being staged for another accumulation.

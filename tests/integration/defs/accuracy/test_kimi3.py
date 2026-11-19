@@ -264,7 +264,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=8),
             moe_config=MoeConfig(
-                backend="TRTLLM",
+                tactic="trtllm_gen",
                 max_num_tokens=131072,
                 use_low_precision_moe_combine=True,
             ),
@@ -483,11 +483,10 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=True,
             enable_chunked_prefill=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=8),
-            # Not the TRTLLM backend TestKimiK3 uses: trtllm-gen ships
-            # SiTu cubins only for W4A8_MXFP4_MXFP8, so K3's NVFP4 routed
-            # experts leave MEGAMOE_CUTEDSL and CUTLASS as the choices.
+            # K3's NVFP4 routed experts on the fused-comm MegaMoE CuteDSL
+            # kernels; TestKimiK3 covers them on TRTLLM-Gen.
             moe_config=MoeConfig(
-                backend="MEGAMOE_CUTEDSL", max_num_tokens=33024, use_low_precision_moe_combine=True
+                tactic="cutedsl.mega_moe", max_num_tokens=33024, use_low_precision_moe_combine=True
             ),
             kv_cache_config=kv_cache_config,
             max_stats_len=-1,
