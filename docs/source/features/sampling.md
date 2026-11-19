@@ -186,8 +186,8 @@ modes.
     with `enable_penalty: true` in the speculative decoding config, because they need
     an occurrence workspace that is allocated up front. While the flag is off, a
     request that sets any of the three is rejected at admission rather than decoded
-    without them. Tree speculation (a dynamic tree) is not
-    supported and such requests are rejected even when the flag is on. Only the
+    without them. Tree speculation (a dynamic tree), relaxed acceptance for thinking and
+    SA are not supported and such requests are rejected even when the flag is on. Only the
     target distribution is penalized; the draft model proposes from its unpenalized
     distribution, which leaves the sampled result unchanged but can lower the
     acceptance rate as the penalty grows.
@@ -202,7 +202,7 @@ modes.
     the occurrence penalties; while it is off, a request that sets either is rejected at
     admission. A request may bias at most 1024 tokens and carry at most 256 bad words of
     at most 16 tokens each; a request beyond these limits is rejected at admission.
-    Tree speculation (a dynamic tree), relaxed acceptance for thinking, vanilla MTP and
+    Tree speculation (a dynamic tree), relaxed acceptance for thinking and
     SA are not supported, and such requests are rejected even when the flag is on. Both
     exact-match verification and rejection sampling verify against the edited target
     distribution, so the sampled result is the one of non-speculative decoding. The

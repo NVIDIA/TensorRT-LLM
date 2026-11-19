@@ -25,9 +25,11 @@ from typing import Optional
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.sampler import penalties as penalty_ops
 from tensorrt_llm._torch.speculative import logit_edits
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 from tensorrt_llm._torch.speculative.logit_edits import LogitEditState
+from tensorrt_llm._torch.speculative.mtp import MTPWorker
 
 pytestmark = pytest.mark.cpu_only
 
@@ -295,12 +297,18 @@ def _spec_metadata(state: LogitEditState, slots: list[int]) -> types.SimpleNames
     )
 
 
-def test_worker_edits_a_copy_in_bias_then_ban_order():
+def test_worker_edits_a_copy_in_bias_penalty_ban_order(monkeypatch):
     state = _state()
-    # A bias on a banned token must not bring it back.
-    state.observe([_Request(1, [3], bias=_bias({7: 50.0, 2: 1.0}), bad_words=[[7]])])
+    # An infinite bias on a banned token must not bring it back: the ban comes last.
+    state.observe([_Request(1, [3], bias=_bias({7: float("inf"), 2: 1.0}), bad_words=[[7]])])
     metadata = _spec_metadata(state, [1])
     logits = torch.zeros((1, VOCAB), dtype=torch.bfloat16)
+    seen = []
+
+    def _record(logits, spec_metadata, row_slots, intra_tokens, intra_valid):
+        seen.append(logits.clone())
+
+    monkeypatch.setattr(penalty_ops, "apply_penalties", _record)
 
     edited = _make_worker()._edit_target_logits(
         logits,
@@ -312,6 +320,10 @@ def test_worker_edits_a_copy_in_bias_then_ban_order():
 
     assert torch.equal(logits, torch.zeros_like(logits))
     assert edited.dtype == torch.float32
+    # The penalties read the logits with the bias on them and the bans not yet applied.
+    assert len(seen) == 1
+    assert seen[0][0, 2].item() == 1.0
+    assert not torch.isneginf(seen[0][0, 7])
     assert _banned(edited) == [[7]]
     assert edited[0, 2].item() == 1.0
 
@@ -367,6 +379,50 @@ def test_no_draft_step_applies_the_edits_and_advances_the_tail():
     logits[0, 6] = 3.0
     outputs = step(logits, num_contexts=0)
     assert outputs["new_tokens"].tolist() == [[6]]
+
+
+def test_vanilla_mtp_exact_match_verifies_against_the_edited_logits():
+    """Vanilla MTP's exact-match branch goes through the logits-edit pass: a draft token
+    the request's bad words ban is not accepted, and the tail follows what was accepted."""
+    state = _state()
+    # After [.. 3 4] the model's favorite 9 is banned; after [.. 4 6] token 2 is.
+    state.observe([_Request(1, [8, 3], bad_words=[[3, 4, 9], [4, 6, 2]])])
+    metadata = _spec_metadata(state, [1])
+    metadata.runtime_draft_len = 2
+    metadata.draft_tokens = torch.tensor([4, 9], dtype=torch.int32)
+    metadata.use_rejection_sampling = False
+    metadata.is_all_greedy_sample = True
+    metadata.mtp_hidden_states_manager = types.SimpleNamespace(sa_manager=None)
+
+    worker = MTPWorker.__new__(MTPWorker)
+    torch.nn.Module.__init__(worker)
+    worker.spec_config = types.SimpleNamespace(use_relaxed_acceptance_for_thinking=False)
+    worker.is_thop = False
+    worker.sa_enhancer = None
+
+    def _exact_match(logits, draft_tokens, num_contexts, batch_size, spec_metadata):
+        targets = logits.argmax(dim=-1).reshape(batch_size, -1)
+        matches = (targets[:, :-1] == draft_tokens).to(torch.int32)
+        return targets, 1 + torch.cumprod(matches, dim=1).sum(dim=1)
+
+    worker._sample_and_accept_draft_tokens_base = _exact_match
+
+    # The rows after token 3, after the draft 4 and after the draft 9.
+    logits = torch.zeros((3, VOCAB))
+    logits[0, 4] = 5.0
+    logits[1, 9] = 5.0
+    logits[1, 6] = 3.0
+    logits[2, 5] = 5.0
+    accepted_tokens, num_accepted_tokens = worker.sample_and_accept_draft_tokens(
+        None, logits, metadata, types.SimpleNamespace(num_seqs=1, num_contexts=0)
+    )
+
+    assert num_accepted_tokens.tolist() == [2]
+    assert accepted_tokens[0, :2].tolist() == [4, 6]
+
+    following = torch.zeros((1, VOCAB))
+    logit_edits.apply_bad_words(following, state, torch.tensor([1]), *_no_drafts(1))
+    assert _banned(following) == [[2]]
 
 
 def _reference_decode(
