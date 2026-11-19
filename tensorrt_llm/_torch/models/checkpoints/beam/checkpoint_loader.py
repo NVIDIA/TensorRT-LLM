@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
 
-#: ``checkpoint_format`` name of the Beam NVFP4 checkpoint loader.
+#: `checkpoint_format` name of the Beam NVFP4 checkpoint loader.
 BEAM_NVFP4_CHECKPOINT_FORMAT = "beam_nvfp4"
 
 register_checkpoint_weight_loader(BEAM_NVFP4_CHECKPOINT_FORMAT)(HfWeightLoader)
@@ -34,7 +34,7 @@ register_config_loader(BEAM_NVFP4_CHECKPOINT_FORMAT)(HfConfigLoader)
 class BeamNvfp4CheckpointLoader(HfCheckpointLoader):
     """Delegate validation and rank-local preloading to the selected model.
 
-    The model must provide ``load_checkpoint(checkpoint_dir)`` and owns checkpoint
+    The model must provide `load_checkpoint(checkpoint_dir)` and owns checkpoint
     compatibility checks and storage. No model implementation is imported here.
     """
 
