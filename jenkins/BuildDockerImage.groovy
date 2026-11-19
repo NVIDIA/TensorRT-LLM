@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/yuel/blossom-job-name-abbreviations']) _
 
 import java.lang.Exception
 import groovy.transform.Field
