@@ -2,31 +2,31 @@
 # SPDX-License-Identifier: Apache-2.0
 """Weights of the Beam NVFP4 full-model target: a direct preload through the native loader.
 
-``BeamNvfp4CheckpointLoader`` reaches the native ``ModelLoader`` in one of two ways: the
-``checkpoint_format`` name ``beam_nvfp4`` (registered in ``_torch/models/checkpoints/beam``),
+`BeamNvfp4CheckpointLoader` reaches the native `ModelLoader` in one of two ways: the
+`checkpoint_format` name `beam_nvfp4` (registered in `_torch/models/checkpoints/beam`),
 from which every rank builds one with the HF weight and configuration loaders
-(``from_environment``), or an instance
-passed as the LLM API's per-instance ``checkpoint_loader``. The native loader constructs the
-target, materializes it on the rank's device and then calls ``load_weights(checkpoint_dir,
-mapping, model=...)``; this loader hands the directory to the target's ``load_checkpoint``,
+(`from_environment`), or an instance
+passed as the LLM API's per-instance `checkpoint_loader`. The native loader constructs the
+target, materializes it on the rank's device and then calls `load_weights(checkpoint_dir,
+mapping, model=...)`; this loader hands the directory to the target's `load_checkpoint`,
 which streams bounded tiles straight into the target's own rank-local storage (packed E2M1
 codes, E4M3 block scales, FP32 scalars, BF16/FP32 dense tensors) as one all-rank transaction,
 and returns no weight dictionary. The native lifecycle continues as for any preloaded checkpoint
-(``is_weights_preloaded``). Configuration loading is the HF loader's; everything else, including
-the HF weight-name mapping (``checkpoint_format`` stays ``"HF"`` on the instance), is the HF
+(`is_weights_preloaded`). Configuration loading is the HF loader's; everything else, including
+the HF weight-name mapping (`checkpoint_format` stays `"HF"` on the instance), is the HF
 checkpoint loader's own behavior.
 
 The checkpoint holds no FP8 KV-cache scales. An explicitly constructed loader takes the table
-as its ``kv_cache_scales`` argument (``read_kv_cache_scales``) and never reads the environment;
-the loader the format name selects reads the JSON file named by ``TRTLLM_MODELING_V2_KV_CACHE_SCALES``
+as its `kv_cache_scales` argument (`read_kv_cache_scales`) and never reads the environment;
+the loader the format name selects reads the JSON file named by `TRTLLM_MODELING_V2_KV_CACHE_SCALES`
 once, when it is built (an experimental, process-scoped setting that the MPI session forwards to
 every rank). Before the target load every rank checks that all ranks hold the same table and
 that it matches the KV cache the engine selected: required with an FP8 cache, refused with a
 BF16 one.
 
 With a DFlash drafter the native loader then reads the drafter checkpoint
-(``speculative_model``) through the same loader, without a model: that second load is the HF
-loader's ordinary weight dictionary, which the target's ``load_draft_weights`` hands to the
+(`speculative_model`) through the same loader, without a model: that second load is the HF
+loader's ordinary weight dictionary, which the target's `load_draft_weights` hands to the
 drafter's own loader. It is accepted only after the target transaction completed and only for
 a directory other than the target's, so neither load can run the other's path; the target
 stays preloaded.
@@ -60,8 +60,8 @@ register_checkpoint_weight_loader(BEAM_NVFP4_CHECKPOINT_FORMAT)(HfWeightLoader)
 register_config_loader(BEAM_NVFP4_CHECKPOINT_FORMAT)(HfConfigLoader)
 
 #: The environment setting naming the FP8 KV-cache scale table (a JSON file) of the loader that
-#: ``checkpoint_format: beam_nvfp4`` selects. Experimental and process-scoped: one engine
-#: configuration per server process, forwarded to every rank like every ``TRTLLM*`` variable.
+#: `checkpoint_format: beam_nvfp4` selects. Experimental and process-scoped: one engine
+#: configuration per server process, forwarded to every rank like every `TRTLLM*` variable.
 KV_CACHE_SCALES_ENV = "TRTLLM_MODELING_V2_KV_CACHE_SCALES"
 
 
@@ -94,13 +94,13 @@ def _scale_section(table: dict, section: str, path: str) -> Optional[tuple]:
 
 
 def read_kv_cache_scales(path: str) -> dict:
-    """The FP8 KV-cache scale table in the JSON file ``path``, validated.
+    """The FP8 KV-cache scale table in the JSON file `path`, validated.
 
-    The file maps ``"target"`` and optionally ``"draft"`` to ``{"layers": n, "scales": {"0": s0,
-    ..., "n-1": s}}``: one finite positive scale per logical layer whose FP32 value and
-    reciprocal are finite and normal, shared by K and V (a value ``x`` is stored as
-    ``e4m3(x / s)``, read as ``code * s``). Returns ``{"target":
-    (...), "draft": (...) or None, "source": path, "sha256": <file digest>}``.
+    The file maps `"target"` and optionally `"draft"` to `{"layers": n, "scales": {"0": s0,
+    ..., "n-1": s}}`: one finite positive scale per logical layer whose FP32 value and
+    reciprocal are finite and normal, shared by K and V (a value `x` is stored as
+    `e4m3(x / s)`, read as `code * s`). Returns `{"target":
+    (...), "draft": (...) or None, "source": path, "sha256": <file digest>}`.
     """
     with open(path, "rb") as f:
         data = f.read()
@@ -119,7 +119,7 @@ def read_kv_cache_scales(path: str) -> dict:
 
 
 def kv_cache_scales_from_environment() -> Optional[dict]:
-    """The validated table named by ``TRTLLM_MODELING_V2_KV_CACHE_SCALES``; None when unset.
+    """The validated table named by `TRTLLM_MODELING_V2_KV_CACHE_SCALES`; None when unset.
 
     An unreadable or malformed file raises ValueError naming the setting.
     """
@@ -146,10 +146,10 @@ def _table_identity(table: Optional[dict]) -> Optional[tuple]:
 class BeamNvfp4CheckpointLoader(HfCheckpointLoader):
     """Preload the Beam NVFP4 full-model target; read a drafter's weights after it.
 
-    ``kv_cache_scales`` (``read_kv_cache_scales``) is the FP8 KV cache's scale table, handed to
-    the target's ``load_checkpoint`` on every rank; None for a BF16 KV cache. The loader
-    ``checkpoint_format`` selects is ``from_environment``. ``weight_loader``, ``weight_mapper``
-    and ``config_loader`` are the native factory's HF loaders (defaults when omitted).
+    `kv_cache_scales` (`read_kv_cache_scales`) is the FP8 KV cache's scale table, handed to
+    the target's `load_checkpoint` on every rank; None for a BF16 KV cache. The loader
+    `checkpoint_format` selects is `from_environment`. `weight_loader`, `weight_mapper`
+    and `config_loader` are the native factory's HF loaders (defaults when omitted).
     """
 
     def __init__(
@@ -175,7 +175,7 @@ class BeamNvfp4CheckpointLoader(HfCheckpointLoader):
         weight_mapper: Optional[BaseWeightMapper] = None,
         config_loader: Optional[BaseConfigLoader] = None,
     ) -> "BeamNvfp4CheckpointLoader":
-        """The loader of ``checkpoint_format: beam_nvfp4``: its table is read here, once."""
+        """The loader of `checkpoint_format: beam_nvfp4`: its table is read here, once."""
         return cls(
             kv_cache_scales_from_environment(),
             weight_loader=weight_loader,
