@@ -19,6 +19,7 @@ executor path. Covers client-id namespacing, worker-side response-lane routing, 
 attached-frontend proxy lifecycle over real ipc:// sockets.
 """
 
+import asyncio
 import os
 import pickle
 import queue
@@ -363,11 +364,14 @@ class TestClassicFrontendProxyEndToEnd:
             )
             worker_ingress.close()
 
-    def test_frontend_fatal_error_still_cancels_its_requests_on_the_engine(self):
+    @pytest.mark.parametrize("drained_by", ["health", "request"])
+    def test_frontend_fatal_error_still_cancels_its_requests_on_the_engine(self, drained_by):
         # Regression: an attached frontend's own fatal error failed its command
         # sender, so pre_shutdown sent no cancellations and its in-flight
-        # requests kept generating on the shared, still healthy engine.
+        # requests kept generating on the shared, still healthy engine. When a
+        # request drained the error before /health, pre_shutdown never ran.
         from tensorrt_llm.executor.request import CancellingRequest, GenerationRequest
+        from tensorrt_llm.executor.utils import EngineDeadError
         from tensorrt_llm.sampling_params import SamplingParams
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -376,11 +380,15 @@ class TestClassicFrontendProxyEndToEnd:
             assert worker_ingress.poll(5)
             assert isinstance(pickle.loads(worker_ingress.get()[0]), GenerationRequest)
 
-            # A frontend-local failure drained by /health, on the event loop.
+            # A frontend-local failure drained on the event loop.
             proxy._error_queue.put(RuntimeError("dispatch thread failed"))
             started = time.monotonic()
-            assert not proxy.check_health()
-            assert time.monotonic() - started < 1.0, "/health waited for shutdown writes"
+            if drained_by == "health":
+                assert not proxy.check_health()
+            else:
+                with pytest.raises(EngineDeadError):
+                    proxy._handle_background_error()
+            assert time.monotonic() - started < 1.0, "the drain waited for shutdown writes"
 
             assert worker_ingress.poll(5), "in-flight request was never cancelled"
             cancel = pickle.loads(worker_ingress.get()[0])
@@ -409,6 +417,68 @@ class TestClassicFrontendProxyEndToEnd:
             # Cancels to a gone peer stop at the disconnect, not after 7 s.
             assert time.monotonic() - started < 4.0
             self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
+
+    def test_command_loss_reaches_a_response_waiter_as_service_unavailable(self):
+        # Regression: when a response was already queued ahead of the
+        # EngineDeadError, the waiter drained the raw ConnectionError from the
+        # error queue, and the HTTP layer answered 400 with an internal message.
+        from http import HTTPStatus
+
+        import tensorrt_llm.bindings.executor as tllm
+        from tensorrt_llm.executor.request import GenerationRequest
+        from tensorrt_llm.executor.utils import EngineDeadError
+        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        token = SimpleNamespace(
+            is_final=False,
+            decoding_iter=1,
+            avg_decoded_tokens_per_iter=None,
+            context_phase_params=None,
+            finish_reasons=[tllm.FinishReason.NOT_FINISHED],
+            output_token_ids=[[5]],
+            sequence_index=0,
+            cum_log_probs=None,
+            log_probs=None,
+            generation_logits=None,
+            time_breakdown_metrics=None,
+            context_logits=None,
+            request_perf_metrics=None,
+            additional_context_outputs=None,
+            additional_generation_outputs=None,
+            per_pos_drafted=None,
+            per_pos_accepted=None,
+            spec_dec_totals=None,
+        )
+
+        async def scenario(proxy, worker_ingress):
+            result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams(max_tokens=4)))
+            assert worker_ingress.poll(5)
+            worker_ingress.get()
+            # A partial response already dispatched for this request.
+            result.queue.put(
+                SimpleNamespace(client_id=result.request_id, result=token, has_error=lambda: False)
+            )
+            worker_ingress.close()
+            deadline = time.monotonic() + 5
+            while not proxy._engine_dead and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert proxy._engine_dead, "command-connection loss was not detected"
+            started = time.monotonic()
+            with pytest.raises(EngineDeadError) as error:
+                await result.aresult()
+            assert time.monotonic() - started < 1.0, "the waiter ran a blocking shutdown"
+            return error.value
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
+            try:
+                error = asyncio.run(scenario(proxy, worker_ingress))
+                response = OpenAIServer._create_exception_response(error)
+                assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+            finally:
+                proxy.shutdown()
+                self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
 
     def test_dispatch_routes_own_lane_responses(self):
         import zmq

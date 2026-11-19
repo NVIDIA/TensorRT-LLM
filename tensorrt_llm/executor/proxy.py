@@ -399,6 +399,33 @@ class GenerationExecutorProxy(GenerationExecutor):
         super()._set_fatal_error(error)
         self._mark_engine_dead(error)
 
+    def _on_fatal_background_error(self, error: BaseException) -> BaseException:
+        """Mark the engine dead and return EngineDeadError for the request.
+
+        Once workers are ready, a worker or command-connection error reaches
+        the request that drains it as EngineDeadError (HTTP 503), like every
+        other pending request, with the original error as its cause. The
+        caller can be an event loop, so teardown starts without blocking:
+        see ``_start_fatal_teardown``. During startup the base behavior is
+        kept, so startup errors and the abort-before-mark order of
+        initialization failure are unchanged.
+        """
+        if not getattr(self, "_workers_ready", False):
+            return super()._on_fatal_background_error(error)
+        self._set_fatal_error(error)
+        self._start_fatal_teardown()
+        if isinstance(error, EngineDeadError):
+            return error
+        dead = EngineDeadError(error)
+        dead.__cause__ = error
+        return dead
+
+    def _start_fatal_teardown(self) -> None:
+        # The error monitor runs pre_shutdown once it sees the fatal error.
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        if shutdown_event is not None:
+            shutdown_event.set()
+
     @property
     def engine_dead(self) -> bool:
         # Worker loss marks the engine dead before, or without, a fatal error
@@ -517,11 +544,11 @@ class GenerationExecutorProxy(GenerationExecutor):
                         include_remote=True):
                     logger.error("Error monitor: MPI worker failure detected, "
                                  "shutting down")
-                    return
+                    break
 
                 self._drain_error_queue()
                 if self._fatal_error is not None:
-                    return
+                    break
             except Exception as exc:
                 logger.debug(f"Error monitor: unexpected exception (ignored): "
                              f"{exc!r}")
@@ -530,6 +557,14 @@ class GenerationExecutorProxy(GenerationExecutor):
             # event-driven (see _handle_worker_death), so a coarse interval is
             # fine. Wakes immediately if _shutdown_event is set.
             self._shutdown_event.wait(timeout=5.0)
+
+        # A request thread can record the fatal error before this thread
+        # sees it (see _on_fatal_background_error). Teardown is still owed.
+        if self._fatal_error is not None and not self.doing_shutdown:
+            try:
+                self.pre_shutdown()
+            except Exception as exc:  # noqa: BLE001 - report, do not raise in a daemon thread
+                logger.error(f"Error monitor: pre_shutdown failed: {exc!r}")
 
     def _setup_queues(self) -> WorkerCommIpcAddrs:
         frontend_result_addrs = None
@@ -1697,6 +1732,8 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
         # stays empty and worker death reaches this frontend through its
         # result lane / error queue instead.
         self._engine_dead = False
+        # Attached only after the launcher's workers are ready.
+        self._workers_ready = True
         self.model_world_size = attach_info.get("model_world_size", 1)
         self._worker_process_monitor = WorkerProcessMonitor()
 
@@ -1767,6 +1804,11 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
                          or self._request_sender.available))
 
         return self._request_sender is None or self._request_sender.available
+
+    def _start_fatal_teardown(self) -> None:
+        # An attached frontend has no error monitor, and its pre_shutdown
+        # does not block, so cancel this frontend's requests now.
+        self.pre_shutdown()
 
     def pre_shutdown(self):
         if self.doing_shutdown:

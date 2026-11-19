@@ -293,8 +293,7 @@ class GenerationExecutor(ABC):
                     print_colored(
                         f"Got background error: {repr(error)}, will shutdown the LLM instance\n",
                         "red")
-                self._set_fatal_error(error)
-                self.shutdown()
+                error = self._on_fatal_background_error(error)
             raise error
 
         # Called once per streamed response: skip the get_nowait() raise/catch
@@ -316,11 +315,16 @@ class GenerationExecutor(ABC):
             elif not isinstance(e, BaseException):
                 e = RuntimeError(repr(e))
             if not isinstance(e, RequestError):
-                self._set_fatal_error(e)
-                self.shutdown()
+                e = self._on_fatal_background_error(e)
             raise e
         except Empty:
             pass
+
+    def _on_fatal_background_error(self, error: BaseException) -> BaseException:
+        """Record a system-level background error and return the error to raise."""
+        self._set_fatal_error(error)
+        self.shutdown()
+        return error
 
     def _set_fatal_error(self, error: BaseException) -> None:
         """Record an unrecoverable engine error.

@@ -41,6 +41,7 @@ from tensorrt_llm.executor.ipc import IpcQueue
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.request import CancellingRequest
 from tensorrt_llm.executor.result import GenerationResult
+from tensorrt_llm.executor.utils import EngineUnavailableError
 from tensorrt_llm.executor.worker_process_monitor import WorkerProcessIdentity
 
 
@@ -591,6 +592,89 @@ def test_submit_rechecks_engine_death_after_registration(monkeypatch, failure):
 
     # The raced result must not be left dangling in _results.
     assert 42 not in proxy._results
+
+
+def _serving_proxy():
+    proxy = _bare_proxy()
+    proxy._workers_ready = True
+    proxy._fatal_error = None
+    proxy._request_sender = None
+    proxy._error_queue = _queue.Queue()
+    proxy._shutdown_event = threading.Event()
+
+    def unexpected_shutdown():
+        raise AssertionError("the request path must not run a blocking shutdown")
+
+    proxy.shutdown = unexpected_shutdown
+    return proxy
+
+
+@pytest.mark.parametrize("queued", [True, False])
+def test_background_engine_error_reaches_a_request_as_engine_dead(queued):
+    # Regression: the first request to drain a worker or command-connection
+    # error got the raw exception, which HTTP reported as 400, while every
+    # other request got EngineDeadError (503). It also ran a blocking shutdown().
+    proxy = _serving_proxy()
+    pending = _FakeResult()
+    proxy._results = {1: pending}
+    lost = ConnectionError("Executor command connection was lost")
+    if queued:
+        proxy._error_queue.put(lost)
+        with pytest.raises(EngineDeadError) as error:
+            proxy._handle_background_error()
+    else:
+        with pytest.raises(EngineDeadError) as error:
+            proxy._handle_background_error(lost)
+    assert error.value.__cause__ is lost
+    assert proxy._fatal_error is lost and proxy._engine_dead
+    assert proxy._shutdown_event.is_set()
+    assert isinstance(pending.queue.get_nowait(), EngineDeadError)
+
+
+def test_error_monitor_tears_down_when_a_request_records_the_error_first():
+    # Regression: a request that recorded the fatal error first woke the
+    # error monitor, which then exited without pre_shutdown, so no stop
+    # sentinel was sent and pending requests were not aborted.
+    proxy = _serving_proxy()
+    proxy._check_remote_worker_death = lambda: False
+    proxy._check_mpi_workers = lambda include_remote=False: False
+    torn_down = threading.Event()
+
+    def pre_shutdown():
+        proxy.doing_shutdown = True
+        torn_down.set()
+
+    proxy.pre_shutdown = pre_shutdown
+    monitor = threading.Thread(target=proxy._error_monitor_loop, daemon=True)
+    monitor.start()
+    with pytest.raises(EngineDeadError):
+        proxy._handle_background_error(ConnectionError("Executor command connection was lost"))
+    assert torn_down.wait(2), "the error monitor exited without pre_shutdown"
+    monitor.join(2)
+    assert not monitor.is_alive()
+
+
+@pytest.mark.parametrize("error", [EngineUnavailableError("queue full"), "bad request"])
+def test_per_request_background_errors_stay_non_fatal(error):
+    from tensorrt_llm.executor.utils import RequestError
+
+    proxy = _serving_proxy()
+    with pytest.raises(RequestError):
+        proxy._handle_background_error(error)
+    assert proxy._fatal_error is None and not proxy._engine_dead
+
+
+def test_startup_background_errors_keep_their_original_type():
+    # Startup failures are classified by type; they must not become
+    # EngineDeadError before the workers are ready.
+    proxy = _serving_proxy()
+    proxy._workers_ready = False
+    shutdowns = []
+    proxy.shutdown = lambda: shutdowns.append(True)
+    failure = RuntimeInitError("rank 1 failed to load")
+    with pytest.raises(RuntimeInitError):
+        proxy._handle_background_error(failure)
+    assert shutdowns == [True]
 
 
 def _llm_with_executor(executor):
