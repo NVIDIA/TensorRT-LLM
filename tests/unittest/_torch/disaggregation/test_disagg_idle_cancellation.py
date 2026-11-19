@@ -173,6 +173,7 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._profile_send_outcomes = {}
     transceiver._profile_send_observers = set()
+    transceiver._profile_send_failures = set()
     transceiver._fp4_mla_bridge_enabled = True
     transceiver._ever_had_recv_session = False
     transceiver._gen_need_sync = False

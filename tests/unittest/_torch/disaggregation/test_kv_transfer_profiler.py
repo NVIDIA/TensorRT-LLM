@@ -37,7 +37,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     KvCacheTransceiver,
 )
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
-from tensorrt_llm._torch.disaggregation.native.transfer import TxSession
+from tensorrt_llm._torch.disaggregation.native.transfer import KVSendTask, TaskStatus, TxSession
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
@@ -73,6 +73,7 @@ def _v2_owner() -> KvCacheTransceiverV2:
     owner = object.__new__(KvCacheTransceiverV2)
     owner._profile_send_outcomes = {}
     owner._profile_send_observers = set()
+    owner._profile_send_failures = set()
     return owner
 
 
@@ -534,6 +535,190 @@ def test_v2_legacy_send_cancellation_preserves_retirement_outcome(
     assert owner._send_reqs == {}
     sender.clear_session.assert_called_once_with(17)
     sender.send_cancel_to_receivers.assert_called_once_with(17)
+
+
+@pytest.mark.parametrize("failed", [False, True], ids=["cancelled", "task-failed"])
+@pytest.mark.parametrize("retirement_path", ["cancel", "poll"])
+def test_v2_legacy_task_failure_survives_deferred_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list,
+    failed: bool,
+    retirement_path: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    """A failed task's ERROR status must survive cancellation until safe retirement."""
+    owner = _v2_owner()
+    owner._wait_reqs = {}
+    owner._send_sessions = {}
+    owner._send_reqs = {}
+    owner._recv_sessions = {}
+    owner._recv_reqs = {}
+    owner._ever_had_send_session = False
+    owner._ctx_need_tp_sync = False
+    owner._ctx_need_pp_sync = False
+    monkeypatch.setattr(
+        owner,
+        "respond_and_send_async",
+        lambda req: setattr(req, "state", LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS),
+    )
+    wrapper = _wrap(owner, monkeypatch)
+    req = _request()
+    wrapper.respond_and_send_async(req)
+    params = DisaggregatedParams(
+        disagg_request_id=17, schedule_style=DisaggScheduleStyle.CONTEXT_FIRST
+    )
+    sender = SimpleNamespace(
+        _enforce_physical_ownership=False,
+        _context_first_ownership=False,
+        _get_req_info=Mock(return_value=None),
+        setup_session=Mock(),
+        clear_session=Mock(),
+        send_cancel_to_receivers=Mock(),
+    )
+    session = TxSession(req.request_id, params, sender)
+    request.addfinalizer(session.close)
+    first = KVSendTask(None, params, slice_id=0)
+    pending = KVSendTask(None, params, slice_id=1)
+    first.bind_logical_outcomes(session._logical_outcomes)
+    pending.bind_logical_outcomes(session._logical_outcomes)
+    session.kv_tasks = [first, pending]
+    pending.status = TaskStatus.TRANSFERRING
+    error = RuntimeError("native send task failed")
+    if failed:
+        first.fail(error)
+        assert session.status is SessionStatus.ERROR
+    assert session.exception is None
+    owner._send_sessions[17] = session
+    owner._send_reqs[17] = req
+
+    for _ in range(2):
+        assert wrapper.cancel_request(req) is False
+        assert session.status is SessionStatus.CANCELLED
+        assert owner.get_send_terminal_outcome(req) is None
+        assert owner.get_send_terminal_outcomes() == {}
+        assert owner._send_sessions == {17: session}
+        assert owner._send_reqs == {17: req}
+        assert not req.py_kv_send_session_retired
+        assert [name for name, _ in events] == ["trtllm::kv_transfer_submit"]
+    sender.clear_session.assert_not_called()
+
+    pending.complete()
+    if retirement_path == "cancel":
+        assert wrapper.cancel_request(req) is True
+    else:
+        owner._retire_send_session(17, req, outcome="cancelled")
+        assert owner.get_send_terminal_outcome(req) == ("failed" if failed else "cancelled")
+        wrapper.check_context_transfer_status(0)
+    assert wrapper.cancel_request(req) is True
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_failed" if failed else "trtllm::kv_transfer_cancelled",
+    ]
+    assert not owner._profile_send_failures
+    assert not owner._profile_send_observers
+    assert not owner._send_sessions and not owner._send_reqs
+    assert not wrapper._records and not wrapper._records_by_status
+    assert req.py_kv_send_session_retired
+    assert session.exception is None
+    if failed:
+        assert first._exception is error
+    sender.clear_session.assert_called_once_with(17)
+    sender.send_cancel_to_receivers.assert_called_once_with(17)
+
+
+@pytest.mark.parametrize("observed", [False, True])
+@pytest.mark.parametrize("cancel_raises", [False, True])
+@pytest.mark.parametrize("logical", [False, True])
+def test_v2_cancel_failure_observation_preserves_native_result(
+    monkeypatch: pytest.MonkeyPatch, observed: bool, cancel_raises: bool, logical: bool
+) -> None:
+    """Unavailable status cannot change native cancellation or add disabled reads."""
+    owner = _v2_owner()
+    req = _request()
+    error = RuntimeError("native cancel failed")
+    session = Mock(_enforce_physical_ownership=logical)
+    owner._context_first_ownership = logical
+    req.is_context_only_request = True
+    req.py_disaggregated_params.schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+    session.has_transferring_tasks.return_value = True
+    if cancel_raises:
+        session.cancel.side_effect = error
+    status = PropertyMock(side_effect=RuntimeError("status unavailable"))
+    monkeypatch.setattr(type(session), "status", status, raising=False)
+    owner._send_sessions = {17: session}
+    owner._send_reqs = {17: req}
+    owner._recv_sessions = {}
+    owner._wait_reqs = {}
+    warning = Mock()
+    monkeypatch.setattr(_profiler, "warn_profiler_failure", warning)
+    if observed:
+        owner.start_send_terminal_outcome_observation(req)
+
+    if cancel_raises:
+        with pytest.raises(RuntimeError) as caught:
+            owner.cancel_request(req)
+        assert caught.value is error
+    else:
+        assert owner.cancel_request(req) is False
+    session.cancel.assert_called_once_with()
+    assert owner._send_sessions == {17: session}
+    assert not owner._profile_send_failures
+    assert owner.get_send_terminal_outcomes() == {}
+    if observed:
+        status.assert_called_once_with()
+        warning.assert_called_once()
+    else:
+        status.assert_not_called()
+        warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "cleanup", ["stop", "retired", "completed", "failed", "prepare-shutdown", "shutdown"]
+)
+def test_v2_pending_send_failure_is_private_until_cleanup(cleanup: str) -> None:
+    """Refused retirement retains the hint; each terminal cleanup releases it."""
+    owner = _v2_owner()
+    req = _request()
+    session = Mock(_enforce_physical_ownership=True, status=SessionStatus.ERROR)
+    session.has_transferring_tasks.return_value = True
+    session.resources_drained.return_value = False
+    session.close.return_value = True
+    owner._send_sessions = {17: session}
+    owner._send_reqs = {17: req}
+    owner._recv_sessions = {}
+    owner._recv_reqs = {}
+    owner._wait_reqs = {}
+    owner._transfer_worker = Mock()
+    owner.start_send_terminal_outcome_observation(req)
+    assert owner.cancel_request(req) is False
+    assert owner._profile_send_failures == {17}
+    with pytest.raises(RuntimeError):
+        owner._retire_send_session(17, req, outcome="cancelled")
+    assert owner._profile_send_failures == {17}
+    assert owner.get_send_terminal_outcomes() == {}
+    assert owner._send_sessions == {17: session} and not req.py_kv_send_session_retired
+    if cleanup == "stop":
+        owner.stop_send_terminal_outcome_observation(req)
+        # Dropping observation does not release an in-flight resource owner.
+        assert owner._send_sessions == {17: session} and not req.py_kv_send_session_retired
+    else:
+        session.resources_drained.return_value = True
+        if cleanup == "failed":
+            owner._close_failed_sessions(owner._send_sessions, owner._send_reqs, [17], True)
+        elif cleanup == "shutdown":
+            owner.shutdown()
+        elif cleanup == "prepare-shutdown":
+            owner.prepare_shutdown()
+        else:
+            owner._retire_send_session(17, req, outcome=cleanup)
+        assert not owner._send_sessions and not owner._send_reqs
+    assert not owner._profile_send_failures
+    expected = (
+        {17: "failed"}
+        if cleanup == "failed"
+        else ({17: "complete"} if cleanup == "completed" else {})
+    )
+    assert owner.get_send_terminal_outcomes() == expected
 
 
 @pytest.mark.parametrize("accessor", ["status", "exception"])
@@ -1796,6 +1981,83 @@ def test_unknown_admission_cannot_reuse_a_stale_terminal_request_state(
         wrapper.request_and_receive_async(req)
     wrapper.check_gen_transfer_status(0)
     assert wrapper._records and len(events) == 1
+
+
+@pytest.mark.parametrize("terminal", ["complete", "failed", "sync-complete"])
+def test_successful_native_receive_retry_confirms_admission(
+    monkeypatch: pytest.MonkeyPatch, events: list, terminal: str
+) -> None:
+    """A retry of the same request becomes an ordinary successful observation."""
+    backend = object.__new__(BindKvCacheTransceiver)
+    backend.impl = Mock()
+    backend.kv_transfer_timeout_ms = None
+    backend.impl.check_gen_transfer_status.return_value = None
+    error = RuntimeError("unknown receive admission")
+    backend.impl.request_and_receive_async.side_effect = error
+    wrapper = _wrap(backend, monkeypatch)
+    req = _request()
+    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    with pytest.raises(RuntimeError) as caught:
+        wrapper.request_and_receive_async(req)
+    assert caught.value is error
+    record = next(iter(wrapper._records.values()))
+    assert record.admission_uncertain
+    assert isinstance(record.request, weakref.ReferenceType)
+    wrapper.check_gen_transfer_status(0)
+    assert len(events) == 1 and wrapper._records
+
+    backend.impl.request_and_receive_async.side_effect = None
+    if terminal == "sync-complete":
+        wrapper.request_and_receive_sync(req)
+    else:
+
+        def admitted(request: SimpleNamespace) -> None:
+            request.state = (
+                LlmRequestState.DISAGG_TRANS_ERROR
+                if terminal == "failed"
+                else LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+            )
+
+        backend.impl.request_and_receive_async.side_effect = admitted
+        wrapper.request_and_receive_async(req)
+        assert not record.admission_uncertain and record.request is req
+        if terminal == "complete":
+            assert len(events) == 1
+            wrapper.check_gen_transfer_status(0)
+            assert len(events) == 1
+            req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            wrapper.check_gen_transfer_status(0)
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_failed" if terminal == "failed" else "trtllm::kv_transfer_complete",
+    ]
+    assert not wrapper._records and not wrapper._records_by_status
+    assert not wrapper._receive_state_records
+    assert events[0][1] == events[1][1]
+
+
+def test_failed_native_receive_retry_keeps_uncertainty_and_original_error(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    """A second unknown admission keeps its weak observation and exact exception."""
+    backend = object.__new__(BindKvCacheTransceiver)
+    backend.impl = Mock()
+    backend.kv_transfer_timeout_ms = None
+    backend.impl.check_gen_transfer_status.return_value = None
+    wrapper = _wrap(backend, monkeypatch)
+    req = _request()
+    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    errors = [RuntimeError("first admission"), RuntimeError("retry admission")]
+    for error in errors:
+        backend.impl.request_and_receive_async.side_effect = error
+        with pytest.raises(RuntimeError) as caught:
+            wrapper.request_and_receive_async(req)
+        assert caught.value is error
+    record = next(iter(wrapper._records.values()))
+    assert record.admission_uncertain and isinstance(record.request, weakref.ReferenceType)
+    wrapper.check_gen_transfer_status(0)
+    assert len(events) == 1 and wrapper._records
+    assert backend.impl.request_and_receive_async.call_count == 2
 
 
 def test_transceiver_selects_its_status_id_domain(monkeypatch, events) -> None:

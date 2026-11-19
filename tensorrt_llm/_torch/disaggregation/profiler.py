@@ -311,7 +311,13 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
             return submit(req)
         existing = self._records.get((id(req), direction))
         if existing is not None:
-            return submit(req)
+            result = submit(req)
+            # Successful retry restores the ordinary admitted-request lifetime.
+            existing.request = req
+            existing.admission_uncertain = False
+            if synchronous or req.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                self._observe_request_terminal(existing)
+            return result
         try:
             record = self._register(req, direction)
         except _OBSERVATION_ERRORS as error:
