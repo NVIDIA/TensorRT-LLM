@@ -1377,6 +1377,58 @@ def test_default_wrapper_forwards_live_retiring_receive_probe_to_v2() -> None:
         inner._detect_deadlock([request], set(), [request], set(), made_progress=False)
 
 
+def test_default_wrapper_accepts_async_transfer_manager_with_v1_scheduler() -> None:
+    scheduler = _scheduler(max_batch_size=1, max_num_tokens=10)
+    transfer_manager = Mock()
+    scheduler.set_async_transfer_manager(transfer_manager)
+    request = _make_v2_request(1, 10)
+
+    assert scheduler.schedule_request([request], set()).context_requests == [request]
+    transfer_manager.has_any_inflight_requests.assert_not_called()
+
+
+@pytest.mark.parametrize("scheduler_cls", [MultimodalScheduler, MultimodalEagerEncoderScheduler])
+def test_wrapper_forwards_async_transfer_manager_to_v2(scheduler_cls) -> None:
+    scheduler, _ = _make_v2_multimodal_scheduler(
+        kv_capacity=0,
+        max_num_tokens=10,
+        encoder_max_num_tokens=4,
+        encoder_batch_size=1,
+        scheduler_cls=scheduler_cls,
+    )
+    inner = scheduler.scheduler
+    inner._DEADLOCK_STALL_ITERS = 2
+    inner.kv_cache_manager.kv_connector_manager = None
+    inner.kv_cache_manager.has_pending_preemption.return_value = False
+    transfer_manager = Mock()
+    transfer_manager.has_any_inflight_requests.return_value = True
+    scheduler.set_async_transfer_manager(transfer_manager)
+    request = _make_v2_request(1, 10)
+
+    # Finished sends still hold KV pages until they land, so this is not a stall.
+    for _ in range(inner._DEADLOCK_STALL_ITERS + 1):
+        inner._detect_deadlock([request], set(), [request], set(), made_progress=False)
+        assert inner._stalled_schedules == 0
+
+    transfer_manager.has_any_inflight_requests.return_value = False
+    inner._detect_deadlock([request], set(), [request], set(), made_progress=False)
+    assert inner._stalled_schedules == 1
+
+
+def test_wrapper_forwards_ctx_demote_threshold() -> None:
+    assert _scheduler(max_batch_size=1, max_num_tokens=10).ctx_demote_uncached_tokens == 0
+
+    scheduler, _ = _make_v2_multimodal_scheduler(
+        kv_capacity=0,
+        max_num_tokens=10,
+        encoder_max_num_tokens=4,
+        encoder_batch_size=1,
+    )
+    scheduler.scheduler._ctx_demote_uncached_tokens = 7
+    # PyExecutor reads this to decide whether the router publishes uncached-prefill estimates.
+    assert scheduler.ctx_demote_uncached_tokens == 7
+
+
 @pytest.mark.parametrize("scheduler_cls", [MultimodalScheduler, MultimodalEagerEncoderScheduler])
 @pytest.mark.parametrize("prompt_len", [11, 15, 19, 20, 21, 25, 29])
 def test_prepared_v2_windows_finish_with_one_item_of_output_capacity(scheduler_cls, prompt_len):
