@@ -8,7 +8,8 @@ Transformers config classes take precedence when available.
 
 The text config also publishes the attributes the engine reads to size the KV cache:
 `layer_types` (`sliding_attention` for the layers in `local_layer_ids`, `full_attention`
-for the rest), `sliding_window` and `max_position_embeddings`.
+for the rest), `sliding_window` and `max_position_embeddings`. Without `local_layer_ids`, every
+sixth layer is global, as in the release, for whatever number of layers the config has.
 """
 
 from transformers import PretrainedConfig
@@ -90,33 +91,36 @@ class Inkling2TextConfig(PretrainedConfig):
 
     @staticmethod
     def _derived(fields) -> dict:
-        """The engine-facing attributes for the source values in `fields`."""
+        """The engine-facing attributes for the source values in `fields`.
+
+        Explicit `local_layer_ids` are kept (sorted) and must name existing layers; unset ones stay
+        unset, so the released pattern follows a later change of `num_hidden_layers`.
+        """
         num_layers = fields["num_hidden_layers"]
-        local_layer_ids = fields["local_layer_ids"]
-        if local_layer_ids is None:
+        derived = {}
+        if fields["local_layer_ids"] is None:
             # The released pattern: five sliding-window layers, then one global layer.
-            local_layer_ids = [i for i in range(num_layers) if i % 6 != 5]
-        local_layer_ids = sorted(int(i) for i in local_layer_ids)
-        out_of_range = [i for i in local_layer_ids if not 0 <= i < num_layers]
-        if out_of_range:
-            raise ValueError(
-                f"local_layer_ids {out_of_range} are outside the {num_layers} decoder layers"
-            )
-        local = set(local_layer_ids)
-        return {
-            "local_layer_ids": local_layer_ids,
-            "layer_types": [
-                "sliding_attention" if i in local else "full_attention" for i in range(num_layers)
-            ],
-            "sliding_window": fields["sliding_window_size"],
-            "max_position_embeddings": fields["model_max_length"],
-        }
+            local = {i for i in range(num_layers) if i % 6 != 5}
+        else:
+            local_layer_ids = sorted(int(i) for i in fields["local_layer_ids"])
+            out_of_range = [i for i in local_layer_ids if not 0 <= i < num_layers]
+            if out_of_range:
+                raise ValueError(
+                    f"local_layer_ids {out_of_range} are outside the {num_layers} decoder layers"
+                )
+            derived["local_layer_ids"] = local_layer_ids
+            local = set(local_layer_ids)
+        derived["layer_types"] = [
+            "sliding_attention" if i in local else "full_attention" for i in range(num_layers)
+        ]
+        derived["sliding_window"] = fields["sliding_window_size"]
+        derived["max_position_embeddings"] = fields["model_max_length"]
+        return derived
 
     @property
     def global_layer_ids(self) -> list:
         """Decoder layers that attend over the whole context."""
-        local = set(self.local_layer_ids)
-        return [i for i in range(self.num_hidden_layers) if i not in local]
+        return [i for i, kind in enumerate(self.layer_types) if kind == "full_attention"]
 
 
 class Inkling2VisionConfig(PretrainedConfig):
