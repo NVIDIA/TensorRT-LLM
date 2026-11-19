@@ -20,6 +20,11 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
+from ..offload import (
+    SparseOffloadState,
+    allocate_sparse_offload_state,
+    get_sparse_offload_metadata_layers,
+)
 from ..params import use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
@@ -94,6 +99,8 @@ class TokenMajorGenView:
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
+    # Sparse attention redirects the selected rows of the mixed-precision high pool itself.
+    mixed_precision_block_offsets_redirect: ClassVar[bool] = False
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
@@ -122,6 +129,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer_quant_block_size: int = 128
     # Enable indexer skip for short sequences
     enable_indexer_skip: bool = False
+    # Build the skip-indexer dense top-k table on the device instead of the host. A model
+    # sets this on the metadata it is given; the default keeps the host build.
+    dense_topk_on_device: bool = False
     shared_topk_indices: Optional[torch.Tensor] = None
     indexer_skip_topk: bool = False
     in_mtp_draft_loop: bool = False
@@ -182,6 +192,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Query tokens per generation request for a uniform runtime tier. Zero
     # falls back to the static draft-token ceiling.
     runtime_tokens_per_gen_step: int = 0
+
+    @property
+    def has_mixed_precision_high_rows(self) -> bool:
+        """Whether this batch reads and writes the selected rows of a mixed-precision high layer
+        through the high page table (the sparse backends' way; dense attention redirects block
+        offsets instead)."""
+        return self.mixed_precision_high_block_table is not None
 
     @property
     def is_ragged_verify(self) -> bool:
@@ -380,9 +397,102 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
+        self._init_dsa_sparse_offload_state()
+
+    def _offloads_dsa_latent(self) -> bool:
+        """Whether attention reads a DSA cache manager's MLA latent through the offload arena."""
+        return self.sparse_metadata_params.enable_kv_cache_offload and is_dsa_cache_manager(
+            self.kv_cache_manager
+        )
+
+    def _init_dsa_sparse_offload_state(self) -> None:
+        """Validate the fixed offload configuration and allocate its persistent state.
+
+        Besides the shared offload state, the MLA latent writer gets a one-token
+        page table [1, B, 2, 1] and per-token write slots [B]: the writer stores
+        each request's new latent row at its arena write row through them. An
+        NVFP4 latent is dequantized for attention into the state's FP8 scratch.
+        """
+        self.sparse_offload_state: Optional[SparseOffloadState] = None
+        self.sparse_latent_block_offsets: Optional[torch.Tensor] = None
+        self.sparse_latent_write_slots: Optional[torch.Tensor] = None
+        self.sparse_offload_attn_indices: Optional[torch.Tensor] = None
+        self.sparse_offload_stream: Optional[torch.cuda.Stream] = None
+        self.sparse_offload_write_pending: Optional[int] = None
+        self.sparse_offload_fetch_pending: Optional[int] = None
+        self.sparse_offload_next_shared_layer: dict[int, int] = {}
+        if not self._offloads_dsa_latent():
+            return
+        self.sparse_offload_stream = torch.cuda.Stream()
+        self.sparse_offload_start_event = torch.cuda.Event()
+        self.sparse_offload_write_event = torch.cuda.Event()
+        self.sparse_offload_fetch_event = torch.cuda.Event()
+        manager = self.kv_cache_manager
+        layers = get_sparse_offload_metadata_layers(self)
+        local_layers = manager.pp_layers
+        indexer_mask = manager.indexer_k_cache_local_layer_mask
+        self.sparse_offload_next_shared_layer = {
+            previous: following
+            for previous, following, has_indexer in zip(
+                local_layers, local_layers[1:], indexer_mask[1:]
+            )
+            if not has_indexer and previous in layers and following in layers
+        }
+        batch = manager.max_batch_size
+
+        def allocate(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            return self.get_empty(
+                self.cuda_graph_buffers,
+                shape,
+                dtype=dtype,
+                cache_name=f"dsa_sparse_offload_{name}",
+                capture_graph=self.is_cuda_graph,
+            )
+
+        # Native fetch always processes every Batch row, including for smaller
+        # graph profiles. Its selection width is fixed by the layer's sparse_cache.
+        self.sparse_offload_state = allocate_sparse_offload_state(
+            allocate,
+            layers,
+            max_batch_size=batch,
+            topk=self.sparse_mla_topk,
+            nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
+        )
+        self.sparse_latent_block_offsets = allocate(
+            "latent_block_offsets", (1, batch, 2, 1), torch.int32
+        )
+        self.sparse_latent_block_offsets.fill_(-1)
+        self.sparse_latent_write_slots = allocate("latent_write_slots", (batch,), torch.int32)
+        self.sparse_latent_write_slots.fill_(-1)
+        self.sparse_offload_attn_indices = allocate(
+            "attn_indices", (batch, self.sparse_mla_topk), torch.int32
+        )
+
+    def _validate_dsa_sparse_offload_batch(self) -> None:
+        """Reject batches offload cannot run, on the host before any model writes.
+
+        An offloading worker only decodes, one query token per request.
+        """
+        self.sparse_offload_state.prepared = False
+        if self.num_contexts:
+            raise NotImplementedError(
+                "Sparse KV cache offload runs decode batches only; context requests reach "
+                "an offloading worker through disaggregated KV transfer"
+            )
+        if self.seq_lens.device.type != "cpu" or self.seq_lens_kv.device.type != "cpu":
+            raise ValueError("Sparse offload batch validation requires host sequence lengths")
+        if not torch.equal(self.seq_lens, self.seq_lens_kv) or not torch.all(self.seq_lens == 1):
+            raise NotImplementedError("Sparse offload decode requires one query per request")
+
+    def _has_mixed_precision_staging(self) -> bool:
+        # No staging: attention reads the gather's FP8 scratch.
+        return False
 
     def prepare(self):
         self._validate_ragged_verification()
+        if self.sparse_offload_state is not None:
+            self._validate_dsa_sparse_offload_batch()
+            self.kv_cache_manager.prepare_sparse_batch(self.request_ids)
         super().prepare()
         self._invalidate_pool_view_cache()
 
@@ -422,6 +532,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
+
+        if self.sparse_offload_state is not None:
+            self.kv_cache_manager.prepare_sparse_offload(
+                self.sparse_offload_state, self.request_ids, beam_width=self.beam_width
+            )
 
     def _prepare_device_window_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
         """Bound host-side KV extents until device-selected windows are installed."""
@@ -945,7 +1060,35 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.nvfp4_mla_compact_indices = None
         if getattr(self.kv_cache_manager, "dtype", None) != tensorrt_llm.bindings.DataType.NVFP4:
             return
+        if self._offloads_dsa_latent():
+            # Offloaded rows are dequantized into the offload state's scratch instead.
+            return
+        from ...fmha.prims_ts_dsa_sparse_mla import prims_ts_reads_nvfp4_mla_records
 
+        if prims_ts_reads_nvfp4_mla_records(self):
+            # PrimTS reads the records in place, so generation gathers no FP8 rows. A layer
+            # that gathers nevertheless calls ensure_nvfp4_mla_generation_buffers().
+            return
+        self._allocate_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
+
+    def ensure_nvfp4_mla_generation_buffers(self) -> None:
+        """Allocate the gather outputs for a layer that gathers after creation left them out.
+
+        Creation decides without the attention layers. A layer whose FMHA list lacks the PrimTS
+        record reader (skip-correction, an unsupported head count) gathers although the metadata
+        expected the records to be read in place. The first such step allocates the rows, in
+        eager execution: CUDA graph capture needs their addresses fixed beforehand.
+        """
+        if self.nvfp4_mla_fp8_scratch is not None and self.nvfp4_mla_compact_indices is not None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "NVFP4 MLA gather buffers must be allocated during eager warmup, not under "
+                "CUDA graph capture"
+            )
+        self._allocate_nvfp4_mla_generation_buffers(capture_graph=self.is_cuda_graph)
+
+    def _allocate_nvfp4_mla_generation_buffers(self, capture_graph=False):
         # MTP verifies the current token and max_draft_tokens draft tokens for
         # every generation request. Each query row has its own TopK selection,
         # so the dequantized FP8 rows and compact offsets must cover the full
@@ -1483,7 +1626,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.nvfp4_mla_fp8_scratch is not None
             and self.nvfp4_mla_fp8_scratch.shape[0] != max_gen_tokens
         ):
-            self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
+            # Resize what exists, whether creation or a gathering layer allocated it.
+            self._allocate_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
         previous_cap = int(getattr(self, "_expanded_alloc_draft_cap", -1))
         allocation_cap = max(self._draft_sizing_cap, previous_cap)
         if allocation_cap > previous_cap:
@@ -2122,7 +2266,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         else:
             self.skip_indexer_for_gen_reqs = False
-        self.prepare_dense_topk_indices(kv_lens)
+        if self.dense_topk_on_device:
+            self.prepare_dense_topk_indices(
+                kv_lens.to(self.seq_lens_cuda.device, non_blocking=True), device=True
+            )
+        else:
+            self.prepare_dense_topk_indices(kv_lens)
 
     def prepare_for_mla_rope_append(self, cached_token_lens: torch.Tensor, kv_lens: torch.Tensor):
         if self.num_contexts > 0:

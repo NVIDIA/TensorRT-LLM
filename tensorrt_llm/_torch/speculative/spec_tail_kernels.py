@@ -37,9 +37,15 @@ import triton
 import triton.language as tl
 
 _BLOCK_TABLE_BLOCK = 2048
+# Rows per program of _strict_accept_kernel. Fixed, like the arguments in its do_not_specialize list, so
+# one compiled variant per draft length serves every batch: serving changes the request counts on every
+# iteration, and a new variant compiles and loads a module on the sampling path.
+_STRICT_ACCEPT_BLOCK_B = 128
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["draft_ptr", "stride_draft_row", "stride_draft_col", "num_ctx", "num_gen"]
+)
 def _strict_accept_kernel(
     target_ptr,
     draft_ptr,
@@ -108,7 +114,7 @@ def strict_accept(
     num_accepted = torch.empty((batch_size,), dtype=torch.int32, device=device)
     if batch_size == 0:
         return accepted, num_accepted
-    block_b = min(triton.next_power_of_2(max(num_contexts, num_gens, 1)), 128)
+    block_b = _STRICT_ACCEPT_BLOCK_B
     grid = (triton.cdiv(max(num_contexts, num_gens, 1), block_b),)
     _strict_accept_kernel[grid](
         target_tokens,
@@ -144,15 +150,15 @@ def _decode_block_table_kernel(
     offs = tl.arange(0, BLOCK)
     src_row = src_ptr + row.to(tl.int64) * stride_src_row
     table_row = table_ptr + row.to(tl.int64) * stride_table
-    count = tl.zeros([BLOCK], dtype=tl.int64)
+    extent = tl.zeros([BLOCK], dtype=tl.int64)
     for start in range(0, n_blocks, BLOCK):
         cols = start + offs
         mask = cols < n_blocks
         encoded = tl.load(src_row + cols * stride_src_col, mask=mask, other=-1).to(tl.int64)
         encoded -= block_offset
-        count += (encoded >= 0).to(tl.int64)
+        extent = tl.maximum(extent, tl.where(encoded >= 0, cols.to(tl.int64) + 1, 0))
         tl.store(table_row + cols, (tl.maximum(encoded, 0) // divisor).to(tl.int32), mask=mask)
-    tl.store(counts_ptr + row, tl.sum(count, axis=0))
+    tl.store(counts_ptr + row, tl.max(extent, axis=0))
 
 
 def decode_draft_block_table(
@@ -166,8 +172,12 @@ def decode_draft_block_table(
     """Decode layer-relative block offsets without modifying ``src``.
 
     For ``encoded = src - block_offset``, computes
-    ``counts[i] = (encoded[i] >= 0).sum()`` and
-    ``table[i] = encoded[i].clamp(min=0) // divisor``.
+    ``table[i] = encoded[i].clamp(min=0) // divisor`` and ``counts[i]`` = one
+    past the last ``j`` with ``encoded[i, j] >= 0`` (0 when none).
+
+    The extent, not the number of backed entries: a sliding-window pool
+    releases a row's low entries, and positions are indexed from entry 0, so
+    only the extent bounds the positions a request may address.
 
     Args:
         src: ``[rows, blocks]`` encoded block offsets (any strides).
@@ -225,15 +235,24 @@ class PagedLatentPrepare(NamedTuple):
     blk_offsets: torch.Tensor  # [G, block] int64
     blk_seq_lens: torch.Tensor  # [G] int32, num_ctx + block
     blk_kv_bounds: torch.Tensor  # [G * block] int32, blk_seq_lens per query token
+    rebase_pages: torch.Tensor  # [G] int64, row entries the block decode skips
 
 
-@triton.jit
+# The generation count, the first generation row and the slot view sliced at
+# that row follow the batch composition. Specializing them (a count of 1 or a
+# multiple of 16, a 16-byte-aligned pointer) would compile kernel variants
+# mid-serving.
+@triton.jit(
+    do_not_specialize=["num_gens", "first_row"],
+    do_not_specialize_on_alignment=["slots_ptr"],
+)
 def _paged_latent_prepare_kernel(
     num_accepted_ptr,
     accepted_ptr,
     stride_accepted,
     slots_ptr,
     ctx_len_ptr,
+    base_pages_ptr,
     block_counts_ptr,
     table_ptr,
     stride_table,
@@ -250,6 +269,7 @@ def _paged_latent_prepare_kernel(
     blk_offsets_ptr,
     blk_seq_lens_ptr,
     blk_kv_bounds_ptr,
+    rebase_ptr,
     num_gens,
     first_row,
     dummy_slot,
@@ -302,8 +322,14 @@ def _paged_latent_prepare_kernel(
     tl.store(ctx_len_ptr + slot, new_len, mask=gm)
     tl.store(ctx_len_ptr + dummy_slot, tl.zeros([], dtype=tl.int64))
 
-    # Advertised context, capped so the block still fits in the allocation.
+    # Advertised context, capped so the block still fits in the allocation,
+    # then rebased past the slot's base pages (dflash_rebased_ctx_view): the
+    # block decode reads row entries from ``rebase`` on.
     num_ctx = tl.minimum(new_len, tl.maximum(capacity - BLOCK_SIZE, 0))
+    base = tl.load(base_pages_ptr + slot, mask=gm, other=0).to(tl.int64)
+    rebase = tl.minimum(base, num_ctx // PAGE_SIZE)
+    num_ctx = tl.maximum(num_ctx - base * PAGE_SIZE, 0)
+    tl.store(rebase_ptr + g, rebase, mask=gm)
     tl.store(num_ctx_ptr + g, num_ctx, mask=gm)
     tl.store(
         seq_lens_ptr + row,
@@ -313,7 +339,8 @@ def _paged_latent_prepare_kernel(
 
     # Block-decode operands: where the block's own latents go, and its bounds.
     bpos = num_ctx[:, None] + j[None, :]
-    bpage = tl.load(table_row[:, None] + tl.minimum(bpos // PAGE_SIZE, max_blocks - 1), mask=qmask)
+    bentry = tl.minimum(rebase[:, None] + bpos // PAGE_SIZE, max_blocks - 1)
+    bpage = tl.load(table_row[:, None] + bentry, mask=qmask)
     tl.store(blk_pages_ptr + blk, bpage.to(tl.int64), mask=qmask)
     tl.store(blk_offsets_ptr + blk, bpos % PAGE_SIZE, mask=qmask)
     seq_len = (num_ctx + BLOCK_SIZE).to(tl.int32)
@@ -330,6 +357,7 @@ def dflash_paged_latent_prepare(
     accepted_tokens: torch.Tensor,
     slots: torch.Tensor,
     ctx_len: torch.Tensor,
+    base_pages: torch.Tensor,
     block_counts: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens_cuda: torch.Tensor,
@@ -353,7 +381,11 @@ def dflash_paged_latent_prepare(
         accepted_tokens: ``[batch, width]`` accepted tokens, unit inner stride.
         slots: ``[G]`` context slots.
         ctx_len: ``[slots]`` int64 context lengths.
-        block_counts: ``[batch]`` pages held per batch row.
+        base_pages: ``[slots]`` int64 pages below each slot's first stored
+            position; ``num_ctx`` and the block placement are rebased past them
+            and ``rebase_pages`` says by how many row entries.
+        block_counts: ``[batch]`` extent of the pages held per batch row
+            (``decode_draft_block_table``).
         block_tables: ``[batch, max_blocks]`` int32 page tables, unit inner stride.
         seq_lens_cuda: ``[batch]`` attention sequence lengths.
         first_row: batch row of generation request 0.
@@ -377,6 +409,7 @@ def dflash_paged_latent_prepare(
         blk_offsets=torch.empty((num_gens, block_size), **i64),
         blk_seq_lens=torch.empty((num_gens,), dtype=torch.int32, device=device),
         blk_kv_bounds=torch.empty((num_gens * block_size,), dtype=torch.int32, device=device),
+        rebase_pages=torch.empty((num_gens,), **i64),
     )
     if num_gens == 0:
         return out
@@ -387,6 +420,7 @@ def dflash_paged_latent_prepare(
         accepted_tokens.stride(0),
         slots,
         ctx_len,
+        base_pages,
         block_counts,
         block_tables,
         block_tables.stride(0),

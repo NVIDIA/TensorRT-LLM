@@ -108,6 +108,22 @@ def test_resident_sms_is_the_block_count_of_a_resident_gather(monkeypatch):
     assert fabric_gather.resident_sms() == 24
 
 
+def test_resident_sms_of_a_gather_chosen_by_the_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Standalone dense DWDP passes its own transport choice instead of the expert one."""
+    _unset(monkeypatch, "TRTLLM_CUTEDSL_SM_RESERVE")
+    monkeypatch.setenv("TRTLLM_DWDP_GATHER_BLOCKS", "30")
+    monkeypatch.setattr(fabric_gather, "available", lambda: False)
+    monkeypatch.setattr(fabric_gather, "THREADS", 1024)
+    assert fabric_gather.resident_sms(gather=True) == 30
+    assert fabric_gather.resident_sms(gather=False) == 0
+    monkeypatch.setattr(fabric_gather, "available", lambda: True)
+    assert fabric_gather.resident_sms(gather=False) == 0
+    monkeypatch.setattr(fabric_gather, "THREADS", 128)
+    assert fabric_gather.resident_sms(gather=True) == 0
+    monkeypatch.setenv("TRTLLM_CUTEDSL_SM_RESERVE", "24")
+    assert fabric_gather.resident_sms(gather=False) == 24
+
+
 def test_sm_reserve_is_set_explicitly():
     from tensorrt_llm._torch import cute_dsl_utils
 
@@ -140,3 +156,51 @@ def test_sm_reserve_shrinks_supported_grids_only(full, cluster_size, reserve, ex
     from tensorrt_llm._torch.cute_dsl_utils import reserved_max_active_clusters
 
     assert reserved_max_active_clusters(full, cluster_size, reserve) == expected
+
+
+_KERNEL_ENV = "TRTLLM_DWDP_GATHER_KERNEL"
+
+
+@pytest.mark.parametrize(
+    "kernel, env, expected, warned",
+    [
+        ("tma", None, True, None),
+        ("register", "register", False, None),
+        ("register", "tma", False, "overrides TRTLLM_DWDP_GATHER_KERNEL='tma'"),
+        ("tma", "register", True, "overrides TRTLLM_DWDP_GATHER_KERNEL='register'"),
+        (None, "tma", True, "is deprecated; set dwdp_config.gather_kernel"),
+        (None, "register", False, "is deprecated; set dwdp_config.gather_kernel"),
+        (None, None, False, None),
+    ],
+    ids=[
+        "config",
+        "same-value",
+        "register-over-env",
+        "tma-over-env",
+        "env-tma",
+        "env-register",
+        "unset",
+    ],
+)
+def test_use_tma_takes_the_config_then_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    kernel: str | None,
+    env: str | None,
+    expected: bool,
+    warned: str | None,
+) -> None:
+    """The configured kernel wins over the environment, which alone still applies; the
+    environment is read, never written."""
+    monkeypatch.delenv(_KERNEL_ENV, raising=False)
+    if env is not None:
+        monkeypatch.setenv(_KERNEL_ENV, env)
+    warnings = []
+    monkeypatch.setattr(fabric_gather.logger, "warning", warnings.append)
+
+    assert fabric_gather.use_tma(kernel) is expected
+
+    assert os.environ.get(_KERNEL_ENV) == env
+    if warned is None:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1 and warned in warnings[0], warnings

@@ -25,7 +25,9 @@ from torch import nn
 from utils.post_transform_qualification import (
     AllReduceStub,
     PostTransformQualificationCase,
+    assert_every_parameter_was_loaded,
     assert_post_transform_lifecycle_equivalent,
+    keep_factory_parameters,
     module_state_snapshot,
     mx_canonical_parameter_catalog,
 )
@@ -36,11 +38,12 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_qwen3_5 as modeling_qwen3_5_mod
 from tensorrt_llm._torch.models import modeling_qwen3_next as modeling_qwen3_next_mod
 from tensorrt_llm._torch.models import modeling_qwen3vl as modeling_qwen3vl_mod
+from tensorrt_llm._torch.models.checkpoints import model_hooks as model_hooks_mod
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.mx import model_loading as mx_loading_mod
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
-from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -199,7 +202,7 @@ def _hf_checkpoint_loader(state_dict: dict[str, torch.Tensor]):
 
 def _qualify(model: nn.Module):
     """Qualify `model` with the identity that `ModelLoader` captures before construction."""
-    return ModelLoader._qualify_post_transform_profile(
+    return mx_loading_mod.qualify_post_transform_profile(
         model,
         config_identity=_CONFIG_IDENTITY,
         speculative_mode=None,
@@ -229,6 +232,7 @@ def _qwen3_5_vl_runtime_config(**overrides: object) -> PostTransformRuntimeConfi
         "cp_size": 1,
         "moe_tp_size": 1,
         "moe_ep_size": 1,
+        "moe_cluster_size": 1,
         "attention_tp_size": 1,
         "attention_cp_size": 1,
         "attention_dp": False,
@@ -308,31 +312,18 @@ def _embedding_logits(model: nn.Module) -> torch.Tensor:
     return llm.lm_head(llm.model.embed_tokens(token_ids))
 
 
-def _assert_every_parameter_was_loaded(producer: nn.Module, factory_model: nn.Module) -> None:
-    """Assert that `prepare_producer` overwrote every parameter of the factory fill.
-
-    The lifecycle probes then compare bytes that came from the checkpoint
-    through the weight mapper rather than the factory's placeholder values.
-    """
-    # Look parameters up by the factory's canonical names: after
-    # `setup_aliases()` the producer also reaches some of them through
-    # `next_layer_layernorm` alias names.
-    unchanged = [
-        name
-        for name, factory_parameter in factory_model.named_parameters()
-        if torch.equal(producer.get_parameter(name), factory_parameter)
-    ]
-    assert unchanged == [], f"Parameters not written by the producer load: {unchanged}"
-
-
 def _lifecycle_case(
     checkpoint_dir: Path,
     state_dict: dict[str, torch.Tensor],
     *,
     tp_size: int = 1,
     rank: int = 0,
-) -> PostTransformQualificationCase:
-    """Build the lifecycle case whose producer runs the real HF load of `state_dict`."""
+) -> tuple[PostTransformQualificationCase, dict[str, torch.Tensor]]:
+    """Build the lifecycle case whose producer runs the real HF load of `state_dict`.
+
+    Also returns the factory parameters that the load overwrites, for
+    `assert_every_parameter_was_loaded`.
+    """
     output_probes = [
         ("linear-outputs", _linear_outputs),
         ("vision-patch-embed", _vision_patch_embed_output),
@@ -340,7 +331,10 @@ def _lifecycle_case(
     ]
     if tp_size == 1:
         output_probes.append(("embedding-logits", _embedding_logits))
-    return PostTransformQualificationCase(
+    prepare_producer, factory_parameters = keep_factory_parameters(
+        _hf_checkpoint_loader(state_dict)
+    )
+    case = PostTransformQualificationCase(
         profile_id=_PROFILE_ID,
         model_factory=lambda: _tiny_qwen3_5_vl_model(checkpoint_dir, tp_size=tp_size, rank=rank),
         unqualified_model_factory=lambda: _tiny_qwen3_5_vl_model(
@@ -355,8 +349,9 @@ def _lifecycle_case(
             ("module-state", module_state_snapshot),
         ),
         output_probes=tuple(output_probes),
-        prepare_producer=_hf_checkpoint_loader(state_dict),
+        prepare_producer=prepare_producer,
     )
+    return case, factory_parameters
 
 
 def test_qwen3_5_vl_profile_qualifies_full_staged_lifecycle(tmp_path: Path) -> None:
@@ -369,11 +364,10 @@ def test_qwen3_5_vl_profile_qualifies_full_staged_lifecycle(tmp_path: Path) -> N
     checkpoint_dir = _write_tiny_checkpoint_config(tmp_path / "ckpt")
     state_dict = _tiny_hf_state_dict()
 
-    producer, receiver = assert_post_transform_lifecycle_equivalent(
-        _lifecycle_case(checkpoint_dir, state_dict)
-    )
+    case, factory_parameters = _lifecycle_case(checkpoint_dir, state_dict)
+    producer, receiver = assert_post_transform_lifecycle_equivalent(case)
 
-    _assert_every_parameter_was_loaded(producer, _tiny_qwen3_5_vl_model(checkpoint_dir))
+    assert_every_parameter_was_loaded(producer, factory_parameters)
 
     # The producer's bytes come from the checkpoint through the weight mapper.
     for trtllm_name, hf_name in (
@@ -388,7 +382,7 @@ def test_qwen3_5_vl_profile_qualifies_full_staged_lifecycle(tmp_path: Path) -> N
     decision = _qualify(receiver)
     assert decision.transform_abi_id == QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1
     assert (
-        ModelLoader._post_transform_transfer_scope(receiver)
+        mx_loading_mod.get_post_transform_transfer_scope(receiver)
         is PostTransformTransferScope.COMPLETE_MODEL
     )
     assert _runtime_config(producer) == _qwen3_5_vl_runtime_config()
@@ -427,14 +421,14 @@ def test_qwen3_5_vl_mx_tensor_catalog_is_complete_and_stable(tmp_path: Path) -> 
     checkpoint_dir = _write_tiny_checkpoint_config(tmp_path / "ckpt")
     producer = _tiny_qwen3_5_vl_model(checkpoint_dir)
     _hf_checkpoint_loader(_tiny_hf_state_dict())(producer)
-    ModelLoader._walk_full_post_load(producer)
+    model_hooks_mod.walk_full_post_load(producer)
     receiver = _tiny_qwen3_5_vl_model(checkpoint_dir)
 
-    ModelLoader._setup_aliases(receiver)
+    model_hooks_mod.setup_aliases(receiver)
     registered_catalog = mx_canonical_parameter_catalog(receiver)
-    ModelLoader._setup_aliases(receiver)
-    ModelLoader._mark_weights_transformed(receiver)
-    ModelLoader._walk_cache_state(receiver)
+    model_hooks_mod.setup_aliases(receiver)
+    model_hooks_mod.mark_weights_transformed(receiver)
+    model_hooks_mod.walk_cache_state(receiver)
     published_catalog = mx_canonical_parameter_catalog(receiver)
 
     assert published_catalog == registered_catalog
@@ -477,7 +471,7 @@ def test_qwen3_5_vl_qualification_requires_preconstruction_identity(tmp_path: Pa
     model = _tiny_qwen3_5_vl_model(_write_tiny_checkpoint_config(tmp_path / "ckpt"))
 
     post_construction_identity = PostTransformConfigIdentity.from_model_config(model.model_config)
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = mx_loading_mod.qualify_post_transform_profile(
         model,
         config_identity=post_construction_identity,
         speculative_mode=None,
@@ -503,13 +497,12 @@ def test_qwen3_5_vl_profile_qualifies_tp2_rank_lifecycle(
     monkeypatch.setattr(modeling_qwen3_next_mod, "AllReduce", AllReduceStub)
     checkpoint_dir = _write_tiny_checkpoint_config(tmp_path / "ckpt")
 
-    producer, _receiver = assert_post_transform_lifecycle_equivalent(
-        _lifecycle_case(checkpoint_dir, _tiny_hf_state_dict(), tp_size=2, rank=rank)
+    case, factory_parameters = _lifecycle_case(
+        checkpoint_dir, _tiny_hf_state_dict(), tp_size=2, rank=rank
     )
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
 
-    _assert_every_parameter_was_loaded(
-        producer, _tiny_qwen3_5_vl_model(checkpoint_dir, tp_size=2, rank=rank)
-    )
+    assert_every_parameter_was_loaded(producer, factory_parameters)
 
     assert _runtime_config(producer) == _qwen3_5_vl_runtime_config(
         tp_size=2,
@@ -568,7 +561,7 @@ def test_qwen3_5_vl_without_local_encoder_falls_back(
 
     assert model.mm_encoder is None
     assert (
-        ModelLoader._post_transform_transfer_scope(model)
+        mx_loading_mod.get_post_transform_transfer_scope(model)
         is PostTransformTransferScope.LANGUAGE_MODEL
     )
     assert _qualify(model).reason is PostTransformQualificationReason.TRANSFER_SCOPE_NOT_REGISTERED
@@ -593,7 +586,10 @@ def test_qwen3_5_vl_source_identity_binds_runtime_max_num_tokens(tmp_path: Path)
             )
         )
 
-    decision = check_weight_sharing_compatibility(*identities, IdentityCheckPolicy.WARN_FALLBACK)
+    call_local, call_source = identities
+    decision = check_weight_sharing_compatibility(
+        call_local, call_source, IdentityCheckPolicy.WARN_FALLBACK
+    )
 
     assert not decision.should_share
     assert decision.match_result.mismatched_fields == ["shard_fingerprint"]
@@ -606,12 +602,12 @@ def _qualify_registry(**overrides: object):
         "architecture": "Qwen3_5ForConditionalGeneration",
         "model_type": "qwen3_5",
         "speculative_mode": None,
-        "protocol_version": ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        "protocol_version": mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         "transfer_scope": PostTransformTransferScope.COMPLETE_MODEL,
         "runtime_config": _qwen3_5_vl_runtime_config(),
     }
     arguments.update(overrides)
-    return ModelLoader._post_transform_profile_registry().qualify(**arguments)
+    return mx_loading_mod.MX_POST_TRANSFORM_PROFILE_REGISTRY.qualify(**arguments)
 
 
 @pytest.mark.cpu_only
@@ -792,6 +788,16 @@ def test_qwen3_5_vl_profile_ignores_moe_only_runtime_dimensions(
     decision = _qualify_registry(runtime_config=_qwen3_5_vl_runtime_config(**runtime_overrides))
 
     assert decision.qualified
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [None, -1, 90, 100, 103, 120])
+def test_qwen3_5_vl_profile_qualifies_on_any_sm_version(sm_version: int | None) -> None:
+    """The BF16 profile pins no SM version, so the device architecture never blocks it."""
+    decision = _qualify_registry(runtime_config=_qwen3_5_vl_runtime_config(sm_version=sm_version))
+
+    assert decision.qualified
+    assert decision.profile.runtime_constraints.sm_versions is None
 
 
 @pytest.mark.cpu_only

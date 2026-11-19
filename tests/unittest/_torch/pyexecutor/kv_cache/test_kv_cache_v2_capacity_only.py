@@ -8,12 +8,15 @@ import pytest
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.pyexecutor._util import _get_num_reserved_index_slots
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
+
+pytestmark = pytest.mark.cpu_only
 
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -37,6 +40,8 @@ def _manager(
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     manager.kv_cache_map = {}
+    # No windowed pools; the window-crossing check reads them on every growth.
+    manager._windowed_layer_group_sizes = {}
     return manager
 
 
@@ -82,6 +87,8 @@ def test_manager_initializes_capacity_only_policy_to_false() -> None:
         pass
 
     class StopAfterPolicyConfig:
+        remote_cache_config = None
+
         @property
         def enable_swa_scratch_reuse(self):
             raise StopInitialization
@@ -204,7 +211,6 @@ def test_dynamic_tree_reserved_capacity(is_draft: bool, expected_capacity: int) 
     cache.resize.assert_called_once_with(expected_capacity, 200)
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("verify_len", "rewind", "accepted", "expected_capacity"),
     [(2, 1, 1, 252), (5, 2, 3, 254)],
@@ -512,3 +518,24 @@ def test_update_of_a_suspended_cache_still_consumes_its_allocation() -> None:
 
     assert cache.capacity == 103
     assert manager._inflight_draft_lens == {}
+
+
+@pytest.mark.parametrize(
+    ("spec_config", "estimating_kv_cache", "expected"),
+    [
+        (None, False, 1),
+        (SimpleNamespace(enable_confidence_scheduling=False), False, 1),
+        (SimpleNamespace(enable_confidence_scheduling=True), False, 2),
+        (SimpleNamespace(enable_confidence_scheduling=True), True, 0),
+    ],
+    ids=[
+        "no-speculation",
+        "static-dspark",
+        "confidence-dspark",
+        "confidence-estimator",
+    ],
+)
+def test_index_mapper_reservation_tracks_confidence_scheduling(
+    spec_config: SimpleNamespace | None, estimating_kv_cache: bool, expected: int
+) -> None:
+    assert _get_num_reserved_index_slots(spec_config, estimating_kv_cache) == expected

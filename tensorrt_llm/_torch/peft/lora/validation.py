@@ -40,6 +40,7 @@ _UNSUPPORTED_QUANT = (
     | QuantMode.W4A16_MXFP4
     | QuantMode.W4A8_MXFP4_MXFP8
     | QuantMode.MXFP8
+    | QuantMode.NVFP4_PLUS
 )
 
 _MOE_LORA_MODULE_NAME_SET: Set[str] = set(MOE_LORA_MODULE_NAMES)

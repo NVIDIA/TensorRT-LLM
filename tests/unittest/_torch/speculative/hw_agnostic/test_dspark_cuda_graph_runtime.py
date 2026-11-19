@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests for DSpark ragged CUDA-graph keys and padding state."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -15,11 +17,91 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunnerConfig,
     DSparkCUDAGraphRunner,
     KeyType,
+    PackedSplitResolver,
     cuda_graph_dummy_request_id,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import inputs as inputs_module
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
+from tensorrt_llm._torch.speculative import dspark_planner
 from tensorrt_llm.mapping import Mapping
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True], ids=["off", "on"])
+def test_decoder_input_preparer_loads_cost_table_for_live_setup(monkeypatch, enabled):
+    from tensorrt_llm.version import __version__ as trtllm_version
+
+    buffers = SimpleNamespace(
+        input_ids_cuda=torch.empty(1, dtype=torch.int32, device="cpu"),
+        gather_ids_cuda=torch.empty(1, dtype=torch.int32, device="cpu"),
+    )
+    spec_config = SimpleNamespace(
+        enable_confidence_scheduling=enabled,
+        enable_fused_confidence_scheduler=False,
+        confidence_cost_table_path="costs.json",
+        confidence_min_predicted_gain=0.02,
+        max_draft_len=4,
+    )
+    config = SimpleNamespace(
+        is_spec_decode=True,
+        spec_config=spec_config,
+        cuda_graph_batch_sizes=[1, 2, 4],
+        enable_attention_dp=True,
+    )
+    mapping = SimpleNamespace(world_size=8, tp_size=8, moe_ep_size=8)
+    table = Mock()
+    table.candidate_cells.return_value = ((1, 2), (2, 4))
+    table.collective_identity_words = tuple(range(8))
+    load_table = Mock(return_value=table)
+    device_name = Mock(return_value="test-device")
+    monkeypatch.setattr(dspark_planner, "load_runtime_sps_cost_table", load_table)
+    monkeypatch.setattr(torch.cuda, "get_device_name", device_name)
+    monkeypatch.setattr(inputs_module, "prefer_pinned", lambda: False)
+    monkeypatch.setattr(inputs_module.spec_step_copies, "is_supported", lambda: False)
+
+    preparer = inputs_module.DecoderInputPreparer(
+        buffers=buffers,
+        config=config,
+        mapping=mapping,
+        dist=None,
+        model=torch.nn.Identity(),
+        get_runtime_tokens_per_gen_step=lambda _draft_len: 5,
+        iter_states={},
+        lora=None,
+        use_beam_search=False,
+        steady_gen_cache_supported=False,
+    )
+
+    assert preparer._buffers is buffers
+    assert preparer._gather_ids_buffer.tensor is buffers.gather_ids_cuda
+    if not enabled:
+        load_table.assert_not_called()
+        device_name.assert_not_called()
+        assert preparer._dspark_sps_cost_table is None
+        assert preparer.previous_verify_lens is None
+        return
+
+    load_table.assert_called_once_with(
+        "costs.json",
+        graph_batch_sizes=[1, 2, 4],
+        max_draft_len=4,
+        minimum_predicted_gain=0.02,
+        live_setup=dspark_planner.CostTableSetup(
+            gpu="test-device",
+            world_size=8,
+            tensor_parallel_size=8,
+            moe_expert_parallel_size=8,
+            enable_attention_dp=True,
+            tensorrt_llm_version=trtllm_version,
+        ),
+    )
+    device_name.assert_called_once_with(buffers.input_ids_cuda.device)
+    table.candidate_cells.assert_called_once_with()
+    assert preparer._dspark_sps_cost_table is table
+    assert preparer._dspark_exact_candidate_cells == ((1, 2), (2, 4))
+    assert preparer._dspark_exact_identity_words == tuple(range(8))
+    assert preparer.previous_verify_lens == []
 
 
 class _Batch:
@@ -271,6 +353,7 @@ def test_reset_padding_dummies_clears_only_runner_owned_state(runner_type):
 def test_cached_shape_agreement_keeps_sampling_tier_collective():
     runner = _runner_stub()
     batch = _Batch([SimpleNamespace(py_verify_len=3, py_draft_tokens=[0] * 5)] * 4)
+    runner.set_policy_iteration(9)
     runner.adp_shape_agreement = _agreement(batch, peer_sizes=(4, 4))
     runner.agreed_ragged_bucket = 16
     runner.enabled = True
@@ -290,20 +373,176 @@ def test_cached_shape_agreement_keeps_sampling_tier_collective():
     )
     runner._resolve_sample_type = lambda *_args: SampleType.FAST
 
-    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, SampleType.FULL)
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (
+        True,
+        SampleType.FULL,
+        None,
+        None,
+    )
     assert exchanges == [[True, 4, 16, 5, SampleType.FAST.value]]
     runner.enable_in_graph_sampling = False
     exchanges.clear()
-    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, None)
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, None, None, None)
     assert exchanges == []
+
+
+def test_shape_agreement_carries_the_kv_regime_when_graphs_are_keyed_by_it():
+    runner = _runner_stub()
+    batch = _Batch([SimpleNamespace(py_verify_len=3, py_draft_tokens=[0] * 5)] * 4)
+    runner.adp_shape_agreement = None
+    runner.agreed_ragged_bucket = 16
+    runner.enabled = True
+    runner.enable_in_graph_sampling = False
+    runner.kv_regime_resolver = lambda batch_size, draft_len: (8192, 16384)
+    runner._kv_regime_for_batch = lambda *_args: 8192
+    exchanges = []
+
+    def allgather(payload):
+        exchanges.append(payload)
+        peer = list(payload)
+        peer[-1] = 16384
+        return torch.tensor([payload, peer])
+
+    runner.config = SimpleNamespace(
+        enable_attention_dp=True,
+        mapping=SimpleNamespace(tp_size=2),
+        dist=SimpleNamespace(tp_allgather_int64=allgather),
+    )
+    runner._resolve_sample_type = lambda *_args: SampleType.FULL
+
+    # the regime is the sixth field of the one shape exchange; the largest regime wins
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (
+        True,
+        SampleType.FULL,
+        16384,
+        None,
+    )
+    assert exchanges == [[True, 4, 16, 5, SampleType.FULL.value, 8192]]
+
+
+def test_shape_agreement_carries_the_packed_split_when_graphs_are_keyed_by_it():
+    runner = _runner_stub()
+    batch = _Batch([SimpleNamespace(py_verify_len=3, py_draft_tokens=[0] * 5)] * 4)
+    runner.adp_shape_agreement = None
+    runner.agreed_ragged_bucket = 16
+    runner.enabled = True
+    runner.enable_in_graph_sampling = False
+    runner.kv_regime_resolver = lambda batch_size, draft_len: (8192, 16384)
+    runner._kv_regime_for_batch = lambda *_args: 8192
+    runner.packed_split_resolver = PackedSplitResolver(
+        variants=lambda batch_size, draft_len: (False, True),
+        decide=lambda batch_size, draft_len, kv_lens: False,
+    )
+    runner._packed_split_for_batch = lambda *_args: False
+    exchanges = []
+
+    def allgather(payload):
+        exchanges.append(payload)
+        peer = list(payload)
+        peer[-1] = 1
+        return torch.tensor([payload, peer])
+
+    runner.config = SimpleNamespace(
+        enable_attention_dp=True,
+        mapping=SimpleNamespace(tp_size=2),
+        dist=SimpleNamespace(tp_allgather_int64=allgather),
+    )
+    runner._resolve_sample_type = lambda *_args: SampleType.FULL
+
+    # the decision follows the regime in the one shape exchange; a peer that splits makes every rank split
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (
+        True,
+        SampleType.FULL,
+        8192,
+        True,
+    )
+    assert exchanges == [[True, 4, 16, 5, SampleType.FULL.value, 8192, 0]]
 
 
 def test_cached_shape_agreement_rejects_a_changed_ragged_key():
     runner = _runner_stub()
     batch = _Batch([SimpleNamespace(py_verify_len=3, py_draft_tokens=[0] * 5)] * 4)
+    runner.set_policy_iteration(9)
     runner.adp_shape_agreement = _agreement(batch, peer_sizes=(4, 4))
     runner.agreed_ragged_bucket = 15
     runner.enable_in_graph_sampling = False
 
     with pytest.raises(RuntimeError, match="no longer matches"):
         runner._agree_graph_shape(batch, True, frozenset())
+
+
+def test_policy_iteration_invalidates_prior_shape_vote():
+    runner = _runner_stub()
+    batch = _Batch([object()] * 3)
+    runner.set_policy_iteration(9)
+    agreement = _agreement(batch)
+    runner.adp_shape_agreement = agreement
+    assert runner._reusable_padding_agreement(batch) is agreement
+    runner.set_policy_iteration(9)
+    assert runner.adp_shape_agreement is agreement
+    runner.set_policy_iteration(10)
+    assert runner.adp_shape_agreement is None
+    # Even a stale producer cannot authenticate its own epoch at the consumer.
+    runner.adp_shape_agreement = agreement
+    assert runner._reusable_padding_agreement(batch) is None
+
+
+def test_stale_replay_vote_rejoins_the_shape_collective():
+    runner = _runner_stub()
+    batch = _Batch([SimpleNamespace(py_verify_len=3, py_draft_tokens=[0] * 5)] * 4)
+    runner.set_policy_iteration(10)
+    runner.adp_shape_agreement = _agreement(batch, iteration=9, peer_sizes=(4, 4))
+    runner.agreed_ragged_bucket = 16
+    runner.enabled = True
+    runner.enable_in_graph_sampling = False
+    exchanges = []
+
+    def exchange(payload):
+        exchanges.append(payload)
+        return SimpleNamespace(tolist=lambda: [payload, list(payload)])
+
+    runner.config = SimpleNamespace(
+        enable_attention_dp=True,
+        mapping=SimpleNamespace(tp_size=2),
+        dist=SimpleNamespace(tp_allgather_int64=exchange),
+    )
+    runner._resolve_sample_type = lambda *_args: SampleType.FAST
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (
+        True,
+        SampleType.FAST,
+        None,
+        None,
+    )
+    assert exchanges == [[True, 4, 16, 5, SampleType.FAST.value]]
+
+
+@pytest.mark.parametrize("failure", [None, "enter", "forward"])
+def test_shape_vote_is_consumed_on_normal_and_exceptional_forward_exit(monkeypatch, failure):
+    runner = _runner_stub()
+    batch = _Batch([object()] * 3)
+    runner.set_policy_iteration(9)
+    agreement = _agreement(batch)
+    runner.adp_shape_agreement = agreement
+
+    @contextmanager
+    def parent_pad(self, scheduled_requests, _resource_manager, _runtime_draft_len):
+        if failure == "enter":
+            raise RuntimeError("padding failed")
+        yield scheduled_requests
+
+    monkeypatch.setattr(CUDAGraphRunner, "pad_batch", parent_pad)
+
+    def forward():
+        with runner.pad_batch(batch, object(), 5) as padded:
+            assert padded is batch
+            assert runner.adp_shape_agreement is agreement
+            if failure == "forward":
+                raise RuntimeError("forward failed")
+
+    if failure is None:
+        forward()
+    else:
+        with pytest.raises(RuntimeError, match="failed"):
+            forward()
+    assert runner.adp_shape_agreement is None
+    assert runner._reusable_padding_agreement(batch) is None
