@@ -27,27 +27,41 @@ MAX_SEQ_LEN = 262144
 _SMALL_WINDOWS = tuple(None if layer % 6 == 5 else 1024 for layer in range(48))
 
 
-def _windows(model_config: ModelConfig, text) -> tuple:
-    """Each layer's window as the model applies it and as the KV cache keeps it (None: full).
+def _windows(model_config: ModelConfig, llm_args: TorchLlmArgs, text) -> tuple:
+    """Each layer's window as the model applies it, as the KV cache keeps it, and as released.
 
-    The KV cache reads the top-level config as `get_layer_attention_window` does; the model reads
-    the text config. A field changed after loading can leave the two apart.
+    None is the whole context, and so is a window of at least `max_seq_len`. The KV cache takes an
+    explicit `kv_cache_config.max_attention_window` as given, and otherwise derives its windows from
+    the top-level config as `get_layer_attention_window` does; the model reads the text config. A
+    field changed after loading, or an explicit cache window, can leave the two apart.
     """
     from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+        _resolve_v2_max_attention_window_vec,
+    )
 
     try:
         dims = InklingDims.from_config(text)
     except ValueError:
-        return None, None
-    model = tuple(
-        None if dims.is_global(layer) else dims.sliding_window for layer in range(dims.num_layers)
-    )
-    cfg = model_config.pretrained_config
+        return None, None, None
+    max_seq_len = llm_args.max_seq_len or MAX_SEQ_LEN
+    layers = list(range(dims.num_layers))
+
+    def span(window):
+        return None if window is None or window >= max_seq_len else window
+
+    model = tuple(span(None if dims.is_global(layer) else dims.sliding_window) for layer in layers)
+    explicit = llm_args.kv_cache_config.max_attention_window
     try:
-        cache = tuple(get_layer_attention_window(cfg, layer) for layer in range(dims.num_layers))
+        if explicit is not None:
+            # The manager's own resolution of an explicit window pattern into per-layer windows.
+            cache = _resolve_v2_max_attention_window_vec(explicit, max_seq_len, layers)
+        else:
+            cfg = model_config.pretrained_config
+            cache = [get_layer_attention_window(cfg, layer) for layer in layers]
     except (NotImplementedError, ValueError):
-        cache = None
-    return model, cache
+        return model, None, None
+    return model, tuple(span(window) for window in cache), tuple(map(span, _SMALL_WINDOWS))
 
 
 @routes("Inkling2ForConditionalGeneration")
@@ -61,8 +75,8 @@ def route(
     shape = (text.num_hidden_layers, text.hidden_size, text.n_routed_experts)
     layout = (mapping.world_size, mapping.tp_size, mapping.moe_ep_size, mapping.moe_tp_size)
     kv_cache_config = llm_args.kv_cache_config
-    model_windows, cache_windows = _windows(model_config, text)
-    released_windows = model_windows == cache_windows == _SMALL_WINDOWS
+    model_windows, cache_windows, small_windows = _windows(model_config, llm_args, text)
+    released_windows = small_windows is not None and model_windows == cache_windows == small_windows
     facts = {
         "GB300 (sm_103)": compute_capability in _SMS,
         "Inkling-2-Small's shape (48 layers, hidden 4608, 384 experts)": shape == _SMALL,

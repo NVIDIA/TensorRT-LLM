@@ -131,6 +131,26 @@ def test_refuses_each_other_deployment_naming_the_condition(kwargs, condition):
     assert f"lacks: {condition}" in message or f"; {condition}" in message, message
 
 
+def test_refuses_an_explicit_kv_cache_window_smaller_than_the_models():
+    # An explicit max_attention_window replaces the windows the KV cache derives from layer_types.
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_attention_window=[512])
+    assert "attention windows" in _refusal(kv_cache_config=kv_cache_config)
+
+
+def test_admits_an_explicit_kv_cache_window_equal_to_the_models():
+    # Every sixth layer full context (a window of max_seq_len), the others 1024: the release's.
+    windows = [1024] * 5 + [_GATED["max_seq_len"]]
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_attention_window=windows)
+    assert _route(kv_cache_config=kv_cache_config).__name__ == _TARGET
+
+
+def test_refuses_a_kv_cache_window_the_model_does_not_apply():
+    # Only the copy the KV cache reads changes; the model keeps the release's window.
+    pretrained = _pretrained()
+    pretrained.sliding_window = 512
+    assert "attention windows" in _refusal(model_config=_model_config(pretrained))
+
+
 def test_refuses_a_window_the_kv_cache_does_not_keep():
     # A field changed after loading (model_kwargs) reaches the text config, which the model
     # reads, but not the copy on the top-level config, which sizes the KV cache's windows.
