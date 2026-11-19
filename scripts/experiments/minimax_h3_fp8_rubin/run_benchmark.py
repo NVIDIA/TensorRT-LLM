@@ -83,6 +83,7 @@ def main() -> None:
         )
         return
     os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
+    os.environ.setdefault("TLLM_DISABLE_MPI", "1")
     os.environ.setdefault("OMP_NUM_THREADS", "8")
     os.environ.setdefault("MKL_NUM_THREADS", "8")
     if os.environ["NVIDIA_TF32_OVERRIDE"] != "0":
@@ -94,7 +95,11 @@ def main() -> None:
     from phase_timer import EventTimer
 
     from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3 import scenarios, transformer_minimax_h3
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3 import (
+        pipeline_minimax_h3,
+        scenarios,
+        transformer_minimax_h3,
+    )
     from tensorrt_llm._torch.visual_gen.models.minimax_h3.minimax_h3_nvfp4__sm_107__u1_u4 import (
         config,
     )
@@ -112,6 +117,13 @@ def main() -> None:
     if _sha(Path(transformer_minimax_h3.__file__)) != proof["native_file_sha256"]:
         raise ValueError("Use the H3 Python runtime matching this integration base; see README")
     original_resolve, original_init = scenarios.resolve_scenario, GatedMLP.__init__
+    original_build = pipeline_minimax_h3.build_packed_sequence
+    layouts = []
+
+    def logged_build(*values: object, **kwargs: object) -> object:
+        layout = original_build(*values, **kwargs)
+        layouts.append(layout.sequence_length)
+        return layout
 
     def resolve(family: type, cfg: object) -> type:
         if scenarios._transformer_quant_algo(cfg) != QuantAlgo.FP8 or cfg.dynamic_weight_quant:
@@ -153,6 +165,7 @@ def main() -> None:
         "source_pins": pins,
     }
     try:
+        pipeline_minimax_h3.build_packed_sequence = logged_build
         scenarios.resolve_scenario = resolve
         if "fuse_bf16_gate_up_swiglu" not in inspect.signature(original_init).parameters:
             GatedMLP.__init__ = compatible_init
@@ -277,6 +290,7 @@ def main() -> None:
             ]
             row.update(
                 actual_transformer_calls=len(events.get("transformer_step", [])),
+                actual_packed_tokens=layouts[-1] if layouts else None,
                 dispatch=delta,
                 no_new_graphs=graphs
                 == int(torch._dynamo.utils.counters.get("stats", {}).get("unique_graphs", 0)),
@@ -291,6 +305,7 @@ def main() -> None:
                 or tuple(audio.shape) != (1, 2, 165600)
                 or audio.dtype != torch.float32
                 or not bool(torch.isfinite(audio).all())
+                or int(value.audio_sample_rate) != 32000
             ):
                 raise ValueError("Invalid H3 output")
             logical = {
@@ -308,20 +323,28 @@ def main() -> None:
                     },
                     args.output / "output.pt",
                 )
+                record["canonical_media_sha256"] = logical
+                record["raw_output_sha256"] = _sha(args.output / "output.pt")
             row["matches_warmup"] = logical == canonical
             _write(args.output / "results.json", record)
-            if row["actual_transformer_calls"] != 49 or delta != [
-                2450,
-                2450,
-                2450,
-                2450,
-                49,
-                0,
-                0,
-                0,
-                0,
-                98,
-            ]:
+            expected_tokens = 38169 if args.scene == "waiter" else 37820
+            if (
+                row["actual_transformer_calls"] != 49
+                or row["actual_packed_tokens"] != expected_tokens
+                or delta
+                != [
+                    2450,
+                    2450,
+                    2450,
+                    2450,
+                    49,
+                    0,
+                    0,
+                    0,
+                    0,
+                    98,
+                ]
+            ):
                 raise RuntimeError("Unexpected fusion dispatch; timing and raw output retained")
             del video, audio, value
         formal = [row for row in record["generations"] if row["kind"] == "timed"]
@@ -345,6 +368,7 @@ def main() -> None:
             )
         )
     finally:
+        pipeline_minimax_h3.build_packed_sequence = original_build
         scenarios.resolve_scenario, GatedMLP.__init__ = original_resolve, original_init
         if runtime is not None:
             record["runtime_report"] = runtime.report()

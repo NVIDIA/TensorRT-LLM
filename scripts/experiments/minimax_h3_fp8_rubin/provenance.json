@@ -1,5 +1,5 @@
 {
-  "integration_base": "0c56fefb9749582e7d532ff26681a10fd5717ea6",
+  "integration_base": "2d9fa027af235df2899d4a4f0a9759f299569f35",
   "research_head": "4daf64858047fe5b1b07ee6c16aef7933b2b68bd",
   "scope": "Opt-in uniform static-FP8 implementation; no product defaults changed",
   "GPU_new_base_validation": "pending",
@@ -19,5 +19,7 @@
     "compiled binaries",
     "historical run manifests",
     "rejected variants"
-  ]
+  ],
+  "integration_repository": "https://github.com/NVIDIA/TensorRT-LLM",
+  "integration_branch": "feat/minimax-h3-rubin"
 }

@@ -9,5 +9,5 @@
   "scope": "Same frozen singlepipeline/U1/graphsOFF, both canonical unquantized FP32 media outputheads, no hooks/weights/config mutation/concurrency. Actual input identity + post-video-GEMM immutability/native-conversion byte gate must pass before uninstrumented requests.",
   "diagnostic_trace": "results/cycle407-full-hidden-FP32-copy-attribution-v2.json",
   "GPU_validation": "pending",
-  "base": "0c56fefb9749582e7d532ff26681a10fd5717ea6"
+  "base": "2d9fa027af235df2899d4a4f0a9759f299569f35"
 }

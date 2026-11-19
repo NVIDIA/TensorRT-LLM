@@ -7,8 +7,8 @@ Opt-in single-GPU implementation for the provided uniform ModelOpt FP8 checkpoin
 It uses FP8 QKV/P, trtllm-gen FP16 softmax with `t=0`, BF16 residuals, and FP32
 output heads. Video VAE FP8 Linears/component graphs follow Kanghwan's scenario.
 
-The integration base is Kanghwan's `feat/minimax-h3-rubin` at
-`0c56fefb9749582e7d532ff26681a10fd5717ea6`. The full fused implementation requires
+The integration base is NVIDIA's `feat/minimax-h3-rubin` at
+`2d9fa027af235df2899d4a4f0a9759f299569f35`. The full fused implementation requires
 SM107 with 212 SMs, Ulysses=TP=1, compile on, whole-model CUDA graphs off, and the
 fixed 1344×768×124, 24 fps requests. Both fixtures use 50 steps / 49 Transformer calls.
 Grace GB300 and four-GPU measurements use the separately documented common recipe.
@@ -67,7 +67,7 @@ implementation and measured validation are recorded in the complete reports:
 
 - [中文报告](https://sc.talos.nvidia.com/view/home/scratch.taianz_inf/workspace/notes/rubin/runs/20261110-h3-static-fp8/report.html)
 - [English report](https://sc.talos.nvidia.com/view/home/scratch.taianz_inf/workspace/notes/rubin/runs/20261110-h3-static-fp8/report-en.html)
-- [Original research branch](https://gitlab-master.nvidia.com/ftp/tekit/-/tree/user/taianz/h3-rubin-fp8-functional)
+- [Historical measurements and experiment ledger](https://sc.talos.nvidia.com/view/home/scratch.taianz_inf/workspace/notes/rubin/runs/20261110-h3-static-fp8/report.html#appendix)
 
 Historical experiments, rejected variants, weights, videos, traces, archives and
 compiled artifacts remain outside this clean source package.

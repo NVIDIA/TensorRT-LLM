@@ -1,6 +1,6 @@
 {
   "schema": "H3-FP8-INTEGRATION-SOURCES-v1",
-  "base": "0c56fefb9749582e7d532ff26681a10fd5717ea6",
+  "base": "2d9fa027af235df2899d4a4f0a9759f299569f35",
   "files": {
     "fusion_round1/fp8_producers.py": "0d38546ba4490ec60369f00178c32c93295748591701ac37cd24198c0d14a4b7",
     "fusion_round1/patch_runtime.py": "eda3a24cb9343938b58212dda47e7ed041f3506939e8e8cbdc96f6d1125c3f65",
@@ -30,7 +30,7 @@
     "long_round5/round5_quant_runtime.py": "5851bb73c7d23fe31fa7a5817164ada7ce8173bd71e7b7817cbb20b57db8b02d",
     "long_round5/round5_runtime.py": "6187f6300febf2be286d20138dc4ec2199c41eab37256a281a89aa42441e105d",
     "long_round5/round5_shared_forward.py": "0dd77881f32d6f295a6c8b41109cac9a02d5e5cd0b5e2cd4d8fe48401f3fbfcd",
-    "long_round5/round5_shared_forward_proof.json": "72abdf245d84ce1e7e603bf2d291de5432d2069abc94651f0f53dcabdcb0eedc",
+    "long_round5/round5_shared_forward_proof.json": "01f1300e7b66dc4af086e97eaa8d827d1a3d2fbe20508e4fd3a8ed7ab97d9fb9",
     "long_round5/round5_shared_runtime.py": "3784f13d193e6567085c262dc3dd2a87a3dc5264e67b19dcef78b127bd0f8626",
     "long_round5/sharedCast.cpp": "a458924b0b7281d77aed64b3ead376b5f21e5deba0d6f86ff158911bf19d6fc3",
     "long_round5/sharedCast.cu": "00139da11b25ebadc56260de59372eb396b4387606e3b98bd0e9e77287b623f2",
@@ -38,10 +38,10 @@
     "long_round5/staticQuant.cpp": "223f1385f132abe7d6b213407eca8ccc833bad3cdae0391a519f5250ca7a1443",
     "long_round5/staticQuant.cu": "58a60b38028e7c3d3dc40443efe695e28673e9cecab33ee0e068ab4d8e52c8f7",
     "phase_timer.py": "8f968093b0a18389508a495e654d7ee637be23b253f7ec661d2c53e176389f92",
-    "provenance.json": "bb21ee836930069bebc4533e4291450b6aa1a99760ef2aca86a3e3d1b3da4218",
+    "provenance.json": "4914d72ccf89fdb14be6df5fe9a6c7763e13e9df7b1a147842088a9c60a7c528",
     "requests/cycling.json": "adada0baf8f7ec70af2d775ac23f682e4e1aebf8589dbb63f17d89cdcf2090bc",
     "requests/waiter.json": "d6781453c91097a294becf64b5b1a37262212aae77b27067e2156310a9007435",
-    "run_benchmark.py": "340b5bda1e6162edd1e3706a1381678c2015259c48cbac16b496fea8e81f6e6a",
+    "run_benchmark.py": "67c967bb64b24d3a84c4d399b832a44f360d7a6aaead669a0f65c34337c29c5c",
     "tests/test_contracts_cpu.py": "1d5bd71c9c86ad2fbe06d58073f640284220913536ac1f2cf3a454e9e2652e9c"
   }
 }
