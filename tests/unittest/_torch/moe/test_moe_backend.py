@@ -7582,7 +7582,7 @@ def test_moe_mxe2m1_weights_valid_dimensions(
     # Reuse the numerical reference without enabling the deprecated test matrix.
     run_direct_case(
         num_tokens=16,
-        hidden_size=pad_up(valid_hidden_size, 128),
+        hidden_size=pad_up(valid_hidden_size, 512),
         intermediate_size=pad_up(valid_intermediate_size, 128),
         routing_info={
             "num_experts": 16,

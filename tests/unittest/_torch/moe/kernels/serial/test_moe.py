@@ -27,7 +27,8 @@ from tensorrt_llm._torch.moe.fused_moe import RoutingMethodType
 from tensorrt_llm._torch.utils import next_positive_power_of_2
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import (
-    reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
+    pad_up, reorder_rows_for_gated_act_gemm, shuffle_matrix_a,
+    shuffle_matrix_sf_a)
 
 # NOTE: Some tests in this file are deprecated and skipped. They are now covered by the
 # unified MoE test framework in tests/unittest/_torch/modules/moe/test_moe_backend.py
@@ -2551,6 +2552,9 @@ def _run_moe_mxe2m1_weights(
                                                  hidden_size // sf_block_size)
 
     # Shuffle weights and scaling factors for transposed mma output
+    # FC2 output rows use 128 alignment independently of the FC1 input padding.
+    output_hidden_size = (pad_up(valid_hidden_size, 128)
+                          if valid_hidden_size is not None else hidden_size)
     gemm1_weights_mxe2m1_shuffled = []
     gemm1_scales_mxe2m1_shuffled = []
     gemm2_weights_mxe2m1_shuffled = []
@@ -2572,16 +2576,19 @@ def _run_moe_mxe2m1_weights(
                 shuffle_matrix_a(gemm1_bias_interleaved[i], epilogue_tile_m))
 
         gemm2_weights_mxe2m1_shuffled.append(
-            shuffle_matrix_a(gemm2_weights_mxe2m1[i].view(torch.uint8),
-                             epilogue_tile_m))
+            shuffle_matrix_a(
+                gemm2_weights_mxe2m1[i, :output_hidden_size].view(torch.uint8),
+                epilogue_tile_m))
         gemm2_scales_mxe2m1_shuffled.append(
-            shuffle_matrix_sf_a(gemm2_scales_linear_mxe2m1[i].view(torch.uint8),
-                                epilogue_tile_m))
+            shuffle_matrix_sf_a(
+                gemm2_scales_linear_mxe2m1[i, :output_hidden_size].view(
+                    torch.uint8), epilogue_tile_m))
 
         if gemm2_bias is not None:
             gemm2_bias_shuffled.append(
-                shuffle_matrix_a(gemm2_bias[i].clone().reshape(-1, 1),
-                                 epilogue_tile_m))
+                shuffle_matrix_a(
+                    gemm2_bias[i, :output_hidden_size].clone().reshape(-1, 1),
+                    epilogue_tile_m))
 
     # Stack weights for all experts
     gemm1_weights_mxe2m1_shuffled = torch.stack(gemm1_weights_mxe2m1_shuffled)
@@ -2592,7 +2599,7 @@ def _run_moe_mxe2m1_weights(
     gemm2_weights_mxe2m1_shuffled = torch.stack(gemm2_weights_mxe2m1_shuffled)
     gemm2_scales_mxe2m1_shuffled = torch.stack(
         gemm2_scales_mxe2m1_shuffled).view(torch.uint8).reshape(
-            num_experts, hidden_size, intermediate_size // sf_block_size)
+            num_experts, output_hidden_size, intermediate_size // sf_block_size)
 
     gemm1_bias_shuffled = (torch.stack(gemm1_bias_shuffled).reshape(
         num_experts, -1) if gemm1_bias_shuffled else None)
